@@ -464,10 +464,23 @@ class FailingAgentRunRepository:
     def __init__(self, delegate, failing_method):
         self.delegate = delegate
         self.failing_method = failing_method
+        self.call_counts = Counter()
+        self.injected_methods = []
 
     def __getattr__(self, name):
         if name == self.failing_method:
-            return self._fail
+            def fail(*args, **kwargs):
+                self.call_counts[name] += 1
+                self.injected_methods.append(name)
+                return self._fail(*args, **kwargs)
+
+            return fail
+        if name in {"append_event", "append_event_bound"}:
+            def count_and_delegate(*args, **kwargs):
+                self.call_counts[name] += 1
+                return getattr(self.delegate, name)(*args, **kwargs)
+
+            return count_and_delegate
         return getattr(self.delegate, name)
 
     @staticmethod
@@ -2700,13 +2713,13 @@ def _failure_injected_recorder_factory(data_dir, failure, *, clock=time.monotoni
         return RunRecorderFactory(repository, key=key, clock=invalid_clock)
     if failure == "locked":
         return RunRecorderFactory(
-            LockedAgentRunRepository(repository, "append_event"),
+            LockedAgentRunRepository(repository, "append_event_bound"),
             key=key,
             clock=clock,
         )
     if failure == "caller-conflict":
         return RunRecorderFactory(
-            ConflictingAgentRunRepository(repository, "append_event"),
+            ConflictingAgentRunRepository(repository, "append_event_bound"),
             key=key,
             clock=clock,
         )
@@ -3025,14 +3038,42 @@ def test_journal_failure_modes_preserve_hitl_ledger_and_domain_behavior(
         control_dir,
         _stable_journal_factory(control_dir, clock=journal_clock),
     )
+    candidate_factory = _failure_injected_recorder_factory(
+        candidate_dir,
+        failure,
+        clock=journal_clock,
+    )
     candidate = exercise(
         candidate_dir,
-        _failure_injected_recorder_factory(
-            candidate_dir,
-            failure,
-            clock=journal_clock,
-        ),
+        candidate_factory,
     )
+    if failure in {"locked", "caller-conflict"} and approved:
+        repository = candidate_factory.repository
+        assert repository.call_counts["append_event_bound"] >= 1
+        assert set(repository.injected_methods) == {"append_event_bound"}
+        runs, events, snapshots = _wait_for_journal_status(
+            candidate_dir,
+            "completed",
+            predicate=_journal_terminal_predicate(
+                required_event_types=("run.resumed", "run.completed"),
+                required_snapshot_kinds=(
+                    "initial",
+                    "model_input",
+                    "confirmation_resume",
+                ),
+            ),
+        )
+        assert runs[0].recording_status == "degraded"
+        assert runs[0].recording_error_count >= 1
+        trace = _journal_trace(candidate_dir, runs[0])
+        assert trace.recording_status == "degraded"
+        assert trace.recording_error_count >= 1
+        assert trace.integrity_status == "known_degraded"
+        assert "recording_degraded" in trace.anomalies
+    if failure == "append":
+        repository = candidate_factory.repository
+        assert repository.call_counts["append_event"] >= 1
+        assert set(repository.injected_methods) == {"append_event"}
     assert candidate == control
 
 

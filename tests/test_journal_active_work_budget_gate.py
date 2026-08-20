@@ -104,8 +104,32 @@ def _parents(tree: ast.AST) -> dict[ast.AST, ast.AST]:
     return result
 
 
+def _is_module_scope(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
+    current = parents.get(node)
+    while current is not None:
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            return False
+        current = parents.get(current)
+    return True
+
+
+def _target_names(node: ast.AST) -> set[str]:
+    names = {
+        child.id
+        for child in ast.walk(node)
+        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
+    }
+    for child in ast.walk(node):
+        if isinstance(child, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+            target = child.name
+            if isinstance(target, str):
+                names.add(target)
+    return names
+
+
 def _top_level_class(tree: ast.AST, name: str) -> ast.ClassDef:
     assert isinstance(tree, ast.Module)
+    parents = _parents(tree)
     matches = [
         node
         for node in ast.walk(tree)
@@ -119,13 +143,30 @@ def _top_level_class(tree: ast.AST, name: str) -> ast.ClassDef:
         for node in ast.walk(tree)
     ), f"{name} must not be shadowed by a function"
     for node in ast.walk(tree):
-        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            assert not any(
-                isinstance(target_node, ast.Name) and target_node.id == name
-                for target in targets
-                for target_node in ast.walk(target)
-            ), f"{name} must not be shadowed by an assignment"
+        if not _is_module_scope(node, parents):
+            continue
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            raise AssertionError(f"{name} must not be shadowed by a function")
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                bound_name = alias.asname or alias.name.split(".", 1)[0]
+                assert bound_name != name, f"{name} must not be shadowed by an import"
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                assert alias.name != "*", f"{name} must not be shadowed by a star import"
+                bound_name = alias.asname or alias.name
+                assert bound_name != name, f"{name} must not be shadowed by an import"
+        elif isinstance(
+            node, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr, ast.For, ast.AsyncFor)
+        ):
+            assert name not in _target_names(node), f"{name} must not be shadowed by a target"
+        elif isinstance(node, ast.withitem):
+            if node.optional_vars is not None:
+                assert name not in _target_names(node.optional_vars), (
+                    f"{name} must not be shadowed by a with target"
+                )
+        elif isinstance(node, ast.ExceptHandler) and node.name == name:
+            raise AssertionError(f"{name} must not be shadowed by an except target")
     return result
 
 
@@ -180,6 +221,15 @@ def _contains_none_literal(node: ast.AST) -> bool:
     )
 
 
+def _is_exact_lease_attribute(node: ast.AST, attribute: str) -> bool:
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == attribute
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "lease"
+    )
+
+
 def _validate_journal_repository_calls(tree: ast.AST) -> None:
     parents = _parents(tree)
     calls = _direct_repository_calls(tree)
@@ -213,6 +263,16 @@ def _validate_journal_repository_calls(tree: ast.AST) -> None:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id == "getattr" and node.args and _is_self_name(node.args[0]):
                 raise AssertionError("dynamic self.repository access is forbidden")
+        if isinstance(node, ast.Attribute) and node.attr == "__getattribute__":
+            raise AssertionError("dynamic self.repository access is forbidden")
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "__getattribute__"
+            and node.args
+            and _is_self_name(node.args[0])
+        ):
+            raise AssertionError("dynamic self.repository access is forbidden")
         if isinstance(node, ast.Attribute) and _is_self_attribute(node, "__dict__"):
             raise AssertionError("dynamic self.__dict__ repository access is forbidden")
 
@@ -221,6 +281,12 @@ def _validate_journal_repository_calls(tree: ast.AST) -> None:
         assert function is not None
         assert function.attr in allowed, f"unknown Journal repository method: {function.attr}"
         keyword_names = [keyword.arg for keyword in call.keywords]
+        assert all(keyword_name is not None for keyword_name in keyword_names), (
+            "Journal repository calls must not forward dynamic keyword arguments"
+        )
+        assert not any(isinstance(argument, ast.Starred) for argument in call.args), (
+            "Journal repository calls must not forward dynamic positional arguments"
+        )
         assert "clock" not in keyword_names, "Journal repository calls must not pass clock"
         if function.attr == "append_event_bound":
             assert "deadline" not in keyword_names
@@ -236,6 +302,12 @@ def _validate_journal_repository_calls(tree: ast.AST) -> None:
             assert len(values) == 1, f"{function.attr} must pass exactly one {required}"
             assert not _contains_none_literal(values[0]), (
                 f"{function.attr} must pass a non-None {required}"
+            )
+            expected_attribute = (
+                "work_deadline" if required == "deadline" else "safe_clock"
+            )
+            assert _is_exact_lease_attribute(values[0], expected_attribute), (
+                f"{function.attr} must pass lease.{expected_attribute} exactly"
             )
 
 
@@ -288,16 +360,14 @@ def _validate_self_clock_access(tree: ast.AST) -> None:
             if isinstance(node.func, ast.Name) and node.func.id == "getattr":
                 if node.args and _is_self_name(node.args[0]):
                     raise AssertionError("dynamic self clock access is forbidden")
-            if (
-                isinstance(node.func, ast.Attribute)
-                and node.func.attr == "__getattribute__"
-                and node.args
-                and _is_self_name(node.args[0])
-            ):
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "__getattribute__":
                 raise AssertionError("dynamic self clock access is forbidden")
 
-        if isinstance(node, ast.Attribute) and _is_self_attribute(node, "__dict__"):
-            raise AssertionError("dynamic self.__dict__ access is forbidden")
+        if isinstance(node, ast.Attribute):
+            if _is_self_attribute(node, "__dict__"):
+                raise AssertionError("dynamic self.__dict__ access is forbidden")
+            if _is_self_attribute(node, "__getattribute__"):
+                raise AssertionError("dynamic self clock access is forbidden")
 
 
 def _validate_bound_method(method: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
@@ -328,14 +398,27 @@ def _validate_bound_method(method: ast.FunctionDef | ast.AsyncFunctionDef) -> No
     assert len(bound_with.items) == 1 and bound_with.items[0] is item
 
     _validate_journal_repository_calls(method)
+    repository_calls = _direct_repository_calls(method)
+    assert len(repository_calls) == 1, "bound path must have exactly one repository call"
     append_calls = [
         call
-        for call in _direct_repository_calls(method)
+        for call in repository_calls
         if _direct_repository_method(call).attr == "append_event_bound"  # type: ignore[union-attr]
     ]
     assert len(append_calls) == 1, "bound path must have exactly one append_event_bound call"
-    body_nodes = {id(node) for statement in bound_with.body for node in ast.walk(statement)}
-    assert id(append_calls[0]) in body_nodes, "append_event_bound must be inside begin_nested body"
+    append_call = append_calls[0]
+    assert append_call.args and isinstance(append_call.args[0], ast.Name)
+    assert append_call.args[0].id == "session", (
+        "append_event_bound must receive the exact session name first"
+    )
+    assert all(keyword.arg is not None for keyword in append_call.keywords)
+    assert not any(isinstance(argument, ast.Starred) for argument in append_call.args)
+    append_statement = parents.get(append_call)
+    assert isinstance(append_statement, ast.Expr)
+    assert parents.get(append_statement) is bound_with
+    assert append_statement in bound_with.body, (
+        "append_event_bound must be a direct begin_nested statement"
+    )
 
     for node in ast.walk(method):
         if not isinstance(node, ast.Name) or node.id != "session":
@@ -361,6 +444,9 @@ def _validate_bound_method(method: ast.FunctionDef | ast.AsyncFunctionDef) -> No
         allowed_append = (
             isinstance(parent, ast.Call)
             and node in parent.args
+            and parent.args
+            and parent.args[0] is node
+            and isinstance(node, ast.Name)
             and _direct_repository_method(parent) is not None
             and _direct_repository_method(parent).attr == "append_event_bound"  # type: ignore[union-attr]
         )
@@ -370,6 +456,7 @@ def _validate_bound_method(method: ast.FunctionDef | ast.AsyncFunctionDef) -> No
     assert not forbidden, f"bound path owns no Journal transaction machinery: {sorted(forbidden)}"
     for node in ast.walk(method):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            assert node.value not in BOUND_FORBIDDEN_NAMES
             assert "pragma" not in node.value.lower(), "bound path must not issue PRAGMA"
 
 
@@ -399,14 +486,36 @@ def _validate_owned_signature(method: ast.FunctionDef | ast.AsyncFunctionDef) ->
     assert method.args.vararg is None and method.args.kwarg is None
 
 
+def _validate_bound_repository_session(method: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+    parents = _parents(method)
+    allowed_helpers = {"_existing_event", "_required_run", "_insert_event"}
+    for node in ast.walk(method):
+        if not isinstance(node, ast.Name) or node.id != "session":
+            continue
+        parent = parents.get(node)
+        allowed_helper_argument = (
+            isinstance(parent, ast.Call)
+            and parent.args
+            and parent.args[0] is node
+            and isinstance(parent.func, ast.Attribute)
+            and _is_self_name(parent.func.value)
+            and parent.func.attr in allowed_helpers
+        )
+        assert allowed_helper_argument, (
+            "append_event_bound must not own or manipulate the caller session"
+        )
+
+
 def _validate_bound_repository_implementation(
     method: ast.FunctionDef | ast.AsyncFunctionDef,
 ) -> None:
     _validate_bound_signature(method)
+    _validate_bound_repository_session(method)
     forbidden = _node_names(method) & BOUND_FORBIDDEN_NAMES
     assert not forbidden, f"repository bound path owns no transaction machinery: {sorted(forbidden)}"
     for node in ast.walk(method):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            assert node.value not in BOUND_FORBIDDEN_NAMES
             assert "pragma" not in node.value.lower()
 
 
@@ -448,6 +557,14 @@ def _validate_boundary_module(tree: ast.AST) -> None:
         for alias in node.names
         if alias.name == "offerpilot.agent_runtime"
     }
+    agent_runtime_aliases.update(
+        alias.asname or alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        if node.level > 0 or node.module == "offerpilot"
+        for alias in node.names
+        if alias.name == "agent_runtime"
+    )
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             assert not any(_is_budget_module_reference(alias.name) for alias in node.names)
@@ -584,6 +701,23 @@ class AgentRunRepository:
 @pytest.mark.parametrize(
     "source",
     (
+        "from other import SafeRunRecorder as SafeRunRecorder\nclass SafeRunRecorder:\n    pass\n",
+        "for SafeRunRecorder in items:\n    pass\nclass SafeRunRecorder:\n    pass\n",
+        "SafeRunRecorder += alias\nclass SafeRunRecorder:\n    pass\n",
+        "with context as SafeRunRecorder:\n    pass\nclass SafeRunRecorder:\n    pass\n",
+        "try:\n    pass\nexcept Exception as SafeRunRecorder:\n    pass\nclass SafeRunRecorder:\n    pass\n",
+        "def SafeRunRecorder():\n    pass\nclass SafeRunRecorder:\n    pass\n",
+        "def outer():\n    def SafeRunRecorder():\n        pass\nclass SafeRunRecorder:\n    pass\n",
+        "class SafeRunRecorder:\n    pass\nclass SafeRunRecorder:\n    pass\n",
+    ),
+)
+def test_mutations_reject_module_level_class_rebinding_and_duplicates(source: str) -> None:
+    _expect_rejected(source, lambda tree: _top_level_class(tree, "SafeRunRecorder"))
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
         "def run(self):\n    repo = self.repository\n    repo.append_event(x)\n",
         "def run(self):\n    (repo := self.repository).append_event(x)\n",
         "def run(self):\n    self.repository.new_method(x)\n",
@@ -591,6 +725,11 @@ class AgentRunRepository:
         "def run(self):\n    self.repository.append_event(x, deadline=lease.work_deadline, safe_clock=None)\n",
         "def run(self):\n    self.repository.append_event(x, deadline=lease.work_deadline, safe_clock=lease.safe_clock, clock=clock)\n",
         "def run(self):\n    self.repository.append_event(x, **kwargs)\n",
+        "def run(self):\n    self.repository.append_event(x, deadline=lease.work_deadline, safe_clock=lease.safe_clock, **kwargs)\n",
+        "def run(self):\n    self.__getattribute__('repository').append_event(x, deadline=lease.work_deadline, safe_clock=lease.safe_clock)\n",
+        "def run(self):\n    self.repository.append_event(x, deadline=0.1, safe_clock=lease.safe_clock)\n",
+        "def run(self):\n    self.repository.append_event(x, deadline=other.work_deadline, safe_clock=lease.safe_clock)\n",
+        "def run(self):\n    self.repository.append_event(x, deadline=lease.work_deadline, safe_clock=clock)\n",
     ),
 )
 def test_mutations_reject_repository_alias_unknown_none_and_clock_paths(source: str) -> None:
@@ -605,6 +744,7 @@ def test_mutations_reject_repository_alias_unknown_none_and_clock_paths(source: 
         "def run(self):\n    return getattr(self, 'clock')\n",
         "def run(self):\n    return getattr(self, key)\n",
         "def run(self):\n    return self.__dict__['clock']\n",
+        "def run(self):\n    return self.__getattribute__('clock')\n",
     ),
 )
 def test_mutations_reject_clock_alias_call_and_dynamic_access(source: str) -> None:
@@ -653,6 +793,58 @@ class SafeRunRecorder:
             with other_context:
                 self.repository.append_event_bound(session, self.run_id, draft)
 """,
+        """
+class SafeRunRecorder:
+    def append_prepared_event_bound(self, session, draft):
+        with session.begin_nested():
+            self.repository.append_event_bound(db, self.run_id, draft)
+""",
+        """
+class SafeRunRecorder:
+    def append_prepared_event_bound(self, session, draft):
+        with session.begin_nested():
+            self.repository.append_event_bound(*args, self.run_id, draft)
+""",
+        """
+class SafeRunRecorder:
+    def append_prepared_event_bound(self, session, draft):
+        with session.begin_nested():
+            self.repository.append_event_bound(session, self.run_id, draft, **kwargs)
+""",
+        """
+class SafeRunRecorder:
+    def append_prepared_event_bound(self, session, draft):
+        with session.begin_nested():
+            def nested():
+                self.repository.append_event_bound(session, self.run_id, draft)
+""",
+        """
+class SafeRunRecorder:
+    def append_prepared_event_bound(self, session, draft):
+        with session.begin_nested():
+            callback = lambda: self.repository.append_event_bound(
+                session, self.run_id, draft
+            )
+""",
+        """
+class SafeRunRecorder:
+    def append_prepared_event_bound(self, session, draft):
+        with session.begin_nested():
+            class Nested:
+                def run(inner):
+                    self.repository.append_event_bound(
+                        session, self.run_id, draft
+                    )
+""",
+        """
+class SafeRunRecorder:
+    def append_prepared_event_bound(self, session, draft):
+        with session.begin_nested():
+            self.repository.append_event_bound(session, self.run_id, draft)
+            self.repository.append_event(
+                draft, deadline=lease.work_deadline, safe_clock=lease.safe_clock
+            )
+""",
     ),
 )
 def test_mutations_reject_bound_session_alias_chain_and_other_calls(source: str) -> None:
@@ -674,6 +866,26 @@ class SafeRunRecorder:
         self.repository.append_event_bound(session, self.run_id, draft)
 """
     _expect_rejected(source, _validate_bound_call_ownership)
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "def append_event_bound(self, session, run_id, draft):\n    session.begin()\n",
+        "def append_event_bound(self, session, run_id, draft):\n    db = session\n    self._insert_event(db, run_id, draft)\n",
+        "def append_event_bound(self, session, run_id, draft):\n    with session.begin_nested():\n        self._insert_event(session, run_id, draft)\n",
+    ),
+)
+def test_mutations_reject_repository_bound_session_ownership(source: str) -> None:
+    wrapped = f"class AgentRunRepository:\n    {source.replace(chr(10), chr(10) + '    ')}"
+    _expect_rejected(
+        wrapped,
+        lambda tree: _validate_bound_repository_implementation(
+            _class_method(
+                _top_level_class(tree, "AgentRunRepository"), "append_event_bound"
+            )
+        ),
+    )
 
 
 @pytest.mark.parametrize(
@@ -703,6 +915,8 @@ def test_mutations_reject_bound_signature_clock_posonly_deadline_and_varargs(sou
         "from offerpilot.agent_runtime import budget as budget\n",
         "import offerpilot.agent_runtime.budget as budget\n",
         "import offerpilot.agent_runtime as runtime\nruntime.budget\n",
+        "from .. import agent_runtime as runtime\nruntime.budget\n",
+        "from offerpilot import agent_runtime as runtime\nruntime.budget\n",
         "import importlib\nimportlib.import_module('offerpilot.agent_runtime.budget')\n",
     ),
 )

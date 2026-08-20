@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import math
 
 import pytest
@@ -119,6 +120,14 @@ def test_begin_operation_requires_valid_entry_and_uses_remaining_allowance() -> 
     assert lease.hard_deadline == pytest.approx(10.030)
     assert lease.work_deadline == pytest.approx(10.025)
     assert lease.budget is budget
+
+
+def test_begin_operation_requires_explicit_hard_cap_argument() -> None:
+    parameter = inspect.signature(ActiveWorkBudget.begin_operation).parameters[
+        "hard_cap_seconds"
+    ]
+
+    assert parameter.default is inspect.Parameter.empty
 
 
 def test_begin_operation_rejects_allowance_equal_to_cleanup_reserve() -> None:

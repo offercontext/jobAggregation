@@ -86,7 +86,7 @@ class ActiveWorkBudget:
     def begin_operation(
         self,
         entry: MonotonicSample,
-        hard_cap_seconds: float = JOURNAL_OPERATION_HARD_CAP_SECONDS,
+        hard_cap_seconds: float,
     ) -> OperationLease:
         if entry.valid is not True:
             raise JournalDeadlineExceeded("clock_invalid")

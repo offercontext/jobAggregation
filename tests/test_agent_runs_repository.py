@@ -1166,18 +1166,27 @@ def test_native_blocking_udf_overshoot_is_classified_after_return_and_restored(
 ) -> None:
     _create_run(tmp_path)
     repository = _repository(tmp_path)
-    started = time.monotonic()
+    clock_value = 0.0
+    udf_called = False
+
+    def slow_udf() -> int:
+        nonlocal clock_value, udf_called
+        udf_called = True
+        time.sleep(0.060)
+        clock_value = 1.0
+        return 1
+
+    safe_clock = SafeClockAdapter(lambda: MonotonicSample(clock_value, True))
     with pytest.raises(JournalDeadlineExceeded):
         with repository._session_guard(
-            deadline=started + 0.010,
-            safe_clock=SafeClockAdapter(
-                lambda: MonotonicSample(time.monotonic(), True)
-            ),
+            deadline=0.500,
+            safe_clock=safe_clock,
         ) as session:
             raw = session.connection().connection.driver_connection
-            raw.create_function("slow_udf", 0, lambda: (time.sleep(0.060), 1)[1])
+            raw.create_function("slow_udf", 0, slow_udf)
             session.connection().exec_driver_sql("SELECT slow_udf()").scalar_one()
-    assert time.monotonic() - started >= 0.050
+    assert udf_called is True
+    assert clock_value >= 0.500
     with repository._session_guard(deadline=None, safe_clock=None) as session:
         assert session.connection().exec_driver_sql("SELECT 1").scalar_one() == 1
         assert (

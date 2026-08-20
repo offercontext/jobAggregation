@@ -1007,6 +1007,60 @@ def test_cleanup_degradation_persists_with_current_non_exhausted_lease() -> None
     assert hasattr(repository.mark_degraded_kwargs[0]["safe_clock"], "sample")
 
 
+@pytest.mark.parametrize(
+    ("primary_error", "sync_error", "expected_error"),
+    [
+        (None, KeyboardInterrupt("sync-keyboard-canary"), KeyboardInterrupt),
+        (None, SystemExit("sync-system-exit-canary"), SystemExit),
+        (
+            KeyboardInterrupt("primary-keyboard-canary"),
+            SystemExit("sync-system-exit-canary"),
+            KeyboardInterrupt,
+        ),
+        (
+            SystemExit("primary-system-exit-canary"),
+            KeyboardInterrupt("sync-keyboard-canary"),
+            SystemExit,
+        ),
+    ],
+)
+def test_ordinary_cleanup_sync_base_exception_preserves_priority(
+    primary_error: BaseException | None,
+    sync_error: BaseException,
+    expected_error: type[BaseException],
+) -> None:
+    clock = ManualClock()
+    repository = RecordingJournalRepository()
+    recorder = _recorder(repository, clock=clock)
+    repository.append_failure = primary_error
+    repository.mark_degraded_failure = sync_error  # type: ignore[assignment]
+
+    def fail_cleanup(_lease: object) -> None:
+        clock.advance(0.010)
+        raise RuntimeError("ordinary-cleanup-canary")
+
+    recorder._cleanup_operation = fail_cleanup  # type: ignore[method-assign]
+
+    raised: BaseException | None = None
+    try:
+        recorder.append_event(_route_event())
+    except BaseException as error:
+        raised = error
+
+    expected_message = str(primary_error if primary_error is not None else sync_error)
+    assert raised is not None
+    assert type(raised) is expected_error
+    assert str(raised) == expected_message
+    assert recorder.recording_status == "degraded"
+    assert recorder.diagnostics == ["journal_cleanup_failed"]
+    assert "ordinary-cleanup-canary" not in json.dumps(recorder.diagnostics)
+    assert recorder.active_budget.used_seconds == pytest.approx(0.010)
+    assert recorder._current_lease is None
+    assert repository.mark_degraded_calls == 1
+    assert recorder._operation_lock.acquire(blocking=False)
+    recorder._operation_lock.release()
+
+
 def test_identity_degradation_persists_with_current_non_exhausted_lease() -> None:
     clock = ManualClock()
     repository = RecordingJournalRepository()

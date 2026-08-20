@@ -720,13 +720,17 @@ class SafeRunRecorder:
                     if acquired:
                         self._cleanup_operation(lease)
                 except Exception:
+                    first_transition = self._degrade("journal_cleanup_failed")
                     if (
-                        self._degrade("journal_cleanup_failed")
+                        first_transition
                         and allow_sync
                         and lease is not None
                         and lease is self._current_lease
                     ):
-                        self._sync_degraded(lease)
+                        try:
+                            self._sync_degraded(lease)
+                        except BaseException as error:
+                            cleanup_base = error
                 except BaseException as error:
                     cleanup_base = error
             finally:

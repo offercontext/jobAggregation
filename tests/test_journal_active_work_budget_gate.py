@@ -731,6 +731,14 @@ def _validate_bound_repository_implementation(
             assert "pragma" not in node.value.lower()
 
 
+def _validate_repository_module(tree: ast.Module) -> None:
+    _validate_external_method_rebindings(tree)
+    repository = _top_level_class(tree, "AgentRunRepository")
+    _validate_bound_repository_implementation(
+        _class_method(repository, "append_event_bound")
+    )
+
+
 PUBLIC_BUDGET_API = frozenset(
     {
         "ActiveWorkBudget",
@@ -1007,10 +1015,13 @@ def test_product_surfaces_do_not_import_journal_budget_types() -> None:
 
 def test_append_event_bound_has_no_deadline_protocol() -> None:
     tree = _module(REPOSITORY_PATH)
-    repository = _top_level_class(tree, "AgentRunRepository")
-    _validate_bound_repository_implementation(
-        _class_method(repository, "append_event_bound")
-    )
+    _validate_repository_module(tree)
+
+
+def test_repository_gate_rejects_post_class_method_rebinding() -> None:
+    source = REPOSITORY_PATH.read_text(encoding="utf-8")
+    source += "\nAgentRunRepository.append_event_bound = replacement\n"
+    _expect_rejected(source, _validate_repository_module)
 
 
 def test_journal_owned_repository_signatures_are_explicitly_budget_bound() -> None:

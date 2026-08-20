@@ -12,6 +12,7 @@ from sqlalchemy.exc import OperationalError
 
 from offerpilot.agent_runtime.budget import (
     JOURNAL_OPERATION_HARD_CAP_SECONDS,
+    JOURNAL_OPERATION_CLEANUP_RESERVE_SECONDS,
     ActiveWorkBudget,
     JournalBudgetExhausted,
     JournalDeadlineExceeded,
@@ -256,6 +257,7 @@ class SafeRunRecorder:
         self._disposition_state: Literal[
             "not_attempted", "claimed", "completed", "failed"
         ] = "not_attempted"
+        self._waits_for_resume = False
         self._wait_flag = False
         self._current_lease: OperationLease | None = None
 
@@ -475,7 +477,7 @@ class SafeRunRecorder:
                     operation,
                     "journal_resume_failed",
                     False,
-                    state_check=lambda: self._resume_state == "claimed",
+                    state_check=self._resume_operation_allowed_locked,
                 )
             )
         finally:
@@ -670,38 +672,37 @@ class SafeRunRecorder:
                     entry,
                     JOURNAL_OPERATION_HARD_CAP_SECONDS,
                 )
-                acquired = self._acquire_operation(lease)
-                if not acquired:
-                    self._degrade("journal_budget_exhausted")
-                else:
-                    refreshed = self.active_budget.begin_operation(
-                        entry,
-                        JOURNAL_OPERATION_HARD_CAP_SECONDS,
-                    )
-                    lease = self._tighten_lease(lease, refreshed)
-                    lease.checkpoint()
-                    with self._state_lock:
-                        allowed = (
-                            self.recording_status == "healthy"
-                            and self._disposition_state == "not_attempted"
-                            and (state_check is None or state_check())
+                with self._state_lock:
+                    pre_allowed = self._ordinary_state_allowed_locked(state_check)
+                if pre_allowed:
+                    acquired = self._acquire_operation(lease)
+                    if not acquired:
+                        self._degrade("journal_budget_exhausted")
+                    else:
+                        refreshed = self.active_budget.begin_operation(
+                            entry,
+                            JOURNAL_OPERATION_HARD_CAP_SECONDS,
                         )
-                    if allowed:
-                        used_before = self.active_budget.used_seconds
-                        clock_invalid_before = self.active_budget.clock_invalid_latched
-                        work_started = True
-                        self._current_lease = lease
-                        try:
-                            result = operation(lease)
-                        except Exception as error:
-                            self._record_failure(
-                                error,
-                                failure_diagnostic,
-                                lease,
-                                allow_sync=allow_sync,
-                            )
-                        except BaseException as error:
-                            primary_base = error
+                        lease = self._tighten_lease(lease, refreshed)
+                        lease.checkpoint()
+                        with self._state_lock:
+                            allowed = self._ordinary_state_allowed_locked(state_check)
+                        if allowed:
+                            used_before = self.active_budget.used_seconds
+                            clock_invalid_before = self.active_budget.clock_invalid_latched
+                            work_started = True
+                            self._current_lease = lease
+                            try:
+                                result = operation(lease)
+                            except Exception as error:
+                                self._record_failure(
+                                    error,
+                                    failure_diagnostic,
+                                    lease,
+                                    allow_sync=allow_sync,
+                                )
+                            except BaseException as error:
+                                primary_base = error
             except Exception as error:
                 self._record_failure(
                     error,
@@ -756,12 +757,44 @@ class SafeRunRecorder:
             raise cleanup_base.with_traceback(cleanup_base.__traceback__)
         return result
 
+    def _ordinary_state_allowed_locked(
+        self,
+        state_check: Callable[[], bool] | None,
+    ) -> bool:
+        if self.recording_status != "healthy":
+            return False
+        if state_check is not None:
+            return state_check()
+        return self._disposition_state == "not_attempted"
+
+    def _resume_operation_allowed_locked(self) -> bool:
+        return self._resume_state == "claimed" and (
+            self._disposition_state == "not_attempted"
+            or (
+                self._disposition_state == "claimed"
+                and (self._waits_for_resume or self._wait_flag)
+            )
+        )
+
     def _acquire_operation(self, lease: OperationLease) -> bool:
         timeout = max(0.0, lease.hard_deadline - lease.entry_started_at)
         try:
             return self._operation_lock.acquire(timeout=timeout)
         except OverflowError:
             return self._operation_lock.acquire(blocking=False)
+
+    def _acquire_final_operation(self, lease: OperationLease) -> bool:
+        sample = lease.safe_clock.sample()
+        if sample.valid is not True:
+            lease.budget.latch_clock_invalid()
+            return False
+        acquire_lease = OperationLease(
+            budget=lease.budget,
+            entry_started_at=sample.value,
+            work_deadline=lease.work_deadline,
+            hard_deadline=lease.hard_deadline,
+        )
+        return self._acquire_operation(acquire_lease)
 
     def _tighten_lease(
         self,
@@ -893,14 +926,27 @@ class SafeRunRecorder:
         operation: Callable[[OperationLease], bool],
         failure_diagnostic: str,
     ) -> None:
+        budget = ActiveWorkBudget(self.disposition_budget_seconds, self.clock)
+        entry = budget.safe_monotonic_read()
+        invalid_entry = False
         with self._state_lock:
             if self._disposition_state != "not_attempted":
                 return
-            self._disposition_state = "claimed"
+            if entry.valid is not True:
+                self._disposition_state = "failed"
+                invalid_entry = True
+            else:
+                self._disposition_state = "claimed"
+                self._waits_for_resume = self._resume_state == "claimed"
+                self._wait_flag = self._waits_for_resume
             self._state_condition.notify_all()
 
-        budget = ActiveWorkBudget(self.disposition_budget_seconds, self.clock)
-        entry = budget.safe_monotonic_read()
+        if invalid_entry:
+            budget.latch_clock_invalid()
+            self._degrade("journal_clock_invalid")
+            return
+
+        hard_deadline = entry.value + self.disposition_budget_seconds
         lease: OperationLease | None = None
         acquired = False
         succeeded = False
@@ -909,17 +955,19 @@ class SafeRunRecorder:
 
         try:
             try:
-                lease = budget.begin_operation(entry, self.disposition_budget_seconds)
-                acquired = self._acquire_operation(lease)
+                lease = OperationLease(
+                    budget=budget,
+                    entry_started_at=entry.value,
+                    work_deadline=hard_deadline - JOURNAL_OPERATION_CLEANUP_RESERVE_SECONDS,
+                    hard_deadline=hard_deadline,
+                )
+                self._wait_for_resume(lease)
+                lease.checkpoint()
+                acquired = self._acquire_final_operation(lease)
                 if not acquired:
-                    self._degrade("journal_disposition_budget_exhausted")
+                    deadline_error = self._final_deadline_error(lease)
+                    raise deadline_error or JournalDeadlineExceeded("deadline")
                 else:
-                    lease = OperationLease(
-                        budget=budget,
-                        entry_started_at=lease.entry_started_at,
-                        work_deadline=lease.hard_deadline,
-                        hard_deadline=lease.hard_deadline,
-                    )
                     lease.checkpoint()
                     with self._state_lock:
                         allowed = self._disposition_state == "claimed"
@@ -950,12 +998,15 @@ class SafeRunRecorder:
                 self._current_lease = None
                 sample = budget.safe_monotonic_read()
                 if sample.valid is not True:
+                    budget.latch_clock_invalid()
                     self._degrade("journal_clock_invalid")
                 elif lease is not None and sample.value >= lease.hard_deadline:
                     self._degrade("journal_disposition_budget_exhausted")
                 if acquired:
                     self._operation_lock.release()
                 with self._state_lock:
+                    self._waits_for_resume = False
+                    self._wait_flag = False
                     self._disposition_state = "completed" if succeeded else "failed"
                     self._state_condition.notify_all()
 
@@ -963,6 +1014,29 @@ class SafeRunRecorder:
             raise primary_base.with_traceback(primary_base.__traceback__)
         if cleanup_base is not None:
             raise cleanup_base.with_traceback(cleanup_base.__traceback__)
+
+    def _wait_for_resume(self, lease: OperationLease) -> None:
+        while True:
+            with self._state_lock:
+                if not (self._waits_for_resume and self._resume_state == "claimed"):
+                    return
+                sample = lease.safe_clock.sample()
+                if sample.valid is not True:
+                    lease.budget.latch_clock_invalid()
+                    raise JournalDeadlineExceeded("clock_invalid")
+                remaining = lease.hard_deadline - sample.value
+                if remaining <= 0:
+                    raise JournalDeadlineExceeded("deadline")
+                self._state_condition.wait(timeout=remaining)
+
+    def _final_deadline_error(self, lease: OperationLease) -> JournalDeadlineExceeded | None:
+        sample = lease.safe_clock.sample()
+        if sample.valid is not True:
+            lease.budget.latch_clock_invalid()
+            return JournalDeadlineExceeded("clock_invalid")
+        if sample.value >= lease.hard_deadline:
+            return JournalDeadlineExceeded("deadline")
+        return None
 
     def _record_final_failure(
         self,
@@ -984,6 +1058,12 @@ class SafeRunRecorder:
         failure_diagnostic: str,
         lease: OperationLease | None,
     ) -> str:
+        if (
+            lease is not None
+            and lease.budget.clock_invalid_latched
+            and not isinstance(error, JournalEventValidationError)
+        ):
+            return "journal_clock_invalid"
         if isinstance(error, JournalDeadlineExceeded):
             return (
                 "journal_clock_invalid"

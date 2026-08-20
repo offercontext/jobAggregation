@@ -1335,7 +1335,7 @@ def test_successful_final_disposition_persists_prior_active_degradation(
     assert repository.converge_calls == 1
     assert repository.mark_degraded_calls == 1
     assert recorder.recording_status == "degraded"
-    assert repository.mark_degraded_kwargs[0]["deadline"] == pytest.approx(0.201)
+    assert repository.mark_degraded_kwargs[0]["deadline"] == pytest.approx(0.196)
     assert hasattr(repository.mark_degraded_kwargs[0]["safe_clock"], "sample")
 
 
@@ -1608,10 +1608,340 @@ def test_final_disposition_preparation_uses_one_independent_fifty_ms_deadline() 
     recorder = _recorder(repository, clock=clock, event_preparer=capture_deadline)
     recorder.finish(TerminalDisposition(status="completed"))
 
-    assert deadlines == [0.05, 0.05]
+    assert deadlines == pytest.approx([0.045, 0.045])
     assert repository.converge_calls == 1
-    assert repository.converge_kwargs[0]["deadline"] == 0.05
+    assert repository.converge_kwargs[0]["deadline"] == pytest.approx(0.045)
     assert hasattr(repository.converge_kwargs[0]["safe_clock"], "sample")
+
+
+def _suspended_command() -> SuspendedDisposition:
+    return SuspendedDisposition(
+        tool_call_id="call-1",
+        tool_name="create_application",
+        tool_kind="write",
+        args_shape_digest="sha256:" + "a" * 64,
+        pending_identity_fingerprint="b" * 64,
+    )
+
+
+def _resumed_command() -> ResumedDisposition:
+    return ResumedDisposition(
+        confirmation_attempt_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab",
+        tool_call_id="call-1",
+    )
+
+
+def test_nonterminal_waiter_rechecks_state_after_final_claim_before_prepare() -> None:
+    repository = RecordingJournalRepository()
+    recorder = _recorder(repository)
+    first_has_lock = threading.Event()
+    release_first = threading.Event()
+    second_waiting = threading.Event()
+    final_waiting = threading.Event()
+    allow_second = threading.Event()
+    allow_final = threading.Event()
+    prepared_by: list[str] = []
+    prepared_lock = threading.Lock()
+    original_acquire = recorder._acquire_operation
+    original_append = repository.append_event
+
+    def blocking_append(run_id: str, draft: object, **kwargs: object) -> object:
+        if threading.current_thread().name == "nonterminal-a":
+            first_has_lock.set()
+            assert release_first.wait(timeout=1.0)
+        return original_append(run_id, draft, **kwargs)
+
+    repository.append_event = blocking_append  # type: ignore[method-assign]
+
+    def tracked_acquire(lease: object) -> bool:
+        name = threading.current_thread().name
+        if name == "nonterminal-a":
+            return original_acquire(lease)  # type: ignore[arg-type]
+        if name == "nonterminal-b":
+            second_waiting.set()
+            assert allow_second.wait(timeout=1.0)
+        elif name == "finalizer-c":
+            final_waiting.set()
+            assert allow_final.wait(timeout=1.0)
+        return original_acquire(lease)  # type: ignore[arg-type]
+
+    recorder._acquire_operation = tracked_acquire  # type: ignore[method-assign]
+
+    def prepare(value: EventInput, deadline: float) -> object:
+        del deadline
+        with prepared_lock:
+            prepared_by.append(threading.current_thread().name)
+        return recorder._prepare_event(value, 1.0)
+
+    recorder._event_preparer = prepare  # type: ignore[assignment]
+    errors: list[BaseException] = []
+
+    def call_nonterminal() -> None:
+        try:
+            recorder.append_event(_route_event())
+        except BaseException as error:
+            errors.append(error)
+
+    first = threading.Thread(target=call_nonterminal, name="nonterminal-a")
+    second = threading.Thread(target=call_nonterminal, name="nonterminal-b")
+    finalizer = threading.Thread(
+        target=lambda: recorder.finish(TerminalDisposition(status="completed")),
+        name="finalizer-c",
+    )
+    first.start()
+    assert first_has_lock.wait(timeout=1.0)
+    second.start()
+    assert second_waiting.wait(timeout=1.0)
+    finalizer.start()
+    assert final_waiting.wait(timeout=1.0)
+    with recorder._state_lock:
+        assert recorder._disposition_state == "claimed"
+    release_first.set()
+    allow_second.set()
+    second.join(timeout=1.0)
+    assert not second.is_alive()
+    allow_final.set()
+    first.join(timeout=1.0)
+    finalizer.join(timeout=1.0)
+
+    assert errors == []
+    assert repository.append_calls == 1
+    assert repository.converge_calls == 1
+    assert prepared_by.count("nonterminal-b") == 0
+
+
+@pytest.mark.parametrize("finalizer_kind", ["finish", "suspend", "abandon"])
+@pytest.mark.parametrize("claim_order", ["resume_first", "finalizer_first"])
+@pytest.mark.parametrize("lock_order", ["resume_first", "finalizer_first"])
+def test_resume_and_finalizer_event_order_is_claim_ordered(
+    finalizer_kind: str,
+    claim_order: str,
+    lock_order: str,
+) -> None:
+    repository = RecordingJournalRepository()
+    recorder = _recorder(repository)
+    resume_claimed = threading.Event()
+    release_resume = threading.Event()
+    finalizer_started = threading.Event()
+    release_finalizer = threading.Event()
+    original_acquire = recorder._acquire_operation
+    original_prepare = recorder._prepare_event
+    event_log: list[str] = []
+    errors: list[BaseException] = []
+
+    original_append = repository.append_event
+
+    def record_append(run_id: str, draft: object, **kwargs: object) -> object:
+        event_type = getattr(draft, "event_type")
+        event_log.append(event_type)
+        return original_append(run_id, draft, **kwargs)
+
+    repository.append_event = record_append  # type: ignore[method-assign]
+    original_converge = repository.converge_disposition
+
+    def record_converge(run_id: str, command: object, **kwargs: object) -> object:
+        event_log.extend(event.event_type for event in getattr(command, "events"))
+        return original_converge(run_id, command, **kwargs)
+
+    repository.converge_disposition = record_converge  # type: ignore[method-assign]
+
+    def tracked_acquire(lease: object) -> bool:
+        if threading.current_thread().name == "resume" and not release_resume.is_set():
+            resume_claimed.set()
+            assert release_resume.wait(timeout=1.0)
+        return original_acquire(lease)  # type: ignore[arg-type]
+
+    recorder._acquire_operation = tracked_acquire  # type: ignore[method-assign]
+
+    def prepare(value: EventInput, deadline: float) -> object:
+        if (
+            threading.current_thread().name == "finalizer"
+            and claim_order == "finalizer_first"
+        ):
+            finalizer_started.set()
+            assert release_finalizer.wait(timeout=1.0)
+        return original_prepare(value, deadline)
+
+    recorder._event_preparer = prepare  # type: ignore[assignment]
+
+    def run_resume() -> None:
+        try:
+            recorder.resume(_resumed_command())
+        except BaseException as error:
+            errors.append(error)
+
+    def run_finalizer() -> None:
+        try:
+            if finalizer_kind == "finish":
+                recorder.finish(TerminalDisposition(status="completed"))
+            elif finalizer_kind == "suspend":
+                recorder.suspend(_suspended_command())
+            else:
+                recorder.abandon()
+        except BaseException as error:
+            errors.append(error)
+
+    resume_thread = threading.Thread(target=run_resume, name="resume")
+    finalizer_thread = threading.Thread(target=run_finalizer, name="finalizer")
+    held_lock = lock_order == "finalizer_first"
+    if held_lock:
+        recorder._operation_lock.acquire()
+    if claim_order == "resume_first":
+        resume_thread.start()
+        assert resume_claimed.wait(timeout=1.0)
+        finalizer_thread.start()
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            with recorder._state_lock:
+                if recorder._disposition_state == "claimed":
+                    break
+            time.sleep(0.001)
+        with recorder._state_lock:
+            assert recorder._disposition_state == "claimed"
+        release_resume.set()
+    else:
+        finalizer_thread.start()
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            with recorder._state_lock:
+                if recorder._disposition_state == "claimed":
+                    break
+            time.sleep(0.001)
+        with recorder._state_lock:
+            assert recorder._disposition_state == "claimed"
+        resume_thread.start()
+        release_resume.set()
+    if held_lock:
+        recorder._operation_lock.release()
+    if claim_order == "finalizer_first":
+        assert finalizer_started.wait(timeout=1.0)
+        release_finalizer.set()
+
+    resume_thread.join(timeout=1.0)
+    finalizer_thread.join(timeout=1.0)
+    assert errors == []
+
+    event_types = event_log
+    if claim_order == "resume_first":
+        assert event_types[0] == "run.resumed"
+        assert repository.converge_calls == (2 if finalizer_kind != "abandon" else 1)
+    else:
+        assert "run.resumed" not in event_types
+        assert repository.converge_calls == (1 if finalizer_kind != "abandon" else 0)
+
+
+def test_spurious_condition_wakeup_keeps_final_deadline_and_predicate() -> None:
+    clock = ManualClock()
+    repository = RecordingJournalRepository()
+    recorder = _recorder(repository, clock=clock)
+    with recorder._state_lock:
+        recorder._resume_state = "claimed"
+    finalizer = threading.Thread(
+        target=lambda: recorder.finish(TerminalDisposition(status="completed"))
+    )
+    finalizer.start()
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        with recorder._state_lock:
+            if recorder._waits_for_resume:
+                break
+        time.sleep(0.001)
+    with recorder._state_lock:
+        assert recorder._waits_for_resume is True
+        recorder._state_condition.notify_all()
+    clock.advance(0.051)
+    with recorder._state_lock:
+        recorder._state_condition.notify_all()
+    finalizer.join(timeout=1.0)
+
+    assert not finalizer.is_alive()
+    assert repository.converge_calls == 0
+    assert recorder._disposition_state == "failed"
+    assert recorder.diagnostics == ["journal_disposition_budget_exhausted"]
+
+
+def test_completed_finalizer_then_invalid_clock_is_absolute_noop() -> None:
+    repository = RecordingJournalRepository()
+    calls = 0
+
+    def clock() -> float:
+        nonlocal calls
+        calls += 1
+        if calls <= 3:
+            return 0.0
+        raise SystemExit
+
+    recorder = _recorder(repository, clock=clock)  # type: ignore[arg-type]
+    recorder.finish(TerminalDisposition(status="completed"))
+    snapshot = (
+        recorder.recording_status,
+        tuple(recorder.diagnostics),
+        recorder.active_budget.used_seconds,
+        recorder._disposition_state,
+        recorder._resume_state,
+        repository.converge_calls,
+        repository.append_calls,
+    )
+    recorder.finish(TerminalDisposition(status="failed", failure_code="ignored"))
+    assert snapshot == (
+        recorder.recording_status,
+        tuple(recorder.diagnostics),
+        recorder.active_budget.used_seconds,
+        recorder._disposition_state,
+        recorder._resume_state,
+        repository.converge_calls,
+        repository.append_calls,
+    )
+
+
+def test_invalid_final_entry_wins_once_and_latches_clock_diagnostic() -> None:
+    repository = RecordingJournalRepository()
+    recorder = _recorder(repository, clock=lambda: (_ for _ in ()).throw(SystemExit()))  # type: ignore[arg-type]
+    recorder.finish(TerminalDisposition(status="completed"))
+    assert recorder._disposition_state == "failed"
+    assert recorder.diagnostics == ["journal_clock_invalid"]
+    assert repository.converge_calls == 0
+    recorder.finish(TerminalDisposition(status="completed"))
+    assert recorder.diagnostics == ["journal_clock_invalid"]
+    assert repository.converge_calls == 0
+
+
+def test_final_lock_timeout_consumes_right_without_retry() -> None:
+    repository = RecordingJournalRepository()
+    recorder = _recorder(repository)
+    recorder._operation_lock.acquire()
+    try:
+        recorder.finish(TerminalDisposition(status="completed"))
+    finally:
+        recorder._operation_lock.release()
+    assert recorder._disposition_state == "failed"
+    assert repository.converge_calls == 0
+    recorder.finish(TerminalDisposition(status="completed"))
+    assert recorder._disposition_state == "failed"
+    assert repository.converge_calls == 0
+
+
+@pytest.mark.parametrize("failure_kind", ["prepare", "cleanup"])
+def test_final_base_exception_marks_state_and_unlocks_before_propagation(
+    failure_kind: str,
+) -> None:
+    repository = RecordingJournalRepository()
+    recorder = _recorder(repository)
+    if failure_kind == "prepare":
+        recorder._event_preparer = lambda _event, _deadline: (_ for _ in ()).throw(
+            KeyboardInterrupt
+        )  # type: ignore[assignment]
+    else:
+        recorder._cleanup_operation = lambda _lease: (_ for _ in ()).throw(  # type: ignore[assignment]
+            KeyboardInterrupt
+        )
+
+    with pytest.raises(KeyboardInterrupt):
+        recorder.finish(TerminalDisposition(status="completed"))
+
+    assert recorder._disposition_state == "failed"
+    assert recorder._operation_lock.acquire(blocking=False)
+    recorder._operation_lock.release()
 
 
 def test_resume_disposition_is_atomic_and_keeps_segment_recorder_open() -> None:

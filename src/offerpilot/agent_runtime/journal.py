@@ -583,6 +583,8 @@ class SafeRunRecorder:
                 deadline=lease.work_deadline,
                 safe_clock=lease.safe_clock,
             )
+            if self.recording_status == "degraded":
+                self._sync_degraded(lease)
             return True
 
         self._run_final(operation, "journal_disposition_failed")
@@ -772,7 +774,7 @@ class SafeRunRecorder:
             self._disposition_state == "not_attempted"
             or (
                 self._disposition_state == "claimed"
-                and (self._waits_for_resume or self._wait_flag)
+                and self._waits_for_resume
             )
         )
 

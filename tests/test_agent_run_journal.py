@@ -1944,6 +1944,62 @@ def test_final_base_exception_marks_state_and_unlocks_before_propagation(
     recorder._operation_lock.release()
 
 
+def test_degraded_abandon_persists_degraded_state_with_final_lease() -> None:
+    clock = ManualClock()
+    repository = RecordingJournalRepository()
+    recorder = _recorder(repository, clock=clock)
+    recorder.recording_status = "degraded"
+    recorder._degraded_persisted = False
+    active_used_before = recorder.active_budget.used_seconds
+
+    recorder.abandon()
+
+    assert recorder._disposition_state == "completed"
+    assert repository.append_calls == 1
+    assert repository.mark_degraded_calls == 1
+    assert recorder._degraded_persisted is True
+    assert recorder.active_budget.used_seconds == active_used_before
+    assert repository.mark_degraded_kwargs[0]["deadline"] == pytest.approx(0.045)
+
+
+def test_stale_wait_flag_cannot_authorize_resume_after_disposition_claim() -> None:
+    repository = RecordingJournalRepository()
+    recorder = _recorder(repository)
+    resume_acquire_started = threading.Event()
+    release_resume = threading.Event()
+    original_acquire = recorder._acquire_operation
+    errors: list[BaseException] = []
+
+    def tracked_acquire(lease: object) -> bool:
+        if threading.current_thread().name == "resume":
+            resume_acquire_started.set()
+            assert release_resume.wait(timeout=1.0)
+        return original_acquire(lease)  # type: ignore[arg-type]
+
+    recorder._acquire_operation = tracked_acquire  # type: ignore[method-assign]
+
+    def run_resume() -> None:
+        try:
+            recorder.resume(_resumed_command())
+        except BaseException as error:
+            errors.append(error)
+
+    resume_thread = threading.Thread(target=run_resume, name="resume")
+    resume_thread.start()
+    assert resume_acquire_started.wait(timeout=1.0)
+    with recorder._state_lock:
+        assert recorder._resume_state == "claimed"
+        recorder._disposition_state = "claimed"
+        recorder._waits_for_resume = False
+        recorder._wait_flag = True
+    release_resume.set()
+    resume_thread.join(timeout=1.0)
+
+    assert errors == []
+    assert recorder._resume_state == "failed"
+    assert repository.converge_calls == 0
+
+
 def test_resume_disposition_is_atomic_and_keeps_segment_recorder_open() -> None:
     repository = RecordingJournalRepository()
     recorder = _recorder(repository)

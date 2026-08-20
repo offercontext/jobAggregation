@@ -208,6 +208,8 @@ def _target_names(node: ast.AST) -> set[str]:
             target = child.name
             if isinstance(target, str):
                 names.add(target)
+        elif isinstance(child, ast.MatchMapping) and isinstance(child.rest, str):
+            names.add(child.rest)
     return names
 
 
@@ -254,6 +256,8 @@ def _top_level_class(tree: ast.AST, name: str) -> ast.ClassDef:
             raise AssertionError(f"{name} must not be shadowed by an except target")
         elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name == name:
             raise AssertionError(f"{name} must not be shadowed by a match capture")
+        elif isinstance(node, ast.MatchMapping) and node.rest == name:
+            raise AssertionError(f"{name} must not be shadowed by a match mapping rest capture")
     return result
 
 
@@ -682,6 +686,9 @@ PUBLIC_BUDGET_API = frozenset(
         "JOURNAL_DEFAULT_BUSY_TIMEOUT_MS",
     }
 )
+PROTECTED_OWNERSHIP_SYMBOLS = PUBLIC_BUDGET_API | frozenset(
+    {"AgentRunRepository", "SafeRunRecorder"}
+)
 BUDGET_MODULE_SUFFIX = "agent_runtime.budget"
 
 
@@ -772,9 +779,131 @@ def _validate_boundary_module(tree: ast.AST) -> None:
             assert node.value not in PUBLIC_BUDGET_API
 
 
+def _validate_protected_symbol_scopes(tree: ast.AST) -> None:
+    assert isinstance(tree, ast.Module)
+    parents = _parents(tree)
+    disallowed_scope_types = (
+        ast.FunctionDef,
+        ast.AsyncFunctionDef,
+        ast.Lambda,
+        ast.ClassDef,
+        ast.ListComp,
+        ast.SetComp,
+        ast.DictComp,
+        ast.GeneratorExp,
+        ast.comprehension,
+    )
+
+    def in_disallowed_scope(node: ast.AST) -> bool:
+        current = parents.get(node)
+        while current is not None:
+            if isinstance(current, disallowed_scope_types):
+                return True
+            current = parents.get(current)
+        return False
+
+    def assert_module_binding(node: ast.AST, symbol: str, reason: str) -> None:
+        if symbol not in PROTECTED_OWNERSHIP_SYMBOLS:
+            return
+        approved_class = (
+            isinstance(node, ast.ClassDef)
+            and node.name == "SafeRunRecorder"
+            and node in tree.body
+        )
+        approved_import = isinstance(node, (ast.Import, ast.ImportFrom)) and node in tree.body
+        assert approved_class or approved_import, (
+            f"protected ownership symbol {symbol} has an unauthorized {reason}"
+        )
+
+    def import_bindings(node: ast.Import | ast.ImportFrom) -> list[tuple[str, str]]:
+        if isinstance(node, ast.Import):
+            return [
+                (alias.asname or alias.name.split(".", 1)[0], alias.name)
+                for alias in node.names
+            ]
+        return [
+            (alias.asname or alias.name, alias.name)
+            for alias in node.names
+        ]
+
+    def approved_protected_import(
+        node: ast.Import | ast.ImportFrom, bound_name: str, imported_name: str
+    ) -> bool:
+        if not isinstance(node, ast.ImportFrom):
+            return False
+        imported_symbol = imported_name.rsplit(".", 1)[-1]
+        if bound_name != imported_symbol:
+            return False
+        module = node.module or ""
+        if imported_symbol in PUBLIC_BUDGET_API:
+            return (
+                (node.level == 0 and module == "offerpilot.agent_runtime.budget")
+                or (node.level > 0 and module in {"budget", "agent_runtime.budget"})
+            )
+        if imported_symbol == "AgentRunRepository":
+            return (
+                (node.level == 0 and module == "offerpilot.repositories.agent_runs")
+                or (node.level > 0 and module in {"repositories.agent_runs", "agent_runs"})
+            )
+        return False
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            direct_module_import = node in tree.body
+            for bound_name, imported_name in import_bindings(node):
+                if imported_name == "*":
+                    raise AssertionError("star imports cannot establish ownership symbols")
+                imported_symbol = imported_name.rsplit(".", 1)[-1]
+                protected_import = (
+                    bound_name in PROTECTED_OWNERSHIP_SYMBOLS
+                    or imported_symbol in PROTECTED_OWNERSHIP_SYMBOLS
+                    or _is_budget_module_reference(imported_name)
+                    or (
+                        isinstance(node, ast.ImportFrom)
+                        and _is_budget_module_reference(node.module or "")
+                    )
+                )
+                if protected_import:
+                    assert not in_disallowed_scope(node), (
+                        "protected ownership imports are not allowed in local scopes"
+                    )
+                    assert direct_module_import, (
+                        "protected ownership imports are module-level only"
+                    )
+                    assert approved_protected_import(node, bound_name, imported_name), (
+                        "protected ownership imports must use approved module bindings"
+                    )
+                    assert_module_binding(node, bound_name, "import")
+
+        if isinstance(node, ast.arg) and node.arg in PROTECTED_OWNERSHIP_SYMBOLS:
+            raise AssertionError(f"protected ownership parameter is rebound: {node.arg}")
+
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name not in PROTECTED_OWNERSHIP_SYMBOLS:
+                continue
+            assert_module_binding(node, node.name, "definition")
+
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            if node.id in PROTECTED_OWNERSHIP_SYMBOLS:
+                raise AssertionError(f"protected ownership name is rebound: {node.id}")
+
+        if isinstance(node, ast.ExceptHandler) and isinstance(node.name, str):
+            if node.name in PROTECTED_OWNERSHIP_SYMBOLS:
+                raise AssertionError(f"protected ownership exception target: {node.name}")
+
+        if isinstance(node, (ast.MatchAs, ast.MatchStar)) and isinstance(node.name, str):
+            if node.name in PROTECTED_OWNERSHIP_SYMBOLS:
+                raise AssertionError(f"protected ownership match target: {node.name}")
+
+        if isinstance(node, ast.MatchMapping) and isinstance(node.rest, str):
+            if node.rest in PROTECTED_OWNERSHIP_SYMBOLS:
+                raise AssertionError(f"protected ownership mapping target: {node.rest}")
+
+
 def test_journal_repository_calls_are_budget_bound() -> None:
     tree = _module(JOURNAL_PATH)
     _top_level_class(tree, "SafeRunRecorder")
+    _validate_protected_symbol_scopes(tree)
     _validate_journal_repository_calls(tree)
     _validate_self_clock_access(tree)
     observed = [
@@ -954,6 +1083,7 @@ def test_mutations_reject_validated_method_class_rebinding(
         "try:\n    pass\nexcept Exception as SafeRunRecorder:\n    pass\nclass SafeRunRecorder:\n    pass\n",
         "match value:\n    case SafeRunRecorder:\n        pass\nclass SafeRunRecorder:\n    pass\n",
         "match value:\n    case _ as SafeRunRecorder:\n        pass\nclass SafeRunRecorder:\n    pass\n",
+        "match value:\n    case {**SafeRunRecorder}:\n        pass\nclass SafeRunRecorder:\n    pass\n",
         "def SafeRunRecorder():\n    pass\nclass SafeRunRecorder:\n    pass\n",
         "def outer():\n    def SafeRunRecorder():\n        pass\nclass SafeRunRecorder:\n    pass\n",
         "class SafeRunRecorder:\n    pass\nclass SafeRunRecorder:\n    pass\n",
@@ -961,6 +1091,47 @@ def test_mutations_reject_validated_method_class_rebinding(
 )
 def test_mutations_reject_module_level_class_rebinding_and_duplicates(source: str) -> None:
     _expect_rejected(source, lambda tree: _top_level_class(tree, "SafeRunRecorder"))
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "def run():\n    ActiveWorkBudget = replacement\n",
+        "def run():\n    (ActiveWorkBudget := replacement)\n",
+        "def run():\n    from evil import ActiveWorkBudget\n",
+        "def run(ActiveWorkBudget):\n    pass\n",
+        "def run():\n    del ActiveWorkBudget\n",
+        "def run():\n    for ActiveWorkBudget in values:\n        pass\n",
+        "def run():\n    with context as ActiveWorkBudget:\n        pass\n",
+        "def run():\n    try:\n        pass\n    except Exception as ActiveWorkBudget:\n        pass\n",
+        "def run():\n    match value:\n        case _ as ActiveWorkBudget:\n            pass\n",
+        "def run():\n    match value:\n        case {**ActiveWorkBudget}:\n            pass\n",
+        "def run():\n    return [value for ActiveWorkBudget in values]\n",
+        "def run():\n    return (lambda ActiveWorkBudget: ActiveWorkBudget)(value)\n",
+        "class Wrapper:\n    ActiveWorkBudget = replacement\n",
+        "def run():\n    SafeRunRecorder = replacement\n",
+        "def run():\n    OperationLease = replacement\n",
+        "def run():\n    SafeClockAdapter = replacement\n",
+        "def run():\n    JournalBudgetExhausted = replacement\n",
+        "def run():\n    JournalDeadlineExceeded = replacement\n",
+        "def run():\n    MonotonicSample = replacement\n",
+        "ActiveWorkBudget = replacement\n",
+        "if enabled:\n    from evil import ActiveWorkBudget\n",
+        "from evil import ActiveWorkBudget\n",
+    ),
+)
+def test_mutations_reject_protected_symbol_scope_rebinding(source: str) -> None:
+    _expect_rejected(source, _validate_protected_symbol_scopes)
+
+
+def test_approved_module_level_protected_bindings_are_accepted() -> None:
+    _validate_protected_symbol_scopes(
+        ast.parse(
+            "from offerpilot.agent_runtime.budget import ActiveWorkBudget\n"
+            "class SafeRunRecorder:\n"
+            "    pass\n"
+        )
+    )
 
 
 @pytest.mark.parametrize(

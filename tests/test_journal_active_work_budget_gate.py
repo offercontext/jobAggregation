@@ -335,25 +335,50 @@ def _is_exact_lease_attribute(node: ast.AST, attribute: str) -> bool:
     )
 
 
-def _validate_external_method_rebindings(tree: ast.AST) -> None:
-    parents = _parents(tree)
-    protected_methods = {
-        "AgentRunRepository": JOURNAL_REPOSITORY_API | {"append_event_bound"},
-        "SafeRunRecorder": frozenset(
-            {
-                "start_segment",
-                "attach_input_message",
-                "capture_context",
-                "append_event",
-                "append_prepared_event_bound",
-                "resume",
-                "suspend",
-                "finish",
-                "abandon",
-                "mark_degraded",
-            }
-        ),
+JOURNAL_STATE_ENTRYPOINTS = {
+    "SafeRunRecorder": frozenset(
+        {"resume", "suspend", "finish", "abandon", "mark_degraded"}
+    ),
+    "RunRecorderFactory": frozenset({"start_run", "resume_waiting_run"}),
+}
+
+
+def _structural_protected_methods(tree: ast.AST) -> dict[str, frozenset[str]]:
+    method_names: dict[str, set[str]] = {
+        "SafeRunRecorder": set(),
+        "RunRecorderFactory": set(),
+        "AgentRunRepository": set(),
     }
+    source_trees = [tree]
+    for path in (JOURNAL_PATH, REPOSITORY_PATH):
+        source_trees.append(_module(path))
+
+    for source_tree in source_trees:
+        for class_node in ast.walk(source_tree):
+            if not isinstance(class_node, ast.ClassDef) or class_node.name not in {
+                "SafeRunRecorder",
+                "RunRecorderFactory",
+            }:
+                continue
+            for statement in class_node.body:
+                if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if _direct_repository_calls(statement):
+                    method_names[class_node.name].add(statement.name)
+
+    for class_name, entrypoints in JOURNAL_STATE_ENTRYPOINTS.items():
+        method_names[class_name].update(entrypoints)
+    method_names["AgentRunRepository"].update(
+        JOURNAL_REPOSITORY_API | {"append_event_bound"}
+    )
+    return {
+        class_name: frozenset(names)
+        for class_name, names in method_names.items()
+    }
+
+
+def _validate_external_method_rebindings(tree: ast.AST) -> None:
+    protected_methods = _structural_protected_methods(tree)
 
     def protected_attribute(node: ast.AST) -> bool:
         return (
@@ -363,8 +388,6 @@ def _validate_external_method_rebindings(tree: ast.AST) -> None:
         )
 
     for node in ast.walk(tree):
-        if not _is_module_scope(node, parents):
-            continue
         if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
             assert not protected_attribute(node), (
                 "validated Journal class methods must not be rebound externally"
@@ -1024,6 +1047,15 @@ def test_repository_gate_rejects_post_class_method_rebinding() -> None:
     _expect_rejected(source, _validate_repository_module)
 
 
+def test_protected_journal_methods_are_structurally_derived() -> None:
+    methods = _structural_protected_methods(_module(JOURNAL_PATH))
+    assert "capture_surface_context" in methods["SafeRunRecorder"]
+    assert {"start_run", "resume_waiting_run"} <= methods["RunRecorderFactory"]
+    assert JOURNAL_REPOSITORY_API | {"append_event_bound"} <= methods[
+        "AgentRunRepository"
+    ]
+
+
 def test_journal_owned_repository_signatures_are_explicitly_budget_bound() -> None:
     tree = _module(REPOSITORY_PATH)
     repository = _top_level_class(tree, "AgentRunRepository")
@@ -1229,6 +1261,8 @@ def test_mutations_reject_module_level_class_deletion(
     (
         "AgentRunRepository.append_event_bound = replacement\n",
         "SafeRunRecorder.append_prepared_event_bound = replacement\n",
+        "SafeRunRecorder.capture_surface_context = replacement\n",
+        "RunRecorderFactory.start_run = replacement\n",
         "AgentRunRepository.append_event = replacement\n",
         "SafeRunRecorder.append_event = replacement\n",
         "AgentRunRepository.append_event_bound: object = replacement\n",
@@ -1237,6 +1271,12 @@ def test_mutations_reject_module_level_class_deletion(
         "del SafeRunRecorder.append_prepared_event_bound\n",
         "setattr(AgentRunRepository, 'append_event_bound', replacement)\n",
         "delattr(SafeRunRecorder, 'append_prepared_event_bound')\n",
+        "class Patcher:\n"
+        "    SafeRunRecorder.append_event = replacement\n"
+        "    AgentRunRepository.append_event = replacement\n"
+        "    RunRecorderFactory.start_run = replacement\n",
+        "def patch():\n"
+        "    setattr(AgentRunRepository, 'append_event_bound', replacement)\n",
     ),
 )
 def test_mutations_reject_external_method_rebinding(source: str) -> None:

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Literal, cast
 from uuid import UUID
 
+from offerpilot.byte_chunks import iter_fixed_byte_chunks, update_digest_in_chunks
 from offerpilot.agent_runtime.keyring import JournalKeyDomain
 
 _CONTEXT_TYPES = {"workspace", "global", "application", "mode"}
@@ -257,10 +258,9 @@ def _canonical_value(
         raise JournalEventValidationError("journal value exceeds canonicalization budget")
     if type(value) is str:
         encoded_bytes = 0
-        for offset in range(0, len(value), 4096):
+        for encoded in iter_fixed_byte_chunks(value):
             if budget_check is not None:
                 budget_check()
-            encoded = value[offset : offset + 4096].encode("utf-8")
             if budget_check is not None:
                 budget_check()
             encoded_bytes += len(encoded)
@@ -364,14 +364,10 @@ def _hmac_fingerprint(
 ) -> str:
     payload = canonical_json(value, budget_check=budget_check)
     _check_budget(budget_check)
-    digest = hmac.new(key.secret, domain, hashlib.sha256)
+    digest = hmac.new(key.secret, digestmod=hashlib.sha256)
     _check_budget(budget_check)
-    for offset in range(0, len(payload), 4096):
-        _check_budget(budget_check)
-        encoded = payload[offset : offset + 4096].encode("utf-8")
-        _check_budget(budget_check)
-        digest.update(encoded)
-        _check_budget(budget_check)
+    update_digest_in_chunks(digest, domain, budget_check=budget_check)
+    update_digest_in_chunks(digest, payload, budget_check=budget_check)
     _check_budget(budget_check)
     fingerprint = digest.hexdigest()
     _check_budget(budget_check)
@@ -483,7 +479,8 @@ def _ordered_digest(
     _check_budget(budget_check)
     encoded = canonical.encode("utf-8")
     _check_budget(budget_check)
-    digest = hashlib.sha256(encoded)
+    digest = hashlib.sha256()
+    update_digest_in_chunks(digest, encoded, budget_check=budget_check)
     _check_budget(budget_check)
     result = digest.hexdigest()
     _check_budget(budget_check)
@@ -588,22 +585,19 @@ def prepare_context_snapshot(
     _check_budget(budget_check)
     logical_json = canonical_json(logical_input, budget_check=budget_check)
     _check_budget(budget_check)
-    logical_digest = hmac.new(
-        key.secret,
-        b"offerpilot-agent-input-v1\0",
-        hashlib.sha256,
-    )
+    logical_digest = hmac.new(key.secret, digestmod=hashlib.sha256)
     _check_budget(budget_check)
-    for offset in range(0, len(logical_json), 4096):
-        _check_budget(budget_check)
-        encoded = logical_json[offset : offset + 4096].encode("utf-8")
-        _check_budget(budget_check)
-        logical_digest.update(encoded)
-        _check_budget(budget_check)
+    update_digest_in_chunks(
+        logical_digest,
+        b"offerpilot-agent-input-v1\0",
+        budget_check=budget_check,
+    )
+    update_digest_in_chunks(logical_digest, logical_json, budget_check=budget_check)
     _check_budget(budget_check)
     logical_input_fingerprint = logical_digest.hexdigest()
     _check_budget(budget_check)
-    manifest_digest = hashlib.sha256(manifest_bytes)
+    manifest_digest = hashlib.sha256()
+    update_digest_in_chunks(manifest_digest, manifest_bytes, budget_check=budget_check)
     _check_budget(budget_check)
     manifest_fingerprint = manifest_digest.hexdigest()
     _check_budget(budget_check)
@@ -841,11 +835,13 @@ def prepare_event(
     _check_budget(budget_check)
     fact_bytes = canonical_json(fact_envelope, budget_check=budget_check).encode("utf-8")
     _check_budget(budget_check)
-    payload_digest = hashlib.sha256(payload_bytes)
+    payload_digest = hashlib.sha256()
+    update_digest_in_chunks(payload_digest, payload_bytes, budget_check=budget_check)
     _check_budget(budget_check)
     payload_fingerprint = payload_digest.hexdigest()
     _check_budget(budget_check)
-    fact_digest = hashlib.sha256(fact_bytes)
+    fact_digest = hashlib.sha256()
+    update_digest_in_chunks(fact_digest, fact_bytes, budget_check=budget_check)
     _check_budget(budget_check)
     fact_fingerprint = fact_digest.hexdigest()
     _check_budget(budget_check)

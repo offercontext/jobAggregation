@@ -6,12 +6,14 @@ import json
 import sqlite3
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from fastapi.testclient import TestClient
 
+import offerpilot.context_projector.manifest as manifest_module
 from offerpilot.agent_runtime.events import (
     JournalEventValidationError,
     validate_context_manifest_json,
@@ -73,6 +75,35 @@ class FailingGuard:
         self.calls += 1
         if self.calls == self.fail_at:
             raise JournalBudgetExhausted
+
+
+class RecordingDigest:
+    def __init__(self, delegate, chunks: list[bytes]) -> None:
+        self._delegate = delegate
+        self._chunks = chunks
+
+    def update(self, chunk: bytes) -> None:
+        self._chunks.append(bytes(chunk))
+        self._delegate.update(chunk)
+
+    def hexdigest(self) -> str:
+        return self._delegate.hexdigest()
+
+    def digest(self) -> bytes:
+        return self._delegate.digest()
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._delegate, name)
+
+
+def _recording_sha256(chunks: list[bytes]):
+    def factory(initial: bytes = b"") -> RecordingDigest:
+        digest = RecordingDigest(hashlib.sha256(), chunks)
+        if initial:
+            digest.update(initial)
+        return digest
+
+    return factory
 
 
 def frozen(role: str, content: str = "", *, message_id: int = 0) -> FrozenMessage:
@@ -594,6 +625,63 @@ def test_manifest_identity_budget_guard_checks_bounded_utf8_chunks(
         )
 
     assert guard.calls == fail_at
+
+
+def test_manifest_v2_sha_updates_fixed_byte_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
+    sources = tuple(
+        RuntimeSourceAudit(
+            f"source_{source_index}",
+            f"revision:{source_index}",
+            "a" * 64,
+            tuple(
+                SourceChunk(
+                    f"$.field_{chunk_index}",
+                    chunk_index + 1,
+                    32,
+                    "",
+                    False,
+                    100,
+                    50,
+                )
+                for chunk_index in range(32)
+            ),
+        )
+        for source_index in range(2)
+    )
+    audit = RuntimeSurfaceAudit(
+        "model-surface-budget-v1",
+        tuple((name, "ready") for name in CONTRIBUTOR_ORDER),
+        tuple(f"group-{index}" for index in range(32)),
+        MODEL_TOOL_NAMES,
+        tuple(source.content_revision_fingerprint for source in sources),
+        100,
+        80,
+        20,
+        True,
+        sources,
+    )
+    chunks: list[bytes] = []
+    monkeypatch.setattr(
+        manifest_module,
+        "hashlib",
+        SimpleNamespace(sha256=_recording_sha256(chunks)),
+    )
+
+    prepared = prepare_surface_manifest_v2(
+        audit,
+        key_id="11111111-1111-4111-8111-111111111111",
+        secret=b"k" * 32,
+        provider_identities=tuple(f"provider-{index}" for index in range(8)),
+        signals=MANIFEST_SIGNAL_VALUES,
+    )
+
+    assert len(prepared.manifest_json.encode("utf-8")) > 4096
+    assert prepared.manifest_digest == hashlib.sha256(
+        prepared.manifest_json.encode("utf-8")
+    ).hexdigest()
+    assert chunks
+    assert max(len(chunk) for chunk in chunks) <= 4096
+    assert any(len(chunk) == 4096 for chunk in chunks)
 
 
 @pytest.mark.parametrize("fail_at", [175, 176, 177])

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
+from offerpilot.byte_chunks import update_digest_in_chunks
 from offerpilot.context_projector.contracts import CONTRIBUTOR_ORDER, RuntimeSurfaceAudit
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_NAMES
 
@@ -89,14 +90,14 @@ def _identity(
     budget_check: Callable[[], None] | None = None,
 ) -> str:
     _check_budget(budget_check)
-    digest = hmac.new(secret, domain + b"\0", hashlib.sha256)
+    digest = hmac.new(secret, digestmod=hashlib.sha256)
     _check_budget(budget_check)
-    for offset in range(0, len(value), 4096):
-        _check_budget(budget_check)
-        encoded = value[offset : offset + 4096].encode("utf-8")
-        _check_budget(budget_check)
-        digest.update(encoded)
-        _check_budget(budget_check)
+    update_digest_in_chunks(
+        digest,
+        domain + b"\0",
+        budget_check=budget_check,
+    )
+    update_digest_in_chunks(digest, value, budget_check=budget_check)
     _check_budget(budget_check)
     fingerprint = digest.hexdigest()
     _check_budget(budget_check)
@@ -274,7 +275,8 @@ def prepare_surface_manifest_v2(
     _check_budget(budget_check)
     validate_surface_manifest_v2(rendered, budget_check=budget_check)
     _check_budget(budget_check)
-    digest = hashlib.sha256(encoded)
+    digest = hashlib.sha256()
+    update_digest_in_chunks(digest, encoded, budget_check=budget_check)
     _check_budget(budget_check)
     manifest_digest = digest.hexdigest()
     _check_budget(budget_check)

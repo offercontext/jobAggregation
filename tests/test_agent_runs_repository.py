@@ -1228,6 +1228,21 @@ def test_progress_handler_is_total_for_invalid_clock() -> None:
     assert callback() != 0
 
 
+@pytest.mark.parametrize(
+    "value",
+    [True, float("nan"), float("inf"), float("-inf"), "not-a-number", object()],
+)
+def test_progress_handler_is_total_for_invalid_sample_values(value: object) -> None:
+    callback = _progress_handler(
+        SafeClockAdapter(
+            lambda: MonotonicSample(value, True)  # type: ignore[arg-type]
+        ),
+        1.0,
+    )
+
+    assert callback() != 0
+
+
 def test_recursive_cte_interrupts_by_deadline_and_connection_is_reusable(tmp_path: Path) -> None:
     _create_run(tmp_path)
     repository = _repository(tmp_path)
@@ -1328,6 +1343,7 @@ def test_commit_and_rollback_cleanup_failure_invalidates_owned_connection(
         ("keyboard", "exception", "primary"),
         ("system_exit", "exception", "primary"),
         ("keyboard", "system_exit", "primary"),
+        ("system_exit", "keyboard", "primary"),
     ],
 )
 def test_cleanup_exception_priority_recovers_connection(

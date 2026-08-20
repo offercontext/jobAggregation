@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import hmac
 import json
@@ -13,6 +14,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 
+import offerpilot.agent_runtime.events as events_module
 import offerpilot.agent_runtime.journal as journal_module
 from offerpilot.agent_runtime.budget import JournalBudgetExhausted, JournalDeadlineExceeded
 from offerpilot.agent_runtime.events import (
@@ -59,6 +61,45 @@ class FailingGuard:
         self.calls += 1
         if self.calls == self.fail_at:
             raise JournalBudgetExhausted
+
+
+class RecordingDigest:
+    def __init__(self, delegate, chunks: list[bytes]) -> None:
+        self._delegate = delegate
+        self._chunks = chunks
+
+    def update(self, chunk: bytes) -> None:
+        self._chunks.append(bytes(chunk))
+        self._delegate.update(chunk)
+
+    def hexdigest(self) -> str:
+        return self._delegate.hexdigest()
+
+    def digest(self) -> bytes:
+        return self._delegate.digest()
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._delegate, name)
+
+
+def _recording_sha256(chunks: list[bytes]):
+    def factory(initial: bytes = b"") -> RecordingDigest:
+        digest = RecordingDigest(hashlib.sha256(), chunks)
+        if initial:
+            digest.update(initial)
+        return digest
+
+    return factory
+
+
+def _recording_hmac_new(chunks: list[bytes]):
+    def factory(key, msg=None, digestmod=None):
+        digest = hmac.new(key, msg, digestmod)
+        if msg is not None:
+            chunks.append(bytes(msg))
+        return RecordingDigest(digest, chunks)
+
+    return factory
 
 
 @pytest.mark.parametrize(
@@ -255,6 +296,85 @@ def test_input_fingerprint_uses_exact_domain_formula() -> None:
     )
 
     assert prepared.logical_input_fingerprint == expected
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        Path("src/offerpilot/agent_runtime/events.py"),
+        Path("src/offerpilot/context_projector/manifest.py"),
+    ],
+)
+def test_journal_sha256_is_initialized_before_bounded_updates(relative_path: Path) -> None:
+    source = (Path(__file__).parents[1] / relative_path).read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(relative_path))
+
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "sha256"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "hashlib"
+    ]
+
+    assert calls
+    assert all(not call.args for call in calls)
+
+
+def test_event_sha_paths_update_fixed_utf8_byte_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
+    chunks: list[bytes] = []
+    baseline = _model_completed()
+    expected_ordered = "sha256:" + hashlib.sha256(
+        canonical_json(["界" * 5000]).encode("utf-8")
+    ).hexdigest()
+    monkeypatch.setattr(
+        events_module,
+        "hashlib",
+        SimpleNamespace(sha256=_recording_sha256(chunks)),
+    )
+
+    assert _ordered_digest(["界" * 5000]) == expected_ordered
+    assert _model_completed() == baseline
+    assert chunks
+    assert max(len(chunk) for chunk in chunks) <= 4096
+    assert any(len(chunk) == 4096 for chunk in chunks)
+
+
+def test_event_hmac_paths_update_fixed_utf8_byte_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chunks: list[bytes] = []
+    value = "界" * 5000
+    expected_fingerprint = hmac.new(
+        KEY.secret,
+        b"offerpilot-agent-pending-v1\0"
+        + canonical_json(value).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    monkeypatch.setattr(
+        events_module,
+        "hmac",
+        SimpleNamespace(new=_recording_hmac_new(chunks)),
+    )
+
+    assert pending_identity_fingerprint(KEY, value) == expected_fingerprint
+    prepared = prepare_context_snapshot(
+        {"content": value},
+        ContextManifestInput((), (), (), ()),
+        key=KEY,
+    )
+    expected_logical = hmac.new(
+        KEY.secret,
+        b"offerpilot-agent-input-v1\0"
+        + canonical_json({"content": value}).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    assert prepared.logical_input_fingerprint == expected_logical
+    assert chunks
+    assert max(len(chunk) for chunk in chunks) <= 4096
+    assert any(len(chunk) == 4096 for chunk in chunks)
 
 
 @pytest.mark.parametrize(

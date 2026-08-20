@@ -47,7 +47,11 @@ class SafeClockAdapter:
             return MonotonicSample(0.0, False)
         if not isinstance(sample, MonotonicSample):
             return MonotonicSample(0.0, False)
-        return sample
+        if sample.valid is not True:
+            return MonotonicSample(0.0, False)
+        if type(sample.value) not in {int, float} or not math.isfinite(sample.value):
+            return MonotonicSample(0.0, False)
+        return MonotonicSample(float(sample.value), True)
 
     def require_value(self) -> float:
         sample = self.sample()

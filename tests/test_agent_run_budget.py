@@ -16,6 +16,7 @@ from offerpilot.agent_runtime.budget import (
     JournalBudgetExhausted,
     JournalDeadlineExceeded,
     MonotonicSample,
+    SafeClockAdapter,
 )
 
 
@@ -94,6 +95,21 @@ def test_safe_adapter_keeps_sample_no_throw_and_require_value_seals_reason() -> 
 
     assert error.value.reason == "clock_invalid"
     assert str(error.value) == "journal deadline exhausted"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [True, float("nan"), float("inf"), float("-inf"), "not-a-number", object()],
+)
+def test_safe_clock_adapter_rejects_invalid_valid_samples(value: object) -> None:
+    adapter = SafeClockAdapter(
+        lambda: MonotonicSample(value, True)  # type: ignore[arg-type]
+    )
+
+    assert adapter.sample() == MonotonicSample(0.0, False)
+    with pytest.raises(JournalDeadlineExceeded) as error:
+        adapter.require_value()
+    assert error.value.reason == "clock_invalid"
 
 
 def test_invalid_final_sample_after_valid_entry_saturates_and_latches() -> None:

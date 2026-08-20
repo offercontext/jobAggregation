@@ -6440,7 +6440,11 @@ def test_chat_confirm_timeout_during_handler_finalizes_durably_later(
             Assistant(content="late follow-up"),
         ]
     )
-    app_client, client, application, pending = _create_status_confirmation(tmp_path, model)
+    app_client, client, application, pending = _create_status_confirmation(
+        tmp_path,
+        model,
+        stable_journal=True,
+    )
     original_update = ApplicationsRepository.update_full
 
     def slow_update(self, app_id, data):
@@ -6476,25 +6480,31 @@ def test_chat_confirm_timeout_during_handler_finalizes_durably_later(
     assert app_client.get(f"/api/applications/{application['id']}").json()["status"] == "offer"
     stored = client.get(f"/api/chat/conversations/{pending['conversation_id']}").json()
     assert sum(message["role"] == "tool" for message in stored) == 1
-    deadline = time.monotonic() + 2
-    while True:
-        runs, _, _ = _journal_rows(tmp_path)
-        assert len(runs) == 1
-        trace = reconstruct_agent_run(
-            AgentRunRepository(journal_session_factory_for_data_dir(tmp_path)),
-            runs[0].id,
-            as_of=datetime.now(timezone.utc),
-            stale_after=None,
-        )
-        if runs[0].status == "completed" and "recording_degraded" in trace.anomalies:
-            break
-        if time.monotonic() >= deadline:
-            pytest.fail(
-                "background confirmation Journal did not converge to durable degraded state: "
-                f"status={runs[0].status!r}, anomalies={trace.anomalies!r}"
-            )
-        time.sleep(0.01)
+    runs, journal_events, journal_snapshots = _wait_for_journal_status(
+        tmp_path,
+        "completed",
+        predicate=_journal_terminal_predicate(
+            required_event_types=("run.completed",),
+            required_snapshot_kinds=("initial", "model_input", "confirmation_resume"),
+        ),
+    )
+    assert len(runs) == 1
+    assert runs[0].recording_status == "healthy"
+    trace = _journal_trace(tmp_path, runs[0])
+    assert trace.lifecycle_status == "completed"
     assert trace.completion_status == "terminal"
+    assert trace.recording_status == "healthy"
+    assert trace.integrity_status == "healthy", trace.anomalies
+    assert "recording_degraded" not in trace.anomalies
+    assert not any(
+        anomaly.startswith("model_call_incomplete:") for anomaly in trace.anomalies
+    )
+    assert journal_events[-1].event_type == "segment.finished"
+    assert {snapshot.snapshot_kind for snapshot in journal_snapshots} == {
+        "initial",
+        "model_input",
+        "confirmation_resume",
+    }
 
 
 @pytest.mark.parametrize("endpoint", ["/api/chat/confirm", "/api/chat/confirm/stream"])

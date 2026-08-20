@@ -183,10 +183,12 @@ class SafeClockAdapter:
 - 捕获 clock 抛出的普通 `Exception` 和 `BaseException`；
 - 拒绝 bool、NaN、Infinity 和相对上一有效 sample 倒退的值；第一份有限数值无论正负都合法，后续只要求不小于上一有效 sample；
 - 成功时更新内部 `last_valid_monotonic`；
-- 失败时返回 `valid=False`、把预算保守饱和到 total，并请求封闭诊断 `journal_clock_invalid`；
+- 失败时只返回 `valid=False`，不修改 `used_seconds`、`recording_status`、diagnostics 或 disposition；
 - 不保存或传播 clock 异常对象，不让 clock 的 `BaseException` 覆盖 Journal 工作路径原本需要传播的 `BaseException`。
 
-普通非终态 Operation、Factory 与 resume ingress 的入口 sample 无效时，不获取 Operation lock、不执行 prepare / Repository，安全降级并返回。finalizer 是唯一例外，按 7.3 直接消费 disposition 权并进入 `failed`。最终 sample 无效时，`finish_operation(entry)` 不做浮点运算，直接把累计预算饱和到 total；之后仍然执行 latch、解锁和原始异常优先级逻辑。
+`latch_clock_invalid_without_raising()` 是独立的 total / no-throw 内存 transition：把预算饱和到 total、设置 degraded 并请求封闭诊断 `journal_clock_invalid`。只有已经取得当前路径状态所有权的调用方才能执行它，不能由 sample 本身提前产生副作用。
+
+普通非终态 Operation、Factory 与 resume ingress 的入口 sample 无效时，调用该 latch 后返回，不获取 Operation lock、不执行 prepare / Repository。finalizer 是唯一例外，按 7.3 先确定 disposition 所有权；CAS loser 为绝对 no-op。最终 sample 无效时，`finish_operation(entry)` 作为当前 Operation owner 执行同一 latch，不做浮点运算；之后仍然执行解锁和原始异常优先级逻辑。
 
 `finish_operation()` 和纯内存 latch transition 同样必须是 total / no-throw：不执行 I/O，不调用用户 callback。任何 clock、浮点值或内部状态异常都不能跳过解锁或泄漏到业务路径。此处捕获 clock `BaseException` 是内部计时器的特殊安全边界，不改变 Repository、canonicalization、cleanup 等其他 `BaseException` 清理后原样传播的规则。
 
@@ -514,9 +516,11 @@ _disposition_state
 finalizer entry
 → safe clock sample
    invalid:
-     latch journal_clock_invalid without throwing
-     state_lock: CAS not_attempted → failed
-     CAS loser: no-op
+     state_lock:
+       if disposition_state != not_attempted:
+         return absolute no-op
+       disposition_state = failed
+       latch journal_clock_invalid without throwing
      Provider / Repository / Event = 0
      return
    valid: hard deadline = sample.value + 50 ms
@@ -534,7 +538,7 @@ finalizer entry
 → state_lock: claimed → completed | failed
 ```
 
-finalizer 的 fresh hard deadline 必须在进入方法时、状态 claim 之前取得。入口 sample 无效时也必须在线性化的状态锁内把 `not_attempted` 直接切为 `failed`；这会消费唯一 final convergence 权，后续 finalizer 只能 no-op，且不得调用 Provider、Repository 或创建 Event。若状态已不是 `not_attempted`，本次只是 no-op，不能覆盖既有状态。
+finalizer 的 fresh hard deadline 必须在进入方法时、状态 claim 之前取得。入口 `safe_monotonic_read()` 的 invalid sample 本身不修改 Recorder 状态。随后只在线性化的状态锁内处理：若 disposition 已是 `claimed | completed | failed`，立即 absolute no-op，不修改预算、`recording_status`、diagnostics、resume/disposition state，也不调用 Repository；只有 `not_attempted → failed` 的 winner 才在同一短临界区执行 no-throw `journal_clock_invalid` latch。这会消费唯一 final convergence 权，且不得调用 Provider、Repository 或创建 Event。
 
 有效入口下，等待 resume Condition 和 Operation lock 共用该同一个 50 ms，不能在 resume 完成或虚假唤醒后重置。Condition 必须使用 predicate loop / `wait_for`：只在 `_resume_state in {completed, failed}` 时退出；每次循环都用 `safe_monotonic_read()` 的有效 sample 对同一个 absolute finalizer deadline 重算剩余时间。无效 sample 或剩余时间小于等于 0 都按 Condition timeout 收敛为 `failed`，不得调用 Repository。CAS winner 一旦将状态置为 `claimed` 就永久消耗该 Segment 的唯一 final convergence 权。即使 resume 等待、前一个非终态 Operation、SQLite lock、cleanup 或 `BaseException` 耗尽 deadline，状态最终也只能进入 `failed`，其他 finalizer 只能 no-op。
 
@@ -622,7 +626,8 @@ journal_clock_invalid
 15. Journal 工作同时有原始 `BaseException`、最终 clock 又抛 `BaseException` 时，传播原始工作异常，clock 异常不能覆盖它。
 16. 第一份有限 monotonic sample 可以为负数；例如 `-10.0 → -9.5 → -9.0` 合法且不产生 `journal_clock_invalid`。只有后续 sample 小于上一有效值才按倒退处理。
 17. `SafeClockAdapter.sample()` 对 clock 非法或抛错始终返回 `valid=false` 且不抛异常；`require_value()` 对同一情况只抛封闭的 `JournalDeadlineExceeded`。
-18. finalizer 入口 sample 非法时原子执行 `not_attempted → failed`，Repository / Event 为 0、第二个 finalizer no-op；Condition 虚假唤醒不会重置 deadline或提前越过 resume predicate。
+18. finalizer 入口 sample 非法时，只有 `not_attempted → failed` winner 能设置 `journal_clock_invalid`；CAS loser 是 absolute no-op。Condition 虚假唤醒不会重置 deadline或提前越过 resume predicate。
+19. 第一次 finalizer 已 `completed` 后，第二次 finalizer 即使读到 invalid clock，disposition 仍为 `completed`，active budget、`recording_status`、diagnostics、Repository 与 Event 全部不变。
 
 ### 10.2 CPU 与序列化
 

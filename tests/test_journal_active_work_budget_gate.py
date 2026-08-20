@@ -295,6 +295,18 @@ def _class_method(
     return direct[0]
 
 
+def _class_method_allowing_decorators(
+    class_node: ast.ClassDef, name: str
+) -> ast.FunctionDef | ast.AsyncFunctionDef:
+    direct = [
+        node
+        for node in class_node.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
+    ]
+    assert len(direct) == 1, f"expected exactly one direct {class_node.name}.{name} method"
+    return direct[0]
+
+
 def _is_self_attribute(node: ast.AST, name: str) -> bool:
     return (
         isinstance(node, ast.Attribute)
@@ -449,6 +461,39 @@ EXPECTED_DIRECT_METHODS = MappingProxyType(
         ),
     }
 )
+EXPECTED_DIRECT_DECORATORS = MappingProxyType(
+    {
+        "SafeRunRecorder": MappingProxyType({}),
+        "RunRecorderFactory": MappingProxyType({}),
+        "AgentRunRepository": MappingProxyType(
+            {
+                "_validate_deadline_args": ("staticmethod",),
+                "_raw_connection": ("staticmethod",),
+                "_progress_handler": ("staticmethod",),
+                "_configure_deadline": ("staticmethod",),
+                "_check_deadline": ("staticmethod",),
+                "_classify_sqlite_exception": ("staticmethod",),
+                "_restore_sqlite_guard": ("staticmethod",),
+                "_invalidate_sqlite_guard": ("staticmethod",),
+                "_session_guard": ("contextmanager",),
+                "_journal_transaction": ("contextmanager",),
+                "_dialect_supports_returning": ("staticmethod",),
+                "_required_run": ("staticmethod",),
+                "_validate_event_draft": ("staticmethod",),
+                "_assert_input_message_belongs": ("staticmethod",),
+                "_validate_snapshot_command": ("staticmethod",),
+                "_assert_run_matches": ("staticmethod",),
+                "_assert_snapshot_matches": ("staticmethod",),
+                "_validate_disposition_shape": ("staticmethod",),
+                "_assert_disposition_matches_run": ("staticmethod",),
+                "_assert_existing_disposition_order": ("staticmethod",),
+                "_assert_status_transition": ("staticmethod",),
+                "_assert_disposition_projection": ("staticmethod",),
+                "_detach": ("staticmethod",),
+            }
+        ),
+    }
+)
 
 
 def _structural_protected_methods(tree: ast.AST) -> dict[str, frozenset[str]]:
@@ -467,22 +512,6 @@ def _validate_class_method_integrity(tree: ast.AST, class_name: str) -> None:
             prefix = decorator_name(node.value)
             return f"{prefix}.{node.attr}" if prefix else None
         return None
-
-    approved_decorators: dict[str, dict[str, tuple[str, ...]]] = {
-        class_name: {} for class_name in JOURNAL_OWNERSHIP_CLASSES
-    }
-    for path in (JOURNAL_PATH, REPOSITORY_PATH):
-        canonical_tree = _module(path)
-        for class_node in ast.walk(canonical_tree):
-            if not isinstance(class_node, ast.ClassDef) or class_node.name not in approved_decorators:
-                continue
-            approved_decorators[class_node.name] = {
-                statement.name: tuple(
-                    decorator_name(decorator) for decorator in statement.decorator_list
-                )
-                for statement in class_node.body
-                if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
-            }
 
     for class_node in ast.walk(tree):
         if not isinstance(class_node, ast.ClassDef) or class_node.name != class_name:
@@ -507,7 +536,7 @@ def _validate_class_method_integrity(tree: ast.AST, class_name: str) -> None:
             actual = tuple(
                 decorator_name(decorator) for decorator in method.decorator_list
             )
-            expected = approved_decorators[class_name].get(method.name, ())
+            expected = EXPECTED_DIRECT_DECORATORS[class_name].get(method.name, ())
             assert actual == expected, (
                 f"{class_name}.{method.name} has an unapproved decorator set"
             )
@@ -1509,6 +1538,49 @@ def test_mutations_reject_external_method_rebinding(source: str) -> None:
 )
 def test_mutations_reject_class_method_integrity_bypasses(source: str) -> None:
     _expect_rejected(source, _validate_journal_repository_calls)
+
+
+@pytest.mark.parametrize(
+    ("path", "class_name", "method_name", "change"),
+    (
+        (JOURNAL_PATH, "SafeRunRecorder", "_ordinary", "add"),
+        (JOURNAL_PATH, "RunRecorderFactory", "_safe", "add"),
+        (REPOSITORY_PATH, "AgentRunRepository", "_insert_event", "add"),
+        (REPOSITORY_PATH, "AgentRunRepository", "_session_guard", "remove"),
+        (REPOSITORY_PATH, "AgentRunRepository", "_validate_deadline_args", "replace"),
+    ),
+)
+def test_mutations_reject_same_source_decorator_bypasses(
+    path: Path,
+    class_name: str,
+    method_name: str,
+    change: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tree = _module(path)
+    class_node = _top_level_class(tree, class_name)
+    method = _class_method_allowing_decorators(class_node, method_name)
+    if change == "add":
+        method.decorator_list.append(ast.Name(id="evil_decorator", ctx=ast.Load()))
+    elif change == "remove":
+        method.decorator_list = []
+    else:
+        method.decorator_list = [ast.Name(id="evil_decorator", ctx=ast.Load())]
+    source = ast.unparse(ast.fix_missing_locations(tree))
+    mutated_path = tmp_path / path.name
+    mutated_path.write_text(source, encoding="utf-8")
+    monkeypatch.setitem(
+        globals(),
+        "JOURNAL_PATH" if path == JOURNAL_PATH else "REPOSITORY_PATH",
+        mutated_path,
+    )
+    validator = (
+        _validate_repository_module
+        if class_name == "AgentRunRepository"
+        else _validate_journal_repository_calls
+    )
+    _expect_rejected(source, validator)
 
 
 @pytest.mark.parametrize(

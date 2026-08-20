@@ -1,5 +1,6 @@
 import json
 import re
+import sqlite3
 import time
 from datetime import datetime, timezone
 from io import BytesIO
@@ -10,6 +11,7 @@ from zipfile import ZipFile
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import delete, select, update
+from sqlalchemy.exc import OperationalError
 
 from offerpilot.ai.types import Assistant, Message, ToolCall
 from offerpilot.ai.agent import PendingAction, StalePendingActionError
@@ -38,15 +40,17 @@ from offerpilot.models import (
     AgentEvent,
     AgentRun,
     ApplicationMaterialKit,
+    ChatMessage,
     Conversation,
     JDAnalysis,
     Question,
     Resume,
     ResumeMatch,
     WriteOperation,
+    WriteOperationTransition,
 )
 from offerpilot.repositories.applications import ApplicationsRepository
-from offerpilot.repositories.agent_runs import AgentRunRepository
+from offerpilot.repositories.agent_runs import AgentRunRepository, JournalConflictError
 from offerpilot.repositories.chat import ChatRepository
 
 
@@ -92,15 +96,61 @@ def _journal_rows(tmp_path):
     return runs, events, snapshots
 
 
-def _stable_journal_factory(data_dir):
+def _wait_for_journal_status(tmp_path, expected_status, timeout=15.0):
+    deadline = time.monotonic() + timeout
+    while True:
+        runs, events, snapshots = _journal_rows(tmp_path)
+        if runs and runs[0].status == expected_status:
+            return runs, events, snapshots
+        if time.monotonic() >= deadline:
+            pytest.fail(
+                f"Journal status did not converge to {expected_status!r}: "
+                f"{[run.status for run in runs]!r}"
+            )
+        time.sleep(0.01)
+
+
+def _journal_trace(tmp_path, run):
+    return reconstruct_agent_run(
+        AgentRunRepository(journal_session_factory_for_data_dir(tmp_path)),
+        run.id,
+        as_of=datetime.now(timezone.utc),
+        stale_after=None,
+    )
+
+
+def _ledger_rows(tmp_path):
+    factory = session_factory_for_data_dir(tmp_path)
+    with factory() as session:
+        operations = list(
+            session.scalars(
+                select(WriteOperation).order_by(WriteOperation.created_at, WriteOperation.id)
+            )
+        )
+        transitions = list(
+            session.scalars(
+                select(WriteOperationTransition).order_by(
+                    WriteOperationTransition.operation_id,
+                    WriteOperationTransition.seq,
+                )
+            )
+        )
+        for row in [*operations, *transitions]:
+            session.expunge(row)
+    return operations, transitions
+
+
+def _stable_journal_factory(
+    data_dir, *, segment_budget_seconds=5.0, disposition_budget_seconds=1.0
+):
     repository = AgentRunRepository(journal_session_factory_for_data_dir(data_dir))
     key = load_or_create_journal_key(data_dir)
     assert key is not None
     return RunRecorderFactory(
         repository,
         key=key,
-        segment_budget_seconds=2.0,
-        disposition_budget_seconds=0.5,
+        segment_budget_seconds=segment_budget_seconds,
+        disposition_budget_seconds=disposition_budget_seconds,
     )
 class ScriptedModel:
     def __init__(self, turns):
@@ -146,6 +196,54 @@ class SlowModel:
     def complete(self, messages, tools):
         time.sleep(0.2)
         return Assistant(content="late reply")
+
+
+class SlowFinalModel:
+    """A real provider wall-time gap must not consume Journal active budget."""
+
+    def __init__(self, reply="stable slow reply", delay=2.05):
+        self.reply = reply
+        self.delay = delay
+        self.calls = 0
+        self.elapsed = 0.0
+
+    def complete(self, messages, tools):
+        del messages, tools
+        self.calls += 1
+        started = time.monotonic()
+        time.sleep(self.delay)
+        self.elapsed = time.monotonic() - started
+        return Assistant(content=self.reply)
+
+
+class SlowReadThenFinalModel:
+    """Wait before a read-tool turn, then finish on the next provider call."""
+
+    def __init__(self, reply="stable read reply", delay=2.05):
+        self.reply = reply
+        self.delay = delay
+        self.calls = 0
+        self.elapsed = 0.0
+
+    def complete(self, messages, tools):
+        del messages, tools
+        self.calls += 1
+        if self.calls == 1:
+            started = time.monotonic()
+            time.sleep(self.delay)
+            self.elapsed = time.monotonic() - started
+            return Assistant(
+                tool_calls=[
+                    ToolCall(
+                        id="slow-journal-read",
+                        name="list_applications",
+                        args="{}",
+                    )
+                ]
+            )
+        if self.calls == 2:
+            return Assistant(content=self.reply)
+        raise AssertionError("unexpected provider call")
 
 
 class SlowAfterPendingModel:
@@ -280,6 +378,37 @@ class EquivalenceModel:
         return assistant
 
 
+class WriteEquivalenceModel:
+    def __init__(self, application_id=1):
+        self.application_id = application_id
+        self.provider_calls = 0
+        self.tool_results = 0
+
+    def complete(self, messages, tools):
+        del tools
+        self.provider_calls += 1
+        self.tool_results = sum(message.role == "tool" for message in messages)
+        if self.provider_calls == 1:
+            return Assistant(
+                tool_calls=[
+                    ToolCall(
+                        id="equivalence-write",
+                        name="update_application_status",
+                        args=json.dumps(
+                            {"id": self.application_id, "status": "offer"}
+                        ),
+                    )
+                ]
+            )
+        return Assistant(content="equivalent write reply")
+
+    def stream_complete(self, messages, tools, on_delta):
+        assistant = self.complete(messages, tools)
+        if assistant.content:
+            on_delta(assistant.content)
+        return assistant
+
+
 class FailingAgentRunRepository:
     def __init__(self, delegate, failing_method):
         self.delegate = delegate
@@ -294,6 +423,22 @@ class FailingAgentRunRepository:
     def _fail(*args, **kwargs):
         del args, kwargs
         raise RuntimeError("injected journal repository failure")
+
+
+class LockedAgentRunRepository(FailingAgentRunRepository):
+    @staticmethod
+    def _fail(*args, **kwargs):
+        del args, kwargs
+        original = sqlite3.OperationalError("database is locked")
+        original.sqlite_errorcode = 5
+        raise OperationalError("INSERT", {}, original)
+
+
+class ConflictingAgentRunRepository(FailingAgentRunRepository):
+    @staticmethod
+    def _fail(*args, **kwargs):
+        del args, kwargs
+        raise JournalConflictError("caller-owned Journal conflict")
 
 
 @pytest.mark.parametrize(
@@ -336,7 +481,7 @@ def test_chat_sync_records_complete_journal_lifecycle(tmp_path):
 
     assert response.status_code == 200
     assert response.json()["message"] == "journal reply"
-    runs, events, snapshots = _journal_rows(tmp_path)
+    runs, events, snapshots = _wait_for_journal_status(tmp_path, "completed")
     assert len(runs) == 1
     assert runs[0].status == "completed"
     assert runs[0].input_message_id is not None
@@ -382,6 +527,184 @@ def test_chat_stream_records_journal_without_changing_sse_identity(tmp_path):
     assert [snapshot.snapshot_kind for snapshot in snapshots] == ["initial", "model_input"]
 
 
+@pytest.mark.parametrize("endpoint", ["/api/chat", "/api/chat/stream"])
+def test_journal_active_budget_ignores_slow_final_provider_gap(
+    tmp_path, endpoint
+):
+    session_factory_for_data_dir(tmp_path)
+    model = SlowFinalModel(reply="stable slow final")
+    client = TestClient(
+        create_app(
+            data_dir=tmp_path,
+            run_recorder_factory=_stable_journal_factory(
+                tmp_path, segment_budget_seconds=2.0, disposition_budget_seconds=0.5
+            ),
+            chat_model=model,
+            title_model=ScriptedModel([Assistant(content="title")]),
+        )
+    )
+
+    started = time.monotonic()
+    response = client.post(
+        endpoint,
+        json={"message": "wait for the provider", "conversation_id": 0},
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed >= 2.0
+    assert model.elapsed >= 2.0
+    assert response.status_code == 200
+    if endpoint.endswith("/stream"):
+        events = _parse_sse_events(response.text)
+        assert events[-1]["event"] == "completed"
+        body = events[-1]["data"]["data"]["response"]
+    else:
+        body = response.json()
+    assert body == {
+        "type": "message",
+        "conversation_id": body["conversation_id"],
+        "message": "stable slow final",
+        "write_status": "none",
+    }
+    assert model.calls == 1
+
+    runs, events, snapshots = _wait_for_journal_status(tmp_path, "completed")
+    assert len(runs) == 1
+    assert runs[0].status == "completed"
+    assert runs[0].recording_status == "healthy"
+    assert [event.event_type for event in events] == [
+        "run.started",
+        "segment.started",
+        "route.selected",
+        "context.captured",
+        "context.captured",
+        "model.requested",
+        "model.completed",
+        "assistant.persisted",
+        "run.completed",
+        "segment.finished",
+    ]
+    assert [snapshot.snapshot_kind for snapshot in snapshots] == [
+        "initial",
+        "model_input",
+    ]
+    trace = _journal_trace(tmp_path, runs[0])
+    assert trace.lifecycle_status == "completed"
+    assert trace.completion_status == "terminal"
+    assert trace.recording_status == "healthy"
+    assert trace.integrity_status == "healthy", trace.anomalies
+    assert not any(
+        anomaly.startswith("model_call_incomplete:") for anomaly in trace.anomalies
+    )
+    client.close()
+
+
+@pytest.mark.parametrize("endpoint", ["/api/chat", "/api/chat/stream"])
+def test_journal_active_budget_ignores_slow_provider_before_read_then_final(
+    tmp_path, endpoint
+):
+    seed = TestClient(create_app(data_dir=tmp_path))
+    application = seed.post(
+        "/api/applications",
+        json={
+            "company_name": "Journal Read Co",
+            "position_name": "Engineer",
+            "status": "interview",
+        },
+    ).json()
+    model = SlowReadThenFinalModel(reply="stable read final", delay=3.05)
+    client = TestClient(
+        create_app(
+            data_dir=tmp_path,
+            run_recorder_factory=_stable_journal_factory(
+                tmp_path, segment_budget_seconds=3.0, disposition_budget_seconds=0.5
+            ),
+            chat_model=model,
+            title_model=ScriptedModel([Assistant(content="title")]),
+        )
+    )
+
+    started = time.monotonic()
+    response = client.post(
+        endpoint,
+        json={"message": "read applications", "conversation_id": 0},
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed >= 2.0
+    assert model.elapsed >= 2.0
+    assert response.status_code == 200
+    if endpoint.endswith("/stream"):
+        transport_events = _parse_sse_events(response.text)
+        assert [event["event"] for event in transport_events] == [
+            "meta",
+            "user_message_saved",
+            "status",
+            "tool_call",
+            "tool_result",
+            "assistant_message",
+            "completed",
+        ]
+        body = transport_events[-1]["data"]["data"]["response"]
+        assert transport_events.index(next(event for event in transport_events if event["event"] == "tool_result")) < len(transport_events) - 1
+    else:
+        body = response.json()
+    assert body == {
+        "type": "message",
+        "conversation_id": body["conversation_id"],
+        "message": "stable read final",
+        "write_status": "none",
+    }
+    assert model.calls == 2
+
+    stored = ChatRepository(session_factory_for_data_dir(tmp_path)).list_messages(
+        body["conversation_id"]
+    )
+    assert all(isinstance(message, ChatMessage) for message in stored)
+    assert [message.role for message in stored] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert [message.tool_call_id for message in stored if message.role == "tool"] == [
+        "slow-journal-read"
+    ]
+    assert seed.get(f"/api/applications/{application['id']}").json()["status"] == "interview"
+
+    runs, events, snapshots = _wait_for_journal_status(tmp_path, "completed")
+    assert len(runs) == 1
+    assert runs[0].status == "completed"
+    assert runs[0].recording_status == "healthy"
+    event_types = [event.event_type for event in events]
+    assert event_types.count("model.requested") == 2
+    assert event_types.count("model.completed") == 2
+    assert event_types.count("tool.started") == 1
+    assert event_types.count("tool.completed") == 1
+    first_model_done = event_types.index("model.completed")
+    tool_started = event_types.index("tool.started")
+    tool_completed = event_types.index("tool.completed")
+    second_model_requested = event_types.index("model.requested", first_model_done + 1)
+    assert first_model_done < tool_started < tool_completed < second_model_requested
+    assert [snapshot.snapshot_kind for snapshot in snapshots] == [
+        "initial",
+        "model_input",
+        "model_input",
+    ]
+    trace = _journal_trace(tmp_path, runs[0])
+    assert trace.lifecycle_status == "completed"
+    assert trace.completion_status == "terminal"
+    assert trace.integrity_status == "healthy", trace.anomalies
+    assert len(trace.segments[0].model_steps) == 2
+    assert len(trace.segments[0].tools) == 1
+    assert trace.segments[0].tools[0].completed_seq is not None
+    assert not any(
+        anomaly.startswith("model_call_incomplete:") for anomaly in trace.anomalies
+    )
+    client.close()
+    seed.close()
+
+
 def test_deterministic_action_records_waiting_run_without_model_events(tmp_path):
     model = CountingFailingModel()
     client = TestClient(
@@ -408,7 +731,9 @@ def test_deterministic_action_records_waiting_run_without_model_events(tmp_path)
     )
 
     assert response.status_code == 200
-    runs, events, snapshots = _journal_rows(tmp_path)
+    runs, events, snapshots = _wait_for_journal_status(
+        tmp_path, "waiting_confirmation"
+    )
     assert len(runs) == 1
     assert runs[0].status == "waiting_confirmation"
     pending = ChatRepository(session_factory_for_data_dir(tmp_path)).get_pending_action(
@@ -1258,6 +1583,415 @@ def _status_confirmation_model(*followups):
     )
 
 
+@pytest.mark.parametrize(
+    ("entry_endpoint", "confirm_endpoint"),
+    [
+        ("/api/chat", "/api/chat/confirm"),
+        ("/api/chat/stream", "/api/chat/confirm/stream"),
+    ],
+)
+def test_journal_hitl_pending_approve_executes_once_and_finishes_healthy(
+    tmp_path, entry_endpoint, confirm_endpoint
+):
+    seed = TestClient(create_app(data_dir=tmp_path))
+    application = seed.post(
+        "/api/applications",
+        json={"company_name": "Journal HITL Co", "position_name": "Engineer", "status": "interview"},
+    ).json()
+    model = CapturingScriptedModel(
+        [
+            Assistant(
+                tool_calls=[
+                    ToolCall(
+                        id="journal-hitl-write",
+                        name="update_application_status",
+                        args=json.dumps({"id": application["id"], "status": "offer"}),
+                    )
+                ]
+            ),
+            Assistant(content="stable approved final"),
+        ]
+    )
+    client = TestClient(
+        create_app(
+            data_dir=tmp_path,
+            chat_model=model,
+            title_model=ScriptedModel([Assistant(content="title")]),
+            run_recorder_factory=_stable_journal_factory(tmp_path),
+        )
+    )
+
+    initial = client.post(
+        entry_endpoint,
+        json={"message": "change status", "conversation_id": 0},
+    )
+    assert initial.status_code == 200
+    if entry_endpoint.endswith("/stream"):
+        initial_events = _parse_sse_events(initial.text)
+        pending_body = initial_events[-1]["data"]["data"]["response"]
+        assert initial_events[-1]["event"] == "completed"
+        assert initial_events.index(
+            next(event for event in initial_events if event["event"] == "confirmation_required")
+        ) < len(initial_events) - 1
+    else:
+        pending_body = initial.json()
+    assert pending_body["type"] == "confirmation_required"
+    pending_action = pending_body["pending_action"]
+    conversation_id = pending_body["conversation_id"]
+    operation_id = pending_action["operation_id"]
+    token = pending_action["confirmation_token"]
+    assert re.fullmatch(r"[0-9a-f]{64}", token)
+    assert client.get("/api/chat/conversations").json()[0]["pending_action"]["confirmation_token"] == token
+    pending = ChatRepository(session_factory_for_data_dir(tmp_path)).get_pending_action(
+        conversation_id
+    )
+    assert pending is not None
+    assert pending.tool_call_id == "journal-hitl-write"
+    operations, transitions = _ledger_rows(tmp_path)
+    proposed = next(operation for operation in operations if operation.id == operation_id)
+    assert proposed.status == "proposed"
+    assert proposed.delivery_status == "pending"
+    assert proposed.tool_call_id == "journal-hitl-write"
+    assert proposed.confirmation_token_fingerprint is not None
+    assert [transition.state for transition in transitions if transition.operation_id == operation_id] == [
+        "proposed"
+    ]
+    runs, initial_events, _ = _wait_for_journal_status(tmp_path, "waiting_confirmation")
+    assert len(runs) == 1
+    assert runs[0].status == "waiting_confirmation"
+    assert runs[0].waiting_tool_call_id == "journal-hitl-write"
+    initial_event_types = [event.event_type for event in initial_events]
+    assert initial_event_types[-4:] == [
+        "tool.proposed",
+        "approval.requested",
+        "run.waiting_confirmation",
+        "segment.finished",
+    ]
+
+    confirmed = client.post(
+        confirm_endpoint,
+        json={
+            "conversation_id": conversation_id,
+            "approved": True,
+            "confirmation_token": token,
+        },
+    )
+    assert confirmed.status_code == 200
+    if confirm_endpoint.endswith("/stream"):
+        confirmation_events = _parse_sse_events(confirmed.text)
+        assert [event["event"] for event in confirmation_events] == [
+            "meta",
+            "status",
+            "tool_call",
+            "tool_result",
+            "assistant_message",
+            "completed",
+        ]
+        body = confirmation_events[-1]["data"]["data"]["response"]
+        assert confirmation_events.index(
+            next(event for event in confirmation_events if event["event"] == "tool_call")
+        ) < confirmation_events.index(
+            next(event for event in confirmation_events if event["event"] == "tool_result")
+        )
+        assert confirmation_events[-1]["data"]["data"]["response"]["operation_id"] == operation_id
+    else:
+        body = confirmed.json()
+    assert body["type"] == "message"
+    assert body["message"] == "stable approved final"
+    assert body["write_status"] == "success"
+    assert body["operation_id"] == operation_id
+    assert body["replayed"] is False
+    assert len(model.calls) == 2
+    assert seed.get(f"/api/applications/{application['id']}").json()["status"] == "offer"
+    assert client.get("/api/chat/conversations").json()[0]["pending_action"] is None
+
+    stored = ChatRepository(session_factory_for_data_dir(tmp_path)).list_messages(conversation_id)
+    assert all(isinstance(message, ChatMessage) for message in stored)
+    assert [message.role for message in stored] == ["user", "assistant", "tool", "assistant"]
+    assert sum(message.role == "tool" for message in stored) == 1
+    operations, transitions = _ledger_rows(tmp_path)
+    committed = next(operation for operation in operations if operation.id == operation_id)
+    assert committed.status == "committed"
+    assert committed.delivery_status == "completed"
+    assert committed.delivery_outcome == "final_response"
+    assert committed.delivery_failure_code is None
+    assert [transition.state for transition in transitions if transition.operation_id == operation_id] == [
+        "proposed",
+        "approved",
+        "claimed",
+        "committed",
+    ]
+
+    runs, journal_events, snapshots = _wait_for_journal_status(tmp_path, "completed")
+    assert len(runs) == 1
+    assert runs[0].status == "completed"
+    assert runs[0].recording_status == "healthy"
+    event_types = [event.event_type for event in journal_events]
+    assert event_types.count("tool.started") == 1
+    assert event_types.count("tool.completed") == 1
+    assert event_types.count("model.requested") == 2
+    assert event_types.index("approval.decided") < event_types.index("run.resumed")
+    assert event_types.index("run.resumed") < event_types.index("tool.started")
+    assert event_types.index("tool.completed") < event_types.index("run.completed")
+    assert [snapshot.snapshot_kind for snapshot in snapshots].count("confirmation_resume") == 1
+    trace = _journal_trace(tmp_path, runs[0])
+    assert trace.lifecycle_status == "completed"
+    assert trace.completion_status == "terminal"
+    assert trace.integrity_status == "healthy", trace.anomalies
+    assert len(trace.segments) == 2
+    assert len(trace.segments[-1].approvals) == 1
+    assert trace.segments[-1].approvals[0].decision == "approved"
+    assert not any(
+        anomaly.startswith(("model_call_incomplete:", "tool_call_incomplete:"))
+        for anomaly in trace.anomalies
+    )
+    client.close()
+    seed.close()
+
+
+@pytest.mark.parametrize("confirm_endpoint", ["/api/chat/confirm", "/api/chat/confirm/stream"])
+def test_journal_hitl_pending_reject_records_ledger_and_no_tool_execution(
+    tmp_path, confirm_endpoint
+):
+    seed = TestClient(create_app(data_dir=tmp_path))
+    application = seed.post(
+        "/api/applications",
+        json={"company_name": "Journal Reject Co", "position_name": "Engineer", "status": "interview"},
+    ).json()
+    model = CapturingScriptedModel(
+        [
+            Assistant(
+                tool_calls=[
+                    ToolCall(
+                        id="journal-hitl-reject",
+                        name="update_application_status",
+                        args=json.dumps({"id": application["id"], "status": "offer"}),
+                    )
+                ]
+            ),
+            Assistant(content="must not be requested"),
+        ]
+    )
+    client = TestClient(
+        create_app(
+            data_dir=tmp_path,
+            chat_model=model,
+            title_model=ScriptedModel([Assistant(content="title")]),
+            run_recorder_factory=_stable_journal_factory(tmp_path),
+        )
+    )
+    initial = client.post(
+        "/api/chat",
+        json={"message": "change status", "conversation_id": 0},
+    )
+    assert initial.status_code == 200
+    pending_body = initial.json()
+    pending_action = pending_body["pending_action"]
+    operation_id = pending_action["operation_id"]
+    token = pending_action["confirmation_token"]
+    runs, _, _ = _wait_for_journal_status(tmp_path, "waiting_confirmation")
+    assert runs[0].waiting_tool_call_id == "journal-hitl-reject"
+    rejected = client.post(
+        confirm_endpoint,
+        json={
+            "conversation_id": pending_body["conversation_id"],
+            "approved": False,
+            "confirmation_token": token,
+            "rejection_feedback": "Keep it in interview.",
+        },
+    )
+    assert rejected.status_code == 200
+    if confirm_endpoint.endswith("/stream"):
+        events = _parse_sse_events(rejected.text)
+        assert events[-1]["event"] == "completed"
+        body = events[-1]["data"]["data"]["response"]
+        assert events.index(next(event for event in events if event["event"] == "assistant_message")) < len(events) - 1
+    else:
+        body = rejected.json()
+    assert body["type"] == "message"
+    assert body["write_status"] == "cancelled"
+    assert "取消" in body["message"] or "保持" in body["message"]
+    assert len(model.calls) == 1
+    assert seed.get(f"/api/applications/{application['id']}").json()["status"] == "interview"
+    assert client.get("/api/chat/conversations").json()[0]["pending_action"] is None
+    stored = ChatRepository(session_factory_for_data_dir(tmp_path)).list_messages(
+        pending_body["conversation_id"]
+    )
+    assert all(isinstance(message, ChatMessage) for message in stored)
+    assert sum(message.role == "tool" for message in stored) == 1
+    operations, transitions = _ledger_rows(tmp_path)
+    operation = next(operation for operation in operations if operation.id == operation_id)
+    assert operation.status == "rejected"
+    assert operation.delivery_status == "completed"
+    assert operation.delivery_outcome == "final_response"
+    assert [transition.state for transition in transitions if transition.operation_id == operation_id] == [
+        "proposed",
+        "rejected",
+    ]
+    runs, journal_events, _ = _wait_for_journal_status(tmp_path, "completed")
+    assert len(runs) == 1
+    assert runs[0].status == "completed"
+    assert runs[0].recording_status in {"healthy", "degraded"}
+    event_types = [event.event_type for event in journal_events]
+    assert event_types.count("approval.decided") == 1
+    assert event_types.count("tool.started") == 0
+    assert event_types.count("tool.completed") == 0
+    decision = next(event for event in journal_events if event.event_type == "approval.decided")
+    assert json.loads(decision.payload_json)["facts"]["decision"] == "rejected"
+    trace = _journal_trace(tmp_path, runs[0])
+    if runs[0].recording_status == "healthy":
+        assert trace.integrity_status == "healthy", trace.anomalies
+    else:
+        assert "recording_degraded" in trace.anomalies
+    assert trace.segments[-1].approvals[0].decision == "rejected"
+    assert not any(anomaly.startswith("model_call_incomplete:") for anomaly in trace.anomalies)
+    client.close()
+    seed.close()
+
+
+@pytest.mark.parametrize("final_approved", [True, False], ids=["approve", "reject"])
+@pytest.mark.parametrize("confirm_endpoint", ["/api/chat/confirm", "/api/chat/confirm/stream"])
+def test_journal_hitl_chained_pending_keeps_ledger_and_run_causal(
+    tmp_path, final_approved, confirm_endpoint
+):
+    seed = TestClient(create_app(data_dir=tmp_path))
+    first_application = seed.post(
+        "/api/applications",
+        json={"company_name": "Journal Chain Co", "position_name": "Engineer", "status": "interview"},
+    ).json()
+    model = CapturingScriptedModel(
+        [
+            Assistant(
+                tool_calls=[
+                    ToolCall(
+                        id="journal-chain-first",
+                        name="update_application_status",
+                        args=json.dumps({"id": first_application["id"], "status": "offer"}),
+                    )
+                ]
+            ),
+            Assistant(
+                tool_calls=[
+                    ToolCall(
+                        id="journal-chain-second",
+                        name="update_application_status",
+                        args=json.dumps(
+                            {
+                                "id": first_application["id"],
+                                "status": "closed",
+                                "closed_reason": "rejected",
+                            }
+                        ),
+                    )
+                ]
+            ),
+            Assistant(content="stable chained final"),
+        ]
+    )
+    client = TestClient(
+        create_app(
+            data_dir=tmp_path,
+            chat_model=model,
+            title_model=ScriptedModel([Assistant(content="title")]),
+            run_recorder_factory=_stable_journal_factory(tmp_path),
+        )
+    )
+    first = client.post(
+        "/api/chat",
+        json={"message": "update twice", "conversation_id": 0},
+    ).json()
+    first_pending = first["pending_action"]
+    first_operation_id = first_pending["operation_id"]
+    first_token = first_pending["confirmation_token"]
+    first_confirmed = client.post(
+        "/api/chat/confirm",
+        json={
+            "conversation_id": first["conversation_id"],
+            "approved": True,
+            "confirmation_token": first_token,
+        },
+    )
+    assert first_confirmed.status_code == 200
+    second = first_confirmed.json()
+    assert second["type"] == "confirmation_required"
+    second_pending = second["pending_action"]
+    second_operation_id = second_pending["operation_id"]
+    second_token = second_pending["confirmation_token"]
+    assert second_token != first_token
+    operations, _ = _ledger_rows(tmp_path)
+    first_operation = next(operation for operation in operations if operation.id == first_operation_id)
+    second_operation = next(operation for operation in operations if operation.id == second_operation_id)
+    assert first_operation.status == "committed"
+    assert first_operation.delivery_status == "completed"
+    assert first_operation.delivery_outcome == "chained_pending"
+    assert second_operation.status == "proposed"
+    assert second_operation.delivery_status == "pending"
+    runs, waiting_events, _ = _wait_for_journal_status(tmp_path, "waiting_confirmation")
+    assert len(runs) == 1
+    assert runs[0].status == "waiting_confirmation"
+    assert runs[0].waiting_tool_call_id == "journal-chain-second"
+    assert [event.event_type for event in waiting_events].count("approval.requested") == 2
+
+    final_payload = {
+        "conversation_id": first["conversation_id"],
+        "approved": final_approved,
+        "confirmation_token": second_token,
+    }
+    if not final_approved:
+        final_payload["rejection_feedback"] = "Keep it as offer."
+    final = client.post(confirm_endpoint, json=final_payload)
+    assert final.status_code == 200
+    if confirm_endpoint.endswith("/stream"):
+        final_events = _parse_sse_events(final.text)
+        assert final_events[-1]["event"] == "completed"
+        body = final_events[-1]["data"]["data"]["response"]
+        assert final_events.index(next(event for event in final_events if event["event"] == "tool_result")) < len(final_events) - 1 if final_approved else True
+    else:
+        body = final.json()
+    assert body["type"] == "message"
+    assert body["write_status"] == ("success" if final_approved else "cancelled")
+    assert client.get("/api/chat/conversations").json()[0]["pending_action"] is None
+    assert len(model.calls) == (3 if final_approved else 2)
+    expected_status = "closed" if final_approved else "offer"
+    assert seed.get(f"/api/applications/{first_application['id']}").json()["status"] == expected_status
+    stored = ChatRepository(session_factory_for_data_dir(tmp_path)).list_messages(first["conversation_id"])
+    assert all(isinstance(message, ChatMessage) for message in stored)
+    assert sum(message.role == "tool" for message in stored) == 2
+    operations, transitions = _ledger_rows(tmp_path)
+    first_operation = next(operation for operation in operations if operation.id == first_operation_id)
+    second_operation = next(operation for operation in operations if operation.id == second_operation_id)
+    assert first_operation.status == "committed"
+    assert first_operation.delivery_outcome == "chained_pending"
+    assert second_operation.status == ("committed" if final_approved else "rejected")
+    assert second_operation.delivery_status == "completed"
+    assert second_operation.delivery_outcome == "final_response"
+    second_states = [transition.state for transition in transitions if transition.operation_id == second_operation_id]
+    assert second_states == (["proposed", "approved", "claimed", "committed"] if final_approved else ["proposed", "rejected"])
+    runs, journal_events, _ = _wait_for_journal_status(tmp_path, "completed")
+    assert runs[0].status == "completed"
+    assert runs[0].recording_status in {"healthy", "degraded"}
+    event_types = [event.event_type for event in journal_events]
+    assert event_types.count("tool.started") == (2 if final_approved else 1)
+    assert event_types.count("tool.completed") == (2 if final_approved else 1)
+    assert event_types.count("approval.decided") == 2
+    assert event_types.index("approval.decided") < event_types.index(
+        "approval.decided", event_types.index("approval.decided") + 1
+    )
+    trace = _journal_trace(tmp_path, runs[0])
+    assert trace.lifecycle_status == "completed"
+    assert trace.completion_status == "terminal"
+    if runs[0].recording_status == "healthy":
+        assert trace.integrity_status == "healthy", trace.anomalies
+    else:
+        assert "recording_degraded" in trace.anomalies
+    assert not any(
+        anomaly.startswith(("model_call_incomplete:", "tool_call_incomplete:"))
+        for anomaly in trace.anomalies
+    )
+    client.close()
+    seed.close()
+
+
 @pytest.mark.parametrize("endpoint", ["/api/chat/confirm", "/api/chat/confirm/stream"])
 def test_journal_confirmation_resumes_original_run_and_orders_approval(
     tmp_path, endpoint
@@ -1277,7 +2011,7 @@ def test_journal_confirmation_resumes_original_run_and_orders_approval(
     )
 
     assert response.status_code == 200
-    runs, events, snapshots = _journal_rows(tmp_path)
+    runs, events, snapshots = _wait_for_journal_status(tmp_path, "completed")
     assert len(runs) == 1
     assert runs[0].status == "completed"
     segment_ids = {
@@ -1682,10 +2416,34 @@ def _failure_injected_recorder_factory(data_dir, failure):
     repository = AgentRunRepository(journal_session_factory_for_data_dir(data_dir))
     key = load_or_create_journal_key(data_dir)
     assert key is not None
+    if failure == "null":
+        return NullRunRecorderFactory("journal_disabled")
     if failure == "disabled":
         return RunRecorderFactory(repository, key=key, enabled=False)
     if failure == "key-unavailable":
         return RunRecorderFactory(repository, key=None)
+    if failure == "active-budget":
+        return RunRecorderFactory(
+            repository,
+            key=key,
+            segment_budget_seconds=0.006,
+            disposition_budget_seconds=0.006,
+        )
+    if failure == "invalid-clock":
+        def invalid_clock():
+            raise RuntimeError("invalid Journal clock")
+
+        return RunRecorderFactory(repository, key=key, clock=invalid_clock)
+    if failure == "locked":
+        return RunRecorderFactory(
+            LockedAgentRunRepository(repository, "append_event"),
+            key=key,
+        )
+    if failure == "caller-conflict":
+        return RunRecorderFactory(
+            ConflictingAgentRunRepository(repository, "append_event"),
+            key=key,
+        )
     method = {
         "create": "create_run_and_initial_segment",
         "append": "append_event",
@@ -1737,10 +2495,96 @@ def _chat_and_business_projection(data_dir):
     return chat_rows, business_rows
 
 
+def _write_business_projection(data_dir):
+    messages = ChatRepository(session_factory_for_data_dir(data_dir)).list_messages(1)
+    operations, transitions = _ledger_rows(data_dir)
+    transition_map = {
+        operation.id: [
+            transition.state
+            for transition in transitions
+            if transition.operation_id == operation.id
+        ]
+        for operation in operations
+    }
+    message_rows = [
+        (
+            message.role,
+            message.tool_call_id,
+            re.sub(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                "<uuid>",
+                re.sub(
+                    r"202[0-9]-[0-9]{2}-[0-9]{2}T[0-9:.+-]+",
+                    "<timestamp>",
+                    message.content or "",
+                ),
+            ),
+        )
+        for message in messages
+    ]
+    operation_rows = [
+        (
+            operation.tool_call_id,
+            operation.tool_name,
+            operation.status,
+            operation.delivery_status,
+            operation.delivery_outcome,
+            operation.failure_category,
+            operation.failure_code,
+            operation.delivery_failure_code,
+            transition_map[operation.id],
+        )
+        for operation in operations
+    ]
+    applications = ApplicationsRepository(session_factory_for_data_dir(data_dir)).list()
+    return message_rows, operation_rows, [application.status for application in applications]
+
+
+def _write_pending_projection(data_dir, conversation_id):
+    pending = ChatRepository(session_factory_for_data_dir(data_dir)).get_pending_action(
+        conversation_id
+    )
+    assert pending is not None
+    operations, transitions = _ledger_rows(data_dir)
+    operation = next(row for row in operations if row.id == pending.operation_id)
+    return (
+        pending.tool_call_id,
+        pending.tool_name,
+        json.loads(pending.args),
+        bool(
+            re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                pending.operation_id,
+            )
+        ),
+        operation.status,
+        operation.delivery_status,
+        operation.delivery_outcome,
+        operation.confirmation_token_fingerprint is not None,
+        [
+            transition.state
+            for transition in transitions
+            if transition.operation_id == pending.operation_id
+        ],
+    )
+
+
 @pytest.mark.parametrize("endpoint", ["/api/chat", "/api/chat/stream"])
 @pytest.mark.parametrize(
     "failure",
-    ["disabled", "key-unavailable", "create", "append", "snapshot", "disposition"],
+    [
+        "null",
+        "disabled",
+        "key-unavailable",
+        "locked",
+        "active-budget",
+        "invalid-clock",
+        "caller-conflict",
+        "create",
+        "append",
+        "snapshot",
+        "disposition",
+    ],
 )
 def test_journal_failure_modes_preserve_business_behavior(tmp_path, endpoint, failure):
     control_dir = tmp_path / "control"
@@ -1790,6 +2634,127 @@ def test_journal_failure_modes_preserve_business_behavior(tmp_path, endpoint, fa
     )
     assert candidate_model.provider_calls == control_model.provider_calls == 2
     assert candidate_model.tool_results == control_model.tool_results == 1
+
+
+@pytest.mark.parametrize(
+    ("chat_endpoint", "confirm_endpoint"),
+    [
+        ("/api/chat", "/api/chat/confirm"),
+        ("/api/chat/stream", "/api/chat/confirm/stream"),
+    ],
+)
+@pytest.mark.parametrize("approved", [True, False], ids=["approve", "reject"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "null",
+        "disabled",
+        "key-unavailable",
+        "locked",
+        "active-budget",
+        "invalid-clock",
+        "caller-conflict",
+    ],
+)
+def test_journal_failure_modes_preserve_hitl_ledger_and_domain_behavior(
+    tmp_path, chat_endpoint, confirm_endpoint, approved, failure
+):
+    def exercise(data_dir, run_recorder_factory=None):
+        model = WriteEquivalenceModel()
+        client = TestClient(
+            create_app(
+                data_dir=data_dir,
+                chat_model=model,
+                title_model=ScriptedModel([Assistant(content="title")]),
+                run_recorder_factory=run_recorder_factory,
+            )
+        )
+        application = client.post(
+            "/api/applications",
+            json={
+                "company_name": "HITL Equivalence Co",
+                "position_name": "Engineer",
+                "status": "interview",
+            },
+        ).json()
+        assert application["id"] == 1
+        initial = client.post(
+            chat_endpoint,
+            json={"message": "change status", "conversation_id": 0},
+        )
+        assert initial.status_code == 200
+        if chat_endpoint.endswith("/stream"):
+            initial_events = _parse_sse_events(initial.text)
+            initial_body = initial_events[-1]["data"]["data"]["response"]
+            initial_transport = [event["event"] for event in initial_events]
+        else:
+            initial_body = initial.json()
+            initial_transport = []
+        assert initial_body["type"] == "confirmation_required"
+        pending_action = initial_body["pending_action"]
+        assert re.fullmatch(r"[0-9a-f]{64}", pending_action["confirmation_token"])
+        pending_projection = _write_pending_projection(
+            data_dir, initial_body["conversation_id"]
+        )
+        confirmation = {
+            "conversation_id": initial_body["conversation_id"],
+            "approved": approved,
+            "confirmation_token": pending_action["confirmation_token"],
+        }
+        if not approved:
+            confirmation["rejection_feedback"] = "Keep it in interview."
+        final = client.post(confirm_endpoint, json=confirmation)
+        assert final.status_code == 200
+        if confirm_endpoint.endswith("/stream"):
+            final_events = _parse_sse_events(final.text)
+            final_body = final_events[-1]["data"]["data"]["response"]
+            final_transport = [event["event"] for event in final_events]
+        else:
+            final_body = final.json()
+            final_transport = []
+        assert final_body["type"] == "message"
+        assert final_body["write_status"] == ("success" if approved else "cancelled")
+        assert client.get("/api/chat/conversations").json()[0]["pending_action"] is None
+        assert client.get("/api/applications/1").json()["status"] == (
+            "offer" if approved else "interview"
+        )
+        assert model.provider_calls == (2 if approved else 1)
+        assert model.tool_results == (1 if approved else 0)
+        undo = final_body.get("undo")
+        if undo is not None:
+            undo = dict(undo)
+            undo["parent_operation_id"] = "<operation>"
+        client.close()
+        return {
+            "initial_body": {
+                "type": initial_body["type"],
+                "conversation_id": initial_body["conversation_id"],
+                "pending_tool": (
+                    pending_action["tool_name"],
+                    pending_action["args"],
+                ),
+            },
+            "initial_transport": initial_transport,
+            "final_body": {
+                "type": final_body["type"],
+                "conversation_id": final_body["conversation_id"],
+                "message": final_body["message"],
+                "write_status": final_body["write_status"],
+                "undo": undo,
+            },
+            "final_transport": final_transport,
+            "pending_projection": pending_projection,
+            "business_projection": _write_business_projection(data_dir),
+        }
+
+    control_dir = tmp_path / "control"
+    candidate_dir = tmp_path / "candidate"
+    control = exercise(control_dir)
+    candidate = exercise(
+        candidate_dir,
+        _failure_injected_recorder_factory(candidate_dir, failure),
+    )
+    assert candidate == control
 
 
 PAGE_CONTEXT_POLICY = (
@@ -2846,7 +3811,13 @@ def test_chat_confirm_stream_recovers_committed_write_when_followup_model_fails(
         name="update_application_status",
         args=json.dumps({"id": application["id"], "status": "offer"}),
     )
-    client = TestClient(create_app(data_dir=tmp_path, chat_model=FailAfterWriteModel(tool_call)))
+    client = TestClient(
+        create_app(
+            data_dir=tmp_path,
+            chat_model=FailAfterWriteModel(tool_call),
+            run_recorder_factory=_stable_journal_factory(tmp_path),
+        )
+    )
     pending = client.post("/api/chat", json={"message": "改成 offer", "conversation_id": 0}).json()
 
     failed_confirm = client.post(
@@ -2872,6 +3843,10 @@ def test_chat_confirm_stream_recovers_committed_write_when_followup_model_fails(
     assert [message["role"] for message in stored].count("tool") == 1
     assert [message["content"] for message in stored].count(completed["message"]) == 1
     assert app_client.get(f"/api/applications/{application['id']}").json()["status"] == "offer"
+    runs, events, _ = _wait_for_journal_status(tmp_path, "completed")
+    assert len(runs) == 1
+    assert any(event.event_type == "run.completed" for event in events)
+    assert _journal_trace(tmp_path, runs[0]).completion_status == "terminal"
 
 
 def test_chat_confirm_recovers_committed_write_when_followup_model_fails(tmp_path):
@@ -2889,6 +3864,7 @@ def test_chat_confirm_recovers_committed_write_when_followup_model_fails(tmp_pat
         create_app(
             data_dir=tmp_path,
             chat_model=FailAfterWriteModel(tool_call),
+            run_recorder_factory=_stable_journal_factory(tmp_path),
         ),
         raise_server_exceptions=False,
     )
@@ -2914,6 +3890,10 @@ def test_chat_confirm_recovers_committed_write_when_followup_model_fails(tmp_pat
     assert [message["role"] for message in stored].count("tool") == 1
     assert [message["content"] for message in stored].count(failed_confirm.json()["message"]) == 1
     assert app_client.get(f"/api/applications/{application['id']}").json()["status"] == "offer"
+    runs, events, _ = _wait_for_journal_status(tmp_path, "completed")
+    assert len(runs) == 1
+    assert any(event.event_type == "run.completed" for event in events)
+    assert _journal_trace(tmp_path, runs[0]).completion_status == "terminal"
 
 
 def test_chat_returns_bad_gateway_when_model_fails(tmp_path):
@@ -3172,7 +4152,13 @@ def test_chat_confirmed_status_update_can_be_undone(tmp_path):
             Assistant(content="已更新为 Offer。"),
         ]
     )
-    client = TestClient(create_app(data_dir=tmp_path, chat_model=model))
+    client = TestClient(
+        create_app(
+            data_dir=tmp_path,
+            chat_model=model,
+            run_recorder_factory=_stable_journal_factory(tmp_path),
+        )
+    )
     pending = client.post("/api/chat", json={"message": "改成 offer", "conversation_id": 0}).json()
     confirmed = client.post(
         "/api/chat/confirm",
@@ -3227,6 +4213,16 @@ def test_chat_confirmed_status_update_can_be_undone(tmp_path):
     assert replayed_undo.status_code == 200
     assert replayed_undo.json()["replayed"] is True
     assert replayed_undo.json()["operation_id"] == undone.json()["operation_id"]
+    runs, events, _ = _wait_for_journal_status(tmp_path, "completed")
+    assert len(runs) == 1
+    trace = _journal_trace(tmp_path, runs[0])
+    assert trace.lifecycle_status == "completed"
+    assert trace.completion_status == "terminal"
+    assert not any(
+        anomaly.startswith(("model_call_incomplete:", "tool_call_incomplete:"))
+        for anomaly in trace.anomalies
+    )
+    assert any(event.event_type == "run.completed" for event in events)
 
 
 def test_chat_status_undo_preserves_unrelated_application_edits(tmp_path):

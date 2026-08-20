@@ -791,7 +791,9 @@ def test_deterministic_action_records_waiting_run_without_model_events(tmp_path)
             data_dir=tmp_path,
             chat_model=model,
             title_model=model,
-            run_recorder_factory=_stable_journal_factory(tmp_path),
+            run_recorder_factory=_stable_journal_factory(
+                tmp_path, clock=_non_advancing_journal_clock
+            ),
         )
     )
     application = client.post(
@@ -2391,7 +2393,9 @@ def test_complete_causal_chain_reconstructs_one_healthy_run(
         create_app(
             data_dir=tmp_path,
             chat_model=model,
-            run_recorder_factory=_stable_journal_factory(tmp_path),
+            run_recorder_factory=_stable_journal_factory(
+                tmp_path, clock=_non_advancing_journal_clock
+            ),
         )
     )
     client.post(
@@ -2449,7 +2453,11 @@ def test_complete_causal_chain_reconstructs_one_healthy_run(
                 "tool.started": 2,
                 "tool.completed": 2,
             },
-            required_snapshot_kinds=("initial", "model_input"),
+            required_snapshot_kinds=(
+                "initial",
+                "model_input",
+                "confirmation_resume",
+            ),
             minimum_snapshot_counts={"model_input": 3},
         ),
     )

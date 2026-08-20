@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
-from offerpilot.byte_chunks import update_digest_in_chunks
+from offerpilot.agent_runtime.events import update_digest_in_chunks
 from offerpilot.context_projector.contracts import CONTRIBUTOR_ORDER, RuntimeSurfaceAudit
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_NAMES
 

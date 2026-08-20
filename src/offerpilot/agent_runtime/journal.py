@@ -264,7 +264,8 @@ class SafeRunRecorder:
             if command.run_id != self.run_id or (
                 command.segment_started.execution_segment_id != self.segment_id
             ):
-                self._degrade("journal_segment_identity_changed")
+                if self._degrade("journal_segment_identity_changed"):
+                    self._sync_degraded(lease)
                 return
             self.repository.start_segment(
                 command,
@@ -715,7 +716,12 @@ class SafeRunRecorder:
                     if acquired:
                         self._cleanup_operation(lease)
                 except Exception:
-                    self._degrade("journal_cleanup_failed")
+                    if (
+                        self._degrade("journal_cleanup_failed")
+                        and lease is not None
+                        and lease is self._current_lease
+                    ):
+                        self._sync_degraded(lease)
                 except BaseException as error:
                     cleanup_base = error
             finally:
@@ -791,6 +797,10 @@ class SafeRunRecorder:
         failure_diagnostic: str,
         lease: OperationLease | None,
     ) -> str:
+        if self.active_budget.clock_invalid_latched and not isinstance(
+            error, JournalEventValidationError
+        ):
+            return "journal_clock_invalid"
         if isinstance(error, JournalDeadlineExceeded):
             return (
                 "journal_clock_invalid"
@@ -816,6 +826,8 @@ class SafeRunRecorder:
         return exhausted or failure_diagnostic
 
     def _lease_exhaustion_diagnostic(self, lease: OperationLease | None) -> str | None:
+        if self.active_budget.clock_invalid_latched:
+            return "journal_clock_invalid"
         if lease is None:
             return "journal_clock_invalid" if self.active_budget.clock_invalid_latched else None
         try:
@@ -1026,15 +1038,22 @@ class SafeRunRecorder:
         with self._state_lock:
             first_transition = self.recording_status != "degraded"
             self.recording_status = "degraded"
-            self._diagnose(diagnostic)
+            should_emit = diagnostic not in self.diagnostics
+            if should_emit:
+                self.diagnostics.append(diagnostic)
             self._state_condition.notify_all()
-            return first_transition
+        if should_emit:
+            self._emit_diagnostic(diagnostic)
+        return first_transition
 
     def _diagnose(self, code: str) -> None:
         with self._state_lock:
             if code in self.diagnostics:
                 return
             self.diagnostics.append(code)
+        self._emit_diagnostic(code)
+
+    def _emit_diagnostic(self, code: str) -> None:
         if self._diagnostic_sink is not None:
             try:
                 self._diagnostic_sink(code)
@@ -1316,6 +1335,8 @@ def _is_sqlite_lock_error(error: OperationalError) -> bool:
 def _factory_lease_exhaustion(lease: OperationLease | None) -> str | None:
     if lease is None:
         return None
+    if lease.budget.clock_invalid_latched:
+        return "journal_clock_invalid"
     try:
         lease.checkpoint()
     except JournalDeadlineExceeded as error:

@@ -669,6 +669,94 @@ def test_cleanup_exception_releases_lock_charges_and_uses_closed_diagnostic() ->
     recorder._operation_lock.release()
 
 
+def test_cleanup_degradation_persists_with_current_non_exhausted_lease() -> None:
+    clock = ManualClock()
+    repository = RecordingJournalRepository()
+    recorder = _recorder(repository, clock=clock)
+
+    def fail_cleanup(_lease: object) -> None:
+        raise RuntimeError("private-cleanup-canary")
+
+    recorder._cleanup_operation = fail_cleanup  # type: ignore[method-assign]
+    recorder.append_event(_route_event())
+
+    assert recorder.recording_status == "degraded"
+    assert repository.mark_degraded_calls == 1
+    assert repository.mark_degraded_kwargs[0]["deadline"] == pytest.approx(0.045)
+    assert hasattr(repository.mark_degraded_kwargs[0]["safe_clock"], "sample")
+
+
+def test_identity_degradation_persists_with_current_non_exhausted_lease() -> None:
+    clock = ManualClock()
+    repository = RecordingJournalRepository()
+    recorder = _recorder(repository, clock=clock)
+
+    recorder.start_segment(
+        SimpleNamespace(
+            run_id="88888888-8888-4888-8888-888888888888",
+            segment_started=_segment_started(),
+        )  # type: ignore[arg-type]
+    )
+
+    assert recorder.recording_status == "degraded"
+    assert recorder.diagnostics == ["journal_segment_identity_changed"]
+    assert repository.mark_degraded_calls == 1
+    assert repository.mark_degraded_kwargs[0]["deadline"] == pytest.approx(0.045)
+    assert hasattr(repository.mark_degraded_kwargs[0]["safe_clock"], "sample")
+
+
+def test_diagnostic_sink_is_reentrant_concurrent_and_deduplicated() -> None:
+    repository = RecordingJournalRepository()
+    repository.append_failure = RuntimeError("private-write-canary")
+    recorder = _recorder(repository)
+    sink_codes: list[str] = []
+    sink_codes_lock = threading.Lock()
+    blocked = threading.Event()
+
+    def sink(code: str) -> None:
+        with sink_codes_lock:
+            sink_codes.append(code)
+        probe_done = threading.Event()
+
+        def probe_state_lock() -> None:
+            with recorder._state_lock:
+                probe_done.set()
+
+        probe = threading.Thread(target=probe_state_lock)
+        probe.start()
+        if not probe_done.wait(timeout=0.25):
+            blocked.set()
+        probe.join(timeout=1.0)
+        recorder._diagnose(code)
+
+    recorder._diagnostic_sink = sink
+    recorder.append_event(_route_event())
+
+    barrier = threading.Barrier(3)
+    errors: list[BaseException] = []
+
+    def degrade_concurrently() -> None:
+        try:
+            barrier.wait(timeout=1.0)
+            recorder._degrade("journal_concurrent_sink")
+        except BaseException as error:
+            errors.append(error)
+
+    threads = [threading.Thread(target=degrade_concurrently) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait(timeout=1.0)
+    for thread in threads:
+        thread.join(timeout=1.0)
+
+    assert errors == []
+    assert not blocked.is_set()
+    assert sink_codes.count("journal_event_write_failed") == 1
+    assert sink_codes.count("journal_concurrent_sink") == 1
+    assert recorder.diagnostics.count("journal_event_write_failed") == 1
+    assert recorder.diagnostics.count("journal_concurrent_sink") == 1
+
+
 def test_concurrent_operations_serialize_and_lock_wait_hits_hard_cap() -> None:
     repository = RecordingJournalRepository()
     started = threading.Event()
@@ -811,6 +899,18 @@ def test_sqlite_lock_exhaustion_is_classified_as_budget_exhaustion() -> None:
 
     assert recorder.diagnostics == ["journal_budget_exhausted"]
     assert "private" not in json.dumps(recorder.diagnostics)
+
+
+def test_prelatched_clock_invalid_precedes_saturated_budget_diagnostic() -> None:
+    repository = RecordingJournalRepository()
+    recorder = _recorder(repository)
+    recorder.active_budget.latch_clock_invalid()
+
+    recorder.append_event(_route_event())
+
+    assert recorder.recording_status == "degraded"
+    assert recorder.diagnostics == ["journal_clock_invalid"]
+    assert repository.append_calls == 0
 
 
 def test_safe_recorder_captures_context_with_model_identity() -> None:

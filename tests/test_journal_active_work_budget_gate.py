@@ -263,6 +263,8 @@ def _validate_journal_repository_calls(tree: ast.AST) -> None:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id == "getattr" and node.args and _is_self_name(node.args[0]):
                 raise AssertionError("dynamic self.repository access is forbidden")
+            if node.func.id == "vars" and node.args and _is_self_name(node.args[0]):
+                raise AssertionError("dynamic self mapping access is forbidden")
         if isinstance(node, ast.Attribute) and node.attr == "__getattribute__":
             raise AssertionError("dynamic self.repository access is forbidden")
         if (
@@ -360,6 +362,9 @@ def _validate_self_clock_access(tree: ast.AST) -> None:
             if isinstance(node.func, ast.Name) and node.func.id == "getattr":
                 if node.args and _is_self_name(node.args[0]):
                     raise AssertionError("dynamic self clock access is forbidden")
+            if isinstance(node.func, ast.Name) and node.func.id == "vars":
+                if node.args and _is_self_name(node.args[0]):
+                    raise AssertionError("dynamic self mapping access is forbidden")
             if isinstance(node.func, ast.Attribute) and node.func.attr == "__getattribute__":
                 raise AssertionError("dynamic self clock access is forbidden")
 
@@ -407,12 +412,21 @@ def _validate_bound_method(method: ast.FunctionDef | ast.AsyncFunctionDef) -> No
     ]
     assert len(append_calls) == 1, "bound path must have exactly one append_event_bound call"
     append_call = append_calls[0]
-    assert append_call.args and isinstance(append_call.args[0], ast.Name)
+    assert len(append_call.args) == 3, (
+        "append_event_bound must receive exactly three positional arguments"
+    )
+    assert isinstance(append_call.args[0], ast.Name)
     assert append_call.args[0].id == "session", (
         "append_event_bound must receive the exact session name first"
     )
-    assert all(keyword.arg is not None for keyword in append_call.keywords)
-    assert not any(isinstance(argument, ast.Starred) for argument in append_call.args)
+    assert _is_self_attribute(append_call.args[1], "run_id"), (
+        "append_event_bound must receive self.run_id second"
+    )
+    assert isinstance(append_call.args[2], ast.Name)
+    assert append_call.args[2].id == "draft", (
+        "append_event_bound must receive draft third"
+    )
+    assert not append_call.keywords, "append_event_bound must not receive keywords"
     append_statement = parents.get(append_call)
     assert isinstance(append_statement, ast.Expr)
     assert parents.get(append_statement) is bound_with
@@ -488,8 +502,20 @@ def _validate_owned_signature(method: ast.FunctionDef | ast.AsyncFunctionDef) ->
 
 def _validate_bound_repository_session(method: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
     parents = _parents(method)
-    allowed_helpers = {"_existing_event", "_required_run", "_insert_event"}
+    required_helpers = {"_existing_event", "_required_run", "_insert_event"}
+    helper_calls: dict[str, list[ast.Call]] = {}
     for node in ast.walk(method):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and _is_self_name(node.func.value)
+            and node.func.attr in required_helpers
+        ):
+            assert node.args and isinstance(node.args[0], ast.Name)
+            assert node.args[0].id == "session", (
+                f"{node.func.attr} must receive the caller session first"
+            )
+            helper_calls.setdefault(node.func.attr, []).append(node)
         if not isinstance(node, ast.Name) or node.id != "session":
             continue
         parent = parents.get(node)
@@ -499,11 +525,15 @@ def _validate_bound_repository_session(method: ast.FunctionDef | ast.AsyncFuncti
             and parent.args[0] is node
             and isinstance(parent.func, ast.Attribute)
             and _is_self_name(parent.func.value)
-            and parent.func.attr in allowed_helpers
+            and parent.func.attr in required_helpers
         )
         assert allowed_helper_argument, (
             "append_event_bound must not own or manipulate the caller session"
         )
+    assert set(helper_calls) == required_helpers
+    assert all(len(calls) == 1 for calls in helper_calls.values()), (
+        "append_event_bound must use each required helper exactly once"
+    )
 
 
 def _validate_bound_repository_implementation(
@@ -739,6 +769,17 @@ def test_mutations_reject_repository_alias_unknown_none_and_clock_paths(source: 
 @pytest.mark.parametrize(
     "source",
     (
+        "def run(self):\n    return vars(self)['repository'].append_event(x, deadline=lease.work_deadline, safe_clock=lease.safe_clock)\n",
+        "def run(self):\n    state = vars(self)\n    return state['repository'].append_event(x, deadline=lease.work_deadline, safe_clock=lease.safe_clock)\n",
+    ),
+)
+def test_mutations_reject_dynamic_repository_mapping_access(source: str) -> None:
+    _expect_rejected(source, _validate_journal_repository_calls)
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
         "def run(self):\n    return self.clock()\n",
         "def run(self):\n    clock = self.clock\n",
         "def run(self):\n    return getattr(self, 'clock')\n",
@@ -748,6 +789,17 @@ def test_mutations_reject_repository_alias_unknown_none_and_clock_paths(source: 
     ),
 )
 def test_mutations_reject_clock_alias_call_and_dynamic_access(source: str) -> None:
+    _expect_rejected(source, _validate_self_clock_access)
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "def run(self):\n    return vars(self)['clock']()\n",
+        "def run(self):\n    state = vars(self)\n    return state['clock']\n",
+    ),
+)
+def test_mutations_reject_dynamic_clock_mapping_access(source: str) -> None:
     _expect_rejected(source, _validate_self_clock_access)
 
 
@@ -815,6 +867,44 @@ class SafeRunRecorder:
 class SafeRunRecorder:
     def append_prepared_event_bound(self, session, draft):
         with session.begin_nested():
+            self.repository.append_event_bound(session, self.run_id, draft, extra)
+""",
+        """
+class SafeRunRecorder:
+    def append_prepared_event_bound(self, session, draft):
+        with session.begin_nested():
+            self.repository.append_event_bound(
+                session, self.run_id, draft, extra=extra
+            )
+""",
+        """
+class SafeRunRecorder:
+    def append_prepared_event_bound(self, session, draft):
+        with session.begin_nested():
+            self.repository.append_event_bound(
+                session, self.run_id, draft, *args
+            )
+""",
+        """
+class SafeRunRecorder:
+    def append_prepared_event_bound(self, session, draft):
+        with session.begin_nested():
+            self.repository.append_event_bound(
+                session, run_id, draft
+            )
+""",
+        """
+class SafeRunRecorder:
+    def append_prepared_event_bound(self, session, draft):
+        with session.begin_nested():
+            self.repository.append_event_bound(
+                session, self.run_id, other_draft
+            )
+""",
+        """
+class SafeRunRecorder:
+    def append_prepared_event_bound(self, session, draft):
+        with session.begin_nested():
             def nested():
                 self.repository.append_event_bound(session, self.run_id, draft)
 """,
@@ -877,6 +967,27 @@ class SafeRunRecorder:
     ),
 )
 def test_mutations_reject_repository_bound_session_ownership(source: str) -> None:
+    wrapped = f"class AgentRunRepository:\n    {source.replace(chr(10), chr(10) + '    ')}"
+    _expect_rejected(
+        wrapped,
+        lambda tree: _validate_bound_repository_implementation(
+            _class_method(
+                _top_level_class(tree, "AgentRunRepository"), "append_event_bound"
+            )
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "def append_event_bound(self, session, run_id, draft):\n    self._existing_event(other_session, run_id, draft)\n    self._required_run(other_session, run_id)\n    return self._insert_event(other_session, run_id, draft)\n",
+        "def append_event_bound(self, session, run_id, draft):\n    self._existing_event(session, run_id, draft)\n    return self._insert_event(session, run_id, draft)\n",
+        "def append_event_bound(self, session, run_id, draft):\n    self._existing_event(session, run_id, draft)\n    self._required_run(other_session, run_id)\n    return self._insert_event(session, run_id, draft)\n",
+        "def append_event_bound(self, session, run_id, draft):\n    self._existing_event(session, run_id, draft)\n    self._required_run(session, run_id)\n    return self._insert_event(other_session, run_id, draft)\n",
+    ),
+)
+def test_mutations_reject_missing_or_non_session_bound_helper_arguments(source: str) -> None:
     wrapped = f"class AgentRunRepository:\n    {source.replace(chr(10), chr(10) + '    ')}"
     _expect_rejected(
         wrapped,

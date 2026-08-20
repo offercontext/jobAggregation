@@ -335,12 +335,9 @@ def _is_exact_lease_attribute(node: ast.AST, attribute: str) -> bool:
     )
 
 
-JOURNAL_STATE_ENTRYPOINTS = {
-    "SafeRunRecorder": frozenset(
-        {"resume", "suspend", "finish", "abandon", "mark_degraded"}
-    ),
-    "RunRecorderFactory": frozenset({"start_run", "resume_waiting_run"}),
-}
+JOURNAL_OWNERSHIP_CLASSES = frozenset(
+    {"SafeRunRecorder", "RunRecorderFactory", "AgentRunRepository"}
+)
 
 
 def _structural_protected_methods(tree: ast.AST) -> dict[str, frozenset[str]]:
@@ -355,22 +352,14 @@ def _structural_protected_methods(tree: ast.AST) -> dict[str, frozenset[str]]:
 
     for source_tree in source_trees:
         for class_node in ast.walk(source_tree):
-            if not isinstance(class_node, ast.ClassDef) or class_node.name not in {
-                "SafeRunRecorder",
-                "RunRecorderFactory",
-            }:
+            if not isinstance(class_node, ast.ClassDef) or class_node.name not in JOURNAL_OWNERSHIP_CLASSES:
                 continue
             for statement in class_node.body:
                 if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
-                if _direct_repository_calls(statement):
-                    method_names[class_node.name].add(statement.name)
+                method_names[class_node.name].add(statement.name)
 
-    for class_name, entrypoints in JOURNAL_STATE_ENTRYPOINTS.items():
-        method_names[class_name].update(entrypoints)
-    method_names["AgentRunRepository"].update(
-        JOURNAL_REPOSITORY_API | {"append_event_bound"}
-    )
+    method_names["AgentRunRepository"].update(JOURNAL_REPOSITORY_API | {"append_event_bound"})
     return {
         class_name: frozenset(names)
         for class_name, names in method_names.items()
@@ -779,7 +768,7 @@ PUBLIC_BUDGET_API = frozenset(
     }
 )
 PROTECTED_OWNERSHIP_SYMBOLS = PUBLIC_BUDGET_API | frozenset(
-    {"AgentRunRepository", "SafeRunRecorder"}
+    {"AgentRunRepository", "RunRecorderFactory", "SafeRunRecorder"}
 )
 BUDGET_MODULE_SUFFIX = "agent_runtime.budget"
 
@@ -899,7 +888,7 @@ def _validate_protected_symbol_scopes(tree: ast.AST) -> None:
             return
         approved_class = (
             isinstance(node, ast.ClassDef)
-            and node.name == "SafeRunRecorder"
+            and node.name in JOURNAL_OWNERSHIP_CLASSES
             and node in tree.body
         )
         approved_import = isinstance(node, (ast.Import, ast.ImportFrom)) and node in tree.body
@@ -995,6 +984,7 @@ def _validate_protected_symbol_scopes(tree: ast.AST) -> None:
 def test_journal_repository_calls_are_budget_bound() -> None:
     tree = _module(JOURNAL_PATH)
     _top_level_class(tree, "SafeRunRecorder")
+    _top_level_class(tree, "RunRecorderFactory")
     _validate_protected_symbol_scopes(tree)
     _validate_journal_repository_calls(tree)
     _validate_self_clock_access(tree)
@@ -1050,8 +1040,12 @@ def test_repository_gate_rejects_post_class_method_rebinding() -> None:
 def test_protected_journal_methods_are_structurally_derived() -> None:
     methods = _structural_protected_methods(_module(JOURNAL_PATH))
     assert "capture_surface_context" in methods["SafeRunRecorder"]
-    assert {"start_run", "resume_waiting_run"} <= methods["RunRecorderFactory"]
+    assert {"_ordinary", "append_prepared_event_bound"} <= methods["SafeRunRecorder"]
+    assert {"start_run", "resume_waiting_run", "_safe"} <= methods["RunRecorderFactory"]
     assert JOURNAL_REPOSITORY_API | {"append_event_bound"} <= methods[
+        "AgentRunRepository"
+    ]
+    assert {"_insert_event", "_existing_event", "_required_run"} <= methods[
         "AgentRunRepository"
     ]
 
@@ -1234,6 +1228,25 @@ def test_mutations_reject_module_level_class_rebinding_and_duplicates(source: st
 
 
 @pytest.mark.parametrize(
+    "source",
+    (
+        "RunRecorderFactory = replacement\n"
+        "class RunRecorderFactory:\n"
+        "    pass\n",
+        "class RunRecorderFactory:\n"
+        "    pass\n"
+        "class RunRecorderFactory:\n"
+        "    pass\n",
+        "@decorator\n"
+        "class RunRecorderFactory:\n"
+        "    pass\n",
+    ),
+)
+def test_mutations_reject_factory_class_rebinding_and_duplicates(source: str) -> None:
+    _expect_rejected(source, lambda tree: _top_level_class(tree, "RunRecorderFactory"))
+
+
+@pytest.mark.parametrize(
     ("source", "class_name"),
     (
         (
@@ -1263,6 +1276,11 @@ def test_mutations_reject_module_level_class_deletion(
         "SafeRunRecorder.append_prepared_event_bound = replacement\n",
         "SafeRunRecorder.capture_surface_context = replacement\n",
         "RunRecorderFactory.start_run = replacement\n",
+        "SafeRunRecorder._ordinary = replacement\n",
+        "RunRecorderFactory._safe = replacement\n",
+        "AgentRunRepository._insert_event = replacement\n",
+        "AgentRunRepository._existing_event = replacement\n",
+        "AgentRunRepository._required_run = replacement\n",
         "AgentRunRepository.append_event = replacement\n",
         "SafeRunRecorder.append_event = replacement\n",
         "AgentRunRepository.append_event_bound: object = replacement\n",
@@ -1275,6 +1293,10 @@ def test_mutations_reject_module_level_class_deletion(
         "    SafeRunRecorder.append_event = replacement\n"
         "    AgentRunRepository.append_event = replacement\n"
         "    RunRecorderFactory.start_run = replacement\n",
+        "class Patcher:\n"
+        "    SafeRunRecorder._ordinary = replacement\n"
+        "    RunRecorderFactory._safe = replacement\n"
+        "    AgentRunRepository._insert_event = replacement\n",
         "def patch():\n"
         "    setattr(AgentRunRepository, 'append_event_bound', replacement)\n",
     ),
@@ -1327,6 +1349,7 @@ def test_mutation_rejects_synthetic_external_method_walrus_target() -> None:
         "def run():\n    JournalBudgetExhausted = replacement\n",
         "def run():\n    JournalDeadlineExceeded = replacement\n",
         "def run():\n    MonotonicSample = replacement\n",
+        "def run():\n    RunRecorderFactory = replacement\n",
         "ActiveWorkBudget = replacement\n",
         "if enabled:\n    from evil import ActiveWorkBudget\n",
         "from evil import ActiveWorkBudget\n",

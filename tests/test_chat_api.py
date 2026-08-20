@@ -1,4 +1,5 @@
 import json
+import inspect
 import re
 import sqlite3
 import time
@@ -256,7 +257,7 @@ def _stable_journal_factory(
     *,
     segment_budget_seconds=2.0,
     disposition_budget_seconds=0.5,
-    clock=time.monotonic,
+    clock=_non_advancing_journal_clock,
 ):
     repository = AgentRunRepository(journal_session_factory_for_data_dir(data_dir))
     key = load_or_create_journal_key(data_dir)
@@ -1385,18 +1386,20 @@ def test_deterministic_pilot_confirmation_writes_once_without_ai(tmp_path, endpo
     assert len(versions) == 1
     assert versions[0]["source_kind"] == "pilot"
     assert model.calls == 0
-    deadline = time.monotonic() + 5
-    while True:
-        runs, journal_events, snapshots = _journal_rows(tmp_path)
-        assert len(runs) == 1
-        if runs[0].status == "completed":
-            break
-        if time.monotonic() >= deadline:
-            pytest.fail(
-                "deterministic confirmation Journal did not converge: "
-                f"status={runs[0].status!r}"
-            )
-        time.sleep(0.01)
+    runs, journal_events, snapshots = _wait_for_journal_status(
+        tmp_path,
+        "completed",
+        predicate=_journal_terminal_predicate(
+            required_event_types=(
+                "approval.decided",
+                "tool.started",
+                "tool.completed",
+                "run.completed",
+            ),
+            required_snapshot_kinds=("initial", "confirmation_resume"),
+        ),
+    )
+    assert len(runs) == 1
     event_types = [event.event_type for event in journal_events]
     assert event_types.index("approval.decided") < event_types.index("tool.started")
     assert not any(event_type.startswith("model.") for event_type in event_types)
@@ -2866,6 +2869,17 @@ def _failure_injected_recorder_factory(
         key=key,
         clock=clock,
     )
+
+
+def test_stable_journal_clock_contract_keeps_real_time_probes_explicit():
+    assert inspect.signature(_stable_journal_factory).parameters["clock"].default is (
+        _non_advancing_journal_clock
+    )
+    for probe in (
+        test_journal_active_budget_ignores_slow_final_provider_gap,
+        test_journal_active_budget_ignores_slow_provider_before_read_then_final,
+    ):
+        assert "clock=time.monotonic" in inspect.getsource(probe)
 
 
 def _normalized_chat_response(response, endpoint):

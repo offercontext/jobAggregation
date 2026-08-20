@@ -924,7 +924,7 @@ def test_hmac_chunk_update_crosses_budget_checkpoint(fail_at: int) -> None:
 def test_context_manifest_assembly_and_final_digest_cross_checkpoints() -> None:
     logical_input = {"content": "x" * 5000}
     manifest = ContextManifestInput((), (), (), ())
-    guard = FailingGuard(fail_at=202)
+    guard = FailingGuard(fail_at=199)
 
     with pytest.raises(JournalBudgetExhausted):
         prepare_context_snapshot(
@@ -934,4 +934,4 @@ def test_context_manifest_assembly_and_final_digest_cross_checkpoints() -> None:
             budget_check=guard,
         )
 
-    assert guard.calls == 202
+    assert guard.calls == 199

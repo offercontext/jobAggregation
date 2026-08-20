@@ -89,9 +89,14 @@ def _identity(
     budget_check: Callable[[], None] | None = None,
 ) -> str:
     _check_budget(budget_check)
-    encoded = value.encode("utf-8")
+    digest = hmac.new(secret, domain + b"\0", hashlib.sha256)
     _check_budget(budget_check)
-    digest = hmac.new(secret, domain + b"\0" + encoded, hashlib.sha256)
+    for offset in range(0, len(value), 4096):
+        _check_budget(budget_check)
+        encoded = value[offset : offset + 4096].encode("utf-8")
+        _check_budget(budget_check)
+        digest.update(encoded)
+        _check_budget(budget_check)
     _check_budget(budget_check)
     fingerprint = digest.hexdigest()
     _check_budget(budget_check)
@@ -121,7 +126,6 @@ def _build_manifest_payload(
             )
         )
         _check_budget(budget_check)
-    _check_budget(budget_check)
 
     contributors: list[dict[str, str]] = []
     _check_budget(budget_check)
@@ -340,7 +344,6 @@ def validate_surface_manifest_v2(
         ):
             raise ManifestV2ValidationError("invalid contributor")
         _check_budget(budget_check)
-    _check_budget(budget_check)
     _check_budget(budget_check)
     if tuple(item["name"] for item in contributors) != CONTRIBUTOR_ORDER:
         raise ManifestV2ValidationError("invalid contributor order")

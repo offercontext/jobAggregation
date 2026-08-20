@@ -550,7 +550,6 @@ def prepare_context_snapshot(
         for item in manifest.domain_source_refs
     ]
     _check_budget(budget_check)
-    _check_budget(budget_check)
     manifest_payload = {
         "manifest_schema_version": 1,
         "conversation": {
@@ -604,11 +603,9 @@ def prepare_context_snapshot(
     _check_budget(budget_check)
     logical_input_fingerprint = logical_digest.hexdigest()
     _check_budget(budget_check)
-    _check_budget(budget_check)
     manifest_digest = hashlib.sha256(manifest_bytes)
     _check_budget(budget_check)
     manifest_fingerprint = manifest_digest.hexdigest()
-    _check_budget(budget_check)
     _check_budget(budget_check)
     prepared = PreparedSnapshot(
         manifest_schema_version=1,
@@ -851,7 +848,6 @@ def prepare_event(
     fact_digest = hashlib.sha256(fact_bytes)
     _check_budget(budget_check)
     fact_fingerprint = fact_digest.hexdigest()
-    _check_budget(budget_check)
     _check_budget(budget_check)
     draft = EventDraft(
         event_type=event_type,

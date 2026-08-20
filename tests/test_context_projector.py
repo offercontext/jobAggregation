@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import sqlite3
 from dataclasses import FrozenInstanceError
@@ -49,6 +51,7 @@ from offerpilot.context_projector.loader import ContextSourceLoader, fetch_rows
 from offerpilot.context_projector.manifest import (
     MANIFEST_SIGNAL_VALUES,
     ManifestV2ValidationError,
+    _identity,
     prepare_surface_manifest_v2,
     validate_surface_manifest_v2,
 )
@@ -556,6 +559,78 @@ def test_manifest_v2_budget_guard_interrupts_maximal_audit_at_exact_checkpoint()
         )
 
     assert guard.calls == 12
+
+
+@pytest.mark.parametrize(
+    "domain",
+    [
+        b"offerpilot-surface-provider-v2",
+        b"offerpilot-surface-history-v2",
+        b"offerpilot-surface-source-v2",
+        b"offerpilot-surface-chunk-v2",
+    ],
+)
+@pytest.mark.parametrize("fail_at", [5, 8])
+def test_manifest_identity_budget_guard_checks_bounded_utf8_chunks(
+    domain: bytes,
+    fail_at: int,
+) -> None:
+    value = "界" * 5000
+    expected = hmac.new(
+        b"k" * 32,
+        domain + b"\0" + value.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    assert _identity(b"k" * 32, domain, value) == expected
+
+    guard = FailingGuard(fail_at=fail_at)
+
+    with pytest.raises(JournalBudgetExhausted):
+        _identity(
+            b"k" * 32,
+            domain,
+            value,
+            budget_check=guard,
+        )
+
+    assert guard.calls == fail_at
+
+
+@pytest.mark.parametrize("fail_at", [175, 176, 177])
+def test_manifest_budget_guard_reaches_source_chunk_validation_and_sha_phases(
+    fail_at: int,
+) -> None:
+    large_identity = "界" * 5000
+    source = RuntimeSourceAudit(
+        "source",
+        large_identity,
+        "a" * 64,
+        (SourceChunk(large_identity, 1, 1, "", False, 100, 50),),
+    )
+    audit = RuntimeSurfaceAudit(
+        "model-surface-budget-v1",
+        tuple((name, "ready") for name in CONTRIBUTOR_ORDER),
+        (large_identity,),
+        (MODEL_TOOL_NAMES[0],),
+        (source.content_revision_fingerprint,),
+        100,
+        80,
+        20,
+        False,
+        (source,),
+    )
+    guard = FailingGuard(fail_at=fail_at)
+
+    with pytest.raises(JournalBudgetExhausted):
+        prepare_surface_manifest_v2(
+            audit,
+            key_id="11111111-1111-4111-8111-111111111111",
+            secret=b"k" * 32,
+            provider_identities=(large_identity,),
+            budget_check=guard,
+        )
+
+    assert guard.calls == fail_at
 
 
 def test_migration_0027_records_and_database_accepts_v2_limit(tmp_path: Path) -> None:

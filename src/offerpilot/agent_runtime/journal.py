@@ -991,13 +991,16 @@ class SafeRunRecorder:
                     if acquired:
                         self._cleanup_operation(lease)
                 except Exception:
+                    succeeded = False
                     if (
                         self._degrade("journal_cleanup_failed")
                         and lease is not None
                         and lease is self._current_lease
                     ):
-                        self._sync_degraded(lease)
-                    succeeded = False
+                        try:
+                            self._sync_degraded(lease)
+                        except BaseException as error:
+                            cleanup_base = error
                 except BaseException as error:
                     cleanup_base = error
                     succeeded = False

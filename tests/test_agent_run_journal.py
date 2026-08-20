@@ -2021,6 +2021,54 @@ def test_final_cleanup_failure_syncs_degraded_with_current_lease() -> None:
     assert repository.mark_degraded_kwargs[0]["deadline"] == pytest.approx(0.045)
 
 
+@pytest.mark.parametrize(
+    ("primary_error", "sync_error", "expected_error"),
+    [
+        (None, KeyboardInterrupt("sync-keyboard-canary"), KeyboardInterrupt),
+        (None, SystemExit("sync-system-exit-canary"), SystemExit),
+        (
+            KeyboardInterrupt("primary-canary"),
+            SystemExit("sync-system-exit-canary"),
+            KeyboardInterrupt,
+        ),
+    ],
+)
+def test_final_cleanup_sync_base_exception_preserves_priority(
+    primary_error: BaseException | None,
+    sync_error: BaseException,
+    expected_error: type[BaseException],
+) -> None:
+    repository = RecordingJournalRepository()
+    recorder = _recorder(repository)
+
+    if primary_error is not None:
+        def fail_converge(_run_id: str, _command: object, **_kwargs: object) -> object:
+            repository.converge_calls += 1
+            raise primary_error
+
+        repository.converge_disposition = fail_converge  # type: ignore[method-assign]
+
+    def fail_cleanup(_lease: object) -> None:
+        raise RuntimeError("final-cleanup-canary")
+
+    recorder._cleanup_operation = fail_cleanup  # type: ignore[method-assign]
+    repository.mark_degraded_failure = sync_error  # type: ignore[assignment]
+
+    with pytest.raises(expected_error) as raised:
+        recorder.finish(TerminalDisposition(status="completed"))
+
+    expected_message = str(primary_error if primary_error is not None else sync_error)
+    assert str(raised.value) == expected_message
+    assert recorder.recording_status == "degraded"
+    assert recorder.diagnostics == ["journal_cleanup_failed"]
+    assert "final-cleanup-canary" not in json.dumps(recorder.diagnostics)
+    assert recorder._disposition_state == "failed"
+    assert repository.converge_calls == 1
+    assert repository.mark_degraded_calls == 1
+    assert recorder._operation_lock.acquire(blocking=False)
+    recorder._operation_lock.release()
+
+
 def test_degraded_abandon_persists_degraded_state_with_final_lease() -> None:
     clock = ManualClock()
     repository = RecordingJournalRepository()

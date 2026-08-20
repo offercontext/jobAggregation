@@ -4,12 +4,13 @@ import hashlib
 import hmac
 import json
 import sqlite3
+import time
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from fastapi.testclient import TestClient
 
@@ -19,6 +20,8 @@ from offerpilot.agent_runtime.events import (
     validate_context_manifest_json,
 )
 from offerpilot.agent_runtime.budget import JournalBudgetExhausted
+from offerpilot.agent_runtime.journal import RunRecorderFactory
+from offerpilot.agent_runtime.keyring import load_or_create_journal_key
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG, MODEL_TOOL_NAMES
 from offerpilot.ai.types import Assistant, Message, ToolCall
 from offerpilot.context_projector.binding import (
@@ -61,8 +64,9 @@ from offerpilot.context_projector.projector import ModelSurfaceProjector, Projec
 from offerpilot.context_projector.selector import ToolSelectionSignals, select_tools
 from offerpilot.context_projector.signals import RuntimeSignalSink
 from offerpilot.config import AIProviderProfile, Config, save_config
-from offerpilot.db import init_database
-from offerpilot.models import AgentContextSnapshot, AgentRun, Conversation
+from offerpilot.db import init_database, journal_session_factory_for_data_dir
+from offerpilot.models import AgentContextSnapshot, AgentEvent, AgentRun, Conversation
+from offerpilot.repositories.agent_runs import AgentRunRepository
 from offerpilot.api import create_app
 
 
@@ -94,6 +98,71 @@ class RecordingDigest:
 
     def __getattr__(self, name: str) -> object:
         return getattr(self._delegate, name)
+
+
+def _non_advancing_journal_clock() -> float:
+    return 0.0
+
+
+def _projector_journal_factory(data_dir: Path) -> RunRecorderFactory:
+    repository = AgentRunRepository(journal_session_factory_for_data_dir(data_dir))
+    key = load_or_create_journal_key(data_dir)
+    assert key is not None
+    return RunRecorderFactory(
+        repository,
+        key=key,
+        clock=_non_advancing_journal_clock,
+        segment_budget_seconds=2.0,
+        disposition_budget_seconds=0.5,
+    )
+
+
+def _wait_for_projector_journal_completion(
+    data_dir: Path, *, timeout: float = 15.0
+) -> tuple[list[AgentRun], list[AgentEvent], list[AgentContextSnapshot]]:
+    factory = init_database(data_dir / "data.db")
+    deadline = time.monotonic() + timeout
+    run: AgentRun | None = None
+    events: list[AgentEvent] = []
+    snapshots: list[AgentContextSnapshot] = []
+    while True:
+        with factory() as session:
+            run = session.scalar(select(AgentRun).order_by(AgentRun.started_at, AgentRun.id))
+            if run is None:
+                events = []
+                snapshots = []
+            else:
+                events = list(
+                    session.scalars(
+                        select(AgentEvent)
+                        .where(AgentEvent.run_id == run.id)
+                        .order_by(AgentEvent.seq)
+                    )
+                )
+                snapshots = list(
+                    session.scalars(
+                        select(AgentContextSnapshot)
+                        .where(AgentContextSnapshot.run_id == run.id)
+                        .order_by(AgentContextSnapshot.created_at)
+                    )
+                )
+            if (
+                run is not None
+                and run.status == "completed"
+                and events
+                and any(event.event_type == "run.completed" for event in events)
+                and events[-1].event_type == "segment.finished"
+                and any(snapshot.snapshot_kind == "model_input" for snapshot in snapshots)
+            ):
+                return [run], events, snapshots
+        if time.monotonic() >= deadline:
+            pytest.fail(
+                "projector Journal did not converge: "
+                f"statuses={[run.status] if run is not None else []!r}, "
+                f"events={[event.event_type for event in events]!r}, "
+                f"snapshots={[snapshot.snapshot_kind for snapshot in snapshots]!r}"
+            )
+        time.sleep(0.01)
 
 
 def _recording_sha256(chunks: list[bytes]):
@@ -801,14 +870,22 @@ def test_real_chat_adapter_uses_projected_surface_and_persists_v2_manifest(
         return {"choices": [{"message": {"content": "已完成", "tool_calls": []}}]}
 
     monkeypatch.setattr(ai_client, "completion", completion)
-    with TestClient(create_app(data_dir=tmp_path)) as client:
+    with TestClient(
+        create_app(
+            data_dir=tmp_path,
+            run_recorder_factory=_projector_journal_factory(tmp_path),
+        )
+    ) as client:
         response = client.post("/api/chat", json={"message": "请比较 offer"})
         assert response.status_code == 200
     assert requests
     assert 0 < len(requests[0].get("tools", [])) < 25  # type: ignore[arg-type]
-    factory = init_database(tmp_path / "data.db")
-    with factory() as session:
-        snapshots = session.query(AgentContextSnapshot).filter_by(snapshot_kind="model_input").all()
+    runs, events, snapshots = _wait_for_projector_journal_completion(tmp_path)
+    assert len(runs) == 1
+    assert runs[0].status == "completed"
+    assert runs[0].recording_status == "healthy"
+    assert events[-1].event_type == "segment.finished"
+    snapshots = [snapshot for snapshot in snapshots if snapshot.snapshot_kind == "model_input"]
     assert snapshots
     assert snapshots[0].manifest_schema_version == 2
     manifest = validate_surface_manifest_v2(snapshots[0].manifest_json)

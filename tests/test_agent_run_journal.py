@@ -1874,6 +1874,39 @@ def test_spurious_condition_wakeup_keeps_final_deadline_and_predicate() -> None:
     assert recorder.diagnostics == ["journal_disposition_budget_exhausted"]
 
 
+def test_final_resume_wait_timeout_consumes_disposition_right(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = RecordingJournalRepository()
+    recorder = SafeRunRecorder(
+        repository,  # type: ignore[arg-type]
+        KEY,
+        "77777777-7777-4777-8777-777777777777",
+        SEGMENT_A,
+        clock=lambda: 0.0,
+        disposition_budget_seconds=0.001,
+    )
+    with recorder._state_lock:
+        recorder._resume_state = "claimed"
+
+    waits: list[float] = []
+
+    def wait(*, timeout: float | None = None) -> bool:
+        waits.append(-1.0 if timeout is None else timeout)
+        if len(waits) > 1:
+            raise AssertionError("Condition.wait looped after a real timeout")
+        return False
+
+    monkeypatch.setattr(recorder._state_condition, "wait", wait)
+    recorder.finish(TerminalDisposition(status="completed"))
+
+    assert waits == pytest.approx([0.001])
+    assert recorder._disposition_state == "failed"
+    assert recorder.recording_status == "degraded"
+    assert recorder.diagnostics == ["journal_disposition_budget_exhausted"]
+    assert repository.converge_calls == 0
+
+
 def test_completed_finalizer_then_invalid_clock_is_absolute_noop() -> None:
     repository = RecordingJournalRepository()
     calls = 0
@@ -1956,6 +1989,36 @@ def test_final_base_exception_marks_state_and_unlocks_before_propagation(
     assert recorder._disposition_state == "failed"
     assert recorder._operation_lock.acquire(blocking=False)
     recorder._operation_lock.release()
+
+
+def test_final_cleanup_failure_syncs_degraded_with_current_lease() -> None:
+    clock = ManualClock()
+    repository = RecordingJournalRepository()
+    recorder = _recorder(repository, clock=clock)
+    seen_leases: list[object] = []
+    original_sync = recorder._sync_degraded
+
+    def fail_cleanup(_lease: object) -> None:
+        raise RuntimeError("final-cleanup-canary")
+
+    def record_sync(lease: object) -> None:
+        seen_leases.append(lease)
+        assert recorder._current_lease is lease
+        original_sync(lease)  # type: ignore[arg-type]
+
+    recorder._cleanup_operation = fail_cleanup  # type: ignore[method-assign]
+    recorder._sync_degraded = record_sync  # type: ignore[method-assign]
+    recorder.finish(TerminalDisposition(status="completed"))
+
+    assert recorder.recording_status == "degraded"
+    assert recorder.diagnostics == ["journal_cleanup_failed"]
+    assert "final-cleanup-canary" not in json.dumps(recorder.diagnostics)
+    assert recorder._disposition_state == "failed"
+    assert repository.converge_calls == 1
+    assert repository.mark_degraded_calls == 1
+    assert len(seen_leases) == 1
+    assert recorder._degraded_persisted is True
+    assert repository.mark_degraded_kwargs[0]["deadline"] == pytest.approx(0.045)
 
 
 def test_degraded_abandon_persists_degraded_state_with_final_lease() -> None:

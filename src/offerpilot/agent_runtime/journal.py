@@ -991,7 +991,12 @@ class SafeRunRecorder:
                     if acquired:
                         self._cleanup_operation(lease)
                 except Exception:
-                    self._degrade("journal_cleanup_failed")
+                    if (
+                        self._degrade("journal_cleanup_failed")
+                        and lease is not None
+                        and lease is self._current_lease
+                    ):
+                        self._sync_degraded(lease)
                     succeeded = False
                 except BaseException as error:
                     cleanup_base = error
@@ -1032,7 +1037,8 @@ class SafeRunRecorder:
                 remaining = lease.hard_deadline - sample.value
                 if remaining <= 0:
                     raise JournalDeadlineExceeded("deadline")
-                self._state_condition.wait(timeout=remaining)
+                if not self._state_condition.wait(timeout=remaining):
+                    raise JournalDeadlineExceeded("deadline")
 
     def _final_deadline_error(self, lease: OperationLease) -> JournalDeadlineExceeded | None:
         sample = lease.safe_clock.sample()

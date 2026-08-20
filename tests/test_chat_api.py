@@ -2,6 +2,7 @@ import json
 import re
 import sqlite3
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from io import BytesIO
 from threading import Event
@@ -96,18 +97,57 @@ def _journal_rows(tmp_path):
     return runs, events, snapshots
 
 
-def _wait_for_journal_status(tmp_path, expected_status, timeout=15.0):
+def _wait_for_journal_status(tmp_path, expected_status, timeout=15.0, *, predicate=None):
     deadline = time.monotonic() + timeout
     while True:
         runs, events, snapshots = _journal_rows(tmp_path)
-        if runs and runs[0].status == expected_status:
+        if (
+            runs
+            and runs[0].status == expected_status
+            and (predicate is None or predicate(runs, events, snapshots))
+        ):
             return runs, events, snapshots
         if time.monotonic() >= deadline:
             pytest.fail(
                 f"Journal status did not converge to {expected_status!r}: "
-                f"{[run.status for run in runs]!r}"
+                f"statuses={[run.status for run in runs]!r}, "
+                f"events={[event.event_type for event in events]!r}, "
+                f"snapshots={[snapshot.snapshot_kind for snapshot in snapshots]!r}"
             )
         time.sleep(0.01)
+
+
+def _journal_terminal_predicate(
+    *,
+    required_event_types=(),
+    minimum_event_counts=None,
+    required_snapshot_kinds=(),
+    minimum_snapshot_counts=None,
+):
+    required_event_types = tuple(required_event_types)
+    minimum_event_counts = dict(minimum_event_counts or {})
+    required_snapshot_kinds = tuple(required_snapshot_kinds)
+    minimum_snapshot_counts = dict(minimum_snapshot_counts or {})
+
+    def predicate(_runs, events, snapshots):
+        event_counts = Counter(event.event_type for event in events)
+        snapshot_counts = Counter(snapshot.snapshot_kind for snapshot in snapshots)
+        return (
+            events
+            and events[-1].event_type == "segment.finished"
+            and all(event_type in event_counts for event_type in required_event_types)
+            and all(
+                event_counts[event_type] >= count
+                for event_type, count in minimum_event_counts.items()
+            )
+            and all(kind in snapshot_counts for kind in required_snapshot_kinds)
+            and all(
+                snapshot_counts[kind] >= count
+                for kind, count in minimum_snapshot_counts.items()
+            )
+        )
+
+    return predicate
 
 
 def _journal_trace(tmp_path, run):
@@ -147,8 +187,8 @@ def _non_advancing_journal_clock():
 def _stable_journal_factory(
     data_dir,
     *,
-    segment_budget_seconds=5.0,
-    disposition_budget_seconds=1.0,
+    segment_budget_seconds=2.0,
+    disposition_budget_seconds=0.5,
     clock=time.monotonic,
 ):
     repository = AgentRunRepository(journal_session_factory_for_data_dir(data_dir))
@@ -492,7 +532,14 @@ def test_chat_sync_records_complete_journal_lifecycle(tmp_path):
 
     assert response.status_code == 200
     assert response.json()["message"] == "journal reply"
-    runs, events, snapshots = _wait_for_journal_status(tmp_path, "completed")
+    runs, events, snapshots = _wait_for_journal_status(
+        tmp_path,
+        "completed",
+        predicate=_journal_terminal_predicate(
+            required_event_types=("run.completed",),
+            required_snapshot_kinds=("initial", "model_input"),
+        ),
+    )
     assert len(runs) == 1
     assert runs[0].status == "completed"
     assert runs[0].input_message_id is not None
@@ -582,7 +629,14 @@ def test_journal_active_budget_ignores_slow_final_provider_gap(
     }
     assert model.calls == 1
 
-    runs, events, snapshots = _wait_for_journal_status(tmp_path, "completed")
+    runs, events, snapshots = _wait_for_journal_status(
+        tmp_path,
+        "completed",
+        predicate=_journal_terminal_predicate(
+            required_event_types=("run.completed",),
+            required_snapshot_kinds=("initial", "model_input"),
+        ),
+    )
     assert len(runs) == 1
     assert runs[0].status == "completed"
     assert runs[0].recording_status == "healthy"
@@ -689,7 +743,15 @@ def test_journal_active_budget_ignores_slow_provider_before_read_then_final(
     ]
     assert seed.get(f"/api/applications/{application['id']}").json()["status"] == "interview"
 
-    runs, events, snapshots = _wait_for_journal_status(tmp_path, "completed")
+    runs, events, snapshots = _wait_for_journal_status(
+        tmp_path,
+        "completed",
+        predicate=_journal_terminal_predicate(
+            required_event_types=("run.completed",),
+            required_snapshot_kinds=("initial", "model_input"),
+            minimum_snapshot_counts={"model_input": 2},
+        ),
+    )
     assert len(runs) == 1
     assert runs[0].status == "completed"
     assert runs[0].recording_status == "healthy"
@@ -1557,6 +1619,58 @@ def _parse_sse_events(raw: str) -> list[dict[str, object]]:
     return events
 
 
+JOURNAL_HITL_ENTRY_SSE_EVENTS = [
+    "meta",
+    "user_message_saved",
+    "status",
+    "tool_call",
+    "status",
+    "confirmation_required",
+    "completed",
+]
+JOURNAL_HITL_CONFIRM_SSE_EVENTS = [
+    "meta",
+    "status",
+    "tool_call",
+    "tool_result",
+    "assistant_message",
+    "completed",
+]
+JOURNAL_HITL_CHAIN_CONFIRM_SSE_EVENTS = [
+    "meta",
+    "status",
+    "tool_call",
+    "tool_call",
+    "tool_result",
+    "status",
+    "confirmation_required",
+    "completed",
+]
+
+
+def _create_journal_hitl_client(tmp_path, model, *, company_name):
+    seed = TestClient(create_app(data_dir=tmp_path))
+    application = seed.post(
+        "/api/applications",
+        json={
+            "company_name": company_name,
+            "position_name": "Engineer",
+            "status": "interview",
+        },
+    ).json()
+    client = TestClient(
+        create_app(
+            data_dir=tmp_path,
+            chat_model=model,
+            title_model=ScriptedModel([Assistant(content="title")]),
+            run_recorder_factory=_stable_journal_factory(
+                tmp_path, clock=_non_advancing_journal_clock
+            ),
+        )
+    )
+    return seed, client, application
+
+
 def _create_status_confirmation(
     tmp_path, model, *, stable_journal=False, journal_clock=None
 ):
@@ -1619,11 +1733,6 @@ def _status_confirmation_model(*followups):
 def test_journal_hitl_pending_approve_executes_once_and_finishes_healthy(
     tmp_path, entry_endpoint, confirm_endpoint
 ):
-    seed = TestClient(create_app(data_dir=tmp_path))
-    application = seed.post(
-        "/api/applications",
-        json={"company_name": "Journal HITL Co", "position_name": "Engineer", "status": "interview"},
-    ).json()
     model = CapturingScriptedModel(
         [
             Assistant(
@@ -1631,22 +1740,15 @@ def test_journal_hitl_pending_approve_executes_once_and_finishes_healthy(
                     ToolCall(
                         id="journal-hitl-write",
                         name="update_application_status",
-                        args=json.dumps({"id": application["id"], "status": "offer"}),
+                        args=json.dumps({"id": 1, "status": "offer"}),
                     )
                 ]
             ),
             Assistant(content="stable approved final"),
         ]
     )
-    client = TestClient(
-        create_app(
-            data_dir=tmp_path,
-            chat_model=model,
-            title_model=ScriptedModel([Assistant(content="title")]),
-            run_recorder_factory=_stable_journal_factory(
-                tmp_path, clock=_non_advancing_journal_clock
-            ),
-        )
+    seed, client, application = _create_journal_hitl_client(
+        tmp_path, model, company_name="Journal HITL Co"
     )
 
     initial = client.post(
@@ -1684,7 +1786,14 @@ def test_journal_hitl_pending_approve_executes_once_and_finishes_healthy(
     assert [transition.state for transition in transitions if transition.operation_id == operation_id] == [
         "proposed"
     ]
-    runs, initial_events, _ = _wait_for_journal_status(tmp_path, "waiting_confirmation")
+    runs, initial_events, _ = _wait_for_journal_status(
+        tmp_path,
+        "waiting_confirmation",
+        predicate=_journal_terminal_predicate(
+            required_event_types=("approval.requested", "run.waiting_confirmation"),
+            required_snapshot_kinds=("initial", "model_input"),
+        ),
+    )
     assert len(runs) == 1
     assert runs[0].status == "waiting_confirmation"
     assert runs[0].waiting_tool_call_id == "journal-hitl-write"
@@ -1750,7 +1859,16 @@ def test_journal_hitl_pending_approve_executes_once_and_finishes_healthy(
         "committed",
     ]
 
-    runs, journal_events, snapshots = _wait_for_journal_status(tmp_path, "completed")
+    runs, journal_events, snapshots = _wait_for_journal_status(
+        tmp_path,
+        "completed",
+        predicate=_journal_terminal_predicate(
+            required_event_types=("approval.decided", "run.completed"),
+            minimum_event_counts={"tool.completed": 1},
+            required_snapshot_kinds=("initial", "model_input", "confirmation_resume"),
+            minimum_snapshot_counts={"model_input": 2},
+        ),
+    )
     assert len(runs) == 1
     assert runs[0].status == "completed"
     assert runs[0].recording_status == "healthy"
@@ -1777,15 +1895,16 @@ def test_journal_hitl_pending_approve_executes_once_and_finishes_healthy(
     seed.close()
 
 
-@pytest.mark.parametrize("confirm_endpoint", ["/api/chat/confirm", "/api/chat/confirm/stream"])
+@pytest.mark.parametrize(
+    ("entry_endpoint", "confirm_endpoint"),
+    [
+        ("/api/chat", "/api/chat/confirm"),
+        ("/api/chat/stream", "/api/chat/confirm/stream"),
+    ],
+)
 def test_journal_hitl_pending_reject_records_ledger_and_no_tool_execution(
-    tmp_path, confirm_endpoint
+    tmp_path, entry_endpoint, confirm_endpoint
 ):
-    seed = TestClient(create_app(data_dir=tmp_path))
-    application = seed.post(
-        "/api/applications",
-        json={"company_name": "Journal Reject Co", "position_name": "Engineer", "status": "interview"},
-    ).json()
     model = CapturingScriptedModel(
         [
             Assistant(
@@ -1793,33 +1912,38 @@ def test_journal_hitl_pending_reject_records_ledger_and_no_tool_execution(
                     ToolCall(
                         id="journal-hitl-reject",
                         name="update_application_status",
-                        args=json.dumps({"id": application["id"], "status": "offer"}),
+                        args=json.dumps({"id": 1, "status": "offer"}),
                     )
                 ]
             ),
             Assistant(content="must not be requested"),
         ]
     )
-    client = TestClient(
-        create_app(
-            data_dir=tmp_path,
-            chat_model=model,
-            title_model=ScriptedModel([Assistant(content="title")]),
-            run_recorder_factory=_stable_journal_factory(
-                tmp_path, clock=_non_advancing_journal_clock
-            ),
-        )
+    seed, client, application = _create_journal_hitl_client(
+        tmp_path, model, company_name="Journal Reject Co"
     )
     initial = client.post(
-        "/api/chat",
+        entry_endpoint,
         json={"message": "change status", "conversation_id": 0},
     )
     assert initial.status_code == 200
-    pending_body = initial.json()
+    if entry_endpoint.endswith("/stream"):
+        initial_events = _parse_sse_events(initial.text)
+        assert [event["event"] for event in initial_events] == JOURNAL_HITL_ENTRY_SSE_EVENTS
+        pending_body = initial_events[-1]["data"]["data"]["response"]
+    else:
+        pending_body = initial.json()
     pending_action = pending_body["pending_action"]
     operation_id = pending_action["operation_id"]
     token = pending_action["confirmation_token"]
-    runs, _, _ = _wait_for_journal_status(tmp_path, "waiting_confirmation")
+    runs, _, _ = _wait_for_journal_status(
+        tmp_path,
+        "waiting_confirmation",
+        predicate=_journal_terminal_predicate(
+            required_event_types=("approval.requested", "run.waiting_confirmation"),
+            required_snapshot_kinds=("initial", "model_input"),
+        ),
+    )
     assert runs[0].waiting_tool_call_id == "journal-hitl-reject"
     rejected = client.post(
         confirm_endpoint,
@@ -1833,9 +1957,10 @@ def test_journal_hitl_pending_reject_records_ledger_and_no_tool_execution(
     assert rejected.status_code == 200
     if confirm_endpoint.endswith("/stream"):
         events = _parse_sse_events(rejected.text)
-        assert events[-1]["event"] == "completed"
+        assert [event["event"] for event in events] == JOURNAL_HITL_CONFIRM_SSE_EVENTS
+        assert events[2]["data"]["data"]["confirm_mode"] == "rejected"
+        assert events[3]["data"]["data"]["status"] == "error"
         body = events[-1]["data"]["data"]["response"]
-        assert events.index(next(event for event in events if event["event"] == "assistant_message")) < len(events) - 1
     else:
         body = rejected.json()
     assert body["type"] == "message"
@@ -1858,10 +1983,18 @@ def test_journal_hitl_pending_reject_records_ledger_and_no_tool_execution(
         "proposed",
         "rejected",
     ]
-    runs, journal_events, _ = _wait_for_journal_status(tmp_path, "completed")
+    runs, journal_events, _ = _wait_for_journal_status(
+        tmp_path,
+        "completed",
+        predicate=_journal_terminal_predicate(
+            required_event_types=("approval.decided", "run.completed"),
+            minimum_event_counts={"approval.decided": 1},
+            required_snapshot_kinds=("initial", "model_input"),
+        ),
+    )
     assert len(runs) == 1
     assert runs[0].status == "completed"
-    assert runs[0].recording_status in {"healthy", "degraded"}
+    assert runs[0].recording_status == "healthy"
     event_types = [event.event_type for event in journal_events]
     assert event_types.count("approval.decided") == 1
     assert event_types.count("tool.started") == 0
@@ -1869,10 +2002,8 @@ def test_journal_hitl_pending_reject_records_ledger_and_no_tool_execution(
     decision = next(event for event in journal_events if event.event_type == "approval.decided")
     assert json.loads(decision.payload_json)["facts"]["decision"] == "rejected"
     trace = _journal_trace(tmp_path, runs[0])
-    if runs[0].recording_status == "healthy":
-        assert trace.integrity_status == "healthy", trace.anomalies
-    else:
-        assert "recording_degraded" in trace.anomalies
+    assert trace.recording_status == "healthy"
+    assert trace.integrity_status == "healthy", trace.anomalies
     assert trace.segments[-1].approvals[0].decision == "rejected"
     assert not any(anomaly.startswith("model_call_incomplete:") for anomaly in trace.anomalies)
     client.close()
@@ -1880,15 +2011,16 @@ def test_journal_hitl_pending_reject_records_ledger_and_no_tool_execution(
 
 
 @pytest.mark.parametrize("final_approved", [True, False], ids=["approve", "reject"])
-@pytest.mark.parametrize("confirm_endpoint", ["/api/chat/confirm", "/api/chat/confirm/stream"])
+@pytest.mark.parametrize(
+    ("entry_endpoint", "confirm_endpoint"),
+    [
+        ("/api/chat", "/api/chat/confirm"),
+        ("/api/chat/stream", "/api/chat/confirm/stream"),
+    ],
+)
 def test_journal_hitl_chained_pending_keeps_ledger_and_run_causal(
-    tmp_path, final_approved, confirm_endpoint
+    tmp_path, final_approved, entry_endpoint, confirm_endpoint
 ):
-    seed = TestClient(create_app(data_dir=tmp_path))
-    first_application = seed.post(
-        "/api/applications",
-        json={"company_name": "Journal Chain Co", "position_name": "Engineer", "status": "interview"},
-    ).json()
     model = CapturingScriptedModel(
         [
             Assistant(
@@ -1896,7 +2028,7 @@ def test_journal_hitl_chained_pending_keeps_ledger_and_run_causal(
                     ToolCall(
                         id="journal-chain-first",
                         name="update_application_status",
-                        args=json.dumps({"id": first_application["id"], "status": "offer"}),
+                        args=json.dumps({"id": 1, "status": "offer"}),
                     )
                 ]
             ),
@@ -1907,7 +2039,7 @@ def test_journal_hitl_chained_pending_keeps_ledger_and_run_causal(
                         name="update_application_status",
                         args=json.dumps(
                             {
-                                "id": first_application["id"],
+                                "id": 1,
                                 "status": "closed",
                                 "closed_reason": "rejected",
                             }
@@ -1918,33 +2050,40 @@ def test_journal_hitl_chained_pending_keeps_ledger_and_run_causal(
             Assistant(content="stable chained final"),
         ]
     )
-    client = TestClient(
-        create_app(
-            data_dir=tmp_path,
-            chat_model=model,
-            title_model=ScriptedModel([Assistant(content="title")]),
-            run_recorder_factory=_stable_journal_factory(
-                tmp_path, clock=_non_advancing_journal_clock
-            ),
-        )
+    seed, client, first_application = _create_journal_hitl_client(
+        tmp_path, model, company_name="Journal Chain Co"
     )
     first = client.post(
-        "/api/chat",
+        entry_endpoint,
         json={"message": "update twice", "conversation_id": 0},
-    ).json()
-    first_pending = first["pending_action"]
+    )
+    assert first.status_code == 200
+    if entry_endpoint.endswith("/stream"):
+        first_events = _parse_sse_events(first.text)
+        assert [event["event"] for event in first_events] == JOURNAL_HITL_ENTRY_SSE_EVENTS
+        first_body = first_events[-1]["data"]["data"]["response"]
+    else:
+        first_body = first.json()
+    first_pending = first_body["pending_action"]
     first_operation_id = first_pending["operation_id"]
     first_token = first_pending["confirmation_token"]
     first_confirmed = client.post(
-        "/api/chat/confirm",
+        confirm_endpoint,
         json={
-            "conversation_id": first["conversation_id"],
+            "conversation_id": first_body["conversation_id"],
             "approved": True,
             "confirmation_token": first_token,
         },
     )
     assert first_confirmed.status_code == 200
-    second = first_confirmed.json()
+    if confirm_endpoint.endswith("/stream"):
+        first_confirmation_events = _parse_sse_events(first_confirmed.text)
+        assert [event["event"] for event in first_confirmation_events] == (
+            JOURNAL_HITL_CHAIN_CONFIRM_SSE_EVENTS
+        )
+        second = first_confirmation_events[-1]["data"]["data"]["response"]
+    else:
+        second = first_confirmed.json()
     assert second["type"] == "confirmation_required"
     second_pending = second["pending_action"]
     second_operation_id = second_pending["operation_id"]
@@ -1958,14 +2097,23 @@ def test_journal_hitl_chained_pending_keeps_ledger_and_run_causal(
     assert first_operation.delivery_outcome == "chained_pending"
     assert second_operation.status == "proposed"
     assert second_operation.delivery_status == "pending"
-    runs, waiting_events, _ = _wait_for_journal_status(tmp_path, "waiting_confirmation")
+    runs, waiting_events, _ = _wait_for_journal_status(
+        tmp_path,
+        "waiting_confirmation",
+        predicate=_journal_terminal_predicate(
+            required_event_types=("approval.requested", "run.waiting_confirmation"),
+            minimum_event_counts={"approval.requested": 2},
+            required_snapshot_kinds=("initial", "model_input", "confirmation_resume"),
+            minimum_snapshot_counts={"model_input": 2},
+        ),
+    )
     assert len(runs) == 1
     assert runs[0].status == "waiting_confirmation"
     assert runs[0].waiting_tool_call_id == "journal-chain-second"
     assert [event.event_type for event in waiting_events].count("approval.requested") == 2
 
     final_payload = {
-        "conversation_id": first["conversation_id"],
+        "conversation_id": first_body["conversation_id"],
         "approved": final_approved,
         "confirmation_token": second_token,
     }
@@ -1975,9 +2123,13 @@ def test_journal_hitl_chained_pending_keeps_ledger_and_run_causal(
     assert final.status_code == 200
     if confirm_endpoint.endswith("/stream"):
         final_events = _parse_sse_events(final.text)
-        assert final_events[-1]["event"] == "completed"
+        assert [event["event"] for event in final_events] == JOURNAL_HITL_CONFIRM_SSE_EVENTS
+        if final_approved:
+            assert final_events[2]["data"]["data"]["confirm_mode"] == "approved"
+        else:
+            assert final_events[2]["data"]["data"]["confirm_mode"] == "rejected"
+            assert final_events[3]["data"]["data"]["status"] == "error"
         body = final_events[-1]["data"]["data"]["response"]
-        assert final_events.index(next(event for event in final_events if event["event"] == "tool_result")) < len(final_events) - 1 if final_approved else True
     else:
         body = final.json()
     assert body["type"] == "message"
@@ -1986,7 +2138,9 @@ def test_journal_hitl_chained_pending_keeps_ledger_and_run_causal(
     assert len(model.calls) == (3 if final_approved else 2)
     expected_status = "closed" if final_approved else "offer"
     assert seed.get(f"/api/applications/{first_application['id']}").json()["status"] == expected_status
-    stored = ChatRepository(session_factory_for_data_dir(tmp_path)).list_messages(first["conversation_id"])
+    stored = ChatRepository(session_factory_for_data_dir(tmp_path)).list_messages(
+        first_body["conversation_id"]
+    )
     assert all(isinstance(message, ChatMessage) for message in stored)
     assert sum(message.role == "tool" for message in stored) == 2
     operations, transitions = _ledger_rows(tmp_path)
@@ -1999,9 +2153,21 @@ def test_journal_hitl_chained_pending_keeps_ledger_and_run_causal(
     assert second_operation.delivery_outcome == "final_response"
     second_states = [transition.state for transition in transitions if transition.operation_id == second_operation_id]
     assert second_states == (["proposed", "approved", "claimed", "committed"] if final_approved else ["proposed", "rejected"])
-    runs, journal_events, _ = _wait_for_journal_status(tmp_path, "completed")
+    runs, journal_events, _ = _wait_for_journal_status(
+        tmp_path,
+        "completed",
+        predicate=_journal_terminal_predicate(
+            required_event_types=("approval.decided", "run.completed"),
+            minimum_event_counts={
+                "approval.decided": 2,
+                "tool.completed": 2 if final_approved else 1,
+            },
+            required_snapshot_kinds=("initial", "model_input", "confirmation_resume"),
+            minimum_snapshot_counts={"model_input": 3 if final_approved else 2},
+        ),
+    )
     assert runs[0].status == "completed"
-    assert runs[0].recording_status in {"healthy", "degraded"}
+    assert runs[0].recording_status == "healthy"
     event_types = [event.event_type for event in journal_events]
     assert event_types.count("tool.started") == (2 if final_approved else 1)
     assert event_types.count("tool.completed") == (2 if final_approved else 1)
@@ -2012,10 +2178,8 @@ def test_journal_hitl_chained_pending_keeps_ledger_and_run_causal(
     trace = _journal_trace(tmp_path, runs[0])
     assert trace.lifecycle_status == "completed"
     assert trace.completion_status == "terminal"
-    if runs[0].recording_status == "healthy":
-        assert trace.integrity_status == "healthy", trace.anomalies
-    else:
-        assert "recording_degraded" in trace.anomalies
+    assert trace.recording_status == "healthy"
+    assert trace.integrity_status == "healthy", trace.anomalies
     assert not any(
         anomaly.startswith(("model_call_incomplete:", "tool_call_incomplete:"))
         for anomaly in trace.anomalies
@@ -2043,7 +2207,15 @@ def test_journal_confirmation_resumes_original_run_and_orders_approval(
     )
 
     assert response.status_code == 200
-    runs, events, snapshots = _wait_for_journal_status(tmp_path, "completed")
+    runs, events, snapshots = _wait_for_journal_status(
+        tmp_path,
+        "completed",
+        predicate=_journal_terminal_predicate(
+            required_event_types=("approval.decided", "run.completed"),
+            required_snapshot_kinds=("initial", "model_input", "confirmation_resume"),
+            minimum_snapshot_counts={"model_input": 2},
+        ),
+    )
     assert len(runs) == 1
     assert runs[0].status == "completed"
     segment_ids = {
@@ -2057,6 +2229,13 @@ def test_journal_confirmation_resumes_original_run_and_orders_approval(
     assert approval_index < event_types.index("tool.started")
     assert event_types[approval_index + 1] == "run.resumed"
     assert [snapshot.snapshot_kind for snapshot in snapshots].count("confirmation_resume") == 1
+    assert runs[0].recording_status == "healthy"
+    assert events[-1].event_type == "segment.finished"
+    trace = _journal_trace(tmp_path, runs[0])
+    assert trace.lifecycle_status == "completed"
+    assert trace.completion_status == "terminal"
+    assert trace.recording_status == "healthy"
+    assert trace.integrity_status == "healthy", trace.anomalies
 
 
 def test_journal_rejected_confirmation_records_decision_without_tool_start(tmp_path):
@@ -2088,8 +2267,16 @@ def test_journal_rejected_confirmation_records_decision_without_tool_start(tmp_p
     )
 
 
-@pytest.mark.parametrize("endpoint", ["/api/chat/confirm", "/api/chat/confirm/stream"])
-def test_journal_invalid_confirmation_token_creates_no_segment(tmp_path, endpoint):
+@pytest.mark.parametrize(
+    ("endpoint", "expected_status"),
+    [
+        ("/api/chat/confirm", 409),
+        ("/api/chat/confirm/stream", 200),
+    ],
+)
+def test_journal_invalid_confirmation_token_creates_no_segment(
+    tmp_path, endpoint, expected_status
+):
     model = _status_confirmation_model(Assistant(content="unused"))
     _, client, _, pending = _create_status_confirmation(
         tmp_path, model, stable_journal=True
@@ -2105,7 +2292,11 @@ def test_journal_invalid_confirmation_token_creates_no_segment(tmp_path, endpoin
         },
     )
 
-    assert response.status_code in {200, 409}
+    assert response.status_code == expected_status
+    if endpoint.endswith("/stream"):
+        events = _parse_sse_events(response.text)
+        assert [event["event"] for event in events] == ["error"]
+        assert events[0]["data"]["data"]["code"] == "stale_pending_action"
     _, after_events, _ = _journal_rows(tmp_path)
     assert [event.id for event in after_events] == [event.id for event in before_events]
 
@@ -3893,10 +4084,28 @@ def test_chat_confirm_stream_recovers_committed_write_when_followup_model_fails(
     assert [message["role"] for message in stored].count("tool") == 1
     assert [message["content"] for message in stored].count(completed["message"]) == 1
     assert app_client.get(f"/api/applications/{application['id']}").json()["status"] == "offer"
-    runs, events, _ = _wait_for_journal_status(tmp_path, "completed")
+    runs, events, _ = _wait_for_journal_status(
+        tmp_path,
+        "completed",
+        predicate=_journal_terminal_predicate(
+            required_event_types=("run.completed",),
+            required_snapshot_kinds=("initial", "model_input", "confirmation_resume"),
+            minimum_snapshot_counts={"model_input": 2},
+        ),
+    )
     assert len(runs) == 1
     assert any(event.event_type == "run.completed" for event in events)
-    assert _journal_trace(tmp_path, runs[0]).completion_status == "terminal"
+    assert events[-1].event_type == "segment.finished"
+    assert runs[0].recording_status == "healthy"
+    trace = _journal_trace(tmp_path, runs[0])
+    assert trace.lifecycle_status == "completed"
+    assert trace.completion_status == "terminal"
+    assert trace.recording_status == "healthy"
+    assert trace.integrity_status == "healthy", trace.anomalies
+    assert not any(
+        anomaly.startswith(("model_call_incomplete:", "tool_call_incomplete:"))
+        for anomaly in trace.anomalies
+    )
 
 
 def test_chat_confirm_recovers_committed_write_when_followup_model_fails(tmp_path):
@@ -3942,10 +4151,28 @@ def test_chat_confirm_recovers_committed_write_when_followup_model_fails(tmp_pat
     assert [message["role"] for message in stored].count("tool") == 1
     assert [message["content"] for message in stored].count(failed_confirm.json()["message"]) == 1
     assert app_client.get(f"/api/applications/{application['id']}").json()["status"] == "offer"
-    runs, events, _ = _wait_for_journal_status(tmp_path, "completed")
+    runs, events, _ = _wait_for_journal_status(
+        tmp_path,
+        "completed",
+        predicate=_journal_terminal_predicate(
+            required_event_types=("run.completed",),
+            required_snapshot_kinds=("initial", "model_input", "confirmation_resume"),
+            minimum_snapshot_counts={"model_input": 2},
+        ),
+    )
     assert len(runs) == 1
     assert any(event.event_type == "run.completed" for event in events)
-    assert _journal_trace(tmp_path, runs[0]).completion_status == "terminal"
+    assert events[-1].event_type == "segment.finished"
+    assert runs[0].recording_status == "healthy"
+    trace = _journal_trace(tmp_path, runs[0])
+    assert trace.lifecycle_status == "completed"
+    assert trace.completion_status == "terminal"
+    assert trace.recording_status == "healthy"
+    assert trace.integrity_status == "healthy", trace.anomalies
+    assert not any(
+        anomaly.startswith(("model_call_incomplete:", "tool_call_incomplete:"))
+        for anomaly in trace.anomalies
+    )
 
 
 def test_chat_returns_bad_gateway_when_model_fails(tmp_path):
@@ -4267,11 +4494,23 @@ def test_chat_confirmed_status_update_can_be_undone(tmp_path):
     assert replayed_undo.status_code == 200
     assert replayed_undo.json()["replayed"] is True
     assert replayed_undo.json()["operation_id"] == undone.json()["operation_id"]
-    runs, events, _ = _wait_for_journal_status(tmp_path, "completed")
+    runs, events, _ = _wait_for_journal_status(
+        tmp_path,
+        "completed",
+        predicate=_journal_terminal_predicate(
+            required_event_types=("run.completed",),
+            required_snapshot_kinds=("initial", "model_input", "confirmation_resume"),
+            minimum_snapshot_counts={"model_input": 2},
+        ),
+    )
     assert len(runs) == 1
+    assert events[-1].event_type == "segment.finished"
+    assert runs[0].recording_status == "healthy"
     trace = _journal_trace(tmp_path, runs[0])
     assert trace.lifecycle_status == "completed"
     assert trace.completion_status == "terminal"
+    assert trace.recording_status == "healthy"
+    assert trace.integrity_status == "healthy", trace.anomalies
     assert not any(
         anomaly.startswith(("model_call_incomplete:", "tool_call_incomplete:"))
         for anomaly in trace.anomalies

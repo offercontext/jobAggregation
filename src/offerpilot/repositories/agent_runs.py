@@ -742,11 +742,11 @@ class AgentRunRepository:
         remaining_ms = math.floor(remaining * 1000)
         busy_timeout_ms = min(JOURNAL_DEFAULT_BUSY_TIMEOUT_MS, max(0, remaining_ms))
         connection.exec_driver_sql(f"PRAGMA busy_timeout = {busy_timeout_ms}")
+        guard.progress_installed = True
         raw_connection.set_progress_handler(
             AgentRunRepository._progress_handler(safe_clock, deadline),
             JOURNAL_SQLITE_PROGRESS_STEPS,
         )
-        guard.progress_installed = True
         return guard
 
     @staticmethod
@@ -821,7 +821,6 @@ class AgentRunRepository:
             try:
                 if guard.connection_record is not None:
                     guard.connection_record.invalidate(error)
-                    return error
             except BaseException:
                 try:
                     if guard.connection_record is not None:
@@ -877,6 +876,9 @@ class AgentRunRepository:
                 )
                 yield session
                 self._check_deadline(deadline, safe_clock)
+                transaction.commit()
+                committed = True
+                self._check_deadline(deadline, safe_clock)
                 if guard is not None:
                     cleanup_failed, restore_error = self._restore_sqlite_guard(guard)
                     guard_restored = not cleanup_failed
@@ -885,9 +887,6 @@ class AgentRunRepository:
                         restore_error = RuntimeError("journal SQLite cleanup failed")
                     if restore_error is not None:
                         raise restore_error
-                transaction.commit()
-                committed = True
-                self._check_deadline(deadline, safe_clock)
             except BaseException as error:
                 primary = self._classify_sqlite_exception(error, deadline, safe_clock)
         except BaseException as error:

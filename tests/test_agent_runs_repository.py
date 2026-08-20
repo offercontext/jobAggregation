@@ -38,6 +38,7 @@ from offerpilot.repositories.agent_runs import (
     JournalDeadlineExceeded,
     StartRunCommand,
     StartSegmentCommand,
+    _SQLiteGuard,
     _progress_handler,
 )
 
@@ -1132,6 +1133,70 @@ def test_dynamic_busy_timeout_uses_remaining_deadline_and_restores_default(tmp_p
         )
 
 
+def test_public_write_commit_keeps_deadline_guard_under_shared_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _create_run(tmp_path)
+    repository = _repository(tmp_path)
+    database_path = tmp_path / "data.db"
+    reader = sqlite3.connect(database_path, timeout=5.0)
+    reader.execute("BEGIN")
+    reader.execute("SELECT id FROM agent_runs").fetchall()
+    commit_busy_timeouts: list[int] = []
+    commit_elapsed: list[float] = []
+    original_commit = SessionTransaction.commit
+    original_restore = AgentRunRepository._restore_sqlite_guard
+    restore_called = False
+
+    def observe_restore(guard):
+        nonlocal restore_called
+        result = original_restore(guard)
+        restore_called = True
+        return result
+
+    def observe_commit(transaction: SessionTransaction, *args, **kwargs):
+        assert restore_called is False
+        connection = transaction.session.connection()
+        commit_busy_timeouts.append(
+            connection.exec_driver_sql("PRAGMA busy_timeout").scalar_one()
+        )
+        commit_started = time.perf_counter()
+        try:
+            return original_commit(transaction, *args, **kwargs)
+        finally:
+            commit_elapsed.append(time.perf_counter() - commit_started)
+
+    monkeypatch.setattr(
+        AgentRunRepository,
+        "_restore_sqlite_guard",
+        staticmethod(observe_restore),
+    )
+    monkeypatch.setattr(SessionTransaction, "commit", observe_commit)
+    started = time.perf_counter()
+    try:
+        with pytest.raises((JournalDeadlineExceeded, OperationalError)) as raised:
+            repository.append_event(
+                RUN_ID,
+                _assistant_event(604),
+                deadline=0.012,
+                safe_clock=_safe_clock(0.0),
+            )
+    finally:
+        reader.rollback()
+        reader.close()
+    elapsed = time.perf_counter() - started
+
+    assert restore_called is True
+    assert commit_busy_timeouts and commit_busy_timeouts[0] <= 12
+    assert commit_elapsed and commit_elapsed[0] < 0.045
+    assert elapsed < 0.250
+    if isinstance(raised.value, JournalDeadlineExceeded):
+        assert str(raised.value) == "deadline"
+    else:
+        assert "locked" in str(raised.value).lower()
+
+
 def test_progress_handler_is_total_for_invalid_clock() -> None:
     callback = _progress_handler(_safe_clock(0.0, valid=False), 1.0)
     assert callback() != 0
@@ -1234,15 +1299,24 @@ class _RawConnectionProxy:
         raw_connection,
         *,
         fail_handler_clear: bool = False,
+        fail_handler_install: bool = False,
         fail_pragma_restore: bool = False,
     ) -> None:
         self.raw_connection = raw_connection
         self.fail_handler_clear = fail_handler_clear
+        self.fail_handler_install = fail_handler_install
         self.fail_pragma_restore = fail_pragma_restore
         self.handler_clear_calls = 0
+        self.handler_install_calls = 0
         self.pragma_restore_calls = 0
 
     def set_progress_handler(self, handler, steps):
+        if handler is not None:
+            self.handler_install_calls += 1
+            result = self.raw_connection.set_progress_handler(handler, steps)
+            if self.fail_handler_install:
+                raise RuntimeError("partial handler install failed")
+            return result
         if handler is None and steps == 0:
             self.handler_clear_calls += 1
             if self.fail_handler_clear:
@@ -1264,6 +1338,7 @@ def _patch_raw_connection_proxy(
     monkeypatch: pytest.MonkeyPatch,
     *,
     fail_handler_clear: bool = False,
+    fail_handler_install: bool = False,
     fail_pragma_restore: bool = False,
 ) -> list[_RawConnectionProxy]:
     proxies: list[_RawConnectionProxy] = []
@@ -1273,6 +1348,7 @@ def _patch_raw_connection_proxy(
         proxy = _RawConnectionProxy(
             raw_connection,
             fail_handler_clear=fail_handler_clear,
+            fail_handler_install=fail_handler_install,
             fail_pragma_restore=fail_pragma_restore,
         )
         proxies.append(proxy)
@@ -1343,6 +1419,30 @@ def test_handler_clear_failure_invalidates_before_next_borrower(
     _assert_next_borrower_is_distinct_and_healthy(repository, owned_dbapi)
 
 
+def test_partial_progress_handler_install_is_cleared_before_reuse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _create_run(tmp_path)
+    repository = _repository(tmp_path)
+    proxies = _patch_raw_connection_proxy(monkeypatch, fail_handler_install=True)
+    with pytest.raises(RuntimeError, match="partial handler install failed"):
+        with repository._journal_transaction(
+            deadline=1.0,
+            safe_clock=_safe_clock(0.0),
+        ):
+            pass
+
+    assert proxies and proxies[0].handler_install_calls == 1
+    assert proxies[0].handler_clear_calls >= 1
+    with repository._session_guard(deadline=None, safe_clock=None) as session:
+        assert session.connection().exec_driver_sql("SELECT 1").scalar_one() == 1
+        assert (
+            session.connection().exec_driver_sql("PRAGMA busy_timeout").scalar_one()
+            == JOURNAL_DEFAULT_BUSY_TIMEOUT_MS
+        )
+
+
 def test_pragma_restore_failure_invalidates_before_next_borrower(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1357,6 +1457,58 @@ def test_pragma_restore_failure_invalidates_before_next_borrower(
 
     assert proxies and proxies[0].pragma_restore_calls >= 1
     _assert_next_borrower_is_distinct_and_healthy(repository, owned_dbapi)
+
+
+@pytest.mark.parametrize("close_fails", [False, True])
+def test_invalidation_closes_detached_raw_handle_after_record_invalidation(
+    close_fails: bool,
+) -> None:
+    class RawConnection:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            if close_fails:
+                raise RuntimeError("raw close failed")
+
+    class ConnectionRecord:
+        def __init__(self) -> None:
+            self.invalidate_calls = 0
+            self.dbapi_connection = object()
+
+        def invalidate(self, _error: BaseException) -> None:
+            self.invalidate_calls += 1
+
+    class Connection:
+        def __init__(self) -> None:
+            self.detach_calls = 0
+
+        def invalidate(self) -> None:
+            raise RuntimeError("connection invalidate failed")
+
+        def detach(self) -> None:
+            self.detach_calls += 1
+
+    raw_connection = RawConnection()
+    connection_record = ConnectionRecord()
+    guard = _SQLiteGuard(
+        Connection(),
+        raw_connection,
+        False,
+        connection_record,
+    )
+
+    error = AgentRunRepository._invalidate_sqlite_guard(guard)
+
+    assert connection_record.invalidate_calls == 1
+    assert raw_connection.close_calls == 1
+    if close_fails:
+        assert isinstance(error, RuntimeError)
+        assert str(error) == "raw close failed"
+    else:
+        assert isinstance(error, RuntimeError)
+        assert str(error) == "connection invalidate failed"
 
 
 def test_invalidation_failure_does_not_return_aba_connection(

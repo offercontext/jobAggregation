@@ -2,18 +2,25 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
-import time
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Literal, TypeVar, cast
+from typing import Any, Literal, TypeVar, cast
 from uuid import uuid4
 
 from sqlalchemy import select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
+from offerpilot.agent_runtime.budget import (
+    JOURNAL_DEFAULT_BUSY_TIMEOUT_MS,
+    JOURNAL_SQLITE_PROGRESS_STEPS,
+    JournalDeadlineExceeded,
+    SafeClockAdapter,
+)
 from offerpilot.agent_runtime.events import (
     EventDraft,
     JournalEventValidationError,
@@ -118,8 +125,30 @@ class JournalConflictError(RuntimeError):
     pass
 
 
-class JournalDeadlineExceeded(RuntimeError):
-    pass
+@dataclass
+class _SQLiteGuard:
+    connection: Any
+    raw_connection: Any
+    progress_installed: bool
+    connection_record: Any | None = None
+
+
+def _progress_handler(
+    safe_clock: SafeClockAdapter,
+    deadline: float,
+) -> Callable[[], int]:
+    """Return a total SQLite callback that never propagates clock failures."""
+
+    def progress() -> int:
+        try:
+            sample = safe_clock.sample()
+            if sample.valid is not True:
+                return 1
+            return int(sample.value >= deadline)
+        except BaseException:
+            return 1
+
+    return progress
 
 
 class AgentRunRepository:
@@ -143,12 +172,12 @@ class AgentRunRepository:
         command: StartRunCommand,
         *,
         deadline: float | None = None,
-        clock: Callable[[], float] = time.monotonic,
+        safe_clock: SafeClockAdapter | None = None,
     ) -> StartedRun:
+        self._validate_deadline_args(deadline, safe_clock)
         self._validate_initial_command(command)
         try:
-            with self.session_factory() as session, session.begin():
-                self._configure_deadline(session, deadline, clock)
+            with self._journal_transaction(deadline=deadline, safe_clock=safe_clock) as session:
                 self._assert_input_message_belongs(
                     session,
                     command.conversation_id,
@@ -195,7 +224,9 @@ class AgentRunRepository:
                     (self._detach(session, first), self._detach(session, second)),
                 )
         except IntegrityError:
-            replayed = self._replay_created_run(command, deadline=deadline, clock=clock)
+            replayed = self._replay_created_run(
+                command, deadline=deadline, safe_clock=safe_clock
+            )
             if replayed is not None:
                 return replayed
             raise JournalConflictError(
@@ -208,11 +239,11 @@ class AgentRunRepository:
         message_id: int,
         *,
         deadline: float | None = None,
-        clock: Callable[[], float] = time.monotonic,
+        safe_clock: SafeClockAdapter | None = None,
     ) -> AgentRun:
+        self._validate_deadline_args(deadline, safe_clock)
         try:
-            with self.session_factory() as session, session.begin():
-                self._configure_deadline(session, deadline, clock)
+            with self._journal_transaction(deadline=deadline, safe_clock=safe_clock) as session:
                 run = self._required_run(session, run_id)
                 if run.input_message_id == message_id:
                     return self._detach(session, run)
@@ -243,7 +274,7 @@ class AgentRunRepository:
                 run_id,
                 message_id,
                 deadline=deadline,
-                clock=clock,
+                safe_clock=safe_clock,
             )
             if replayed is not None:
                 return replayed
@@ -254,14 +285,14 @@ class AgentRunRepository:
         command: StartSegmentCommand,
         *,
         deadline: float | None = None,
-        clock: Callable[[], float] = time.monotonic,
+        safe_clock: SafeClockAdapter | None = None,
     ) -> AgentEvent:
+        self._validate_deadline_args(deadline, safe_clock)
         self._validate_event_draft(command.segment_started)
         if command.segment_started.event_type != "segment.started":
             raise JournalConflictError("segment command requires segment.started")
         try:
-            with self.session_factory() as session, session.begin():
-                self._configure_deadline(session, deadline, clock)
+            with self._journal_transaction(deadline=deadline, safe_clock=safe_clock) as session:
                 existing = self._existing_event(session, command.run_id, command.segment_started)
                 if existing is not None:
                     return self._detach(session, existing)
@@ -282,7 +313,7 @@ class AgentRunRepository:
                 command.run_id,
                 command.segment_started,
                 deadline=deadline,
-                clock=clock,
+                safe_clock=safe_clock,
             )
             if replayed is not None:
                 return replayed
@@ -296,8 +327,9 @@ class AgentRunRepository:
         draft: EventDraft,
         *,
         deadline: float | None = None,
-        clock: Callable[[], float] = time.monotonic,
+        safe_clock: SafeClockAdapter | None = None,
     ) -> AgentEvent:
+        self._validate_deadline_args(deadline, safe_clock)
         self._validate_event_draft(draft)
         is_noop_finish = False
         if draft.event_type == "segment.finished":
@@ -306,8 +338,7 @@ class AgentRunRepository:
         if draft.event_type in _DISPOSITION_EVENT_TYPES and not is_noop_finish:
             raise JournalConflictError("disposition event requires its atomic repository method")
         try:
-            with self.session_factory() as session, session.begin():
-                self._configure_deadline(session, deadline, clock)
+            with self._journal_transaction(deadline=deadline, safe_clock=safe_clock) as session:
                 existing = self._existing_event(session, run_id, draft)
                 if existing is not None:
                     return self._detach(session, existing)
@@ -337,7 +368,7 @@ class AgentRunRepository:
                 run_id,
                 draft,
                 deadline=deadline,
-                clock=clock,
+                safe_clock=safe_clock,
             )
             if replayed is not None:
                 return replayed
@@ -362,8 +393,9 @@ class AgentRunRepository:
         command: CaptureContextCommand,
         *,
         deadline: float | None = None,
-        clock: Callable[[], float] = time.monotonic,
+        safe_clock: SafeClockAdapter | None = None,
     ) -> CapturedContext:
+        self._validate_deadline_args(deadline, safe_clock)
         self._validate_snapshot_command(command)
         try:
             event_draft = prepare_event(
@@ -384,8 +416,7 @@ class AgentRunRepository:
         except JournalEventValidationError:
             raise JournalConflictError("context event identity is invalid") from None
         try:
-            with self.session_factory() as session, session.begin():
-                self._configure_deadline(session, deadline, clock)
+            with self._journal_transaction(deadline=deadline, safe_clock=safe_clock) as session:
                 existing = session.scalar(
                     select(AgentContextSnapshot).where(
                         AgentContextSnapshot.run_id == run_id,
@@ -444,7 +475,7 @@ class AgentRunRepository:
                 command,
                 event_draft,
                 deadline=deadline,
-                clock=clock,
+                safe_clock=safe_clock,
             )
             if replayed is not None:
                 return replayed
@@ -458,12 +489,12 @@ class AgentRunRepository:
         command: DispositionCommand,
         *,
         deadline: float | None = None,
-        clock: Callable[[], float] = time.monotonic,
+        safe_clock: SafeClockAdapter | None = None,
     ) -> tuple[AgentEvent, ...]:
+        self._validate_deadline_args(deadline, safe_clock)
         self._validate_disposition_shape(run_id, command)
         try:
-            with self.session_factory() as session, session.begin():
-                self._configure_deadline(session, deadline, clock)
+            with self._journal_transaction(deadline=deadline, safe_clock=safe_clock) as session:
                 existing: list[AgentEvent | None] = [
                     self._existing_event(session, run_id, draft) for draft in command.events
                 ]
@@ -505,7 +536,7 @@ class AgentRunRepository:
                 run_id,
                 command,
                 deadline=deadline,
-                clock=clock,
+                safe_clock=safe_clock,
             )
             if replayed is not None:
                 return replayed
@@ -518,12 +549,12 @@ class AgentRunRepository:
         run_id: str,
         *,
         deadline: float | None = None,
-        clock: Callable[[], float] = time.monotonic,
+        safe_clock: SafeClockAdapter | None = None,
     ) -> AgentRun:
         """Latch persisted recording health without changing the business lifecycle."""
 
-        with self.session_factory() as session, session.begin():
-            self._configure_deadline(session, deadline, clock)
+        self._validate_deadline_args(deadline, safe_clock)
+        with self._journal_transaction(deadline=deadline, safe_clock=safe_clock) as session:
             run = self._required_run(session, run_id)
             if run.recording_status == "degraded":
                 return self._detach(session, run)
@@ -554,10 +585,10 @@ class AgentRunRepository:
         tool_call_id: str,
         *,
         deadline: float | None = None,
-        clock: Callable[[], float] = time.monotonic,
+        safe_clock: SafeClockAdapter | None = None,
     ) -> AgentRun | None:
-        with self.session_factory() as session:
-            self._configure_deadline(session, deadline, clock)
+        self._validate_deadline_args(deadline, safe_clock)
+        with self._journal_transaction(deadline=deadline, safe_clock=safe_clock) as session:
             run = session.scalar(
                 select(AgentRun).where(
                     AgentRun.conversation_id == conversation_id,
@@ -637,25 +668,286 @@ class AgentRunRepository:
             )
 
     @staticmethod
+    def _validate_deadline_args(
+        deadline: float | None,
+        safe_clock: SafeClockAdapter | None,
+    ) -> None:
+        if deadline is not None and safe_clock is None:
+            raise ValueError("safe_clock is required when deadline is provided")
+
+    @staticmethod
+    def _raw_connection(connection: Any) -> Any:
+        driver_connection = getattr(connection, "driver_connection", None)
+        if driver_connection is not None:
+            return driver_connection
+        return connection
+
+    @staticmethod
+    def _progress_handler(
+        safe_clock: SafeClockAdapter,
+        deadline: float,
+    ) -> Callable[[], int]:
+        return _progress_handler(safe_clock, deadline)
+
+    @staticmethod
     def _configure_deadline(
         session: Session,
         deadline: float | None,
-        clock: Callable[[], float],
+        safe_clock: SafeClockAdapter | None,
+        _guard: _SQLiteGuard | None = None,
+    ) -> _SQLiteGuard:
+        AgentRunRepository._validate_deadline_args(deadline, safe_clock)
+        if deadline is None:
+            guard = _guard
+            if guard is None:
+                connection = session.connection()
+                raw_connection = AgentRunRepository._raw_connection(connection.connection)
+                guard = _SQLiteGuard(
+                    connection,
+                    raw_connection,
+                    False,
+                    getattr(connection.connection, "_connection_record", None),
+                )
+            else:
+                connection = guard.connection
+            connection.exec_driver_sql(
+                f"PRAGMA busy_timeout = {JOURNAL_DEFAULT_BUSY_TIMEOUT_MS}"
+            )
+            return guard
+
+        assert safe_clock is not None
+        now = safe_clock.require_value()
+        remaining = deadline - now
+        if remaining <= 0:
+            raise JournalDeadlineExceeded("deadline")
+        remaining_ms = math.floor(remaining * 1000)
+        # Pool checkout is Journal work too.  Re-read after checkout so a slow
+        # connect cannot hand SQLite a stale 50 ms window.
+        guard = _guard
+        if guard is None:
+            connection = session.connection()
+            raw_connection = AgentRunRepository._raw_connection(connection.connection)
+            guard = _SQLiteGuard(
+                connection,
+                raw_connection,
+                False,
+                getattr(connection.connection, "_connection_record", None),
+            )
+        connection = guard.connection
+        raw_connection = guard.raw_connection
+        now = safe_clock.require_value()
+        remaining = deadline - now
+        if remaining <= 0:
+            raise JournalDeadlineExceeded("deadline")
+        remaining_ms = math.floor(remaining * 1000)
+        busy_timeout_ms = min(JOURNAL_DEFAULT_BUSY_TIMEOUT_MS, max(0, remaining_ms))
+        connection.exec_driver_sql(f"PRAGMA busy_timeout = {busy_timeout_ms}")
+        raw_connection.set_progress_handler(
+            AgentRunRepository._progress_handler(safe_clock, deadline),
+            JOURNAL_SQLITE_PROGRESS_STEPS,
+        )
+        guard.progress_installed = True
+        return guard
+
+    @staticmethod
+    def _check_deadline(
+        deadline: float | None,
+        safe_clock: SafeClockAdapter | None,
     ) -> None:
         if deadline is None:
-            session.connection().exec_driver_sql("PRAGMA busy_timeout = 50")
             return
-        remaining = deadline - clock()
-        if remaining <= 0:
-            raise JournalDeadlineExceeded("journal deadline exhausted")
-        connection = session.connection()
-        remaining = deadline - clock()
-        if remaining <= 0:
-            raise JournalDeadlineExceeded("journal deadline exhausted")
-        busy_timeout_ms = min(50, max(0, int(remaining * 1000)))
-        connection.exec_driver_sql(f"PRAGMA busy_timeout = {busy_timeout_ms}")
-        if clock() >= deadline:
-            raise JournalDeadlineExceeded("journal deadline exhausted")
+        AgentRunRepository._validate_deadline_args(deadline, safe_clock)
+        assert safe_clock is not None
+        if safe_clock.require_value() >= deadline:
+            raise JournalDeadlineExceeded("deadline")
+
+    @staticmethod
+    def _classify_sqlite_exception(
+        error: BaseException,
+        deadline: float | None,
+        safe_clock: SafeClockAdapter | None,
+    ) -> BaseException:
+        if not isinstance(error, OperationalError) or deadline is None or safe_clock is None:
+            return error
+        try:
+            interrupted = "interrupted" in str(error).lower()
+        except BaseException:
+            return error
+        if not interrupted:
+            return error
+        sample = safe_clock.sample()
+        if sample.valid is not True:
+            return JournalDeadlineExceeded("clock_invalid")
+        if sample.value >= deadline:
+            return JournalDeadlineExceeded("deadline")
+        return error
+
+    @staticmethod
+    def _restore_sqlite_guard(guard: _SQLiteGuard) -> tuple[bool, BaseException | None]:
+        failed = False
+        cleanup_error: BaseException | None = None
+        if guard.progress_installed:
+            try:
+                guard.raw_connection.set_progress_handler(None, 0)
+            except BaseException as error:
+                failed = True
+                cleanup_error = error
+        try:
+            cursor = guard.raw_connection.execute(
+                f"PRAGMA busy_timeout = {JOURNAL_DEFAULT_BUSY_TIMEOUT_MS}"
+            )
+            close = getattr(cursor, "close", None)
+            if callable(close):
+                close()
+        except BaseException as error:
+            failed = True
+            if cleanup_error is None:
+                cleanup_error = error
+        return failed, cleanup_error
+
+    @staticmethod
+    def _invalidate_sqlite_guard(guard: _SQLiteGuard) -> BaseException | None:
+        try:
+            guard.connection.invalidate()
+            return None
+        except BaseException as error:
+            try:
+                # ``invalidate`` itself may fail after a driver error.  Detach
+                # before closing so the Pool cannot hand the closed DBAPI handle
+                # to the next borrower (the ABA case).
+                guard.connection.detach()
+            except BaseException:
+                pass
+            try:
+                if guard.connection_record is not None:
+                    guard.connection_record.invalidate(error)
+                    return error
+            except BaseException:
+                try:
+                    if guard.connection_record is not None:
+                        guard.connection_record.dbapi_connection = None
+                except BaseException:
+                    pass
+            try:
+                guard.raw_connection.close()
+            except BaseException as close_error:
+                return close_error
+            return error
+
+    @contextmanager
+    def _session_guard(
+        self,
+        *,
+        deadline: float | None,
+        safe_clock: SafeClockAdapter | None,
+    ) -> Generator[Session, None, None]:
+        """Own one Journal Session and restore every SQLite connection setting."""
+
+        self._validate_deadline_args(deadline, safe_clock)
+        session: Session | None = None
+        guard: _SQLiteGuard | None = None
+        transaction: Any | None = None
+        committed = False
+        guard_restored = False
+        guard_cleanup_failed = False
+        rollback_failed = False
+        primary: BaseException | None = None
+        cleanup_error: BaseException | None = None
+        try:
+            session = self.session_factory()
+            transaction = session.begin()
+            try:
+                if deadline is not None:
+                    safe_clock_required = safe_clock
+                    assert safe_clock_required is not None
+                    self._check_deadline(deadline, safe_clock_required)
+                connection = session.connection()
+                guard = _SQLiteGuard(
+                    connection,
+                    self._raw_connection(connection.connection),
+                    False,
+                    getattr(connection.connection, "_connection_record", None),
+                )
+                guard = self._configure_deadline(
+                    session,
+                    deadline,
+                    safe_clock,
+                    _guard=guard,
+                )
+                yield session
+                self._check_deadline(deadline, safe_clock)
+                if guard is not None:
+                    cleanup_failed, restore_error = self._restore_sqlite_guard(guard)
+                    guard_restored = not cleanup_failed
+                    guard_cleanup_failed = cleanup_failed
+                    if cleanup_failed and restore_error is None:
+                        restore_error = RuntimeError("journal SQLite cleanup failed")
+                    if restore_error is not None:
+                        raise restore_error
+                transaction.commit()
+                committed = True
+                self._check_deadline(deadline, safe_clock)
+            except BaseException as error:
+                primary = self._classify_sqlite_exception(error, deadline, safe_clock)
+        except BaseException as error:
+            if primary is None:
+                primary = self._classify_sqlite_exception(error, deadline, safe_clock)
+        finally:
+            if transaction is not None and not committed:
+                try:
+                    assert session is not None
+                    session.rollback()
+                except BaseException as error:
+                    rollback_failed = True
+                    if cleanup_error is None:
+                        cleanup_error = error
+
+            if guard is not None and not guard_restored:
+                try:
+                    cleanup_failed, restore_error = self._restore_sqlite_guard(guard)
+                except BaseException as error:
+                    cleanup_failed, restore_error = True, error
+                if restore_error is not None and cleanup_error is None:
+                    cleanup_error = restore_error
+                if cleanup_failed or guard_cleanup_failed or rollback_failed:
+                    try:
+                        invalidate_error = self._invalidate_sqlite_guard(guard)
+                    except BaseException as error:
+                        invalidate_error = error
+                    if invalidate_error is not None and cleanup_error is None:
+                        cleanup_error = invalidate_error
+
+            if session is not None:
+                try:
+                    session.close()
+                except BaseException as error:
+                    cleanup_failed = True
+                    if cleanup_error is None:
+                        cleanup_error = error
+                    if guard is not None:
+                        try:
+                            invalidate_error = self._invalidate_sqlite_guard(guard)
+                        except BaseException as invalidate_exception:
+                            invalidate_error = invalidate_exception
+                        if invalidate_error is not None and cleanup_error is None:
+                            cleanup_error = invalidate_error
+
+            if primary is not None:
+                raise primary.with_traceback(primary.__traceback__)
+            if cleanup_error is not None:
+                raise cleanup_error.with_traceback(cleanup_error.__traceback__)
+
+    @contextmanager
+    def _journal_transaction(
+        self,
+        *,
+        deadline: float | None,
+        safe_clock: SafeClockAdapter | None,
+    ) -> Generator[Session, None, None]:
+        """Compatibility name for the owned-session guard contract."""
+
+        with self._session_guard(deadline=deadline, safe_clock=safe_clock) as session:
+            yield session
 
     @staticmethod
     def _dialect_supports_returning(session: Session) -> bool:
@@ -768,10 +1060,10 @@ class AgentRunRepository:
         command: StartRunCommand,
         *,
         deadline: float | None,
-        clock: Callable[[], float],
+        safe_clock: SafeClockAdapter | None,
     ) -> StartedRun | None:
-        with self.session_factory() as session:
-            self._configure_deadline(session, deadline, clock)
+        self._validate_deadline_args(deadline, safe_clock)
+        with self._journal_transaction(deadline=deadline, safe_clock=safe_clock) as session:
             run = session.get(AgentRun, command.run_id)
             if run is None:
                 return None
@@ -791,10 +1083,10 @@ class AgentRunRepository:
         message_id: int,
         *,
         deadline: float | None,
-        clock: Callable[[], float],
+        safe_clock: SafeClockAdapter | None,
     ) -> AgentRun | None:
-        with self.session_factory() as session:
-            self._configure_deadline(session, deadline, clock)
+        self._validate_deadline_args(deadline, safe_clock)
+        with self._journal_transaction(deadline=deadline, safe_clock=safe_clock) as session:
             run = session.get(AgentRun, run_id)
             if run is None or run.input_message_id != message_id:
                 return None
@@ -806,10 +1098,10 @@ class AgentRunRepository:
         draft: EventDraft,
         *,
         deadline: float | None,
-        clock: Callable[[], float],
+        safe_clock: SafeClockAdapter | None,
     ) -> AgentEvent | None:
-        with self.session_factory() as session:
-            self._configure_deadline(session, deadline, clock)
+        self._validate_deadline_args(deadline, safe_clock)
+        with self._journal_transaction(deadline=deadline, safe_clock=safe_clock) as session:
             event = self._existing_event(session, run_id, draft)
             return None if event is None else self._detach(session, event)
 
@@ -820,10 +1112,10 @@ class AgentRunRepository:
         event_draft: EventDraft,
         *,
         deadline: float | None,
-        clock: Callable[[], float],
+        safe_clock: SafeClockAdapter | None,
     ) -> CapturedContext | None:
-        with self.session_factory() as session:
-            self._configure_deadline(session, deadline, clock)
+        self._validate_deadline_args(deadline, safe_clock)
+        with self._journal_transaction(deadline=deadline, safe_clock=safe_clock) as session:
             snapshot = session.scalar(
                 select(AgentContextSnapshot).where(
                     AgentContextSnapshot.run_id == run_id,
@@ -847,10 +1139,10 @@ class AgentRunRepository:
         command: DispositionCommand,
         *,
         deadline: float | None,
-        clock: Callable[[], float],
+        safe_clock: SafeClockAdapter | None,
     ) -> tuple[AgentEvent, ...] | None:
-        with self.session_factory() as session:
-            self._configure_deadline(session, deadline, clock)
+        self._validate_deadline_args(deadline, safe_clock)
+        with self._journal_transaction(deadline=deadline, safe_clock=safe_clock) as session:
             events = [self._existing_event(session, run_id, draft) for draft in command.events]
             if any(event is None for event in events):
                 return None

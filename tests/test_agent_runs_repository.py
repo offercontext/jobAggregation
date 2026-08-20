@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import sqlite3
 import threading
 import time
@@ -10,6 +11,7 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.engine import Connection
 from sqlalchemy.exc import OperationalError, TimeoutError
 from sqlalchemy.orm import Session
 
@@ -18,6 +20,12 @@ from offerpilot.agent_runtime.events import (
     PreparedSnapshot,
     canonical_json,
     prepare_event,
+)
+from offerpilot.agent_runtime.budget import (
+    JOURNAL_DEFAULT_BUSY_TIMEOUT_MS,
+    JournalDeadlineExceeded as BudgetJournalDeadlineExceeded,
+    MonotonicSample,
+    SafeClockAdapter,
 )
 from offerpilot.db import init_database, journal_session_factory_for_data_dir
 from offerpilot.models import AgentContextSnapshot, AgentEvent, ChatMessage, Conversation
@@ -29,6 +37,7 @@ from offerpilot.repositories.agent_runs import (
     JournalDeadlineExceeded,
     StartRunCommand,
     StartSegmentCommand,
+    _progress_handler,
 )
 
 
@@ -806,7 +815,14 @@ def test_sqlite_write_lock_fails_within_budget(tmp_path: Path) -> None:
     started = time.monotonic()
     try:
         with pytest.raises(OperationalError):
-            repository.append_event(RUN_ID, _assistant_event(601))
+            repository.append_event(
+                RUN_ID,
+                _assistant_event(601),
+                deadline=time.monotonic() + 0.050,
+                safe_clock=SafeClockAdapter(
+                    lambda: MonotonicSample(time.monotonic(), True)
+                ),
+            )
     finally:
         blocker.rollback()
         blocker.close()
@@ -839,7 +855,7 @@ def test_expired_call_deadline_prevents_repository_write(tmp_path: Path) -> None
             RUN_ID,
             _assistant_event(602),
             deadline=1.0,
-            clock=lambda: 1.0,
+            safe_clock=_safe_clock(1.0),
         )
 
     assert repository.count_events(RUN_ID, _assistant_event(602).dedupe_key) == 0
@@ -1071,4 +1087,160 @@ def test_confirmation_loser_can_finish_segment_after_winner_terminates_run(
                 execution_segment_id=winner_segment,
                 facts={"outcome": "noop", "terminal_run_status": None},
             ),
+        )
+
+
+def _safe_clock(value: float, *, valid: bool = True) -> SafeClockAdapter:
+    return SafeClockAdapter(lambda: MonotonicSample(value, valid))
+
+
+def test_journal_repository_deadline_api_uses_safe_clock_adapter() -> None:
+    assert JournalDeadlineExceeded is BudgetJournalDeadlineExceeded
+    for name in (
+        "create_run_and_initial_segment",
+        "attach_input_message",
+        "start_segment",
+        "append_event",
+        "capture_context",
+        "converge_disposition",
+        "mark_degraded",
+        "find_waiting_run",
+    ):
+        signature = inspect.signature(getattr(AgentRunRepository, name))
+        assert "clock" not in signature.parameters
+        assert signature.parameters["deadline"].annotation == "float | None"
+        assert signature.parameters["safe_clock"].annotation == "SafeClockAdapter | None"
+
+
+def test_deadline_without_safe_clock_is_rejected_before_checkout(tmp_path: Path) -> None:
+    repository, _, _ = _create_run(tmp_path)
+    with pytest.raises(ValueError, match="safe_clock"):
+        repository.append_event(RUN_ID, _assistant_event(603), deadline=1.0)
+
+
+def test_dynamic_busy_timeout_uses_remaining_deadline_and_restores_default(tmp_path: Path) -> None:
+    _create_run(tmp_path)
+    repository = _repository(tmp_path)
+    with repository._session_guard(deadline=0.012, safe_clock=_safe_clock(0.0)) as session:
+        timeout = session.connection().exec_driver_sql("PRAGMA busy_timeout").scalar_one()
+        assert 0 <= timeout <= 12
+    with repository._session_guard(deadline=None, safe_clock=None) as session:
+        assert (
+            session.connection().exec_driver_sql("PRAGMA busy_timeout").scalar_one()
+            == JOURNAL_DEFAULT_BUSY_TIMEOUT_MS
+        )
+
+
+def test_progress_handler_is_total_for_invalid_clock() -> None:
+    callback = _progress_handler(_safe_clock(0.0, valid=False), 1.0)
+    assert callback() != 0
+
+
+def test_recursive_cte_interrupts_by_deadline_and_connection_is_reusable(tmp_path: Path) -> None:
+    _create_run(tmp_path)
+    repository = _repository(tmp_path)
+    now = time.monotonic()
+    started = time.monotonic()
+    with pytest.raises(JournalDeadlineExceeded):
+        with repository._session_guard(
+            deadline=now + 0.010,
+            safe_clock=SafeClockAdapter(
+                lambda: MonotonicSample(time.monotonic(), True)
+            ),
+        ) as session:
+            session.connection().exec_driver_sql(
+                "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n "
+                "LIMIT 100000000) SELECT sum(x) FROM n"
+            ).scalar_one()
+    assert time.monotonic() - started < 0.250
+    with repository._session_guard(deadline=None, safe_clock=None) as session:
+        assert session.connection().exec_driver_sql("SELECT 1").scalar_one() == 1
+        assert (
+            session.connection().exec_driver_sql("PRAGMA busy_timeout").scalar_one()
+            == JOURNAL_DEFAULT_BUSY_TIMEOUT_MS
+        )
+
+
+def test_native_blocking_udf_overshoot_is_classified_after_return_and_restored(
+    tmp_path: Path,
+) -> None:
+    _create_run(tmp_path)
+    repository = _repository(tmp_path)
+    started = time.monotonic()
+    with pytest.raises(JournalDeadlineExceeded):
+        with repository._session_guard(
+            deadline=started + 0.010,
+            safe_clock=SafeClockAdapter(
+                lambda: MonotonicSample(time.monotonic(), True)
+            ),
+        ) as session:
+            raw = session.connection().connection.driver_connection
+            raw.create_function("slow_udf", 0, lambda: (time.sleep(0.060), 1)[1])
+            session.connection().exec_driver_sql("SELECT slow_udf()").scalar_one()
+    assert time.monotonic() - started >= 0.050
+    with repository._session_guard(deadline=None, safe_clock=None) as session:
+        assert session.connection().exec_driver_sql("SELECT 1").scalar_one() == 1
+        assert (
+            session.connection().exec_driver_sql("PRAGMA busy_timeout").scalar_one()
+            == JOURNAL_DEFAULT_BUSY_TIMEOUT_MS
+        )
+
+
+@pytest.mark.parametrize("failure", ["rollback", "handler", "pragma", "invalidate"])
+def test_cleanup_failures_invalidate_before_next_borrower(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    _create_run(tmp_path)
+    repository = _repository(tmp_path)
+    if failure == "rollback":
+        original_rollback = Session.rollback
+        calls = 0
+
+        def fail_once(session: Session) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("rollback cleanup failed")
+            original_rollback(session)
+
+        monkeypatch.setattr(Session, "rollback", fail_once)
+        with pytest.raises(RuntimeError, match="primary"):
+            with repository._journal_transaction(deadline=None, safe_clock=None):
+                raise RuntimeError("primary")
+    else:
+        if failure in {"handler", "pragma"}:
+            monkeypatch.setattr(
+                AgentRunRepository,
+                "_restore_sqlite_guard",
+                staticmethod(
+                    lambda _guard: (True, RuntimeError("restore cleanup failed"))
+                ),
+            )
+        else:
+            monkeypatch.setattr(
+                AgentRunRepository,
+                "_restore_sqlite_guard",
+                staticmethod(
+                    lambda _guard: (True, RuntimeError("restore cleanup failed"))
+                ),
+            )
+            monkeypatch.setattr(
+                Connection,
+                "invalidate",
+                lambda _connection: (_ for _ in ()).throw(
+                    RuntimeError("invalidate cleanup failed")
+                ),
+            )
+        with pytest.raises(RuntimeError, match="cleanup"):
+            with repository._journal_transaction(deadline=None, safe_clock=None):
+                pass
+
+    engine = repository.session_factory.kw["bind"]
+    with engine.connect() as connection:
+        assert connection.exec_driver_sql("SELECT 1").scalar_one() == 1
+        assert (
+            connection.exec_driver_sql("PRAGMA busy_timeout").scalar_one()
+            == JOURNAL_DEFAULT_BUSY_TIMEOUT_MS
         )

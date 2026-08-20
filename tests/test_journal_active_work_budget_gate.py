@@ -335,7 +335,61 @@ def _is_exact_lease_attribute(node: ast.AST, attribute: str) -> bool:
     )
 
 
+def _validate_external_method_rebindings(tree: ast.AST) -> None:
+    parents = _parents(tree)
+    protected_methods = {
+        "AgentRunRepository": JOURNAL_REPOSITORY_API | {"append_event_bound"},
+        "SafeRunRecorder": frozenset(
+            {
+                "start_segment",
+                "attach_input_message",
+                "capture_context",
+                "append_event",
+                "append_prepared_event_bound",
+                "resume",
+                "suspend",
+                "finish",
+                "abandon",
+                "mark_degraded",
+            }
+        ),
+    }
+
+    def protected_attribute(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.attr in protected_methods.get(node.value.id, ())
+        )
+
+    for node in ast.walk(tree):
+        if not _is_module_scope(node, parents):
+            continue
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            assert not protected_attribute(node), (
+                "validated Journal class methods must not be rebound externally"
+            )
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            continue
+        if node.func.id not in {"setattr", "delattr"} or len(node.args) < 2:
+            continue
+        class_name = (
+            node.args[0].id if isinstance(node.args[0], ast.Name) else None
+        )
+        method_name = (
+            node.args[1].value
+            if isinstance(node.args[1], ast.Constant)
+            and isinstance(node.args[1].value, str)
+            else None
+        )
+        if class_name in protected_methods and method_name in protected_methods[class_name]:
+            raise AssertionError(
+                "validated Journal class methods must not be changed with setattr/delattr"
+            )
+
+
 def _validate_journal_repository_calls(tree: ast.AST) -> None:
+    _validate_external_method_rebindings(tree)
     parents = _parents(tree)
     calls = _direct_repository_calls(tree)
     allowed = JOURNAL_REPOSITORY_API | {"append_event_bound"}
@@ -1157,6 +1211,47 @@ def test_mutations_reject_module_level_class_deletion(
     source: str, class_name: str
 ) -> None:
     _expect_rejected(source, lambda tree: _top_level_class(tree, class_name))
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "AgentRunRepository.append_event_bound = replacement\n",
+        "SafeRunRecorder.append_prepared_event_bound = replacement\n",
+        "AgentRunRepository.append_event = replacement\n",
+        "SafeRunRecorder.append_event = replacement\n",
+        "AgentRunRepository.append_event_bound: object = replacement\n",
+        "SafeRunRecorder.append_prepared_event_bound += replacement\n",
+        "del AgentRunRepository.append_event_bound\n",
+        "del SafeRunRecorder.append_prepared_event_bound\n",
+        "setattr(AgentRunRepository, 'append_event_bound', replacement)\n",
+        "delattr(SafeRunRecorder, 'append_prepared_event_bound')\n",
+    ),
+)
+def test_mutations_reject_external_method_rebinding(source: str) -> None:
+    _expect_rejected(source, _validate_journal_repository_calls)
+
+
+def test_mutation_rejects_synthetic_external_method_walrus_target() -> None:
+    target = ast.Attribute(
+        value=ast.Name(id="AgentRunRepository", ctx=ast.Load()),
+        attr="append_event_bound",
+        ctx=ast.Store(),
+    )
+    tree = ast.Module(
+        body=[
+            ast.Expr(
+                value=ast.NamedExpr(
+                    target=target,
+                    value=ast.Name(id="replacement", ctx=ast.Load()),
+                )
+            )
+        ],
+        type_ignores=[],
+    )
+    ast.fix_missing_locations(tree)
+    with pytest.raises(AssertionError):
+        _validate_journal_repository_calls(tree)
 
 
 @pytest.mark.parametrize(

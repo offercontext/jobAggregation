@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from collections.abc import Callable
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
 
@@ -338,31 +339,123 @@ def _is_exact_lease_attribute(node: ast.AST, attribute: str) -> bool:
 JOURNAL_OWNERSHIP_CLASSES = frozenset(
     {"SafeRunRecorder", "RunRecorderFactory", "AgentRunRepository"}
 )
+EXPECTED_DIRECT_METHODS = MappingProxyType(
+    {
+        "SafeRunRecorder": frozenset(
+            {
+                "__init__",
+                "start_segment",
+                "attach_input_message",
+                "capture_context",
+                "append_event",
+                "capture_surface_context",
+                "prepare_event_draft",
+                "append_prepared_event_bound",
+                "resume",
+                "suspend",
+                "finish",
+                "abandon",
+                "mark_degraded",
+                "fingerprint_model_id",
+                "fingerprint_pending_identity",
+                "_prepare_event",
+                "_prepare_context",
+                "_ordinary",
+                "_ordinary_state_allowed_locked",
+                "_resume_operation_allowed_locked",
+                "_acquire_operation",
+                "_acquire_final_operation",
+                "_tighten_lease",
+                "_record_failure",
+                "_diagnostic_for",
+                "_lease_exhaustion_diagnostic",
+                "_cleanup_operation",
+                "_checkpoint",
+                "_checkpoint_callback",
+                "_converge",
+                "_run_final",
+                "_wait_for_resume",
+                "_final_deadline_error",
+                "_record_final_failure",
+                "_diagnostic_for_final",
+                "_sync_degraded",
+                "_degrade",
+                "_diagnose",
+                "_emit_diagnostic",
+            }
+        ),
+        "RunRecorderFactory": frozenset(
+            {
+                "__init__",
+                "start_run",
+                "resume_waiting_run",
+                "_safe",
+                "_null",
+                "_diagnose",
+            }
+        ),
+        "AgentRunRepository": frozenset(
+            {
+                "__init__",
+                "create_run_and_initial_segment",
+                "attach_input_message",
+                "start_segment",
+                "append_event",
+                "append_event_bound",
+                "capture_context",
+                "converge_disposition",
+                "mark_degraded",
+                "find_waiting_run",
+                "get_run",
+                "list_events",
+                "list_snapshots",
+                "read_run_journal",
+                "count_events",
+                "_validate_deadline_args",
+                "_raw_connection",
+                "_progress_handler",
+                "_configure_deadline",
+                "_check_deadline",
+                "_classify_sqlite_exception",
+                "_restore_sqlite_guard",
+                "_invalidate_sqlite_guard",
+                "_session_guard",
+                "_journal_transaction",
+                "_dialect_supports_returning",
+                "_insert_event",
+                "_allocate_seq",
+                "_cas_increment",
+                "_existing_event",
+                "_replay_created_run",
+                "_replay_input_attachment",
+                "_replay_event",
+                "_replay_captured_context",
+                "_replay_disposition",
+                "_required_run",
+                "_validate_initial_command",
+                "_validate_event_draft",
+                "_assert_input_message_belongs",
+                "_validate_snapshot_command",
+                "_assert_run_matches",
+                "_assert_snapshot_matches",
+                "_validate_disposition_shape",
+                "_assert_disposition_matches_run",
+                "_assert_existing_disposition_order",
+                "_assert_status_transition",
+                "_assert_disposition_projection",
+                "_utc_now",
+                "_detach",
+            }
+        ),
+    }
+)
 
 
 def _structural_protected_methods(tree: ast.AST) -> dict[str, frozenset[str]]:
-    method_names: dict[str, set[str]] = {
-        "SafeRunRecorder": set(),
-        "RunRecorderFactory": set(),
-        "AgentRunRepository": set(),
-    }
-    source_trees = [tree]
-    for path in (JOURNAL_PATH, REPOSITORY_PATH):
-        source_trees.append(_module(path))
-
-    for source_tree in source_trees:
-        for class_node in ast.walk(source_tree):
-            if not isinstance(class_node, ast.ClassDef) or class_node.name not in JOURNAL_OWNERSHIP_CLASSES:
-                continue
-            for statement in class_node.body:
-                if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    continue
-                method_names[class_node.name].add(statement.name)
-
-    method_names["AgentRunRepository"].update(JOURNAL_REPOSITORY_API | {"append_event_bound"})
+    del tree
     return {
-        class_name: frozenset(names)
-        for class_name, names in method_names.items()
+        class_name: frozenset(methods)
+        for class_name, methods in EXPECTED_DIRECT_METHODS.items()
     }
 
 
@@ -402,6 +495,9 @@ def _validate_class_method_integrity(tree: ast.AST, class_name: str) -> None:
         method_names = [method.name for method in direct_methods]
         assert len(method_names) == len(set(method_names)), (
             f"{class_name} direct method names must be unique"
+        )
+        assert frozenset(method_names) == EXPECTED_DIRECT_METHODS[class_name], (
+            f"{class_name} direct method names must match the immutable manifest"
         )
         class_body_names = _class_body_bound_names(class_node)
         assert not set(method_names) & class_body_names, (
@@ -1103,6 +1199,27 @@ def test_protected_journal_methods_are_structurally_derived() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    ("path", "class_name"),
+    (
+        (JOURNAL_PATH, "SafeRunRecorder"),
+        (JOURNAL_PATH, "RunRecorderFactory"),
+        (REPOSITORY_PATH, "AgentRunRepository"),
+    ),
+)
+def test_expected_direct_method_manifests_match_canonical_sources(
+    path: Path, class_name: str
+) -> None:
+    class_node = _top_level_class(_module(path), class_name)
+    method_names = [
+        statement.name
+        for statement in class_node.body
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    assert len(method_names) == len(set(method_names))
+    assert frozenset(method_names) == EXPECTED_DIRECT_METHODS[class_name]
+
+
 def test_journal_owned_repository_signatures_are_explicitly_budget_bound() -> None:
     tree = _module(REPOSITORY_PATH)
     repository = _top_level_class(tree, "AgentRunRepository")
@@ -1394,6 +1511,49 @@ def test_mutations_reject_class_method_integrity_bypasses(source: str) -> None:
     _expect_rejected(source, _validate_journal_repository_calls)
 
 
+@pytest.mark.parametrize(
+    ("path", "class_name", "method_name", "replace_method"),
+    (
+        (JOURNAL_PATH, "SafeRunRecorder", "_ordinary", False),
+        (JOURNAL_PATH, "SafeRunRecorder", "_ordinary", True),
+        (JOURNAL_PATH, "RunRecorderFactory", "_safe", False),
+        (JOURNAL_PATH, "RunRecorderFactory", "_safe", True),
+        (REPOSITORY_PATH, "AgentRunRepository", "_insert_event", False),
+        (REPOSITORY_PATH, "AgentRunRepository", "_insert_event", True),
+    ),
+)
+def test_mutations_reject_missing_expected_direct_methods(
+    path: Path, class_name: str, method_name: str, replace_method: bool
+) -> None:
+    tree = _module(path)
+    class_node = _top_level_class(tree, class_name)
+    for index, statement in enumerate(class_node.body):
+        if (
+            isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and statement.name == method_name
+        ):
+            if replace_method:
+                class_node.body[index] = ast.copy_location(
+                    ast.Assign(
+                        targets=[ast.Name(id=method_name, ctx=ast.Store())],
+                        value=ast.Name(id="replacement", ctx=ast.Load()),
+                    ),
+                    statement,
+                )
+            else:
+                del class_node.body[index]
+            break
+    else:
+        raise AssertionError(f"missing canonical method {class_name}.{method_name}")
+
+    validator = (
+        _validate_repository_module
+        if class_name == "AgentRunRepository"
+        else _validate_journal_repository_calls
+    )
+    _expect_rejected(ast.unparse(ast.fix_missing_locations(tree)), validator)
+
+
 def test_mutation_rejects_synthetic_external_method_walrus_target() -> None:
     target = ast.Attribute(
         value=ast.Name(id="AgentRunRepository", ctx=ast.Load()),
@@ -1484,7 +1644,7 @@ def test_mutations_reject_repository_alias_unknown_none_and_clock_paths(source: 
 def test_approved_constructor_repository_initialization_is_accepted() -> None:
     _validate_journal_repository_calls(
         ast.parse(
-            "class SafeRunRecorder:\n"
+            "class ConstructorProbe:\n"
             "    def __init__(self, repository):\n"
             "        self.repository = repository\n"
         )

@@ -237,7 +237,6 @@ class SafeRunRecorder:
         self.key = key
         self.run_id = run_id
         self.segment_id = segment_id
-        self._clock = clock
         self.segment_budget_seconds = segment_budget_seconds
         self.disposition_budget_seconds = disposition_budget_seconds
         self.active_budget = active_budget or ActiveWorkBudget(segment_budget_seconds, clock)
@@ -932,7 +931,7 @@ class SafeRunRecorder:
         operation: Callable[[OperationLease], bool],
         failure_diagnostic: str,
     ) -> None:
-        budget = ActiveWorkBudget(self.disposition_budget_seconds, self._clock)
+        budget = ActiveWorkBudget(self.disposition_budget_seconds, self.active_budget.clock)
         entry = budget.safe_monotonic_read()
         invalid_entry = False
         with self._state_lock:

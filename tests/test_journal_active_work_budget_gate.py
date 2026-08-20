@@ -104,6 +104,90 @@ def _parents(tree: ast.AST) -> dict[ast.AST, ast.AST]:
     return result
 
 
+def _is_direct_constructor_method(
+    node: ast.AST, parents: dict[ast.AST, ast.AST]
+) -> bool:
+    current = parents.get(node)
+    while current is not None:
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            class_node = parents.get(current)
+            return (
+                current.name == "__init__"
+                and isinstance(class_node, ast.ClassDef)
+                and current in class_node.body
+            )
+        current = parents.get(current)
+    return False
+
+
+def _is_constructor_attribute_write(
+    node: ast.AST, attribute: str, parents: dict[ast.AST, ast.AST]
+) -> bool:
+    if not _is_self_attribute(node, attribute) or not isinstance(node.ctx, ast.Store):
+        return False
+    assignment = parents.get(node)
+    if isinstance(assignment, ast.Assign):
+        exact_target = len(assignment.targets) == 1 and assignment.targets[0] is node
+    elif isinstance(assignment, ast.AnnAssign):
+        exact_target = assignment.target is node and assignment.value is not None
+    else:
+        exact_target = False
+    return exact_target and _is_direct_constructor_method(assignment, parents)
+
+
+def _class_body_bound_names(class_node: ast.ClassDef) -> set[str]:
+    names: set[str] = set()
+
+    class BoundNameVisitor(ast.NodeVisitor):
+        def visit_Name(self, node: ast.Name) -> None:
+            if isinstance(node.ctx, ast.Store):
+                names.add(node.id)
+
+        def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+            if isinstance(node.name, str):
+                names.add(node.name)
+            self.generic_visit(node)
+
+        def visit_Import(self, node: ast.Import) -> None:
+            for alias in node.names:
+                names.add(alias.asname or alias.name.split(".", 1)[0])
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            for alias in node.names:
+                names.add(alias.asname or alias.name)
+                if alias.name == "*":
+                    names.add("*")
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            names.add(node.name)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            names.add(node.name)
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            names.add(node.name)
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            return
+
+        def visit_MatchAs(self, node: ast.MatchAs) -> None:
+            if isinstance(node.name, str):
+                names.add(node.name)
+            self.generic_visit(node)
+
+        def visit_MatchStar(self, node: ast.MatchStar) -> None:
+            if isinstance(node.name, str):
+                names.add(node.name)
+            self.generic_visit(node)
+
+    visitor = BoundNameVisitor()
+    for statement in class_node.body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        visitor.visit(statement)
+    return names
+
+
 def _is_module_scope(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
     current = parents.get(node)
     while current is not None:
@@ -138,6 +222,7 @@ def _top_level_class(tree: ast.AST, name: str) -> ast.ClassDef:
     assert len(matches) == 1, f"expected exactly one {name} class"
     result = matches[0]
     assert result in tree.body, f"{name} must not be nested or shadowed"
+    assert not result.decorator_list, f"{name} must not be decorated"
     assert not any(
         isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
         for node in ast.walk(tree)
@@ -167,6 +252,8 @@ def _top_level_class(tree: ast.AST, name: str) -> ast.ClassDef:
                 )
         elif isinstance(node, ast.ExceptHandler) and node.name == name:
             raise AssertionError(f"{name} must not be shadowed by an except target")
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name == name:
+            raise AssertionError(f"{name} must not be shadowed by a match capture")
     return result
 
 
@@ -185,6 +272,13 @@ def _class_method(
     ]
     assert len(direct) == 1 and len(all_matches) == 1, (
         f"expected exactly one direct {class_node.name}.{name} method"
+    )
+    assert not direct[0].decorator_list, (
+        f"validated {class_node.name}.{name} method must not be decorated"
+    )
+    class_body_names = _class_body_bound_names(class_node)
+    assert name not in class_body_names and "*" not in class_body_names, (
+        f"validated {class_node.name}.{name} method must not be rebound in its class"
     )
     return direct[0]
 
@@ -239,6 +333,9 @@ def _validate_journal_repository_calls(tree: ast.AST) -> None:
         if not _is_self_attribute(node, "repository"):
             continue
         if isinstance(node.ctx, ast.Store):
+            assert _is_constructor_attribute_write(node, "repository", parents), (
+                "self.repository may only be initialized in a constructor"
+            )
             continue
         method_attr = parents.get(node)
         if (
@@ -265,8 +362,12 @@ def _validate_journal_repository_calls(tree: ast.AST) -> None:
                 raise AssertionError("dynamic self.repository access is forbidden")
             if node.func.id == "vars" and node.args and _is_self_name(node.args[0]):
                 raise AssertionError("dynamic self mapping access is forbidden")
+            if node.func.id == "setattr" and node.args and _is_self_name(node.args[0]):
+                raise AssertionError("dynamic self.repository writes are forbidden")
         if isinstance(node, ast.Attribute) and node.attr == "__getattribute__":
             raise AssertionError("dynamic self.repository access is forbidden")
+        if isinstance(node, ast.Attribute) and node.attr == "__setattr__":
+            raise AssertionError("dynamic self.repository writes are forbidden")
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -346,8 +447,19 @@ def _is_self_name(node: ast.AST) -> bool:
 def _validate_self_clock_access(tree: ast.AST) -> None:
     parents = _parents(tree)
     for node in ast.walk(tree):
-        if _is_self_attribute(node, "clock"):
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "self"
+            and node.attr in {"clock", "_clock"}
+        ):
+            attribute = node.attr
             parent = parents.get(node)
+            if isinstance(node.ctx, ast.Store):
+                assert _is_constructor_attribute_write(node, attribute, parents), (
+                    f"self.{attribute} may only be initialized in a constructor"
+                )
+                continue
             assert (
                 isinstance(parent, ast.Call)
                 and isinstance(parent.func, ast.Name)
@@ -365,8 +477,13 @@ def _validate_self_clock_access(tree: ast.AST) -> None:
             if isinstance(node.func, ast.Name) and node.func.id == "vars":
                 if node.args and _is_self_name(node.args[0]):
                     raise AssertionError("dynamic self mapping access is forbidden")
+            if isinstance(node.func, ast.Name) and node.func.id == "setattr":
+                if node.args and _is_self_name(node.args[0]):
+                    raise AssertionError("dynamic self clock writes are forbidden")
             if isinstance(node.func, ast.Attribute) and node.func.attr == "__getattribute__":
                 raise AssertionError("dynamic self clock access is forbidden")
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "__setattr__":
+                raise AssertionError("dynamic self clock writes are forbidden")
 
         if isinstance(node, ast.Attribute):
             if _is_self_attribute(node, "__dict__"):
@@ -568,6 +685,40 @@ PUBLIC_BUDGET_API = frozenset(
 BUDGET_MODULE_SUFFIX = "agent_runtime.budget"
 
 
+def _dotted_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _dotted_name(node.value)
+        return f"{prefix}.{node.attr}" if prefix else None
+    return None
+
+
+def _module_aliases(tree: ast.AST) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                bound_name = alias.asname or alias.name.split(".", 1)[0]
+                aliases[bound_name] = alias.name if alias.asname else bound_name
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name != "agent_runtime":
+                    continue
+                bound_name = alias.asname or alias.name
+                if node.level > 0:
+                    aliases[bound_name] = "agent_runtime"
+                else:
+                    aliases[bound_name] = f"{node.module or ''}.agent_runtime".lstrip(".")
+    return aliases
+
+
+def _resolve_dotted_name(value: str, aliases: dict[str, str]) -> str:
+    root, _, suffix = value.partition(".")
+    target = aliases.get(root, root)
+    return f"{target}.{suffix}" if suffix else target
+
+
 def _is_budget_module_reference(value: str) -> bool:
     normalized = value.lstrip(".")
     return (
@@ -580,21 +731,7 @@ def _is_budget_module_reference(value: str) -> bool:
 def _validate_boundary_module(tree: ast.AST) -> None:
     names = _node_names(tree) & PUBLIC_BUDGET_API
     assert not names, f"product boundary references Journal budget API: {sorted(names)}"
-    agent_runtime_aliases = {
-        alias.asname or alias.name.split(".", 1)[0]
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Import)
-        for alias in node.names
-        if alias.name == "offerpilot.agent_runtime"
-    }
-    agent_runtime_aliases.update(
-        alias.asname or alias.name
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom)
-        if node.level > 0 or node.module == "offerpilot"
-        for alias in node.names
-        if alias.name == "agent_runtime"
-    )
+    module_aliases = _module_aliases(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             assert not any(_is_budget_module_reference(alias.name) for alias in node.names)
@@ -608,13 +745,13 @@ def _validate_boundary_module(tree: ast.AST) -> None:
                     and any(alias.name in {"budget", "*"} for alias in node.names)
                 )
             )
-        elif (
-            isinstance(node, ast.Attribute)
-            and node.attr == "budget"
-            and isinstance(node.value, ast.Name)
-            and node.value.id in agent_runtime_aliases
-        ):
-            raise AssertionError("dynamic agent_runtime.budget access is forbidden")
+        elif isinstance(node, ast.Attribute):
+            dotted = _dotted_name(node)
+            resolved = _resolve_dotted_name(dotted, module_aliases) if dotted else None
+            assert not (
+                (dotted and _is_budget_module_reference(dotted))
+                or (resolved and _is_budget_module_reference(resolved))
+            ), "dynamic agent_runtime.budget access is forbidden"
         elif isinstance(node, ast.Call):
             function_name = (
                 node.func.id
@@ -729,6 +866,85 @@ class AgentRunRepository:
 
 
 @pytest.mark.parametrize(
+    ("source", "class_name"),
+    (
+        ("@decorator\nclass SafeRunRecorder:\n    pass\n", "SafeRunRecorder"),
+        ("@decorator\nclass AgentRunRepository:\n    pass\n", "AgentRunRepository"),
+    ),
+)
+def test_mutations_reject_target_class_decorators(source: str, class_name: str) -> None:
+    _expect_rejected(source, lambda tree: _top_level_class(tree, class_name))
+
+
+@pytest.mark.parametrize(
+    ("source", "class_name", "method_name"),
+    (
+        (
+            "class SafeRunRecorder:\n"
+            "    @decorator\n"
+            "    def append_prepared_event_bound(self, session, draft):\n"
+            "        pass\n",
+            "SafeRunRecorder",
+            "append_prepared_event_bound",
+        ),
+        (
+            "class AgentRunRepository:\n"
+            "    @decorator\n"
+            "    def append_event_bound(self, session, run_id, draft):\n"
+            "        pass\n",
+            "AgentRunRepository",
+            "append_event_bound",
+        ),
+    ),
+)
+def test_mutations_reject_validated_method_decorators(
+    source: str, class_name: str, method_name: str
+) -> None:
+    _expect_rejected(
+        source,
+        lambda tree: _class_method(_top_level_class(tree, class_name), method_name),
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "class_name", "method_name"),
+    (
+        (
+            "class SafeRunRecorder:\n"
+            "    def append_prepared_event_bound(self, session, draft):\n"
+            "        pass\n"
+            "    append_prepared_event_bound = replacement\n",
+            "SafeRunRecorder",
+            "append_prepared_event_bound",
+        ),
+        (
+            "class AgentRunRepository:\n"
+            "    append_event_bound = replacement\n"
+            "    def append_event_bound(self, session, run_id, draft):\n"
+            "        pass\n",
+            "AgentRunRepository",
+            "append_event_bound",
+        ),
+        (
+            "class AgentRunRepository:\n"
+            "    def append_event_bound(self, session, run_id, draft):\n"
+            "        pass\n"
+            "    append_event_bound: object\n",
+            "AgentRunRepository",
+            "append_event_bound",
+        ),
+    ),
+)
+def test_mutations_reject_validated_method_class_rebinding(
+    source: str, class_name: str, method_name: str
+) -> None:
+    _expect_rejected(
+        source,
+        lambda tree: _class_method(_top_level_class(tree, class_name), method_name),
+    )
+
+
+@pytest.mark.parametrize(
     "source",
     (
         "from other import SafeRunRecorder as SafeRunRecorder\nclass SafeRunRecorder:\n    pass\n",
@@ -736,6 +952,8 @@ class AgentRunRepository:
         "SafeRunRecorder += alias\nclass SafeRunRecorder:\n    pass\n",
         "with context as SafeRunRecorder:\n    pass\nclass SafeRunRecorder:\n    pass\n",
         "try:\n    pass\nexcept Exception as SafeRunRecorder:\n    pass\nclass SafeRunRecorder:\n    pass\n",
+        "match value:\n    case SafeRunRecorder:\n        pass\nclass SafeRunRecorder:\n    pass\n",
+        "match value:\n    case _ as SafeRunRecorder:\n        pass\nclass SafeRunRecorder:\n    pass\n",
         "def SafeRunRecorder():\n    pass\nclass SafeRunRecorder:\n    pass\n",
         "def outer():\n    def SafeRunRecorder():\n        pass\nclass SafeRunRecorder:\n    pass\n",
         "class SafeRunRecorder:\n    pass\nclass SafeRunRecorder:\n    pass\n",
@@ -760,10 +978,22 @@ def test_mutations_reject_module_level_class_rebinding_and_duplicates(source: st
         "def run(self):\n    self.repository.append_event(x, deadline=0.1, safe_clock=lease.safe_clock)\n",
         "def run(self):\n    self.repository.append_event(x, deadline=other.work_deadline, safe_clock=lease.safe_clock)\n",
         "def run(self):\n    self.repository.append_event(x, deadline=lease.work_deadline, safe_clock=clock)\n",
+        "def run(self):\n    self.repository = other_repository\n    self.repository.append_event(x, deadline=lease.work_deadline, safe_clock=lease.safe_clock)\n",
+        "def run(self):\n    setattr(self, 'repository', other_repository)\n    self.repository.append_event(x, deadline=lease.work_deadline, safe_clock=lease.safe_clock)\n",
     ),
 )
 def test_mutations_reject_repository_alias_unknown_none_and_clock_paths(source: str) -> None:
     _expect_rejected(source, _validate_journal_repository_calls)
+
+
+def test_approved_constructor_repository_initialization_is_accepted() -> None:
+    _validate_journal_repository_calls(
+        ast.parse(
+            "class SafeRunRecorder:\n"
+            "    def __init__(self, repository):\n"
+            "        self.repository = repository\n"
+        )
+    )
 
 
 @pytest.mark.parametrize(
@@ -786,6 +1016,9 @@ def test_mutations_reject_dynamic_repository_mapping_access(source: str) -> None
         "def run(self):\n    return getattr(self, key)\n",
         "def run(self):\n    return self.__dict__['clock']\n",
         "def run(self):\n    return self.__getattribute__('clock')\n",
+        "def run(self):\n    return self._clock()\n",
+        "def run(self):\n    clock = self._clock\n",
+        "def run(self):\n    return self.__dict__['_clock']\n",
     ),
 )
 def test_mutations_reject_clock_alias_call_and_dynamic_access(source: str) -> None:
@@ -797,6 +1030,8 @@ def test_mutations_reject_clock_alias_call_and_dynamic_access(source: str) -> No
     (
         "def run(self):\n    return vars(self)['clock']()\n",
         "def run(self):\n    state = vars(self)\n    return state['clock']\n",
+        "def run(self):\n    return vars(self)['_clock']()\n",
+        "def run(self):\n    state = vars(self)\n    return state['_clock']\n",
     ),
 )
 def test_mutations_reject_dynamic_clock_mapping_access(source: str) -> None:
@@ -806,6 +1041,20 @@ def test_mutations_reject_dynamic_clock_mapping_access(source: str) -> None:
 def test_approved_clock_constructor_argument_is_accepted() -> None:
     _validate_self_clock_access(
         ast.parse("def run(self):\n    return ActiveWorkBudget(0.1, self.clock)\n")
+    )
+    _validate_self_clock_access(
+        ast.parse("def run(self):\n    return ActiveWorkBudget(0.1, self._clock)\n")
+    )
+
+
+def test_approved_constructor_clock_initialization_is_accepted() -> None:
+    _validate_self_clock_access(
+        ast.parse(
+            "class SafeRunRecorder:\n"
+            "    def __init__(self, clock):\n"
+            "        self._clock = clock\n"
+            "        self.clock = clock\n"
+        )
     )
 
 
@@ -1026,6 +1275,8 @@ def test_mutations_reject_bound_signature_clock_posonly_deadline_and_varargs(sou
         "from offerpilot.agent_runtime import budget as budget\n",
         "import offerpilot.agent_runtime.budget as budget\n",
         "import offerpilot.agent_runtime as runtime\nruntime.budget\n",
+        "import offerpilot\nofferpilot.agent_runtime.budget\n",
+        "import offerpilot.agent_runtime\nofferpilot.agent_runtime.budget\n",
         "from .. import agent_runtime as runtime\nruntime.budget\n",
         "from offerpilot import agent_runtime as runtime\nruntime.budget\n",
         "import importlib\nimportlib.import_module('offerpilot.agent_runtime.budget')\n",

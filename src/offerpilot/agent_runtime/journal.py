@@ -4,11 +4,19 @@ import os
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from threading import Condition, Lock, RLock
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar
 from uuid import uuid4
 
 from sqlalchemy.exc import OperationalError
 
+from offerpilot.agent_runtime.budget import (
+    JOURNAL_OPERATION_HARD_CAP_SECONDS,
+    ActiveWorkBudget,
+    JournalBudgetExhausted,
+    JournalDeadlineExceeded,
+    OperationLease,
+)
 from offerpilot.agent_runtime.events import (
     ContextManifestInput,
     EventDraft,
@@ -24,7 +32,6 @@ from offerpilot.repositories.agent_runs import (
     AgentRunRepository,
     CaptureContextCommand,
     DispositionCommand,
-    JournalDeadlineExceeded,
     RunStatus,
     StartRunCommand,
     StartSegmentCommand,
@@ -46,10 +53,7 @@ StartSegmentBuilder = Callable[
     StartSegmentCommand,
 ]
 _PENDING_IDENTITY_UNSET = object()
-
-
-class JournalBudgetExhausted(RuntimeError):
-    pass
+_T = TypeVar("_T")
 
 
 @dataclass(frozen=True)
@@ -208,7 +212,7 @@ class NullRunRecorder:
 
 
 class SafeRunRecorder:
-    """Fail-open, per-segment Journal facade with an irreversible degraded latch."""
+    """Fail-open Journal facade with a cumulative active-work budget."""
 
     def __init__(
         self,
@@ -221,11 +225,13 @@ class SafeRunRecorder:
         segment_budget_seconds: float = 0.150,
         disposition_budget_seconds: float = 0.050,
         segment_started_at: float | None = None,
+        active_budget: ActiveWorkBudget | None = None,
         event_preparer: EventPreparer | None = None,
         context_preparer: ContextPreparer | None = None,
         uuid_factory: Callable[[], str] = lambda: str(uuid4()),
         diagnostic_sink: Callable[[str], None] | None = None,
     ) -> None:
+        del segment_started_at
         self.repository = repository
         self.key = key
         self.run_id = run_id
@@ -233,8 +239,7 @@ class SafeRunRecorder:
         self.clock = clock
         self.segment_budget_seconds = segment_budget_seconds
         self.disposition_budget_seconds = disposition_budget_seconds
-        self._segment_started_at = clock() if segment_started_at is None else segment_started_at
-        self._segment_deadline = self._segment_started_at + segment_budget_seconds
+        self.active_budget = active_budget or ActiveWorkBudget(segment_budget_seconds, clock)
         self._event_preparer = event_preparer or self._prepare_event
         self._context_preparer = context_preparer or self._prepare_context
         self._uuid_factory = uuid_factory
@@ -242,32 +247,43 @@ class SafeRunRecorder:
         self.recording_status: RecordingStatus = "healthy"
         self.diagnostics: list[str] = []
         self._degraded_persisted = False
-        self._disposition_attempted = False
+        self._operation_lock = Lock()
+        self._state_lock = RLock()
+        self._state_condition = Condition(self._state_lock)
+        self._resume_state: Literal["not_attempted", "claimed", "completed", "failed"] = (
+            "not_attempted"
+        )
+        self._disposition_state: Literal[
+            "not_attempted", "claimed", "completed", "failed"
+        ] = "not_attempted"
+        self._wait_flag = False
+        self._current_lease: OperationLease | None = None
 
     def start_segment(self, command: StartSegmentCommand) -> None:
-        if command.run_id != self.run_id or (
-            command.segment_started.execution_segment_id != self.segment_id
-        ):
-            self._degrade("journal_segment_identity_changed")
-            return
-        self._nonterminal_write(
-            lambda: self.repository.start_segment(
+        def operation(lease: OperationLease) -> None:
+            if command.run_id != self.run_id or (
+                command.segment_started.execution_segment_id != self.segment_id
+            ):
+                self._degrade("journal_segment_identity_changed")
+                return
+            self.repository.start_segment(
                 command,
-                deadline=self._segment_deadline,
-                clock=self.clock,
-            ),
-            "journal_segment_write_failed",
-        )
+                deadline=lease.work_deadline,
+                safe_clock=lease.safe_clock,
+            )
+
+        self._ordinary(operation, "journal_segment_write_failed", None)
 
     def attach_input_message(self, message_id: int) -> None:
-        self._nonterminal_write(
-            lambda: self.repository.attach_input_message(
+        self._ordinary(
+            lambda lease: self.repository.attach_input_message(
                 self.run_id,
                 message_id,
-                deadline=self._segment_deadline,
-                clock=self.clock,
+                deadline=lease.work_deadline,
+                safe_clock=lease.safe_clock,
             ),
             "journal_message_link_failed",
+            None,
         )
 
     def capture_context(
@@ -282,16 +298,13 @@ class SafeRunRecorder:
         token_estimator_name: str | None = None,
         token_estimator_version: str | None = None,
     ) -> str | None:
-        if self.recording_status == "degraded" or self._disposition_attempted:
-            return None
-        try:
-            self._require_budget(self._segment_deadline)
+        def operation(lease: OperationLease) -> str:
             prepared = self._context_preparer(
                 logical_input,
                 manifest,
-                self._segment_deadline,
+                lease.work_deadline,
             )
-            self._require_budget(self._segment_deadline)
+            lease.checkpoint()
             snapshot_id = self._uuid_factory()
             if snapshot_kind == "model_input":
                 if model_call_id is None:
@@ -318,63 +331,25 @@ class SafeRunRecorder:
             self.repository.capture_context(
                 self.run_id,
                 command,
-                deadline=self._segment_deadline,
-                clock=self.clock,
+                deadline=lease.work_deadline,
+                safe_clock=lease.safe_clock,
             )
-            self._require_budget(self._segment_deadline)
             return snapshot_id
-        except JournalBudgetExhausted:
-            self._degrade("journal_budget_exhausted")
-        except JournalDeadlineExceeded:
-            self._degrade("journal_budget_exhausted")
-        except OperationalError as error:
-            diagnostic = (
-                "journal_budget_exhausted"
-                if self._operational_error_exhausted_budget(
-                    error,
-                    self._segment_deadline,
-                )
-                else "journal_context_write_failed"
-            )
-            self._degrade(diagnostic)
-        except JournalEventValidationError:
-            self._degrade("journal_context_invalid")
-        except Exception:
-            self._degrade("journal_context_write_failed")
-        return None
+
+        return self._ordinary(operation, "journal_context_write_failed", None)
 
     def append_event(self, event: EventInput) -> None:
-        if self.recording_status == "degraded" or self._disposition_attempted:
-            return
-        try:
-            self._require_budget(self._segment_deadline)
-            draft = self._event_preparer(event, self._segment_deadline)
-            self._require_budget(self._segment_deadline)
+        def operation(lease: OperationLease) -> None:
+            draft = self._event_preparer(event, lease.work_deadline)
+            lease.checkpoint()
             self.repository.append_event(
                 self.run_id,
                 draft,
-                deadline=self._segment_deadline,
-                clock=self.clock,
+                deadline=lease.work_deadline,
+                safe_clock=lease.safe_clock,
             )
-            self._require_budget(self._segment_deadline)
-        except JournalBudgetExhausted:
-            self._degrade("journal_budget_exhausted")
-        except JournalDeadlineExceeded:
-            self._degrade("journal_budget_exhausted")
-        except OperationalError as error:
-            diagnostic = (
-                "journal_budget_exhausted"
-                if self._operational_error_exhausted_budget(
-                    error,
-                    self._segment_deadline,
-                )
-                else "journal_event_write_failed"
-            )
-            self._degrade(diagnostic)
-        except JournalEventValidationError:
-            self._degrade("journal_event_invalid")
-        except Exception:
-            self._degrade("journal_event_write_failed")
+
+        self._ordinary(operation, "journal_event_write_failed", None)
 
     def capture_surface_context(
         self,
@@ -387,23 +362,21 @@ class SafeRunRecorder:
     ) -> str | None:
         """Project transient audit to V2; every failure remains journal-only."""
 
-        if self.recording_status == "degraded" or self._disposition_attempted:
-            return None
-        try:
+        def operation(lease: OperationLease) -> str:
             from offerpilot.context_projector.manifest import prepare_surface_manifest_v2
 
-            self._require_budget(self._segment_deadline)
             identity = prepare_context_snapshot(
                 logical_input,
                 ContextManifestInput((), (), (), ()),
                 key=self.key,
-                budget_check=lambda: self._require_budget(self._segment_deadline),
+                budget_check=lease.checkpoint,
             )
             manifest = prepare_surface_manifest_v2(
                 audit,
                 key_id=self.key.key_id,
                 secret=self.key.secret,
                 provider_identities=provider_identities,
+                budget_check=lease.checkpoint,
             )
             prepared = PreparedSnapshot(
                 manifest_schema_version=2,
@@ -428,46 +401,47 @@ class SafeRunRecorder:
             self.repository.capture_context(
                 self.run_id,
                 command,
-                deadline=self._segment_deadline,
-                clock=self.clock,
+                deadline=lease.work_deadline,
+                safe_clock=lease.safe_clock,
             )
-            self._require_budget(self._segment_deadline)
             return snapshot_id
-        except JournalBudgetExhausted:
-            self._degrade("journal_budget_exhausted")
-        except JournalDeadlineExceeded:
-            self._degrade("journal_budget_exhausted")
-        except Exception:
-            self._degrade("journal_context_write_failed")
-        return None
+
+        return self._ordinary(operation, "journal_context_write_failed", None)
 
     def prepare_event_draft(self, event: EventInput) -> EventDraft | None:
-        """Prepare canonical Journal bytes before an external business transaction."""
-
-        if self.recording_status == "degraded" or self._disposition_attempted:
-            return None
-        try:
-            return self._event_preparer(event, self._segment_deadline)
-        except Exception:
-            self._degrade("journal_tool_projection_failed")
-            return None
+        return self._ordinary(
+            lambda lease: self._event_preparer(event, lease.work_deadline),
+            "journal_tool_projection_failed",
+            None,
+        )
 
     def append_prepared_event_bound(self, session: Any, draft: EventDraft) -> bool:
-        if self.recording_status == "degraded" or self._disposition_attempted:
-            return False
-        try:
+        def operation(lease: OperationLease) -> bool:
+            lease.checkpoint()
             with session.begin_nested():
                 self.repository.append_event_bound(session, self.run_id, draft)
             return True
-        except Exception:
-            self._degrade("journal_tool_projection_failed")
-            return False
+
+        return self._ordinary(
+            operation,
+            "journal_tool_projection_failed",
+            False,
+            allow_sync=False,
+        )
 
     def resume(self, command: ResumedDisposition) -> None:
-        if self.recording_status == "degraded" or self._disposition_attempted:
-            return
-        try:
-            self._require_budget(self._segment_deadline)
+        with self._state_lock:
+            if (
+                self._resume_state != "not_attempted"
+                or self._disposition_state != "not_attempted"
+            ):
+                return
+            self._resume_state = "claimed"
+            self._state_condition.notify_all()
+
+        succeeded = False
+
+        def operation(lease: OperationLease) -> bool:
             event = self._event_preparer(
                 EventInput(
                     event_type="run.resumed",
@@ -478,7 +452,7 @@ class SafeRunRecorder:
                     source_ref_type="tool_call",
                     source_ref_id=command.tool_call_id,
                 ),
-                self._segment_deadline,
+                lease.work_deadline,
             )
             self.repository.converge_disposition(
                 self.run_id,
@@ -488,40 +462,36 @@ class SafeRunRecorder:
                     waiting_tool_call_id=None,
                     failure_code=None,
                 ),
-                deadline=self._segment_deadline,
-                clock=self.clock,
+                deadline=lease.work_deadline,
+                safe_clock=lease.safe_clock,
             )
-            self._require_budget(self._segment_deadline)
-        except JournalBudgetExhausted:
-            self._degrade("journal_budget_exhausted")
-        except JournalDeadlineExceeded:
-            self._degrade("journal_budget_exhausted")
-        except OperationalError as error:
-            diagnostic = (
-                "journal_budget_exhausted"
-                if self._operational_error_exhausted_budget(
-                    error,
-                    self._segment_deadline,
+            return True
+
+        try:
+            succeeded = bool(
+                self._ordinary(
+                    operation,
+                    "journal_resume_failed",
+                    False,
+                    state_check=lambda: self._resume_state == "claimed",
                 )
-                else "journal_resume_failed"
             )
-            self._degrade(diagnostic)
-        except JournalEventValidationError:
-            self._degrade("journal_resume_invalid")
-        except Exception:
-            self._degrade("journal_resume_failed")
+        finally:
+            with self._state_lock:
+                self._resume_state = "completed" if succeeded else "failed"
+                self._wait_flag = False
+                self._state_condition.notify_all()
 
     def suspend(self, command: SuspendedDisposition) -> None:
-        def inputs(deadline: float) -> tuple[EventDraft, ...]:
+        def inputs(lease: OperationLease) -> tuple[EventDraft, ...]:
             pending_fingerprint = command.pending_identity_fingerprint
             if pending_fingerprint is None:
                 if command.pending_identity is _PENDING_IDENTITY_UNSET:
                     raise JournalEventValidationError("pending identity is required")
-                self._require_budget(deadline)
                 pending_fingerprint = pending_identity_fingerprint(
                     self.key,
                     command.pending_identity,
-                    budget_check=lambda: self._require_budget(deadline),
+                    budget_check=lease.checkpoint,
                 )
             values = (
                 EventInput(
@@ -557,7 +527,7 @@ class SafeRunRecorder:
                     facts={"outcome": "suspended", "terminal_run_status": None},
                 ),
             )
-            return tuple(self._event_preparer(value, deadline) for value in values)
+            return tuple(self._event_preparer(value, lease.work_deadline) for value in values)
 
         self._converge(
             inputs,
@@ -567,7 +537,7 @@ class SafeRunRecorder:
         )
 
     def finish(self, command: TerminalDisposition) -> None:
-        def inputs(deadline: float) -> tuple[EventDraft, ...]:
+        def inputs(lease: OperationLease) -> tuple[EventDraft, ...]:
             values = (
                 EventInput(
                     event_type=f"run.{command.status}",
@@ -585,7 +555,7 @@ class SafeRunRecorder:
                     },
                 ),
             )
-            return tuple(self._event_preparer(value, deadline) for value in values)
+            return tuple(self._event_preparer(value, lease.work_deadline) for value in values)
 
         self._converge(
             inputs,
@@ -595,81 +565,51 @@ class SafeRunRecorder:
         )
 
     def abandon(self) -> None:
-        if self._disposition_attempted:
-            return
-        self._disposition_attempted = True
-        deadline = self.clock() + self.disposition_budget_seconds
-        try:
+        def operation(lease: OperationLease) -> bool:
             event = self._event_preparer(
                 EventInput(
                     event_type="segment.finished",
                     facts={"outcome": "noop", "terminal_run_status": None},
                 ),
-                deadline,
+                lease.work_deadline,
             )
-            self._require_budget(deadline)
             self.repository.append_event(
                 self.run_id,
                 event,
-                deadline=deadline,
-                clock=self.clock,
+                deadline=lease.work_deadline,
+                safe_clock=lease.safe_clock,
             )
-            self._require_budget(deadline)
-            if self.recording_status == "degraded":
-                self._sync_degraded(deadline)
-        except JournalBudgetExhausted:
-            self._degrade("journal_disposition_budget_exhausted")
-        except JournalDeadlineExceeded:
-            self._degrade("journal_disposition_budget_exhausted")
-        except OperationalError as error:
-            diagnostic = (
-                "journal_disposition_budget_exhausted"
-                if self._operational_error_exhausted_budget(error, deadline)
-                else "journal_disposition_failed"
-            )
-            self._degrade(diagnostic)
-        except JournalEventValidationError:
-            self._degrade("journal_disposition_invalid")
-        except Exception:
-            self._degrade("journal_disposition_failed")
+            return True
+
+        self._run_final(operation, "journal_disposition_failed")
 
     def mark_degraded(self, diagnostic: str = "journal_recording_degraded") -> None:
         self._degrade(diagnostic)
 
     def fingerprint_model_id(self, value: str) -> str | None:
-        return self._fingerprint(
-            lambda: model_id_fingerprint(
+        return self._ordinary(
+            lambda lease: model_id_fingerprint(
                 self.key,
                 value,
-                budget_check=lambda: self._require_budget(self._segment_deadline),
-            )
+                budget_check=lease.checkpoint,
+            ),
+            "journal_fingerprint_failed",
+            None,
         )
 
     def fingerprint_pending_identity(self, value: object) -> str | None:
-        return self._fingerprint(
-            lambda: pending_identity_fingerprint(
+        return self._ordinary(
+            lambda lease: pending_identity_fingerprint(
                 self.key,
                 value,
-                budget_check=lambda: self._require_budget(self._segment_deadline),
-            )
+                budget_check=lease.checkpoint,
+            ),
+            "journal_fingerprint_failed",
+            None,
         )
 
-    def _fingerprint(self, operation: Callable[[], str]) -> str | None:
-        if self.recording_status == "degraded":
-            return None
-        try:
-            self._require_budget(self._segment_deadline)
-            value = operation()
-            self._require_budget(self._segment_deadline)
-            return value
-        except JournalBudgetExhausted:
-            self._degrade("journal_budget_exhausted")
-        except Exception:
-            self._degrade("journal_fingerprint_failed")
-        return None
-
     def _prepare_event(self, value: EventInput, deadline: float) -> EventDraft:
-        self._require_budget(deadline)
+        self._checkpoint(deadline)
         facts = dict(value.facts)
         contains_hmac = any(field.endswith("_fingerprint") for field in facts)
         draft = prepare_event(
@@ -682,9 +622,9 @@ class SafeRunRecorder:
             source_ref_type=value.source_ref_type,
             source_ref_id=value.source_ref_id,
             fingerprint_key_id=self.key.key_id if contains_hmac else None,
-            budget_check=lambda: self._require_budget(deadline),
+            budget_check=self._checkpoint_callback,
         )
-        self._require_budget(deadline)
+        self._checkpoint(deadline)
         return draft
 
     def _prepare_context(
@@ -693,59 +633,222 @@ class SafeRunRecorder:
         manifest: ContextManifestInput,
         deadline: float,
     ) -> PreparedSnapshot:
-        self._require_budget(deadline)
+        self._checkpoint(deadline)
         prepared = prepare_context_snapshot(
             logical_input,
             manifest,
             key=self.key,
-            budget_check=lambda: self._require_budget(deadline),
+            budget_check=self._checkpoint_callback,
         )
-        self._require_budget(deadline)
+        self._checkpoint(deadline)
         return prepared
 
-    def _nonterminal_write(
+    def _ordinary(
         self,
-        operation: Callable[[], object],
+        operation: Callable[[OperationLease], _T],
         failure_diagnostic: str,
-    ) -> None:
-        if self.recording_status == "degraded" or self._disposition_attempted:
-            return
+        default: _T,
+        *,
+        allow_sync: bool = True,
+        state_check: Callable[[], bool] | None = None,
+    ) -> _T:
+        entry = self.active_budget.safe_monotonic_read()
+        lease: OperationLease | None = None
+        acquired = False
+        result = default
+        primary_base: BaseException | None = None
+        cleanup_base: BaseException | None = None
+        work_started = False
+        used_before = self.active_budget.used_seconds
+        clock_invalid_before = self.active_budget.clock_invalid_latched
+
         try:
-            self._require_budget(self._segment_deadline)
-            operation()
-            self._require_budget(self._segment_deadline)
-        except JournalBudgetExhausted:
-            self._degrade("journal_budget_exhausted")
-        except JournalDeadlineExceeded:
-            self._degrade("journal_budget_exhausted")
-        except OperationalError as error:
-            diagnostic = (
-                "journal_budget_exhausted"
-                if self._operational_error_exhausted_budget(
-                    error,
-                    self._segment_deadline,
+            try:
+                lease = self.active_budget.begin_operation(
+                    entry,
+                    JOURNAL_OPERATION_HARD_CAP_SECONDS,
                 )
-                else failure_diagnostic
+                acquired = self._acquire_operation(lease)
+                if not acquired:
+                    self._degrade("journal_budget_exhausted")
+                else:
+                    refreshed = self.active_budget.begin_operation(
+                        entry,
+                        JOURNAL_OPERATION_HARD_CAP_SECONDS,
+                    )
+                    lease = self._tighten_lease(lease, refreshed)
+                    lease.checkpoint()
+                    with self._state_lock:
+                        allowed = (
+                            self.recording_status == "healthy"
+                            and self._disposition_state == "not_attempted"
+                            and (state_check is None or state_check())
+                        )
+                    if allowed:
+                        work_started = True
+                        self._current_lease = lease
+                        try:
+                            result = operation(lease)
+                        except Exception as error:
+                            self._record_failure(
+                                error,
+                                failure_diagnostic,
+                                lease,
+                                allow_sync=allow_sync,
+                            )
+                        except BaseException as error:
+                            primary_base = error
+            except Exception as error:
+                self._record_failure(
+                    error,
+                    failure_diagnostic,
+                    lease,
+                    allow_sync=allow_sync and work_started,
+                )
+            except BaseException as error:
+                primary_base = error
+        finally:
+            try:
+                try:
+                    if acquired:
+                        self._cleanup_operation(lease)
+                except Exception:
+                    self._degrade("journal_cleanup_failed")
+                except BaseException as error:
+                    cleanup_base = error
+            finally:
+                self._current_lease = None
+                try:
+                    exhausted = self.active_budget.finish_operation(entry)
+                except BaseException:
+                    self.active_budget.latch_clock_invalid()
+                    exhausted = True
+                if self.active_budget.clock_invalid_latched and not clock_invalid_before:
+                    self._degrade("journal_clock_invalid")
+                elif (
+                    self.recording_status != "degraded"
+                    and (
+                        exhausted
+                        or self.active_budget.used_seconds - used_before
+                        >= JOURNAL_OPERATION_HARD_CAP_SECONDS
+                    )
+                ):
+                    self._degrade("journal_budget_exhausted")
+                if acquired:
+                    self._operation_lock.release()
+
+        if primary_base is not None:
+            raise primary_base.with_traceback(primary_base.__traceback__)
+        if cleanup_base is not None:
+            raise cleanup_base.with_traceback(cleanup_base.__traceback__)
+        return result
+
+    def _acquire_operation(self, lease: OperationLease) -> bool:
+        timeout = max(0.0, lease.hard_deadline - lease.entry_started_at)
+        try:
+            return self._operation_lock.acquire(timeout=timeout)
+        except OverflowError:
+            return self._operation_lock.acquire(blocking=False)
+
+    def _tighten_lease(
+        self,
+        original: OperationLease,
+        refreshed: OperationLease,
+    ) -> OperationLease:
+        hard_deadline = min(original.hard_deadline, refreshed.hard_deadline)
+        reserve = original.hard_deadline - original.work_deadline
+        return OperationLease(
+            budget=self.active_budget,
+            entry_started_at=original.entry_started_at,
+            work_deadline=hard_deadline - reserve,
+            hard_deadline=hard_deadline,
+        )
+
+    def _record_failure(
+        self,
+        error: Exception,
+        failure_diagnostic: str,
+        lease: OperationLease | None,
+        *,
+        allow_sync: bool,
+    ) -> None:
+        diagnostic = self._diagnostic_for(error, failure_diagnostic, lease)
+        first_transition = self._degrade(diagnostic)
+        if first_transition and allow_sync and lease is not None and diagnostic not in {
+            "journal_budget_exhausted",
+            "journal_clock_invalid",
+        }:
+            self._sync_degraded(lease)
+
+    def _diagnostic_for(
+        self,
+        error: Exception,
+        failure_diagnostic: str,
+        lease: OperationLease | None,
+    ) -> str:
+        if isinstance(error, JournalDeadlineExceeded):
+            return (
+                "journal_clock_invalid"
+                if error.reason == "clock_invalid"
+                else "journal_budget_exhausted"
             )
-            self._degrade(diagnostic)
-        except Exception:
-            self._degrade(failure_diagnostic)
+        if isinstance(error, JournalBudgetExhausted):
+            return "journal_budget_exhausted"
+        if isinstance(error, JournalEventValidationError):
+            if failure_diagnostic.startswith("journal_context"):
+                return "journal_context_invalid"
+            if failure_diagnostic.startswith("journal_event"):
+                return "journal_event_invalid"
+            if failure_diagnostic.startswith("journal_resume"):
+                return "journal_resume_invalid"
+            return failure_diagnostic
+        if isinstance(error, OperationalError):
+            if _is_sqlite_lock_error(error):
+                return "journal_budget_exhausted"
+            exhausted = self._lease_exhaustion_diagnostic(lease)
+            return exhausted or failure_diagnostic
+        exhausted = self._lease_exhaustion_diagnostic(lease)
+        return exhausted or failure_diagnostic
+
+    def _lease_exhaustion_diagnostic(self, lease: OperationLease | None) -> str | None:
+        if lease is None:
+            return "journal_clock_invalid" if self.active_budget.clock_invalid_latched else None
+        try:
+            lease.checkpoint()
+        except JournalDeadlineExceeded as error:
+            return "journal_clock_invalid" if error.reason == "clock_invalid" else "journal_budget_exhausted"
+        except JournalBudgetExhausted:
+            return "journal_budget_exhausted"
+        return None
+
+    def _cleanup_operation(self, _lease: OperationLease | None) -> None:
+        return None
+
+    def _checkpoint(self, _deadline: float) -> None:
+        if self._current_lease is not None:
+            self._current_lease.checkpoint()
+            return
+        sample = self.active_budget.safe_monotonic_read()
+        if sample.valid is not True:
+            self.active_budget.latch_clock_invalid()
+            raise JournalDeadlineExceeded("clock_invalid")
+
+    def _checkpoint_callback(self) -> None:
+        if self._current_lease is None:
+            raise JournalBudgetExhausted
+        self._current_lease.checkpoint()
 
     def _converge(
         self,
-        prepare: Callable[[float], tuple[EventDraft, ...]],
+        prepare: Callable[[OperationLease], tuple[EventDraft, ...]],
         *,
         target_status: RunStatus,
         waiting_tool_call_id: str | None,
         failure_code: str | None,
     ) -> None:
-        if self._disposition_attempted:
-            return
-        self._disposition_attempted = True
-        deadline = self.clock() + self.disposition_budget_seconds
-        try:
-            events = prepare(deadline)
-            self._require_budget(deadline)
+        def operation(lease: OperationLease) -> bool:
+            events = prepare(lease)
+            lease.checkpoint()
             self.repository.converge_disposition(
                 self.run_id,
                 DispositionCommand(
@@ -754,82 +857,182 @@ class SafeRunRecorder:
                     waiting_tool_call_id=waiting_tool_call_id,
                     failure_code=failure_code,
                 ),
-                deadline=deadline,
-                clock=self.clock,
+                deadline=lease.work_deadline,
+                safe_clock=lease.safe_clock,
             )
-            self._require_budget(deadline)
-            if self.recording_status == "degraded":
-                self._sync_degraded(deadline)
-        except JournalBudgetExhausted:
-            self._degrade("journal_disposition_budget_exhausted")
-        except JournalDeadlineExceeded:
-            self._degrade("journal_disposition_budget_exhausted")
-        except OperationalError as error:
-            diagnostic = (
-                "journal_disposition_budget_exhausted"
-                if self._operational_error_exhausted_budget(error, deadline)
-                else "journal_disposition_failed"
-            )
-            self._degrade(diagnostic)
-        except JournalEventValidationError:
-            self._degrade("journal_disposition_invalid")
-        except Exception:
-            self._degrade("journal_disposition_failed")
+            if target_status == "waiting_confirmation":
+                with self._state_lock:
+                    self._wait_flag = True
+            return True
 
-    def _degrade(self, diagnostic: str) -> None:
-        first_transition = self.recording_status != "degraded"
-        self.recording_status = "degraded"
-        self._diagnose(diagnostic)
-        if (
-            first_transition
-            and not diagnostic.endswith("budget_exhausted")
-            and self.clock() < self._segment_deadline
-        ):
-            self._sync_degraded(self._segment_deadline)
+        self._run_final(operation, "journal_disposition_failed")
 
-    def _sync_degraded(self, deadline: float | None) -> None:
-        if self._degraded_persisted:
-            return
-        if deadline is not None and self.clock() >= deadline:
-            return
+    def _run_final(
+        self,
+        operation: Callable[[OperationLease], bool],
+        failure_diagnostic: str,
+    ) -> None:
+        with self._state_lock:
+            if self._disposition_state != "not_attempted":
+                return
+            self._disposition_state = "claimed"
+            self._state_condition.notify_all()
+
+        budget = ActiveWorkBudget(self.disposition_budget_seconds, self.clock)
+        entry = budget.safe_monotonic_read()
+        lease: OperationLease | None = None
+        acquired = False
+        succeeded = False
+        primary_base: BaseException | None = None
+        cleanup_base: BaseException | None = None
+
         try:
+            try:
+                lease = budget.begin_operation(entry, self.disposition_budget_seconds)
+                acquired = self._acquire_operation(lease)
+                if not acquired:
+                    self._degrade("journal_disposition_budget_exhausted")
+                else:
+                    lease = OperationLease(
+                        budget=budget,
+                        entry_started_at=lease.entry_started_at,
+                        work_deadline=lease.hard_deadline,
+                        hard_deadline=lease.hard_deadline,
+                    )
+                    lease.checkpoint()
+                    with self._state_lock:
+                        allowed = self._disposition_state == "claimed"
+                    if allowed:
+                        self._current_lease = lease
+                        try:
+                            succeeded = bool(operation(lease))
+                        except Exception as error:
+                            self._record_final_failure(error, failure_diagnostic, lease)
+                        except BaseException as error:
+                            primary_base = error
+            except Exception as error:
+                self._record_final_failure(error, failure_diagnostic, lease)
+            except BaseException as error:
+                primary_base = error
+        finally:
+            try:
+                try:
+                    if acquired:
+                        self._cleanup_operation(lease)
+                except Exception:
+                    self._degrade("journal_cleanup_failed")
+                    succeeded = False
+                except BaseException as error:
+                    cleanup_base = error
+                    succeeded = False
+            finally:
+                self._current_lease = None
+                sample = budget.safe_monotonic_read()
+                if sample.valid is not True:
+                    self._degrade("journal_clock_invalid")
+                elif lease is not None and sample.value >= lease.hard_deadline:
+                    self._degrade("journal_disposition_budget_exhausted")
+                if acquired:
+                    self._operation_lock.release()
+                with self._state_lock:
+                    self._disposition_state = "completed" if succeeded else "failed"
+                    self._state_condition.notify_all()
+
+        if primary_base is not None:
+            raise primary_base.with_traceback(primary_base.__traceback__)
+        if cleanup_base is not None:
+            raise cleanup_base.with_traceback(cleanup_base.__traceback__)
+
+    def _record_final_failure(
+        self,
+        error: Exception,
+        failure_diagnostic: str,
+        lease: OperationLease | None,
+    ) -> None:
+        diagnostic = self._diagnostic_for_final(error, failure_diagnostic, lease)
+        first_transition = self._degrade(diagnostic)
+        if first_transition and lease is not None and diagnostic not in {
+            "journal_disposition_budget_exhausted",
+            "journal_clock_invalid",
+        }:
+            self._sync_degraded(lease)
+
+    def _diagnostic_for_final(
+        self,
+        error: Exception,
+        failure_diagnostic: str,
+        lease: OperationLease | None,
+    ) -> str:
+        if isinstance(error, JournalDeadlineExceeded):
+            return (
+                "journal_clock_invalid"
+                if error.reason == "clock_invalid"
+                else "journal_disposition_budget_exhausted"
+            )
+        if isinstance(error, JournalBudgetExhausted):
+            return "journal_disposition_budget_exhausted"
+        if isinstance(error, JournalEventValidationError):
+            return "journal_disposition_invalid"
+        if isinstance(error, OperationalError):
+            if _is_sqlite_lock_error(error):
+                return "journal_disposition_budget_exhausted"
+            if lease is not None:
+                try:
+                    lease.checkpoint()
+                except JournalDeadlineExceeded as deadline_error:
+                    return (
+                        "journal_clock_invalid"
+                        if deadline_error.reason == "clock_invalid"
+                        else "journal_disposition_budget_exhausted"
+                    )
+                except JournalBudgetExhausted:
+                    return "journal_disposition_budget_exhausted"
+            return failure_diagnostic
+        return failure_diagnostic
+
+    def _sync_degraded(self, lease: OperationLease) -> None:
+        with self._state_lock:
+            if self._degraded_persisted:
+                return
+        try:
+            lease.checkpoint()
             self.repository.mark_degraded(
                 self.run_id,
-                deadline=deadline,
-                clock=self.clock,
+                deadline=lease.work_deadline,
+                safe_clock=lease.safe_clock,
             )
-            self._degraded_persisted = True
-        except JournalDeadlineExceeded:
+            with self._state_lock:
+                self._degraded_persisted = True
+        except JournalDeadlineExceeded as error:
+            if error.reason == "clock_invalid":
+                self._degrade("journal_clock_invalid")
+        except JournalBudgetExhausted:
             return
         except OperationalError as error:
-            if self._operational_error_exhausted_budget(error, deadline):
+            if _is_sqlite_lock_error(error):
                 return
             self._diagnose("journal_mark_degraded_failed")
         except Exception:
             self._diagnose("journal_mark_degraded_failed")
 
+    def _degrade(self, diagnostic: str) -> bool:
+        with self._state_lock:
+            first_transition = self.recording_status != "degraded"
+            self.recording_status = "degraded"
+            self._diagnose(diagnostic)
+            self._state_condition.notify_all()
+            return first_transition
+
     def _diagnose(self, code: str) -> None:
-        if code in self.diagnostics:
-            return
-        self.diagnostics.append(code)
+        with self._state_lock:
+            if code in self.diagnostics:
+                return
+            self.diagnostics.append(code)
         if self._diagnostic_sink is not None:
             try:
                 self._diagnostic_sink(code)
-            except Exception:
+            except BaseException:
                 pass
-
-    def _require_budget(self, deadline: float) -> None:
-        if self.clock() >= deadline:
-            raise JournalBudgetExhausted
-
-    def _operational_error_exhausted_budget(
-        self,
-        error: OperationalError,
-        deadline: float | None,
-    ) -> bool:
-        if deadline is not None and self.clock() >= deadline:
-            return True
-        return _is_sqlite_lock_error(error)
 
 
 class RunRecorderFactory:
@@ -854,46 +1057,89 @@ class RunRecorderFactory:
         self.diagnostics: list[str] = []
 
     def start_run(self, command: StartRunCommand | StartRunBuilder) -> RunRecorder:
-        started_at = self.clock()
         if not self.enabled:
             return NullRunRecorder()
         if self.key is None:
             return self._null("journal_secret_unavailable")
-        deadline = started_at + self.segment_budget_seconds
-        if callable(command):
-            try:
-                command = command(
-                    self.key,
-                    lambda: self._require_factory_budget(deadline),
-                )
-                self._require_factory_budget(deadline)
-            except JournalBudgetExhausted:
-                return self._null("journal_budget_exhausted")
-            except Exception:
-                return self._null("journal_run_create_failed")
-        if command.fingerprint_key_id != self.key.key_id:
-            return self._null("fingerprint_key_domain_changed")
+
+        budget = ActiveWorkBudget(self.segment_budget_seconds, self.clock)
+        entry = budget.safe_monotonic_read()
+        lease: OperationLease | None = None
+        result_command: StartRunCommand | None = None
+        diagnostic: str | None = None
+        primary_base: BaseException | None = None
+        used_before = budget.used_seconds
         try:
-            self.repository.create_run_and_initial_segment(
-                command,
-                deadline=deadline,
-                clock=self.clock,
-            )
-        except JournalDeadlineExceeded:
-            return self._null("journal_budget_exhausted")
-        except OperationalError as error:
-            if self._operational_error_exhausted_budget(error, deadline):
-                return self._null("journal_budget_exhausted")
-            return self._null("journal_run_create_failed")
-        except Exception:
-            return self._null("journal_run_create_failed")
+            try:
+                lease = budget.begin_operation(entry, JOURNAL_OPERATION_HARD_CAP_SECONDS)
+                lease.checkpoint()
+                if callable(command):
+                    command = command(self.key, lease.checkpoint)
+                lease.checkpoint()
+                if command.fingerprint_key_id != self.key.key_id:
+                    diagnostic = "fingerprint_key_domain_changed"
+                else:
+                    self.repository.create_run_and_initial_segment(
+                        command,
+                        deadline=lease.work_deadline,
+                        safe_clock=lease.safe_clock,
+                    )
+                    result_command = command
+            except JournalDeadlineExceeded as error:
+                diagnostic = (
+                    "journal_clock_invalid"
+                    if error.reason == "clock_invalid"
+                    else "journal_budget_exhausted"
+                )
+            except JournalBudgetExhausted:
+                diagnostic = "journal_budget_exhausted"
+            except OperationalError as error:
+                exhausted_diagnostic = _factory_lease_exhaustion(lease)
+                diagnostic = exhausted_diagnostic or (
+                    "journal_budget_exhausted"
+                    if _is_sqlite_lock_error(error)
+                    else "journal_run_create_failed"
+                )
+            except Exception:
+                diagnostic = (
+                    _factory_lease_exhaustion(lease)
+                    or "journal_run_create_failed"
+                )
+            except BaseException as error:
+                primary_base = error
+        finally:
+            try:
+                exhausted = budget.finish_operation(entry)
+            except BaseException:
+                budget.latch_clock_invalid()
+                exhausted = True
+            if budget.clock_invalid_latched:
+                diagnostic = diagnostic or "journal_clock_invalid"
+            elif (
+                diagnostic is None
+                and (
+                    exhausted
+                    or budget.used_seconds - used_before
+                    >= JOURNAL_OPERATION_HARD_CAP_SECONDS
+                )
+            ):
+                diagnostic = "journal_budget_exhausted"
+
+        if primary_base is not None:
+            raise primary_base.with_traceback(primary_base.__traceback__)
+        if result_command is None:
+            return self._null(diagnostic or "journal_run_create_failed")
         recorder = self._safe(
-            command.run_id,
-            command.segment_started.execution_segment_id,
-            started_at,
+            result_command.run_id,
+            result_command.segment_started.execution_segment_id,
+            budget,
         )
-        if self.clock() >= started_at + self.segment_budget_seconds:
-            recorder.mark_degraded("journal_budget_exhausted")
+        if diagnostic in {"journal_budget_exhausted", "journal_clock_invalid"} or budget.used_seconds >= budget.total_seconds:
+            recorder.mark_degraded(
+                "journal_clock_invalid"
+                if budget.clock_invalid_latched or diagnostic == "journal_clock_invalid"
+                else "journal_budget_exhausted"
+            )
         return recorder
 
     def resume_waiting_run(
@@ -902,69 +1148,114 @@ class RunRecorderFactory:
         waiting_tool_call_id: str,
         command: StartSegmentCommand | StartSegmentBuilder,
     ) -> RunRecorder:
-        started_at = self.clock()
         if not self.enabled:
             return NullRunRecorder()
         if self.key is None:
             return self._null("journal_secret_unavailable")
-        deadline = started_at + self.segment_budget_seconds
+
+        budget = ActiveWorkBudget(self.segment_budget_seconds, self.clock)
+        entry = budget.safe_monotonic_read()
+        lease: OperationLease | None = None
+        run: Any = None
+        result_command: StartSegmentCommand | None = None
+        diagnostic: str | None = None
+        primary_base: BaseException | None = None
+        used_before = budget.used_seconds
         try:
-            run = self.repository.find_waiting_run(
-                conversation_id,
-                waiting_tool_call_id,
-                deadline=deadline,
-                clock=self.clock,
-            )
-        except JournalDeadlineExceeded:
-            return self._null("journal_budget_exhausted")
-        except OperationalError as error:
-            if self._operational_error_exhausted_budget(error, deadline):
-                return self._null("journal_budget_exhausted")
-            return self._null("journal_run_lookup_failed")
-        except Exception:
-            return self._null("journal_run_lookup_failed")
-        if run is None:
-            return self._null("journal_run_missing")
-        if run.fingerprint_key_id != self.key.key_id:
-            return self._null("fingerprint_key_domain_changed")
-        if callable(command):
             try:
-                command = command(
-                    run.id,
-                    self.key,
-                    lambda: self._require_factory_budget(deadline),
+                lease = budget.begin_operation(entry, JOURNAL_OPERATION_HARD_CAP_SECONDS)
+                lease.checkpoint()
+                run = self.repository.find_waiting_run(
+                    conversation_id,
+                    waiting_tool_call_id,
+                    deadline=lease.work_deadline,
+                    safe_clock=lease.safe_clock,
                 )
-                self._require_factory_budget(deadline)
+                lease.checkpoint()
+                if run is None:
+                    diagnostic = "journal_run_missing"
+                elif run.fingerprint_key_id != self.key.key_id:
+                    diagnostic = "fingerprint_key_domain_changed"
+                else:
+                    if callable(command):
+                        command = command(run.id, self.key, lease.checkpoint)
+                    lease.checkpoint()
+                    if command.run_id != run.id:
+                        diagnostic = "journal_run_identity_changed"
+                    else:
+                        self.repository.start_segment(
+                            command,
+                            deadline=lease.work_deadline,
+                            safe_clock=lease.safe_clock,
+                        )
+                        result_command = command
+            except JournalDeadlineExceeded as error:
+                diagnostic = (
+                    "journal_clock_invalid"
+                    if error.reason == "clock_invalid"
+                    else "journal_budget_exhausted"
+                )
             except JournalBudgetExhausted:
-                return self._null("journal_budget_exhausted")
+                diagnostic = "journal_budget_exhausted"
+            except OperationalError as error:
+                exhausted_diagnostic = _factory_lease_exhaustion(lease)
+                diagnostic = exhausted_diagnostic or (
+                    "journal_budget_exhausted"
+                    if _is_sqlite_lock_error(error)
+                    else "journal_run_lookup_failed"
+                )
+                if run is not None:
+                    diagnostic = "journal_segment_create_failed"
             except Exception:
-                return self._null("journal_segment_create_failed")
-        if command.run_id != run.id:
-            return self._null("journal_run_identity_changed")
-        try:
-            self.repository.start_segment(
-                command,
-                deadline=deadline,
-                clock=self.clock,
-            )
-        except JournalDeadlineExceeded:
-            return self._null("journal_budget_exhausted")
-        except OperationalError as error:
-            if self._operational_error_exhausted_budget(error, deadline):
-                return self._null("journal_budget_exhausted")
-            return self._null("journal_segment_create_failed")
-        except Exception:
-            return self._null("journal_segment_create_failed")
+                exhausted_diagnostic = _factory_lease_exhaustion(lease)
+                diagnostic = exhausted_diagnostic or (
+                    "journal_segment_create_failed"
+                    if run is not None
+                    else "journal_run_lookup_failed"
+                )
+            except BaseException as error:
+                primary_base = error
+        finally:
+            try:
+                exhausted = budget.finish_operation(entry)
+            except BaseException:
+                budget.latch_clock_invalid()
+                exhausted = True
+            if budget.clock_invalid_latched:
+                diagnostic = diagnostic or "journal_clock_invalid"
+            elif (
+                diagnostic is None
+                and (
+                    exhausted
+                    or budget.used_seconds - used_before
+                    >= JOURNAL_OPERATION_HARD_CAP_SECONDS
+                )
+            ):
+                diagnostic = "journal_budget_exhausted"
+
+        if primary_base is not None:
+            raise primary_base.with_traceback(primary_base.__traceback__)
+        if result_command is None or run is None:
+            return self._null(diagnostic or "journal_segment_create_failed")
         recorder = self._safe(
             run.id,
-            command.segment_started.execution_segment_id,
-            started_at,
+            result_command.segment_started.execution_segment_id,
+            budget,
         )
-        if self.clock() >= started_at + self.segment_budget_seconds:
-            recorder.mark_degraded("journal_budget_exhausted")
+        if diagnostic in {"journal_budget_exhausted", "journal_clock_invalid"} or budget.used_seconds >= budget.total_seconds:
+            recorder.mark_degraded(
+                "journal_clock_invalid"
+                if budget.clock_invalid_latched or diagnostic == "journal_clock_invalid"
+                else "journal_budget_exhausted"
+            )
         return recorder
 
-    def _safe(self, run_id: str, segment_id: str, started_at: float) -> SafeRunRecorder:
+    def _safe(
+        self,
+        run_id: str,
+        segment_id: str,
+        active_budget: ActiveWorkBudget,
+    ) -> SafeRunRecorder:
         assert self.key is not None
         return SafeRunRecorder(
             self.repository,
@@ -974,7 +1265,7 @@ class RunRecorderFactory:
             clock=self.clock,
             segment_budget_seconds=self.segment_budget_seconds,
             disposition_budget_seconds=self.disposition_budget_seconds,
-            segment_started_at=started_at,
+            active_budget=active_budget,
             diagnostic_sink=self._diagnostic_sink,
         )
 
@@ -988,19 +1279,8 @@ class RunRecorderFactory:
         if self._diagnostic_sink is not None:
             try:
                 self._diagnostic_sink(code)
-            except Exception:
+            except BaseException:
                 pass
-
-    def _require_factory_budget(self, deadline: float) -> None:
-        if self.clock() >= deadline:
-            raise JournalBudgetExhausted
-
-    def _operational_error_exhausted_budget(
-        self,
-        error: OperationalError,
-        deadline: float,
-    ) -> bool:
-        return self.clock() >= deadline or _is_sqlite_lock_error(error)
 
 
 class NullRunRecorderFactory:
@@ -1024,6 +1304,18 @@ def _is_sqlite_lock_error(error: OperationalError) -> bool:
     return type(sqlite_error_code) is int and sqlite_error_code & 0xFF in {5, 6}
 
 
+def _factory_lease_exhaustion(lease: OperationLease | None) -> str | None:
+    if lease is None:
+        return None
+    try:
+        lease.checkpoint()
+    except JournalDeadlineExceeded as error:
+        return "journal_clock_invalid" if error.reason == "clock_invalid" else "journal_budget_exhausted"
+    except JournalBudgetExhausted:
+        return "journal_budget_exhausted"
+    return None
+
+
 def _journal_enabled_from_env() -> bool:
     value = os.getenv("OFFERPILOT_AGENT_JOURNAL_ENABLED", "true")
     return value.strip().lower() not in {"0", "false", "no", "off"}
@@ -1033,12 +1325,9 @@ __all__ = [
     "EventInput",
     "NullRunRecorderFactory",
     "NullRunRecorder",
-    "RunRecorder",
     "RunRecorderFactory",
-    "ResumedDisposition",
     "SafeRunRecorder",
-    "StartRunBuilder",
-    "StartSegmentBuilder",
+    "ResumedDisposition",
     "SuspendedDisposition",
     "TerminalDisposition",
 ]

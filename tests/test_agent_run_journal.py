@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import threading
+import time
 from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -521,6 +523,156 @@ def test_segment_budget_includes_preprocessing_and_stops_nonterminal_writes() ->
     assert recorder.diagnostics == ["journal_budget_exhausted"]
 
 
+def test_active_work_budget_ignores_gap_between_recorder_calls() -> None:
+    clock = ManualClock()
+    repository = RecordingJournalRepository()
+    recorder = _recorder(repository, clock=clock)
+
+    recorder.append_event(_route_event())
+    used_after_first = recorder.active_budget.used_seconds
+    clock.advance(2.0)
+    recorder.append_event(_route_event())
+
+    assert recorder.recording_status == "healthy"
+    assert repository.append_calls == 2
+    assert recorder.active_budget.used_seconds == used_after_first
+
+
+def test_five_thirty_ms_operations_share_segment_budget_and_later_work_is_noop() -> None:
+    clock = ManualClock()
+    repository = RecordingJournalRepository()
+    prepares = 0
+
+    def thirty_ms_prepare(value: EventInput, _deadline: float) -> object:
+        nonlocal prepares
+        prepares += 1
+        clock.advance(0.030)
+        return prepare_event(
+            event_type=value.event_type,
+            execution_segment_id=SEGMENT_A,
+            facts=dict(value.facts),
+        )
+
+    recorder = _recorder(repository, clock=clock, event_preparer=thirty_ms_prepare)
+    for _ in range(6):
+        recorder.append_event(_route_event())
+
+    assert recorder.recording_status == "degraded"
+    assert prepares == 5
+    assert repository.append_calls == 4
+    assert recorder.diagnostics == ["journal_budget_exhausted"]
+
+
+def test_native_overshoot_keeps_successful_result_then_latches_degraded() -> None:
+    clock = ManualClock()
+    repository = RecordingJournalRepository()
+
+    def overshooting_capture(_run_id: str, command: object, **_kwargs: object) -> object:
+        clock.advance(0.060)
+        repository.capture_calls += 1
+        return command
+
+    repository.capture_context = overshooting_capture  # type: ignore[method-assign]
+    recorder = _recorder(repository, clock=clock)
+
+    snapshot_id = recorder.capture_context(
+        {"messages": [1]},
+        ContextManifestInput((), (), (), ()),
+        snapshot_kind="model_input",
+        model_step=1,
+        model_call_id=CALL_A,
+    )
+
+    assert snapshot_id is not None
+    assert repository.capture_calls == 1
+    assert recorder.recording_status == "degraded"
+    assert recorder.diagnostics == ["journal_budget_exhausted"]
+
+
+def test_base_exception_work_propagates_after_final_clock_failure_and_unlock() -> None:
+    repository = RecordingJournalRepository()
+    clock_values: list[float | BaseException] = [0.0, 0.0, SystemExit()]
+
+    def clock() -> float:
+        value = clock_values.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    def interrupt_prepare(_value: EventInput, _deadline: float) -> object:
+        raise KeyboardInterrupt
+
+    recorder = _recorder(
+        repository,
+        clock=clock,  # type: ignore[arg-type]
+        event_preparer=interrupt_prepare,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        recorder.append_event(_route_event())
+
+    assert recorder.active_budget.clock_invalid_latched is True
+    assert recorder.active_budget.used_seconds == recorder.active_budget.total_seconds
+    assert "journal_clock_invalid" in recorder.diagnostics
+    assert recorder._operation_lock.acquire(blocking=False)
+    recorder._operation_lock.release()
+
+
+def test_cleanup_exception_releases_lock_charges_and_uses_closed_diagnostic() -> None:
+    clock = ManualClock()
+    repository = RecordingJournalRepository()
+    recorder = _recorder(repository, clock=clock)
+
+    def fail_cleanup(_lease: object) -> None:
+        raise RuntimeError("private-cleanup-canary")
+
+    recorder._cleanup_operation = fail_cleanup  # type: ignore[method-assign]
+    recorder.append_event(_route_event())
+
+    assert recorder.recording_status == "degraded"
+    assert recorder.diagnostics == ["journal_cleanup_failed"]
+    assert "private-cleanup-canary" not in json.dumps(recorder.diagnostics)
+    assert recorder._operation_lock.acquire(blocking=False)
+    recorder._operation_lock.release()
+
+
+def test_concurrent_operations_serialize_and_lock_wait_hits_hard_cap() -> None:
+    repository = RecordingJournalRepository()
+    started = threading.Event()
+    release = threading.Event()
+
+    original_append = repository.append_event
+
+    def blocking_append(run_id: str, draft: object, **kwargs: object) -> object:
+        started.set()
+        release.wait(timeout=1.0)
+        return original_append(run_id, draft, **kwargs)
+
+    repository.append_event = blocking_append  # type: ignore[method-assign]
+    recorder = _recorder(repository, clock=time.monotonic)
+    first = threading.Thread(target=lambda: recorder.append_event(_route_event()))
+    second_done = threading.Event()
+
+    first.start()
+    assert started.wait(timeout=1.0)
+
+    def second_call() -> None:
+        recorder.append_event(_route_event())
+        second_done.set()
+
+    second = threading.Thread(target=second_call)
+    second.start()
+    time.sleep(0.08)
+    release.set()
+    first.join(timeout=1.0)
+    second.join(timeout=1.0)
+
+    assert second_done.is_set()
+    assert repository.append_calls == 1
+    assert recorder.recording_status == "degraded"
+    assert "journal_budget_exhausted" in recorder.diagnostics
+
+
 def test_safe_recorder_does_not_swallow_base_exception() -> None:
     repository = RecordingJournalRepository()
     repository.append_failure = KeyboardInterrupt()
@@ -721,8 +873,11 @@ def test_factory_success_returns_safe_recorder_for_initial_segment() -> None:
     assert isinstance(recorder, SafeRunRecorder)
     assert recorder.run_id == "77777777-7777-4777-8777-777777777777"
     assert recorder.segment_id == SEGMENT_A
-    assert repository.create_kwargs[0]["deadline"] == 0.15
-    assert repository.create_kwargs[0]["clock"] is clock
+    assert repository.create_kwargs[0]["deadline"] == pytest.approx(0.045)
+    assert (
+        repository.create_kwargs[0]["safe_clock"]._reader
+        == recorder.active_budget.safe_monotonic_read
+    )
 
 
 def test_factory_budget_starts_before_deferred_command_preprocessing() -> None:
@@ -796,7 +951,7 @@ def test_final_disposition_preparation_uses_one_independent_fifty_ms_deadline() 
     assert deadlines == [0.05, 0.05]
     assert repository.converge_calls == 1
     assert repository.converge_kwargs[0]["deadline"] == 0.05
-    assert repository.converge_kwargs[0]["clock"] is clock
+    assert hasattr(repository.converge_kwargs[0]["safe_clock"], "sample")
 
 
 def test_resume_disposition_is_atomic_and_keeps_segment_recorder_open() -> None:
@@ -866,7 +1021,7 @@ def test_exhausted_initial_segment_still_converges_and_later_resumes_same_run() 
     )
     resumed.finish(TerminalDisposition(status="completed"))
 
-    assert initial.diagnostics == ["journal_budget_exhausted"]
+    assert initial.diagnostics == []
     assert [getattr(command, "target_status") for command in repository.dispositions] == [
         "waiting_confirmation",
         "running",

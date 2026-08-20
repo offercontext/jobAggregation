@@ -159,6 +159,31 @@ def _journal_trace(tmp_path, run):
     )
 
 
+def _assert_degraded_journal(
+    tmp_path,
+    *,
+    required_event_types=(),
+    required_snapshot_kinds=(),
+):
+    runs, events, snapshots = _wait_for_journal_status(
+        tmp_path,
+        "completed",
+        predicate=_journal_terminal_predicate(
+            required_event_types=required_event_types,
+            required_snapshot_kinds=required_snapshot_kinds,
+        ),
+    )
+    assert len(runs) == 1
+    assert runs[0].recording_status == "degraded"
+    assert runs[0].recording_error_count >= 1
+    trace = _journal_trace(tmp_path, runs[0])
+    assert trace.recording_status == "degraded"
+    assert trace.recording_error_count >= 1
+    assert trace.integrity_status == "known_degraded"
+    assert "recording_degraded" in trace.anomalies
+    return runs, events, snapshots
+
+
 def _ledger_rows(tmp_path):
     factory = session_factory_for_data_dir(tmp_path)
     with factory() as session:
@@ -2688,7 +2713,13 @@ def test_journal_complete_secret_canary_scan(tmp_path):
         assert canary not in external_text
 
 
-def _failure_injected_recorder_factory(data_dir, failure, *, clock=time.monotonic):
+def _failure_injected_recorder_factory(
+    data_dir,
+    failure,
+    *,
+    clock=time.monotonic,
+    injected_method=None,
+):
     repository = AgentRunRepository(journal_session_factory_for_data_dir(data_dir))
     key = load_or_create_journal_key(data_dir)
     assert key is not None
@@ -2712,14 +2743,20 @@ def _failure_injected_recorder_factory(data_dir, failure, *, clock=time.monotoni
 
         return RunRecorderFactory(repository, key=key, clock=invalid_clock)
     if failure == "locked":
+        if injected_method not in {"append_event", "append_event_bound"}:
+            raise AssertionError("locked failure requires an explicit injection method")
         return RunRecorderFactory(
-            LockedAgentRunRepository(repository, "append_event_bound"),
+            LockedAgentRunRepository(repository, injected_method),
             key=key,
             clock=clock,
         )
     if failure == "caller-conflict":
+        if injected_method not in {"append_event", "append_event_bound"}:
+            raise AssertionError(
+                "caller-conflict failure requires an explicit injection method"
+            )
         return RunRecorderFactory(
-            ConflictingAgentRunRepository(repository, "append_event_bound"),
+            ConflictingAgentRunRepository(repository, injected_method),
             key=key,
             clock=clock,
         )
@@ -2878,14 +2915,24 @@ def test_journal_failure_modes_preserve_business_behavior(tmp_path, endpoint, fa
             title_model=ScriptedModel([Assistant(content="title")]),
         )
     )
+    candidate_factory = _failure_injected_recorder_factory(
+        candidate_dir,
+        failure,
+        clock=(
+            _non_advancing_journal_clock
+            if failure in {"locked", "caller-conflict"}
+            else time.monotonic
+        ),
+        injected_method=(
+            "append_event" if failure in {"locked", "caller-conflict"} else None
+        ),
+    )
     candidate = TestClient(
         create_app(
             data_dir=candidate_dir,
             chat_model=candidate_model,
             title_model=ScriptedModel([Assistant(content="title")]),
-            run_recorder_factory=_failure_injected_recorder_factory(
-                candidate_dir, failure
-            ),
+            run_recorder_factory=candidate_factory,
         )
     )
     application_payload = {
@@ -2914,6 +2961,14 @@ def test_journal_failure_modes_preserve_business_behavior(tmp_path, endpoint, fa
     )
     assert candidate_model.provider_calls == control_model.provider_calls == 2
     assert candidate_model.tool_results == control_model.tool_results == 1
+    if failure in {"locked", "caller-conflict"}:
+        repository = candidate_factory.repository
+        assert repository.call_counts["append_event"] >= 1
+        assert set(repository.injected_methods) == {"append_event"}
+        _assert_degraded_journal(
+            candidate_dir,
+            required_event_types=("run.completed",),
+        )
 
 
 @pytest.mark.parametrize(
@@ -3042,6 +3097,13 @@ def test_journal_failure_modes_preserve_hitl_ledger_and_domain_behavior(
         candidate_dir,
         failure,
         clock=journal_clock,
+        injected_method=(
+            "append_event_bound"
+            if approved and failure in {"locked", "caller-conflict"}
+            else "append_event"
+            if not approved and failure in {"locked", "caller-conflict"}
+            else None
+        ),
     )
     candidate = exercise(
         candidate_dir,
@@ -3070,6 +3132,14 @@ def test_journal_failure_modes_preserve_hitl_ledger_and_domain_behavior(
         assert trace.recording_error_count >= 1
         assert trace.integrity_status == "known_degraded"
         assert "recording_degraded" in trace.anomalies
+    if failure in {"locked", "caller-conflict"} and not approved:
+        repository = candidate_factory.repository
+        assert repository.call_counts["append_event"] >= 1
+        assert set(repository.injected_methods) == {"append_event"}
+        _assert_degraded_journal(
+            candidate_dir,
+            required_event_types=("approval.requested", "run.completed"),
+        )
     if failure == "append":
         repository = candidate_factory.repository
         assert repository.call_counts["append_event"] >= 1

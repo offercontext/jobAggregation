@@ -14,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import OperationalError, TimeoutError
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.session import SessionTransaction
 
 from offerpilot.agent_runtime.events import (
     EventDraft,
@@ -1195,61 +1196,190 @@ def test_native_blocking_udf_overshoot_is_classified_after_return_and_restored(
         )
 
 
-@pytest.mark.parametrize("failure", ["rollback", "handler", "pragma", "invalidate"])
-def test_cleanup_failures_invalidate_before_next_borrower(
+def test_commit_and_rollback_cleanup_failure_invalidates_owned_connection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    failure: str,
 ) -> None:
     _create_run(tmp_path)
     repository = _repository(tmp_path)
-    if failure == "rollback":
-        original_rollback = Session.rollback
-        calls = 0
-
-        def fail_once(session: Session) -> None:
-            nonlocal calls
-            calls += 1
-            if calls == 1:
-                raise RuntimeError("rollback cleanup failed")
-            original_rollback(session)
-
-        monkeypatch.setattr(Session, "rollback", fail_once)
-        with pytest.raises(RuntimeError, match="primary"):
-            with repository._journal_transaction(deadline=None, safe_clock=None):
-                raise RuntimeError("primary")
-    else:
-        if failure in {"handler", "pragma"}:
-            monkeypatch.setattr(
-                AgentRunRepository,
-                "_restore_sqlite_guard",
-                staticmethod(
-                    lambda _guard: (True, RuntimeError("restore cleanup failed"))
-                ),
-            )
-        else:
-            monkeypatch.setattr(
-                AgentRunRepository,
-                "_restore_sqlite_guard",
-                staticmethod(
-                    lambda _guard: (True, RuntimeError("restore cleanup failed"))
-                ),
-            )
-            monkeypatch.setattr(
-                Connection,
-                "invalidate",
-                lambda _connection: (_ for _ in ()).throw(
-                    RuntimeError("invalidate cleanup failed")
-                ),
-            )
-        with pytest.raises(RuntimeError, match="cleanup"):
-            with repository._journal_transaction(deadline=None, safe_clock=None):
-                pass
-
     engine = repository.session_factory.kw["bind"]
+    owned_dbapi = None
+
+    def fail_commit(_transaction: SessionTransaction) -> None:
+        raise RuntimeError("commit primary")
+
+    def fail_rollback(_session: Session) -> None:
+        raise RuntimeError("rollback cleanup failed")
+
+    monkeypatch.setattr(SessionTransaction, "commit", fail_commit)
+    monkeypatch.setattr(Session, "rollback", fail_rollback)
+    with pytest.raises(RuntimeError, match="commit primary"):
+        with repository._journal_transaction(deadline=None, safe_clock=None) as session:
+            owned_dbapi = session.connection().connection.driver_connection
+
+    assert owned_dbapi is not None
     with engine.connect() as connection:
+        next_dbapi = connection.connection.driver_connection
+        assert next_dbapi is not owned_dbapi
         assert connection.exec_driver_sql("SELECT 1").scalar_one() == 1
         assert (
             connection.exec_driver_sql("PRAGMA busy_timeout").scalar_one()
             == JOURNAL_DEFAULT_BUSY_TIMEOUT_MS
         )
+
+
+class _RawConnectionProxy:
+    def __init__(
+        self,
+        raw_connection,
+        *,
+        fail_handler_clear: bool = False,
+        fail_pragma_restore: bool = False,
+    ) -> None:
+        self.raw_connection = raw_connection
+        self.fail_handler_clear = fail_handler_clear
+        self.fail_pragma_restore = fail_pragma_restore
+        self.handler_clear_calls = 0
+        self.pragma_restore_calls = 0
+
+    def set_progress_handler(self, handler, steps):
+        if handler is None and steps == 0:
+            self.handler_clear_calls += 1
+            if self.fail_handler_clear:
+                raise RuntimeError("handler clear failed")
+        return self.raw_connection.set_progress_handler(handler, steps)
+
+    def execute(self, statement, *parameters):
+        if "PRAGMA busy_timeout = 50" in str(statement):
+            self.pragma_restore_calls += 1
+            if self.fail_pragma_restore:
+                raise RuntimeError("pragma restore failed")
+        return self.raw_connection.execute(statement, *parameters)
+
+    def __getattr__(self, name):
+        return getattr(self.raw_connection, name)
+
+
+def _patch_raw_connection_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    fail_handler_clear: bool = False,
+    fail_pragma_restore: bool = False,
+) -> list[_RawConnectionProxy]:
+    proxies: list[_RawConnectionProxy] = []
+
+    def wrap(connection):
+        raw_connection = getattr(connection, "driver_connection", connection)
+        proxy = _RawConnectionProxy(
+            raw_connection,
+            fail_handler_clear=fail_handler_clear,
+            fail_pragma_restore=fail_pragma_restore,
+        )
+        proxies.append(proxy)
+        return proxy
+
+    monkeypatch.setattr(AgentRunRepository, "_raw_connection", staticmethod(wrap))
+    return proxies
+
+
+def _assert_next_borrower_is_distinct_and_healthy(
+    repository: AgentRunRepository,
+    owned_dbapi,
+) -> None:
+    assert owned_dbapi is not None
+    engine = repository.session_factory.kw["bind"]
+    with engine.connect() as connection:
+        next_dbapi = connection.connection.driver_connection
+        assert next_dbapi is not owned_dbapi
+        assert connection.exec_driver_sql("SELECT 1").scalar_one() == 1
+        assert (
+            connection.exec_driver_sql("PRAGMA busy_timeout").scalar_one()
+            == JOURNAL_DEFAULT_BUSY_TIMEOUT_MS
+        )
+
+
+def test_rollback_cleanup_failure_invalidates_before_next_borrower(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _create_run(tmp_path)
+    repository = _repository(tmp_path)
+    owned_dbapi = None
+    original_rollback = Session.rollback
+    calls = 0
+
+    def fail_once(session: Session) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("rollback cleanup failed")
+        original_rollback(session)
+
+    monkeypatch.setattr(Session, "rollback", fail_once)
+    with pytest.raises(RuntimeError, match="primary"):
+        with repository._journal_transaction(deadline=None, safe_clock=None) as session:
+            owned_dbapi = session.connection().connection.driver_connection
+            raise RuntimeError("primary")
+
+    _assert_next_borrower_is_distinct_and_healthy(repository, owned_dbapi)
+
+
+def test_handler_clear_failure_invalidates_before_next_borrower(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _create_run(tmp_path)
+    repository = _repository(tmp_path)
+    proxies = _patch_raw_connection_proxy(monkeypatch, fail_handler_clear=True)
+    owned_dbapi = None
+    with pytest.raises(RuntimeError, match="handler clear failed"):
+        with repository._journal_transaction(
+            deadline=1.0,
+            safe_clock=_safe_clock(0.0),
+        ) as session:
+            owned_dbapi = session.connection().connection.driver_connection
+
+    assert proxies and proxies[0].handler_clear_calls >= 1
+    _assert_next_borrower_is_distinct_and_healthy(repository, owned_dbapi)
+
+
+def test_pragma_restore_failure_invalidates_before_next_borrower(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _create_run(tmp_path)
+    repository = _repository(tmp_path)
+    proxies = _patch_raw_connection_proxy(monkeypatch, fail_pragma_restore=True)
+    owned_dbapi = None
+    with pytest.raises(RuntimeError, match="pragma restore failed"):
+        with repository._journal_transaction(deadline=None, safe_clock=None) as session:
+            owned_dbapi = session.connection().connection.driver_connection
+
+    assert proxies and proxies[0].pragma_restore_calls >= 1
+    _assert_next_borrower_is_distinct_and_healthy(repository, owned_dbapi)
+
+
+def test_invalidation_failure_does_not_return_aba_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _create_run(tmp_path)
+    repository = _repository(tmp_path)
+    monkeypatch.setattr(
+        AgentRunRepository,
+        "_restore_sqlite_guard",
+        staticmethod(lambda _guard: (True, RuntimeError("restore cleanup failed"))),
+    )
+    monkeypatch.setattr(
+        Connection,
+        "invalidate",
+        lambda _connection: (_ for _ in ()).throw(
+            RuntimeError("invalidate cleanup failed")
+        ),
+    )
+    owned_dbapi = None
+    with pytest.raises(RuntimeError, match="restore cleanup failed"):
+        with repository._journal_transaction(deadline=None, safe_clock=None) as session:
+            owned_dbapi = session.connection().connection.driver_connection
+
+    _assert_next_borrower_is_distinct_and_healthy(repository, owned_dbapi)

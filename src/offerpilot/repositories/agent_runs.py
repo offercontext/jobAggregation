@@ -851,6 +851,7 @@ class AgentRunRepository:
         guard_restored = False
         guard_cleanup_failed = False
         rollback_failed = False
+        cleanup_failed = False
         primary: BaseException | None = None
         cleanup_error: BaseException | None = None
         try:
@@ -902,13 +903,14 @@ class AgentRunRepository:
                     if cleanup_error is None:
                         cleanup_error = error
 
-            if guard is not None and not guard_restored:
-                try:
-                    cleanup_failed, restore_error = self._restore_sqlite_guard(guard)
-                except BaseException as error:
-                    cleanup_failed, restore_error = True, error
-                if restore_error is not None and cleanup_error is None:
-                    cleanup_error = restore_error
+            if guard is not None:
+                if not guard_restored:
+                    try:
+                        cleanup_failed, restore_error = self._restore_sqlite_guard(guard)
+                    except BaseException as error:
+                        cleanup_failed, restore_error = True, error
+                    if restore_error is not None and cleanup_error is None:
+                        cleanup_error = restore_error
                 if cleanup_failed or guard_cleanup_failed or rollback_failed:
                     try:
                         invalidate_error = self._invalidate_sqlite_guard(guard)

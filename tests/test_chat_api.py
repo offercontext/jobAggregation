@@ -140,8 +140,16 @@ def _ledger_rows(tmp_path):
     return operations, transitions
 
 
+def _non_advancing_journal_clock():
+    return 0.0
+
+
 def _stable_journal_factory(
-    data_dir, *, segment_budget_seconds=5.0, disposition_budget_seconds=1.0
+    data_dir,
+    *,
+    segment_budget_seconds=5.0,
+    disposition_budget_seconds=1.0,
+    clock=time.monotonic,
 ):
     repository = AgentRunRepository(journal_session_factory_for_data_dir(data_dir))
     key = load_or_create_journal_key(data_dir)
@@ -149,9 +157,12 @@ def _stable_journal_factory(
     return RunRecorderFactory(
         repository,
         key=key,
+        clock=clock,
         segment_budget_seconds=segment_budget_seconds,
         disposition_budget_seconds=disposition_budget_seconds,
     )
+
+
 class ScriptedModel:
     def __init__(self, turns):
         self.turns = list(turns)
@@ -532,12 +543,15 @@ def test_journal_active_budget_ignores_slow_final_provider_gap(
     tmp_path, endpoint
 ):
     session_factory_for_data_dir(tmp_path)
-    model = SlowFinalModel(reply="stable slow final")
+    model = SlowFinalModel(reply="stable slow final", delay=3.05)
     client = TestClient(
         create_app(
             data_dir=tmp_path,
             run_recorder_factory=_stable_journal_factory(
-                tmp_path, segment_budget_seconds=2.0, disposition_budget_seconds=0.5
+                tmp_path,
+                segment_budget_seconds=3.0,
+                disposition_budget_seconds=0.5,
+                clock=time.monotonic,
             ),
             chat_model=model,
             title_model=ScriptedModel([Assistant(content="title")]),
@@ -617,7 +631,10 @@ def test_journal_active_budget_ignores_slow_provider_before_read_then_final(
         create_app(
             data_dir=tmp_path,
             run_recorder_factory=_stable_journal_factory(
-                tmp_path, segment_budget_seconds=3.0, disposition_budget_seconds=0.5
+                tmp_path,
+                segment_budget_seconds=3.0,
+                disposition_budget_seconds=0.5,
+                clock=time.monotonic,
             ),
             chat_model=model,
             title_model=ScriptedModel([Assistant(content="title")]),
@@ -1540,8 +1557,17 @@ def _parse_sse_events(raw: str) -> list[dict[str, object]]:
     return events
 
 
-def _create_status_confirmation(tmp_path, model, *, stable_journal=False):
-    journal_factory = _stable_journal_factory(tmp_path) if stable_journal else None
+def _create_status_confirmation(
+    tmp_path, model, *, stable_journal=False, journal_clock=None
+):
+    journal_factory = (
+        _stable_journal_factory(
+            tmp_path,
+            clock=(journal_clock or _non_advancing_journal_clock),
+        )
+        if stable_journal
+        else None
+    )
     app_client = TestClient(create_app(data_dir=tmp_path))
     application = app_client.post(
         "/api/applications",
@@ -1617,7 +1643,9 @@ def test_journal_hitl_pending_approve_executes_once_and_finishes_healthy(
             data_dir=tmp_path,
             chat_model=model,
             title_model=ScriptedModel([Assistant(content="title")]),
-            run_recorder_factory=_stable_journal_factory(tmp_path),
+            run_recorder_factory=_stable_journal_factory(
+                tmp_path, clock=_non_advancing_journal_clock
+            ),
         )
     )
 
@@ -1777,7 +1805,9 @@ def test_journal_hitl_pending_reject_records_ledger_and_no_tool_execution(
             data_dir=tmp_path,
             chat_model=model,
             title_model=ScriptedModel([Assistant(content="title")]),
-            run_recorder_factory=_stable_journal_factory(tmp_path),
+            run_recorder_factory=_stable_journal_factory(
+                tmp_path, clock=_non_advancing_journal_clock
+            ),
         )
     )
     initial = client.post(
@@ -1893,7 +1923,9 @@ def test_journal_hitl_chained_pending_keeps_ledger_and_run_causal(
             data_dir=tmp_path,
             chat_model=model,
             title_model=ScriptedModel([Assistant(content="title")]),
-            run_recorder_factory=_stable_journal_factory(tmp_path),
+            run_recorder_factory=_stable_journal_factory(
+                tmp_path, clock=_non_advancing_journal_clock
+            ),
         )
     )
     first = client.post(
@@ -2412,20 +2444,21 @@ def test_journal_complete_secret_canary_scan(tmp_path):
         assert canary not in external_text
 
 
-def _failure_injected_recorder_factory(data_dir, failure):
+def _failure_injected_recorder_factory(data_dir, failure, *, clock=time.monotonic):
     repository = AgentRunRepository(journal_session_factory_for_data_dir(data_dir))
     key = load_or_create_journal_key(data_dir)
     assert key is not None
     if failure == "null":
         return NullRunRecorderFactory("journal_disabled")
     if failure == "disabled":
-        return RunRecorderFactory(repository, key=key, enabled=False)
+        return RunRecorderFactory(repository, key=key, enabled=False, clock=clock)
     if failure == "key-unavailable":
-        return RunRecorderFactory(repository, key=None)
+        return RunRecorderFactory(repository, key=None, clock=clock)
     if failure == "active-budget":
         return RunRecorderFactory(
             repository,
             key=key,
+            clock=clock,
             segment_budget_seconds=0.006,
             disposition_budget_seconds=0.006,
         )
@@ -2438,11 +2471,13 @@ def _failure_injected_recorder_factory(data_dir, failure):
         return RunRecorderFactory(
             LockedAgentRunRepository(repository, "append_event"),
             key=key,
+            clock=clock,
         )
     if failure == "caller-conflict":
         return RunRecorderFactory(
             ConflictingAgentRunRepository(repository, "append_event"),
             key=key,
+            clock=clock,
         )
     method = {
         "create": "create_run_and_initial_segment",
@@ -2453,6 +2488,7 @@ def _failure_injected_recorder_factory(data_dir, failure):
     return RunRecorderFactory(
         FailingAgentRunRepository(repository, method),
         key=key,
+        clock=clock,
     )
 
 
@@ -2749,10 +2785,22 @@ def test_journal_failure_modes_preserve_hitl_ledger_and_domain_behavior(
 
     control_dir = tmp_path / "control"
     candidate_dir = tmp_path / "candidate"
-    control = exercise(control_dir)
+    journal_clock = (
+        time.monotonic
+        if failure in {"active-budget", "invalid-clock"}
+        else _non_advancing_journal_clock
+    )
+    control = exercise(
+        control_dir,
+        _stable_journal_factory(control_dir, clock=journal_clock),
+    )
     candidate = exercise(
         candidate_dir,
-        _failure_injected_recorder_factory(candidate_dir, failure),
+        _failure_injected_recorder_factory(
+            candidate_dir,
+            failure,
+            clock=journal_clock,
+        ),
     )
     assert candidate == control
 
@@ -3815,7 +3863,9 @@ def test_chat_confirm_stream_recovers_committed_write_when_followup_model_fails(
         create_app(
             data_dir=tmp_path,
             chat_model=FailAfterWriteModel(tool_call),
-            run_recorder_factory=_stable_journal_factory(tmp_path),
+            run_recorder_factory=_stable_journal_factory(
+                tmp_path, clock=_non_advancing_journal_clock
+            ),
         )
     )
     pending = client.post("/api/chat", json={"message": "改成 offer", "conversation_id": 0}).json()
@@ -3864,7 +3914,9 @@ def test_chat_confirm_recovers_committed_write_when_followup_model_fails(tmp_pat
         create_app(
             data_dir=tmp_path,
             chat_model=FailAfterWriteModel(tool_call),
-            run_recorder_factory=_stable_journal_factory(tmp_path),
+            run_recorder_factory=_stable_journal_factory(
+                tmp_path, clock=_non_advancing_journal_clock
+            ),
         ),
         raise_server_exceptions=False,
     )
@@ -4156,7 +4208,9 @@ def test_chat_confirmed_status_update_can_be_undone(tmp_path):
         create_app(
             data_dir=tmp_path,
             chat_model=model,
-            run_recorder_factory=_stable_journal_factory(tmp_path),
+            run_recorder_factory=_stable_journal_factory(
+                tmp_path, clock=_non_advancing_journal_clock
+            ),
         )
     )
     pending = client.post("/api/chat", json={"message": "改成 offer", "conversation_id": 0}).json()

@@ -12,7 +12,8 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy.exc import OperationalError
 
-from offerpilot.agent_runtime.budget import JournalBudgetExhausted
+import offerpilot.agent_runtime.journal as journal_module
+from offerpilot.agent_runtime.budget import JournalBudgetExhausted, JournalDeadlineExceeded
 from offerpilot.agent_runtime.events import (
     ContextManifestInput,
     JournalEventValidationError,
@@ -423,14 +424,18 @@ class RecordingJournalRepository:
         self.append_calls = 0
         self.capture_calls = 0
         self.create_calls = 0
+        self.start_segment_calls = 0
         self.converge_calls = 0
         self.dispositions: list[object] = []
         self.converge_kwargs: list[dict[str, object]] = []
         self.create_kwargs: list[dict[str, object]] = []
+        self.start_segment_kwargs: list[dict[str, object]] = []
         self.mark_degraded_calls = 0
+        self.mark_degraded_kwargs: list[dict[str, object]] = []
         self.append_failure: BaseException | None = None
         self.mark_degraded_failure: Exception | None = None
         self.create_failure: Exception | None = None
+        self.start_segment_failure: BaseException | None = None
         self.waiting_run: object | None = None
 
     def append_event(self, _run_id: str, draft: object, **_kwargs: object) -> object:
@@ -455,6 +460,7 @@ class RecordingJournalRepository:
 
     def mark_degraded(self, run_id: str, **_kwargs: object) -> object:
         self.mark_degraded_calls += 1
+        self.mark_degraded_kwargs.append(dict(_kwargs))
         if self.mark_degraded_failure is not None:
             raise self.mark_degraded_failure
         return SimpleNamespace(id=run_id, recording_status="degraded")
@@ -477,6 +483,10 @@ class RecordingJournalRepository:
         return self.waiting_run
 
     def start_segment(self, command: object, **_kwargs: object) -> object:
+        self.start_segment_calls += 1
+        self.start_segment_kwargs.append(dict(_kwargs))
+        if self.start_segment_failure is not None:
+            raise self.start_segment_failure
         return getattr(command, "segment_started")
 
 
@@ -582,11 +592,34 @@ def test_native_overshoot_keeps_successful_result_then_latches_degraded() -> Non
         model_step=1,
         model_call_id=CALL_A,
     )
-
     assert snapshot_id is not None
     assert repository.capture_calls == 1
     assert recorder.recording_status == "degraded"
     assert recorder.diagnostics == ["journal_budget_exhausted"]
+
+
+def _segment_started(segment_id: str = SEGMENT_B) -> object:
+    return prepare_event(
+        event_type="segment.started",
+        execution_segment_id=segment_id,
+        facts={
+            "request_kind": "confirmation",
+            "transport_mode": "sync",
+            "execution_path": "agent_resume",
+            "transport_run_id": None,
+        },
+    )
+
+
+def test_public_journal_protocol_and_builder_types_are_exported() -> None:
+    assert {
+        "RunRecorder",
+        "StartRunBuilder",
+        "StartSegmentBuilder",
+    }.issubset(journal_module.__all__)
+    assert journal_module.RunRecorder is not None
+    assert journal_module.StartRunBuilder is not None
+    assert journal_module.StartSegmentBuilder is not None
 
 
 def test_base_exception_work_propagates_after_final_clock_failure_and_unlock() -> None:
@@ -671,6 +704,71 @@ def test_concurrent_operations_serialize_and_lock_wait_hits_hard_cap() -> None:
     assert repository.append_calls == 1
     assert recorder.recording_status == "degraded"
     assert "journal_budget_exhausted" in recorder.diagnostics
+
+
+def test_serialized_operations_charge_only_their_own_post_lock_work() -> None:
+    clock = ManualClock()
+    repository = RecordingJournalRepository()
+    recorder = _recorder(repository, clock=clock)
+    first_prepare = threading.Event()
+    release_first = threading.Event()
+    second_waiting = threading.Event()
+    prepare_count = 0
+    prepare_count_lock = threading.Lock()
+    errors: list[BaseException] = []
+
+    def prepare(value: EventInput, _deadline: float) -> object:
+        nonlocal prepare_count
+        with prepare_count_lock:
+            prepare_count += 1
+            number = prepare_count
+        clock.advance(0.030)
+        if number == 1:
+            first_prepare.set()
+            if not release_first.wait(timeout=1.0):
+                raise AssertionError("first operation was not released")
+        return prepare_event(
+            event_type=value.event_type,
+            execution_segment_id=SEGMENT_A,
+            facts=dict(value.facts),
+        )
+
+    recorder._event_preparer = prepare  # type: ignore[assignment]
+    original_acquire = recorder._acquire_operation
+    acquire_count = 0
+    acquire_count_lock = threading.Lock()
+
+    def tracked_acquire(lease: object) -> bool:
+        nonlocal acquire_count
+        with acquire_count_lock:
+            acquire_count += 1
+            number = acquire_count
+        if number == 2:
+            second_waiting.set()
+        return original_acquire(lease)  # type: ignore[arg-type]
+
+    recorder._acquire_operation = tracked_acquire  # type: ignore[method-assign]
+
+    def call_recorder() -> None:
+        try:
+            recorder.append_event(_route_event())
+        except BaseException as error:
+            errors.append(error)
+
+    first = threading.Thread(target=call_recorder)
+    second = threading.Thread(target=call_recorder)
+    first.start()
+    assert first_prepare.wait(timeout=1.0)
+    second.start()
+    assert second_waiting.wait(timeout=1.0)
+    release_first.set()
+    first.join(timeout=1.0)
+    second.join(timeout=1.0)
+
+    assert errors == []
+    assert repository.append_calls == 2
+    assert recorder.recording_status == "healthy"
+    assert recorder.diagnostics == []
 
 
 def test_safe_recorder_does_not_swallow_base_exception() -> None:
@@ -792,6 +890,48 @@ def test_degraded_recorder_attempts_final_convergence_only_once(
         assert event_types == ["run.failed", "segment.finished"]
 
 
+@pytest.mark.parametrize("disposition_kind", ["suspended", "terminal"])
+def test_successful_final_disposition_persists_prior_active_degradation(
+    disposition_kind: str,
+) -> None:
+    clock = ManualClock()
+    repository = RecordingJournalRepository()
+    recorder = _recorder(repository, clock=clock)
+    default_prepare = recorder._prepare_event
+    prepare_count = 0
+
+    def degrade_first_prepare(value: EventInput, deadline: float) -> object:
+        nonlocal prepare_count
+        prepare_count += 1
+        if prepare_count == 1:
+            clock.advance(0.151)
+        return default_prepare(value, deadline)
+
+    recorder._event_preparer = degrade_first_prepare  # type: ignore[assignment]
+    recorder.append_event(_route_event())
+    assert recorder.recording_status == "degraded"
+    assert repository.mark_degraded_calls == 0
+
+    if disposition_kind == "suspended":
+        recorder.suspend(
+            SuspendedDisposition(
+                tool_call_id="call-1",
+                tool_name="create_application",
+                tool_kind="write",
+                args_shape_digest="sha256:" + "a" * 64,
+                pending_identity_fingerprint="b" * 64,
+            )
+        )
+    else:
+        recorder.finish(TerminalDisposition(status="completed"))
+
+    assert repository.converge_calls == 1
+    assert repository.mark_degraded_calls == 1
+    assert recorder.recording_status == "degraded"
+    assert repository.mark_degraded_kwargs[0]["deadline"] == pytest.approx(0.201)
+    assert hasattr(repository.mark_degraded_kwargs[0]["safe_clock"], "sample")
+
+
 def test_factory_returns_null_recorder_when_key_is_unavailable() -> None:
     repository = RecordingJournalRepository()
     factory = RunRecorderFactory(repository, key=None)  # type: ignore[arg-type]
@@ -841,6 +981,119 @@ def test_factory_run_creation_failure_is_fail_open_and_safely_classified() -> No
     assert isinstance(recorder, NullRunRecorder)
     assert recorder.diagnostics == ["journal_run_create_failed"]
     assert "canary" not in json.dumps(recorder.diagnostics)
+
+
+def test_factory_final_clock_invalid_authoritatively_replaces_generic_failure() -> None:
+    repository = RecordingJournalRepository()
+    repository.create_failure = RuntimeError("private-create-canary")
+    clock_values: list[float | BaseException] = [0.0, 0.0, 0.0, SystemExit()]
+
+    def clock() -> float:
+        value = clock_values.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    factory = RunRecorderFactory(  # type: ignore[arg-type]
+        repository,
+        key=KEY,
+        clock=clock,  # type: ignore[arg-type]
+    )
+    recorder = factory.start_run(
+        SimpleNamespace(
+            run_id="77777777-7777-4777-8777-777777777777",
+            fingerprint_key_id=KEY.key_id,
+            segment_started=_segment_started(SEGMENT_A),
+        )  # type: ignore[arg-type]
+    )
+
+    assert isinstance(recorder, NullRunRecorder)
+    assert recorder.diagnostics == ["journal_clock_invalid"]
+
+
+@pytest.mark.parametrize(
+    ("failure", "clock", "expected"),
+    [
+        (
+            OperationalError(
+                "private statement",
+                {"private": "params"},
+                type("LockedError", (Exception,), {"sqlite_errorcode": 5})(
+                    "private lock"
+                ),
+            ),
+            ManualClock(),
+            "journal_budget_exhausted",
+        ),
+        (JournalDeadlineExceeded("deadline"), ManualClock(), "journal_budget_exhausted"),
+        (JournalDeadlineExceeded("clock_invalid"), ManualClock(), "journal_clock_invalid"),
+    ],
+)
+def test_resume_start_segment_keeps_budget_and_clock_classifications(
+    failure: BaseException,
+    clock: ManualClock,
+    expected: str,
+) -> None:
+    repository = RecordingJournalRepository()
+    repository.waiting_run = SimpleNamespace(
+        id="77777777-7777-4777-8777-777777777777",
+        fingerprint_key_id=KEY.key_id,
+    )
+    repository.start_segment_failure = failure
+    factory = RunRecorderFactory(  # type: ignore[arg-type]
+        repository,
+        key=KEY,
+        clock=clock,
+    )
+
+    recorder = factory.resume_waiting_run(
+        1,
+        "call-1",
+        SimpleNamespace(
+            run_id="77777777-7777-4777-8777-777777777777",
+            segment_started=_segment_started(),
+        ),  # type: ignore[arg-type]
+    )
+
+    assert isinstance(recorder, NullRunRecorder)
+    assert recorder.diagnostics == [expected]
+
+
+def test_resume_start_segment_operational_error_final_clock_invalid_is_authoritative() -> None:
+    repository = RecordingJournalRepository()
+    repository.waiting_run = SimpleNamespace(
+        id="77777777-7777-4777-8777-777777777777",
+        fingerprint_key_id=KEY.key_id,
+    )
+    repository.start_segment_failure = OperationalError(
+        "private statement",
+        {"private": "params"},
+        RuntimeError("private lock"),
+    )
+    clock_values: list[float | BaseException] = [0.0, 0.0, 0.0, SystemExit()]
+
+    def clock() -> float:
+        value = clock_values.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    factory = RunRecorderFactory(  # type: ignore[arg-type]
+        repository,
+        key=KEY,
+        clock=clock,  # type: ignore[arg-type]
+    )
+    recorder = factory.resume_waiting_run(
+        1,
+        "call-1",
+        SimpleNamespace(
+            run_id="77777777-7777-4777-8777-777777777777",
+            segment_started=_segment_started(),
+        ),  # type: ignore[arg-type]
+    )
+
+    assert isinstance(recorder, NullRunRecorder)
+    assert recorder.diagnostics == ["journal_clock_invalid"]
 
 
 def test_factory_success_returns_safe_recorder_for_initial_segment() -> None:

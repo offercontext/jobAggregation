@@ -659,7 +659,7 @@ class SafeRunRecorder:
         primary_base: BaseException | None = None
         cleanup_base: BaseException | None = None
         work_started = False
-        used_before = self.active_budget.used_seconds
+        used_before: float | None = None
         clock_invalid_before = self.active_budget.clock_invalid_latched
 
         try:
@@ -685,6 +685,8 @@ class SafeRunRecorder:
                             and (state_check is None or state_check())
                         )
                     if allowed:
+                        used_before = self.active_budget.used_seconds
+                        clock_invalid_before = self.active_budget.clock_invalid_latched
                         work_started = True
                         self._current_lease = lease
                         try:
@@ -729,8 +731,11 @@ class SafeRunRecorder:
                     self.recording_status != "degraded"
                     and (
                         exhausted
-                        or self.active_budget.used_seconds - used_before
-                        >= JOURNAL_OPERATION_HARD_CAP_SECONDS
+                        or (
+                            used_before is not None
+                            and self.active_budget.used_seconds - used_before
+                            >= JOURNAL_OPERATION_HARD_CAP_SECONDS
+                        )
                     )
                 ):
                     self._degrade("journal_budget_exhausted")
@@ -860,6 +865,8 @@ class SafeRunRecorder:
                 deadline=lease.work_deadline,
                 safe_clock=lease.safe_clock,
             )
+            if self.recording_status == "degraded":
+                self._sync_degraded(lease)
             if target_status == "waiting_confirmation":
                 with self._state_lock:
                     self._wait_flag = True
@@ -1114,7 +1121,7 @@ class RunRecorderFactory:
                 budget.latch_clock_invalid()
                 exhausted = True
             if budget.clock_invalid_latched:
-                diagnostic = diagnostic or "journal_clock_invalid"
+                diagnostic = "journal_clock_invalid"
             elif (
                 diagnostic is None
                 and (
@@ -1202,10 +1209,12 @@ class RunRecorderFactory:
                 diagnostic = exhausted_diagnostic or (
                     "journal_budget_exhausted"
                     if _is_sqlite_lock_error(error)
-                    else "journal_run_lookup_failed"
+                    else (
+                        "journal_segment_create_failed"
+                        if run is not None
+                        else "journal_run_lookup_failed"
+                    )
                 )
-                if run is not None:
-                    diagnostic = "journal_segment_create_failed"
             except Exception:
                 exhausted_diagnostic = _factory_lease_exhaustion(lease)
                 diagnostic = exhausted_diagnostic or (
@@ -1222,7 +1231,7 @@ class RunRecorderFactory:
                 budget.latch_clock_invalid()
                 exhausted = True
             if budget.clock_invalid_latched:
-                diagnostic = diagnostic or "journal_clock_invalid"
+                diagnostic = "journal_clock_invalid"
             elif (
                 diagnostic is None
                 and (
@@ -1325,9 +1334,12 @@ __all__ = [
     "EventInput",
     "NullRunRecorderFactory",
     "NullRunRecorder",
+    "RunRecorder",
     "RunRecorderFactory",
     "SafeRunRecorder",
     "ResumedDisposition",
+    "StartRunBuilder",
+    "StartSegmentBuilder",
     "SuspendedDisposition",
     "TerminalDisposition",
 ]

@@ -50,7 +50,7 @@ segment_started_at
 - API、SSE、前端、Provider、Tool Schema 或 Tool Outcome 变化；
 - Agent Loop、Runtime Orchestration 或 Context Projector 重构；
 - Journal 后台队列、异步批量写入或跨进程 Recorder；
-- Journal 与业务事务的原子提交；
+- 扩大或新建 Journal 与业务事务的原子提交范围；既有 `tool.started` caller-owned Session 窄例外必须保留同 commit、同 rollback；
 - 业务 exactly-once、SSE replay 或 Event Sourcing；
 - 改变 `healthy / degraded`、Trace anomaly 或 fail-open 语义；
 - 调整 Journal 独立 SQLite Pool 的大小或启用 WAL。
@@ -142,8 +142,11 @@ class ActiveWorkBudget:
     used_seconds: float
     clock: Callable[[], float]
 
-    def begin_operation(self, hard_cap_seconds: float) -> OperationLease: ...
-    def charge(self, elapsed_seconds: float) -> bool: ...
+    def safe_monotonic_read(self) -> MonotonicSample: ...
+    def begin_operation(
+        self, entry: MonotonicSample, hard_cap_seconds: float
+    ) -> OperationLease: ...
+    def finish_operation(self, entry: MonotonicSample) -> bool: ...
     def remaining(self) -> float: ...
 
 
@@ -155,6 +158,11 @@ class OperationLease:
 
     def checkpoint(self) -> None: ...
     def remaining_seconds(self) -> float: ...
+
+
+class MonotonicSample:
+    value: float
+    valid: bool
 ```
 
 它们：
@@ -165,7 +173,17 @@ class OperationLease:
 - 使用 `repr=False` 隐藏内部 clock / lock；
 - 禁止通用序列化。
 
-`ActiveWorkBudget.charge()` 和纯内存 latch transition 必须是 total / no-throw 操作：不执行 I/O，不调用用户 callback。若 clock 读取、浮点值或内部状态非法，保守地把 `used_seconds` 饱和到 total、返回 exhausted 并使用 `journal_clock_invalid`；不能让计费异常跳过解锁或泄漏到业务路径。
+所有时间读取只能通过 `ActiveWorkBudget.safe_monotonic_read()`，禁止 Recorder、OperationLease、Repository deadline adapter 或 finally 直接调用原始注入 clock callable。该方法是 total / no-throw：
+
+- 捕获 clock 抛出的普通 `Exception` 和 `BaseException`；
+- 拒绝 bool、NaN、Infinity、负值和相对上一有效 sample 倒退的值；
+- 成功时更新内部 `last_valid_monotonic`；
+- 失败时返回 `valid=False`、把预算保守饱和到 total，并请求封闭诊断 `journal_clock_invalid`；
+- 不保存或传播 clock 异常对象，不让 clock 的 `BaseException` 覆盖 Journal 工作路径原本需要传播的 `BaseException`。
+
+入口 sample 无效时，不获取 Operation lock、不执行 prepare / Repository，安全降级并返回。最终 sample 无效时，`finish_operation(entry)` 不做浮点运算，直接把累计预算饱和到 total；之后仍然执行 latch、解锁和原始异常优先级逻辑。
+
+`finish_operation()` 和纯内存 latch transition 同样必须是 total / no-throw：不执行 I/O，不调用用户 callback。任何 clock、浮点值或内部状态异常都不能跳过解锁或泄漏到业务路径。此处捕获 clock `BaseException` 是内部计时器的特殊安全边界，不改变 Repository、canonicalization、cleanup 等其他 `BaseException` 清理后原样传播的规则。
 
 Factory 为新 Segment 创建一个 `ActiveWorkBudget`。`start_run()` 或 `resume_waiting_run()` 自身消耗的 active time 先从该对象扣除；成功后同一个对象传给 `SafeRunRecorder`，不能在 Run / Segment 建立后重置为 150 ms。
 
@@ -184,15 +202,22 @@ Factory 为新 Segment 创建一个 `ActiveWorkBudget`。`start_run()` 或 `resu
 7. 如果扣费使累计预算耗尽，内存 degraded latch 必须在方法返回或异常传播前设置。
 8. lock timeout、预算耗尽或晚到的非终态调用不得制造部分 Event 序列。
 9. 最终 disposition 在等待 Operation lock 前，必须先通过状态锁把 `not_attempted` 原子切换为 `claimed`；认领成功立即消耗唯一权利，即使随后等待超时也不允许第二个 finalizer 重试。
+10. 每个普通非终态调用在等待 Operation lock 前可以做一次快速状态检查，但取得 Operation lock 后必须再次在状态锁内验证 `recording_status == healthy` 且 `_disposition_state == not_attempted`。这是权威检查；失败时 prepare、HMAC、Repository 和 replay 均为 0 次，只在 `finally` 计入已经发生的 lock wait。
+11. post-lock 状态复核与随后开始 prepare 之间保持 Operation lock，因此 finalizer 不能在中间插入持久化工作；finalizer仍可先认领 disposition，但只能等待当前已经通过权威复核的持锁操作完成。
+
+必须覆盖三线程顺序：A 持有 Operation lock，B 通过初始检查后等待，C 认领 final disposition，A 释放后 B 即使先于 C 取得 Operation lock，也必须在 post-lock 复核处 no-op，随后 C 才执行 convergence。
 
 计费状态使用单独的短临界区保护，不能在持有计费锁时执行 SQLite 或 canonicalization。
 
 ### 4.3 finally 扣费与异常优先级
 
-所有 active Operation 使用嵌套 `try/finally` 的等价结构。下面的 `capture_primary()` / `capture_cleanup_base()` 只表示控制流，不得保存异常到 Recorder、diagnostics 或持久层：
+所有 active Operation 使用嵌套 `try/finally` 的等价结构。下面的 `primary_base` / `cleanup_base` 只表示当前调用栈内的控制流，不得保存异常到 Recorder、diagnostics 或持久层：
 
 ```python
-entry = clock()
+entry = budget.safe_monotonic_read()
+if not entry.valid:
+    latch_clock_invalid_without_raising()
+    return SAFE_NOOP
 acquired = False
 primary_base = None
 cleanup_base = None
@@ -200,7 +225,7 @@ result = MISSING
 try:
     try:
         acquired = acquire_with_hard_cap(...)
-        lease = budget.begin_operation(...)
+        lease = budget.begin_operation(entry, ...)
         lease.checkpoint()
         result = journal_work(lease)
     except Exception as exc:
@@ -218,7 +243,7 @@ finally:
             cleanup_base = exc
     finally:
         try:
-            exhausted = budget.charge(max(0.0, clock() - entry))
+            exhausted = budget.finish_operation(entry)
             if exhausted:
                 latch_degraded_without_raising()
         finally:
@@ -234,14 +259,16 @@ return result
 
 失败、普通异常、`CancelledError`、`KeyboardInterrupt`、`SystemExit` 和其他 `BaseException` 都必须执行同一扣费并释放锁。普通 Journal 或 cleanup `Exception` 继续映射为安全诊断并 fail-open。存在原始 `BaseException` 时必须优先传播原始对象；只有没有原始 `BaseException` 时才传播 cleanup 自己抛出的 `BaseException`。任何 cleanup 失败都不能跳过扣费、latch 或 lock release。
 
-monotonic clock 若倒退，单次 elapsed 按 0 计并记录封闭诊断 `journal_clock_invalid`，随后进入 degraded；不得增加剩余预算。
+monotonic clock 非法或倒退时不以 0 假装一次免费调用，而是把累计预算饱和到 total、记录封闭诊断 `journal_clock_invalid` 并进入 degraded；不得增加剩余预算。
 
 ## 5. CPU、canonical JSON 与 HMAC 预算
 
 调用前后检查不足以限制 Python 侧工作。普通 Journal 工作调用 Operation lease 的 `checkpoint()`，验证：
 
 ```text
-clock() < operation_work_deadline
+sample = budget.safe_monotonic_read()
+sample.valid
+sample.value < operation_work_deadline
 budget.used_seconds + current_operation_elapsed < total_active_budget
 ```
 
@@ -292,7 +319,10 @@ Python 无法安全异步中断任意单条原生调用，因此 50 ms hard cap 
 checkout 后、任何 SQL 前执行：
 
 ```text
-remaining_ms = floor((operation_work_deadline - monotonic()) * 1000)
+sample = safe_clock_adapter.sample()
+if not sample.valid:
+    raise JournalDeadlineExceeded
+remaining_ms = floor((operation_work_deadline - sample.value) * 1000)
 busy_timeout_ms = min(50, max(0, remaining_ms))
 PRAGMA busy_timeout = busy_timeout_ms
 ```
@@ -316,10 +346,12 @@ Pool checkout 失败计入本次 Operation，并按现有 fail-open 分类降级
 
 ```text
 every 100 VM steps:
-    return non-zero when monotonic() >= operation_work_deadline
+    sample = safe_clock_adapter.sample()
+    return non-zero when not sample.valid
+    return non-zero when sample.value >= operation_work_deadline
 ```
 
-被中断且 deadline 已耗尽时统一映射为 `journal_budget_exhausted`。Progress handler 只能在 SQLite VM 指令边界运行，不能中断正在执行的阻塞 UDF 或任意 native call；此类调用返回后依靠 `finally` 全额计费并进入 degraded。其他 SQLite operational failure 保持现有安全分类，不保存 SQL、参数或异常正文。
+`safe_clock_adapter` 是 `ActiveWorkBudget.safe_monotonic_read()` 的 Repository-facing 封闭适配器；Repository、progress handler 与连接恢复逻辑都不得直接调用原始注入 clock。被中断且 deadline 已耗尽或 clock sample 非法时统一映射为 `journal_budget_exhausted`。Progress handler 只能在 SQLite VM 指令边界运行，不能中断正在执行的阻塞 UDF 或任意 native call；此类调用返回后依靠 `finally` 全额计费并进入 degraded。其他 SQLite operational failure 保持现有安全分类，不保存 SQL、参数或异常正文。
 
 ### 6.3 连接恢复
 
@@ -416,17 +448,37 @@ healthy + remaining budget
 
 ```text
 _resume_state = not_attempted | claimed | completed | failed
+_disposition_waits_for_resume = false | true
 ```
 
 规则：
 
-1. `resume()` 先在短状态锁内确认 `_disposition_state == not_attempted`，再把 `_resume_state` 从 `not_attempted` 原子认领为 `claimed`；重复调用或 final disposition 已认领时 no-op。
-2. 它使用该新 Segment 的普通 ActiveWorkBudget 和单次 50 ms Operation hard cap。
-3. 它不读取、不设置 `_disposition_state`，不消耗独立 50 ms final convergence。
-4. 成功后状态为 `completed`；预算、锁、validation 或 Repository 失败后为 `failed` 并按现有规则 degraded。
-5. 无论 resume Journal 是否成功，业务确认恢复继续 fail-open；该 Recorder 后续仍可且只能执行一次 `finish()`、`suspend()` 或 `abandon()`。
-6. `resume → finish` 和 `resume → chained Pending → suspend` 必须各产生正确的新 Segment 事件顺序。
-7. `_resume_state` 的 `claimed → completed | failed` 更新位于 resume 最外层 `finally`；即使 cleanup 或工作路径抛出 `BaseException`，也必须先更新状态、扣费并解锁，再原样传播。
+1. `_resume_state` 与 `_disposition_state` 使用同一个状态锁和 Condition，claim 的状态锁线性化顺序决定先后，不依赖 Operation lock 公平性。
+2. `resume()` claim 先发生时：确认 `_disposition_state == not_attempted`，把 `_resume_state` 从 `not_attempted` 改为 `claimed`。随后到达的 finalizer仍可认领 `_disposition_state`，但必须同时设置 `_disposition_waits_for_resume=True`。
+3. finalizer claim 先发生时：`resume()` 看到 `_disposition_state != not_attempted` 后不得认领，直接 no-op；因此 final Event 后不可能出现 `run.resumed`。
+4. resume 取得 Operation lock 后执行专用 post-lock 复核，唯一允许继续的条件是：
+
+   ```text
+   _resume_state == claimed
+   and (
+       _disposition_state == not_attempted
+       or (
+           _disposition_state == claimed
+           and _disposition_waits_for_resume == true
+       )
+   )
+   ```
+
+   finalizer 已承诺等待时，resume 即使后取得 Operation lock也具有 ingress 优先权；`completed | failed` 的 disposition 永远不能被 wait flag 绕过。
+5. 等待 resume 的 finalizer 不持有 Operation lock；它通过 Condition 等待 `_resume_state` 进入 `completed | failed`，等待时间计入自己的独立 50 ms。Condition 的剩余 timeout 也只能由 `safe_monotonic_read()` 的有效 sample 计算；sample 非法时立即按 deadline 耗尽处理。这样 resume 可以取得 Operation lock、完成计费和通知。
+6. resume 在最外层 `finally` 把状态置为 `completed | failed` 并 `notify_all()`。finalizer 被唤醒后，只有在自己剩余 deadline 内才继续取得 Operation lock和收敛；Condition 等待超时则不调用 Repository、不产生 final Event，把 disposition 置为 `failed`、清除 wait flag并消耗唯一 final 权。尚未通过 post-lock 复核的 resume 因此会被 fence；已经持有 Operation lock 并通过复核的 resume 可以完成，但此时同样不存在一个排在它前面的 final Event。
+7. `resume()` 使用该新 Segment 的普通 ActiveWorkBudget 和单次 50 ms Operation hard cap。
+8. 它不消耗独立 50 ms final convergence。
+9. 无论 resume Journal 是否成功，业务确认恢复继续 fail-open；该 Recorder 后续仍可且只能执行一次 `finish()`、`suspend()` 或 `abandon()`。
+10. `resume → finish` 和 `resume → chained Pending → suspend` 必须各产生正确的新 Segment 事件顺序。
+11. finalizer 与 resume 两种 claim 顺序，以及 `finish / suspend / abandon` 三种 target，都必须证明 `run.resumed` 从不出现在 final disposition Event 之后。
+
+`_resume_state` 的 `claimed → completed | failed` 更新位于 resume 最外层 `finally`；即使 cleanup 或工作路径抛出 `BaseException`，也必须先更新状态、通知等待者、扣费并解锁，再原样传播。
 
 ### 7.3 独立 final disposition convergence
 
@@ -443,9 +495,12 @@ _disposition_state
 
 ```text
 finalizer entry
+→ safe clock sample; hard deadline = entry + 50 ms
 → state_lock: CAS not_attempted → claimed
    CAS loser: no-op
-→ fresh hard deadline = entry + 50 ms
+→ if resume already claimed:
+     set disposition_waits_for_resume
+     condition-wait for resume completed | failed
 → bounded acquire same Operation lock
 → work deadline = hard deadline - 5 ms cleanup reserve
 → prepare fixed disposition events
@@ -455,9 +510,9 @@ finalizer entry
 → state_lock: claimed → completed | failed
 ```
 
-CAS winner 一旦将状态置为 `claimed` 就永久消耗该 Segment 的唯一 final convergence 权。即使前一个非终态 Operation 占锁超过 50 ms、SQLite lock 超时、cleanup 失败或 winner 遭遇 `BaseException`，状态最终也只能进入 `failed`，其他 finalizer 只能 no-op。
+finalizer 的 fresh hard deadline 必须在进入方法时、状态 claim 之前取得；等待 resume Condition 和 Operation lock 共用该同一个 50 ms，不能在 resume 完成后重置。CAS winner 一旦将状态置为 `claimed` 就永久消耗该 Segment 的唯一 final convergence 权。即使 resume 等待、前一个非终态 Operation、SQLite lock、cleanup 或 `BaseException` 耗尽 deadline，状态最终也只能进入 `failed`，其他 finalizer 只能 no-op。
 
-`claimed → completed | failed` 必须位于 finalizer 的最外层 `finally`，在 nested cleanup、扣费和 Operation lock release 之后、任何 `BaseException` 重新传播之前执行。只有 Repository convergence 已确定成功时进入 `completed`；lock timeout、预算耗尽、普通异常、cleanup 异常和 `BaseException` 都进入 `failed`。
+`claimed → completed | failed` 必须位于 finalizer 的最外层 `finally`，在 nested cleanup、扣费和 Operation lock release 之后、任何 `BaseException` 重新传播之前执行，并清除 `_disposition_waits_for_resume` 后 `notify_all()`。只有 Repository convergence 已确定成功时进入 `completed`；Condition / lock timeout、预算耗尽、普通异常、cleanup 异常和 `BaseException` 都进入 `failed`。
 
 认领本身只持有短状态锁，不执行 I/O。等待仍在执行的非终态 Journal Operation 计入 finalizer 的独立 50 ms。claim 之后到达的新非终态操作看到 `_disposition_state != not_attempted` 后直接 no-op；claim 前已持有 Operation lock 的工作允许完成，winner 在其后执行 convergence。
 
@@ -485,9 +540,14 @@ deadline: float | None
 clock: Callable[[], float]
 ```
 
-不把 ActiveWorkBudget 或 OperationLease 传入 Repository，避免持久化层反向依赖 Runtime。Repository 只负责遵守传入的动态 deadline、设置 SQLite guard、恢复连接并抛出封闭异常。
+不把 ActiveWorkBudget 或 OperationLease 传入 Repository，避免持久化层反向依赖 Runtime。Journal-owned Session 的 Repository 调用接收动态 work deadline，以及由 OperationLease 暴露的 no-throw safe clock adapter；该 adapter 内部使用 `safe_monotonic_read()`，无效时抛封闭的 `JournalDeadlineExceeded`，绝不调用或暴露原始注入 clock 异常。Repository 只负责遵守 deadline、设置 SQLite guard、恢复自己拥有的连接并抛出封闭异常。
 
-`deadline=None` 只保留给明确的内部维护和旧测试路径；Recorder / Factory 的生产调用必须始终提供 Operation deadline。增加 AST / spy 门禁证明所有生产 Journal Repository 调用都传递 deadline 和 clock。
+`deadline=None` 只保留给明确的内部维护和旧测试路径。机械门禁拆成两类：
+
+1. 所有使用 Journal-owned Session 的生产 Repository 调用必须传递动态 deadline 和 safe clock adapter；缺少任一参数即失败。
+2. `append_event_bound(caller_session, run_id, draft)` 是封闭且唯一的 caller-owned 例外。AST 门禁必须证明只有 `SafeRunRecorder.append_prepared_event_bound()` 能调用它，签名不新增 deadline / clock，并禁止其调用 `_configure_deadline`、progress handler、PRAGMA、rollback、commit、close、invalidate 或 Journal Session factory。
+
+新增任何 caller-owned Repository API 必须重新设计和复审，不能通过扩大 allowlist 静默绕过 deadline 门禁。
 
 ## 9. 兼容性与隐私
 
@@ -530,6 +590,10 @@ journal_clock_invalid
 9. 并发非终态调用串行，lock wait 计入 hard cap。
 10. timeout finalizer 在等待 Operation lock 前原子认领；即使等待超时，第二个 finalizer 也不得重试。
 11. `resume()` 使用独立 `_resume_state`，不会消耗后续 finish / suspend 权利。
+12. 三线程 barrier 固定 A 持锁、B 已通过初检并等待、C claim final；B 抢先取得锁后必须 post-lock no-op，prepare / Repository 均为 0。
+13. resume-first 时 finalizer 在同一 50 ms 内等待 ingress；finalizer-first 时 resume 无法 claim。两种 Operation lock 获取顺序都不得产生 final Event 后的 `run.resumed`。
+14. `safe_monotonic_read()` 在 Operation entry 和 finally 各自覆盖 NaN、Infinity、倒退、抛 `Exception` 和抛 `BaseException`；全部 no-throw、预算饱和且诊断无异常正文。
+15. Journal 工作同时有原始 `BaseException`、最终 clock 又抛 `BaseException` 时，传播原始工作异常，clock 异常不能覆盖它。
 
 ### 10.2 CPU 与序列化
 
@@ -557,6 +621,7 @@ journal_clock_invalid
 7. 阻塞 UDF / native call 返回后全额扣费、进入 degraded、完成连接清理且不再开始新 Journal 工作；不断言它在 50 ms 内被抢占。
 8. caller-owned Session 不安装 handler、不修改 PRAGMA、不 rollback / close / invalidate 外层连接。
 9. bound Event 成功、Journal conflict、budget-before-entry、native overshoot、普通异常和 `BaseException` 均保持 SAVEPOINT 与外层业务事务原子性。
+10. AST / spy 精确证明所有 Journal-owned 调用带 deadline / safe clock，且唯一 `append_event_bound` 例外既不接受 deadline，也不触碰连接级 guard 或 cleanup。
 
 ### 10.4 disposition
 
@@ -567,6 +632,7 @@ journal_clock_invalid
 - resumed Segment 使用新的 150 ms active budget，`resume()` 只消耗 ingress claim；
 - `resume → finish` 与 `resume → chained pending → suspend` 都能完成 final convergence；
 - 重复 `resume()` 不重复 ingress；重复或并发 finish / suspend / abandon 不产生第二次 final convergence；
+- resume-first / finalizer-first 分别与 finish、suspend、abandon 做参数化并发测试；
 - disposition 等待并发非终态操作时仍受自己的 50 ms 限制；
 - 第一个 finalizer 等待 Operation lock 超时后，第二个 finalizer仍为 no-op；
 - disposition SQLite 锁定时安全失败，业务结果不变。

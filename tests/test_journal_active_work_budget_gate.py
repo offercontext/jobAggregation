@@ -180,6 +180,11 @@ def _class_body_bound_names(class_node: ast.ClassDef) -> set[str]:
                 names.add(node.name)
             self.generic_visit(node)
 
+        def visit_MatchMapping(self, node: ast.MatchMapping) -> None:
+            if isinstance(node.rest, str):
+                names.add(node.rest)
+            self.generic_visit(node)
+
     visitor = BoundNameVisitor()
     for statement in class_node.body:
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -1059,6 +1064,26 @@ def test_mutations_reject_validated_method_decorators(
             "    def append_event_bound(self, session, run_id, draft):\n"
             "        pass\n"
             "    append_event_bound: object\n",
+            "AgentRunRepository",
+            "append_event_bound",
+        ),
+        (
+            "class SafeRunRecorder:\n"
+            "    match value:\n"
+            "        case {**append_prepared_event_bound}:\n"
+            "            pass\n"
+            "    def append_prepared_event_bound(self, session, draft):\n"
+            "        pass\n",
+            "SafeRunRecorder",
+            "append_prepared_event_bound",
+        ),
+        (
+            "class AgentRunRepository:\n"
+            "    match value:\n"
+            "        case {**append_event_bound}:\n"
+            "            pass\n"
+            "    def append_event_bound(self, session, run_id, draft):\n"
+            "        pass\n",
             "AgentRunRepository",
             "append_event_bound",
         ),

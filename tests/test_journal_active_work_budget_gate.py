@@ -366,8 +366,61 @@ def _structural_protected_methods(tree: ast.AST) -> dict[str, frozenset[str]]:
     }
 
 
+def _validate_class_method_integrity(tree: ast.AST, class_name: str) -> None:
+    def decorator_name(node: ast.AST) -> str | None:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            prefix = decorator_name(node.value)
+            return f"{prefix}.{node.attr}" if prefix else None
+        return None
+
+    approved_decorators: dict[str, dict[str, tuple[str, ...]]] = {
+        class_name: {} for class_name in JOURNAL_OWNERSHIP_CLASSES
+    }
+    for path in (JOURNAL_PATH, REPOSITORY_PATH):
+        canonical_tree = _module(path)
+        for class_node in ast.walk(canonical_tree):
+            if not isinstance(class_node, ast.ClassDef) or class_node.name not in approved_decorators:
+                continue
+            approved_decorators[class_node.name] = {
+                statement.name: tuple(
+                    decorator_name(decorator) for decorator in statement.decorator_list
+                )
+                for statement in class_node.body
+                if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+
+    for class_node in ast.walk(tree):
+        if not isinstance(class_node, ast.ClassDef) or class_node.name != class_name:
+            continue
+        direct_methods = [
+            statement
+            for statement in class_node.body
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        method_names = [method.name for method in direct_methods]
+        assert len(method_names) == len(set(method_names)), (
+            f"{class_name} direct method names must be unique"
+        )
+        class_body_names = _class_body_bound_names(class_node)
+        assert not set(method_names) & class_body_names, (
+            f"{class_name} class body must not rebind direct methods"
+        )
+        for method in direct_methods:
+            actual = tuple(
+                decorator_name(decorator) for decorator in method.decorator_list
+            )
+            expected = approved_decorators[class_name].get(method.name, ())
+            assert actual == expected, (
+                f"{class_name}.{method.name} has an unapproved decorator set"
+            )
+
+
 def _validate_external_method_rebindings(tree: ast.AST) -> None:
     protected_methods = _structural_protected_methods(tree)
+    for class_name in JOURNAL_OWNERSHIP_CLASSES:
+        _validate_class_method_integrity(tree, class_name)
 
     def protected_attribute(node: ast.AST) -> bool:
         return (
@@ -1302,6 +1355,42 @@ def test_mutations_reject_module_level_class_deletion(
     ),
 )
 def test_mutations_reject_external_method_rebinding(source: str) -> None:
+    _expect_rejected(source, _validate_journal_repository_calls)
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "class SafeRunRecorder:\n"
+        "    def _ordinary(self):\n"
+        "        pass\n"
+        "    def _ordinary(self):\n"
+        "        pass\n",
+        "class SafeRunRecorder:\n"
+        "    _ordinary = replacement\n"
+        "    def _ordinary(self):\n"
+        "        pass\n",
+        "class SafeRunRecorder:\n"
+        "    match value:\n"
+        "        case {**_ordinary}:\n"
+        "            pass\n"
+        "    def _ordinary(self):\n"
+        "        pass\n",
+        "class SafeRunRecorder:\n"
+        "    del _ordinary\n"
+        "    def _ordinary(self):\n"
+        "        pass\n",
+        "class RunRecorderFactory:\n"
+        "    @decorator\n"
+        "    def _safe(self):\n"
+        "        pass\n",
+        "class AgentRunRepository:\n"
+        "    @decorator\n"
+        "    def _insert_event(self):\n"
+        "        pass\n",
+    ),
+)
+def test_mutations_reject_class_method_integrity_bypasses(source: str) -> None:
     _expect_rejected(source, _validate_journal_repository_calls)
 
 

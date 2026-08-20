@@ -10,12 +10,15 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy.exc import OperationalError
 
+from offerpilot.agent_runtime.budget import JournalBudgetExhausted
 from offerpilot.agent_runtime.events import (
     ContextManifestInput,
     JournalEventValidationError,
+    _ordered_digest,
     canonical_json,
     normalize_context_identity,
     normalize_source_reference,
+    pending_identity_fingerprint,
     prepare_context_snapshot,
     prepare_event,
 )
@@ -38,6 +41,17 @@ SEGMENT_A = "22222222-2222-4222-8222-222222222222"
 SEGMENT_B = "33333333-3333-4333-8333-333333333333"
 CALL_A = "44444444-4444-4444-8444-444444444444"
 CALL_B = "55555555-5555-4555-8555-555555555555"
+
+
+class FailingGuard:
+    def __init__(self, fail_at: int) -> None:
+        self.fail_at = fail_at
+        self.calls = 0
+
+    def __call__(self) -> None:
+        self.calls += 1
+        if self.calls == self.fail_at:
+            raise JournalBudgetExhausted
 
 
 @pytest.mark.parametrize(
@@ -872,3 +886,52 @@ def test_canonicalization_invokes_budget_guard_during_collection_traversal() -> 
     with pytest.raises(RuntimeError, match="deadline"):
         canonical_json(list(range(100)), budget_check=guard)
     assert checks == 8
+
+
+def test_canonicalization_utf8_encoding_crosses_budget_checkpoint() -> None:
+    guard = FailingGuard(fail_at=3)
+
+    with pytest.raises(JournalBudgetExhausted):
+        canonical_json("中" * 4097, budget_check=guard)
+
+    assert guard.calls == 3
+
+
+@pytest.mark.parametrize("fail_at", [11, 13])
+def test_ordered_digest_crosses_encoding_and_final_digest_checkpoints(fail_at: int) -> None:
+    guard = FailingGuard(fail_at=fail_at)
+
+    with pytest.raises(JournalBudgetExhausted):
+        _ordered_digest(["message"], budget_check=guard)
+
+    assert guard.calls == fail_at
+
+
+@pytest.mark.parametrize("fail_at", [14, 19])
+def test_hmac_chunk_update_crosses_budget_checkpoint(fail_at: int) -> None:
+    guard = FailingGuard(fail_at=fail_at)
+
+    with pytest.raises(JournalBudgetExhausted):
+        pending_identity_fingerprint(
+            KEY,
+            "x" * 5000,
+            budget_check=guard,
+        )
+
+    assert guard.calls == fail_at
+
+
+def test_context_manifest_assembly_and_final_digest_cross_checkpoints() -> None:
+    logical_input = {"content": "x" * 5000}
+    manifest = ContextManifestInput((), (), (), ())
+    guard = FailingGuard(fail_at=202)
+
+    with pytest.raises(JournalBudgetExhausted):
+        prepare_context_snapshot(
+            logical_input,
+            manifest,
+            key=KEY,
+            budget_check=guard,
+        )
+
+    assert guard.calls == 202

@@ -237,6 +237,11 @@ class EventDraft:
     dedupe_key: str
 
 
+def _check_budget(budget_check: Callable[[], None] | None) -> None:
+    if budget_check is not None:
+        budget_check()
+
+
 def _canonical_value(
     value: object,
     *,
@@ -255,7 +260,10 @@ def _canonical_value(
         for offset in range(0, len(value), 4096):
             if budget_check is not None:
                 budget_check()
-            encoded_bytes += len(value[offset : offset + 4096].encode("utf-8"))
+            encoded = value[offset : offset + 4096].encode("utf-8")
+            if budget_check is not None:
+                budget_check()
+            encoded_bytes += len(encoded)
             if encoded_bytes > _MAX_CANONICAL_STRING_BYTES:
                 raise JournalEventValidationError(
                     "journal string exceeds canonicalization budget"
@@ -326,12 +334,15 @@ def canonical_json(
         sort_keys=True,
         separators=(",", ":"),
     )
+    _check_budget(budget_check)
     chunks: list[str] = []
     for chunk in encoder.iterencode(normalized):
-        if budget_check is not None:
-            budget_check()
+        _check_budget(budget_check)
         chunks.append(chunk)
-    return "".join(chunks)
+    _check_budget(budget_check)
+    rendered = "".join(chunks)
+    _check_budget(budget_check)
+    return rendered
 
 
 def _canonical_uuid(value: object) -> str | None:
@@ -352,12 +363,19 @@ def _hmac_fingerprint(
     budget_check: Callable[[], None] | None = None,
 ) -> str:
     payload = canonical_json(value, budget_check=budget_check)
+    _check_budget(budget_check)
     digest = hmac.new(key.secret, domain, hashlib.sha256)
+    _check_budget(budget_check)
     for offset in range(0, len(payload), 4096):
-        if budget_check is not None:
-            budget_check()
-        digest.update(payload[offset : offset + 4096].encode("utf-8"))
-    return digest.hexdigest()
+        _check_budget(budget_check)
+        encoded = payload[offset : offset + 4096].encode("utf-8")
+        _check_budget(budget_check)
+        digest.update(encoded)
+        _check_budget(budget_check)
+    _check_budget(budget_check)
+    fingerprint = digest.hexdigest()
+    _check_budget(budget_check)
+    return fingerprint
 
 
 def pending_identity_fingerprint(
@@ -461,9 +479,15 @@ def _ordered_digest(
     *,
     budget_check: Callable[[], None] | None = None,
 ) -> str:
-    return "sha256:" + hashlib.sha256(
-        canonical_json(value, budget_check=budget_check).encode("utf-8")
-    ).hexdigest()
+    canonical = canonical_json(value, budget_check=budget_check)
+    _check_budget(budget_check)
+    encoded = canonical.encode("utf-8")
+    _check_budget(budget_check)
+    digest = hashlib.sha256(encoded)
+    _check_budget(budget_check)
+    result = digest.hexdigest()
+    _check_budget(budget_check)
+    return "sha256:" + result
 
 
 def _normalize_manifest_ref(
@@ -506,24 +530,27 @@ def prepare_context_snapshot(
 ) -> PreparedSnapshot:
     messages = manifest.conversation_message_ids
     for message_id in messages:
-        if budget_check is not None:
-            budget_check()
+        _check_budget(budget_check)
         if type(message_id) is not int or message_id <= 0:
             raise JournalEventValidationError("invalid conversation message id")
+    _check_budget(budget_check)
     tools = manifest.tool_names
     for tool_name in tools:
-        if budget_check is not None:
-            budget_check()
+        _check_budget(budget_check)
         if type(tool_name) is not str or _SAFE_NAME.fullmatch(tool_name) is None:
             raise JournalEventValidationError("invalid tool name")
+    _check_budget(budget_check)
     attachments = [
         _normalize_manifest_ref(item, budget_check=budget_check)
         for item in manifest.attachment_refs
     ]
+    _check_budget(budget_check)
     sources = [
         _normalize_manifest_ref(item, budget_check=budget_check)
         for item in manifest.domain_source_refs
     ]
+    _check_budget(budget_check)
+    _check_budget(budget_check)
     manifest_payload = {
         "manifest_schema_version": 1,
         "conversation": {
@@ -552,26 +579,46 @@ def prepare_context_snapshot(
             "included_refs": sources[:32],
         },
     }
+    _check_budget(budget_check)
     manifest_json = canonical_json(manifest_payload, budget_check=budget_check)
-    if len(manifest_json.encode("utf-8")) > 16_384:
+    _check_budget(budget_check)
+    manifest_bytes = manifest_json.encode("utf-8")
+    _check_budget(budget_check)
+    if len(manifest_bytes) > 16_384:
         raise JournalEventValidationError("manifest exceeds 16 KiB")
+    _check_budget(budget_check)
     logical_json = canonical_json(logical_input, budget_check=budget_check)
+    _check_budget(budget_check)
     logical_digest = hmac.new(
         key.secret,
         b"offerpilot-agent-input-v1\0",
         hashlib.sha256,
     )
+    _check_budget(budget_check)
     for offset in range(0, len(logical_json), 4096):
-        if budget_check is not None:
-            budget_check()
-        logical_digest.update(logical_json[offset : offset + 4096].encode("utf-8"))
-    return PreparedSnapshot(
+        _check_budget(budget_check)
+        encoded = logical_json[offset : offset + 4096].encode("utf-8")
+        _check_budget(budget_check)
+        logical_digest.update(encoded)
+        _check_budget(budget_check)
+    _check_budget(budget_check)
+    logical_input_fingerprint = logical_digest.hexdigest()
+    _check_budget(budget_check)
+    _check_budget(budget_check)
+    manifest_digest = hashlib.sha256(manifest_bytes)
+    _check_budget(budget_check)
+    manifest_fingerprint = manifest_digest.hexdigest()
+    _check_budget(budget_check)
+    _check_budget(budget_check)
+    prepared = PreparedSnapshot(
         manifest_schema_version=1,
         manifest_json=manifest_json,
-        manifest_digest=hashlib.sha256(manifest_json.encode("utf-8")).hexdigest(),
-        logical_input_fingerprint=logical_digest.hexdigest(),
+        manifest_digest=manifest_fingerprint,
+        logical_input_fingerprint=logical_input_fingerprint,
         fingerprint_key_id=key.key_id,
     )
+    _check_budget(budget_check)
+    return prepared
 
 
 def validate_context_manifest_json(manifest_json: str) -> dict[str, object]:
@@ -774,10 +821,16 @@ def prepare_event(
         normalized_type, normalized_id = normalize_source_reference(source_ref_type, source_ref_id)
         if normalized_type is None:
             raise JournalEventValidationError("invalid source reference")
+    _check_budget(budget_check)
     payload = {"facts": facts, "telemetry": telemetry}
+    _check_budget(budget_check)
     payload_json = canonical_json(payload, budget_check=budget_check)
-    if len(payload_json.encode("utf-8")) > 4096:
+    _check_budget(budget_check)
+    payload_bytes = payload_json.encode("utf-8")
+    _check_budget(budget_check)
+    if len(payload_bytes) > 4096:
         raise JournalEventValidationError("event payload exceeds 4 KiB")
+    _check_budget(budget_check)
     fact_envelope = {
         "event_type": event_type,
         "schema_version": 1,
@@ -788,7 +841,19 @@ def prepare_event(
         "source_ref_id": normalized_id,
         "facts": facts,
     }
-    return EventDraft(
+    _check_budget(budget_check)
+    fact_bytes = canonical_json(fact_envelope, budget_check=budget_check).encode("utf-8")
+    _check_budget(budget_check)
+    payload_digest = hashlib.sha256(payload_bytes)
+    _check_budget(budget_check)
+    payload_fingerprint = payload_digest.hexdigest()
+    _check_budget(budget_check)
+    fact_digest = hashlib.sha256(fact_bytes)
+    _check_budget(budget_check)
+    fact_fingerprint = fact_digest.hexdigest()
+    _check_budget(budget_check)
+    _check_budget(budget_check)
+    draft = EventDraft(
         event_type=event_type,
         schema_version=1,
         execution_segment_id=segment,
@@ -798,12 +863,12 @@ def prepare_event(
         source_ref_id=normalized_id,
         fingerprint_key_id=fingerprint_key_id,
         payload_json=payload_json,
-        payload_digest=hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
-        fact_digest=hashlib.sha256(
-            canonical_json(fact_envelope, budget_check=budget_check).encode("utf-8")
-        ).hexdigest(),
+        payload_digest=payload_fingerprint,
+        fact_digest=fact_fingerprint,
         dedupe_key=_dedupe_key(event_type, segment, call, facts),
     )
+    _check_budget(budget_check)
+    return draft
 
 
 def validate_event_draft(draft: EventDraft) -> EventDraft:

@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
@@ -64,12 +65,183 @@ class PreparedSurfaceManifestV2:
     fingerprint_key_id: str
 
 
-def _canonical(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+def _check_budget(budget_check: Callable[[], None] | None) -> None:
+    if budget_check is not None:
+        budget_check()
 
 
-def _identity(secret: bytes, domain: bytes, value: str) -> str:
-    return hmac.new(secret, domain + b"\0" + value.encode("utf-8"), hashlib.sha256).hexdigest()
+def _canonical(
+    value: object,
+    *,
+    budget_check: Callable[[], None] | None = None,
+) -> str:
+    _check_budget(budget_check)
+    rendered = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    _check_budget(budget_check)
+    return rendered
+
+
+def _identity(
+    secret: bytes,
+    domain: bytes,
+    value: str,
+    *,
+    budget_check: Callable[[], None] | None = None,
+) -> str:
+    _check_budget(budget_check)
+    encoded = value.encode("utf-8")
+    _check_budget(budget_check)
+    digest = hmac.new(secret, domain + b"\0" + encoded, hashlib.sha256)
+    _check_budget(budget_check)
+    fingerprint = digest.hexdigest()
+    _check_budget(budget_check)
+    return fingerprint
+
+
+def _build_manifest_payload(
+    audit: RuntimeSurfaceAudit,
+    *,
+    key_id: str,
+    secret: bytes,
+    provider_identities: tuple[str, ...],
+    signals: tuple[str, ...],
+    budget_check: Callable[[], None] | None,
+) -> dict[str, object]:
+    _check_budget(budget_check)
+    providers: list[str] = []
+    _check_budget(budget_check)
+    for item in provider_identities:
+        _check_budget(budget_check)
+        providers.append(
+            _identity(
+                secret,
+                b"offerpilot-surface-provider-v2",
+                item,
+                budget_check=budget_check,
+            )
+        )
+        _check_budget(budget_check)
+    _check_budget(budget_check)
+
+    contributors: list[dict[str, str]] = []
+    _check_budget(budget_check)
+    for name, status in audit.contributor_statuses:
+        _check_budget(budget_check)
+        contributors.append({"name": name, "status": status})
+        _check_budget(budget_check)
+    _check_budget(budget_check)
+
+    history_groups: list[str] = []
+    _check_budget(budget_check)
+    for item in audit.selected_history_group_ids:
+        _check_budget(budget_check)
+        history_groups.append(
+            _identity(
+                secret,
+                b"offerpilot-surface-history-v2",
+                item,
+                budget_check=budget_check,
+            )
+        )
+        _check_budget(budget_check)
+    _check_budget(budget_check)
+
+    tools: list[str] = []
+    _check_budget(budget_check)
+    for item in audit.selected_tool_names:
+        _check_budget(budget_check)
+        tools.append(item)
+        _check_budget(budget_check)
+    _check_budget(budget_check)
+
+    sources: list[dict[str, object]] = []
+    _check_budget(budget_check)
+    for source in audit.source_records:
+        _check_budget(budget_check)
+        chunks: list[dict[str, object]] = []
+        _check_budget(budget_check)
+        for chunk in source.chunks:
+            _check_budget(budget_check)
+            chunks.append(
+                {
+                    "path_hmac": _identity(
+                        secret,
+                        b"offerpilot-surface-chunk-v2",
+                        chunk.path,
+                        budget_check=budget_check,
+                    ),
+                    "ordinal": chunk.ordinal,
+                    "total": chunk.total,
+                    "truncated": chunk.truncated,
+                    "original_bytes": chunk.original_bytes,
+                    "original_codepoints": chunk.original_codepoints,
+                }
+            )
+            _check_budget(budget_check)
+        _check_budget(budget_check)
+        sources.append(
+            {
+                "source_hmac": _identity(
+                    secret,
+                    b"offerpilot-surface-source-v2",
+                    f"{source.kind}:{source.revision_identity}",
+                    budget_check=budget_check,
+                ),
+                "content_revision_fingerprint": source.content_revision_fingerprint,
+                "chunks": chunks,
+            }
+        )
+        _check_budget(budget_check)
+    _check_budget(budget_check)
+    if not sources:
+        _check_budget(budget_check)
+        for index, fingerprint in enumerate(audit.source_fingerprints):
+            _check_budget(budget_check)
+            sources.append(
+                {
+                    "source_hmac": _identity(
+                        secret,
+                        b"offerpilot-surface-source-v2",
+                        f"{index}:{fingerprint}",
+                        budget_check=budget_check,
+                    ),
+                    "content_revision_fingerprint": fingerprint,
+                    "chunks": [],
+                }
+            )
+            _check_budget(budget_check)
+        _check_budget(budget_check)
+
+    effective_signals = signals or audit.signals
+    _check_budget(budget_check)
+    signal_values: list[str] = []
+    _check_budget(budget_check)
+    for signal in effective_signals:
+        _check_budget(budget_check)
+        signal_values.append(signal)
+        _check_budget(budget_check)
+    _check_budget(budget_check)
+
+    _check_budget(budget_check)
+    manifest: dict[str, object] = {
+        "manifest_schema_version": 2,
+        "budget_policy_version": audit.budget_policy_version,
+        "providers": providers,
+        "contributors": contributors,
+        "history_groups": history_groups,
+        "tools": tools,
+        "sources": sources,
+        "signals": signal_values,
+        "counts": {
+            "estimated_input_units": audit.estimated_input_units,
+            "canonical_message_bytes": audit.canonical_message_bytes,
+            "canonical_tool_bytes": audit.canonical_tool_bytes,
+        },
+        "truncated": audit.truncated,
+        "fingerprint_key_id": key_id,
+    }
+    _check_budget(budget_check)
+    return manifest
 
 
 def prepare_surface_manifest_v2(
@@ -79,83 +251,52 @@ def prepare_surface_manifest_v2(
     secret: bytes,
     provider_identities: tuple[str, ...],
     signals: tuple[str, ...] = (),
+    budget_check: Callable[[], None] | None = None,
 ) -> PreparedSurfaceManifestV2:
     """Failing helper; callers/recorders must catch all failures (journal is fail-open)."""
-    sources = [
-        {
-            "source_hmac": _identity(
-                secret,
-                b"offerpilot-surface-source-v2",
-                f"{source.kind}:{source.revision_identity}",
-            ),
-            "content_revision_fingerprint": source.content_revision_fingerprint,
-            "chunks": [
-                {
-                    "path_hmac": _identity(secret, b"offerpilot-surface-chunk-v2", chunk.path),
-                    "ordinal": chunk.ordinal,
-                    "total": chunk.total,
-                    "truncated": chunk.truncated,
-                    "original_bytes": chunk.original_bytes,
-                    "original_codepoints": chunk.original_codepoints,
-                }
-                for chunk in source.chunks
-            ],
-        }
-        for source in audit.source_records
-    ]
-    if not sources:
-        sources = [
-            {
-                "source_hmac": _identity(
-                    secret, b"offerpilot-surface-source-v2", f"{index}:{fingerprint}"
-                ),
-                "content_revision_fingerprint": fingerprint,
-                "chunks": [],
-            }
-            for index, fingerprint in enumerate(audit.source_fingerprints)
-        ]
-    effective_signals = signals or audit.signals
-    manifest = {
-        "manifest_schema_version": 2,
-        "budget_policy_version": audit.budget_policy_version,
-        "providers": [
-            _identity(secret, b"offerpilot-surface-provider-v2", item)
-            for item in provider_identities
-        ],
-        "contributors": [
-            {"name": name, "status": status} for name, status in audit.contributor_statuses
-        ],
-        "history_groups": [
-            _identity(secret, b"offerpilot-surface-history-v2", item)
-            for item in audit.selected_history_group_ids
-        ],
-        "tools": list(audit.selected_tool_names),
-        "sources": sources,
-        "signals": list(effective_signals),
-        "counts": {
-            "estimated_input_units": audit.estimated_input_units,
-            "canonical_message_bytes": audit.canonical_message_bytes,
-            "canonical_tool_bytes": audit.canonical_tool_bytes,
-        },
-        "truncated": audit.truncated,
-        "fingerprint_key_id": key_id,
-    }
-    rendered = _canonical(manifest)
-    validate_surface_manifest_v2(rendered)
+    _check_budget(budget_check)
+    manifest = _build_manifest_payload(
+        audit,
+        key_id=key_id,
+        secret=secret,
+        provider_identities=provider_identities,
+        signals=signals,
+        budget_check=budget_check,
+    )
+    _check_budget(budget_check)
+    rendered = _canonical(manifest, budget_check=budget_check)
+    _check_budget(budget_check)
+    encoded = rendered.encode("utf-8")
+    _check_budget(budget_check)
+    validate_surface_manifest_v2(rendered, budget_check=budget_check)
+    _check_budget(budget_check)
+    digest = hashlib.sha256(encoded)
+    _check_budget(budget_check)
+    manifest_digest = digest.hexdigest()
+    _check_budget(budget_check)
     return PreparedSurfaceManifestV2(
         rendered,
-        hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
+        manifest_digest,
         key_id,
     )
 
 
-def validate_surface_manifest_v2(value: str) -> dict[str, Any]:
-    if len(value.encode("utf-8")) > MANIFEST_BYTE_CAP:
+def validate_surface_manifest_v2(
+    value: str,
+    *,
+    budget_check: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    _check_budget(budget_check)
+    encoded = value.encode("utf-8")
+    _check_budget(budget_check)
+    if len(encoded) > MANIFEST_BYTE_CAP:
         raise ManifestV2ValidationError("manifest exceeds 64 KiB")
+    _check_budget(budget_check)
     try:
         manifest = json.loads(value)
     except (TypeError, json.JSONDecodeError):
         raise ManifestV2ValidationError("invalid manifest JSON") from None
+    _check_budget(budget_check)
     required = {
         "manifest_schema_version",
         "budget_policy_version",
@@ -169,21 +310,26 @@ def validate_surface_manifest_v2(value: str) -> dict[str, Any]:
         "truncated",
         "fingerprint_key_id",
     }
-    if type(manifest) is not dict or set(manifest) != required or _canonical(manifest) != value:
+    _check_budget(budget_check)
+    canonical_manifest = _canonical(manifest, budget_check=budget_check)
+    _check_budget(budget_check)
+    if type(manifest) is not dict or set(manifest) != required or canonical_manifest != value:
         raise ManifestV2ValidationError("invalid manifest shape or canonical form")
     if manifest["manifest_schema_version"] != 2:
         raise ManifestV2ValidationError("invalid manifest version")
     if manifest["budget_policy_version"] != "model-surface-budget-v1":
         raise ManifestV2ValidationError("invalid budget policy")
-    _hash_array(manifest["providers"], 8)
-    _hash_array(manifest["history_groups"], 32)
+    _hash_array(manifest["providers"], 8, budget_check=budget_check)
+    _hash_array(manifest["history_groups"], 32, budget_check=budget_check)
     providers = manifest["providers"]
     if not providers:
         raise ManifestV2ValidationError("empty provider chain")
     contributors = manifest["contributors"]
     if type(contributors) is not list or len(contributors) != 10:
         raise ManifestV2ValidationError("invalid contributors")
+    _check_budget(budget_check)
     for item in contributors:
+        _check_budget(budget_check)
         if (
             type(item) is not dict
             or set(item) != {"name", "status"}
@@ -193,39 +339,66 @@ def validate_surface_manifest_v2(value: str) -> dict[str, Any]:
             or item["status"] not in _STATUSES
         ):
             raise ManifestV2ValidationError("invalid contributor")
+        _check_budget(budget_check)
+    _check_budget(budget_check)
+    _check_budget(budget_check)
     if tuple(item["name"] for item in contributors) != CONTRIBUTOR_ORDER:
         raise ManifestV2ValidationError("invalid contributor order")
     tools = manifest["tools"]
     if type(tools) is not list or len(tools) > 25:
         raise ManifestV2ValidationError("invalid tools")
-    if any(type(item) is not str or _SAFE_NAME.fullmatch(item) is None for item in tools):
-        raise ManifestV2ValidationError("invalid tool")
+    _check_budget(budget_check)
+    for item in tools:
+        _check_budget(budget_check)
+        if type(item) is not str or _SAFE_NAME.fullmatch(item) is None:
+            raise ManifestV2ValidationError("invalid tool")
+        _check_budget(budget_check)
+    _check_budget(budget_check)
     if len(set(tools)) != len(tools):
         raise ManifestV2ValidationError("invalid tools")
-    if any(item not in MODEL_TOOL_NAMES for item in tools):
-        raise ManifestV2ValidationError("unapproved tool")
+    _check_budget(budget_check)
+    for item in tools:
+        _check_budget(budget_check)
+        if item not in MODEL_TOOL_NAMES:
+            raise ManifestV2ValidationError("unapproved tool")
+        _check_budget(budget_check)
+    _check_budget(budget_check)
     signals = manifest["signals"]
     if type(signals) is not list or len(signals) > 32:
         raise ManifestV2ValidationError("invalid signals")
-    if any(type(signal) is not str for signal in signals):
-        raise ManifestV2ValidationError("invalid signal")
+    _check_budget(budget_check)
+    for signal in signals:
+        _check_budget(budget_check)
+        if type(signal) is not str:
+            raise ManifestV2ValidationError("invalid signal")
+        _check_budget(budget_check)
+    _check_budget(budget_check)
     if len(set(signals)) != len(signals):
         raise ManifestV2ValidationError("invalid signals")
-    if any(signal not in _SIGNALS for signal in signals):
-        raise ManifestV2ValidationError("invalid signal")
+    _check_budget(budget_check)
+    for signal in signals:
+        _check_budget(budget_check)
+        if signal not in _SIGNALS:
+            raise ManifestV2ValidationError("invalid signal")
+        _check_budget(budget_check)
+    _check_budget(budget_check)
     sources = manifest["sources"]
     if type(sources) is not list or len(sources) > 8:
         raise ManifestV2ValidationError("invalid sources")
     total_chunks = 0
+    _check_budget(budget_check)
     for source in sources:
+        _check_budget(budget_check)
         if type(source) is not dict or set(source) != {
             "source_hmac",
             "content_revision_fingerprint",
             "chunks",
         }:
             raise ManifestV2ValidationError("invalid source")
-        if not _is_hex64(source["source_hmac"]) or not _is_hex64(
-            source["content_revision_fingerprint"]
+        if not _is_hex64(
+            source["source_hmac"], budget_check=budget_check
+        ) or not _is_hex64(
+            source["content_revision_fingerprint"], budget_check=budget_check
         ):
             raise ManifestV2ValidationError("invalid source fingerprint")
         chunks = source["chunks"]
@@ -233,7 +406,9 @@ def validate_surface_manifest_v2(value: str) -> dict[str, Any]:
             raise ManifestV2ValidationError("invalid chunks")
         total_chunks += len(chunks)
         seen_ordinals: set[int] = set()
+        _check_budget(budget_check)
         for chunk in chunks:
+            _check_budget(budget_check)
             if type(chunk) is not dict or set(chunk) != {
                 "path_hmac",
                 "ordinal",
@@ -243,7 +418,7 @@ def validate_surface_manifest_v2(value: str) -> dict[str, Any]:
                 "original_codepoints",
             }:
                 raise ManifestV2ValidationError("invalid chunk")
-            if not _is_hex64(chunk["path_hmac"]):
+            if not _is_hex64(chunk["path_hmac"], budget_check=budget_check):
                 raise ManifestV2ValidationError("invalid chunk identity")
             if (
                 any(
@@ -260,8 +435,12 @@ def validate_surface_manifest_v2(value: str) -> dict[str, Any]:
             ):
                 raise ManifestV2ValidationError("invalid chunk ordinal")
             seen_ordinals.add(chunk["ordinal"])
+            _check_budget(budget_check)
+        _check_budget(budget_check)
         if seen_ordinals != set(range(1, len(chunks) + 1)):
             raise ManifestV2ValidationError("invalid chunk ordinal")
+        _check_budget(budget_check)
+    _check_budget(budget_check)
     if total_chunks > 64:
         raise ManifestV2ValidationError("too many chunks")
     counts = manifest["counts"]
@@ -271,8 +450,13 @@ def validate_surface_manifest_v2(value: str) -> dict[str, Any]:
         "canonical_tool_bytes",
     }:
         raise ManifestV2ValidationError("invalid counts")
-    if any(type(item) is not int or item < 0 for item in counts.values()):
-        raise ManifestV2ValidationError("invalid count")
+    _check_budget(budget_check)
+    for item in counts.values():
+        _check_budget(budget_check)
+        if type(item) is not int or item < 0:
+            raise ManifestV2ValidationError("invalid count")
+        _check_budget(budget_check)
+    _check_budget(budget_check)
     if type(manifest["truncated"]) is not bool:
         raise ManifestV2ValidationError("invalid truncated flag")
     try:
@@ -283,17 +467,37 @@ def validate_surface_manifest_v2(value: str) -> dict[str, Any]:
         raise ManifestV2ValidationError("invalid key id")
     if "logical_input_fingerprint" in manifest:
         raise ManifestV2ValidationError("logical fingerprint must not be duplicated")
+    _check_budget(budget_check)
     return manifest
 
 
-def _hash_array(value: object, maximum: int) -> None:
+def _hash_array(
+    value: object,
+    maximum: int,
+    *,
+    budget_check: Callable[[], None] | None = None,
+) -> None:
+    _check_budget(budget_check)
     if type(value) is not list or len(value) > maximum:
         raise ManifestV2ValidationError("invalid identity array")
-    if any(not _is_hex64(item) for item in value):
-        raise ManifestV2ValidationError("invalid identity")
+    _check_budget(budget_check)
+    for item in value:
+        _check_budget(budget_check)
+        if not _is_hex64(item, budget_check=budget_check):
+            raise ManifestV2ValidationError("invalid identity")
+        _check_budget(budget_check)
+    _check_budget(budget_check)
     if len(set(value)) != len(value):
         raise ManifestV2ValidationError("duplicate identity")
+    _check_budget(budget_check)
 
 
-def _is_hex64(value: object) -> bool:
-    return type(value) is str and _HEX64.fullmatch(value) is not None
+def _is_hex64(
+    value: object,
+    *,
+    budget_check: Callable[[], None] | None = None,
+) -> bool:
+    _check_budget(budget_check)
+    result = type(value) is str and _HEX64.fullmatch(value) is not None
+    _check_budget(budget_check)
+    return result

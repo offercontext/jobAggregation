@@ -14,6 +14,7 @@ from offerpilot.agent_runtime.events import (
     JournalEventValidationError,
     validate_context_manifest_json,
 )
+from offerpilot.agent_runtime.budget import JournalBudgetExhausted
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG, MODEL_TOOL_NAMES
 from offerpilot.ai.types import Assistant, Message, ToolCall
 from offerpilot.context_projector.binding import (
@@ -58,6 +59,17 @@ from offerpilot.config import AIProviderProfile, Config, save_config
 from offerpilot.db import init_database
 from offerpilot.models import AgentContextSnapshot, AgentRun, Conversation
 from offerpilot.api import create_app
+
+
+class FailingGuard:
+    def __init__(self, fail_at: int) -> None:
+        self.fail_at = fail_at
+        self.calls = 0
+
+    def __call__(self) -> None:
+        self.calls += 1
+        if self.calls == self.fail_at:
+            raise JournalBudgetExhausted
 
 
 def frozen(role: str, content: str = "", *, message_id: int = 0) -> FrozenMessage:
@@ -496,6 +508,54 @@ def test_maximal_semantic_manifest_reaches_every_array_limit_under_cap() -> None
     assert len(manifest["sources"]) == 8
     assert sum(len(source["chunks"]) for source in manifest["sources"]) == 64
     assert len(manifest["signals"]) == 32
+
+
+def test_manifest_v2_budget_guard_interrupts_maximal_audit_at_exact_checkpoint() -> None:
+    sources = tuple(
+        RuntimeSourceAudit(
+            f"source_{source_index}",
+            f"revision:{source_index}",
+            f"{source_index:064x}",
+            tuple(
+                SourceChunk(
+                    f"$.field_{chunk_index}",
+                    chunk_index + 1,
+                    8,
+                    "",
+                    False,
+                    100,
+                    50,
+                )
+                for chunk_index in range(8)
+            ),
+        )
+        for source_index in range(8)
+    )
+    audit = RuntimeSurfaceAudit(
+        "model-surface-budget-v1",
+        tuple((name, "ready") for name in CONTRIBUTOR_ORDER),
+        tuple(f"group-{index}" for index in range(32)),
+        MODEL_TOOL_NAMES,
+        tuple(source.content_revision_fingerprint for source in sources),
+        100,
+        80,
+        20,
+        True,
+        sources,
+    )
+    guard = FailingGuard(fail_at=12)
+
+    with pytest.raises(JournalBudgetExhausted):
+        prepare_surface_manifest_v2(
+            audit,
+            key_id="11111111-1111-4111-8111-111111111111",
+            secret=b"k" * 32,
+            provider_identities=tuple(f"provider-{index}" for index in range(8)),
+            signals=MANIFEST_SIGNAL_VALUES,
+            budget_check=guard,
+        )
+
+    assert guard.calls == 12
 
 
 def test_migration_0027_records_and_database_accepts_v2_limit(tmp_path: Path) -> None:

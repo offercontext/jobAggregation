@@ -494,6 +494,32 @@ def test_append_event_rejects_disposition_events(tmp_path: Path, draft: EventDra
     assert run is not None and run.status == "running" and run.last_seq == 2
 
 
+def test_append_event_bound_keeps_caller_transaction_ownership(tmp_path: Path) -> None:
+    repository, conversation_id, _ = _create_run(tmp_path)
+    caller_factory = init_database(tmp_path / "data.db")
+    draft = _assistant_event(930)
+
+    with caller_factory() as session:
+        with session.begin():
+            event = repository.append_event_bound(session, RUN_ID, draft)
+            session.add(
+                ChatMessage(
+                    conversation_id=conversation_id,
+                    role="assistant",
+                    content="bound-domain-marker",
+                )
+            )
+            assert event.dedupe_key == draft.dedupe_key
+
+    with caller_factory() as session:
+        assert session.scalar(
+            select(AgentEvent).where(AgentEvent.dedupe_key == draft.dedupe_key)
+        ) is not None
+        assert session.scalar(
+            select(ChatMessage).where(ChatMessage.content == "bound-domain-marker")
+        ) is not None
+
+
 def test_concurrent_identical_event_append_returns_one_persisted_event(tmp_path: Path) -> None:
     _create_run(tmp_path)
     draft = _assistant_event(92)

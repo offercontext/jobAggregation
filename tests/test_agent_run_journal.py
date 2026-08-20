@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 
 import offerpilot.agent_runtime.journal as journal_module
@@ -26,6 +27,7 @@ from offerpilot.agent_runtime.events import (
     prepare_event,
 )
 from offerpilot.agent_runtime.keyring import JournalKeyDomain
+from offerpilot.db import init_database
 from offerpilot.agent_runtime.journal import (
     EventInput,
     NullRunRecorder,
@@ -35,6 +37,8 @@ from offerpilot.agent_runtime.journal import (
     SuspendedDisposition,
     TerminalDisposition,
 )
+from offerpilot.models import AgentEvent, ChatMessage, Conversation
+from offerpilot.repositories.agent_runs import AgentRunRepository, StartRunCommand
 
 KEY = JournalKeyDomain(
     key_id="11111111-1111-4111-8111-111111111111",
@@ -511,6 +515,309 @@ def _recorder(
         clock=clock or ManualClock(),
         event_preparer=event_preparer,  # type: ignore[arg-type]
     )
+
+
+BOUND_RUN_ID = "77777777-7777-4777-8777-777777777777"
+
+
+class _BoundRepository(AgentRunRepository):
+    def __init__(self, session_factory: object, *, clock: ManualClock) -> None:
+        super().__init__(session_factory)  # type: ignore[arg-type]
+        self.clock = clock
+        self.bound_calls = 0
+        self.after_bound: object | None = None
+
+    def append_event_bound(self, session: object, run_id: str, draft: object) -> object:
+        self.bound_calls += 1
+        result = super().append_event_bound(session, run_id, draft)  # type: ignore[arg-type]
+        if self.after_bound is not None:
+            self.after_bound()  # type: ignore[operator]
+        return result
+
+
+def _bound_start_command(conversation_id: int) -> StartRunCommand:
+    run_started = prepare_event(
+        event_type="run.started",
+        execution_segment_id=SEGMENT_A,
+        facts={
+            "agent_run_id": BOUND_RUN_ID,
+            "origin_kind": "user_message",
+            "conversation_id": conversation_id,
+            "context_type": "workspace",
+            "transport_mode": "sync",
+        },
+    )
+    segment_started = prepare_event(
+        event_type="segment.started",
+        execution_segment_id=SEGMENT_A,
+        facts={
+            "request_kind": "initial",
+            "transport_mode": "sync",
+            "execution_path": "model_turn",
+            "transport_run_id": None,
+        },
+    )
+    return StartRunCommand(
+        run_id=BOUND_RUN_ID,
+        conversation_id=conversation_id,
+        input_message_id=None,
+        origin_kind="user_message",
+        initial_context_type="workspace",
+        initial_context_entity_id=None,
+        initial_context_ref_fingerprint=None,
+        fingerprint_key_id=KEY.key_id,
+        initial_transport_mode="sync",
+        initial_route_kind="model",
+        run_started=run_started,
+        segment_started=segment_started,
+    )
+
+
+def _bound_draft(*, message_kind: str = "assistant") -> object:
+    return prepare_event(
+        event_type="assistant.persisted",
+        execution_segment_id=SEGMENT_A,
+        facts={"message_id": 991, "message_kind": message_kind},
+        source_ref_type="message",
+        source_ref_id=991,
+    )
+
+
+def _seed_bound_recorder(
+    tmp_path: Path,
+    clock: ManualClock,
+) -> tuple[_BoundRepository, object, SafeRunRecorder, object, int]:
+    session_factory = init_database(tmp_path / "bound.db")
+    with session_factory() as seed:
+        conversation = Conversation(title="bound transaction")
+        seed.add(conversation)
+        seed.flush()
+        conversation_id = conversation.id
+        seed.commit()
+    repository = _BoundRepository(session_factory, clock=clock)
+    repository.create_run_and_initial_segment(_bound_start_command(conversation_id))
+    recorder = SafeRunRecorder(
+        repository,
+        KEY,
+        BOUND_RUN_ID,
+        SEGMENT_A,
+        clock=clock,
+    )
+    return repository, session_factory, recorder, _bound_draft(), conversation_id
+
+
+def _write_bound_marker(session: object, conversation_id: int) -> None:
+    session.add(  # type: ignore[union-attr]
+        ChatMessage(
+            conversation_id=conversation_id,
+            role="assistant",
+            content="bound-domain-marker",
+        )
+    )
+
+
+def _load_bound_rows(
+    session_factory: object,
+    draft: object,
+) -> tuple[AgentEvent | None, ChatMessage | None]:
+    with session_factory() as session:  # type: ignore[operator]
+        event = session.scalar(  # type: ignore[union-attr]
+            select(AgentEvent).where(AgentEvent.dedupe_key == draft.dedupe_key)  # type: ignore[union-attr]
+        )
+        marker = session.scalar(  # type: ignore[union-attr]
+            select(ChatMessage).where(ChatMessage.content == "bound-domain-marker")
+        )
+        return event, marker
+
+
+def test_bound_success_commits_journal_event_and_outer_domain_marker(
+    tmp_path: Path,
+) -> None:
+    clock = ManualClock()
+    repository, session_factory, recorder, draft, conversation_id = _seed_bound_recorder(
+        tmp_path, clock
+    )
+    with session_factory() as session:  # type: ignore[operator]
+        with session.begin():
+            assert recorder.append_prepared_event_bound(session, draft) is True
+            _write_bound_marker(session, conversation_id)
+
+    event, marker = _load_bound_rows(session_factory, draft)
+    assert event is not None
+    assert marker is not None
+    assert repository.bound_calls == 1
+    assert recorder.recording_status == "healthy"
+
+
+def test_bound_conflict_rolls_back_savepoint_and_commits_outer_marker(
+    tmp_path: Path,
+) -> None:
+    clock = ManualClock()
+    repository, session_factory, recorder, draft, conversation_id = _seed_bound_recorder(
+        tmp_path, clock
+    )
+    repository.append_event(BOUND_RUN_ID, draft)  # type: ignore[arg-type]
+    conflicting = _bound_draft(message_kind="tool")
+
+    with session_factory() as session:  # type: ignore[operator]
+        with session.begin():
+            assert recorder.append_prepared_event_bound(session, conflicting) is False
+            _write_bound_marker(session, conversation_id)
+        assert session.is_active
+
+    event, marker = _load_bound_rows(session_factory, conflicting)
+    assert event is not None
+    assert marker is not None
+    assert repository.bound_calls == 1
+    assert recorder.diagnostics == ["journal_tool_projection_failed"]
+
+
+def test_bound_exhausted_before_entry_skips_prepare_savepoint_and_repository(
+    tmp_path: Path,
+) -> None:
+    clock = ManualClock()
+    repository, session_factory, recorder, draft, conversation_id = _seed_bound_recorder(
+        tmp_path, clock
+    )
+    recorder.active_budget.used_seconds = recorder.active_budget.total_seconds
+    prepared_calls = 0
+
+    def should_not_prepare(_event: EventInput, _deadline: float) -> object:
+        nonlocal prepared_calls
+        prepared_calls += 1
+        return _bound_draft()
+
+    recorder._event_preparer = should_not_prepare  # type: ignore[assignment]
+    assert recorder.prepare_event_draft(_route_event()) is None
+    assert prepared_calls == 0
+
+    with session_factory() as session:  # type: ignore[operator]
+        with session.begin():
+            assert recorder.append_prepared_event_bound(session, draft) is False
+            _write_bound_marker(session, conversation_id)
+
+    event, marker = _load_bound_rows(session_factory, draft)
+    assert event is None
+    assert marker is not None
+    assert repository.bound_calls == 0
+    assert recorder.recording_status == "degraded"
+
+
+def test_bound_native_overshoot_returns_true_and_preserves_outer_commit(
+    tmp_path: Path,
+) -> None:
+    clock = ManualClock()
+    repository, session_factory, recorder, draft, conversation_id = _seed_bound_recorder(
+        tmp_path, clock
+    )
+    repository.after_bound = lambda: clock.advance(0.060)
+
+    with session_factory() as session:  # type: ignore[operator]
+        with session.begin():
+            assert recorder.append_prepared_event_bound(session, draft) is True
+            _write_bound_marker(session, conversation_id)
+
+    event, marker = _load_bound_rows(session_factory, draft)
+    assert event is not None
+    assert marker is not None
+    assert repository.bound_calls == 1
+    assert recorder.recording_status == "degraded"
+    assert recorder.diagnostics == ["journal_budget_exhausted"]
+
+
+def test_bound_ordinary_exception_rolls_back_savepoint_and_commits_outer_marker(
+    tmp_path: Path,
+) -> None:
+    clock = ManualClock()
+    repository, session_factory, recorder, draft, conversation_id = _seed_bound_recorder(
+        tmp_path, clock
+    )
+    repository.after_bound = lambda: (_ for _ in ()).throw(RuntimeError("bound-canary"))
+
+    with session_factory() as session:  # type: ignore[operator]
+        with session.begin():
+            assert recorder.append_prepared_event_bound(session, draft) is False
+            _write_bound_marker(session, conversation_id)
+        assert session.is_active
+
+    event, marker = _load_bound_rows(session_factory, draft)
+    assert event is None
+    assert marker is not None
+    assert repository.bound_calls == 1
+    assert recorder.diagnostics == ["journal_tool_projection_failed"]
+
+
+@pytest.mark.parametrize("base_error", [KeyboardInterrupt, SystemExit])
+def test_bound_base_exception_cleans_savepoint_and_preserves_original_priority(
+    tmp_path: Path,
+    base_error: type[BaseException],
+) -> None:
+    clock = ManualClock()
+    repository, session_factory, recorder, draft, conversation_id = _seed_bound_recorder(
+        tmp_path, clock
+    )
+    repository.after_bound = lambda: (_ for _ in ()).throw(base_error())
+
+    with session_factory() as session:  # type: ignore[operator]
+        session.begin()
+        with pytest.raises(base_error):
+            recorder.append_prepared_event_bound(session, draft)
+        _write_bound_marker(session, conversation_id)
+        session.flush()
+        session.rollback()
+        assert session.is_active
+
+    event, marker = _load_bound_rows(session_factory, draft)
+    assert event is None
+    assert marker is None
+    assert repository.bound_calls == 1
+    assert recorder.recording_status == "healthy"
+
+
+def test_prepared_event_draft_is_cpu_only_and_does_not_persist_degraded_state() -> None:
+    repository = RecordingJournalRepository()
+
+    def fail_prepare(_event: EventInput, _deadline: float) -> object:
+        raise RuntimeError("prepare-canary")
+
+    recorder = _recorder(repository, event_preparer=fail_prepare)
+
+    assert recorder.prepare_event_draft(_route_event()) is None
+    assert repository.append_calls == 0
+    assert repository.mark_degraded_calls == 0
+    assert recorder.diagnostics == ["journal_tool_projection_failed"]
+
+
+def test_bound_cleanup_failure_never_syncs_degraded_through_caller_session(
+    tmp_path: Path,
+) -> None:
+    clock = ManualClock()
+    repository, session_factory, recorder, draft, conversation_id = _seed_bound_recorder(
+        tmp_path, clock
+    )
+    sync_calls = 0
+
+    def fail_cleanup(_lease: object) -> None:
+        raise RuntimeError("cleanup-canary")
+
+    def record_sync(_lease: object) -> None:
+        nonlocal sync_calls
+        sync_calls += 1
+
+    recorder._cleanup_operation = fail_cleanup  # type: ignore[method-assign]
+    recorder._sync_degraded = record_sync  # type: ignore[method-assign]
+    with session_factory() as session:  # type: ignore[operator]
+        with session.begin():
+            assert recorder.append_prepared_event_bound(session, draft) is True
+            _write_bound_marker(session, conversation_id)
+
+    event, marker = _load_bound_rows(session_factory, draft)
+    assert event is not None
+    assert marker is not None
+    assert repository.bound_calls == 1
+    assert sync_calls == 0
+    assert recorder.recording_status == "degraded"
+    assert recorder.diagnostics == ["journal_cleanup_failed"]
 
 
 def test_segment_budget_includes_preprocessing_and_stops_nonterminal_writes() -> None:

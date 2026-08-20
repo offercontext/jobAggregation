@@ -414,6 +414,7 @@ class SafeRunRecorder:
             lambda lease: self._event_preparer(event, lease.work_deadline),
             "journal_tool_projection_failed",
             None,
+            allow_sync=False,
         )
 
     def append_prepared_event_bound(self, session: Any, draft: EventDraft) -> bool:
@@ -718,6 +719,7 @@ class SafeRunRecorder:
                 except Exception:
                     if (
                         self._degrade("journal_cleanup_failed")
+                        and allow_sync
                         and lease is not None
                         and lease is self._current_lease
                     ):

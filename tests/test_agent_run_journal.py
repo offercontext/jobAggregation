@@ -1907,6 +1907,64 @@ def test_final_resume_wait_timeout_consumes_disposition_right(
     assert repository.converge_calls == 0
 
 
+def test_final_resume_wait_false_after_resume_completion_proceeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = RecordingJournalRepository()
+    recorder = _recorder(repository, clock=ManualClock())
+    with recorder._state_lock:
+        recorder._resume_state = "claimed"
+
+    waits: list[float] = []
+
+    def wait(*, timeout: float | None = None) -> bool:
+        waits.append(-1.0 if timeout is None else timeout)
+        with recorder._state_lock:
+            recorder._resume_state = "completed"
+            recorder._state_condition.notify_all()
+        return False
+
+    monkeypatch.setattr(recorder._state_condition, "wait", wait)
+    recorder.finish(TerminalDisposition(status="completed"))
+
+    assert waits == pytest.approx([0.05])
+    assert recorder._disposition_state == "completed"
+    assert recorder.recording_status == "healthy"
+    assert recorder.diagnostics == []
+    assert repository.converge_calls == 1
+
+
+def test_final_resume_wait_false_with_invalid_boundary_clock_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = RecordingJournalRepository()
+    clock = ScriptedClock([0.0, 0.0, SystemExit(), 0.0])
+    recorder = SafeRunRecorder(
+        repository,  # type: ignore[arg-type]
+        KEY,
+        "77777777-7777-4777-8777-777777777777",
+        SEGMENT_A,
+        clock=clock,
+    )
+    with recorder._state_lock:
+        recorder._resume_state = "claimed"
+
+    waits: list[float] = []
+
+    def wait(*, timeout: float | None = None) -> bool:
+        waits.append(-1.0 if timeout is None else timeout)
+        return False
+
+    monkeypatch.setattr(recorder._state_condition, "wait", wait)
+    recorder.finish(TerminalDisposition(status="completed"))
+
+    assert waits == pytest.approx([0.05])
+    assert recorder._disposition_state == "failed"
+    assert recorder.recording_status == "degraded"
+    assert recorder.diagnostics == ["journal_clock_invalid"]
+    assert repository.converge_calls == 0
+
+
 def test_completed_finalizer_then_invalid_clock_is_absolute_noop() -> None:
     repository = RecordingJournalRepository()
     calls = 0

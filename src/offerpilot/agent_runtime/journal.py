@@ -1041,6 +1041,12 @@ class SafeRunRecorder:
                 if remaining <= 0:
                     raise JournalDeadlineExceeded("deadline")
                 if not self._state_condition.wait(timeout=remaining):
+                    if not (self._waits_for_resume and self._resume_state == "claimed"):
+                        return
+                    sample = lease.safe_clock.sample()
+                    if sample.valid is not True:
+                        lease.budget.latch_clock_invalid()
+                        raise JournalDeadlineExceeded("clock_invalid")
                     raise JournalDeadlineExceeded("deadline")
 
     def _final_deadline_error(self, lease: OperationLease) -> JournalDeadlineExceeded | None:

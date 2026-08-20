@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import delete, select, update
 from sqlalchemy.exc import OperationalError
 
+import offerpilot.agent_runtime.journal as journal_module
 from offerpilot.ai.types import Assistant, Message, ToolCall
 from offerpilot.ai.agent import PendingAction, StalePendingActionError
 from offerpilot.ai.tool_runtime.contracts import (
@@ -666,8 +667,11 @@ def test_chat_stream_records_journal_without_changing_sse_identity(tmp_path):
 
 @pytest.mark.parametrize("endpoint", ["/api/chat", "/api/chat/stream"])
 def test_journal_active_budget_ignores_slow_final_provider_gap(
-    tmp_path, endpoint
+    tmp_path, monkeypatch, endpoint
 ):
+    # This test isolates the provider wall-time gap from the independently tested
+    # 50 ms per-operation default; the 0.5 s cap remains far below the 3.05 s gap.
+    monkeypatch.setattr(journal_module, "JOURNAL_OPERATION_HARD_CAP_SECONDS", 0.5)
     session_factory_for_data_dir(tmp_path)
     model = SlowFinalModel(reply="stable slow final", delay=3.05)
     client = TestClient(
@@ -748,8 +752,11 @@ def test_journal_active_budget_ignores_slow_final_provider_gap(
 
 @pytest.mark.parametrize("endpoint", ["/api/chat", "/api/chat/stream"])
 def test_journal_active_budget_ignores_slow_provider_before_read_then_final(
-    tmp_path, endpoint
+    tmp_path, monkeypatch, endpoint
 ):
+    # Keep the real monotonic clock and provider delay while isolating Journal
+    # operation scheduling jitter from the separate hard-cap unit contract.
+    monkeypatch.setattr(journal_module, "JOURNAL_OPERATION_HARD_CAP_SECONDS", 0.5)
     seed = TestClient(create_app(data_dir=tmp_path))
     application = seed.post(
         "/api/applications",
@@ -759,6 +766,7 @@ def test_journal_active_budget_ignores_slow_provider_before_read_then_final(
             "status": "interview",
         },
     ).json()
+    seed.close()
     model = SlowReadThenFinalModel(reply="stable read final", delay=3.05)
     client = TestClient(
         create_app(
@@ -820,7 +828,7 @@ def test_journal_active_budget_ignores_slow_provider_before_read_then_final(
     assert [message.tool_call_id for message in stored if message.role == "tool"] == [
         "slow-journal-read"
     ]
-    assert seed.get(f"/api/applications/{application['id']}").json()["status"] == "interview"
+    assert client.get(f"/api/applications/{application['id']}").json()["status"] == "interview"
 
     runs, events, snapshots = _wait_for_journal_status(
         tmp_path,
@@ -860,7 +868,6 @@ def test_journal_active_budget_ignores_slow_provider_before_read_then_final(
         anomaly.startswith("model_call_incomplete:") for anomaly in trace.anomalies
     )
     client.close()
-    seed.close()
 
 
 def test_deterministic_action_records_waiting_run_without_model_events(tmp_path):

@@ -117,6 +117,47 @@ def _wait_for_journal_status(tmp_path, expected_status, timeout=15.0, *, predica
         time.sleep(0.01)
 
 
+def _wait_for_journal_observation(tmp_path, *, predicate, timeout=15.0):
+    deadline = time.monotonic() + timeout
+    while True:
+        runs, events, snapshots = _journal_rows(tmp_path)
+        if predicate(runs, events, snapshots):
+            return runs, events, snapshots
+        if time.monotonic() >= deadline:
+            pytest.fail(
+                "Journal observation did not converge: "
+                f"statuses={[run.status for run in runs]!r}, "
+                f"events={[event.event_type for event in events]!r}, "
+                f"snapshots={[snapshot.snapshot_kind for snapshot in snapshots]!r}"
+            )
+        time.sleep(0.01)
+
+
+def _journal_confirmation_segment_predicate(*, finished_facts=None):
+    def predicate(runs, events, _snapshots):
+        if not runs:
+            return False
+        confirmation_segments = {
+            event.execution_segment_id
+            for event in events
+            if event.event_type == "segment.started"
+            and json.loads(event.payload_json)["facts"].get("request_kind")
+            == "confirmation"
+        }
+        if not confirmation_segments:
+            return False
+        if finished_facts is None:
+            return True
+        return any(
+            event.event_type == "segment.finished"
+            and event.execution_segment_id in confirmation_segments
+            and json.loads(event.payload_json)["facts"] == finished_facts
+            for event in events
+        )
+
+    return predicate
+
+
 def _journal_terminal_predicate(
     *,
     required_event_types=(),
@@ -881,7 +922,9 @@ def test_deterministic_pending_replay_uses_original_journal_run(tmp_path):
             data_dir=tmp_path,
             chat_model=model,
             title_model=model,
-            run_recorder_factory=_stable_journal_factory(tmp_path),
+            run_recorder_factory=_stable_journal_factory(
+                tmp_path, clock=_non_advancing_journal_clock
+            ),
         )
     )
     application = client.post(
@@ -908,7 +951,29 @@ def test_deterministic_pending_replay_uses_original_journal_run(tmp_path):
     )
 
     assert replay.status_code == 200
-    runs, events, _ = _journal_rows(tmp_path)
+    replay_predicate = _journal_terminal_predicate(
+        required_event_types=("run.waiting_confirmation",)
+    )
+    runs, events, _ = _wait_for_journal_status(
+        tmp_path,
+        "waiting_confirmation",
+        predicate=lambda runs, events, snapshots: (
+            replay_predicate(runs, events, snapshots)
+            and len(
+                [event for event in events if event.event_type == "segment.started"]
+            )
+            == 2
+            and json.loads(
+                next(
+                    event
+                    for event in reversed(events)
+                    if event.event_type == "segment.started"
+                ).payload_json
+            )["facts"]["request_kind"]
+            == "pending_replay"
+            and json.loads(events[-1].payload_json)["facts"]["outcome"] == "noop"
+        ),
+    )
     assert len(runs) == 1
     assert runs[0].status == "waiting_confirmation"
     segment_starts = [event for event in events if event.event_type == "segment.started"]
@@ -1390,7 +1455,9 @@ def test_deterministic_pilot_rejection_does_not_write_without_ai(tmp_path):
             data_dir=tmp_path,
             chat_model=model,
             title_model=model,
-            run_recorder_factory=_stable_journal_factory(tmp_path),
+            run_recorder_factory=_stable_journal_factory(
+                tmp_path, clock=_non_advancing_journal_clock
+            ),
         )
     )
     application = client.post(
@@ -1421,7 +1488,14 @@ def test_deterministic_pilot_rejection_does_not_write_without_ai(tmp_path):
     assert "取消" in response.json()["message"]
     assert client.get(f"/api/applications/{application['id']}/job-description/versions").json() == []
     assert model.calls == 0
-    runs, journal_events, _ = _journal_rows(tmp_path)
+    runs, journal_events, _ = _wait_for_journal_status(
+        tmp_path,
+        "completed",
+        predicate=_journal_terminal_predicate(
+            required_event_types=("approval.decided", "run.completed"),
+            required_snapshot_kinds=("initial", "confirmation_resume"),
+        ),
+    )
     assert len(runs) == 1
     assert runs[0].status == "completed"
     decisions = [
@@ -1495,7 +1569,16 @@ def test_deterministic_pilot_retries_same_key_after_chat_cas_failure(
     monkeypatch, tmp_path, endpoint
 ):
     model = CountingFailingModel()
-    client = TestClient(create_app(data_dir=tmp_path, chat_model=model, title_model=model))
+    client = TestClient(
+        create_app(
+            data_dir=tmp_path,
+            chat_model=model,
+            title_model=model,
+            run_recorder_factory=_stable_journal_factory(
+                tmp_path, clock=_non_advancing_journal_clock
+            ),
+        )
+    )
     application = client.post(
         "/api/applications",
         json={"company_name": "启明智能", "position_name": "后端工程师", "status": "interview"},
@@ -1527,7 +1610,12 @@ def test_deterministic_pilot_retries_same_key_after_chat_cas_failure(
     }
 
     first = client.post(endpoint, json=confirmation)
-    runs, events, _ = _journal_rows(tmp_path)
+    runs, events, _ = _wait_for_journal_observation(
+        tmp_path,
+        predicate=_journal_confirmation_segment_predicate(
+            finished_facts={"outcome": "noop", "terminal_run_status": None}
+        ),
+    )
     assert len(runs) == 1
     assert runs[0].status in {"running", "waiting_confirmation"}
     confirmation_segment = next(
@@ -6313,7 +6401,9 @@ def test_chat_confirm_result_cas_loss_stays_stale_on_followup_failure(
         if failure_kind == "provider"
         else SlowAfterPendingModel(tool_call)
     )
-    _, client, _, pending = _create_status_confirmation(tmp_path, model)
+    _, client, _, pending = _create_status_confirmation(
+        tmp_path, model, stable_journal=True
+    )
     if failure_kind == "timeout":
         # The follow-up model sleeps for one second, so this still exercises the
         # timeout path while leaving enough scheduling time for the deliberately
@@ -6339,7 +6429,12 @@ def test_chat_confirm_result_cas_loss_stays_stale_on_followup_failure(
         assert response.status_code == 409
     conversation = client.get("/api/chat/conversations").json()[0]
     assert conversation["pending_action"]["args"]["closed_reason"] == "newer"
-    runs, events, _ = _journal_rows(tmp_path)
+    runs, events, _ = _wait_for_journal_observation(
+        tmp_path,
+        predicate=_journal_confirmation_segment_predicate(
+            finished_facts={"outcome": "noop", "terminal_run_status": None}
+        ),
+    )
     assert len(runs) == 1
     assert runs[0].status in {"running", "waiting_confirmation"}
     confirmation_segment = next(

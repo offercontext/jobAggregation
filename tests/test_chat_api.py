@@ -810,8 +810,17 @@ def test_deterministic_action_records_waiting_run_without_model_events(tmp_path)
     )
 
     assert response.status_code == 200
+    waiting_predicate = _journal_terminal_predicate(
+        required_event_types=("approval.requested", "run.waiting_confirmation"),
+        required_snapshot_kinds=("initial",),
+    )
     runs, events, snapshots = _wait_for_journal_status(
-        tmp_path, "waiting_confirmation"
+        tmp_path,
+        "waiting_confirmation",
+        predicate=lambda runs, events, snapshots: (
+            waiting_predicate(runs, events, snapshots)
+            and runs[0].recording_status == "healthy"
+        ),
     )
     assert len(runs) == 1
     assert runs[0].status == "waiting_confirmation"
@@ -2420,7 +2429,30 @@ def test_complete_causal_chain_reconstructs_one_healthy_run(
     else:
         confirmation_sse_run_id = None
 
-    runs, events, snapshots = _journal_rows(tmp_path)
+    runs, events, snapshots = _wait_for_journal_status(
+        tmp_path,
+        "completed",
+        predicate=_journal_terminal_predicate(
+            required_event_types=(
+                "model.requested",
+                "model.completed",
+                "tool.started",
+                "tool.completed",
+                "approval.requested",
+                "approval.decided",
+                "run.resumed",
+                "run.completed",
+            ),
+            minimum_event_counts={
+                "model.requested": 3,
+                "model.completed": 3,
+                "tool.started": 2,
+                "tool.completed": 2,
+            },
+            required_snapshot_kinds=("initial", "model_input"),
+            minimum_snapshot_counts={"model_input": 3},
+        ),
+    )
     assert len(runs) == 1
     run = runs[0]
     assert model.calls == 3

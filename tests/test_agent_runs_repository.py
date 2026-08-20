@@ -1319,6 +1319,56 @@ def test_commit_and_rollback_cleanup_failure_invalidates_owned_connection(
         )
 
 
+@pytest.mark.parametrize(
+    ("primary_kind", "cleanup_kind", "expected_kind"),
+    [
+        ("exception", "exception", "primary"),
+        ("exception", "keyboard", "cleanup"),
+        ("exception", "system_exit", "cleanup"),
+        ("keyboard", "exception", "primary"),
+        ("system_exit", "exception", "primary"),
+        ("keyboard", "system_exit", "primary"),
+    ],
+)
+def test_cleanup_exception_priority_recovers_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    primary_kind: str,
+    cleanup_kind: str,
+    expected_kind: str,
+) -> None:
+    _create_run(tmp_path)
+    repository = _repository(tmp_path)
+    owned_dbapi = None
+    error_types = {
+        "exception": RuntimeError,
+        "keyboard": KeyboardInterrupt,
+        "system_exit": SystemExit,
+    }
+    primary = error_types[primary_kind](f"primary-{primary_kind}")
+    cleanup = error_types[cleanup_kind](f"cleanup-{cleanup_kind}")
+    original_rollback = Session.rollback
+    rollback_calls = 0
+
+    def fail_cleanup_once(session: Session) -> None:
+        nonlocal rollback_calls
+        rollback_calls += 1
+        if rollback_calls == 1:
+            raise cleanup
+        original_rollback(session)
+
+    monkeypatch.setattr(Session, "rollback", fail_cleanup_once)
+    expected = primary if expected_kind == "primary" else cleanup
+
+    with pytest.raises(type(expected)) as raised:
+        with repository._journal_transaction(deadline=None, safe_clock=None) as session:
+            owned_dbapi = session.connection().connection.driver_connection
+            raise primary
+
+    assert str(raised.value) == str(expected)
+    _assert_next_borrower_is_distinct_and_healthy(repository, owned_dbapi)
+
+
 class _RawConnectionProxy:
     def __init__(
         self,

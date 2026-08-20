@@ -933,6 +933,10 @@ class AgentRunRepository:
                         if invalidate_error is not None and cleanup_error is None:
                             cleanup_error = invalidate_error
 
+            if primary is not None and not isinstance(primary, Exception):
+                raise primary.with_traceback(primary.__traceback__)
+            if cleanup_error is not None and not isinstance(cleanup_error, Exception):
+                raise cleanup_error.with_traceback(cleanup_error.__traceback__)
             if primary is not None:
                 raise primary.with_traceback(primary.__traceback__)
             if cleanup_error is not None:

@@ -998,11 +998,14 @@ class SafeRunRecorder:
                     succeeded = False
             finally:
                 self._current_lease = None
-                sample = budget.safe_monotonic_read()
-                if sample.valid is not True:
+                try:
+                    exhausted = budget.finish_operation(entry)
+                except BaseException:
                     budget.latch_clock_invalid()
+                    exhausted = True
+                if budget.clock_invalid_latched:
                     self._degrade("journal_clock_invalid")
-                elif lease is not None and sample.value >= lease.hard_deadline:
+                elif exhausted:
                     self._degrade("journal_disposition_budget_exhausted")
                 if acquired:
                     self._operation_lock.release()

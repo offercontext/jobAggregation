@@ -423,6 +423,20 @@ class ManualClock:
         self.value += seconds
 
 
+class ScriptedClock:
+    def __init__(self, values: list[float | BaseException]) -> None:
+        self.values = iter(values)
+
+    def __call__(self) -> float:
+        value = next(self.values)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    def set_values(self, values: list[float | BaseException]) -> None:
+        self.values = iter(values)
+
+
 class RecordingJournalRepository:
     def __init__(self) -> None:
         self.append_calls = 0
@@ -1998,6 +2012,73 @@ def test_stale_wait_flag_cannot_authorize_resume_after_disposition_claim() -> No
     assert errors == []
     assert recorder._resume_state == "failed"
     assert repository.converge_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("final_sample", "expected_diagnostic", "expected_used", "invalid"),
+    [
+        (0.010, None, 0.010, False),
+        (SystemExit(), "journal_clock_invalid", 0.050, True),
+        (0.050, "journal_disposition_budget_exhausted", 0.050, False),
+    ],
+)
+def test_final_budget_finishes_after_cleanup_and_preserves_segment_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    final_sample: float | BaseException,
+    expected_diagnostic: str | None,
+    expected_used: float,
+    invalid: bool,
+) -> None:
+    clock = ScriptedClock([0.0, 0.0, 0.0, 0.0, 0.0])
+    repository = RecordingJournalRepository()
+    recorder = _recorder(repository, clock=clock)  # type: ignore[arg-type]
+    active_used_before = recorder.active_budget.used_seconds
+    observed: list[tuple[object, bool, float, bool]] = []
+    original_finish = journal_module.ActiveWorkBudget.finish_operation
+
+    def finish_operation(budget: object, entry: object) -> bool:
+        exhausted = original_finish(budget, entry)  # type: ignore[arg-type]
+        observed.append(
+            (
+                budget,
+                exhausted,
+                getattr(budget, "used_seconds"),
+                getattr(budget, "clock_invalid_latched"),
+            )
+        )
+        return exhausted
+
+    monkeypatch.setattr(
+        journal_module.ActiveWorkBudget,
+        "finish_operation",
+        finish_operation,
+    )
+
+    def capture(value: EventInput, _deadline: float) -> object:
+        return prepare_event(
+            event_type=value.event_type,
+            execution_segment_id=SEGMENT_A,
+            facts=dict(value.facts),
+        )
+
+    recorder._event_preparer = capture  # type: ignore[assignment]
+    recorder._cleanup_operation = lambda _lease: clock.set_values([final_sample])  # type: ignore[assignment]
+    recorder.finish(TerminalDisposition(status="completed"))
+
+    assert len(observed) == 1
+    final_budget, exhausted, used_seconds, clock_invalid_latched = observed[0]
+    assert getattr(final_budget, "total_seconds") == pytest.approx(0.050)
+    if invalid:
+        assert exhausted is True
+        assert clock_invalid_latched is True
+    else:
+        assert exhausted is (
+            expected_diagnostic == "journal_disposition_budget_exhausted"
+        )
+        assert clock_invalid_latched is False
+    assert used_seconds == pytest.approx(expected_used)
+    assert recorder.active_budget.used_seconds == active_used_before
+    assert recorder.diagnostics == ([] if expected_diagnostic is None else [expected_diagnostic])
 
 
 def test_resume_disposition_is_atomic_and_keeps_segment_recorder_open() -> None:

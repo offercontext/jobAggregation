@@ -140,7 +140,7 @@ def _class_body_bound_names(class_node: ast.ClassDef) -> set[str]:
 
     class BoundNameVisitor(ast.NodeVisitor):
         def visit_Name(self, node: ast.Name) -> None:
-            if isinstance(node.ctx, ast.Store):
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
                 names.add(node.id)
 
         def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
@@ -206,7 +206,7 @@ def _target_names(node: ast.AST) -> set[str]:
     names = {
         child.id
         for child in ast.walk(node)
-        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
+        if isinstance(child, ast.Name) and isinstance(child.ctx, (ast.Store, ast.Del))
     }
     for child in ast.walk(node):
         if isinstance(child, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
@@ -252,6 +252,8 @@ def _top_level_class(tree: ast.AST, name: str) -> ast.ClassDef:
             node, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr, ast.For, ast.AsyncFor)
         ):
             assert name not in _target_names(node), f"{name} must not be shadowed by a target"
+        elif isinstance(node, ast.Delete):
+            assert name not in _target_names(node), f"{name} must not be deleted"
         elif isinstance(node, ast.withitem):
             if node.optional_vars is not None:
                 assert name not in _target_names(node.optional_vars), (
@@ -1087,6 +1089,22 @@ def test_mutations_reject_validated_method_decorators(
             "AgentRunRepository",
             "append_event_bound",
         ),
+        (
+            "class SafeRunRecorder:\n"
+            "    del append_prepared_event_bound\n"
+            "    def append_prepared_event_bound(self, session, draft):\n"
+            "        pass\n",
+            "SafeRunRecorder",
+            "append_prepared_event_bound",
+        ),
+        (
+            "class AgentRunRepository:\n"
+            "    del append_event_bound\n"
+            "    def append_event_bound(self, session, run_id, draft):\n"
+            "        pass\n",
+            "AgentRunRepository",
+            "append_event_bound",
+        ),
     ),
 )
 def test_mutations_reject_validated_method_class_rebinding(
@@ -1116,6 +1134,29 @@ def test_mutations_reject_validated_method_class_rebinding(
 )
 def test_mutations_reject_module_level_class_rebinding_and_duplicates(source: str) -> None:
     _expect_rejected(source, lambda tree: _top_level_class(tree, "SafeRunRecorder"))
+
+
+@pytest.mark.parametrize(
+    ("source", "class_name"),
+    (
+        (
+            "class SafeRunRecorder:\n"
+            "    pass\n"
+            "del SafeRunRecorder\n",
+            "SafeRunRecorder",
+        ),
+        (
+            "class AgentRunRepository:\n"
+            "    pass\n"
+            "del AgentRunRepository\n",
+            "AgentRunRepository",
+        ),
+    ),
+)
+def test_mutations_reject_module_level_class_deletion(
+    source: str, class_name: str
+) -> None:
+    _expect_rejected(source, lambda tree: _top_level_class(tree, class_name))
 
 
 @pytest.mark.parametrize(

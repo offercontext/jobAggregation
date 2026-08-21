@@ -11,6 +11,7 @@ from offerpilot.pilot_runtime.contracts import (
     AssistantMessageEvent,
     CancelReason,
     ConfirmationRequiredOutcome,
+    InvocationState,
     MessageOutcome,
     RuntimeFailureOutcome,
     RuntimeTransportContext,
@@ -24,6 +25,7 @@ from offerpilot.pilot_runtime.errors import (
     RuntimeTransportAborted,
 )
 from offerpilot.pilot_runtime.event_sink import InMemoryRuntimeInvocationControl
+from offerpilot.chat_transport import SyncAgentExecutionHost
 from offerpilot.pilot_runtime.service import (
     PilotRuntime,
     ResolvedModel,
@@ -338,14 +340,20 @@ def _runtime(
     return runtime, resolved_persistence, resolved_journal
 
 
-def _start(runtime: PilotRuntime, host: _Host, *, message: str = "hi") -> object:
+def _start(
+    runtime: PilotRuntime,
+    host: _Host,
+    *,
+    message: str = "hi",
+    control: InMemoryRuntimeInvocationControl | None = None,
+) -> object:
     return runtime.start_turn(
         StartTurnRequest(message=message),
         transport=RuntimeTransportContext(mode="sync"),
         event_sink=None,
         signal_sink=None,
         execution_host=host,
-        invocation_control=InMemoryRuntimeInvocationControl(),
+        invocation_control=control or InMemoryRuntimeInvocationControl(),
         cancel_check=lambda: False,
     )
 
@@ -374,6 +382,25 @@ def test_start_turn_sync_sequence_is_frozen() -> None:
     ]
     assert persistence.user_count == 1
     assert persistence.message_count == 1
+
+
+def test_sync_host_leaves_control_active_until_runtime_terminal_commit() -> None:
+    phases = _Phases()
+    runtime, persistence, _journal = _runtime(phases)
+    control = InMemoryRuntimeInvocationControl()
+
+    result = runtime.start_turn(
+        StartTurnRequest(message="hi"),
+        transport=RuntimeTransportContext(mode="sync"),
+        execution_host=SyncAgentExecutionHost(timeout_seconds=1.0),
+        invocation_control=control,
+        cancel_check=lambda: False,
+    )
+
+    assert isinstance(result, MessageOutcome)
+    assert persistence.user_count == 1
+    assert persistence.message_count == 1
+    assert control.state is InvocationState.COMPLETED
 
 
 @pytest.mark.parametrize(
@@ -410,6 +437,7 @@ def test_confirmation_token_matches_closed_baseline_helper() -> None:
 
 def test_pending_outcome_uses_confirmation_token_from_persisted_pending() -> None:
     phases = _Phases()
+    control = InMemoryRuntimeInvocationControl()
     pending = PendingAction(
         "call-17",
         "create_application",
@@ -424,9 +452,10 @@ def test_pending_outcome_uses_confirmation_token_from_persisted_pending() -> Non
         driver=_Driver(phases, result=SimpleNamespace(added=[], reply="", pending=pending)),
     )
 
-    result = _start(runtime, _Host(phases))
+    result = _start(runtime, _Host(phases), control=control)
 
     assert isinstance(result, ConfirmationRequiredOutcome)
+    assert control.state is InvocationState.COMPLETED
     assert result.confirmation_token == baseline_confirmation_token(pending)
     assert result.pending_action is not None
     assert result.pending_action.confirmation_token == result.confirmation_token
@@ -598,18 +627,58 @@ def test_live_pending_stops_before_model_resolution() -> None:
 
 def test_source_failure_persists_user_and_finishes_failed_journal() -> None:
     phases = _Phases()
+    control = InMemoryRuntimeInvocationControl()
     runtime, persistence, journal = _runtime(
         phases,
         source=_Source(phases, error=RuntimeError("source failed")),
     )
 
-    result = _start(runtime, _Host(phases))
+    result = _start(runtime, _Host(phases), control=control)
 
     assert isinstance(result, RuntimeFailureOutcome)
     assert result.code is RuntimeFailureCode.SOURCE_LOAD_FAILED
     assert persistence.user_count == 1
     assert persistence.message_count == 0
     assert journal.recorder.dispositions == [("failed", "source_load_failed")]
+    assert control.state is InvocationState.COMPLETED
+
+
+@pytest.mark.parametrize("failure_mode", ["exception", "none", "failed"])
+def test_initial_user_persist_failure_is_safe_before_journal_or_agent(
+    failure_mode: str,
+) -> None:
+    phases = _Phases()
+
+    class FailingUserPersistence(_Persistence):
+        def persist_initial_user_message(self, conversation_id: int, content: str) -> object:
+            del conversation_id, content
+            if failure_mode == "exception":
+                raise OSError("user persist secret")
+            if failure_mode == "none":
+                return None
+            return PersistenceResult(PersistenceStatus.CAS_LOST)
+
+    persistence = FailingUserPersistence(phases)
+    driver = _Driver(phases)
+    runtime, _, journal = _runtime(
+        phases,
+        persistence=persistence,
+        driver=driver,
+    )
+
+    result = _start(runtime, _Host(phases))
+
+    assert isinstance(result, RuntimeFailureOutcome)
+    assert result.code is RuntimeFailureCode.OPERATION_FAILED
+    assert result.status_code == 503
+    assert result.retryable is True
+    assert "user persist secret" not in result.message
+    assert persistence.message_count == 0
+    assert driver.provider_calls == 0
+    assert journal.recorder.dispositions == []
+    assert "run_start" not in phases.items
+    assert "source_load" not in phases.items
+    assert "agent_host" not in phases.items
 
 
 def test_phase_sink_failure_is_fail_open_before_authoritative_finish() -> None:
@@ -664,6 +733,14 @@ def test_phase_sink_failure_does_not_block_authoritative_abandon() -> None:
 
 def test_timeout_writes_fixed_assistant_message_and_does_not_provider_map() -> None:
     phases = _Phases()
+    control = InMemoryRuntimeInvocationControl()
+
+    class TimeoutHost:
+        def run(self, thunk: object, invocation_control: object) -> object:
+            del thunk
+            assert invocation_control is control
+            assert control.request_timeout()
+            raise RuntimeAgentTimedOut()
 
     class TimeoutPersistence(_Persistence):
         def persist_timeout_assistant(self, conversation_id: int, content: str) -> object:
@@ -674,12 +751,13 @@ def test_timeout_writes_fixed_assistant_message_and_does_not_provider_map() -> N
 
     persistence = TimeoutPersistence(phases)
     runtime, _, journal = _runtime(phases, persistence=persistence)
-    result = _start(runtime, _Host(phases, RuntimeAgentTimedOut()))
+    result = _start(runtime, TimeoutHost(), control=control)  # type: ignore[arg-type]
 
     assert isinstance(result, MessageOutcome)
     assert result.message
     assert persistence.message_count == 1
     assert journal.recorder.dispositions == [("timed_out", "timeout")]
+    assert control.state is InvocationState.TIMED_OUT
 
 
 @pytest.mark.parametrize("failure_mode", ["exception", "none", "failed"])

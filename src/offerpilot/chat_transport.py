@@ -159,7 +159,7 @@ class SyncAgentExecutionHost(Generic[_ResultT]):
                 _record_control_exception(invocation_control, exc)
                 raise
 
-            if invocation_control.mark_completed():
+            if invocation_control.is_active():
                 return result
             cancel_futures = True
             _raise_control_terminal(invocation_control)
@@ -311,7 +311,7 @@ class _SseInvocationIterator(Generic[_ResultT], Iterator[RuntimeEvent]):
         except BaseException as exc:
             _record_control_exception(self._control, exc)
             raise
-        if not self._control.mark_completed():
+        if not self._control.is_active():
             _raise_control_terminal(self._control)
         self._result = result
         self._result_set = True

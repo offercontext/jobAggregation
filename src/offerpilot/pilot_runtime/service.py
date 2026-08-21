@@ -43,6 +43,7 @@ from .contracts import (
     RuntimeEvent,
     RuntimeEventSink,
     RuntimeFailureOutcome,
+    InvocationState,
     RuntimeInvocationControl,
     RuntimeOutcome,
     RuntimeSignalSink,
@@ -973,6 +974,11 @@ class PilotRuntime:
         if execution_host is None or invocation_control is None:
             raise TypeError("execution_host and invocation_control are required")
         cancel = cancel_check or (lambda: False)
+
+        def complete_early(outcome: RuntimeOutcome) -> RuntimeOutcome:
+            self._mark_completed(invocation_control)
+            return outcome
+
         self._phase("validate")
         self._validate(request)
         self._check_cancel(cancel, invocation_control)
@@ -980,12 +986,18 @@ class PilotRuntime:
         self._phase("conversation")
         conversation = self._load_conversation(request)
         if conversation is None:
-            return self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404)
+            return complete_early(
+                self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404)
+            )
         conversation_id = _conversation_id(conversation)
         if conversation_id is None:
-            return self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404)
+            return complete_early(
+                self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404)
+            )
         if _is_archived(conversation):
-            return self._failure(RuntimeFailureCode.CONVERSATION_ARCHIVED, "conversation is archived", 409)
+            return complete_early(
+                self._failure(RuntimeFailureCode.CONVERSATION_ARCHIVED, "conversation is archived", 409)
+            )
 
         route = self._select_route(request, conversation)
         self._phase(f"route:{route.value}")
@@ -993,7 +1005,9 @@ class PilotRuntime:
             # Deterministic and confirmation orchestration is intentionally
             # private to later extraction tasks.  Return before user/Run/
             # Source/Agent side effects.
-            return self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400)
+            return complete_early(
+                self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400)
+            )
 
         self._phase("pending_guard")
         try:
@@ -1001,45 +1015,65 @@ class PilotRuntime:
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
             raise
         except Exception:
-            return self._failure(
-                RuntimeFailureCode.OPERATION_FAILED,
-                "对话当前不可读取。",
-                503,
-                retryable=True,
+            return complete_early(
+                self._failure(
+                    RuntimeFailureCode.OPERATION_FAILED,
+                    "对话当前不可读取。",
+                    503,
+                    retryable=True,
+                )
             )
         except BaseException:
             raise
         if pending_guard is not None and pending_guard is not False:
-            return self._failure(
-                RuntimeFailureCode.PENDING_CONFIRMATION_REQUIRED,
-                "当前写入仍待确认，请先处理确认卡。",
-                409,
+            return complete_early(
+                self._failure(
+                    RuntimeFailureCode.PENDING_CONFIRMATION_REQUIRED,
+                    "当前写入仍待确认，请先处理确认卡。",
+                    409,
+                )
             )
 
         self._phase("model_resolve")
         resolved = self._resolve_model(request, conversation)
         if isinstance(resolved, RuntimeFailureOutcome):
-            return resolved
+            return complete_early(resolved)
         if resolved is None:
-            return self._failure(
-                RuntimeFailureCode.MODEL_UNCONFIGURED,
-                "AI 设置尚未完成，请检查模型配置。",
-                503,
-                retryable=False,
+            return complete_early(
+                self._failure(
+                    RuntimeFailureCode.MODEL_UNCONFIGURED,
+                    "AI 设置尚未完成，请检查模型配置。",
+                    503,
+                    retryable=False,
+                )
             )
 
         persistence = self._require_dependency("persistence")
         persistence_failure = self._validate_persistence_surface(persistence)
         if persistence_failure is not None:
-            return persistence_failure
+            return complete_early(persistence_failure)
         self._phase("user_persist")
         self._check_cancel(cancel, invocation_control)
-        user_result = self._persist_user(
-            persistence,
-            conversation_id,
-            request.message,
-            control=invocation_control,
-        )
+        try:
+            user_result = self._persist_user(
+                persistence,
+                conversation_id,
+                request.message,
+                control=invocation_control,
+            )
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception:
+            return complete_early(
+                self._failure(
+                    RuntimeFailureCode.OPERATION_FAILED,
+                    "对话当前不可写入。",
+                    503,
+                    retryable=True,
+                )
+            )
+        except BaseException:
+            raise
         if not _result_persisted(user_result):
             code = (
                 RuntimeFailureCode.CONVERSATION_ARCHIVED
@@ -1049,18 +1083,27 @@ class PilotRuntime:
                 else RuntimeFailureCode.OPERATION_FAILED
             )
             status = 409 if code is RuntimeFailureCode.CONVERSATION_ARCHIVED else 404 if code is RuntimeFailureCode.APPLICATION_NOT_FOUND else 503
-            return self._failure(code, "对话当前不可写入。", status)
+            return complete_early(
+                self._failure(
+                    code,
+                    "对话当前不可写入。",
+                    status,
+                    retryable=code is RuntimeFailureCode.OPERATION_FAILED,
+                )
+            )
 
         input_message_id = _attribute(user_result, "message_id")
         if type(input_message_id) is not int or input_message_id <= 0:
             try:
                 persisted_ids = self._snapshot_message_ids(persistence, conversation_id)
             except _PersistenceReadbackError:
-                return self._failure(
-                    RuntimeFailureCode.OPERATION_FAILED,
-                    "对话结果暂时无法保存。",
-                    503,
-                    retryable=True,
+                return complete_early(
+                    self._failure(
+                        RuntimeFailureCode.OPERATION_FAILED,
+                        "对话结果暂时无法保存。",
+                        503,
+                        retryable=True,
+                    )
                 )
             input_message_id = persisted_ids[-1] if persisted_ids else None
 
@@ -1075,6 +1118,7 @@ class PilotRuntime:
         )
 
         abandoned = False
+        completion_marked = False
 
         def abandon_once() -> None:
             nonlocal abandoned
@@ -1082,6 +1126,13 @@ class PilotRuntime:
                 return
             abandoned = True
             self._abandon(recorder, journal_started)
+
+        def complete_once() -> None:
+            nonlocal completion_marked
+            if completion_marked:
+                return
+            self._mark_completed(invocation_control)
+            completion_marked = True
 
         def finish_or_raise(
             status: str,
@@ -1098,6 +1149,8 @@ class PilotRuntime:
                     invocation_control,
                     allow_timeout=allow_timeout,
                 )
+                if not allow_timeout:
+                    complete_once()
             except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
                 abandon_once()
                 raise
@@ -1343,6 +1396,11 @@ class PilotRuntime:
             except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
                 abandon_once()
                 raise
+            try:
+                complete_once()
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                abandon_once()
+                raise
         else:
             if isinstance(outcome, RuntimeFailureOutcome):
                 finish_or_raise("failed", "unknown")
@@ -1519,6 +1577,18 @@ class PilotRuntime:
                 require_runtime_active(control)
             raise RuntimeCancelled()
         return result[1]
+
+    @staticmethod
+    def _mark_completed(control: RuntimeInvocationControl) -> None:
+        """Close the invocation only after Runtime-owned terminal work."""
+
+        if control.mark_completed():
+            return
+        state = control.state
+        if state is InvocationState.COMPLETED:
+            raise RuntimeTransportAborted()
+        require_runtime_active(control)
+        raise RuntimeTransportAborted()
 
     @staticmethod
     def _validate_persistence_surface(persistence: object) -> RuntimeFailureOutcome | None:

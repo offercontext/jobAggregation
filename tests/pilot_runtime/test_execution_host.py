@@ -49,7 +49,7 @@ def test_sync_host_times_only_the_agent_thunk() -> None:
 
     assert result == "ok"
     assert elapsed >= 0.04
-    assert control.state is InvocationState.COMPLETED
+    assert control.state is InvocationState.ACTIVE
 
 
 def test_sync_host_timeout_does_not_wait_for_uncancellable_worker() -> None:
@@ -126,7 +126,7 @@ def test_sse_host_is_typed_ordered_and_uses_unbounded_queue() -> None:
 
     assert delivered == events
     assert result == "done"
-    assert control.state is InvocationState.COMPLETED
+    assert control.state is InvocationState.ACTIVE
     assert host.timeout_seconds == 0.2
     assert CHAT_AGENT_TIMEOUT_SECONDS == 120.0
 
@@ -150,7 +150,7 @@ def test_sse_host_worker_is_not_blocked_by_slow_consumer() -> None:
 
     assert delivered == events
     assert result == "done"
-    assert control.state is InvocationState.COMPLETED
+    assert control.state is InvocationState.ACTIVE
 
 
 def test_sse_host_timeout_drops_late_events_and_result() -> None:

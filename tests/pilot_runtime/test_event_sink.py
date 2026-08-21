@@ -34,6 +34,7 @@ from offerpilot.pilot_runtime.event_sink import (
     emit_runtime_event,
     require_runtime_active,
     runtime_event_payload,
+    runtime_outcome_payload,
 )
 
 
@@ -154,6 +155,27 @@ def test_event_and_sse_projection_reject_runtime_event_subclasses() -> None:
         event_sse_payload(child)  # type: ignore[arg-type]
 
 
+def test_outcome_renderers_are_closed_exact_types() -> None:
+    from offerpilot.chat_transport import outcome_http_payload, outcome_http_status
+    from offerpilot.pilot_runtime.contracts import MessageOutcome
+
+    class ChildMessageOutcome(MessageOutcome):
+        pass
+
+    outcome = MessageOutcome(message="done")
+    assert outcome_http_status(outcome) == 200
+    assert outcome_http_payload(outcome)["message"] == "done"
+    assert runtime_outcome_payload(outcome)["message"] == "done"
+
+    for unknown in (object(), ChildMessageOutcome(message="child")):
+        with pytest.raises(TypeError):
+            outcome_http_status(unknown)  # type: ignore[arg-type]
+        with pytest.raises(TypeError):
+            outcome_http_payload(unknown)  # type: ignore[arg-type]
+        with pytest.raises(TypeError):
+            runtime_outcome_payload(unknown)
+
+
 def test_invocation_control_is_closed_cas_and_maps_control_errors() -> None:
     control = InMemoryRuntimeInvocationControl()
     assert control.state is InvocationState.ACTIVE
@@ -191,8 +213,8 @@ def test_runtime_signal_latch_is_capacity_one_nonblocking_and_fail_open() -> Non
     assert latch.try_emit(signal) is SignalEmitResult.DUPLICATE
     latch.close()
     assert latch.try_emit(signal) is SignalEmitResult.CLOSED
-    assert latch.finalize() is None
-    assert latch.finalize() is None
+    assert latch.finalize() is SignalEmitResult.CLOSED
+    assert latch.finalize() is SignalEmitResult.CLOSED
 
 
 def test_runtime_signal_latch_reports_full_and_registration_failure_without_leaking() -> None:
@@ -208,9 +230,9 @@ def test_runtime_signal_latch_reports_full_and_registration_failure_without_leak
 
     failed = RuntimeSignalLatch(register=register)
     assert failed.try_emit(FirstModelCompletedSignal()) is SignalEmitResult.EMITTED
-    assert failed.finalize() is None
+    assert failed.finalize() is SignalEmitResult.DEGRADED
     assert len(calls) == 1
-    assert failed.finalize() is None
+    assert failed.finalize() is SignalEmitResult.CLOSED
 
 
 def test_runtime_signal_latch_has_permanent_one_shot_and_close_discards_signal() -> None:
@@ -251,7 +273,13 @@ def test_runtime_signal_latch_try_emit_does_not_run_sink_callback() -> None:
 
 def test_runtime_signal_latch_dispatches_sink_once_during_finalize() -> None:
     seen: list[FirstModelCompletedSignal] = []
-    latch = RuntimeSignalLatch(sink=seen.append)
+
+    class TypedSink:
+        def try_emit(self, signal: FirstModelCompletedSignal) -> SignalEmitResult:
+            seen.append(signal)
+            return SignalEmitResult.EMITTED
+
+    latch = RuntimeSignalLatch(sink=TypedSink())
     signal = FirstModelCompletedSignal()
 
     assert latch.try_emit(signal) is SignalEmitResult.EMITTED
@@ -259,6 +287,20 @@ def test_runtime_signal_latch_dispatches_sink_once_during_finalize() -> None:
     latch.finalize()
 
     assert seen == [signal]
+
+
+def test_runtime_signal_latch_rejects_non_signal_and_finalize_reports_no_signal() -> None:
+    registered: list[FirstModelCompletedSignal] = []
+    latch = RuntimeSignalLatch(register=registered.append)
+
+    with pytest.raises(TypeError):
+        latch.try_emit("title")  # type: ignore[arg-type]
+    signal = FirstModelCompletedSignal()
+    assert latch.try_emit(signal) is SignalEmitResult.EMITTED
+    assert latch.drain() == signal
+    assert latch.finalize() is SignalEmitResult.CLOSED
+    assert latch.finalize() is SignalEmitResult.CLOSED
+    assert registered == []
 
 
 class _DelayedLifecycleRuntime:

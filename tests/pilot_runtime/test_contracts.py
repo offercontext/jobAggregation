@@ -347,6 +347,12 @@ def test_signal_sink_protocol_has_closed_nonblocking_result() -> None:
     }
 
 
+def test_signal_sink_protocol_is_generic_for_typed_title_signals() -> None:
+    typed = RuntimeSignalSink[FirstModelCompletedSignal]
+    assert get_origin(typed) is RuntimeSignalSink
+    assert get_args(typed) == (FirstModelCompletedSignal,)
+
+
 def _json_object(value: dict[str, object]) -> MappingProxyType:
     return MappingProxyType(value)
 

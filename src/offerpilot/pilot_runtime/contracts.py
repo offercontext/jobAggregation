@@ -1033,9 +1033,12 @@ class RuntimeEventSink(Protocol):
     def emit(self, event: RuntimeEvent) -> None: ...
 
 
+SignalT_contra = TypeVar("SignalT_contra", contravariant=True)
+
+
 @runtime_checkable
-class RuntimeSignalSink(Protocol):
-    def try_emit(self, signal: FirstModelCompletedSignal) -> SignalEmitResult: ...
+class RuntimeSignalSink(Protocol[SignalT_contra]):
+    def try_emit(self, signal: SignalT_contra) -> SignalEmitResult: ...
 
 
 ResultT = TypeVar("ResultT")

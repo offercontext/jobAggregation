@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from starlette.requests import ClientDisconnect
 
 from offerpilot.pilot_runtime.contracts import (
     AssistantMessageEvent,
@@ -14,9 +15,14 @@ from offerpilot.pilot_runtime.contracts import (
     RuntimeFailureOutcome,
     RuntimeFailureCode,
 )
-from offerpilot.pilot_runtime.errors import RuntimeTransportAborted
+from offerpilot.pilot_runtime.errors import (
+    RuntimeAgentTimedOut,
+    RuntimeCancelled,
+    RuntimeTransportAborted,
+)
 from offerpilot.chat_transport import (
     build_guarded_streaming_response,
+    encode_sse_event,
     GuardedStreamingResponse,
     PreparedStreamGuard,
     event_sse_payload,
@@ -232,6 +238,183 @@ def test_guarded_response_renderer_failure_maps_transport_aborted() -> None:
         )
     assert lifecycle.state is PreparedLifecycleState.COMPLETED
     assert lifecycle.completion_reason is CompletionReason.TRANSPORT_ABORTED
+
+
+def test_guarded_response_first_send_oserror_becomes_client_disconnect_and_aborts() -> None:
+    from starlette.requests import ClientDisconnect
+
+    lifecycle = PreparedLifecycle()
+    calls = {"execute": 0}
+    guard = PreparedStreamGuard(
+        lifecycle=lifecycle,
+        on_execute=lambda: calls.__setitem__("execute", calls["execute"] + 1),
+    )
+    response = GuardedStreamingResponse([b"never"], guard)
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(_message: dict[str, object]) -> None:
+        raise OSError("client disconnected")
+
+    with pytest.raises(ClientDisconnect):
+        asyncio.run(
+            response(
+                {"type": "http", "method": "GET", "path": "/", "headers": [], "asgi": {"spec_version": "2.4"}},
+                receive,
+                send,
+            )
+        )
+    assert lifecycle.state is PreparedLifecycleState.ABORTED
+    assert calls["execute"] == 0
+
+
+def test_guarded_response_midstream_send_oserror_becomes_client_disconnect_cancelled() -> None:
+    from starlette.requests import ClientDisconnect
+
+    lifecycle = PreparedLifecycle()
+    guard = PreparedStreamGuard(lifecycle=lifecycle)
+    response = GuardedStreamingResponse([b"hello"], guard)
+    sends = {"count": 0}
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict[str, object]) -> None:
+        sends["count"] += 1
+        if message["type"] == "http.response.body":
+            raise OSError("client disconnected")
+
+    with pytest.raises(ClientDisconnect):
+        asyncio.run(
+            response(
+                {"type": "http", "method": "GET", "path": "/", "headers": [], "asgi": {"spec_version": "2.4"}},
+                receive,
+                send,
+            )
+        )
+    assert sends["count"] == 2
+    assert lifecycle.state is PreparedLifecycleState.COMPLETED
+    assert lifecycle.completion_reason is CompletionReason.CANCELLED
+
+
+@pytest.mark.parametrize(
+    "background_error, expected_reason",
+    [
+        (RuntimeCancelled(), CompletionReason.CANCELLED),
+        (RuntimeTransportAborted(), CompletionReason.TRANSPORT_ABORTED),
+        (RuntimeAgentTimedOut(), CompletionReason.CANCELLED),
+        (ClientDisconnect(), CompletionReason.CANCELLED),
+        (asyncio.CancelledError(), CompletionReason.CANCELLED),
+    ],
+)
+def test_background_control_exception_is_preserved_and_classified(
+    background_error: BaseException,
+    expected_reason: CompletionReason,
+) -> None:
+    lifecycle = PreparedLifecycle()
+
+    def background() -> None:
+        raise background_error
+
+    response = GuardedStreamingResponse([b"hello"], PreparedStreamGuard(lifecycle=lifecycle), background=background)
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(_message: dict[str, object]) -> None:
+        return None
+
+    with pytest.raises(type(background_error)):
+        asyncio.run(
+            response(
+                {"type": "http", "method": "GET", "path": "/", "headers": [], "asgi": {"spec_version": "2.4"}},
+                receive,
+                send,
+            )
+        )
+    assert lifecycle.state is PreparedLifecycleState.COMPLETED
+    assert lifecycle.completion_reason is expected_reason
+
+
+def test_cleanup_control_exception_is_not_reclassified_as_transport_failure() -> None:
+    lifecycle = PreparedLifecycle()
+
+    def cleanup(_reason: CompletionReason | None) -> None:
+        raise RuntimeCancelled()
+
+    response = GuardedStreamingResponse(
+        [b"hello"],
+        PreparedStreamGuard(lifecycle=lifecycle, on_cleanup=cleanup),
+    )
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(_message: dict[str, object]) -> None:
+        return None
+
+    with pytest.raises(RuntimeCancelled):
+        asyncio.run(
+            response(
+                {"type": "http", "method": "GET", "path": "/", "headers": [], "asgi": {"spec_version": "2.4"}},
+                receive,
+                send,
+            )
+        )
+
+
+def test_background_ordinary_exception_maps_transport_aborted() -> None:
+    lifecycle = PreparedLifecycle()
+
+    def background() -> None:
+        raise OSError("background failed")
+
+    response = GuardedStreamingResponse(
+        [b"hello"],
+        PreparedStreamGuard(lifecycle=lifecycle),
+        background=background,
+    )
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(_message: dict[str, object]) -> None:
+        return None
+
+    with pytest.raises(RuntimeTransportAborted):
+        asyncio.run(
+            response(
+                {"type": "http", "method": "GET", "path": "/", "headers": [], "asgi": {"spec_version": "2.4"}},
+                receive,
+                send,
+            )
+        )
+    assert lifecycle.completion_reason is CompletionReason.TRANSPORT_ABORTED
+
+
+def test_sse_envelope_cannot_override_reserved_typed_fields() -> None:
+    event = AssistantMessageEvent(message="hello")
+    for key, value in (("seq", 99), ("event", "wrong"), ("data", {"message": "wrong"})):
+        with pytest.raises(ValueError):
+            encode_sse_event(event, seq=1, envelope={key: value})
+
+
+def test_unneeded_transport_aliases_are_not_exported() -> None:
+    import offerpilot.chat_transport as transport
+
+    for name in (
+        "runtime_event_sse_payload",
+        "render_outcome_http",
+        "outcome_to_http",
+        "render_outcome_response",
+        "outcome_to_http_payload",
+        "render_event_sse",
+        "event_to_sse_payload",
+        "make_guarded_streaming_response",
+        "prepared_streaming_response",
+    ):
+        assert not hasattr(transport, name)
 
 
 @pytest.mark.parametrize("base_error", [KeyboardInterrupt(), SystemExit(7)])

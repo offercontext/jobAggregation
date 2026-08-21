@@ -99,17 +99,17 @@ def _http_message_payload(outcome: MessageOutcome) -> dict[str, object]:
 def outcome_http_payload(outcome: RuntimeOutcome | ImmediateHttpOutcome) -> dict[str, object]:
     """Project a typed outcome to the existing safe HTTP JSON body."""
 
-    if isinstance(outcome, ImmediateHttpOutcome):
+    if type(outcome) is ImmediateHttpOutcome:
         return {str(key): _plain(value) for key, value in outcome.payload.items()}
-    if isinstance(outcome, MessageOutcome):
+    if type(outcome) is MessageOutcome:
         return _http_message_payload(outcome)
-    if isinstance(outcome, ConfirmationRequiredOutcome):
+    if type(outcome) is ConfirmationRequiredOutcome:
         return runtime_outcome_payload(outcome)
-    if isinstance(outcome, RuntimeFailureOutcome):
+    if type(outcome) is RuntimeFailureOutcome:
         payload: dict[str, object] = {"error": outcome.message}
         payload["error_code"] = outcome.code.value
         return payload
-    if isinstance(outcome, OperationPendingOutcome):
+    if type(outcome) is OperationPendingOutcome:
         payload = {
             "error": outcome.message,
             "error_code": outcome.code.value,
@@ -120,7 +120,7 @@ def outcome_http_payload(outcome: RuntimeOutcome | ImmediateHttpOutcome) -> dict
         if outcome.retry_after_seconds is not None:
             payload["retry_after_seconds"] = outcome.retry_after_seconds
         return payload
-    if isinstance(outcome, OperationReplayOutcome):
+    if type(outcome) is OperationReplayOutcome:
         return runtime_outcome_payload(outcome)
     raise TypeError("outcome must be a typed RuntimeOutcome or ImmediateHttpOutcome")
 
@@ -128,13 +128,15 @@ def outcome_http_payload(outcome: RuntimeOutcome | ImmediateHttpOutcome) -> dict
 def outcome_http_status(outcome: RuntimeOutcome | ImmediateHttpOutcome) -> int:
     """Return the closed status mapping for a Runtime outcome."""
 
-    if isinstance(outcome, ImmediateHttpOutcome):
+    if type(outcome) is ImmediateHttpOutcome:
         return outcome.status_code
-    if isinstance(outcome, RuntimeFailureOutcome):
+    if type(outcome) is RuntimeFailureOutcome:
         return outcome.status_code
-    if isinstance(outcome, OperationPendingOutcome):
+    if type(outcome) is OperationPendingOutcome:
         return 409 if outcome.code.value == "operation_delivery_pending" else 503
-    return 200
+    if type(outcome) in {MessageOutcome, ConfirmationRequiredOutcome, OperationReplayOutcome}:
+        return 200
+    raise TypeError("outcome must be a typed RuntimeOutcome or ImmediateHttpOutcome")
 
 
 def outcome_http_response(outcome: RuntimeOutcome | ImmediateHttpOutcome) -> JSONResponse:
@@ -155,10 +157,6 @@ def event_sse_payload(event: RuntimeEvent) -> dict[str, object]:
     return runtime_event_payload(event)
 
 
-def runtime_event_sse_payload(event: RuntimeEvent) -> dict[str, object]:
-    return event_sse_payload(event)
-
-
 def encode_sse_event(
     event: RuntimeEvent,
     *,
@@ -173,46 +171,20 @@ def encode_sse_event(
     if type(seq) is not int or seq < 1:
         raise ValueError("seq must be a positive integer")
     data: dict[str, object] = dict(envelope or {})
-    if not data:
-        data = {
+    reserved = {"seq", "event", "data"}
+    if reserved.intersection(data):
+        raise ValueError("SSE envelope cannot override typed event fields")
+    data.update(
+        {
             "seq": seq,
             "event": event_sse_name(event),
             "data": event_sse_payload(event),
         }
+    )
     body = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     event_name = event_sse_name(event)
     event_id = f"{run_id}:{seq}" if run_id else str(seq)
     return f"event: {event_name}\nid: {event_id}\ndata: {body}\n\n"
-
-
-def render_outcome_http(
-    outcome: RuntimeOutcome | ImmediateHttpOutcome,
-) -> tuple[int, dict[str, object]]:
-    """Pure status/payload projection used by HTTP route adapters."""
-
-    return outcome_http_status(outcome), outcome_http_payload(outcome)
-
-
-def outcome_to_http(
-    outcome: RuntimeOutcome | ImmediateHttpOutcome,
-) -> tuple[int, dict[str, object]]:
-    return render_outcome_http(outcome)
-
-
-def render_outcome_response(outcome: RuntimeOutcome | ImmediateHttpOutcome) -> JSONResponse:
-    return outcome_http_response(outcome)
-
-
-def outcome_to_http_payload(outcome: RuntimeOutcome | ImmediateHttpOutcome) -> dict[str, object]:
-    return outcome_http_payload(outcome)
-
-
-def render_event_sse(event: RuntimeEvent) -> dict[str, object]:
-    return event_sse_payload(event)
-
-
-def event_to_sse_payload(event: RuntimeEvent) -> dict[str, object]:
-    return event_sse_payload(event)
 
 
 def _adapt_cleanup_callback(callback: Callable[..., object] | None) -> CleanupCallback | None:
@@ -608,6 +580,14 @@ class GuardedStreamingResponse(StreamingResponse):
                 reason = CompletionReason.NORMAL if self._body_exhausted else failure_reason
                 try:
                     self._finalize_owner(reason)
+                except (
+                    RuntimeCancelled,
+                    RuntimeTransportAborted,
+                    RuntimeAgentTimedOut,
+                    ClientDisconnect,
+                    asyncio.CancelledError,
+                ):
+                    raise
                 except Exception as exc:
                     raise RuntimeTransportAborted() from exc
 
@@ -675,6 +655,10 @@ class GuardedStreamingResponse(StreamingResponse):
             try:
                 await send(message)
             except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut, ClientDisconnect):
+                raise
+            except OSError:
+                # Starlette owns the ASGI send-disconnect translation.  Keep
+                # OSError intact so its response adapter raises ClientDisconnect.
                 raise
             except Exception as exc:
                 raise RuntimeTransportAborted() from exc
@@ -766,27 +750,14 @@ def build_guarded_streaming_response(
         raise
 
 
-make_guarded_streaming_response = build_guarded_streaming_response
-prepared_streaming_response = build_guarded_streaming_response
-
-
 __all__ = [
     "GuardedStreamingResponse",
     "PreparedStreamGuard",
     "build_guarded_streaming_response",
     "encode_sse_event",
-    "event_to_sse_payload",
     "event_sse_name",
     "event_sse_payload",
-    "make_guarded_streaming_response",
     "outcome_http_payload",
     "outcome_http_response",
     "outcome_http_status",
-    "outcome_to_http",
-    "outcome_to_http_payload",
-    "prepared_streaming_response",
-    "render_event_sse",
-    "render_outcome_http",
-    "render_outcome_response",
-    "runtime_event_sse_payload",
 ]

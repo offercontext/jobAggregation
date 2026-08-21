@@ -166,7 +166,7 @@ def runtime_outcome_payload(outcome: object) -> dict[str, object]:
         RuntimeFailureOutcome,
     )
 
-    if isinstance(outcome, MessageOutcome):
+    if type(outcome) is MessageOutcome:
         payload: dict[str, object] = {
             "type": "message",
             "message": outcome.message,
@@ -179,7 +179,7 @@ def runtime_outcome_payload(outcome: object) -> dict[str, object]:
         if outcome.replayed:
             payload["replayed"] = True
         return payload
-    if isinstance(outcome, ConfirmationRequiredOutcome):
+    if type(outcome) is ConfirmationRequiredOutcome:
         payload = {"type": "confirmation_required"}
         _optional(payload, "conversation_id", outcome.conversation_id)
         _optional(payload, "operation_id", outcome.operation_id)
@@ -190,14 +190,14 @@ def runtime_outcome_payload(outcome: object) -> dict[str, object]:
         if outcome.replayed:
             payload["replayed"] = True
         return payload
-    if isinstance(outcome, RuntimeFailureOutcome):
+    if type(outcome) is RuntimeFailureOutcome:
         return {
             "error_code": outcome.code.value,
             "error": outcome.message,
             "retryable": outcome.retryable,
             "degraded": outcome.degraded,
         }
-    if isinstance(outcome, OperationPendingOutcome):
+    if type(outcome) is OperationPendingOutcome:
         payload = {
             "type": "operation_pending",
             "operation_id": outcome.operation_id,
@@ -207,7 +207,7 @@ def runtime_outcome_payload(outcome: object) -> dict[str, object]:
         _optional(payload, "conversation_id", outcome.conversation_id)
         _optional(payload, "retry_after_seconds", outcome.retry_after_seconds)
         return payload
-    if isinstance(outcome, OperationReplayOutcome):
+    if type(outcome) is OperationReplayOutcome:
         payload = {
             "type": "message",
             "operation_id": outcome.operation_id,
@@ -363,7 +363,9 @@ class RuntimeSignalLatch:
         self,
         register: Callable[[FirstModelCompletedSignal], None] | None = None,
         *,
-        sink: Callable[[FirstModelCompletedSignal], object] | RuntimeSignalSink | None = None,
+        sink: Callable[[FirstModelCompletedSignal], object]
+        | RuntimeSignalSink[FirstModelCompletedSignal]
+        | None = None,
         on_signal: Callable[[FirstModelCompletedSignal], object] | None = None,
     ) -> None:
         if register is not None and not callable(register):
@@ -390,7 +392,7 @@ class RuntimeSignalLatch:
             return self._closed
 
     def try_emit(self, signal: FirstModelCompletedSignal) -> SignalEmitResult:
-        if not isinstance(signal, FirstModelCompletedSignal):
+        if type(signal) is not FirstModelCompletedSignal:
             raise TypeError("signal must be a FirstModelCompletedSignal")
         with self._lock:
             if self._closed:
@@ -422,10 +424,10 @@ class RuntimeSignalLatch:
     def consumer_exit(self) -> None:
         self.close()
 
-    def finalize(self) -> None:
+    def finalize(self) -> SignalEmitResult:
         with self._lock:
             if self._finalized:
-                return
+                return SignalEmitResult.CLOSED
             self._finalized = True
             self._closed = True
             signal = self._signal
@@ -433,7 +435,7 @@ class RuntimeSignalLatch:
             sink = self._sink
             register = self._register
         if signal is None:
-            return
+            return SignalEmitResult.CLOSED
         degraded = False
         if sink is not None:
             try:
@@ -450,11 +452,13 @@ class RuntimeSignalLatch:
         if degraded:
             with self._lock:
                 self._degraded = True
+            return SignalEmitResult.DEGRADED
+        return SignalEmitResult.EMITTED
 
     # The owner uses ``drain_and_close`` when it wants an explicit, named
     # finalizer; retaining ``finalize`` keeps the operation idempotent.
-    def drain_and_close(self) -> None:
-        self.finalize()
+    def drain_and_close(self) -> SignalEmitResult:
+        return self.finalize()
 
     def mark_degraded(self) -> SignalEmitResult:
         with self._lock:

@@ -7,7 +7,7 @@ module deliberately contains no HTTP, SSE, database, or provider concerns.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from threading import Lock
+from threading import Lock, RLock, get_ident
 from typing import Final, cast
 
 from .contracts import (
@@ -273,12 +273,13 @@ def emit_runtime_event(sink: RuntimeEventSink, event: RuntimeEvent) -> None:
 class InMemoryRuntimeInvocationControl:
     """Atomic, in-memory invocation state used by Runtime and transport hosts."""
 
-    __slots__ = ("_state", "_cancel_reason", "_lock")
+    __slots__ = ("_state", "_cancel_reason", "_lock", "_fence_owner")
 
     def __init__(self) -> None:
         self._state = InvocationState.ACTIVE
         self._cancel_reason: CancelReason | None = None
-        self._lock = Lock()
+        self._lock = RLock()
+        self._fence_owner: int | None = None
 
     @property
     def state(self) -> InvocationState:
@@ -294,6 +295,8 @@ class InMemoryRuntimeInvocationControl:
         if not isinstance(reason, CancelReason):
             raise TypeError("reason must be a CancelReason")
         with self._lock:
+            if self._fence_owner == get_ident():
+                raise RuntimeError("control mutation is not allowed inside a commit fence")
             if self._state is not InvocationState.ACTIVE:
                 return False
             object.__setattr__(self, "_state", InvocationState.CANCELLED)
@@ -302,6 +305,8 @@ class InMemoryRuntimeInvocationControl:
 
     def request_timeout(self) -> bool:
         with self._lock:
+            if self._fence_owner == get_ident():
+                raise RuntimeError("control mutation is not allowed inside a commit fence")
             if self._state is not InvocationState.ACTIVE:
                 return False
             object.__setattr__(self, "_state", InvocationState.TIMED_OUT)
@@ -310,6 +315,8 @@ class InMemoryRuntimeInvocationControl:
 
     def mark_completed(self) -> bool:
         with self._lock:
+            if self._fence_owner == get_ident():
+                raise RuntimeError("control mutation is not allowed inside a commit fence")
             if self._state is not InvocationState.ACTIVE:
                 return False
             object.__setattr__(self, "_state", InvocationState.COMPLETED)
@@ -318,6 +325,37 @@ class InMemoryRuntimeInvocationControl:
     def is_active(self) -> bool:
         with self._lock:
             return self._state is InvocationState.ACTIVE
+
+    def run_if_active(
+        self,
+        action: Callable[[], object],
+        *,
+        allow_timeout: bool = False,
+    ) -> tuple[bool, object | None]:
+        """Linearize one persistence commit against cancellation.
+
+        The control lock remains held while ``action`` executes.  Therefore a
+        request_cancel/request_timeout from another thread waits for a commit
+        that already won the fence, while a request that won first prevents the
+        callback from running.  Commit callbacks must not mutate this control;
+        same-thread mutation is rejected explicitly to avoid re-entrant
+        deadlocks and ambiguous winner semantics.
+        """
+
+        if not callable(action):
+            raise TypeError("action must be callable")
+        with self._lock:
+            if self._fence_owner is not None:
+                raise RuntimeError("commit fences may not be re-entered")
+            if self._state is not InvocationState.ACTIVE and not (
+                allow_timeout and self._state is InvocationState.TIMED_OUT
+            ):
+                return False, None
+            self._fence_owner = get_ident()
+            try:
+                return True, action()
+            finally:
+                self._fence_owner = None
 
 
 def require_runtime_active(control: RuntimeInvocationControl) -> None:

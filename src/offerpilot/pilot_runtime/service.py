@@ -60,7 +60,13 @@ from .errors import (
     RuntimeTransportAborted,
 )
 from .event_sink import emit_runtime_event, require_runtime_active
-from .persistence import PersistenceStatus
+from .persistence import (
+    PendingActionView,
+    PendingClarificationView,
+    PersistedMessageView,
+    PersistenceResult,
+    PersistenceStatus,
+)
 
 
 CHAT_TIMEOUT_MESSAGE = "这次处理时间过长，已停止。你可以重试或换一种问法。"
@@ -112,18 +118,79 @@ class ToolCatalog(Protocol):
 
 
 class RuntimePersistence(Protocol):
-    def get_pending_action(self, conversation_id: int) -> object | None: ...
+    """Complete Task 6 read/write facade.
 
-    def persist_initial_user_message(self, conversation_id: int, content: str) -> object: ...
+    Every method is deliberately listed instead of being discovered by
+    duck-typing at the call site.  The Runtime preflights this surface before
+    the first user write and treats a missing/readback operation as a closed
+    persistence failure.
+    """
 
-    def persist_initial_messages(self, conversation_id: int, messages: Sequence[object]) -> object: ...
+    def get_pending_action(self, conversation_id: int) -> PendingActionView | None: ...
+
+    def get_pending_clarification(
+        self, conversation_id: int
+    ) -> PendingClarificationView | None: ...
+
+    def list_messages(self, conversation_id: int) -> tuple[PersistedMessageView, ...]: ...
+
+    def persist_initial_user_message(
+        self, conversation_id: int, content: str
+    ) -> PersistenceResult: ...
+
+    def persist_initial_assistant_message(
+        self,
+        conversation_id: int,
+        content: str,
+        *,
+        tool_calls: str = "",
+        tool_call_id: str = "",
+        provider_blocks: str = "",
+    ) -> PersistenceResult: ...
+
+    def persist_assistant_message(
+        self,
+        conversation_id: int,
+        content: str,
+        *,
+        tool_calls: str = "",
+        tool_call_id: str = "",
+        provider_blocks: str = "",
+    ) -> PersistenceResult: ...
+
+    def persist_initial_messages(
+        self, conversation_id: int, messages: Sequence[Message]
+    ) -> PersistenceResult: ...
 
     def persist_initial_pending(
         self,
         conversation_id: int,
-        messages: Sequence[object],
+        messages: Sequence[Message],
         pending: PendingAction,
-    ) -> object: ...
+    ) -> PersistenceResult: ...
+
+    def persist_clarification(
+        self,
+        conversation_id: int,
+        messages: Sequence[Message],
+        pending: PendingAction,
+        question: str,
+    ) -> PersistenceResult: ...
+
+    def set_pending_clarification(
+        self,
+        conversation_id: int,
+        pending: PendingAction,
+        question: str,
+    ) -> PersistenceResult: ...
+
+    def clear_pending_action(self, conversation_id: int) -> PersistenceResult: ...
+
+    def clear_pending_clarification(self, conversation_id: int) -> PersistenceResult: ...
+
+    def persist_timeout_assistant(
+        self, conversation_id: int, content: str
+    ) -> PersistenceResult: ...
 
 
 class JournalFactory(Protocol):
@@ -183,6 +250,27 @@ class NormalizedAgentTurn:
 class _PersistedTurn:
     outcome: RuntimeOutcome
     message_ids: tuple[int, ...] = ()
+
+
+class _PersistenceReadbackError(RuntimeError):
+    """A required detached persistence snapshot was unavailable or invalid."""
+
+
+_REQUIRED_PERSISTENCE_METHODS = (
+    "get_pending_action",
+    "get_pending_clarification",
+    "list_messages",
+    "persist_initial_user_message",
+    "persist_initial_assistant_message",
+    "persist_assistant_message",
+    "persist_initial_messages",
+    "persist_initial_pending",
+    "persist_clarification",
+    "set_pending_clarification",
+    "clear_pending_action",
+    "clear_pending_clarification",
+    "persist_timeout_assistant",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -735,6 +823,8 @@ def _normalize_agent_result(value: object) -> NormalizedAgentTurn:
 
 def _resolved_model(value: object) -> ResolvedModel | None:
     if isinstance(value, ResolvedModel):
+        if value.model is None or value.model is False:
+            return None
         return value
     if value is None or isinstance(value, RuntimeFailureOutcome):
         return None
@@ -749,6 +839,29 @@ def _resolved_model(value: object) -> ResolvedModel | None:
         return None
     config = _attribute(value, "config")
     return _resolved_model_parts(value if model is value else model, config, source=value)
+
+
+def _explicitly_unconfigured_model(value: object) -> bool:
+    """Recognize only a closed ``model=None`` resolver result.
+
+    A resolver exception or an invalid non-null shape is a provider/runtime
+    failure, not configuration absence.  This helper therefore inspects only
+    explicit model fields and never parses exception text.
+    """
+
+    if value is None:
+        return True
+    if isinstance(value, ResolvedModel):
+        return value.model is None
+    if isinstance(value, tuple) and value:
+        return value[0] is None
+    if isinstance(value, Mapping) and "model" in value:
+        return value["model"] is None
+    try:
+        model = getattr(value, "model")
+    except AttributeError:
+        return False
+    return model is None
 
 
 def _resolved_model_parts(model: object, config: object | None, *, source: object | None = None) -> ResolvedModel:
@@ -883,7 +996,19 @@ class PilotRuntime:
             return self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400)
 
         self._phase("pending_guard")
-        pending_guard = self._pending_guard(conversation_id, conversation, request)
+        try:
+            pending_guard = self._pending_guard(conversation_id, conversation, request)
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception:
+            return self._failure(
+                RuntimeFailureCode.OPERATION_FAILED,
+                "对话当前不可读取。",
+                503,
+                retryable=True,
+            )
+        except BaseException:
+            raise
         if pending_guard is not None and pending_guard is not False:
             return self._failure(
                 RuntimeFailureCode.PENDING_CONFIRMATION_REQUIRED,
@@ -904,9 +1029,17 @@ class PilotRuntime:
             )
 
         persistence = self._require_dependency("persistence")
+        persistence_failure = self._validate_persistence_surface(persistence)
+        if persistence_failure is not None:
+            return persistence_failure
         self._phase("user_persist")
         self._check_cancel(cancel, invocation_control)
-        user_result = self._persist_user(persistence, conversation_id, request.message)
+        user_result = self._persist_user(
+            persistence,
+            conversation_id,
+            request.message,
+            control=invocation_control,
+        )
         if not _result_persisted(user_result):
             code = (
                 RuntimeFailureCode.CONVERSATION_ARCHIVED
@@ -920,7 +1053,15 @@ class PilotRuntime:
 
         input_message_id = _attribute(user_result, "message_id")
         if type(input_message_id) is not int or input_message_id <= 0:
-            persisted_ids = self._snapshot_message_ids(persistence, conversation_id)
+            try:
+                persisted_ids = self._snapshot_message_ids(persistence, conversation_id)
+            except _PersistenceReadbackError:
+                return self._failure(
+                    RuntimeFailureCode.OPERATION_FAILED,
+                    "对话结果暂时无法保存。",
+                    503,
+                    retryable=True,
+                )
             input_message_id = persisted_ids[-1] if persisted_ids else None
 
         self._phase("run_start")
@@ -1025,6 +1166,14 @@ class PilotRuntime:
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
             abandon_once()
             raise
+        except _PersistenceReadbackError:
+            finish_or_raise("failed", "unknown")
+            return self._failure(
+                RuntimeFailureCode.OPERATION_FAILED,
+                "对话结果暂时无法保存。",
+                503,
+                retryable=True,
+            )
         except BaseException:
             abandon_once()
             raise
@@ -1057,7 +1206,11 @@ class PilotRuntime:
         except RuntimeAgentTimedOut:
             try:
                 self._allow_timeout_persistence(invocation_control)
-                timeout_result = self._persist_timeout(persistence, conversation_id)
+                timeout_result = self._persist_timeout(
+                    persistence,
+                    conversation_id,
+                    control=invocation_control,
+                )
             except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
                 abandon_once()
                 raise
@@ -1147,6 +1300,7 @@ class PilotRuntime:
                 conversation,
                 catalog=resolved.catalog,
                 ensure_active=lambda: self._check_cancel(cancel, invocation_control),
+                control=invocation_control,
             )
             self._check_cancel(cancel, invocation_control)
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
@@ -1320,7 +1474,7 @@ class PilotRuntime:
             raise
         if isinstance(value, RuntimeFailureOutcome):
             return value
-        if value is None:
+        if _explicitly_unconfigured_model(value):
             return None
         if value is False or (
             isinstance(value, tuple) and bool(value) and value[0] is False
@@ -1341,17 +1495,71 @@ class PilotRuntime:
             )
         return resolved
 
-    def _persist_user(self, persistence: object, conversation_id: int, message: str) -> object:
+    @staticmethod
+    def _commit_fence(
+        control: RuntimeInvocationControl,
+        action: Callable[[], object],
+        *,
+        allow_timeout: bool = False,
+    ) -> object:
+        fence = getattr(control, "run_if_active", None)
+        if not callable(fence):
+            raise TypeError("invocation control does not provide run_if_active")
+        result = fence(action, allow_timeout=allow_timeout)
+        if (
+            not isinstance(result, tuple)
+            or len(result) != 2
+            or type(result[0]) is not bool
+        ):
+            raise TypeError("run_if_active must return (bool, value)")
+        if not result[0]:
+            if allow_timeout:
+                PilotRuntime._allow_timeout_persistence(control)
+            else:
+                require_runtime_active(control)
+            raise RuntimeCancelled()
+        return result[1]
+
+    @staticmethod
+    def _validate_persistence_surface(persistence: object) -> RuntimeFailureOutcome | None:
+        missing: list[str] = []
+        for name in _REQUIRED_PERSISTENCE_METHODS:
+            try:
+                candidate = getattr(persistence, name, None)
+            except Exception:
+                candidate = None
+            if not callable(candidate):
+                missing.append(name)
+        if missing:
+            return PilotRuntime._failure(
+                RuntimeFailureCode.OPERATION_FAILED,
+                "对话结果暂时无法保存。",
+                503,
+                retryable=True,
+            )
+        return None
+
+    def _persist_user(
+        self,
+        persistence: object,
+        conversation_id: int,
+        message: str,
+        *,
+        control: RuntimeInvocationControl,
+    ) -> object:
         function = _callable(
             persistence,
             ("persist_initial_user_message", "persist_user_message", "persist_user", "append_user"),
         )
         if function is None:
             raise TypeError("persistence does not provide user message persistence")
-        return _invoke(
-            function,
-            {"conversation_id": conversation_id, "content": message, "message": message},
-            (conversation_id, message),
+        return self._commit_fence(
+            control,
+            lambda: _invoke(
+                function,
+                {"conversation_id": conversation_id, "content": message, "message": message},
+                (conversation_id, message),
+            ),
         )
 
     def _start_journal(
@@ -1504,32 +1712,46 @@ class PilotRuntime:
             return ()
         try:
             contracts = provider_contracts()
-        except Exception:
+        except BaseException:
             return ()
         if not isinstance(contracts, Sequence) or isinstance(contracts, (str, bytes)):
             return ()
-        return tuple(
-            str(name)
-            for contract in contracts
-            if (name := _attribute(contract, "name")) is not None
-        )
+        try:
+            return tuple(
+                str(name)
+                for contract in contracts
+                if (name := _attribute(contract, "name")) is not None
+            )
+        except BaseException:
+            return ()
 
     @staticmethod
     def _snapshot_message_ids(persistence: object, conversation_id: int) -> tuple[int, ...]:
         function = getattr(persistence, "list_messages", None)
         if not callable(function):
-            return ()
+            raise _PersistenceReadbackError("persistence list_messages capability is missing")
         try:
             values = function(conversation_id)
-        except Exception:
-            return ()
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception as exc:
+            raise _PersistenceReadbackError("persistence message readback failed") from exc
         if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
-            return ()
-        return tuple(
-            int(value)
-            for item in values
-            if type(value := _attribute(item, "id")) is int and value > 0
-        )
+            raise _PersistenceReadbackError("persistence message snapshot is invalid")
+        try:
+            ids: list[int] = []
+            for item in values:
+                value = _attribute(item, "id")
+                if type(value) is not int or value <= 0:
+                    raise _PersistenceReadbackError("persistence message snapshot is invalid")
+                ids.append(value)
+            return tuple(ids)
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except _PersistenceReadbackError:
+            raise
+        except Exception as exc:
+            raise _PersistenceReadbackError("persistence message snapshot is invalid") from exc
 
     def _capture_initial_journal_context(
         self,
@@ -1588,14 +1810,17 @@ class PilotRuntime:
         if callable(function):
             try:
                 values = function(conversation_id)
-            except Exception:
-                values = ()
-            if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
-                role_by_id = {
-                    int(item.id): str(item.role)
-                    for item in values
-                    if type(_attribute(item, "id")) is int
-                }
+                if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
+                    for item in values:
+                        item_id = _attribute(item, "id")
+                        if type(item_id) is int:
+                            role_by_id[item_id] = str(_attribute(item, "role"))
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                raise
+            except BaseException:
+                # Journal projection is diagnostic only.  A malformed frozen
+                # or Mapping snapshot must never change the product outcome.
+                return
         for message_id in message_ids:
             if type(message_id) is not int or message_id <= 0:
                 continue
@@ -1724,21 +1949,63 @@ class PilotRuntime:
         }
         return _invoke(function, values, (invocation,), var_keyword_values=optional)
 
-    def _persist_timeout(self, persistence: object, conversation_id: int) -> object:
+    def _persist_timeout(
+        self,
+        persistence: object,
+        conversation_id: int,
+        *,
+        control: RuntimeInvocationControl,
+    ) -> object:
         function = _callable(persistence, ("persist_timeout_assistant",))
         if function is not None:
-            return _invoke(function, {"conversation_id": conversation_id, "content": CHAT_TIMEOUT_MESSAGE}, (conversation_id, CHAT_TIMEOUT_MESSAGE))
+            commit_function = function
+            result = self._commit_fence(
+                control,
+                lambda: _invoke(
+                    commit_function,
+                    {"conversation_id": conversation_id, "content": CHAT_TIMEOUT_MESSAGE},
+                    (conversation_id, CHAT_TIMEOUT_MESSAGE),
+                ),
+                allow_timeout=True,
+            )
+            if not _timeout_result_persisted(result):
+                return result
+            if not self._verify_pending_cleared(
+                persistence,
+                conversation_id,
+                clarification=True,
+            ):
+                return None
+            return result
         function = _callable(persistence, ("persist_assistant_message", "persist_initial_assistant_message"))
         if function is None:
             return None
-        result = _invoke(function, {"conversation_id": conversation_id, "content": CHAT_TIMEOUT_MESSAGE}, (conversation_id, CHAT_TIMEOUT_MESSAGE))
+        result = self._commit_fence(
+            control,
+            lambda: _invoke(
+                function,
+                {"conversation_id": conversation_id, "content": CHAT_TIMEOUT_MESSAGE},
+                (conversation_id, CHAT_TIMEOUT_MESSAGE),
+            ),
+            allow_timeout=True,
+        )
         if not _timeout_result_persisted(result):
             return result
         clear = _callable(persistence, ("clear_pending_clarification",))
         if clear is not None:
-            clear_result = _invoke(clear, {"conversation_id": conversation_id}, (conversation_id,))
+            clear_result = self._commit_fence(
+                control,
+                lambda: _invoke(clear, {"conversation_id": conversation_id}, (conversation_id,)),
+                allow_timeout=True,
+            )
             if not _timeout_result_persisted(clear_result):
                 return clear_result
+            if not self._verify_pending_cleared(
+                persistence,
+                conversation_id,
+                clarification=True,
+            ):
+                return None
         return result
 
     def _persist_result(
@@ -1751,6 +2018,7 @@ class PilotRuntime:
         *,
         catalog: object | None,
         ensure_active: Callable[[], None],
+        control: RuntimeInvocationControl,
     ) -> _PersistedTurn:
         del request
         pending = result.pending
@@ -1798,16 +2066,21 @@ class PilotRuntime:
                     question,
                     catalog=catalog,
                     ensure_active=ensure_active,
+                    control=control,
                 )
             function = _callable(persistence, ("persist_initial_pending", "persist_pending"))
             if function is None:
                 raise TypeError("persistence does not provide atomic pending persistence")
+            commit_function = function
             before_ids = self._snapshot_message_ids(persistence, conversation_id)
             ensure_active()
-            persisted = _invoke(
-                function,
-                {"conversation_id": conversation_id, "messages": messages, "pending": pending},
-                (conversation_id, messages, pending),
+            persisted = self._commit_fence(
+                control,
+                lambda: _invoke(
+                    commit_function,
+                    {"conversation_id": conversation_id, "messages": messages, "pending": pending},
+                    (conversation_id, messages, pending),
+                ),
             )
             if not _result_persisted(persisted):
                 return _PersistedTurn(
@@ -1854,7 +2127,14 @@ class PilotRuntime:
             raise TypeError("persistence does not provide message persistence")
         before_ids = self._snapshot_message_ids(persistence, conversation_id)
         ensure_active()
-        persisted = _invoke(function, {"conversation_id": conversation_id, "messages": messages}, (conversation_id, messages))
+        persisted = self._commit_fence(
+            control,
+            lambda: _invoke(
+                function,
+                {"conversation_id": conversation_id, "messages": messages},
+                (conversation_id, messages),
+            ),
+        )
         if not _result_persisted(persisted):
             return _PersistedTurn(
                 self._persistence_failure(persisted, "对话已归档，无法保存回复。")
@@ -1885,19 +2165,34 @@ class PilotRuntime:
                         self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话澄清暂时无法保存。", 503, retryable=True),
                         message_ids,
                     )
+                commit_setter = setter
                 ensure_active()
-                set_result = _invoke(
-                    setter,
-                    {
-                        "conversation_id": conversation_id,
-                        "pending": forced_pending,
-                        "question": forced_reply,
-                    },
-                    (conversation_id, forced_pending, forced_reply),
+                set_result = self._commit_fence(
+                    control,
+                    lambda: _invoke(
+                        commit_setter,
+                        {
+                            "conversation_id": conversation_id,
+                            "pending": forced_pending,
+                            "question": forced_reply,
+                        },
+                        (conversation_id, forced_pending, forced_reply),
+                    ),
                 )
                 if not _result_persisted(set_result):
                     return _PersistedTurn(
                         self._persistence_failure(set_result, "对话澄清暂时无法保存。"),
+                        message_ids,
+                    )
+                if not self._verify_pending_snapshot(
+                    persistence,
+                    conversation_id,
+                    forced_pending,
+                    clarification=True,
+                    expected_question=forced_reply,
+                ):
+                    return _PersistedTurn(
+                        self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话澄清暂时无法保存。", 503, retryable=True),
                         message_ids,
                     )
         elif clarification is not None and _looks_like_followup_question(reply):
@@ -1917,18 +2212,32 @@ class PilotRuntime:
                     message_ids,
                 )
             ensure_active()
-            set_result = _invoke(
-                setter,
-                {
-                    "conversation_id": conversation_id,
-                    "pending": clarification[0],
-                    "question": reply,
-                },
-                (conversation_id, clarification[0], reply),
+            set_result = self._commit_fence(
+                control,
+                lambda: _invoke(
+                    setter,
+                    {
+                        "conversation_id": conversation_id,
+                        "pending": clarification[0],
+                        "question": reply,
+                    },
+                    (conversation_id, clarification[0], reply),
+                ),
             )
             if not _result_persisted(set_result):
                 return _PersistedTurn(
                     self._persistence_failure(set_result, "对话澄清暂时无法保存。"),
+                    message_ids,
+                )
+            if not self._verify_pending_snapshot(
+                persistence,
+                conversation_id,
+                clarification[0],
+                clarification=True,
+                expected_question=reply,
+            ):
+                return _PersistedTurn(
+                    self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话澄清暂时无法保存。", 503, retryable=True),
                     message_ids,
                 )
         else:
@@ -1940,14 +2249,26 @@ class PilotRuntime:
                 )
             if clear is not None:
                 ensure_active()
-                clear_result = _invoke(
-                    clear,
-                    {"conversation_id": conversation_id},
-                    (conversation_id,),
+                clear_result = self._commit_fence(
+                    control,
+                    lambda: _invoke(
+                        clear,
+                        {"conversation_id": conversation_id},
+                        (conversation_id,),
+                    ),
                 )
                 if not _result_persisted(clear_result):
                     return _PersistedTurn(
                         self._persistence_failure(clear_result, "对话澄清暂时无法清理。"),
+                        message_ids,
+                    )
+                if not self._verify_pending_cleared(
+                    persistence,
+                    conversation_id,
+                    clarification=True,
+                ):
+                    return _PersistedTurn(
+                        self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话澄清暂时无法清理。", 503, retryable=True),
                         message_ids,
                     )
         return _PersistedTurn(
@@ -1967,11 +2288,12 @@ class PilotRuntime:
         expected: PendingAction,
         *,
         clarification: bool = False,
+        expected_question: str | None = None,
     ) -> bool:
         names = ("get_pending_clarification",) if clarification else ("get_pending_action",)
         getter = _callable(persistence, names)
         if getter is None:
-            return True
+            return False
         try:
             value = _invoke(getter, {"conversation_id": conversation_id}, (conversation_id,))
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
@@ -1980,13 +2302,20 @@ class PilotRuntime:
             return False
         except BaseException:
             raise
+        question: object | None = None
         if clarification:
             if isinstance(value, tuple) and value:
-                value = value[0]
+                if len(value) == 2:
+                    value, question = value
+                else:
+                    value = value[0]
             else:
+                question = _attribute(value, "question")
                 value = _attribute(value, "pending")
         actual = _pending(value)
         if actual is None:
+            return False
+        if expected_question is not None and question != expected_question:
             return False
         return (
             actual.tool_call_id == expected.tool_call_id
@@ -1998,6 +2327,25 @@ class PilotRuntime:
                 or (clarification and actual.operation_id in {"", expected.operation_id})
             )
         )
+
+    @staticmethod
+    def _verify_pending_cleared(
+        persistence: object,
+        conversation_id: int,
+        *,
+        clarification: bool,
+    ) -> bool:
+        names = ("get_pending_clarification",) if clarification else ("get_pending_action",)
+        getter = _callable(persistence, names)
+        if getter is None:
+            return False
+        try:
+            value = _invoke(getter, {"conversation_id": conversation_id}, (conversation_id,))
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception as exc:
+            raise _PersistenceReadbackError("persistence clear readback failed") from exc
+        return value is None
 
     @staticmethod
     def _result_message_ids(
@@ -2024,14 +2372,21 @@ class PilotRuntime:
     ) -> tuple[PendingAction, str] | None:
         getter = _callable(persistence, ("get_pending_clarification",))
         if getter is None:
-            return None
-        value = _invoke(getter, {"conversation_id": conversation_id}, (conversation_id,))
+            raise _PersistenceReadbackError("persistence clarification readback capability is missing")
+        try:
+            value = _invoke(getter, {"conversation_id": conversation_id}, (conversation_id,))
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception as exc:
+            raise _PersistenceReadbackError("persistence clarification readback failed") from exc
         if isinstance(value, tuple) and len(value) == 2:
             pending_value, question = value
         else:
             pending_value = _attribute(value, "pending")
             question = _attribute(value, "question")
         pending = _pending(pending_value)
+        if value is not None and (pending is None or not isinstance(question, str)):
+            raise _PersistenceReadbackError("persistence clarification snapshot is invalid")
         return (pending, question) if pending is not None and isinstance(question, str) else None
 
     def _persistence_failure(self, result: object, archived_message: str) -> RuntimeFailureOutcome:
@@ -2060,6 +2415,7 @@ class PilotRuntime:
         *,
         catalog: object | None,
         ensure_active: Callable[[], None],
+        control: RuntimeInvocationControl,
     ) -> _PersistedTurn:
         if not _valid_pending_action(pending, catalog):
             return _PersistedTurn(
@@ -2069,15 +2425,18 @@ class PilotRuntime:
         if atomic is not None:
             before_ids = self._snapshot_message_ids(persistence, conversation_id)
             ensure_active()
-            persisted = _invoke(
-                atomic,
-                {
-                    "conversation_id": conversation_id,
-                    "messages": messages,
-                    "pending": pending,
-                    "question": question,
-                },
-                (conversation_id, messages, pending, question),
+            persisted = self._commit_fence(
+                control,
+                lambda: _invoke(
+                    atomic,
+                    {
+                        "conversation_id": conversation_id,
+                        "messages": messages,
+                        "pending": pending,
+                        "question": question,
+                    },
+                    (conversation_id, messages, pending, question),
+                ),
             )
             if not _result_persisted(persisted):
                 return _PersistedTurn(
@@ -2094,6 +2453,7 @@ class PilotRuntime:
                 conversation_id,
                 pending,
                 clarification=True,
+                expected_question=question,
             ):
                 return _PersistedTurn(
                     self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话澄清暂时无法保存。", 503, retryable=True),
@@ -2105,25 +2465,47 @@ class PilotRuntime:
                 raise TypeError("persistence does not provide clarification persistence")
             before_ids = self._snapshot_message_ids(persistence, conversation_id)
             ensure_active()
-            persisted = _invoke(initial, {"conversation_id": conversation_id, "messages": messages}, (conversation_id, messages))
+            persisted = self._commit_fence(
+                control,
+                lambda: _invoke(
+                    initial,
+                    {"conversation_id": conversation_id, "messages": messages},
+                    (conversation_id, messages),
+                ),
+            )
             message_ids = self._result_message_ids(persistence, conversation_id, persisted, before_ids)
             if not _result_persisted(persisted):
                 return _PersistedTurn(self._persistence_failure(persisted, "对话已归档，无法保存回复。"), message_ids)
             clear = _callable(persistence, ("clear_pending_action",))
             if clear is not None:
                 ensure_active()
-                clear_result = _invoke(clear, {"conversation_id": conversation_id}, (conversation_id,))
+                clear_result = self._commit_fence(
+                    control,
+                    lambda: _invoke(clear, {"conversation_id": conversation_id}, (conversation_id,)),
+                )
                 if not _result_persisted(clear_result):
                     return _PersistedTurn(self._persistence_failure(clear_result, "对话已归档，无法保存回复。"), message_ids)
+                if not self._verify_pending_cleared(
+                    persistence,
+                    conversation_id,
+                    clarification=False,
+                ):
+                    return _PersistedTurn(
+                        self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话结果暂时无法保存。", 503, retryable=True),
+                        message_ids,
+                    )
             setter = _callable(persistence, ("set_pending_clarification",))
             if setter is None:
                 raise TypeError("persistence does not provide clarification persistence")
             try:
                 ensure_active()
-                set_result = _invoke(
-                    setter,
-                    {"conversation_id": conversation_id, "pending": pending, "question": question},
-                    (conversation_id, pending, question),
+                set_result = self._commit_fence(
+                    control,
+                    lambda: _invoke(
+                        setter,
+                        {"conversation_id": conversation_id, "pending": pending, "question": question},
+                        (conversation_id, pending, question),
+                    ),
                 )
             except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
                 raise
@@ -2147,6 +2529,7 @@ class PilotRuntime:
                 conversation_id,
                 pending,
                 clarification=True,
+                expected_question=question,
             ):
                 return _PersistedTurn(
                     self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话澄清暂时无法保存。", 503, retryable=True),
@@ -2159,7 +2542,14 @@ class PilotRuntime:
                     message_ids,
                 )
             ensure_active()
-            persisted = _invoke(assistant, {"conversation_id": conversation_id, "content": question}, (conversation_id, question))
+            persisted = self._commit_fence(
+                control,
+                lambda: _invoke(
+                    assistant,
+                    {"conversation_id": conversation_id, "content": question},
+                    (conversation_id, question),
+                ),
+            )
             assistant_ids = self._result_message_ids(persistence, conversation_id, persisted, before_ids)
             message_ids = tuple(dict.fromkeys((*message_ids, *assistant_ids)))
         if not _result_persisted(persisted):

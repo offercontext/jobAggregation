@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event, Thread
 from types import SimpleNamespace
 
 import pytest
@@ -102,6 +103,9 @@ class _Persistence:
     def __init__(self, phases: _Phases, *, pending: object | None = None) -> None:
         self.phases = phases
         self.pending = pending
+        self.clarification: object | None = None
+        self._next_message_id = 11
+        self._messages: list[object] = []
         self.user_count = 0
         self.message_count = 0
         self.pending_count = 0
@@ -111,21 +115,61 @@ class _Persistence:
         del conversation_id
         return self.pending
 
+    def get_pending_clarification(self, conversation_id: int) -> object | None:
+        del conversation_id
+        return self.clarification
+
+    def list_messages(self, conversation_id: int) -> tuple[object, ...]:
+        del conversation_id
+        return tuple(self._messages)
+
+    def _append_message(self, role: str) -> int:
+        message_id = self._next_message_id
+        self._next_message_id += 1
+        self._messages.append(SimpleNamespace(id=message_id, role=role))
+        return message_id
+
     def persist_initial_user_message(self, conversation_id: int, content: str) -> object:
         del conversation_id, content
         self.user_count += 1
-        return PersistenceResult(PersistenceStatus.PERSISTED, message_count=1, message_id=11)
+        message_id = self._append_message("user")
+        return PersistenceResult(PersistenceStatus.PERSISTED, message_count=1, message_id=message_id)
 
     def persist_initial_messages(self, conversation_id: int, messages: object) -> object:
-        del conversation_id, messages
+        del conversation_id
         self.message_count += 1
-        return PersistenceResult(PersistenceStatus.PERSISTED, message_id=12)
+        values = tuple(messages) if isinstance(messages, (tuple, list)) else ()
+        message_ids = tuple(
+            self._append_message(str(getattr(message, "role", "assistant")))
+            for message in values
+        )
+        if not message_ids:
+            message_ids = (self._append_message("assistant"),)
+        return PersistenceResult(PersistenceStatus.PERSISTED, message_ids=message_ids)
 
     def persist_initial_pending(self, conversation_id: int, messages: object, pending: object) -> object:
-        del conversation_id, messages
+        del conversation_id
         self.pending = pending
         self.pending_count += 1
-        return PersistenceResult(PersistenceStatus.PERSISTED)
+        values = tuple(messages) if isinstance(messages, (tuple, list)) else ()
+        message_ids = tuple(
+            self._append_message(str(getattr(message, "role", "assistant")))
+            for message in values
+        )
+        return PersistenceResult(
+            PersistenceStatus.PERSISTED,
+            message_ids=message_ids,
+        )
+
+    def persist_initial_assistant_message(self, conversation_id: int, content: str, **kwargs: object) -> object:
+        del conversation_id, content, kwargs
+        return PersistenceResult(
+            PersistenceStatus.PERSISTED,
+            message_id=self._append_message("assistant"),
+        )
+
+    def persist_assistant_message(self, conversation_id: int, content: str, **kwargs: object) -> object:
+        return self.persist_initial_assistant_message(conversation_id, content, **kwargs)
 
     def persist_clarification(
         self,
@@ -134,9 +178,41 @@ class _Persistence:
         pending: object,
         question: str,
     ) -> object:
-        del conversation_id, messages, pending, question
+        del conversation_id
+        self.clarification_count += 1
+        values = tuple(messages) if isinstance(messages, (tuple, list)) else ()
+        message_ids = tuple(
+            self._append_message(str(getattr(message, "role", "assistant")))
+            for message in values
+        )
+        self.pending = None
+        self.clarification = SimpleNamespace(pending=pending, question=question)
+        message_ids += (self._append_message("assistant"),)
+        return PersistenceResult(PersistenceStatus.PERSISTED, message_ids=message_ids)
+
+    def set_pending_clarification(self, conversation_id: int, pending: object, question: str) -> object:
+        del conversation_id
+        self.clarification = SimpleNamespace(pending=pending, question=question)
         self.clarification_count += 1
         return PersistenceResult(PersistenceStatus.PERSISTED)
+
+    def clear_pending_action(self, conversation_id: int) -> object:
+        del conversation_id
+        self.pending = None
+        return PersistenceResult(PersistenceStatus.PERSISTED)
+
+    def clear_pending_clarification(self, conversation_id: int) -> object:
+        del conversation_id
+        self.clarification = None
+        return PersistenceResult(PersistenceStatus.PERSISTED)
+
+    def persist_timeout_assistant(self, conversation_id: int, content: str) -> object:
+        del conversation_id, content
+        self.clarification = None
+        return PersistenceResult(
+            PersistenceStatus.PERSISTED,
+            message_id=self._append_message("assistant"),
+        )
 
 
 class _Recorder:
@@ -720,6 +796,169 @@ def test_model_resolver_exception_is_provider_failure_not_unconfigured() -> None
     assert persistence.user_count == 0
 
 
+def test_resolved_model_with_none_model_is_unconfigured_before_user_persist() -> None:
+    phases = _Phases()
+    persistence = _Persistence(phases)
+    driver = _Driver(phases)
+
+    def resolve_model(request: object, conversation: object) -> object:
+        del request, conversation
+        return ResolvedModel(model=None, catalog=_Catalog())
+
+    runtime, _, _journal = _runtime(
+        phases,
+        persistence=persistence,
+        driver=driver,
+        model_resolver=resolve_model,
+    )
+
+    result = _start(runtime, _Host(phases))
+
+    assert isinstance(result, RuntimeFailureOutcome)
+    assert result.code is RuntimeFailureCode.MODEL_UNCONFIGURED
+    assert persistence.user_count == 0
+    assert driver.provider_calls == 0
+
+
+def test_missing_persistence_readback_capability_fails_before_user_persist() -> None:
+    phases = _Phases()
+    persistence = _Persistence(phases)
+    persistence.get_pending_clarification = None  # type: ignore[method-assign]
+    runtime, _, _journal = _runtime(phases, persistence=persistence)
+
+    result = _start(runtime, _Host(phases))
+
+    assert isinstance(result, RuntimeFailureOutcome)
+    assert result.code is RuntimeFailureCode.OPERATION_FAILED
+    assert persistence.user_count == 0
+
+
+def test_forced_clarification_requires_exact_pending_readback() -> None:
+    phases = _Phases()
+
+    class MismatchClarification(_Persistence):
+        def get_pending_clarification(self, conversation_id: int) -> object | None:
+            del conversation_id
+            return SimpleNamespace(
+                pending=SimpleNamespace(
+                    tool_call_id="other-call",
+                    tool_name="write",
+                    args="{}",
+                    human="write",
+                    operation_id="",
+                ),
+                question="other question",
+            )
+
+    persistence = MismatchClarification(phases)
+    result_value = SimpleNamespace(
+        added=[
+            SimpleNamespace(
+                role="assistant",
+                content="",
+                tool_calls=[SimpleNamespace(id="call-1", name="write", args="{}")],
+            )
+        ],
+        reply="",
+        pending=None,
+        records=(
+            SimpleNamespace(
+                prepared=SimpleNamespace(spec=SimpleNamespace(kind="write")),
+                outcome=SimpleNamespace(code="company_required"),
+            ),
+        ),
+        failures=(ToolFailure("validation_error", "company_required", "company_required"),),
+    )
+    runtime, _, journal = _runtime(
+        phases,
+        persistence=persistence,
+        driver=_Driver(phases, result=result_value),
+    )
+
+    result = _start(runtime, _Host(phases))
+
+    assert isinstance(result, RuntimeFailureOutcome)
+    assert result.code is RuntimeFailureCode.OPERATION_FAILED
+    assert journal.recorder.dispositions == [("failed", "unknown")]
+
+
+def test_journal_persisted_projection_accepts_mapping_snapshots() -> None:
+    phases = _Phases()
+
+    class MappingPersistence(_Persistence):
+        def list_messages(self, conversation_id: int) -> tuple[object, ...]:
+            del conversation_id
+            return (
+                {"id": 11, "role": "user"},
+                {"id": 12, "role": "assistant"},
+            )
+
+        def persist_initial_messages(self, conversation_id: int, messages: object) -> object:
+            del conversation_id, messages
+            self.message_count += 1
+            return PersistenceResult(PersistenceStatus.PERSISTED, message_ids=(12,))
+
+    persistence = MappingPersistence(phases)
+    runtime, _, journal = _runtime(phases, persistence=persistence)
+
+    result = _start(runtime, _Host(phases))
+
+    assert isinstance(result, MessageOutcome)
+    assert any(
+        getattr(event, "source_ref_id", None) == 12
+        for event in journal.recorder.events
+        if getattr(event, "event_type", None) == "assistant.persisted"
+    )
+
+
+def test_commit_fence_cancel_wins_without_running_callback() -> None:
+    control = InMemoryRuntimeInvocationControl()
+    writes: list[str] = []
+
+    assert control.request_cancel(CancelReason.EXPLICIT_CANCEL)
+    committed, value = control.run_if_active(
+        lambda: (writes.append("persisted"), "value")[1]
+    )
+
+    assert committed is False
+    assert value is None
+    assert writes == []
+
+
+def test_commit_fence_persist_wins_then_cancel_waits_for_commit() -> None:
+    control = InMemoryRuntimeInvocationControl()
+    entered = Event()
+    release = Event()
+    writes: list[str] = []
+    result: list[tuple[bool, object | None]] = []
+
+    def persist() -> str:
+        entered.set()
+        assert release.wait(timeout=5)
+        writes.append("persisted")
+        return "value"
+
+    worker = Thread(target=lambda: result.append(control.run_if_active(persist)))
+    worker.start()
+    assert entered.wait(timeout=5)
+    cancel_result: list[bool] = []
+    canceller = Thread(
+        target=lambda: cancel_result.append(
+            control.request_cancel(CancelReason.EXPLICIT_CANCEL)
+        )
+    )
+    canceller.start()
+    release.set()
+    worker.join(timeout=5)
+    canceller.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert not canceller.is_alive()
+    assert result == [(True, "value")]
+    assert writes == ["persisted"]
+    assert cancel_result == [True]
+
+
 def test_provider_failure_is_safe_and_finishes_provider_error() -> None:
     phases = _Phases()
     runtime, persistence, journal = _runtime(phases, driver=_Driver(phases, error=ValueError("secret")))
@@ -969,9 +1208,9 @@ def test_non_atomic_clarification_set_failure_stops_before_assistant_and_complet
 
     assert isinstance(result, RuntimeFailureOutcome)
     assert result.code is RuntimeFailureCode.OPERATION_FAILED
-    assert persistence.setter_calls == 1
+    assert persistence.setter_calls == 0
     assert persistence.assistant_calls == 0
-    assert journal.recorder.dispositions == [("failed", "unknown")]
+    assert journal.recorder.dispositions == []
 
 
 def test_final_projection_redacts_internal_tool_names_and_uses_safe_write_error() -> None:

@@ -1061,6 +1061,13 @@ class RuntimeInvocationControl(Protocol):
 
     def is_active(self) -> bool: ...
 
+    def run_if_active(
+        self,
+        action: AgentThunk[ResultT],
+        *,
+        allow_timeout: bool = False,
+    ) -> tuple[bool, ResultT | None]: ...
+
 
 @runtime_checkable
 class AgentExecutionHost(Protocol[ResultT]):

@@ -164,23 +164,28 @@ def encode_sse_event(
     run_id: str = "",
     envelope: Mapping[str, object] | None = None,
 ) -> str:
-    """Encode one typed event; ``seq`` is owned by this transport boundary."""
+    """Encode one typed event with an optional complete legacy envelope.
+
+    The typed event owns ``seq``, ``event``, and ``data``.  A complete
+    ``SseRun.envelope()`` may carry those reserved fields only when they are
+    exactly the canonical values; all other envelope fields are preserved as
+    extra metadata.
+    """
 
     if type(event) not in _EVENT_NAMES:
         raise TypeError("event must be a typed RuntimeEvent")
     if type(seq) is not int or seq < 1:
         raise ValueError("seq must be a positive integer")
+    canonical = {
+        "seq": seq,
+        "event": event_sse_name(event),
+        "data": event_sse_payload(event),
+    }
     data: dict[str, object] = dict(envelope or {})
-    reserved = {"seq", "event", "data"}
-    if reserved.intersection(data):
-        raise ValueError("SSE envelope cannot override typed event fields")
-    data.update(
-        {
-            "seq": seq,
-            "event": event_sse_name(event),
-            "data": event_sse_payload(event),
-        }
-    )
+    for key, expected in canonical.items():
+        if key in data and (type(data[key]) is not type(expected) or data[key] != expected):
+            raise ValueError(f"SSE envelope cannot override typed field: {key}")
+    data.update(canonical)
     body = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     event_name = event_sse_name(event)
     event_id = f"{run_id}:{seq}" if run_id else str(seq)

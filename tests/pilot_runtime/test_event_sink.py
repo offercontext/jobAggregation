@@ -29,6 +29,7 @@ from offerpilot.pilot_runtime.errors import (
 )
 from offerpilot.pilot_runtime.event_sink import (
     CallableRuntimeEventSink,
+    ClosedAgentSignalSink,
     InMemoryRuntimeInvocationControl,
     RuntimeSignalLatch,
     emit_runtime_event,
@@ -301,6 +302,33 @@ def test_runtime_signal_latch_rejects_non_signal_and_finalize_reports_no_signal(
     assert latch.finalize() is SignalEmitResult.CLOSED
     assert latch.finalize() is SignalEmitResult.CLOSED
     assert registered == []
+
+
+def test_closed_agent_signal_sink_adapts_only_the_legacy_title_signal() -> None:
+    legacy_title = "first_complete_agent_response"
+    latch = RuntimeSignalLatch()
+    adapter = ClosedAgentSignalSink(latch)
+
+    assert adapter.try_emit(legacy_title) is SignalEmitResult.EMITTED
+    assert adapter.try_emit(legacy_title) is SignalEmitResult.DUPLICATE
+    signal = latch.drain()
+    assert type(signal) is FirstModelCompletedSignal
+    assert repr(adapter).find(legacy_title) == -1
+    assert repr(signal).find(legacy_title) == -1
+
+    assert adapter.try_emit("some_other_agent_signal") is SignalEmitResult.DEGRADED
+    assert latch.degraded is False
+
+
+def test_closed_agent_signal_sink_preserves_typed_latch_capacity_and_close() -> None:
+    legacy_title = "first_complete_agent_response"
+    full_latch = RuntimeSignalLatch()
+    assert full_latch.try_emit(FirstModelCompletedSignal()) is SignalEmitResult.EMITTED
+    assert ClosedAgentSignalSink(full_latch).try_emit(legacy_title) is SignalEmitResult.FULL
+
+    closed_latch = RuntimeSignalLatch()
+    closed_latch.close()
+    assert ClosedAgentSignalSink(closed_latch).try_emit(legacy_title) is SignalEmitResult.CLOSED
 
 
 class _DelayedLifecycleRuntime:

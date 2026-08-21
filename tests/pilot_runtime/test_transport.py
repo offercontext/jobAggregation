@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 from starlette.requests import ClientDisconnect
+
+from offerpilot.sse import SseRun
 
 from offerpilot.pilot_runtime.contracts import (
     AssistantMessageEvent,
@@ -398,6 +401,34 @@ def test_sse_envelope_cannot_override_reserved_typed_fields() -> None:
     for key, value in (("seq", 99), ("event", "wrong"), ("data", {"message": "wrong"})):
         with pytest.raises(ValueError):
             encode_sse_event(event, seq=1, envelope={key: value})
+
+
+def test_sse_run_complete_envelope_merges_with_canonical_typed_event() -> None:
+    run = SseRun(
+        run_id="run-1",
+        conversation_id=7,
+        context_type="application",
+        context_ref="app-1",
+        mode="agent",
+    )
+    envelope = run.envelope("assistant_message", {"message": "hello"})
+
+    encoded = encode_sse_event(
+        AssistantMessageEvent(message="hello"),
+        seq=1,
+        run_id=run.run_id,
+        envelope=envelope,
+    )
+    payload = json.loads(encoded.split("data: ", 1)[1].splitlines()[0])
+
+    assert payload["run_id"] == "run-1"
+    assert payload["conversation_id"] == 7
+    assert payload["context_type"] == "application"
+    assert payload["context_ref"] == "app-1"
+    assert payload["mode"] == "agent"
+    assert payload["seq"] == 1
+    assert payload["event"] == "assistant_message"
+    assert payload["data"] == {"message": "hello"}
 
 
 def test_unneeded_transport_aliases_are_not_exported() -> None:

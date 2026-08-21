@@ -408,6 +408,13 @@ class RuntimeSignalLatch:
         return SignalEmitResult.EMITTED
 
     def drain(self) -> FirstModelCompletedSignal | None:
+        """Consume the signal through the sole drain owner path.
+
+        ``drain`` and ``finalize`` are mutually exclusive owner operations.
+        Once this method consumes a pending signal, a later ``finalize`` is a
+        closed/no-signal result and never registers that signal.
+        """
+
         with self._lock:
             if self._closed:
                 self._signal = None
@@ -425,6 +432,13 @@ class RuntimeSignalLatch:
         self.close()
 
     def finalize(self) -> SignalEmitResult:
+        """Consume and register through the sole finalizer owner path.
+
+        Composition code must choose ``finalize`` rather than ``drain`` when
+        registration is required.  If ``drain`` already owns consumption,
+        this method is idempotently closed and performs no registration.
+        """
+
         with self._lock:
             if self._finalized:
                 return SignalEmitResult.CLOSED
@@ -467,6 +481,31 @@ class RuntimeSignalLatch:
         return SignalEmitResult.DEGRADED
 
 
+class ClosedAgentSignalSink(RuntimeSignalSink[str]):
+    """Adapt the one legacy Agent title string to the typed signal boundary.
+
+    The adapter is deliberately closed: only the historical
+    ``first_complete_agent_response`` marker is accepted.  It stores one
+    typed signal instance, never the legacy marker or model text, and all
+    capacity/closed/duplicate behavior remains owned by ``RuntimeSignalLatch``.
+    """
+
+    __slots__ = ("_latch", "_signal")
+
+    _LEGACY_MARKER: Final[str] = "first_complete_agent_response"
+
+    def __init__(self, latch: RuntimeSignalLatch) -> None:
+        if type(latch) is not RuntimeSignalLatch:
+            raise TypeError("latch must be a RuntimeSignalLatch")
+        self._latch = latch
+        self._signal = FirstModelCompletedSignal()
+
+    def try_emit(self, signal: str) -> SignalEmitResult:
+        if type(signal) is not str or signal != self._LEGACY_MARKER:
+            return SignalEmitResult.DEGRADED
+        return self._latch.try_emit(self._signal)
+
+
 InMemoryRuntimeSignalLatch = RuntimeSignalLatch
 safe_emit_runtime_event = emit_runtime_event
 require_active = require_runtime_active
@@ -474,6 +513,7 @@ require_active = require_runtime_active
 
 __all__ = [
     "CallableRuntimeEventSink",
+    "ClosedAgentSignalSink",
     "InMemoryRuntimeInvocationControl",
     "InMemoryRuntimeSignalLatch",
     "RuntimeSignalLatch",

@@ -285,8 +285,13 @@ PreparedStreamExecution
 - preparation_kind: model | deterministic_initial | deterministic_confirmation | confirmation | replay
 - execution_mode: direct | agent_host
 - opaque prepared state（repr=False）
-- single-use state: prepared | executing | aborted | completed
+- lifecycle_state: prepared | executing | aborted | completed
+- completion_reason: null | normal | cancelled | transport_aborted
 ```
+
+`completion_reason` 仅在 `lifecycle_state=completed` 时为非 `null`。它是瞬态安全枚举，不进入
+ChatMessage、Pending、Ledger、Journal、Trace、日志或 SSE；`aborted` 不设置 completion
+reason，因为它专指执行开始前终止。
 
 `ImmediateHttpOutcome` 只表示 baseline 本来会在 `StreamingResponse` 创建前直接返回的
 HTTP 结果。`PreparedStreamExecution` 不进入 ChatMessage、Pending、Ledger、Journal、Graph
@@ -742,14 +747,27 @@ prepare_stream() returns PreparedStreamExecution
 generator 自身 `finally`。guard 的 begin、abort、complete 都委托同一个 Runtime CAS：
 
 ```text
-prepared → executing → completed
 prepared → aborted
-executing → cancelled/aborted_delivery → completed
+prepared → executing
+executing → completed(reason=normal)
+executing → completed(reason=cancelled)
+executing → completed(reason=transport_aborted)
 ```
 
+不允许其他 lifecycle state 或转换：
+
+- `aborted` 只表示 Agent worker/direct SSE 执行开始前终止；
+- 执行开始后的用户取消、disconnect 映射为 `completed(reason=cancelled)`；
+- Sink、consumer 或 response delivery 中止映射为
+  `completed(reason=transport_aborted)`；
+- 正常交付映射为 `completed(reason=normal)`；
+- 只有 `executing → completed(reason)` 的唯一 CAS winner 执行执行后 cleanup/disposition；
+- 只有 `prepared → aborted` 的唯一 CAS winner 执行 before-start cleanup；
+- lifecycle 与 completion reason 的 CAS 必须在同一状态锁内原子更新，不能先完成再补原因。
+
 CAS loser 必须绝对 no-op。`begin_execution()` 与 `abort_if_prepared()` 并发时只有一个 winner；
-Response 构造异常、零次 body 迭代、立即 disconnect、正常完成和重复 finalizer 都不得产生
-第二次 Runtime 执行或 disposition。
+Response 构造异常、零次 body 迭代、立即 disconnect、正常完成、body finalizer、Background
+finalizer 和重复 abort 都不得产生第二次 Runtime 执行、cleanup 或 disposition。
 
 #### 4.2.3 Agent Worker 与 Queue
 
@@ -1037,6 +1055,11 @@ Golden 只使用合成数据，不保存 SQLite、真实用户内容、密钥、
 除 golden 外必须覆盖：
 
 - Runtime 状态转换表的每个合法和非法边；
+- Prepared lifecycle 只接受 `prepared→aborted`、`prepared→executing` 和
+  `executing→completed(reason)`；`prepared→completed`、`aborted→*`、`completed→*` 及
+  第二次 completion reason 更新均失败且零副作用；
+- normal/cancelled/transport_aborted 三个 completion reason 分别验证，cleanup/disposition
+  只由唯一 `executing→completed` winner 执行一次；
 - `ImmediateHttpOutcome` 与 `PreparedStreamExecution` 的全部 preparation kind；
 - prepared handle single-use、worker 启动前 abort、execute/abort 竞态和重复调用绝对 no-op；
 - Response 构造失败、Response 已构造但 body iterator 零次启动、首次迭代立即断开、正常完成

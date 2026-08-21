@@ -196,6 +196,72 @@ def test_confirmation_continuation_matches_baseline_message_sanitization(
     assert "provider-api-key-secret" not in json.dumps(expected, ensure_ascii=False)
 
 
+@pytest.mark.parametrize("as_json_string", [False, True])
+def test_mapping_tool_args_preserve_nested_json_and_do_not_alias_input(
+    tmp_path: Path,
+    as_json_string: bool,
+) -> None:
+    coordinator, conversation_id = make_persistence_coordinator(tmp_path)
+    nested_args = {
+        "id": 7,
+        "nested": {"labels": ["safe", {"depth": [1, 2, 3]}]},
+    }
+    tool_call_values = [
+        {
+            "id": "mapping-call",
+            "name": "update_application_status",
+            "args": nested_args,
+        }
+    ]
+    tool_calls: object = (
+        json.dumps(tool_call_values, ensure_ascii=False)
+        if as_json_string
+        else tool_call_values
+    )
+    mapping = {
+        "role": "assistant",
+        "content": "执行 `update_application_status`。",
+        "tool_calls": tool_calls,
+        "tool_call_id": "mapping-call",
+        "provider_blocks": {
+            "reasoning_content": "保留",
+            "request_id": "丢弃",
+            "canary": "丢弃",
+        },
+    }
+    expected = _persistable_ai_messages(
+        [
+            Message(
+                role="assistant",
+                content="执行 `update_application_status`。",
+                tool_calls=[
+                    ToolCall(
+                        id="mapping-call",
+                        name="update_application_status",
+                        args=json.dumps(nested_args, ensure_ascii=False),
+                    )
+                ],
+                tool_call_id="mapping-call",
+                provider_blocks={
+                    "reasoning_content": "保留",
+                    "request_id": "丢弃",
+                    "canary": "丢弃",
+                },
+            )
+        ]
+    )[0]
+
+    result = coordinator.persist_initial_messages(conversation_id, [mapping])
+
+    assert result.persisted is True
+    expected_args = json.loads(expected["tool_calls"])[0]["args"]
+    nested_args["nested"]["labels"].append("mutated")
+    mapping["provider_blocks"]["reasoning_content"] = "mutated"
+    stored = coordinator.chat.list_messages(conversation_id)[-1]
+    assert _message_projection(stored) == expected
+    assert json.loads(stored.tool_calls)[0]["args"] == expected_args
+
+
 def test_initial_pending_persists_atomic_tool_chain_and_pending(tmp_path: Path) -> None:
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
     pending = PendingAction("call-1", "update_application_status", '{"id": 1}', "更新状态")

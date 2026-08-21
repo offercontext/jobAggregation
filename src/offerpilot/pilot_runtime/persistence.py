@@ -235,7 +235,7 @@ def _mapping_to_message(message: Mapping[str, object]) -> Message:
                 ToolCall(
                     id=str(item.get("id", "")),
                     name=str(item.get("name", "")),
-                    args=str(item.get("args", "")),
+                    args=_mapping_tool_call_args(item),
                 )
                 for item in decoded
                 if isinstance(item, Mapping)
@@ -247,6 +247,11 @@ def _mapping_to_message(message: Mapping[str, object]) -> Message:
         tool_call_id=values["tool_call_id"],
         provider_blocks=_decode_provider_blocks(values["provider_blocks"]),
     )
+
+
+def _mapping_tool_call_args(item: Mapping[str, object]) -> str:
+    raw_args = item.get("args", "")
+    return raw_args if isinstance(raw_args, str) else _json_text(raw_args)
 
 
 def _message_values(message: MessageInput) -> dict[str, str]:

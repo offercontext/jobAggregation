@@ -11,8 +11,12 @@ import asyncio
 import inspect
 import json
 from collections.abc import AsyncIterable, Awaitable, Callable, Iterable, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from threading import Lock
-from typing import Any, Final, TypeAlias, cast
+from queue import Empty, Queue
+from threading import Event
+from time import perf_counter
+from typing import Any, Final, Generic, Iterator, NoReturn, TypeAlias, TypeVar, cast
 
 from starlette.background import BackgroundTask
 from starlette.concurrency import iterate_in_threadpool
@@ -21,8 +25,10 @@ from starlette.responses import JSONResponse, StreamingResponse
 from starlette.types import Receive, Scope, Send
 
 from offerpilot.pilot_runtime.contracts import (
+    AgentThunk,
     AssistantDeltaEvent,
     AssistantMessageEvent,
+    CancelReason,
     CompletionReason,
     CompletedEvent,
     ConfirmationRequiredEvent,
@@ -37,8 +43,11 @@ from offerpilot.pilot_runtime.contracts import (
     PreparedLifecycleState,
     PreparedStreamExecution,
     RuntimeEvent,
+    RuntimeEventSink,
     RuntimeFailureOutcome,
+    RuntimeInvocationControl,
     RuntimeOutcome,
+    InvocationState,
     StatusEvent,
     ToolCallEvent,
     ToolResultEvent,
@@ -54,6 +63,9 @@ from offerpilot.pilot_runtime.event_sink import runtime_event_payload, runtime_o
 
 Content: TypeAlias = Iterable[bytes | str] | AsyncIterable[bytes | str]
 CleanupCallback: TypeAlias = Callable[[CompletionReason | None], object]
+CHAT_AGENT_TIMEOUT_SECONDS: Final[float] = 120.0
+SSE_POLL_SECONDS: Final[float] = 0.1
+_ResultT = TypeVar("_ResultT")
 _EVENT_NAMES: Final[dict[type[object], str]] = {
     MetaEvent: "meta",
     UserMessageSavedEvent: "user_message_saved",
@@ -66,6 +78,355 @@ _EVENT_NAMES: Final[dict[type[object], str]] = {
     ErrorEvent: "error",
     CompletedEvent: "completed",
 }
+
+
+def _host_timeout_seconds(value: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("timeout_seconds must be a number")
+    timeout = float(value)
+    if timeout < 0 or timeout != timeout or timeout == float("inf"):
+        raise ValueError("timeout_seconds must be a finite non-negative number")
+    return timeout
+
+
+def _raise_control_terminal(control: RuntimeInvocationControl) -> NoReturn:
+    state = control.state
+    if state is InvocationState.TIMED_OUT:
+        raise RuntimeAgentTimedOut()
+    if state is InvocationState.CANCELLED:
+        if control.cancel_reason is CancelReason.TRANSPORT_ABORTED:
+            raise RuntimeTransportAborted()
+        raise RuntimeCancelled(control.cancel_reason)
+    raise RuntimeTransportAborted()
+
+
+def _record_control_exception(
+    control: RuntimeInvocationControl,
+    exc: BaseException,
+) -> None:
+    """Keep control state useful when a thunk raises a control marker itself."""
+
+    if isinstance(exc, RuntimeAgentTimedOut):
+        control.request_timeout()
+    elif isinstance(exc, RuntimeCancelled):
+        control.request_cancel(control.cancel_reason or CancelReason.EXPLICIT_CANCEL)
+    elif isinstance(exc, RuntimeTransportAborted):
+        control.request_cancel(CancelReason.TRANSPORT_ABORTED)
+
+
+def _require_host_active(control: RuntimeInvocationControl) -> None:
+    if not control.is_active():
+        _raise_control_terminal(control)
+
+
+class SyncAgentExecutionHost(Generic[_ResultT]):
+    """Run one Runtime thunk with the bounded, non-joining Agent deadline."""
+
+    __slots__ = ("timeout_seconds", "_started", "_lock")
+
+    def __init__(self, timeout_seconds: float = CHAT_AGENT_TIMEOUT_SECONDS) -> None:
+        self.timeout_seconds = _host_timeout_seconds(timeout_seconds)
+        self._started = False
+        self._lock = Lock()
+
+    def run(
+        self,
+        thunk: AgentThunk[_ResultT],
+        invocation_control: RuntimeInvocationControl,
+    ) -> _ResultT:
+        if not callable(thunk):
+            raise TypeError("thunk must be callable")
+        with self._lock:
+            if self._started:
+                raise RuntimeTransportAborted()
+            self._started = True
+        _require_host_active(invocation_control)
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        future: Future[_ResultT] = executor.submit(thunk)
+        cancel_futures = False
+        try:
+            try:
+                result = future.result(timeout=self.timeout_seconds)
+            except FutureTimeoutError as exc:
+                cancel_futures = True
+                future.cancel()
+                if invocation_control.request_timeout():
+                    raise RuntimeAgentTimedOut() from exc
+                _raise_control_terminal(invocation_control)
+            except BaseException as exc:
+                cancel_futures = True
+                _record_control_exception(invocation_control, exc)
+                raise
+
+            if invocation_control.mark_completed():
+                return result
+            cancel_futures = True
+            _raise_control_terminal(invocation_control)
+        finally:
+            if cancel_futures:
+                executor.shutdown(wait=False, cancel_futures=True)
+            else:
+                executor.shutdown(wait=False)
+
+
+class _QueueRuntimeEventSink:
+    """Typed, unbounded, non-blocking event sink owned by one SSE host."""
+
+    __slots__ = ("_queue", "_cancel_event", "_control")
+
+    def __init__(
+        self,
+        event_queue: Queue[RuntimeEvent | object],
+        cancel_event: Event,
+        control: RuntimeInvocationControl,
+    ) -> None:
+        self._queue = event_queue
+        self._cancel_event = cancel_event
+        self._control = control
+
+    def emit(self, event: RuntimeEvent) -> None:
+        if type(event) not in _EVENT_NAMES:
+            raise TypeError("event must be a typed RuntimeEvent")
+        if self._cancel_event.is_set() or not self._control.is_active():
+            return
+        self._queue.put_nowait(event)
+
+    def __call__(self, event: RuntimeEvent) -> None:
+        self.emit(event)
+
+
+def _invoke_sse_thunk(
+    thunk: Callable[..., _ResultT],
+    sink: RuntimeEventSink,
+    cancel_check: Callable[[], bool],
+) -> _ResultT:
+    """Call a typed Runtime thunk without catching errors from its body.
+
+    Runtime implementations may use a zero-argument closure, a typed event
+    sink, or the legacy two-callback shape while the transport migration is in
+    progress.  Signature inspection keeps a thunk's own ``TypeError`` intact.
+    """
+
+    try:
+        signature = inspect.signature(thunk)
+    except (TypeError, ValueError):
+        return thunk(sink, cancel_check)
+
+    positional = [
+        parameter
+        for parameter in signature.parameters.values()
+        if parameter.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    accepts_varargs = any(
+        parameter.kind is inspect.Parameter.VAR_POSITIONAL
+        for parameter in signature.parameters.values()
+    )
+    if accepts_varargs or len(positional) >= 2:
+        return thunk(sink, cancel_check)
+    if positional:
+        return thunk(sink)
+
+    keyword_only = {
+        parameter.name: parameter
+        for parameter in signature.parameters.values()
+        if parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    }
+    if keyword_only:
+        kwargs: dict[str, object] = {}
+        for name in keyword_only:
+            lowered = name.lower()
+            if "cancel" in lowered:
+                kwargs[name] = cancel_check
+            elif "sink" in lowered or "event" in lowered:
+                kwargs[name] = sink
+        if kwargs:
+            return thunk(**kwargs)
+    return thunk()
+
+
+class _SseInvocationIterator(Generic[_ResultT], Iterator[RuntimeEvent]):
+    """One started SSE invocation; StopIteration.value is the typed result."""
+
+    __slots__ = (
+        "event_queue",
+        "poll_seconds",
+        "cancel_event",
+        "_control",
+        "_executor",
+        "_future",
+        "_sentinel",
+        "_deadline",
+        "_completion_at",
+        "_closed",
+        "_result",
+        "_result_set",
+    )
+
+    def __init__(
+        self,
+        thunk: Callable[..., _ResultT],
+        control: RuntimeInvocationControl,
+        *,
+        timeout_seconds: float,
+        poll_seconds: float,
+    ) -> None:
+        self.event_queue: Queue[RuntimeEvent | object] = Queue()
+        self.poll_seconds = poll_seconds
+        self.cancel_event = Event()
+        self._control = control
+        self._sentinel = object()
+        self._completion_at: list[float | None] = [None]
+        self._closed = False
+        self._result: _ResultT | None = None
+        self._result_set = False
+        self._executor = ThreadPoolExecutor(max_workers=1)
+        sink = _QueueRuntimeEventSink(self.event_queue, self.cancel_event, control)
+        self._future: Future[_ResultT] = self._executor.submit(
+            _invoke_sse_thunk,
+            thunk,
+            sink,
+            self.cancel_event.is_set,
+        )
+        self._deadline = perf_counter() + timeout_seconds
+
+        def on_done(_future: Future[_ResultT]) -> None:
+            self._completion_at[0] = perf_counter()
+            self.event_queue.put_nowait(self._sentinel)
+
+        self._future.add_done_callback(on_done)
+
+    def _deadline_expired(self) -> bool:
+        completed_at = self._completion_at[0]
+        if completed_at is not None:
+            return completed_at > self._deadline
+        return perf_counter() >= self._deadline
+
+    def _finish(self) -> None:
+        try:
+            result = self._future.result()
+        except BaseException as exc:
+            _record_control_exception(self._control, exc)
+            raise
+        if not self._control.mark_completed():
+            _raise_control_terminal(self._control)
+        self._result = result
+        self._result_set = True
+
+    def _timeout(self, cause: BaseException | None = None) -> None:
+        self._future.cancel()
+        if self._control.request_timeout():
+            if cause is None:
+                raise RuntimeAgentTimedOut()
+            raise RuntimeAgentTimedOut() from cause
+        _raise_control_terminal(self._control)
+
+    def __next__(self) -> RuntimeEvent:
+        if self._closed:
+            raise StopIteration(self._result if self._result_set else None)
+        completed = False
+        try:
+            while True:
+                if not self._control.is_active():
+                    self._future.cancel()
+                    _raise_control_terminal(self._control)
+                if self._deadline_expired():
+                    self._timeout()
+                try:
+                    item = self.event_queue.get(timeout=self.poll_seconds)
+                except Empty as exc:
+                    if not self._control.is_active():
+                        self._future.cancel()
+                        _raise_control_terminal(self._control)
+                    if self._deadline_expired():
+                        self._timeout(exc)
+                    continue
+                if item is self._sentinel:
+                    self._finish()
+                    self._closed = True
+                    self.cancel_event.set()
+                    self._executor.shutdown(wait=False, cancel_futures=False)
+                    completed = True
+                    break
+                if type(item) not in _EVENT_NAMES:
+                    raise TypeError("event must be a typed RuntimeEvent")
+                if not self._control.is_active():
+                    self._future.cancel()
+                    _raise_control_terminal(self._control)
+                return cast(RuntimeEvent, item)
+        except BaseException:
+            self._closed = True
+            self.cancel_event.set()
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        if completed:
+            raise StopIteration(self._result)
+        raise RuntimeTransportAborted()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.cancel_event.set()
+        self._control.request_cancel(CancelReason.EXPLICIT_CANCEL)
+        self._future.cancel()
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+    @property
+    def result(self) -> _ResultT:
+        if not self._result_set:
+            raise RuntimeTransportAborted()
+        return cast(_ResultT, self._result)
+
+
+class SseAgentExecutionHost(Generic[_ResultT]):
+    """Run one typed Runtime thunk while forwarding typed SSE events."""
+
+    __slots__ = ("timeout_seconds", "poll_seconds", "_started", "_lock")
+
+    def __init__(
+        self,
+        timeout_seconds: float = CHAT_AGENT_TIMEOUT_SECONDS,
+        *,
+        poll_seconds: float = SSE_POLL_SECONDS,
+    ) -> None:
+        self.timeout_seconds = _host_timeout_seconds(timeout_seconds)
+        if isinstance(poll_seconds, bool) or not isinstance(poll_seconds, (int, float)):
+            raise TypeError("poll_seconds must be a number")
+        if poll_seconds <= 0:
+            raise ValueError("poll_seconds must be positive")
+        self.poll_seconds = float(poll_seconds)
+        self._started = False
+        self._lock = Lock()
+
+    def run(
+        self,
+        thunk: Callable[..., _ResultT],
+        invocation_control: RuntimeInvocationControl,
+    ) -> _SseInvocationIterator[_ResultT]:
+        if not callable(thunk):
+            raise TypeError("thunk must be callable")
+        with self._lock:
+            if self._started:
+                raise RuntimeTransportAborted()
+            self._started = True
+        _require_host_active(invocation_control)
+        return _SseInvocationIterator(
+            thunk,
+            invocation_control,
+            timeout_seconds=self.timeout_seconds,
+            poll_seconds=self.poll_seconds,
+        )
+
+    def iter_events(
+        self,
+        thunk: Callable[..., _ResultT],
+        invocation_control: RuntimeInvocationControl,
+    ) -> _SseInvocationIterator[_ResultT]:
+        return self.run(thunk, invocation_control)
+
+    stream = iter_events
 
 
 def _plain(value: object) -> object:

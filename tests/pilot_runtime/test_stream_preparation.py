@@ -1,21 +1,34 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 
 from offerpilot.chat_transport import PreparedStreamGuard, SseAgentExecutionHost
+from offerpilot.ai.agent import PendingAction
+from offerpilot.agent_runtime.journal import NullRunRecorder, RunRecorderFactory
+from offerpilot.agent_runtime.keyring import JournalKeyDomain
+from offerpilot.db import init_database
+from offerpilot.pilot_runtime.persistence import ChatPersistenceCoordinator
+from offerpilot.repositories.agent_runs import AgentRunRepository
+from offerpilot.repositories.chat import ChatRepository
+from offerpilot.pilot_runtime.errors import RuntimeTransportAborted
 from offerpilot.pilot_runtime.contracts import (
     AssistantMessageEvent,
     CompletedEvent,
+    CompletionReason,
+    ConfirmationRequiredEvent,
+    ErrorEvent,
     ImmediateHttpOutcome,
     InvocationState,
     MessageOutcome,
     MetaEvent,
     PreparationKind,
     PreparedStreamExecution,
+    PilotActionDescriptor,
     RuntimeTransportContext,
     StartTurnRequest,
     StatusEvent,
@@ -53,9 +66,11 @@ class Conversation:
 class Conversations:
     def __init__(self, value: Conversation | None = None) -> None:
         self.value = value or Conversation()
+        self.create_calls = 0
 
     def create(self, request: object) -> Conversation:
         del request
+        self.create_calls += 1
         return self.value
 
     def load(self, conversation_id: int) -> Conversation | None:
@@ -155,18 +170,29 @@ class Source:
 
 
 class Assembler:
+    def __init__(self, value: object | None = None) -> None:
+        self.value = value
+
     def assemble(self, source: object, conversation: object, request: object) -> list[str]:
         del source, conversation, request
+        if self.value is not None:
+            return self.value  # type: ignore[return-value]
         return ["frozen-context"]
 
 
 class Driver:
     def __init__(self) -> None:
         self.calls = 0
+        self.error: BaseException | None = None
+        self.result: object | None = None
 
     def run_turn(self, model: object, messages: object, **kwargs: object) -> object:
         del model, messages, kwargs
         self.calls += 1
+        if self.error is not None:
+            raise self.error
+        if self.result is not None:
+            return self.result
         return SimpleNamespace(added=[], reply="hello", pending=None)
 
 
@@ -216,6 +242,8 @@ def runtime(
     route: str = "model",
     conversation: Conversation | None = None,
     model: object = "model",
+    catalog: object | None = None,
+    assembled: object | None = None,
 ) -> tuple[PilotRuntime, Persistence, Driver, Host, Journal]:
     persistence = Persistence()
     driver = Driver()
@@ -224,7 +252,7 @@ def runtime(
 
     def resolve(request: object, conversation: object) -> object:
         del request, conversation
-        return None if model is None else ResolvedModel(model=model)
+        return None if model is None else ResolvedModel(model=model, catalog=catalog)
 
     instance = PilotRuntime(
         RuntimeDependencies(
@@ -232,7 +260,7 @@ def runtime(
             persistence=persistence,
             model_resolver=resolve,
             source_loader=source or Source(),
-            context_assembler=Assembler(),
+            context_assembler=Assembler(assembled),
             agent_driver=driver,
             journal=journal,
             route_selector=lambda request, conversation: route,
@@ -287,6 +315,8 @@ def test_stream_model_prepare_and_agent_host_execution_emits_baseline_prefix() -
         def emit(self, event: object) -> None:
             seen.append(event)
 
+    guard = PreparedStreamGuard(prepared=prepared)
+    assert guard.begin_execution() is True
     result = instance.execute_prepared_stream(
         prepared,
         event_sink=Sink(),
@@ -318,6 +348,43 @@ def test_prepare_rejects_deterministic_route_before_user_or_run() -> None:
     assert persistence.user_count == 0
     assert driver.calls == 0
     assert host.calls == 0
+    assert journal.recorder.finished == []
+    assert control.state is InvocationState.COMPLETED
+
+
+def test_deterministic_pilot_action_is_rejected_before_conversation_side_effects() -> None:
+    phases = Phases()
+    conversations = Conversations()
+    persistence = Persistence()
+    driver = Driver()
+    journal = Journal()
+    instance = PilotRuntime(
+        RuntimeDependencies(
+            conversations=conversations,
+            persistence=persistence,
+            model_resolver=lambda request, conversation: ResolvedModel(model="model"),
+            source_loader=Source(),
+            context_assembler=Assembler(),
+            agent_driver=driver,
+            journal=journal,
+            phase_sink=phases,
+        )
+    )
+    control = InMemoryRuntimeInvocationControl()
+    result = instance.prepare_stream(
+        StartTurnRequest(
+            message="run deterministic",
+            pilot_action=PilotActionDescriptor(kind="create_application"),
+        ),
+        transport=transport(),
+        invocation_control=control,
+    )
+
+    assert isinstance(result, ImmediateHttpOutcome)
+    assert result.status_code == 400
+    assert conversations.create_calls == 0
+    assert persistence.user_count == 0
+    assert driver.calls == 0
     assert journal.recorder.finished == []
     assert control.state is InvocationState.COMPLETED
 
@@ -363,6 +430,8 @@ def test_direct_prepared_execution_has_no_agent_host_and_is_single_use(
         def emit(self, event: object) -> None:
             seen.append(event)
 
+    guard = PreparedStreamGuard(prepared=prepared)
+    assert guard.begin_execution() is True
     assert instance.execute_prepared_stream(
         prepared,
         event_sink=Sink(),
@@ -373,13 +442,14 @@ def test_direct_prepared_execution_has_no_agent_host_and_is_single_use(
     assert host.calls == 0
     assert driver.calls == 0
     assert seen == [MetaEvent(), AssistantMessageEvent(message="already committed"), CompletedEvent(response=outcome)]
-    assert instance.execute_prepared_stream(
-        prepared,
-        event_sink=Sink(),
-        signal_sink=None,
-        execution_host=host,
-        cancel_check=lambda: False,
-    ) == outcome
+    with pytest.raises(RuntimeTransportAborted):
+        instance.execute_prepared_stream(
+            prepared,
+            event_sink=Sink(),
+            signal_sink=None,
+            execution_host=host,
+            cancel_check=lambda: False,
+        )
     assert host.calls == 0
 
 
@@ -406,6 +476,8 @@ def test_model_prepared_stream_adapts_sse_host_queue_once() -> None:
     control = InMemoryRuntimeInvocationControl()
     prepared = instance.prepare_stream(StartTurnRequest(message="hi"), transport=transport(), invocation_control=control)
     assert isinstance(prepared, PreparedStreamExecution)
+    guard = PreparedStreamGuard(prepared=prepared)
+    assert guard.begin_execution() is True
     seen: list[object] = []
 
     class Sink:
@@ -423,3 +495,411 @@ def test_model_prepared_stream_adapts_sse_host_queue_once() -> None:
     assert driver.calls == 1
     assert [type(item) for item in seen[:3]] == [MetaEvent, UserMessageSavedEvent, StatusEvent]
     assert isinstance(seen[-1], CompletedEvent)
+
+
+def test_real_stream_run_recorder_keeps_transport_uuid_and_terminal_events(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path
+    sessions = init_database(data_dir / "offerpilot.db")
+    chat = ChatRepository(sessions)
+    conversation = chat.create_conversation("real stream journal")
+    persistence = ChatPersistenceCoordinator(chat)
+    repository = AgentRunRepository(sessions)
+    key = JournalKeyDomain("00000000-0000-0000-0000-000000000003", b"s" * 32)
+
+    class CapturingFactory(RunRecorderFactory):
+        recorder: object | None = None
+
+        def start_run(self, command: object) -> object:
+            self.recorder = super().start_run(command)  # type: ignore[arg-type]
+            return self.recorder
+
+    journal = CapturingFactory(repository, key=key, enabled=True)
+
+    class Gateway:
+        def create(self, request: object) -> object:
+            del request
+            return conversation
+
+        def load(self, conversation_id: int) -> object:
+            assert conversation_id == conversation.id
+            return conversation
+
+    instance = PilotRuntime(
+        RuntimeDependencies(
+            conversations=Gateway(),
+            persistence=persistence,
+            model_resolver=lambda request, current: ResolvedModel(model="model"),
+            source_loader=Source(),
+            context_assembler=Assembler(),
+            agent_driver=Driver(),
+            journal=journal,
+        )
+    )
+    control = InMemoryRuntimeInvocationControl()
+    prepared = instance.prepare_stream(
+        StartTurnRequest(message="hi"),
+        transport=transport(),
+        invocation_control=control,
+    )
+    assert isinstance(prepared, PreparedStreamExecution)
+    guard = PreparedStreamGuard(prepared=prepared)
+    assert guard.begin_execution() is True
+    result = instance.execute_prepared_stream(
+        prepared,
+        event_sink=None,
+        signal_sink=None,
+        execution_host=Host(),
+        cancel_check=lambda: False,
+    )
+
+    assert isinstance(result, MessageOutcome)
+    assert journal.recorder is not None
+    run_id = getattr(journal.recorder, "run_id")
+    assert isinstance(run_id, str)
+    events = repository.list_events(run_id)
+    assert events
+    assert {event.event_type for event in events} >= {
+        "route.selected",
+        "context.captured",
+        "assistant.persisted",
+        "segment.finished",
+    }
+
+
+def test_null_journal_recorder_does_not_mark_prepared_run_open() -> None:
+    phases = Phases()
+    instance, _persistence, _driver, _host, _journal = runtime(phases)
+
+    class NullJournal:
+        def start_run(self, builder: object) -> NullRunRecorder:
+            del builder
+            return NullRunRecorder(["journal_disabled"])
+
+    instance = PilotRuntime(
+        RuntimeDependencies(
+            conversations=Conversations(),
+            persistence=Persistence(),
+            model_resolver=lambda request, conversation: ResolvedModel(model="model"),
+            source_loader=Source(),
+            context_assembler=Assembler(),
+            agent_driver=Driver(),
+            journal=NullJournal(),
+        )
+    )
+    control = InMemoryRuntimeInvocationControl()
+    prepared = instance.prepare_stream(
+        StartTurnRequest(message="hi"),
+        transport=transport(),
+        invocation_control=control,
+    )
+    assert isinstance(prepared, PreparedStreamExecution)
+    assert getattr(prepared.opaque_state, "journal_started") is False
+    assert getattr(prepared.opaque_state, "cell").run_open is False
+
+
+def test_execute_prepared_stream_requires_guard_begin_and_does_not_self_start() -> None:
+    phases = Phases()
+    instance, _persistence, driver, host, _journal = runtime(phases)
+    control = InMemoryRuntimeInvocationControl()
+    prepared = instance.prepare_stream(
+        StartTurnRequest(message="hi"),
+        transport=transport(),
+        invocation_control=control,
+    )
+    assert isinstance(prepared, PreparedStreamExecution)
+    seen: list[object] = []
+
+    class Sink:
+        def emit(self, event: object) -> None:
+            seen.append(event)
+
+    with pytest.raises(RuntimeTransportAborted):
+        instance.execute_prepared_stream(
+            prepared,
+            event_sink=Sink(),
+            signal_sink=None,
+            execution_host=host,
+            cancel_check=lambda: False,
+        )
+    assert prepared.lifecycle_state.value == "prepared"
+    assert seen == []
+    assert driver.calls == 0
+    assert host.calls == 0
+
+
+def test_sink_abort_after_recorder_finish_does_not_abandon_finished_run() -> None:
+    phases = Phases()
+    instance, _persistence, _driver, host, journal = runtime(phases)
+    control = InMemoryRuntimeInvocationControl()
+    prepared = instance.prepare_stream(
+        StartTurnRequest(message="hi"),
+        transport=transport(),
+        invocation_control=control,
+    )
+    assert isinstance(prepared, PreparedStreamExecution)
+    guard = PreparedStreamGuard(prepared=prepared)
+    assert guard.begin_execution() is True
+
+    class FailingSink:
+        def emit(self, event: object) -> None:
+            if isinstance(event, CompletedEvent):
+                raise RuntimeTransportAborted()
+
+    with pytest.raises(RuntimeTransportAborted):
+        instance.execute_prepared_stream(
+            prepared,
+            event_sink=FailingSink(),
+            signal_sink=None,
+            execution_host=host,
+            cancel_check=lambda: False,
+        )
+    assert journal.recorder.finished
+    assert journal.recorder.abandoned == 0
+    assert prepared.lifecycle_state.value == "completed"
+    assert prepared.completion_reason is CompletionReason.TRANSPORT_ABORTED
+    second_seen: list[object] = []
+
+    class SecondSink:
+        def emit(self, event: object) -> None:
+            second_seen.append(event)
+
+    with pytest.raises(RuntimeTransportAborted):
+        instance.execute_prepared_stream(
+            prepared,
+            event_sink=SecondSink(),
+            signal_sink=None,
+            execution_host=host,
+            cancel_check=lambda: False,
+        )
+    assert second_seen == []
+
+
+def test_stream_meta_supports_delta_reflects_resolved_stream_model() -> None:
+    class StreamingModel:
+        def stream_complete(self, messages: object, tools: object, on_delta: object) -> object:
+            del messages, tools, on_delta
+            return None
+
+    phases = Phases()
+    instance, _persistence, _driver, host, _journal = runtime(
+        phases,
+        model=StreamingModel(),
+    )
+    control = InMemoryRuntimeInvocationControl()
+    prepared = instance.prepare_stream(
+        StartTurnRequest(message="hi"),
+        transport=transport(),
+        invocation_control=control,
+    )
+    assert isinstance(prepared, PreparedStreamExecution)
+    guard = PreparedStreamGuard(prepared=prepared)
+    assert guard.begin_execution() is True
+    seen: list[object] = []
+
+    class Sink:
+        def emit(self, event: object) -> None:
+            seen.append(event)
+
+    instance.execute_prepared_stream(
+        prepared,
+        event_sink=Sink(),
+        signal_sink=None,
+        execution_host=host,
+        cancel_check=lambda: False,
+    )
+    assert seen[0] == MetaEvent(supports_delta=True)
+
+
+def test_stream_provider_failure_ends_with_error_without_completed_event() -> None:
+    phases = Phases()
+    instance, _persistence, driver, host, _journal = runtime(phases)
+    driver.error = RuntimeError("provider down")
+    control = InMemoryRuntimeInvocationControl()
+    prepared = instance.prepare_stream(
+        StartTurnRequest(message="hi"),
+        transport=transport(),
+        invocation_control=control,
+    )
+    assert isinstance(prepared, PreparedStreamExecution)
+    guard = PreparedStreamGuard(prepared=prepared)
+    assert guard.begin_execution() is True
+    seen: list[object] = []
+
+    class Sink:
+        def emit(self, event: object) -> None:
+            seen.append(event)
+
+    result = instance.execute_prepared_stream(
+        prepared,
+        event_sink=Sink(),
+        signal_sink=None,
+        execution_host=host,
+        cancel_check=lambda: False,
+    )
+    assert getattr(result, "code", None).value == "ai_provider_error"
+    assert [type(event) for event in seen] == [
+        MetaEvent,
+        UserMessageSavedEvent,
+        StatusEvent,
+        ErrorEvent,
+    ]
+    assert not any(isinstance(event, CompletedEvent) for event in seen)
+
+
+def test_stream_pending_emits_waiting_status_before_confirmation() -> None:
+    class Catalog:
+        def resolve(self, name: str) -> object:
+            return SimpleNamespace(name=name, kind="write")
+
+        def write_names(self) -> set[str]:
+            return {"update_application_status"}
+
+        def provider_contracts(self) -> list[object]:
+            return [SimpleNamespace(name="update_application_status")]
+
+    phases = Phases()
+    instance, _persistence, driver, host, _journal = runtime(
+        phases,
+        catalog=Catalog(),
+    )
+    driver.result = SimpleNamespace(
+        added=[],
+        reply="",
+        pending=PendingAction(
+            "call-1",
+            "update_application_status",
+            "{}",
+            "更新状态",
+            "op-1",
+        ),
+    )
+    control = InMemoryRuntimeInvocationControl()
+    prepared = instance.prepare_stream(
+        StartTurnRequest(message="hi"),
+        transport=transport(),
+        invocation_control=control,
+    )
+    assert isinstance(prepared, PreparedStreamExecution)
+    guard = PreparedStreamGuard(prepared=prepared)
+    assert guard.begin_execution() is True
+    seen: list[object] = []
+
+    class Sink:
+        def emit(self, event: object) -> None:
+            seen.append(event)
+
+    result = instance.execute_prepared_stream(
+        prepared,
+        event_sink=Sink(),
+        signal_sink=None,
+        execution_host=host,
+        cancel_check=lambda: False,
+    )
+    assert result.__class__.__name__ == "ConfirmationRequiredOutcome"
+    assert [type(event) for event in seen] == [
+        MetaEvent,
+        UserMessageSavedEvent,
+        StatusEvent,
+        StatusEvent,
+        ConfirmationRequiredEvent,
+        CompletedEvent,
+    ]
+    assert isinstance(seen[3], StatusEvent)
+    assert seen[3].phase == "waiting_confirmation"
+
+
+def test_stream_host_iterator_is_closed_when_outer_execution_aborts() -> None:
+    phases = Phases()
+    instance, _persistence, _driver, _host, _journal = runtime(phases)
+    control = InMemoryRuntimeInvocationControl()
+    prepared = instance.prepare_stream(
+        StartTurnRequest(message="hi"),
+        transport=transport(),
+        invocation_control=control,
+    )
+    assert isinstance(prepared, PreparedStreamExecution)
+    guard = PreparedStreamGuard(prepared=prepared)
+    assert guard.begin_execution() is True
+
+    class Iterator:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def __iter__(self) -> "Iterator":
+            return self
+
+        def __next__(self) -> object:
+            raise RuntimeTransportAborted()
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    class Host:
+        def __init__(self) -> None:
+            self.iterator = Iterator()
+
+        def iter_events(self, thunk: object, control: object) -> object:
+            del thunk, control
+            return self.iterator
+
+        def run(self, thunk: object, control: object) -> object:
+            return self.iter_events(thunk, control)
+
+    host = Host()
+    with pytest.raises(RuntimeTransportAborted):
+        instance.execute_prepared_stream(
+            prepared,
+            event_sink=None,
+            signal_sink=None,
+            execution_host=host,
+            cancel_check=lambda: False,
+        )
+    assert host.iterator.close_calls == 1
+
+
+def test_prepare_stream_rejects_unknown_detached_context_value_fail_closed() -> None:
+    unknown = object()
+    phases = Phases()
+    instance, persistence, driver, host, journal = runtime(
+        phases,
+        assembled=[unknown],
+    )
+    control = InMemoryRuntimeInvocationControl()
+
+    result = instance.prepare_stream(
+        StartTurnRequest(message="hi"),
+        transport=transport(),
+        invocation_control=control,
+    )
+
+    assert isinstance(result, ImmediateHttpOutcome)
+    assert result.status_code == 503
+    assert result.payload["error_code"] == "operation_failed"
+    assert persistence.user_count == 1
+    assert driver.calls == 0
+    assert host.calls == 0
+    assert journal.recorder.abandoned == 1
+
+
+def test_prepared_state_does_not_retain_resolved_provider_object() -> None:
+    class Provider:
+        def __repr__(self) -> str:
+            return "PROVIDER_CREDENTIAL_CANARY"
+
+    phases = Phases()
+    instance, _persistence, _driver, _host, _journal = runtime(
+        phases,
+        model=Provider(),
+    )
+    control = InMemoryRuntimeInvocationControl()
+    prepared = instance.prepare_stream(
+        StartTurnRequest(message="hi"),
+        transport=transport(),
+        invocation_control=control,
+    )
+    assert isinstance(prepared, PreparedStreamExecution)
+    state = prepared.opaque_state
+    assert getattr(state, "resolved", None) is None
+    assert "PROVIDER_CREDENTIAL_CANARY" not in repr(prepared)

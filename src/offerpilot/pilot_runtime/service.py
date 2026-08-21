@@ -15,6 +15,7 @@ from hashlib import sha256
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
+from math import isfinite
 from typing import Any, Protocol, TypeAlias, cast
 from threading import Lock
 from uuid import uuid4
@@ -30,6 +31,7 @@ from offerpilot.agent_runtime.events import (
 )
 from offerpilot.agent_runtime.journal import (
     EventInput,
+    NullRunRecorder,
     StartRunBuilder,
     SuspendedDisposition,
     TerminalDisposition,
@@ -329,7 +331,7 @@ class _PreparedStreamState:
     request: StartTurnRequest | ConfirmationRequest = field(repr=False, compare=False)
     conversation: _PreparedConversation | None = field(repr=False, compare=False)
     conversation_id: int | None = field(default=None, compare=False)
-    resolved: ResolvedModel | None = field(default=None, repr=False, compare=False)
+    model_token: object | None = field(default=None, repr=False, compare=False)
     assembled: tuple[object, ...] = field(default=(), repr=False, compare=False)
     recorder: object = field(default_factory=lambda: _NoopRecorder(), repr=False, compare=False)
     journal_started: bool = field(default=False, compare=False)
@@ -707,19 +709,41 @@ def _message(value: object) -> Message:
 def _freeze_stream_value(value: object) -> object:
     """Snapshot source/context values without retaining mutable containers."""
 
+    if value is None or type(value) in {str, int, bool}:
+        return value
+    if type(value) is float:
+        if not isfinite(value):
+            raise ValueError("stream preparation requires finite numbers")
+        return value
     if isinstance(value, Message):
-        blocks = value.provider_blocks if isinstance(value.provider_blocks, Mapping) else {}
-        try:
-            frozen_blocks = freeze_json_mapping(cast(Mapping[str, object], blocks))
-        except (TypeError, ValueError):
-            frozen_blocks = freeze_json_mapping({})
+        text_fields = (
+            value.role,
+            value.content,
+            value.tool_call_id,
+            value.surface_contributor,
+            value.surface_signal,
+            value.surface_revision,
+            value.surface_attachment_kinds,
+        )
+        if any(type(item) is not str for item in text_fields):
+            raise TypeError("stream message contains an unsupported field")
+        if not isinstance(value.provider_blocks, Mapping):
+            raise TypeError("stream message provider blocks must be a mapping")
+        if not isinstance(value.tool_calls, (list, tuple)):
+            raise TypeError("stream message tool calls must be a sequence")
+        prepared_tool_calls: list[_PreparedToolCall] = []
+        for call in value.tool_calls:
+            if not isinstance(call, ToolCall):
+                raise TypeError("stream message tool calls must be typed values")
+            if any(type(item) is not str for item in (call.id, call.name, call.args)):
+                raise TypeError("stream message tool call contains an unsupported field")
+            prepared_tool_calls.append(_PreparedToolCall(call.id, call.name, call.args))
+        blocks = value.provider_blocks
+        frozen_blocks = freeze_json_mapping(cast(Mapping[str, object], blocks))
         return _PreparedMessage(
             role=value.role,
             content=value.content,
-            tool_calls=tuple(
-                _PreparedToolCall(call.id, call.name, call.args)
-                for call in value.tool_calls
-            ),
+            tool_calls=tuple(prepared_tool_calls),
             tool_call_id=value.tool_call_id,
             provider_blocks=frozen_blocks,
             surface_contributor=value.surface_contributor,
@@ -728,16 +752,10 @@ def _freeze_stream_value(value: object) -> object:
             surface_attachment_kinds=value.surface_attachment_kinds,
         )
     if isinstance(value, Mapping):
-        try:
-            return freeze_json_mapping(cast(Mapping[str, object], value))
-        except (TypeError, ValueError):
-            return tuple(
-                (str(key), _freeze_stream_value(child))
-                for key, child in value.items()
-            )
+        return freeze_json_mapping(cast(Mapping[str, object], value))
     if isinstance(value, (list, tuple)):
         return tuple(_freeze_stream_value(child) for child in value)
-    return value
+    raise TypeError("stream preparation contains a mutable or unsupported value")
 
 
 def _materialize_stream_value(value: object) -> object:
@@ -1168,7 +1186,7 @@ def _is_agent_cancelled(exc: BaseException) -> bool:
 class PilotRuntime:
     """The synchronous model-only Start Turn state machine."""
 
-    __slots__ = ("_dependencies", "_owner_token")
+    __slots__ = ("_dependencies", "_owner_token", "_prepared_models")
 
     def __init__(
         self,
@@ -1176,6 +1194,7 @@ class PilotRuntime:
         **kwargs: object,
     ) -> None:
         self._owner_token = object()
+        self._prepared_models: dict[object, ResolvedModel] = {}
         if dependencies is None:
             values = dict(kwargs)
             self._dependencies = RuntimeDependencies(**cast(Any, _dependency_values(values)))
@@ -1705,6 +1724,15 @@ class PilotRuntime:
                 ),
                 invocation_control,
             )
+        if request.pilot_action is not None:
+            return self._stream_immediate(
+                self._failure(
+                    RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                    "unsupported runtime route",
+                    400,
+                ),
+                invocation_control,
+            )
 
         self._phase("conversation")
         try:
@@ -1943,16 +1971,22 @@ class PilotRuntime:
             )
 
         cell = _PreparedExecutionCell(run_open=journal_started)
+        model_token = object()
+        self._prepared_models[model_token] = resolved
+
+        def release_model() -> None:
+            self._prepared_models.pop(model_token, None)
 
         def on_abort() -> None:
             with cell.lock:
-                if cell.aborted:
+                if cell.aborted or cell.completed:
                     return
                 cell.aborted = True
                 should_abandon = cell.run_open
                 cell.run_open = False
             if should_abandon:
                 self._abandon(recorder, journal_started)
+            release_model()
             if invocation_control.state is InvocationState.ACTIVE:
                 invocation_control.mark_completed()
 
@@ -1960,8 +1994,22 @@ class PilotRuntime:
             with cell.lock:
                 cell.run_open = False
                 cell.completed = True
+            release_model()
 
-        frozen_assembled = _freeze_stream_value(assembled)
+        try:
+            frozen_assembled = _freeze_stream_value(assembled)
+        except (TypeError, ValueError):
+            release_model()
+            self._abandon(recorder, journal_started)
+            return self._stream_immediate(
+                self._failure(
+                    RuntimeFailureCode.OPERATION_FAILED,
+                    "对话结果暂时无法保存。",
+                    503,
+                    retryable=True,
+                ),
+                invocation_control,
+            )
         assembled_values = (
             cast(tuple[object, ...], frozen_assembled)
             if isinstance(frozen_assembled, tuple)
@@ -1975,7 +2023,7 @@ class PilotRuntime:
             request=request,
             conversation=_prepared_conversation(conversation, conversation_id),
             conversation_id=conversation_id,
-            resolved=resolved,
+            model_token=model_token,
             assembled=assembled_values,
             recorder=recorder,
             journal_started=journal_started,
@@ -1986,6 +2034,7 @@ class PilotRuntime:
         )
         transport_run_id = transport.transport_run_id
         if transport_run_id is None:  # pragma: no cover - RuntimeTransportContext validates this
+            release_model()
             self._abandon(recorder, journal_started)
             return self._stream_immediate(
                 self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400),
@@ -2021,25 +2070,10 @@ class PilotRuntime:
         if not callable(cancel_check):
             raise TypeError("cancel_check must be callable")
 
-        with state.cell.lock:
-            cached = state.cell.outcome
-            running = state.cell.running
-        if cached is not None:
-            return cached
-        if prepared.lifecycle_state is PreparedLifecycleState.ABORTED:
-            raise RuntimeTransportAborted()
-        lifecycle_state = prepared.lifecycle_state
-        if lifecycle_state is PreparedLifecycleState.PREPARED:
-            if not prepared.begin():
-                with state.cell.lock:
-                    cached = state.cell.outcome
-                if cached is not None:
-                    return cached
-                raise RuntimeTransportAborted()
-        if running:
+        if prepared.lifecycle_state is not PreparedLifecycleState.EXECUTING:
             raise RuntimeTransportAborted()
         with state.cell.lock:
-            if state.cell.running:
+            if state.cell.running or state.cell.aborted or state.cell.completed:
                 raise RuntimeTransportAborted()
             state.cell.running = True
 
@@ -2049,6 +2083,13 @@ class PilotRuntime:
         safe_signal_sink: RuntimeSignalSink[str] | None = (
             _SafeSignalSink(signal_sink) if signal_sink is not None else None
         )
+
+        def close_terminal_owner() -> None:
+            """Close Runtime ownership before projecting terminal events."""
+
+            with state.cell.lock:
+                state.cell.run_open = False
+                state.cell.completed = True
 
         def finish(outcome: RuntimeOutcome, reason: CompletionReason) -> RuntimeOutcome:
             with state.cell.lock:
@@ -2102,13 +2143,24 @@ class PilotRuntime:
                 abort(CompletionReason.TRANSPORT_ABORTED)
                 raise
 
-        if state.resolved is None or state.conversation is None or state.conversation_id is None:
+        resolved_model = (
+            self._prepared_models.get(state.model_token)
+            if state.model_token is not None
+            else None
+        )
+        if resolved_model is None or state.conversation is None or state.conversation_id is None:
             abort(CompletionReason.TRANSPORT_ABORTED)
             raise RuntimeTransportAborted()
-        resolved_model = state.resolved
 
         try:
-            emit_runtime_event(safe_event_sink, MetaEvent())
+            emit_runtime_event(
+                safe_event_sink,
+                MetaEvent(
+                    supports_delta=callable(
+                        getattr(resolved_model.model, "stream_complete", None)
+                    )
+                ),
+            )
             emit_runtime_event(safe_event_sink, UserMessageSavedEvent())
             emit_runtime_event(
                 safe_event_sink,
@@ -2145,15 +2197,23 @@ class PilotRuntime:
 
                 streamed = cast(Any, execution_host).run(stream_thunk, state.control)
                 if hasattr(streamed, "__next__"):
-                    for agent_event in cast(Iterable[object], streamed):
-                        emit_runtime_event(safe_event_sink, cast(RuntimeEvent, agent_event))
-                    result_reader = getattr(streamed, "result", None)
-                    if callable(result_reader):
-                        raw_result = result_reader()
-                    elif result_reader is not None:
-                        raw_result = result_reader
-                    else:
-                        raise RuntimeTransportAborted()
+                    try:
+                        for agent_event in cast(Iterable[object], streamed):
+                            emit_runtime_event(safe_event_sink, cast(RuntimeEvent, agent_event))
+                        result_reader = getattr(streamed, "result", None)
+                        if callable(result_reader):
+                            raw_result = result_reader()
+                        elif result_reader is not None:
+                            raw_result = result_reader
+                        else:
+                            raise RuntimeTransportAborted()
+                    finally:
+                        close = getattr(streamed, "close", None)
+                        if callable(close):
+                            try:
+                                close()
+                            except BaseException:
+                                pass
                 else:
                     raw_result = streamed
             else:
@@ -2202,6 +2262,7 @@ class PilotRuntime:
                     state.control,
                     allow_timeout=True,
                 )
+                close_terminal_owner()
                 outcome = MessageOutcome(
                     message=CHAT_TIMEOUT_MESSAGE,
                     conversation_id=state.conversation_id,
@@ -2217,6 +2278,7 @@ class PilotRuntime:
                 state.control,
                 allow_timeout=True,
             )
+            close_terminal_owner()
             outcome = self._failure(
                 RuntimeFailureCode.OPERATION_FAILED,
                 "对话结果暂时无法保存。",
@@ -2247,9 +2309,9 @@ class PilotRuntime:
                 "provider_error",
                 state.control,
             )
+            close_terminal_owner()
             self._mark_completed_if_active(state.control)
             emit_runtime_event(safe_event_sink, ErrorEvent(outcome.code, outcome.message, outcome.retryable, outcome.degraded))
-            emit_runtime_event(safe_event_sink, CompletedEvent(response=outcome))
             return finish(outcome, CompletionReason.NORMAL)
         except BaseException:
             abort(CompletionReason.TRANSPORT_ABORTED)
@@ -2268,7 +2330,7 @@ class PilotRuntime:
                 cast(StartTurnRequest, state.request),
                 normalized,
                 state.conversation,
-                catalog=state.resolved.catalog,
+                catalog=resolved_model.catalog,
                 ensure_active=lambda: self._check_cancel(cancel_check, state.control),
                 control=state.control,
             )
@@ -2287,8 +2349,9 @@ class PilotRuntime:
                     state.journal_started,
                     normalized.pending,
                     state.control,
-                    catalog=state.resolved.catalog,
+                    catalog=resolved_model.catalog,
                 )
+                close_terminal_owner()
                 self._mark_completed_if_active(state.control)
                 if normalized.pending is not None:
                     args, token = _safe_pending_payload(normalized.pending)
@@ -2303,6 +2366,10 @@ class PilotRuntime:
                     )
                     emit_runtime_event(
                         safe_event_sink,
+                        StatusEvent(phase="waiting_confirmation", label="需要确认"),
+                    )
+                    emit_runtime_event(
+                        safe_event_sink,
                         ConfirmationRequiredEvent(
                             confirmation_token=token,
                             operation_id=normalized.pending.operation_id or None,
@@ -2311,10 +2378,12 @@ class PilotRuntime:
                     )
             elif isinstance(outcome, RuntimeFailureOutcome):
                 self._finish(state.recorder, state.journal_started, "failed", "unknown", state.control)
+                close_terminal_owner()
                 self._mark_completed_if_active(state.control)
                 emit_runtime_event(safe_event_sink, ErrorEvent(outcome.code, outcome.message, outcome.retryable, outcome.degraded))
             else:
                 self._finish(state.recorder, state.journal_started, "completed", None, state.control)
+                close_terminal_owner()
                 self._mark_completed_if_active(state.control)
                 if isinstance(outcome, (MessageOutcome, OperationReplayOutcome)):
                     emit_runtime_event(safe_event_sink, AssistantMessageEvent(message=outcome.message))
@@ -2338,6 +2407,7 @@ class PilotRuntime:
             )
             try:
                 self._finish(state.recorder, state.journal_started, "failed", "unknown", state.control)
+                close_terminal_owner()
                 self._mark_completed_if_active(state.control)
             except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
                 abort(CompletionReason.TRANSPORT_ABORTED)
@@ -2648,7 +2718,11 @@ class PilotRuntime:
                     "request_kind": "initial",
                     "transport_mode": transport.mode,
                     "execution_path": "model_turn",
-                    "transport_run_id": transport.transport_run_id,
+                    "transport_run_id": (
+                        str(transport.transport_run_id)
+                        if transport.transport_run_id is not None
+                        else None
+                    ),
                 },
                 budget_check=budget_check,
             )
@@ -2680,7 +2754,11 @@ class PilotRuntime:
             return _NoopRecorder(), False
         except BaseException:
             raise
-        return (recorder if recorder is not None else _NoopRecorder()), True
+        if recorder is None:
+            return _NoopRecorder(), False
+        if isinstance(recorder, NullRunRecorder):
+            return recorder, False
+        return recorder, True
 
     @staticmethod
     def _journal_call(

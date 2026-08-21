@@ -765,7 +765,12 @@ class PreparedStreamGuard:
         if self._abort is not None:
             return self._abort()
         if self._prepared is not None:
-            return self._prepared.abort_if_prepared()
+            won = self._prepared.abort_if_prepared()
+            if won:
+                callback = getattr(self._prepared.opaque_state, "on_abort", None)
+                if callable(callback):
+                    callback()
+            return won
         if self._lifecycle is not None:
             return self._lifecycle.abort_if_prepared()
         return self._call_runtime(("abort_if_prepared", "abort_before_start", "abort"))
@@ -774,7 +779,12 @@ class PreparedStreamGuard:
         if self._complete is not None:
             return self._complete(reason)
         if self._prepared is not None:
-            return self._prepared.complete(reason)
+            won = self._prepared.complete(reason)
+            if won:
+                callback = getattr(self._prepared.opaque_state, "on_complete", None)
+                if callable(callback):
+                    callback(reason)
+            return won
         if self._lifecycle is not None:
             return self._lifecycle.complete(reason)
         return self._call_runtime(("complete_execution", "complete_prepared_stream", "complete"), reason)

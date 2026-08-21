@@ -1,7 +1,7 @@
 """Transport-independent synchronous Pilot Runtime orchestration.
 
-Task 6 deliberately contains only the initial model turn.  The service owns the
-causal order around the existing Agent driver, while the transport owns the
+The service owns the causal order around the existing Agent driver, including
+the response-header preparation boundary.  The transport owns the
 ``AgentExecutionHost`` (and therefore the worker and deadline).  All external
 objects are injected through small structural seams so this module does not
 need to know about FastAPI, ORM rows, or LangGraph state.
@@ -13,9 +13,10 @@ import inspect
 import json
 from hashlib import sha256
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol, TypeAlias, cast
+from threading import Lock
 from uuid import uuid4
 
 from offerpilot.ai.agent import PendingAction
@@ -37,9 +38,22 @@ from offerpilot.repositories.agent_runs import StartRunCommand
 
 from .contracts import (
     AgentExecutionHost,
+    AssistantDeltaEvent,
+    AssistantMessageEvent,
     ConfirmationRequiredOutcome,
+    ConfirmationRequest,
+    ConfirmationRequiredEvent,
+    CompletedEvent,
+    CompletionReason,
+    ErrorEvent,
     ImmutablePayload,
+    ImmediateHttpOutcome,
     MessageOutcome,
+    MetaEvent,
+    OperationReplayOutcome,
+    PreparationKind,
+    PreparedLifecycleState,
+    PreparedStreamExecution,
     RuntimeEvent,
     RuntimeEventSink,
     RuntimeFailureOutcome,
@@ -50,6 +64,11 @@ from .contracts import (
     RuntimeTransportContext,
     SignalEmitResult,
     StartTurnRequest,
+    StatusEvent,
+    StreamExecutionMode,
+    ToolCallEvent,
+    ToolResultEvent,
+    UserMessageSavedEvent,
     WriteStatus,
     freeze_json_mapping,
 )
@@ -253,6 +272,83 @@ class _PersistedTurn:
     message_ids: tuple[int, ...] = ()
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class _PreparedConversation:
+    """Detached conversation identity retained by a prepared stream."""
+
+    conversation_id: int
+    context_type: str
+    context_ref: str
+    mode: str
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _PreparedToolCall:
+    id: str
+    name: str
+    args: str
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _PreparedMessage:
+    """Immutable message snapshot used to cross the response-header boundary."""
+
+    role: str
+    content: str
+    tool_calls: tuple[_PreparedToolCall, ...] = ()
+    tool_call_id: str = ""
+    provider_blocks: ImmutablePayload = field(default_factory=lambda: freeze_json_mapping({}))
+    surface_contributor: str = ""
+    surface_signal: str = ""
+    surface_revision: str = ""
+    surface_attachment_kinds: str = ""
+
+
+class _PreparedExecutionCell:
+    """Small mutable cell for one-shot execution and cached direct outcomes."""
+
+    __slots__ = ("lock", "running", "outcome", "run_open", "aborted", "completed")
+
+    def __init__(self, *, run_open: bool) -> None:
+        self.lock = Lock()
+        self.running = False
+        self.outcome: RuntimeOutcome | None = None
+        self.run_open = run_open
+        self.aborted = False
+        self.completed = False
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _PreparedStreamState:
+    """Runtime-owned opaque state for one response-header preparation."""
+
+    owner_token: object = field(repr=False, compare=False)
+    preparation_kind: PreparationKind
+    execution_mode: StreamExecutionMode
+    control: RuntimeInvocationControl = field(repr=False, compare=False)
+    request: StartTurnRequest | ConfirmationRequest = field(repr=False, compare=False)
+    conversation: _PreparedConversation | None = field(repr=False, compare=False)
+    conversation_id: int | None = field(default=None, compare=False)
+    resolved: ResolvedModel | None = field(default=None, repr=False, compare=False)
+    assembled: tuple[object, ...] = field(default=(), repr=False, compare=False)
+    recorder: object = field(default_factory=lambda: _NoopRecorder(), repr=False, compare=False)
+    journal_started: bool = field(default=False, compare=False)
+    transport: RuntimeTransportContext | None = field(default=None, compare=False)
+    cell: _PreparedExecutionCell = field(
+        default_factory=lambda: _PreparedExecutionCell(run_open=False),
+        repr=False,
+        compare=False,
+    )
+    events: tuple[RuntimeEvent, ...] = field(default=(), repr=False, compare=False)
+    outcome: RuntimeOutcome | None = field(default=None, repr=False, compare=False)
+    on_abort: Callable[[], object] | None = field(default=None, repr=False, compare=False)
+    on_complete: Callable[[CompletionReason], object] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+
 class _PersistenceReadbackError(RuntimeError):
     """A required detached persistence snapshot was unavailable or invalid."""
 
@@ -341,11 +437,10 @@ class _SafeEventSink:
         emit_runtime_event(self._sink, event)
 
     def __call__(self, event: object) -> None:
-        # The current Agent driver still has a legacy callback-shaped event
-        # seam.  Sync Start Turn has no transport event delivery, so legacy
-        # dictionaries are intentionally ignored; typed RuntimeEvents use the
-        # same safe boundary as ``emit``.
         if isinstance(event, Mapping):
+            typed = _legacy_runtime_event(event)
+            if typed is not None:
+                self.emit(typed)
             return None
         self.emit(cast(RuntimeEvent, event))
 
@@ -363,6 +458,91 @@ class _SafeSignalSink:
             raise
         except Exception:
             return SignalEmitResult.DEGRADED
+
+
+def _legacy_runtime_event(value: Mapping[object, object]) -> RuntimeEvent | None:
+    """Project the existing Agent callback dictionaries into typed events."""
+
+    name = value.get("event")
+    data = value.get("data")
+    if not isinstance(name, str) or not isinstance(data, Mapping):
+        return None
+    if name == "assistant_delta":
+        return AssistantDeltaEvent(delta=str(data.get("delta") or ""))
+    if name == "assistant_message":
+        return AssistantMessageEvent(message=str(data.get("message") or ""))
+    if name == "status":
+        return StatusEvent(
+            phase=str(data.get("phase") or "model_running"),
+            label=str(data.get("label") or ""),
+        )
+    if name == "tool_call":
+        try:
+            args_summary = freeze_json_mapping(
+                cast(Mapping[str, object], data.get("args_summary") or {})
+            )
+        except (TypeError, ValueError):
+            args_summary = freeze_json_mapping({})
+        kind = str(data.get("kind") or "read")
+        if kind not in {"read", "write"}:
+            kind = "read"
+        confirm_mode = str(data.get("confirm_mode") or "none")
+        if confirm_mode not in {"none", "hitl", "approved", "rejected"}:
+            confirm_mode = "none"
+        return ToolCallEvent(
+            tool_call_id=str(data.get("tool_call_id") or "unknown"),
+            tool_name=str(data.get("tool_name") or "unknown"),
+            public_label=str(data.get("public_label") or ""),
+            kind=cast(Any, kind),
+            confirm_mode=cast(Any, confirm_mode),
+            summary=str(data.get("summary") or ""),
+            args_summary=args_summary,
+        )
+    if name == "tool_result":
+        status = str(data.get("status") or "error")
+        if status not in {"success", "error", "cancelled"}:
+            status = "error"
+        write_status = data.get("write_status")
+        if write_status not in {None, "none", "success", "failed", "cancelled"}:
+            write_status = None
+        return ToolResultEvent(
+            tool_call_id=str(data.get("tool_call_id") or "unknown"),
+            tool_name=str(data.get("tool_name") or "unknown"),
+            status=cast(Any, status),
+            summary=str(data.get("summary") or ""),
+            message=str(data.get("message") or ""),
+            visible_result=str(data.get("visible_result") or ""),
+            operation_id=(
+                str(data["operation_id"])
+                if data.get("operation_id") not in (None, "")
+                else None
+            ),
+            write_status=cast(Any, write_status),
+        )
+    if name == "confirmation_required":
+        token = str(data.get("confirmation_token") or data.get("token") or "")
+        if not token:
+            return None
+        return ConfirmationRequiredEvent(
+            confirmation_token=token,
+            operation_id=(
+                str(data["operation_id"])
+                if data.get("operation_id") not in (None, "")
+                else None
+            ),
+        )
+    if name == "error":
+        try:
+            code = RuntimeFailureCode(str(data.get("code") or "operation_failed"))
+        except ValueError:
+            code = RuntimeFailureCode.OPERATION_FAILED
+        return ErrorEvent(
+            code=code,
+            message=str(data.get("message") or ""),
+            retryable=data.get("retryable") is True,
+            degraded=data.get("degraded") is True,
+        )
+    return None
 
 
 def _callable(target: object | None, names: tuple[str, ...]) -> Callable[..., object] | None:
@@ -521,6 +701,73 @@ def _message(value: object) -> Message:
         tool_calls=tool_calls,
         tool_call_id=str(_attribute(value, "tool_call_id", "") or ""),
         provider_blocks=provider_blocks,
+    )
+
+
+def _freeze_stream_value(value: object) -> object:
+    """Snapshot source/context values without retaining mutable containers."""
+
+    if isinstance(value, Message):
+        blocks = value.provider_blocks if isinstance(value.provider_blocks, Mapping) else {}
+        try:
+            frozen_blocks = freeze_json_mapping(cast(Mapping[str, object], blocks))
+        except (TypeError, ValueError):
+            frozen_blocks = freeze_json_mapping({})
+        return _PreparedMessage(
+            role=value.role,
+            content=value.content,
+            tool_calls=tuple(
+                _PreparedToolCall(call.id, call.name, call.args)
+                for call in value.tool_calls
+            ),
+            tool_call_id=value.tool_call_id,
+            provider_blocks=frozen_blocks,
+            surface_contributor=value.surface_contributor,
+            surface_signal=value.surface_signal,
+            surface_revision=value.surface_revision,
+            surface_attachment_kinds=value.surface_attachment_kinds,
+        )
+    if isinstance(value, Mapping):
+        try:
+            return freeze_json_mapping(cast(Mapping[str, object], value))
+        except (TypeError, ValueError):
+            return tuple(
+                (str(key), _freeze_stream_value(child))
+                for key, child in value.items()
+            )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_stream_value(child) for child in value)
+    return value
+
+
+def _materialize_stream_value(value: object) -> object:
+    """Thaw only the message shape expected by the existing Agent driver."""
+
+    if isinstance(value, _PreparedMessage):
+        return Message(
+            role=value.role,
+            content=value.content,
+            tool_calls=[ToolCall(call.id, call.name, call.args) for call in value.tool_calls],
+            tool_call_id=value.tool_call_id,
+            provider_blocks=dict(value.provider_blocks),
+            surface_contributor=value.surface_contributor,
+            surface_signal=value.surface_signal,
+            surface_revision=value.surface_revision,
+            surface_attachment_kinds=value.surface_attachment_kinds,
+        )
+    if isinstance(value, tuple):
+        return tuple(_materialize_stream_value(child) for child in value)
+    if isinstance(value, Mapping):
+        return {str(key): _materialize_stream_value(child) for key, child in value.items()}
+    return value
+
+
+def _prepared_conversation(value: object, conversation_id: int) -> _PreparedConversation:
+    return _PreparedConversation(
+        conversation_id=conversation_id,
+        context_type=str(_attribute(value, "context_type", "workspace") or "workspace"),
+        context_ref=str(_attribute(value, "context_ref", "") or ""),
+        mode=str(_attribute(value, "mode", "general") or "general"),
     )
 
 
@@ -921,13 +1168,14 @@ def _is_agent_cancelled(exc: BaseException) -> bool:
 class PilotRuntime:
     """The synchronous model-only Start Turn state machine."""
 
-    __slots__ = ("_dependencies",)
+    __slots__ = ("_dependencies", "_owner_token")
 
     def __init__(
         self,
         dependencies: RuntimeDependenciesLike | None = None,
         **kwargs: object,
     ) -> None:
+        self._owner_token = object()
         if dependencies is None:
             values = dict(kwargs)
             self._dependencies = RuntimeDependencies(**cast(Any, _dependency_values(values)))
@@ -1408,6 +1656,719 @@ class PilotRuntime:
                 finish_or_raise("completed", None)
         return outcome
 
+    # ---- stream preparation/execution --------------------------------------
+
+    def prepare_stream(
+        self,
+        request: StartTurnRequest | ConfirmationRequest,
+        *,
+        transport: RuntimeTransportContext,
+        invocation_control: RuntimeInvocationControl,
+    ) -> ImmediateHttpOutcome | PreparedStreamExecution:
+        """Perform the response-header preparation boundary for SSE.
+
+        The stream model path intentionally keeps Source before Run.  No Agent
+        host is touched until the returned prepared handle is begun by the
+        transport guard.
+        """
+
+        if not isinstance(request, (StartTurnRequest, ConfirmationRequest)):
+            raise TypeError("request must be a StartTurnRequest or ConfirmationRequest")
+        if not isinstance(transport, RuntimeTransportContext):
+            raise TypeError("transport must be a RuntimeTransportContext")
+        if not isinstance(invocation_control, RuntimeInvocationControl):
+            # RuntimeInvocationControl is runtime-checkable, so this catches
+            # accidental test/route objects before any write side effect.
+            raise TypeError("invocation_control must implement RuntimeInvocationControl")
+        if transport.mode != "stream":
+            return self._stream_immediate(
+                self._failure(
+                    RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                    "unsupported runtime route",
+                    400,
+                ),
+                invocation_control,
+            )
+
+        self._phase("validate")
+        self._validate(cast(StartTurnRequest, request))
+        self._check_cancel(lambda: False, invocation_control)
+
+        # Task 8/9 own these branches.  Keeping them before conversation and
+        # persistence makes the unsupported boundary deterministic and safe.
+        if isinstance(request, ConfirmationRequest):
+            return self._stream_immediate(
+                self._failure(
+                    RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                    "unsupported runtime route",
+                    400,
+                ),
+                invocation_control,
+            )
+
+        self._phase("conversation")
+        try:
+            conversation = self._load_conversation(request)
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception:
+            return self._stream_immediate(
+                self._failure(
+                    RuntimeFailureCode.APPLICATION_NOT_FOUND,
+                    "conversation not found",
+                    404,
+                ),
+                invocation_control,
+            )
+        conversation_id = _conversation_id(conversation) if conversation is not None else None
+        if conversation is None or conversation_id is None:
+            return self._stream_immediate(
+                self._failure(
+                    RuntimeFailureCode.APPLICATION_NOT_FOUND,
+                    "conversation not found",
+                    404,
+                ),
+                invocation_control,
+            )
+        if _is_archived(conversation):
+            return self._stream_immediate(
+                self._failure(
+                    RuntimeFailureCode.CONVERSATION_ARCHIVED,
+                    "conversation is archived",
+                    409,
+                ),
+                invocation_control,
+            )
+
+        try:
+            route = self._select_route(request, conversation)
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception:
+            return self._stream_immediate(
+                self._failure(
+                    RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                    "unsupported runtime route",
+                    400,
+                ),
+                invocation_control,
+            )
+        self._phase(f"route:{route.value}")
+        if route is not RouteKind.MODEL:
+            return self._stream_immediate(
+                self._failure(
+                    RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                    "unsupported runtime route",
+                    400,
+                ),
+                invocation_control,
+            )
+
+        self._phase("pending_guard")
+        try:
+            pending_guard = self._pending_guard(conversation_id, conversation, request)
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception:
+            return self._stream_immediate(
+                self._failure(
+                    RuntimeFailureCode.OPERATION_FAILED,
+                    "对话当前不可读取。",
+                    503,
+                    retryable=True,
+                ),
+                invocation_control,
+            )
+        if pending_guard is not None and pending_guard is not False:
+            return self._stream_immediate(
+                self._failure(
+                    RuntimeFailureCode.PENDING_CONFIRMATION_REQUIRED,
+                    "当前写入仍待确认，请先处理确认卡。",
+                    409,
+                ),
+                invocation_control,
+            )
+
+        self._phase("model_resolve")
+        resolved = self._resolve_model(request, conversation)
+        if isinstance(resolved, RuntimeFailureOutcome):
+            return self._stream_immediate(resolved, invocation_control)
+        if resolved is None:
+            return self._stream_immediate(
+                self._failure(
+                    RuntimeFailureCode.MODEL_UNCONFIGURED,
+                    "AI 设置尚未完成，请检查模型配置。",
+                    503,
+                ),
+                invocation_control,
+            )
+
+        persistence = self._require_dependency("persistence")
+        persistence_failure = self._validate_persistence_surface(persistence)
+        if persistence_failure is not None:
+            return self._stream_immediate(persistence_failure, invocation_control)
+
+        self._phase("user_persist")
+        self._check_cancel(lambda: False, invocation_control)
+        try:
+            user_result = self._persist_user(
+                persistence,
+                conversation_id,
+                request.message,
+                control=invocation_control,
+            )
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception:
+            return self._stream_immediate(
+                self._failure(
+                    RuntimeFailureCode.OPERATION_FAILED,
+                    "对话当前不可写入。",
+                    503,
+                    retryable=True,
+                ),
+                invocation_control,
+            )
+        if not _result_persisted(user_result):
+            status = _failure_status(user_result)
+            code = (
+                RuntimeFailureCode.CONVERSATION_ARCHIVED
+                if status == "closed"
+                else RuntimeFailureCode.APPLICATION_NOT_FOUND
+                if status == "not_found"
+                else RuntimeFailureCode.OPERATION_FAILED
+            )
+            status_code = 409 if code is RuntimeFailureCode.CONVERSATION_ARCHIVED else 404 if code is RuntimeFailureCode.APPLICATION_NOT_FOUND else 503
+            return self._stream_immediate(
+                self._failure(
+                    code,
+                    "对话当前不可写入。",
+                    status_code,
+                    retryable=code is RuntimeFailureCode.OPERATION_FAILED,
+                ),
+                invocation_control,
+            )
+
+        input_message_id = _attribute(user_result, "message_id")
+        if type(input_message_id) is not int or input_message_id <= 0:
+            try:
+                persisted_ids = self._snapshot_message_ids(persistence, conversation_id)
+            except _PersistenceReadbackError:
+                return self._stream_immediate(
+                    self._failure(
+                        RuntimeFailureCode.OPERATION_FAILED,
+                        "对话结果暂时无法保存。",
+                        503,
+                        retryable=True,
+                    ),
+                    invocation_control,
+                )
+            input_message_id = persisted_ids[-1] if persisted_ids else None
+
+        try:
+            self._phase("source_load")
+            source = self._load_source(conversation, request)
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception:
+            return self._stream_immediate(
+                self._failure(
+                    RuntimeFailureCode.SOURCE_LOAD_FAILED,
+                    "上下文暂时无法加载，请稍后重试。",
+                    503,
+                    retryable=True,
+                ),
+                invocation_control,
+            )
+
+        try:
+            self._phase("context_assemble")
+            assembled = self._assemble_context(source, conversation, request)
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception:
+            return self._stream_immediate(
+                self._failure(
+                    RuntimeFailureCode.SOURCE_LOAD_FAILED,
+                    "上下文暂时无法加载，请稍后重试。",
+                    503,
+                    retryable=True,
+                ),
+                invocation_control,
+            )
+
+        self._phase("transport_identity")
+        self._check_cancel(lambda: False, invocation_control)
+        self._phase("run_start")
+        recorder, journal_started = self._start_journal(
+            conversation,
+            conversation_id,
+            input_message_id,
+            request,
+            transport,
+        )
+
+        try:
+            self._record_journal_route(
+                recorder,
+                journal_started,
+                route_kind="model",
+                route_reason_code="model_default",
+                control=invocation_control,
+            )
+            self._phase("context_capture")
+            self._capture_initial_journal_context(
+                recorder,
+                journal_started,
+                conversation,
+                conversation_id,
+                input_message_id,
+                resolved.catalog,
+                persistence,
+                invocation_control,
+            )
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            self._abandon(recorder, journal_started)
+            raise
+        except Exception:
+            self._abandon(recorder, journal_started)
+            return self._stream_immediate(
+                self._failure(
+                    RuntimeFailureCode.OPERATION_FAILED,
+                    "对话结果暂时无法保存。",
+                    503,
+                    retryable=True,
+                ),
+                invocation_control,
+            )
+
+        cell = _PreparedExecutionCell(run_open=journal_started)
+
+        def on_abort() -> None:
+            with cell.lock:
+                if cell.aborted:
+                    return
+                cell.aborted = True
+                should_abandon = cell.run_open
+                cell.run_open = False
+            if should_abandon:
+                self._abandon(recorder, journal_started)
+            if invocation_control.state is InvocationState.ACTIVE:
+                invocation_control.mark_completed()
+
+        def on_complete(_reason: CompletionReason) -> None:
+            with cell.lock:
+                cell.run_open = False
+                cell.completed = True
+
+        frozen_assembled = _freeze_stream_value(assembled)
+        assembled_values = (
+            cast(tuple[object, ...], frozen_assembled)
+            if isinstance(frozen_assembled, tuple)
+            else (frozen_assembled,)
+        )
+        state = _PreparedStreamState(
+            owner_token=self._owner_token,
+            preparation_kind=PreparationKind.MODEL,
+            execution_mode=StreamExecutionMode.AGENT_HOST,
+            control=invocation_control,
+            request=request,
+            conversation=_prepared_conversation(conversation, conversation_id),
+            conversation_id=conversation_id,
+            resolved=resolved,
+            assembled=assembled_values,
+            recorder=recorder,
+            journal_started=journal_started,
+            transport=transport,
+            cell=cell,
+            on_abort=on_abort,
+            on_complete=on_complete,
+        )
+        transport_run_id = transport.transport_run_id
+        if transport_run_id is None:  # pragma: no cover - RuntimeTransportContext validates this
+            self._abandon(recorder, journal_started)
+            return self._stream_immediate(
+                self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400),
+                invocation_control,
+            )
+        prepared = PreparedStreamExecution(
+            invocation_id=transport_run_id,
+            preparation_kind=PreparationKind.MODEL,
+            execution_mode=StreamExecutionMode.AGENT_HOST,
+            opaque_state=state,
+        )
+        self._phase("prepared")
+        return prepared
+
+    def execute_prepared_stream(
+        self,
+        prepared: PreparedStreamExecution,
+        *,
+        event_sink: RuntimeEventSink | None,
+        signal_sink: RuntimeSignalSink[str] | None,
+        execution_host: AgentExecutionHost[object],
+        cancel_check: Callable[[], bool],
+    ) -> RuntimeOutcome:
+        """Execute one prepared handle; direct handles never enter the Agent host."""
+
+        if not isinstance(prepared, PreparedStreamExecution):
+            raise TypeError("prepared must be a PreparedStreamExecution")
+        state = prepared.opaque_state
+        if not isinstance(state, _PreparedStreamState):
+            raise TypeError("prepared stream state is not owned by PilotRuntime")
+        if state.owner_token is not self._owner_token:
+            raise TypeError("prepared stream belongs to a different PilotRuntime")
+        if not callable(cancel_check):
+            raise TypeError("cancel_check must be callable")
+
+        with state.cell.lock:
+            cached = state.cell.outcome
+            running = state.cell.running
+        if cached is not None:
+            return cached
+        if prepared.lifecycle_state is PreparedLifecycleState.ABORTED:
+            raise RuntimeTransportAborted()
+        lifecycle_state = prepared.lifecycle_state
+        if lifecycle_state is PreparedLifecycleState.PREPARED:
+            if not prepared.begin():
+                with state.cell.lock:
+                    cached = state.cell.outcome
+                if cached is not None:
+                    return cached
+                raise RuntimeTransportAborted()
+        if running:
+            raise RuntimeTransportAborted()
+        with state.cell.lock:
+            if state.cell.running:
+                raise RuntimeTransportAborted()
+            state.cell.running = True
+
+        safe_event_sink: RuntimeEventSink = (
+            _SafeEventSink(event_sink) if event_sink is not None else _NoopEventSink()
+        )
+        safe_signal_sink: RuntimeSignalSink[str] | None = (
+            _SafeSignalSink(signal_sink) if signal_sink is not None else None
+        )
+
+        def finish(outcome: RuntimeOutcome, reason: CompletionReason) -> RuntimeOutcome:
+            with state.cell.lock:
+                state.cell.outcome = outcome
+                state.cell.running = False
+            if state.on_complete is not None:
+                try:
+                    state.on_complete(reason)
+                except BaseException:
+                    pass
+            prepared.complete(reason)
+            return outcome
+
+        def abort(reason: CompletionReason) -> None:
+            with state.cell.lock:
+                state.cell.running = False
+            if state.on_abort is not None:
+                try:
+                    state.on_abort()
+                except BaseException:
+                    pass
+            prepared.complete(reason)
+
+        if state.execution_mode is StreamExecutionMode.DIRECT:
+            try:
+                self._check_cancel(cancel_check, state.control)
+                for event in state.events:
+                    if type(event) is CompletedEvent:
+                        continue
+                    emit_runtime_event(safe_event_sink, event)
+                outcome: RuntimeOutcome
+                if state.outcome is None:
+                    outcome = self._failure(
+                        RuntimeFailureCode.OPERATION_FAILED,
+                        "对话结果暂时无法保存。",
+                        503,
+                        retryable=True,
+                    )
+                else:
+                    outcome = state.outcome
+                self._mark_completed_if_active(state.control)
+                emit_runtime_event(safe_event_sink, CompletedEvent(response=outcome))
+                return finish(outcome, CompletionReason.NORMAL)
+            except RuntimeCancelled:
+                abort(CompletionReason.CANCELLED)
+                raise
+            except (RuntimeTransportAborted, RuntimeAgentTimedOut):
+                abort(CompletionReason.TRANSPORT_ABORTED)
+                raise
+            except BaseException:
+                abort(CompletionReason.TRANSPORT_ABORTED)
+                raise
+
+        if state.resolved is None or state.conversation is None or state.conversation_id is None:
+            abort(CompletionReason.TRANSPORT_ABORTED)
+            raise RuntimeTransportAborted()
+        resolved_model = state.resolved
+
+        try:
+            emit_runtime_event(safe_event_sink, MetaEvent())
+            emit_runtime_event(safe_event_sink, UserMessageSavedEvent())
+            emit_runtime_event(
+                safe_event_sink,
+                StatusEvent(phase="model_running", label="正在思考"),
+            )
+            self._check_cancel(cancel_check, state.control)
+
+            def checked_cancel() -> bool:
+                self._check_cancel(cancel_check, state.control)
+                return False
+
+            driver = self._require_dependency("agent_driver")
+
+            def build_invocation(agent_events: RuntimeEventSink) -> AgentInvocation:
+                return self._agent_invocation(
+                    resolved_model,
+                    tuple(_materialize_stream_value(item) for item in state.assembled),
+                    state.conversation,
+                    cast(StartTurnRequest, state.request),
+                    state.recorder,
+                    agent_events,
+                    safe_signal_sink,
+                    checked_cancel,
+                )
+
+            # SseAgentExecutionHost owns an unbounded queue and passes its
+            # typed sink to a one-argument thunk.  Sync/fake hosts use the
+            # ordinary zero-argument Runtime thunk.  Keep this adaptation at
+            # the host boundary; business preparation remains Runtime-owned.
+            if callable(getattr(execution_host, "iter_events", None)):
+                def stream_thunk(agent_events: RuntimeEventSink) -> object:
+                    invocation = build_invocation(_SafeEventSink(agent_events))
+                    return self._run_driver(driver, invocation)
+
+                streamed = cast(Any, execution_host).run(stream_thunk, state.control)
+                if hasattr(streamed, "__next__"):
+                    for agent_event in cast(Iterable[object], streamed):
+                        emit_runtime_event(safe_event_sink, cast(RuntimeEvent, agent_event))
+                    result_reader = getattr(streamed, "result", None)
+                    if callable(result_reader):
+                        raw_result = result_reader()
+                    elif result_reader is not None:
+                        raw_result = result_reader
+                    else:
+                        raise RuntimeTransportAborted()
+                else:
+                    raw_result = streamed
+            else:
+                invocation = build_invocation(safe_event_sink)
+
+                def thunk() -> object:
+                    return self._run_driver(driver, invocation)
+
+                raw_result = execution_host.run(thunk, state.control)
+            self._check_cancel(cancel_check, state.control)
+            normalized = _normalize_agent_result(raw_result)
+        except RuntimeAgentTimedOut:
+            persistence = self._require_dependency("persistence")
+            timeout_result: object | None = None
+            try:
+                self._allow_timeout_persistence(state.control)
+                timeout_result = self._persist_timeout(
+                    persistence,
+                    state.conversation_id,
+                    control=state.control,
+                )
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                abort(CompletionReason.CANCELLED)
+                raise
+            except Exception:
+                timeout_result = None
+            if _timeout_result_persisted(timeout_result):
+                self._record_journal_persisted(
+                    state.recorder,
+                    state.journal_started,
+                    persistence,
+                    state.conversation_id,
+                    tuple(
+                        value
+                        for value in (_attribute(timeout_result, "message_id"),)
+                        if type(value) is int
+                    ),
+                    state.control,
+                    allow_timeout=True,
+                )
+                self._finish(
+                    state.recorder,
+                    state.journal_started,
+                    "timed_out",
+                    "timeout",
+                    state.control,
+                    allow_timeout=True,
+                )
+                outcome = MessageOutcome(
+                    message=CHAT_TIMEOUT_MESSAGE,
+                    conversation_id=state.conversation_id,
+                )
+                emit_runtime_event(safe_event_sink, AssistantMessageEvent(message=outcome.message))
+                emit_runtime_event(safe_event_sink, CompletedEvent(response=outcome))
+                return finish(outcome, CompletionReason.CANCELLED)
+            self._finish(
+                state.recorder,
+                state.journal_started,
+                "failed",
+                "unknown",
+                state.control,
+                allow_timeout=True,
+            )
+            outcome = self._failure(
+                RuntimeFailureCode.OPERATION_FAILED,
+                "对话结果暂时无法保存。",
+                503,
+                retryable=True,
+            )
+            emit_runtime_event(safe_event_sink, ErrorEvent(outcome.code, outcome.message, outcome.retryable, outcome.degraded))
+            emit_runtime_event(safe_event_sink, CompletedEvent(response=outcome))
+            return finish(outcome, CompletionReason.CANCELLED)
+        except RuntimeCancelled:
+            abort(CompletionReason.CANCELLED)
+            raise
+        except RuntimeTransportAborted:
+            abort(CompletionReason.TRANSPORT_ABORTED)
+            raise
+        except Exception as exc:
+            del exc
+            outcome = self._failure(
+                RuntimeFailureCode.AI_PROVIDER_ERROR,
+                "AI 连接失败。请检查 AI 设置或稍后重试。",
+                502,
+                retryable=True,
+            )
+            self._finish(
+                state.recorder,
+                state.journal_started,
+                "failed",
+                "provider_error",
+                state.control,
+            )
+            self._mark_completed_if_active(state.control)
+            emit_runtime_event(safe_event_sink, ErrorEvent(outcome.code, outcome.message, outcome.retryable, outcome.degraded))
+            emit_runtime_event(safe_event_sink, CompletedEvent(response=outcome))
+            return finish(outcome, CompletionReason.NORMAL)
+        except BaseException:
+            abort(CompletionReason.TRANSPORT_ABORTED)
+            raise
+
+        persistence = self._require_dependency("persistence")
+        try:
+            self._phase("result_normalize")
+            self._check_cancel(cancel_check, state.control)
+            # ``normalized`` is already the sealed result; the phase is kept
+            # for parity with sync diagnostics and golden ordering.
+            self._phase("message_persist")
+            persisted_turn = self._persist_result(
+                persistence,
+                state.conversation_id,
+                cast(StartTurnRequest, state.request),
+                normalized,
+                state.conversation,
+                catalog=state.resolved.catalog,
+                ensure_active=lambda: self._check_cancel(cancel_check, state.control),
+                control=state.control,
+            )
+            self._record_journal_persisted(
+                state.recorder,
+                state.journal_started,
+                persistence,
+                state.conversation_id,
+                persisted_turn.message_ids,
+                state.control,
+            )
+            outcome = persisted_turn.outcome
+            if isinstance(outcome, ConfirmationRequiredOutcome):
+                self._suspend(
+                    state.recorder,
+                    state.journal_started,
+                    normalized.pending,
+                    state.control,
+                    catalog=state.resolved.catalog,
+                )
+                self._mark_completed_if_active(state.control)
+                if normalized.pending is not None:
+                    args, token = _safe_pending_payload(normalized.pending)
+                    from .contracts import PendingActionPayload
+
+                    payload = PendingActionPayload(
+                        tool_name=normalized.pending.tool_name,
+                        operation_id=normalized.pending.operation_id or normalized.pending.tool_call_id,
+                        human=normalized.pending.human,
+                        args=args,
+                        confirmation_token=token,
+                    )
+                    emit_runtime_event(
+                        safe_event_sink,
+                        ConfirmationRequiredEvent(
+                            confirmation_token=token,
+                            operation_id=normalized.pending.operation_id or None,
+                            pending_action=payload,
+                        ),
+                    )
+            elif isinstance(outcome, RuntimeFailureOutcome):
+                self._finish(state.recorder, state.journal_started, "failed", "unknown", state.control)
+                self._mark_completed_if_active(state.control)
+                emit_runtime_event(safe_event_sink, ErrorEvent(outcome.code, outcome.message, outcome.retryable, outcome.degraded))
+            else:
+                self._finish(state.recorder, state.journal_started, "completed", None, state.control)
+                self._mark_completed_if_active(state.control)
+                if isinstance(outcome, (MessageOutcome, OperationReplayOutcome)):
+                    emit_runtime_event(safe_event_sink, AssistantMessageEvent(message=outcome.message))
+            emit_runtime_event(safe_event_sink, CompletedEvent(response=outcome))
+            return finish(outcome, CompletionReason.NORMAL)
+        except RuntimeCancelled:
+            abort(CompletionReason.CANCELLED)
+            raise
+        except RuntimeTransportAborted:
+            abort(CompletionReason.TRANSPORT_ABORTED)
+            raise
+        except (RuntimeAgentTimedOut,):
+            abort(CompletionReason.CANCELLED)
+            raise
+        except Exception:
+            outcome = self._failure(
+                RuntimeFailureCode.OPERATION_FAILED,
+                "对话结果暂时无法保存。",
+                503,
+                retryable=True,
+            )
+            try:
+                self._finish(state.recorder, state.journal_started, "failed", "unknown", state.control)
+                self._mark_completed_if_active(state.control)
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                abort(CompletionReason.TRANSPORT_ABORTED)
+                raise
+            emit_runtime_event(safe_event_sink, ErrorEvent(outcome.code, outcome.message, outcome.retryable, outcome.degraded))
+            emit_runtime_event(safe_event_sink, CompletedEvent(response=outcome))
+            return finish(outcome, CompletionReason.NORMAL)
+        except BaseException:
+            abort(CompletionReason.TRANSPORT_ABORTED)
+            raise
+
+    def _stream_immediate(
+        self,
+        outcome: RuntimeFailureOutcome,
+        control: RuntimeInvocationControl,
+    ) -> ImmediateHttpOutcome:
+        self._mark_completed_if_active(control)
+        return ImmediateHttpOutcome(
+            status_code=outcome.status_code,
+            payload=freeze_json_mapping(
+                {"error": outcome.message, "error_code": outcome.code.value}
+            ),
+        )
+
+    @staticmethod
+    def _mark_completed_if_active(control: RuntimeInvocationControl) -> None:
+        if control.state is InvocationState.ACTIVE:
+            if not control.mark_completed():
+                require_runtime_active(control)
+
+
     # ---- state-machine stages -------------------------------------------------
 
     def _require_dependency(self, name: str) -> object:
@@ -1425,7 +2386,7 @@ class PilotRuntime:
             raise TypeError(f"PilotRuntime dependency {name} is required")
         return value
 
-    def _validate(self, request: StartTurnRequest) -> None:
+    def _validate(self, request: StartTurnRequest | ConfirmationRequest) -> None:
         validator = _callable(self._dependencies.validator, ("validate", "validate_request"))
         if validator is not None:
             _invoke(validator, {"request": request}, (request,))

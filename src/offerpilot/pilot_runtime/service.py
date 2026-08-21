@@ -11,14 +11,29 @@ from __future__ import annotations
 
 import inspect
 import json
-from collections.abc import Callable, Mapping, Sequence
+from hashlib import sha256
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol, TypeAlias, cast
+from uuid import uuid4
 
 from offerpilot.ai.agent import PendingAction
+from offerpilot.ai.tool_runtime.contracts import ToolFailure, ToolSuccess
 from offerpilot.ai.tool_runtime.journal import journal_shape_digest
 from offerpilot.ai.types import Message, ToolCall
+from offerpilot.agent_runtime.events import (
+    ContextManifestInput,
+    normalize_context_identity,
+    prepare_event,
+)
+from offerpilot.agent_runtime.journal import (
+    EventInput,
+    StartRunBuilder,
+    SuspendedDisposition,
+    TerminalDisposition,
+)
+from offerpilot.repositories.agent_runs import StartRunCommand
 
 from .contracts import (
     AgentExecutionHost,
@@ -102,7 +117,7 @@ class RuntimePersistence(Protocol):
 
 
 class JournalFactory(Protocol):
-    def start_run(self, *args: object, **kwargs: object) -> object: ...
+    def start_run(self, command: StartRunCommand | StartRunBuilder) -> object: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +170,12 @@ class NormalizedAgentTurn:
 
 
 @dataclass(frozen=True, slots=True)
+class _PersistedTurn:
+    outcome: RuntimeOutcome
+    message_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class RuntimeDependencies:
     """Composition seams used by :class:`PilotRuntime`.
 
@@ -179,6 +200,7 @@ class RuntimeDependencies:
     pending_guard: object | None = None
     validator: object | None = None
     phase_sink: object | None = None
+    application_visible: object | None = None
 
 
 RuntimeDependenciesLike: TypeAlias = RuntimeDependencies | Mapping[str, object]
@@ -238,7 +260,7 @@ class _SafeSignalSink:
     def try_emit(self, signal: str) -> SignalEmitResult:
         try:
             return self._sink.try_emit(signal)
-        except (RuntimeCancelled, RuntimeTransportAborted):
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
             raise
         except Exception:
             return SignalEmitResult.DEGRADED
@@ -362,6 +384,7 @@ def _result_persisted(result: object) -> bool:
         "closed",
         "not_found",
         "cas_lost",
+        "duplicate",
     }:
         return False
     return True
@@ -435,6 +458,192 @@ def _pending(value: object) -> PendingAction | None:
         args=str(_attribute(value, "args", "") or ""),
         human=str(_attribute(value, "human", "") or ""),
         operation_id=str(_attribute(value, "operation_id", "") or ""),
+    )
+
+
+def _confirmation_token(pending: PendingAction) -> str:
+    """Return the exact token used by the legacy Chat confirmation helper."""
+
+    try:
+        parsed_args = json.loads(pending.args)
+        canonical_args = json.dumps(
+            parsed_args,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (json.JSONDecodeError, TypeError, ValueError):
+        canonical_args = pending.args
+    identity = json.dumps(
+        [pending.tool_call_id, pending.tool_name, canonical_args],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return sha256(identity.encode("utf-8")).hexdigest()
+
+
+_USER_FACING_TOOL_NAMES = {
+    "update_application_status": "更新投递状态",
+    "create_application_event": "添加投递日程",
+    "update_application_event": "更新投递日程",
+    "delete_application_event": "删除投递日程",
+    "add_application": "新建投递记录",
+    "create_application": "新建投递记录",
+    "add_note": "添加复盘记录",
+    "update_note": "更新复盘记录",
+    "delete_note": "删除复盘记录",
+}
+
+
+def _user_facing_assistant_content(content: str) -> str:
+    """Apply the baseline's internal-tool-name redaction to assistant text."""
+
+    if not content:
+        return content
+    sanitized = content
+    for internal_name, label in _USER_FACING_TOOL_NAMES.items():
+        sanitized = sanitized.replace(f"`{internal_name}`", label)
+        sanitized = sanitized.replace(internal_name, label)
+    return sanitized
+
+
+def _record_outcome(record: object) -> object | None:
+    return _attribute(record, "outcome")
+
+
+def _record_is_write(record: object) -> bool:
+    prepared = _attribute(record, "prepared")
+    spec = _attribute(prepared, "spec")
+    kind = _attribute(spec, "kind")
+    return str(getattr(kind, "value", kind or "")) == "write"
+
+
+def _failure_detail(failure: object) -> str:
+    detail = _attribute(failure, "compatibility_detail", "")
+    if isinstance(detail, str) and detail:
+        return detail
+    code = _attribute(failure, "code", "operation_failed")
+    return str(code)
+
+
+def _with_write_error_followup(
+    added: Sequence[object],
+    records: Sequence[object],
+    failures: Sequence[object],
+) -> tuple[list[Message], str]:
+    followup = _write_error_followup(records, failures)
+    updated = [_message(item) for item in added]
+    if not followup:
+        return updated, ""
+    for index in range(len(updated) - 1, -1, -1):
+        message = updated[index]
+        if message.role == "assistant" and not message.tool_calls:
+            updated[index] = Message(
+                role="assistant",
+                content=followup,
+                provider_blocks=message.provider_blocks,
+            )
+            return updated, followup
+    updated.append(Message(role="assistant", content=followup))
+    return updated, followup
+
+
+def _write_error_followup(records: Sequence[object], failures: Sequence[object]) -> str:
+    recorded_failures = tuple(
+        outcome
+        for outcome in (_record_outcome(record) for record in records)
+        if isinstance(outcome, ToolFailure)
+    )
+    for failure in reversed((*recorded_failures, *failures)):
+        code = str(_attribute(failure, "code", ""))
+        if code == "unclear_note_date":
+            return "这次复盘的具体面试日期还不明确。请告诉我具体日期，或回复“日期待定”确认先按待定保存。"
+        if code == "company_required":
+            return "这次复盘还缺少公司信息。请告诉我公司名称，或先说明不关联具体公司。"
+        if code == "new_position_confirmation_required":
+            return "我找到同公司已有不同岗位记录。请确认是否为这个新岗位单独新建一条投递记录？确认后我再继续整理。"
+    return ""
+
+
+def _write_outcome(
+    records: Sequence[object],
+    attempted: bool,
+    failures: Sequence[object] = (),
+) -> tuple[str, str]:
+    if not attempted:
+        return "none", ""
+    write_records = tuple(record for record in records if _record_is_write(record))
+    for record in reversed(write_records):
+        outcome = _record_outcome(record)
+        if isinstance(outcome, ToolFailure):
+            return "failed", _failure_detail(outcome)
+        # Keep the projection safe for strict fakes that use a detached
+        # failure-like value instead of importing the transient ToolFailure.
+        if outcome is not None and _attribute(outcome, "code") is not None:
+            return "failed", _failure_detail(outcome)
+    if failures:
+        return "failed", _failure_detail(failures[-1])
+    for record in reversed(write_records):
+        outcome = _record_outcome(record)
+        result = _attribute(outcome, "result")
+        if isinstance(outcome, ToolSuccess) and isinstance(result, dict):
+            if result.get("deleted") is False:
+                return "failed", "目标记录不存在"
+            return "success", ""
+        if isinstance(result, dict):
+            if result.get("deleted") is False:
+                return "failed", "目标记录不存在"
+            return "success", ""
+    return "failed", "写入未完成"
+
+
+def _catalog_write_names(catalog: object | None) -> set[str]:
+    function = _callable(catalog, ("write_names",))
+    if function is None:
+        return set()
+    try:
+        values = function()
+    except Exception:
+        return set()
+    if isinstance(values, (str, bytes)):
+        return set()
+    try:
+        return {str(value) for value in cast(Iterable[object], values)}
+    except TypeError:
+        return set()
+
+
+def _has_write_attempt(added: Sequence[object], records: Sequence[object], catalog: object | None) -> bool:
+    write_names = _catalog_write_names(catalog)
+    for item in added:
+        message = _message(item)
+        if message.role == "assistant" and any(
+            call.name in write_names for call in message.tool_calls
+        ):
+            return True
+    return any(_record_is_write(record) for record in records)
+
+
+def _pending_action_from_added_write_call(
+    added: Sequence[object],
+    catalog: object | None,
+) -> PendingAction | None:
+    write_names = _catalog_write_names(catalog)
+    for item in reversed(added):
+        message = _message(item)
+        if message.role != "assistant" or not message.tool_calls:
+            continue
+        call = message.tool_calls[0]
+        if write_names and call.name not in write_names:
+            continue
+        return PendingAction(call.id, call.name, call.args, call.name)
+    return None
+
+
+def _looks_like_followup_question(reply: str) -> bool:
+    trimmed = reply.strip()
+    return bool(trimmed) and (
+        "?" in trimmed or "？" in trimmed or "请告诉我" in trimmed or "请补充" in trimmed
     )
 
 
@@ -515,10 +724,7 @@ def _safe_pending_payload(pending: PendingAction) -> tuple[ImmutablePayload, str
     if not isinstance(parsed, Mapping):
         parsed = {}
     args = freeze_json_mapping(cast(Mapping[str, object], parsed))
-    token = pending.operation_id or pending.tool_call_id
-    if not token:
-        token = "pending"
-    return args, token
+    return args, _confirmation_token(pending)
 
 
 def _write_status(result: NormalizedAgentTurn) -> WriteStatus:
@@ -652,6 +858,7 @@ class PilotRuntime:
 
         persistence = self._require_dependency("persistence")
         self._phase("user_persist")
+        self._check_cancel(cancel, invocation_control)
         user_result = self._persist_user(persistence, conversation_id, request.message)
         if not _result_persisted(user_result):
             code = (
@@ -664,23 +871,70 @@ class PilotRuntime:
             status = 409 if code is RuntimeFailureCode.CONVERSATION_ARCHIVED else 404 if code is RuntimeFailureCode.APPLICATION_NOT_FOUND else 503
             return self._failure(code, "对话当前不可写入。", status)
 
+        input_message_id = _attribute(user_result, "message_id")
+        if type(input_message_id) is not int or input_message_id <= 0:
+            persisted_ids = self._snapshot_message_ids(persistence, conversation_id)
+            input_message_id = persisted_ids[-1] if persisted_ids else None
+
         self._phase("run_start")
+        self._check_cancel(cancel, invocation_control)
         recorder, journal_started = self._start_journal(
             conversation,
             conversation_id,
-            _attribute(user_result, "message_id"),
+            input_message_id,
             request,
             resolved_transport,
         )
+
+        abandoned = False
+
+        def abandon_once() -> None:
+            nonlocal abandoned
+            if abandoned:
+                return
+            abandoned = True
+            self._abandon(recorder, journal_started)
+
+        def finish_or_raise(
+            status: str,
+            failure_code: str | None,
+            *,
+            allow_timeout: bool = False,
+        ) -> None:
+            try:
+                self._finish(
+                    recorder,
+                    journal_started,
+                    status,
+                    failure_code,
+                    invocation_control,
+                    allow_timeout=allow_timeout,
+                )
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                abandon_once()
+                raise
+
+        try:
+            # These are the first two baseline Journal facts after run creation.
+            self._record_journal_route(
+                recorder,
+                journal_started,
+                route_kind="model",
+                route_reason_code="model_default",
+                control=invocation_control,
+            )
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            abandon_once()
+            raise
 
         try:
             self._phase("source_load")
             source = self._load_source(conversation, request)
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
-            self._abandon(recorder, journal_started)
+            abandon_once()
             raise
         except Exception:
-            self._finish(recorder, journal_started, "failed", RuntimeFailureCode.SOURCE_LOAD_FAILED.value)
+            finish_or_raise("failed", RuntimeFailureCode.SOURCE_LOAD_FAILED.value)
             return self._failure(
                 RuntimeFailureCode.SOURCE_LOAD_FAILED,
                 "上下文暂时无法加载，请稍后重试。",
@@ -688,17 +942,17 @@ class PilotRuntime:
                 retryable=True,
             )
         except BaseException:
-            self._abandon(recorder, journal_started)
+            abandon_once()
             raise
 
         try:
             self._phase("context_assemble")
             assembled = self._assemble_context(source, conversation, request)
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
-            self._abandon(recorder, journal_started)
+            abandon_once()
             raise
         except Exception:
-            self._finish(recorder, journal_started, "failed", RuntimeFailureCode.SOURCE_LOAD_FAILED.value)
+            finish_or_raise("failed", RuntimeFailureCode.SOURCE_LOAD_FAILED.value)
             return self._failure(
                 RuntimeFailureCode.SOURCE_LOAD_FAILED,
                 "上下文暂时无法加载，请稍后重试。",
@@ -706,7 +960,26 @@ class PilotRuntime:
                 retryable=True,
             )
         except BaseException:
-            self._abandon(recorder, journal_started)
+            abandon_once()
+            raise
+
+        try:
+            self._capture_initial_journal_context(
+                recorder,
+                journal_started,
+                conversation,
+                conversation_id,
+                input_message_id,
+                self._dependencies.catalog,
+                persistence,
+                invocation_control,
+            )
+            self._check_cancel(cancel, invocation_control)
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            abandon_once()
+            raise
+        except BaseException:
+            abandon_once()
             raise
 
         driver = self._require_dependency("agent_driver")
@@ -736,31 +1009,42 @@ class PilotRuntime:
             require_runtime_active(invocation_control)
         except RuntimeAgentTimedOut:
             try:
+                self._allow_timeout_persistence(invocation_control)
                 timeout_result = self._persist_timeout(persistence, conversation_id)
-            except (RuntimeCancelled, RuntimeTransportAborted):
-                self._abandon(recorder, journal_started)
+                timeout_message_id = _attribute(timeout_result, "message_id")
+                self._record_journal_persisted(
+                    recorder,
+                    journal_started,
+                    persistence,
+                    conversation_id,
+                    (timeout_message_id,) if type(timeout_message_id) is int else (),
+                    invocation_control,
+                    allow_timeout=True,
+                )
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                abandon_once()
                 raise
             except Exception:
                 timeout_result = None
             except BaseException:
-                self._abandon(recorder, journal_started)
+                abandon_once()
                 raise
             if _result_persisted(timeout_result):
-                self._finish(recorder, journal_started, "timed_out", "timeout")
+                finish_or_raise("timed_out", "timeout", allow_timeout=True)
                 return MessageOutcome(
                     message=CHAT_TIMEOUT_MESSAGE,
                     conversation_id=conversation_id,
                 )
-            self._finish(recorder, journal_started, "timed_out", "timeout")
+            finish_or_raise("timed_out", "timeout", allow_timeout=True)
             return self._failure(RuntimeFailureCode.CHAT_AGENT_TIMEOUT, CHAT_TIMEOUT_MESSAGE, 504, retryable=True)
         except (RuntimeCancelled, RuntimeTransportAborted):
-            self._abandon(recorder, journal_started)
+            abandon_once()
             raise
         except Exception as exc:
             if _is_agent_cancelled(exc):
-                self._abandon(recorder, journal_started)
+                abandon_once()
                 raise RuntimeCancelled() from exc
-            self._finish(recorder, journal_started, "failed", "provider_error")
+            finish_or_raise("failed", "provider_error")
             return self._failure(
                 RuntimeFailureCode.AI_PROVIDER_ERROR,
                 "AI 连接失败。请检查 AI 设置或稍后重试。",
@@ -768,17 +1052,19 @@ class PilotRuntime:
                 retryable=True,
             )
         except BaseException:
-            self._abandon(recorder, journal_started)
+            abandon_once()
             raise
 
         try:
             self._phase("result_normalize")
+            self._check_cancel(cancel, invocation_control)
             normalized = _normalize_agent_result(raw_result)
+            self._check_cancel(cancel, invocation_control)
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
-            self._abandon(recorder, journal_started)
+            abandon_once()
             raise
         except Exception:
-            self._finish(recorder, journal_started, "failed", "provider_error")
+            finish_or_raise("failed", "provider_error")
             return self._failure(
                 RuntimeFailureCode.AI_PROVIDER_ERROR,
                 "AI 连接失败。请检查 AI 设置或稍后重试。",
@@ -786,32 +1072,65 @@ class PilotRuntime:
                 retryable=True,
             )
         except BaseException:
-            self._abandon(recorder, journal_started)
+            abandon_once()
             raise
 
         try:
             self._phase("message_persist")
-            outcome = self._persist_result(
+            self._check_cancel(cancel, invocation_control)
+            persisted_turn = self._persist_result(
                 persistence,
                 conversation_id,
                 request,
                 normalized,
                 conversation,
+                ensure_active=lambda: self._check_cancel(cancel, invocation_control),
             )
+            self._check_cancel(cancel, invocation_control)
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
-            self._abandon(recorder, journal_started)
+            abandon_once()
             raise
         except Exception:
-            self._finish(recorder, journal_started, "failed", "unknown")
+            finish_or_raise("failed", "unknown")
             return self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话结果暂时无法保存。", 503, retryable=True)
         except BaseException:
-            self._abandon(recorder, journal_started)
+            abandon_once()
+            raise
+
+        outcome = persisted_turn.outcome
+        try:
+            self._record_journal_persisted(
+                recorder,
+                journal_started,
+                persistence,
+                conversation_id,
+                persisted_turn.message_ids,
+                invocation_control,
+            )
+            self._check_cancel(cancel, invocation_control)
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            abandon_once()
+            raise
+        except BaseException:
+            abandon_once()
             raise
 
         if isinstance(outcome, ConfirmationRequiredOutcome):
-            self._suspend(recorder, journal_started, normalized.pending)
+            try:
+                self._suspend(
+                    recorder,
+                    journal_started,
+                    normalized.pending,
+                    invocation_control,
+                )
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                abandon_once()
+                raise
         else:
-            self._finish(recorder, journal_started, "completed", None)
+            if isinstance(outcome, RuntimeFailureOutcome):
+                finish_or_raise("failed", "unknown")
+            else:
+                finish_or_raise("completed", None)
         return outcome
 
     # ---- state-machine stages -------------------------------------------------
@@ -947,21 +1266,76 @@ class PilotRuntime:
         factory = self._dependencies.journal
         if factory is None:
             return _NoopRecorder(), False
-        function = _callable(factory, ("start_run", "start", "create"))
-        if function is None:
+        function = getattr(factory, "start_run", None)
+        if not callable(function):
             return _NoopRecorder(), False
-        values = {
-            "conversation": conversation,
-            "conversation_id": conversation_id,
-            "input_message_id": input_message_id,
-            "request": request,
-            "transport": transport,
-            "transport_mode": transport.mode,
-            "route": "model",
-            "route_kind": "model",
-        }
+
+        context_type = _attribute(conversation, "context_type", request.context_type)
+        context_ref = _attribute(conversation, "context_ref", request.context_ref)
+        application_visible = _callable(
+            self._dependencies.application_visible,
+            ("__call__", "is_visible", "application_visible"),
+        )
+        if application_visible is None:
+            def application_visible(_application_id: int) -> bool:
+                return False
+
+        def build_start_command(key: object, budget_check: Callable[[], None]) -> StartRunCommand:
+            budget_check()
+            normalized = normalize_context_identity(
+                context_type,
+                context_ref,
+                application_visible=cast(Callable[[int], bool], application_visible),
+                key=key,  # type: ignore[arg-type]
+                budget_check=budget_check,
+            )
+            run_id = str(uuid4())
+            segment_id = str(uuid4())
+            run_started = prepare_event(
+                event_type="run.started",
+                execution_segment_id=segment_id,
+                facts={
+                    "agent_run_id": run_id,
+                    "origin_kind": "user_message",
+                    "conversation_id": conversation_id,
+                    "context_type": normalized.context_type,
+                    "transport_mode": transport.mode,
+                },
+                budget_check=budget_check,
+            )
+            segment_started = prepare_event(
+                event_type="segment.started",
+                execution_segment_id=segment_id,
+                facts={
+                    "request_kind": "initial",
+                    "transport_mode": transport.mode,
+                    "execution_path": "model_turn",
+                    "transport_run_id": transport.transport_run_id,
+                },
+                budget_check=budget_check,
+            )
+            budget_check()
+            return StartRunCommand(
+                run_id=run_id,
+                conversation_id=conversation_id,
+                input_message_id=input_message_id if type(input_message_id) is int else None,
+                origin_kind="user_message",
+                initial_context_type=normalized.context_type,
+                initial_context_entity_id=(
+                    str(normalized.entity_id) if normalized.entity_id is not None else None
+                ),
+                initial_context_ref_fingerprint=normalized.ref_fingerprint,
+                fingerprint_key_id=str(getattr(key, "key_id")),
+                initial_transport_mode=transport.mode,
+                initial_route_kind="model",
+                run_started=run_started,
+                segment_started=segment_started,
+            )
         try:
-            recorder = _invoke(function, values, (conversation, input_message_id, transport))
+            # RunRecorderFactory.start_run accepts exactly one StartRunCommand
+            # or StartRunBuilder.  Passing the builder preserves its budget and
+            # key-domain validation; no fallback signature is attempted.
+            recorder = function(build_start_command)
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
             raise
         except Exception:
@@ -969,6 +1343,178 @@ class PilotRuntime:
         except BaseException:
             raise
         return (recorder if recorder is not None else _NoopRecorder()), True
+
+    @staticmethod
+    def _journal_call(
+        recorder: object,
+        method_name: str,
+        *args: object,
+        control: RuntimeInvocationControl | None = None,
+        allow_timeout: bool = False,
+        **kwargs: object,
+    ) -> object | None:
+        if control is not None:
+            if allow_timeout:
+                PilotRuntime._allow_timeout_persistence(control)
+            else:
+                require_runtime_active(control)
+        function = getattr(recorder, method_name, None)
+        if not callable(function):
+            return None
+        try:
+            return cast(object, function(*args, **kwargs))
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception:
+            # Journal is explicitly fail-open; a degraded recorder must not
+            # change the product outcome.
+            return None
+        except BaseException:
+            return None
+
+    def _record_journal_route(
+        self,
+        recorder: object,
+        started: bool,
+        *,
+        route_kind: str,
+        route_reason_code: str,
+        control: RuntimeInvocationControl,
+    ) -> None:
+        if not started:
+            return
+        self._journal_call(
+            recorder,
+            "append_event",
+            EventInput(
+                event_type="route.selected",
+                facts={
+                    "route_kind": route_kind,
+                    "route_reason_code": route_reason_code,
+                },
+            ),
+            control=control,
+        )
+
+    @staticmethod
+    def _journal_tool_names(catalog: object | None) -> tuple[str, ...]:
+        if catalog is None:
+            return ()
+        provider_contracts = _callable(catalog, ("provider_contracts",))
+        if provider_contracts is None:
+            return ()
+        try:
+            contracts = provider_contracts()
+        except Exception:
+            return ()
+        if not isinstance(contracts, Sequence) or isinstance(contracts, (str, bytes)):
+            return ()
+        return tuple(
+            str(name)
+            for contract in contracts
+            if (name := _attribute(contract, "name")) is not None
+        )
+
+    @staticmethod
+    def _snapshot_message_ids(persistence: object, conversation_id: int) -> tuple[int, ...]:
+        function = getattr(persistence, "list_messages", None)
+        if not callable(function):
+            return ()
+        try:
+            values = function(conversation_id)
+        except Exception:
+            return ()
+        if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+            return ()
+        return tuple(
+            int(value)
+            for item in values
+            if type(value := _attribute(item, "id")) is int and value > 0
+        )
+
+    def _capture_initial_journal_context(
+        self,
+        recorder: object,
+        started: bool,
+        conversation: object,
+        conversation_id: int,
+        input_message_id: object,
+        catalog: object | None,
+        persistence: object,
+        control: RuntimeInvocationControl,
+    ) -> None:
+        if not started:
+            return
+        message_ids = self._snapshot_message_ids(persistence, conversation_id)
+        if type(input_message_id) is int and input_message_id > 0 and input_message_id not in message_ids:
+            message_ids = (*message_ids, input_message_id)
+        logical_input = {
+            "conversation_id": conversation_id,
+            "context_type": str(_attribute(conversation, "context_type", "workspace") or "workspace"),
+            "context_ref": str(_attribute(conversation, "context_ref", "") or ""),
+            "mode": str(_attribute(conversation, "mode", "general") or "general"),
+            "message_count": len(message_ids),
+            "tool_names": list(self._journal_tool_names(catalog)),
+        }
+        manifest = ContextManifestInput(
+            conversation_message_ids=message_ids,
+            tool_names=self._journal_tool_names(catalog),
+            attachment_refs=(),
+            domain_source_refs=(),
+        )
+        self._journal_call(
+            recorder,
+            "capture_context",
+            logical_input,
+            manifest,
+            snapshot_kind="initial",
+            control=control,
+        )
+
+    def _record_journal_persisted(
+        self,
+        recorder: object,
+        started: bool,
+        persistence: object,
+        conversation_id: int,
+        message_ids: Sequence[int],
+        control: RuntimeInvocationControl,
+        *,
+        allow_timeout: bool = False,
+    ) -> None:
+        if not started:
+            return
+        role_by_id: dict[int, str] = {}
+        function = getattr(persistence, "list_messages", None)
+        if callable(function):
+            try:
+                values = function(conversation_id)
+            except Exception:
+                values = ()
+            if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
+                role_by_id = {
+                    int(item.id): str(item.role)
+                    for item in values
+                    if type(_attribute(item, "id")) is int
+                }
+        for message_id in message_ids:
+            if type(message_id) is not int or message_id <= 0:
+                continue
+            self._journal_call(
+                recorder,
+                "append_event",
+                EventInput(
+                    event_type="assistant.persisted",
+                    facts={
+                        "message_id": message_id,
+                        "message_kind": role_by_id.get(message_id, "assistant"),
+                    },
+                source_ref_type="message",
+                source_ref_id=message_id,
+                ),
+                control=control,
+                allow_timeout=allow_timeout,
+            )
 
     def _load_source(self, conversation: object, request: StartTurnRequest) -> object:
         loader = self._require_dependency("source_loader")
@@ -1096,24 +1642,74 @@ class PilotRuntime:
         request: StartTurnRequest,
         result: NormalizedAgentTurn,
         conversation: object,
-    ) -> RuntimeOutcome:
-        del request, conversation
+        *,
+        ensure_active: Callable[[], None],
+    ) -> _PersistedTurn:
+        del request
         pending = result.pending
-        messages = [_message(item) for item in result.added]
+        effective_messages, forced_reply = _with_write_error_followup(
+            result.added,
+            result.records,
+            result.failures,
+        )
+        reply = forced_reply or _user_facing_assistant_content(result.reply)
+        write_status, write_error = _write_outcome(
+            result.records,
+            _has_write_attempt(result.added, result.records, self._dependencies.catalog),
+            result.failures,
+        )
+        messages = [
+            Message(
+                role=message.role,
+                content=(
+                    _user_facing_assistant_content(message.content)
+                    if message.role == "assistant"
+                    else message.content
+                ),
+                tool_calls=message.tool_calls,
+                tool_call_id=message.tool_call_id,
+                provider_blocks=message.provider_blocks,
+                surface_contributor=message.surface_contributor,
+                surface_signal=message.surface_signal,
+                surface_revision=message.surface_revision,
+                surface_attachment_kinds=message.surface_attachment_kinds,
+            )
+            for message in effective_messages
+        ]
         if pending is not None:
             question = self._missing_question(pending, conversation_id)
             if question:
-                return self._persist_clarification(persistence, conversation_id, messages, pending, question)
+                return self._persist_clarification(
+                    persistence,
+                    conversation_id,
+                    messages,
+                    pending,
+                    question,
+                    ensure_active=ensure_active,
+                )
             function = _callable(persistence, ("persist_initial_pending", "persist_pending"))
             if function is None:
                 raise TypeError("persistence does not provide atomic pending persistence")
+            before_ids = self._snapshot_message_ids(persistence, conversation_id)
+            ensure_active()
             persisted = _invoke(
                 function,
                 {"conversation_id": conversation_id, "messages": messages, "pending": pending},
                 (conversation_id, messages, pending),
             )
             if not _result_persisted(persisted):
-                return self._failure(RuntimeFailureCode.CONVERSATION_ARCHIVED, "对话已归档，无法保存待确认操作。", 409)
+                return _PersistedTurn(
+                    self._persistence_failure(
+                        persisted,
+                        "对话已归档，无法保存待确认操作。",
+                    )
+                )
+            message_ids = self._result_message_ids(
+                persistence,
+                conversation_id,
+                persisted,
+                before_ids,
+            )
             args, token = _safe_pending_payload(pending)
             from .contracts import PendingActionPayload  # local import keeps module exports compact
 
@@ -1124,26 +1720,142 @@ class PilotRuntime:
                 args=args,
                 confirmation_token=token,
             )
-            return ConfirmationRequiredOutcome(
-                confirmation_token=token,
-                conversation_id=conversation_id,
-                operation_id=pending.operation_id or None,
-                pending_action=payload,
+            return _PersistedTurn(
+                ConfirmationRequiredOutcome(
+                    confirmation_token=token,
+                    conversation_id=conversation_id,
+                    operation_id=pending.operation_id or None,
+                    pending_action=payload,
+                ),
+                message_ids,
             )
 
-        if not messages and result.reply:
-            messages = [Message(role="assistant", content=result.reply)]
+        if not messages and reply:
+            messages = [Message(role="assistant", content=reply)]
         function = _callable(persistence, ("persist_initial_messages", "persist_messages", "persist_ai_messages"))
         if function is None:
             raise TypeError("persistence does not provide message persistence")
+        before_ids = self._snapshot_message_ids(persistence, conversation_id)
+        ensure_active()
         persisted = _invoke(function, {"conversation_id": conversation_id, "messages": messages}, (conversation_id, messages))
         if not _result_persisted(persisted):
-            return self._failure(RuntimeFailureCode.CONVERSATION_ARCHIVED, "对话已归档，无法保存回复。", 409)
-        return MessageOutcome(
-            message=result.reply,
-            conversation_id=conversation_id,
-            write_status=_write_status(result),
+            return _PersistedTurn(
+                self._persistence_failure(persisted, "对话已归档，无法保存回复。")
+            )
+        message_ids = self._result_message_ids(
+            persistence,
+            conversation_id,
+            persisted,
+            before_ids,
         )
+        ensure_active()
+
+        clarification = self._existing_clarification(persistence, conversation_id)
+        if forced_reply:
+            forced_pending = _pending_action_from_added_write_call(
+                result.added,
+                self._dependencies.catalog,
+            )
+            if forced_pending is not None:
+                setter = _callable(persistence, ("set_pending_clarification",))
+                if setter is not None:
+                    ensure_active()
+                    set_result = _invoke(
+                        setter,
+                        {
+                            "conversation_id": conversation_id,
+                            "pending": forced_pending,
+                            "question": forced_reply,
+                        },
+                        (conversation_id, forced_pending, forced_reply),
+                    )
+                    if not _result_persisted(set_result):
+                        return _PersistedTurn(
+                            self._persistence_failure(set_result, "对话澄清暂时无法保存。"),
+                            message_ids,
+                        )
+        elif clarification is not None and _looks_like_followup_question(reply):
+            setter = _callable(persistence, ("set_pending_clarification",))
+            if setter is not None:
+                ensure_active()
+                set_result = _invoke(
+                    setter,
+                    {
+                        "conversation_id": conversation_id,
+                        "pending": clarification[0],
+                        "question": reply,
+                    },
+                    (conversation_id, clarification[0], reply),
+                )
+                if not _result_persisted(set_result):
+                    return _PersistedTurn(
+                        self._persistence_failure(set_result, "对话澄清暂时无法保存。"),
+                        message_ids,
+                    )
+        else:
+            clear = _callable(persistence, ("clear_pending_clarification",))
+            if clear is not None:
+                ensure_active()
+                clear_result = _invoke(
+                    clear,
+                    {"conversation_id": conversation_id},
+                    (conversation_id,),
+                )
+                if not _result_persisted(clear_result):
+                    return _PersistedTurn(
+                        self._persistence_failure(clear_result, "对话澄清暂时无法清理。"),
+                        message_ids,
+                    )
+        return _PersistedTurn(
+            MessageOutcome(
+                message=reply,
+                conversation_id=conversation_id,
+                write_status=cast(Any, write_status),
+                write_error=write_error or None,
+            ),
+            message_ids,
+        )
+
+    @staticmethod
+    def _result_message_ids(
+        persistence: object,
+        conversation_id: int,
+        result: object,
+        before_ids: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        raw_ids = _attribute(result, "message_ids", ())
+        if isinstance(raw_ids, Sequence) and not isinstance(raw_ids, (str, bytes)):
+            ids = tuple(value for value in raw_ids if type(value) is int and value > 0)
+            if ids:
+                return ids
+        message_id = _attribute(result, "message_id")
+        if type(message_id) is int and message_id > 0:
+            return (message_id,)
+        after_ids = PilotRuntime._snapshot_message_ids(persistence, conversation_id)
+        return tuple(value for value in after_ids if value not in before_ids)
+
+    @staticmethod
+    def _existing_clarification(
+        persistence: object,
+        conversation_id: int,
+    ) -> tuple[PendingAction, str] | None:
+        getter = _callable(persistence, ("get_pending_clarification",))
+        if getter is None:
+            return None
+        value = _invoke(getter, {"conversation_id": conversation_id}, (conversation_id,))
+        if not isinstance(value, tuple) or len(value) != 2:
+            return None
+        pending = _pending(value[0])
+        question = value[1]
+        return (pending, question) if pending is not None and isinstance(question, str) else None
+
+    def _persistence_failure(self, result: object, archived_message: str) -> RuntimeFailureOutcome:
+        status = _failure_status(result)
+        if status in {"", "closed"}:
+            return self._failure(RuntimeFailureCode.CONVERSATION_ARCHIVED, archived_message, 409)
+        if status == "not_found":
+            return self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404)
+        return self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话结果暂时无法保存。", 503, retryable=True)
 
     def _missing_question(self, pending: PendingAction, conversation_id: int) -> str | None:
         function = _callable(self._dependencies.missing_target_question, ("missing_target_question", "question", "resolve"))
@@ -1160,9 +1872,13 @@ class PilotRuntime:
         messages: Sequence[Message],
         pending: PendingAction,
         question: str,
-    ) -> MessageOutcome:
+        *,
+        ensure_active: Callable[[], None],
+    ) -> _PersistedTurn:
         atomic = _callable(persistence, ("persist_clarification", "persist_pending_clarification"))
         if atomic is not None:
+            before_ids = self._snapshot_message_ids(persistence, conversation_id)
+            ensure_active()
             persisted = _invoke(
                 atomic,
                 {
@@ -1173,17 +1889,32 @@ class PilotRuntime:
                 },
                 (conversation_id, messages, pending, question),
             )
+            message_ids = self._result_message_ids(
+                persistence,
+                conversation_id,
+                persisted,
+                before_ids,
+            )
         else:
             initial = _callable(persistence, ("persist_initial_messages", "persist_messages"))
             if initial is None:
                 raise TypeError("persistence does not provide clarification persistence")
+            before_ids = self._snapshot_message_ids(persistence, conversation_id)
+            ensure_active()
             persisted = _invoke(initial, {"conversation_id": conversation_id, "messages": messages}, (conversation_id, messages))
+            message_ids = self._result_message_ids(persistence, conversation_id, persisted, before_ids)
+            if not _result_persisted(persisted):
+                return _PersistedTurn(self._persistence_failure(persisted, "对话已归档，无法保存回复。"), message_ids)
             clear = _callable(persistence, ("clear_pending_action",))
             if clear is not None:
-                _invoke(clear, {"conversation_id": conversation_id}, (conversation_id,))
+                ensure_active()
+                clear_result = _invoke(clear, {"conversation_id": conversation_id}, (conversation_id,))
+                if not _result_persisted(clear_result):
+                    return _PersistedTurn(self._persistence_failure(clear_result, "对话已归档，无法保存回复。"), message_ids)
             setter = _callable(persistence, ("set_pending_clarification",))
             if setter is None:
                 raise TypeError("persistence does not provide clarification persistence")
+            ensure_active()
             _invoke(
                 setter,
                 {"conversation_id": conversation_id, "pending": pending, "question": question},
@@ -1191,10 +1922,13 @@ class PilotRuntime:
             )
             assistant = _callable(persistence, ("persist_assistant_message", "persist_initial_assistant_message"))
             if assistant is not None:
+                ensure_active()
                 persisted = _invoke(assistant, {"conversation_id": conversation_id, "content": question}, (conversation_id, question))
+                assistant_ids = self._result_message_ids(persistence, conversation_id, persisted, before_ids)
+                message_ids = tuple(dict.fromkeys((*message_ids, *assistant_ids)))
         if not _result_persisted(persisted):
-            return self._failure(RuntimeFailureCode.CONVERSATION_ARCHIVED, "对话已归档，无法保存回复。", 409)  # type: ignore[return-value]
-        return MessageOutcome(message=question, conversation_id=conversation_id)
+            return _PersistedTurn(self._persistence_failure(persisted, "对话已归档，无法保存回复。"), message_ids)
+        return _PersistedTurn(MessageOutcome(message=question, conversation_id=conversation_id), message_ids)
 
     # ---- cleanup and control -------------------------------------------------
 
@@ -1202,7 +1936,7 @@ class PilotRuntime:
     def _check_cancel(cancel_check: Callable[[], bool], control: RuntimeInvocationControl) -> None:
         try:
             requested = cancel_check()
-        except (RuntimeCancelled, RuntimeTransportAborted):
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
             raise
         except Exception as exc:
             raise RuntimeTransportAborted() from exc
@@ -1211,6 +1945,16 @@ class PilotRuntime:
         if requested:
             require_runtime_active(control)
             raise RuntimeCancelled()
+        require_runtime_active(control)
+
+    @staticmethod
+    def _allow_timeout_persistence(control: RuntimeInvocationControl) -> None:
+        state = getattr(control, "state", None)
+        state_value = str(getattr(state, "value", state or ""))
+        if state_value == "timed_out":
+            return
+        if state_value in {"active", "completed"}:
+            return
         require_runtime_active(control)
 
     @staticmethod
@@ -1230,55 +1974,72 @@ class PilotRuntime:
             degraded=degraded,
         )
 
-    @staticmethod
-    def _recorder_method(recorder: object, names: tuple[str, ...]) -> Callable[..., object] | None:
-        return _callable(recorder, names)
-
-    def _finish(self, recorder: object, started: bool, status: str, failure_code: str | None) -> None:
+    def _finish(
+        self,
+        recorder: object,
+        started: bool,
+        status: str,
+        failure_code: str | None,
+        control: RuntimeInvocationControl,
+        *,
+        allow_timeout: bool = False,
+    ) -> None:
         if not started:
             return
+        if allow_timeout:
+            self._allow_timeout_persistence(control)
+        else:
+            require_runtime_active(control)
         self._phase("run_finish")
-        function = self._recorder_method(recorder, ("finish", "finish_run"))
-        if function is None:
+        if allow_timeout:
+            self._allow_timeout_persistence(control)
+        else:
+            require_runtime_active(control)
+        function = getattr(recorder, "finish", None)
+        if not callable(function):
             return
         try:
-            parameters = inspect.signature(function).parameters
-            first = next(iter(parameters.values()), None)
-            if first is not None and first.name in {"command", "disposition"}:
-                from offerpilot.agent_runtime.journal import TerminalDisposition
-
-                _invoke(function, {"command": TerminalDisposition(status=cast(Any, status), failure_code=failure_code), "disposition": TerminalDisposition(status=cast(Any, status), failure_code=failure_code)}, (TerminalDisposition(status=cast(Any, status), failure_code=failure_code),))
-            else:
-                _invoke(function, {"status": status, "failure_code": failure_code}, (status, failure_code))
+            function(TerminalDisposition(status=cast(Any, status), failure_code=failure_code))
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception:
             return
         except BaseException:
             return
 
-    def _suspend(self, recorder: object, started: bool, pending: PendingAction | None) -> None:
+    def _suspend(
+        self,
+        recorder: object,
+        started: bool,
+        pending: PendingAction | None,
+        control: RuntimeInvocationControl,
+    ) -> None:
         if not started or pending is None:
             return
+        require_runtime_active(control)
         self._phase("run_suspend")
-        function = self._recorder_method(recorder, ("suspend", "suspend_run"))
-        if function is None:
+        require_runtime_active(control)
+        function = getattr(recorder, "suspend", None)
+        if not callable(function):
             return
         try:
-            parameters = inspect.signature(function).parameters
-            first = next(iter(parameters.values()), None)
-            if first is not None and first.name in {"command", "disposition"}:
-                from offerpilot.agent_runtime.journal import SuspendedDisposition
-
-                identity = {
-                    "tool_call_id": pending.tool_call_id,
-                    "tool_name": pending.tool_name,
-                    "args": pending.args,
-                }
-                fingerprint_method = self._recorder_method(recorder, ("fingerprint_pending_identity",))
-                fingerprint = None
-                if fingerprint_method is not None:
-                    value = fingerprint_method(identity)
-                    fingerprint = value if isinstance(value, str) else None
-                disposition = SuspendedDisposition(
+            identity = {
+                "tool_call_id": pending.tool_call_id,
+                "tool_name": pending.tool_name,
+                "args": pending.args,
+            }
+            fingerprint = None
+            if callable(getattr(recorder, "fingerprint_pending_identity", None)):
+                value = self._journal_call(
+                    recorder,
+                    "fingerprint_pending_identity",
+                    identity,
+                    control=control,
+                )
+                fingerprint = value if isinstance(value, str) else None
+            require_runtime_active(control)
+            function(
+                SuspendedDisposition(
                     tool_call_id=pending.tool_call_id,
                     tool_name=pending.tool_name,
                     tool_kind="write",
@@ -1286,10 +2047,10 @@ class PilotRuntime:
                     pending_identity_fingerprint=fingerprint,
                     pending_identity=identity,
                 )
-                _invoke(function, {"command": disposition, "disposition": disposition}, (disposition,))
-            else:
-                _invoke(function, {"pending": pending}, (pending,))
+            )
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception:
             return
         except BaseException:
             return
@@ -1297,7 +2058,7 @@ class PilotRuntime:
     def _abandon(self, recorder: object, started: bool) -> None:
         if not started:
             return
-        function = self._recorder_method(recorder, ("abandon", "abandon_segment"))
+        function = getattr(recorder, "abandon", None)
         if function is None:
             return
         try:

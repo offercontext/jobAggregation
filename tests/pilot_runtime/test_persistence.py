@@ -163,6 +163,38 @@ def test_initial_pending_matches_baseline_message_sanitization(tmp_path: Path) -
     assert "provider-api-key-secret" not in json.dumps(expected, ensure_ascii=False)
 
 
+def test_message_persistence_returns_detached_message_id(tmp_path: Path) -> None:
+    coordinator, conversation_id = make_persistence_coordinator(tmp_path)
+
+    result = coordinator.persist_initial_user_message(conversation_id, "hello")
+
+    assert result.persisted is True
+    assert type(result.message_id) is int
+    assert result.message_id > 0
+    assert result.message_ids == (result.message_id,)
+
+
+def test_clarification_replaces_stale_clarification_and_reports_assistant_id(
+    tmp_path: Path,
+) -> None:
+    coordinator, conversation_id = make_persistence_coordinator(tmp_path)
+    stale = PendingAction("old-call", "add_note", '{"company":"旧"}', "旧复盘")
+    fresh = PendingAction("new-call", "add_note", '{"company":"新"}', "新复盘")
+    assert coordinator.set_pending_clarification(conversation_id, stale, "旧问题").persisted
+
+    result = coordinator.persist_clarification(
+        conversation_id,
+        [Message(role="assistant", content="需要补充")],
+        fresh,
+        "新问题",
+    )
+
+    assert result.persisted is True
+    assert type(result.message_id) is int
+    assert coordinator._chat.get_pending_clarification(conversation_id) == (fresh, "新问题")
+    assert coordinator._chat.get_pending_action(conversation_id) is None
+
+
 def test_confirmation_continuation_matches_baseline_message_sanitization(
     tmp_path: Path,
 ) -> None:

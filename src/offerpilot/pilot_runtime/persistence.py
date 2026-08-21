@@ -67,6 +67,8 @@ class PersistenceResult:
     generation: datetime | None = None
     delivery_outcome: DeliveryOutcome | None = None
     message_count: int = 0
+    message_id: int | None = None
+    message_ids: tuple[int, ...] = ()
     operation_id: str | None = None
     persisted: bool = field(init=False)
 
@@ -81,6 +83,18 @@ class PersistenceResult:
             raise TypeError("delivery_outcome must be a DeliveryOutcome")
         if type(self.message_count) is not int or self.message_count < 0:
             raise ValueError("message_count must be a non-negative integer")
+        if self.message_id is not None and (type(self.message_id) is not int or self.message_id <= 0):
+            raise ValueError("message_id must be a positive integer or None")
+        if type(self.message_ids) is not tuple:
+            raise TypeError("message_ids must be a tuple")
+        if any(type(value) is not int or value <= 0 for value in self.message_ids):
+            raise ValueError("message_ids must contain positive integers")
+        if self.message_id is not None and self.message_ids and self.message_id not in self.message_ids:
+            raise ValueError("message_id must be present in message_ids")
+        if self.message_id is None and self.message_ids:
+            object.__setattr__(self, "message_id", self.message_ids[-1])
+        elif self.message_id is not None and not self.message_ids:
+            object.__setattr__(self, "message_ids", (self.message_id,))
         if self.operation_id is not None and type(self.operation_id) is not str:
             raise TypeError("operation_id must be a string or None")
         object.__setattr__(self, "persisted", self.status is PersistenceStatus.PERSISTED)
@@ -311,6 +325,21 @@ def _message_values(message: MessageInput) -> dict[str, str]:
 
     candidate = message if isinstance(message, Message) else _mapping_to_message(message)
     return _persistable_ai_messages([candidate])[0]
+
+
+def _message_id(value: object) -> int | None:
+    """Detach a repository atom's generated id before crossing this boundary."""
+
+    raw = getattr(value, "id", None)
+    return raw if type(raw) is int and raw > 0 else None
+
+
+def _new_message_ids(
+    before: Sequence[PersistedMessageView],
+    after: Sequence[PersistedMessageView],
+) -> tuple[int, ...]:
+    before_ids = {message.id for message in before}
+    return tuple(message.id for message in after if message.id not in before_ids)
 
 
 def _as_message(message: MessageInput) -> Message:
@@ -545,7 +574,7 @@ class ChatPersistenceCoordinator:
                 "provider_blocks": provider_blocks,
             }
         )
-        self._chat.append_message(
+        created = self._chat.append_message(
             conversation_id,
             values["role"],
             content=values["content"],
@@ -553,7 +582,12 @@ class ChatPersistenceCoordinator:
             tool_call_id=values["tool_call_id"],
             provider_blocks=values["provider_blocks"],
         )
-        return PersistenceResult(PersistenceStatus.PERSISTED, message_count=1)
+        created_id = _message_id(created)
+        return PersistenceResult(
+            PersistenceStatus.PERSISTED,
+            message_count=1,
+            message_id=created_id,
+        )
 
     def persist_initial_user_message(
         self,
@@ -591,8 +625,10 @@ class ChatPersistenceCoordinator:
         if status is not None:
             return PersistenceResult(status)
         values = [_message_values(message) for message in messages]
+        before = self.list_messages(conversation_id)
+        created_ids: list[int] = []
         for value in values:
-            self._chat.append_message(
+            created = self._chat.append_message(
                 conversation_id,
                 value["role"],
                 content=value["content"],
@@ -600,7 +636,16 @@ class ChatPersistenceCoordinator:
                 tool_call_id=value["tool_call_id"],
                 provider_blocks=value["provider_blocks"],
             )
-        return PersistenceResult(PersistenceStatus.PERSISTED, message_count=len(values))
+            created_id = _message_id(created)
+            if created_id is not None:
+                created_ids.append(created_id)
+        if len(created_ids) != len(values):
+            created_ids = list(_new_message_ids(before, self.list_messages(conversation_id)))
+        return PersistenceResult(
+            PersistenceStatus.PERSISTED,
+            message_count=len(values),
+            message_ids=tuple(created_ids),
+        )
 
     def persist_initial_pending(
         self,
@@ -619,15 +664,18 @@ class ChatPersistenceCoordinator:
         status = self._writable_status(conversation_id)
         if status is not None:
             return PersistenceResult(status, operation_id=pending.operation_id or None)
+        before = self.list_messages(conversation_id)
         persisted = self._chat.persist_pending_action(
             conversation_id,
             pending,
             [_message_values(message) for message in messages],
         )
         if persisted:
+            message_ids = _new_message_ids(before, self.list_messages(conversation_id))
             return PersistenceResult(
                 PersistenceStatus.PERSISTED,
                 message_count=len(messages),
+                message_ids=message_ids,
                 operation_id=pending.operation_id or None,
             )
         return PersistenceResult(
@@ -669,9 +717,13 @@ class ChatPersistenceCoordinator:
         assistant = self.persist_assistant_message(conversation_id, question)
         if not assistant.persisted:
             return assistant
+        message_ids = tuple(
+            dict.fromkeys((*initial.message_ids, *assistant.message_ids))
+        )
         return PersistenceResult(
             PersistenceStatus.PERSISTED,
             message_count=initial.message_count + assistant.message_count,
+            message_ids=message_ids,
         )
 
     def set_pending_clarification(
@@ -819,6 +871,8 @@ class ChatPersistenceCoordinator:
                     operation_id=operation_id,
                 )
 
+        before_messages = self.list_messages(conversation_id)
+
         persisted_generation: datetime | None
         origin_persisted = False
         values = [_message_values(message) for message in continuation_values]
@@ -890,6 +944,7 @@ class ChatPersistenceCoordinator:
                 self._failure_status(conversation_id, operation_id=operation_id),
                 operation_id=operation_id,
             )
+        message_ids = _new_message_ids(before_messages, self.list_messages(conversation_id))
         return PersistenceResult(
             PersistenceStatus.PERSISTED,
             generation=persisted_generation,
@@ -897,6 +952,7 @@ class ChatPersistenceCoordinator:
             if ownership is not None
             else None,
             message_count=len(values) + (1 if origin_persisted else 0),
+            message_ids=message_ids,
             operation_id=operation_id,
         )
 

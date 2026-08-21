@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gc
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,7 +17,7 @@ from offerpilot.db import init_database
 from offerpilot.pilot_runtime.persistence import ChatPersistenceCoordinator
 from offerpilot.repositories.agent_runs import AgentRunRepository
 from offerpilot.repositories.chat import ChatRepository
-from offerpilot.pilot_runtime.errors import RuntimeTransportAborted
+from offerpilot.pilot_runtime.errors import RuntimeCancelled, RuntimeTransportAborted
 from offerpilot.pilot_runtime.contracts import (
     AssistantMessageEvent,
     CompletedEvent,
@@ -302,6 +304,7 @@ def test_stream_model_prepare_and_agent_host_execution_emits_baseline_prefix() -
     prepared = instance.prepare_stream(StartTurnRequest(message="hi"), transport=transport(), invocation_control=control)
 
     assert isinstance(prepared, PreparedStreamExecution)
+    assert len(instance._prepared_models) == 1  # type: ignore[attr-defined]
     assert prepared.preparation_kind is PreparationKind.MODEL
     assert prepared.execution_mode is StreamExecutionMode.AGENT_HOST
     assert phases.items == [
@@ -334,6 +337,7 @@ def test_stream_model_prepare_and_agent_host_execution_emits_baseline_prefix() -
     assert isinstance(seen[-1], CompletedEvent)
     assert control.state is InvocationState.COMPLETED
     assert journal.recorder.finished
+    assert len(instance._prepared_models) == 0  # type: ignore[attr-defined]
 
 
 def test_prepare_rejects_deterministic_route_before_user_or_run() -> None:
@@ -461,6 +465,7 @@ def test_model_abort_keeps_user_and_abandons_open_run_without_new_facts() -> Non
     assert isinstance(prepared, PreparedStreamExecution)
     guard = PreparedStreamGuard(prepared=prepared)
 
+    assert len(instance._prepared_models) == 1  # type: ignore[attr-defined]
     assert guard.abort_if_prepared() is True
     assert prepared.lifecycle_state.value == "aborted"
     assert persistence.user_count == 1
@@ -468,6 +473,7 @@ def test_model_abort_keeps_user_and_abandons_open_run_without_new_facts() -> Non
     assert persistence.pending is None
     assert journal.recorder.abandoned == 1
     assert guard.abort_if_prepared() is False
+    assert len(instance._prepared_models) == 0  # type: ignore[attr-defined]
 
 
 def test_model_prepared_stream_adapts_sse_host_queue_once() -> None:
@@ -657,6 +663,7 @@ def test_sink_abort_after_recorder_finish_does_not_abandon_finished_run() -> Non
         )
     assert journal.recorder.finished
     assert journal.recorder.abandoned == 0
+    assert len(instance._prepared_models) == 0  # type: ignore[attr-defined]
     assert prepared.lifecycle_state.value == "completed"
     assert prepared.completion_reason is CompletionReason.TRANSPORT_ABORTED
     second_seen: list[object] = []
@@ -674,6 +681,118 @@ def test_sink_abort_after_recorder_finish_does_not_abandon_finished_run() -> Non
             cancel_check=lambda: False,
         )
     assert second_seen == []
+
+
+def test_terminal_abort_releases_provider_token_and_canary_exactly_once() -> None:
+    class Provider:
+        pass
+
+    provider = Provider()
+    provider_ref = weakref.ref(provider)
+
+    class Resolver:
+        def __init__(self, model: object) -> None:
+            self.model = model
+
+        def resolve(self, request: object, conversation: object) -> object:
+            del request, conversation
+            return ResolvedModel(model=self.model)
+
+    resolver = Resolver(provider)
+    instance = PilotRuntime(
+        RuntimeDependencies(
+            conversations=Conversations(),
+            persistence=Persistence(),
+            model_resolver=resolver,
+            source_loader=Source(),
+            context_assembler=Assembler(),
+            agent_driver=Driver(),
+            journal=Journal(),
+        )
+    )
+    control = InMemoryRuntimeInvocationControl()
+    prepared = instance.prepare_stream(
+        StartTurnRequest(message="hi"),
+        transport=transport(),
+        invocation_control=control,
+    )
+    assert isinstance(prepared, PreparedStreamExecution)
+    assert len(instance._prepared_models) == 1  # type: ignore[attr-defined]
+    resolver.model = None
+    del provider
+    guard = PreparedStreamGuard(prepared=prepared)
+    assert guard.begin_execution() is True
+
+    class FailingSink:
+        def emit(self, event: object) -> None:
+            if isinstance(event, CompletedEvent):
+                raise RuntimeTransportAborted()
+
+    with pytest.raises(RuntimeTransportAborted):
+        instance.execute_prepared_stream(
+            prepared,
+            event_sink=FailingSink(),
+            signal_sink=None,
+            execution_host=Host(),
+            cancel_check=lambda: False,
+        )
+    assert len(instance._prepared_models) == 0  # type: ignore[attr-defined]
+    gc.collect()
+    assert provider_ref() is None
+    with pytest.raises(RuntimeTransportAborted):
+        instance.execute_prepared_stream(
+            prepared,
+            event_sink=None,
+            signal_sink=None,
+            execution_host=Host(),
+            cancel_check=lambda: False,
+        )
+    assert len(instance._prepared_models) == 0  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    ("raised", "reason"),
+    [
+        (RuntimeCancelled(), CompletionReason.CANCELLED),
+        (RuntimeTransportAborted(), CompletionReason.TRANSPORT_ABORTED),
+        (KeyboardInterrupt(), CompletionReason.TRANSPORT_ABORTED),
+    ],
+)
+def test_preterminal_cancel_abort_and_baseexception_release_model_token_once(
+    raised: BaseException,
+    reason: CompletionReason,
+) -> None:
+    phases = Phases()
+    instance, _persistence, _driver, host, journal = runtime(phases)
+    control = InMemoryRuntimeInvocationControl()
+    prepared = instance.prepare_stream(
+        StartTurnRequest(message="hi"),
+        transport=transport(),
+        invocation_control=control,
+    )
+    assert isinstance(prepared, PreparedStreamExecution)
+    assert len(instance._prepared_models) == 1  # type: ignore[attr-defined]
+    guard = PreparedStreamGuard(prepared=prepared)
+    assert guard.begin_execution() is True
+
+    class FailingSink:
+        def emit(self, event: object) -> None:
+            del event
+            raise raised
+
+    with pytest.raises(type(raised)):
+        instance.execute_prepared_stream(
+            prepared,
+            event_sink=FailingSink(),
+            signal_sink=None,
+            execution_host=host,
+            cancel_check=lambda: False,
+        )
+    assert prepared.completion_reason is reason
+    assert len(instance._prepared_models) == 0  # type: ignore[attr-defined]
+    assert journal.recorder.abandoned == 1
+    assert guard.abort_if_prepared() is False
+    assert len(instance._prepared_models) == 0  # type: ignore[attr-defined]
 
 
 def test_stream_meta_supports_delta_reflects_resolved_stream_model() -> None:

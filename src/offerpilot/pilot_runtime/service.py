@@ -320,6 +320,25 @@ class _PreparedExecutionCell:
         self.completed = False
 
 
+class _PreparedModelLease:
+    """Independent once-only release gate for a prepared provider token."""
+
+    __slots__ = ("_lock", "_released", "_release")
+
+    def __init__(self, release: Callable[[], object]) -> None:
+        self._lock = Lock()
+        self._released = False
+        self._release = release
+
+    def release_once(self) -> bool:
+        with self._lock:
+            if self._released:
+                return False
+            self._released = True
+        self._release()
+        return True
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class _PreparedStreamState:
     """Runtime-owned opaque state for one response-header preparation."""
@@ -1973,11 +1992,15 @@ class PilotRuntime:
         cell = _PreparedExecutionCell(run_open=journal_started)
         model_token = object()
         self._prepared_models[model_token] = resolved
+        model_lease = _PreparedModelLease(
+            lambda: self._prepared_models.pop(model_token, None)
+        )
 
         def release_model() -> None:
-            self._prepared_models.pop(model_token, None)
+            model_lease.release_once()
 
         def on_abort() -> None:
+            release_model()
             with cell.lock:
                 if cell.aborted or cell.completed:
                     return
@@ -1986,15 +2009,14 @@ class PilotRuntime:
                 cell.run_open = False
             if should_abandon:
                 self._abandon(recorder, journal_started)
-            release_model()
             if invocation_control.state is InvocationState.ACTIVE:
                 invocation_control.mark_completed()
 
         def on_complete(_reason: CompletionReason) -> None:
+            release_model()
             with cell.lock:
                 cell.run_open = False
                 cell.completed = True
-            release_model()
 
         try:
             frozen_assembled = _freeze_stream_value(assembled)
@@ -2040,12 +2062,17 @@ class PilotRuntime:
                 self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400),
                 invocation_control,
             )
-        prepared = PreparedStreamExecution(
-            invocation_id=transport_run_id,
-            preparation_kind=PreparationKind.MODEL,
-            execution_mode=StreamExecutionMode.AGENT_HOST,
-            opaque_state=state,
-        )
+        try:
+            prepared = PreparedStreamExecution(
+                invocation_id=transport_run_id,
+                preparation_kind=PreparationKind.MODEL,
+                execution_mode=StreamExecutionMode.AGENT_HOST,
+                opaque_state=state,
+            )
+        except BaseException:
+            release_model()
+            self._abandon(recorder, journal_started)
+            raise
         self._phase("prepared")
         return prepared
 

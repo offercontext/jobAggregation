@@ -75,6 +75,17 @@ class RuntimeAgentTimedOut(Exception):
         raise TypeError("runtime control exceptions cannot be serialized")
 
 
+@final
+class ModelUnconfiguredError(Exception):
+    """Closed resolver signal for an intentionally absent model configuration."""
+
+    def __init__(self) -> None:
+        super().__init__("model unconfigured")
+
+    def __repr__(self) -> str:
+        return "ModelUnconfiguredError()"
+
+
 class RuntimeFailureCode(StrEnum):
     """Closed failure codes emitted by the four Chat routes.
 
@@ -87,6 +98,9 @@ class RuntimeFailureCode(StrEnum):
     SOURCE_LOAD_FAILED = "source_load_failed"
     CHAT_AGENT_TIMEOUT = "chat_agent_timeout"
     AI_PROVIDER_ERROR = "ai_provider_error"
+    # Model configuration is an internal classification of the closed
+    # provider-error route outcome; keep the public failure-code set closed.
+    MODEL_UNCONFIGURED = AI_PROVIDER_ERROR
     CONVERSATION_ARCHIVED = "conversation_archived"
     STALE_PENDING_ACTION = "stale_pending_action"
     CONFIRMATION_IN_PROGRESS = "confirmation_in_progress"
@@ -124,4 +138,5 @@ __all__ = [
     "RuntimeCancelled",
     "RuntimeFailureCode",
     "RuntimeTransportAborted",
+    "ModelUnconfiguredError",
 ]

@@ -53,6 +53,7 @@ from .contracts import (
     WriteStatus,
 )
 from .errors import (
+    ModelUnconfiguredError,
     RuntimeAgentTimedOut,
     RuntimeCancelled,
     RuntimeFailureCode,
@@ -86,6 +87,7 @@ from .service import (
     RuntimePersistence,
     SourceLoader,
     StartTurnDependencies,
+    ToolCatalog,
 )
 
 __all__ = [
@@ -120,6 +122,7 @@ __all__ = [
     "MISSING_EDITED_ARGS",
     "MessageOutcome",
     "ModelResolver",
+    "ModelUnconfiguredError",
     "MetaEvent",
     "OperationPendingOutcome",
     "OperationReplayOutcome",
@@ -160,6 +163,7 @@ __all__ = [
     "StartTurnRequest",
     "SourceLoader",
     "StartTurnDependencies",
+    "ToolCatalog",
     "StatusEvent",
     "StreamVersion",
     "StreamExecutionMode",

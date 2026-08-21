@@ -19,10 +19,16 @@ from offerpilot.pilot_runtime.errors import (
     RuntimeAgentTimedOut,
     RuntimeCancelled,
     RuntimeFailureCode,
+    ModelUnconfiguredError,
     RuntimeTransportAborted,
 )
 from offerpilot.pilot_runtime.event_sink import InMemoryRuntimeInvocationControl
-from offerpilot.pilot_runtime.service import PilotRuntime, RuntimeDependencies
+from offerpilot.pilot_runtime.service import (
+    PilotRuntime,
+    ResolvedModel,
+    RuntimeDependencies,
+    _result_persisted,
+)
 from offerpilot.ai.agent import PendingAction
 from offerpilot.ai.tool_runtime.contracts import ToolFailure
 from offerpilot.api import _confirmation_token as baseline_confirmation_token
@@ -31,7 +37,11 @@ from offerpilot.agent_runtime.journal import SuspendedDisposition, TerminalDispo
 from offerpilot.agent_runtime.keyring import JournalKeyDomain
 from offerpilot.agent_runtime.journal import RunRecorderFactory
 from offerpilot.db import init_database
-from offerpilot.pilot_runtime.persistence import ChatPersistenceCoordinator
+from offerpilot.pilot_runtime.persistence import (
+    ChatPersistenceCoordinator,
+    PersistenceResult,
+    PersistenceStatus,
+)
 from offerpilot.repositories.agent_runs import AgentRunRepository
 from offerpilot.repositories.chat import ChatRepository
 from offerpilot.repositories.agent_runs import StartRunCommand
@@ -70,6 +80,24 @@ class _ConversationStore:
         return self.conversation
 
 
+class _Catalog:
+    def __init__(self, *, write_names: tuple[str, ...] = ("write", "create_application")) -> None:
+        self._write_names = frozenset(write_names)
+
+    def resolve(self, name: str) -> object | None:
+        if name in self._write_names:
+            return SimpleNamespace(name=name, kind="write")
+        if name == "read_tool":
+            return SimpleNamespace(name=name, kind="read")
+        return None
+
+    def write_names(self) -> frozenset[str]:
+        return self._write_names
+
+    def provider_contracts(self) -> tuple[object, ...]:
+        return tuple(SimpleNamespace(name=name) for name in sorted(self._write_names))
+
+
 class _Persistence:
     def __init__(self, phases: _Phases, *, pending: object | None = None) -> None:
         self.phases = phases
@@ -86,17 +114,18 @@ class _Persistence:
     def persist_initial_user_message(self, conversation_id: int, content: str) -> object:
         del conversation_id, content
         self.user_count += 1
-        return SimpleNamespace(persisted=True, message_count=1, message_id=11)
+        return PersistenceResult(PersistenceStatus.PERSISTED, message_count=1, message_id=11)
 
     def persist_initial_messages(self, conversation_id: int, messages: object) -> object:
         del conversation_id, messages
         self.message_count += 1
-        return SimpleNamespace(persisted=True, message_id=12)
+        return PersistenceResult(PersistenceStatus.PERSISTED, message_id=12)
 
     def persist_initial_pending(self, conversation_id: int, messages: object, pending: object) -> object:
-        del conversation_id, messages, pending
+        del conversation_id, messages
+        self.pending = pending
         self.pending_count += 1
-        return SimpleNamespace(persisted=True)
+        return PersistenceResult(PersistenceStatus.PERSISTED)
 
     def persist_clarification(
         self,
@@ -107,7 +136,7 @@ class _Persistence:
     ) -> object:
         del conversation_id, messages, pending, question
         self.clarification_count += 1
-        return SimpleNamespace(persisted=True)
+        return PersistenceResult(PersistenceStatus.PERSISTED)
 
 
 class _Recorder:
@@ -115,6 +144,7 @@ class _Recorder:
         self.phases = phases
         self.dispositions: list[tuple[object, object | None]] = []
         self.abandoned = 0
+        self.events: list[object] = []
 
     def finish(self, command: TerminalDisposition) -> None:
         self.dispositions.append((command.status, command.failure_code))
@@ -124,6 +154,9 @@ class _Recorder:
 
     def abandon(self) -> None:
         self.abandoned += 1
+
+    def append_event(self, event: object) -> None:
+        self.events.append(event)
 
 
 class _Journal:
@@ -197,14 +230,25 @@ def _runtime(
     model: object = "model",
     route: object = "model",
     missing_target_question: object | None = None,
+    catalog: object | None = None,
+    dependency_catalog: object | None = None,
+    model_resolver: object | None = None,
 ) -> tuple[PilotRuntime, _Persistence, _Journal]:
     resolved_persistence = persistence or _Persistence(phases)
     resolved_journal = journal or _Journal(phases)
+    resolved_catalog = catalog or _Catalog()
+
+    def resolve_model(request: object, conversation: object) -> object:
+        del request, conversation
+        if model is None:
+            return None
+        return ResolvedModel(model=model, catalog=resolved_catalog)
+
     runtime = PilotRuntime(
         RuntimeDependencies(
             conversations=_ConversationStore(phases, conversation),
             route_selector=lambda request, conversation: route,
-            model_resolver=lambda request, conversation: model,
+            model_resolver=model_resolver or resolve_model,
             persistence=resolved_persistence,
             journal=resolved_journal,
             source_loader=source or _Source(phases),
@@ -212,6 +256,7 @@ def _runtime(
             agent_driver=driver or _Driver(phases),
             phase_sink=phases,
             missing_target_question=missing_target_question,
+            catalog=dependency_catalog,
         )
     )
     return runtime, resolved_persistence, resolved_journal
@@ -253,6 +298,23 @@ def test_start_turn_sync_sequence_is_frozen() -> None:
     ]
     assert persistence.user_count == 1
     assert persistence.message_count == 1
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        SimpleNamespace(),
+        SimpleNamespace(persisted=True),
+        SimpleNamespace(status="persisted"),
+        SimpleNamespace(status="unknown"),
+    ],
+)
+def test_persistence_result_projection_is_fail_closed(value: object) -> None:
+    assert _result_persisted(value) is False
+    assert _result_persisted(True) is True
+    assert _result_persisted(False) is False
+    assert _result_persisted(PersistenceResult(PersistenceStatus.PERSISTED)) is True
 
 
 def test_confirmation_token_matches_closed_baseline_helper() -> None:
@@ -398,6 +460,40 @@ def test_real_run_recorder_factory_accepts_runtime_builder_and_records_terminal_
     assert event_types[-1] == "segment.finished"
 
 
+def test_journal_persisted_events_skip_user_messages() -> None:
+    phases = _Phases()
+
+    class RolePersistence(_Persistence):
+        def list_messages(self, conversation_id: int) -> tuple[object, ...]:
+            del conversation_id
+            return (
+                SimpleNamespace(id=11, role="user"),
+                SimpleNamespace(id=12, role="assistant"),
+                SimpleNamespace(id=13, role="tool"),
+            )
+
+        def persist_initial_messages(self, conversation_id: int, messages: object) -> object:
+            del conversation_id, messages
+            self.message_count += 1
+            return PersistenceResult(
+                PersistenceStatus.PERSISTED,
+                message_ids=(11, 12, 13),
+            )
+
+    persistence = RolePersistence(phases)
+    runtime, _, journal = _runtime(phases, persistence=persistence)
+
+    result = _start(runtime, _Host(phases))
+
+    assert isinstance(result, MessageOutcome)
+    persisted_ids = {
+        getattr(event, "source_ref_id", None)
+        for event in journal.recorder.events
+        if getattr(event, "event_type", None) == "assistant.persisted"
+    }
+    assert persisted_ids == {12, 13}
+
+
 def test_missing_conversation_has_no_model_or_persistence_side_effect() -> None:
     phases = _Phases()
     persistence = _Persistence(phases)
@@ -440,6 +536,56 @@ def test_source_failure_persists_user_and_finishes_failed_journal() -> None:
     assert journal.recorder.dispositions == [("failed", "source_load_failed")]
 
 
+def test_phase_sink_failure_is_fail_open_before_authoritative_finish() -> None:
+    class FailingFinishPhase(_Phases):
+        def once(self, name: str) -> None:
+            super().once(name)
+            if name == "run_finish":
+                raise OSError("diagnostic sink unavailable")
+
+        append = once
+
+    phases = FailingFinishPhase()
+    runtime, _persistence, journal = _runtime(
+        phases,
+        source=_Source(phases, error=RuntimeError("source failed")),
+    )
+
+    result = _start(runtime, _Host(phases))
+
+    assert isinstance(result, RuntimeFailureOutcome)
+    assert result.code is RuntimeFailureCode.SOURCE_LOAD_FAILED
+    assert journal.recorder.dispositions == [("failed", "source_load_failed")]
+
+
+def test_phase_sink_failure_does_not_block_authoritative_abandon() -> None:
+    control = InMemoryRuntimeInvocationControl()
+
+    class FailingCancelPhase(_Phases):
+        def once(self, name: str) -> None:
+            super().once(name)
+            if name == "run_finish":
+                control.request_cancel(CancelReason.EXPLICIT_CANCEL)
+                raise OSError("diagnostic sink unavailable")
+
+        append = once
+
+    phases = FailingCancelPhase()
+    runtime, _persistence, journal = _runtime(phases)
+
+    with pytest.raises(RuntimeCancelled):
+        runtime.start_turn(
+            StartTurnRequest(message="hi"),
+            transport=RuntimeTransportContext(mode="sync"),
+            execution_host=_Host(phases),
+            invocation_control=control,
+            cancel_check=lambda: False,
+        )
+
+    assert journal.recorder.dispositions == []
+    assert journal.recorder.abandoned == 1
+
+
 def test_timeout_writes_fixed_assistant_message_and_does_not_provider_map() -> None:
     phases = _Phases()
 
@@ -448,7 +594,7 @@ def test_timeout_writes_fixed_assistant_message_and_does_not_provider_map() -> N
             del conversation_id, content
             self.message_count += 1
             self.phases.once("message_persist")
-            return SimpleNamespace(persisted=True)
+            return PersistenceResult(PersistenceStatus.PERSISTED)
 
     persistence = TimeoutPersistence(phases)
     runtime, _, journal = _runtime(phases, persistence=persistence)
@@ -473,7 +619,7 @@ def test_timeout_persistence_failure_is_safe_and_not_reported_as_message(
                 raise OSError("timeout message unavailable")
             if failure_mode == "none":
                 return None
-            return SimpleNamespace(persisted=False, status="failed")
+            return PersistenceResult(PersistenceStatus.CAS_LOST)
 
     persistence = FailingTimeoutPersistence(phases)
     runtime, _, journal = _runtime(phases, persistence=persistence)
@@ -503,7 +649,7 @@ def test_host_timeout_with_timed_out_control_still_records_timeout_delivery() ->
         def persist_timeout_assistant(self, conversation_id: int, content: str) -> object:
             del conversation_id, content
             self.message_count += 1
-            return SimpleNamespace(persisted=True, message_id=13)
+            return PersistenceResult(PersistenceStatus.PERSISTED, message_id=13)
 
     persistence = TimeoutPersistence(phases)
     runtime, _, journal = _runtime(phases, persistence=persistence)
@@ -538,7 +684,39 @@ def test_model_unconfigured_returns_before_user_persist() -> None:
     result = _start(runtime, _Host(phases))
 
     assert isinstance(result, RuntimeFailureOutcome)
+    assert result.code is RuntimeFailureCode.MODEL_UNCONFIGURED
+    assert persistence.user_count == 0
+
+
+def test_model_unconfigured_is_only_mapped_from_closed_signal() -> None:
+    phases = _Phases()
+    def resolve_model(request: object, conversation: object) -> object:
+        del request, conversation
+        raise ModelUnconfiguredError()
+
+    runtime, persistence, _journal = _runtime(phases, model_resolver=resolve_model)
+
+    result = _start(runtime, _Host(phases))
+
+    assert isinstance(result, RuntimeFailureOutcome)
+    assert result.code is RuntimeFailureCode.MODEL_UNCONFIGURED
+    assert persistence.user_count == 0
+
+
+def test_model_resolver_exception_is_provider_failure_not_unconfigured() -> None:
+    phases = _Phases()
+    def resolve_model(request: object, conversation: object) -> object:
+        del request, conversation
+        raise ValueError("AI is not configured")
+
+    runtime, persistence, _journal = _runtime(phases, model_resolver=resolve_model)
+
+    result = _start(runtime, _Host(phases))
+
+    assert isinstance(result, RuntimeFailureOutcome)
     assert result.code is RuntimeFailureCode.AI_PROVIDER_ERROR
+    assert result.status_code == 502
+    assert result.retryable is True
     assert persistence.user_count == 0
 
 
@@ -580,6 +758,93 @@ def test_pending_result_is_atomically_persisted_and_suspended() -> None:
 
 
 @pytest.mark.parametrize(
+    "pending",
+    [
+        SimpleNamespace(tool_call_id="", tool_name="write", args="{}", human="write", operation_id="op-1"),
+        SimpleNamespace(tool_call_id="call-1", tool_name="", args="{}", human="write", operation_id="op-1"),
+        SimpleNamespace(tool_call_id="call-1", tool_name="write", args="{}", human="write", operation_id=""),
+        SimpleNamespace(tool_call_id="call-1", tool_name="unknown", args="{}", human="write", operation_id="op-1"),
+        SimpleNamespace(tool_call_id="call-1", tool_name="read_tool", args="{}", human="read", operation_id="op-1"),
+        SimpleNamespace(tool_call_id="call-1", tool_name="write", args="[]", human="write", operation_id="op-1"),
+        SimpleNamespace(tool_call_id="call-1", tool_name="write", args='{"x": NaN}', human="write", operation_id="op-1"),
+    ],
+)
+def test_invalid_pending_is_rejected_before_any_pending_persistence(pending: object) -> None:
+    phases = _Phases()
+    persistence = _Persistence(phases)
+    runtime, _, journal = _runtime(
+        phases,
+        persistence=persistence,
+        driver=_Driver(phases, result=SimpleNamespace(added=[], reply="", pending=pending)),
+    )
+
+    result = _start(runtime, _Host(phases))
+
+    assert isinstance(result, RuntimeFailureOutcome)
+    assert result.code is RuntimeFailureCode.OPERATION_FAILED
+    assert persistence.pending_count == 0
+    assert persistence.clarification_count == 0
+    assert journal.recorder.dispositions == [("failed", "unknown")]
+
+
+def test_pending_uses_resolved_catalog_not_global_dependency_catalog() -> None:
+    phases = _Phases()
+    pending = PendingAction("call-1", "write", "{}", "write", "op-1")
+    persistence = _Persistence(phases)
+    runtime, _, journal = _runtime(
+        phases,
+        persistence=persistence,
+        catalog=_Catalog(write_names=()),
+        dependency_catalog=_Catalog(write_names=("write",)),
+        driver=_Driver(phases, result=SimpleNamespace(added=[], reply="", pending=pending)),
+    )
+
+    result = _start(runtime, _Host(phases))
+
+    assert isinstance(result, RuntimeFailureOutcome)
+    assert result.code is RuntimeFailureCode.OPERATION_FAILED
+    assert persistence.pending_count == 0
+    assert journal.recorder.dispositions == [("failed", "unknown")]
+
+
+def test_pending_readback_identity_mismatch_is_safe_after_persistence() -> None:
+    phases = _Phases()
+    pending = PendingAction("call-1", "write", "{}", "write", "op-1")
+
+    class MismatchPersistence(_Persistence):
+        def __init__(self, phases: _Phases) -> None:
+            super().__init__(phases)
+            self.guard_reads = 0
+
+        def get_pending_action(self, conversation_id: int) -> object | None:
+            del conversation_id
+            self.guard_reads += 1
+            if self.guard_reads == 1:
+                return None
+            return SimpleNamespace(
+                tool_call_id="other-call",
+                tool_name="write",
+                args="{}",
+                human="write",
+                operation_id="other-op",
+            )
+
+    persistence = MismatchPersistence(phases)
+    runtime, _, journal = _runtime(
+        phases,
+        persistence=persistence,
+        driver=_Driver(phases, result=SimpleNamespace(added=[], reply="", pending=pending)),
+    )
+
+    result = _start(runtime, _Host(phases))
+
+    assert isinstance(result, RuntimeFailureOutcome)
+    assert result.code is RuntimeFailureCode.OPERATION_FAILED
+    assert persistence.pending_count == 1
+    assert journal.recorder.dispositions == [("failed", "unknown")]
+
+
+@pytest.mark.parametrize(
     ("pending", "status", "expected_code"),
     [
         (True, "cas_lost", RuntimeFailureCode.OPERATION_FAILED),
@@ -602,11 +867,11 @@ def test_persistence_failure_finishes_failed_not_completed(
             pending_value: object,
         ) -> object:
             del conversation_id, messages, pending_value
-            return SimpleNamespace(persisted=False, status=status)
+            return PersistenceResult(PersistenceStatus(status))
 
         def persist_initial_messages(self, conversation_id: int, messages: object) -> object:
             del conversation_id, messages
-            return SimpleNamespace(persisted=False, status=status)
+            return PersistenceResult(PersistenceStatus(status))
 
     persistence = FailingPersistence(phases)
     result_value = (
@@ -685,12 +950,12 @@ def test_non_atomic_clarification_set_failure_stops_before_assistant_and_complet
                 raise OSError("clarification CAS unavailable")
             if failure_mode == "none":
                 return None
-            return SimpleNamespace(persisted=False, status="cas_lost")
+            return PersistenceResult(PersistenceStatus.CAS_LOST)
 
         def persist_assistant_message(self, conversation_id: int, content: str) -> object:
             del conversation_id, content
             self.assistant_calls += 1
-            return SimpleNamespace(persisted=True, message_id=13)
+            return PersistenceResult(PersistenceStatus.PERSISTED, message_id=13)
 
     persistence = FallbackPersistence(phases)
     runtime, _, journal = _runtime(
@@ -720,7 +985,7 @@ def test_final_projection_redacts_internal_tool_names_and_uses_safe_write_error(
         def persist_initial_messages(self, conversation_id: int, messages: object) -> object:
             del conversation_id
             self.messages = messages
-            return SimpleNamespace(persisted=True, message_id=12)
+            return PersistenceResult(PersistenceStatus.PERSISTED, message_id=12)
 
     persistence = CapturingPersistence(phases)
     write_record = SimpleNamespace(
@@ -915,3 +1180,10 @@ def test_control_and_base_exceptions_are_rethrown_after_journal_cleanup(control_
 
     assert raised.value is control_error
     assert journal.recorder.abandoned == 1
+
+
+def test_unknown_runtime_dependency_key_is_rejected() -> None:
+    with pytest.raises(TypeError, match="unknown runtime dependency"):
+        PilotRuntime({"unknown_dependency": object()})
+    with pytest.raises(TypeError, match="unknown runtime dependency"):
+        PilotRuntime(SimpleNamespace(unknown_dependency=object()))

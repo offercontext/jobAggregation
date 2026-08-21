@@ -2256,6 +2256,7 @@ class PilotRuntime:
                 # Direct preparation has already committed its terminal facts;
                 # close Runtime ownership before projecting any external event.
                 close_terminal_owner()
+                self._mark_completed_if_active(state.control)
                 for event in state.events:
                     if type(event) is CompletedEvent:
                         continue
@@ -2270,7 +2271,6 @@ class PilotRuntime:
                     )
                 else:
                     outcome = state.outcome
-                self._mark_completed_if_active(state.control)
                 emit_runtime_event(safe_event_sink, CompletedEvent(response=outcome))
                 return finish(outcome, CompletionReason.NORMAL)
             except RuntimeCancelled:

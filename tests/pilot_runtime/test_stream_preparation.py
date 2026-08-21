@@ -21,6 +21,7 @@ from offerpilot.repositories.chat import ChatRepository
 from offerpilot.pilot_runtime.errors import RuntimeCancelled, RuntimeTransportAborted
 from offerpilot.pilot_runtime.contracts import (
     AssistantMessageEvent,
+    CancelReason,
     CompletedEvent,
     CompletionReason,
     ConfirmationRequiredEvent,
@@ -514,6 +515,92 @@ def test_direct_terminal_sink_failure_does_not_abandon_precomputed_facts() -> No
     assert abandoned == []
     assert cell.completed is True
     assert guard.complete(CompletionReason.TRANSPORT_ABORTED) is True
+
+
+def test_direct_first_event_abort_closes_invocation_before_projection() -> None:
+    phases = Phases()
+    instance, _persistence, driver, host, journal = runtime(phases)
+    control = InMemoryRuntimeInvocationControl()
+    cell = _PreparedExecutionCell(run_open=True)
+    model_token = object()
+    instance._prepared_models[model_token] = ResolvedModel(model="prepared-model")  # type: ignore[attr-defined]
+    release_calls = 0
+
+    def release_model() -> None:
+        nonlocal release_calls
+        if model_token in instance._prepared_models:  # type: ignore[attr-defined]
+            instance._prepared_models.pop(model_token)  # type: ignore[attr-defined]
+            release_calls += 1
+
+    def on_abort() -> None:
+        release_model()
+        with cell.lock:
+            if cell.aborted or cell.completed:
+                return
+            cell.aborted = True
+            cell.run_open = False
+        if control.state is InvocationState.ACTIVE:
+            control.mark_completed()
+        journal.recorder.abandon()
+
+    def on_complete(_reason: CompletionReason) -> None:
+        release_model()
+
+    journal.recorder.finished.append("terminal-fact")
+    state = _PreparedStreamState(
+        owner_token=instance._owner_token,  # type: ignore[attr-defined]
+        preparation_kind=PreparationKind.DETERMINISTIC_INITIAL,
+        execution_mode=StreamExecutionMode.DIRECT,
+        control=control,
+        request=StartTurnRequest(message="hi"),
+        conversation=None,
+        model_token=model_token,
+        recorder=journal.recorder,
+        journal_started=True,
+        cell=cell,
+        events=(MetaEvent(),),
+        outcome=MessageOutcome(message="already committed", conversation_id=7),
+        on_abort=on_abort,
+        on_complete=on_complete,
+    )
+    prepared = PreparedStreamExecution(
+        invocation_id=transport().transport_run_id,
+        preparation_kind=PreparationKind.DETERMINISTIC_INITIAL,
+        execution_mode=StreamExecutionMode.DIRECT,
+        opaque_state=state,
+    )
+    seen: list[object] = []
+
+    class FirstEventFailingSink:
+        def emit(self, event: object) -> None:
+            seen.append(event)
+            raise RuntimeTransportAborted()
+
+    guard = PreparedStreamGuard(
+        prepared=prepared,
+        execute=lambda: instance.execute_prepared_stream(
+            prepared,
+            event_sink=FirstEventFailingSink(),
+            signal_sink=None,
+            execution_host=host,
+            cancel_check=lambda: False,
+        ),
+    )
+    assert guard.begin_execution() is True
+    with pytest.raises(RuntimeTransportAborted):
+        guard.execute_once()
+    assert control.state is InvocationState.COMPLETED
+    assert control.request_cancel(CancelReason.EXPLICIT_CANCEL) is False
+    assert seen == [MetaEvent()]
+    assert driver.calls == 0
+    assert host.calls == 0
+    assert cell.completed is True
+    assert journal.recorder.abandoned == 0
+    assert journal.recorder.finished == ["terminal-fact"]
+    assert release_calls == 1
+    assert len(instance._prepared_models) == 0  # type: ignore[attr-defined]
+    assert guard.complete(CompletionReason.TRANSPORT_ABORTED) is True
+    assert release_calls == 1
 
 
 def test_model_abort_keeps_user_and_abandons_open_run_without_new_facts() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import gc
 import weakref
 from dataclasses import dataclass
@@ -45,7 +46,11 @@ from offerpilot.pilot_runtime.service import (
     RuntimeDependencies,
     _PreparedExecutionCell,
     _PreparedStreamState,
+    _legacy_runtime_event,
+    _freeze_stream_value,
+    _materialize_stream_value,
 )
+from offerpilot.ai.types import Message, ToolCall
 
 
 class Phases:
@@ -320,13 +325,14 @@ def test_stream_model_prepare_and_agent_host_execution_emits_baseline_prefix() -
 
     guard = PreparedStreamGuard(prepared=prepared)
     assert guard.begin_execution() is True
-    result = instance.execute_prepared_stream(
+    guard._execute = lambda: instance.execute_prepared_stream(
         prepared,
         event_sink=Sink(),
         signal_sink=None,
         execution_host=host,
         cancel_check=lambda: False,
     )
+    result = guard.execute_once()
     assert isinstance(result, MessageOutcome)
     assert result.message == "hello"
     assert persistence.user_count == 1
@@ -335,9 +341,11 @@ def test_stream_model_prepare_and_agent_host_execution_emits_baseline_prefix() -
     assert host.calls == 1
     assert [type(event) for event in seen[:3]] == [MetaEvent, UserMessageSavedEvent, StatusEvent]
     assert isinstance(seen[-1], CompletedEvent)
+    assert guard.complete(CompletionReason.NORMAL) is True
     assert control.state is InvocationState.COMPLETED
     assert journal.recorder.finished
     assert len(instance._prepared_models) == 0  # type: ignore[attr-defined]
+    assert "agent_host" in phases.items
 
 
 def test_prepare_rejects_deterministic_route_before_user_or_run() -> None:
@@ -436,25 +444,76 @@ def test_direct_prepared_execution_has_no_agent_host_and_is_single_use(
 
     guard = PreparedStreamGuard(prepared=prepared)
     assert guard.begin_execution() is True
-    assert instance.execute_prepared_stream(
+    guard._execute = lambda: instance.execute_prepared_stream(
         prepared,
         event_sink=Sink(),
         signal_sink=None,
         execution_host=host,
         cancel_check=lambda: False,
-    ) == outcome
+    )
+    assert guard.execute_once() == outcome
     assert host.calls == 0
     assert driver.calls == 0
     assert seen == [MetaEvent(), AssistantMessageEvent(message="already committed"), CompletedEvent(response=outcome)]
-    with pytest.raises(RuntimeTransportAborted):
-        instance.execute_prepared_stream(
+    assert guard.complete(CompletionReason.NORMAL) is True
+    assert guard.execute_once() is None
+    assert host.calls == 0
+
+
+def test_direct_terminal_sink_failure_does_not_abandon_precomputed_facts() -> None:
+    phases = Phases()
+    instance, _persistence, _driver, host, _journal = runtime(phases)
+    control = InMemoryRuntimeInvocationControl()
+    cell = _PreparedExecutionCell(run_open=True)
+    abandoned: list[bool] = []
+
+    def on_abort() -> None:
+        with cell.lock:
+            if not cell.completed:
+                abandoned.append(True)
+            cell.aborted = True
+            cell.run_open = False
+
+    state = _PreparedStreamState(
+        owner_token=instance._owner_token,  # type: ignore[attr-defined]
+        preparation_kind=PreparationKind.DETERMINISTIC_INITIAL,
+        execution_mode=StreamExecutionMode.DIRECT,
+        control=control,
+        request=StartTurnRequest(message="hi"),
+        conversation=None,
+        cell=cell,
+        events=(MetaEvent(),),
+        outcome=MessageOutcome(message="already committed", conversation_id=7),
+        on_abort=on_abort,
+    )
+    prepared = PreparedStreamExecution(
+        invocation_id=transport().transport_run_id,
+        preparation_kind=PreparationKind.DETERMINISTIC_INITIAL,
+        execution_mode=StreamExecutionMode.DIRECT,
+        opaque_state=state,
+    )
+
+    class FailingSink:
+        def emit(self, event: object) -> None:
+            if isinstance(event, CompletedEvent):
+                raise RuntimeTransportAborted()
+
+    guard = PreparedStreamGuard(
+        prepared=prepared,
+        execute=lambda: instance.execute_prepared_stream(
             prepared,
-            event_sink=Sink(),
+            event_sink=FailingSink(),
             signal_sink=None,
             execution_host=host,
             cancel_check=lambda: False,
-        )
-    assert host.calls == 0
+        ),
+    )
+    assert guard.begin_execution() is True
+    with pytest.raises(RuntimeTransportAborted):
+        guard.execute_once()
+    assert abandoned == []
+    assert cell.completed is True
+    assert guard.complete(CompletionReason.TRANSPORT_ABORTED) is True
 
 
 def test_model_abort_keeps_user_and_abandons_open_run_without_new_facts() -> None:
@@ -490,17 +549,19 @@ def test_model_prepared_stream_adapts_sse_host_queue_once() -> None:
         def emit(self, event: object) -> None:
             seen.append(event)
 
-    result = instance.execute_prepared_stream(
+    guard._execute = lambda: instance.execute_prepared_stream(
         prepared,
         event_sink=Sink(),
         signal_sink=None,
         execution_host=SseAgentExecutionHost(timeout_seconds=1.0),
         cancel_check=lambda: False,
     )
+    result = guard.execute_once()
     assert isinstance(result, MessageOutcome)
     assert driver.calls == 1
     assert [type(item) for item in seen[:3]] == [MetaEvent, UserMessageSavedEvent, StatusEvent]
     assert isinstance(seen[-1], CompletedEvent)
+    assert guard.complete(CompletionReason.NORMAL) is True
 
 
 def test_real_stream_run_recorder_keeps_transport_uuid_and_terminal_events(
@@ -552,13 +613,14 @@ def test_real_stream_run_recorder_keeps_transport_uuid_and_terminal_events(
     assert isinstance(prepared, PreparedStreamExecution)
     guard = PreparedStreamGuard(prepared=prepared)
     assert guard.begin_execution() is True
-    result = instance.execute_prepared_stream(
+    guard._execute = lambda: instance.execute_prepared_stream(
         prepared,
         event_sink=None,
         signal_sink=None,
         execution_host=Host(),
         cancel_check=lambda: False,
     )
+    result = guard.execute_once()
 
     assert isinstance(result, MessageOutcome)
     assert journal.recorder is not None
@@ -572,6 +634,7 @@ def test_real_stream_run_recorder_keeps_transport_uuid_and_terminal_events(
         "assistant.persisted",
         "segment.finished",
     }
+    assert guard.complete(CompletionReason.NORMAL) is True
 
 
 def test_null_journal_recorder_does_not_mark_prepared_run_open() -> None:
@@ -653,17 +716,20 @@ def test_sink_abort_after_recorder_finish_does_not_abandon_finished_run() -> Non
             if isinstance(event, CompletedEvent):
                 raise RuntimeTransportAborted()
 
+    guard._execute = lambda: instance.execute_prepared_stream(
+        prepared,
+        event_sink=FailingSink(),
+        signal_sink=None,
+        execution_host=host,
+        cancel_check=lambda: False,
+    )
     with pytest.raises(RuntimeTransportAborted):
-        instance.execute_prepared_stream(
-            prepared,
-            event_sink=FailingSink(),
-            signal_sink=None,
-            execution_host=host,
-            cancel_check=lambda: False,
-        )
+        guard.execute_once()
     assert journal.recorder.finished
     assert journal.recorder.abandoned == 0
     assert len(instance._prepared_models) == 0  # type: ignore[attr-defined]
+    assert prepared.lifecycle_state.value == "executing"
+    assert guard.complete(CompletionReason.TRANSPORT_ABORTED) is True
     assert prepared.lifecycle_state.value == "completed"
     assert prepared.completion_reason is CompletionReason.TRANSPORT_ABORTED
     second_seen: list[object] = []
@@ -672,14 +738,7 @@ def test_sink_abort_after_recorder_finish_does_not_abandon_finished_run() -> Non
         def emit(self, event: object) -> None:
             second_seen.append(event)
 
-    with pytest.raises(RuntimeTransportAborted):
-        instance.execute_prepared_stream(
-            prepared,
-            event_sink=SecondSink(),
-            signal_sink=None,
-            execution_host=host,
-            cancel_check=lambda: False,
-        )
+    assert guard.execute_once() is None
     assert second_seen == []
 
 
@@ -728,25 +787,20 @@ def test_terminal_abort_releases_provider_token_and_canary_exactly_once() -> Non
             if isinstance(event, CompletedEvent):
                 raise RuntimeTransportAborted()
 
+    guard._execute = lambda: instance.execute_prepared_stream(
+        prepared,
+        event_sink=FailingSink(),
+        signal_sink=None,
+        execution_host=Host(),
+        cancel_check=lambda: False,
+    )
     with pytest.raises(RuntimeTransportAborted):
-        instance.execute_prepared_stream(
-            prepared,
-            event_sink=FailingSink(),
-            signal_sink=None,
-            execution_host=Host(),
-            cancel_check=lambda: False,
-        )
+        guard.execute_once()
     assert len(instance._prepared_models) == 0  # type: ignore[attr-defined]
     gc.collect()
     assert provider_ref() is None
-    with pytest.raises(RuntimeTransportAborted):
-        instance.execute_prepared_stream(
-            prepared,
-            event_sink=None,
-            signal_sink=None,
-            execution_host=Host(),
-            cancel_check=lambda: False,
-        )
+    assert guard.complete(CompletionReason.TRANSPORT_ABORTED) is True
+    assert guard.execute_once() is None
     assert len(instance._prepared_models) == 0  # type: ignore[attr-defined]
 
 
@@ -780,14 +834,16 @@ def test_preterminal_cancel_abort_and_baseexception_release_model_token_once(
             del event
             raise raised
 
+    guard._execute = lambda: instance.execute_prepared_stream(
+        prepared,
+        event_sink=FailingSink(),
+        signal_sink=None,
+        execution_host=host,
+        cancel_check=lambda: False,
+    )
     with pytest.raises(type(raised)):
-        instance.execute_prepared_stream(
-            prepared,
-            event_sink=FailingSink(),
-            signal_sink=None,
-            execution_host=host,
-            cancel_check=lambda: False,
-        )
+        guard.execute_once()
+    assert guard.complete(reason) is True
     assert prepared.completion_reason is reason
     assert len(instance._prepared_models) == 0  # type: ignore[attr-defined]
     assert journal.recorder.abandoned == 1
@@ -821,14 +877,16 @@ def test_stream_meta_supports_delta_reflects_resolved_stream_model() -> None:
         def emit(self, event: object) -> None:
             seen.append(event)
 
-    instance.execute_prepared_stream(
+    guard._execute = lambda: instance.execute_prepared_stream(
         prepared,
         event_sink=Sink(),
         signal_sink=None,
         execution_host=host,
         cancel_check=lambda: False,
     )
+    guard.execute_once()
     assert seen[0] == MetaEvent(supports_delta=True)
+    assert guard.complete(CompletionReason.NORMAL) is True
 
 
 def test_stream_provider_failure_ends_with_error_without_completed_event() -> None:
@@ -850,13 +908,14 @@ def test_stream_provider_failure_ends_with_error_without_completed_event() -> No
         def emit(self, event: object) -> None:
             seen.append(event)
 
-    result = instance.execute_prepared_stream(
+    guard._execute = lambda: instance.execute_prepared_stream(
         prepared,
         event_sink=Sink(),
         signal_sink=None,
         execution_host=host,
         cancel_check=lambda: False,
     )
+    result = guard.execute_once()
     assert getattr(result, "code", None).value == "ai_provider_error"
     assert [type(event) for event in seen] == [
         MetaEvent,
@@ -865,6 +924,266 @@ def test_stream_provider_failure_ends_with_error_without_completed_event() -> No
         ErrorEvent,
     ]
     assert not any(isinstance(event, CompletedEvent) for event in seen)
+    assert guard.complete(CompletionReason.NORMAL) is True
+
+
+def test_provider_error_sink_abort_releases_before_guard_completion() -> None:
+    phases = Phases()
+    instance, _persistence, driver, host, journal = runtime(phases)
+    driver.error = RuntimeError("provider down")
+    control = InMemoryRuntimeInvocationControl()
+    prepared = instance.prepare_stream(
+        StartTurnRequest(message="hi"),
+        transport=transport(),
+        invocation_control=control,
+    )
+    assert isinstance(prepared, PreparedStreamExecution)
+    seen: list[object] = []
+
+    class FailingSink:
+        def emit(self, event: object) -> None:
+            seen.append(event)
+            if isinstance(event, ErrorEvent):
+                raise RuntimeTransportAborted()
+
+    guard = PreparedStreamGuard(
+        prepared=prepared,
+        execute=lambda: instance.execute_prepared_stream(
+            prepared,
+            event_sink=FailingSink(),
+            signal_sink=None,
+            execution_host=host,
+            cancel_check=lambda: False,
+        ),
+    )
+    assert guard.begin_execution() is True
+    with pytest.raises(RuntimeTransportAborted):
+        guard.execute_once()
+    assert len(instance._prepared_models) == 0  # type: ignore[attr-defined]
+    assert journal.recorder.finished
+    assert prepared.opaque_state.cell.running is False  # type: ignore[union-attr]
+    assert prepared.lifecycle_state.value == "executing"
+    assert guard.complete(CompletionReason.TRANSPORT_ABORTED) is True
+    assert len(instance._prepared_models) == 0  # type: ignore[attr-defined]
+
+
+def test_runtime_does_not_complete_guard_lifecycle_before_transport_owner() -> None:
+    phases = Phases()
+    instance, _persistence, _driver, host, _journal = runtime(phases)
+    control = InMemoryRuntimeInvocationControl()
+    prepared = instance.prepare_stream(
+        StartTurnRequest(message="hi"),
+        transport=transport(),
+        invocation_control=control,
+    )
+    assert isinstance(prepared, PreparedStreamExecution)
+    cleanup: list[CompletionReason | None] = []
+    guard = PreparedStreamGuard(
+        prepared=prepared,
+        on_cleanup=lambda reason=None: cleanup.append(reason),
+    )
+    assert guard.begin_execution() is True
+    guard._execute = lambda: instance.execute_prepared_stream(
+        prepared,
+        event_sink=None,
+        signal_sink=None,
+        execution_host=host,
+        cancel_check=lambda: False,
+    )
+    result = guard.execute_once()
+    assert isinstance(result, MessageOutcome)
+    assert prepared.lifecycle_state is not None
+    assert prepared.lifecycle_state.value == "executing"
+    assert cleanup == []
+    assert guard.complete(CompletionReason.NORMAL) is True
+    assert cleanup == [CompletionReason.NORMAL]
+
+
+@pytest.mark.parametrize(
+    ("error_type", "reason"),
+    [
+        (None, CompletionReason.NORMAL),
+        (RuntimeCancelled, CompletionReason.CANCELLED),
+        (RuntimeTransportAborted, CompletionReason.TRANSPORT_ABORTED),
+    ],
+)
+def test_guard_runtime_completion_owner_cleans_up_once(
+    error_type: type[BaseException] | None,
+    reason: CompletionReason,
+) -> None:
+    phases = Phases()
+    instance, _persistence, _driver, host, _journal = runtime(phases)
+    control = InMemoryRuntimeInvocationControl()
+    prepared = instance.prepare_stream(
+        StartTurnRequest(message="hi"),
+        transport=transport(),
+        invocation_control=control,
+    )
+    assert isinstance(prepared, PreparedStreamExecution)
+    cleanup: list[CompletionReason | None] = []
+
+    class Sink:
+        def emit(self, _event: object) -> None:
+            if error_type is not None:
+                raise error_type()
+
+    guard = PreparedStreamGuard(
+        prepared=prepared,
+        on_cleanup=lambda completion_reason=None: cleanup.append(completion_reason),
+    )
+    guard._execute = lambda: instance.execute_prepared_stream(
+        prepared,
+        event_sink=Sink(),
+        signal_sink=None,
+        execution_host=host,
+        cancel_check=lambda: False,
+    )
+    assert guard.begin_execution() is True
+    if error_type is None:
+        guard.execute_once()
+    else:
+        with pytest.raises(error_type):
+            guard.execute_once()
+    assert prepared.lifecycle_state.value == "executing"
+    assert guard.complete(reason) is True
+    assert cleanup == [reason]
+    assert prepared.completion_reason is reason
+    assert len(instance._prepared_models) == 0  # type: ignore[attr-defined]
+
+
+def test_bare_execute_after_lifecycle_begin_is_rejected_without_side_effects() -> None:
+    phases = Phases()
+    instance, persistence, driver, host, journal = runtime(phases)
+    control = InMemoryRuntimeInvocationControl()
+    prepared = instance.prepare_stream(
+        StartTurnRequest(message="hi"),
+        transport=transport(),
+        invocation_control=control,
+    )
+    assert isinstance(prepared, PreparedStreamExecution)
+    assert prepared.begin() is True
+    with pytest.raises(RuntimeTransportAborted):
+        instance.execute_prepared_stream(
+            prepared,
+            event_sink=None,
+            signal_sink=None,
+            execution_host=host,
+            cancel_check=lambda: False,
+        )
+    assert persistence.assistant_count == 0
+    assert driver.calls == 0
+    assert journal.recorder.finished == []
+    assert len(instance._prepared_models) == 1  # type: ignore[attr-defined]
+
+
+def test_guard_does_not_execute_after_completion_winner() -> None:
+    from offerpilot.pilot_runtime.contracts import PreparedLifecycle
+
+    lifecycle = PreparedLifecycle()
+    calls: list[str] = []
+    guard = PreparedStreamGuard(
+        lifecycle=lifecycle,
+        execute=lambda: calls.append("execute"),
+    )
+    assert guard.begin_execution() is True
+    assert guard.complete(CompletionReason.NORMAL) is True
+    assert guard.execute_once() is None
+    assert calls == []
+
+
+def test_background_finalizer_does_not_complete_active_body_owner() -> None:
+    async def scenario() -> tuple[object, object]:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        lifecycle = PreparedLifecycle()
+        guard = PreparedStreamGuard(lifecycle=lifecycle)
+
+        async def content():
+            entered.set()
+            await release.wait()
+            yield b"body"
+
+        response = GuardedStreamingResponse(content(), guard)
+
+        async def receive() -> dict[str, object]:
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(_message: dict[str, object]) -> None:
+            return None
+
+        task = asyncio.create_task(
+            response(
+                {
+                    "type": "http",
+                    "method": "GET",
+                    "path": "/",
+                    "headers": [],
+                    "asgi": {"spec_version": "2.4"},
+                },
+                receive,
+                send,
+            )
+        )
+        await entered.wait()
+        await response._background_finalizer()
+        during = lifecycle.state
+        release.set()
+        await task
+        return during, lifecycle.state
+
+    from offerpilot.chat_transport import GuardedStreamingResponse
+    from offerpilot.pilot_runtime.contracts import PreparedLifecycle, PreparedLifecycleState
+
+    during, after = asyncio.run(scenario())
+    assert during is PreparedLifecycleState.EXECUTING
+    assert after is PreparedLifecycleState.COMPLETED
+
+
+def test_prepared_message_surface_roundtrip_preserves_projector_fingerprint() -> None:
+    original = Message(
+        role="user",
+        content="context",
+        tool_calls=[ToolCall(id="call-1", name="list_applications", args="{}")],
+        tool_call_id="tool-1",
+        provider_blocks={"provider": {"kind": "surface"}},
+        surface_contributor="request_page_context",
+        surface_signal="applications",
+        surface_revision="revision-1",
+        surface_page_kind="application_detail",
+        surface_attachment_kinds="resume",
+    )
+    frozen = _freeze_stream_value(original)
+    restored = _materialize_stream_value(frozen)
+    assert isinstance(restored, Message)
+    assert restored == original
+
+
+def test_materialize_stream_value_rejects_unknown_detached_values() -> None:
+    with pytest.raises(TypeError):
+        _materialize_stream_value(object())
+
+
+def test_legacy_tool_result_maps_structured_payloads_immutably() -> None:
+    event = _legacy_runtime_event(
+        {
+            "event": "tool_result",
+            "data": {
+                "tool_call_id": "call-1",
+                "tool_name": "list_applications",
+                "status": "success",
+                "summary": "listed",
+                "evidence": [{"id": "e-1", "kind": "application"}],
+                "affected_resources": [{"id": "a-1", "kind": "application"}],
+                "changed_entities": [{"id": "c-1", "kind": "application"}],
+            },
+        }
+    )
+    assert event is not None
+    assert event.evidence == ({"id": "e-1", "kind": "application"},)
+    assert event.affected_resources == ({"id": "a-1", "kind": "application"},)
+    assert event.changed_entities == ({"id": "c-1", "kind": "application"},)
+    with pytest.raises(TypeError):
+        event.evidence[0]["id"] = "mutated"  # type: ignore[index]
 
 
 def test_stream_pending_emits_waiting_status_before_confirmation() -> None:
@@ -909,13 +1228,14 @@ def test_stream_pending_emits_waiting_status_before_confirmation() -> None:
         def emit(self, event: object) -> None:
             seen.append(event)
 
-    result = instance.execute_prepared_stream(
+    guard._execute = lambda: instance.execute_prepared_stream(
         prepared,
         event_sink=Sink(),
         signal_sink=None,
         execution_host=host,
         cancel_check=lambda: False,
     )
+    result = guard.execute_once()
     assert result.__class__.__name__ == "ConfirmationRequiredOutcome"
     assert [type(event) for event in seen] == [
         MetaEvent,
@@ -927,6 +1247,7 @@ def test_stream_pending_emits_waiting_status_before_confirmation() -> None:
     ]
     assert isinstance(seen[3], StatusEvent)
     assert seen[3].phase == "waiting_confirmation"
+    assert guard.complete(CompletionReason.NORMAL) is True
 
 
 def test_stream_host_iterator_is_closed_when_outer_execution_aborts() -> None:
@@ -967,15 +1288,17 @@ def test_stream_host_iterator_is_closed_when_outer_execution_aborts() -> None:
             return self.iter_events(thunk, control)
 
     host = Host()
+    guard._execute = lambda: instance.execute_prepared_stream(
+        prepared,
+        event_sink=None,
+        signal_sink=None,
+        execution_host=host,
+        cancel_check=lambda: False,
+    )
     with pytest.raises(RuntimeTransportAborted):
-        instance.execute_prepared_stream(
-            prepared,
-            event_sink=None,
-            signal_sink=None,
-            execution_host=host,
-            cancel_check=lambda: False,
-        )
+        guard.execute_once()
     assert host.iterator.close_calls == 1
+    assert guard.complete(CompletionReason.TRANSPORT_ABORTED) is True
 
 
 def test_prepare_stream_rejects_unknown_detached_context_value_fail_closed() -> None:

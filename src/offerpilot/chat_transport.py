@@ -636,6 +636,7 @@ class PreparedStreamGuard:
         "_completed",
         "_cleanup_done",
         "_response_started",
+        "_execution_active",
     )
 
     def __init__(
@@ -712,6 +713,7 @@ class PreparedStreamGuard:
         self._completed = False
         self._cleanup_done = False
         self._response_started = False
+        self._execution_active = False
 
     @property
     def lifecycle_state(self) -> PreparedLifecycleState:
@@ -830,6 +832,14 @@ class PreparedStreamGuard:
                 return
             if transition == "begin":
                 self._begun = True
+                self._execution_active = True
+                if won and self._prepared is not None:
+                    state = self._prepared.opaque_state
+                    cell = getattr(state, "cell", None)
+                    lock = getattr(cell, "lock", None)
+                    if cell is not None and lock is not None and hasattr(cell, "execution_owner"):
+                        with lock:
+                            cell.execution_owner = self
             elif transition == "abort":
                 self._aborted = True
             else:
@@ -847,15 +857,25 @@ class PreparedStreamGuard:
             raise
         return won
 
+    def _mark_execution_owner_exit(self) -> None:
+        with self._lock:
+            self._execution_active = False
+
+    def _execution_owner_active(self) -> bool:
+        with self._lock:
+            return self._execution_active
+
     def begin(self) -> bool:
         return self.begin_execution()
 
     def execute_once(self) -> object | None:
         with self._lock:
-            if not self._begun or self._executed:
+            if not self._begun or self._executed or self._aborted or self._completed:
                 return None
             self._executed = True
             execute = self._execute
+        if self.lifecycle_state is not PreparedLifecycleState.EXECUTING:
+            return None
         if execute is None:
             return None
         return execute()
@@ -992,7 +1012,7 @@ class GuardedStreamingResponse(StreamingResponse):
         state = self.guard.lifecycle_state
         if state is PreparedLifecycleState.PREPARED:
             self.guard.abort_if_prepared()
-        elif state is PreparedLifecycleState.EXECUTING:
+        elif state is PreparedLifecycleState.EXECUTING and not self.guard._execution_owner_active():
             self.guard.complete(reason)
 
     def _finalize_owner_preserving(self, reason: CompletionReason) -> None:
@@ -1009,6 +1029,8 @@ class GuardedStreamingResponse(StreamingResponse):
         self._body_entered = True
         try:
             replacement = self.guard.execute_once()
+            if replacement is None and self.guard.lifecycle_state is not PreparedLifecycleState.EXECUTING:
+                return
             source: Any = replacement if replacement is not None else content
             if hasattr(source, "__aiter__"):
                 async for chunk in cast(AsyncIterable[bytes | str], source):
@@ -1018,19 +1040,29 @@ class GuardedStreamingResponse(StreamingResponse):
                     yield chunk
             self._body_exhausted = True
         except (RuntimeCancelled, RuntimeAgentTimedOut, asyncio.CancelledError, ClientDisconnect):
+            self.guard._mark_execution_owner_exit()
             self._complete_preserving(CompletionReason.CANCELLED)
             raise
         except RuntimeTransportAborted:
+            self.guard._mark_execution_owner_exit()
             self._complete_preserving(CompletionReason.TRANSPORT_ABORTED)
             raise
         except Exception as exc:
+            self.guard._mark_execution_owner_exit()
             self._complete_preserving(CompletionReason.TRANSPORT_ABORTED)
             raise RuntimeTransportAborted() from exc
+        except GeneratorExit:
+            self.guard._mark_execution_owner_exit()
+            self._complete_preserving(CompletionReason.CANCELLED)
+            raise
         except BaseException:
             # Cleanup is owned by the CAS winner; never suppress the original
             # BaseException (including KeyboardInterrupt/SystemExit).
+            self.guard._mark_execution_owner_exit()
             self._complete_preserving(CompletionReason.TRANSPORT_ABORTED)
             raise
+        finally:
+            self.guard._mark_execution_owner_exit()
 
     def _complete_preserving(self, reason: CompletionReason) -> None:
         try:
@@ -1098,7 +1130,11 @@ class GuardedStreamingResponse(StreamingResponse):
             self._finalize_owner_preserving(CompletionReason.CANCELLED)
             raise
         except Exception as exc:
-            self._finalize_owner_preserving(CompletionReason.TRANSPORT_ABORTED)
+            self._finalize_owner_preserving(
+                CompletionReason.CANCELLED
+                if self.guard.response_started
+                else CompletionReason.TRANSPORT_ABORTED
+            )
             raise RuntimeTransportAborted() from exc
         except BaseException:
             self._finalize_owner_preserving(CompletionReason.TRANSPORT_ABORTED)

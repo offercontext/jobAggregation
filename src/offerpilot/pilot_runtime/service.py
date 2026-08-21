@@ -303,13 +303,22 @@ class _PreparedMessage:
     surface_contributor: str = ""
     surface_signal: str = ""
     surface_revision: str = ""
+    surface_page_kind: str = ""
     surface_attachment_kinds: str = ""
 
 
 class _PreparedExecutionCell:
     """Small mutable cell for one-shot execution and cached direct outcomes."""
 
-    __slots__ = ("lock", "running", "outcome", "run_open", "aborted", "completed")
+    __slots__ = (
+        "lock",
+        "running",
+        "outcome",
+        "run_open",
+        "aborted",
+        "completed",
+        "execution_owner",
+    )
 
     def __init__(self, *, run_open: bool) -> None:
         self.lock = Lock()
@@ -318,6 +327,7 @@ class _PreparedExecutionCell:
         self.run_open = run_open
         self.aborted = False
         self.completed = False
+        self.execution_owner: object | None = None
 
 
 class _PreparedModelLease:
@@ -531,6 +541,9 @@ def _legacy_runtime_event(value: Mapping[object, object]) -> RuntimeEvent | None
             tool_name=str(data.get("tool_name") or "unknown"),
             status=cast(Any, status),
             summary=str(data.get("summary") or ""),
+            evidence=_legacy_payload_tuple(data.get("evidence")),
+            affected_resources=_legacy_payload_tuple(data.get("affected_resources")),
+            changed_entities=_legacy_payload_tuple(data.get("changed_entities")),
             message=str(data.get("message") or ""),
             visible_result=str(data.get("visible_result") or ""),
             operation_id=(
@@ -564,6 +577,22 @@ def _legacy_runtime_event(value: Mapping[object, object]) -> RuntimeEvent | None
             degraded=data.get("degraded") is True,
         )
     return None
+
+
+def _legacy_payload_tuple(value: object) -> tuple[ImmutablePayload, ...]:
+    """Snapshot legacy tool-result payload arrays into immutable mappings."""
+
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return ()
+    items: list[ImmutablePayload] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        try:
+            items.append(freeze_json_mapping(cast(Mapping[str, object], item)))
+        except (TypeError, ValueError):
+            continue
+    return tuple(items)
 
 
 def _callable(target: object | None, names: tuple[str, ...]) -> Callable[..., object] | None:
@@ -703,6 +732,11 @@ def _message(value: object) -> Message:
             tool_calls=tool_calls,
             tool_call_id=str(value.get("tool_call_id") or ""),
             provider_blocks=dict(value.get("provider_blocks") or {}) if isinstance(value.get("provider_blocks"), Mapping) else {},
+            surface_contributor=str(value.get("surface_contributor") or ""),
+            surface_signal=str(value.get("surface_signal") or ""),
+            surface_revision=str(value.get("surface_revision") or ""),
+            surface_page_kind=str(value.get("surface_page_kind") or ""),
+            surface_attachment_kinds=str(value.get("surface_attachment_kinds") or ""),
         )
     raw_tool_calls = _attribute(value, "tool_calls", ())
     tool_calls = (
@@ -722,6 +756,11 @@ def _message(value: object) -> Message:
         tool_calls=tool_calls,
         tool_call_id=str(_attribute(value, "tool_call_id", "") or ""),
         provider_blocks=provider_blocks,
+        surface_contributor=str(_attribute(value, "surface_contributor", "") or ""),
+        surface_signal=str(_attribute(value, "surface_signal", "") or ""),
+        surface_revision=str(_attribute(value, "surface_revision", "") or ""),
+        surface_page_kind=str(_attribute(value, "surface_page_kind", "") or ""),
+        surface_attachment_kinds=str(_attribute(value, "surface_attachment_kinds", "") or ""),
     )
 
 
@@ -742,6 +781,7 @@ def _freeze_stream_value(value: object) -> object:
             value.surface_contributor,
             value.surface_signal,
             value.surface_revision,
+            value.surface_page_kind,
             value.surface_attachment_kinds,
         )
         if any(type(item) is not str for item in text_fields):
@@ -768,6 +808,7 @@ def _freeze_stream_value(value: object) -> object:
             surface_contributor=value.surface_contributor,
             surface_signal=value.surface_signal,
             surface_revision=value.surface_revision,
+            surface_page_kind=value.surface_page_kind,
             surface_attachment_kinds=value.surface_attachment_kinds,
         )
     if isinstance(value, Mapping):
@@ -780,6 +821,8 @@ def _freeze_stream_value(value: object) -> object:
 def _materialize_stream_value(value: object) -> object:
     """Thaw only the message shape expected by the existing Agent driver."""
 
+    if value is None or type(value) in {str, int, bool, float}:
+        return value
     if isinstance(value, _PreparedMessage):
         return Message(
             role=value.role,
@@ -790,13 +833,14 @@ def _materialize_stream_value(value: object) -> object:
             surface_contributor=value.surface_contributor,
             surface_signal=value.surface_signal,
             surface_revision=value.surface_revision,
+            surface_page_kind=value.surface_page_kind,
             surface_attachment_kinds=value.surface_attachment_kinds,
         )
     if isinstance(value, tuple):
         return tuple(_materialize_stream_value(child) for child in value)
     if isinstance(value, Mapping):
         return {str(key): _materialize_stream_value(child) for key, child in value.items()}
-    return value
+    raise TypeError("prepared stream contains an unsupported detached value")
 
 
 def _prepared_conversation(value: object, conversation_id: int) -> _PreparedConversation:
@@ -918,7 +962,14 @@ def _with_write_error_followup(
             updated[index] = Message(
                 role="assistant",
                 content=followup,
+                tool_calls=message.tool_calls,
+                tool_call_id=message.tool_call_id,
                 provider_blocks=message.provider_blocks,
+                surface_contributor=message.surface_contributor,
+                surface_signal=message.surface_signal,
+                surface_revision=message.surface_revision,
+                surface_page_kind=message.surface_page_kind,
+                surface_attachment_kinds=message.surface_attachment_kinds,
             )
             return updated, followup
     updated.append(Message(role="assistant", content=followup))
@@ -2015,6 +2066,8 @@ class PilotRuntime:
         def on_complete(_reason: CompletionReason) -> None:
             release_model()
             with cell.lock:
+                if cell.aborted or cell.completed:
+                    return
                 cell.run_open = False
                 cell.completed = True
 
@@ -2085,6 +2138,61 @@ class PilotRuntime:
         execution_host: AgentExecutionHost[object],
         cancel_check: Callable[[], bool],
     ) -> RuntimeOutcome:
+        """Execute business work; the transport Guard owns lifecycle completion."""
+
+        state = (
+            prepared.opaque_state
+            if isinstance(prepared, PreparedStreamExecution)
+            and isinstance(prepared.opaque_state, _PreparedStreamState)
+            else None
+        )
+        should_abort = False
+        if state is not None and state.owner_token is self._owner_token:
+            with state.cell.lock:
+                should_abort = (
+                    state.cell.execution_owner is not None
+                    and not state.cell.running
+                    and not state.cell.aborted
+                    and not state.cell.completed
+                )
+
+        def cleanup_on_error() -> None:
+            if not should_abort or state is None or state.on_abort is None:
+                return
+            with state.cell.lock:
+                state.cell.running = False
+            try:
+                state.on_abort()
+            except BaseException:
+                pass
+
+        try:
+            return self._execute_prepared_stream_body(
+                prepared,
+                event_sink=event_sink,
+                signal_sink=signal_sink,
+                execution_host=execution_host,
+                cancel_check=cancel_check,
+            )
+        except RuntimeCancelled:
+            cleanup_on_error()
+            raise
+        except (RuntimeTransportAborted, RuntimeAgentTimedOut):
+            cleanup_on_error()
+            raise
+        except BaseException:
+            cleanup_on_error()
+            raise
+
+    def _execute_prepared_stream_body(
+        self,
+        prepared: PreparedStreamExecution,
+        *,
+        event_sink: RuntimeEventSink | None,
+        signal_sink: RuntimeSignalSink[str] | None,
+        execution_host: AgentExecutionHost[object],
+        cancel_check: Callable[[], bool],
+    ) -> RuntimeOutcome:
         """Execute one prepared handle; direct handles never enter the Agent host."""
 
         if not isinstance(prepared, PreparedStreamExecution):
@@ -2100,6 +2208,8 @@ class PilotRuntime:
         if prepared.lifecycle_state is not PreparedLifecycleState.EXECUTING:
             raise RuntimeTransportAborted()
         with state.cell.lock:
+            if state.cell.execution_owner is None:
+                raise RuntimeTransportAborted()
             if state.cell.running or state.cell.aborted or state.cell.completed:
                 raise RuntimeTransportAborted()
             state.cell.running = True
@@ -2122,12 +2232,13 @@ class PilotRuntime:
             with state.cell.lock:
                 state.cell.outcome = outcome
                 state.cell.running = False
+                state.cell.run_open = False
+                state.cell.completed = True
             if state.on_complete is not None:
                 try:
                     state.on_complete(reason)
                 except BaseException:
                     pass
-            prepared.complete(reason)
             return outcome
 
         def abort(reason: CompletionReason) -> None:
@@ -2138,11 +2249,13 @@ class PilotRuntime:
                     state.on_abort()
                 except BaseException:
                     pass
-            prepared.complete(reason)
 
         if state.execution_mode is StreamExecutionMode.DIRECT:
             try:
                 self._check_cancel(cancel_check, state.control)
+                # Direct preparation has already committed its terminal facts;
+                # close Runtime ownership before projecting any external event.
+                close_terminal_owner()
                 for event in state.events:
                     if type(event) is CompletedEvent:
                         continue
@@ -2218,6 +2331,8 @@ class PilotRuntime:
             # ordinary zero-argument Runtime thunk.  Keep this adaptation at
             # the host boundary; business preparation remains Runtime-owned.
             if callable(getattr(execution_host, "iter_events", None)):
+                self._phase("agent_host")
+
                 def stream_thunk(agent_events: RuntimeEventSink) -> object:
                     invocation = build_invocation(_SafeEventSink(agent_events))
                     return self._run_driver(driver, invocation)
@@ -2244,6 +2359,7 @@ class PilotRuntime:
                 else:
                     raw_result = streamed
             else:
+                self._phase("agent_host")
                 invocation = build_invocation(safe_event_sink)
 
                 def thunk() -> object:
@@ -3187,6 +3303,7 @@ class PilotRuntime:
                 surface_contributor=message.surface_contributor,
                 surface_signal=message.surface_signal,
                 surface_revision=message.surface_revision,
+                surface_page_kind=message.surface_page_kind,
                 surface_attachment_kinds=message.surface_attachment_kinds,
             )
             for message in effective_messages

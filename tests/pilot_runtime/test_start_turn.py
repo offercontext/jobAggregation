@@ -527,7 +527,15 @@ def test_real_run_recorder_factory_accepts_runtime_builder_and_records_terminal_
             self.recorder = super().start_run(command)  # type: ignore[arg-type]
             return self.recorder
 
-    journal = CapturingFactory(repository, key=key, enabled=True)
+    # The integration assertion exercises the real repository path; freeze the
+    # journal clock so suite load cannot turn this identity check into a
+    # fail-open budget diagnostic.
+    journal = CapturingFactory(
+        repository,
+        key=key,
+        enabled=True,
+        clock=lambda: 0.0,
+    )
 
     class Gateway:
         def create(self, request: object) -> object:

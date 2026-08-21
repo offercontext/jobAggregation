@@ -7,13 +7,16 @@ stream's response lifecycle is owned.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 from collections.abc import AsyncIterable, Awaitable, Callable, Iterable, Mapping
+from threading import Lock
 from typing import Any, Final, TypeAlias, cast
 
 from starlette.background import BackgroundTask
 from starlette.concurrency import iterate_in_threadpool
+from starlette.requests import ClientDisconnect
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.types import Receive, Scope, Send
 
@@ -50,6 +53,7 @@ from offerpilot.pilot_runtime.event_sink import runtime_event_payload, runtime_o
 
 
 Content: TypeAlias = Iterable[bytes | str] | AsyncIterable[bytes | str]
+CleanupCallback: TypeAlias = Callable[[CompletionReason | None], object]
 _EVENT_NAMES: Final[dict[type[object], str]] = {
     MetaEvent: "meta",
     UserMessageSavedEvent: "user_message_saved",
@@ -211,6 +215,48 @@ def event_to_sse_payload(event: RuntimeEvent) -> dict[str, object]:
     return event_sse_payload(event)
 
 
+def _adapt_cleanup_callback(callback: Callable[..., object] | None) -> CleanupCallback | None:
+    """Adapt a zero- or one-argument cleanup callable once at construction."""
+
+    if callback is None:
+        return None
+    try:
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        return cast(CleanupCallback, callback)
+    positional = [
+        parameter
+        for parameter in signature.parameters.values()
+        if parameter.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    accepts_varargs = any(
+        parameter.kind is inspect.Parameter.VAR_POSITIONAL
+        for parameter in signature.parameters.values()
+    )
+    required_positional = [
+        parameter
+        for parameter in positional
+        if parameter.default is inspect.Parameter.empty
+    ]
+    required_keyword_only = [
+        parameter
+        for parameter in signature.parameters.values()
+        if parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        and parameter.default is inspect.Parameter.empty
+    ]
+    if required_keyword_only or len(required_positional) > 1:
+        raise TypeError("cleanup callback must accept at most one required reason")
+    if accepts_varargs or positional:
+        return cast(CleanupCallback, callback)
+    if not required_keyword_only:
+        def no_argument_adapter(_reason: CompletionReason | None) -> object:
+            return callback()
+
+        return no_argument_adapter
+    raise TypeError("cleanup callback must accept a reason or no arguments")
+
+
 class PreparedStreamGuard:
     """Single-owner CAS guard for prepared stream execution and cleanup."""
 
@@ -223,6 +269,8 @@ class PreparedStreamGuard:
         "_complete",
         "_cleanup",
         "_execute",
+        "_lock",
+        "_transition_inflight",
         "_begun",
         "_executed",
         "_aborted",
@@ -285,11 +333,20 @@ class PreparedStreamGuard:
         self._prepared = prepared
         self._lifecycle = lifecycle
         self._runtime = runtime
-        self._begin = begin or on_begin
-        self._abort = abort_if_prepared or on_abort
-        self._complete = complete or on_complete
-        self._cleanup = on_cleanup or cleanup
-        self._execute = on_execute or execute
+        self._begin = begin if begin is not None else on_begin
+        self._abort = abort_if_prepared if abort_if_prepared is not None else on_abort
+        self._complete = complete if complete is not None else on_complete
+        cleanup_callback = on_cleanup if on_cleanup is not None else cleanup
+        if cleanup_callback is None and runtime is not None:
+            for name in ("cleanup", "cleanup_prepared_stream", "finish_cleanup"):
+                candidate = getattr(runtime, name, None)
+                if callable(candidate):
+                    cleanup_callback = cast(Callable[..., object], candidate)
+                    break
+        self._cleanup = _adapt_cleanup_callback(cleanup_callback)
+        self._execute = on_execute if on_execute is not None else execute
+        self._lock = Lock()
+        self._transition_inflight = False
         self._begun = False
         self._executed = False
         self._aborted = False
@@ -299,9 +356,13 @@ class PreparedStreamGuard:
 
     @property
     def lifecycle_state(self) -> PreparedLifecycleState:
-        if self._aborted:
+        with self._lock:
+            aborted = self._aborted
+            completed = self._completed
+            begun = self._begun
+        if aborted:
             return PreparedLifecycleState.ABORTED
-        if self._completed:
+        if completed:
             return PreparedLifecycleState.COMPLETED
         if self._prepared is not None:
             return self._prepared.lifecycle_state
@@ -311,7 +372,7 @@ class PreparedStreamGuard:
             state = getattr(self._runtime, "lifecycle_state", None)
             if isinstance(state, PreparedLifecycleState):
                 return state
-        return PreparedLifecycleState.EXECUTING if self._begun else PreparedLifecycleState.PREPARED
+        return PreparedLifecycleState.EXECUTING if begun else PreparedLifecycleState.PREPARED
 
     @property
     def response_started(self) -> bool:
@@ -360,54 +421,87 @@ class PreparedStreamGuard:
         return self._call_runtime(("complete_execution", "complete_prepared_stream", "complete"), reason)
 
     def _run_cleanup(self, reason: CompletionReason | None) -> None:
-        if self._cleanup_done:
-            return
-        self._cleanup_done = True
-        cleanup = self._cleanup
-        if cleanup is None and self._runtime is not None:
-            for name in ("cleanup", "cleanup_prepared_stream", "finish_cleanup"):
-                candidate = getattr(self._runtime, name, None)
-                if callable(candidate):
-                    cleanup = candidate
-                    break
+        with self._lock:
+            if self._cleanup_done:
+                return
+            self._cleanup_done = True
+            cleanup = self._cleanup
         if cleanup is None:
             return
-        try:
-            result = cleanup(reason) if reason is not None else cleanup()
-        except TypeError:
-            # A callback may intentionally be zero-argument for both paths.
-            result = cleanup()
+        result = cleanup(reason)
         if inspect.isawaitable(result):
             # Guard transitions are synchronous; async cleanup is scheduled by
             # the response finalizer instead of being silently awaited here.
             raise RuntimeError("PreparedStreamGuard cleanup must be synchronous")
 
+    def _claim_transition(self, transition: str) -> bool:
+        with self._lock:
+            if self._transition_inflight:
+                return False
+            if transition == "begin":
+                if self._begun or self._aborted or self._completed:
+                    return False
+            elif transition == "abort":
+                if self._begun or self._aborted or self._completed:
+                    return False
+            elif transition == "complete":
+                if not self._begun or self._aborted or self._completed:
+                    return False
+            else:  # pragma: no cover - private callers use the closed set
+                raise ValueError("unknown guard transition")
+            self._transition_inflight = True
+            return True
+
+    def _finish_transition(self, transition: str, won: bool) -> None:
+        if type(won) is not bool:
+            raise TypeError("lifecycle transition must return bool")
+        with self._lock:
+            self._transition_inflight = False
+            if not won:
+                return
+            if transition == "begin":
+                self._begun = True
+            elif transition == "abort":
+                self._aborted = True
+            else:
+                self._completed = True
+
     def begin_execution(self) -> bool:
-        if self._begun or self._aborted or self._completed:
+        if not self._claim_transition("begin"):
             return False
-        won = self._transition_begin()
-        if not won:
-            return False
-        self._begun = True
-        return True
+        try:
+            won = self._transition_begin()
+            self._finish_transition("begin", won)
+        except BaseException:
+            with self._lock:
+                self._transition_inflight = False
+            raise
+        return won
 
     def begin(self) -> bool:
         return self.begin_execution()
 
     def execute_once(self) -> object | None:
-        if not self._begun or self._executed:
+        with self._lock:
+            if not self._begun or self._executed:
+                return None
+            self._executed = True
+            execute = self._execute
+        if execute is None:
             return None
-        self._executed = True
-        if self._execute is None:
-            return None
-        return self._execute()
+        return execute()
 
     def abort_if_prepared(self) -> bool:
-        if self._aborted or self._completed or self._begun:
+        if not self._claim_transition("abort"):
             return False
-        won = self._transition_abort()
+        try:
+            won = self._transition_abort()
+            self._finish_transition("abort", won)
+        except BaseException:
+            with self._lock:
+                self._transition_inflight = False
+            raise
         if won:
-            self._aborted = True
             self._run_cleanup(None)
         return won
 
@@ -417,11 +511,16 @@ class PreparedStreamGuard:
     def complete(self, reason: CompletionReason) -> bool:
         if not isinstance(reason, CompletionReason):
             raise TypeError("reason must be a CompletionReason")
-        if self._aborted or self._completed or not self._begun:
+        if not self._claim_transition("complete"):
             return False
-        won = self._transition_complete(reason)
+        try:
+            won = self._transition_complete(reason)
+            self._finish_transition("complete", won)
+        except BaseException:
+            with self._lock:
+                self._transition_inflight = False
+            raise
         if won:
-            self._completed = True
             self._run_cleanup(reason)
         return won
 
@@ -463,8 +562,11 @@ class GuardedStreamingResponse(StreamingResponse):
         if execute is not None:
             guard._execute = execute
         self._body_entered = False
+        self._body_exhausted = False
         self._finalizer_registered = False
         self._original_background = background
+        self._background_finalizer_lock = Lock()
+        self._background_finalized = False
         wrapped_content = self._wrap_content(content)
         wrapped_background = BackgroundTask(self._background_finalizer)
         super().__init__(
@@ -477,14 +579,37 @@ class GuardedStreamingResponse(StreamingResponse):
         self._finalizer_registered = True
 
     async def _background_finalizer(self) -> None:
+        with self._background_finalizer_lock:
+            if self._background_finalized:
+                return
+            self._background_finalized = True
+        background_error: BaseException | None = None
+        failure_reason = CompletionReason.TRANSPORT_ABORTED
         try:
             original = self._original_background
             if original is not None:
                 result = original() if callable(original) else original
                 if inspect.isawaitable(result):
                     await cast(Awaitable[object], result)
+        except (RuntimeCancelled, RuntimeAgentTimedOut, asyncio.CancelledError, ClientDisconnect) as exc:
+            background_error = exc
+            failure_reason = CompletionReason.CANCELLED
+            raise
+        except RuntimeTransportAborted as exc:
+            background_error = exc
+            raise
+        except BaseException as exc:
+            background_error = exc
+            raise
         finally:
-            self._finalize_owner_preserving(CompletionReason.TRANSPORT_ABORTED)
+            if background_error is not None:
+                self._finalize_owner_preserving(failure_reason)
+            else:
+                reason = CompletionReason.NORMAL if self._body_exhausted else failure_reason
+                try:
+                    self._finalize_owner(reason)
+                except Exception as exc:
+                    raise RuntimeTransportAborted() from exc
 
     def _finalize_owner(self, reason: CompletionReason) -> None:
         state = self.guard.lifecycle_state
@@ -514,13 +639,16 @@ class GuardedStreamingResponse(StreamingResponse):
             else:
                 async for chunk in iterate_in_threadpool(cast(Iterable[bytes | str], source)):
                     yield chunk
-            self.guard.complete(CompletionReason.NORMAL)
-        except (RuntimeCancelled, RuntimeAgentTimedOut):
+            self._body_exhausted = True
+        except (RuntimeCancelled, RuntimeAgentTimedOut, asyncio.CancelledError, ClientDisconnect):
             self._complete_preserving(CompletionReason.CANCELLED)
             raise
         except RuntimeTransportAborted:
             self._complete_preserving(CompletionReason.TRANSPORT_ABORTED)
             raise
+        except Exception as exc:
+            self._complete_preserving(CompletionReason.TRANSPORT_ABORTED)
+            raise RuntimeTransportAborted() from exc
         except BaseException:
             # Cleanup is owned by the CAS winner; never suppress the original
             # BaseException (including KeyboardInterrupt/SystemExit).
@@ -544,33 +672,41 @@ class GuardedStreamingResponse(StreamingResponse):
         async def tracked_send(message: Any) -> None:
             if message.get("type") == "http.response.start":
                 self.guard.mark_response_started()
-            await send(message)
+            try:
+                await send(message)
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut, ClientDisconnect):
+                raise
+            except Exception as exc:
+                raise RuntimeTransportAborted() from exc
 
-        # Starlette's pre-2.4 implementation races body iteration against the
-        # disconnect listener.  A receive-first barrier makes an already
-        # disconnected response deterministic and, for a normal request body,
-        # replays the first message to Starlette unchanged.
         guarded_receive = receive
-        spec_version = tuple(
-            map(int, scope.get("asgi", {}).get("spec_version", "2.0").split("."))
-        )
-        if spec_version < (2, 4):
-            first_message = await receive()
-            if first_message.get("type") == "http.disconnect":
-                self._finalize_owner(CompletionReason.TRANSPORT_ABORTED)
-                return
-            replayed = False
-
-            async def replay_receive() -> dict[str, Any]:
-                nonlocal replayed
-                if not replayed:
-                    replayed = True
-                    return cast(dict[str, Any], first_message)
-                return cast(dict[str, Any], await receive())
-
-            guarded_receive = replay_receive
         try:
+            # Starlette's pre-2.4 implementation races body iteration against
+            # the disconnect listener.  A receive-first barrier makes an
+            # already disconnected response deterministic and, for a normal
+            # request body, replays the first message unchanged.
+            spec_version = tuple(
+                map(int, scope.get("asgi", {}).get("spec_version", "2.0").split("."))
+            )
+            if spec_version < (2, 4):
+                first_message = await receive()
+                if first_message.get("type") == "http.disconnect":
+                    self._finalize_owner(CompletionReason.TRANSPORT_ABORTED)
+                    return
+                replayed = False
+
+                async def replay_receive() -> dict[str, Any]:
+                    nonlocal replayed
+                    if not replayed:
+                        replayed = True
+                        return cast(dict[str, Any], first_message)
+                    return cast(dict[str, Any], await receive())
+
+                guarded_receive = replay_receive
             await super().__call__(scope, guarded_receive, tracked_send)
+        except (asyncio.CancelledError, ClientDisconnect):
+            self._finalize_owner_preserving(CompletionReason.CANCELLED)
+            raise
         except RuntimeCancelled:
             self._finalize_owner_preserving(CompletionReason.CANCELLED)
             raise
@@ -580,13 +716,22 @@ class GuardedStreamingResponse(StreamingResponse):
         except RuntimeAgentTimedOut:
             self._finalize_owner_preserving(CompletionReason.CANCELLED)
             raise
+        except Exception as exc:
+            self._finalize_owner_preserving(CompletionReason.TRANSPORT_ABORTED)
+            raise RuntimeTransportAborted() from exc
         except BaseException:
             self._finalize_owner_preserving(CompletionReason.TRANSPORT_ABORTED)
             raise
         finally:
             # This is authoritative for a response whose body iterator was
             # never entered.  BackgroundTask calls the same operation again.
-            self._finalize_owner(CompletionReason.CANCELLED if self._body_entered else CompletionReason.TRANSPORT_ABORTED)
+            self._finalize_owner_preserving(
+                CompletionReason.NORMAL
+                if self._body_exhausted
+                else CompletionReason.CANCELLED
+                if self._body_entered
+                else CompletionReason.TRANSPORT_ABORTED
+            )
 
 
 def build_guarded_streaming_response(
@@ -612,7 +757,12 @@ def build_guarded_streaming_response(
             media_type=media_type,
         )
     except BaseException:
-        guard.abort_if_prepared()
+        try:
+            guard.abort_if_prepared()
+        except BaseException:
+            # The construction error remains authoritative; cleanup is
+            # best-effort and must not replace it.
+            pass
         raise
 
 

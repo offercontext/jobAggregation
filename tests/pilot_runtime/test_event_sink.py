@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from threading import Barrier, Event, Lock, Thread
+from time import sleep
 
 import pytest
 
@@ -9,6 +11,7 @@ from offerpilot.pilot_runtime.contracts import (
     AssistantMessageEvent,
     CancelReason,
     CompletedEvent,
+    CompletionReason,
     FirstModelCompletedSignal,
     InvocationState,
     MetaEvent,
@@ -102,6 +105,55 @@ def test_runtime_event_payload_is_closed_and_pure() -> None:
         runtime_event_payload(object())  # type: ignore[arg-type]
 
 
+def test_payload_projection_omits_baseline_absent_optional_fields_and_internal_status() -> None:
+    event = ToolResultEvent(
+        tool_call_id="call-1",
+        tool_name="lookup",
+        status="success",
+        summary="done",
+    )
+    assert runtime_event_payload(event) == {
+        "tool_call_id": "call-1",
+        "tool_name": "lookup",
+        "status": "success",
+        "summary": "done",
+        "evidence": [],
+        "affected_resources": [],
+        "changed_entities": [],
+    }
+
+    from offerpilot.pilot_runtime.contracts import OperationReplayOutcome
+    from offerpilot.chat_transport import event_sse_payload, outcome_http_payload
+
+    replay = OperationReplayOutcome(
+        operation_id="op-1",
+        message="已完成",
+        status="committed",
+        write_status="success",
+    )
+    assert outcome_http_payload(replay) == {
+        "type": "message",
+        "operation_id": "op-1",
+        "message": "已完成",
+        "write_status": "success",
+        "replayed": True,
+    }
+    assert "status" not in event_sse_payload(CompletedEvent(response=replay))["response"]
+
+
+def test_event_and_sse_projection_reject_runtime_event_subclasses() -> None:
+    class ChildStatusEvent(StatusEvent):
+        pass
+
+    child = ChildStatusEvent(phase="thinking", label="思考")
+    from offerpilot.chat_transport import event_sse_payload
+
+    with pytest.raises(TypeError):
+        runtime_event_payload(child)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        event_sse_payload(child)  # type: ignore[arg-type]
+
+
 def test_invocation_control_is_closed_cas_and_maps_control_errors() -> None:
     control = InMemoryRuntimeInvocationControl()
     assert control.state is InvocationState.ACTIVE
@@ -136,7 +188,7 @@ def test_runtime_signal_latch_is_capacity_one_nonblocking_and_fail_open() -> Non
     assert latch.try_emit(signal) is SignalEmitResult.DUPLICATE
     assert latch.drain() == signal
     assert latch.drain() is None
-    assert latch.try_emit(signal) is SignalEmitResult.EMITTED
+    assert latch.try_emit(signal) is SignalEmitResult.DUPLICATE
     latch.close()
     assert latch.try_emit(signal) is SignalEmitResult.CLOSED
     assert latch.finalize() is None
@@ -159,6 +211,124 @@ def test_runtime_signal_latch_reports_full_and_registration_failure_without_leak
     assert failed.finalize() is None
     assert len(calls) == 1
     assert failed.finalize() is None
+
+
+def test_runtime_signal_latch_has_permanent_one_shot_and_close_discards_signal() -> None:
+    signal = FirstModelCompletedSignal()
+    latch = RuntimeSignalLatch()
+    assert latch.try_emit(signal) is SignalEmitResult.EMITTED
+    assert latch.drain() == signal
+    assert latch.try_emit(signal) is SignalEmitResult.DUPLICATE
+
+    registered: list[FirstModelCompletedSignal] = []
+    closed = RuntimeSignalLatch(register=registered.append)
+    assert closed.try_emit(signal) is SignalEmitResult.EMITTED
+    closed.close()
+    assert closed.drain() is None
+    closed.finalize()
+    assert registered == []
+    assert closed.try_emit(signal) is SignalEmitResult.CLOSED
+
+    exited = RuntimeSignalLatch(register=registered.append)
+    assert exited.try_emit(signal) is SignalEmitResult.EMITTED
+    exited.consumer_exit()
+    assert exited.drain() is None
+    exited.finalize()
+    assert registered == []
+
+
+def test_runtime_signal_latch_try_emit_does_not_run_sink_callback() -> None:
+    called = Event()
+
+    def sink(_signal: FirstModelCompletedSignal) -> None:
+        called.set()
+        raise OSError("sink should run only during owner finalization")
+
+    latch = RuntimeSignalLatch(sink=sink)
+    assert latch.try_emit(FirstModelCompletedSignal()) is SignalEmitResult.EMITTED
+    assert not called.is_set()
+
+
+def test_runtime_signal_latch_dispatches_sink_once_during_finalize() -> None:
+    seen: list[FirstModelCompletedSignal] = []
+    latch = RuntimeSignalLatch(sink=seen.append)
+    signal = FirstModelCompletedSignal()
+
+    assert latch.try_emit(signal) is SignalEmitResult.EMITTED
+    latch.finalize()
+    latch.finalize()
+
+    assert seen == [signal]
+
+
+class _DelayedLifecycleRuntime:
+    def __init__(self) -> None:
+        from offerpilot.pilot_runtime.contracts import PreparedLifecycle
+
+        self.lifecycle = PreparedLifecycle()
+        self.begin_calls = 0
+        self.abort_calls = 0
+        self.cleanup_calls = 0
+        self._lock = Lock()
+        self.entered = Event()
+        self.release = Event()
+
+    @property
+    def lifecycle_state(self) -> object:
+        return self.lifecycle.state
+
+    def begin(self) -> bool:
+        with self._lock:
+            self.begin_calls += 1
+        self.entered.set()
+        self.release.wait(timeout=5)
+        return self.lifecycle.begin()
+
+    def abort(self) -> bool:
+        with self._lock:
+            self.abort_calls += 1
+        self.entered.set()
+        self.release.wait(timeout=5)
+        return self.lifecycle.abort_if_prepared()
+
+    def complete(self, _reason: object) -> bool:
+        return self.lifecycle.complete(_reason)  # type: ignore[arg-type]
+
+    def cleanup(self, _reason: object | None) -> None:
+        with self._lock:
+            self.cleanup_calls += 1
+
+
+def test_guard_transition_callback_is_claimed_once_under_40_thread_race() -> None:
+    from offerpilot.chat_transport import PreparedStreamGuard
+
+    runtime = _DelayedLifecycleRuntime()
+    guard = PreparedStreamGuard(runtime=runtime)
+    barrier = Barrier(40)
+    results: list[bool] = []
+    results_lock = Lock()
+
+    def worker(index: int) -> None:
+        barrier.wait(timeout=5)
+        result = guard.begin_execution() if index % 2 == 0 else guard.abort_if_prepared()
+        with results_lock:
+            results.append(result)
+
+    threads = [Thread(target=worker, args=(index,)) for index in range(40)]
+    for thread in threads:
+        thread.start()
+    assert runtime.entered.wait(timeout=5)
+    sleep(0.01)
+    runtime.release.set()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert len(results) == 40
+    assert runtime.begin_calls + runtime.abort_calls == 1
+    if runtime.lifecycle.state.name == "EXECUTING":
+        assert guard.complete(CompletionReason.NORMAL) is True
+    assert runtime.cleanup_calls == 1
+    assert sum(results) == 1
 
 
 def test_control_exceptions_are_not_product_outcomes() -> None:

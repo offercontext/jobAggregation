@@ -63,7 +63,7 @@ def _plain_json(value: object) -> object:
 
 
 def _optional(payload: dict[str, object], key: str, value: object | None) -> None:
-    if value is not None:
+    if value is not None and value != "":
         payload[key] = _plain_json(value)
 
 
@@ -82,7 +82,7 @@ def runtime_event_payload(event: RuntimeEvent) -> dict[str, object]:
     at this boundary.
     """
 
-    if not isinstance(event, _EVENT_TYPES):
+    if type(event) not in _EVENT_TYPES:
         raise TypeError("event must be a typed RuntimeEvent")
     if isinstance(event, MetaEvent):
         return {
@@ -116,9 +116,11 @@ def runtime_event_payload(event: RuntimeEvent) -> dict[str, object]:
             "evidence": _plain_json(event.evidence),
             "affected_resources": _plain_json(event.affected_resources),
             "changed_entities": _plain_json(event.changed_entities),
-            "message": event.message,
-            "visible_result": event.visible_result,
         }
+        if event.message:
+            payload["message"] = event.message
+        if event.visible_result:
+            payload["visible_result"] = event.visible_result
         _optional(payload, "operation_id", event.operation_id)
         _optional(payload, "write_status", event.write_status)
         return payload
@@ -210,7 +212,6 @@ def runtime_outcome_payload(outcome: object) -> dict[str, object]:
             "type": "message",
             "operation_id": outcome.operation_id,
             "message": outcome.message,
-            "status": outcome.status,
             "replayed": outcome.replayed,
         }
         _optional(payload, "conversation_id", outcome.conversation_id)
@@ -239,7 +240,7 @@ class CallableRuntimeEventSink:
             return self._failed
 
     def emit(self, event: RuntimeEvent) -> None:
-        if not isinstance(event, _EVENT_TYPES):
+        if type(event) not in _EVENT_TYPES:
             raise TypeError("event must be a typed RuntimeEvent")
         with self._lock:
             if self._failed:
@@ -259,7 +260,7 @@ class CallableRuntimeEventSink:
 def emit_runtime_event(sink: RuntimeEventSink, event: RuntimeEvent) -> None:
     """Emit an event, preserving control exceptions and closing on sink errors."""
 
-    if not isinstance(event, _EVENT_TYPES):
+    if type(event) not in _EVENT_TYPES:
         raise TypeError("event must be a typed RuntimeEvent")
     try:
         sink.emit(event)
@@ -349,6 +350,7 @@ class RuntimeSignalLatch:
 
     __slots__ = (
         "_signal",
+        "_emitted",
         "_closed",
         "_degraded",
         "_finalized",
@@ -369,6 +371,7 @@ class RuntimeSignalLatch:
         if sink is not None and on_signal is not None:
             raise TypeError("provide only one signal sink")
         self._signal: FirstModelCompletedSignal | None = None
+        self._emitted = False
         self._closed = False
         self._degraded = False
         self._finalized = False
@@ -394,29 +397,19 @@ class RuntimeSignalLatch:
                 return SignalEmitResult.CLOSED
             if self._degraded:
                 return SignalEmitResult.DEGRADED
-            if self._signal is not None:
-                if signal is self._signal:
-                    return SignalEmitResult.DUPLICATE
-                return SignalEmitResult.FULL
+            if self._emitted:
+                if self._signal is not None and signal is not self._signal:
+                    return SignalEmitResult.FULL
+                return SignalEmitResult.DUPLICATE
+            self._emitted = True
             self._signal = signal
-            sink = self._sink
-        if sink is not None:
-            try:
-                result = sink.try_emit(signal) if hasattr(sink, "try_emit") else sink(signal)
-                if isinstance(result, SignalEmitResult) and result is SignalEmitResult.DEGRADED:
-                    with self._lock:
-                        self._degraded = True
-                        self._signal = None
-                    return SignalEmitResult.DEGRADED
-            except Exception:
-                with self._lock:
-                    self._degraded = True
-                    self._signal = None
-                return SignalEmitResult.DEGRADED
         return SignalEmitResult.EMITTED
 
     def drain(self) -> FirstModelCompletedSignal | None:
         with self._lock:
+            if self._closed:
+                self._signal = None
+                return None
             signal = self._signal
             self._signal = None
             return signal
@@ -424,6 +417,7 @@ class RuntimeSignalLatch:
     def close(self) -> None:
         with self._lock:
             self._closed = True
+            self._signal = None
 
     def consumer_exit(self) -> None:
         self.close()
@@ -436,20 +430,37 @@ class RuntimeSignalLatch:
             self._closed = True
             signal = self._signal
             self._signal = None
+            sink = self._sink
             register = self._register
-        if signal is None or register is None:
+        if signal is None:
             return
-        try:
-            register(signal)
-        except Exception:
+        degraded = False
+        if sink is not None:
+            try:
+                result = sink.try_emit(signal) if hasattr(sink, "try_emit") else sink(signal)
+                if isinstance(result, SignalEmitResult) and result is SignalEmitResult.DEGRADED:
+                    degraded = True
+            except Exception:
+                degraded = True
+        if register is not None:
+            try:
+                register(signal)
+            except Exception:
+                degraded = True
+        if degraded:
             with self._lock:
                 self._degraded = True
-            return
 
     # The owner uses ``drain_and_close`` when it wants an explicit, named
     # finalizer; retaining ``finalize`` keeps the operation idempotent.
     def drain_and_close(self) -> None:
         self.finalize()
+
+    def mark_degraded(self) -> SignalEmitResult:
+        with self._lock:
+            self._degraded = True
+            self._signal = None
+        return SignalEmitResult.DEGRADED
 
 
 InMemoryRuntimeSignalLatch = RuntimeSignalLatch

@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -194,6 +195,30 @@ def test_sse_host_worker_exception_is_rethrown_and_cancel_event_is_set() -> None
         next(stream)
     assert raised.value is error
     assert stream.cancel_event.is_set()
+
+
+def test_sse_worker_exception_keeps_baseline_shutdown_flag_false() -> None:
+    shutdown_flags: list[bool] = []
+
+    class SpyExecutor(ThreadPoolExecutor):
+        def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+            shutdown_flags.append(cancel_futures)
+            super().shutdown(wait=wait, cancel_futures=cancel_futures)
+
+    control = InMemoryRuntimeInvocationControl()
+    host = SseAgentExecutionHost[str](
+        timeout_seconds=0.2,
+        executor_factory=lambda **kwargs: SpyExecutor(**kwargs),
+    )
+
+    def thunk(_sink: RuntimeEventSink) -> str:
+        raise ValueError("ordinary worker failure")
+
+    stream = host.run(thunk, control)
+    with pytest.raises(ValueError, match="ordinary worker failure"):
+        next(stream)
+
+    assert shutdown_flags == [False]
 
 
 def test_sse_host_client_cancel_is_control_flow_and_does_not_start_again() -> None:

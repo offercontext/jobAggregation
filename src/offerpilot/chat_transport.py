@@ -262,6 +262,7 @@ class _SseInvocationIterator(Generic[_ResultT], Iterator[RuntimeEvent]):
         "_closed",
         "_result",
         "_result_set",
+        "_shutdown_called",
     )
 
     def __init__(
@@ -271,6 +272,7 @@ class _SseInvocationIterator(Generic[_ResultT], Iterator[RuntimeEvent]):
         *,
         timeout_seconds: float,
         poll_seconds: float,
+        executor_factory: Callable[..., ThreadPoolExecutor],
     ) -> None:
         self.event_queue: Queue[RuntimeEvent | object] = Queue()
         self.poll_seconds = poll_seconds
@@ -281,7 +283,8 @@ class _SseInvocationIterator(Generic[_ResultT], Iterator[RuntimeEvent]):
         self._closed = False
         self._result: _ResultT | None = None
         self._result_set = False
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._shutdown_called = False
+        self._executor = executor_factory(max_workers=1)
         sink = _QueueRuntimeEventSink(self.event_queue, self.cancel_event, control)
         self._future: Future[_ResultT] = self._executor.submit(
             _invoke_sse_thunk,
@@ -322,10 +325,17 @@ class _SseInvocationIterator(Generic[_ResultT], Iterator[RuntimeEvent]):
             raise RuntimeAgentTimedOut() from cause
         _raise_control_terminal(self._control)
 
+    def _shutdown(self, *, cancel_futures: bool) -> None:
+        if self._shutdown_called:
+            return
+        self._shutdown_called = True
+        self._executor.shutdown(wait=False, cancel_futures=cancel_futures)
+
     def __next__(self) -> RuntimeEvent:
         if self._closed:
             raise StopIteration(self._result if self._result_set else None)
         completed = False
+        cancel_futures = True
         try:
             while True:
                 if not self._control.is_active():
@@ -343,10 +353,14 @@ class _SseInvocationIterator(Generic[_ResultT], Iterator[RuntimeEvent]):
                         self._timeout(exc)
                     continue
                 if item is self._sentinel:
+                    # The sentinel proves the sole worker is done.  Lock the
+                    # normal-completion cleanup policy before observing its
+                    # result, including when that result is an exception.
+                    cancel_futures = False
                     self._finish()
                     self._closed = True
                     self.cancel_event.set()
-                    self._executor.shutdown(wait=False, cancel_futures=False)
+                    self._shutdown(cancel_futures=False)
                     completed = True
                     break
                 if type(item) not in _EVENT_NAMES:
@@ -358,7 +372,7 @@ class _SseInvocationIterator(Generic[_ResultT], Iterator[RuntimeEvent]):
         except BaseException:
             self._closed = True
             self.cancel_event.set()
-            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._shutdown(cancel_futures=cancel_futures)
             raise
         if completed:
             raise StopIteration(self._result)
@@ -371,7 +385,7 @@ class _SseInvocationIterator(Generic[_ResultT], Iterator[RuntimeEvent]):
         self.cancel_event.set()
         self._control.request_cancel(CancelReason.EXPLICIT_CANCEL)
         self._future.cancel()
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._shutdown(cancel_futures=True)
 
     @property
     def result(self) -> _ResultT:
@@ -383,13 +397,20 @@ class _SseInvocationIterator(Generic[_ResultT], Iterator[RuntimeEvent]):
 class SseAgentExecutionHost(Generic[_ResultT]):
     """Run one typed Runtime thunk while forwarding typed SSE events."""
 
-    __slots__ = ("timeout_seconds", "poll_seconds", "_started", "_lock")
+    __slots__ = (
+        "timeout_seconds",
+        "poll_seconds",
+        "_executor_factory",
+        "_started",
+        "_lock",
+    )
 
     def __init__(
         self,
         timeout_seconds: float = CHAT_AGENT_TIMEOUT_SECONDS,
         *,
         poll_seconds: float = SSE_POLL_SECONDS,
+        executor_factory: Callable[..., ThreadPoolExecutor] | None = None,
     ) -> None:
         self.timeout_seconds = _host_timeout_seconds(timeout_seconds)
         if isinstance(poll_seconds, bool) or not isinstance(poll_seconds, (int, float)):
@@ -397,6 +418,7 @@ class SseAgentExecutionHost(Generic[_ResultT]):
         if poll_seconds <= 0:
             raise ValueError("poll_seconds must be positive")
         self.poll_seconds = float(poll_seconds)
+        self._executor_factory = ThreadPoolExecutor if executor_factory is None else executor_factory
         self._started = False
         self._lock = Lock()
 
@@ -417,6 +439,7 @@ class SseAgentExecutionHost(Generic[_ResultT]):
             invocation_control,
             timeout_seconds=self.timeout_seconds,
             poll_seconds=self.poll_seconds,
+            executor_factory=self._executor_factory,
         )
 
     def iter_events(

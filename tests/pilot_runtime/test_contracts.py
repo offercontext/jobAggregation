@@ -23,6 +23,7 @@ from offerpilot.pilot_runtime.contracts import (
     ConfirmationRequiredOutcome,
     EditedArgs,
     ErrorEvent,
+    freeze_json_mapping,
     FirstModelCompletedSignal,
     ImmediateHttpOutcome,
     InvocationState,
@@ -128,6 +129,39 @@ def test_lifecycle_cas_race_has_one_winner_and_no_illegal_state() -> None:
         assert lifecycle.completion_reason is None
 
 
+def test_lifecycle_identity_hash_and_set_membership_survive_transitions() -> None:
+    lifecycle = PreparedLifecycle()
+    original_hash = hash(lifecycle)
+    members = {lifecycle}
+    assert lifecycle in members
+    assert PreparedLifecycle() not in members
+    assert lifecycle.begin() is True
+    assert lifecycle.complete(CompletionReason.NORMAL) is True
+    assert hash(lifecycle) == original_hash
+    assert lifecycle in members
+
+
+def test_prepared_stream_execution_uses_identity_semantics() -> None:
+    first = PreparedStreamExecution(
+        invocation_id="run-1",
+        preparation_kind=PreparationKind.MODEL,
+        execution_mode=StreamExecutionMode.AGENT_HOST,
+        opaque_state=MappingProxyType({"secret": "one"}),
+    )
+    second = PreparedStreamExecution(
+        invocation_id="run-1",
+        preparation_kind=PreparationKind.MODEL,
+        execution_mode=StreamExecutionMode.AGENT_HOST,
+        opaque_state=MappingProxyType({"secret": "one"}),
+    )
+    members = {first}
+    assert first != second
+    assert first in members
+    assert first.begin() is True
+    assert first.complete(CompletionReason.NORMAL) is True
+    assert first in members
+
+
 def test_all_contracts_are_closed_frozen_slot_dataclasses() -> None:
     values = [
         StartTurnRequest(message="hello"),
@@ -189,6 +223,39 @@ def test_request_and_event_reject_framework_objects_and_mutable_mappings() -> No
         ImmediateHttpOutcome(status_code=200, payload={"ok": True})  # type: ignore[arg-type]
     with pytest.raises(TypeError):
         ToolResultEvent(tool_call_id="call-1", status="completed", payload={"x": 1})  # type: ignore[arg-type]
+
+
+def test_freeze_json_mapping_snapshots_mutable_route_values() -> None:
+    backing_list = ["before"]
+    backing = {"nested": {"items": backing_list}, "tuple": ("before",)}
+    frozen = freeze_json_mapping(backing)
+    backing_list.append("after")
+    backing["nested"]["items"] = ["changed"]
+    backing["tuple"] = ("changed",)
+    assert frozen["nested"]["items"] == ("before",)
+    assert frozen["tuple"] == ("before",)
+
+
+def test_json_fields_snapshot_backing_mapping_aliases() -> None:
+    args_backing = {"value": "before"}
+    args = (MappingProxyType(args_backing),)
+    event = ToolCallEvent(
+        tool_call_id="call-1",
+        tool_name="lookup",
+        args_summary=args,
+    )
+    args_backing["value"] = "after"
+    assert event.args_summary == (MappingProxyType({"value": "before"}),)
+
+    opaque_backing = {"value": "before"}
+    prepared = PreparedStreamExecution(
+        invocation_id="run-1",
+        preparation_kind=PreparationKind.MODEL,
+        execution_mode=StreamExecutionMode.AGENT_HOST,
+        opaque_state=MappingProxyType(opaque_backing),
+    )
+    opaque_backing["value"] = "after"
+    assert prepared.opaque_state == MappingProxyType({"value": "before"})
 
 
 def test_confirmation_edited_args_distinguish_missing_empty_and_nonempty() -> None:
@@ -562,13 +629,75 @@ def test_sensitive_and_opaque_values_are_not_exposed_by_repr() -> None:
 
 def test_stream_version_and_transport_mode_are_closed_and_consistent() -> None:
     assert RuntimeTransportContext(mode="sync").stream_version is None
-    assert RuntimeTransportContext(mode="stream", stream_version="pilot-sse-v1").stream_version == "pilot-sse-v1"
+    run_id = uuid4()
+    assert RuntimeTransportContext(
+        mode="stream", transport_run_id=run_id, stream_version="pilot-sse-v1"
+    ).stream_version == "pilot-sse-v1"
+    with pytest.raises(TypeError):
+        RuntimeTransportContext(mode=object())  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        RuntimeTransportContext(mode="sync", transport_run_id=run_id)
+    with pytest.raises(ValueError):
+        RuntimeTransportContext(mode="stream", stream_version="pilot-sse-v1")
+    with pytest.raises(TypeError):
+        RuntimeTransportContext(
+            mode="stream", transport_run_id="run-1", stream_version="pilot-sse-v1"
+        )  # type: ignore[arg-type]
     with pytest.raises(ValueError):
         RuntimeTransportContext(mode="sync", stream_version="pilot-sse-v1")
     with pytest.raises(ValueError):
         RuntimeTransportContext(mode="stream", stream_version="pilot-sse-v2")
     with pytest.raises(ValueError):
         MetaEvent(stream_version="pilot-sse-v2")
+
+
+def test_invalid_lifecycle_objects_are_rejected_before_property_access() -> None:
+    with pytest.raises(TypeError):
+        PreparedStreamExecution(
+            invocation_id="run-1",
+            preparation_kind=PreparationKind.MODEL,
+            execution_mode=StreamExecutionMode.AGENT_HOST,
+            opaque_state=object(),
+            lifecycle=object(),  # type: ignore[arg-type]
+            lifecycle_state=PreparedLifecycleState.PREPARED,
+        )
+
+
+def test_failure_http_status_and_sensitive_repr_fields_are_closed() -> None:
+    RuntimeFailureOutcome(code=RuntimeFailureCode.AI_PROVIDER_ERROR, status_code=100)
+    RuntimeFailureOutcome(code=RuntimeFailureCode.AI_PROVIDER_ERROR, status_code=599)
+    with pytest.raises(ValueError):
+        RuntimeFailureOutcome(code=RuntimeFailureCode.AI_PROVIDER_ERROR, status_code=99)
+    with pytest.raises(ValueError):
+        RuntimeFailureOutcome(code=RuntimeFailureCode.AI_PROVIDER_ERROR, status_code=600)
+
+    secret = _json_object({"secret": "do-not-print"})
+    message = MessageOutcome(message="done", undo=secret)
+    result = ToolResultEvent(
+        tool_call_id="call-1",
+        tool_name="lookup",
+        status="success",
+        summary="done",
+        evidence=(secret,),
+        affected_resources=(secret,),
+        changed_entities=(secret,),
+    )
+    assert "do-not-print" not in repr(message)
+    assert "do-not-print" not in repr(result)
+
+
+def test_prepared_runtime_state_explicitly_rejects_serialization() -> None:
+    prepared = PreparedStreamExecution(
+        invocation_id="run-1",
+        preparation_kind=PreparationKind.MODEL,
+        execution_mode=StreamExecutionMode.AGENT_HOST,
+        opaque_state=object(),
+    )
+    for value in (PreparedLifecycle(), prepared):
+        with pytest.raises(TypeError):
+            pickle.dumps(value)
+        with pytest.raises(TypeError):
+            value.__getstate__()  # type: ignore[attr-defined]
 
 
 def test_agent_host_contract_is_generic_and_does_not_use_object_result() -> None:

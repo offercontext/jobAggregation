@@ -18,6 +18,7 @@ from typing import (
     TYPE_CHECKING,
     TypeAlias,
     TypeVar,
+    NoReturn,
     cast,
     runtime_checkable,
 )
@@ -85,6 +86,27 @@ def _validate_json_value(value: object, *, field_name: str) -> None:
     raise TypeError(f"{field_name} contains an unsupported value")
 
 
+def _snapshot_json_value(value: object, *, field_name: str) -> JsonValue:
+    """Copy route-owned JSON into the runtime's immutable JSON representation."""
+
+    _reject_framework_value(value, field_name=field_name)
+    if value is None or type(value) in {str, int, float, bool}:
+        return cast(JsonValue, value)
+    if isinstance(value, Mapping):
+        copied: dict[str, JsonValue] = {}
+        for key, child in value.items():
+            if type(key) is not str:
+                raise TypeError(f"{field_name} keys must be strings")
+            copied[key] = _snapshot_json_value(child, field_name=f"{field_name}.{key}")
+        return MappingProxyType(copied)
+    if type(value) in {list, tuple}:
+        return tuple(
+            _snapshot_json_value(child, field_name=f"{field_name}[{index}]")
+            for index, child in enumerate(cast(tuple[object, ...] | list[object], value))
+        )
+    raise TypeError(f"{field_name} contains an unsupported value")
+
+
 def _require_text(value: object, *, field_name: str, allow_empty: bool = True) -> str:
     _reject_framework_value(value, field_name=field_name)
     if type(value) is not str:
@@ -145,6 +167,15 @@ def _freeze_mapping(value: Mapping[str, JsonValue]) -> MappingProxyType[str, Jso
 
 def _empty_json_object() -> MappingProxyType[str, JsonValue]:
     return MappingProxyType({})
+
+
+def freeze_json_mapping(mapping: Mapping[str, object]) -> ImmutablePayload:
+    """Snapshot a validated route mapping into closed immutable JSON."""
+
+    snapshot = _snapshot_json_value(mapping, field_name="mapping")
+    if not isinstance(snapshot, MappingProxyType):  # pragma: no cover - defensive
+        raise TypeError("mapping must be a JSON object")
+    return cast(ImmutablePayload, snapshot)
 
 
 def _require_payload_tuple(
@@ -209,7 +240,7 @@ class CancelReason(StrEnum):
     TRANSPORT_ABORTED = "transport_aborted"
 
 
-@dataclass(frozen=True, slots=True, init=False, repr=False)
+@dataclass(frozen=True, slots=True, init=False, repr=False, eq=False)
 class PreparedLifecycle:
     """A four-state, single-use lifecycle with atomic CAS transitions."""
 
@@ -269,6 +300,12 @@ class PreparedLifecycle:
             object.__setattr__(self, "_state", PreparedLifecycleState.COMPLETED)
             object.__setattr__(self, "_completion_reason", reason)
             return True
+
+    def __reduce_ex__(self, _protocol: object) -> NoReturn:
+        raise TypeError("prepared lifecycle cannot be serialized")
+
+    def __getstate__(self) -> NoReturn:
+        raise TypeError("prepared lifecycle cannot be serialized")
 
 
 @dataclass(frozen=True, slots=True)
@@ -471,14 +508,20 @@ class RuntimeTransportContext:
     stream_version: StreamVersion | None = None
 
     def __post_init__(self) -> None:
-        _reject_framework_value(self.mode, field_name="mode")
+        _require_text(self.mode, field_name="mode", allow_empty=False)
         if self.mode not in {"sync", "stream"}:
             raise ValueError("mode must be sync or stream")
-        if self.transport_run_id is not None and not isinstance(self.transport_run_id, UUID):
+        if self.mode == "sync":
+            if self.transport_run_id is not None:
+                raise ValueError("sync transport cannot carry a transport run id")
+            if self.stream_version is not None:
+                raise ValueError("sync transport cannot carry a stream version")
+            return
+        if self.transport_run_id is None:
+            raise ValueError("stream transport requires a transport run id")
+        if not isinstance(self.transport_run_id, UUID):
             raise TypeError("transport_run_id must be a UUID")
-        if self.mode == "sync" and self.stream_version is not None:
-            raise ValueError("sync transport cannot carry a stream version")
-        if self.mode == "stream" and self.stream_version != "pilot-sse-v1":
+        if self.stream_version != "pilot-sse-v1":
             raise ValueError("stream transport requires pilot-sse-v1")
 
 
@@ -508,7 +551,7 @@ class MessageOutcome:
     conversation_id: int | None = None
     write_status: WriteStatus | None = None
     write_error: str | None = None
-    undo: ImmutablePayload | None = None
+    undo: ImmutablePayload | None = field(default=None, repr=False)
     operation_id: str | None = None
     replayed: bool = False
     persisted: bool = True
@@ -573,6 +616,8 @@ class RuntimeFailureOutcome:
             raise TypeError("code must be a RuntimeFailureCode")
         _require_text(self.message, field_name="message")
         _require_int(self.status_code, field_name="status_code")
+        if self.status_code < 100 or self.status_code > 599:
+            raise ValueError("status_code must be a valid HTTP status")
         _require_bool(self.retryable, field_name="retryable")
         _require_bool(self.degraded, field_name="degraded")
 
@@ -650,16 +695,17 @@ RuntimeOutcome: TypeAlias = (
 _MISSING_OPAQUE_STATE = object()
 
 
-@dataclass(frozen=True, slots=True, init=False)
+@dataclass(frozen=True, slots=True, init=False, eq=False)
 class PreparedStreamExecution:
     invocation_id: str | UUID
     preparation_kind: PreparationKind
     execution_mode: StreamExecutionMode
-    opaque_state: object = field(repr=False)
+    opaque_state: object = field(repr=False, compare=False, hash=False)
     _lifecycle: PreparedLifecycle = field(
         default_factory=PreparedLifecycle,
         repr=False,
         compare=False,
+        hash=False,
     )
 
     def __init__(
@@ -675,9 +721,19 @@ class PreparedStreamExecution:
     ) -> None:
         if opaque_state is _MISSING_OPAQUE_STATE:
             raise TypeError("opaque_state is required")
+        if lifecycle is not None and not isinstance(lifecycle, PreparedLifecycle):
+            raise TypeError("lifecycle must be a PreparedLifecycle")
+        if lifecycle_state is not None and not isinstance(
+            lifecycle_state, PreparedLifecycleState
+        ):
+            raise TypeError("lifecycle_state must be a PreparedLifecycleState")
+        if completion_reason is not None and not isinstance(completion_reason, CompletionReason):
+            raise TypeError("completion_reason must be a CompletionReason")
         if lifecycle is None:
             lifecycle = PreparedLifecycle(
-                lifecycle_state or PreparedLifecycleState.PREPARED,
+                lifecycle_state
+                if lifecycle_state is not None
+                else PreparedLifecycleState.PREPARED,
                 completion_reason,
             )
         elif lifecycle_state is not None and lifecycle.state is not lifecycle_state:
@@ -695,6 +751,18 @@ class PreparedStreamExecution:
         _reject_framework_value(self.opaque_state, field_name="opaque_state")
         if isinstance(self.opaque_state, Mapping):
             _validate_json_value(self.opaque_state, field_name="opaque_state")
+            object.__setattr__(
+                self,
+                "opaque_state",
+                _freeze_value(cast(JsonValue, self.opaque_state)),
+            )
+        elif type(self.opaque_state) is tuple:
+            _validate_json_value(self.opaque_state, field_name="opaque_state")
+            object.__setattr__(
+                self,
+                "opaque_state",
+                _freeze_value(cast(JsonValue, self.opaque_state)),
+            )
         if not isinstance(self.invocation_id, (str, UUID)):
             raise TypeError("invocation_id must be a string or UUID")
         if isinstance(self.invocation_id, str) and not self.invocation_id:
@@ -718,6 +786,12 @@ class PreparedStreamExecution:
         # approve/modify continuation is the Agent-hosted path.
         if self.execution_mode not in allowed_modes[self.preparation_kind]:
             raise ValueError("preparation kind and execution mode are incompatible")
+
+    def __reduce_ex__(self, _protocol: object) -> NoReturn:
+        raise TypeError("prepared stream execution cannot be serialized")
+
+    def __getstate__(self) -> NoReturn:
+        raise TypeError("prepared stream execution cannot be serialized")
 
     @property
     def lifecycle(self) -> PreparedLifecycle:
@@ -815,12 +889,11 @@ class ToolCallEvent:
         )
         _require_text(self.summary, field_name="summary")
         _validate_json_value(self.args_summary, field_name="args_summary")
-        if isinstance(self.args_summary, Mapping):
-            object.__setattr__(
-                self,
-                "args_summary",
-                _require_immutable_mapping(self.args_summary, field_name="args_summary"),
-            )
+        object.__setattr__(
+            self,
+            "args_summary",
+            _freeze_value(self.args_summary),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -829,9 +902,9 @@ class ToolResultEvent:
     tool_name: str
     status: ToolResultStatus
     summary: str
-    evidence: tuple[ImmutablePayload, ...] = ()
-    affected_resources: tuple[ImmutablePayload, ...] = ()
-    changed_entities: tuple[ImmutablePayload, ...] = ()
+    evidence: tuple[ImmutablePayload, ...] = field(default=(), repr=False)
+    affected_resources: tuple[ImmutablePayload, ...] = field(default=(), repr=False)
+    changed_entities: tuple[ImmutablePayload, ...] = field(default=(), repr=False)
     operation_id: str | None = None
     message: str = ""
     visible_result: str = ""

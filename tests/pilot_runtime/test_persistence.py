@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -7,7 +8,7 @@ from uuid import uuid4
 import pytest
 
 from offerpilot.ai.agent import PendingAction
-from offerpilot.ai.types import Message
+from offerpilot.ai.types import Message, ToolCall
 from offerpilot.ai.write_operations import (
     DeliveryOwnership,
     OperationFailed,
@@ -16,6 +17,7 @@ from offerpilot.ai.write_operations import (
     ledger_fingerprint,
     load_or_create_ledger_key,
 )
+from offerpilot.api import _persistable_ai_messages
 from offerpilot.db import init_database
 from offerpilot.repositories.chat import ChatRepository
 from offerpilot.pilot_runtime.persistence import (
@@ -83,6 +85,115 @@ def conversation_generation(chat: ChatRepository, conversation_id: int) -> datet
     conversation = chat.get_conversation(conversation_id)
     assert conversation is not None
     return conversation.updated_at
+
+
+def _message_projection(message: object) -> dict[str, str]:
+    return {
+        field: str(getattr(message, field))
+        for field in ("role", "content", "tool_calls", "tool_call_id", "provider_blocks")
+    }
+
+
+def _raw_agent_messages() -> list[Message]:
+    return [
+        Message(
+            role="assistant",
+            content=(
+                "将执行 `update_application_status`；"
+                "update_application_status 已准备。"
+            ),
+            tool_calls=[
+                ToolCall(
+                    id="call-malicious-1",
+                    name="update_application_status",
+                    args=json.dumps(
+                        {
+                            "id": 7,
+                            "nested": {
+                                "request_id": "nested-request-secret",
+                                "canary": "nested-canary-secret",
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+            ],
+            provider_blocks={
+                "reasoning_content": "保留的推理摘要",
+                "request_id": "provider-request-secret",
+                "canary": "provider-canary-secret",
+                "api_key": "provider-api-key-secret",
+            },
+        ),
+        Message(
+            role="tool",
+            content="工具结果",
+            tool_call_id="call-malicious-1",
+            provider_blocks={
+                "reasoning_content": "tool 摘要",
+                "request_id": "tool-request-secret",
+                "canary": "tool-canary-secret",
+            },
+        ),
+    ]
+
+
+def test_initial_pending_matches_baseline_message_sanitization(tmp_path: Path) -> None:
+    coordinator, conversation_id = make_persistence_coordinator(tmp_path)
+    messages = _raw_agent_messages()
+    pending = PendingAction(
+        "call-malicious-1", "update_application_status", '{"id": 7}', "更新状态"
+    )
+    expected = _persistable_ai_messages(messages)
+
+    result = coordinator.persist_initial_pending(conversation_id, messages, pending)
+
+    assert result.persisted is True
+    stored = coordinator.chat.list_messages(conversation_id)[-len(messages) :]
+    assert [_message_projection(item) for item in stored] == expected
+    assert "provider-request-secret" not in json.dumps(expected, ensure_ascii=False)
+    assert "provider-canary-secret" not in json.dumps(expected, ensure_ascii=False)
+    assert "provider-api-key-secret" not in json.dumps(expected, ensure_ascii=False)
+
+
+def test_confirmation_continuation_matches_baseline_message_sanitization(
+    tmp_path: Path,
+) -> None:
+    coordinator, conversation_id, chat, _operations, pending, ownership = make_delivery_fixtures(
+        tmp_path
+    )
+    raw_messages = _raw_agent_messages()
+    origin = Message(
+        role="tool",
+        content=raw_messages[1].content,
+        tool_call_id=pending.tool_call_id,
+        provider_blocks=raw_messages[1].provider_blocks,
+    )
+    continuation = raw_messages[:1]
+    expected = _persistable_ai_messages([origin, *continuation])
+
+    result = coordinator.persist_confirmation_delivery(
+        conversation_id,
+        ownership,
+        origin,
+        continuation,
+        expected_generation=conversation_generation(chat, conversation_id),
+        expected_pending=pending,
+        claim_id=pending.operation_id,
+    )
+
+    assert result.persisted is True
+    stored = chat.list_messages(conversation_id)[-len(expected) :]
+    assert {
+        field: getattr(stored[0], field)
+        for field in ("role", "content", "tool_call_id")
+    } == {
+        field: expected[0][field] for field in ("role", "content", "tool_call_id")
+    }
+    assert _message_projection(stored[1]) == expected[1]
+    assert "provider-request-secret" not in json.dumps(expected, ensure_ascii=False)
+    assert "provider-canary-secret" not in json.dumps(expected, ensure_ascii=False)
+    assert "provider-api-key-secret" not in json.dumps(expected, ensure_ascii=False)
 
 
 def test_initial_pending_persists_atomic_tool_chain_and_pending(tmp_path: Path) -> None:

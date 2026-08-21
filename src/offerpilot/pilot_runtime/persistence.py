@@ -118,27 +118,97 @@ def _json_text(value: object) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def _message_values(message: MessageInput) -> dict[str, str]:
-    """Convert a Message or route-shaped mapping without dropping identity."""
+_USER_FACING_TOOL_NAMES = {
+    "update_application_status": "更新投递状态",
+    "create_application_event": "添加投递日程",
+    "update_application_event": "更新投递日程",
+    "delete_application_event": "删除投递日程",
+    "add_application": "新建投递记录",
+    "create_application": "新建投递记录",
+    "add_note": "添加复盘记录",
+    "update_note": "更新复盘记录",
+    "delete_note": "删除复盘记录",
+}
 
-    if isinstance(message, Message):
-        tool_calls: object = [
+
+def _user_facing_assistant_content(content: str) -> str:
+    """Copy the baseline Chat projection's assistant-content sanitization."""
+
+    if not content:
+        return content
+    sanitized = content
+    for internal_name, label in _USER_FACING_TOOL_NAMES.items():
+        sanitized = sanitized.replace(f"`{internal_name}`", label)
+        sanitized = sanitized.replace(internal_name, label)
+    return sanitized
+
+
+def _safe_tool_args(raw: str) -> dict[str, Any]:
+    """Keep only the baseline's JSON-object tool-argument representation."""
+
+    try:
+        args = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(args, dict):
+        return {}
+    return args
+
+
+def _dump_tool_calls(tool_calls: list[ToolCall]) -> str:
+    """Serialize tool calls with the exact baseline argument projection."""
+
+    if not tool_calls:
+        return ""
+    return json.dumps(
+        [
             {
-                "id": item.id,
-                "name": item.name,
-                "args": item.args,
+                "id": tool_call.id,
+                "name": tool_call.name,
+                "args": _safe_tool_args(tool_call.args),
             }
-            for item in message.tool_calls
-        ]
-        provider_blocks: object = message.provider_blocks
-        return {
-            "role": message.role,
-            "content": message.content,
-            "tool_calls": _json_text(tool_calls) if tool_calls else "",
-            "tool_call_id": message.tool_call_id,
-            "provider_blocks": _json_text(provider_blocks) if provider_blocks else "",
-        }
+            for tool_call in tool_calls
+        ],
+        ensure_ascii=False,
+    )
 
+
+def _dump_provider_blocks(provider_blocks: dict[str, Any]) -> str:
+    """Persist only the provider block explicitly allowed by the baseline."""
+
+    if not provider_blocks:
+        return ""
+    allowed = {
+        key: value
+        for key, value in provider_blocks.items()
+        if key == "reasoning_content" and value is not None
+    }
+    if not allowed:
+        return ""
+    return json.dumps(allowed, ensure_ascii=False)
+
+
+def _persistable_ai_messages(messages: list[Message]) -> list[dict[str, str]]:
+    """Project Agent messages using the unchanged Chat persistence contract."""
+
+    persisted: list[dict[str, str]] = []
+    for message in messages:
+        content = message.content
+        if message.role == "assistant":
+            content = _user_facing_assistant_content(content)
+        persisted.append(
+            {
+                "role": message.role,
+                "content": content,
+                "tool_calls": _dump_tool_calls(message.tool_calls),
+                "tool_call_id": message.tool_call_id,
+                "provider_blocks": _dump_provider_blocks(message.provider_blocks),
+            }
+        )
+    return persisted
+
+
+def _raw_mapping_values(message: Mapping[str, object]) -> dict[str, str]:
     role = message.get("role", "")
     if not isinstance(role, str):
         raise TypeError("message role must be a string")
@@ -151,10 +221,8 @@ def _message_values(message: MessageInput) -> dict[str, str]:
     }
 
 
-def _as_message(message: MessageInput) -> Message:
-    if isinstance(message, Message):
-        return message
-    values = _message_values(message)
+def _mapping_to_message(message: Mapping[str, object]) -> Message:
+    values = _raw_mapping_values(message)
     raw_tool_calls = values["tool_calls"]
     parsed_tool_calls: list[ToolCall] = []
     if raw_tool_calls:
@@ -168,6 +236,43 @@ def _as_message(message: MessageInput) -> Message:
                     id=str(item.get("id", "")),
                     name=str(item.get("name", "")),
                     args=str(item.get("args", "")),
+                )
+                for item in decoded
+                if isinstance(item, Mapping)
+            ]
+    return Message(
+        role=values["role"],
+        content=values["content"],
+        tool_calls=parsed_tool_calls,
+        tool_call_id=values["tool_call_id"],
+        provider_blocks=_decode_provider_blocks(values["provider_blocks"]),
+    )
+
+
+def _message_values(message: MessageInput) -> dict[str, str]:
+    """Convert a raw Agent message through the baseline projection first."""
+
+    candidate = message if isinstance(message, Message) else _mapping_to_message(message)
+    return _persistable_ai_messages([candidate])[0]
+
+
+def _as_message(message: MessageInput) -> Message:
+    """Return a sanitized Message for repository atoms that accept a Message."""
+
+    values = _message_values(message)
+    raw_tool_calls = values["tool_calls"]
+    parsed_tool_calls: list[ToolCall] = []
+    if raw_tool_calls:
+        try:
+            decoded = json.loads(raw_tool_calls)
+        except (TypeError, json.JSONDecodeError):
+            decoded = []
+        if isinstance(decoded, list):
+            parsed_tool_calls = [
+                ToolCall(
+                    id=str(item.get("id", "")),
+                    name=str(item.get("name", "")),
+                    args=json.dumps(item.get("args", {}), ensure_ascii=False),
                 )
                 for item in decoded
                 if isinstance(item, Mapping)

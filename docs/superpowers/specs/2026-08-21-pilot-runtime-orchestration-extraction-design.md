@@ -117,6 +117,9 @@ src/offerpilot/pilot_runtime/
 ├── deterministic.py   # 现有确定性 Pilot Action 显式桥接
 ├── composition.py     # 依赖装配；不读取 FastAPI 请求
 └── errors.py          # 封闭 Runtime failure 分类
+
+src/offerpilot/chat_transport.py
+└── FastAPI HTTP/SSE renderer、AgentExecutionHost、PreparedStreamGuard
 ```
 
 模块可以在实施中按依赖图合并小文件，但不得把编排重新塞回 `api.py` 或
@@ -279,7 +282,7 @@ ImmediateHttpOutcome
 
 PreparedStreamExecution
 - invocation_id
-- preparation_kind: model | deterministic | confirmation | replay
+- preparation_kind: model | deterministic_initial | deterministic_confirmation | confirmation | replay
 - execution_mode: direct | agent_host
 - opaque prepared state（repr=False）
 - single-use state: prepared | executing | aborted | completed
@@ -291,9 +294,10 @@ State 或 checkpoint，不可通用序列化，也不得携带活跃 ORM/Session
 拥有的不可变 DTO、RunRecorder、一次性控制 token 和已经冻结的 Source；敏感字段必须
 `repr=False`。
 
-`PreparedStreamExecution` 只能由创建它的 `PilotRuntime` 执行一次。Transport 若在执行
-开始前失败或客户端断开，必须调用 Runtime 的 abort transition；该 transition 只收敛
-Runtime 自己的资源，不执行 Provider、Tool 或新的业务写入。
+`PreparedStreamExecution` 只能由创建它的 `PilotRuntime` 执行一次。Transport 不直接操作
+其状态，而是使用 `PreparedStreamGuard` 调用 Runtime 的 begin/abort/finish transition。
+abort 不撤销 prepare 阶段已经提交的事实，也不重做任何操作；它只阻止新增 Provider、Tool
+和领域副作用，并按 preparation kind 收敛仍由本次调用持有的 Journal/delivery 资源。
 
 ### 2.6 Runtime Event Sink
 
@@ -306,6 +310,7 @@ class RuntimeEventSink(Protocol):
 
 ```text
 meta
+user_message_saved
 status
 assistant_delta
 tool_call
@@ -315,6 +320,15 @@ assistant_message
 error
 completed
 ```
+
+`user_message_saved` 使用独立的 `UserMessageSavedEvent`，payload 封闭为当前兼容字段：
+
+```text
+role = "user"
+```
+
+它只在 baseline 当前会发送该事件的初始 model/deterministic stream 出现，不得添加到确认
+stream、terminal replay 或其他原本没有该事件的路径。
 
 规则：
 
@@ -352,23 +366,76 @@ completed
 
 ### 3.1 Start Turn
 
-固定阶段：
+不存在一条适用于所有入口的严格线性顺序。Runtime 使用同一封闭状态机，但按
+`transport.mode + preparation_kind` 选择已冻结的阶段表；表内顺序是兼容契约：
 
 ```text
-validate normalized request
-→ create/load Conversation
-→ trusted route selection
-→ pending guard
-→ persist current user message（模型路径）
-→ start Run / Segment
-→ load frozen context sources
-→ assemble current runtime messages
-→ invoke unchanged Agent Driver
-→ normalize tool/write outcome
-→ persist messages / clarification / Pending
-→ finish or suspend Run
-→ return RuntimeOutcome
+sync model
+  validate normalized request
+  → create/load Conversation
+  → trusted route selection
+  → live Pending guard / model resolution
+  → persist current user message
+  → start Run / Segment
+  → load frozen context sources
+  → assemble runtime messages / capture initial context
+  → AgentExecutionHost
+  → normalize and persist result
+  → finish/suspend Run
+  → RuntimeOutcome
+
+stream model（响应头前 prepare）
+  validate normalized request
+  → create/load Conversation
+  → trusted route selection
+  → live Pending guard / model resolution
+  → persist current user message
+  → load frozen context sources
+  → assemble runtime messages
+  → create transport identity and start Run / Segment
+  → capture initial context
+  → PreparedStreamExecution
+  → meta → user_message_saved → status
+  → AgentExecutionHost
+  → normalize and persist result
+  → finish/suspend Run
+  → RuntimeOutcome / completed SSE
+
+deterministic initial direct
+  validate normalized request
+  → create/load Conversation
+  → trusted deterministic match
+  → start new Journal Run or resume pending replay（按 baseline）
+  → execute existing DeterministicPilotAdapter before response headers
+  → preserve its Chat/Pending/CAS/write ordering
+  → finish/suspend existing Run
+  → ImmediateHttpOutcome or execution_mode=direct stream
+
+deterministic confirmation
+  safe control fields
+  → load trusted server-side Legacy Pending / closed-name routing
+  → token/CAS and existing deterministic confirmation transaction before response headers
+  → preserve committed Chat/Pending/Ledger/domain facts
+  → ImmediateHttpOutcome or execution_mode=direct stream
+
+confirmation proposed/live
+  safe control fields / Ledger-first lookup
+  → trusted Pending/token/request identity
+  → resume Durable Run / create confirmation Segment（按 baseline）
+  → approve/modify 或 reject 的专用状态机
+  → delivery / chained Pending / RuntimeOutcome
+
+terminal replay
+  safe control fields / Ledger-first terminal lookup
+  → identity/fingerprint/integrity validation
+  → Provider = Projector = executor = 0
+  → baseline immediate HTTP 或 direct SSE delivery projection
 ```
+
+`sync model` 与 `stream model` 的 Source/Run 顺序不得互相归一：sync 保持先创建
+Run/Segment 再加载 Source；stream 保持先加载 Source 再创建 Run/Segment。每个
+preparation kind 都用独立 transition table 和 golden 验证 Journal 事件序列。Route 只选择
+Transport mode，不得执行或重排表中阶段。
 
 Route selection 只产生两种可信结果：
 
@@ -610,12 +677,81 @@ Provider 或 Tool。
 对应 Run/Segment 时，不得因抽象统一而提前创建；sync 路径也不得被迫改成 stream 的顺序。
 所有顺序差异由一个 Runtime 状态机中的显式 preparation kind 表达，不允许 Route 重新编排。
 
-`PreparedStreamExecution` 创建后若响应构造失败、响应迭代从未开始或 Agent worker 提交失败，
-Transport 必须调用一次 `abort_before_start()`。Runtime 以一次性 CAS 将 `prepared → aborted`，
-完成既有 Journal/lease 清理；Provider、Tool executor 和新业务写入均为 0。已进入
-`executing` 后只能通过 invocation cancellation 收敛，不能再调用 before-start abort。
+`abort_before_start()` 的作用不是回滚整个请求，而是终止尚未开始的 SSE 交付。按
+`preparation_kind` 固定：
 
-#### 4.2.2 Agent Worker 与 Queue
+```text
+model
+  保留 prepare 阶段已写入的 user ChatMessage
+  若 Run/Segment 已创建，则按 baseline 停止/abandon；Journal 失败仍 fail-open
+  assistant/tool message、Pending、Ledger 和领域写入不新增
+
+deterministic initial
+  保留已经创建的 Conversation/ChatMessage/Pending 或确定性结果
+  已 finish/suspend 的 Run 绝对 no-op；仍 open 的 Run 才执行一次安全收敛
+  不撤销、不重做 deterministic action
+
+deterministic confirmation
+  保留已经提交的 Ledger/领域终态、Pending CAS 与消息事实
+  不执行 Undo，不重新确认，不再次 delivery
+  仅释放/收敛仍归本次 invocation 持有的 lease 与 Journal disposition
+
+terminal replay
+  Provider = Projector = executor = 0
+  保持已存在 terminal fact，不重新回放或写 fallback
+  只终止本次尚未开始的 delivery attempt，并服从 generation/owner fencing
+```
+
+所有类型中，abort 自身不得产生额外 Provider、Tool executor 或领域写入；它可以执行既有
+Journal fail-open disposition、释放 lease，或按 Phase 3 协议放弃未完成的 delivery ownership。
+已完成/已释放资源必须绝对 no-op。
+
+#### 4.2.2 PreparedStreamGuard
+
+普通 generator 从未开始迭代时不会执行 generator body 的 `finally`，因此 Transport 必须使用
+`PreparedStreamGuard`，不能只依赖生成器清理：
+
+```text
+PreparedStreamGuard（Transport-owned）
+- prepared execution handle（repr=False）
+- shared Runtime CAS reference
+- response_started flag
+- finalizer_registered flag
+```
+
+生命周期固定为：
+
+```text
+prepare_stream() returns PreparedStreamExecution
+→ construct guard
+→ construct GuardedStreamingResponse in try
+   → construction raises: guard.abort_if_prepared()
+   → construction succeeds: register response finalizer
+→ ASGI response __call__ starts
+   → body iterator first entry: guard.begin_execution()
+      prepared → executing winner 才能调用 execute_prepared_stream()
+→ body iterator / ASGI response finally
+   → executing: signal cancel/finish，并且只按 baseline 规则等待/清理
+   → prepared: guard.abort_if_prepared()
+→ response background/finalizer
+   → 再执行一次 guard.abort_if_prepared() 作为幂等兜底
+```
+
+`GuardedStreamingResponse.__call__` 的 `finally` 是“Response 已构造但 body iterator 从未开始”
+场景的权威 hook；BackgroundTask/finalizer 是幂等兜底，不能依赖 `__del__`、垃圾回收时机或
+generator 自身 `finally`。guard 的 begin、abort、complete 都委托同一个 Runtime CAS：
+
+```text
+prepared → executing → completed
+prepared → aborted
+executing → cancelled/aborted_delivery → completed
+```
+
+CAS loser 必须绝对 no-op。`begin_execution()` 与 `abort_if_prepared()` 并发时只有一个 winner；
+Response 构造异常、零次 body 迭代、立即 disconnect、正常完成和重复 finalizer 都不得产生
+第二次 Runtime 执行或 disposition。
+
+#### 4.2.3 Agent Worker 与 Queue
 
 固定规则：
 
@@ -642,6 +778,7 @@ timeout 和断线语义，不得在本期顺带实施。
 
 ```text
 meta
+→ user_message_saved（仅 baseline 初始 stream）
 → status
 → assistant_delta / tool_call / tool_result ...
 → confirmation_required | assistant_message | error
@@ -746,6 +883,7 @@ Transport owner
 - baseline unbounded Runtime Event Queue
 - cancel Event 与 wall-clock deadline
 - SSE seq / response encoding / consumer lifecycle
+- PreparedStreamGuard / GuardedStreamingResponse / response finalizer
 - RuntimeSignalSink 的 drain / close / title registration finalizer
 
 Runtime owner
@@ -820,6 +958,8 @@ Golden 必须从固定 `b05d915` 独立捕获并作为只读合成资产提交�
 接受新结果。至少覆盖：
 
 - 四个 endpoint 的 HTTP/SSE 完整响应；
+- 初始 model 与 deterministic SSE 均严格为
+  `meta → user_message_saved → status → ...`；confirmation/replay 不得新增该事件；
 - 新建和已有 Conversation；
 - workspace/application scope；
 - read + read、write + read、read + write、write + write；
@@ -842,7 +982,9 @@ SSE 响应头边界还必须逐项锁定：
   baseline 409/422/503 继续直接返回 JSON；
 - 只有 baseline 本来进入 SSE 的结果才创建 `StreamingResponse`；只有
   `execution_mode=agent_host` 才创建 worker 与 Queue，deterministic direct stream 继续为 0；
-- precomputed deterministic/replay SSE 不重复业务执行。
+- precomputed deterministic/replay SSE 不重复业务执行；
+- sync model 锁定 `user persist → Run start → Source load`，stream model 锁定
+  `user persist → Source load → Run start`，并逐项比较 Journal 序列；
 
 每个场景比较：
 
@@ -871,6 +1013,7 @@ Golden 只使用合成数据，不保存 SQLite、真实用户内容、密钥、
 - `pilot_runtime` 不导入 FastAPI/Starlette response/background task；
 - Agent Runner 不导入 `pilot_runtime`；
 - SSE 编码和 `seq` 分配只存在于 Transport allowlist；
+- `UserMessageSavedEvent` 是 RuntimeEvent 联合成员，payload 只能是 `role="user"`；
 - outer executor/Future、无界 Queue、cancel Event 和 title finalizer 只存在于 Transport
   ownership allowlist；
 - `AgentExecutionHost` 不依赖 Repository/Journal/Pending/Ledger，且只能执行 Runtime 提供的
@@ -879,6 +1022,8 @@ Golden 只使用合成数据，不保存 SQLite、真实用户内容、密钥、
   task；
 - `prepare_stream()` 是响应头前业务判断的唯一入口，Route 不复制 Source/Pending/Ledger
   precheck；
+- 所有 `PreparedStreamExecution` 必须由 `PreparedStreamGuard` 包装；不得直接构造裸
+  StreamingResponse 或只依赖 generator `finally`；
 - Runtime Event 不包含任意 dict payload 或异常对象；
 - 模型 dispatcher 不引用 Legacy deterministic adapter；
 - 旧 Route 编排 helper 和 callback 闭包已删除，无 feature flag/fallback/shadow；
@@ -894,6 +1039,10 @@ Golden 只使用合成数据，不保存 SQLite、真实用户内容、密钥、
 - Runtime 状态转换表的每个合法和非法边；
 - `ImmediateHttpOutcome` 与 `PreparedStreamExecution` 的全部 preparation kind；
 - prepared handle single-use、worker 启动前 abort、execute/abort 竞态和重复调用绝对 no-op；
+- Response 构造失败、Response 已构造但 body iterator 零次启动、首次迭代立即断开、正常完成
+  和 Background/finalizer 重复调用均通过同一 CAS；
+- model abort 保留 user message 且不写领域；deterministic initial abort 保留 Chat/Pending；
+  deterministic confirmation abort 保留 Ledger/领域 terminal；terminal replay abort 不重放；
 - Outcome → HTTP 与 Outcome/Event → SSE 的纯函数映射；
 - Event Queue 明确为 baseline 无界 `Queue()`；慢 consumer 不阻塞 worker，也不改变 timeout
   起点或事件顺序；

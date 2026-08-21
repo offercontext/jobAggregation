@@ -6,8 +6,10 @@ import time
 from collections import Counter
 from datetime import datetime, timezone
 from io import BytesIO
+from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
+from typing import Any
 from zipfile import ZipFile
 
 import pytest
@@ -1766,32 +1768,15 @@ def _parse_sse_events(raw: str) -> list[dict[str, object]]:
     return events
 
 
-JOURNAL_HITL_ENTRY_SSE_EVENTS = [
-    "meta",
-    "user_message_saved",
-    "status",
-    "tool_call",
-    "status",
-    "confirmation_required",
-    "completed",
-]
-JOURNAL_HITL_CONFIRM_SSE_EVENTS = [
-    "meta",
-    "status",
-    "tool_call",
-    "tool_result",
-    "assistant_message",
-    "completed",
-]
-JOURNAL_HITL_CHAIN_CONFIRM_SSE_EVENTS = [
-    "meta",
-    "status",
-    "tool_call",
-    "tool_call",
-    "tool_result",
-    "status",
-    "confirmation_required",
-    "completed",
+def _pilot_runtime_baseline_golden() -> dict[str, Any]:
+    path = Path(__file__).parent / "fixtures" / "pilot_runtime" / "baseline_golden.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+JOURNAL_HITL_ENTRY_SSE_EVENTS = _pilot_runtime_baseline_golden()["sse_sequences"]["hitl_entry"]
+JOURNAL_HITL_CONFIRM_SSE_EVENTS = _pilot_runtime_baseline_golden()["sse_sequences"]["hitl_confirm"]
+JOURNAL_HITL_CHAIN_CONFIRM_SSE_EVENTS = _pilot_runtime_baseline_golden()["sse_sequences"][
+    "hitl_chain_confirm"
 ]
 
 
@@ -1963,14 +1948,7 @@ def test_journal_hitl_pending_approve_executes_once_and_finishes_healthy(
     assert confirmed.status_code == 200
     if confirm_endpoint.endswith("/stream"):
         confirmation_events = _parse_sse_events(confirmed.text)
-        assert [event["event"] for event in confirmation_events] == [
-            "meta",
-            "status",
-            "tool_call",
-            "tool_result",
-            "assistant_message",
-            "completed",
-        ]
+        assert [event["event"] for event in confirmation_events] == JOURNAL_HITL_CONFIRM_SSE_EVENTS
         body = confirmation_events[-1]["data"]["data"]["response"]
         assert confirmation_events.index(
             next(event for event in confirmation_events if event["event"] == "tool_call")
@@ -4042,13 +4020,9 @@ def test_chat_stream_emits_pilot_sse_v1_sequence(tmp_path):
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
     events = _parse_sse_events(response.text)
-    assert [event["event"] for event in events] == [
-        "meta",
-        "user_message_saved",
-        "status",
-        "assistant_message",
-        "completed",
-    ]
+    assert [event["event"] for event in events] == _pilot_runtime_baseline_golden()[
+        "sse_sequences"
+    ]["initial_model"]
     seqs = [event["data"]["seq"] for event in events]
     assert seqs == sorted(seqs)
     assert events[0]["data"]["data"]["stream_version"] == "pilot-sse-v1"
@@ -4283,14 +4257,7 @@ def test_chat_confirm_stream_executes_pending_write_and_completes(tmp_path):
 
     assert response.status_code == 200
     events = _parse_sse_events(response.text)
-    assert [event["event"] for event in events] == [
-        "meta",
-        "status",
-        "tool_call",
-        "tool_result",
-        "assistant_message",
-        "completed",
-    ]
+    assert [event["event"] for event in events] == JOURNAL_HITL_CONFIRM_SSE_EVENTS
     assert events[2]["data"]["data"]["confirm_mode"] == "approved"
     assert events[3]["data"]["data"]["status"] == "success"
     completed = events[-1]["data"]["data"]["response"]

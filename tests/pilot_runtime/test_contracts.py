@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import pickle
+import ast
 from dataclasses import FrozenInstanceError, fields, is_dataclass
 from enum import StrEnum
 from threading import Barrier, Thread
 from types import MappingProxyType
-from typing import Literal, get_args, get_origin, get_type_hints
+from typing import Literal, TypeVar, get_args, get_origin, get_type_hints
 from uuid import uuid4
+from pathlib import Path
 
 import pytest
 
@@ -26,11 +29,14 @@ from offerpilot.pilot_runtime.contracts import (
     MetaEvent,
     OperationPendingOutcome,
     OperationReplayOutcome,
+    PendingActionPayload,
     PreparationKind,
     PreparedLifecycle,
     PreparedLifecycleState,
     PreparedStreamExecution,
     RuntimeFailureOutcome,
+    RuntimeFailureCode,
+    AgentExecutionHost,
     RuntimeSignalSink,
     RuntimeTransportContext,
     SignalEmitResult,
@@ -41,6 +47,7 @@ from offerpilot.pilot_runtime.contracts import (
     ToolResultEvent,
     UserMessageSavedEvent,
 )
+from offerpilot.pilot_runtime.errors import RuntimeCancelled, RuntimeTransportAborted
 
 
 def test_prepared_lifecycle_accepts_only_reviewed_transitions() -> None:
@@ -78,7 +85,7 @@ def test_lifecycle_completion_reason_and_state_are_validated_without_side_effect
             invocation_id=uuid4(),
             preparation_kind=PreparationKind.MODEL,
             execution_mode=StreamExecutionMode.DIRECT,
-            prepared_state=object(),
+            opaque_state=object(),
             lifecycle_state=PreparedLifecycleState.COMPLETED,
             completion_reason=None,
         )
@@ -87,7 +94,7 @@ def test_lifecycle_completion_reason_and_state_are_validated_without_side_effect
             invocation_id=uuid4(),
             preparation_kind=PreparationKind.MODEL,
             execution_mode=StreamExecutionMode.DIRECT,
-            prepared_state=object(),
+            opaque_state=object(),
             lifecycle_state=PreparedLifecycleState.PREPARED,
             completion_reason=CompletionReason.NORMAL,
         )
@@ -128,7 +135,7 @@ def test_all_contracts_are_closed_frozen_slot_dataclasses() -> None:
         ImmediateHttpOutcome(status_code=200, payload=MappingProxyType({"ok": True})),
         MessageOutcome(message="done"),
         ConfirmationRequiredOutcome(conversation_id=1, confirmation_token="token"),
-        RuntimeFailureOutcome(code="provider_error", message="暂时不可用"),
+        RuntimeFailureOutcome(code=RuntimeFailureCode.AI_PROVIDER_ERROR, message="暂时不可用"),
         OperationPendingOutcome(operation_id="op-1"),
         OperationReplayOutcome(operation_id="op-1"),
         PreparedLifecycle(),
@@ -137,10 +144,15 @@ def test_all_contracts_are_closed_frozen_slot_dataclasses() -> None:
         StatusEvent(phase="model_running", label="正在思考"),
         AssistantDeltaEvent(delta="hi"),
         ToolCallEvent(tool_call_id="call-1", tool_name="lookup"),
-        ToolResultEvent(tool_call_id="call-1", status="completed"),
+        ToolResultEvent(
+            tool_call_id="call-1",
+            tool_name="lookup",
+            status="completed",
+            summary="done",
+        ),
         ConfirmationRequiredEvent(confirmation_token="token"),
         AssistantMessageEvent(message="done"),
-        ErrorEvent(code="provider_error", message="暂时不可用"),
+        ErrorEvent(code=RuntimeFailureCode.AI_PROVIDER_ERROR, message="暂时不可用"),
         CompletedEvent(),
         FirstModelCompletedSignal(),
     ]
@@ -233,3 +245,281 @@ def test_signal_sink_protocol_has_closed_nonblocking_result() -> None:
         "explicit_cancel",
         "deadline",
     }
+
+
+def _json_object(value: dict[str, object]) -> MappingProxyType:
+    return MappingProxyType(value)
+
+
+def test_baseline_nested_tool_payloads_are_closed_and_lossless() -> None:
+    nested_args = _json_object(
+        {
+            "filters": _json_object({"status": "open", "ids": (1, 2)}),
+            "locations": ("remote", "hybrid"),
+        }
+    )
+    tool_call = ToolCallEvent(
+        tool_call_id="call-1",
+        tool_name="search_applications",
+        args_summary=nested_args,
+    )
+    assert tool_call.args_summary == nested_args
+    evidence = (_json_object({"id": "application-1", "kind": "application"}),)
+    result = ToolResultEvent(
+        tool_call_id="call-1",
+        tool_name="search_applications",
+        status="success",
+        summary="找到 1 条投递记录",
+        evidence=evidence,
+        affected_resources=evidence,
+        changed_entities=(),
+    )
+    assert result.evidence == evidence
+    assert result.affected_resources == evidence
+    with pytest.raises(TypeError):
+        ToolCallEvent(
+            tool_call_id="call-1",
+            tool_name="search_applications",
+            args_summary={"filters": {"ids": [1, 2]}},  # type: ignore[arg-type]
+        )
+    with pytest.raises(TypeError):
+        ToolCallEvent(
+            tool_call_id="call-1",
+            tool_name="search_applications",
+            args_summary=_json_object({"filters": ["open"]}),  # type: ignore[arg-type]
+        )
+    with pytest.raises(TypeError):
+        ToolResultEvent(
+            tool_call_id="call-1",
+            tool_name="search_applications",
+            summary="bad",
+            evidence=([{"id": "application-1"}],),  # type: ignore[arg-type]
+        )
+
+
+def test_confirmation_payload_preserves_complete_pending_action_shape() -> None:
+    pending = PendingActionPayload(
+        tool_name="create_application",
+        operation_id="op-1",
+        human="创建投递记录",
+        args=_json_object(
+            {
+                "company_name": "OfferPilot",
+                "status": "applied",
+                "nested": _json_object({"ids": (1, 2)}),
+            }
+        ),
+        confirmation_token="a" * 64,
+        editable_fields=(_json_object({"field": "status", "label": "状态"}),),
+        details=_json_object(
+            {
+                "target": _json_object(
+                    {"id": "application-draft-1", "kind": "application"}
+                ),
+                "proposed_changes": (
+                    _json_object({"field": "status", "before": "", "after": "applied"}),
+                ),
+                "evidence": (),
+            }
+        ),
+    )
+    outcome = ConfirmationRequiredOutcome(
+        conversation_id=1,
+        confirmation_token=pending.confirmation_token,
+        pending_action=pending,
+    )
+    event = ConfirmationRequiredEvent(
+        confirmation_token=pending.confirmation_token,
+        pending_action=pending,
+    )
+    assert outcome.pending_action == pending
+    assert event.pending_action.details["target"] == pending.details["target"]
+    with pytest.raises(TypeError):
+        PendingActionPayload(
+            tool_name="create_application",
+            operation_id="op-1",
+            human="创建投递记录",
+            args={"company_name": "OfferPilot"},  # type: ignore[arg-type]
+            confirmation_token="a" * 64,
+        )
+
+
+def test_message_replay_pending_and_failure_outcomes_cover_baseline_body_fields() -> None:
+    undo = _json_object(
+        {"kind": "delete_application", "application_id": 1, "parent_operation_id": "op-1"}
+    )
+    message = MessageOutcome(
+        message="已保存",
+        conversation_id=1,
+        write_status="success",
+        write_error="目标记录不存在",
+        undo=undo,
+        operation_id="op-1",
+        replayed=False,
+    )
+    replay = OperationReplayOutcome(
+        operation_id="op-1",
+        conversation_id=1,
+        message="操作已完成。",
+        status="committed",
+        write_status="success",
+        write_error="operation_failed",
+        undo=undo,
+        replayed=True,
+    )
+    pending = OperationPendingOutcome(
+        operation_id="op-2",
+        conversation_id=1,
+        message="确认操作仍在后台执行",
+        code=RuntimeFailureCode.OPERATION_DELIVERY_PENDING,
+    )
+    failure = RuntimeFailureOutcome(
+        code=RuntimeFailureCode.AI_PROVIDER_ERROR,
+        message="AI 连接失败",
+        retryable=True,
+    )
+    assert message.undo == undo
+    assert message.write_error == "目标记录不存在"
+    assert replay.write_error == "operation_failed"
+    assert replay.replayed is True
+    assert pending.code is RuntimeFailureCode.OPERATION_DELIVERY_PENDING
+    assert failure.code is RuntimeFailureCode.AI_PROVIDER_ERROR
+
+
+@pytest.mark.parametrize(
+    ("kind", "mode", "valid"),
+    [
+        (PreparationKind.MODEL, StreamExecutionMode.AGENT_HOST, True),
+        (PreparationKind.MODEL, StreamExecutionMode.DIRECT, False),
+        (PreparationKind.DETERMINISTIC_INITIAL, StreamExecutionMode.DIRECT, True),
+        (PreparationKind.DETERMINISTIC_INITIAL, StreamExecutionMode.AGENT_HOST, False),
+        (PreparationKind.DETERMINISTIC_CONFIRMATION, StreamExecutionMode.DIRECT, True),
+        (PreparationKind.DETERMINISTIC_CONFIRMATION, StreamExecutionMode.AGENT_HOST, False),
+        (PreparationKind.CONFIRMATION, StreamExecutionMode.DIRECT, True),
+        (PreparationKind.CONFIRMATION, StreamExecutionMode.AGENT_HOST, True),
+        (PreparationKind.REPLAY, StreamExecutionMode.DIRECT, True),
+        (PreparationKind.REPLAY, StreamExecutionMode.AGENT_HOST, False),
+    ],
+)
+def test_prepared_execution_kind_and_mode_matrix(
+    kind: PreparationKind,
+    mode: StreamExecutionMode,
+    valid: bool,
+) -> None:
+    if valid:
+        prepared = PreparedStreamExecution(
+            invocation_id=uuid4(),
+            preparation_kind=kind,
+            execution_mode=mode,
+            opaque_state=object(),
+        )
+        assert prepared.lifecycle_state is PreparedLifecycleState.PREPARED
+    else:
+        with pytest.raises(ValueError):
+            PreparedStreamExecution(
+                invocation_id=uuid4(),
+                preparation_kind=kind,
+                execution_mode=mode,
+                opaque_state=object(),
+            )
+
+
+def test_failure_codes_are_closed_and_errors_are_not_serializable() -> None:
+    assert RuntimeFailureOutcome(code=RuntimeFailureCode.SOURCE_LOAD_FAILED).code is RuntimeFailureCode.SOURCE_LOAD_FAILED
+    with pytest.raises((TypeError, ValueError)):
+        RuntimeFailureOutcome(code="made_up_failure")  # type: ignore[arg-type]
+    with pytest.raises((TypeError, ValueError)):
+        ErrorEvent(code="made_up_failure", message="bad")  # type: ignore[arg-type]
+    for error in (RuntimeCancelled("secret reason"), RuntimeTransportAborted("secret reason")):
+        assert "secret reason" not in repr(error)
+        assert "secret reason" not in str(error)
+        with pytest.raises(TypeError):
+            pickle.dumps(error)
+
+
+def test_sensitive_and_opaque_values_are_not_exposed_by_repr() -> None:
+    class SecretOpaque:
+        def __repr__(self) -> str:
+            return "opaque-secret"
+
+    prepared = PreparedStreamExecution(
+        invocation_id=uuid4(),
+        preparation_kind=PreparationKind.MODEL,
+        execution_mode=StreamExecutionMode.AGENT_HOST,
+        opaque_state=SecretOpaque(),
+    )
+    pending = PendingActionPayload(
+        tool_name="update_application_status",
+        operation_id="op-1",
+        human="更新投递状态",
+        args=_json_object({"password": "secret-password"}),
+        confirmation_token="secret-token",
+    )
+    confirmation = ConfirmationRequest(
+        conversation_id=1,
+        approved=True,
+        confirmation_token="secret-token",
+    )
+    required = ConfirmationRequiredOutcome(
+        confirmation_token="secret-token",
+        pending_action=pending,
+    )
+    required_event = ConfirmationRequiredEvent(
+        confirmation_token="secret-token",
+        pending_action=pending,
+    )
+    assert "opaque-secret" not in repr(prepared)
+    assert "secret-password" not in repr(pending)
+    assert "secret-token" not in repr(pending)
+    assert "secret-token" not in repr(confirmation)
+    assert "secret-token" not in repr(required)
+    assert "secret-token" not in repr(required_event)
+
+
+def test_stream_version_and_transport_mode_are_closed_and_consistent() -> None:
+    assert RuntimeTransportContext(mode="sync").stream_version is None
+    assert RuntimeTransportContext(mode="stream", stream_version="pilot-sse-v1").stream_version == "pilot-sse-v1"
+    with pytest.raises(ValueError):
+        RuntimeTransportContext(mode="sync", stream_version="pilot-sse-v1")
+    with pytest.raises(ValueError):
+        RuntimeTransportContext(mode="stream", stream_version="pilot-sse-v2")
+    with pytest.raises(ValueError):
+        MetaEvent(stream_version="pilot-sse-v2")
+
+
+def test_agent_host_contract_is_generic_and_does_not_use_object_result() -> None:
+    return_type = get_type_hints(AgentExecutionHost.run)["return"]
+    assert isinstance(return_type, TypeVar)
+    assert return_type.__name__ == "ResultT"
+
+
+def test_chat_route_failure_literals_are_members_of_closed_code_enum() -> None:
+    api_path = Path(__file__).parents[2] / "src" / "offerpilot" / "api.py"
+    tree = ast.parse(api_path.read_text(encoding="utf-8"))
+    route_names = {"send_chat", "send_chat_stream", "confirm_chat", "confirm_chat_stream"}
+    route_nodes = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name in route_names
+    ]
+    literals: set[str] = set()
+    for node in route_nodes:
+        for child in ast.walk(node):
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
+                if child.func.id == "error_response":
+                    for keyword in child.keywords:
+                        if keyword.arg == "code" and isinstance(keyword.value, ast.Constant):
+                            if isinstance(keyword.value.value, str):
+                                literals.add(keyword.value.value)
+            if isinstance(child, ast.Dict):
+                for key, value in zip(child.keys, child.values):
+                    if (
+                        isinstance(key, ast.Constant)
+                        and key.value == "code"
+                        and isinstance(value, ast.Constant)
+                        and isinstance(value.value, str)
+                    ):
+                        literals.add(value.value)
+    enum_values = {item.value for item in RuntimeFailureCode}
+    assert literals
+    assert literals <= enum_values

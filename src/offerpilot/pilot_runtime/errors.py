@@ -8,7 +8,7 @@ include a caller-provided reason.
 from __future__ import annotations
 
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
 from typing import final
 
 
@@ -34,6 +34,12 @@ class RuntimeCancelled(Exception):
     def __repr__(self) -> str:
         return "RuntimeCancelled()"
 
+    def __reduce_ex__(self, _protocol: object) -> NoReturn:
+        raise TypeError("runtime control exceptions cannot be serialized")
+
+    def __getstate__(self) -> NoReturn:
+        raise TypeError("runtime control exceptions cannot be serialized")
+
 
 @final
 class RuntimeTransportAborted(Exception):
@@ -45,36 +51,57 @@ class RuntimeTransportAborted(Exception):
     def __repr__(self) -> str:
         return "RuntimeTransportAborted()"
 
+    def __reduce_ex__(self, _protocol: object) -> NoReturn:
+        raise TypeError("runtime control exceptions cannot be serialized")
 
-class RuntimeFailureCategory(StrEnum):
-    """Safe, finite product/runtime failure categories.
+    def __getstate__(self) -> NoReturn:
+        raise TypeError("runtime control exceptions cannot be serialized")
 
-    These values are intentionally coarse.  The runtime may retain a more
-    detailed internal cause, but only one of these categories crosses the
-    contract boundary.
-    """
 
-    VALIDATION = "validation_error"
-    CONVERSATION_NOT_FOUND = "conversation_not_found"
+class RuntimeFailureCode(StrEnum):
+    """Closed failure codes emitted by the four Chat routes."""
+
     PENDING_CONFIRMATION_REQUIRED = "pending_confirmation_required"
     SOURCE_LOAD_FAILED = "source_load_failed"
-    PROVIDER_ERROR = "provider_error"
-    AGENT_TIMEOUT = "chat_agent_timeout"
-    OPERATION_PENDING = "operation_pending"
-    OPERATION_REPLAY = "operation_replay"
-    UNKNOWN = "runtime_error"
-
-
-# Names used by later transport/continuation tasks remain aliases of the same
-# closed enum rather than introducing a second, divergent failure vocabulary.
-ProductFailureCategory = RuntimeFailureCategory
-RuntimeFailureCode = RuntimeFailureCategory
+    CHAT_AGENT_TIMEOUT = "chat_agent_timeout"
+    AI_PROVIDER_ERROR = "ai_provider_error"
+    CONVERSATION_ARCHIVED = "conversation_archived"
+    STALE_PENDING_ACTION = "stale_pending_action"
+    CONFIRMATION_IN_PROGRESS = "confirmation_in_progress"
+    INVALID_CONFIRMATION = "invalid_confirmation"
+    OPERATION_IDENTITY_CONFLICT = "operation_identity_conflict"
+    OPERATION_UNAVAILABLE = "operation_unavailable"
+    OPERATION_RESULT_UNKNOWN = "operation_result_unknown"
+    OPERATION_INPUT_CONFLICT = "operation_input_conflict"
+    OPERATION_DELIVERY_PENDING = "operation_delivery_pending"
+    OPERATION_DELIVERY_UNKNOWN = "operation_delivery_unknown"
+    OPERATION_DELIVERY_FAILED = "operation_delivery_failed"
+    OPERATION_INTEGRITY_ERROR = "operation_integrity_error"
+    OPERATION_NOT_COMMITTED = "operation_not_committed"
+    OPERATION_NOT_TRANSACTIONAL = "operation_not_transactional"
+    OPERATION_PROJECTION_FAILED = "operation_projection_failed"
+    OPERATION_RESULT_TOO_LARGE = "operation_result_too_large"
+    OPERATION_BUSY = "operation_busy"
+    OPERATION_FAILED = "operation_failed"
+    UNDO_CONFLICT = "undo_conflict"
+    APPLICATION_JD_INVALID_REQUEST = "application_jd_invalid_request"
+    APPLICATION_JD_STALE_CURRENT_VERSION = "application_jd_stale_current_version"
+    APPLICATION_JD_IDEMPOTENCY_CONFLICT = "application_jd_idempotency_conflict"
+    APPLICATION_JD_NOT_FOUND = "application_jd_not_found"
+    APPLICATION_JD_SOURCE_CONFLICT = "application_jd_source_conflict"
+    APPLICATION_JD_VERSION_REQUIRED = "application_jd_version_required"
+    APPLICATION_ARCHIVE_IDEMPOTENCY_CONFLICT = "application_archive_idempotency_conflict"
+    APPLICATION_ARCHIVE_SOURCE_CONFLICT = "application_archive_source_conflict"
+    APPLICATION_ARCHIVE_INVALID_REQUEST = "application_archive_invalid_request"
+    APPLICATION_OUTCOME_IDEMPOTENCY_CONFLICT = "application_outcome_idempotency_conflict"
+    APPLICATION_OUTCOME_SOURCE_CONFLICT = "application_outcome_source_conflict"
+    APPLICATION_OUTCOME_INVALID_REQUEST = "application_outcome_invalid_request"
+    JD_TEXT_REQUIRED = "jd_text_required"
+    JD_URL_NOT_SUPPORTED = "jd_url_not_supported"
 
 
 __all__ = [
-    "ProductFailureCategory",
     "RuntimeCancelled",
-    "RuntimeFailureCategory",
     "RuntimeFailureCode",
     "RuntimeTransportAborted",
 ]

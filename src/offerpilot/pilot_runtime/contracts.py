@@ -17,10 +17,13 @@ from typing import (
     Protocol,
     TYPE_CHECKING,
     TypeAlias,
+    TypeVar,
     cast,
     runtime_checkable,
 )
 from uuid import UUID
+
+from .errors import RuntimeFailureCode
 
 
 if TYPE_CHECKING:
@@ -38,6 +41,7 @@ else:
 JsonScalar: TypeAlias = str | int | float | bool | None
 JsonValue: TypeAlias = JsonScalar | tuple["JsonValue", ...] | Mapping[str, "JsonValue"]
 ImmutablePayload: TypeAlias = Mapping[str, JsonValue]
+StreamVersion: TypeAlias = Literal["pilot-sse-v1"]
 
 
 def _reject_framework_value(value: object, *, field_name: str) -> None:
@@ -118,6 +122,24 @@ def _freeze_mapping(value: Mapping[str, JsonValue]) -> MappingProxyType[str, Jso
     return MappingProxyType({key: _freeze_value(child) for key, child in value.items()})
 
 
+def _empty_json_object() -> MappingProxyType[str, JsonValue]:
+    return MappingProxyType({})
+
+
+def _require_payload_tuple(
+    value: object,
+    *,
+    field_name: str,
+) -> tuple[ImmutablePayload, ...]:
+    _reject_framework_value(value, field_name=field_name)
+    if type(value) is not tuple:
+        raise TypeError(f"{field_name} must be a tuple")
+    items: list[ImmutablePayload] = []
+    for index, item in enumerate(cast(tuple[object, ...], value)):
+        items.append(_require_immutable_mapping(item, field_name=f"{field_name}[{index}]"))
+    return tuple(items)
+
+
 class PreparedLifecycleState(StrEnum):
     PREPARED = "prepared"
     EXECUTING = "executing"
@@ -164,14 +186,6 @@ class CancelReason(StrEnum):
     EXPLICIT_CANCEL = "explicit_cancel"
     DEADLINE = "deadline"
     TRANSPORT_ABORTED = "transport_aborted"
-
-
-# Explicit aliases keep the contract vocabulary discoverable for transport and
-# host implementations without creating duplicate enums.
-RuntimeInvocationState = InvocationState
-InvocationCancelReason = CancelReason
-RuntimeCancelReason = CancelReason
-SignalResult = SignalEmitResult
 
 
 @dataclass(frozen=True, slots=True, init=False, repr=False)
@@ -301,6 +315,52 @@ MISSING_EDITED_ARGS = EditedArgs.missing()
 
 
 @dataclass(frozen=True, slots=True)
+class PendingActionPayload:
+    """Immutable projection of the complete confirmation-card payload."""
+
+    tool_name: str
+    operation_id: str
+    human: str
+    args: ImmutablePayload = field(repr=False)
+    confirmation_token: str = field(repr=False)
+    editable_fields: tuple[ImmutablePayload, ...] = ()
+    details: ImmutablePayload = field(default_factory=_empty_json_object, repr=False)
+
+    def __post_init__(self) -> None:
+        _require_text(self.tool_name, field_name="tool_name", allow_empty=False)
+        _require_text(self.operation_id, field_name="operation_id", allow_empty=False)
+        _require_text(self.human, field_name="human")
+        object.__setattr__(
+            self,
+            "args",
+            _require_immutable_mapping(self.args, field_name="args"),
+        )
+        _require_text(self.confirmation_token, field_name="confirmation_token", allow_empty=False)
+        object.__setattr__(
+            self,
+            "editable_fields",
+            _require_payload_tuple(self.editable_fields, field_name="editable_fields"),
+        )
+        object.__setattr__(
+            self,
+            "details",
+            _require_immutable_mapping(self.details, field_name="details"),
+        )
+
+    def as_mapping(self) -> ImmutablePayload:
+        payload: dict[str, JsonValue] = {
+            "tool_name": self.tool_name,
+            "operation_id": self.operation_id,
+            "human": self.human,
+            "args": self.args,
+            "confirmation_token": self.confirmation_token,
+            "editable_fields": self.editable_fields,
+        }
+        payload.update(self.details)
+        return _freeze_mapping(payload)
+
+
+@dataclass(frozen=True, slots=True)
 class StartTurnRequest:
     message: str
     conversation_id: int | None = None
@@ -339,7 +399,7 @@ class StartTurnRequest:
 class ConfirmationRequest:
     conversation_id: int
     approved: bool
-    confirmation_token: str = ""
+    confirmation_token: str = field(default="", repr=False)
     operation_id: str | None = None
     edited_args: EditedArgs = field(default_factory=EditedArgs.missing)
     rejection_feedback: str = ""
@@ -369,7 +429,7 @@ class ConfirmationRequest:
 class RuntimeTransportContext:
     mode: Literal["sync", "stream"]
     transport_run_id: UUID | None = None
-    stream_version: str | None = None
+    stream_version: StreamVersion | None = None
 
     def __post_init__(self) -> None:
         _reject_framework_value(self.mode, field_name="mode")
@@ -377,8 +437,10 @@ class RuntimeTransportContext:
             raise ValueError("mode must be sync or stream")
         if self.transport_run_id is not None and not isinstance(self.transport_run_id, UUID):
             raise TypeError("transport_run_id must be a UUID")
-        if self.stream_version is not None:
-            _require_text(self.stream_version, field_name="stream_version", allow_empty=False)
+        if self.mode == "sync" and self.stream_version is not None:
+            raise ValueError("sync transport cannot carry a stream version")
+        if self.mode == "stream" and self.stream_version != "pilot-sse-v1":
+            raise ValueError("stream transport requires pilot-sse-v1")
 
 
 @dataclass(frozen=True, slots=True)
@@ -406,6 +468,8 @@ class MessageOutcome:
     message: str
     conversation_id: int | None = None
     write_status: str | None = None
+    write_error: str | None = None
+    undo: ImmutablePayload | None = None
     operation_id: str | None = None
     replayed: bool = False
     persisted: bool = True
@@ -416,6 +480,14 @@ class MessageOutcome:
             _require_int(self.conversation_id, field_name="conversation_id")
         if self.write_status is not None:
             _require_text(self.write_status, field_name="write_status")
+        if self.write_error is not None:
+            _require_text(self.write_error, field_name="write_error")
+        if self.undo is not None:
+            object.__setattr__(
+                self,
+                "undo",
+                _require_immutable_mapping(self.undo, field_name="undo"),
+            )
         if self.operation_id is not None:
             _require_text(self.operation_id, field_name="operation_id")
         _require_bool(self.replayed, field_name="replayed")
@@ -424,11 +496,11 @@ class MessageOutcome:
 
 @dataclass(frozen=True, slots=True)
 class ConfirmationRequiredOutcome:
-    confirmation_token: str
+    confirmation_token: str = field(repr=False)
     conversation_id: int | None = None
     operation_id: str | None = None
     message: str = ""
-    pending_action: tuple[tuple[str, str], ...] = ()
+    pending_action: PendingActionPayload | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.confirmation_token, field_name="confirmation_token", allow_empty=False)
@@ -437,25 +509,23 @@ class ConfirmationRequiredOutcome:
         if self.operation_id is not None:
             _require_text(self.operation_id, field_name="operation_id")
         _require_text(self.message, field_name="message")
-        if type(self.pending_action) is not tuple:
-            raise TypeError("pending_action must be a tuple")
-        for item in self.pending_action:
-            if type(item) is not tuple or len(item) != 2:
-                raise TypeError("pending_action entries must be key/value tuples")
-            _require_text(item[0], field_name="pending_action key")
-            _require_text(item[1], field_name="pending_action value")
+        if self.pending_action is not None and not isinstance(
+            self.pending_action, PendingActionPayload
+        ):
+            raise TypeError("pending_action must be a PendingActionPayload")
 
 
 @dataclass(frozen=True, slots=True)
 class RuntimeFailureOutcome:
-    code: str
+    code: RuntimeFailureCode
     message: str = ""
     status_code: int = 500
     retryable: bool = False
     degraded: bool = False
 
     def __post_init__(self) -> None:
-        _require_text(self.code, field_name="code", allow_empty=False)
+        if not isinstance(self.code, RuntimeFailureCode):
+            raise TypeError("code must be a RuntimeFailureCode")
         _require_text(self.message, field_name="message")
         _require_int(self.status_code, field_name="status_code")
         _require_bool(self.retryable, field_name="retryable")
@@ -467,6 +537,7 @@ class OperationPendingOutcome:
     operation_id: str
     conversation_id: int | None = None
     message: str = ""
+    code: RuntimeFailureCode = RuntimeFailureCode.OPERATION_DELIVERY_PENDING
     retry_after_seconds: int | None = None
 
     def __post_init__(self) -> None:
@@ -474,6 +545,8 @@ class OperationPendingOutcome:
         if self.conversation_id is not None:
             _require_int(self.conversation_id, field_name="conversation_id")
         _require_text(self.message, field_name="message")
+        if not isinstance(self.code, RuntimeFailureCode):
+            raise TypeError("code must be a RuntimeFailureCode")
         if self.retry_after_seconds is not None:
             _require_int(self.retry_after_seconds, field_name="retry_after_seconds")
             if self.retry_after_seconds < 0:
@@ -486,6 +559,10 @@ class OperationReplayOutcome:
     conversation_id: int | None = None
     message: str = ""
     status: str = "committed"
+    write_status: str | None = None
+    write_error: str | None = None
+    undo: ImmutablePayload | None = None
+    replayed: bool = True
     persisted: bool = True
 
     def __post_init__(self) -> None:
@@ -494,6 +571,17 @@ class OperationReplayOutcome:
             _require_int(self.conversation_id, field_name="conversation_id")
         _require_text(self.message, field_name="message")
         _require_text(self.status, field_name="status", allow_empty=False)
+        if self.write_status is not None:
+            _require_text(self.write_status, field_name="write_status")
+        if self.write_error is not None:
+            _require_text(self.write_error, field_name="write_error")
+        if self.undo is not None:
+            object.__setattr__(
+                self,
+                "undo",
+                _require_immutable_mapping(self.undo, field_name="undo"),
+            )
+        _require_bool(self.replayed, field_name="replayed")
         _require_bool(self.persisted, field_name="persisted")
 
 
@@ -528,21 +616,12 @@ class PreparedStreamExecution:
         execution_mode: StreamExecutionMode,
         opaque_state: object = _MISSING_OPAQUE_STATE,
         *,
-        prepared_state: object = _MISSING_OPAQUE_STATE,
         lifecycle: PreparedLifecycle | None = None,
-        state: PreparedLifecycleState | None = None,
         lifecycle_state: PreparedLifecycleState | None = None,
         completion_reason: CompletionReason | None = None,
     ) -> None:
-        if opaque_state is not _MISSING_OPAQUE_STATE and prepared_state is not _MISSING_OPAQUE_STATE:
-            raise TypeError("pass only opaque_state or prepared_state")
         if opaque_state is _MISSING_OPAQUE_STATE:
-            if prepared_state is _MISSING_OPAQUE_STATE:
-                raise TypeError("opaque_state is required")
-            opaque_state = prepared_state
-        if state is not None and lifecycle_state is not None and state is not lifecycle_state:
-            raise ValueError("state does not match lifecycle_state")
-        lifecycle_state = state or lifecycle_state
+            raise TypeError("opaque_state is required")
         if lifecycle is None:
             lifecycle = PreparedLifecycle(
                 lifecycle_state or PreparedLifecycleState.PREPARED,
@@ -573,6 +652,17 @@ class PreparedStreamExecution:
             raise TypeError("execution_mode must be a StreamExecutionMode")
         if not isinstance(self._lifecycle, PreparedLifecycle):
             raise TypeError("lifecycle must be a PreparedLifecycle")
+        allowed_modes: dict[PreparationKind, frozenset[StreamExecutionMode]] = {
+            PreparationKind.MODEL: frozenset({StreamExecutionMode.AGENT_HOST}),
+            PreparationKind.DETERMINISTIC_INITIAL: frozenset({StreamExecutionMode.DIRECT}),
+            PreparationKind.DETERMINISTIC_CONFIRMATION: frozenset({StreamExecutionMode.DIRECT}),
+            PreparationKind.CONFIRMATION: frozenset(
+                {StreamExecutionMode.DIRECT, StreamExecutionMode.AGENT_HOST}
+            ),
+            PreparationKind.REPLAY: frozenset({StreamExecutionMode.DIRECT}),
+        }
+        if self.execution_mode not in allowed_modes[self.preparation_kind]:
+            raise ValueError("preparation kind and execution mode are incompatible")
 
     @property
     def lifecycle(self) -> PreparedLifecycle:
@@ -583,16 +673,8 @@ class PreparedStreamExecution:
         return self._lifecycle.state
 
     @property
-    def state(self) -> PreparedLifecycleState:
-        return self._lifecycle.state
-
-    @property
     def completion_reason(self) -> CompletionReason | None:
         return self._lifecycle.completion_reason
-
-    @property
-    def prepared_state(self) -> object:
-        return self.opaque_state
 
     def begin(self) -> bool:
         return self._lifecycle.begin()
@@ -615,13 +697,14 @@ class FirstModelCompletedSignal:
 
 @dataclass(frozen=True, slots=True)
 class MetaEvent:
-    stream_version: str = "pilot-sse-v1"
+    stream_version: StreamVersion = "pilot-sse-v1"
     supports_delta: bool = False
     supports_tool_events: bool = True
     supports_confirmation: bool = True
 
     def __post_init__(self) -> None:
-        _require_text(self.stream_version, field_name="stream_version", allow_empty=False)
+        if self.stream_version != "pilot-sse-v1":
+            raise ValueError("stream_version must be pilot-sse-v1")
         _require_bool(self.supports_delta, field_name="supports_delta")
         _require_bool(self.supports_tool_events, field_name="supports_tool_events")
         _require_bool(self.supports_confirmation, field_name="supports_confirmation")
@@ -662,7 +745,7 @@ class ToolCallEvent:
     kind: Literal["read", "write"] = "read"
     confirm_mode: str = "none"
     summary: str = ""
-    args_summary: tuple[tuple[str, str], ...] = ()
+    args_summary: JsonValue = field(default_factory=_empty_json_object, repr=False)
 
     def __post_init__(self) -> None:
         _require_text(self.tool_call_id, field_name="tool_call_id", allow_empty=False)
@@ -672,19 +755,24 @@ class ToolCallEvent:
             raise ValueError("kind must be read or write")
         _require_text(self.confirm_mode, field_name="confirm_mode", allow_empty=False)
         _require_text(self.summary, field_name="summary")
-        if type(self.args_summary) is not tuple:
-            raise TypeError("args_summary must be a tuple")
-        for item in self.args_summary:
-            if type(item) is not tuple or len(item) != 2:
-                raise TypeError("args_summary entries must be key/value tuples")
-            _require_text(item[0], field_name="args_summary key")
-            _require_text(item[1], field_name="args_summary value")
+        _validate_json_value(self.args_summary, field_name="args_summary")
+        if isinstance(self.args_summary, Mapping):
+            object.__setattr__(
+                self,
+                "args_summary",
+                _require_immutable_mapping(self.args_summary, field_name="args_summary"),
+            )
 
 
 @dataclass(frozen=True, slots=True)
 class ToolResultEvent:
     tool_call_id: str
-    status: str = "completed"
+    tool_name: str
+    status: str
+    summary: str
+    evidence: tuple[ImmutablePayload, ...] = ()
+    affected_resources: tuple[ImmutablePayload, ...] = ()
+    changed_entities: tuple[ImmutablePayload, ...] = ()
     operation_id: str | None = None
     message: str = ""
     visible_result: str = ""
@@ -692,7 +780,24 @@ class ToolResultEvent:
 
     def __post_init__(self) -> None:
         _require_text(self.tool_call_id, field_name="tool_call_id", allow_empty=False)
+        _require_text(self.tool_name, field_name="tool_name", allow_empty=False)
         _require_text(self.status, field_name="status", allow_empty=False)
+        _require_text(self.summary, field_name="summary")
+        object.__setattr__(
+            self,
+            "evidence",
+            _require_payload_tuple(self.evidence, field_name="evidence"),
+        )
+        object.__setattr__(
+            self,
+            "affected_resources",
+            _require_payload_tuple(self.affected_resources, field_name="affected_resources"),
+        )
+        object.__setattr__(
+            self,
+            "changed_entities",
+            _require_payload_tuple(self.changed_entities, field_name="changed_entities"),
+        )
         if self.operation_id is not None:
             _require_text(self.operation_id, field_name="operation_id")
         _require_text(self.message, field_name="message")
@@ -703,21 +808,18 @@ class ToolResultEvent:
 
 @dataclass(frozen=True, slots=True)
 class ConfirmationRequiredEvent:
-    confirmation_token: str
+    confirmation_token: str = field(repr=False)
     operation_id: str | None = None
-    pending_action: tuple[tuple[str, str], ...] = ()
+    pending_action: PendingActionPayload | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.confirmation_token, field_name="confirmation_token", allow_empty=False)
         if self.operation_id is not None:
             _require_text(self.operation_id, field_name="operation_id")
-        if type(self.pending_action) is not tuple:
-            raise TypeError("pending_action must be a tuple")
-        for item in self.pending_action:
-            if type(item) is not tuple or len(item) != 2:
-                raise TypeError("pending_action entries must be key/value tuples")
-            _require_text(item[0], field_name="pending_action key")
-            _require_text(item[1], field_name="pending_action value")
+        if self.pending_action is not None and not isinstance(
+            self.pending_action, PendingActionPayload
+        ):
+            raise TypeError("pending_action must be a PendingActionPayload")
 
 
 @dataclass(frozen=True, slots=True)
@@ -730,13 +832,14 @@ class AssistantMessageEvent:
 
 @dataclass(frozen=True, slots=True)
 class ErrorEvent:
-    code: str
+    code: RuntimeFailureCode
     message: str
     retryable: bool = False
     degraded: bool = False
 
     def __post_init__(self) -> None:
-        _require_text(self.code, field_name="code", allow_empty=False)
+        if not isinstance(self.code, RuntimeFailureCode):
+            raise TypeError("code must be a RuntimeFailureCode")
         _require_text(self.message, field_name="message")
         _require_bool(self.retryable, field_name="retryable")
         _require_bool(self.degraded, field_name="degraded")
@@ -786,7 +889,8 @@ class RuntimeSignalSink(Protocol):
     def try_emit(self, signal: FirstModelCompletedSignal) -> SignalEmitResult: ...
 
 
-AgentThunk = Callable[[], object]
+ResultT = TypeVar("ResultT")
+AgentThunk: TypeAlias = Callable[[], ResultT]
 
 
 @runtime_checkable
@@ -807,8 +911,12 @@ class RuntimeInvocationControl(Protocol):
 
 
 @runtime_checkable
-class AgentExecutionHost(Protocol):
-    def run(self, thunk: AgentThunk, invocation_control: RuntimeInvocationControl) -> object: ...
+class AgentExecutionHost(Protocol[ResultT]):
+    def run(
+        self,
+        thunk: AgentThunk[ResultT],
+        invocation_control: RuntimeInvocationControl,
+    ) -> ResultT: ...
 
 
 __all__ = [
@@ -828,7 +936,6 @@ __all__ = [
     "FirstModelCompletedSignal",
     "ImmediateHttpOutcome",
     "ImmutablePayload",
-    "InvocationCancelReason",
     "InvocationState",
     "JsonScalar",
     "JsonValue",
@@ -837,24 +944,24 @@ __all__ = [
     "MetaEvent",
     "OperationPendingOutcome",
     "OperationReplayOutcome",
+    "PendingActionPayload",
     "PilotActionDescriptor",
     "PreparationKind",
     "PreparedLifecycle",
     "PreparedLifecycleState",
     "PreparedStreamExecution",
-    "RuntimeCancelReason",
     "RuntimeEvent",
     "RuntimeEventSink",
     "RuntimeFailureOutcome",
+    "RuntimeFailureCode",
     "RuntimeInvocationControl",
-    "RuntimeInvocationState",
     "RuntimeOutcome",
     "RuntimeSignalSink",
     "RuntimeTransportContext",
     "SignalEmitResult",
-    "SignalResult",
     "StartTurnRequest",
     "StatusEvent",
+    "StreamVersion",
     "StreamExecutionMode",
     "ToolCallEvent",
     "ToolResultEvent",

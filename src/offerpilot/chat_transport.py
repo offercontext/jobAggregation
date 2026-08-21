@@ -12,9 +12,9 @@ import inspect
 import json
 from collections.abc import AsyncIterable, Awaitable, Callable, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from threading import Lock
+from math import isfinite
 from queue import Empty, Queue
-from threading import Event
+from threading import Event, Lock
 from time import perf_counter
 from typing import Any, Final, Generic, Iterator, NoReturn, TypeAlias, TypeVar, cast
 
@@ -205,13 +205,15 @@ def _invoke_sse_thunk(
 
     Runtime implementations may use a zero-argument closure, a typed event
     sink, or the legacy two-callback shape while the transport migration is in
-    progress.  Signature inspection keeps a thunk's own ``TypeError`` intact.
+    progress.  Required positional parameters select the one supported shape;
+    optional parameters are left at their defaults.  Signature inspection
+    keeps a thunk's own ``TypeError`` intact and avoids guessing.
     """
 
     try:
         signature = inspect.signature(thunk)
     except (TypeError, ValueError):
-        return thunk(sink, cancel_check)
+        raise TypeError("SSE thunk signature is unsupported")
 
     positional = [
         parameter
@@ -219,31 +221,34 @@ def _invoke_sse_thunk(
         if parameter.kind
         in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
     ]
-    accepts_varargs = any(
+    has_varargs = any(
         parameter.kind is inspect.Parameter.VAR_POSITIONAL
         for parameter in signature.parameters.values()
     )
-    if accepts_varargs or len(positional) >= 2:
-        return thunk(sink, cancel_check)
-    if positional:
-        return thunk(sink)
-
-    keyword_only = {
-        parameter.name: parameter
+    has_varkw = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
         for parameter in signature.parameters.values()
-        if parameter.kind is inspect.Parameter.KEYWORD_ONLY
-    }
-    if keyword_only:
-        kwargs: dict[str, object] = {}
-        for name in keyword_only:
-            lowered = name.lower()
-            if "cancel" in lowered:
-                kwargs[name] = cancel_check
-            elif "sink" in lowered or "event" in lowered:
-                kwargs[name] = sink
-        if kwargs:
-            return thunk(**kwargs)
-    return thunk()
+    )
+    required_keyword_only = any(
+        parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        and parameter.default is inspect.Parameter.empty
+        for parameter in signature.parameters.values()
+    )
+    if has_varargs or has_varkw or required_keyword_only:
+        raise TypeError("SSE thunk signature is unsupported")
+
+    required_positional = [
+        parameter
+        for parameter in positional
+        if parameter.default is inspect.Parameter.empty
+    ]
+    if len(required_positional) == 0:
+        return thunk()
+    if len(required_positional) == 1:
+        return thunk(sink)
+    if len(required_positional) == 2:
+        return thunk(sink, cancel_check)
+    raise TypeError("SSE thunk signature is unsupported")
 
 
 class _SseInvocationIterator(Generic[_ResultT], Iterator[RuntimeEvent]):
@@ -258,7 +263,6 @@ class _SseInvocationIterator(Generic[_ResultT], Iterator[RuntimeEvent]):
         "_future",
         "_sentinel",
         "_deadline",
-        "_completion_at",
         "_closed",
         "_result",
         "_result_set",
@@ -279,7 +283,6 @@ class _SseInvocationIterator(Generic[_ResultT], Iterator[RuntimeEvent]):
         self.cancel_event = Event()
         self._control = control
         self._sentinel = object()
-        self._completion_at: list[float | None] = [None]
         self._closed = False
         self._result: _ResultT | None = None
         self._result_set = False
@@ -295,15 +298,11 @@ class _SseInvocationIterator(Generic[_ResultT], Iterator[RuntimeEvent]):
         self._deadline = perf_counter() + timeout_seconds
 
         def on_done(_future: Future[_ResultT]) -> None:
-            self._completion_at[0] = perf_counter()
             self.event_queue.put_nowait(self._sentinel)
 
         self._future.add_done_callback(on_done)
 
     def _deadline_expired(self) -> bool:
-        completed_at = self._completion_at[0]
-        if completed_at is not None:
-            return completed_at > self._deadline
         return perf_counter() >= self._deadline
 
     def _finish(self) -> None:
@@ -341,8 +340,6 @@ class _SseInvocationIterator(Generic[_ResultT], Iterator[RuntimeEvent]):
                 if not self._control.is_active():
                     self._future.cancel()
                     _raise_control_terminal(self._control)
-                if self._deadline_expired():
-                    self._timeout()
                 try:
                     item = self.event_queue.get(timeout=self.poll_seconds)
                 except Empty as exc:
@@ -415,9 +412,10 @@ class SseAgentExecutionHost(Generic[_ResultT]):
         self.timeout_seconds = _host_timeout_seconds(timeout_seconds)
         if isinstance(poll_seconds, bool) or not isinstance(poll_seconds, (int, float)):
             raise TypeError("poll_seconds must be a number")
-        if poll_seconds <= 0:
-            raise ValueError("poll_seconds must be positive")
-        self.poll_seconds = float(poll_seconds)
+        poll = float(poll_seconds)
+        if not isfinite(poll) or poll <= 0:
+            raise ValueError("poll_seconds must be a finite positive number")
+        self.poll_seconds = poll
         self._executor_factory = ThreadPoolExecutor if executor_factory is None else executor_factory
         self._started = False
         self._lock = Lock()

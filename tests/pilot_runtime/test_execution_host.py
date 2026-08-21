@@ -4,6 +4,8 @@ import threading
 import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from queue import Empty as QueueEmpty
+from queue import Queue as StdQueue
 
 import pytest
 
@@ -219,6 +221,125 @@ def test_sse_worker_exception_keeps_baseline_shutdown_flag_false() -> None:
         next(stream)
 
     assert shutdown_flags == [False]
+
+
+def test_sse_queued_events_crossing_deadline_follow_baseline_queue_order(monkeypatch) -> None:
+    import offerpilot.chat_transport as transport
+
+    class ScriptedQueue:
+        maxsize = 0
+
+        def __init__(self) -> None:
+            self._queue: StdQueue[object] = StdQueue()
+            self.get_calls = 0
+
+        def put_nowait(self, item: object) -> None:
+            self._queue.put_nowait(item)
+
+        def get(self, timeout: float) -> object:
+            del timeout
+            self.get_calls += 1
+            try:
+                return self._queue.get_nowait()
+            except QueueEmpty:
+                raise QueueEmpty
+
+    now = [0.0]
+    monkeypatch.setattr(transport, "Queue", ScriptedQueue)
+    monkeypatch.setattr(transport, "perf_counter", lambda: now[0])
+    control = InMemoryRuntimeInvocationControl()
+    before_deadline = AssistantDeltaEvent(delta="before")
+    after_deadline = AssistantDeltaEvent(delta="after")
+    after_deadline_allowed = threading.Event()
+    after_deadline_queued = threading.Event()
+
+    def thunk(sink: RuntimeEventSink) -> str:
+        sink.emit(before_deadline)
+        after_deadline_allowed.wait(1)
+        sink.emit(after_deadline)
+        after_deadline_queued.set()
+        return "done"
+
+    stream = SseAgentExecutionHost[str](timeout_seconds=0.5).run(thunk, control)
+    now[0] = 1.0
+    after_deadline_allowed.set()
+    assert after_deadline_queued.wait(0.2)
+
+    assert next(stream) is before_deadline
+    assert next(stream) is after_deadline
+    with pytest.raises(StopIteration) as stopped:
+        next(stream)
+    assert stopped.value.value == "done"
+    assert stream.event_queue.get_calls == 3
+
+
+def test_sse_empty_queue_after_deadline_times_out(monkeypatch) -> None:
+    import offerpilot.chat_transport as transport
+
+    class ScriptedQueue:
+        maxsize = 0
+
+        def __init__(self) -> None:
+            self.get_calls = 0
+
+        def put_nowait(self, _item: object) -> None:
+            return None
+
+        def get(self, timeout: float) -> object:
+            del timeout
+            self.get_calls += 1
+            raise QueueEmpty
+
+    now = [0.0]
+    monkeypatch.setattr(transport, "Queue", ScriptedQueue)
+    monkeypatch.setattr(transport, "perf_counter", lambda: now[0])
+    control = InMemoryRuntimeInvocationControl()
+    release = threading.Event()
+
+    def thunk(_sink: RuntimeEventSink) -> str:
+        release.wait(1)
+        return "late"
+
+    stream = SseAgentExecutionHost[str](timeout_seconds=0.5).run(thunk, control)
+    now[0] = 1.0
+    with pytest.raises(RuntimeAgentTimedOut):
+        next(stream)
+    assert stream.event_queue.get_calls == 1
+    release.set()
+
+
+def test_sse_thunk_with_only_optional_positional_parameters_is_called_without_sink() -> None:
+    control = InMemoryRuntimeInvocationControl()
+
+    def thunk(value: object = 42) -> object:
+        return value
+
+    stream = SseAgentExecutionHost[object](timeout_seconds=0.2).run(thunk, control)
+    _events, result = _collect(stream)
+
+    assert result == 42
+
+
+@pytest.mark.parametrize(
+    "thunk",
+    [
+        lambda *args: "ambiguous",
+        lambda **kwargs: "ambiguous",
+        lambda first, second, third: "unsupported",
+    ],
+)
+def test_sse_host_rejects_ambiguous_or_unsupported_thunk_shapes(thunk) -> None:
+    control = InMemoryRuntimeInvocationControl()
+    stream = SseAgentExecutionHost[str](timeout_seconds=0.2).run(thunk, control)
+
+    with pytest.raises(TypeError, match="SSE thunk signature is unsupported"):
+        next(stream)
+
+
+@pytest.mark.parametrize("poll_seconds", [0.0, -0.1, float("nan"), float("inf"), float("-inf")])
+def test_sse_host_rejects_non_finite_or_non_positive_poll_seconds(poll_seconds: float) -> None:
+    with pytest.raises(ValueError):
+        SseAgentExecutionHost[str](poll_seconds=poll_seconds)
 
 
 def test_sse_host_client_cancel_is_control_flow_and_does_not_start_again() -> None:

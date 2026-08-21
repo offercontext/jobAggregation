@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from dataclasses import FrozenInstanceError
 from pathlib import Path
+from types import MappingProxyType
+from typing import Any, get_type_hints
 from uuid import uuid4
 
 import pytest
@@ -23,6 +26,10 @@ from offerpilot.repositories.chat import ChatRepository
 from offerpilot.pilot_runtime.persistence import (
     ChatPersistenceCoordinator,
     DeliveryOutcome,
+    PendingActionView,
+    PendingClarificationView,
+    PersistedMessageView,
+    PersistedToolCallView,
     PersistenceStatus,
 )
 
@@ -909,6 +916,125 @@ def test_repository_is_private_to_persistence_coordinator(tmp_path: Path) -> Non
 
     assert not hasattr(coordinator, "chat")
     assert hasattr(coordinator, "_chat")
+
+
+def test_public_message_reads_are_frozen_detached_snapshots(tmp_path: Path) -> None:
+    coordinator, conversation_id = make_persistence_coordinator(tmp_path)
+    tool_args = {
+        "id": 7,
+        "nested": {"items": [1, {"safe": True}]},
+    }
+    provider_blocks = {
+        "reasoning_content": {"summary": "保留", "items": ["a", "b"]},
+        "request_id": "provider-request-secret",
+        "canary": "provider-canary-secret",
+    }
+    result = coordinator.persist_message(
+        conversation_id,
+        "assistant",
+        "将调用 `update_application_status`。",
+        tool_calls=json.dumps(
+            [{"id": "call-1", "name": "update_application_status", "args": tool_args}],
+            ensure_ascii=False,
+        ),
+        provider_blocks=json.dumps(provider_blocks, ensure_ascii=False),
+    )
+
+    assert result.persisted is True
+    views = coordinator.list_messages(conversation_id)
+
+    assert isinstance(views, tuple)
+    assert len(views) == 1
+    view = views[0]
+    assert isinstance(view, PersistedMessageView)
+    assert isinstance(view.tool_calls, tuple)
+    assert isinstance(view.tool_calls[0], PersistedToolCallView)
+    assert isinstance(view.tool_calls[0].args, MappingProxyType)
+    assert view.tool_calls[0].args["nested"]["items"] == (1, {"safe": True})
+    assert isinstance(view.provider_blocks, MappingProxyType)
+    assert view.provider_blocks["reasoning_content"]["items"] == ("a", "b")
+    assert "request_id" not in view.provider_blocks
+    assert "canary" not in view.provider_blocks
+    assert "update_application_status" not in view.content
+    assert view.content == "将调用 更新投递状态。"
+
+    with pytest.raises(FrozenInstanceError):
+        view.content = "changed"
+    with pytest.raises(TypeError):
+        view.provider_blocks["new"] = "value"
+    with pytest.raises(TypeError):
+        view.tool_calls[0].args["nested"]["new"] = "value"
+
+    backing = coordinator._chat.list_messages(conversation_id)[0]
+    backing.content = "mutated backing content"
+    backing.provider_blocks = json.dumps(
+        {"reasoning_content": {"items": ["mutated"]}}, ensure_ascii=False
+    )
+    backing.tool_calls = json.dumps(
+        [{"id": "call-1", "name": "other", "args": {"changed": True}}],
+        ensure_ascii=False,
+    )
+    assert view.content == "将调用 更新投递状态。"
+    assert view.provider_blocks["reasoning_content"]["items"] == ("a", "b")
+    assert view.tool_calls[0].name == "update_application_status"
+
+
+def test_public_pending_reads_are_frozen_snapshots(tmp_path: Path) -> None:
+    coordinator, conversation_id = make_persistence_coordinator(tmp_path)
+    pending = PendingAction(
+        "call-1", "update_application_status", '{"id": 7}', "更新状态"
+    )
+    assert coordinator._chat.set_pending_action(conversation_id, pending) is True
+    assert coordinator._chat.set_pending_clarification(
+        conversation_id, pending, "还缺什么？"
+    ) is None
+
+    pending_view = coordinator.get_pending_action(conversation_id)
+    clarification_view = coordinator.get_pending_clarification(conversation_id)
+
+    assert isinstance(pending_view, PendingActionView)
+    assert pending_view is not pending
+    assert pending_view.args == '{"id": 7}'
+    with pytest.raises(FrozenInstanceError):
+        pending_view.tool_name = "changed"
+
+    assert isinstance(clarification_view, PendingClarificationView)
+    assert clarification_view.pending.tool_call_id == "call-1"
+    assert clarification_view.question == "还缺什么？"
+    with pytest.raises(FrozenInstanceError):
+        clarification_view.question = "changed"
+    with pytest.raises(FrozenInstanceError):
+        clarification_view.pending.args = "changed"
+
+    backing_pending = coordinator._chat.get_pending_action(conversation_id)
+    assert backing_pending is not None
+    backing_pending.tool_name = "mutated backing tool"
+    backing_clarification = coordinator._chat.get_pending_clarification(conversation_id)
+    assert backing_clarification is not None
+    backing_clarification[0].args = "mutated backing args"
+    assert pending_view.tool_name == "update_application_status"
+    assert clarification_view.pending.args == '{"id": 7}'
+
+
+def test_public_read_annotations_are_closed_snapshot_types() -> None:
+    for method_name in (
+        "list_messages",
+        "get_pending_action",
+        "get_pending_clarification",
+    ):
+        return_annotation = get_type_hints(
+            getattr(ChatPersistenceCoordinator, method_name)
+        )["return"]
+        rendered = str(return_annotation)
+        assert return_annotation is not Any
+        assert "Any" not in rendered
+        assert "offerpilot.ai.agent.PendingAction" not in rendered
+        assert "sqlalchemy" not in rendered
+
+    assert PersistedMessageView.__slots__
+    assert PersistedToolCallView.__slots__
+    assert PendingActionView.__slots__
+    assert PendingClarificationView.__slots__
 
 
 

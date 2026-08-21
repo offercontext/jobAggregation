@@ -13,12 +13,14 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, cast
 
 from offerpilot.ai.agent import PendingAction
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.ai.write_operations import DeliveryOwnership
 from offerpilot.repositories.chat import ChatRepository
+
+from .contracts import ImmutablePayload, freeze_json_mapping
 
 
 if TYPE_CHECKING:
@@ -94,6 +96,67 @@ class PersistenceResult:
     @property
     def duplicate(self) -> bool:
         return self.status is PersistenceStatus.DUPLICATE
+
+
+@dataclass(frozen=True, slots=True)
+class PersistedToolCallView:
+    """Immutable, detached projection of one persisted tool call."""
+
+    id: str
+    name: str
+    args: ImmutablePayload
+
+
+@dataclass(frozen=True, slots=True)
+class PersistedMessageView:
+    """Immutable, detached projection of one persisted Chat message."""
+
+    id: int
+    conversation_id: int
+    role: str
+    content: str
+    tool_calls: tuple[PersistedToolCallView, ...]
+    tool_call_id: str
+    provider_blocks: ImmutablePayload
+    operation_id: str | None
+    delivery_kind: str | None
+    delivery_ordinal: int | None
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class PendingActionView:
+    """Immutable, detached projection of a live pending action."""
+
+    tool_call_id: str
+    tool_name: str
+    args: str
+    human: str
+    operation_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class PendingClarificationView:
+    """Immutable, detached projection of a pending clarification."""
+
+    pending: PendingActionView
+    question: str
+
+
+class _ChatMessageRecord(Protocol):
+    """Structural shape consumed by the read-side snapshot converter."""
+
+    id: int
+    conversation_id: int
+    role: str
+    content: str
+    tool_calls: str
+    tool_call_id: str
+    provider_blocks: str
+    operation_id: str | None
+    delivery_kind: str | None
+    delivery_ordinal: int | None
+    created_at: datetime
 
 
 MessageInput: TypeAlias = Message | Mapping[str, object]
@@ -298,6 +361,101 @@ def _decode_provider_blocks(value: str) -> dict[str, object]:
     return decoded if isinstance(decoded, dict) else {}
 
 
+def _empty_immutable_payload() -> ImmutablePayload:
+    return freeze_json_mapping({})
+
+
+def _freeze_payload(value: Mapping[str, object]) -> ImmutablePayload:
+    """Deep-copy JSON-compatible values into the Runtime's closed payload."""
+
+    try:
+        return freeze_json_mapping(value)
+    except (TypeError, ValueError):
+        return _empty_immutable_payload()
+
+
+def _snapshot_tool_call_args(raw: object) -> ImmutablePayload:
+    if isinstance(raw, str):
+        decoded = _safe_tool_args(raw)
+        return _freeze_payload(decoded)
+    if isinstance(raw, Mapping):
+        return _freeze_payload(cast(Mapping[str, object], dict(raw)))
+    return _empty_immutable_payload()
+
+
+def _snapshot_tool_calls(value: str) -> tuple[PersistedToolCallView, ...]:
+    if not value:
+        return ()
+    try:
+        decoded: object = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return ()
+    if not isinstance(decoded, list):
+        return ()
+
+    calls: list[PersistedToolCallView] = []
+    for item in decoded:
+        if not isinstance(item, Mapping):
+            continue
+        raw_id = item.get("id", "")
+        raw_name = item.get("name", "")
+        calls.append(
+            PersistedToolCallView(
+                id=raw_id if isinstance(raw_id, str) else str(raw_id),
+                name=raw_name if isinstance(raw_name, str) else str(raw_name),
+                args=_snapshot_tool_call_args(item.get("args", {})),
+            )
+        )
+    return tuple(calls)
+
+
+def _snapshot_provider_blocks(value: str) -> ImmutablePayload:
+    decoded = _decode_provider_blocks(value)
+    reasoning_content = decoded.get("reasoning_content")
+    if reasoning_content is None:
+        return _empty_immutable_payload()
+    return _freeze_payload({"reasoning_content": reasoning_content})
+
+
+def _snapshot_message(message: _ChatMessageRecord) -> PersistedMessageView:
+    content = message.content
+    if message.role == "assistant":
+        content = _user_facing_assistant_content(content)
+    return PersistedMessageView(
+        id=message.id,
+        conversation_id=message.conversation_id,
+        role=message.role,
+        content=content,
+        tool_calls=_snapshot_tool_calls(message.tool_calls),
+        tool_call_id=message.tool_call_id,
+        provider_blocks=_snapshot_provider_blocks(message.provider_blocks),
+        operation_id=message.operation_id,
+        delivery_kind=message.delivery_kind,
+        delivery_ordinal=message.delivery_ordinal,
+        created_at=message.created_at,
+    )
+
+
+def _snapshot_pending_action(pending: PendingAction) -> PendingActionView:
+    return PendingActionView(
+        tool_call_id=pending.tool_call_id,
+        tool_name=pending.tool_name,
+        args=pending.args,
+        human=pending.human,
+        operation_id=pending.operation_id,
+    )
+
+
+def _snapshot_pending_clarification(
+    clarification: tuple[PendingAction, str],
+) -> PendingClarificationView:
+    pending, question = clarification
+    return PendingClarificationView(
+        pending=_snapshot_pending_action(pending),
+        question=question,
+    )
+
+
 class ChatPersistenceCoordinator:
     """Narrow Runtime-owned facade over :class:`ChatRepository` atoms.
 
@@ -310,22 +468,31 @@ class ChatPersistenceCoordinator:
     def __init__(self, chat: ChatRepository) -> None:
         self._chat = chat
 
-    def list_messages(self, conversation_id: int) -> list[Any]:
-        """Read persisted messages without exposing the repository handle."""
+    def list_messages(self, conversation_id: int) -> tuple[PersistedMessageView, ...]:
+        """Read detached immutable messages without exposing ORM rows."""
 
-        return self._chat.list_messages(conversation_id)
+        return tuple(
+            _snapshot_message(message)
+            for message in self._chat.list_messages(conversation_id)
+        )
 
-    def get_pending_action(self, conversation_id: int) -> PendingAction | None:
-        """Read the live pending action through the coordinator boundary."""
+    def get_pending_action(self, conversation_id: int) -> PendingActionView | None:
+        """Read a detached immutable pending action through the coordinator boundary."""
 
-        return self._chat.get_pending_action(conversation_id)
+        pending = self._chat.get_pending_action(conversation_id)
+        return None if pending is None else _snapshot_pending_action(pending)
 
     def get_pending_clarification(
         self, conversation_id: int
-    ) -> tuple[PendingAction, str] | None:
-        """Read the live clarification through the coordinator boundary."""
+    ) -> PendingClarificationView | None:
+        """Read a detached immutable clarification through the coordinator boundary."""
 
-        return self._chat.get_pending_clarification(conversation_id)
+        clarification = self._chat.get_pending_clarification(conversation_id)
+        return (
+            None
+            if clarification is None
+            else _snapshot_pending_clarification(clarification)
+        )
 
     def _failure_status(
         self,
@@ -803,6 +970,10 @@ __all__ = [
     "ChatPersistenceCoordinator",
     "DeliveryOutcome",
     "MessageInput",
+    "PendingActionView",
+    "PendingClarificationView",
+    "PersistedMessageView",
+    "PersistedToolCallView",
     "PersistenceResult",
     "PersistenceStatus",
 ]

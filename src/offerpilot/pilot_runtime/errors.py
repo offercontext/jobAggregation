@@ -58,6 +58,23 @@ class RuntimeTransportAborted(Exception):
         raise TypeError("runtime control exceptions cannot be serialized")
 
 
+@final
+class RuntimeAgentTimedOut(Exception):
+    """The Agent execution deadline elapsed before the invocation completed."""
+
+    def __init__(self, _reason: object | None = None) -> None:
+        super().__init__("runtime agent timed out")
+
+    def __repr__(self) -> str:
+        return "RuntimeAgentTimedOut()"
+
+    def __reduce_ex__(self, _protocol: object) -> NoReturn:
+        raise TypeError("runtime control exceptions cannot be serialized")
+
+    def __getstate__(self) -> NoReturn:
+        raise TypeError("runtime control exceptions cannot be serialized")
+
+
 class RuntimeFailureCode(StrEnum):
     """Closed failure codes emitted by the four Chat routes.
 
@@ -103,6 +120,7 @@ class RuntimeFailureCode(StrEnum):
 
 
 __all__ = [
+    "RuntimeAgentTimedOut",
     "RuntimeCancelled",
     "RuntimeFailureCode",
     "RuntimeTransportAborted",

@@ -53,6 +53,7 @@ from .contracts import (
     WriteStatus,
 )
 from .errors import (
+    RuntimeAgentTimedOut,
     RuntimeCancelled,
     RuntimeFailureCode,
     RuntimeTransportAborted,
@@ -92,6 +93,7 @@ __all__ = [
     "PreparedLifecycle",
     "PreparedLifecycleState",
     "PreparedStreamExecution",
+    "RuntimeAgentTimedOut",
     "RuntimeCancelled",
     "RuntimeEvent",
     "RuntimeEventSink",

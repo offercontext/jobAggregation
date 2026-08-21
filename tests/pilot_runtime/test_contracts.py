@@ -52,6 +52,27 @@ from offerpilot.pilot_runtime.contracts import (
 from offerpilot.pilot_runtime.errors import RuntimeCancelled, RuntimeTransportAborted
 
 
+def test_freeze_json_mapping_has_stable_contract_exports() -> None:
+    import offerpilot.pilot_runtime as pilot_runtime
+    from offerpilot.pilot_runtime import contracts
+
+    assert "freeze_json_mapping" in contracts.__all__
+    assert "freeze_json_mapping" in pilot_runtime.__all__
+    assert pilot_runtime.freeze_json_mapping is freeze_json_mapping
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_json_values_reject_nonfinite_floats(value: float) -> None:
+    with pytest.raises(ValueError):
+        freeze_json_mapping({"value": value})
+    with pytest.raises(ValueError):
+        ToolCallEvent(
+            tool_call_id="call-1",
+            tool_name="lookup",
+            args_summary=MappingProxyType({"value": value}),
+        )
+
+
 def test_prepared_lifecycle_accepts_only_reviewed_transitions() -> None:
     lifecycle = PreparedLifecycle()
     assert lifecycle.begin() is True

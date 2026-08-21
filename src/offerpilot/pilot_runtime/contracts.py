@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
+from math import isfinite
 from types import MappingProxyType
 from threading import Lock
 from typing import (
@@ -68,7 +69,11 @@ def _reject_framework_value(value: object, *, field_name: str) -> None:
 
 def _validate_json_value(value: object, *, field_name: str) -> None:
     _reject_framework_value(value, field_name=field_name)
-    if value is None or type(value) in {str, int, float, bool}:
+    if value is None or type(value) in {str, int, bool}:
+        return
+    if type(value) is float:
+        if not isfinite(value):
+            raise ValueError(f"{field_name} must be a finite number")
         return
     if isinstance(value, Mapping):
         # A mutable mapping would make a frozen DTO mutable by aliasing.
@@ -90,7 +95,11 @@ def _snapshot_json_value(value: object, *, field_name: str) -> JsonValue:
     """Copy route-owned JSON into the runtime's immutable JSON representation."""
 
     _reject_framework_value(value, field_name=field_name)
-    if value is None or type(value) in {str, int, float, bool}:
+    if value is None or type(value) in {str, int, bool}:
+        return cast(JsonValue, value)
+    if type(value) is float:
+        if not isfinite(value):
+            raise ValueError(f"{field_name} must be a finite number")
         return cast(JsonValue, value)
     if isinstance(value, Mapping):
         copied: dict[str, JsonValue] = {}
@@ -1075,6 +1084,7 @@ __all__ = [
     "EditedArgs",
     "ErrorEvent",
     "FirstModelCompletedSignal",
+    "freeze_json_mapping",
     "ImmediateHttpOutcome",
     "ImmutablePayload",
     "InvocationState",

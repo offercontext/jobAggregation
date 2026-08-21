@@ -635,6 +635,45 @@ class ChatPersistenceCoordinator:
             operation_id=pending.operation_id or None,
         )
 
+    def clear_pending_action(self, conversation_id: int) -> PersistenceResult:
+        """Clear a live Pending card through the existing repository atom."""
+
+        status = self._writable_status(conversation_id)
+        if status is not None:
+            return PersistenceResult(status)
+        self._chat.clear_pending_action(conversation_id)
+        if self._chat.get_pending_action(conversation_id) is None:
+            return PersistenceResult(PersistenceStatus.PERSISTED)
+        return PersistenceResult(self._failure_status(conversation_id))
+
+    def persist_clarification(
+        self,
+        conversation_id: int,
+        messages: Sequence[MessageInput],
+        pending: PendingAction,
+        question: str,
+    ) -> PersistenceResult:
+        """Persist a missing-target clarification using current Chat atoms."""
+
+        if not isinstance(question, str):
+            raise TypeError("question must be a string")
+        initial = self.persist_initial_messages(conversation_id, messages)
+        if not initial.persisted:
+            return initial
+        cleared = self.clear_pending_action(conversation_id)
+        if not cleared.persisted:
+            return cleared
+        clarification = self.set_pending_clarification(conversation_id, pending, question)
+        if not clarification.persisted:
+            return clarification
+        assistant = self.persist_assistant_message(conversation_id, question)
+        if not assistant.persisted:
+            return assistant
+        return PersistenceResult(
+            PersistenceStatus.PERSISTED,
+            message_count=initial.message_count + assistant.message_count,
+        )
+
     def set_pending_clarification(
         self,
         conversation_id: int,

@@ -42,6 +42,15 @@ JsonScalar: TypeAlias = str | int | float | bool | None
 JsonValue: TypeAlias = JsonScalar | tuple["JsonValue", ...] | Mapping[str, "JsonValue"]
 ImmutablePayload: TypeAlias = Mapping[str, JsonValue]
 StreamVersion: TypeAlias = Literal["pilot-sse-v1"]
+ConfirmMode: TypeAlias = Literal["none", "hitl", "approved", "rejected"]
+ToolResultStatus: TypeAlias = Literal["success", "error", "cancelled"]
+WriteStatus: TypeAlias = Literal["none", "success", "failed", "cancelled"]
+OperationStatus: TypeAlias = Literal["committed", "rejected", "failed"]
+
+_CONFIRM_MODES = frozenset({"none", "hitl", "approved", "rejected"})
+_TOOL_RESULT_STATUSES = frozenset({"success", "error", "cancelled"})
+_WRITE_STATUSES = frozenset({"none", "success", "failed", "cancelled"})
+_OPERATION_STATUSES = frozenset({"committed", "rejected", "failed"})
 
 
 def _reject_framework_value(value: object, *, field_name: str) -> None:
@@ -83,6 +92,18 @@ def _require_text(value: object, *, field_name: str, allow_empty: bool = True) -
     if not allow_empty and not value:
         raise ValueError(f"{field_name} must not be empty")
     return value
+
+
+def _require_choice(
+    value: object,
+    *,
+    field_name: str,
+    choices: frozenset[str],
+) -> str:
+    text = _require_text(value, field_name=field_name, allow_empty=False)
+    if text not in choices:
+        raise ValueError(f"{field_name} is not a supported value")
+    return text
 
 
 def _require_int(value: object, *, field_name: str) -> int:
@@ -282,6 +303,15 @@ class EditedArgs(Mapping[str, JsonValue]):
 
     _values: MappingProxyType[str, JsonValue] | None = field(repr=False)
 
+    def __post_init__(self) -> None:
+        if self._values is None:
+            return
+        object.__setattr__(
+            self,
+            "_values",
+            _require_immutable_mapping(self._values, field_name="edited_args"),
+        )
+
     @classmethod
     def missing(cls) -> EditedArgs:
         return cls(None)
@@ -341,11 +371,18 @@ class PendingActionPayload:
             "editable_fields",
             _require_payload_tuple(self.editable_fields, field_name="editable_fields"),
         )
-        object.__setattr__(
-            self,
-            "details",
-            _require_immutable_mapping(self.details, field_name="details"),
-        )
+        details = _require_immutable_mapping(self.details, field_name="details")
+        canonical_keys = {
+            "tool_name",
+            "operation_id",
+            "human",
+            "args",
+            "confirmation_token",
+            "editable_fields",
+        }
+        if canonical_keys.intersection(details):
+            raise ValueError("details cannot override canonical pending action fields")
+        object.__setattr__(self, "details", details)
 
     def as_mapping(self) -> ImmutablePayload:
         payload: dict[str, JsonValue] = {
@@ -413,7 +450,9 @@ class ConfirmationRequest:
         if self.operation_id is not None:
             _require_text(self.operation_id, field_name="operation_id")
         if isinstance(self.edited_args, EditedArgs):
-            pass
+            # Re-run the wrapper validation so a manually constructed wrapper
+            # cannot smuggle a mutable mapping through the request boundary.
+            self.edited_args.__post_init__()
         elif isinstance(self.edited_args, Mapping):
             # Mutable mappings must never be accepted, and immutable mappings are
             # normalized to the explicit missing/empty/non-empty wrapper.
@@ -467,7 +506,7 @@ class ImmediateHttpOutcome:
 class MessageOutcome:
     message: str
     conversation_id: int | None = None
-    write_status: str | None = None
+    write_status: WriteStatus | None = None
     write_error: str | None = None
     undo: ImmutablePayload | None = None
     operation_id: str | None = None
@@ -479,7 +518,11 @@ class MessageOutcome:
         if self.conversation_id is not None:
             _require_int(self.conversation_id, field_name="conversation_id")
         if self.write_status is not None:
-            _require_text(self.write_status, field_name="write_status")
+            _require_choice(
+                self.write_status,
+                field_name="write_status",
+                choices=_WRITE_STATUSES,
+            )
         if self.write_error is not None:
             _require_text(self.write_error, field_name="write_error")
         if self.undo is not None:
@@ -501,6 +544,7 @@ class ConfirmationRequiredOutcome:
     operation_id: str | None = None
     message: str = ""
     pending_action: PendingActionPayload | None = None
+    replayed: bool = False
 
     def __post_init__(self) -> None:
         _require_text(self.confirmation_token, field_name="confirmation_token", allow_empty=False)
@@ -513,6 +557,7 @@ class ConfirmationRequiredOutcome:
             self.pending_action, PendingActionPayload
         ):
             raise TypeError("pending_action must be a PendingActionPayload")
+        _require_bool(self.replayed, field_name="replayed")
 
 
 @dataclass(frozen=True, slots=True)
@@ -558,8 +603,8 @@ class OperationReplayOutcome:
     operation_id: str
     conversation_id: int | None = None
     message: str = ""
-    status: str = "committed"
-    write_status: str | None = None
+    status: OperationStatus = "committed"
+    write_status: WriteStatus | None = None
     write_error: str | None = None
     undo: ImmutablePayload | None = None
     replayed: bool = True
@@ -570,9 +615,17 @@ class OperationReplayOutcome:
         if self.conversation_id is not None:
             _require_int(self.conversation_id, field_name="conversation_id")
         _require_text(self.message, field_name="message")
-        _require_text(self.status, field_name="status", allow_empty=False)
+        _require_choice(
+            self.status,
+            field_name="status",
+            choices=_OPERATION_STATUSES,
+        )
         if self.write_status is not None:
-            _require_text(self.write_status, field_name="write_status")
+            _require_choice(
+                self.write_status,
+                field_name="write_status",
+                choices=_WRITE_STATUSES,
+            )
         if self.write_error is not None:
             _require_text(self.write_error, field_name="write_error")
         if self.undo is not None:
@@ -661,6 +714,8 @@ class PreparedStreamExecution:
             ),
             PreparationKind.REPLAY: frozenset({StreamExecutionMode.DIRECT}),
         }
+        # Ordinary reject is a direct, provider-free delivery projection;
+        # approve/modify continuation is the Agent-hosted path.
         if self.execution_mode not in allowed_modes[self.preparation_kind]:
             raise ValueError("preparation kind and execution mode are incompatible")
 
@@ -743,7 +798,7 @@ class ToolCallEvent:
     tool_name: str
     public_label: str = ""
     kind: Literal["read", "write"] = "read"
-    confirm_mode: str = "none"
+    confirm_mode: ConfirmMode = "none"
     summary: str = ""
     args_summary: JsonValue = field(default_factory=_empty_json_object, repr=False)
 
@@ -753,7 +808,11 @@ class ToolCallEvent:
         _require_text(self.public_label, field_name="public_label")
         if self.kind not in {"read", "write"}:
             raise ValueError("kind must be read or write")
-        _require_text(self.confirm_mode, field_name="confirm_mode", allow_empty=False)
+        _require_choice(
+            self.confirm_mode,
+            field_name="confirm_mode",
+            choices=_CONFIRM_MODES,
+        )
         _require_text(self.summary, field_name="summary")
         _validate_json_value(self.args_summary, field_name="args_summary")
         if isinstance(self.args_summary, Mapping):
@@ -768,7 +827,7 @@ class ToolCallEvent:
 class ToolResultEvent:
     tool_call_id: str
     tool_name: str
-    status: str
+    status: ToolResultStatus
     summary: str
     evidence: tuple[ImmutablePayload, ...] = ()
     affected_resources: tuple[ImmutablePayload, ...] = ()
@@ -776,12 +835,16 @@ class ToolResultEvent:
     operation_id: str | None = None
     message: str = ""
     visible_result: str = ""
-    write_status: str | None = None
+    write_status: WriteStatus | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.tool_call_id, field_name="tool_call_id", allow_empty=False)
         _require_text(self.tool_name, field_name="tool_name", allow_empty=False)
-        _require_text(self.status, field_name="status", allow_empty=False)
+        _require_choice(
+            self.status,
+            field_name="status",
+            choices=_TOOL_RESULT_STATUSES,
+        )
         _require_text(self.summary, field_name="summary")
         object.__setattr__(
             self,
@@ -803,7 +866,11 @@ class ToolResultEvent:
         _require_text(self.message, field_name="message")
         _require_text(self.visible_result, field_name="visible_result")
         if self.write_status is not None:
-            _require_text(self.write_status, field_name="write_status")
+            _require_choice(
+                self.write_status,
+                field_name="write_status",
+                choices=_WRITE_STATUSES,
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -928,6 +995,7 @@ __all__ = [
     "CancelReason",
     "CompletedEvent",
     "CompletionReason",
+    "ConfirmMode",
     "ConfirmationRequest",
     "ConfirmationRequiredEvent",
     "ConfirmationRequiredOutcome",
@@ -944,6 +1012,7 @@ __all__ = [
     "MetaEvent",
     "OperationPendingOutcome",
     "OperationReplayOutcome",
+    "OperationStatus",
     "PendingActionPayload",
     "PilotActionDescriptor",
     "PreparationKind",
@@ -963,7 +1032,9 @@ __all__ = [
     "StatusEvent",
     "StreamVersion",
     "StreamExecutionMode",
+    "ToolResultStatus",
     "ToolCallEvent",
     "ToolResultEvent",
     "UserMessageSavedEvent",
+    "WriteStatus",
 ]

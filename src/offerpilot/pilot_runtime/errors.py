@@ -59,7 +59,12 @@ class RuntimeTransportAborted(Exception):
 
 
 class RuntimeFailureCode(StrEnum):
-    """Closed failure codes emitted by the four Chat routes."""
+    """Closed failure codes emitted by the four Chat routes.
+
+    The set is deliberately limited to Chat's direct route responses plus the
+    deterministic legacy and write-ledger codes those routes can surface.
+    Endpoint-only JD/undo codes do not belong to this runtime contract.
+    """
 
     PENDING_CONFIRMATION_REQUIRED = "pending_confirmation_required"
     SOURCE_LOAD_FAILED = "source_load_failed"
@@ -83,21 +88,18 @@ class RuntimeFailureCode(StrEnum):
     OPERATION_RESULT_TOO_LARGE = "operation_result_too_large"
     OPERATION_BUSY = "operation_busy"
     OPERATION_FAILED = "operation_failed"
-    UNDO_CONFLICT = "undo_conflict"
     APPLICATION_JD_INVALID_REQUEST = "application_jd_invalid_request"
     APPLICATION_JD_STALE_CURRENT_VERSION = "application_jd_stale_current_version"
     APPLICATION_JD_IDEMPOTENCY_CONFLICT = "application_jd_idempotency_conflict"
     APPLICATION_JD_NOT_FOUND = "application_jd_not_found"
-    APPLICATION_JD_SOURCE_CONFLICT = "application_jd_source_conflict"
-    APPLICATION_JD_VERSION_REQUIRED = "application_jd_version_required"
     APPLICATION_ARCHIVE_IDEMPOTENCY_CONFLICT = "application_archive_idempotency_conflict"
     APPLICATION_ARCHIVE_SOURCE_CONFLICT = "application_archive_source_conflict"
     APPLICATION_ARCHIVE_INVALID_REQUEST = "application_archive_invalid_request"
     APPLICATION_OUTCOME_IDEMPOTENCY_CONFLICT = "application_outcome_idempotency_conflict"
     APPLICATION_OUTCOME_SOURCE_CONFLICT = "application_outcome_source_conflict"
     APPLICATION_OUTCOME_INVALID_REQUEST = "application_outcome_invalid_request"
-    JD_TEXT_REQUIRED = "jd_text_required"
-    JD_URL_NOT_SUPPORTED = "jd_url_not_supported"
+    APPLICATION_NOT_FOUND = "application_not_found"
+    RESUME_NOT_FOUND = "resume_not_found"
 
 
 __all__ = [

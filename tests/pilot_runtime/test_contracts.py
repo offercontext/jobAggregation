@@ -21,6 +21,7 @@ from offerpilot.pilot_runtime.contracts import (
     ConfirmationRequest,
     ConfirmationRequiredEvent,
     ConfirmationRequiredOutcome,
+    EditedArgs,
     ErrorEvent,
     FirstModelCompletedSignal,
     ImmediateHttpOutcome,
@@ -147,7 +148,7 @@ def test_all_contracts_are_closed_frozen_slot_dataclasses() -> None:
         ToolResultEvent(
             tool_call_id="call-1",
             tool_name="lookup",
-            status="completed",
+            status="success",
             summary="done",
         ),
         ConfirmationRequiredEvent(confirmation_token="token"),
@@ -222,6 +223,17 @@ def test_confirmation_edited_args_distinguish_missing_empty_and_nonempty() -> No
             confirmation_token="token",
             edited_args=None,
         )
+
+
+def test_direct_edited_args_reject_mutable_aliases() -> None:
+    mutable = {"title": "old"}
+    with pytest.raises(TypeError):
+        EditedArgs(mutable)  # type: ignore[arg-type]
+
+    source = {"title": "old"}
+    edited = EditedArgs(MappingProxyType(source))
+    source["title"] = "mutated"
+    assert edited["title"] == "old"
 
 
 def test_signal_sink_protocol_has_closed_nonblocking_result() -> None:
@@ -344,6 +356,32 @@ def test_confirmation_payload_preserves_complete_pending_action_shape() -> None:
         )
 
 
+def test_pending_action_details_cannot_shadow_canonical_fields() -> None:
+    with pytest.raises(ValueError):
+        PendingActionPayload(
+            tool_name="create_application",
+            operation_id="op-1",
+            human="创建投递记录",
+            args=_json_object({"company_name": "OfferPilot"}),
+            confirmation_token="a" * 64,
+            details=_json_object({"tool_name": "spoofed"}),
+        )
+
+
+def test_confirmation_required_outcome_marks_chained_replay() -> None:
+    replay = ConfirmationRequiredOutcome(
+        confirmation_token="a" * 64,
+        operation_id="op-1",
+        replayed=True,
+    )
+    assert replay.replayed is True
+    with pytest.raises(TypeError):
+        ConfirmationRequiredOutcome(
+            confirmation_token="a" * 64,
+            replayed="true",  # type: ignore[arg-type]
+        )
+
+
 def test_message_replay_pending_and_failure_outcomes_cover_baseline_body_fields() -> None:
     undo = _json_object(
         {"kind": "delete_application", "application_id": 1, "parent_operation_id": "op-1"}
@@ -395,7 +433,9 @@ def test_message_replay_pending_and_failure_outcomes_cover_baseline_body_fields(
         (PreparationKind.DETERMINISTIC_INITIAL, StreamExecutionMode.AGENT_HOST, False),
         (PreparationKind.DETERMINISTIC_CONFIRMATION, StreamExecutionMode.DIRECT, True),
         (PreparationKind.DETERMINISTIC_CONFIRMATION, StreamExecutionMode.AGENT_HOST, False),
+        # Ordinary reject uses direct delivery and must not call a provider.
         (PreparationKind.CONFIRMATION, StreamExecutionMode.DIRECT, True),
+        # Approve/modify continuation is hosted by the agent runtime.
         (PreparationKind.CONFIRMATION, StreamExecutionMode.AGENT_HOST, True),
         (PreparationKind.REPLAY, StreamExecutionMode.DIRECT, True),
         (PreparationKind.REPLAY, StreamExecutionMode.AGENT_HOST, False),
@@ -435,6 +475,50 @@ def test_failure_codes_are_closed_and_errors_are_not_serializable() -> None:
         assert "secret reason" not in str(error)
         with pytest.raises(TypeError):
             pickle.dumps(error)
+
+
+def test_tool_and_write_statuses_use_baseline_finite_vocabularies() -> None:
+    for confirm_mode in ("none", "hitl", "approved", "rejected"):
+        ToolCallEvent(
+            tool_call_id="call-1",
+            tool_name="lookup",
+            confirm_mode=confirm_mode,
+        )
+    with pytest.raises(ValueError):
+        ToolCallEvent(tool_call_id="call-1", tool_name="lookup", confirm_mode="ask")
+
+    for status in ("success", "error", "cancelled"):
+        ToolResultEvent(
+            tool_call_id="call-1",
+            tool_name="lookup",
+            status=status,
+            summary="done",
+        )
+    with pytest.raises(ValueError):
+        ToolResultEvent(
+            tool_call_id="call-1",
+            tool_name="lookup",
+            status="completed",
+            summary="done",
+        )
+
+    for write_status in ("none", "success", "failed", "cancelled"):
+        MessageOutcome(message="done", write_status=write_status)
+        OperationReplayOutcome(operation_id="op-1", write_status=write_status)
+        ToolResultEvent(
+            tool_call_id="call-1",
+            tool_name="lookup",
+            status="success",
+            summary="done",
+            write_status=write_status,
+        )
+    with pytest.raises(ValueError):
+        MessageOutcome(message="done", write_status="pending")
+
+    for status in ("committed", "rejected", "failed"):
+        OperationReplayOutcome(operation_id="op-1", status=status)
+    with pytest.raises(ValueError):
+        OperationReplayOutcome(operation_id="op-1", status="success")
 
 
 def test_sensitive_and_opaque_values_are_not_exposed_by_repr() -> None:
@@ -493,7 +577,7 @@ def test_agent_host_contract_is_generic_and_does_not_use_object_result() -> None
     assert return_type.__name__ == "ResultT"
 
 
-def test_chat_route_failure_literals_are_members_of_closed_code_enum() -> None:
+def test_chat_route_failure_codes_match_the_closed_baseline_set() -> None:
     api_path = Path(__file__).parents[2] / "src" / "offerpilot" / "api.py"
     tree = ast.parse(api_path.read_text(encoding="utf-8"))
     route_names = {"send_chat", "send_chat_stream", "confirm_chat", "confirm_chat_stream"}
@@ -520,6 +604,115 @@ def test_chat_route_failure_literals_are_members_of_closed_code_enum() -> None:
                         and isinstance(value.value, str)
                     ):
                         literals.add(value.value)
+    expected = {
+        "ai_provider_error",
+        "application_archive_idempotency_conflict",
+        "application_archive_invalid_request",
+        "application_archive_source_conflict",
+        "application_jd_idempotency_conflict",
+        "application_jd_invalid_request",
+        "application_jd_not_found",
+        "application_jd_stale_current_version",
+        "application_not_found",
+        "application_outcome_idempotency_conflict",
+        "application_outcome_invalid_request",
+        "application_outcome_source_conflict",
+        "chat_agent_timeout",
+        "confirmation_in_progress",
+        "conversation_archived",
+        "invalid_confirmation",
+        "operation_busy",
+        "operation_delivery_failed",
+        "operation_delivery_pending",
+        "operation_delivery_unknown",
+        "operation_failed",
+        "operation_identity_conflict",
+        "operation_input_conflict",
+        "operation_integrity_error",
+        "operation_not_committed",
+        "operation_not_transactional",
+        "operation_projection_failed",
+        "operation_result_too_large",
+        "operation_result_unknown",
+        "operation_unavailable",
+        "pending_confirmation_required",
+        "resume_not_found",
+        "source_load_failed",
+        "stale_pending_action",
+    }
     enum_values = {item.value for item in RuntimeFailureCode}
     assert literals
     assert literals <= enum_values
+    # These are the non-literal sources reached by the four routes: the
+    # operation ledger and the two deterministic legacy repositories.  Keep
+    # this evidence explicit so a route-only AST scan cannot silently omit a
+    # dynamic exception or mapping value.
+    source_expectations = {
+        api_path: {
+            "ai_provider_error",
+            "application_archive_idempotency_conflict",
+            "application_archive_invalid_request",
+            "application_archive_source_conflict",
+            "application_jd_idempotency_conflict",
+            "application_jd_invalid_request",
+            "application_jd_not_found",
+            "application_jd_stale_current_version",
+            "application_not_found",
+            "application_outcome_idempotency_conflict",
+            "application_outcome_invalid_request",
+            "application_outcome_source_conflict",
+            "chat_agent_timeout",
+            "confirmation_in_progress",
+            "conversation_archived",
+            "invalid_confirmation",
+            "operation_delivery_failed",
+            "operation_delivery_pending",
+            "operation_failed",
+            "operation_identity_conflict",
+            "operation_input_conflict",
+            "operation_integrity_error",
+            "operation_result_unknown",
+            "operation_unavailable",
+            "pending_confirmation_required",
+            "resume_not_found",
+            "source_load_failed",
+            "stale_pending_action",
+        },
+        api_path.parents[0] / "ai" / "write_operations.py": {
+            "operation_busy",
+            "operation_delivery_failed",
+            "operation_delivery_pending",
+            "operation_delivery_unknown",
+            "operation_identity_conflict",
+            "operation_input_conflict",
+            "operation_integrity_error",
+            "operation_not_committed",
+            "operation_not_transactional",
+            "operation_projection_failed",
+            "operation_result_too_large",
+            "operation_result_unknown",
+            "operation_unavailable",
+        },
+        api_path.parents[0] / "repositories" / "application_jd_versions.py": {
+            "application_jd_idempotency_conflict",
+            "application_jd_invalid_request",
+            "application_jd_not_found",
+            "application_jd_stale_current_version",
+        },
+        api_path.parents[0] / "repositories" / "application_outcomes.py": {
+            "application_archive_idempotency_conflict",
+            "application_archive_invalid_request",
+            "application_archive_source_conflict",
+            "application_not_found",
+            "application_outcome_idempotency_conflict",
+            "application_outcome_invalid_request",
+            "application_outcome_source_conflict",
+            "resume_not_found",
+        },
+    }
+    for source_path, source_codes in source_expectations.items():
+        source_text = source_path.read_text(encoding="utf-8")
+        assert source_codes <= {
+            code for code in expected if code in source_text
+        }, source_path
+    assert enum_values == expected

@@ -202,10 +202,10 @@ export default function ContextPanel({
 
       {!hasKey && (
         <div className={`${styles.notice} ${styles.noticeWarn}`}>
-          尚未配置 API key，请先完成 AI 设置。
+          尚未配置 API key，请先完成设置。
           {onOpenSettings && (
             <button type="button" className={styles.noticeAction} onClick={onOpenSettings}>
-              打开 AI 设置
+              打开设置
             </button>
           )}
         </div>

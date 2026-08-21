@@ -9,7 +9,9 @@ import type { ScheduleEvent } from '@/types/event';
 import {
   filterAndSortApplications,
   formatNextApplicationEvent,
+  DEFAULT_APPLICATION_VIEW_STATE,
   type ApplicationSortBy,
+  type ApplicationViewState,
 } from './KanbanBoard/applicationLifecycle';
 import styles from './ApplicationListView.module.css';
 import { createPilotAttachmentDragBinding } from './PilotAttachmentHandle';
@@ -20,6 +22,8 @@ interface ApplicationListViewProps {
   onOpenDetail: (app: Application) => void;
   onAskPilot: (app: Application) => void;
   onAttachToPilot?: (attachment: import('@/types/chat').PilotContextAttachment) => void;
+  viewState?: ApplicationViewState;
+  onViewStateChange?: (state: ApplicationViewState) => void;
 }
 
 const STATUS_FILTERS = [
@@ -34,10 +38,23 @@ const SORT_OPTIONS: { value: ApplicationSortBy; label: string }[] = [
   { value: 'applied_asc', label: '最早投递优先' },
 ];
 
-export default function ApplicationListView({ applications, events, onOpenDetail, onAskPilot, onAttachToPilot }: ApplicationListViewProps) {
-  const [keyword, setKeyword] = useState('');
-  const [status, setStatus] = useState<ApplicationStatus | 'all'>('all');
-  const [sortBy, setSortBy] = useState<ApplicationSortBy>('updated_desc');
+export default function ApplicationListView({
+  applications,
+  events,
+  onOpenDetail,
+  onAskPilot,
+  onAttachToPilot,
+  viewState,
+  onViewStateChange,
+}: ApplicationListViewProps) {
+  const [localViewState, setLocalViewState] = useState<ApplicationViewState>(DEFAULT_APPLICATION_VIEW_STATE);
+  const currentViewState = viewState ?? localViewState;
+  const { keyword, status, sortBy } = currentViewState;
+  const updateViewState = (patch: Partial<ApplicationViewState>) => {
+    const next = { ...currentViewState, ...patch };
+    if (onViewStateChange) onViewStateChange(next);
+    else setLocalViewState(next);
+  };
 
   const rows = useMemo(
     () => filterAndSortApplications(applications, { keyword, status, sortBy }),
@@ -108,20 +125,20 @@ export default function ApplicationListView({ applications, events, onOpenDetail
           allowClear
           placeholder="搜索公司、岗位、备注"
           value={keyword}
-          onChange={(event) => setKeyword(event.target.value)}
+          onChange={(event) => updateViewState({ keyword: event.target.value })}
         />
         <Select
           aria-label="状态"
           value={status}
           options={STATUS_FILTERS}
-          onChange={(value) => setStatus(value)}
+          onChange={(value) => updateViewState({ status: value })}
           style={{ width: 140 }}
         />
         <Select
           aria-label="排序"
           value={sortBy}
           options={SORT_OPTIONS}
-          onChange={(value) => setSortBy(value)}
+          onChange={(value) => updateViewState({ sortBy: value })}
           style={{ width: 160 }}
         />
       </div>

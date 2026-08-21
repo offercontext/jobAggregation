@@ -14,7 +14,7 @@ vi.mock('@dnd-kit/core', () => ({
   PointerSensor: class PointerSensor {}, useSensor: () => ({}), useSensors: () => ({}),
 }));
 vi.mock('antd', () => {
-  const Layout = Object.assign((props: any) => <div {...props}>{props.children}</div>, {
+  const Layout = Object.assign(({ hasSider: _hasSider, ...props }: any) => <div {...props}>{props.children}</div>, {
     Content: (props: any) => <main {...props}>{props.children}</main>,
   });
   return {
@@ -164,10 +164,6 @@ describe('AppShell Pilot mascot integration', () => {
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="hide-mascot"]')?.click());
     await flush();
     expect(host.querySelector('[data-testid="pilot-mascot"]')).toBeNull();
-    expect(host.querySelector('[data-testid="pilot-drawer-chat"]')).not.toBeNull();
-
-    act(() => host.querySelector<HTMLButtonElement>('[data-testid="close-pilot"]')?.click());
-    await flush();
     expect(host.querySelector('[data-testid="pilot-rail-chat"]')).not.toBeNull();
 
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="nav-settings"]')?.click());
@@ -178,7 +174,7 @@ describe('AppShell Pilot mascot integration', () => {
     expect(host.querySelector('[data-testid="pilot-rail-chat"]')).toBeNull();
   });
 
-  it('keeps one contextual Pilot mounted in the background and opens its exact completed conversation', async () => {
+  it('keeps one contextual controller mounted and opens its exact completed conversation in Haru', async () => {
     await act(async () => root.render(<AppShell />));
     await flush();
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="toggle-mascot-pilot"]')?.click());
@@ -193,19 +189,19 @@ describe('AppShell Pilot mascot integration', () => {
 
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="toggle-mascot-pilot"]')?.click());
     await flush();
-    expect(host.querySelector('[data-testid="pilot-drawer-chat"]')?.getAttribute('data-open')).toBe('true');
+    expect(document.querySelector('[role="dialog"][aria-label="Haru 轻量对话"]')).not.toBeNull();
     expect(host.querySelector('[data-testid="pilot-drawer-chat"]')?.getAttribute('data-conversation-request')).toBe('418');
     expect(host.querySelector('[data-testid="pilot-mascot"]')?.getAttribute('data-notification')).toBeNull();
   });
 
-  it('renders Haru on the top-level Pilot page and keeps activity connected to that page ChatPanel', async () => {
+  it('hides Haru on the top-level Pilot page while preserving the old workspace route', async () => {
     await act(async () => root.render(<AppShell />));
     await flush();
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="nav-pilot"]')?.click());
     await flush();
 
     expect(host.querySelector('[data-testid="pilot-page-chat"]')).not.toBeNull();
-    expect(host.querySelector('[data-testid="pilot-mascot"]')?.getAttribute('data-placement')).toBe('pilot-page');
+    expect(host.querySelector('[data-testid="pilot-mascot"]')).toBeNull();
     expect(host.querySelector('.op-app-main-pilot')).not.toBeNull();
     expect(host.querySelector('.op-app-content-pilot')).not.toBeNull();
     expect(host.querySelector('.op-pilot-page-layout')).not.toBeNull();

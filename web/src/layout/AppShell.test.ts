@@ -121,9 +121,10 @@ describe('AppShell source contract', () => {
     expect(source).toContain('pilotV2DraftsRef.current.delete(current.applicationId);');
   });
 
-  it('renders Pilot as a normal tab with the expanded assistant workspace', () => {
+  it('keeps the old Pilot view as the expanded assistant workspace', () => {
     expect(source).toContain("view === 'pilot'");
-    expect(source).toContain('variant="page"');
+    expect(source).toContain('<PilotWorkspace');
+    expect(source).toContain('<AssistantSurfaceProvider>');
     expect(source).not.toContain('PilotHomeView');
   });
 
@@ -165,7 +166,7 @@ describe('AppShell source contract', () => {
     const fullPilotEnd = source.indexOf("{view === 'settings'", fullPilotStart);
     const fullPilotSource = source.slice(fullPilotStart, fullPilotEnd);
 
-    expect(fullPilotSource).toContain('variant="page"');
+    expect(fullPilotSource).toContain('<PilotWorkspace');
     expect(fullPilotSource).not.toContain('pageContext=');
     expect(source.match(/pageContext=\{pageContext\}/g)).toHaveLength(1);
   });
@@ -205,8 +206,8 @@ describe('AppShell source contract', () => {
   });
 
   it('registers one persistent dnd-kit target for the contextual Pilot owner', () => {
-    expect(source).toContain('const contextualPilotPanelOpen = pilotRailAvailable ? pilotDrawerOpen : chatOpen;');
-    expect(source).toContain('const contextualPilotOpen = contextualPilotPanelOpen || contextualPilotRailMode;');
+    expect(source).toContain("const contextualPilotOpen = assistantSurface.surface === 'pilot_workspace' || contextualPilotRailMode;");
+    expect(source).toContain("controllerActive={assistantSurface.surface === 'haru_chat'}");
     expect(source.match(/pilotDropTarget/g)).toHaveLength(1);
   });
 
@@ -219,6 +220,12 @@ describe('AppShell source contract', () => {
     expect(attachSource).toContain('addAttachmentToKey(attachmentKey, attachment);');
   });
 
+  it('keeps one application filter state while switching board and list views', () => {
+    expect(source).toContain('const [applicationViewState, setApplicationViewState] = useState');
+    expect(source.match(/viewState=\{applicationViewState\}/g)).toHaveLength(2);
+    expect(source).toContain('onViewStateChange={setApplicationViewState}');
+  });
+
   it('routes evidence through one-shot destination focus without changing Pilot visibility', () => {
     expect(source).toContain("import type { EvidenceTarget } from '@/components/ChatPanel/model'");
     expect(source).toContain(
@@ -228,7 +235,7 @@ describe('AppShell source contract', () => {
     expect(source).toContain('setEvidenceFocus((current) => (current === target ? null : current));');
     expect(source).toContain('const openEvidence = (target: EvidenceTarget) => {');
     expect(source).toContain("if (view === 'pilot' && !pilotRailAvailable) {");
-    expect(source).toContain('setChatOpen(true);');
+    expect(source).toContain('assistantSurface.closeSurface();');
     expect(source).toContain('onOpenEvidence={openEvidence}');
     expect(source.match(/onOpenEvidence=\{openEvidence\}/g)).toHaveLength(2);
   });

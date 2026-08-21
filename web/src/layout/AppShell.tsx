@@ -95,6 +95,17 @@ import {
   writePilotMascotZoom,
   writePilotMascotVisible,
 } from '@/features/pilotMascot/pilotMascotPreference';
+import {
+  AssistantSurfaceProvider,
+  useAssistantSurface,
+  usePilotConversationController,
+} from '@/features/assistantSurface/AssistantSurfaceProvider';
+import HaruDock from '@/features/assistantSurface/HaruDock';
+import PilotWorkspace from '@/features/assistantSurface/PilotWorkspace';
+import {
+  DEFAULT_APPLICATION_VIEW_STATE,
+  type ApplicationViewState,
+} from '@/components/KanbanBoard/applicationLifecycle';
 
 const { Content } = Layout;
 
@@ -185,18 +196,23 @@ function computeStreak(apps: Application[], now = dayjs()): number {
 export default function AppShell() {
   return (
     <PilotAttachmentProvider>
-      <AppShellContent />
+      <AssistantSurfaceProvider>
+        <AppShellContent />
+      </AssistantSurfaceProvider>
     </PilotAttachmentProvider>
   );
 }
 
 function AppShellContent() {
+  const assistantSurface = useAssistantSurface();
+  const pilotController = usePilotConversationController();
   const [view, setView] = useState<ViewMode>('dashboard');
+  const [applicationViewState, setApplicationViewState] = useState<ApplicationViewState>(
+    DEFAULT_APPLICATION_VIEW_STATE,
+  );
   const [adaptivePracticeFocus, setAdaptivePracticeFocus] = useState<AdaptivePracticeFocus | undefined>();
   const [addOpen, setAddOpen] = useState(false);
   const [resumeUploadOpen, setResumeUploadOpen] = useState(false);
-  const [chatOpen, setChatOpen] = useState(false);
-  const [pilotDrawerOpen, setPilotDrawerOpen] = useState(false);
   const [pilotMascotVisible, setPilotMascotVisible] = useState(readPilotMascotVisible);
   const [pilotMascotZoom, setPilotMascotZoom] = useState(readPilotMascotZoom);
   const [pilotMascotActivity, setPilotMascotActivity] = useState<PilotMascotActivity>('idle');
@@ -577,6 +593,10 @@ function AppShellContent() {
   const moduleTabs = moduleTabsForView(view);
 
   useEffect(() => {
+    pilotController.setFollowingContext(pageContext);
+  }, [pageContext, pilotController.setFollowingContext]);
+
+  useEffect(() => {
     window.scrollTo({ top: 0, left: 0 });
   }, [selectedApp?.id, view]);
 
@@ -587,28 +607,24 @@ function AppShellContent() {
   }, [apps, selected]);
 
   const shouldShowContextualPilot = view !== 'pilot';
-  const contextualPilotPanelOpen = pilotRailAvailable ? pilotDrawerOpen : chatOpen;
   const contextualPilotRailMode = shouldShowContextualPilot
     && pilotRailAvailable
-    && !pilotDrawerOpen
+    && assistantSurface.surface === 'mascot'
     && !pilotMascotVisible;
-  const contextualPilotOpen = contextualPilotPanelOpen || contextualPilotRailMode;
+  const contextualPilotOpen = assistantSurface.surface === 'pilot_workspace' || contextualPilotRailMode;
 
   const openChat = (offerId?: number) => {
     setCoachOfferId(offerId);
     if (view === 'pilot') {
       setView('dashboard');
     }
-    if (pilotRailAvailable) {
-      setPilotDrawerOpen(true);
-      return;
-    }
-    setChatOpen(true);
+    assistantSurface.openHaru();
   };
 
   const setPilotMascotPreference = (visible: boolean) => {
     writePilotMascotVisible(visible);
     setPilotMascotVisible(visible);
+    if (!visible) assistantSurface.closeSurface();
   };
 
   const setPilotMascotZoomPreference = (zoom: number) => {
@@ -617,6 +633,10 @@ function AppShellContent() {
   };
 
   const handlePilotReplyLifecycle = (event: PilotReplyLifecycleEvent) => {
+    assistantSurface.reportTaskState(
+      event.status === 'success' ? 'completed' : 'failed',
+      event.conversationId,
+    );
     if (!event.background) return;
     setPilotMascotNotification({
       status: event.status,
@@ -637,8 +657,7 @@ function AppShellContent() {
       requestPilotConversation(notificationConversationId);
       setPilotMascotNotification(null);
       if (view !== 'pilot') {
-        if (pilotRailAvailable) setPilotDrawerOpen(true);
-        else setChatOpen(true);
+        assistantSurface.openHaru();
       }
       return;
     }
@@ -647,8 +666,8 @@ function AppShellContent() {
       setPilotOnboardingFocusToken(nextPilotOnboardingFocusToken.current);
       return;
     }
-    if (pilotRailAvailable) setPilotDrawerOpen((open) => !open);
-    else setChatOpen((open) => !open);
+    if (assistantSurface.surface === 'haru_chat') assistantSurface.closeSurface();
+    else assistantSurface.openHaru();
   };
 
   const attachToPilot = (attachment: PilotContextAttachment) => {
@@ -697,8 +716,7 @@ function AppShellContent() {
       ...(action ? { initialMessage, pilot_action: action } : {}),
     });
     if (view !== 'pilot') {
-      if (pilotRailAvailable) setPilotDrawerOpen(true);
-      else setChatOpen(true);
+      assistantSurface.openHaru();
     }
   };
 
@@ -714,12 +732,29 @@ function AppShellContent() {
     setSelected(null);
     if (!preserveEvidenceFocus) setEvidenceFocus(null);
     if (nextView === 'pilot') {
-      setChatOpen(false);
-      setPilotDrawerOpen(false);
       setCoachOfferId(undefined);
+      assistantSurface.openPilot();
+    } else if (view === 'pilot' && assistantSurface.surface === 'pilot_workspace') {
+      assistantSurface.closeSurface();
     }
     setView(nextView);
   };
+
+  const previousAssistantSurfaceRef = useRef(assistantSurface.surface);
+  useEffect(() => {
+    const becamePilot = previousAssistantSurfaceRef.current !== 'pilot_workspace'
+      && assistantSurface.surface === 'pilot_workspace';
+    previousAssistantSurfaceRef.current = assistantSurface.surface;
+    if (becamePilot && view !== 'pilot') {
+      setCoachOfferId(undefined);
+      setSelected(null);
+      setView('pilot');
+      return;
+    }
+    if (!becamePilot && assistantSurface.surface === 'pilot_workspace' && view !== 'pilot') {
+      assistantSurface.closeSurface();
+    }
+  }, [assistantSurface.closeSurface, assistantSurface.surface, view]);
 
   const consumePilotOnboardingFocus = (token: number) => {
     setPilotOnboardingFocusToken((current) => (current === token ? 0 : current));
@@ -731,7 +766,7 @@ function AppShellContent() {
     if (intent.openAISettings) setAISettingsOpen(true);
     if (intent.openApplicationForm) setAddOpen(true);
     if (intent.focusResumeEntry) setResumeOnboardingFocusToken((token) => token + 1);
-    if (intent.openPilotDrawer) setChatOpen(true);
+    if (intent.openPilotDrawer) assistantSurface.openHaru();
     if (intent.focusPilot) {
       nextPilotOnboardingFocusToken.current += 1;
       setPilotOnboardingFocusToken(nextPilotOnboardingFocusToken.current);
@@ -835,6 +870,7 @@ function AppShellContent() {
         applicationId: app.id,
         pilotDraftKey: crypto.randomUUID(),
       });
+    assistantSurface.openPilot();
     setView('pilot');
   };
 
@@ -1392,7 +1428,7 @@ function AppShellContent() {
   const openEvidence = (target: EvidenceTarget) => {
     setAISettingsOpen(false);
     if (view === 'pilot' && !pilotRailAvailable) {
-      setChatOpen(true);
+      assistantSurface.closeSurface();
     }
     if (target.kind === 'application') {
       setEvidenceFocus(null);
@@ -1617,7 +1653,12 @@ function AppShellContent() {
             />
           )}
           {view === 'board' && (
-            <KanbanBoard applications={apps} onOpenDetail={openApplicationDetail} onAttachToPilot={attachToPilot} />
+            <KanbanBoard
+              applications={apps}
+              onOpenDetail={openApplicationDetail}
+              onAttachToPilot={attachToPilot}
+              viewState={applicationViewState}
+            />
           )}
           {view === 'applications-list' && (
             <ApplicationListView
@@ -1626,6 +1667,8 @@ function AppShellContent() {
                onOpenDetail={openApplicationDetail}
                onAskPilot={startApplicationChat}
                onAttachToPilot={attachToPilot}
+               viewState={applicationViewState}
+               onViewStateChange={setApplicationViewState}
             />
           )}
           {view === 'calendar' && (
@@ -1743,13 +1786,11 @@ function AppShellContent() {
                   }}
                 />
               ) : null}
-              <ChatPanel
-                variant="page"
-                open
+              <PilotWorkspace
                 onboardingFocusToken={pilotOnboardingFocusToken}
                 onOnboardingFocusConsumed={consumePilotOnboardingFocus}
                 onClose={() => undefined}
-                onOpenSettings={() => setAISettingsOpen(true)}
+                onOpenSettings={() => navigateToView('settings')}
                 startRequest={chatStartRequest}
                 onStartRequestConsumed={claimChatStartRequest}
                 onDataChanged={refreshWorkspaceData}
@@ -1801,7 +1842,7 @@ function AppShellContent() {
           streakDays={streak}
           onAdd={() => setAddOpen(true)}
           onSearch={() => setPaletteOpen(true)}
-          onOpenSettings={() => setAISettingsOpen(true)}
+          onOpenSettings={() => navigateToView('settings')}
         />
         <Content
           className={`op-app-content${view === 'pilot' ? ' op-app-content-pilot' : ''}`}
@@ -1830,16 +1871,16 @@ function AppShellContent() {
           <ChatPanel
             variant={contextualPilotRailMode ? 'rail' : 'drawer'}
             open={contextualPilotOpen}
+            controllerActive={assistantSurface.surface === 'haru_chat'}
             onboardingFocusToken={pilotOnboardingFocusToken}
             onOnboardingFocusConsumed={consumePilotOnboardingFocus}
             pilotDropTarget
             onClose={() => {
-              setChatOpen(false);
-              setPilotDrawerOpen(false);
+              assistantSurface.closeSurface();
               setCoachOfferId(undefined);
             }}
             offerId={coachOfferId}
-            onOpenSettings={() => setAISettingsOpen(true)}
+            onOpenSettings={() => navigateToView('settings')}
             onExpand={() => {
               handoffPilotAttachmentDraft();
               navigateToView('pilot');
@@ -1865,16 +1906,20 @@ function AppShellContent() {
         </div>
       ) : null}
 
-      {pilotRailAvailable && pilotMascotVisible && !interviewStudioContext ? (
-        <PilotMascot
-          activity={pilotMascotNotification?.status ?? pilotMascotActivity}
-          panelOpen={view === 'pilot' || pilotDrawerOpen}
-          onTogglePilot={handlePilotMascotAction}
+      {view !== 'pilot' && !interviewStudioContext ? (
+        <HaruDock
+          visible={pilotMascotVisible}
+          activity={pilotMascotActivity}
           onHide={() => setPilotMascotPreference(false)}
           zoom={pilotMascotZoom}
           onZoomChange={setPilotMascotZoomPreference}
           notification={pilotMascotNotification}
-          placement={view === 'pilot' ? 'pilot-page' : 'contextual'}
+          onOpen={handlePilotMascotAction}
+          onExpand={() => {
+            nextPilotOnboardingFocusToken.current += 1;
+            setPilotOnboardingFocusToken(nextPilotOnboardingFocusToken.current);
+            navigateToView('pilot');
+          }}
         />
       ) : null}
 
@@ -1918,7 +1963,8 @@ function AppShellContent() {
         onOpenResume={() => navigateToView('resumes')}
         onUploadResume={() => setResumeUploadOpen(true)}
         onOpenChat={() => openChat(undefined)}
-        onOpenSettings={() => setAISettingsOpen(true)}
+        onOpenPilot={() => navigateToView('pilot')}
+        onOpenSettings={() => navigateToView('settings')}
         pipelineActions={pipelineActions}
         onRunPipelineAction={runPipelineAction}
       />

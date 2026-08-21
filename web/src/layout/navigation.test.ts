@@ -7,34 +7,34 @@ import {
 } from './navigation';
 
 describe('module navigation contract', () => {
-  it('keeps Pilot as a normal top-level tab and groups pages by product module', () => {
+  it('keeps four business destinations plus Settings and removes Pilot from primary navigation', () => {
     expect(MODULE_NAV.map((item) => item.label)).toEqual([
-      '工作台',
-      '简历',
-      '练习',
+      '今日',
       '投递',
       '面试',
-      '知识库',
-      'Pilot',
+      '资料',
       '设置',
     ]);
 
-    expect(MODULE_NAV.some((item) => item.label === 'Pilot')).toBe(true);
+    expect(MODULE_NAV.some((item) => item.label === 'Pilot')).toBe(false);
     expect(MODULE_NAV.some((item) => item.label === '面试')).toBe(true);
-    expect(resolveModuleForView('board')).toBe('pipeline');
-    expect(resolveModuleForView('applications-list')).toBe('pipeline');
-    expect(resolveModuleForView('calendar')).toBe('pipeline');
-    expect(resolveModuleForView('questions')).toBe('practice');
+    expect(resolveModuleForView('dashboard')).toBe('today');
+    expect(resolveModuleForView('reminders')).toBe('today');
+    expect(resolveModuleForView('board')).toBe('applications');
+    expect(resolveModuleForView('applications-list')).toBe('applications');
+    expect(resolveModuleForView('calendar')).toBe('applications');
+    expect(resolveModuleForView('questions')).toBe('interview');
     expect(resolveModuleForView('interview')).toBe('interview');
+    expect(resolveModuleForView('resumes')).toBe('resources');
+    expect(resolveModuleForView('knowledge')).toBe('resources');
     expect(resolveModuleForView('pilot')).toBe('pilot');
   });
 
   it('selects stable defaults for module clicks', () => {
-    expect(defaultViewForModule('workspace')).toBe('dashboard');
-    expect(defaultViewForModule('resume')).toBe('resumes');
-    expect(defaultViewForModule('pipeline')).toBe('board');
+    expect(defaultViewForModule('today')).toBe('dashboard');
+    expect(defaultViewForModule('applications')).toBe('board');
     expect(defaultViewForModule('interview')).toBe('interview');
-    expect(defaultViewForModule('pilot')).toBe('pilot');
+    expect(defaultViewForModule('resources')).toBe('resumes');
     expect(defaultViewForModule('settings')).toBe('settings');
   });
 
@@ -44,9 +44,19 @@ describe('module navigation contract', () => {
       { view: 'applications-list', label: '列表' },
       { view: 'calendar', label: '日历' },
       { view: 'offers', label: 'Offer' },
+    ]);
+    expect(moduleTabsForView('dashboard')).toEqual([
+      { view: 'dashboard', label: '今日重点' },
       { view: 'reminders', label: '提醒' },
     ]);
-    expect(moduleTabsForView('interview')).toEqual([{ view: 'interview', label: '面试' }]);
+    expect(moduleTabsForView('interview')).toEqual([
+      { view: 'interview', label: '面试' },
+      { view: 'questions', label: '练习' },
+    ]);
+    expect(moduleTabsForView('knowledge')).toEqual([
+      { view: 'resumes', label: '简历与经历' },
+      { view: 'knowledge', label: '学习资料' },
+    ]);
     expect(moduleTabsForView('pilot')).toEqual([{ view: 'pilot', label: '会话中心' }]);
   });
 });

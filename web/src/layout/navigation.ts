@@ -14,12 +14,10 @@ export type ViewMode =
   | 'settings';
 
 export type ModuleKey =
-  | 'workspace'
-  | 'resume'
-  | 'practice'
-  | 'pipeline'
+  | 'today'
+  | 'applications'
   | 'interview'
-  | 'knowledge'
+  | 'resources'
   | 'pilot'
   | 'settings';
 
@@ -35,55 +33,59 @@ export interface ModuleTabItem {
 }
 
 export const MODULE_NAV: ModuleNavItem[] = [
-  { key: 'workspace', label: '工作台', defaultView: 'dashboard' },
-  { key: 'resume', label: '简历', defaultView: 'resumes' },
-  { key: 'practice', label: '练习', defaultView: 'questions' },
-  { key: 'pipeline', label: '投递', defaultView: 'board' },
+  { key: 'today', label: '今日', defaultView: 'dashboard' },
+  { key: 'applications', label: '投递', defaultView: 'board' },
   { key: 'interview', label: '面试', defaultView: 'interview' },
-  { key: 'knowledge', label: '知识库', defaultView: 'knowledge' },
-  { key: 'pilot', label: 'Pilot', defaultView: 'pilot' },
+  { key: 'resources', label: '资料', defaultView: 'resumes' },
   { key: 'settings', label: '设置', defaultView: 'settings' },
 ];
 
 export const MODULE_TABS: Record<ModuleKey, ModuleTabItem[]> = {
-  workspace: [{ view: 'dashboard', label: '总览' }],
-  resume: [{ view: 'resumes', label: '简历库' }],
-  practice: [{ view: 'questions', label: '题库' }],
-  pipeline: [
+  today: [
+    { view: 'dashboard', label: '今日重点' },
+    { view: 'reminders', label: '提醒' },
+  ],
+  applications: [
     { view: 'board', label: '看板' },
     { view: 'applications-list', label: '列表' },
     { view: 'calendar', label: '日历' },
     { view: 'offers', label: 'Offer' },
-    { view: 'reminders', label: '提醒' },
   ],
-  interview: [{ view: 'interview', label: '面试' }],
-  knowledge: [{ view: 'knowledge', label: '知识库' }],
+  interview: [
+    { view: 'interview', label: '面试' },
+    { view: 'questions', label: '练习' },
+  ],
+  resources: [
+    { view: 'resumes', label: '简历与经历' },
+    { view: 'knowledge', label: '学习资料' },
+  ],
   pilot: [{ view: 'pilot', label: '会话中心' }],
   settings: [{ view: 'settings', label: '设置' }],
 };
 
 const VIEW_TO_MODULE: Partial<Record<ViewMode, ModuleKey>> = {
-  dashboard: 'workspace',
-  resumes: 'resume',
-  questions: 'practice',
-  board: 'pipeline',
-  'applications-list': 'pipeline',
-  calendar: 'pipeline',
-  reminders: 'pipeline',
-  offers: 'pipeline',
+  dashboard: 'today',
+  reminders: 'today',
+  resumes: 'resources',
+  knowledge: 'resources',
+  questions: 'interview',
+  board: 'applications',
+  'applications-list': 'applications',
+  calendar: 'applications',
+  offers: 'applications',
   interview: 'interview',
-  knowledge: 'knowledge',
   pilot: 'pilot',
   settings: 'settings',
 };
 
-const DEFAULT_VIEW_BY_MODULE = MODULE_NAV.reduce(
-  (acc, item) => {
-    acc[item.key] = item.defaultView;
-    return acc;
-  },
-  {} as Record<ModuleKey, ViewMode>
-);
+const DEFAULT_VIEW_BY_MODULE: Record<ModuleKey, ViewMode> = {
+  today: 'dashboard',
+  applications: 'board',
+  interview: 'interview',
+  resources: 'resumes',
+  pilot: 'pilot',
+  settings: 'settings',
+};
 
 export function resolveModuleForView(view: ViewMode): ModuleKey {
   const module = VIEW_TO_MODULE[view];

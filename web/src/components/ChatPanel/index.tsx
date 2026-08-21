@@ -10,8 +10,6 @@ import {
   StopOutlined,
 } from '@ant-design/icons';
 import {
-  streamChat,
-  streamConfirmAction,
   getSettings,
   SETTINGS_QUERY_KEY,
   updateAutoApprove,
@@ -28,18 +26,15 @@ import type {
   ChatResponse,
   ChatStartRequest,
   ChatStreamEvent,
-  ChatUndo,
   Conversation,
   PendingAction,
   PilotPageContext,
 } from '@/types/chat';
 import type { Offer } from '@/types/offer';
 import {
-  buildChatRequestContext,
   buildTurns,
   collectEvidence,
   pendingActionForConversation,
-  pendingAutoSelectReducer,
   shouldApplyConversationRequest,
   isCurrentVisibleConversationRequest,
   shouldAbortActiveRequestOnReplacement,
@@ -56,8 +51,6 @@ import {
   shouldRestoreConfirmationRetryFocus,
   type EvidenceItem,
   type EvidenceTarget,
-  type ActiveConversationRequestOwner,
-  type UITurn,
 } from './model';
 import {
   filterConversationsByView,
@@ -86,9 +79,19 @@ import PilotContextDropTarget from '@/components/KanbanBoard/PilotContextDropTar
 import styles from './ChatPanel.module.css';
 import type { PilotMascotActivity } from '@/features/pilotMascot/PilotMascot';
 import { derivePilotMascotActivity } from '@/features/pilotMascot/pilotMascotActivity';
+import {
+  AssistantSurfaceProvider,
+  useHasAssistantSurfaceProvider,
+  usePilotConversationController,
+} from '@/features/assistantSurface/AssistantSurfaceProvider';
+import type {
+  ConfirmationExecution,
+  SendMessageOutcome,
+} from '@/features/assistantSurface/usePilotConversationController';
 
-interface Props {
+export interface Props {
   open: boolean;
+  controllerActive?: boolean;
   onClose: () => void;
   offerId?: number;
   onOpenSettings?: () => void;
@@ -125,11 +128,6 @@ export interface PilotConversationRequest {
   conversationId: number;
 }
 
-interface ConfirmationExecution {
-  conversationId: number;
-  confirmationToken: string;
-}
-
 const INTERVIEW_STORY_PILOT_INTENTS = new Set([
   '整理面试故事',
   '帮我整理一个面试故事',
@@ -154,10 +152,6 @@ export function VoiceCoachingPilotEntry({ onOpen }: { onOpen: () => void }) {
       查看表达成长
     </Button>
   );
-}
-
-interface ActiveConversationRequest extends ActiveConversationRequestOwner {
-  controller: AbortController;
 }
 
 const CHAT_WIDTH_STORAGE_KEY = 'offerpilot.chatPanelWidth';
@@ -229,8 +223,21 @@ function streamLoadingLabel(event: ChatStreamEvent): string | undefined {
   return undefined;
 }
 
-export default function ChatPanel({
+export default function ChatPanel(props: Props) {
+  const hasProvider = useHasAssistantSurfaceProvider();
+  if (!hasProvider) {
+    return (
+      <AssistantSurfaceProvider>
+        <ChatPanelView {...props} />
+      </AssistantSurfaceProvider>
+    );
+  }
+  return <ChatPanelView {...props} />;
+}
+
+function ChatPanelView({
   open,
+  controllerActive = false,
   onClose,
   offerId,
   onOpenSettings,
@@ -269,26 +276,97 @@ export default function ChatPanel({
     ensureNewAttachmentDraft,
   } = usePilotAttachments();
   const incomingPageContextKey = pageContextKey(pageContext);
-  const [turns, setTurns] = useState<UITurn[]>([]);
-  const [convID, setConvID] = useState<number | undefined>(undefined);
-  const [pending, setPending] = useState<PendingAction | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [autoApprove, setAutoApprove] = useState(false);
-  const [hasKey, setHasKey] = useState(true);
-  const [degraded, setDegraded] = useState(false);
-  const [conversations, setConversations] = useState<Conversation[]>([]);
-  const [showArchived, setShowArchived] = useState(false);
-  const [, dispatchPendingAutoSelect] = useReducer(pendingAutoSelectReducer, false);
+  const controller = usePilotConversationController();
+  const {
+    turns,
+    setTurns,
+    conversationId: convID,
+    setConversationId: setConvID,
+    pending,
+    setPending,
+    loading,
+    setLoading,
+    autoApprove,
+    setAutoApprove,
+    hasKey,
+    setHasKey,
+    degraded,
+    setDegraded,
+    conversations,
+    setConversations,
+    showArchived,
+    setShowArchived,
+    dispatchPendingAutoSelect,
+    draftContext,
+    setDraftContext,
+    lastError,
+    setLastError,
+    lastFailedText,
+    setLastFailedText,
+    confirmError,
+    setConfirmError,
+    confirmPhase,
+    setConfirmPhase,
+    lastUndo,
+    setLastUndo,
+    loadingLabel,
+    setLoadingLabel,
+    hasStreamingAssistantContent,
+    setHasStreamingAssistantContent,
+    composerResetKey,
+    setComposerResetKey,
+    pinnedContext,
+    pinConversationContext,
+    activateConversationContext,
+    setRequestContextSnapshot,
+    setAttachments: setControllerAttachments,
+    activeRequestRef,
+    streamingAssistantActiveRef,
+    titleRefreshTimeoutsRef,
+    lastConfirmationInputRef,
+    activePendingRef,
+    activeConversationIdRef,
+    confirmationMonitorRef,
+    confirmationLocksRef,
+    confirmationReconcileOnOpenRef,
+    lockedConfirmationRef,
+    startedRequestKeyRef,
+    pendingAutoSelectSuppressedRef,
+    conversationSelectionRequestRef,
+    conversationListRequestRef,
+    visibleRequestGenerationRef,
+    showArchivedRef,
+    consumedOnboardingFocusTokenRef,
+    consumedConversationRequestRef,
+    openRef,
+    bindActions,
+    releaseActions,
+    bindStopFeedback,
+    beginActiveRequest,
+    beginConversationSelection,
+    buildRequestContext,
+    cancelConversationSelection,
+    finishActiveRequest,
+    finishConversationSelection,
+    streamChatRequest,
+    streamConfirmationRequest,
+    stopActiveRequest,
+    approvePending,
+    rejectPending,
+  } = controller;
   const [offer, setOffer] = useState<Offer | null>(null);
-  const [draftContext, setDraftContext] = useState<ChatStartRequest | null>(null);
   const [panelOpen, setPanelOpen] = useState(false);
-  const [lastError, setLastError] = useState<string | null>(null);
-  const [lastFailedText, setLastFailedText] = useState('');
-  const [confirmError, setConfirmError] = useState<string | null>(null);
-  const [confirmPhase, setConfirmPhase] = useState<'idle' | 'saving' | 'success' | 'error'>('idle');
-  const [lastUndo, setLastUndo] = useState<ChatUndo | null>(null);
-  const [loadingLabel, setLoadingLabel] = useState<string | undefined>(undefined);
-  const [hasStreamingAssistantContent, setHasStreamingAssistantContent] = useState(false);
+
+  useEffect(() => {
+    setControllerAttachments((current) => {
+      const unchanged = current.length === attachments.length
+        && current.every((item, index) => {
+          const next = attachments[index];
+          return item.kind === next?.kind && item.id === next.id && item.label === next.label;
+        });
+      return unchanged ? current : attachments;
+    });
+  }, [attachments, setControllerAttachments]);
 
   useEffect(() => {
     const activity = derivePilotMascotActivity({
@@ -320,31 +398,14 @@ export default function ChatPanel({
   });
   const endRef = useRef<HTMLDivElement>(null);
   const threadOfferId = useRef<number | undefined>(undefined);
-  const activeRequestRef = useRef<ActiveConversationRequest | null>(null);
-  const streamingAssistantActiveRef = useRef(false);
-  const titleRefreshTimeoutsRef = useRef<number[]>([]);
-  const [composerResetKey, setComposerResetKey] = useState(0);
-  const lastConfirmationInputRef = useRef<ConfirmationInput | null>(null);
-  const activePendingRef = useRef<PendingAction | null>(null);
+  const actionOwnerRef = useRef({});
   const confirmRetryButtonRef = useRef<HTMLButtonElement | null>(null);
   const restoreConfirmationRetryFocusRef = useRef(false);
-  const activeConversationIdRef = useRef<number | undefined>(undefined);
-  const confirmationMonitorRef = useRef(0);
-  const confirmationLocksRef = useRef(new Map<number, ConfirmationExecution>());
-  const confirmationReconcileOnOpenRef = useRef<ConfirmationExecution | null>(null);
-  const lockedConfirmationRef = useRef<ConfirmationExecution | null>(null);
-  const startedRequestKeyRef = useRef<number | null>(null);
-  const pendingAutoSelectSuppressedRef = useRef(false);
-  const conversationSelectionRequestRef = useRef(0);
-  const conversationListRequestRef = useRef(0);
-  const visibleRequestGenerationRef = useRef(0);
-  const showArchivedRef = useRef(showArchived);
   const handoffAttachmentKeyRef = useRef<PilotAttachmentConversationKey>();
-  const consumedOnboardingFocusTokenRef = useRef(0);
-  const consumedConversationRequestRef = useRef(0);
-  const openRef = useRef(open);
-  openRef.current = open;
+  const conversationSurfaceActive = open || controllerActive;
+  openRef.current = conversationSurfaceActive;
   showArchivedRef.current = showArchived;
+  bindStopFeedback(() => toast.info('已停止当前回复'));
   const docked = variant === 'rail';
   const inlinePage = variant === 'page';
 
@@ -363,16 +424,16 @@ export default function ChatPanel({
   const settingsQuery = useQuery({
     queryKey: SETTINGS_QUERY_KEY,
     queryFn: getSettings,
-    enabled: open,
+    enabled: conversationSurfaceActive,
   });
 
   useEffect(() => {
-    if (!onboardingFocusToken || !open || onboardingFocusToken === consumedOnboardingFocusTokenRef.current) return;
+    if (!onboardingFocusToken || !conversationSurfaceActive || onboardingFocusToken === consumedOnboardingFocusTokenRef.current) return;
 
     consumedOnboardingFocusTokenRef.current = onboardingFocusToken;
     setOnboardingFocusEventToken(onboardingFocusToken);
     onOnboardingFocusConsumed?.(onboardingFocusToken);
-  }, [onboardingFocusToken, onOnboardingFocusConsumed, open]);
+  }, [conversationSurfaceActive, onboardingFocusToken, onOnboardingFocusConsumed]);
 
   useEffect(() => {
     if (!onboardingFocusEventToken) return;
@@ -426,7 +487,7 @@ export default function ChatPanel({
   }, [convID]);
 
   useEffect(() => {
-    if (open) {
+    if (conversationSurfaceActive) {
       const reconciliation = confirmationReconcileOnOpenRef.current;
       confirmationReconcileOnOpenRef.current = null;
       if (
@@ -447,7 +508,7 @@ export default function ChatPanel({
         );
       }
     }
-  }, [open]);
+  }, [conversationSurfaceActive]);
 
   useEffect(() => {
     if (
@@ -498,9 +559,10 @@ export default function ChatPanel({
   }, []);
 
   useEffect(() => {
-    if (!open) return;
+    if (!conversationSurfaceActive) return;
     if (offerId !== threadOfferId.current) {
-      conversationSelectionRequestRef.current += 1;
+      stopActiveRequest({ silent: true });
+      cancelConversationSelection();
       visibleRequestGenerationRef.current += 1;
       streamingAssistantActiveRef.current = false;
       setConvID(undefined);
@@ -508,13 +570,15 @@ export default function ChatPanel({
       setPending(null);
       setLoading(false);
       setLoadingLabel(undefined);
+      setRequestContextSnapshot(undefined);
+      activateConversationContext(undefined);
       markPendingAutoSelect('allow');
       lastConfirmationInputRef.current = null;
       setDegraded(false);
       threadOfferId.current = offerId;
     }
     refreshConversations(showArchived);
-  }, [open, offerId, showArchived]);
+  }, [conversationSurfaceActive, offerId, showArchived]);
 
   useEffect(() => {
     if (!settingsQuery.data) return;
@@ -567,9 +631,13 @@ export default function ChatPanel({
   }
 
   function startNewChat() {
+    if (activeRequestRef.current?.kind === 'confirmation') {
+      toast.info('操作确认仍在处理中，请稍候');
+      return false;
+    }
     beginNewAttachmentDraft();
     markPendingAutoSelect('suppress');
-    conversationSelectionRequestRef.current += 1;
+    cancelConversationSelection();
     visibleRequestGenerationRef.current += 1;
     if (shouldAbortActiveRequestOnReplacement(activeRequestRef.current)) {
       stopActiveRequest({ silent: true });
@@ -590,15 +658,18 @@ export default function ChatPanel({
     setLoadingLabel(undefined);
     setHasStreamingAssistantContent(false);
     setDraftContext(null);
+    setRequestContextSnapshot(undefined);
+    activateConversationContext(undefined);
     setComposerResetKey((key) => key + 1);
     setLoading(false);
+    return true;
   }
 
   useEffect(() => {
-    if (!startRequest) return;
-    startNewChat();
+    if (!startRequest || startedRequestKeyRef.current === startRequest.requestKey) return;
+    if (!startNewChat()) return;
     setDraftContext(startRequest);
-  }, [startRequest?.requestKey]);
+  }, [startRequest?.requestKey, loading]);
 
   useEffect(() => {
     if (!draftContext?.initialMessage || startedRequestKeyRef.current === draftContext.requestKey) return;
@@ -613,10 +684,12 @@ export default function ChatPanel({
   async function selectConversation(id: number) {
     markPendingAutoSelect('allow');
     if (id === convID) return;
+    setDraftContext(null);
+    setRequestContextSnapshot(undefined);
+    activateConversationContext(id);
     visibleRequestGenerationRef.current += 1;
     const visibleRequestGeneration = visibleRequestGenerationRef.current;
-    const requestId = ++conversationSelectionRequestRef.current;
-    setLoading(true);
+    const requestId = beginConversationSelection();
     try {
       const stored = await getConversation(id);
       if (
@@ -658,20 +731,20 @@ export default function ChatPanel({
         toast.error(e?.response?.data?.error ?? '加载对话失败');
       }
     } finally {
-      if (requestId === conversationSelectionRequestRef.current) setLoading(false);
+      finishConversationSelection(requestId);
     }
   }
 
   useEffect(() => {
     if (
-      !open
+      !conversationSurfaceActive
       || !conversationRequest
       || conversationRequest.requestKey === consumedConversationRequestRef.current
     ) return;
     consumedConversationRequestRef.current = conversationRequest.requestKey;
     onConversationRequestConsumed?.(conversationRequest.requestKey);
     void selectConversation(conversationRequest.conversationId);
-  }, [conversationRequest?.conversationId, conversationRequest?.requestKey, onConversationRequestConsumed, open]);
+  }, [conversationRequest?.conversationId, conversationRequest?.requestKey, conversationSurfaceActive, onConversationRequestConsumed]);
 
   async function removeConversation(id: number) {
     try {
@@ -701,20 +774,22 @@ export default function ChatPanel({
   async function clearActiveContext() {
     if (!convID) {
       setDraftContext(null);
+      activateConversationContext(undefined);
       return;
     }
     await handleConversationUpdate(convID, { context_type: 'workspace', context_ref: '' });
+    pinConversationContext(convID, undefined);
   }
 
   useEffect(() => {
-    if (!open || draftContext !== null || convID !== undefined || turns.length > 0 || loading) return;
+    if (!conversationSurfaceActive || draftContext !== null || convID !== undefined || turns.length > 0 || loading) return;
     if (showArchived) return;
     if (pendingAutoSelectSuppressedRef.current) return;
     const activeConversations = filterConversationsByView(conversations, 'active');
     const pendingConversationId = firstPendingConversationId(activeConversations);
     if (pendingConversationId === undefined) return;
     void selectConversation(pendingConversationId);
-  }, [open, convID, conversations, turns.length, loading, showArchived, draftContext]);
+  }, [conversationSurfaceActive, convID, conversations, turns.length, loading, showArchived, draftContext]);
 
   async function finishMessage(
     resp: Extract<ChatResponse, { type: 'message' }>,
@@ -880,30 +955,23 @@ export default function ChatPanel({
     }
   }
 
-  function stopActiveRequest(options: { silent?: boolean } = {}) {
-    const activeRequest = activeRequestRef.current;
-    if (!activeRequest) return;
-    activeRequest.controller.abort();
-    activeRequestRef.current = null;
-    setLoading(false);
-    if (!options.silent) toast.info('已停止当前回复');
-  }
-
-  async function sendMessage(text: string): Promise<boolean> {
+  async function sendMessage(text: string): Promise<SendMessageOutcome> {
     const trimmed = text.trim();
-    if (!trimmed || loading || activePending) return false;
+    if (!trimmed || loading || activePending) return 'ignored';
     if (onOpenInterviewStoryLibrary && isInterviewStoryPilotIntent(trimmed)) {
       // This is a local navigation intent.  It must not create a Chat message,
       // call a Provider, or make a Story-domain write before the user selects
       // original sources and confirms the later Story action.
       onOpenInterviewStoryLibrary();
-      return true;
+      return 'sent';
     }
     if (onOpenVoiceCoachingGrowth && isVoiceCoachingPilotIntent(trimmed)) {
       // Local read-only navigation: no Chat message, Provider call, or domain write.
       onOpenVoiceCoachingGrowth();
-      return true;
+      return 'sent';
     }
+    const requestLease = beginActiveRequest('chat', convID);
+    if (!requestLease) return 'ignored';
     const attachmentDraftKeyAtSend = activeAttachmentKey ?? ensureNewAttachmentDraft();
     if (convID === undefined) markPendingAutoSelect('suppress');
     const visibleRequestGeneration = ++visibleRequestGenerationRef.current;
@@ -916,35 +984,20 @@ export default function ChatPanel({
     setTurns((t) => [...t, { role: 'user', content: trimmed }]);
     streamingAssistantActiveRef.current = false;
     setHasStreamingAssistantContent(false);
-    setLoading(true);
-    const controller = new AbortController();
-    activeRequestRef.current = {
-      controller,
-      kind: 'chat',
-      conversationId: convID,
-    };
+    const requestPageContext = convID === undefined ? activePageContext : pinnedContext;
+    setRequestContextSnapshot(requestPageContext);
     let streamConversationId = convID;
     try {
       const isNew = convID === undefined;
-      const requestContext = {
-        ...(isNew && draftContext
-          ? {
-              context_type: draftContext.context_type,
-              context_ref: draftContext.context_ref,
-              mode: draftContext.mode,
-              ...(draftContext.pilot_action ? { pilot_action: draftContext.pilot_action } : {}),
-              ...(activePageContext ? { page_context: activePageContext } : {}),
-            }
-          : buildChatRequestContext({
-              conversationId: convID,
-              offerApplicationId: offer?.application_id,
-              offerId,
-              pageContext: activePageContext,
-            })),
-        ...(attachments.length ? { attachments: [...attachments] } : {}),
-      };
-      const resp = await streamChat(trimmed, convID, requestContext, {
-        signal: controller.signal,
+      const requestContext = buildRequestContext({
+        conversationId: convID,
+        draftContext,
+        offerApplicationId: offer?.application_id,
+        offerId,
+        pageContext: requestPageContext,
+        attachments,
+      });
+      const resp = await streamChatRequest(requestLease, trimmed, convID, requestContext, {
         onEvent: (event) => {
           if (event.event === 'user_message_saved') {
             void queryClient.invalidateQueries({ queryKey: ONBOARDING_QUERY_KEY });
@@ -952,7 +1005,10 @@ export default function ChatPanel({
           if (!isCurrentVisibleRequest(visibleRequestGeneration)) return;
           if (event.conversation_id) {
             streamConversationId = event.conversation_id;
-            if (isNew) setConvID(event.conversation_id);
+            if (isNew) {
+              setConvID(event.conversation_id);
+              pinConversationContext(event.conversation_id, requestPageContext);
+            }
           }
           if (event.event === 'assistant_delta') {
             const data = event.data as { delta?: unknown };
@@ -969,7 +1025,11 @@ export default function ChatPanel({
       if (!isCurrentVisibleRequest(visibleRequestGeneration)) {
         refreshConversations();
         if (attachmentDraftKeyAtSend) clearAttachmentsByKey(attachmentDraftKeyAtSend);
-        return true;
+        return 'sent';
+      }
+      if (isNew) {
+        setConvID(resp.conversation_id);
+        pinConversationContext(resp.conversation_id, requestPageContext);
       }
       if (resp.type === 'confirmation_required') {
         setLoadingLabel('正在准备确认卡片');
@@ -1001,21 +1061,21 @@ export default function ChatPanel({
           background: !openRef.current,
         });
       }
-      return true;
+      return 'sent';
     } catch (e: any) {
       if (!isCurrentVisibleRequest(visibleRequestGeneration)) {
         refreshConversations();
-        return false;
+        return 'ignored';
       }
       if (isAbortError(e)) {
         await syncConversationAfterAbort(streamConversationId, visibleRequestGeneration);
-        return false;
+        return 'stopped';
       }
       const error = e?.response?.data?.error ?? e?.message ?? '对话失败，请稍后重试';
       if (streamingAssistantActiveRef.current) {
         streamingAssistantActiveRef.current = false;
         await syncConversationAfterAbort(streamConversationId, visibleRequestGeneration);
-        if (!isCurrentVisibleRequest(visibleRequestGeneration)) return false;
+        if (!isCurrentVisibleRequest(visibleRequestGeneration)) return 'ignored';
         setLastError(error);
         setLastFailedText(trimmed);
         toast.error(error);
@@ -1026,7 +1086,7 @@ export default function ChatPanel({
             background: !openRef.current,
           });
         }
-        return false;
+        return 'failed';
       }
       setTurns((items) => {
         const last = items[items.length - 1];
@@ -1042,12 +1102,12 @@ export default function ChatPanel({
           background: !openRef.current,
         });
       }
-      return false;
+      return 'failed';
     } finally {
-      if (activeRequestRef.current?.controller === controller) activeRequestRef.current = null;
+      finishActiveRequest(requestLease);
       if (isCurrentVisibleRequest(visibleRequestGeneration)) {
-        setLoading(false);
         setLoadingLabel(undefined);
+        setRequestContextSnapshot(undefined);
       }
     }
   }
@@ -1070,6 +1130,8 @@ export default function ChatPanel({
     if (!convID) return;
     if (input.confirmation_token !== activePendingRef.current?.confirmation_token) return;
     if (confirmationLocksRef.current.has(convID)) return;
+    const requestLease = beginActiveRequest('confirmation', convID, input.confirmation_token);
+    if (!requestLease) return;
     const visibleRequestGeneration = ++visibleRequestGenerationRef.current;
     const confirmationExecution: ConfirmationExecution = {
       conversationId: convID,
@@ -1079,20 +1141,11 @@ export default function ChatPanel({
     const approved = input.approved;
     lastConfirmationInputRef.current = confirmationInputForRetry(input);
     setConfirmPhase(approved ? 'saving' : 'idle');
-    setLoading(true);
     setLoadingLabel(approved ? `正在执行：${activePendingLabel(activePending)}` : '正在取消本次写入');
     streamingAssistantActiveRef.current = false;
     setHasStreamingAssistantContent(false);
-    const controller = new AbortController();
-    activeRequestRef.current = {
-      controller,
-      kind: 'confirmation',
-      conversationId: convID,
-      confirmationToken: input.confirmation_token,
-    };
     try {
-      const resp = await streamConfirmAction(convID, input, {
-        signal: controller.signal,
+      const resp = await streamConfirmationRequest(requestLease, convID, input, {
         onEvent: (event) => {
           if (!isCurrentVisibleRequest(visibleRequestGeneration)) return;
           if (event.event === 'assistant_delta') {
@@ -1229,9 +1282,8 @@ export default function ChatPanel({
       );
       toast.error(error);
     } finally {
-      if (activeRequestRef.current?.controller === controller) activeRequestRef.current = null;
+      finishActiveRequest(requestLease);
       if (isCurrentVisibleRequest(visibleRequestGeneration)) {
-        setLoading(false);
         setLoadingLabel(undefined);
       }
     }
@@ -1254,20 +1306,15 @@ export default function ChatPanel({
 
   async function handleUndoLastWrite() {
     if (!convID || !lastUndo || loading) return;
+    const requestLease = beginActiveRequest('undo', convID);
+    if (!requestLease) return;
     const visibleRequestGeneration = ++visibleRequestGenerationRef.current;
     setConfirmPhase('saving');
-    setLoading(true);
-    const controller = new AbortController();
-    activeRequestRef.current = {
-      controller,
-      kind: 'undo',
-      conversationId: convID,
-    };
     try {
       const resp = await undoLastWrite(
         convID,
         lastUndo.parent_operation_id,
-        { signal: controller.signal },
+        { signal: requestLease.controller.signal },
       );
       const applied = await finishMessage(resp, visibleRequestGeneration);
       if (applied) {
@@ -1283,9 +1330,8 @@ export default function ChatPanel({
       setConfirmPhase('error');
       toast.error(error);
     } finally {
-      if (activeRequestRef.current?.controller === controller) activeRequestRef.current = null;
+      finishActiveRequest(requestLease);
       if (isCurrentVisibleRequest(visibleRequestGeneration)) {
-        setLoading(false);
         setLoadingLabel(undefined);
       }
     }
@@ -1312,6 +1358,20 @@ export default function ChatPanel({
     if (!activePageContext) return;
     dispatchPageContextRemoval({ type: 'remove', contextKey: incomingPageContextKey, chipKey });
   }
+
+  bindActions(actionOwnerRef.current, {
+    sendMessage,
+    selectConversation,
+    startNewChat,
+    retryLastMessage,
+    clearLastFailure,
+    handleConfirm,
+    retryConfirmAction,
+    refreshConfirmationStatus,
+    clearActiveContext,
+  });
+
+  useEffect(() => () => releaseActions(actionOwnerRef.current), [releaseActions]);
 
   const composerDisabled = loading || !!activePending || !hasKey;
   const composerDisabledReason = !hasKey
@@ -1572,22 +1632,8 @@ export default function ChatPanel({
                   loading={loading || confirmPhase === 'saving'}
                   evidence={confirmationEvidence}
                   onOpenEvidence={onOpenEvidence}
-                  onConfirm={(editedArgs) =>
-                    handleConfirm({
-                      approved: true,
-                      operation_id: activePending.operation_id,
-                      confirmation_token: activePending.confirmation_token,
-                      ...(editedArgs ? { edited_args: editedArgs } : {}),
-                    })
-                  }
-                  onCancel={(rejectionFeedback) =>
-                    handleConfirm({
-                      approved: false,
-                      operation_id: activePending.operation_id,
-                      confirmation_token: activePending.confirmation_token,
-                      ...(rejectionFeedback ? { rejection_feedback: rejectionFeedback } : {}),
-                    })
-                  }
+                  onConfirm={approvePending}
+                  onCancel={rejectPending}
                 />
               </div>
             )}
@@ -1629,7 +1675,7 @@ export default function ChatPanel({
                 <span>尚未配置 API key，配置后即可使用 Pilot 对话和工具调用。</span>
                 {onOpenSettings && (
                   <button type="button" onClick={onOpenSettings}>
-                    打开 AI 设置
+                    打开设置
                   </button>
                 )}
               </div>

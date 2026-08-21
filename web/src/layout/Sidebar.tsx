@@ -1,10 +1,8 @@
 import {
   AppstoreOutlined,
-  BookOutlined,
   BulbOutlined,
   DashboardOutlined,
   FileTextOutlined,
-  ReadOutlined,
   RobotOutlined,
   SettingOutlined,
   AudioOutlined,
@@ -19,12 +17,10 @@ import {
 } from './navigation';
 
 const MODULE_ICONS: Record<ModuleKey, React.ReactNode> = {
-  workspace: <DashboardOutlined />,
-  resume: <FileTextOutlined />,
-  practice: <ReadOutlined />,
-  pipeline: <AppstoreOutlined />,
+  today: <DashboardOutlined />,
+  applications: <AppstoreOutlined />,
   interview: <AudioOutlined />,
-  knowledge: <BookOutlined />,
+  resources: <FileTextOutlined />,
   pilot: <RobotOutlined />,
   settings: <SettingOutlined />,
 };
@@ -95,7 +91,7 @@ export default function Sidebar({ view, onChange, reminderCount }: Props) {
           >
             <span style={{ fontSize: 16, display: 'inline-flex' }}>{MODULE_ICONS[item.key]}</span>
             <span style={{ flex: 1 }}>{item.label}</span>
-            {item.key === 'pipeline' && reminderCount > 0 && (
+            {item.key === 'today' && reminderCount > 0 && (
               <Badge count={reminderCount} size="small" />
             )}
           </button>

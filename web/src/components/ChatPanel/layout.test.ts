@@ -8,6 +8,7 @@ import evidenceList from './EvidenceList.tsx?raw';
 import processTimeline from './ProcessTimeline.tsx?raw';
 import threadRail from './ThreadRail.tsx?raw';
 import composer from './Composer.tsx?raw';
+import controller from '../../features/assistantSurface/usePilotConversationController.ts?raw';
 
 async function loadCss(): Promise<string> {
   const fsModule = 'node:fs';
@@ -86,7 +87,7 @@ describe('ChatPanel docked layout contract', () => {
   it('lets users stop an in-flight assistant response', () => {
     expect(component).toContain('activeRequestRef');
     expect(component).toContain('stopActiveRequest');
-    expect(component).toContain('activeRequest.controller.abort()');
+    expect(controller).toContain('activeRequest.controller.abort()');
     expect(component).toContain('isAbortError');
     expect(component).toContain('aria-label="停止当前回复"');
     expect(component).toContain('已停止当前回复');
@@ -94,7 +95,7 @@ describe('ChatPanel docked layout contract', () => {
 
   it('uses Pilot SSE stream services for chat and confirmation flows', () => {
     expect(component).toContain('streamChat');
-    expect(component).toContain('streamConfirmAction');
+    expect(component).toContain('streamConfirmationRequest');
     expect(component).toContain('streamLoadingLabel');
     expect(component).toContain('appendAssistantDelta');
     expect(component).toContain("event.event === 'assistant_delta'");
@@ -103,9 +104,9 @@ describe('ChatPanel docked layout contract', () => {
   });
 
   it('snapshots current context attachments into the chat stream request', () => {
-    expect(component).toContain('attachments: [...attachments]');
+    expect(controller).toContain('attachments: [...input.attachments]');
     expect(component).toContain('const requestContext');
-    expect(component).toContain('streamChat(trimmed, convID, requestContext');
+    expect(component).toContain('streamChatRequest(requestLease, trimmed, convID, requestContext');
   });
 
   it('hides the thinking indicator once assistant text is streaming', () => {
@@ -207,8 +208,8 @@ describe('ChatPanel docked layout contract', () => {
     expect(recoverySource).toContain('重试会继续提交拒绝');
     expect(recoverySource).not.toContain('handleConfirm({');
     expect(recoverySource).not.toContain('approved: false');
-    expect(component.match(/approved: false/g)).toHaveLength(1);
-    expect(component.match(/onCancel=\{\(rejectionFeedback\)/g)).toHaveLength(1);
+    expect(controller.match(/approved: false/g)).toHaveLength(1);
+    expect(component.match(/onCancel=\{rejectPending\}/g)).toHaveLength(1);
   });
 
   it('gives confirmation recovery a compact accessible retry target', async () => {
@@ -284,9 +285,9 @@ describe('ChatPanel docked layout contract', () => {
   it('attaches the current pending token to edited approval and rejection intents', () => {
     expect(proposalCard).toContain("onConfirm: (editedArgs?: Record<string, unknown>) => void");
     expect(proposalCard).toContain("onCancel: (rejectionFeedback?: string) => void");
-    expect(component).toContain("...(editedArgs ? { edited_args: editedArgs } : {})");
-    expect(component).toContain("...(rejectionFeedback ? { rejection_feedback: rejectionFeedback } : {})");
-    expect(component).toContain("confirmation_token: activePending.confirmation_token");
+    expect(controller).toContain("...(editedArgs ? { edited_args: editedArgs } : {})");
+    expect(controller).toContain("...(rejectionFeedback ? { rejection_feedback: rejectionFeedback } : {})");
+    expect(controller).toContain("confirmation_token: action.confirmation_token");
     expect(component).toContain("key={`${convID}:${activePending.confirmation_token}`}");
     expect(component).toContain("retryInput.confirmation_token !== activePending.confirmation_token");
     expect(component).toContain("input.confirmation_token !== activePendingRef.current?.confirmation_token");
@@ -318,8 +319,10 @@ describe('ChatPanel docked layout contract', () => {
     expect(component).toContain('deriveActivePageContext(pageContext, pageContextRemovalState)');
     expect(component).toContain("type: 'sync', contextKey: incomingPageContextKey");
     expect(component).toContain('}, [incomingPageContextKey]);');
-    expect(component).toContain('buildChatRequestContext({');
-    expect(component).toContain('pageContext: activePageContext');
+    expect(component).toContain('buildRequestContext({');
+    expect(controller).toContain('buildChatRequestContext({');
+    expect(component).toContain('const requestPageContext = convID === undefined ? activePageContext : pinnedContext');
+    expect(component).toContain('pageContext: requestPageContext');
     expect(component).toContain('pageContextChips(activePageContext)');
     expect(component).toContain("type: 'remove', contextKey: incomingPageContextKey, chipKey");
     expect(component).toContain('aria-label={`\u79fb\u9664${chip.label}`}');
@@ -333,8 +336,8 @@ describe('ChatPanel docked layout contract', () => {
 
   it('does not mix persistent context fields into existing conversation requests', () => {
     expect(component).toContain('conversationId: convID');
-    expect(component).toContain('buildChatRequestContext({');
-    expect(component).toContain('streamChat(trimmed, convID, requestContext');
+    expect(component).toContain('buildRequestContext({');
+    expect(component).toContain('streamChatRequest(requestLease, trimmed, convID, requestContext');
   });
 
   it('scopes attachment drafts to the displayed conversation or fresh request', () => {
@@ -368,8 +371,8 @@ describe('ChatPanel docked layout contract', () => {
     expect(css).toContain('.contextAttachmentRemove');
     expect(css).toContain('.quickQuestion');
     expect(css).toContain('min-height: 40px;');
-    expect(component).toContain('streamChat(trimmed, convID, requestContext');
-    expect(component).not.toContain('streamChat(trimmed, convID, requestContext, attachments');
+    expect(component).toContain('streamChatRequest(requestLease, trimmed, convID, requestContext');
+    expect(component).not.toContain('streamChatRequest(requestLease, trimmed, convID, requestContext, attachments');
   });
 
   it('lets users manage conversations and remove active context from the Pilot UI', () => {
@@ -407,7 +410,7 @@ describe('ChatPanel docked layout contract', () => {
     expect(component).toContain('pendingAutoSelectSuppressedRef');
     expect(component).toContain('conversationSelectionRequestRef');
     expect(component).toContain('shouldApplyConversationRequest(');
-    expect(component).toContain('conversationSelectionRequestRef.current += 1;');
+    expect(component).toContain('cancelConversationSelection();');
     expect(component).toContain('visibleRequestGeneration: number,');
     expect(component).toContain('!isCurrentVisibleRequest(visibleRequestGeneration)');
     expect(component).toContain("markPendingAutoSelect('suppress')");
@@ -431,11 +434,13 @@ describe('ChatPanel docked layout contract', () => {
     const contextEnd = component.indexOf('threadOfferId.current = offerId;', contextStart);
     const contextReset = component.slice(contextStart, contextEnd);
 
-    expect(component).toContain('openRef.current = open;');
+    expect(component).toContain('const conversationSurfaceActive = open || controllerActive;');
+    expect(component).toContain('openRef.current = conversationSurfaceActive;');
     expect(component).toContain('background: !openRef.current');
     expect(component).toContain('confirmationLocksRef.current.set(convID, confirmationExecution);');
-    expect(component).toContain("kind: 'confirmation'");
-    expect(component).toContain('confirmationToken: input.confirmation_token');
+    expect(component).toContain("beginActiveRequest('confirmation'");
+    expect(component).toContain('input.confirmation_token');
+    expect(controller).toContain('...(confirmationToken ? { confirmationToken } : {})');
     expect(component).toContain(
       'clearOwnedConfirmationLock(',
     );
@@ -450,6 +455,10 @@ describe('ChatPanel docked layout contract', () => {
     const newChatStart = component.indexOf('function startNewChat()');
     const newChatEnd = component.indexOf('async function selectConversation', newChatStart);
     const newChat = component.slice(newChatStart, newChatEnd);
+    expect(newChat).toContain("if (activeRequestRef.current?.kind === 'confirmation')");
+    expect(newChat).toContain('操作确认仍在处理中，请稍候');
+    expect(newChat).toContain('return false;');
+    expect(newChat).toContain('return true;');
     expect(newChat).toContain('shouldAbortActiveRequestOnReplacement(activeRequestRef.current)');
     expect(component).not.toContain('confirmationExecution.settled = true;');
     expect(component).toContain('CONFIRMATION_RECONCILE_MAX_POLLS = 240');
@@ -460,7 +469,7 @@ describe('ChatPanel docked layout contract', () => {
     expect(contextReset).toContain('setLoadingLabel(undefined);');
 
     const confirmationResponseStart = component.indexOf(
-      'const resp = await streamConfirmAction',
+      'const resp = await streamConfirmationRequest',
     );
     const staleCompletionStart = component.indexOf(
       'if (!isCurrentVisibleRequest(visibleRequestGeneration)) {',
@@ -473,6 +482,39 @@ describe('ChatPanel docked layout contract', () => {
     const staleCompletion = component.slice(staleCompletionStart, staleCompletionEnd);
     expect(staleCompletion).toContain('refreshConversations();');
     expect(staleCompletion).not.toContain('clearOwnedConfirmationLock(');
+  });
+
+  it('fences stale new-conversation completions before mutating the visible conversation', () => {
+    const responseStart = component.indexOf('const resp = await streamChatRequest');
+    const staleFence = component.indexOf(
+      'if (!isCurrentVisibleRequest(visibleRequestGeneration)) {',
+      responseStart,
+    );
+    const conversationMutation = component.indexOf('setConvID(resp.conversation_id);', staleFence);
+    expect(staleFence).toBeGreaterThan(responseStart);
+    expect(conversationMutation).toBeGreaterThan(staleFence);
+  });
+
+  it('clears draft context before activating an existing conversation', () => {
+    const selectionStart = component.indexOf('async function selectConversation(id: number)');
+    const draftReset = component.indexOf('setDraftContext(null);', selectionStart);
+    const contextActivation = component.indexOf('activateConversationContext(id);', selectionStart);
+    expect(draftReset).toBeGreaterThan(selectionStart);
+    expect(contextActivation).toBeGreaterThan(draftReset);
+  });
+
+  it('keeps the shared busy state while a background confirmation owns the request lease', () => {
+    const selectionStart = component.indexOf('async function selectConversation(id: number)');
+    const selectionEnd = component.indexOf('async function removeConversation', selectionStart);
+    const selection = component.slice(selectionStart, selectionEnd);
+    expect(selection).toContain('const requestId = beginConversationSelection();');
+    expect(selection).toContain('finishConversationSelection(requestId);');
+    expect(controller).toContain('activeConversationSelectionRef.current !== null');
+    expect(controller).toContain('setLoading(activeConversationSelectionRef.current !== null);');
+    expect(controller).toContain('setLoading(activeRequestRef.current !== null);');
+    expect(component).toContain('if (!startNewChat()) return;');
+    expect(component).toContain('startedRequestKeyRef.current === startRequest.requestKey');
+    expect(component).toContain('[startRequest?.requestKey, loading]');
   });
 
   it('guards conversation list refreshes against stale view responses', () => {

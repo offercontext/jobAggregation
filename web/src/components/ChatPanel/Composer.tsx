@@ -4,6 +4,7 @@ import { SendOutlined } from '@ant-design/icons';
 import type { Capability } from './capabilities';
 import SlashMenu from './SlashMenu';
 import styles from './ChatPanel.module.css';
+import type { SendMessageOutcome } from '@/features/assistantSurface/usePilotConversationController';
 
 interface Props {
   capabilities: Capability[];
@@ -14,7 +15,11 @@ interface Props {
   suggestions?: string[];
   onSuggestionSelect?: (question: string) => void;
   onboardingFocusToken?: number;
-  onSend: (text: string) => void | boolean | Promise<void | boolean>;
+  onSend: (text: string) => void | boolean | SendMessageOutcome | Promise<void | boolean | SendMessageOutcome>;
+}
+
+function shouldClearAfterSend(result: void | boolean | SendMessageOutcome): boolean {
+  return result !== false && result !== 'failed' && result !== 'stopped' && result !== 'ignored';
 }
 
 export default function Composer({
@@ -76,7 +81,7 @@ export default function Composer({
     }
 
     const sent = await onSend(cap.prompt);
-    if (sent !== false) {
+    if (shouldClearAfterSend(sent)) {
       setValue('');
       setSel(0);
     }
@@ -86,7 +91,7 @@ export default function Composer({
     const text = value.trim();
     if (!text || disabled) return;
     const sent = await onSend(text);
-    if (sent !== false) {
+    if (shouldClearAfterSend(sent)) {
       setValue('');
       setSel(0);
     }

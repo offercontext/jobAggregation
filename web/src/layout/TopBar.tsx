@@ -45,9 +45,9 @@ export default function TopBar({
       </div>
       <div className="op-topbar-actions" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
         <Button icon={<SearchOutlined />} onClick={onSearch}>
-          搜索 <span style={{ opacity: 0.6, marginLeft: 4 }}>⌘K</span>
+          快速打开 <span style={{ opacity: 0.6, marginLeft: 4 }}>⌘K</span>
         </Button>
-        <Button icon={<SettingOutlined />} onClick={onOpenSettings} aria-label="AI 设置" />
+        <Button icon={<SettingOutlined />} onClick={onOpenSettings} aria-label="设置" />
         <Button type="primary" icon={<PlusOutlined />} onClick={onAdd}>
           添加投递
         </Button>

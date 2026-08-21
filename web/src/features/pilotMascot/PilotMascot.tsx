@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type PointerEvent } from 'react';
+import { useEffect, useRef, useState, type PointerEvent, type RefObject } from 'react';
 import { CloseOutlined, MessageOutlined, MinusOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons';
 import {
   live2dPilotMascotRuntime,
@@ -41,6 +41,7 @@ interface Props {
   position?: PilotMascotPosition;
   onPositionChange?: (position: PilotMascotPosition) => void;
   runtime?: PilotMascotRuntime;
+  triggerRef?: RefObject<HTMLButtonElement>;
 }
 
 const ACTIVITY_COPY: Record<PilotMascotActivity, { label: string; detail: string }> = {
@@ -82,9 +83,11 @@ export default function PilotMascot({
   position,
   onPositionChange,
   runtime = live2dPilotMascotRuntime,
+  triggerRef: externalTriggerRef,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const triggerRef = useRef<HTMLButtonElement>(null);
+  const internalTriggerRef = useRef<HTMLButtonElement>(null);
+  const triggerRef = externalTriggerRef ?? internalTriggerRef;
   const hideRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const runtimeControllerRef = useRef<PilotMascotRuntimeController>();
@@ -283,7 +286,7 @@ export default function PilotMascot({
       data-activity={activity}
       data-notification={notification?.status}
       data-interview-studio-companion={studioPlacement ? 'true' : undefined}
-      aria-label="Haru Pilot 看板娘"
+      aria-label="Haru 助手"
       style={{ width: frameWidth, height: frameHeight, left: `${frameLeft}px`, top: `${frameTop}px`, right: 'auto', bottom: 'auto' }}
     >
       {notification || (!panelOpen && activity !== 'idle') ? (
@@ -328,7 +331,7 @@ export default function PilotMascot({
         </span>
         <span className={styles.nameplate} aria-hidden="true">
           <span className={styles.statusDot} />
-          Haru · Pilot
+          Haru
         </span>
       </button>
       {menuOpen ? (

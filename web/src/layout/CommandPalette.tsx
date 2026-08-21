@@ -69,7 +69,7 @@ export function buildPipelineNavigationCommands(
     { key: 'pipeline-board', label: '打开投递看板', hint: '投递', view: 'board' },
     { key: 'pipeline-list', label: '打开投递列表', hint: '投递', view: 'applications-list' },
     { key: 'pipeline-calendar', label: '打开事件日历', hint: '投递', view: 'calendar' },
-    { key: 'pipeline-reminders', label: '打开跟进提醒', hint: '投递', view: 'reminders' },
+    { key: 'pipeline-reminders', label: '打开今日提醒', hint: '今日', view: 'reminders' },
   ].map((item) => ({
     key: item.key,
     label: item.label,
@@ -91,6 +91,7 @@ interface Props {
   onOpenResume: () => void;
   onUploadResume?: () => void;
   onOpenChat: () => void;
+  onOpenPilot?: () => void;
   onOpenSettings: () => void;
   pipelineActions: PipelineInsight[];
   onRunPipelineAction: (item: PipelineInsight) => void;
@@ -106,6 +107,7 @@ export default function CommandPalette({
   onOpenResume,
   onUploadResume,
   onOpenChat,
+  onOpenPilot,
   onOpenSettings,
   pipelineActions,
   onRunPipelineAction,
@@ -127,8 +129,9 @@ export default function CommandPalette({
       { key: 'resume-library', label: '打开简历库', hint: '简历', run: () => { onOpenResume(); onClose(); } },
       { key: 'new-resume', label: '新建简历', hint: '在简历库创建薄版', run: () => { onOpenResume(); onClose(); } },
       { key: 'uploadResume', label: '上传简历', hint: 'PDF 到简历库', run: () => { onUploadResume?.(); onClose(); } },
-      { key: 'chat', label: '打开右侧 Pilot 对话', hint: '动作', run: () => { onOpenChat(); onClose(); } },
-      { key: 'settings-ai', label: '打开 AI 设置', hint: '设置', run: () => { onOpenSettings(); onClose(); } },
+      { key: 'haru', label: '问 Haru', hint: '助手', run: () => { onOpenChat(); onClose(); } },
+      { key: 'pilot', label: '打开 Pilot 工作区', hint: '助手', run: () => { onOpenPilot?.(); onClose(); } },
+      { key: 'settings', label: '打开设置', hint: '设置', run: () => { onOpenSettings(); onClose(); } },
       ...buildPipelineNavigationCommands(onNavigate, onClose),
       ...MODULE_NAV.map((item) => ({
         key: `nav-${item.key}`,
@@ -140,7 +143,7 @@ export default function CommandPalette({
         },
       })),
     ],
-    [onAddApplication, onOpenResume, onUploadResume, onOpenChat, onOpenSettings, onNavigate, onClose]
+    [onAddApplication, onOpenResume, onUploadResume, onOpenChat, onOpenPilot, onOpenSettings, onNavigate, onClose]
   );
 
   const kw = q.trim().toLowerCase();
@@ -198,7 +201,7 @@ export default function CommandPalette({
         aria-activedescendant={activeItem ? commandOptionId(activeItem.key) : undefined}
         size="large"
         variant="borderless"
-        placeholder="搜索投递、跳转页面、执行动作…"
+        placeholder="快速打开页面、投递或助手…"
         value={q}
         onChange={(e) => setQ(e.target.value)}
         onKeyDown={onKeyDown}

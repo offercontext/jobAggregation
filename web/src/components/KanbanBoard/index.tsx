@@ -21,6 +21,9 @@ import {
   requiresClosedReason,
   resolveKanbanDropDestination,
   willRecordFirstStatusTimestamp,
+  filterAndSortApplications,
+  DEFAULT_APPLICATION_VIEW_STATE,
+  type ApplicationViewState,
 } from './applicationLifecycle';
 import styles from './KanbanBoard.module.css';
 
@@ -28,9 +31,10 @@ interface KanbanBoardProps {
   applications: Application[];
   onOpenDetail?: (app: Application) => void;
   onAttachToPilot?: (attachment: import('@/types/chat').PilotContextAttachment) => void;
+  viewState?: ApplicationViewState;
 }
 
-export default function KanbanBoard({ applications, onOpenDetail, onAttachToPilot }: KanbanBoardProps) {
+export default function KanbanBoard({ applications, onOpenDetail, onAttachToPilot, viewState }: KanbanBoardProps) {
   const queryClient = useQueryClient();
   const [activeId, setActiveId] = useState<number | null>(null);
   const [pendingMove, setPendingMove] = useState<{ app: Application; status: ApplicationStatus } | null>(null);
@@ -40,16 +44,11 @@ export default function KanbanBoard({ applications, onOpenDetail, onAttachToPilo
   const columns = useMemo(() => {
     const grouped = {} as Record<ApplicationStatus, Application[]>;
     for (const s of KANBAN_COLUMNS) grouped[s] = [];
-    applications.forEach((app) => {
+    filterAndSortApplications(applications, viewState ?? DEFAULT_APPLICATION_VIEW_STATE).forEach((app) => {
       if (grouped[app.status]) grouped[app.status].push(app);
     });
-    for (const key of KANBAN_COLUMNS) {
-      grouped[key].sort(
-        (a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime()
-      );
-    }
     return grouped;
-  }, [applications]);
+  }, [applications, viewState]);
 
   const activeRecord = applications.find((a) => a.id === activeId) ?? null;
 

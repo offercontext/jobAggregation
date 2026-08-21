@@ -6,6 +6,18 @@ import { EVENT_TYPE_LABELS } from '@/types/event';
 
 export type ApplicationSortBy = 'updated_desc' | 'updated_asc' | 'applied_desc' | 'applied_asc';
 
+export interface ApplicationViewState {
+  keyword: string;
+  status: ApplicationStatus | 'all';
+  sortBy: ApplicationSortBy;
+}
+
+export const DEFAULT_APPLICATION_VIEW_STATE: ApplicationViewState = {
+  keyword: '',
+  status: 'all',
+  sortBy: 'updated_desc',
+};
+
 export interface ApplicationListFilter {
   keyword: string;
   status: ApplicationStatus | 'all';

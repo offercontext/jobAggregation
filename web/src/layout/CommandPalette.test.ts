@@ -35,9 +35,15 @@ describe('CommandPalette resume commands', () => {
     expect(source).not.toContain('简历匹配');
   });
 
-  it('separates the Pilot tab navigation from the contextual chat entry', () => {
-    expect(source).toContain('打开右侧 Pilot 对话');
-    expect(source).toContain('前往 ${item.label}');
+  it('offers Haru and the full Pilot workspace as separate assistant destinations', () => {
+    expect(source).toContain('问 Haru');
+    expect(source).toContain('打开 Pilot 工作区');
+    expect(source).toContain('快速打开');
+  });
+
+  it('uses the unified settings destination wording', () => {
+    expect(source).toContain("label: '打开设置'");
+    expect(source).not.toContain('打开 AI 设置');
   });
 
   it('builds application search commands without soft-deleted rows', () => {
@@ -68,7 +74,7 @@ describe('CommandPalette resume commands', () => {
       '打开投递看板',
       '打开投递列表',
       '打开事件日历',
-      '打开跟进提醒',
+      '打开今日提醒',
     ]);
 
     commands[1].run();

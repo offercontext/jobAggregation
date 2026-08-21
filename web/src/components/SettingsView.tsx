@@ -174,7 +174,7 @@ export default function SettingsView({
             </span>
             <div>
               <Typography.Title id="pilot-mascot-settings-title" level={4} style={panelTitleStyle}>
-                Pilot 看板娘
+                Haru
               </Typography.Title>
               <Typography.Text style={{ color: 'var(--op-muted)' }}>
                 在桌面宽屏显示 Haru。隐藏后将恢复默认 Pilot 侧边栏。

@@ -1773,9 +1773,10 @@ def _pilot_runtime_baseline_golden() -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-JOURNAL_HITL_ENTRY_SSE_EVENTS = _pilot_runtime_baseline_golden()["sse_sequences"]["hitl_entry"]
-JOURNAL_HITL_CONFIRM_SSE_EVENTS = _pilot_runtime_baseline_golden()["sse_sequences"]["hitl_confirm"]
-JOURNAL_HITL_CHAIN_CONFIRM_SSE_EVENTS = _pilot_runtime_baseline_golden()["sse_sequences"][
+_PILOT_RUNTIME_BASELINE = _pilot_runtime_baseline_golden()
+JOURNAL_HITL_ENTRY_SSE_EVENTS = _PILOT_RUNTIME_BASELINE["sse_sequences"]["hitl_entry"]
+JOURNAL_HITL_CONFIRM_SSE_EVENTS = _PILOT_RUNTIME_BASELINE["sse_sequences"]["hitl_confirm"]
+JOURNAL_HITL_CHAIN_CONFIRM_SSE_EVENTS = _PILOT_RUNTIME_BASELINE["sse_sequences"][
     "hitl_chain_confirm"
 ]
 
@@ -4020,9 +4021,9 @@ def test_chat_stream_emits_pilot_sse_v1_sequence(tmp_path):
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
     events = _parse_sse_events(response.text)
-    assert [event["event"] for event in events] == _pilot_runtime_baseline_golden()[
-        "sse_sequences"
-    ]["initial_model"]
+    assert [event["event"] for event in events] == _PILOT_RUNTIME_BASELINE["sse_sequences"][
+        "initial_model"
+    ]
     seqs = [event["data"]["seq"] for event in events]
     assert seqs == sorted(seqs)
     assert events[0]["data"]["data"]["stream_version"] == "pilot-sse-v1"

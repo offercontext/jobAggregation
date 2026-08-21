@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
 
@@ -65,3 +66,16 @@ def test_pilot_runtime_baseline_golden_is_canonical_and_pinned() -> None:
         "error_code": "stale_pending_action",
         "status": 409,
     }
+
+
+def test_pilot_runtime_baseline_required_tests_are_defined() -> None:
+    value = json.loads(GOLDEN.read_text(encoding="utf-8"))
+    tests_root = Path(__file__).parents[1]
+    defined_names = {
+        node.name
+        for path in tests_root.rglob("*.py")
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"), filename=str(path)))
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    missing = sorted(set(value["required_existing_tests"]) - defined_names)
+    assert not missing, f"required tests missing from {tests_root}: {missing}"

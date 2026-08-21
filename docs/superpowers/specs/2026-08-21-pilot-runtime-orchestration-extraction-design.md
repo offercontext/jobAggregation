@@ -150,6 +150,8 @@ class PilotRuntime:
         transport: RuntimeTransportContext,
         event_sink: RuntimeEventSink,
         signal_sink: RuntimeSignalSink[str] | None,
+        execution_host: AgentExecutionHost,
+        invocation_control: RuntimeInvocationControl,
         cancel_check: Callable[[], bool],
     ) -> RuntimeOutcome: ...
 
@@ -159,13 +161,53 @@ class PilotRuntime:
         *,
         transport: RuntimeTransportContext,
         event_sink: RuntimeEventSink,
+        execution_host: AgentExecutionHost,
+        invocation_control: RuntimeInvocationControl,
+        cancel_check: Callable[[], bool],
+    ) -> RuntimeOutcome: ...
+
+    def prepare_stream(
+        self,
+        request: StartTurnRequest | ConfirmationRequest,
+        *,
+        transport: RuntimeTransportContext,
+        invocation_control: RuntimeInvocationControl,
+    ) -> ImmediateHttpOutcome | PreparedStreamExecution: ...
+
+    def execute_prepared_stream(
+        self,
+        prepared: PreparedStreamExecution,
+        *,
+        event_sink: RuntimeEventSink,
+        signal_sink: RuntimeSignalSink[str] | None,
+        execution_host: AgentExecutionHost,
         cancel_check: Callable[[], bool],
     ) -> RuntimeOutcome: ...
 ```
 
-API 的 sync adapter 在现有 timeout worker 中调用它；SSE adapter 在现有 worker +
-有界事件通道中调用它。不得在本期将同步 SQLite/Provider 调用包装成表面 `async`，也不得
-依赖 `asyncio.wait_for()` 取消底层线程。
+Runtime 本身在 Transport owner 的调用栈上执行；到达现有 Agent 调用阶段时，Runtime 将
+一次性的 Agent thunk 交给 Transport-owned `AgentExecutionHost`。该 Host 唯一创建和管理
+当前 timeout worker、Future、cancel Event 以及 SSE 的无界 `Queue()`。Source Loader、
+precheck、消息持久化和其他 baseline 不计入 Agent timeout 的阶段不得被移入 worker。
+
+SSE adapter 先在返回响应头前同步调用 `prepare_stream()`，只有得到
+`PreparedStreamExecution` 才构造 StreamingResponse；其 generator 再调用
+`execute_prepared_stream()`，Runtime 到达 Agent 阶段后才让 Host 创建 worker。不得在本期
+将同步 SQLite/Provider 调用包装成表面 `async`，也不得依赖 `asyncio.wait_for()` 或
+`Future.cancel()` 强制中断已经运行的底层线程。
+
+`AgentExecutionHost` 是 Transport 注入的窄能力，不包含 Repository、Journal、Pending 或
+Ledger 方法。它只能：
+
+```text
+执行一个 Runtime 提供的 Agent thunk
+转发 Agent runtime events
+实施 baseline Agent deadline/poll/cancel
+返回 AgentTurnResult 或抛出封闭 timeout/control exception
+```
+
+Runtime 仍然是阶段顺序和业务结果的唯一编排者；Host 不解析 ToolMessage、Outcome、SSE
+字符串或业务异常。
 
 ### 2.3 输入 DTO
 
@@ -220,7 +262,6 @@ ConfirmationRequiredOutcome
 RuntimeFailureOutcome
 OperationPendingOutcome
 OperationReplayOutcome
-CancelledOutcome（只供 Transport 控制，不渲染普通产品错误）
 ```
 
 每个 Outcome 只包含生成现有 HTTP/SSE 响应所需的安全字段。HTTP status、错误 code、
@@ -228,6 +269,31 @@ retryable、degraded 和现有中文文案的映射是只读兼容表，不允�
 
 Runtime 内部可以使用更细的失败原因，但不得把异常对象、原始异常文本、密钥、参数或工具
 结果放入 Outcome、日志、Journal 或 SSE。
+
+SSE 准备阶段另外使用两个封闭瞬态类型：
+
+```text
+ImmediateHttpOutcome
+- status_code
+- safe response payload
+
+PreparedStreamExecution
+- invocation_id
+- preparation_kind: model | deterministic | confirmation | replay
+- execution_mode: direct | agent_host
+- opaque prepared state（repr=False）
+- single-use state: prepared | executing | aborted | completed
+```
+
+`ImmediateHttpOutcome` 只表示 baseline 本来会在 `StreamingResponse` 创建前直接返回的
+HTTP 结果。`PreparedStreamExecution` 不进入 ChatMessage、Pending、Ledger、Journal、Graph
+State 或 checkpoint，不可通用序列化，也不得携带活跃 ORM/Session。它可以持有 Runtime
+拥有的不可变 DTO、RunRecorder、一次性控制 token 和已经冻结的 Source；敏感字段必须
+`repr=False`。
+
+`PreparedStreamExecution` 只能由创建它的 `PilotRuntime` 执行一次。Transport 若在执行
+开始前失败或客户端断开，必须调用 Runtime 的 abort transition；该 transition 只收敛
+Runtime 自己的资源，不执行 Provider、Tool 或新的业务写入。
 
 ### 2.6 Runtime Event Sink
 
@@ -255,10 +321,20 @@ completed
 - Runtime 生成逻辑事件，不编码 `text/event-stream`；
 - SSE adapter 唯一分配并编码现有 `seq`；
 - Sync sink 可以忽略中间事件，但不得改变 Runtime 执行；
-- Event Sink 交付失败视为 Transport 失败，不得重跑 Provider、executor 或 Ledger；
+- Event Sink 交付失败统一转换为 `RuntimeTransportAborted` 控制异常；
+- `RuntimeTransportAborted` 与 `RuntimeCancelled` 必须先于通用 `Exception` 被处理，清理后
+  重新传播给 Transport；
+- 控制异常不得生成产品错误、assistant message 或 `RuntimeFailureOutcome`，也不得重跑
+  Provider、executor 或 Ledger；
 - Journal 不是 Runtime Event Sink，继续由现有 RunRecorder 接点独立记录；
 - 不允许从 SSE 字符串反向解析 Runtime 状态；
 - sync 与 stream 的 Runtime Outcome 必须来自同一状态机，而不是从事件重新拼装业务结果。
+
+`RuntimeCancelled` 与 `RuntimeTransportAborted` 是 `Exception` 的封闭 final 子类，只用于
+当前调用栈控制，不可序列化、不可持久化、`repr` 不含原因正文。Transport 设置
+`RuntimeInvocationControl` 的取消原因后，Runtime 的 `cancel_check` wrapper 必须据此抛出
+对应类型：用户断开/显式取消为 `RuntimeCancelled`，Event consumer/response renderer 已
+不可继续为 `RuntimeTransportAborted`。二者不得依赖解析异常文本来分类。
 
 ### 2.7 标题资格信号
 
@@ -466,13 +542,18 @@ sync Route 只负责：
 normalize payload
 → build DTO
 → create SyncResultSink + title signal
-→ invoke PilotRuntime through existing timeout owner
+→ invoke PilotRuntime on request owner
+→ Runtime 在 Agent 阶段调用 SyncAgentExecutionHost
 → drain/close title signal exactly once
 → render RuntimeOutcome to JSONResponse
 ```
 
-Runtime 的 timeout、Pending、Ledger 和 persistence 已经完成后，Transport 才渲染响应。
-Transport renderer 失败不得触发第二次 Runtime 调用。
+Agent 阶段的 outer executor、Future、deadline、cancel event 和 title signal finalizer 归
+sync Transport owner。Source load 和 Agent 返回后的 persistence 继续位于 Agent timeout
+之外。Runtime 通过 `RuntimeInvocationControl` 拥有 timeout/cancel 对业务状态的收敛规则。
+Host 到达 deadline 后只调用一次 control transition 并把封闭 timeout 结果交回 Runtime；
+不得自行写 ChatMessage、Pending、Ledger 或 Journal。Transport renderer 失败不得触发第二次
+Runtime 调用。
 
 ### 4.2 SSE Adapter
 
@@ -481,17 +562,68 @@ SSE Route 只负责：
 ```text
 normalize payload
 → build DTO + SseRun transport identity
-→ start one Runtime worker
-→ consume bounded RuntimeEvent channel
+→ PilotRuntime.prepare_stream()（响应头发送前，同步）
+→ ImmediateHttpOutcome：直接渲染 HTTP
+  | PreparedStreamExecution：构造 StreamingResponse
+→ generator 调用 PilotRuntime.execute_prepared_stream()
+→ execution_mode=direct：按 baseline 直接投影预计算 SSE
+  | execution_mode=agent_host：Runtime 在 Agent 阶段调用 SseAgentExecutionHost
+    → Host 创建一个 Agent worker 并消费 baseline unbounded RuntimeEvent Queue
 → assign seq and encode existing SSE
 → drain/close title signal exactly once
 → propagate disconnect cancellation
 ```
 
+#### 4.2.1 响应头前准备阶段
+
+`prepare_stream()` 必须在构造/返回 `StreamingResponse` 前完成 baseline 当前位于该边界前的
+全部判断和副作用，包括：
+
+- Conversation 创建/读取和 live Pending guard；
+- 当前模型配置是否可用；
+- 初始 stream 的 user message 写入与 Context Source 加载；
+- deterministic route 的匹配、执行和直接 JSON 错误；
+- confirmation 的 conversation、token、operation、Ledger、edited args 和 Pending 身份检查；
+- terminal replay/delivery 对账中 baseline 会直接返回的结果；
+- 创建或恢复 Journal Run/Segment 的 baseline 对应部分。
+
+准备结果固定为：
+
+```text
+baseline 在响应头前返回 4xx/5xx JSON
+→ ImmediateHttpOutcome
+→ worker = 0
+→ event channel = 0
+
+baseline 会进入 SSE
+→ PreparedStreamExecution
+→ Transport 才返回 StreamingResponse
+→ 只有 baseline 原本使用 Agent worker 且执行到 Agent 阶段才启动 worker
+```
+
+如果 deterministic 或 replay 已经在准备阶段得到最终业务结果，但 baseline 仍以 SSE 交付，
+则 `PreparedStreamExecution` 保存安全的预计算 Outcome，并使用 `execution_mode=direct`
+投影既有 SSE，不创建 Agent worker，也不再次执行 deterministic action、Ledger replay、
+Provider 或 Tool。
+
+准备阶段必须保留 baseline 的准确顺序。例如当前初始 stream 在 Source Loader 成功后才创建
+对应 Run/Segment 时，不得因抽象统一而提前创建；sync 路径也不得被迫改成 stream 的顺序。
+所有顺序差异由一个 Runtime 状态机中的显式 preparation kind 表达，不允许 Route 重新编排。
+
+`PreparedStreamExecution` 创建后若响应构造失败、响应迭代从未开始或 Agent worker 提交失败，
+Transport 必须调用一次 `abort_before_start()`。Runtime 以一次性 CAS 将 `prepared → aborted`，
+完成既有 Journal/lease 清理；Provider、Tool executor 和新业务写入均为 0。已进入
+`executing` 后只能通过 invocation cancellation 收敛，不能再调用 before-start abort。
+
+#### 4.2.2 Agent Worker 与 Queue
+
 固定规则：
 
-- 一个请求只启动一个 Runtime worker；
-- channel 容量、backpressure、poll interval、worker join 和 timeout 使用 baseline 常量；
+- 一次 Agent 阶段只启动一个 Host-owned Agent worker，与 baseline 的多轮 Agent 调用边界一致；
+- Runtime Event channel 必须继续使用 baseline 的无界 `Queue()`；本期不引入 capacity、
+  backpressure、丢弃或合并事件；
+- Agent worker 使用非阻塞 `Queue.put()`/等价无界写入，不因慢客户端等待消费者；
+- poll interval、worker shutdown、timeout 起点和 `cancel_futures` 规则保持 baseline；
 - `seq` 只由单一 SSE owner 单调分配；
 - worker 不直接 yield FastAPI response bytes；
 - Runtime 不持有 Request/Response/BackgroundTasks；
@@ -500,6 +632,9 @@ normalize payload
 - 已提交 Ledger terminal 仍由 Phase 3 delivery lease/fencing 收敛；
 - late Bundle 继续被 owner token/generation fencing 丢弃；
 - SSE emitter/renderer 异常不得重跑 Runtime。
+
+有界队列或 SSE backpressure 属于后续独立行为变更，必须单独设计慢消费者、内存上限、
+timeout 和断线语义，不得在本期顺带实施。
 
 ### 4.3 Event 顺序
 
@@ -527,13 +662,47 @@ meta
 - fresh read 也无法确认结果时返回既有 `operation_result_unknown`；
 - timeout/fallback 不产生第二次 Provider、executor 或 continuation。
 
+outer Python thread 不能被 `Future.cancel()` 强制停止。每次调用必须有一个瞬态
+`RuntimeInvocationControl`，状态至少为：
+
+```text
+active → completed
+active → timed_out
+active → cancelled
+```
+
+AgentExecutionHost 拥有 wall-clock deadline，并且只能请求一次
+`active → timed_out/cancelled`。Runtime 拥有 transition 的业务收敛实现。Agent worker 在
+Provider/Tool 前后检查状态；Runtime owner 在持久化前和 delivery 前再次检查：
+
+- timeout/cancel winner 已产生后，晚到的非写 Runtime Outcome 直接丢弃，不再写
+  assistant/tool message、Pending 或 Journal terminal；
+- 已进入 executor/terminal 的写操作继续以 Ledger 和 delivery owner/generation fencing 为
+  权威，晚到 Bundle 不能提交 delivery；
+- 已经不可中断的 Provider/native 调用允许返回，但返回值只用于清理，不得重新变成响应；
+- Transport 不等待迟到结果，也不得启动第二个 Runtime；
+- Runtime `finally` 停止 Runtime-owned heartbeat/lease，Host/Transport `finally` 只回收自己的
+  Future/executor/channel/signal。
+
 ### 4.5 Cancellation 与 BaseException
 
-- `ChatRunCancelled` 和请求 cancellation 按 Transport 控制流处理；
+- 取消和 Transport 中止只有异常传播一种权威表达，不定义 `CancelledOutcome`；
+- `RuntimeCancelled` 表示 cancel event/request disconnect；
+- `RuntimeTransportAborted` 表示 Event Sink 关闭、consumer 退出、响应投影不可继续或
+  Transport adapter 故障；
+- `cancel_check()` 和 `event_sink.emit()` 由窄 wrapper 调用。wrapper 把普通 Sink/Transport
+  异常转换为 `RuntimeTransportAborted`，但不吞掉 `BaseException`；
+- Runtime 必须按 `RuntimeCancelled`、`RuntimeTransportAborted`、已知产品异常、普通
+  `Exception`、`BaseException` 的顺序处理；前两者清理后原样传播，绝不进入
+  `_ai_provider_error`、`_safe_stream_error` 或产品失败映射；
+- Sink 失败后不得尝试向同一 Sink 再发送 `error`/`completed`；
+- `ChatRunCancelled` 仅保留在 Agent Driver adapter 内，并在 Runtime 边界转换为
+  `RuntimeCancelled`；
 - `asyncio.CancelledError`、`KeyboardInterrupt`、`SystemExit` 和其他 `BaseException` 清理后
   原样传播；
-- Runtime 只捕获普通 `Exception` 并映射封闭安全失败；
-- cancellation 必须停止 title signal、delivery heartbeat 和 worker；
+- 只有排除上述控制流之后的普通 `Exception` 才能映射封闭安全失败；
+- cancellation 必须停止 Runtime-owned delivery heartbeat/lease；outer worker、event
+  channel、cancel event 与 title signal 由 Transport finalizer 回收；
 - cancellation 不主动生成普通 projection/provider failure；
 - Journal cleanup 继续 fail-open，不能覆盖原始 BaseException。
 
@@ -569,24 +738,43 @@ Route 不得持有这些副作用的 callback 闭包。
 
 ### 5.3 一次性所有权
 
-Runtime 必须显式拥有并在 `finally` 释放：
+所有权固定拆分为：
 
 ```text
-Run/Segment disposition
-Agent worker
-Runtime event channel
-title signal finalizer
-delivery heartbeat
-delivery ownership token/generation
-confirmation cancellation token
+Transport owner
+- outer executor / Future / worker thread handle
+- baseline unbounded Runtime Event Queue
+- cancel Event 与 wall-clock deadline
+- SSE seq / response encoding / consumer lifecycle
+- RuntimeSignalSink 的 drain / close / title registration finalizer
+
+Runtime owner
+- PreparedStreamExecution 的一次性状态
+- RuntimeInvocationControl 的业务收敛 transition
+- Run / Segment disposition
+- Context Source UoW 与冻结 DTO
+- Pending / Ledger coordination
+- delivery heartbeat / ownership token / generation
+- confirmation attempt state
+- Agent Driver 调用期间创建的非线程业务资源
 ```
 
-同一资源不得同时由 Route 与 Runtime finalizer。所有 cleanup 必须满足：
+Runtime 不拥有承载自身的 outer worker，也不得在自身 `finally` 中 shutdown 该 executor 或
+关闭 Event Queue。Transport 不得直接 finish/abandon Journal、停止 delivery heartbeat、写
+fallback 或修改 Pending/Ledger；它只能触发 Runtime 提供的一次性 timeout/cancel/abort
+transition。
+
+同一资源不得同时由 Transport 与 Runtime finalizer。所有 cleanup 必须满足：
 
 - 普通异常不覆盖更早的业务/取消异常；
 - cleanup 失败不触发 Provider/executor 重跑；
 - Journal cleanup 失败只增加安全诊断；
 - delivery fencing 的数据库结果继续权威于内存状态。
+
+Transport timeout 或 disconnect 后，即使 `Future.cancel()` 返回 false，也立即关闭本次交付
+资格。Agent worker 的迟到返回先检查 `RuntimeInvocationControl`，不能写响应或消息；写
+Operation 的迟到结果还必须通过既有 delivery generation/owner token CAS。Transport 丢弃
+任何迟到 Outcome，且只执行一次 title signal finalizer。
 
 ### 5.4 依赖冻结
 
@@ -646,6 +834,16 @@ Golden 必须从固定 `b05d915` 独立捕获并作为只读合成资产提交�
 - deterministic initial action、approve、modify、reject、replay；
 - Journal enabled/disabled/degraded。
 
+SSE 响应头边界还必须逐项锁定：
+
+- Source Loader 失败继续是响应头前 HTTP 503，而不是 HTTP 200 + SSE `error`；
+- deterministic 校验/执行产生的 baseline 4xx/5xx 继续直接返回 JSON；
+- confirmation token、edited args、Ledger/Pending 身份和 terminal replay 校验产生的
+  baseline 409/422/503 继续直接返回 JSON；
+- 只有 baseline 本来进入 SSE 的结果才创建 `StreamingResponse`；只有
+  `execution_mode=agent_host` 才创建 worker 与 Queue，deterministic direct stream 继续为 0；
+- precomputed deterministic/replay SSE 不重复业务执行。
+
 每个场景比较：
 
 ```text
@@ -673,6 +871,14 @@ Golden 只使用合成数据，不保存 SQLite、真实用户内容、密钥、
 - `pilot_runtime` 不导入 FastAPI/Starlette response/background task；
 - Agent Runner 不导入 `pilot_runtime`；
 - SSE 编码和 `seq` 分配只存在于 Transport allowlist；
+- outer executor/Future、无界 Queue、cancel Event 和 title finalizer 只存在于 Transport
+  ownership allowlist；
+- `AgentExecutionHost` 不依赖 Repository/Journal/Pending/Ledger，且只能执行 Runtime 提供的
+  Agent thunk；
+- Runtime 不 shutdown outer executor、不 close Event Queue，也不注册 FastAPI background
+  task；
+- `prepare_stream()` 是响应头前业务判断的唯一入口，Route 不复制 Source/Pending/Ledger
+  precheck；
 - Runtime Event 不包含任意 dict payload 或异常对象；
 - 模型 dispatcher 不引用 Legacy deterministic adapter；
 - 旧 Route 编排 helper 和 callback 闭包已删除，无 feature flag/fallback/shadow；
@@ -686,13 +892,23 @@ Golden 只使用合成数据，不保存 SQLite、真实用户内容、密钥、
 除 golden 外必须覆盖：
 
 - Runtime 状态转换表的每个合法和非法边；
+- `ImmediateHttpOutcome` 与 `PreparedStreamExecution` 的全部 preparation kind；
+- prepared handle single-use、worker 启动前 abort、execute/abort 竞态和重复调用绝对 no-op；
 - Outcome → HTTP 与 Outcome/Event → SSE 的纯函数映射；
-- Sink 抛异常、关闭、满载和 consumer 退出；
+- Event Queue 明确为 baseline 无界 `Queue()`；慢 consumer 不阻塞 worker，也不改变 timeout
+  起点或事件顺序；
+- Sink 抛异常、consumer 退出和 response renderer 失败分别产生
+  `RuntimeTransportAborted`，不产生产品错误；
+- cancel event 产生 `RuntimeCancelled`，并与 transport abort、Provider failure 做机械分类；
 - sync/SSE title signal 所有退出路径恰好 finalizer 一次；
 - 双连接 confirmation claim winner；
 - terminal commit 后 delivery owner 活跃、崩溃 takeover、late Bundle；
 - source read lock 与 heartbeat 协调；
 - timeout 发生在 claim 前、executor 中、terminal 后和 continuation 中；
+- Source Loader 和 Agent 返回后的 persistence 延迟不计入 Agent timeout；Agent deadline
+  起点、poll 和结束点与 baseline 一致；
+- timeout 后不可取消 Provider 的迟到成功/失败均被 invocation control 丢弃；非写消息和
+  Pending 不落库，写 delivery 由 generation/owner fencing 拒绝；
 - cancellation 与 `BaseException` cleanup；
 - Journal 故障不改变 Outcome、副作用或调用次数；
 - renderer/transport/projector 后处理失败不重跑 Provider/executor；

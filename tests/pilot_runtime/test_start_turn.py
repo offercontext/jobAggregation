@@ -460,6 +460,34 @@ def test_timeout_writes_fixed_assistant_message_and_does_not_provider_map() -> N
     assert journal.recorder.dispositions == [("timed_out", "timeout")]
 
 
+@pytest.mark.parametrize("failure_mode", ["exception", "none", "failed"])
+def test_timeout_persistence_failure_is_safe_and_not_reported_as_message(
+    failure_mode: str,
+) -> None:
+    phases = _Phases()
+
+    class FailingTimeoutPersistence(_Persistence):
+        def persist_timeout_assistant(self, conversation_id: int, content: str) -> object:
+            del conversation_id, content
+            if failure_mode == "exception":
+                raise OSError("timeout message unavailable")
+            if failure_mode == "none":
+                return None
+            return SimpleNamespace(persisted=False, status="failed")
+
+    persistence = FailingTimeoutPersistence(phases)
+    runtime, _, journal = _runtime(phases, persistence=persistence)
+
+    result = _start(runtime, _Host(phases, RuntimeAgentTimedOut()))
+
+    assert isinstance(result, RuntimeFailureOutcome)
+    assert result.code is RuntimeFailureCode.OPERATION_FAILED
+    assert result.status_code == 503
+    assert result.retryable is True
+    assert persistence.message_count == 0
+    assert journal.recorder.dispositions == [("failed", "unknown")]
+
+
 def test_host_timeout_with_timed_out_control_still_records_timeout_delivery() -> None:
     phases = _Phases()
     control = InMemoryRuntimeInvocationControl()
@@ -623,6 +651,62 @@ def test_missing_target_uses_clarification_without_pending_outcome() -> None:
     assert result.message == "请先选择投递目标。"
     assert persistence.clarification_count == 1
     assert journal.recorder.dispositions == [("completed", None)]
+
+
+@pytest.mark.parametrize("failure_mode", ["exception", "none", "failed"])
+def test_non_atomic_clarification_set_failure_stops_before_assistant_and_completion(
+    failure_mode: str,
+) -> None:
+    phases = _Phases()
+    pending = SimpleNamespace(
+        tool_call_id="call-1",
+        tool_name="write",
+        args="{}",
+        human="write",
+        operation_id="op-1",
+    )
+
+    class FallbackPersistence(_Persistence):
+        def __init__(self, phases: _Phases) -> None:
+            super().__init__(phases)
+            self.persist_clarification = None  # type: ignore[method-assign]
+            self.setter_calls = 0
+            self.assistant_calls = 0
+
+        def set_pending_clarification(
+            self,
+            conversation_id: int,
+            pending_value: object,
+            question: str,
+        ) -> object:
+            del conversation_id, pending_value, question
+            self.setter_calls += 1
+            if failure_mode == "exception":
+                raise OSError("clarification CAS unavailable")
+            if failure_mode == "none":
+                return None
+            return SimpleNamespace(persisted=False, status="cas_lost")
+
+        def persist_assistant_message(self, conversation_id: int, content: str) -> object:
+            del conversation_id, content
+            self.assistant_calls += 1
+            return SimpleNamespace(persisted=True, message_id=13)
+
+    persistence = FallbackPersistence(phases)
+    runtime, _, journal = _runtime(
+        phases,
+        persistence=persistence,
+        driver=_Driver(phases, result=SimpleNamespace(added=[], reply="", pending=pending)),
+        missing_target_question=lambda pending, conversation_id: "请先选择投递目标。",
+    )
+
+    result = _start(runtime, _Host(phases))
+
+    assert isinstance(result, RuntimeFailureOutcome)
+    assert result.code is RuntimeFailureCode.OPERATION_FAILED
+    assert persistence.setter_calls == 1
+    assert persistence.assistant_calls == 0
+    assert journal.recorder.dispositions == [("failed", "unknown")]
 
 
 def test_final_projection_redacts_internal_tool_names_and_uses_safe_write_error() -> None:

@@ -390,6 +390,20 @@ def _result_persisted(result: object) -> bool:
     return True
 
 
+def _timeout_result_persisted(result: object) -> bool:
+    """Require explicit success before exposing the timeout assistant reply."""
+
+    if result is None:
+        return False
+    if type(result) is bool:
+        return result
+    persisted = _attribute(result, "persisted")
+    if type(persisted) is bool:
+        return persisted
+    status = _attribute(result, "status")
+    return str(getattr(status, "value", status or "")) == "persisted"
+
+
 def _failure_status(result: object) -> str:
     status = _attribute(result, "status")
     return str(getattr(status, "value", status or ""))
@@ -1011,16 +1025,6 @@ class PilotRuntime:
             try:
                 self._allow_timeout_persistence(invocation_control)
                 timeout_result = self._persist_timeout(persistence, conversation_id)
-                timeout_message_id = _attribute(timeout_result, "message_id")
-                self._record_journal_persisted(
-                    recorder,
-                    journal_started,
-                    persistence,
-                    conversation_id,
-                    (timeout_message_id,) if type(timeout_message_id) is int else (),
-                    invocation_control,
-                    allow_timeout=True,
-                )
             except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
                 abandon_once()
                 raise
@@ -1029,14 +1033,38 @@ class PilotRuntime:
             except BaseException:
                 abandon_once()
                 raise
-            if _result_persisted(timeout_result):
+            if _timeout_result_persisted(timeout_result):
+                try:
+                    timeout_message_id = _attribute(timeout_result, "message_id")
+                    self._record_journal_persisted(
+                        recorder,
+                        journal_started,
+                        persistence,
+                        conversation_id,
+                        (timeout_message_id,) if type(timeout_message_id) is int else (),
+                        invocation_control,
+                        allow_timeout=True,
+                    )
+                except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                    abandon_once()
+                    raise
+                except Exception:
+                    pass
+                except BaseException:
+                    abandon_once()
+                    raise
                 finish_or_raise("timed_out", "timeout", allow_timeout=True)
                 return MessageOutcome(
                     message=CHAT_TIMEOUT_MESSAGE,
                     conversation_id=conversation_id,
                 )
-            finish_or_raise("timed_out", "timeout", allow_timeout=True)
-            return self._failure(RuntimeFailureCode.CHAT_AGENT_TIMEOUT, CHAT_TIMEOUT_MESSAGE, 504, retryable=True)
+            finish_or_raise("failed", "unknown", allow_timeout=True)
+            return self._failure(
+                RuntimeFailureCode.OPERATION_FAILED,
+                "对话结果暂时无法保存。",
+                503,
+                retryable=True,
+            )
         except (RuntimeCancelled, RuntimeTransportAborted):
             abandon_once()
             raise
@@ -1630,9 +1658,13 @@ class PilotRuntime:
         if function is None:
             return None
         result = _invoke(function, {"conversation_id": conversation_id, "content": CHAT_TIMEOUT_MESSAGE}, (conversation_id, CHAT_TIMEOUT_MESSAGE))
+        if not _timeout_result_persisted(result):
+            return result
         clear = _callable(persistence, ("clear_pending_clarification",))
         if clear is not None:
-            _invoke(clear, {"conversation_id": conversation_id}, (conversation_id,))
+            clear_result = _invoke(clear, {"conversation_id": conversation_id}, (conversation_id,))
+            if not _timeout_result_persisted(clear_result):
+                return clear_result
         return result
 
     def _persist_result(
@@ -1914,12 +1946,30 @@ class PilotRuntime:
             setter = _callable(persistence, ("set_pending_clarification",))
             if setter is None:
                 raise TypeError("persistence does not provide clarification persistence")
-            ensure_active()
-            _invoke(
-                setter,
-                {"conversation_id": conversation_id, "pending": pending, "question": question},
-                (conversation_id, pending, question),
-            )
+            try:
+                ensure_active()
+                set_result = _invoke(
+                    setter,
+                    {"conversation_id": conversation_id, "pending": pending, "question": question},
+                    (conversation_id, pending, question),
+                )
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                raise
+            except Exception:
+                return _PersistedTurn(
+                    self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话结果暂时无法保存。", 503, retryable=True),
+                    message_ids,
+                )
+            if set_result is None:
+                return _PersistedTurn(
+                    self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话结果暂时无法保存。", 503, retryable=True),
+                    message_ids,
+                )
+            if not _result_persisted(set_result):
+                return _PersistedTurn(
+                    self._persistence_failure(set_result, "对话澄清暂时无法保存。"),
+                    message_ids,
+                )
             assistant = _callable(persistence, ("persist_assistant_message", "persist_initial_assistant_message"))
             if assistant is not None:
                 ensure_active()

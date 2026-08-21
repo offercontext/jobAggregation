@@ -150,8 +150,8 @@ function DashboardTestHarness({ props }: { props: any }) {
     <div data-testid="dashboard">
       <button
         type="button"
-        data-testid="readonly-application-detail"
-        onClick={() => props.onNextStepReadonlyNavigate?.({ kind: 'application_detail', applicationId: 7 })}
+        data-testid="open-dashboard-application"
+        onClick={() => props.onOpenDetailById?.(7)}
       />
       <button
         type="button"
@@ -307,11 +307,11 @@ describe('AppShell evidence navigation', () => {
     expect(view.querySelector('[data-testid="offer-focus"]')?.textContent).toBe('none');
   });
 
-  it('mounts the readonly adapter without turning source-risk navigation into a write flow', async () => {
+  it('keeps application drill-down available without turning unsupported source-risk navigation into a write flow', async () => {
     const view = render(<AppShell />);
     await flush();
 
-    act(() => view.querySelector<HTMLButtonElement>('[data-testid="readonly-application-detail"]')?.click());
+    act(() => view.querySelector<HTMLButtonElement>('[data-testid="open-dashboard-application"]')?.click());
     await flush();
     expect(view.querySelector('[data-testid="application-detail"]')?.textContent).toContain('7');
 

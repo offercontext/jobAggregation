@@ -70,7 +70,6 @@ describe('SettingsView Pilot mascot preference', () => {
     act(() => {
       root.render(
         <SettingsView
-          onOpenAISettings={vi.fn()}
           pilotMascotVisible={false}
           onPilotMascotVisibleChange={onChange}
         />,

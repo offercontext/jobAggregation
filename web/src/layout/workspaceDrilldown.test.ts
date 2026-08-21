@@ -12,6 +12,7 @@ import reviewForm from '@/components/ReviewFormDrawer.tsx?raw';
 import reviewManagement from '@/components/ReviewManagementView.tsx?raw';
 import resumeEditor from '@/components/ResumeEditorDrawer.tsx?raw';
 import resumeLibrary from '@/components/ResumeLibraryView.tsx?raw';
+import settingsView from '@/components/SettingsView.tsx?raw';
 import scheduleEventForm from '@/components/ScheduleEventForm.tsx?raw';
 import appShell from './AppShell.tsx?raw';
 
@@ -79,13 +80,14 @@ describe('workspace drill-down layout contract', () => {
   });
 
   it('opens AI settings inside workspace content instead of the shell edge', () => {
-    expect(appShell).toContain('const workspaceContent = aiSettingsOpen ? (');
+    expect(settingsView).toContain('const [aiSettingsOpen, setAISettingsOpen] = useState(false);');
+    expect(settingsView).toContain('<AISettingsDrawer open');
     expect(aiSettings).toContain('返回设置');
-    expect(appShell).not.toContain('<AISettingsDrawer open={aiSettingsOpen}');
+    expect(appShell).not.toContain('setAISettingsOpen');
   });
 
   it('renders application detail inside the workspace content instead of the shell edge', () => {
-    expect(appShell).toContain(') : selectedApp ? (');
+    expect(appShell).toContain('const workspaceContent = selectedApp ? (');
     expect(appShell).toContain('{workspaceContent}');
     expect(appShell).not.toContain('<ApplicationDetail\n        application={selectedApp}');
   });

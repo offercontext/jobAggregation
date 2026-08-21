@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Alert, Button, Empty, List, Space, Spin, Tabs, Tag, Typography } from 'antd';
-import { ArrowRightOutlined, CompassOutlined, SoundOutlined } from '@ant-design/icons';
+import { ArrowRightOutlined, BookOutlined, CompassOutlined, SoundOutlined } from '@ant-design/icons';
 import { listInterviews } from '@/services/interviews';
 import { listAdaptivePracticeRecommendations } from '@/services/adaptiveInterviewPractice';
 import type { InterviewIndexItem } from '@/types/interviewIndex';
@@ -22,20 +22,21 @@ interface Props {
   onOpenStoryLibrary?: (reviewNoteId?: number) => void;
   onOpenAdaptivePractice?: (focus: AdaptivePracticeFocus) => void;
   onOpenVoiceCoachingGrowth?: () => void;
+  onOpenQuestionBank?: () => void;
   applications?: Application[];
   events?: ScheduleEvent[];
   resumes?: Resume[];
   onOpenStudio?: (context: RealInterviewStudioContext | QuickPracticeStudioContext) => void;
 }
 
-export default function InterviewV01View({ onOpenApplication, onOpenPreparation, onOpenMockInterview, onOpenStoryLibrary, onOpenAdaptivePractice, onOpenVoiceCoachingGrowth, applications, events, resumes, onOpenStudio }: Props) {
+export default function InterviewV01View({ onOpenApplication, onOpenPreparation, onOpenMockInterview, onOpenStoryLibrary, onOpenAdaptivePractice, onOpenVoiceCoachingGrowth, onOpenQuestionBank, applications, events, resumes, onOpenStudio }: Props) {
   const [items, setItems] = useState<InterviewIndexItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
   const [practice, setPractice] = useState<AdaptivePracticeRecommendation | null>(null);
   const [practiceError, setPracticeError] = useState(false);
   const hasReadinessCenter = applications !== undefined || events !== undefined || resumes !== undefined || onOpenStudio !== undefined;
-  const [activeTab, setActiveTab] = useState<'start' | 'history' | 'growth'>(hasReadinessCenter ? 'start' : 'history');
+  const [activeTab, setActiveTab] = useState<'prepare' | 'practice' | 'questions' | 'growth'>(hasReadinessCenter ? 'prepare' : 'growth');
 
   useEffect(() => {
     let active = true;
@@ -62,14 +63,15 @@ export default function InterviewV01View({ onOpenApplication, onOpenPreparation,
     <div data-testid="interview-surface" className={`${workflowStyles.surface} op-view-enter`} style={{ padding: 24 }}>
       <Tabs
         activeKey={activeTab}
-        onChange={(key) => setActiveTab(key as 'start' | 'history' | 'growth')}
+        onChange={(key) => setActiveTab(key as 'prepare' | 'practice' | 'questions' | 'growth')}
         items={[
-          { key: 'start', label: '开始面试' },
-          { key: 'history', label: '记录与复盘' },
-          { key: 'growth', label: '训练与成长' },
+          { key: 'prepare', label: '待准备' },
+          { key: 'practice', label: '模拟练习' },
+          { key: 'questions', label: '题库' },
+          { key: 'growth', label: '复盘与成长' },
         ]}
       />
-      {activeTab === 'start' && hasReadinessCenter ? (
+      {activeTab === 'prepare' && hasReadinessCenter ? (
         <InterviewReadinessCenter
           applications={applications}
           events={events}
@@ -79,17 +81,24 @@ export default function InterviewV01View({ onOpenApplication, onOpenPreparation,
           onOpenStudio={onOpenStudio}
         />
       ) : null}
-      {activeTab !== 'start' || !hasReadinessCenter ? <>
+      {activeTab === 'questions' ? (
+        <div className="op-empty-state">
+          <Empty description="从题库选择题目，继续已有刷题计划。" image={Empty.PRESENTED_IMAGE_SIMPLE}>
+            {onOpenQuestionBank ? <Button type="primary" icon={<BookOutlined />} onClick={onOpenQuestionBank}>进入题库</Button> : null}
+          </Empty>
+        </div>
+      ) : null}
+      {activeTab === 'practice' || activeTab === 'growth' || (!hasReadinessCenter && activeTab === 'prepare') ? <>
       <div className="op-section-heading" style={{ marginBottom: 20 }}>
         <div>
           <Title level={3} style={{ margin: 0 }}>面试</Title>
           <Paragraph type="secondary" style={{ margin: '6px 0 0' }}>
-            查看已安排的面试事件、复盘、证据化建议和准备入口。
+            {activeTab === 'practice' ? '开始一次文本、语音或快速模拟练习。' : '查看面试记录、复盘、故事和薄弱点。'}
           </Paragraph>
         </div>
         <Space wrap>
           {onOpenVoiceCoachingGrowth ? <Button icon={<SoundOutlined />} onClick={onOpenVoiceCoachingGrowth}>表达成长</Button> : null}
-          {onOpenStoryLibrary ? <Button type="primary" data-story-audit="ui-library" onClick={() => onOpenStoryLibrary()}>面试故事库</Button> : null}
+          {onOpenStoryLibrary ? <Button type={activeTab === 'growth' ? 'primary' : 'default'} data-story-audit="ui-library" onClick={() => onOpenStoryLibrary()}>经历与故事</Button> : null}
         </Space>
       </div>
       {practice && onOpenAdaptivePractice ? (

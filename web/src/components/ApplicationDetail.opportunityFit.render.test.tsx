@@ -75,6 +75,7 @@ vi.mock('@ant-design/icons', () => ({
   AudioOutlined: () => null,
   DatabaseOutlined: () => null,
   FileTextOutlined: () => null,
+  MoreOutlined: () => null,
 }));
 vi.mock('antd', () => {
   const Form = Object.assign(
@@ -94,6 +95,9 @@ vi.mock('antd', () => {
     Text: (props: { children: ReactNode }) => <span>{props.children}</span>,
   };
   return {
+    Dropdown: (props: { children: ReactNode; menu?: { items?: Array<{ key: string; label: ReactNode; onClick?: () => void }> } }) => (
+      <>{props.children}{props.menu?.items?.map((item) => <button key={item.key} onClick={item.onClick}>{item.label}</button>)}</>
+    ),
     Button: ({ children, htmlType: _htmlType, loading: _loading, icon: _icon, ...props }: React.ButtonHTMLAttributes<HTMLButtonElement> & { htmlType?: string; loading?: boolean; icon?: ReactNode }) => (
       <button {...props}>{children}</button>
     ),
@@ -203,7 +207,7 @@ describe('ApplicationDetail opportunity fit handoff', () => {
     act(() => root?.render(<ApplicationDetail application={application} open onClose={vi.fn()} />));
     act(() => {
       [...(container?.querySelectorAll('button') || [])]
-        .find((button) => button.textContent === '材料包')
+        .find((button) => button.textContent === '打开投递材料')
         ?.click();
     });
 
@@ -338,7 +342,7 @@ describe('ApplicationDetail opportunity fit handoff', () => {
     const openPilot = vi.fn();
     act(() => root?.render(<ApplicationDetail application={application} open onClose={vi.fn()} onOpenPilotOpportunityFit={openPilot} />));
     const button = [...(container?.querySelectorAll('button') || [])]
-      .find((candidate) => candidate.textContent === '在 Pilot 中评估');
+      .find((candidate) => candidate.textContent === '评估岗位匹配');
     act(() => button?.click());
     expect(openPilot).toHaveBeenCalledWith(application);
     expect(state.analyzeJD).not.toHaveBeenCalled();

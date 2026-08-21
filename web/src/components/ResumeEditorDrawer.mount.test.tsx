@@ -55,6 +55,7 @@ const resume: Resume = {
     projects: [],
     skills: ['TypeScript'],
     career_intent: { target_roles: ['前端工程师'] },
+    custom_root: { keep: true },
   },
   deleted_at: null,
   created_at: '2026-08-06T00:00:00Z',
@@ -133,6 +134,45 @@ afterEach(() => {
 });
 
 describe('ResumeEditorDrawer mounted audit flow', () => {
+  it('keeps structured edits when switching through advanced JSON and saving', async () => {
+    state.updateResume.mockResolvedValue(resume);
+    renderEditor();
+    const saveButton = container?.querySelector('button.ant-btn-primary');
+    if (!(saveButton instanceof HTMLButtonElement)) throw new Error('save button not found');
+    await click(findButton('基本信息'));
+
+    const nameLabel = Array.from(container?.querySelectorAll('label') ?? []).find((item) => item.textContent === '姓名');
+    const nameInput = nameLabel?.parentElement?.querySelector('input');
+    if (!(nameInput instanceof HTMLInputElement)) throw new Error('name input not found');
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set?.call(nameInput, 'Grace');
+      nameInput.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+
+    await click(findButton('高级 JSON'));
+    const advanced = container?.querySelector('textarea');
+    if (!(advanced instanceof HTMLTextAreaElement)) throw new Error('advanced JSON input not found');
+    expect(JSON.parse(advanced.value)).toMatchObject({ contact: { name: 'Grace' }, custom_root: { keep: true } });
+
+    const advancedContent = JSON.parse(advanced.value);
+    advancedContent.contact.name = 'Marie';
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set?.call(advanced, JSON.stringify(advancedContent));
+      advanced.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await click(findButton('高级 JSON'));
+    const updatedNameInput = Array.from(container?.querySelectorAll('label') ?? [])
+      .find((item) => item.textContent === '姓名')?.parentElement?.querySelector('input');
+    expect(updatedNameInput).toBeInstanceOf(HTMLInputElement);
+    expect((updatedNameInput as HTMLInputElement).value).toBe('Marie');
+
+    await click(saveButton);
+    await act(async () => Promise.resolve());
+    expect(state.updateResume).toHaveBeenCalledWith(1, expect.objectContaining({
+      content_json: expect.objectContaining({ contact: expect.objectContaining({ name: 'Marie' }), custom_root: { keep: true } }),
+    }));
+  });
+
   it('opens, expands, collapses, and closes the audit without write, AI, HTTP, or navigation calls', async () => {
     renderEditor();
 

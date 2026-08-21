@@ -9,6 +9,7 @@ const { Text } = Typography;
 
 interface Props {
   offer: Offer;
+  selectable?: boolean;
   selected: boolean;
   onToggleSelect: (id: number) => void;
   onCoach: (offer: Offer) => void;
@@ -21,7 +22,7 @@ function formatWan(n: number): string {
   return (n / 10000).toFixed(1) + '万';
 }
 
-export default function OfferCard({ offer, selected, onToggleSelect, onCoach, onNegotiation, onView, onAttachToPilot }: Props) {
+export default function OfferCard({ offer, selectable = true, selected, onToggleSelect, onCoach, onNegotiation, onView, onAttachToPilot }: Props) {
   const offerDragBinding = onAttachToPilot
     ? createPilotAttachmentDragBinding({
         kind: 'offer',
@@ -38,7 +39,7 @@ export default function OfferCard({ offer, selected, onToggleSelect, onCoach, on
       {...offerDragBinding}
       title={
         <Space className={styles.heading}>
-          <Checkbox aria-label={`选择 Offer：${offer.company_name}｜${offer.position_name}`} checked={selected} onChange={() => onToggleSelect(offer.id)} />
+          {selectable ? <Checkbox aria-label={`选择 Offer：${offer.company_name}｜${offer.position_name}`} checked={selected} onChange={() => onToggleSelect(offer.id)} /> : null}
           <Text strong>{offer.company_name}</Text>
         </Space>
       }
@@ -46,13 +47,14 @@ export default function OfferCard({ offer, selected, onToggleSelect, onCoach, on
     >
       <div className={styles.position}>{offer.position_name}</div>
       <div className={styles.salary}>
-        {offer.base_monthly / 1000}K×{offer.months_per_year}
+        {offer.base_monthly > 0 ? `${offer.base_monthly / 1000}K` : '月薪待确认'}
+        {offer.months_per_year > 0 ? ` × ${offer.months_per_year} 薪` : ' · 年薪月数待确认'}
       </div>
       <div className={styles.facts}>
         签字费 {offer.signing_bonus == null ? '尚未填写' : formatWan(offer.signing_bonus)}
         {offer.equity ? ` · 期权 ${offer.equity}` : ''}
         <br />
-        年总包约 {formatWan(offer.total_cash)}
+        {offer.total_cash > 0 ? `年总包约 ${formatWan(offer.total_cash)}` : '年总包待确认'}
         {offer.deadline ? ` · 截止 ${offer.deadline}` : ''}
         {offer.application_id ? ` · 关联投递 #${offer.application_id}` : ' · 无关联投递'}
       </div>

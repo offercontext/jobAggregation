@@ -2,10 +2,22 @@ import { describe, expect, it } from 'vitest';
 import source from './SettingsView.tsx?raw';
 
 describe('SettingsView localization', () => {
+  it('groups the workspace settings into stable product sections', () => {
+    expect(source).toContain('AI 与模型');
+    expect(source).toContain('数据与备份');
+    expect(source).toContain('Haru 与外观');
+    expect(source).toContain('语音');
+    expect(source).toContain('高级与诊断');
+    expect(source).toContain('<AISettingsDrawer');
+    expect(source).toContain('高级运行信息');
+    expect(source).toContain('查看运行日志与诊断');
+    expect(source).not.toContain('onOpenAISettings');
+  });
+
   it('uses Chinese product copy for settings and diagnostics', () => {
     expect(source).toContain('设置');
-    expect(source).toContain('AI 运行时');
-    expect(source).toContain('运行诊断');
+    expect(source).toContain('AI 与模型');
+    expect(source).toContain('高级与诊断');
     expect(source).toContain('配置 AI');
     expect(source).toContain('导出备份');
     expect(source).toContain('复制诊断信息');

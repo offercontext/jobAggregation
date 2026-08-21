@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
-import { Button, Input, Spin, message } from 'antd';
+import { Button, Dropdown, Input, Spin, message } from 'antd';
 import {
   CloudUploadOutlined,
   FileAddOutlined,
   FileTextOutlined,
   PlusOutlined,
+  MoreOutlined,
 } from '@ant-design/icons';
 import type { DragEvent } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
@@ -64,13 +65,13 @@ export default function ResumeLibraryView({
   const createDialogMut = useMutation({
     mutationFn: () =>
       createResume({
-        title: 'Pilot 对话薄版简历',
+        title: 'Haru 对话初稿简历',
         source: 'dialog',
         content_json: BLANK_RESUME_CONTENT,
         career_intent: BLANK_RESUME_CONTENT.career_intent,
       }),
     onSuccess: (res) => {
-      message.success('已创建薄版简历');
+      message.success('已创建初稿简历');
       qc.invalidateQueries({ queryKey: ['resumes'] });
       qc.invalidateQueries({ queryKey: ONBOARDING_QUERY_KEY });
       setEditing(res);
@@ -305,17 +306,12 @@ export default function ResumeLibraryView({
             loading={createDialogMut.isPending}
             onClick={() => createDialogMut.mutate()}
           >
-            和 Pilot 创建薄版
-          </Button>
-          <Button icon={<CloudUploadOutlined />} onClick={() => setUploadOpen(true)}>上传 PDF</Button>
-          <Button
-            type="primary"
-            icon={<FileAddOutlined />}
-            loading={sampleMut.isPending}
-            onClick={() => sampleMut.mutate()}
-          >
-            用样例开始
-          </Button>
+             和 Haru 创建初稿
+           </Button>
+           <Button type="primary" icon={<CloudUploadOutlined />} onClick={() => setUploadOpen(true)}>上传现有简历</Button>
+           <Dropdown menu={{ items: [{ key: 'sample', label: '用样例开始', icon: <FileAddOutlined />, onClick: () => sampleMut.mutate() }] }}>
+             <Button icon={<MoreOutlined />} loading={sampleMut.isPending}>更多创建方式</Button>
+           </Dropdown>
         </div>
       </div>
 
@@ -326,16 +322,12 @@ export default function ResumeLibraryView({
           <div className={styles.emptyHint}>选择一个入口开始，之后都可以在编辑器里补全结构化章节。</div>
           <div className={styles.emptyActions}>
             <button className={styles.emptyAction} type="button" onClick={() => createDialogMut.mutate()}>
-              <div className={styles.emptyActionTitle}>和 Pilot 创建薄版</div>
+               <div className={styles.emptyActionTitle}>和 Haru 创建初稿</div>
               <div className={styles.emptyActionDesc}>先生成可编辑的空结构，再逐章补充。</div>
             </button>
             <button className={styles.emptyAction} type="button" onClick={() => setUploadOpen(true)}>
-              <div className={styles.emptyActionTitle}>上传 PDF</div>
+               <div className={styles.emptyActionTitle}>上传现有简历</div>
               <div className={styles.emptyActionDesc}>继续使用现有上传流程，仅支持 PDF。</div>
-            </button>
-            <button className={styles.emptyAction} type="button" onClick={() => sampleMut.mutate()}>
-              <div className={styles.emptyActionTitle}>用样例开始</div>
-              <div className={styles.emptyActionDesc}>默认创建后端工程师样例。</div>
             </button>
           </div>
         </div>
@@ -365,7 +357,7 @@ export default function ResumeLibraryView({
       {resumes.length > 0 && !resumesQuery.isLoading && (
         <div className={`${styles.dropZone} ${styles.dropZoneCompact} ${dragActive ? styles.dropZoneActive : ''}`} style={{ marginTop: 16 }}>
           <div className={styles.dropTitle}>拖拽 PDF 到此处上传</div>
-          <div className={styles.dropHint}>或点击「上传 PDF」按钮</div>
+           <div className={styles.dropHint}>或点击「上传现有简历」按钮</div>
         </div>
       )}
 

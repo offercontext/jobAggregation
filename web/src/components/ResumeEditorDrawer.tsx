@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Button, Descriptions, Input, Progress, Space, Tag, message } from 'antd';
+import { Alert, Button, Input, Modal, Progress, Space, Tag, message } from 'antd';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { updateResume } from '@/services/resumes';
-import type { CareerIntent, Resume, ResumeContent, UpdateResumeInput } from '@/types/resume';
+import type { Resume, ResumeContent, UpdateResumeInput } from '@/types/resume';
+import { buildAdvancedResumeJson, parseStructuredResume, serializeStructuredResume, type StructuredResumeDraft } from '@/lib/structuredResume';
 import dayjs from 'dayjs';
 import styles from './ResumeLibraryView.module.css';
 import ResumeEvidenceAuditPanel from './ResumeEvidenceAuditPanel';
@@ -21,124 +22,63 @@ interface Props {
   onFactCopyResultUnknown?: () => void;
 }
 
-type SectionKey = 'contact' | 'education' | 'experience' | 'projects' | 'skills' | 'raw_text';
-
-interface SectionMeta {
-  key: SectionKey;
-  label: string;
-  example: string;
-  placeholder: string;
-  mode: 'json' | 'text';
-}
-
-const SECTION_META: SectionMeta[] = [
-  {
-    key: 'contact',
-    label: '联系方式',
-    example: '{"name":"Ada","email":"ada@example.com","phone":"13800000000"}',
-    placeholder: '填写联系方式 JSON',
-    mode: 'json',
-  },
-  {
-    key: 'education',
-    label: '教育经历',
-    example: '[{"school":"Sample University","degree":"B.S. Computer Science"}]',
-    placeholder: '填写教育经历数组 JSON',
-    mode: 'json',
-  },
-  {
-    key: 'experience',
-    label: '工作经历',
-    example: '[{"company":"Sample Tech","title":"Backend Intern","highlights":["Built APIs"]}]',
-    placeholder: '填写工作经历数组 JSON',
-    mode: 'json',
-  },
-  {
-    key: 'projects',
-    label: '项目经历',
-    example: '[{"name":"Resume Builder","highlights":["Designed resume CRUD"]}]',
-    placeholder: '填写项目经历数组 JSON',
-    mode: 'json',
-  },
-  {
-    key: 'skills',
-    label: '技能清单',
-    example: '["Python","FastAPI","SQLAlchemy"]',
-    placeholder: '填写技能数组 JSON',
-    mode: 'json',
-  },
-  {
-    key: 'raw_text',
-    label: '原始文本',
-    example: 'Backend Engineer sample resume with Python, FastAPI, and SQL systems.',
-    placeholder: '可保留 PDF 解析文本或手动补充底稿',
-    mode: 'text',
-  },
-];
+type SectionKey = 'intent' | 'contact' | 'education' | 'experience' | 'projects' | 'skills' | 'other';
 
 const SECTION_LABELS: Record<string, string> = {
-  career_intent: '求职意向',
-  contact: '联系方式',
-  education: '教育经历',
-  experience: '工作经历',
-  projects: '项目经历',
-  skills: '技能清单',
+  career_intent: '求职意向', contact: '基本信息', education: '教育经历', experience: '工作经历', projects: '项目经历', skills: '技能',
 };
 
 const SOURCE_LABELS: Record<string, string> = {
-  manual: '手动创建',
-  dialog: 'Pilot 对话',
-  upload: 'PDF 上传',
-  sample: '样例开始',
-  sample_copy: '样例副本',
+  manual: '手动创建', dialog: 'Haru 对话', upload: '现有简历上传', sample: '样例', sample_copy: '样例副本',
 };
 
-const EMPTY_DRAFTS: Record<SectionKey, string> = {
-  contact: '{}',
-  education: '[]',
-  experience: '[]',
-  projects: '[]',
-  skills: '[]',
-  raw_text: '',
+const SECTIONS: Array<{ key: SectionKey; label: string }> = [
+  { key: 'intent', label: '求职意向' },
+  { key: 'contact', label: '基本信息' },
+  { key: 'education', label: '教育经历' },
+  { key: 'experience', label: '工作经历' },
+  { key: 'projects', label: '项目经历' },
+  { key: 'skills', label: '技能' },
+  { key: 'other', label: '其他' },
+];
+
+const EMPTY_DRAFT: StructuredResumeDraft = {
+  careerIntent: { targetRoles: [], targetLocations: [] },
+  contact: {}, education: [], experience: [], projects: [], skills: [], rawText: '',
 };
 
 export default function ResumeEditorDrawer({
-  resume,
-  open,
-  onClose,
-  onSaved,
-  onFactVersionCreated,
-  onFactCopyCreated,
-  onFactContinueInCopy,
-  onFactExitToLibrary,
-  onFactCopyResultUnknown,
+  resume, open, onClose, onSaved, onFactVersionCreated, onFactCopyCreated,
+  onFactContinueInCopy, onFactExitToLibrary, onFactCopyResultUnknown,
 }: Props) {
   const qc = useQueryClient();
+  const parsed = useMemo(() => parseStructuredResume(resume?.content_json), [resume?.content_json]);
+  const baselineDraft = parsed.mode === 'structured' ? parsed.draft : EMPTY_DRAFT;
+  const baselineFingerprint = useMemo(() => JSON.stringify(baselineDraft), [baselineDraft]);
   const [title, setTitle] = useState('');
-  const [targetRoles, setTargetRoles] = useState('');
-  const [targetLocations, setTargetLocations] = useState('');
-  const [activeSection, setActiveSection] = useState<'career_intent' | SectionKey>('career_intent');
-  const [drafts, setDrafts] = useState<Record<SectionKey, string>>(EMPTY_DRAFTS);
+  const [draft, setDraft] = useState<StructuredResumeDraft>(baselineDraft);
+  const [activeSection, setActiveSection] = useState<SectionKey>('intent');
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [advancedJson, setAdvancedJson] = useState('');
   const [auditOpen, setAuditOpen] = useState(false);
   const [supplementFinding, setSupplementFinding] = useState<ResumeAuditFinding | null>(null);
-  const baseline = useMemo(() => buildEditorValues(resume), [resume]);
 
   useEffect(() => {
     if (!resume) return;
-    setTitle(baseline.title);
-    setTargetRoles(baseline.targetRoles);
-    setTargetLocations(baseline.targetLocations);
-    setDrafts(baseline.drafts);
-    setActiveSection('career_intent');
+    setTitle(resume.title || resume.name || '');
+    setDraft(parsed.mode === 'structured' ? parsed.draft : EMPTY_DRAFT);
+    setAdvancedJson(parsed.mode === 'recovery' ? parsed.raw : JSON.stringify(resume.content_json, null, 2));
+    setActiveSection('intent');
+    setAdvancedOpen(false);
     setAuditOpen(false);
     setSupplementFinding(null);
-  }, [baseline, open, resume]);
+  }, [open, parsed, resume]);
 
   const saveMut = useMutation({
     mutationFn: (input: UpdateResumeInput) => updateResume(resume!.id, input),
     onSuccess: (updated) => {
       message.success('已保存');
-      qc.invalidateQueries({ queryKey: ['resumes'] });
+      void qc.invalidateQueries({ queryKey: ['resumes'] });
       onSaved?.(updated);
       onClose();
     },
@@ -147,21 +87,30 @@ export default function ResumeEditorDrawer({
 
   const missingLabels = useMemo(
     () => (resume?.missing_sections ?? []).map((item) => SECTION_LABELS[item] ?? item),
-    [resume?.missing_sections]
+    [resume?.missing_sections],
+  );
+  const editorDirty = Boolean(resume) && (
+    title !== (resume?.title || resume?.name || '')
+    || JSON.stringify(draft) !== baselineFingerprint
+    || (advancedOpen && advancedJson !== JSON.stringify(resume?.content_json, null, 2))
   );
 
   if (!open || !resume) return null;
 
-  const currentMeta = SECTION_META.find((item) => item.key === activeSection);
-
-  const handleDraftChange = (key: SectionKey, value: string) => {
-    setDrafts((prev) => ({ ...prev, [key]: value }));
+  const requestClose = () => {
+    if (!editorDirty) {
+      onClose();
+      return;
+    }
+    Modal.confirm({
+      title: '有未保存的更改',
+      content: '离开后，本次编辑内容不会保存。',
+      okText: '放弃更改',
+      cancelText: '继续编辑',
+      okButtonProps: { danger: true },
+      onOk: onClose,
+    });
   };
-
-  const editorDirty = title !== baseline.title
-    || targetRoles !== baseline.targetRoles
-    || targetLocations !== baseline.targetLocations
-    || SECTION_META.some((section) => drafts[section.key] !== baseline.drafts[section.key]);
 
   const handleSupplement = (finding: ResumeAuditFinding) => {
     if (editorDirty) {
@@ -171,242 +120,203 @@ export default function ResumeEditorDrawer({
     setSupplementFinding(finding);
   };
 
-  const handleSave = () => {
-    if (!resume) return;
-    let content: ResumeContent;
-    try {
-      content = buildContent({ targetRoles, targetLocations, drafts });
-    } catch (error) {
-      message.error(error instanceof Error ? error.message : '结构化内容格式错误');
+  const toggleAdvancedEditor = () => {
+    if (!advancedOpen) {
+      if (parsed.mode === 'structured') {
+        setAdvancedJson(buildAdvancedResumeJson(resume.content_json, draft));
+      }
+      setAdvancedOpen(true);
       return;
     }
-    saveMut.mutate({
-      title: title.trim() || '未命名简历',
-      content_json: content,
-      career_intent: content.career_intent,
-    });
+
+    try {
+      const advancedContent = JSON.parse(advancedJson) as ResumeContent;
+      const nextParsed = parseStructuredResume(advancedContent);
+      if (nextParsed.mode !== 'structured') throw new Error('高级 JSON 与当前简历契约不兼容');
+      setDraft(nextParsed.draft);
+      setAdvancedOpen(false);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '请先修复高级 JSON');
+    }
+  };
+
+  const handleSave = () => {
+    if (!title.trim()) {
+      message.error('请填写简历标题');
+      return;
+    }
+    try {
+      let content: ResumeContent;
+      if (advancedOpen) {
+        content = JSON.parse(advancedJson) as ResumeContent;
+        if (parseStructuredResume(content).mode !== 'structured') throw new Error('高级 JSON 与当前简历契约不兼容');
+      } else {
+        if (parsed.mode === 'recovery') throw new Error('当前历史数据无法安全使用结构化表单保存');
+        content = serializeStructuredResume(resume.content_json, draft);
+      }
+      if (parseStructuredResume(content).mode !== 'structured') throw new Error('保存前 round-trip 校验失败');
+      saveMut.mutate({ title: title.trim(), content_json: content, career_intent: content.career_intent });
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '简历内容格式错误');
+    }
   };
 
   return (
     <section className={styles.editorWorkspace} aria-label="编辑简历">
       <div className={styles.editorWorkspaceToolbar}>
         <div>
-          <Button type="link" className={styles.backButton} onClick={onClose}>
-            返回简历库
-          </Button>
+          <Button type="link" className={styles.backButton} onClick={requestClose}>返回简历库</Button>
           <div className={styles.editorWorkspaceTitle}>编辑简历</div>
         </div>
-        <Space>
-          <Button
-            aria-expanded={auditOpen}
-            aria-controls="resume-evidence-audit-panel"
-            onClick={() => setAuditOpen((current) => !current)}
-          >
+        <Space wrap>
+          <Button aria-expanded={auditOpen} aria-controls="resume-evidence-audit-panel" onClick={() => setAuditOpen((value) => !value)}>
             简历事实体检
           </Button>
-          <Button onClick={onClose}>取消</Button>
-          <Button type="primary" loading={saveMut.isPending} onClick={handleSave}>
-            保存
-          </Button>
+          <Button aria-expanded={advancedOpen} onClick={toggleAdvancedEditor}>高级 JSON</Button>
+          <Button onClick={requestClose}>取消</Button>
+          <Button type="primary" disabled={parsed.mode === 'recovery' && !advancedOpen} loading={saveMut.isPending} onClick={handleSave}>保存</Button>
         </Space>
       </div>
 
       <div className={styles.editorHeader}>
-        <Input
-          value={title}
-          onChange={(e) => setTitle(e.target.value)}
-          placeholder="简历标题"
-          className={styles.editorTitleInput}
-        />
+        <Input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="简历标题" className={styles.editorTitleInput} />
         <div className={styles.editorMeta}>
-          <Tag color={resume?.is_master ? 'blue' : 'default'}>{resume?.is_master ? '主简历' : '非主简历'}</Tag>
-          <Tag>{SOURCE_LABELS[resume?.source ?? 'manual'] ?? resume?.source}</Tag>
-          <span>{resume ? dayjs(resume.created_at).format('YYYY-MM-DD HH:mm') : ''}</span>
+          <Tag color={resume.is_master ? 'blue' : 'default'}>{resume.is_master ? '主简历' : '非主简历'}</Tag>
+          <Tag>{SOURCE_LABELS[resume.source] ?? resume.source}</Tag>
+          <span>{dayjs(resume.created_at).format('YYYY-MM-DD HH:mm')}</span>
         </div>
         <div className={styles.editorCompletion}>
-          <Progress percent={resume?.completion_percent ?? 0} size="small" />
+          <Progress percent={resume.completion_percent ?? 0} size="small" />
           <div className={styles.missingLine}>
-            {missingLabels.length ? (
-              <>
-                <span>待补：</span>
-                {missingLabels.map((label) => <Tag key={label}>{label}</Tag>)}
-              </>
-            ) : (
-              <Tag color="success">结构完整</Tag>
-            )}
+            {missingLabels.length ? <><span>待补：</span>{missingLabels.map((label) => <Tag key={label}>{label}</Tag>)}</> : <Tag color="success">结构完整</Tag>}
           </div>
         </div>
       </div>
 
-      <Descriptions size="small" column={1} className={styles.editorDescriptions}>
-        <Descriptions.Item label="章节大纲">
-          <span>求职意向 / 联系方式 / 教育经历 / 工作经历 / 项目经历 / 技能清单 / 原始文本</span>
-        </Descriptions.Item>
-      </Descriptions>
+      {parsed.mode === 'recovery' ? (
+        <Alert
+          type="error"
+          showIcon
+          message="无法安全使用结构化表单"
+          description={`${parsed.reason}。原始内容保持只读；如需恢复，请复制内容后在“高级 JSON”中谨慎修复。`}
+        />
+      ) : null}
 
-      {auditOpen && (
-        <div id="resume-evidence-audit-panel">
-          <ResumeEvidenceAuditPanel resume={resume} onSupplement={handleSupplement} />
+      {auditOpen ? <div id="resume-evidence-audit-panel"><ResumeEvidenceAuditPanel resume={resume} onSupplement={handleSupplement} /></div> : null}
+
+      {advancedOpen ? (
+        <section className={styles.sectionEditor} aria-label="高级 JSON 编辑">
+          <Alert type="warning" showIcon message="高级入口会直接编辑完整 JSON；保存前仍会校验现有契约和 round-trip。" />
+          <Input.TextArea className={styles.codeTextarea} rows={22} value={advancedJson} onChange={(event) => setAdvancedJson(event.target.value)} />
+        </section>
+      ) : parsed.mode === 'recovery' ? (
+        <Input.TextArea className={styles.codeTextarea} rows={22} value={parsed.raw} readOnly aria-label="历史简历原始内容" />
+      ) : (
+        <div className={styles.editorGrid}>
+          <nav className={styles.sectionNav} aria-label="简历章节">
+            {SECTIONS.map((section) => (
+              <button key={section.key} type="button" className={activeSection === section.key ? styles.sectionNavActive : undefined} onClick={() => setActiveSection(section.key)}>
+                {section.label}
+              </button>
+            ))}
+          </nav>
+          <section className={styles.sectionEditor}>
+            <StructuredSection section={activeSection} draft={draft} onChange={setDraft} />
+          </section>
         </div>
       )}
 
-      <div className={styles.editorGrid}>
-        <nav className={styles.sectionNav} aria-label="简历章节">
-          <button
-            type="button"
-            className={activeSection === 'career_intent' ? styles.sectionNavActive : undefined}
-            onClick={() => setActiveSection('career_intent')}
-          >
-            求职意向
-          </button>
-          {SECTION_META.map((item) => (
-            <button
-              type="button"
-              key={item.key}
-              className={activeSection === item.key ? styles.sectionNavActive : undefined}
-              onClick={() => setActiveSection(item.key)}
-            >
-              {item.label}
-            </button>
-          ))}
-        </nav>
-
-        <section className={styles.sectionEditor}>
-          {activeSection === 'career_intent' ? (
-            <>
-              <div className={styles.sectionTitle}>求职意向</div>
-              <label className={styles.fieldLabel}>目标岗位</label>
-              <Input
-                value={targetRoles}
-                onChange={(e) => setTargetRoles(e.target.value)}
-                placeholder="Backend Engineer, Platform Engineer"
-              />
-              <div className={styles.inlineExample}>例子：Backend Engineer, Platform Engineer</div>
-              <label className={styles.fieldLabel}>目标城市</label>
-              <Input
-                value={targetLocations}
-                onChange={(e) => setTargetLocations(e.target.value)}
-                placeholder="Shanghai, Remote"
-              />
-              <div className={styles.inlineExample}>例子：Shanghai, Remote</div>
-            </>
-          ) : currentMeta ? (
-            <>
-              <div className={styles.sectionTitle}>{currentMeta.label}</div>
-              <Input.TextArea
-                value={drafts[currentMeta.key]}
-                onChange={(e) => handleDraftChange(currentMeta.key, e.target.value)}
-                rows={currentMeta.mode === 'text' ? 12 : 14}
-                placeholder={currentMeta.placeholder}
-                className={currentMeta.mode === 'json' ? styles.codeTextarea : undefined}
-              />
-              <div className={styles.inlineExample}>例子：{currentMeta.example}</div>
-            </>
-          ) : null}
-        </section>
-      </div>
-
-      {supplementFinding && (
+      {supplementFinding ? (
         <ResumeFactSupplementWorkspace
-          open
-          source={resume}
-          finding={supplementFinding}
-          onClose={() => setSupplementFinding(null)}
-          onCompleted={(created) => {
-            setSupplementFinding(null);
-            onFactVersionCreated?.(created);
-          }}
+          open source={resume} finding={supplementFinding} onClose={() => setSupplementFinding(null)}
+          onCompleted={(created) => { setSupplementFinding(null); onFactVersionCreated?.(created); }}
           onCopyCreated={onFactCopyCreated}
-          onContinueInCopy={(copy) => {
-            setSupplementFinding(null);
-            onFactContinueInCopy?.(copy);
-          }}
-          onExitToLibrary={() => {
-            setSupplementFinding(null);
-            onFactExitToLibrary?.();
-          }}
+          onContinueInCopy={(copy) => { setSupplementFinding(null); onFactContinueInCopy?.(copy); }}
+          onExitToLibrary={() => { setSupplementFinding(null); onFactExitToLibrary?.(); }}
           onCopyResultUnknown={onFactCopyResultUnknown}
         />
-      )}
+      ) : null}
     </section>
   );
 }
 
-function normalizeContent(content: ResumeContent | unknown): ResumeContent {
-  return content && typeof content === 'object' && !Array.isArray(content) ? (content as ResumeContent) : {};
-}
-
-function normalizeCareerIntent(intent: ResumeContent['career_intent']): CareerIntent {
-  return intent && typeof intent === 'object' && !Array.isArray(intent) ? intent : {};
-}
-
-function stringifyDraft(value: unknown): string {
-  if (typeof value === 'string') return value;
-  return JSON.stringify(value, null, 2);
-}
-
-function buildEditorValues(resume: Resume | null) {
-  if (!resume) {
-    return { title: '', targetRoles: '', targetLocations: '', drafts: EMPTY_DRAFTS };
+function StructuredSection({ section, draft, onChange }: { section: SectionKey; draft: StructuredResumeDraft; onChange: (draft: StructuredResumeDraft) => void }) {
+  if (section === 'intent') {
+    return <>
+      <div className={styles.sectionTitle}>求职意向</div>
+      <LabeledInput label="目标岗位" value={draft.careerIntent.targetRoles.join(', ')} onChange={(value) => onChange({ ...draft, careerIntent: { ...draft.careerIntent, targetRoles: splitList(value) } })} />
+      <LabeledInput label="目标城市" value={draft.careerIntent.targetLocations.join(', ')} onChange={(value) => onChange({ ...draft, careerIntent: { ...draft.careerIntent, targetLocations: splitList(value) } })} />
+    </>;
   }
-  const content = normalizeContent(resume.content_json);
-  const intent = normalizeCareerIntent(content.career_intent);
-  return {
-    title: resume.title || resume.name || '',
-    targetRoles: (intent.target_roles ?? []).join(', '),
-    targetLocations: (intent.target_locations ?? []).join(', '),
-    drafts: {
-      contact: stringifyDraft(content.contact ?? {}),
-      education: stringifyDraft(content.education ?? []),
-      experience: stringifyDraft(content.experience ?? []),
-      projects: stringifyDraft(content.projects ?? []),
-      skills: stringifyDraft(content.skills ?? []),
-      raw_text: typeof content.raw_text === 'string' ? content.raw_text : resume.parsed_data ?? '',
-    },
-  };
-}
-
-function buildContent({
-  targetRoles,
-  targetLocations,
-  drafts,
-}: {
-  targetRoles: string;
-  targetLocations: string;
-  drafts: Record<SectionKey, string>;
-}): ResumeContent {
-  const content: Record<string, unknown> = {
-    career_intent: {
-      target_roles: splitList(targetRoles),
-      target_locations: splitList(targetLocations),
-    },
-  };
-
-  for (const meta of SECTION_META) {
-    const draft = drafts[meta.key] ?? '';
-    if (meta.mode === 'text') {
-      content[meta.key] = draft;
-      continue;
-    }
-    try {
-      content[meta.key] = draft.trim() ? JSON.parse(draft) : sectionDefault(meta.key);
-    } catch {
-      throw new Error(`${meta.label} 需要是合法 JSON`);
-    }
+  if (section === 'contact') {
+    return <>
+      <div className={styles.sectionTitle}>基本信息</div>
+      {(['name', 'email', 'phone', 'location'] as const).map((field) => (
+        <LabeledInput key={field} label={{ name: '姓名', email: '邮箱', phone: '电话', location: '所在地' }[field]} value={stringValue(draft.contact[field])} onChange={(value) => onChange({ ...draft, contact: { ...draft.contact, [field]: value } })} />
+      ))}
+    </>;
   }
-
-  return content as ResumeContent;
+  if (section === 'skills') {
+    return <>
+      <div className={styles.sectionTitle}>技能</div>
+      <Input.TextArea rows={8} value={draft.skills.join('\n')} placeholder="每行一个技能" onChange={(event) => onChange({ ...draft, skills: event.target.value.split('\n').map((item) => item.trim()).filter(Boolean) })} />
+    </>;
+  }
+  if (section === 'other') {
+    return <>
+      <div className={styles.sectionTitle}>其他</div>
+      <Input.TextArea rows={14} value={draft.rawText} placeholder="补充现有简历中的其他文本" onChange={(event) => onChange({ ...draft, rawText: event.target.value })} />
+    </>;
+  }
+  const meta = {
+    education: { title: '教育经历', fields: [['school', '学校'], ['degree', '学历'], ['major', '专业'], ['start_date', '开始时间'], ['end_date', '结束时间']] },
+    experience: { title: '工作经历', fields: [['company', '公司'], ['title', '职位'], ['start_date', '开始时间'], ['end_date', '结束时间'], ['highlights', '工作亮点']] },
+    projects: { title: '项目经历', fields: [['name', '项目名称'], ['role', '职责'], ['start_date', '开始时间'], ['end_date', '结束时间'], ['highlights', '项目亮点']] },
+  }[section];
+  const entries = draft[section];
+  return <EntrySection
+    title={meta.title}
+    entries={entries}
+    fields={meta.fields}
+    onChange={(next) => onChange({ ...draft, [section]: next })}
+  />;
 }
 
-function sectionDefault(key: SectionKey) {
-  if (key === 'contact') return {};
-  if (key === 'raw_text') return '';
-  return [];
+function EntrySection({ title, entries, fields, onChange }: { title: string; entries: Record<string, unknown>[]; fields: string[][]; onChange: (entries: Record<string, unknown>[]) => void }) {
+  const move = (index: number, offset: number) => {
+    const target = index + offset;
+    if (target < 0 || target >= entries.length) return;
+    const next = [...entries];
+    [next[index], next[target]] = [next[target], next[index]];
+    onChange(next);
+  };
+  return <>
+    <div className={styles.sectionTitle}>{title}</div>
+    <div className={styles.structuredEntryList}>
+      {entries.map((entry, index) => (
+        <div className={styles.structuredEntry} key={`${index}-${stringValue(entry[fields[0][0]])}`}>
+          <div className={styles.structuredEntryToolbar}>
+            <strong>{title} {index + 1}</strong>
+            <Space size="small">
+              <Button size="small" disabled={index === 0} onClick={() => move(index, -1)}>上移</Button>
+              <Button size="small" disabled={index === entries.length - 1} onClick={() => move(index, 1)}>下移</Button>
+              <Button size="small" danger onClick={() => onChange(entries.filter((_, itemIndex) => itemIndex !== index))}>删除</Button>
+            </Space>
+          </div>
+          {fields.map(([field, label]) => field === 'highlights' ? (
+            <div key={field}><label className={styles.fieldLabel}>{label}</label><Input.TextArea rows={4} value={arrayText(entry[field])} onChange={(event) => onChange(entries.map((item, itemIndex) => itemIndex === index ? { ...item, [field]: event.target.value.split('\n').filter(Boolean) } : item))} /></div>
+          ) : <LabeledInput key={field} label={label} value={stringValue(entry[field])} onChange={(value) => onChange(entries.map((item, itemIndex) => itemIndex === index ? { ...item, [field]: value } : item))} />)}
+        </div>
+      ))}
+    </div>
+    <Button onClick={() => onChange([...entries, {}])}>新增{title}</Button>
+  </>;
 }
 
-function splitList(value: string): string[] {
-  return value
-    .split(/[,，\n]/)
-    .map((item) => item.trim())
-    .filter(Boolean);
+function LabeledInput({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) {
+  return <div><label className={styles.fieldLabel}>{label}</label><Input value={value} status={!value.trim() && ['姓名', '学校', '公司', '项目名称'].includes(label) ? 'warning' : undefined} onChange={(event) => onChange(event.target.value)} /></div>;
 }
+
+function splitList(value: string) { return value.split(/[,，\n]/).map((item) => item.trim()).filter(Boolean); }
+function stringValue(value: unknown) { return typeof value === 'string' ? value : ''; }
+function arrayText(value: unknown) { return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string').join('\n') : ''; }

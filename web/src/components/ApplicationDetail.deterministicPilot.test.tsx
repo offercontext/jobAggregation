@@ -2,6 +2,7 @@
 import { act, type ReactNode } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Application } from '@/types/application';
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -12,6 +13,7 @@ const state = vi.hoisted(() => ({
   jdHistory: [] as unknown[],
   jdDetail: null as unknown,
   events: [] as unknown[],
+  notes: [] as unknown[],
 }));
 
 vi.mock('@/services/ai', () => ({ analyzeJD: state.analyzeJD }));
@@ -33,6 +35,8 @@ vi.mock('@tanstack/react-query', () => ({
   useQuery: (options: { queryKey?: unknown[] }) => ({
     data: options.queryKey?.[0] === 'events'
       ? state.events
+      : options.queryKey?.[0] === 'notes'
+        ? state.notes
       : options.queryKey?.[0] === 'application-jd-current'
         ? state.jdCurrent
         : options.queryKey?.[0] === 'application-jd-history'
@@ -74,6 +78,7 @@ vi.mock('@ant-design/icons', () => ({
   AudioOutlined: () => null,
   FileTextOutlined: () => null,
   DatabaseOutlined: () => null,
+  MoreOutlined: () => null,
 }));
 vi.mock('antd', () => {
   const Form = Object.assign(
@@ -92,6 +97,9 @@ vi.mock('antd', () => {
     Text: (props: { children: ReactNode }) => <span>{props.children}</span>,
   };
   return {
+    Dropdown: (props: { children: ReactNode; menu?: { items?: Array<{ key: string; label: ReactNode; onClick?: () => void }> } }) => (
+      <>{props.children}{props.menu?.items?.map((item) => <button key={item.key} onClick={item.onClick}>{item.label}</button>)}</>
+    ),
     Button: ({ children, htmlType: _htmlType, loading: _loading, icon: _icon, ...props }: React.ButtonHTMLAttributes<HTMLButtonElement> & { htmlType?: string; loading?: boolean; icon?: ReactNode }) => (
       <button {...props}>{children}</button>
     ),
@@ -119,7 +127,7 @@ vi.mock('antd', () => {
 
 const { default: ApplicationDetail } = await import('./ApplicationDetail');
 
-const application = {
+const application: Application = {
   id: 7,
   company_name: '示例公司',
   position_name: '后端工程师',
@@ -130,7 +138,7 @@ const application = {
   applied_at: '2026-07-21T00:00:00Z',
   created_at: '2026-07-21T00:00:00Z',
   updated_at: '2026-07-21T00:00:00Z',
-} as never;
+};
 
 let root: Root | undefined;
 let container: HTMLDivElement | undefined;
@@ -142,6 +150,7 @@ beforeEach(() => {
   state.jdHistory = [];
   state.jdDetail = null;
   state.events = [];
+  state.notes = [];
   container = document.createElement('div');
   document.body.appendChild(container);
   root = createRoot(container);
@@ -174,7 +183,7 @@ describe('ApplicationDetail deterministic Pilot JD entry', () => {
     act(() => root?.render(<ApplicationDetail application={application} open onClose={vi.fn()} onAskPilot={onAskPilot} />));
 
     const shortcut = [...(container?.querySelectorAll('button') ?? [])]
-      .find((button) => button.textContent?.includes('保存岗位资料'));
+      .find((button) => button.textContent?.includes('让 Haru 帮我'));
     expect(shortcut).not.toBeUndefined();
     act(() => (shortcut as HTMLButtonElement).click());
 
@@ -189,7 +198,7 @@ describe('ApplicationDetail deterministic Pilot JD entry', () => {
     act(() => root?.render(<ApplicationDetail application={application} open onClose={vi.fn()} onAskPilot={onAskPilot} />));
 
     const shortcut = [...(container?.querySelectorAll('button') ?? [])]
-      .find((button) => button.textContent?.includes('更新岗位资料'));
+      .find((button) => button.textContent?.includes('让 Haru 帮我'));
     expect(shortcut).not.toBeUndefined();
     act(() => (shortcut as HTMLButtonElement).click());
 
@@ -207,6 +216,31 @@ describe('ApplicationDetail deterministic Pilot JD entry', () => {
 
     expect(container?.querySelector('[role="dialog"]')?.textContent)
       .toContain('示例公司 · 投递事实与结果工作区');
+  });
+
+  it('routes the Offer stage primary action to the Offer workspace', () => {
+    const onOpenOffers = vi.fn();
+    const offerApplication = { ...application, status: 'offer' } as never;
+    act(() => root?.render(<ApplicationDetail application={offerApplication} open onClose={vi.fn()} onOpenOffers={onOpenOffers} />));
+
+    const button = [...(container?.querySelectorAll('button') ?? [])]
+      .find((candidate) => candidate.textContent?.includes('查看 Offer 与截止时间'));
+    expect(button).not.toBeUndefined();
+    act(() => (button as HTMLButtonElement).click());
+
+    expect(onOpenOffers).toHaveBeenCalledOnce();
+    expect(container?.textContent).not.toContain('投递事实与结果工作区');
+  });
+
+  it('keeps a completed interview in the completed stage when its review exists', () => {
+    state.events = [{ id: 31, event_type: 'interview', scheduled_at: '2026-01-01T00:00:00Z' }];
+    state.notes = [{ id: 51, application_event_id: 31 }];
+    const interviewApplication = { ...application, status: 'interview' } as never;
+    act(() => root?.render(<ApplicationDetail application={interviewApplication} open onClose={vi.fn()} />));
+
+    expect(container?.textContent).toContain('面试结束');
+    expect(container?.textContent).toContain('查看本轮复盘');
+    expect(container?.textContent).not.toContain('准备本轮面试');
   });
 
   it('renders long JD history previews and details in dedicated wrapping containers', () => {

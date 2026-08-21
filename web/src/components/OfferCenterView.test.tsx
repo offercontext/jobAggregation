@@ -58,6 +58,37 @@ describe('OfferCenterView comparison guardrails', () => {
     host = null;
   });
 
+  it('guides entry with one primary action when there are no offers', async () => {
+    queryState.offers = [];
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    await act(async () => { root?.render(<OfferCenterView applications={[]} onCoach={vi.fn()} />); });
+    expect(host.textContent).toContain('录入第一份 Offer');
+    expect(host.textContent).not.toContain('比较维度');
+  });
+
+  it('shows one offer facts and pending confirmations without comparison controls', async () => {
+    queryState.offers = [{ ...offer(1), deadline: '', equity: '', base_monthly: 0 }];
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    await act(async () => { root?.render(<OfferCenterView applications={[]} onCoach={vi.fn()} />); });
+    expect(host.textContent).toContain('待确认');
+    expect(host.textContent).toContain('截止时间');
+    expect(host.textContent).not.toContain('对比选中');
+  });
+
+  it('shows comparison selection only for two or more offers and dimensions only after entry', async () => {
+    queryState.offers = [offer(1), offer(2)];
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    await act(async () => { root?.render(<OfferCenterView applications={[]} onCoach={vi.fn()} />); });
+    expect(host.textContent).toContain('选择至少两份 Offer 进行比较');
+    expect(host.querySelector('[data-selected-comparison-dimensions]')).toBeNull();
+  });
+
   it('does not show unsupported aggregate claims for any offer count', async () => {
     queryState.offers = [offer(1), offer(2)];
     host = document.createElement('div');

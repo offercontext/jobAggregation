@@ -233,6 +233,21 @@
   padding: 14px;
   background: var(--op-surface);
 }
+
+.structuredEntryList { display: grid; gap: 14px; margin-bottom: 14px; }
+.structuredEntry {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border-radius: 10px;
+  background: var(--op-layout-bg);
+  box-shadow: inset 0 0 0 1px var(--op-border);
+}
+.structuredEntryToolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+
+@media (max-width: 1179px) {
+  .structuredEntryToolbar { align-items: flex-start; flex-direction: column; }
+}
 .sectionTitle {
   font-size: 15px;
   font-weight: 700;

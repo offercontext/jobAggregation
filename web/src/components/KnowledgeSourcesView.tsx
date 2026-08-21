@@ -211,7 +211,7 @@ export default function KnowledgeSourcesView() {
       uploadKnowledgeSource(file, titleHint),
     onSuccess: (data) => {
       if (data.deduplicated) {
-        message.success('资料已导入，已进入已有 Source');
+        message.success('资料已导入，已进入已有资料来源');
       } else {
         message.success('资料已导入');
       }
@@ -237,7 +237,7 @@ export default function KnowledgeSourcesView() {
     }) => uploadKnowledgeBundle(main, assets, titleHint),
     onSuccess: (data) => {
       if (data.deduplicated) {
-        message.success('资料已导入，已进入已有 Source');
+        message.success('资料已导入，已进入已有资料来源');
       } else {
         message.success('Bundle 已导入，图片以附件形式保留');
       }
@@ -263,7 +263,7 @@ export default function KnowledgeSourcesView() {
     }) => pasteKnowledgeSource(paste, { titleHint, originUrl }),
     onSuccess: (data) => {
       if (data.deduplicated) {
-        message.success('资料已导入，已进入已有 Source');
+        message.success('资料已导入，已进入已有资料来源');
       } else {
         message.success('正文已导入');
       }
@@ -358,7 +358,7 @@ export default function KnowledgeSourcesView() {
           </span>
         </div>
         <Paragraph type="secondary" className="knowledge-page-subtitle">
-          上传 Markdown/Text、上传图文 Bundle，或直接粘贴正文；系统按自然结构生成 Evidence，并提供关键词检索。
+          上传 Markdown/Text、上传图文 Bundle，或直接粘贴正文；系统按自然结构生成来源依据，并提供关键词检索。
         </Paragraph>
       </div>
 
@@ -380,7 +380,7 @@ export default function KnowledgeSourcesView() {
           </Button>
           <span className="knowledge-toolbar-spacer" />
           <Input
-            placeholder="搜索 Evidence（中文/英文关键词）"
+            placeholder="搜索来源依据（中文/英文关键词）"
             className="knowledge-sources-search-input"
             style={{ width: 'min(320px, 100%)' }}
             value={searchQuery}
@@ -547,7 +547,7 @@ function SourceDetailPanel({
   if (sourceId == null) {
     return (
       <div style={{ border: '1px solid var(--op-border, #eee)', padding: 24, borderRadius: 8 }}>
-        <Empty description="选择左侧的 Source 查看详情" />
+        <Empty description="选择左侧的资料来源查看详情" />
       </div>
     );
   }
@@ -618,7 +618,7 @@ function SourceDetailContent({
   const briefRebuildMutation = useMutation({
     mutationFn: (id: number) => rebuildKnowledgeSourceBrief(id),
     onSuccess: (data) => {
-      message.success('已请求重新生成 Brief');
+      message.success('已请求重新生成资料导读');
       // 立即用 202 响应刷新 source / brief 缓存，避免等下一轮 refetch 才看到「排队中」。
       queryClient.setQueryData<KnowledgeSource>(
         ['knowledge', 'source', sourceId],
@@ -670,7 +670,7 @@ function SourceDetailContent({
     },
     onError: (error: unknown) => {
       const detail = extractErrorMessage(error);
-      message.error(`Brief 重建失败：${detail}`);
+      message.error(`资料导读重建失败：${detail}`);
     },
   });
   const [briefCitationTarget, setBriefCitationTarget] = useState<string | null>(
@@ -838,7 +838,7 @@ function SourceDetailContent({
         ) : null}
         <SourceMetadataItem label="导入时间" value={formatDateTime(source.created_at)} />
         <SourceMetadataItem
-          label="Evidence"
+          label="来源依据"
           value={evidenceQuery.isLoading ? '—' : `${evidenceQuery.data?.items.length ?? 0} 条`}
         />
       </div>
@@ -874,7 +874,7 @@ function SourceDetailContent({
           },
           {
             key: 'evidence',
-            label: `Evidence${evidenceQuery.data?.items.length ? ` (${evidenceQuery.data.items.length})` : ''}`,
+            label: `来源依据${evidenceQuery.data?.items.length ? ` (${evidenceQuery.data.items.length})` : ''}`,
             children: (
               <EvidenceBlock
                 evidence={evidenceQuery.data?.items ?? []}
@@ -902,7 +902,7 @@ function SourceDetailContent({
           },
           {
             key: 'jobs',
-            label: '后台任务',
+            label: '技术详情',
             children: (
               <JobsBlock
                 data={jobsQuery.data ?? { jobs: [], origins: [] }}
@@ -933,7 +933,7 @@ function SourceDetailContent({
             showCount
           />
           <Text type="secondary" style={{ fontSize: 12 }}>
-            修改展示标题不会触发重新解析，Evidence ID 保持不变。
+            修改展示标题不会触发重新解析，来源依据的内部标识保持不变。
           </Text>
         </Space>
       </Modal>
@@ -958,15 +958,15 @@ function SourceDetailContent({
           <div className="knowledge-delete-warning">
             <Title level={5}>危险操作</Title>
             <Paragraph type="secondary">
-              永久删除会清除原件、附件、Evidence、Snapshot 与 Job 历史,不可恢复。
-              删除后相同内容可作为新 Source 重新导入。
+              永久删除会清除原件、附件、来源依据、保存版本与处理记录,不可恢复。
+              删除后相同内容可作为新的资料来源重新导入。
             </Paragraph>
           </div>
           <Alert
             type="error"
             showIcon
             message="此操作不可恢复"
-            description="删除后原件、Evidence、附件和 Job 历史都会被清除。如果之后再次上传相同内容,会得到全新的 Source。"
+            description="删除后原件、来源依据、附件和处理记录都会被清除。如果之后再次上传相同内容,会得到全新的资料来源。"
           />
           <Text type="secondary" style={{ fontSize: 12 }}>
             为防止误操作,请在下方输入框中输入"删除"以确认。
@@ -1012,29 +1012,29 @@ function StatusBlock({
     <div className="knowledge-status-record">
       <StatusLine label="生命周期" value={STATUS_LABEL[source.lifecycle] ?? source.lifecycle} />
       <StatusLine
-        label="Extraction"
+        label="内容整理"
         value={EXTRACTION_LABEL[source.extraction_status] ?? source.extraction_status}
       />
       {SHOW_BRIEF_UI ? (
         <>
-          <StatusLine label="Brief" value={BRIEF_LABEL[source.brief_status] ?? source.brief_status} />
-          <StatusLine label="Brief 暂缓原因" value={source.brief_block_reason || '无'} />
+          <StatusLine label="资料导读" value={BRIEF_LABEL[source.brief_status] ?? source.brief_status} />
+          <StatusLine label="资料导读暂缓原因" value={source.brief_block_reason || '无'} />
           <BriefAttemptTimeline attempts={briefAttempts} onCitationJump={onCitationJump} />
         </>
       ) : null}
       {extractionError ? (
-        <Alert type="error" showIcon message="Extraction 失败" description={extractionError} />
+        <Alert type="error" showIcon message="内容整理失败" description={extractionError} />
       ) : null}
       {filterSummary && filteredTotal > 0 ? (
         <div className="knowledge-status-filter-summary">
           <Space size={4} align="center">
-            <Title level={5}>Evidence 过滤统计</Title>
-            <Tooltip title="系统在生成 Evidence 时按确定性规则过滤作者卡、阅读数、导航、图片壳、Obsidian/Evernote 残片等元数据样板；原文仍可完整查看，被过滤块不参与检索。">
+            <Title level={5}>来源依据过滤统计</Title>
+            <Tooltip title="系统在整理来源依据时按确定性规则过滤作者卡、阅读数、导航、图片壳、Obsidian/Evernote 残片等元数据样板；原文仍可完整查看，被过滤块不参与检索。">
               <Button
                 type="text"
                 size="small"
                 icon={<QuestionCircleOutlined />}
-                aria-label="查看 Evidence 过滤说明"
+                aria-label="查看来源依据过滤说明"
               />
             </Tooltip>
           </Space>
@@ -1054,7 +1054,7 @@ function StatusBlock({
         <Space size={4} align="center" className="knowledge-jobs-origins-title">
           <Title level={5}>导入记录</Title>
           <Tooltip
-            title="相同内容自动复用已有 Source。重复上传相同字节时，系统会让上传结果进入已有 Source，不会创建重复 Evidence；每次导入都会追加一条 Origin 记录。"
+            title="相同内容自动复用已有资料来源。重复上传相同字节时，系统会让上传结果进入已有资料来源，不会创建重复来源依据；每次导入都会追加一条导入记录。"
           >
             <Button
               type="text"
@@ -1105,7 +1105,7 @@ const BRIEF_ATTEMPT_PHASE_LABEL: Record<string, string> = {
   program_check: '程序检查',
   validation_report: '校验报告',
   validation_result: '单条支持校验',
-  validation: 'Evidence 支持校验',
+  validation: '来源依据支持校验',
   repair: '修复',
   repair_requested: '修复请求',
   repair_patch_parsed: '修复补丁解析',
@@ -1185,11 +1185,11 @@ function BriefAttemptTimeline({
   return (
     <div className="knowledge-brief-attempts">
       <Title level={5} className="knowledge-brief-attempts-title">
-        Brief 处理记录
+        资料导读处理记录
       </Title>
       {orderedAttempts.length === 0 ? (
         <Text type="secondary" style={{ fontSize: 12 }}>
-          暂无 Brief Attempt 记录
+          暂无资料导读处理记录
         </Text>
       ) : (
         <List
@@ -1326,7 +1326,7 @@ function BriefEvidenceLinks({
   return (
     <Space size={4} wrap className="knowledge-brief-step-evidence">
       <Text type="secondary" style={{ fontSize: 11 }}>
-        Evidence：
+        来源依据：
       </Text>
       {evidenceIds.map((evidenceId) => (
         <Button
@@ -1381,7 +1381,7 @@ function BriefBlock({
           <span className="knowledge-brief-spark">
             <ReadOutlined />
           </span>
-          Brief 导读
+          资料导读
         </Title>
         <Space size={6} wrap>
           <Pill variant={isRebuilding || outdated || rebuildFailed ? 'amber' : 'violet'}>
@@ -1393,7 +1393,7 @@ function BriefBlock({
             loading={rebuilding}
             disabled={briefStatus === 'processing'}
           >
-            {brief ? '重建 Brief' : '生成 Brief'}
+            {brief ? '重建资料导读' : '生成资料导读'}
           </Button>
         </Space>
       </div>
@@ -1401,16 +1401,16 @@ function BriefBlock({
         <Alert
           type="warning"
           showIcon
-          message={`Brief 暂缓：${blockReason}`}
-          description="请先在设置中配置满足 96K context 的 Provider，然后点击生成 Brief。"
+          message={`资料导读暂缓：${blockReason}`}
+          description="请先在设置中配置满足 96K context 的 Provider，然后点击生成资料导读。"
         />
       ) : null}
       {outdated ? (
         <Alert
           type="warning"
           showIcon
-          message="Brief 已相对当前配置过期"
-          description="Provider / Prompt / Schema / Snapshot 已变化，旧 Brief 仍可查看，建议重建。"
+          message="资料导读已相对当前配置过期"
+          description="服务、提示词、结构或保存版本已变化，旧资料导读仍可查看，建议重建。"
           style={{ marginTop: 8 }}
         />
       ) : null}
@@ -1418,7 +1418,7 @@ function BriefBlock({
         <Alert
           type="error"
           showIcon
-          message="最近一次 Brief 校验未通过"
+          message="最近一次资料导读校验未通过"
           description={errorMessage}
           style={{ marginTop: 8 }}
         />
@@ -1427,7 +1427,7 @@ function BriefBlock({
         <Alert
           type="warning"
           showIcon
-          message="最近一次重建未通过，已保留旧 Brief"
+          message="最近一次重建未通过，已保留旧资料导读"
           description={latestAttempt?.error_message ?? ''}
           style={{ marginTop: 8 }}
         />
@@ -1440,12 +1440,12 @@ function BriefBlock({
         />
       ) : null}
       {showEmpty && !blockReason ? (
-        <Empty description="尚未生成 Brief，可在上方点击「生成 Brief」" />
+        <Empty description="尚未生成资料导读，可在上方点击「生成资料导读」" />
       ) : null}
       {brief ? (
         <BriefPayloadView brief={brief} onCitationJump={onCitationJump} />
       ) : null}
-      <div className="knowledge-brief-footer">Source ID：{sourceId}</div>
+      <div className="knowledge-brief-footer">资料来源内部编号：{sourceId}</div>
     </div>
   );
 }
@@ -1487,7 +1487,7 @@ export function BriefValidationIssues({
       style={{ marginTop: 8 }}
       message={
         report.summary ??
-        `Brief 质量校验失败：共 ${report.failure_count ?? issues.length} 条`
+        `资料导读质量校验失败：共 ${report.failure_count ?? issues.length} 条`
       }
       description={
         <Space direction="vertical" size={6} style={{ width: '100%' }}>
@@ -1697,7 +1697,7 @@ function EvidenceBlock({
   }
   if (!evidence.length) {
     return (
-      <Empty description="尚未生成 Evidence" />
+      <Empty description="尚未生成来源依据" />
     );
   }
   return (
@@ -1716,9 +1716,6 @@ function EvidenceBlock({
               >
                 <div className="knowledge-evidence-meta">
                   <span className="knowledge-evidence-kind">{item.block_kind}</span>
-                  <span className="knowledge-evidence-loc">
-                    行 {item.line_start}-{item.line_end} · 字符 {item.char_start}-{item.char_end}
-                  </span>
                   {isHighlighted ? (
                     <Pill variant="amber" className="knowledge-evidence-hit-badge">
                       搜索命中
@@ -1745,7 +1742,13 @@ function EvidenceBlock({
                   />
                 ) : null}
                 <MarkdownContent content={item.canonical_excerpt} />
-                <span className="knowledge-evidence-id">{item.id}</span>
+                <details>
+                  <summary>技术详情</summary>
+                  <span className="knowledge-evidence-loc">
+                    行 {item.line_start}-{item.line_end} · 字符 {item.char_start}-{item.char_end}
+                  </span>
+                  <span className="knowledge-evidence-id">{item.id}</span>
+                </details>
               </div>
             </List.Item>
           );
@@ -1940,8 +1943,8 @@ function SearchResultsPanel({
       <Alert
         type="info"
         showIcon
-        message={`未匹配 Evidence：${query}`}
-        description="尝试更宽的关键词，或确认 Extraction 已完成。"
+        message={`未匹配来源依据：${query}`}
+        description="尝试更宽的关键词，或确认内容整理已完成。"
       />
     );
   }
@@ -1949,7 +1952,7 @@ function SearchResultsPanel({
     <Alert
       type="success"
       showIcon
-      message={`命中 ${hits.length} 条 Evidence：${query}`}
+      message={`命中 ${hits.length} 条来源依据：${query}`}
       description={
         <List
           dataSource={hits}
@@ -1969,7 +1972,7 @@ function SearchResultsPanel({
               <Space direction="vertical" size={2} style={{ width: '100%' }}>
                 <Space size={6}>
                   <Text type="secondary" style={{ fontSize: 12 }}>
-                    Source #{item.source_id}
+                    资料来源 #{item.source_id}
                   </Text>
                   <span className="knowledge-evidence-kind">{item.block_kind}</span>
                   {item.heading_path.length ? (

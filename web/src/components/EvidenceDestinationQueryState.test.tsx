@@ -42,10 +42,16 @@ vi.mock('antd', () => {
   const Empty = (props: any) => <div>{props.description}{props.children}</div>;
   const Spin = () => <div>loading-spinner</div>;
   const Box = (props: any) => <div>{props.children}</div>;
+  const Typography = {
+    Text: (props: any) => <span>{props.children}</span>,
+    Title: (props: any) => <h2>{props.children}</h2>,
+  };
 
   return {
+    Alert: (props: any) => <div>{props.message}{props.description}</div>,
     Button,
     Col: Box,
+    Dropdown: Box,
     Empty,
     Input,
     message: antdState.message,
@@ -56,6 +62,7 @@ vi.mock('antd', () => {
     Statistic: (props: any) => <div>{props.title}{props.value}</div>,
     Tag: Box,
     Tooltip: Box,
+    Typography,
   };
 });
 
@@ -66,6 +73,7 @@ vi.mock('@ant-design/icons', () => ({
   FileAddOutlined: () => null,
   FileTextOutlined: () => null,
   LeftOutlined: () => null,
+  MoreOutlined: () => null,
   PlusOutlined: () => null,
   RightOutlined: () => null,
   SwapOutlined: () => null,

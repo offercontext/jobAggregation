@@ -53,10 +53,10 @@ export const MODULE_TABS: Record<ModuleKey, ModuleTabItem[]> = {
   ],
   interview: [
     { view: 'interview', label: '面试' },
-    { view: 'questions', label: '练习' },
   ],
   resources: [
-    { view: 'resumes', label: '简历与经历' },
+    { view: 'resumes', label: '简历' },
+    { view: 'reviews', label: '经历与故事' },
     { view: 'knowledge', label: '学习资料' },
   ],
   pilot: [{ view: 'pilot', label: '会话中心' }],
@@ -67,6 +67,7 @@ const VIEW_TO_MODULE: Partial<Record<ViewMode, ModuleKey>> = {
   dashboard: 'today',
   reminders: 'today',
   resumes: 'resources',
+  reviews: 'resources',
   knowledge: 'resources',
   questions: 'interview',
   board: 'applications',

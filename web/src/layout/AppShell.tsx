@@ -53,7 +53,6 @@ import ChatPanel, {
   type PilotReplyLifecycleEvent,
 } from '@/components/ChatPanel';
 import type { EvidenceTarget } from '@/components/ChatPanel/model';
-import AISettingsDrawer from '@/components/AISettingsDrawer';
 import CommandPalette from './CommandPalette';
 import { moduleTabsForView, type ViewMode } from './navigation';
 import {
@@ -250,7 +249,6 @@ function AppShellContent() {
     pilotV2HistoryRequestRef.current += 1;
     setPilotV2HistoryPending(false);
   };
-  const [aiSettingsOpen, setAISettingsOpen] = useState(false);
   const [resumeOnboardingFocusToken, setResumeOnboardingFocusToken] = useState(0);
   const [pilotOnboardingFocusToken, setPilotOnboardingFocusToken] = useState(0);
   const nextPilotOnboardingFocusToken = useRef(0);
@@ -322,15 +320,15 @@ function AppShellContent() {
     queryKey: ['applications'],
     queryFn: () => listApplications(),
   });
-  const { data: eventsData } = useQuery({
+  const { data: eventsData, isLoading: eventsLoading, isError: eventsError } = useQuery({
     queryKey: ['events'],
     queryFn: () => listEvents(),
   });
-  const { data: offersData } = useQuery({
+  const { data: offersData, isLoading: offersLoading, isError: offersError } = useQuery({
     queryKey: ['offers'],
     queryFn: () => listOffers(),
   });
-  const { data: practiceStats } = useQuery({
+  const { data: practiceStats, isLoading: practiceLoading, isError: practiceError } = useQuery({
     queryKey: ['questions', 'stats'],
     queryFn: () => getPracticeStats(),
     retry: false,
@@ -728,7 +726,6 @@ function AppShellContent() {
   };
 
   const navigateToView = (nextView: ViewMode, { preserveEvidenceFocus = false }: { preserveEvidenceFocus?: boolean } = {}) => {
-    setAISettingsOpen(false);
     setSelected(null);
     if (!preserveEvidenceFocus) setEvidenceFocus(null);
     if (nextView === 'pilot') {
@@ -763,7 +760,6 @@ function AppShellContent() {
   const handleOnboardingAction = (action: OnboardingAction) => {
     const intent = onboardingActionIntent(action, pilotRailAvailable);
     if (intent.view) navigateToView(intent.view);
-    if (intent.openAISettings) setAISettingsOpen(true);
     if (intent.openApplicationForm) setAddOpen(true);
     if (intent.focusResumeEntry) setResumeOnboardingFocusToken((token) => token + 1);
     if (intent.openPilotDrawer) assistantSurface.openHaru();
@@ -774,7 +770,6 @@ function AppShellContent() {
   };
 
   const openApplicationDetail = (app: Application) => {
-    setAISettingsOpen(false);
     exitPilotContext();
     setSelected(app);
   };
@@ -854,7 +849,6 @@ function AppShellContent() {
   };
 
   const startPilotOpportunityFit = (app: Application) => {
-    setAISettingsOpen(false);
     setSelected(null);
     const currentPilot = pilotApplicationContextRef.current;
     if (currentPilot && currentPilot.applicationId !== app.id) {
@@ -1426,7 +1420,6 @@ function AppShellContent() {
   };
 
   const openEvidence = (target: EvidenceTarget) => {
-    setAISettingsOpen(false);
     if (view === 'pilot' && !pilotRailAvailable) {
       assistantSurface.closeSurface();
     }
@@ -1567,13 +1560,15 @@ function AppShellContent() {
     });
   };
 
-  const workspaceContent = aiSettingsOpen ? (
-    <AISettingsDrawer open onClose={() => setAISettingsOpen(false)} />
-  ) : selectedApp ? (
+  const workspaceContent = selectedApp ? (
     <ApplicationDetail
       application={selectedApp}
       open
       onClose={() => setSelected(null)}
+      onOpenOffers={() => {
+        setSelected(null);
+        navigateToView('offers');
+      }}
       onAskPilot={startApplicationChat}
       onOpenPilotOpportunityFit={startPilotOpportunityFit}
       pilotInterviewReviewApplicationId={pilotInterviewReviewApplicationId}
@@ -1629,27 +1624,15 @@ function AppShellContent() {
         <div className="op-view-enter">
           {view === 'dashboard' && (
             <DashboardView
+              applications={apps}
+              events={evs}
+              offers={ofrs}
+              practiceStats={practiceStats}
+              dataState={{ eventsLoading, eventsError, offersLoading, offersError, practiceLoading, practiceError }}
               onNavigate={navigateToView}
               onOpenDetailById={goDetailById}
               onAddApplication={() => setAddOpen(true)}
               onOnboardingAction={handleOnboardingAction}
-              nextStepFactsForApplication={buildNextStepFacts}
-              suggestionSessionStates={suggestionSessionStates}
-              onSetDisposition={updateSuggestionSessionState}
-              onNextStepNavigate={handleNextStepNavigate}
-              isNextStepNavigationAvailable={isNextStepNavigationAvailable}
-              onNextStepReadonlyNavigate={handleNextStepReadonlyNavigate}
-              isNextStepReadonlyNavigationAvailable={isNextStepReadonlyNavigationAvailable}
-              onPruneDisposition={(applicationId, suggestionId, stateKey) => {
-                const key = `${applicationId}:${suggestionId}`;
-                setSuggestionSessionStates((current) => {
-                  const existing = current[key];
-                  if (!existing || existing.stateKey === stateKey) return current;
-                  const next = { ...current };
-                  delete next[key];
-                  return next;
-                });
-              }}
             />
           )}
           {view === 'board' && (
@@ -1694,6 +1677,13 @@ function AppShellContent() {
             />
           )}
           {view === 'knowledge' && <KnowledgeSourcesView />}
+          {view === 'reviews' && (
+            <InterviewStoryLibraryView
+              key={interviewStoryLibraryRevision}
+              onBack={() => setView('resumes')}
+              onOpenDraft={openInterviewStoryDraft}
+            />
+          )}
           {view === 'questions' && <QuestionBankView adaptiveFocus={adaptivePracticeFocus} onAdaptiveFocusConsumed={() => setAdaptivePracticeFocus(undefined)} />}
           {view === 'interview' && (voiceCoachingGrowthOpen ? (
             <VoiceCoachingGrowthView
@@ -1731,6 +1721,7 @@ function AppShellContent() {
                 if (reviewNoteId) openInterviewStoryDraft({ entrypoint: 'ui', reviewNoteId });
               }}
               onOpenVoiceCoachingGrowth={openVoiceCoachingGrowth}
+              onOpenQuestionBank={() => navigateToView('questions')}
               onOpenAdaptivePractice={(focus) => {
                 setAdaptivePracticeFocus(focus);
                 navigateToView('questions');
@@ -1812,7 +1803,6 @@ function AppShellContent() {
           )}
           {view === 'settings' && (
             <SettingsView
-              onOpenAISettings={() => setAISettingsOpen(true)}
               pilotMascotVisible={pilotMascotVisible}
               onPilotMascotVisibleChange={setPilotMascotPreference}
             />
@@ -1857,7 +1847,7 @@ function AppShellContent() {
               加载失败，请稍后重试
             </div>
           ) : (
-            <ViewErrorBoundary key={aiSettingsOpen ? 'ai-settings' : selectedApp ? `application-${selectedApp.id}` : view}>
+            <ViewErrorBoundary key={selectedApp ? `application-${selectedApp.id}` : view}>
               {workspaceContent}
             </ViewErrorBoundary>
           )}

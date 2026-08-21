@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Row, Col, Button, Space, Statistic, Spin, Empty, message } from 'antd';
+import { Alert, Row, Col, Button, Space, Spin, Empty, Typography, message } from 'antd';
 import { PlusOutlined, SwapOutlined } from '@ant-design/icons';
 import type { Application } from '@/types/application';
 import type { Offer } from '@/types/offer';
@@ -11,6 +11,7 @@ import OfferCompareDrawer from '@/components/OfferCompareDrawer';
 import OfferComparisonDimensionPanel from '@/components/OfferComparisonDimensionPanel';
 import OfferNegotiationDrawer, { type OfferNegotiationDraft } from '@/components/OfferNegotiationDrawer';
 import { findEvidenceFocusRecord } from '@/lib/pilotEvidenceFocus';
+import { getOfferWorkspaceMode, listMissingOfferFacts } from './offerWorkspaceModel';
 
 interface Props {
   applications: Application[];
@@ -80,6 +81,7 @@ export default function OfferCenterView({
   const selectedOffers = selectedIds
     .map((id) => offers.find((offer) => offer.id === id))
     .filter((offer): offer is Offer => Boolean(offer));
+  const mode = getOfferWorkspaceMode(offers.length, compareOpen);
 
   if (isLoading) {
     return <div role="status" style={{ textAlign: 'center', padding: 48 }}><Spin size="large" /><div>正在加载 Offer</div></div>;
@@ -88,55 +90,92 @@ export default function OfferCenterView({
     return <div role="alert" style={{ textAlign: 'center', padding: 48 }}><Empty description="加载 Offer 失败"><Button onClick={() => void refetch()}>重试</Button></Empty></div>;
   }
   if (compareOpen) {
-    return <OfferCompareDrawer
-      open={compareOpen}
-      onClose={() => setCompareOpen(false)}
-      offers={selectedOffers}
-      dimensionIds={selectedDimensionIds}
-      onCoach={onCoach}
-      onNegotiation={openNegotiation}
-    />;
+    return (
+      <div style={{ display: 'grid', gap: 16 }}>
+        <OfferComparisonDimensionPanel offers={offers} onSelectionChange={setSelectedDimensionIds} />
+        <div data-selected-comparison-dimensions={selectedDimensionIds.join(',')}>
+          <OfferCompareDrawer
+            open={compareOpen}
+            onClose={() => setCompareOpen(false)}
+            offers={selectedOffers}
+            dimensionIds={selectedDimensionIds}
+            onCoach={onCoach}
+            onNegotiation={openNegotiation}
+          />
+        </div>
+      </div>
+    );
   }
 
   return (
-    <div>
-      <Row justify="space-between" align="middle" style={{ marginBottom: 16 }}>
-        <Col><Space size="large"><Statistic title="Offer 总数" value={offers.length} /></Space></Col>
+    <div style={{ display: 'grid', gap: 16 }} data-offer-workspace-mode={mode}>
+      <Row justify="space-between" align="middle">
         <Col>
-          <Space>
-            <Button icon={<SwapOutlined />} disabled={selectedIds.length < 2} onClick={() => setCompareOpen(true)}>
-              对比选中 ({selectedIds.length})
-            </Button>
-            <Button type="primary" icon={<PlusOutlined />} onClick={() => { setEditing(null); setAddOpen(true); }}>
-              录入 Offer
-            </Button>
-          </Space>
+          <Typography.Title level={2} style={{ margin: 0 }}>Offer</Typography.Title>
+          {mode === 'selection' ? <Typography.Text type="secondary">选择至少两份 Offer 进行比较</Typography.Text> : null}
+        </Col>
+        <Col>
+          {mode === 'selection' ? (
+            <Space>
+              <Button icon={<SwapOutlined />} disabled={selectedIds.length < 2} onClick={() => setCompareOpen(true)}>
+                开始比较（已选 {selectedIds.length}）
+              </Button>
+              <Button icon={<PlusOutlined />} onClick={() => { setEditing(null); setAddOpen(true); }}>录入 Offer</Button>
+            </Space>
+          ) : null}
         </Col>
       </Row>
-      {offers.length === 0 ? (
-        <Empty description="还没有 Offer，点击“录入 Offer”开始" />
-      ) : (
+      {mode === 'entry' ? (
+        <Empty
+          description="先录入 Offer，再逐步补齐薪酬、截止时间和沟通安排"
+        >
+          <Button type="primary" icon={<PlusOutlined />} onClick={() => { setEditing(null); setAddOpen(true); }}>
+            录入第一份 Offer
+          </Button>
+        </Empty>
+      ) : null}
+      {mode === 'single' ? (
         <>
-          <OfferComparisonDimensionPanel offers={offers} onSelectionChange={setSelectedDimensionIds} />
-          <div data-selected-comparison-dimensions={selectedDimensionIds.join(',')}>
-            <Row gutter={[16, 16]}>
-              {offers.map((offer) => (
-                <Col key={offer.id} xs={24} sm={12} md={8}>
-                  <OfferCard
-                    offer={offer}
-                    selected={selectedIds.includes(offer.id)}
-                    onToggleSelect={toggleSelect}
-                    onCoach={onCoach}
-                    onNegotiation={openNegotiation}
-                    onAttachToPilot={onAttachToPilot}
-                    onView={(o) => { setEditing(o); setAddOpen(true); }}
-                  />
-                </Col>
-              ))}
-            </Row>
-          </div>
+          <Alert
+            type="info"
+            showIcon
+            message={`待确认：${listMissingOfferFacts(offers[0]).join('、') || '关键信息已补齐'}`}
+            description={`截止时间：${offers[0].deadline || '待确认'} · 下一次沟通：待安排`}
+          />
+          <Row gutter={[16, 16]}>
+            <Col xs={24} lg={12}>
+              <OfferCard
+                offer={offers[0]}
+                selectable={false}
+                selected={false}
+                onToggleSelect={toggleSelect}
+                onCoach={onCoach}
+                onNegotiation={openNegotiation}
+                onAttachToPilot={onAttachToPilot}
+                onView={(o) => { setEditing(o); setAddOpen(true); }}
+              />
+            </Col>
+          </Row>
+          <Button style={{ justifySelf: 'start' }} icon={<PlusOutlined />} onClick={() => { setEditing(null); setAddOpen(true); }}>录入另一份 Offer</Button>
         </>
-      )}
+      ) : null}
+      {mode === 'selection' ? (
+        <Row gutter={[16, 16]}>
+          {offers.map((offer) => (
+            <Col key={offer.id} xs={24} sm={12} md={8}>
+              <OfferCard
+                offer={offer}
+                selected={selectedIds.includes(offer.id)}
+                onToggleSelect={toggleSelect}
+                onCoach={onCoach}
+                onNegotiation={openNegotiation}
+                onAttachToPilot={onAttachToPilot}
+                onView={(o) => { setEditing(o); setAddOpen(true); }}
+              />
+            </Col>
+          ))}
+        </Row>
+      ) : null}
       <AddOfferForm open={addOpen} onClose={() => setAddOpen(false)} applications={applications} editing={editing} />
       {negotiationOffer && (
         <OfferNegotiationDrawer

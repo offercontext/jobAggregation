@@ -15,20 +15,17 @@ import {
   Popconfirm,
   Space,
   Modal,
+  Dropdown,
 } from 'antd';
 import {
   ArrowLeftOutlined,
   CalendarOutlined,
-  RobotOutlined,
   PlusOutlined,
-  AudioOutlined,
-  FileTextOutlined,
-  DatabaseOutlined,
+  MoreOutlined,
 } from '@ant-design/icons';
 import dayjs from 'dayjs';
 import type { Application } from '@/types/application';
 import type { PilotActionRequest } from '@/types/chat';
-import { STATUS_LABELS } from '@/types/application';
 import { listNotesByApp, createNote, deleteNote as removeNote, updateNote } from '@/services/notes';
 import { listEvents } from '@/services/events';
 import type { CreateNoteInput, InterviewNote } from '@/types/note';
@@ -75,6 +72,7 @@ import type {
   SuggestionSessionState,
 } from '@/lib/nextStepSuggestions';
 import styles from './ApplicationDetail.module.css';
+import { getApplicationWorkspaceStage } from './applicationWorkspaceModel';
 
 const { Title, Paragraph, Text } = Typography;
 
@@ -88,6 +86,7 @@ interface ApplicationDetailProps {
   application: Application | null;
   open: boolean;
   onClose: () => void;
+  onOpenOffers?: () => void;
   onMockInterview?: (app: Application) => void;
   onAskPilot?: (app: Application, action?: PilotActionRequest) => void;
   onOpenPilotOpportunityFit?: (app: Application) => void;
@@ -125,7 +124,7 @@ interface ApplicationDetailProps {
   onOpportunityFitDraftChange?: (applicationId: number, patch: Partial<OpportunityFitV2Draft> | null) => void;
 }
 
-export default function ApplicationDetail({ application, open, onClose, onMockInterview, onAskPilot, onOpenPilotOpportunityFit, pilotInterviewReviewApplicationId, onPilotInterviewReviewFocusConsumed, pilotInterviewPreparationApplicationId, pilotInterviewPreparationEventId, onPilotInterviewPreparationFocusConsumed, onAttachToPilot, interviewReviewProposalAttempts, onInterviewReviewProposalAttemptChange, onInterviewNoteChanged, interviewKnowledgeCaptureDrafts, onInterviewKnowledgeCaptureDraftChange, onInterviewKnowledgeCaptureNoteChanged, resumes = [], interviewPreparationAttempts, onInterviewPreparationAttemptChange, interviewPreparationDrafts, onInterviewPreparationDraftChange, interviewPreparationKnowledgeOptions = [], nextStepSuggestions, nextStepSessionState = null, onSetDisposition, onNextStepNavigate, isNavigationAvailable, onNextStepReadonlyNavigate, isReadonlyNavigationAvailable, applicationJdDraft, onApplicationJdDraftChange, opportunityFitDraft, onOpportunityFitDraftChange }: ApplicationDetailProps) {
+export default function ApplicationDetail({ application, open, onClose, onOpenOffers, onMockInterview, onAskPilot, onOpenPilotOpportunityFit, pilotInterviewReviewApplicationId, onPilotInterviewReviewFocusConsumed, pilotInterviewPreparationApplicationId, pilotInterviewPreparationEventId, onPilotInterviewPreparationFocusConsumed, onAttachToPilot, interviewReviewProposalAttempts, onInterviewReviewProposalAttemptChange, onInterviewNoteChanged, interviewKnowledgeCaptureDrafts, onInterviewKnowledgeCaptureDraftChange, onInterviewKnowledgeCaptureNoteChanged, resumes = [], interviewPreparationAttempts, onInterviewPreparationAttemptChange, interviewPreparationDrafts, onInterviewPreparationDraftChange, interviewPreparationKnowledgeOptions = [], nextStepSuggestions, nextStepSessionState = null, onSetDisposition, onNextStepNavigate, isNavigationAvailable, onNextStepReadonlyNavigate, isReadonlyNavigationAvailable, applicationJdDraft, onApplicationJdDraftChange, opportunityFitDraft, onOpportunityFitDraftChange }: ApplicationDetailProps) {
   const queryClient = useQueryClient();
   const [form] = Form.useForm();
   const [eventFormOpen, setEventFormOpen] = useState(false);
@@ -525,6 +524,78 @@ export default function ApplicationDetail({ application, open, onClose, onMockIn
       })
     : undefined;
 
+  const interviewEvents = (eventsQuery.data ?? []).filter((event) => event.event_type === 'interview');
+  const completedInterview = interviewEvents
+    .filter((event) => dayjs(event.scheduled_at).isBefore(dayjs()))
+    .sort((left, right) => dayjs(right.scheduled_at).valueOf() - dayjs(left.scheduled_at).valueOf())[0];
+  const upcomingEvent = (eventsQuery.data ?? [])
+    .filter((event) => dayjs(event.scheduled_at).isAfter(dayjs()))
+    .sort((left, right) => dayjs(left.scheduled_at).valueOf() - dayjs(right.scheduled_at).valueOf())[0];
+  const stage = getApplicationWorkspaceStage(application.status, {
+    hasCompletedInterview: Boolean(completedInterview),
+    hasInterviewReview: Boolean(completedInterview && notesQuery.data?.some((note) => note.application_event_id === completedInterview.id)),
+  });
+
+  const openMaterials = () => {
+    const currentJd = applicationJdQuery.data?.current;
+    setMaterialKitPrefill(currentJd ? { jdSnapshot: currentJd.jd_text, jdVersionID: currentJd.id } : {});
+    setMaterialKitApplicationId(application.id);
+    setMaterialKitOpen(true);
+  };
+
+  const runStageAction = () => {
+    switch (stage.action) {
+      case 'materials':
+        openMaterials();
+        break;
+      case 'followup':
+      case 'written-test':
+        setEventFormOpen(true);
+        break;
+      case 'interview-prepare': {
+        const nextInterview = interviewEvents
+          .filter((event) => dayjs(event.scheduled_at).isAfter(dayjs()))
+          .sort((left, right) => dayjs(left.scheduled_at).valueOf() - dayjs(right.scheduled_at).valueOf())[0] ?? interviewEvents[0];
+        if (nextInterview) {
+          setPreparationEventID(nextInterview.id);
+          setPreparationOpen(true);
+        } else {
+          setEventFormOpen(true);
+        }
+        break;
+      }
+      case 'interview-review': {
+        const linkedNote = completedInterview
+          ? notesQuery.data?.find((note) => note.application_event_id === completedInterview.id)
+          : undefined;
+        setReviewEventID(completedInterview?.id ?? null);
+        setEditingNote(linkedNote ?? null);
+        setReviewFormOpen(!linkedNote);
+        setReviewProposalOpen(Boolean(linkedNote));
+        break;
+      }
+      case 'offer':
+        if (onOpenOffers) {
+          onOpenOffers();
+          break;
+        }
+        setApplicationOutcomeOpen(true);
+        break;
+      case 'outcome':
+        setApplicationOutcomeOpen(true);
+        break;
+    }
+  };
+
+  const moreActionItems = [
+    ...(onAskPilot ? [{ key: 'haru', label: '让 Haru 帮我', onClick: () => onAskPilot(application, { type: 'application_jd_save' }) }] : []),
+    ...(onOpenPilotOpportunityFit ? [{ key: 'fit', label: '评估岗位匹配', onClick: () => onOpenPilotOpportunityFit(application) }] : []),
+    { key: 'materials', label: '打开投递材料', onClick: openMaterials },
+    { key: 'decision', label: '岗位决策漏斗', onClick: () => setOpportunityFitOpen(true) },
+    { key: 'facts', label: '投递事实与结果', onClick: () => setApplicationOutcomeOpen(true) },
+    ...(onMockInterview ? [{ key: 'mock', label: '开始模拟面试', onClick: () => onMockInterview(application) }] : []),
+  ];
+
   return (
     <>
       <Modal
@@ -617,13 +688,31 @@ export default function ApplicationDetail({ application, open, onClose, onMockIn
             返回上一层
           </Button>
           <div className={styles.titleRow}>
-            <Title level={3} className={styles.title}>
-              {application.company_name} · {application.position_name}
-            </Title>
-            <Tag color="green">{STATUS_LABELS[application.status]}</Tag>
-            <SourceStateTag state="current" detail="当前投递" />
+            <div className={styles.stageIdentity}>
+              <Title level={3} className={styles.title}>
+                {application.company_name} · {application.position_name}
+              </Title>
+              <Space wrap>
+                <Tag color="green">{stage.label}</Tag>
+                <SourceStateTag state="current" detail="当前投递" />
+                <Text type="secondary">
+                  下一步时间：{upcomingEvent ? dayjs(upcomingEvent.scheduled_at).format('M 月 D 日 HH:mm') : '待安排'}
+                </Text>
+              </Space>
+            </div>
+            <Space>
+              <Button type="primary" size="large" onClick={runStageAction}>{stage.primaryActionLabel}</Button>
+              <Dropdown menu={{ items: moreActionItems }} trigger={['click']}>
+                <Button size="large" icon={<MoreOutlined />}>更多操作</Button>
+              </Dropdown>
+            </Space>
           </div>
         </div>
+
+        <section className={styles.workspaceSection} aria-labelledby="application-overview-heading">
+          <Title id="application-overview-heading" level={4} className={styles.workspaceSectionTitle}>概览</Title>
+          {application.notes ? <Paragraph type="secondary">备注：{application.notes}</Paragraph> : <Text type="secondary">暂无补充备注</Text>}
+        </section>
 
         {nextStepSuggestions && onSetDisposition && onNextStepNavigate && (
           <NextStepSuggestions
@@ -638,20 +727,14 @@ export default function ApplicationDetail({ application, open, onClose, onMockIn
           />
         )}
 
+        <section className={styles.workspaceSection} aria-labelledby="application-materials-heading">
+          <Title id="application-materials-heading" level={4} className={styles.workspaceSectionTitle}>岗位与材料</Title>
         <div style={{ border: '1px solid #e2e8f0', borderRadius: 10, padding: 14, marginBottom: 16 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
             <Text strong>{'\u6295\u9012\u5c97\u4f4d\u8d44\u6599'}</Text>
             <Space>
               <Button size="small" onClick={() => { setJdHistoryOpen(true); setSelectedJdVersion(null); }}>{'\u67e5\u770b\u5386\u53f2'}</Button>
-              <Button size="small" type="primary" onClick={startJdEditor}>{applicationJdQuery.data?.current ? '\u66f4\u65b0 JD' : '\u6dfb\u52a0 JD'}</Button>
-              {onAskPilot && (
-                <Button
-                  size="small"
-                  onClick={() => onAskPilot(application, { type: 'application_jd_save' })}
-                >
-                  {applicationJdQuery.data?.current ? '更新岗位资料' : '保存岗位资料'}
-                </Button>
-              )}
+              <Button size="small" onClick={startJdEditor}>{applicationJdQuery.data?.current ? '\u66f4\u65b0 JD' : '\u6dfb\u52a0 JD'}</Button>
             </Space>
           </div>
           {applicationJdQuery.isLoading ? <Spin size="small" /> : applicationJdQuery.data?.current ? (
@@ -673,59 +756,11 @@ export default function ApplicationDetail({ application, open, onClose, onMockIn
             </>
           ) : <Text type="secondary">{'\u5c1a\u672a\u786e\u8ba4\u5c97\u4f4d\u63cf\u8ff0'}</Text>}
         </div>
-
-        <div className={styles.actionRow}>
-          {onAskPilot && (
-            <Button icon={<RobotOutlined />} onClick={() => onAskPilot(application)}>
-              问 Pilot
-            </Button>
-          )}
-          {onOpenPilotOpportunityFit && (
-            <Button onClick={() => onOpenPilotOpportunityFit(application)} style={{ marginLeft: 8 }}>
-              在 Pilot 中评估
-            </Button>
-          )}
-          <Button
-            icon={<FileTextOutlined />}
-            onClick={() => {
-              const currentJd = applicationJdQuery.data?.current;
-              setMaterialKitPrefill(currentJd ? {
-                jdSnapshot: currentJd.jd_text,
-                jdVersionID: currentJd.id,
-              } : {});
-              setMaterialKitApplicationId(application.id);
-              setMaterialKitOpen(true);
-            }}
-            style={{ marginLeft: 8 }}
-          >
-            材料包
-          </Button>
-          <Button onClick={() => setOpportunityFitOpen(true)} style={{ marginLeft: 8 }}>
-            岗位决策漏斗
-          </Button>
-          <Button
-            icon={<DatabaseOutlined />}
-            onClick={() => setApplicationOutcomeOpen(true)}
-            style={{ marginLeft: 8 }}
-          >
-            投递事实与结果
-          </Button>
-          {onMockInterview && (
-            <Button
-              icon={<AudioOutlined />}
-              onClick={() => onMockInterview(application)}
-              style={{ marginLeft: 8 }}
-            >
-              模拟面试
-            </Button>
-          )}
-        </div>
-
-        {application.notes && (
-          <Paragraph type="secondary">备注：{application.notes}</Paragraph>
-        )}
+        </section>
 
         <Divider />
+        <section className={styles.workspaceSection} aria-labelledby="application-schedule-heading">
+        <Title id="application-schedule-heading" level={4} className={styles.workspaceSectionTitle}>日程与沟通</Title>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
           <Title level={5} style={{ margin: 0 }}>
             <CalendarOutlined /> 日程
@@ -789,6 +824,9 @@ export default function ApplicationDetail({ application, open, onClose, onMockIn
         ) : (
           <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无笔试、面试或测评日程" style={{ marginBottom: 16 }} />
         )}
+        </section>
+        <section className={styles.workspaceSection} aria-labelledby="application-interview-heading">
+        <Title id="application-interview-heading" level={4} className={styles.workspaceSectionTitle}>面试</Title>
         <Title level={5} style={{ marginTop: 8 }}>
           面试复盘
         </Title>
@@ -908,6 +946,17 @@ export default function ApplicationDetail({ application, open, onClose, onMockIn
         ) : (
           <Empty description="还没有面试复盘" />
         )}
+        </section>
+        <section className={styles.workspaceSection} aria-labelledby="application-result-heading">
+          <Title id="application-result-heading" level={4} className={styles.workspaceSectionTitle}>结果</Title>
+          <Text type="secondary">
+            {application.status === 'offer'
+              ? '已进入 Offer 阶段，可通过顶部主操作查看事实、截止时间和待确认信息。'
+              : application.status === 'closed'
+                ? '该投递已结束，结果与经验记录保留在投递事实中。'
+                : '尚未进入结果阶段，后续状态会继续在这里汇总。'}
+          </Text>
+        </section>
       </section>
 
     </>

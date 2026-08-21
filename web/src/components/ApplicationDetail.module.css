@@ -22,6 +22,24 @@
   flex-wrap: wrap;
 }
 
+.stageIdentity { min-width: 0; }
+
+.workspaceSection {
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid var(--op-border);
+}
+
+.workspaceSectionTitle {
+  margin: 0 0 14px !important;
+  color: var(--op-ink) !important;
+  text-wrap: balance;
+}
+
+@media (max-width: 1179px) {
+  .titleRow { align-items: flex-start; flex-direction: column; }
+}
+
 .title {
   margin: 0 !important;
 }

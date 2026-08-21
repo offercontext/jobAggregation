@@ -13,6 +13,12 @@ async function loadWorkflowCss(): Promise<string> {
 }
 
 describe('InterviewV01View', () => {
+  it('organizes the workspace around preparation, practice, question bank and growth', () => {
+    expect(source).toContain("label: '待准备'");
+    expect(source).toContain("label: '模拟练习'");
+    expect(source).toContain("label: '题库'");
+    expect(source).toContain("label: '复盘与成长'");
+  });
   it('renders the interview index loading surface without mock interview entry points', () => {
     const markup = renderToStaticMarkup(
       <AntApp>

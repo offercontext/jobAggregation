@@ -1,0 +1,13 @@
+{
+  "project": "Desktop Workspace Experience Redesign",
+  "baseline": "2f6e895e02b86f33052a2e507e9b0404bb82f4b5",
+  "worktreeLocator": "D:\\Users\\yuqi.chen\\offerpilot\\.worktrees\\refactor-20260821-assistant-surface-shell",
+  "allowlist": [
+    "web/**",
+    "docs/superpowers/specs/**",
+    "docs/superpowers/plans/**",
+    "docs/reports/**"
+  ],
+  "allowlistCanonicalJson": "[\"web/**\",\"docs/superpowers/specs/**\",\"docs/superpowers/plans/**\",\"docs/reports/**\"]",
+  "allowlistSha256": "6806fa6815a5eb009934d12178e92d32bbe4ce7163fbe407266e1ad505c3e873"
+}

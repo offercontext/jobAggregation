@@ -4,10 +4,10 @@ import dashboardSource from '@/features/dashboard/DashboardView.tsx?raw';
 
 describe('next-step suggestions AppShell integration contract', () => {
   it('mounts the shared suggestion component without adding per-application history queries', () => {
-    expect(dashboardSource).toContain('deriveNextStepSuggestions');
+    expect(appShellSource).toContain('deriveNextStepSuggestions');
     expect(appShellSource).toContain('suggestionSessionStates');
-    expect(appShellSource).toContain('nextStepFactsForApplication');
-    expect(dashboardSource).toContain('NextStepSuggestions');
+    expect(appShellSource).toContain('nextStepSuggestions={selectedNextStepSuggestions ?? undefined}');
+    expect(dashboardSource).not.toContain('NextStepSuggestions');
     expect(appShellSource).not.toContain('listOpportunityFitV2Reviews(application.id)');
     expect(appShellSource).not.toContain('listMockInterviewHistory(application.id)');
   });
@@ -16,7 +16,6 @@ describe('next-step suggestions AppShell integration contract', () => {
     expect(appShellSource).toContain("reason: 'not_loaded'");
     expect(appShellSource).toContain("reason: 'not_supported'");
     expect(dashboardSource).toContain('materialKitsQ');
-    expect(dashboardSource).toContain('NextStepSuggestions');
     expect(dashboardSource).toContain('hasPartialMaterialKitCoverage');
   });
 
@@ -34,7 +33,7 @@ describe('next-step suggestions AppShell integration contract', () => {
   it('prunes a stale state entry instead of only ignoring it while rendering', () => {
     expect(appShellSource).toContain('delete next[key]');
     expect(appShellSource).toContain('existing.stateKey === selectedNextStepCandidate.stateKey');
-    expect(dashboardSource).toContain('onPruneDisposition');
+    expect(dashboardSource).not.toContain('onPruneDisposition');
   });
 
   it('does not drop review destination context when no typed adapter exists', () => {

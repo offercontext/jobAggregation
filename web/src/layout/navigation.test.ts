@@ -51,10 +51,10 @@ describe('module navigation contract', () => {
     ]);
     expect(moduleTabsForView('interview')).toEqual([
       { view: 'interview', label: '面试' },
-      { view: 'questions', label: '练习' },
     ]);
     expect(moduleTabsForView('knowledge')).toEqual([
-      { view: 'resumes', label: '简历与经历' },
+      { view: 'resumes', label: '简历' },
+      { view: 'reviews', label: '经历与故事' },
       { view: 'knowledge', label: '学习资料' },
     ]);
     expect(moduleTabsForView('pilot')).toEqual([{ view: 'pilot', label: '会话中心' }]);

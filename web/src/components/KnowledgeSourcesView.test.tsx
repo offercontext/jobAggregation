@@ -26,9 +26,9 @@ describe('KnowledgeSourcesView', () => {
     expect(markup).toContain('上传 Markdown / Text');
     expect(markup).toContain('上传图文 Bundle');
     expect(markup).toContain('粘贴正文');
-    expect(markup).toContain('Evidence');
+    expect(markup).toContain('来源依据');
     // SSR 阶段 React Query 处于 loading 状态；右栏空状态提供引导文案。
-    expect(markup).toContain('选择左侧的 Source 查看详情');
+    expect(markup).toContain('选择左侧的资料来源查看详情');
     expect(markup).not.toContain('Wiki');
     expect(markup).not.toContain('Page');
   });
@@ -65,7 +65,7 @@ describe('KnowledgeSourcesView', () => {
   it('exposes KI-08 evidence search entry with CJK-friendly placeholder', () => {
     const markup = renderWithProviders();
 
-    expect(markup).toContain('搜索 Evidence');
+    expect(markup).toContain('搜索来源依据');
     expect(markup).toContain('中文/英文关键词');
   });
 

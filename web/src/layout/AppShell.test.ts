@@ -287,7 +287,7 @@ describe('AppShell source contract', () => {
     expect(source).toContain('const handleOnboardingAction = (action: OnboardingAction) => {');
     expect(source).toContain('const intent = onboardingActionIntent(action, pilotRailAvailable);');
     expect(source).toContain('navigateToView(intent.view);');
-    expect(source).toContain('setAISettingsOpen(true);');
+    expect(source).not.toContain('setAISettingsOpen');
     expect(source).toContain('setAddOpen(true);');
     expect(source).toContain('setResumeOnboardingFocusToken((token) => token + 1);');
     expect(source).toContain('const nextPilotOnboardingFocusToken = useRef(0);');

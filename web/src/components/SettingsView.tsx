@@ -5,10 +5,11 @@ import { exportBackup, getLogs, getSettings, getSettingsBackup, type LogEntry, t
 import { ONBOARDING_QUERY_KEY, setOnboardingForceOpen } from '@/services/onboarding';
 import { buildDiagnosticsText } from '@/lib/diagnostics';
 import OfflineWhisperModelCard from '@/features/mockInterviewVoice/OfflineWhisperModelCard';
-import { useEffect, useMemo, useState } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
+
+const AISettingsDrawer = lazy(() => import('./AISettingsDrawer'));
 
 interface Props {
-  onOpenAISettings: () => void;
   pilotMascotVisible: boolean;
   onPilotMascotVisibleChange: (visible: boolean) => void;
 }
@@ -16,7 +17,6 @@ interface Props {
 const LOG_PAGE_SIZE = 20;
 
 export default function SettingsView({
-  onOpenAISettings,
   pilotMascotVisible,
   onPilotMascotVisibleChange,
 }: Props) {
@@ -24,6 +24,7 @@ export default function SettingsView({
   const [logLevel, setLogLevel] = useState('');
   const [logPage, setLogPage] = useState(1);
   const [lastLogsPage, setLastLogsPage] = useState<LogsPage>();
+  const [aiSettingsOpen, setAISettingsOpen] = useState(false);
   const logOffset = (logPage - 1) * LOG_PAGE_SIZE;
   const settingsQuery = useQuery({
     queryKey: ['settings-summary'],
@@ -93,6 +94,14 @@ export default function SettingsView({
     });
   }
 
+  if (aiSettingsOpen) {
+    return (
+      <Suspense fallback={<Skeleton active paragraph={{ rows: 8 }} />}>
+        <AISettingsDrawer open onClose={() => setAISettingsOpen(false)} />
+      </Suspense>
+    );
+  }
+
   return (
     <section
       style={{
@@ -114,7 +123,7 @@ export default function SettingsView({
           </span>
           <div>
             <Typography.Title level={4} style={panelTitleStyle}>
-              AI 运行时
+              AI 与模型
             </Typography.Title>
             <Typography.Text style={{ color: 'var(--op-muted)' }}>
               管理模型供应商、模型、密钥与写入确认策略。
@@ -131,18 +140,38 @@ export default function SettingsView({
         >
           <RuntimeField label="运行模式" value={formatRuntimeMode(settings?.runtime_mode)} />
           <RuntimeField label="版本" value={settings?.version ?? '-'} />
-          <RuntimeField label="多供应商" value={`${settings?.providers.length ?? 0} 个`} />
-          <RuntimeField label="Fallback" value={fallbackLabel(settings)} />
-          <RuntimeField label="日志级别" value={settings?.log_level ?? '-'} />
-          <RuntimeField label="访问控制" value={settings?.auth_enabled ? '已开启' : '未开启'} />
           <RuntimeField label="密钥状态" value={settings?.has_api_key ? '已配置' : '未配置'} />
-          <RuntimeField label="数据目录" value={settings?.data_dir ?? '-'} />
         </div>
+        <details style={detailsStyle}>
+          <summary style={detailsSummaryStyle}>高级运行信息</summary>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 12, marginTop: 12 }}>
+            <RuntimeField label="多供应商" value={`${settings?.providers.length ?? 0} 个`} />
+            <RuntimeField label="Fallback" value={fallbackLabel(settings)} />
+            <RuntimeField label="日志级别" value={settings?.log_level ?? '-'} />
+            <RuntimeField label="访问控制" value={settings?.auth_enabled ? '已开启' : '未开启'} />
+          </div>
+        </details>
         <div>
           <Space wrap>
-            <Button type="primary" icon={<SettingOutlined />} onClick={onOpenAISettings}>
+            <Button type="primary" icon={<SettingOutlined />} onClick={() => setAISettingsOpen(true)}>
               配置 AI
             </Button>
+          </Space>
+        </div>
+      </section>
+
+      <section style={panelStyle} aria-labelledby="data-backup-settings-title">
+        <Space align="start" size={12}>
+          <span style={panelIconStyle}><DownloadOutlined /></span>
+          <div>
+            <Typography.Title id="data-backup-settings-title" level={4} style={panelTitleStyle}>数据与备份</Typography.Title>
+            <Typography.Text style={{ color: 'var(--op-muted)' }}>导出本机设置或完整工作区数据。</Typography.Text>
+          </div>
+        </Space>
+        <Divider style={{ margin: 0 }} />
+        <RuntimeField label="数据目录" value={settings?.data_dir ?? '-'} />
+        <div>
+          <Space wrap>
             <Button
               icon={<DownloadOutlined />}
               loading={backupMutation.isPending}
@@ -174,7 +203,7 @@ export default function SettingsView({
             </span>
             <div>
               <Typography.Title id="pilot-mascot-settings-title" level={4} style={panelTitleStyle}>
-                Haru
+                Haru 与外观
               </Typography.Title>
               <Typography.Text style={{ color: 'var(--op-muted)' }}>
                 在桌面宽屏显示 Haru。隐藏后将恢复默认 Pilot 侧边栏。
@@ -195,7 +224,10 @@ export default function SettingsView({
         </Typography.Text>
       </section>
 
-      <OfflineWhisperModelCard />
+      <section style={panelStyle} aria-labelledby="voice-settings-title">
+        <Typography.Title id="voice-settings-title" level={4} style={panelTitleStyle}>语音</Typography.Title>
+        <OfflineWhisperModelCard />
+      </section>
 
       <section style={panelStyle}>
         <Space align="start" size={12}>
@@ -204,42 +236,38 @@ export default function SettingsView({
           </span>
           <div style={{ flex: 1 }}>
             <Typography.Title level={4} style={panelTitleStyle}>
-              运行诊断
+              高级与诊断
             </Typography.Title>
             <Typography.Text style={{ color: 'var(--op-muted)' }}>
               最近的本地运行日志。
             </Typography.Text>
           </div>
-          <Space wrap>
-            <Select
-              aria-label="日志筛选"
-              value={logLevel}
-              onChange={(value) => {
-                setLogLevel(value);
-                setLogPage(1);
-              }}
-              options={[
-                { value: '', label: '全部日志' },
-                { value: 'DEBUG', label: 'DEBUG' },
-                { value: 'INFO', label: 'INFO' },
-                { value: 'WARNING', label: 'WARNING' },
-                { value: 'ERROR', label: 'ERROR' },
-              ]}
-              style={{ width: 130 }}
-            />
-            <Button icon={<CopyOutlined />} onClick={copyDiagnostics} disabled={!settings}>
-              复制诊断信息
-            </Button>
-          </Space>
-          <Button
-            icon={<ReloadOutlined />}
-            onClick={refreshLogs}
-            loading={logsQuery.isFetching}
-            aria-label="刷新日志"
-          />
         </Space>
-        <Divider style={{ margin: 0 }} />
-        {!logsPage ? (
+        <details style={detailsStyle}>
+          <summary style={detailsSummaryStyle}>查看运行日志与诊断</summary>
+          <div style={{ display: 'grid', gap: 16, marginTop: 16 }}>
+            <Space wrap>
+              <Select
+                aria-label="日志筛选"
+                value={logLevel}
+                onChange={(value) => {
+                  setLogLevel(value);
+                  setLogPage(1);
+                }}
+                options={[
+                  { value: '', label: '全部日志' },
+                  { value: 'DEBUG', label: 'DEBUG' },
+                  { value: 'INFO', label: 'INFO' },
+                  { value: 'WARNING', label: 'WARNING' },
+                  { value: 'ERROR', label: 'ERROR' },
+                ]}
+                style={{ width: 130 }}
+              />
+              <Button icon={<CopyOutlined />} onClick={copyDiagnostics} disabled={!settings}>复制诊断信息</Button>
+              <Button icon={<ReloadOutlined />} onClick={refreshLogs} loading={logsQuery.isFetching} aria-label="刷新日志" />
+            </Space>
+            <Divider style={{ margin: 0 }} />
+            {!logsPage ? (
           logsQuery.isError ? (
             <Alert
               type="error"
@@ -254,7 +282,7 @@ export default function SettingsView({
           ) : (
             <Skeleton active paragraph={{ rows: 3 }} />
           )
-        ) : (
+            ) : (
           <>
             {logsQuery.isError ? (
               <Alert
@@ -284,7 +312,9 @@ export default function SettingsView({
               onChange={(page) => setLogPage(page)}
             />
           </>
-        )}
+            )}
+          </div>
+        </details>
       </section>
     </section>
   );
@@ -310,6 +340,18 @@ const panelTitleStyle = {
   margin: 0,
   color: 'var(--op-ink)',
   textWrap: 'balance',
+} as const;
+
+const detailsStyle = {
+  border: '1px solid var(--op-border)',
+  borderRadius: 6,
+  padding: '10px 12px',
+} as const;
+
+const detailsSummaryStyle = {
+  color: 'var(--op-ink)',
+  cursor: 'pointer',
+  fontWeight: 600,
 } as const;
 
 function RuntimeField({ label, value }: { label: string; value: string }) {

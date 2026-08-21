@@ -1,12 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Alert, Skeleton, Button } from 'antd';
+import { Alert, Button, Collapse, Empty } from 'antd';
 import dayjs from 'dayjs';
-import { listApplications } from '@/services/applications';
-import { listEvents } from '@/services/events';
-import { listOffers } from '@/services/offers';
 import { getApplicationMaterialKit } from '@/services/materialKits';
-import { getPracticeStats } from '@/services/questions';
 import {
   summarizePipelineHealth,
   type ActionCommand,
@@ -23,11 +19,7 @@ import KpiCards from './widgets/KpiCards';
 import ConversionFunnel from './widgets/ConversionFunnel';
 import MomentumChart from './widgets/MomentumChart';
 import UpcomingSchedule from './widgets/UpcomingSchedule';
-import MissionHeader from './widgets/MissionHeader';
 import WeeklyMissionPanel from './widgets/WeeklyMissionPanel';
-import TodayActionPlan from './widgets/TodayActionPlan';
-import ApplicationReadinessStrip from './widgets/ApplicationReadinessStrip';
-import FocusWorkspace from './widgets/FocusWorkspace';
 import styles from './dashboard.module.css';
 import OnboardingChecklist from '@/features/onboarding/OnboardingChecklist';
 import type { OnboardingAction } from '@/features/onboarding/actionRouting';
@@ -36,15 +28,11 @@ import {
   ONBOARDING_QUERY_KEY,
   setOnboardingForceOpen,
 } from '@/services/onboarding';
-import NextStepSuggestions from '@/components/NextStepSuggestions';
-import {
-  deriveNextStepSuggestions,
-  deriveMaterialKitFact,
-  type NextStepDestination,
-  type NextStepFacts,
-  type ReadonlyDestination,
-  type SuggestionSessionState,
-} from '@/lib/nextStepSuggestions';
+import { deriveTodayWorkspace } from './todayWorkspace';
+import type { Application } from '@/types/application';
+import type { ScheduleEvent } from '@/types/event';
+import type { Offer } from '@/types/offer';
+import type { PracticeStats } from '@/types/question';
 
 type DetailAction = ActionCommand & { id?: string };
 type DetailInsight = PipelineInsight & {
@@ -66,45 +54,44 @@ function findInsightAction(item: PipelineInsight, actionId: string): DetailActio
 }
 
 interface Props {
+  applications: Application[];
+  events: ScheduleEvent[];
+  offers: Offer[];
+  practiceStats?: PracticeStats;
+  dataState?: {
+    eventsLoading?: boolean;
+    eventsError?: boolean;
+    offersLoading?: boolean;
+    offersError?: boolean;
+    practiceLoading?: boolean;
+    practiceError?: boolean;
+  };
   onNavigate: (v: ViewMode) => void;
   onOpenDetailById: (id: number) => void;
   onAddApplication: () => void;
   onOnboardingAction: (action: OnboardingAction) => void;
-  nextStepFactsForApplication: (applicationId: number) => NextStepFacts;
-  suggestionSessionStates: Record<string, SuggestionSessionState>;
-  onSetDisposition: (applicationId: number, suggestionId: string, state: SuggestionSessionState | null) => void;
-  onNextStepNavigate: (destination: NextStepDestination | ReadonlyDestination) => void;
-  isNextStepNavigationAvailable: (destination: NextStepDestination | ReadonlyDestination) => boolean;
-  onNextStepReadonlyNavigate: (destination: ReadonlyDestination) => void;
-  isNextStepReadonlyNavigationAvailable: (destination: ReadonlyDestination) => boolean;
-  onPruneDisposition: (applicationId: number, suggestionId: string, stateKey: string) => void;
 }
 
 export default function DashboardView({
+  applications: apps,
+  events,
+  offers,
+  practiceStats,
+  dataState,
   onNavigate,
   onOpenDetailById,
   onAddApplication,
   onOnboardingAction,
-  nextStepFactsForApplication,
-  suggestionSessionStates,
-  onSetDisposition,
-  onNextStepNavigate,
-  isNextStepNavigationAvailable,
-  onNextStepReadonlyNavigate,
-  isNextStepReadonlyNavigationAvailable,
-  onPruneDisposition,
 }: Props) {
   const queryClient = useQueryClient();
   const [now, setNow] = useState(() => dayjs());
   const [selectedInsightId, setSelectedInsightId] = useState<string | null>(null);
-  const [focusApplicationId, setFocusApplicationId] = useState<number | undefined>(undefined);
 
   useEffect(() => {
     const id = window.setInterval(() => setNow(dayjs()), 60_000);
     return () => window.clearInterval(id);
   }, []);
 
-  const appsQ = useQuery({ queryKey: ['applications'], queryFn: () => listApplications() });
   const onboardingQ = useQuery({
     queryKey: ONBOARDING_QUERY_KEY,
     queryFn: getOnboarding,
@@ -114,18 +101,6 @@ export default function DashboardView({
     mutationFn: () => setOnboardingForceOpen(false),
     onSuccess: (status) => queryClient.setQueryData(ONBOARDING_QUERY_KEY, status),
   });
-  const eventsQ = useQuery({ queryKey: ['events'], queryFn: () => listEvents() });
-  const offersQ = useQuery({ queryKey: ['offers'], queryFn: () => listOffers() });
-  const practiceStatsQ = useQuery({
-    queryKey: ['questions', 'stats'],
-    queryFn: () => getPracticeStats(),
-    retry: false,
-  });
-
-  const apps = appsQ.data ?? [];
-  const events = eventsQ.data ?? [];
-  const offers = offersQ.data ?? [];
-
   const activeApplications = useMemo(
     () => apps.filter((app) => ['pending', 'applied', 'written_test', 'interview', 'offer'].includes(app.status)),
     [apps],
@@ -148,8 +123,8 @@ export default function DashboardView({
   const funnel = useMemo(() => computeFunnel(apps), [apps]);
   const momentum = useMemo(() => computeMomentum(apps, 4, now), [apps, now]);
   const insights = useMemo(
-    () => deriveActionHints({ apps, events, offers, practiceStats: practiceStatsQ.data, weeklyTarget: 6, now }),
-    [apps, events, offers, practiceStatsQ.data, now],
+    () => deriveActionHints({ apps, events, offers, practiceStats, weeklyTarget: 6, now }),
+    [apps, events, offers, practiceStats, now],
   );
   const health = useMemo(() => summarizePipelineHealth(apps, insights, 6, now), [apps, insights, now]);
   const mission = useMemo(
@@ -159,73 +134,37 @@ export default function DashboardView({
         events,
         offers,
         materialKits: missionMaterialKits,
-        practiceStats: practiceStatsQ.data,
+        practiceStats,
         insights,
         healthLabel: health.label,
         weeklyTarget: 6,
         now,
       }),
-    [apps, events, offers, missionMaterialKits, practiceStatsQ.data, insights, health.label, now],
+    [apps, events, offers, missionMaterialKits, practiceStats, insights, health.label, now],
   );
   const missionUnavailableKinds = useMemo(() => {
     const kinds: MissionMetricKind[] = [];
-    if (eventsQ.isLoading || eventsQ.isError) kinds.push('interviews');
-    if (offersQ.isLoading || offersQ.isError) kinds.push('offers');
-    if (practiceStatsQ.isLoading || practiceStatsQ.isError) kinds.push('practice');
+    if (dataState?.eventsLoading || dataState?.eventsError) kinds.push('interviews');
+    if (dataState?.offersLoading || dataState?.offersError) kinds.push('offers');
+    if (dataState?.practiceLoading || dataState?.practiceError) kinds.push('practice');
     if (hasPartialMaterialKitCoverage || materialKitsQ.isLoading || materialKitsQ.isError) kinds.push('materials');
     return kinds;
   }, [
-    eventsQ.isError,
-    eventsQ.isLoading,
+    dataState?.eventsError,
+    dataState?.eventsLoading,
     hasPartialMaterialKitCoverage,
     materialKitsQ.isError,
     materialKitsQ.isLoading,
-    offersQ.isError,
-    offersQ.isLoading,
-    practiceStatsQ.isError,
-    practiceStatsQ.isLoading,
+    dataState?.offersError,
+    dataState?.offersLoading,
+    dataState?.practiceError,
+    dataState?.practiceLoading,
   ]);
 
-  const effectiveFocusApplicationId = focusApplicationId ?? mission.focusApplicationId;
-  const focusApplication = effectiveFocusApplicationId
-    ? apps.find((app) => app.id === effectiveFocusApplicationId)
-    : undefined;
-  const focusReadiness = effectiveFocusApplicationId
-    ? mission.readiness.find((item) => item.applicationId === effectiveFocusApplicationId)
-    : undefined;
-  const workbenchFacts = useMemo(() => {
-    if (!focusApplication) return null;
-    const baseFacts = nextStepFactsForApplication(focusApplication.id);
-    const materialKit = deriveMaterialKitFact({
-      applicationId: focusApplication.id,
-      status: materialKitsQ.isError ? 'error' : materialKitsQ.isLoading ? 'loading' : 'success',
-      complete: !hasPartialMaterialKitCoverage && materialKitsQ.isSuccess,
-      kits: missionMaterialKits,
-    });
-    return { ...baseFacts, materialKit };
-  }, [
-    focusApplication,
-    hasPartialMaterialKitCoverage,
-    materialKitsQ.isError,
-    materialKitsQ.isLoading,
-    materialKitsQ.isSuccess,
-    missionMaterialKits,
-    nextStepFactsForApplication,
-  ]);
-  const workbenchSuggestions = workbenchFacts
-    ? deriveNextStepSuggestions(workbenchFacts, 'workbench', now.toDate())
-    : null;
-  const workbenchCandidate = workbenchSuggestions?.candidates[0];
-  const workbenchSessionState = workbenchCandidate
-    ? suggestionSessionStates[`${focusApplication?.id}:${workbenchCandidate.id}`] ?? null
-    : null;
-
-  useEffect(() => {
-    if (focusApplication && workbenchCandidate) {
-      onPruneDisposition(focusApplication.id, workbenchCandidate.id, workbenchCandidate.stateKey);
-    }
-  }, [focusApplication, onPruneDisposition, workbenchCandidate]);
-  const nextMissionAction = mission.actions[0];
+  const todayWorkspace = useMemo(
+    () => deriveTodayWorkspace({ actions: mission.actions, events, now }),
+    [events, mission.actions, now],
+  );
   const selectedInsight = useMemo(
     () => insights.find((item) => item.id === selectedInsightId) ?? null,
     [insights, selectedInsightId],
@@ -236,12 +175,6 @@ export default function DashboardView({
       setSelectedInsightId(null);
     }
   }, [selectedInsight, selectedInsightId]);
-
-  useEffect(() => {
-    if (focusApplicationId && !mission.readiness.some((item) => item.applicationId === focusApplicationId)) {
-      setFocusApplicationId(undefined);
-    }
-  }, [focusApplicationId, mission.readiness]);
 
   const handleAction = (item: PipelineInsight) => {
     setSelectedInsightId(item.id);
@@ -275,16 +208,7 @@ export default function DashboardView({
         onAction={onOnboardingAction}
       />
     </div>
-  ) : onboardingQ.data ? (
-    <div className={styles.card} style={{ marginBottom: 16, display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
-      <span style={{ color: 'var(--op-ink)', fontWeight: 600 }}>新手引导已完成</span>
-      <Button type="link" onClick={() => collapseOnboarding.mutate()}>收起</Button>
-    </div>
   ) : null;
-
-  if (appsQ.isLoading) {
-    return <Skeleton active paragraph={{ rows: 8 }} />;
-  }
 
   if (apps.length === 0) {
     return (
@@ -319,61 +243,66 @@ export default function DashboardView({
   return (
     <div className={styles.grid}>
       {onboarding}
-      {focusApplication && workbenchSuggestions ? (
-        <NextStepSuggestions
-          applicationId={focusApplication.id}
-          suggestions={workbenchSuggestions}
-          sessionState={workbenchSessionState}
-          onSetDisposition={onSetDisposition}
-          onNavigate={onNextStepNavigate}
-          isNavigationAvailable={isNextStepNavigationAvailable}
-          onNavigateReadonly={onNextStepReadonlyNavigate}
-          isReadonlyNavigationAvailable={isNextStepReadonlyNavigationAvailable}
-        />
-      ) : null}
-      <MissionHeader
-        summary={mission}
-        nextAction={nextMissionAction}
-        onRunAction={handleAction}
-        onAddApplication={onAddApplication}
-      />
-      <WeeklyMissionPanel
-        metrics={mission.metrics}
-        unavailableKinds={missionUnavailableKinds}
-        onNavigate={onNavigate}
-      />
-      <div className={styles.missionWorkspaceGrid}>
-        <TodayActionPlan
-          groups={mission.actionGroups}
-          onAction={handleAction}
-          onSeeAll={() => onNavigate('reminders')}
-        />
-        <FocusWorkspace
-          application={focusApplication}
-          readiness={focusReadiness}
-          onOpenDetail={onOpenDetailById}
-          onNavigate={onNavigate}
-        />
-      </div>
-      <ApplicationReadinessStrip
-        items={mission.readiness}
-        focusApplicationId={effectiveFocusApplicationId}
-        onFocus={setFocusApplicationId}
-      />
-      <KpiCards kpis={kpis} />
-      <div className={styles.row2b}>
-        <ConversionFunnel stages={funnel} />
-        <MomentumChart buckets={momentum} />
-      </div>
-      <div className={styles.row2b}>
-        <UpcomingSchedule events={events} />
-        <div className={styles.card}>
-          <div className={styles.cardTitle}>行动说明</div>
-          <div className={styles.empty}>
-            今日行动由投递停滞、即将到来的面试、Offer 截止期和到期题目自动推导。
+      <section className={styles.todayPrimary} aria-labelledby="today-primary-title">
+        <div className={styles.commandEyebrow}>当前最重要的行动</div>
+        {todayWorkspace.primaryAction ? (
+          <div className={styles.todayPrimaryContent}>
+            <div>
+              <h1 id="today-primary-title" className={styles.todayPrimaryTitle}>{todayWorkspace.primaryAction.title}</h1>
+              <p className={styles.todayPrimaryReason}>{todayWorkspace.primaryAction.reason}</p>
+            </div>
+            <Button type="primary" size="large" onClick={() => handleAction(todayWorkspace.primaryAction!)}>
+              {todayWorkspace.primaryAction.primaryAction.label}
+            </Button>
           </div>
+        ) : (
+          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="今天没有需要立即处理的行动。" />
+        )}
+      </section>
+
+      <section className={styles.todaySecondary} aria-labelledby="today-secondary-title">
+        <div className={styles.sectionHeaderLine}>
+          <h2 id="today-secondary-title" className={styles.sectionHeading}>今日其他待办</h2>
+          <Button type="link" onClick={() => onNavigate('reminders')}>查看全部</Button>
         </div>
+        {todayWorkspace.otherActions.length ? (
+          <div className={styles.todaySecondaryList}>
+            {todayWorkspace.otherActions.map((item) => (
+              <button key={item.id} type="button" className={styles.todaySecondaryRow} onClick={() => handleAction(item)}>
+                <span><strong>{item.title}</strong><small>{item.reason}</small></span>
+                <span>{item.primaryAction.label}</span>
+              </button>
+            ))}
+          </div>
+        ) : <div className={styles.empty}>暂无其他待办</div>}
+      </section>
+
+      <div className={styles.todayLowerGrid}>
+        <section aria-label="未来 7 天日程">
+          <UpcomingSchedule events={todayWorkspace.upcomingEvents} />
+        </section>
+        <section aria-label="本周进度">
+          <WeeklyMissionPanel metrics={mission.metrics} unavailableKinds={missionUnavailableKinds} onNavigate={onNavigate} />
+        </section>
       </div>
+
+      <Collapse
+        className={styles.analyticsCollapse}
+        defaultActiveKey={[]}
+        items={[{
+          key: 'analytics',
+          label: '数据分析',
+          children: (
+            <div className={styles.analyticsBody}>
+              <KpiCards kpis={kpis} />
+              <div className={styles.row2b}>
+                <ConversionFunnel stages={funnel} />
+                <MomentumChart buckets={momentum} />
+              </div>
+            </div>
+          ),
+        }]}
+      />
     </div>
   );
 }

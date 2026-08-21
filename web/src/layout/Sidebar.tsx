@@ -65,7 +65,7 @@ export default function Sidebar({ view, onChange, reminderCount }: Props) {
         </span>
       </div>
 
-      {MODULE_NAV.map((item) => {
+      {MODULE_NAV.filter((item) => item.key !== 'settings').map((item) => {
         const active = activeModule === item.key;
         return (
           <button
@@ -99,6 +99,26 @@ export default function Sidebar({ view, onChange, reminderCount }: Props) {
       })}
 
       <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <button
+          data-navigation-tier="utility"
+          aria-current={activeModule === 'settings' ? 'page' : undefined}
+          onClick={() => onChange('settings')}
+          style={{
+            border: 'none',
+            cursor: 'pointer',
+            textAlign: 'left',
+            background: activeModule === 'settings' ? 'var(--op-layout-bg)' : 'transparent',
+            borderRadius: 8,
+            padding: '9px 11px',
+            color: activeModule === 'settings' ? 'var(--op-primary)' : 'var(--op-muted)',
+            fontSize: 13,
+            display: 'flex',
+            gap: 8,
+            alignItems: 'center',
+          }}
+        >
+          <SettingOutlined /> 设置
+        </button>
         <button
           onClick={toggle}
           aria-label="切换明暗模式"

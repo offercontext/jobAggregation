@@ -1,6 +1,6 @@
 # Pilot Runtime Orchestration Extraction 设计
 
-状态：待复审
+状态：已复审通过
 
 固定 baseline：`b05d915bbb52b2740f6801b4ec46ee8f4ccda2e2`
 
@@ -1132,4 +1132,5 @@ controlled real-AI verify
 - 发布报告明确这是内部破坏性提取，不是 Agent Loop 重写；
 - 不宣称 Scoped Capability、Metadata Convergence 或全局 exactly-once 已完成。
 
-本设计复审通过前不编写实施计划，不修改生产代码。
+本设计已于 2026-08-21 完成书面复审，无剩余 P0/P1/P2。实施必须先遵循测试先行计划，
+不得跳过 characterization golden、机械门禁或独立 CR。

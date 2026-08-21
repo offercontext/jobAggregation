@@ -96,17 +96,6 @@ class PersistenceResult:
         return self.status is PersistenceStatus.DUPLICATE
 
 
-# These aliases keep the result vocabulary discoverable at the call sites
-# without creating several structurally identical DTOs.
-ChatPersistenceResult = PersistenceResult
-MessagePersistenceResult = PersistenceResult
-PendingPersistenceResult = PersistenceResult
-DeliveryPersistenceResult = PersistenceResult
-PersistedPendingResult = PersistenceResult
-PersistedDeliveryResult = PersistenceResult
-PersistenceState = PersistenceStatus
-
-
 MessageInput: TypeAlias = Message | Mapping[str, object]
 
 
@@ -319,7 +308,24 @@ class ChatPersistenceCoordinator:
     """
 
     def __init__(self, chat: ChatRepository) -> None:
-        self.chat = chat
+        self._chat = chat
+
+    def list_messages(self, conversation_id: int) -> list[Any]:
+        """Read persisted messages without exposing the repository handle."""
+
+        return self._chat.list_messages(conversation_id)
+
+    def get_pending_action(self, conversation_id: int) -> PendingAction | None:
+        """Read the live pending action through the coordinator boundary."""
+
+        return self._chat.get_pending_action(conversation_id)
+
+    def get_pending_clarification(
+        self, conversation_id: int
+    ) -> tuple[PendingAction, str] | None:
+        """Read the live clarification through the coordinator boundary."""
+
+        return self._chat.get_pending_clarification(conversation_id)
 
     def _failure_status(
         self,
@@ -327,7 +333,7 @@ class ChatPersistenceCoordinator:
         *,
         operation_id: str | None = None,
     ) -> PersistenceStatus:
-        conversation = self.chat.get_conversation(conversation_id)
+        conversation = self._chat.get_conversation(conversation_id)
         if conversation is None:
             return PersistenceStatus.NOT_FOUND
         if conversation.archived_at is not None:
@@ -335,13 +341,13 @@ class ChatPersistenceCoordinator:
         if operation_id:
             if any(
                 message.operation_id == operation_id
-                for message in self.chat.list_messages(conversation_id)
+                for message in self._chat.list_messages(conversation_id)
             ):
                 return PersistenceStatus.DUPLICATE
         return PersistenceStatus.CAS_LOST
 
     def _writable_status(self, conversation_id: int) -> PersistenceStatus | None:
-        conversation = self.chat.get_conversation(conversation_id)
+        conversation = self._chat.get_conversation(conversation_id)
         if conversation is None:
             return PersistenceStatus.NOT_FOUND
         if conversation.archived_at is not None:
@@ -363,13 +369,22 @@ class ChatPersistenceCoordinator:
         status = self._writable_status(conversation_id)
         if status is not None:
             return PersistenceResult(status)
-        self.chat.append_message(
+        values = _message_values(
+            {
+                "role": role,
+                "content": content,
+                "tool_calls": tool_calls,
+                "tool_call_id": tool_call_id,
+                "provider_blocks": provider_blocks,
+            }
+        )
+        self._chat.append_message(
             conversation_id,
-            role,
-            content=content,
-            tool_calls=tool_calls,
-            tool_call_id=tool_call_id,
-            provider_blocks=provider_blocks,
+            values["role"],
+            content=values["content"],
+            tool_calls=values["tool_calls"],
+            tool_call_id=values["tool_call_id"],
+            provider_blocks=values["provider_blocks"],
         )
         return PersistenceResult(PersistenceStatus.PERSISTED, message_count=1)
 
@@ -410,7 +425,7 @@ class ChatPersistenceCoordinator:
             return PersistenceResult(status)
         values = [_message_values(message) for message in messages]
         for value in values:
-            self.chat.append_message(
+            self._chat.append_message(
                 conversation_id,
                 value["role"],
                 content=value["content"],
@@ -426,12 +441,18 @@ class ChatPersistenceCoordinator:
         messages: Sequence[MessageInput],
         pending: PendingAction,
     ) -> PersistenceResult:
-        """Atomically persist the assistant/tool chain and a new Pending card."""
+        """Atomically persist a Runtime-authorized initial Pending proposal.
+
+        The caller must provide a fresh Pending action authorized by the Runtime.
+        Operation/Ledger identity is authoritative in continuation handling and
+        the later Task 9 Runtime; this coordinator delegates that identity to
+        the existing repository atom and never fabricates cross-layer checks.
+        """
 
         status = self._writable_status(conversation_id)
         if status is not None:
             return PersistenceResult(status, operation_id=pending.operation_id or None)
-        persisted = self.chat.persist_pending_action(
+        persisted = self._chat.persist_pending_action(
             conversation_id,
             pending,
             [_message_values(message) for message in messages],
@@ -456,8 +477,8 @@ class ChatPersistenceCoordinator:
         status = self._writable_status(conversation_id)
         if status is not None:
             return PersistenceResult(status)
-        self.chat.set_pending_clarification(conversation_id, pending, question)
-        stored = self.chat.get_pending_clarification(conversation_id)
+        self._chat.set_pending_clarification(conversation_id, pending, question)
+        stored = self._chat.get_pending_clarification(conversation_id)
         if stored is not None:
             stored_pending, stored_question = stored
             # ChatRepository's clarification atom intentionally stores only
@@ -479,8 +500,8 @@ class ChatPersistenceCoordinator:
         status = self._writable_status(conversation_id)
         if status is not None:
             return PersistenceResult(status)
-        self.chat.clear_pending_clarification(conversation_id)
-        if self.chat.get_pending_clarification(conversation_id) is None:
+        self._chat.clear_pending_clarification(conversation_id)
+        if self._chat.get_pending_clarification(conversation_id) is None:
             return PersistenceResult(PersistenceStatus.PERSISTED)
         return PersistenceResult(self._failure_status(conversation_id))
 
@@ -542,15 +563,19 @@ class ChatPersistenceCoordinator:
         """
 
         if continuation is not None and messages is not None:
-            raise TypeError("pass continuation or messages, not both")
+            raise ValueError("pass continuation or messages, not both")
         if chained_pending is not None and pending is not None:
-            raise TypeError("pass chained_pending or pending, not both")
+            raise ValueError("pass chained_pending or pending, not both")
+        if clarification is not None and (
+            chained_pending is not None or pending is not None
+        ):
+            raise ValueError("clarification cannot be combined with pending")
         if clarification is not None:
             clarification_action, clarification_question = clarification
             if not isinstance(clarification_action, PendingAction):
-                raise TypeError("clarification action must be a PendingAction")
+                raise ValueError("clarification action must be a PendingAction")
             if not isinstance(clarification_question, str):
-                raise TypeError("clarification question must be a string")
+                raise ValueError("clarification question must be a string")
         if chained_pending is None:
             chained_pending = pending
         continuation_values = continuation if continuation is not None else messages or ()
@@ -559,10 +584,10 @@ class ChatPersistenceCoordinator:
             operation_id = ownership.operation_id if ownership is not None else None
             return PersistenceResult(status, operation_id=operation_id)
 
-        current = self.chat.get_conversation(conversation_id)
+        current = self._chat.get_conversation(conversation_id)
         if current is None:
             return PersistenceResult(PersistenceStatus.NOT_FOUND)
-        active_pending = self.chat.get_pending_action(conversation_id)
+        active_pending = self._chat.get_pending_action(conversation_id)
         expected = expected_pending if expected_pending is not None else active_pending
         generation = expected_generation
         if generation is None and expected is not None:
@@ -575,16 +600,16 @@ class ChatPersistenceCoordinator:
         if claim_id is None and expected is not None and expected.operation_id:
             claim_id = expected.operation_id
 
+        if ownership is None and expected is not None and clarification is not None:
+            raise ValueError("legacy confirmation atom does not support clarification")
+
         if ownership is not None and operation_id:
             if any(
                 message.operation_id == operation_id
-                for message in self.chat.list_messages(conversation_id)
+                for message in self._chat.list_messages(conversation_id)
             ):
                 return PersistenceResult(
                     PersistenceStatus.DUPLICATE,
-                    delivery_outcome=self._delivery_outcome(
-                        chained_pending, delivery_failure_code
-                    ),
                     operation_id=operation_id,
                 )
 
@@ -595,7 +620,7 @@ class ChatPersistenceCoordinator:
 
         if ownership is not None and expected is not None:
             origin_persisted = True
-            persisted_generation = self.chat.persist_confirmation_continuation(
+            persisted_generation = self._chat.persist_confirmation_continuation(
                 conversation_id,
                 generation,
                 values,
@@ -618,7 +643,7 @@ class ChatPersistenceCoordinator:
             terminal = values[0]["content"] if values else ""
             if chained_pending is not None:
                 origin_persisted = True
-                persisted_generation = self.chat.replace_pending_confirmation(
+                persisted_generation = self._chat.replace_pending_confirmation(
                     conversation_id,
                     expected,
                     chained_pending,
@@ -629,7 +654,7 @@ class ChatPersistenceCoordinator:
                 )
             else:
                 origin_persisted = True
-                persisted_generation = self.chat.resolve_pending_confirmation(
+                persisted_generation = self._chat.resolve_pending_confirmation(
                     conversation_id,
                     expected,
                     origin,
@@ -641,7 +666,7 @@ class ChatPersistenceCoordinator:
             # This is the post-resolve continuation path: the origin result is
             # already durable and only the generation CAS plus continuation is
             # still owned by this call.
-            persisted_generation = self.chat.persist_confirmation_continuation(
+            persisted_generation = self._chat.persist_confirmation_continuation(
                 conversation_id,
                 generation,
                 values,
@@ -762,12 +787,6 @@ class ChatPersistenceCoordinator:
             delivery_failure_code=delivery_failure_code,
         )
 
-    # Names used by the Runtime state machine stay explicit while preserving
-    # the repository vocabulary at this boundary.
-    persist_clarification = set_pending_clarification
-    clear_clarification = clear_pending_clarification
-    persist_timeout_message = persist_timeout_assistant
-
     @staticmethod
     def _delivery_outcome(
         pending: PendingAction | None,
@@ -780,23 +799,10 @@ class ChatPersistenceCoordinator:
         return DeliveryOutcome.FINAL_RESPONSE
 
 
-# Friendly aliases for composition code that names the action rather than the
-# implementation detail of the class.
-ChatPersistence = ChatPersistenceCoordinator
-
-
 __all__ = [
-    "ChatPersistence",
     "ChatPersistenceCoordinator",
-    "ChatPersistenceResult",
     "DeliveryOutcome",
-    "DeliveryPersistenceResult",
     "MessageInput",
-    "MessagePersistenceResult",
-    "PendingPersistenceResult",
-    "PersistedDeliveryResult",
-    "PersistedPendingResult",
     "PersistenceResult",
-    "PersistenceState",
     "PersistenceStatus",
 ]

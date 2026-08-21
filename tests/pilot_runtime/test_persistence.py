@@ -149,7 +149,7 @@ def test_initial_pending_matches_baseline_message_sanitization(tmp_path: Path) -
     result = coordinator.persist_initial_pending(conversation_id, messages, pending)
 
     assert result.persisted is True
-    stored = coordinator.chat.list_messages(conversation_id)[-len(messages) :]
+    stored = coordinator._chat.list_messages(conversation_id)[-len(messages) :]
     assert [_message_projection(item) for item in stored] == expected
     assert "provider-request-secret" not in json.dumps(expected, ensure_ascii=False)
     assert "provider-canary-secret" not in json.dumps(expected, ensure_ascii=False)
@@ -257,7 +257,7 @@ def test_mapping_tool_args_preserve_nested_json_and_do_not_alias_input(
     expected_args = json.loads(expected["tool_calls"])[0]["args"]
     nested_args["nested"]["labels"].append("mutated")
     mapping["provider_blocks"]["reasoning_content"] = "mutated"
-    stored = coordinator.chat.list_messages(conversation_id)[-1]
+    stored = coordinator._chat.list_messages(conversation_id)[-1]
     assert _message_projection(stored) == expected
     assert json.loads(stored.tool_calls)[0]["args"] == expected_args
 
@@ -279,20 +279,20 @@ def test_initial_pending_persists_atomic_tool_chain_and_pending(tmp_path: Path) 
     result = coordinator.persist_initial_pending(conversation_id, messages, pending)
 
     assert result.persisted is True
-    assert coordinator.chat.get_pending_action(conversation_id) == pending
-    assert [item.role for item in coordinator.chat.list_messages(conversation_id)][-2:] == [
+    assert coordinator._chat.get_pending_action(conversation_id) == pending
+    assert [item.role for item in coordinator._chat.list_messages(conversation_id)][-2:] == [
         "assistant",
         "tool",
     ]
-    assert coordinator.chat.list_messages(conversation_id)[-1].tool_call_id == "call-1"
+    assert coordinator._chat.list_messages(conversation_id)[-1].tool_call_id == "call-1"
 
 
 def test_confirmation_delivery_atomically_replaces_chained_pending(tmp_path: Path) -> None:
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
     current = PendingAction("old-call", "update_application_status", '{"id": 1}', "旧卡")
     replacement = PendingAction("new-call", "update_application_status", '{"id": 2}', "新卡")
-    assert coordinator.chat.set_pending_action(conversation_id, current)
-    generation = conversation_generation(coordinator.chat, conversation_id)
+    assert coordinator._chat.set_pending_action(conversation_id, current)
+    generation = conversation_generation(coordinator._chat, conversation_id)
     ownership = DeliveryOwnership("missing-operation", 1, b"raw", "fingerprint")
 
     # A bad owner must fail before it can leave a partial origin/continuation.
@@ -307,14 +307,79 @@ def test_confirmation_delivery_atomically_replaces_chained_pending(tmp_path: Pat
     )
 
     assert result.persisted is False
-    assert coordinator.chat.get_pending_action(conversation_id) == current
-    assert coordinator.chat.list_messages(conversation_id) == []
+    assert coordinator._chat.get_pending_action(conversation_id) == current
+    assert coordinator._chat.list_messages(conversation_id) == []
+
+
+def test_confirmation_delivery_rejects_conflicting_pending_and_clarification_inputs(
+    tmp_path: Path,
+) -> None:
+    coordinator, conversation_id = make_persistence_coordinator(tmp_path)
+    current = PendingAction("old-call", "update_application_status", '{"id": 1}', "旧卡")
+    replacement = PendingAction("new-call", "update_application_status", '{"id": 2}', "新卡")
+    clarification = (replacement, "请补充信息")
+    origin = Message(role="tool", content="结果", tool_call_id=current.tool_call_id)
+    continuation = [Message(role="assistant", content="继续")]
+
+    with pytest.raises(ValueError, match="clarification.*pending"):
+        coordinator.persist_confirmation_delivery(
+            conversation_id,
+            None,
+            origin,
+            continuation,
+            pending=current,
+            clarification=clarification,
+        )
+
+    assert coordinator._chat.list_messages(conversation_id) == []
+
+
+def test_confirmation_delivery_rejects_both_pending_parameter_names_without_writes(
+    tmp_path: Path,
+) -> None:
+    coordinator, conversation_id = make_persistence_coordinator(tmp_path)
+    current = PendingAction("old-call", "update_application_status", '{"id": 1}', "旧卡")
+    replacement = PendingAction("new-call", "update_application_status", '{"id": 2}', "新卡")
+
+    with pytest.raises(ValueError, match="pending"):
+        coordinator.persist_confirmation_delivery(
+            conversation_id,
+            None,
+            Message(role="tool", content="结果", tool_call_id=current.tool_call_id),
+            [Message(role="assistant", content="继续")],
+            replacement,
+            pending=current,
+        )
+
+    assert coordinator._chat.list_messages(conversation_id) == []
+
+
+def test_legacy_confirmation_rejects_unsupported_clarification_without_writes(
+    tmp_path: Path,
+) -> None:
+    coordinator, conversation_id = make_persistence_coordinator(tmp_path)
+    current = PendingAction("old-call", "update_application_status", '{"id": 1}', "旧卡")
+    clarification = PendingAction("clarify-call", "update_application_status", '{"id": 2}', "补充")
+    assert coordinator._chat.set_pending_action(conversation_id, current)
+
+    with pytest.raises(ValueError, match="clarification"):
+        coordinator.persist_confirmation_delivery(
+            conversation_id,
+            None,
+            Message(role="tool", content="结果", tool_call_id=current.tool_call_id),
+            [Message(role="assistant", content="继续")],
+            expected_pending=current,
+            clarification=(clarification, "请补充信息"),
+        )
+
+    assert coordinator._chat.list_messages(conversation_id) == []
+    assert coordinator._chat.get_pending_action(conversation_id) == current
 
 
 def test_legacy_origin_mapping_keeps_delivery_when_metadata_is_opaque(tmp_path: Path) -> None:
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
     pending = PendingAction("call-1", "update_application_status", '{"id": 1}', "更新状态")
-    assert coordinator.chat.set_pending_action(conversation_id, pending)
+    assert coordinator._chat.set_pending_action(conversation_id, pending)
 
     result = coordinator.persist_confirmation_delivery(
         conversation_id,
@@ -331,7 +396,7 @@ def test_legacy_origin_mapping_keeps_delivery_when_metadata_is_opaque(tmp_path: 
     )
 
     assert result.persisted is True
-    assert [(item.role, item.tool_call_id) for item in coordinator.chat.list_messages(conversation_id)] == [
+    assert [(item.role, item.tool_call_id) for item in coordinator._chat.list_messages(conversation_id)] == [
         ("tool", "call-1"),
         ("assistant", ""),
     ]
@@ -492,11 +557,11 @@ def test_clarification_set_and_clear_are_typed(tmp_path: Path) -> None:
 
     set_result = coordinator.set_pending_clarification(conversation_id, pending, "缺什么？")
     assert set_result.status is PersistenceStatus.PERSISTED
-    assert coordinator.chat.get_pending_clarification(conversation_id) == (pending, "缺什么？")
+    assert coordinator._chat.get_pending_clarification(conversation_id) == (pending, "缺什么？")
 
     clear_result = coordinator.clear_pending_clarification(conversation_id)
     assert clear_result.status is PersistenceStatus.PERSISTED
-    assert coordinator.chat.get_pending_clarification(conversation_id) is None
+    assert coordinator._chat.get_pending_clarification(conversation_id) is None
 
 
 def test_clarification_set_ignores_ledger_operation_id_not_stored_by_chat_atom(
@@ -514,7 +579,7 @@ def test_clarification_set_ignores_ledger_operation_id_not_stored_by_chat_atom(
     result = coordinator.set_pending_clarification(conversation_id, pending, "缺什么？")
 
     assert result.status is PersistenceStatus.PERSISTED
-    stored = coordinator.chat.get_pending_clarification(conversation_id)
+    stored = coordinator._chat.get_pending_clarification(conversation_id)
     assert stored is not None
     assert stored[0].operation_id == ""
     assert stored[0].tool_call_id == pending.tool_call_id
@@ -522,7 +587,7 @@ def test_clarification_set_ignores_ledger_operation_id_not_stored_by_chat_atom(
 
 def test_archived_initial_pending_is_closed_without_messages(tmp_path: Path) -> None:
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
-    coordinator.chat.update_conversation_for_archive(
+    coordinator._chat.update_conversation_for_archive(
         conversation_id, {"archived_at": datetime.now(timezone.utc)}
     )
     pending = PendingAction("call-1", "update_application_status", '{"id": 1}', "更新状态")
@@ -531,14 +596,14 @@ def test_archived_initial_pending_is_closed_without_messages(tmp_path: Path) -> 
 
     assert result.status is PersistenceStatus.CLOSED
     assert result.persisted is False
-    assert coordinator.chat.list_messages(conversation_id) == []
+    assert coordinator._chat.list_messages(conversation_id) == []
 
 
 def test_archived_confirmation_delivery_is_closed_without_calling_atom(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
-    coordinator.chat.update_conversation_for_archive(
+    coordinator._chat.update_conversation_for_archive(
         conversation_id, {"archived_at": datetime.now(timezone.utc)}
     )
     owner = DeliveryOwnership("operation-1", 1, b"raw", "fingerprint")
@@ -549,7 +614,7 @@ def test_archived_confirmation_delivery_is_closed_without_calling_atom(
         calls += 1
         raise AssertionError("archived delivery must not call the atom")
 
-    monkeypatch.setattr(coordinator.chat, "persist_confirmation_continuation", fail_if_called)
+    monkeypatch.setattr(coordinator._chat, "persist_confirmation_continuation", fail_if_called)
     result = coordinator.persist_confirmation_delivery(
         conversation_id,
         owner,
@@ -559,20 +624,20 @@ def test_archived_confirmation_delivery_is_closed_without_calling_atom(
 
     assert result.status is PersistenceStatus.CLOSED
     assert calls == 0
-    assert coordinator.chat.list_messages(conversation_id) == []
+    assert coordinator._chat.list_messages(conversation_id) == []
 
 
 def test_pending_cas_loss_is_typed_and_non_mutating(tmp_path: Path) -> None:
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
     first = PendingAction("call-1", "update_application_status", '{"id": 1}', "第一张")
     second = PendingAction("call-2", "update_application_status", '{"id": 2}', "第二张")
-    assert coordinator.chat.set_pending_action(conversation_id, first)
+    assert coordinator._chat.set_pending_action(conversation_id, first)
 
     result = coordinator.persist_initial_pending(conversation_id, [], second)
 
     assert result.status is PersistenceStatus.CAS_LOST
-    assert coordinator.chat.get_pending_action(conversation_id) == first
-    assert coordinator.chat.list_messages(conversation_id) == []
+    assert coordinator._chat.get_pending_action(conversation_id) == first
+    assert coordinator._chat.list_messages(conversation_id) == []
 
 
 def test_confirmation_fallback_and_replay_have_typed_delivery_outcomes(
@@ -580,16 +645,16 @@ def test_confirmation_fallback_and_replay_have_typed_delivery_outcomes(
 ) -> None:
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
     pending = PendingAction("call-1", "update_application_status", '{"id": 1}', "更新状态")
-    assert coordinator.chat.set_pending_action(conversation_id, pending)
+    assert coordinator._chat.set_pending_action(conversation_id, pending)
     owner = DeliveryOwnership("operation-1", 1, b"raw", "fingerprint")
-    generation = conversation_generation(coordinator.chat, conversation_id)
+    generation = conversation_generation(coordinator._chat, conversation_id)
     captured: list[dict[str, object]] = []
 
     def fake_continuation(*args: object, **kwargs: object) -> datetime:
         captured.append({"args": args, "kwargs": kwargs})
         return generation
 
-    monkeypatch.setattr(coordinator.chat, "persist_confirmation_continuation", fake_continuation)
+    monkeypatch.setattr(coordinator._chat, "persist_confirmation_continuation", fake_continuation)
 
     fallback = coordinator.persist_confirmation_fallback(
         conversation_id,
@@ -639,6 +704,55 @@ def test_confirmation_fallback_marks_ledger_delivery_failed(tmp_path: Path) -> N
     assert operation.delivery_failure_code == "operation_delivery_failed"
 
 
+def test_duplicate_chained_delivery_without_pending_has_no_inferred_outcome(
+    tmp_path: Path,
+) -> None:
+    coordinator, conversation_id, chat, _operations, pending, ownership = make_delivery_fixtures(
+        tmp_path
+    )
+    replacement = PendingAction(
+        "call-2",
+        "update_application_status",
+        '{"id": 2}',
+        "更新第二条状态",
+        str(uuid4()),
+    )
+    origin = Message(role="tool", content="结果", tool_call_id=pending.tool_call_id)
+    continuation = [Message(role="assistant", content="请确认下一步。")]
+    first = coordinator.persist_confirmation_delivery(
+        conversation_id,
+        ownership,
+        origin,
+        continuation,
+        chained_pending=replacement,
+        expected_generation=conversation_generation(chat, conversation_id),
+        expected_pending=pending,
+        claim_id=pending.operation_id,
+    )
+    before = [
+        (item.id, item.role, item.content, item.operation_id, item.delivery_ordinal)
+        for item in chat.list_messages(conversation_id)
+    ]
+
+    replay = coordinator.persist_replay_delivery(
+        conversation_id,
+        ownership,
+        origin,
+        continuation,
+        expected_generation=first.generation,
+        claim_id=pending.operation_id,
+    )
+
+    assert replay.status is PersistenceStatus.DUPLICATE
+    assert replay.delivery_outcome is None
+    assert chat.get_pending_action(conversation_id) == replacement
+    after = [
+        (item.id, item.role, item.content, item.operation_id, item.delivery_ordinal)
+        for item in chat.list_messages(conversation_id)
+    ]
+    assert after == before
+
+
 def test_replay_delivery_returns_duplicate_after_delivery_without_new_messages(
     tmp_path: Path,
 ) -> None:
@@ -670,6 +784,7 @@ def test_replay_delivery_returns_duplicate_after_delivery_without_new_messages(
 
     assert first.persisted is True
     assert replay.status is PersistenceStatus.DUPLICATE
+    assert replay.delivery_outcome is None
     after = chat.list_messages(conversation_id)
     assert [(item.id, item.role, item.content, item.operation_id) for item in after] == [
         (item.id, item.role, item.content, item.operation_id) for item in before
@@ -687,7 +802,7 @@ def test_duplicate_delivery_is_idempotent_and_does_not_call_atom(
         operation_id = "operation-1"
 
     monkeypatch.setattr(
-        coordinator.chat,
+        coordinator._chat,
         "list_messages",
         lambda _conversation_id: [ExistingMessage()],
     )
@@ -697,7 +812,7 @@ def test_duplicate_delivery_is_idempotent_and_does_not_call_atom(
         calls += 1
         raise AssertionError("duplicate delivery must not call the atom")
 
-    monkeypatch.setattr(coordinator.chat, "persist_confirmation_continuation", fail_if_called)
+    monkeypatch.setattr(coordinator._chat, "persist_confirmation_continuation", fail_if_called)
     result = coordinator.persist_replay_delivery(
         conversation_id,
         owner,
@@ -710,6 +825,92 @@ def test_duplicate_delivery_is_idempotent_and_does_not_call_atom(
     assert calls == 0
 
 
+def test_direct_assistant_and_tool_messages_use_baseline_sanitization(
+    tmp_path: Path,
+) -> None:
+    coordinator, conversation_id = make_persistence_coordinator(tmp_path)
+    args = {"id": 7, "nested": {"items": [1, {"safe": True}]}}
+    tool_calls = json.dumps(
+        [{"id": "call-1", "name": "update_application_status", "args": args}],
+        ensure_ascii=False,
+    )
+    provider_blocks = json.dumps(
+        {
+            "reasoning_content": "保留",
+            "request_id": "provider-request-secret",
+            "canary": "provider-canary-secret",
+        },
+        ensure_ascii=False,
+    )
+
+    assistant = coordinator.persist_assistant_message(
+        conversation_id,
+        "将调用 `update_application_status`。",
+        tool_calls=tool_calls,
+        tool_call_id="",
+        provider_blocks=provider_blocks,
+    )
+    tool = coordinator.persist_message(
+        conversation_id,
+        "tool",
+        "工具结果",
+        tool_calls=tool_calls,
+        tool_call_id="call-1",
+        provider_blocks=provider_blocks,
+    )
+
+    assert assistant.persisted is True
+    assert tool.persisted is True
+    stored = coordinator._chat.list_messages(conversation_id)[-2:]
+    expected = _persistable_ai_messages(
+        [
+            Message(
+                role="assistant",
+                content="将调用 `update_application_status`。",
+                tool_calls=[
+                    ToolCall(
+                        id="call-1",
+                        name="update_application_status",
+                        args=json.dumps(args, ensure_ascii=False),
+                    )
+                ],
+                provider_blocks={
+                    "reasoning_content": "保留",
+                    "request_id": "provider-request-secret",
+                    "canary": "provider-canary-secret",
+                },
+            ),
+            Message(
+                role="tool",
+                content="工具结果",
+                tool_calls=[
+                    ToolCall(
+                        id="call-1",
+                        name="update_application_status",
+                        args=json.dumps(args, ensure_ascii=False),
+                    )
+                ],
+                tool_call_id="call-1",
+                provider_blocks={
+                    "reasoning_content": "保留",
+                    "request_id": "provider-request-secret",
+                    "canary": "provider-canary-secret",
+                },
+            ),
+        ]
+    )
+    assert [_message_projection(item) for item in stored] == expected
+    assert "provider-request-secret" not in json.dumps(stored, default=str)
+    assert "provider-canary-secret" not in json.dumps(stored, default=str)
+
+
+def test_repository_is_private_to_persistence_coordinator(tmp_path: Path) -> None:
+    coordinator, _conversation_id = make_persistence_coordinator(tmp_path)
+
+    assert not hasattr(coordinator, "chat")
+    assert hasattr(coordinator, "_chat")
+
+
 
 @pytest.mark.parametrize("method", ["persist_timeout_assistant", "persist_initial_user_message"])
 def test_message_helpers_preserve_identity_fields(tmp_path: Path, method: str) -> None:
@@ -718,9 +919,9 @@ def test_message_helpers_preserve_identity_fields(tmp_path: Path, method: str) -
         result = coordinator.persist_initial_user_message(conversation_id, "用户消息")
     else:
         pending = PendingAction("call-1", "update_application_status", '{"id": 1}', "更新状态")
-        coordinator.chat.set_pending_clarification(conversation_id, pending, "缺什么？")
+        coordinator._chat.set_pending_clarification(conversation_id, pending, "缺什么？")
         result = coordinator.persist_timeout_assistant(conversation_id, "超时，请重试。")
     assert result.persisted is True
-    assert coordinator.chat.list_messages(conversation_id)[-1].content
+    assert coordinator._chat.list_messages(conversation_id)[-1].content
     if method == "persist_timeout_assistant":
-        assert coordinator.chat.get_pending_clarification(conversation_id) is None
+        assert coordinator._chat.get_pending_clarification(conversation_id) is None

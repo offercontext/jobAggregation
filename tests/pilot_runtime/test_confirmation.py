@@ -27,7 +27,7 @@ from offerpilot.ai.write_operations import (
     WriteOperationRepository,
     load_or_create_ledger_key,
 )
-from offerpilot.agent_runtime.journal import NullRunRecorder
+from offerpilot.agent_runtime.journal import NullRunRecorder, NullRunRecorderFactory
 from offerpilot.chat_transport import SseAgentExecutionHost, outcome_http_payload
 from offerpilot.db import init_database
 from offerpilot.pilot_runtime.persistence import ChatPersistenceCoordinator
@@ -60,7 +60,7 @@ from offerpilot.pilot_runtime.continuation import (
     _confirmation_token,
 )
 from offerpilot.pilot_runtime.event_sink import InMemoryRuntimeInvocationControl
-from offerpilot.pilot_runtime.errors import RuntimeFailureCode
+from offerpilot.pilot_runtime.errors import RuntimeAgentTimedOut, RuntimeFailureCode
 from offerpilot.pilot_runtime.persistence import PersistenceResult, PersistenceStatus
 from offerpilot.pilot_runtime.service import PilotRuntime, RuntimeDependencies
 from offerpilot.pilot_runtime.service import ResolvedModel
@@ -1907,3 +1907,344 @@ def test_stream_provider_failure_is_502_and_does_not_clear_pending() -> None:
     assert getattr(outcome, "code", None).value == "ai_provider_error"
     assert getattr(outcome, "status_code", None) == 502
     assert persistence.pending is not None
+
+
+class _ConfirmationJournalRecorder:
+    """Small healthy recorder used as the enabled Journal control case."""
+
+    run_id = "run-confirmation"
+    segment_id = "segment-confirmation"
+    diagnostics: list[str] = []
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def fingerprint_pending_identity(self, _value: object) -> str:
+        self.calls.append("fingerprint_pending_identity")
+        return "pending-fingerprint"
+
+    def capture_context(self, *_args: object, **_kwargs: object) -> str:
+        self.calls.append("capture_context")
+        return "snapshot-confirmation"
+
+    def append_event(self, event: object) -> None:
+        self.calls.append(str(getattr(event, "event_type", "append_event")))
+
+    def resume(self, *_args: object, **_kwargs: object) -> None:
+        self.calls.append("resume")
+
+    def suspend(self, *_args: object, **_kwargs: object) -> None:
+        self.calls.append("suspend")
+
+    def finish(self, *_args: object, **_kwargs: object) -> None:
+        self.calls.append("finish")
+
+    def abandon(self, *_args: object, **_kwargs: object) -> None:
+        self.calls.append("abandon")
+
+
+class _ConfirmationJournalFactory:
+    def __init__(self, recorder: object) -> None:
+        self.recorder = recorder
+        self.resume_calls = 0
+
+    def resume_waiting_run(self, *_args: object, **_kwargs: object) -> object:
+        self.resume_calls += 1
+        return self.recorder
+
+
+class _DisabledConfirmationJournal(NullRunRecorderFactory):
+    def __init__(self) -> None:
+        super().__init__()
+        self.resume_calls = 0
+
+    def resume_waiting_run(
+        self,
+        conversation_id: int,
+        waiting_tool_call_id: str,
+        command: object,
+    ) -> NullRunRecorder:
+        self.resume_calls += 1
+        return super().resume_waiting_run(
+            conversation_id,
+            waiting_tool_call_id,
+            cast(Any, command),
+        )
+
+
+class _DegradedConfirmationJournalRecorder(_ConfirmationJournalRecorder):
+    """Every recorder hook fails ordinarily; Runtime must fail open."""
+
+    def _fail(self, name: str) -> None:
+        self.calls.append(name)
+        raise RuntimeError("journal recorder degraded")
+
+    def fingerprint_pending_identity(self, _value: object) -> str:
+        self._fail("fingerprint_pending_identity")
+        raise AssertionError("unreachable")
+
+    def capture_context(self, *_args: object, **_kwargs: object) -> str:
+        self._fail("capture_context")
+        raise AssertionError("unreachable")
+
+    def append_event(self, event: object) -> None:
+        self._fail(str(getattr(event, "event_type", "append_event")))
+
+    def resume(self, *_args: object, **_kwargs: object) -> None:
+        self._fail("resume")
+
+    def suspend(self, *_args: object, **_kwargs: object) -> None:
+        self._fail("suspend")
+
+    def finish(self, *_args: object, **_kwargs: object) -> None:
+        self._fail("finish")
+
+    def abandon(self, *_args: object, **_kwargs: object) -> None:
+        self._fail("abandon")
+
+
+class _ConfirmationJournalBaseException(BaseException):
+    pass
+
+
+class _BaseExceptionConfirmationJournalRecorder(_ConfirmationJournalRecorder):
+    def __init__(self, error: _ConfirmationJournalBaseException) -> None:
+        super().__init__()
+        self.error = error
+
+    def capture_context(self, *_args: object, **_kwargs: object) -> str:
+        self.calls.append("capture_context")
+        raise self.error
+
+
+def _confirmation_journal_for_mode(mode: str) -> tuple[object, object]:
+    if mode == "enabled":
+        recorder = _ConfirmationJournalRecorder()
+        return _ConfirmationJournalFactory(recorder), recorder
+    if mode == "disabled":
+        journal = _DisabledConfirmationJournal()
+        return journal, journal
+    if mode == "degraded":
+        recorder = _DegradedConfirmationJournalRecorder()
+        return _ConfirmationJournalFactory(recorder), recorder
+    if mode == "base_exception":
+        recorder = _BaseExceptionConfirmationJournalRecorder(
+            _ConfirmationJournalBaseException("journal base exception")
+        )
+        return _ConfirmationJournalFactory(recorder), recorder
+    raise AssertionError(f"unsupported Journal mode: {mode}")
+
+
+def _confirmation_outcome_signature(outcome: object) -> tuple[object, ...]:
+    code = getattr(outcome, "code", None)
+    if isinstance(outcome, RuntimeFailureOutcome):
+        return (
+            "failure",
+            code.value if isinstance(code, RuntimeFailureCode) else str(code),
+            getattr(outcome, "status_code", None),
+            getattr(outcome, "retryable", None),
+        )
+    return (
+        type(outcome).__name__,
+        getattr(outcome, "message", None),
+        getattr(outcome, "write_status", None),
+        getattr(outcome, "persisted", None),
+    )
+
+
+def _run_confirmation_journal_case(
+    mode: str,
+    case: str,
+) -> tuple[dict[str, object], object]:
+    operations = _Operations(status="proposed")
+    pending = PendingAction(
+        "call-1", "create_application", "{}", "create", operations.operation_id
+    )
+    persistence = _Persistence(pending)
+    deliveries: list[dict[str, object]] = []
+
+    def persist_confirmation_delivery(**kwargs: object) -> PersistenceResult:
+        deliveries.append(kwargs)
+        return PersistenceResult(PersistenceStatus.PERSISTED, message_ids=(1,))
+
+    persistence.persist_confirmation_delivery = persist_confirmation_delivery  # type: ignore[attr-defined]
+    write = _WriteCoordinator()
+    coordinator = ConfirmationCoordinator(_deps(persistence, operations, write))
+    journal, recorder = _confirmation_journal_for_mode(mode)
+    provider_calls = 0
+    resolver_calls = 0
+    context = SimpleNamespace(operation_executor=None)
+
+    class Conversations:
+        def load(self, _conversation_id: int) -> object:
+            return SimpleNamespace(id=7, archived_at=None)
+
+    class Driver:
+        def resume_after_confirm(
+            self,
+            _messages: list[Message],
+            current: PendingAction,
+            _approved: bool,
+            _auto_approve: bool,
+            _max_iter: int,
+            **kwargs: object,
+        ) -> object:
+            nonlocal provider_calls
+            provider_calls += 1
+            if case == "timeout":
+                raise RuntimeAgentTimedOut()
+            prepared = SimpleNamespace(
+                pending_identity="call-1:create_application",
+                pending_action_revision=1,
+                tool_call_id=current.tool_call_id,
+                spec=SimpleNamespace(name=current.tool_name),
+                arguments_digest="digest",
+            )
+            authorization = cast(Any, kwargs["confirmation_attempt_sink"])(
+                current, prepared
+            )
+            record = cast(Any, kwargs["tool_context"]).operation_executor(
+                prepared,
+                kwargs["tool_context"],
+                authorization,
+            )
+            origin = Message(
+                role="tool",
+                content="saved",
+                tool_call_id=current.tool_call_id,
+            )
+            cast(Any, kwargs["confirmation_result_sink"])(
+                current,
+                True,
+                origin,
+                record,
+            )
+            return SimpleNamespace(
+                added=(origin, Message(role="assistant", content="done")),
+                reply="done",
+                pending=None,
+                records=(record,),
+                failures=(),
+            )
+
+    def resolve(_request: object, _conversation: object) -> ResolvedModel:
+        nonlocal resolver_calls
+        resolver_calls += 1
+        return ResolvedModel(model=object(), tool_context=context)
+
+    dependencies = RuntimeDependencies(
+        conversations=Conversations(),
+        persistence=persistence,  # type: ignore[arg-type]
+        confirmation_coordinator=coordinator,
+        journal=cast(Any, journal),
+        model_resolver=resolve if case != "reject" else None,
+        agent_driver=Driver() if case != "reject" else None,
+    )
+    runtime = PilotRuntime(dependencies)
+    request = ConfirmationRequest(
+        conversation_id=7,
+        approved=case != "reject",
+        operation_id=operations.operation_id,
+        confirmation_token=operations.token,
+    )
+    outcome = runtime.continue_confirmation(
+        request,
+        invocation_control=InMemoryRuntimeInvocationControl(),
+    )
+    pending_snapshot = (
+        persistence.pending.tool_call_id,
+        persistence.pending.tool_name,
+        persistence.pending.args,
+        persistence.pending.operation_id is not None,
+    ) if persistence.pending is not None else None
+    snapshot = {
+        "outcome": _confirmation_outcome_signature(outcome),
+        "provider_calls": provider_calls,
+        "resolver_calls": resolver_calls,
+        "executor_calls": write.execute_calls,
+        "reject_calls": write.reject_calls,
+        "delivery_calls": len(deliveries),
+        "pending": pending_snapshot,
+        "ledger": (
+            operations.operation.status,
+            operations.operation.delivery_status,
+        ),
+        "pending_reads": persistence.pending_reads,
+    }
+    return snapshot, recorder
+
+
+@pytest.mark.parametrize("case", ("approve", "reject", "timeout"))
+def test_confirmation_journal_disabled_and_degraded_are_enabled_equivalent(
+    case: str,
+) -> None:
+    enabled, enabled_recorder = _run_confirmation_journal_case("enabled", case)
+    disabled, disabled_journal = _run_confirmation_journal_case("disabled", case)
+    degraded, degraded_recorder = _run_confirmation_journal_case("degraded", case)
+
+    assert disabled == enabled
+    assert degraded == enabled
+    assert cast(Any, disabled_journal).resume_calls == 1
+    assert cast(Any, degraded_recorder).calls
+    assert cast(Any, enabled_recorder).calls
+
+    expected = {
+        "approve": (1, 1, 1),
+        "reject": (0, 0, 1),
+        "timeout": (1, 0, 0),
+    }[case]
+    assert (
+        enabled["provider_calls"],
+        enabled["executor_calls"],
+        enabled["delivery_calls"],
+    ) == expected
+
+
+def test_confirmation_journal_base_exception_is_propagated_unchanged() -> None:
+    journal, recorder = _confirmation_journal_for_mode("base_exception")
+    operations = _Operations(status="proposed")
+    pending = PendingAction(
+        "call-1", "create_application", "{}", "create", operations.operation_id
+    )
+    persistence = _Persistence(pending)
+    persistence.persist_confirmation_delivery = lambda **_kwargs: PersistenceResult(  # type: ignore[attr-defined]
+        PersistenceStatus.PERSISTED
+    )
+    coordinator = ConfirmationCoordinator(_deps(persistence, operations, _WriteCoordinator()))
+
+    class Conversations:
+        def load(self, _conversation_id: int) -> object:
+            return SimpleNamespace(id=7, archived_at=None)
+
+    class Driver:
+        def resume_after_confirm(self, *_args: object, **_kwargs: object) -> object:
+            raise AssertionError("Journal BaseException must abort before Agent")
+
+    runtime = PilotRuntime(
+        RuntimeDependencies(
+            conversations=Conversations(),
+            persistence=persistence,  # type: ignore[arg-type]
+            confirmation_coordinator=coordinator,
+            model_resolver=lambda _request, _conversation: ResolvedModel(
+                model=object(), tool_context=SimpleNamespace(operation_executor=None)
+            ),
+            agent_driver=Driver(),
+            journal=cast(Any, journal),
+        )
+    )
+    error = cast(Any, recorder).error
+    with pytest.raises(_ConfirmationJournalBaseException) as raised:
+        runtime.continue_confirmation(
+            ConfirmationRequest(
+                conversation_id=7,
+                approved=True,
+                operation_id=operations.operation_id,
+                confirmation_token=operations.token,
+            ),
+            invocation_control=InMemoryRuntimeInvocationControl(),
+        )
+
+    assert raised.value is error
+    assert cast(Any, recorder).calls == ["capture_context"]
+    assert persistence.pending is pending
+    assert operations.operation.status == "proposed"

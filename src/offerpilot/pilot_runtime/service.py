@@ -6153,7 +6153,10 @@ class PilotRuntime:
             # change the product outcome.
             return None
         except BaseException:
-            return None
+            # Preserve process/control-flow signals from a recorder.  Ordinary
+            # Journal failures are diagnostic-only, but BaseException values
+            # must retain their identity and escape the Runtime boundary.
+            raise
 
     def _record_journal_route(
         self,

@@ -65,6 +65,15 @@ from .deterministic import (
     DeterministicPilotAdapter,
     LEGACY_DETERMINISTIC_NAMES,
 )
+from .continuation import (
+    ConfirmationCoordinator,
+    ConfirmationDependencies,
+    ConfirmationIdentity,
+    ConfirmationReplayError,
+    ConfirmationSession,
+    ConfirmationState,
+    DeliveryBundle,
+)
 from .persistence import (
     ChatPersistenceCoordinator,
     DeliveryOutcome,
@@ -109,6 +118,13 @@ __all__ = [
     "DeterministicDependencies",
     "DeterministicExecution",
     "DeterministicPilotAdapter",
+    "ConfirmationCoordinator",
+    "ConfirmationDependencies",
+    "ConfirmationIdentity",
+    "ConfirmationReplayError",
+    "ConfirmationSession",
+    "ConfirmationState",
+    "DeliveryBundle",
     "LEGACY_DETERMINISTIC_NAMES",
     "ContextAssembler",
     "CompletedEvent",

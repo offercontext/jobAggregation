@@ -25,6 +25,7 @@ from offerpilot.ai.tool_runtime.contracts import ToolFailure, ToolSuccess
 from offerpilot.ai.tool_runtime.legacy import LEGACY_DETERMINISTIC_NAMES
 from offerpilot.ai.tool_runtime.journal import journal_shape_digest
 from offerpilot.ai.types import Message, ToolCall
+from offerpilot.ai.write_operations import OperationReplay
 from offerpilot.agent_runtime.events import (
     ContextManifestInput,
     normalize_context_identity,
@@ -86,6 +87,11 @@ from .errors import (
 )
 from .deterministic import DeterministicExecution, DeterministicPilotAdapter
 from .event_sink import emit_runtime_event, require_runtime_active
+from .continuation import (
+    ConfirmationCoordinator,
+    ConfirmationReplayError,
+    DeliveryBundle,
+)
 from .persistence import (
     PendingActionView,
     PendingClarificationView,
@@ -133,6 +139,8 @@ class ContextAssembler(Protocol):
 
 class AgentDriver(Protocol):
     def run_turn(self, *args: object, **kwargs: object) -> object: ...
+
+    def resume_after_confirm(self, *args: object, **kwargs: object) -> object: ...
 
 
 class ToolCatalog(Protocol):
@@ -376,6 +384,8 @@ class _PreparedStreamState:
     )
     events: tuple[RuntimeEvent, ...] = field(default=(), repr=False, compare=False)
     outcome: RuntimeOutcome | None = field(default=None, repr=False, compare=False)
+    confirmation_session: object | None = field(default=None, repr=False, compare=False)
+    confirmation_model: ResolvedModel | None = field(default=None, repr=False, compare=False)
     on_abort: Callable[[], object] | None = field(default=None, repr=False, compare=False)
     on_complete: Callable[[CompletionReason], object] | None = field(
         default=None,
@@ -432,6 +442,12 @@ class RuntimeDependencies:
     phase_sink: Callable[[str], None] | None = None
     application_visible: Callable[[int], bool] | None = None
     deterministic: DeterministicPilotAdapter | None = None
+    confirmation_coordinator: ConfirmationCoordinator | None = field(
+        default=None, repr=False, compare=False
+    )
+    continuation: ConfirmationCoordinator | None = field(
+        default=None, repr=False, compare=False
+    )
 
 
 RuntimeDependenciesLike: TypeAlias = RuntimeDependencies | Mapping[str, object]
@@ -671,8 +687,10 @@ def _invoke(
                 kwargs[parameter.name] = value
             else:
                 args.append(value)
-        if has_var_keyword and var_keyword_values:
-            for name, value in var_keyword_values.items():
+        if has_var_keyword:
+            keyword_values = dict(values)
+            keyword_values.update(var_keyword_values or {})
+            for name, value in keyword_values.items():
                 if name not in kwargs and name not in signature.parameters:
                     kwargs[name] = value
         return tuple(args), kwargs
@@ -691,7 +709,9 @@ def _invoke(
             } and parameter.name in values:
                 kwargs[parameter.name] = values[parameter.name]
         if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters):
-            for name, value in (var_keyword_values or {}).items():
+            keyword_values = dict(values)
+            keyword_values.update(var_keyword_values or {})
+            for name, value in keyword_values.items():
                 if name not in signature.parameters:
                     kwargs[name] = value
         return tuple(args), kwargs
@@ -1880,12 +1900,17 @@ class PilotRuntime:
         *,
         transport: RuntimeTransportContext | None = None,
         invocation_control: RuntimeInvocationControl | None = None,
+        event_sink: RuntimeEventSink | None = None,
+        signal_sink: RuntimeSignalSink[str] | None = None,
+        execution_host: AgentExecutionHost[object] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> RuntimeOutcome:
-        """Dispatch a confirmation to the trusted deterministic bridge.
+        """Dispatch a confirmation through the Ledger continuation boundary.
 
-        General Agent confirmation remains owned by the later continuation
-        extraction.  Keeping this narrow method here prevents a deterministic
-        confirmation from accidentally resolving a model/provider dependency.
+        The legacy deterministic adapter remains available when no Ledger
+        coordinator is installed.  A coordinator-owned confirmation keeps
+        replay/rejection provider-free and resumes approved work through the
+        unchanged Agent Driver callback contract.
         """
 
         if not isinstance(request, ConfirmationRequest):
@@ -1896,6 +1921,17 @@ class PilotRuntime:
         resolved_transport = transport or RuntimeTransportContext(mode="sync")
         if resolved_transport.mode != "sync":
             return self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400)
+        continuation = self._confirmation_coordinator()
+        if continuation is not None:
+            return self._continue_ledger_confirmation(
+                continuation,
+                request,
+                control=control,
+                event_sink=event_sink,
+                signal_sink=signal_sink,
+                execution_host=execution_host,
+                cancel_check=cancel_check or (lambda: False),
+            )
         self._phase("validate")
         self._validate(request)
         self._check_cancel(lambda: False, control)
@@ -1985,6 +2021,349 @@ class PilotRuntime:
         self._mark_completed_if_active(control)
         return outcome
 
+    def _confirmation_coordinator(self) -> ConfirmationCoordinator | None:
+        return self._dependencies.confirmation_coordinator or self._dependencies.continuation
+
+    def _continue_ledger_confirmation(
+        self,
+        coordinator: ConfirmationCoordinator,
+        request: ConfirmationRequest,
+        *,
+        control: RuntimeInvocationControl,
+        event_sink: RuntimeEventSink | None,
+        signal_sink: RuntimeSignalSink[str] | None,
+        execution_host: AgentExecutionHost[object] | None,
+        cancel_check: Callable[[], bool],
+    ) -> RuntimeOutcome:
+        """Run a Ledger-backed confirmation without opening the old route state.
+
+        Terminal replay and rejection are deliberately completed before any
+        Conversation/model dependency is touched.  Only an approved live
+        Pending enters the Agent Driver's unchanged ``resume_after_confirm``
+        method; all result persistence remains a coordinator atom.
+        """
+
+        self._phase("validate")
+        self._validate(request)
+        self._check_cancel(cancel_check, control)
+
+        try:
+            replay = coordinator.replay_outcome(request)
+        except Exception as exc:
+            self._mark_completed_if_active(control)
+            return self._confirmation_failure(exc)
+        if replay is not None:
+            self._mark_completed_if_active(control)
+            return replay
+
+        try:
+            conversation = self._load_confirmation_conversation(request)
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception:
+            self._mark_completed_if_active(control)
+            return self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404)
+        if conversation is None or _conversation_id(conversation) != request.conversation_id:
+            self._mark_completed_if_active(control)
+            return self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404)
+        if _is_archived(conversation):
+            self._mark_completed_if_active(control)
+            return self._failure(RuntimeFailureCode.CONVERSATION_ARCHIVED, "conversation is archived", 409)
+
+        # Rejection is a direct Ledger worker path.  It must not resolve a
+        # model, decode the proposal, invoke a provider, or start an Agent.
+        if not request.approved:
+            try:
+                session = coordinator.reject(request, conversation=conversation)
+                claimed = session.on_confirmation_attempt(session.pending, None)
+                if isinstance(claimed, ToolFailure):
+                    self._mark_completed_if_active(control)
+                    return self._failure(RuntimeFailureCode.STALE_PENDING_ACTION, claimed.code, 409)
+                visible = str(
+                    _attribute(
+                        _attribute(session.state.terminal_execution, "payload"),
+                        "visible_result",
+                        "已取消这次操作。",
+                    )
+                    or "已取消这次操作。"
+                )
+                origin = Message(
+                    role="tool",
+                    content=visible,
+                    tool_call_id=session.pending.tool_call_id,
+                )
+                session.on_confirmation_result(session.pending, False, origin, None)
+                self._check_cancel(cancel_check, control)
+                delivered = coordinator.final_delivery(
+                    session,
+                    DeliveryBundle((Message(role="assistant", content=visible),)),
+                )
+                if _failure_status(delivered) in {"cas_lost", "closed", "not_found"}:
+                    self._mark_completed_if_active(control)
+                    return self._failure(RuntimeFailureCode.OPERATION_DELIVERY_FAILED, "对话结果暂时无法保存。", 503, retryable=True)
+                self._mark_completed_if_active(control)
+                return MessageOutcome(
+                    message=visible,
+                    conversation_id=request.conversation_id,
+                    write_status="cancelled",
+                    operation_id=request.operation_id or session.state.identity.operation_id,
+                    persisted=True,
+                )
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                coordinator.cancel_cleanup(session) if "session" in locals() else None
+                raise
+            except Exception as exc:
+                self._mark_completed_if_active(control)
+                return self._confirmation_failure(exc)
+
+        resolved_model: ResolvedModel | None = None
+        if self._dependencies.model_resolver is not None:
+            model_request = StartTurnRequest(
+                message="继续处理已确认的操作",
+                conversation_id=request.conversation_id,
+            )
+            resolved = self._resolve_model(model_request, conversation)
+            if isinstance(resolved, RuntimeFailureOutcome):
+                self._mark_completed_if_active(control)
+                return resolved
+            resolved_model = resolved
+        catalog = resolved_model.catalog if resolved_model is not None else self._dependencies.catalog
+        try:
+            session_or_replay = coordinator.approve_modify(
+                request,
+                conversation=conversation,
+                catalog=catalog,
+            )
+            if isinstance(session_or_replay, OperationReplay):
+                self._mark_completed_if_active(control)
+                return coordinator.replay_outcome(request) or self._failure(
+                    RuntimeFailureCode.OPERATION_RESULT_UNKNOWN,
+                    "operation result is unavailable",
+                    503,
+                    retryable=True,
+                )
+            session = session_or_replay
+        except ConfirmationReplayError:
+            self._mark_completed_if_active(control)
+            return coordinator.replay_outcome(request) or self._failure(
+                RuntimeFailureCode.OPERATION_RESULT_UNKNOWN,
+                "operation result is unavailable",
+                503,
+                retryable=True,
+            )
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception as exc:
+            self._mark_completed_if_active(control)
+            return self._confirmation_failure(exc)
+
+        driver = self._dependencies.agent_driver
+        resume = _callable(driver, ("resume_after_confirm",))
+        if resume is None:
+            coordinator.cancel_cleanup(session)
+            self._mark_completed_if_active(control)
+            return self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400)
+        messages = list(session.continuation_message_loader())
+        model = resolved_model.model if resolved_model is not None else None
+        auto_approve = resolved_model.auto_approve if resolved_model is not None else False
+        max_iter = resolved_model.max_iter if resolved_model is not None else DEFAULT_MAX_ITERATIONS
+        thread_id = (
+            resolved_model.thread_id
+            if resolved_model is not None and resolved_model.thread_id is not None
+            else f"conversation:{request.conversation_id}"
+        )
+        resume_values: dict[str, object] = {
+            "messages": messages,
+            "pending": session.pending,
+            "approved": True,
+            "auto_approve": auto_approve,
+            "max_iter": max_iter,
+            "max_iterations": max_iter,
+            "rejection_feedback": request.rejection_feedback,
+            "model": model,
+            "catalog": catalog,
+            "tool_catalog": catalog,
+            "tool_context": resolved_model.tool_context if resolved_model is not None else None,
+            "conversation": conversation,
+            "request": request,
+            "event_sink": event_sink,
+            "signal_sink": signal_sink,
+            "runtime_signal_sink": signal_sink,
+            "cancel_check": cancel_check,
+            "confirmation_attempt_sink": session.on_confirmation_attempt,
+            "on_confirmation_attempt": session.on_confirmation_attempt,
+            "confirmation_result_sink": session.on_confirmation_result,
+            "on_confirmation_result": session.on_confirmation_result,
+            "delivery_fence": session.delivery_fence,
+            "continuation_message_loader": session.continuation_message_loader,
+            "thread_id": thread_id,
+        }
+        optional = {
+            key: value
+            for key, value in resume_values.items()
+            if key
+            not in {"messages", "pending", "approved", "auto_approve", "max_iter", "max_iterations", "rejection_feedback"}
+        }
+        try:
+            self._check_cancel(cancel_check, control)
+
+            def invoke_resume() -> object:
+                return _invoke(
+                    resume,
+                    resume_values,
+                    (
+                        messages,
+                        session.pending,
+                        True,
+                        auto_approve,
+                        max_iter,
+                        request.rejection_feedback,
+                    ),
+                    var_keyword_values=optional,
+                )
+
+            raw_result = (
+                execution_host.run(invoke_resume, control)
+                if execution_host is not None
+                else invoke_resume()
+            )
+            self._check_cancel(cancel_check, control)
+            normalized = _normalize_agent_result(raw_result)
+            return self._finish_ledger_confirmation(
+                coordinator,
+                session,
+                normalized,
+                request,
+                control,
+            )
+        except RuntimeAgentTimedOut:
+            coordinator.timeout_convergence(session)
+            self._mark_completed_if_active(control)
+            return self._failure(RuntimeFailureCode.CHAT_AGENT_TIMEOUT, CHAT_TIMEOUT_MESSAGE, 504, retryable=True)
+        except RuntimeCancelled:
+            coordinator.cancel_cleanup(session)
+            raise
+        except RuntimeTransportAborted:
+            coordinator.cancel_cleanup(session)
+            raise
+        except ConfirmationReplayError:
+            replay = coordinator.replay_outcome(request)
+            if replay is not None:
+                self._mark_completed_if_active(control)
+                return replay
+            raise
+        except Exception as exc:
+            coordinator.timeout_convergence(session)
+            self._mark_completed_if_active(control)
+            return self._confirmation_failure(exc)
+
+    def _finish_ledger_confirmation(
+        self,
+        coordinator: ConfirmationCoordinator,
+        session: object,
+        normalized: NormalizedAgentTurn,
+        request: ConfirmationRequest,
+        control: RuntimeInvocationControl,
+    ) -> RuntimeOutcome:
+        typed_session = cast(Any, session)
+        state = typed_session.state
+        origin = state.origin_tool_message
+        if origin is None:
+            # A driver that does not use the unchanged callback boundary is
+            # not allowed to make an unowned write appear durable.
+            coordinator.cancel_cleanup(typed_session)
+            self._mark_completed_if_active(control)
+            return self._failure(RuntimeFailureCode.OPERATION_FAILED, "写入结果暂时无法保存。", 503, retryable=True)
+        added = [_message(item) for item in normalized.added]
+        continuation: list[Message] = []
+        origin_removed = False
+        for message in added:
+            if (
+                not origin_removed
+                and message.role == "tool"
+                and message.tool_call_id == origin.tool_call_id
+            ):
+                origin_removed = True
+                continue
+            continuation.append(message)
+        if not continuation and normalized.reply:
+            continuation.append(Message(role="assistant", content=normalized.reply))
+        pending = normalized.pending
+        delivery = coordinator.final_delivery(
+            typed_session,
+            DeliveryBundle(tuple(continuation), pending=pending),
+        )
+        if _failure_status(delivery) in {"cas_lost", "closed", "not_found"}:
+            self._mark_completed_if_active(control)
+            return self._failure(RuntimeFailureCode.OPERATION_DELIVERY_FAILED, "对话结果暂时无法保存。", 503, retryable=True)
+        self._mark_completed_if_active(control)
+        if pending is not None:
+            args, token = _safe_pending_payload(pending)
+            from .contracts import PendingActionPayload
+
+            return ConfirmationRequiredOutcome(
+                confirmation_token=token,
+                conversation_id=request.conversation_id,
+                operation_id=pending.operation_id or state.identity.operation_id,
+                message=normalized.reply,
+                pending_action=PendingActionPayload(
+                    tool_name=pending.tool_name,
+                    operation_id=pending.operation_id or state.identity.operation_id,
+                    human=pending.human,
+                    args=args,
+                    confirmation_token=token,
+                ),
+            )
+        payload = _attribute(_attribute(state.terminal_execution, "payload"), "failure_code")
+        write_status: WriteStatus = (
+            "success" if state.succeeded else "failed"
+        )
+        if not state.approved:
+            write_status = "cancelled"
+        undo = state.undo_update
+        return MessageOutcome(
+            message=normalized.reply or continuation[-1].content if continuation else "",
+            conversation_id=request.conversation_id,
+            write_status=write_status,
+            write_error=str(payload) if payload else None,
+            undo=freeze_json_mapping(undo) if isinstance(undo, Mapping) and undo else None,
+            operation_id=state.identity.operation_id,
+            replayed=state.replayed,
+            persisted=True,
+        )
+
+    @staticmethod
+    def _confirmation_failure(error: BaseException) -> RuntimeFailureOutcome:
+        code = str(_attribute(error, "code", "operation_failed") or "operation_failed")
+        status_code = 503
+        try:
+            failure_code = RuntimeFailureCode(code)
+        except ValueError:
+            if code == "stale_pending_action":
+                failure_code = RuntimeFailureCode.STALE_PENDING_ACTION
+                status_code = 409
+            elif code == "operation_identity_conflict":
+                failure_code = RuntimeFailureCode.OPERATION_IDENTITY_CONFLICT
+                status_code = 409
+            elif code == "operation_input_conflict":
+                failure_code = RuntimeFailureCode.INVALID_CONFIRMATION
+                status_code = 422
+            else:
+                failure_code = RuntimeFailureCode.OPERATION_FAILED
+        if failure_code in {
+            RuntimeFailureCode.STALE_PENDING_ACTION,
+            RuntimeFailureCode.OPERATION_IDENTITY_CONFLICT,
+            RuntimeFailureCode.OPERATION_INPUT_CONFLICT,
+            RuntimeFailureCode.INVALID_CONFIRMATION,
+        }:
+            status_code = 409 if failure_code is not RuntimeFailureCode.INVALID_CONFIRMATION else 422
+        return PilotRuntime._failure(
+            failure_code,
+            "对话结果暂时无法保存。",
+            status_code,
+            retryable=True,
+        )
+
     confirmation = continue_confirmation
     execute_confirmation = continue_confirmation
 
@@ -2026,6 +2405,30 @@ class PilotRuntime:
         self._validate(cast(StartTurnRequest, request))
         self._check_cancel(lambda: False, invocation_control)
 
+        confirmation_coordinator = self._confirmation_coordinator()
+        stream_replay: OperationReplayOutcome | None = None
+        if isinstance(request, ConfirmationRequest) and confirmation_coordinator is not None:
+            try:
+                stream_replay = confirmation_coordinator.replay_outcome(request)
+            except Exception as exc:
+                return self._stream_immediate(
+                    self._confirmation_failure(exc), invocation_control
+                )
+            if stream_replay is not None:
+                # Ledger replay is transport-independent and must not load a
+                # Conversation or source before the response header.
+                return self._prepare_deterministic_stream(
+                    DeterministicExecution(
+                        stream_replay,
+                        preparation_kind=PreparationKind.REPLAY,
+                    ),
+                    request=request,
+                    conversation=None,
+                    conversation_id=request.conversation_id,
+                    transport=transport,
+                    invocation_control=invocation_control,
+                )
+
         if (
             isinstance(request, StartTurnRequest)
             and request.conversation_id in (None, 0)
@@ -2065,7 +2468,11 @@ class PilotRuntime:
         # deterministic requests fail before Conversation creation.  Once the
         # trusted bridge is installed, the branch is prepared below so all
         # pre-header deterministic effects happen exactly once.
-        if (isinstance(request, ConfirmationRequest) or request.pilot_action is not None) and self._dependencies.deterministic is None:
+        if (
+            (isinstance(request, ConfirmationRequest) or request.pilot_action is not None)
+            and self._dependencies.deterministic is None
+            and self._confirmation_coordinator() is None
+        ):
             return self._stream_immediate(
                 self._failure(
                     RuntimeFailureCode.OPERATION_UNAVAILABLE,
@@ -2111,6 +2518,19 @@ class PilotRuntime:
                     409,
                 ),
                 invocation_control,
+            )
+
+        continuation = self._confirmation_coordinator()
+        if isinstance(request, ConfirmationRequest) and continuation is not None:
+            return self._prepare_ledger_confirmation_stream(
+                continuation,
+                request,
+                conversation,
+                conversation_id,
+                transport,
+                invocation_control,
+                replay=stream_replay,
+                terminal_checked=True,
             )
 
         adapter = self._dependencies.deterministic
@@ -2740,6 +3160,44 @@ class PilotRuntime:
                 except BaseException:
                     pass
 
+        if (
+            isinstance(state.request, ConfirmationRequest)
+            and state.confirmation_session is not None
+        ):
+            try:
+                confirmation_outcome = self._execute_prepared_ledger_confirmation(
+                    state,
+                    safe_event_sink,
+                    safe_signal_sink,
+                    execution_host,
+                    cancel_check,
+                )
+                if isinstance(confirmation_outcome, ConfirmationRequiredOutcome):
+                    emit_runtime_event(
+                        safe_event_sink,
+                        StatusEvent(phase="waiting_confirmation", label="需要确认"),
+                    )
+                    if confirmation_outcome.pending_action is not None:
+                        emit_runtime_event(
+                            safe_event_sink,
+                            ConfirmationRequiredEvent(
+                                confirmation_token=confirmation_outcome.confirmation_token,
+                                operation_id=confirmation_outcome.operation_id,
+                                pending_action=confirmation_outcome.pending_action,
+                            ),
+                        )
+                emit_runtime_event(safe_event_sink, CompletedEvent(response=confirmation_outcome))
+                return finish(confirmation_outcome, CompletionReason.NORMAL)
+            except RuntimeCancelled:
+                abort(CompletionReason.CANCELLED)
+                raise
+            except (RuntimeTransportAborted, RuntimeAgentTimedOut):
+                abort(CompletionReason.TRANSPORT_ABORTED)
+                raise
+            except BaseException:
+                abort(CompletionReason.TRANSPORT_ABORTED)
+                raise
+
         if state.execution_mode is StreamExecutionMode.DIRECT:
             try:
                 self._check_cancel(cancel_check, state.control)
@@ -3152,6 +3610,311 @@ class PilotRuntime:
             raise
         self._phase("prepared")
         return prepared
+
+    def _prepare_ledger_confirmation_stream(
+        self,
+        coordinator: ConfirmationCoordinator,
+        request: ConfirmationRequest,
+        conversation: object,
+        conversation_id: int,
+        transport: RuntimeTransportContext,
+        invocation_control: RuntimeInvocationControl,
+        *,
+        replay: OperationReplayOutcome | None = None,
+        terminal_checked: bool = False,
+    ) -> ImmediateHttpOutcome | PreparedStreamExecution:
+        """Freeze Ledger replay/rejection, or lease approved Agent work."""
+
+        if not terminal_checked:
+            try:
+                replay = coordinator.replay_outcome(request)
+            except Exception as exc:
+                return self._stream_immediate(self._confirmation_failure(exc), invocation_control)
+        if replay is not None:
+            return self._prepare_deterministic_stream(
+                DeterministicExecution(
+                    replay,
+                    preparation_kind=PreparationKind.REPLAY,
+                ),
+                request=request,
+                conversation=conversation,
+                conversation_id=conversation_id,
+                transport=transport,
+                invocation_control=invocation_control,
+            )
+
+        if not request.approved:
+            try:
+                session = coordinator.reject(request, conversation=conversation)
+                claimed = session.on_confirmation_attempt(session.pending, None)
+                if isinstance(claimed, ToolFailure):
+                    return self._stream_immediate(
+                        self._failure(RuntimeFailureCode.STALE_PENDING_ACTION, claimed.code, 409),
+                        invocation_control,
+                    )
+                visible = str(
+                    _attribute(
+                        _attribute(session.state.terminal_execution, "payload"),
+                        "visible_result",
+                        "已取消这次操作。",
+                    )
+                    or "已取消这次操作。"
+                )
+                origin = Message(
+                    role="tool",
+                    content=visible,
+                    tool_call_id=session.pending.tool_call_id,
+                )
+                session.on_confirmation_result(session.pending, False, origin, None)
+                delivered = coordinator.final_delivery(
+                    session,
+                    DeliveryBundle((Message(role="assistant", content=visible),)),
+                )
+                if _failure_status(delivered) in {"cas_lost", "closed", "not_found"}:
+                    return self._stream_immediate(
+                        self._failure(RuntimeFailureCode.OPERATION_DELIVERY_FAILED, "对话结果暂时无法保存。", 503, retryable=True),
+                        invocation_control,
+                    )
+                return self._prepare_deterministic_stream(
+                    DeterministicExecution(
+                        MessageOutcome(
+                            message=visible,
+                            conversation_id=conversation_id,
+                            write_status="cancelled",
+                            operation_id=session.state.identity.operation_id,
+                        ),
+                        preparation_kind=PreparationKind.CONFIRMATION,
+                    ),
+                    request=request,
+                    conversation=conversation,
+                    conversation_id=conversation_id,
+                    transport=transport,
+                    invocation_control=invocation_control,
+                )
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                raise
+            except Exception as exc:
+                return self._stream_immediate(self._confirmation_failure(exc), invocation_control)
+
+        resolved_model: ResolvedModel | None = None
+        if self._dependencies.model_resolver is not None:
+            resolved = self._resolve_model(
+                StartTurnRequest(message="继续处理已确认的操作", conversation_id=conversation_id),
+                conversation,
+            )
+            if isinstance(resolved, RuntimeFailureOutcome):
+                return self._stream_immediate(resolved, invocation_control)
+            resolved_model = resolved
+        try:
+            session_or_replay = coordinator.approve_modify(
+                request,
+                conversation=conversation,
+                catalog=(resolved_model.catalog if resolved_model is not None else self._dependencies.catalog),
+            )
+        except ConfirmationReplayError:
+            replay = coordinator.replay_outcome(request)
+            if replay is not None:
+                return self._prepare_deterministic_stream(
+                    DeterministicExecution(replay, preparation_kind=PreparationKind.REPLAY),
+                    request=request,
+                    conversation=conversation,
+                    conversation_id=conversation_id,
+                    transport=transport,
+                    invocation_control=invocation_control,
+                )
+            return self._stream_immediate(
+                self._failure(RuntimeFailureCode.OPERATION_RESULT_UNKNOWN, "operation result is unavailable", 503, retryable=True),
+                invocation_control,
+            )
+        except Exception as exc:
+            return self._stream_immediate(self._confirmation_failure(exc), invocation_control)
+        if isinstance(session_or_replay, OperationReplay):
+            replay = coordinator.replay_outcome(request)
+            if replay is None:
+                return self._stream_immediate(
+                    self._failure(RuntimeFailureCode.OPERATION_RESULT_UNKNOWN, "operation result is unavailable", 503, retryable=True),
+                    invocation_control,
+                )
+            return self._prepare_deterministic_stream(
+                DeterministicExecution(replay, preparation_kind=PreparationKind.REPLAY),
+                request=request,
+                conversation=conversation,
+                conversation_id=conversation_id,
+                transport=transport,
+                invocation_control=invocation_control,
+            )
+        session = session_or_replay
+        assembled = tuple(session.continuation_message_loader())
+        cell = _PreparedExecutionCell(run_open=False)
+
+        def on_abort() -> None:
+            coordinator.cancel_cleanup(session)
+            with cell.lock:
+                cell.aborted = True
+                cell.run_open = False
+
+        def on_complete(_reason: CompletionReason) -> None:
+            with cell.lock:
+                cell.run_open = False
+
+        state = _PreparedStreamState(
+            owner_token=self._owner_token,
+            preparation_kind=PreparationKind.CONFIRMATION,
+            execution_mode=StreamExecutionMode.AGENT_HOST,
+            control=invocation_control,
+            request=request,
+            conversation=_prepared_conversation(conversation, conversation_id),
+            conversation_id=conversation_id,
+            assembled=cast(tuple[object, ...], _freeze_stream_value(assembled)),
+            cell=cell,
+            transport=transport,
+            confirmation_session=session,
+            confirmation_model=resolved_model,
+            on_abort=on_abort,
+            on_complete=on_complete,
+        )
+        transport_run_id = transport.transport_run_id
+        if transport_run_id is None:
+            on_abort()
+            return self._stream_immediate(
+                self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400),
+                invocation_control,
+            )
+        return PreparedStreamExecution(
+            invocation_id=transport_run_id,
+            preparation_kind=PreparationKind.CONFIRMATION,
+            execution_mode=StreamExecutionMode.AGENT_HOST,
+            opaque_state=state,
+        )
+
+    def _execute_prepared_ledger_confirmation(
+        self,
+        state: _PreparedStreamState,
+        event_sink: RuntimeEventSink,
+        signal_sink: RuntimeSignalSink[str] | None,
+        execution_host: AgentExecutionHost[object],
+        cancel_check: Callable[[], bool],
+    ) -> RuntimeOutcome:
+        session = cast(Any, state.confirmation_session)
+        driver = self._dependencies.agent_driver
+        resume = _callable(driver, ("resume_after_confirm",))
+        if resume is None:
+            return self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400)
+        model_view = state.confirmation_model
+        catalog = model_view.catalog if model_view is not None else self._dependencies.catalog
+        messages = [
+            _materialize_stream_value(item)
+            for item in state.assembled
+        ]
+        auto_approve = model_view.auto_approve if model_view is not None else False
+        max_iter = model_view.max_iter if model_view is not None else DEFAULT_MAX_ITERATIONS
+        thread_id = (
+            model_view.thread_id
+            if model_view is not None and model_view.thread_id is not None
+            else f"conversation:{state.conversation_id}"
+        )
+        request = cast(ConfirmationRequest, state.request)
+        deferred_origin_events: list[RuntimeEvent] = []
+        origin_tool_call_id = session.pending.tool_call_id
+
+        class _ConfirmationEventSink:
+            def emit(self, event: RuntimeEvent) -> None:
+                if (
+                    isinstance(event, ToolResultEvent)
+                    and event.tool_call_id == origin_tool_call_id
+                ):
+                    deferred_origin_events.append(event)
+                    return
+                emit_runtime_event(event_sink, event)
+
+        confirmation_event_sink: RuntimeEventSink = _ConfirmationEventSink()
+        resume_values: dict[str, object] = {
+            "messages": messages,
+            "pending": session.pending,
+            "approved": True,
+            "auto_approve": auto_approve,
+            "max_iter": max_iter,
+            "max_iterations": max_iter,
+            "rejection_feedback": request.rejection_feedback,
+            "model": model_view.model if model_view is not None else None,
+            "catalog": catalog,
+            "tool_catalog": catalog,
+            "tool_context": model_view.tool_context if model_view is not None else None,
+            "conversation": state.conversation,
+            "request": request,
+            "event_sink": confirmation_event_sink,
+            "signal_sink": signal_sink,
+            "runtime_signal_sink": signal_sink,
+            "cancel_check": cancel_check,
+            "confirmation_attempt_sink": session.on_confirmation_attempt,
+            "on_confirmation_attempt": session.on_confirmation_attempt,
+            "confirmation_result_sink": session.on_confirmation_result,
+            "on_confirmation_result": session.on_confirmation_result,
+            "delivery_fence": session.delivery_fence,
+            "continuation_message_loader": session.continuation_message_loader,
+            "thread_id": thread_id,
+        }
+        optional = {
+            key: value
+            for key, value in resume_values.items()
+            if key
+            not in {"messages", "pending", "approved", "auto_approve", "max_iter", "max_iterations", "rejection_feedback"}
+        }
+
+        def invoke_resume(agent_events: RuntimeEventSink | None = None) -> object:
+            values = dict(resume_values)
+            values["event_sink"] = agent_events or confirmation_event_sink
+            return _invoke(
+                resume,
+                values,
+                (
+                    messages,
+                    session.pending,
+                    True,
+                    auto_approve,
+                    max_iter,
+                    request.rejection_feedback,
+                ),
+                var_keyword_values=optional,
+            )
+
+        if callable(getattr(execution_host, "iter_events", None)):
+            streamed = cast(Any, execution_host).run(invoke_resume, state.control)
+            if hasattr(streamed, "__next__"):
+                try:
+                    for agent_event in cast(Iterable[object], streamed):
+                        typed_agent_event = cast(RuntimeEvent, agent_event)
+                        if (
+                            isinstance(typed_agent_event, ToolResultEvent)
+                            and typed_agent_event.tool_call_id == origin_tool_call_id
+                        ):
+                            deferred_origin_events.append(typed_agent_event)
+                        else:
+                            emit_runtime_event(event_sink, typed_agent_event)
+                    result_reader = getattr(streamed, "result", None)
+                    raw_result = result_reader() if callable(result_reader) else result_reader
+                finally:
+                    close = getattr(streamed, "close", None)
+                    if callable(close):
+                        close()
+            else:
+                raw_result = streamed
+        else:
+            raw_result = execution_host.run(lambda: invoke_resume(), state.control)
+        normalized = _normalize_agent_result(raw_result)
+        outcome = self._finish_ledger_confirmation(
+            cast(ConfirmationCoordinator, self._confirmation_coordinator()),
+            session,
+            normalized,
+            request,
+            state.control,
+        )
+        if not isinstance(outcome, RuntimeFailureOutcome):
+            for deferred_event in deferred_origin_events:
+                emit_runtime_event(event_sink, deferred_event)
+        if isinstance(outcome, (MessageOutcome, OperationReplayOutcome)):
+            emit_runtime_event(event_sink, AssistantMessageEvent(message=outcome.message))
+        return outcome
 
     @staticmethod
     def _mark_completed_if_active(control: RuntimeInvocationControl) -> None:
@@ -5161,6 +5924,10 @@ def _dependency_values(values: Mapping[str, object]) -> dict[str, object]:
         "pending_checker": "pending_guard",
         "request_validator": "validator",
         "phase_recorder": "phase_sink",
+        "confirmation": "confirmation_coordinator",
+        "confirmation_runtime": "confirmation_coordinator",
+        "confirmation_continuation": "continuation",
+        "continuation_coordinator": "continuation",
     }
     result: dict[str, object] = {}
     for key, value in values.items():

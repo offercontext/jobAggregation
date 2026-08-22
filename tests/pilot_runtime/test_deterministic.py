@@ -608,6 +608,49 @@ def test_deterministic_invoke_does_not_retry_varargs_body_exception(error: Excep
     assert len(secondary_effects) == 1
 
 
+def test_deterministic_invoke_forwards_all_named_to_var_kwargs() -> None:
+    calls = 0
+    received: dict[str, object] = {}
+    pending = object()
+    named = {
+        "operation_id": "operation-1",
+        "claim_id": "claim-1",
+        "pending": pending,
+    }
+
+    def sink(**kwargs: object) -> str:
+        nonlocal calls
+        calls += 1
+        received.update(kwargs)
+        return "ok"
+
+    assert deterministic_invoke(sink, named, ("unused fallback",)) == "ok"
+    assert calls == 1
+    assert received == named
+
+
+def test_deterministic_invoke_merges_explicit_and_var_kwargs_without_duplicates() -> None:
+    calls = 0
+    received: dict[str, object] = {}
+    pending = object()
+    named = {
+        "operation_id": "operation-1",
+        "claim_id": "claim-1",
+        "pending": pending,
+    }
+
+    def sink(operation_id: object, **kwargs: object) -> str:
+        nonlocal calls
+        calls += 1
+        received["operation_id"] = operation_id
+        received.update(kwargs)
+        return "ok"
+
+    assert deterministic_invoke(sink, named, ("unused fallback",)) == "ok"
+    assert calls == 1
+    assert received == named
+
+
 def test_initial_and_clarification_are_provider_free_and_typed() -> None:
     persistence = _Persistence()
     adapter, _operations, coordinator = _adapter(persistence)

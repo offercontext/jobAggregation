@@ -241,15 +241,19 @@ def _invoke(function: Callable[..., object], named: Mapping[str, object], positi
         args: list[object] = []
         kwargs: dict[str, object] = {}
         fallback_index = 0
+        consumed_named: set[str] = set()
+        has_var_keyword = False
         for parameter in parameters:
             if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
                 args.extend(positional[fallback_index:])
                 fallback_index = len(positional)
                 continue
             if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+                has_var_keyword = True
                 continue
             if parameter.name in named:
                 value = named[parameter.name]
+                consumed_named.add(parameter.name)
             elif fallback_index < len(positional):
                 value = positional[fallback_index]
                 fallback_index += 1
@@ -261,21 +265,36 @@ def _invoke(function: Callable[..., object], named: Mapping[str, object], positi
                 kwargs[parameter.name] = value
             else:
                 args.append(value)
+        if has_var_keyword:
+            for name, value in named.items():
+                if name not in consumed_named:
+                    kwargs[name] = value
         return tuple(args), kwargs
 
     def named_call() -> tuple[tuple[object, ...], dict[str, object]]:
         args: list[object] = []
         kwargs: dict[str, object] = {}
+        consumed_named: set[str] = set()
+        has_var_keyword = False
         for parameter in parameters:
             if parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
                 if parameter.name in named:
                     args.append(named[parameter.name])
+                    consumed_named.add(parameter.name)
+                continue
+            if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+                has_var_keyword = True
                 continue
             if parameter.kind in {
                 inspect.Parameter.POSITIONAL_OR_KEYWORD,
                 inspect.Parameter.KEYWORD_ONLY,
             } and parameter.name in named:
                 kwargs[parameter.name] = named[parameter.name]
+                consumed_named.add(parameter.name)
+        if has_var_keyword:
+            for name, value in named.items():
+                if name not in consumed_named:
+                    kwargs[name] = value
         return tuple(args), kwargs
 
     candidates: tuple[tuple[tuple[object, ...], dict[str, object]], ...] = (

@@ -7793,6 +7793,37 @@ def test_chat_new_stream_conversation_uses_deterministic_title(tmp_path):
     assert conversation["title"] == "请帮我准备后端面试。"
 
 
+def test_chat_new_stream_runs_late_registered_generated_title_task(tmp_path):
+    class CountingTitleModel:
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, messages, tools):
+            del messages, tools
+            self.calls += 1
+            return Assistant(content="流式标题")
+
+    title_model = CountingTitleModel()
+    client = TestClient(
+        create_app(
+            data_dir=tmp_path,
+            chat_model=StreamingModel(),
+            title_model=title_model,
+        )
+    )
+
+    response = client.post(
+        "/api/chat/stream",
+        json={"message": "请帮我规划流式标题", "conversation_id": 0},
+    )
+
+    assert response.status_code == 200
+    conversation = client.get("/api/chat/conversations").json()[0]
+    assert title_model.calls == 1
+    assert conversation["title"] == "流式标题"
+    assert conversation["title_source"] == "generated"
+
+
 def test_chat_conversations_detail_and_delete(tmp_path):
     model = ScriptedModel([Assistant(content="你好")])
     client = TestClient(create_app(data_dir=tmp_path, chat_model=model))

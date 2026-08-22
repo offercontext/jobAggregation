@@ -4606,7 +4606,7 @@ def create_app(
             return build_guarded_streaming_response(
                 (),
                 guard=guard,
-                background=(lambda: title_latch.finalize()) if title_latch is not None else None,
+                background=_runtime_stream_background(background_tasks, title_latch),
                 headers=sse_headers(),
             )
         except (RuntimeAgentTimedOut, RuntimeCancelled, RuntimeTransportAborted) as exc:
@@ -7674,6 +7674,26 @@ def _runtime_title_latch(
         holder["conversation_id"] = value
 
     return latch, ClosedAgentSignalSink(latch), set_conversation_id
+
+
+def _runtime_stream_background(
+    background_tasks: BackgroundTasks,
+    title_latch: RuntimeSignalLatch | None,
+) -> Callable[[], object]:
+    """Run stream finalization before the request's live task collection.
+
+    ``BackgroundTasks`` is deliberately captured by reference.  The first
+    model signal can register the title task while the stream body is being
+    consumed, so copying ``background_tasks.tasks`` at response construction
+    would lose that late registration.
+    """
+
+    async def finalize() -> None:
+        if title_latch is not None:
+            title_latch.finalize()
+        await background_tasks()
+
+    return finalize
 
 
 def _runtime_sse_envelope(

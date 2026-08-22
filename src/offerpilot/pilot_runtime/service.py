@@ -27,6 +27,7 @@ from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import ToolFailure, ToolSuccess
 from offerpilot.ai.tool_runtime.legacy import LEGACY_DETERMINISTIC_NAMES
 from offerpilot.ai.tool_runtime.journal import journal_shape_digest
+from offerpilot.ai.tool_specs.catalog import editable_fields_for_tool
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.ai.write_operations import OperationReplay, WriteOperationError
 from offerpilot.agent_runtime.events import (
@@ -107,6 +108,10 @@ from .persistence import (
 
 CHAT_TIMEOUT_MESSAGE = "这次处理时间过长，已停止。你可以重试或换一种问法。"
 DEFAULT_MAX_ITERATIONS = 20
+_CANCELLED_TOOL_RESULT = json.dumps(
+    {"status": "cancelled", "message": "用户取消了该操作，未执行。"},
+    ensure_ascii=False,
+)
 
 
 class RouteKind(str, Enum):
@@ -251,6 +256,9 @@ class ResolvedModel:
     auto_approve: bool = False
     max_iter: int = DEFAULT_MAX_ITERATIONS
     thread_id: str | None = None
+    provider_error_message: Callable[[Exception], str] | None = field(
+        default=None, repr=False, compare=False
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -439,6 +447,7 @@ class RuntimeDependencies:
     journal: JournalFactory | None = None
     catalog: ToolCatalog | None = None
     missing_target_question: Callable[..., str | None] | None = None
+    pending_action_details: Callable[[PendingAction], Mapping[str, object]] | None = None
     conversation_store: ConversationGateway | None = None
     conversation_gateway: ConversationGateway | None = None
     pending_guard: Callable[..., object] | RuntimePersistence | None = None
@@ -1142,6 +1151,46 @@ def _write_outcome(
     return "failed", "写入未完成"
 
 
+def _last_successful_tool_payload(records: Sequence[object]) -> dict[str, Any]:
+    for record in reversed(tuple(records)):
+        outcome = _record_outcome(record)
+        result = _attribute(outcome, "result")
+        if isinstance(outcome, ToolSuccess) and isinstance(result, dict):
+            return cast(dict[str, Any], result)
+    return {}
+
+
+def _prepend_write_success(
+    reply: str,
+    pending: PendingAction,
+    records: Sequence[object],
+) -> str:
+    if pending.tool_name not in {"create_application", "add_note", "create_application_event"}:
+        return reply
+    payload = _last_successful_tool_payload(records)
+    if not payload:
+        return reply
+    if pending.tool_name == "create_application":
+        record_id = payload.get("application_id") or payload.get("id")
+        company = str(payload.get("company_name") or "").strip()
+        position = str(payload.get("position_name") or "").strip()
+        meta = " · ".join(value for value in (company, position) if value)
+        summary = f"✅ 创建成功：投递记录 #{record_id} 已保存（{meta}）。" if record_id and meta else ""
+    elif pending.tool_name == "add_note":
+        record_id = payload.get("note_id") or payload.get("id")
+        company = str(payload.get("company") or "").strip()
+        position = str(payload.get("position") or "").strip()
+        round_name = str(payload.get("round") or "").strip()
+        meta = " · ".join(value for value in (company, position, round_name) if value)
+        summary = f"✅ 保存成功：复盘记录 #{record_id} 已保存（{meta}）。" if record_id and meta else ""
+    else:
+        record_id = payload.get("application_event_id") or payload.get("id")
+        summary = f"✅ 创建成功：日程 #{record_id} 已保存。" if record_id else ""
+    if not summary or summary in reply:
+        return reply
+    return f"{summary}\n\n{reply}".strip()
+
+
 def _catalog_write_names(catalog: object | None) -> set[str]:
     function = _callable(catalog, ("write_names",))
     if function is None:
@@ -1336,6 +1385,11 @@ def _resolved_model_parts(model: object, config: object | None, *, source: objec
         auto_approve=auto_approve is True,
         max_iter=max_iter if type(max_iter) is int and max_iter > 0 else DEFAULT_MAX_ITERATIONS,
         thread_id=thread_id if isinstance(thread_id, str) else None,
+        provider_error_message=(
+            cast(Callable[[Exception], str], _attribute(origin, "provider_error_message"))
+            if callable(_attribute(origin, "provider_error_message"))
+            else None
+        ),
     )
 
 
@@ -1510,7 +1564,7 @@ class PilotRuntime:
             )
         except BaseException:
             raise
-        if pending_guard is not None and pending_guard is not False:
+        if route is RouteKind.MODEL and pending_guard is not None and pending_guard is not False:
             return complete_early(
                 self._failure(
                     RuntimeFailureCode.PENDING_CONFIRMATION_REQUIRED,
@@ -1843,12 +1897,7 @@ class PilotRuntime:
                 abandon_once()
                 raise RuntimeCancelled() from exc
             finish_or_raise("failed", "provider_error")
-            return self._failure(
-                RuntimeFailureCode.AI_PROVIDER_ERROR,
-                "AI 连接失败。请检查 AI 设置或稍后重试。",
-                502,
-                retryable=True,
-            )
+            return self._provider_failure(resolved, exc)
         except BaseException:
             abandon_once()
             raise
@@ -1858,17 +1907,13 @@ class PilotRuntime:
             self._check_cancel(cancel, invocation_control)
             normalized = _normalize_agent_result(raw_result)
             self._check_cancel(cancel, invocation_control)
+            self._settle_deferred_proposals(invocation.run_recorder, normalized.pending)
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
             abandon_once()
             raise
-        except Exception:
+        except Exception as exc:
             finish_or_raise("failed", "provider_error")
-            return self._failure(
-                RuntimeFailureCode.AI_PROVIDER_ERROR,
-                "AI 连接失败。请检查 AI 设置或稍后重试。",
-                502,
-                retryable=True,
-            )
+            return self._provider_failure(resolved, exc)
         except BaseException:
             abandon_once()
             raise
@@ -1967,7 +2012,7 @@ class PilotRuntime:
         if resolved_transport.mode != "sync":
             return self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400)
         continuation = self._confirmation_coordinator()
-        if continuation is not None:
+        if continuation is not None and not self._is_deterministic_confirmation(request):
             return self._continue_ledger_confirmation(
                 continuation,
                 request,
@@ -2070,6 +2115,37 @@ class PilotRuntime:
     def _confirmation_coordinator(self) -> ConfirmationCoordinator | None:
         return self._dependencies.confirmation_coordinator or self._dependencies.continuation
 
+    def _is_deterministic_confirmation(self, request: ConfirmationRequest) -> bool:
+        """Select the closed deterministic adapter from the persisted operation kind."""
+
+        if not isinstance(request, ConfirmationRequest):
+            return False
+        operation_id = request.operation_id
+        if not isinstance(operation_id, str) or not operation_id:
+            pending_getter = _callable(
+                self._dependencies.persistence,
+                ("get_pending_action", "pending_action"),
+            )
+            if pending_getter is None:
+                return False
+            pending = _invoke(
+                pending_getter,
+                {"conversation_id": request.conversation_id, "id": request.conversation_id},
+                (request.conversation_id,),
+            )
+            operation_id = str(_attribute(pending, "operation_id", "") or "")
+        coordinator = self._confirmation_coordinator()
+        write_operations = _attribute(_attribute(coordinator, "dependencies"), "write_operations")
+        getter = _callable(write_operations, ("get", "get_operation"))
+        if getter is None or not operation_id:
+            return False
+        operation = _invoke(
+            getter,
+            {"operation_id": operation_id, "id": operation_id},
+            (operation_id,),
+        )
+        return str(_attribute(operation, "adapter_kind", "") or "") == "legacy_deterministic"
+
     @staticmethod
     def _bind_confirmation_context(
         raw_context: object | None,
@@ -2154,6 +2230,7 @@ class PilotRuntime:
         base_attempt = session.on_confirmation_attempt
         base_result = session.on_confirmation_result
         attempt_id = str(uuid4())
+        late_journal_closed = False
 
         def attempt(action: PendingAction, prepared: object | None) -> object:
             # Decision/resume is recorded before the CAS atom.  If the CAS is
@@ -2166,8 +2243,7 @@ class PilotRuntime:
                 session.state.pending,
                 action,
                 prepared is not None,
-                edited=str(_attribute(action, "args", session.state.pending.args))
-                != session.state.pending.args,
+                edited=not session.state.edited_args.is_missing(),
                 control=control,
             )
             return base_attempt(action, cast(Any, prepared))
@@ -2178,12 +2254,40 @@ class PilotRuntime:
             tool_message: Message,
             execution_record: object | None,
         ) -> object:
+            nonlocal late_journal_closed
             value = base_result(
                 action,
                 approved,
                 tool_message,
                 cast(Any, execution_record),
             )
+            with session.state.lock:
+                late_terminal = (
+                    session.state.timed_out
+                    and session.state.origin_tool_message is not None
+                    and (
+                        session.state.active is False
+                        or session.state.transactional_delivery_persisted
+                    )
+                )
+                succeeded = session.state.succeeded
+            if late_terminal and started and not late_journal_closed:
+                late_failure_code = None
+                if not succeeded:
+                    late_outcome = _attribute(execution_record, "outcome")
+                    late_failure_code = str(
+                        _attribute(late_outcome, "code", "operation_failed")
+                        or "operation_failed"
+                    )
+                self._finish(
+                    recorder,
+                    True,
+                    "completed" if succeeded else "failed",
+                    late_failure_code,
+                    control,
+                    allow_timeout=True,
+                )
+                late_journal_closed = True
             # The production ``execute_prepared`` atom projects terminal
             # success/failure inside its Ledger transaction.  Re-projecting
             # it from this callback would create duplicate tool.completed or
@@ -2205,6 +2309,7 @@ class PilotRuntime:
                 tool_message.content,
                 succeeded,
                 control,
+                allow_timeout=session.state.timed_out,
             )
             return value
 
@@ -2330,16 +2435,26 @@ class PilotRuntime:
             control,
             allow_timeout=allow_timeout,
         )
-        self._close_ledger_journal(
-            recorder,
-            started,
-            outcome,
-            control,
-            pending=pending,
-            catalog=catalog,
-            allow_timeout=allow_timeout,
-            delivery_succeeded=delivery_succeeded,
-        )
+        with session.state.lock:
+            defer_late_terminal = (
+                allow_timeout
+                and session.state.confirmation_attempted
+                and session.state.active
+                and not session.state.delivered
+                and not session.state.transactional_delivery_persisted
+                and session.state.origin_tool_message is None
+            )
+        if not defer_late_terminal:
+            self._close_ledger_journal(
+                recorder,
+                started,
+                outcome,
+                control,
+                pending=pending,
+                catalog=catalog,
+                allow_timeout=allow_timeout,
+                delivery_succeeded=delivery_succeeded,
+            )
         if deferred_origin_events is not None:
             self._release_confirmation_origin_events(
                 event_sink,
@@ -2403,7 +2518,7 @@ class PilotRuntime:
                     ),
                     transport,
                     control,
-                    execution_path="rejection",
+                    execution_path="agent_resume",
                 )
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
             coordinator.cancel_cleanup(session)
@@ -2458,7 +2573,7 @@ class PilotRuntime:
         )
         origin = Message(
             role="tool",
-            content=visible,
+            content=_CANCELLED_TOOL_RESULT,
             tool_call_id=session.pending.tool_call_id,
         )
         try:
@@ -2499,8 +2614,13 @@ class PilotRuntime:
             message=visible,
             conversation_id=request.conversation_id,
             write_status="cancelled",
+            undo=self._previous_write_undo(
+                None,
+                request.conversation_id,
+            ),
             operation_id=request.operation_id or session.state.identity.operation_id,
             persisted=True,
+            legacy_projection=True,
         )
         self._close_ledger_journal(recorder, journal_started, outcome, control)
         self._mark_completed_if_active(control)
@@ -2531,7 +2651,7 @@ class PilotRuntime:
                     "attachments": (),
                     "page_context": None,
                 },
-                (conversation, request),
+                (),
             )
             assembled = source
             if assembler is not None:
@@ -2787,7 +2907,7 @@ class PilotRuntime:
             "event_sink": confirmation_event_sink,
             "signal_sink": signal_sink,
             "runtime_signal_sink": signal_sink,
-            "cancel_check": cancel_check,
+            "cancel_check": self._confirmation_cancel_check(control, cancel_check),
             "confirmation_attempt_sink": session.on_confirmation_attempt,
             "on_confirmation_attempt": session.on_confirmation_attempt,
             "confirmation_result_sink": session.on_confirmation_result,
@@ -2833,6 +2953,7 @@ class PilotRuntime:
                 normalized,
                 request,
                 control,
+                catalog=catalog,
             )
             self._finalize_confirmation_result(
                 recorder,
@@ -2845,7 +2966,7 @@ class PilotRuntime:
                 event_sink=event_sink,
                 deferred_origin_events=deferred_origin_events,
             )
-            coordinator.stop_heartbeat(session)
+            self._stop_confirmation_heartbeat(coordinator, session)
             return outcome
         except RuntimeAgentTimedOut:
             try:
@@ -2857,8 +2978,8 @@ class PilotRuntime:
                 timeout_error: BaseException | None = exc
             else:
                 timeout_error = None
-            coordinator.stop_heartbeat(session)
             state = session.state
+            self._stop_confirmation_heartbeat(coordinator, session)
             if timeout_error is not None:
                 outcome = self._confirmation_failure(timeout_error)
             elif state.cas_lost:
@@ -2877,8 +2998,10 @@ class PilotRuntime:
                     message=coordinator._fallback_message(state),
                     conversation_id=request.conversation_id,
                     write_status="success" if state.succeeded else "failed",
+                    undo=self._confirmation_undo(state),
                     operation_id=state.identity.operation_id,
                     persisted=True,
+                    legacy_projection=True,
                 )
             elif _failure_status(fallback) in {
                 PersistenceStatus.PERSISTED.value,
@@ -2888,8 +3011,10 @@ class PilotRuntime:
                     message=coordinator._fallback_message(state),
                     conversation_id=request.conversation_id,
                     write_status="success" if state.succeeded else "failed",
+                    undo=self._confirmation_undo(state),
                     operation_id=state.identity.operation_id,
                     persisted=True,
+                    legacy_projection=True,
                 )
             elif state.confirmation_attempted:
                 outcome = self._failure(
@@ -2926,7 +3051,7 @@ class PilotRuntime:
             self._abandon(recorder, journal_started)
             raise
         except ConfirmationReplayError:
-            coordinator.stop_heartbeat(session)
+            self._stop_confirmation_heartbeat(coordinator, session)
             self._abandon(recorder, journal_started)
             try:
                 replay = coordinator.replay_outcome(request)
@@ -2938,7 +3063,6 @@ class PilotRuntime:
                 return replay
             raise
         except Exception as exc:
-            coordinator.stop_heartbeat(session)
             if _attribute(exc, "code") == RuntimeFailureCode.OPERATION_INTEGRITY_ERROR.value:
                 coordinator.cancel_cleanup(session)
                 self._abandon(recorder, journal_started)
@@ -2955,19 +3079,29 @@ class PilotRuntime:
                 delivery_error_value = None
             if delivery_error_value is not None:
                 outcome = self._confirmation_failure(delivery_error_value)
+            elif state.cas_lost:
+                outcome = self._failure(
+                    RuntimeFailureCode.STALE_PENDING_ACTION,
+                    "待确认操作已被更新，请刷新对话后重试。",
+                    409,
+                    retryable=True,
+                )
             elif _failure_status(failure_delivery) in {
                 PersistenceStatus.PERSISTED.value,
                 PersistenceStatus.DUPLICATE.value,
             }:
+                coordinator._hydrate_terminal_undo(state)
                 outcome = MessageOutcome(
                     message=coordinator._fallback_message(state),
                     conversation_id=request.conversation_id,
                     write_status="success" if state.succeeded else "failed",
+                    undo=self._confirmation_undo(state),
                     operation_id=state.identity.operation_id,
                     persisted=True,
+                    legacy_projection=True,
                 )
             else:
-                outcome = self._provider_confirmation_failure(exc)
+                outcome = self._provider_confirmation_failure(exc, resolved_model)
             self._finalize_confirmation_result(
                 recorder,
                 journal_started,
@@ -2986,7 +3120,7 @@ class PilotRuntime:
         finally:
             # ``stop_heartbeat`` is idempotent and is the final safety net for
             # provider failures, sink aborts, and uncancellable late results.
-            coordinator.stop_heartbeat(session)
+            self._stop_confirmation_heartbeat(coordinator, session)
 
     def _finish_ledger_confirmation(
         self,
@@ -2995,6 +3129,8 @@ class PilotRuntime:
         normalized: NormalizedAgentTurn,
         request: ConfirmationRequest,
         control: RuntimeInvocationControl,
+        *,
+        catalog: object | None = None,
     ) -> RuntimeOutcome:
         typed_session = cast(Any, session)
         state = typed_session.state
@@ -3060,27 +3196,117 @@ class PilotRuntime:
                     human=pending.human,
                     args=args,
                     confirmation_token=token,
+                    editable_fields=self._pending_editable_fields(
+                        pending, catalog or self._dependencies.catalog
+                    ),
+                    details=self._pending_action_details(pending),
                 ),
             )
         payload = _attribute(_attribute(state.terminal_execution, "payload"), "failure_code")
+        record_outcome = _attribute(_attribute(state, "execution_record"), "outcome")
+        compatibility_detail = _attribute(record_outcome, "compatibility_detail", "")
+        write_error = (
+            str(compatibility_detail)
+            if isinstance(compatibility_detail, str) and compatibility_detail
+            else str(payload) if payload else None
+        )
         write_status: WriteStatus = (
             "success" if state.succeeded else "failed"
         )
         if not state.approved:
             write_status = "cancelled"
-        undo = state.undo_update
         visible_reply = _user_facing_assistant_content(
             normalized.reply or continuation[-1].content if continuation else ""
+        )
+        visible_reply = _prepend_write_success(
+            visible_reply,
+            state.pending,
+            normalized.records,
         )
         return MessageOutcome(
             message=visible_reply,
             conversation_id=request.conversation_id,
             write_status=write_status,
-            write_error=str(payload) if payload else None,
-            undo=freeze_json_mapping(undo) if isinstance(undo, Mapping) and undo else None,
+            write_error=write_error,
+            undo=self._confirmation_undo(state),
             operation_id=state.identity.operation_id,
             replayed=state.replayed,
             persisted=True,
+            legacy_projection=True,
+        )
+
+    @staticmethod
+    def _confirmation_undo(state: object) -> ImmutablePayload | None:
+        raw = (
+            _attribute(state, "undo_update")
+            if _attribute(state, "approved", True)
+            else _attribute(state, "undo")
+        )
+        if not isinstance(raw, Mapping) or not raw:
+            return None
+        value = dict(raw)
+        identity = _attribute(state, "identity")
+        operation_id = _attribute(identity, "operation_id", "") or _attribute(
+            state, "undo_operation_id", ""
+        )
+        if isinstance(operation_id, str) and operation_id:
+            value["parent_operation_id"] = operation_id
+        return freeze_json_mapping(value)
+
+    @staticmethod
+    def _stop_confirmation_heartbeat(
+        coordinator: ConfirmationCoordinator,
+        session: ConfirmationSession,
+    ) -> None:
+        state = session.state
+        with state.lock:
+            retain_for_late_result = bool(
+                state.timed_out
+                and state.active
+                and state.confirmation_attempted
+                and not state.delivered
+                and not state.cas_lost
+            )
+        if not retain_for_late_result:
+            coordinator.stop_heartbeat(session)
+
+    def _previous_write_undo(
+        self,
+        conversation: object | None,
+        conversation_id: int | None = None,
+    ) -> ImmutablePayload | None:
+        raw = _attribute(conversation, "last_write_undo")
+        if raw is None and conversation_id is not None:
+            getter = _callable(self._dependencies.persistence, ("get_last_write_undo",))
+            if getter is not None:
+                raw = _invoke(
+                    getter,
+                    {"conversation_id": conversation_id, "id": conversation_id},
+                    (conversation_id,),
+                )
+        if not isinstance(raw, Mapping) or not raw:
+            return None
+        value = dict(raw)
+        operation_id = _attribute(conversation, "last_write_operation_id", "")
+        if isinstance(operation_id, str) and operation_id:
+            value["parent_operation_id"] = operation_id
+        return freeze_json_mapping(value)
+
+    def _pending_action_details(self, pending: PendingAction) -> ImmutablePayload:
+        function = _callable(self._dependencies.pending_action_details, ("resolve", "details"))
+        if function is None:
+            return freeze_json_mapping({})
+        value = _invoke(function, {"pending": pending}, (pending,))
+        return freeze_json_mapping(value) if isinstance(value, Mapping) else freeze_json_mapping({})
+
+    @staticmethod
+    def _pending_editable_fields(
+        pending: PendingAction,
+        _catalog: object | None,
+    ) -> tuple[ImmutablePayload, ...]:
+        return tuple(
+            freeze_json_mapping(cast(Mapping[str, object], descriptor))
+            for descriptor in editable_fields_for_tool(pending.tool_name)
         )
 
     @staticmethod
@@ -3117,7 +3343,31 @@ class PilotRuntime:
         )
 
     @staticmethod
-    def _provider_confirmation_failure(error: BaseException) -> RuntimeFailureOutcome:
+    def _provider_failure(
+        resolved: ResolvedModel | None,
+        error: Exception,
+    ) -> RuntimeFailureOutcome:
+        formatter = _attribute(resolved, "provider_error_message")
+        message = None
+        if callable(formatter):
+            try:
+                candidate = formatter(error)
+            except Exception:
+                candidate = None
+            if isinstance(candidate, str) and candidate:
+                message = candidate
+        return PilotRuntime._failure(
+            RuntimeFailureCode.AI_PROVIDER_ERROR,
+            message or "AI 连接失败。请检查 AI 设置或稍后重试。",
+            502,
+            retryable=True,
+        )
+
+    @staticmethod
+    def _provider_confirmation_failure(
+        error: BaseException,
+        resolved: ResolvedModel | None = None,
+    ) -> RuntimeFailureOutcome:
         """Map an uncategorized Agent/provider exception to the baseline 502."""
 
         if isinstance(error, PendingActionValidationError):
@@ -3136,11 +3386,9 @@ class PilotRuntime:
             )
         if _attribute(error, "code") not in (None, ""):
             return PilotRuntime._confirmation_failure(error)
-        return PilotRuntime._failure(
-            RuntimeFailureCode.AI_PROVIDER_ERROR,
-            "AI 连接失败。请检查 AI 设置或稍后重试。",
-            502,
-            retryable=True,
+        return PilotRuntime._provider_failure(
+            resolved,
+            error if isinstance(error, Exception) else RuntimeError(str(error)),
         )
 
     confirmation = continue_confirmation
@@ -3199,7 +3447,11 @@ class PilotRuntime:
         confirmation_coordinator = self._confirmation_coordinator()
         stream_replay: RuntimeOutcome | None = None
         preflight_pending: PendingAction | None = None
-        if isinstance(request, ConfirmationRequest) and confirmation_coordinator is not None:
+        if (
+            isinstance(request, ConfirmationRequest)
+            and confirmation_coordinator is not None
+            and not self._is_deterministic_confirmation(request)
+        ):
             try:
                 stream_replay = confirmation_coordinator.replay_outcome(request)
             except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
@@ -3367,7 +3619,11 @@ class PilotRuntime:
             )
 
         continuation = self._confirmation_coordinator()
-        if isinstance(request, ConfirmationRequest) and continuation is not None:
+        if (
+            isinstance(request, ConfirmationRequest)
+            and continuation is not None
+            and not self._is_deterministic_confirmation(request)
+        ):
             return self._prepare_ledger_confirmation_stream(
                 continuation,
                 request,
@@ -3518,7 +3774,7 @@ class PilotRuntime:
                 )
             except BaseException:
                 raise
-            if pending_guard is not None and pending_guard is not False:
+            if route is RouteKind.MODEL and pending_guard is not None and pending_guard is not False:
                 return self._stream_immediate(
                     self._failure(
                         RuntimeFailureCode.PENDING_CONFIRMATION_REQUIRED,
@@ -4033,7 +4289,18 @@ class PilotRuntime:
                                 pending_action=confirmation_outcome.pending_action,
                             ),
                         )
-                emit_runtime_event(safe_event_sink, CompletedEvent(response=confirmation_outcome))
+                if isinstance(confirmation_outcome, RuntimeFailureOutcome):
+                    emit_runtime_event(
+                        safe_event_sink,
+                        ErrorEvent(
+                            confirmation_outcome.code,
+                            confirmation_outcome.message,
+                            confirmation_outcome.retryable,
+                            confirmation_outcome.degraded,
+                        ),
+                    )
+                else:
+                    emit_runtime_event(safe_event_sink, CompletedEvent(response=confirmation_outcome))
                 return finish(confirmation_outcome, CompletionReason.NORMAL)
             except RuntimeCancelled:
                 abort(CompletionReason.CANCELLED)
@@ -4108,9 +4375,10 @@ class PilotRuntime:
                 return False
 
             driver = self._require_dependency("agent_driver")
+            invocation_holder: dict[str, AgentInvocation] = {}
 
             def build_invocation(agent_events: RuntimeEventSink) -> AgentInvocation:
-                return self._agent_invocation(
+                invocation = self._agent_invocation(
                     resolved_model,
                     tuple(_materialize_stream_value(item) for item in state.assembled),
                     state.conversation,
@@ -4120,6 +4388,8 @@ class PilotRuntime:
                     safe_signal_sink,
                     checked_cancel,
                 )
+                invocation_holder["value"] = invocation
+                return invocation
 
             # SseAgentExecutionHost owns an unbounded queue and passes its
             # typed sink to a one-argument thunk.  Sync/fake hosts use the
@@ -4163,6 +4433,11 @@ class PilotRuntime:
                 raw_result = execution_host.run(thunk, state.control)
             self._check_cancel(cancel_check, state.control)
             normalized = _normalize_agent_result(raw_result)
+            completed_invocation = invocation_holder.get("value")
+            if completed_invocation is not None:
+                self._settle_deferred_proposals(
+                    completed_invocation.run_recorder, normalized.pending
+                )
         except RuntimeAgentTimedOut:
             persistence = self._require_dependency("persistence")
             timeout_result: object | None = None
@@ -4233,13 +4508,7 @@ class PilotRuntime:
             abort(CompletionReason.TRANSPORT_ABORTED)
             raise
         except Exception as exc:
-            del exc
-            outcome = self._failure(
-                RuntimeFailureCode.AI_PROVIDER_ERROR,
-                "AI 连接失败。请检查 AI 设置或稍后重试。",
-                502,
-                retryable=True,
-            )
+            outcome = self._provider_failure(resolved_model, exc)
             self._finish(
                 state.recorder,
                 state.journal_started,
@@ -4301,6 +4570,10 @@ class PilotRuntime:
                         human=normalized.pending.human,
                         args=args,
                         confirmation_token=token,
+                        editable_fields=self._pending_editable_fields(
+                            normalized.pending, resolved_model.catalog
+                        ),
+                        details=self._pending_action_details(normalized.pending),
                     )
                     emit_runtime_event(
                         safe_event_sink,
@@ -4370,11 +4643,16 @@ class PilotRuntime:
         self,
         outcome: RuntimeFailureOutcome,
         control: RuntimeInvocationControl,
+        *,
+        direct: bool = False,
     ) -> ImmediateHttpOutcome:
         self._mark_completed_if_active(control)
         payload: dict[str, object] = {
             "error": outcome.message,
             "error_code": outcome.code.value,
+            "_runtime_stream_retryable": outcome.retryable,
+            "_runtime_stream_degraded": outcome.degraded,
+            "_runtime_stream_direct": direct or outcome.status_code == 422,
         }
         if outcome.pending_action is not None:
             payload["pending_action"] = outcome.pending_action.as_mapping()
@@ -4506,7 +4784,7 @@ class PilotRuntime:
                     rejected=outcome.write_status == "cancelled",
                 )
         if isinstance(outcome, RuntimeFailureOutcome):
-            return self._stream_immediate(outcome, invocation_control)
+            return self._stream_immediate(outcome, invocation_control, direct=True)
         if isinstance(outcome, OperationPendingOutcome):
             status = 409 if outcome.code is RuntimeFailureCode.OPERATION_DELIVERY_PENDING else 503
             self._mark_completed_if_active(invocation_control)
@@ -4517,6 +4795,7 @@ class PilotRuntime:
                         "error": outcome.message,
                         "error_code": outcome.code.value,
                         "operation_id": outcome.operation_id,
+                        "_runtime_stream_direct": True,
                     }
                 ),
             )
@@ -4618,7 +4897,7 @@ class PilotRuntime:
                     ),
                     transport,
                     invocation_control,
-                    execution_path="rejection",
+                    execution_path="agent_resume",
                 )
                 claimed = session.on_confirmation_attempt(session.pending, None)
                 if isinstance(session.state.terminal_execution, OperationReplay):
@@ -4668,7 +4947,7 @@ class PilotRuntime:
                 )
                 origin = Message(
                     role="tool",
-                    content=visible,
+                    content=_CANCELLED_TOOL_RESULT,
                     tool_call_id=session.pending.tool_call_id,
                 )
                 session.on_confirmation_result(session.pending, False, origin, None)
@@ -4709,7 +4988,9 @@ class PilotRuntime:
                     message=visible,
                     conversation_id=conversation_id,
                     write_status="cancelled",
+                    undo=self._previous_write_undo(conversation, conversation_id),
                     operation_id=session.state.identity.operation_id,
+                    legacy_projection=True,
                 )
                 self._close_ledger_journal(
                     recorder,
@@ -4898,10 +5179,6 @@ class PilotRuntime:
             coordinator.cancel_cleanup(session)
             self._abandon(recorder, journal_started)
             bind_outcome = self._confirmation_failure(exc)
-            emit_runtime_event(
-                event_sink,
-                ErrorEvent(bind_outcome.code, bind_outcome.message, bind_outcome.retryable, bind_outcome.degraded),
-            )
             return bind_outcome
         except BaseException:
             coordinator = cast(ConfirmationCoordinator, self._confirmation_coordinator())
@@ -4958,7 +5235,7 @@ class PilotRuntime:
             "event_sink": confirmation_event_sink,
             "signal_sink": signal_sink,
             "runtime_signal_sink": signal_sink,
-            "cancel_check": cancel_check,
+            "cancel_check": self._confirmation_cancel_check(state.control, cancel_check),
             "confirmation_attempt_sink": session.on_confirmation_attempt,
             "on_confirmation_attempt": session.on_confirmation_attempt,
             "confirmation_result_sink": session.on_confirmation_result,
@@ -5059,7 +5336,7 @@ class PilotRuntime:
             else:
                 timeout_error = None
             state_value = session.state
-            coordinator.stop_heartbeat(session)
+            self._stop_confirmation_heartbeat(coordinator, session)
             if timeout_error is not None:
                 outcome = self._confirmation_failure(timeout_error)
             elif state_value.cas_lost:
@@ -5074,8 +5351,10 @@ class PilotRuntime:
                     message=coordinator._fallback_message(state_value),
                     conversation_id=request.conversation_id,
                     write_status="success" if state_value.succeeded else "failed",
+                    undo=self._confirmation_undo(state_value),
                     operation_id=state_value.identity.operation_id,
                     persisted=True,
+                    legacy_projection=True,
                 )
             elif _failure_status(fallback) in {
                 PersistenceStatus.PERSISTED.value,
@@ -5085,8 +5364,10 @@ class PilotRuntime:
                     message=coordinator._fallback_message(state_value),
                     conversation_id=request.conversation_id,
                     write_status="success" if state_value.succeeded else "failed",
+                    undo=self._confirmation_undo(state_value),
                     operation_id=state_value.identity.operation_id,
                     persisted=True,
+                    legacy_projection=True,
                 )
             elif state_value.confirmation_attempted:
                 outcome = self._failure(
@@ -5114,11 +5395,6 @@ class PilotRuntime:
             )
             if isinstance(outcome, MessageOutcome):
                 emit_runtime_event(event_sink, AssistantMessageEvent(message=outcome.message))
-            else:
-                emit_runtime_event(
-                    event_sink,
-                    ErrorEvent(outcome.code, outcome.message, outcome.retryable, outcome.degraded),
-                )
             return outcome
         except (RuntimeCancelled, RuntimeTransportAborted):
             coordinator.cancel_cleanup(session)
@@ -5131,10 +5407,6 @@ class PilotRuntime:
                 replay = coordinator.replay_outcome(request)
             except Exception as exc:
                 outcome = self._confirmation_failure(exc)
-                emit_runtime_event(
-                    event_sink,
-                    ErrorEvent(outcome.code, outcome.message, outcome.retryable, outcome.degraded),
-                )
                 return outcome
             if replay is not None:
                 if isinstance(replay, OperationReplayOutcome):
@@ -5142,15 +5414,10 @@ class PilotRuntime:
                 return replay
             raise
         except Exception as exc:
-            coordinator.stop_heartbeat(session)
             if _attribute(exc, "code") == RuntimeFailureCode.OPERATION_INTEGRITY_ERROR.value:
                 coordinator.cancel_cleanup(session)
                 self._abandon(recorder, journal_started)
                 outcome = self._confirmation_failure(exc)
-                emit_runtime_event(
-                    event_sink,
-                    ErrorEvent(outcome.code, outcome.message, outcome.retryable, outcome.degraded),
-                )
                 return outcome
             state_value = session.state
             try:
@@ -5162,16 +5429,26 @@ class PilotRuntime:
                 delivery_error_value = None
             if delivery_error_value is not None:
                 outcome = self._confirmation_failure(delivery_error_value)
+            elif state_value.cas_lost:
+                outcome = self._failure(
+                    RuntimeFailureCode.STALE_PENDING_ACTION,
+                    "待确认操作已被更新，请刷新对话后重试。",
+                    409,
+                    retryable=True,
+                )
             elif _failure_status(failure_delivery) in {
                 PersistenceStatus.PERSISTED.value,
                 PersistenceStatus.DUPLICATE.value,
             }:
+                coordinator._hydrate_terminal_undo(state_value)
                 outcome = MessageOutcome(
                     message=coordinator._fallback_message(state_value),
                     conversation_id=request.conversation_id,
                     write_status="success" if state_value.succeeded else "failed",
+                    undo=self._confirmation_undo(state_value),
                     operation_id=state_value.identity.operation_id,
                     persisted=True,
+                    legacy_projection=True,
                 )
             else:
                 outcome = self._provider_confirmation_failure(exc)
@@ -5184,19 +5461,15 @@ class PilotRuntime:
                 event_sink=event_sink,
                 deferred_origin_events=deferred_origin_events,
             )
-            emit_runtime_event(
-                event_sink,
-                ErrorEvent(outcome.code, outcome.message, outcome.retryable, outcome.degraded)
-                if isinstance(outcome, RuntimeFailureOutcome)
-                else AssistantMessageEvent(message=outcome.message),
-            )
+            if isinstance(outcome, MessageOutcome):
+                emit_runtime_event(event_sink, AssistantMessageEvent(message=outcome.message))
             return outcome
         except BaseException:
             coordinator.cancel_cleanup(session)
             self._abandon(recorder, journal_started)
             raise
         finally:
-            coordinator.stop_heartbeat(session)
+            self._stop_confirmation_heartbeat(coordinator, session)
 
     @staticmethod
     def _mark_completed_if_active(control: RuntimeInvocationControl) -> None:
@@ -5388,7 +5661,7 @@ class PilotRuntime:
         except ModelUnconfiguredError:
             return self._failure(
                 RuntimeFailureCode.MODEL_UNCONFIGURED,
-                "AI 设置尚未完成，请检查模型配置。",
+                "AI is not configured: run `oc config` to set your API key",
                 503,
                 retryable=False,
             )
@@ -5940,6 +6213,8 @@ class PilotRuntime:
         result: str,
         succeeded: bool,
         control: RuntimeInvocationControl,
+        *,
+        allow_timeout: bool = False,
     ) -> None:
         if not started:
             return
@@ -5964,6 +6239,7 @@ class PilotRuntime:
                 source_ref_id=pending.tool_call_id,
             ),
             control=control,
+            allow_timeout=allow_timeout,
         )
 
     def _start_deterministic_turn(
@@ -6322,6 +6598,17 @@ class PilotRuntime:
                 allow_timeout=allow_timeout,
             )
 
+    @staticmethod
+    def _settle_deferred_proposals(recorder: object, pending: PendingAction | None) -> None:
+        """Order tool proposal facts after the assistant tool-call persists."""
+
+        if pending is not None:
+            settle = getattr(recorder, "discard_proposals", None)
+        else:
+            settle = getattr(recorder, "release_proposals", None)
+        if callable(settle):
+            settle()
+
     def _load_source(self, conversation: object, request: StartTurnRequest) -> object:
         loader = self._require_dependency("source_loader")
         function = _callable(loader, ("load", "load_sources", "load_chat_source_messages"))
@@ -6589,6 +6876,8 @@ class PilotRuntime:
                 human=pending.human,
                 args=args,
                 confirmation_token=token,
+                editable_fields=self._pending_editable_fields(pending, catalog),
+                details=self._pending_action_details(pending),
             )
             return _PersistedTurn(
                 ConfirmationRequiredOutcome(
@@ -7052,6 +7341,22 @@ class PilotRuntime:
             require_runtime_active(control)
             raise RuntimeCancelled()
         require_runtime_active(control)
+
+    @staticmethod
+    def _confirmation_cancel_check(
+        control: RuntimeInvocationControl,
+        external_check: Callable[[], bool],
+    ) -> Callable[[], bool]:
+        """Preserve the route cancel seam while fencing late confirmation work."""
+
+        def check() -> bool:
+            if external_check():
+                require_runtime_active(control)
+                raise RuntimeCancelled()
+            require_runtime_active(control)
+            return False
+
+        return check
 
     @staticmethod
     def _allow_timeout_persistence(control: RuntimeInvocationControl) -> None:

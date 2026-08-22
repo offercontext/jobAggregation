@@ -1442,6 +1442,7 @@ class DeterministicPilotAdapter:
                 function,
                 {
                     "conversation_id": conversation_id,
+                    "expected": pending,
                     "pending": pending,
                     "tool_message": origin,
                     "undo": undo,
@@ -1600,6 +1601,7 @@ class DeterministicPilotAdapter:
                 function,
                 {
                     "conversation_id": conversation_id,
+                    "expected": pending,
                     "pending": pending,
                     "replacement": replacement,
                     "tool_message": origin,

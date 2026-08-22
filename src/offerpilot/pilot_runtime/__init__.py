@@ -91,6 +91,7 @@ from .persistence import (
     PersistenceResult,
     PersistenceStatus,
 )
+from .event_sink import InMemoryRuntimeInvocationControl
 from .service import (
     AgentDriver,
     AgentInvocation,
@@ -111,6 +112,7 @@ from .service import (
     StartTurnDependencies,
     ToolCatalog,
 )
+from .composition import build_pilot_runtime
 
 __all__ = [
     "AgentExecutionHost",
@@ -154,6 +156,7 @@ __all__ = [
     "FirstModelCompletedSignal",
     "freeze_json_mapping",
     "ImmediateHttpOutcome",
+    "InMemoryRuntimeInvocationControl",
     "ImmutablePayload",
     "InvocationState",
     "JournalFactory",
@@ -212,4 +215,5 @@ __all__ = [
     "ToolResultStatus",
     "UserMessageSavedEvent",
     "WriteStatus",
+    "build_pilot_runtime",
 ]

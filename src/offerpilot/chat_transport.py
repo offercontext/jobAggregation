@@ -482,7 +482,11 @@ def outcome_http_payload(outcome: RuntimeOutcome | ImmediateHttpOutcome) -> dict
     """Project a typed outcome to the existing safe HTTP JSON body."""
 
     if type(outcome) is ImmediateHttpOutcome:
-        return {str(key): _plain(value) for key, value in outcome.payload.items()}
+        return {
+            str(key): _plain(value)
+            for key, value in outcome.payload.items()
+            if not str(key).startswith("_runtime_")
+        }
     if type(outcome) is MessageOutcome:
         return _http_message_payload(outcome)
     if type(outcome) is ConfirmationRequiredOutcome:
@@ -523,10 +527,17 @@ def outcome_http_status(outcome: RuntimeOutcome | ImmediateHttpOutcome) -> int:
     raise TypeError("outcome must be a typed RuntimeOutcome or ImmediateHttpOutcome")
 
 
-def outcome_http_response(outcome: RuntimeOutcome | ImmediateHttpOutcome) -> JSONResponse:
+def outcome_http_response(
+    outcome: RuntimeOutcome | ImmediateHttpOutcome,
+    *,
+    include_error_code: bool = True,
+) -> JSONResponse:
     """Construct one JSON response from an already validated outcome."""
 
-    return JSONResponse(outcome_http_payload(outcome), status_code=outcome_http_status(outcome))
+    payload = outcome_http_payload(outcome)
+    if not include_error_code and isinstance(outcome, RuntimeFailureOutcome):
+        payload.pop("error_code", None)
+    return JSONResponse(payload, status_code=outcome_http_status(outcome))
 
 
 def event_sse_name(event: RuntimeEvent) -> str:
@@ -1100,8 +1111,16 @@ class GuardedStreamingResponse(StreamingResponse):
             # the disconnect listener.  A receive-first barrier makes an
             # already disconnected response deterministic and, for a normal
             # request body, replays the first message unchanged.
-            spec_version = tuple(
-                map(int, scope.get("asgi", {}).get("spec_version", "2.0").split("."))
+            asgi_metadata = scope.get("asgi")
+            spec_text = (
+                asgi_metadata.get("spec_version")
+                if isinstance(asgi_metadata, Mapping)
+                else None
+            )
+            spec_version = (
+                tuple(map(int, spec_text.split(".")))
+                if isinstance(spec_text, str)
+                else (2, 4)
             )
             if spec_version < (2, 4):
                 first_message = await receive()

@@ -1,49 +1,30 @@
 import hashlib
 import json
-import os
 import re
 import sqlite3
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from hashlib import sha256
 from importlib.metadata import PackageNotFoundError, version as package_version
 from io import BytesIO
 from pathlib import Path
-from queue import Empty, Queue
 from secrets import compare_digest
-from threading import Event, Lock
 from time import perf_counter
 from typing import Any, Callable, Generator, Literal, Mapping, Optional, cast
 from uuid import UUID, uuid4
 
 from fastapi import BackgroundTasks, Body, FastAPI, File, Form, Query, Request, UploadFile
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pypdf import PdfReader
 from sqlalchemy.orm import Session
 
 from offerpilot.ai.agent import (
-    DEFAULT_MAX_ITERATIONS,
     ChatModel,
-    ChatRunCancelled,
     PendingAction,
-    PendingActionValidationError,
-    StalePendingActionError,
-    _rejection_result,
-    prepare_pending_action,
     resume_after_confirm,
-    run_turn,
 )
 from offerpilot.ai.deterministic_actions import (
-    PilotAction,
-    PilotOutcomeAction,
-    PilotSubmissionSnapshotAction,
-    build_outcome_pending_action,
-    build_pilot_pending_action,
-    build_submission_snapshot_pending_action,
-    decide_pilot_action,
     parse_pilot_action,
 )
 from offerpilot.ai.material_proposals import MaterialProposalModelError
@@ -80,23 +61,16 @@ from offerpilot.ai.client import ConfiguredAIClient
 from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.contracts import (
-    ExecutionAuthorization,
-    PreparedToolCall,
     ToolExecutionRecord,
     ToolFailure,
     ToolSuccess,
 )
-from offerpilot.ai.tool_runtime.journal import journal_shape_digest as _journal_shape_digest
-from offerpilot.ai.tool_runtime.legacy import prepare_legacy_arguments
 from offerpilot.ai.tool_specs.catalog import (
     MODEL_TOOL_CATALOG,
     editable_fields_for_tool,
 )
-from offerpilot.ai.tool_specs.legacy import build_legacy_deterministic_catalog
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.ai.write_operations import (
-    DeliveryHeartbeat,
-    OperationCommitted,
     OperationFailed,
     OperationReplay,
     OperationUnknown,
@@ -108,20 +82,10 @@ from offerpilot.ai.write_operations import (
     operation_request_fingerprint,
     load_or_create_ledger_key,
 )
-from offerpilot.agent_runtime.events import (
-    ContextManifestInput,
-    normalize_context_identity,
-    prepare_event,
-)
 from offerpilot.agent_runtime.journal import (
-    EventInput,
-    NullRunRecorder,
     NullRunRecorderFactory,
-    ResumedDisposition,
     RunRecorder,
     RunRecorderFactory,
-    SuspendedDisposition,
-    TerminalDisposition,
 )
 from offerpilot.agent_runtime.keyring import JOURNAL_KEY_FILENAME, load_or_create_journal_key
 from offerpilot.application_status import application_status_options, normalize_application_status
@@ -136,6 +100,32 @@ from offerpilot.config import (
 from offerpilot.context_projector.loader import ContextSourceLoader, fetch_rows
 from offerpilot.context_projector.contracts import ProjectionError
 from offerpilot.context_projector.signals import RegistrationState, RuntimeSignalSink
+from offerpilot.pilot_runtime import (
+    AttachmentReference,
+    ConfirmationRequest,
+    EditedArgs,
+    ErrorEvent,
+    ImmediateHttpOutcome,
+    InMemoryRuntimeInvocationControl,
+    PilotActionDescriptor,
+    PreparedStreamExecution,
+    RuntimeFailureCode,
+    RuntimeFailureOutcome,
+    RuntimeTransportContext,
+    StreamVersion,
+    StartTurnRequest,
+    build_pilot_runtime,
+    freeze_json_mapping,
+)
+from offerpilot.pilot_runtime.event_sink import (
+    ClosedAgentSignalSink,
+    RuntimeSignalLatch,
+)
+from offerpilot.pilot_runtime.errors import (
+    RuntimeAgentTimedOut,
+    RuntimeCancelled,
+    RuntimeTransportAborted,
+)
 from offerpilot.db import journal_session_factory_for_data_dir, session_factory_for_data_dir
 from offerpilot.diagnostics import append_log_entry, read_recent_log_page
 from offerpilot.knowledge import (
@@ -163,8 +153,6 @@ from offerpilot.knowledge.worker import (
 from offerpilot.repositories.applications import ApplicationCreate, ApplicationsRepository
 from offerpilot.repositories.agent_runs import (
     AgentRunRepository,
-    StartRunCommand,
-    StartSegmentCommand,
 )
 from offerpilot.repositories.application_jd_versions import (
     ApplicationJDService,
@@ -325,7 +313,15 @@ from offerpilot.schemas import (
     resume_payload,
 )
 from offerpilot.skills import SkillRegistryError, register_skill, skills_payload, update_skill
-from offerpilot.sse import STREAM_VERSION, SseRun, format_sse, sse_headers
+from offerpilot.sse import STREAM_VERSION, sse_headers
+from offerpilot.chat_transport import (
+    PreparedStreamGuard,
+    SseAgentExecutionHost,
+    SyncAgentExecutionHost,
+    build_guarded_streaming_response,
+    encode_sse_event,
+    outcome_http_response,
+)
 
 _MOCK_INTERVIEW_TRACE_RUN_ID = uuid4().hex
 
@@ -401,9 +397,6 @@ try:
 except PackageNotFoundError:
     APP_VERSION = "0.1.0"
 
-CHAT_CONFIRMED_WRITE_FALLBACK = "写入已完成，但暂时无法生成后续说明。你可以刷新数据查看结果。"
-CHAT_CONFIRMED_WRITE_ERROR_FALLBACK = "写入未完成，错误结果已记录。请检查输入后重试。"
-CHAT_REJECTION_FALLBACK = "已记录取消，但暂时无法生成后续说明。"
 CHAT_PAGE_CONTEXT_VIEWS = {
     "dashboard",
     "board",
@@ -434,19 +427,42 @@ _ORPHAN_TOOL_RESULT = json.dumps(
     ensure_ascii=False,
 )
 
-
-class ChatAgentTimedOut(RuntimeError):
-    pass
-
-
-class ChatOperationReplay(RuntimeError):
-    def __init__(self, replay: OperationReplay):
-        super().__init__(replay.operation_id)
-        self.replay = replay
-
-
-class _StaleConfirmationResponse(JSONResponse):
-    pass
+# The four Chat endpoints can surface these values from runtime outcomes,
+# operation-ledger records, and deterministic action adapters.  Keep the
+# closed public vocabulary visible at the transport boundary even though the
+# route implementation now delegates all orchestration to PilotRuntime.
+_CHAT_RUNTIME_FAILURE_CODE_CATALOG = frozenset(
+    {
+        "ai_provider_error",
+        "application_archive_idempotency_conflict",
+        "application_archive_invalid_request",
+        "application_archive_source_conflict",
+        "application_jd_idempotency_conflict",
+        "application_jd_invalid_request",
+        "application_jd_not_found",
+        "application_jd_stale_current_version",
+        "application_not_found",
+        "application_outcome_idempotency_conflict",
+        "application_outcome_invalid_request",
+        "application_outcome_source_conflict",
+        "chat_agent_timeout",
+        "confirmation_in_progress",
+        "conversation_archived",
+        "invalid_confirmation",
+        "operation_delivery_failed",
+        "operation_delivery_pending",
+        "operation_failed",
+        "operation_identity_conflict",
+        "operation_input_conflict",
+        "operation_integrity_error",
+        "operation_result_unknown",
+        "operation_unavailable",
+        "pending_confirmation_required",
+        "resume_not_found",
+        "source_load_failed",
+        "stale_pending_action",
+    }
+)
 
 
 def _json_datetime(value: Any) -> str | None:
@@ -1175,130 +1191,6 @@ def _log_mock_interview_ai_failure(
     )
 
 
-def _journal_start_run_builder(
-    *,
-    conversation_id: int,
-    input_message_id: int | None,
-    origin_kind: str,
-    context_type: object,
-    context_ref: object,
-    transport_mode: str,
-    transport_run_id: str | None,
-    route_kind: str,
-    application_visible: Callable[[int], bool],
-) -> Callable[..., StartRunCommand]:
-    def build(key: Any, budget_check: Callable[[], None]) -> StartRunCommand:
-        budget_check()
-        normalized = normalize_context_identity(
-            context_type,
-            context_ref,
-            application_visible=application_visible,
-            key=key,
-            budget_check=budget_check,
-        )
-        run_id = str(uuid4())
-        segment_id = str(uuid4())
-        run_started = prepare_event(
-            event_type="run.started",
-            execution_segment_id=segment_id,
-            facts={
-                "agent_run_id": run_id,
-                "origin_kind": origin_kind,
-                "conversation_id": conversation_id,
-                "context_type": normalized.context_type,
-                "transport_mode": transport_mode,
-            },
-            budget_check=budget_check,
-        )
-        segment_started = prepare_event(
-            event_type="segment.started",
-            execution_segment_id=segment_id,
-            facts={
-                "request_kind": "initial",
-                "transport_mode": transport_mode,
-                "execution_path": (
-                    "model_turn" if route_kind == "model" else "deterministic_action"
-                ),
-                "transport_run_id": transport_run_id,
-            },
-            budget_check=budget_check,
-        )
-        budget_check()
-        return StartRunCommand(
-            run_id=run_id,
-            conversation_id=conversation_id,
-            input_message_id=input_message_id,
-            origin_kind=origin_kind,
-            initial_context_type=normalized.context_type,
-            initial_context_entity_id=(
-                str(normalized.entity_id) if normalized.entity_id is not None else None
-            ),
-            initial_context_ref_fingerprint=normalized.ref_fingerprint,
-            fingerprint_key_id=key.key_id,
-            initial_transport_mode=transport_mode,
-            initial_route_kind=route_kind,
-            run_started=run_started,
-            segment_started=segment_started,
-        )
-
-    return build
-
-
-def _journal_pending_replay_builder(
-    *,
-    transport_mode: str,
-    transport_run_id: str | None,
-) -> Callable[..., StartSegmentCommand]:
-    def build(
-        run_id: str,
-        _key: Any,
-        budget_check: Callable[[], None],
-    ) -> StartSegmentCommand:
-        segment_id = str(uuid4())
-        event = prepare_event(
-            event_type="segment.started",
-            execution_segment_id=segment_id,
-            facts={
-                "request_kind": "pending_replay",
-                "transport_mode": transport_mode,
-                "execution_path": "deterministic_action",
-                "transport_run_id": transport_run_id,
-            },
-            budget_check=budget_check,
-        )
-        return StartSegmentCommand(run_id=run_id, segment_started=event)
-
-    return build
-
-
-def _journal_confirmation_segment_builder(
-    *,
-    transport_mode: str,
-    transport_run_id: str | None,
-    execution_path: str,
-) -> Callable[..., StartSegmentCommand]:
-    def build(
-        run_id: str,
-        _key: Any,
-        budget_check: Callable[[], None],
-    ) -> StartSegmentCommand:
-        segment_id = str(uuid4())
-        event = prepare_event(
-            event_type="segment.started",
-            execution_segment_id=segment_id,
-            facts={
-                "request_kind": "confirmation",
-                "transport_mode": transport_mode,
-                "execution_path": execution_path,
-                "transport_run_id": transport_run_id,
-            },
-            budget_check=budget_check,
-        )
-        return StartSegmentCommand(run_id=run_id, segment_started=event)
-
-    return build
-
-
 def create_app(
     data_dir: Optional[Path] = None,
     chat_model: Optional[ChatModel] = None,
@@ -1403,6 +1295,132 @@ def create_app(
     app.state.write_operation_coordinator = write_coordinator
     app.state.knowledge_runtime = knowledge_runtime
 
+    def _runtime_source_loader(
+        conversation: object,
+        request: object,
+        *,
+        attachments: tuple[object, ...] = (),
+        pending_tool_call_id: str = "",
+        **_kwargs: object,
+    ) -> object:
+        normalized_attachments: list[dict[str, str]] = []
+        for attachment in attachments:
+            if isinstance(attachment, AttachmentReference):
+                normalized_attachments.append(
+                    {"kind": attachment.kind, "id": attachment.ref}
+                )
+            elif isinstance(attachment, Mapping):
+                kind = attachment.get("kind")
+                ref = attachment.get("id", attachment.get("ref"))
+                if isinstance(kind, str) and isinstance(ref, str):
+                    normalized_attachments.append({"kind": kind, "id": ref})
+        return _load_chat_source_messages(
+            context_source_loader,
+            conversation,
+            normalized_attachments or None,
+            pending_tool_call_id=pending_tool_call_id,
+        )
+
+    def _runtime_tool_context(conversation: object, run_recorder: object) -> object:
+        return _model_tool_context(
+            cast(Any, conversation),
+            applications,
+            events,
+            notes,
+            offers,
+            resumes,
+            jd_analyses,
+            cast(RunRecorder, run_recorder),
+        )
+
+    def _runtime_resume_after_confirm(
+        model: object,
+        catalog: object,
+        messages: list[Message],
+        pending: PendingAction,
+        approved: bool,
+        auto_approve: bool,
+        max_iter: int,
+        rejection_feedback: str = "",
+        *,
+        thread_id: str = "conversation",
+        event_sink: object | None = None,
+        cancel_check: Callable[[], bool] | None = None,
+        confirmation_result_sink: object | None = None,
+        confirmation_attempt_sink: object | None = None,
+        run_recorder: object | None = None,
+        delivery_fence: object | None = None,
+        continuation_message_loader: object | None = None,
+        tool_context: object,
+    ) -> object:
+        return resume_after_confirm(
+            cast(ChatModel, model),
+            cast(Any, catalog),
+            messages,
+            pending,
+            approved=approved,
+            auto_approve=auto_approve,
+            max_iter=max_iter,
+            rejection_feedback=rejection_feedback,
+            thread_id=thread_id,
+            event_sink=cast(Any, event_sink),
+            cancel_check=cancel_check,
+            confirmation_result_sink=cast(Any, confirmation_result_sink),
+            confirmation_attempt_sink=cast(Any, confirmation_attempt_sink),
+            run_recorder=cast(Any, run_recorder),
+            delivery_fence=cast(Any, delivery_fence),
+            continuation_message_loader=cast(Any, continuation_message_loader),
+            tool_context=cast(Any, tool_context),
+        )
+
+    app.state.pilot_runtime = build_pilot_runtime(
+        data_dir=resolved_data_dir,
+        chat=chat,
+        applications=applications,
+        application_jd_versions=application_jd_versions,
+        application_outcomes=application_outcomes,
+        events=events,
+        notes=notes,
+        offers=offers,
+        resumes=resumes,
+        jd_analyses=jd_analyses,
+        context_source_loader=context_source_loader,
+        run_recorder_factory=resolved_run_recorder_factory,
+        chat_model=chat_model,
+        write_operations=write_operations,
+        write_coordinator=write_coordinator,
+        source_loader=_runtime_source_loader,
+        system_message=_chat_response_system_message,
+        clarification_message=_chat_clarification_message,
+        page_context_messages=lambda page: _chat_page_context_messages(
+            dict(page) if page is not None else None
+        ),
+        model_tool_context=_runtime_tool_context,
+        resume_after_confirm_fn=_runtime_resume_after_confirm,
+        missing_target_question=lambda pending, _conversation_id: _pending_action_missing_question(
+            cast(PendingAction, pending),
+            applications,
+        ),
+        pending_action_details=lambda pending: _pending_action_details(
+            pending.tool_name,
+            _safe_tool_args(pending.args),
+            applications,
+            application_jd_versions,
+        ),
+        undo_seed_for_pending=lambda pending, current_applications: _undo_seed_for_pending(
+            pending,
+            cast(Any, current_applications),
+        ),
+        build_write_undo=lambda pending, record, seed: _build_write_undo(
+            pending,
+            cast(Any, record),
+            cast(dict[str, Any], seed),
+        ),
+        title_from_message=_title_from_message,
+        catalog=MODEL_TOOL_CATALOG,
+        application_visible=lambda application_id: applications.get(application_id) is not None,
+    )
+
     @app.on_event("startup")
     def _start_knowledge_worker() -> None:
         knowledge_runtime.start()
@@ -1413,1076 +1431,6 @@ def create_app(
         context_source_loader.close()
         if journal_engine is not None:
             journal_engine.dispose()
-
-    def _start_journal_run(
-        conversation: Any,
-        *,
-        input_message_id: int | None,
-        origin_kind: str,
-        route_kind: str,
-        transport_mode: str,
-        transport_run_id: str | None,
-    ) -> RunRecorder:
-        try:
-            return cast(
-                RunRecorder,
-                cast(Any, resolved_run_recorder_factory).start_run(
-                    _journal_start_run_builder(
-                        conversation_id=int(conversation.id),
-                        input_message_id=input_message_id,
-                        origin_kind=origin_kind,
-                        context_type=conversation.context_type,
-                        context_ref=conversation.context_ref,
-                        transport_mode=transport_mode,
-                        transport_run_id=transport_run_id,
-                        route_kind=route_kind,
-                        application_visible=lambda application_id: (
-                            applications.get(application_id) is not None
-                        ),
-                    )
-                ),
-            )
-        except Exception:
-            return NullRunRecorder(["journal_run_create_failed"])
-
-    def _resume_journal_replay(
-        conversation_id: int,
-        pending: PendingAction,
-        *,
-        transport_mode: str,
-        transport_run_id: str | None,
-    ) -> RunRecorder:
-        try:
-            return cast(
-                RunRecorder,
-                cast(Any, resolved_run_recorder_factory).resume_waiting_run(
-                    conversation_id,
-                    pending.tool_call_id,
-                    _journal_pending_replay_builder(
-                        transport_mode=transport_mode,
-                        transport_run_id=transport_run_id,
-                    ),
-                ),
-            )
-        except Exception:
-            return NullRunRecorder(["journal_run_lookup_failed"])
-
-    def _resume_journal_confirmation(
-        conversation_id: int,
-        pending: PendingAction,
-        *,
-        transport_mode: str,
-        transport_run_id: str | None,
-        execution_path: str,
-    ) -> RunRecorder:
-        try:
-            return cast(
-                RunRecorder,
-                cast(Any, resolved_run_recorder_factory).resume_waiting_run(
-                    conversation_id,
-                    pending.tool_call_id,
-                    _journal_confirmation_segment_builder(
-                        transport_mode=transport_mode,
-                        transport_run_id=transport_run_id,
-                        execution_path=execution_path,
-                    ),
-                ),
-            )
-        except Exception:
-            return NullRunRecorder(["journal_run_lookup_failed"])
-
-    def _journal_call(operation: Callable[[], Any]) -> Any:
-        try:
-            return operation()
-        except Exception:
-            return None
-
-    def _record_journal_route(
-        recorder: RunRecorder,
-        *,
-        route_kind: str,
-        route_reason_code: str,
-    ) -> None:
-        _journal_call(
-            lambda: recorder.append_event(
-                EventInput(
-                    event_type="route.selected",
-                    facts={
-                        "route_kind": route_kind,
-                        "route_reason_code": route_reason_code,
-                    },
-                )
-            )
-        )
-
-    def _capture_initial_journal_context(
-        recorder: RunRecorder,
-        conversation: Any,
-        *,
-        tool_names: tuple[str, ...] = (),
-    ) -> None:
-        stored_messages = chat.list_messages(int(conversation.id))
-        logical_input = {
-            "conversation_id": int(conversation.id),
-            "context_type": str(conversation.context_type or "workspace"),
-            "context_ref": str(conversation.context_ref or ""),
-            "mode": str(conversation.mode or "general"),
-            "message_count": len(stored_messages),
-            "tool_names": list(tool_names),
-        }
-        manifest = ContextManifestInput(
-            conversation_message_ids=tuple(int(message.id) for message in stored_messages),
-            tool_names=tool_names,
-            attachment_refs=(),
-            domain_source_refs=(),
-        )
-        _journal_call(
-            lambda: recorder.capture_context(
-                logical_input,
-                manifest,
-                snapshot_kind="initial",
-            )
-        )
-
-    def _capture_confirmation_journal_context(
-        recorder: RunRecorder,
-        conversation: Any,
-        *,
-        tool_names: tuple[str, ...],
-    ) -> None:
-        stored_messages = chat.list_messages(int(conversation.id))
-        _journal_call(
-            lambda: recorder.capture_context(
-                {
-                    "conversation_id": int(conversation.id),
-                    "context_type": str(conversation.context_type or "workspace"),
-                    "context_ref": str(conversation.context_ref or ""),
-                    "message_count": len(stored_messages),
-                    "tool_names": list(tool_names),
-                },
-                ContextManifestInput(
-                    conversation_message_ids=tuple(int(message.id) for message in stored_messages),
-                    tool_names=tool_names,
-                    attachment_refs=(),
-                    domain_source_refs=(),
-                ),
-                snapshot_kind="confirmation_resume",
-            )
-        )
-
-    def _record_journal_approval(
-        recorder: RunRecorder,
-        *,
-        confirmation_attempt_id: str,
-        original_pending: PendingAction,
-        effective_pending: PendingAction,
-        approved: bool,
-        edited: bool,
-    ) -> None:
-        original_fingerprint = _journal_call(
-            lambda: recorder.fingerprint_pending_identity(
-                {
-                    "tool_call_id": original_pending.tool_call_id,
-                    "tool_name": original_pending.tool_name,
-                    "args": original_pending.args,
-                }
-            )
-        )
-        decided_fingerprint = _journal_call(
-            lambda: recorder.fingerprint_pending_identity(
-                {
-                    "tool_call_id": effective_pending.tool_call_id,
-                    "tool_name": effective_pending.tool_name,
-                    "args": effective_pending.args,
-                }
-            )
-        )
-        if not isinstance(original_fingerprint, str) or not isinstance(decided_fingerprint, str):
-            return
-        _journal_call(
-            lambda: recorder.append_event(
-                EventInput(
-                    event_type="approval.decided",
-                    facts={
-                        "confirmation_attempt_id": confirmation_attempt_id,
-                        "decision": (
-                            "rejected" if not approved else "edited" if edited else "approved"
-                        ),
-                        "tool_call_id": original_pending.tool_call_id,
-                        "original_input_fingerprint": original_fingerprint,
-                        "decided_input_fingerprint": decided_fingerprint,
-                    },
-                    source_ref_type="tool_call",
-                    source_ref_id=original_pending.tool_call_id,
-                )
-            )
-        )
-        _journal_call(
-            lambda: recorder.resume(
-                ResumedDisposition(
-                    confirmation_attempt_id=confirmation_attempt_id,
-                    tool_call_id=original_pending.tool_call_id,
-                )
-            )
-        )
-
-    def _record_journal_tool_start(
-        recorder: RunRecorder,
-        pending: PendingAction,
-    ) -> None:
-        _journal_call(
-            lambda: recorder.append_event(
-                EventInput(
-                    event_type="tool.started",
-                    facts={
-                        "tool_call_id": pending.tool_call_id,
-                        "tool_name": pending.tool_name,
-                        "result_contract": "legacy_string_v1",
-                    },
-                    source_ref_type="tool_call",
-                    source_ref_id=pending.tool_call_id,
-                )
-            )
-        )
-
-    def _record_journal_tool_result(
-        recorder: RunRecorder,
-        pending: PendingAction,
-        result: str,
-        succeeded: bool,
-    ) -> None:
-        if not succeeded:
-            event = EventInput(
-                event_type="tool.failed",
-                facts={
-                    "tool_call_id": pending.tool_call_id,
-                    "tool_name": pending.tool_name,
-                    "failure_category": "tool_error",
-                },
-                source_ref_type="tool_call",
-                source_ref_id=pending.tool_call_id,
-            )
-        else:
-            event = EventInput(
-                event_type="tool.completed",
-                facts={
-                    "tool_call_id": pending.tool_call_id,
-                    "tool_name": pending.tool_name,
-                    "outcome": "completed",
-                    "result_shape_digest": _journal_shape_digest(result),
-                },
-                source_ref_type="tool_call",
-                source_ref_id=pending.tool_call_id,
-            )
-        _journal_call(lambda: recorder.append_event(event))
-
-    def _deterministic_confirmation_journal_callbacks(
-        conversation: Any,
-        pending: PendingAction,
-        *,
-        edited: bool,
-        transport_mode: str,
-        transport_run_id: str | None,
-    ) -> tuple[
-        dict[str, RunRecorder],
-        Callable[[PendingAction, bool], None],
-        Callable[[PendingAction, str, bool], None],
-    ]:
-        holder: dict[str, RunRecorder] = {}
-        confirmation_attempt_id = str(uuid4())
-
-        def attempt(effective_pending: PendingAction, approved: bool) -> None:
-            recorder = _resume_journal_confirmation(
-                int(conversation.id),
-                pending,
-                transport_mode=transport_mode,
-                transport_run_id=transport_run_id,
-                execution_path="deterministic_confirmation",
-            )
-            holder["recorder"] = recorder
-            _capture_confirmation_journal_context(
-                recorder,
-                conversation,
-                tool_names=(pending.tool_name,),
-            )
-            _record_journal_approval(
-                recorder,
-                confirmation_attempt_id=confirmation_attempt_id,
-                original_pending=pending,
-                effective_pending=effective_pending,
-                approved=approved,
-                edited=edited,
-            )
-            if approved:
-                _record_journal_tool_start(recorder, effective_pending)
-
-        def result(effective_pending: PendingAction, value: str, succeeded: bool) -> None:
-            recorder = holder.get("recorder")
-            if recorder is not None:
-                _record_journal_tool_result(recorder, effective_pending, value, succeeded)
-
-        return holder, attempt, result
-
-    def _finish_deterministic_confirmation_journal(
-        holder: dict[str, RunRecorder],
-        original_pending: PendingAction,
-        response: JSONResponse | dict[str, Any],
-        conversation_id: int,
-    ) -> None:
-        recorder = holder.get("recorder")
-        if recorder is None:
-            return
-        current_pending = chat.get_pending_action(conversation_id)
-        if isinstance(response, _StaleConfirmationResponse):
-            _abandon_journal_segment(recorder)
-        elif (
-            current_pending is not None
-            and current_pending.tool_call_id != original_pending.tool_call_id
-        ):
-            _suspend_journal(recorder, current_pending)
-        elif isinstance(response, JSONResponse):
-            _finish_journal(recorder, "failed", "unknown")
-        else:
-            _finish_journal(recorder, "completed")
-
-    def _record_persisted_messages(recorder: RunRecorder, messages: list[Any]) -> None:
-        for message in messages:
-            if message.role not in {"assistant", "tool"}:
-                continue
-            message_id = int(message.id)
-            message_kind = str(message.role)
-            _journal_call(
-                lambda: recorder.append_event(
-                    EventInput(
-                        event_type="assistant.persisted",
-                        facts={
-                            "message_id": message_id,
-                            "message_kind": message_kind,
-                        },
-                        source_ref_type="message",
-                        source_ref_id=message_id,
-                    )
-                )
-            )
-
-    def _suspend_journal(recorder: RunRecorder, pending: PendingAction) -> None:
-        pending_identity = {
-            "tool_call_id": pending.tool_call_id,
-            "tool_name": pending.tool_name,
-            "args": pending.args,
-        }
-        pending_fingerprint = _journal_call(
-            lambda: recorder.fingerprint_pending_identity(pending_identity)
-        )
-        _journal_call(
-            lambda: recorder.suspend(
-                SuspendedDisposition(
-                    tool_call_id=pending.tool_call_id,
-                    tool_name=pending.tool_name,
-                    tool_kind="write",
-                    args_shape_digest=_journal_shape_digest(pending.args),
-                    pending_identity_fingerprint=(
-                        pending_fingerprint if isinstance(pending_fingerprint, str) else None
-                    ),
-                    pending_identity=pending_identity,
-                )
-            )
-        )
-
-    def _finish_journal(
-        recorder: RunRecorder,
-        status: Literal["completed", "failed", "cancelled", "timed_out"],
-        failure_code: str | None = None,
-    ) -> None:
-        _journal_call(
-            lambda: recorder.finish(TerminalDisposition(status=status, failure_code=failure_code))
-        )
-
-    def _finish_journal_replay(recorder: RunRecorder) -> None:
-        _journal_call(
-            lambda: recorder.append_event(
-                EventInput(
-                    event_type="segment.finished",
-                    facts={"outcome": "noop", "terminal_run_status": None},
-                )
-            )
-        )
-
-    def _abandon_journal_segment(recorder: RunRecorder) -> None:
-        _journal_call(recorder.abandon)
-
-    def _deterministic_pilot_pending_messages(pending: PendingAction) -> list[dict[str, str]]:
-        return [
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": json.dumps(
-                    [
-                        {
-                            "id": pending.tool_call_id,
-                            "name": pending.tool_name,
-                            "args": _safe_tool_args(pending.args),
-                        }
-                    ],
-                    ensure_ascii=False,
-                ),
-            }
-        ]
-
-    def _deterministic_pilot_application(conversation: Any) -> Any | JSONResponse:
-        if conversation.context_type != "application":
-            return error_response(422, "application context is required for saving a JD")
-        try:
-            application_id = int(conversation.context_ref)
-        except (TypeError, ValueError):
-            return error_response(422, "application context is invalid")
-        application = applications.get(application_id)
-        if application is None:
-            return error_response(404, "application not found")
-        return application
-
-    def _new_deterministic_context_error(
-        payload: dict[str, Any], message: str
-    ) -> JSONResponse | None:
-        if (
-            "pilot_action" not in payload
-            and decide_pilot_action(message, has_current_jd=False).kind == "normal_agent"
-        ):
-            return None
-        context_type = str(payload.get("context_type") or "workspace").strip() or "workspace"
-        if context_type != "application":
-            return error_response(422, "application context is required for saving a JD")
-        try:
-            application_id = int(str(payload.get("context_ref") or ""))
-        except (TypeError, ValueError):
-            return error_response(422, "application context is invalid")
-        if applications.get(application_id) is None:
-            return error_response(404, "application not found")
-        return None
-
-    def _is_deterministic_pilot_route(
-        payload: dict[str, Any],
-        message: str,
-        conversation: Any,
-    ) -> bool:
-        if "pilot_action" in payload:
-            return True
-        clarification = chat.get_pending_clarification(int(conversation.id))
-        if (
-            clarification is not None
-            and clarification[0].tool_name == "save_application_jd_version"
-        ):
-            return True
-        application = _deterministic_pilot_application(conversation)
-        if isinstance(application, JSONResponse):
-            return False
-        current_jd = application_jd_versions.get_current(application.id)
-        return (
-            decide_pilot_action(
-                message,
-                has_current_jd=current_jd is not None,
-                collecting_jd=False,
-            ).kind
-            != "normal_agent"
-        )
-
-    def _deterministic_pilot_chat(
-        payload: dict[str, Any],
-        message: str,
-        conversation_id: int,
-        conversation: Any,
-        *,
-        on_user_message_persisted: Callable[[Any], None] | None = None,
-    ) -> JSONResponse | dict[str, Any] | None:
-        def append_user_message() -> Any:
-            persisted = chat.append_message(conversation_id, "user", content=message)
-            if on_user_message_persisted is not None:
-                on_user_message_persisted(persisted)
-            return persisted
-
-        explicit_action = "pilot_action" in payload
-        action = None
-        if explicit_action:
-            try:
-                action = parse_pilot_action(payload["pilot_action"])
-            except ValueError as exc:
-                return error_response(422, str(exc))
-
-        clarification = chat.get_pending_clarification(conversation_id)
-        jd_clarification = (
-            clarification
-            if clarification is not None
-            and clarification[0].tool_name == "save_application_jd_version"
-            else None
-        )
-        current_jd = None
-        application = _deterministic_pilot_application(conversation)
-        if isinstance(application, JSONResponse):
-            if explicit_action or jd_clarification is not None:
-                return application
-            return None
-        current_jd = application_jd_versions.get_current(application.id)
-
-        if explicit_action and isinstance(
-            action, (PilotSubmissionSnapshotAction, PilotOutcomeAction)
-        ):
-            existing_pending = chat.get_pending_action(conversation_id)
-            if existing_pending is not None:
-                return {
-                    "type": "confirmation_required",
-                    "conversation_id": conversation_id,
-                    "pending_action": _pending_action_json(
-                        existing_pending, applications, application_jd_versions
-                    ),
-                }
-            pending = (
-                build_submission_snapshot_pending_action(
-                    application_id=application.id,
-                    action=action,
-                    id_factory=lambda: uuid4().hex,
-                    key_factory=lambda: uuid4().hex,
-                )
-                if isinstance(action, PilotSubmissionSnapshotAction)
-                else build_outcome_pending_action(
-                    application_id=application.id,
-                    action=action,
-                    id_factory=lambda: uuid4().hex,
-                    key_factory=lambda: uuid4().hex,
-                )
-            )
-            append_user_message()
-            if not chat.persist_pending_action(
-                conversation_id, pending, _deterministic_pilot_pending_messages(pending)
-            ):
-                return error_response(409, "conversation is archived")
-            return {
-                "type": "confirmation_required",
-                "conversation_id": conversation_id,
-                "pending_action": _pending_action_json(
-                    pending, applications, application_jd_versions
-                ),
-            }
-
-        if explicit_action:
-            if isinstance(action, PilotAction) and action.jd_text is None:
-                decision_kind = "collecting_jd"
-                decision_question = "请粘贴完整岗位描述"
-                decision_text = None
-            else:
-                decision_kind = "pending_confirmation"
-                decision_question = ""
-                decision_text = action.jd_text if isinstance(action, PilotAction) else None
-        else:
-            decision = decide_pilot_action(
-                message,
-                has_current_jd=current_jd is not None,
-                collecting_jd=jd_clarification is not None,
-            )
-            decision_kind = decision.kind
-            decision_question = decision.question
-            decision_text = decision.jd_text
-
-        if decision_kind == "normal_agent":
-            return None
-
-        existing_pending = chat.get_pending_action(conversation_id)
-        if existing_pending is not None:
-            if existing_pending.tool_name != "save_application_jd_version":
-                return error_response(409, "请先处理当前待确认操作")
-            return {
-                "type": "confirmation_required",
-                "conversation_id": conversation_id,
-                "pending_action": _pending_action_json(
-                    existing_pending, applications, application_jd_versions
-                ),
-            }
-
-        if decision_kind == "cancelled":
-            append_user_message()
-            chat.clear_pending_clarification(conversation_id)
-            chat.append_message(conversation_id, "assistant", content="已取消保存岗位资料。")
-            return {
-                "type": "message",
-                "conversation_id": conversation_id,
-                "message": "已取消保存岗位资料。",
-            }
-
-        if decision_kind == "collecting_jd":
-            source_url = action.source_url if isinstance(action, PilotAction) else None
-            pending = build_pilot_pending_action(
-                application_id=application.id,
-                current_version_id=current_jd.id if current_jd is not None else None,
-                jd_text="",
-                source_url=source_url,
-                id_factory=lambda: uuid4().hex,
-                key_factory=lambda: uuid4().hex,
-            )
-            append_user_message()
-            chat.clear_pending_action(conversation_id)
-            chat.set_pending_clarification(conversation_id, pending, decision_question)
-            chat.append_message(conversation_id, "assistant", content=decision_question)
-            return {
-                "type": "message",
-                "conversation_id": conversation_id,
-                "message": decision_question,
-            }
-
-        if not isinstance(decision_text, str) or not decision_text.strip():
-            return error_response(422, "jd_text is required")
-        source_url = action.source_url if isinstance(action, PilotAction) else None
-
-        def new_id() -> str:
-            return uuid4().hex
-
-        def new_key() -> str:
-            return uuid4().hex
-
-        id_factory: Callable[[], str] = new_id
-        key_factory: Callable[[], str] = new_key
-        if jd_clarification is not None:
-            previous_pending = jd_clarification[0]
-            previous_args = _safe_tool_args(previous_pending.args)
-            previous_key = previous_args.get("idempotency_key")
-            if isinstance(previous_key, str):
-
-                def previous_id() -> str:
-                    return previous_pending.tool_call_id
-
-                def previous_key_factory() -> str:
-                    return previous_key
-
-                id_factory = previous_id
-                key_factory = previous_key_factory
-            if source_url is None:
-                previous_url = previous_args.get("source_url")
-                source_url = previous_url if isinstance(previous_url, str) else None
-
-        pending = build_pilot_pending_action(
-            application_id=application.id,
-            current_version_id=current_jd.id if current_jd is not None else None,
-            jd_text=decision_text,
-            source_url=source_url,
-            id_factory=id_factory,
-            key_factory=key_factory,
-        )
-        append_user_message()
-        if not chat.persist_pending_action(
-            conversation_id,
-            pending,
-            _deterministic_pilot_pending_messages(pending),
-        ):
-            return error_response(409, "conversation is archived")
-        return {
-            "type": "confirmation_required",
-            "conversation_id": conversation_id,
-            "pending_action": _pending_action_json(pending, applications, application_jd_versions),
-        }
-
-    def _deterministic_pilot_stream_response(
-        conversation: Any,
-        response: dict[str, Any],
-        *,
-        run: SseRun | None = None,
-    ) -> StreamingResponse:
-        if run is None:
-            run = SseRun(
-                run_id=str(uuid4()),
-                conversation_id=int(response["conversation_id"]),
-                context_type=str(conversation.context_type or "workspace"),
-                context_ref=str(conversation.context_ref or ""),
-                mode=str(conversation.mode or "general"),
-            )
-
-        def emit(event: str, data: dict[str, Any] | None = None) -> str:
-            envelope = run.envelope(event, data)
-            return format_sse(event, f"{run.run_id}:{envelope['seq']}", envelope)
-
-        def stream() -> Any:
-            yield emit(
-                "meta",
-                {
-                    "stream_version": STREAM_VERSION,
-                    "supports_delta": False,
-                    "supports_tool_events": False,
-                    "supports_confirmation": True,
-                },
-            )
-            yield emit("user_message_saved", {"role": "user"})
-            if response["type"] == "confirmation_required":
-                yield emit("status", {"phase": "waiting_confirmation", "label": "需要确认"})
-                yield emit(
-                    "confirmation_required",
-                    {"pending_action": response["pending_action"]},
-                )
-            else:
-                yield emit("status", {"phase": "collecting_jd", "label": "等待岗位描述"})
-                yield emit("assistant_message", {"message": response["message"]})
-            yield emit("completed", {"response": response, "persisted": True})
-
-        return StreamingResponse(
-            stream(), media_type="text/event-stream; charset=utf-8", headers=sse_headers()
-        )
-
-    def _deterministic_pilot_confirmation(
-        conversation_id: int,
-        pending: PendingAction,
-        *,
-        approved: bool,
-        edited_args: dict[str, Any] | None,
-        rejection_feedback: str,
-        request_fingerprint: str,
-        on_confirmation_attempt: Callable[[PendingAction, bool], None] | None = None,
-        on_tool_result: Callable[[PendingAction, str, bool], None] | None = None,
-    ) -> JSONResponse | dict[str, Any]:
-        legacy_catalog = build_legacy_deterministic_catalog(
-            application_jd_versions,
-            application_outcomes,
-        )
-        adapter = legacy_catalog.resolve_server_loaded(pending)
-        if adapter is None:
-            return error_response(409, "pending action is no longer available")
-        delivery_ownership = None
-        try:
-            if approved:
-                effective_args, human = prepare_legacy_arguments(
-                    adapter,
-                    pending.args,
-                    edited_args,
-                )
-                effective_pending = PendingAction(
-                    tool_call_id=pending.tool_call_id,
-                    tool_name=pending.tool_name,
-                    args=effective_args,
-                    human=human,
-                )
-            else:
-                effective_pending = pending
-        except ValueError as exc:
-            return error_response(422, f"invalid confirmation edits: {exc}")
-
-        if approved:
-            validation_error = adapter.validate(effective_pending.args)
-            if validation_error:
-                return error_response(422, validation_error)
-            if on_confirmation_attempt is not None:
-                on_confirmation_attempt(effective_pending, True)
-            if write_coordinator is None or write_operations is None:
-                return error_response(503, "写入账本暂不可用。", code="operation_unavailable")
-            input_fingerprint = ledger_fingerprint(
-                write_operations.key,
-                "write-operation-legacy-input-v1",
-                cast(Any, json.loads(effective_pending.args)),
-            )
-            execution = write_coordinator.execute_legacy(
-                operation_id=pending.operation_id,
-                conversation_id=conversation_id,
-                tool_call_id=pending.tool_call_id,
-                tool_name=pending.tool_name,
-                input_fingerprint=input_fingerprint,
-                request_fingerprint=request_fingerprint,
-                executor=lambda session: cast(
-                    Any,
-                    build_legacy_deterministic_catalog(
-                        application_jd_versions.bind(session),
-                        application_outcomes.bind(session),
-                    ).resolve_server_loaded(effective_pending),
-                ).execute(effective_pending.args),
-            )
-            if isinstance(execution, OperationUnknown):
-                return error_response(
-                    503 if execution.retryable else 409,
-                    "写入结果暂时无法确认，请保留确认卡后重试。",
-                    code=execution.code,
-                )
-            if isinstance(execution, OperationReplay):
-                replay_operation = write_operations.get(pending.operation_id)
-                if replay_operation is None:
-                    return error_response(
-                        503,
-                        "写入结果暂时无法确认，请保留确认卡后重试。",
-                        code="operation_result_unknown",
-                    )
-                return _operation_replay_response(
-                    conversation_id,
-                    _converged_operation_replay(
-                        write_operations, replay_operation, request_fingerprint
-                    ),
-                    chat,
-                    applications,
-                )
-            if isinstance(execution, (OperationCommitted, OperationFailed)):
-                delivery_ownership = execution.ownership
-            result = execution.payload.visible_result
-            succeeded = execution.payload.status == "committed"
-            failure_code = execution.payload.failure_code or ""
-            if on_tool_result is not None:
-                on_tool_result(effective_pending, result, succeeded)
-            tool_message = Message(
-                role="tool",
-                content=result,
-                tool_call_id=effective_pending.tool_call_id,
-            )
-
-            def persist_legacy_failure(status_code: int, message: str) -> JSONResponse:
-                generation = chat.resolve_pending_confirmation(
-                    conversation_id,
-                    pending,
-                    tool_message,
-                    {},
-                    claim_id=pending.operation_id,
-                    terminal_assistant_content=message,
-                    delivery_ownership=delivery_ownership,
-                )
-                if generation is None:
-                    return _StaleConfirmationResponse(
-                        {"error": "待确认操作已被更新，请刷新对话后重试。"},
-                        status_code=409,
-                    )
-                return error_response(status_code, message, code=failure_code)
-
-            if not succeeded:
-                if failure_code in {
-                    "application_jd_stale_current_version",
-                    "application_jd_idempotency_conflict",
-                }:
-                    args = _safe_tool_args(effective_pending.args)
-                    application_id = args.get("application_id")
-                    jd_text = args.get("jd_text")
-                    if type(application_id) is not int or not isinstance(jd_text, str):
-                        return persist_legacy_failure(409, "岗位资料已发生冲突，请刷新后重试。")
-                    current = application_jd_versions.get_current(application_id)
-                    source_url = args.get("source_url")
-                    try:
-                        replacement = build_pilot_pending_action(
-                            application_id=application_id,
-                            current_version_id=current.id if current is not None else None,
-                            jd_text=jd_text,
-                            source_url=source_url if isinstance(source_url, str) else None,
-                            id_factory=lambda: uuid4().hex,
-                            key_factory=lambda: uuid4().hex,
-                        )
-                    except ValueError:
-                        return persist_legacy_failure(409, "岗位资料已发生冲突，请刷新后重试。")
-                    replaced = chat.replace_pending_confirmation(
-                        conversation_id,
-                        pending,
-                        replacement,
-                        tool_message,
-                        {},
-                        terminal_assistant_content="当前岗位资料已变化，请重新确认保存。",
-                        claim_id=pending.operation_id,
-                        delivery_ownership=delivery_ownership,
-                    )
-                    if replaced is None:
-                        return _StaleConfirmationResponse(
-                            {"error": "待确认操作已被更新，请刷新对话后重试。"},
-                            status_code=409,
-                        )
-                    return error_response(
-                        409,
-                        "当前岗位资料已变化，请重新确认保存。",
-                        code=failure_code,
-                        details={
-                            "pending_action": _pending_action_json(
-                                replacement, applications, application_jd_versions
-                            )
-                        },
-                    )
-                if failure_code == "application_jd_invalid_request":
-                    return persist_legacy_failure(422, "岗位资料参数无效，请修改后重试。")
-                if failure_code in {
-                    "application_archive_idempotency_conflict",
-                    "application_archive_source_conflict",
-                    "application_outcome_idempotency_conflict",
-                    "application_outcome_source_conflict",
-                }:
-                    return persist_legacy_failure(409, "投递事实已发生变化，请刷新后重新确认。")
-                if failure_code in {
-                    "application_archive_invalid_request",
-                    "application_outcome_invalid_request",
-                }:
-                    return persist_legacy_failure(422, "投递事实参数无效，请修改后重试。")
-                return persist_legacy_failure(502, "岗位资料保存失败，请检查后重试。")
-            undo_update: dict[str, Any] | None = {}
-            response_message = (
-                "岗位资料已保存。" if succeeded else "岗位资料保存失败，请检查后重试。"
-            )
-            write_status = "success" if succeeded else "failed"
-        else:
-            if on_confirmation_attempt is not None:
-                on_confirmation_attempt(pending, False)
-            result = _CANCELLED_TOOL_RESULT
-            if write_coordinator is None or write_operations is None:
-                return error_response(503, "写入账本暂不可用。", code="operation_unavailable")
-            rejection = write_coordinator.reject_primary(
-                operation_id=pending.operation_id,
-                conversation_id=conversation_id,
-                tool_call_id=pending.tool_call_id,
-                tool_name=pending.tool_name,
-                request_fingerprint=request_fingerprint,
-                visible_result=result,
-            )
-            if isinstance(rejection, OperationUnknown):
-                rejection_error = WriteOperationError(
-                    rejection.code,
-                    retryable=rejection.retryable,
-                )
-                return error_response(
-                    _write_operation_error_status(rejection_error),
-                    "无法确认写入结果，请保留原请求后重试。",
-                    code=rejection.code,
-                )
-            if isinstance(rejection, OperationReplay):
-                replay_operation = write_operations.get(pending.operation_id)
-                if replay_operation is None:
-                    return error_response(
-                        503,
-                        "写入结果暂时无法确认，请保留确认卡后重试。",
-                        code="operation_result_unknown",
-                    )
-                return _operation_replay_response(
-                    conversation_id,
-                    _converged_operation_replay(
-                        write_operations, replay_operation, request_fingerprint
-                    ),
-                    chat,
-                    applications,
-                )
-            if isinstance(rejection, (OperationCommitted, OperationFailed)):
-                delivery_ownership = rejection.ownership
-            tool_message = Message(
-                role="tool",
-                content=result,
-                tool_call_id=pending.tool_call_id,
-            )
-            undo_update = None
-            response_message = "已取消保存岗位资料。"
-            write_status = "cancelled"
-
-        generation = chat.resolve_pending_confirmation(
-            conversation_id,
-            pending,
-            tool_message,
-            undo_update,
-            claim_id=pending.operation_id,
-            terminal_assistant_content=response_message,
-            delivery_ownership=delivery_ownership,
-        )
-        if generation is None:
-            return _StaleConfirmationResponse(
-                {"error": "待确认操作已被更新，请刷新对话后重试。"},
-                status_code=409,
-            )
-        response: dict[str, Any] = {
-            "type": "message",
-            "conversation_id": conversation_id,
-            "message": response_message,
-            "write_status": write_status,
-            "operation_id": pending.operation_id,
-            "replayed": isinstance(execution if approved else rejection, OperationReplay),
-        }
-        return response
-
-    def _deterministic_pilot_confirmation_stream_response(
-        conversation: Any,
-        response: dict[str, Any],
-        *,
-        run: SseRun | None = None,
-    ) -> StreamingResponse:
-        if run is None:
-            run = SseRun(
-                run_id=str(uuid4()),
-                conversation_id=int(response["conversation_id"]),
-                context_type=str(conversation.context_type or "workspace"),
-                context_ref=str(conversation.context_ref or ""),
-                mode=str(conversation.mode or "general"),
-            )
-
-        def emit(event: str, data: dict[str, Any] | None = None) -> str:
-            envelope = run.envelope(event, data)
-            return format_sse(event, f"{run.run_id}:{envelope['seq']}", envelope)
-
-        def stream() -> Any:
-            yield emit(
-                "meta",
-                {
-                    "stream_version": STREAM_VERSION,
-                    "supports_delta": False,
-                    "supports_tool_events": False,
-                    "supports_confirmation": True,
-                },
-            )
-            yield emit("user_message_saved", {"role": "user"})
-            yield emit("status", {"phase": "completed", "label": "已完成"})
-            yield emit("assistant_message", {"message": response["message"]})
-            yield emit("completed", {"response": response, "persisted": True})
-
-        return StreamingResponse(
-            stream(), media_type="text/event-stream; charset=utf-8", headers=sse_headers()
-        )
-
-    @app.middleware("http")
-    async def cors_middleware(request: Request, call_next):  # type: ignore[no-untyped-def]
-        audit_path = os.getenv("OFFERPILOT_HTTP_AUDIT_FILE")
-        if audit_path:
-            with open(audit_path, "a", encoding="utf-8") as audit:
-                audit.write(
-                    json.dumps(
-                        {
-                            "kind": "inbound",
-                            "scheme": request.url.scheme,
-                            "host": request.url.hostname,
-                            "port": request.url.port,
-                            "method": request.method,
-                            "path": request.url.path,
-                            "sec_fetch_mode": request.headers.get("sec-fetch-mode"),
-                            "sec_fetch_site": request.headers.get("sec-fetch-site"),
-                            "user_agent": request.headers.get("user-agent"),
-                        },
-                        ensure_ascii=True,
-                    )
-                    + "\n"
-                )
-        if request.method == "OPTIONS":
-            response = Response(status_code=200)
-        else:
-            auth_response = _auth_guard_response(request, resolved_data_dir)
-            response = auth_response if auth_response is not None else await call_next(request)
-        origin = request.headers.get("origin")
-        same_origin = f"{request.url.scheme}://{request.url.netloc}"
-        if origin == same_origin:
-            response.headers["Access-Control-Allow-Origin"] = origin
-            response.headers["Access-Control-Allow-Methods"] = (
-                "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-            )
-            response.headers["Access-Control-Allow-Headers"] = (
-                "Content-Type, Authorization, X-OfferPilot-Token"
-            )
-        return response
-
-    @app.exception_handler(RequestValidationError)
-    async def validation_exception_handler(
-        request: Request,
-        exc: RequestValidationError,
-    ) -> JSONResponse:
-        errors = exc.errors()
-        if errors and all(
-            err.get("type") == "int_parsing"
-            and isinstance(err.get("loc"), tuple)
-            and err["loc"][:1] == ("path",)
-            for err in errors
-        ):
-            return error_response(400, "Invalid ID")
-        if "/voice-coaching" in request.url.path:
-            return error_response(
-                422,
-                "语音复盘数据不完整，请检查后重试。",
-                code="voice_coaching_invalid_payload",
-            )
-        return JSONResponse(
-            status_code=422,
-            content={"error": "validation_failed", "detail": errors},
-        )
 
     @app.get("/api/health")
     def health() -> dict[str, str]:
@@ -5477,1198 +4425,156 @@ def create_app(
 
     @app.post("/api/chat")
     def send_chat(
+        http_request: Request,
         background_tasks: BackgroundTasks,
         payload: dict[str, Any] = Body(...),
     ) -> JSONResponse:
-        try:
-            page_context = _normalize_chat_page_context(payload.get("page_context"))
-            attachments = (
-                _normalize_chat_attachments(payload["attachments"])
-                if "attachments" in payload
-                else None
-            )
-        except ValueError as exc:
-            return error_response(422, str(exc))
-        message = str(payload.get("message") or "")
-        if not message:
-            return error_response(400, "message is required")
-        if "pilot_action" in payload:
-            try:
-                parse_pilot_action(payload["pilot_action"])
-            except ValueError as exc:
-                return error_response(422, str(exc))
-        conversation_id = int(payload.get("conversation_id") or 0)
-        created_new = conversation_id == 0
-        if created_new:
-            context_error = _new_deterministic_context_error(payload, message)
-            if context_error is not None:
-                return context_error
-        conversation = None
-        if conversation_id == 0:
-            context_type = str(payload.get("context_type") or "workspace").strip() or "workspace"
-            context_ref = str(payload.get("context_ref") or "").strip()
-            mode = str(payload.get("mode") or "general").strip() or "general"
-            title = _title_from_message(message)
-            conversation = chat.create_conversation(
-                title,
-                mode=mode,
-                context_type=context_type,
-                context_ref=context_ref,
-            )
-            conversation_id = conversation.id
-        else:
-            conversation = chat.get_conversation(conversation_id)
-            if conversation is None:
-                return error_response(404, "conversation not found")
-
-        if _is_deterministic_pilot_route(payload, message, conversation):
-            replay_pending = chat.get_pending_action(conversation_id)
-            if replay_pending is not None:
-                deterministic_recorder = _resume_journal_replay(
-                    conversation_id,
-                    replay_pending,
-                    transport_mode="sync",
-                    transport_run_id=None,
-                )
-                route_reason = "pending_action_replay"
-            else:
-                deterministic_recorder = _start_journal_run(
-                    conversation,
-                    input_message_id=None,
-                    origin_kind="pilot_action",
-                    route_kind="deterministic",
-                    transport_mode="sync",
-                    transport_run_id=None,
-                )
-                route_reason = "deterministic_action_match"
-            _record_journal_route(
-                deterministic_recorder,
-                route_kind="deterministic",
-                route_reason_code=route_reason,
-            )
-            _capture_initial_journal_context(deterministic_recorder, conversation)
-            deterministic_response = _deterministic_pilot_chat(
-                payload,
-                message,
-                conversation_id,
-                conversation,
-                on_user_message_persisted=lambda persisted: _journal_call(
-                    lambda: deterministic_recorder.attach_input_message(int(persisted.id))
-                ),
-            )
-            if replay_pending is not None:
-                _finish_journal_replay(deterministic_recorder)
-            elif isinstance(deterministic_response, JSONResponse):
-                _finish_journal(deterministic_recorder, "failed", "unknown")
-            elif deterministic_response is not None:
-                persisted_pending = chat.get_pending_action(conversation_id)
-                if (
-                    deterministic_response.get("type") == "confirmation_required"
-                    and persisted_pending is not None
-                ):
-                    _suspend_journal(deterministic_recorder, persisted_pending)
-                else:
-                    _finish_journal(deterministic_recorder, "completed")
-            if isinstance(deterministic_response, JSONResponse):
-                return deterministic_response
-            if deterministic_response is not None:
-                return JSONResponse(deterministic_response)
-
-        existing_pending = chat.get_pending_action(conversation_id)
-        if existing_pending is not None:
-            return error_response(
-                409,
-                "当前写入仍待确认，请先处理确认卡。",
-                code="pending_confirmation_required",
-                details={"pending_action": _pending_action_json(existing_pending, applications)},
-            )
-        model = _chat_model(chat_model, resolved_data_dir)
-        if isinstance(model, JSONResponse):
-            return model
-
-        clarification = chat.get_pending_clarification(conversation_id)
-        input_message = chat.append_message(conversation_id, "user", content=message)
-        run_recorder = _start_journal_run(
-            conversation,
-            input_message_id=int(input_message.id),
-            origin_kind="user_message",
-            route_kind="model",
-            transport_mode="sync",
-            transport_run_id=None,
-        )
-        _record_journal_route(
-            run_recorder,
-            route_kind="model",
-            route_reason_code="model_default",
-        )
-        title_signal = RuntimeSignalSink[str]() if created_new else None
-        try:
-            source_messages = _load_chat_source_messages(
-                context_source_loader, conversation, attachments
-            )
-        except ProjectionError:
-            if title_signal is not None:
-                title_signal.drain()
-                title_signal.close()
-            _finish_journal(run_recorder, "failed", "source_load_failed")
-            return error_response(503, "上下文暂时无法加载，请稍后重试。", code="source_load_failed")
-        page_context_messages = _chat_page_context_messages(page_context)
-        clarification_message = _chat_clarification_message(clarification, message)
-        history = [
-            _chat_response_system_message(),
-            *([clarification_message] if clarification_message is not None else []),
-            *(
-                [source_messages.context_message]
-                if source_messages.context_message is not None
-                else []
-            ),
-            *page_context_messages,
-            *source_messages.attachment_messages,
-            *source_messages.history,
-        ]
-        catalog = MODEL_TOOL_CATALOG
-        _capture_initial_journal_context(
-            run_recorder,
-            conversation,
-            tool_names=tuple(contract.name for contract in catalog.provider_contracts()),
-        )
-        try:
-            turn_result = _run_chat_agent_with_timeout(
-                lambda: run_turn(
-                    model,
-                    catalog,
-                    history,
-                    auto_approve=load_config(resolved_data_dir).chat_auto_approve_writes,
-                    max_iter=DEFAULT_MAX_ITERATIONS,
-                    thread_id=_agent_thread_id(conversation_id),
-                    run_recorder=run_recorder,
-                    runtime_signal_sink=title_signal,
-                    tool_context=_model_tool_context(
-                        conversation,
-                        applications,
-                        events,
-                        notes,
-                        offers,
-                        resumes,
-                        jd_analyses,
-                        run_recorder,
-                    ),
-                )
-            )
-            added, reply, pending = turn_result
-            tool_records = turn_result.records
-            tool_failures = turn_result.failures
-        except ChatAgentTimedOut:
-            timeout_message = chat.append_message(
-                conversation_id, "assistant", content=CHAT_TIMEOUT_MESSAGE
-            )
-            chat.clear_pending_clarification(conversation_id)
-            _record_persisted_messages(run_recorder, [timeout_message])
-            _finish_journal(run_recorder, "timed_out", "timeout")
-            return JSONResponse(
-                {
-                    "type": "message",
-                    "conversation_id": conversation_id,
-                    "message": CHAT_TIMEOUT_MESSAGE,
-                }
-            )
-        except Exception as exc:
-            _finish_journal(run_recorder, "failed", "provider_error")
-            return _ai_provider_error(exc, resolved_data_dir)
-        finally:
-            _register_title_signal(
-                title_signal,
+        typed_request = _normalize_runtime_start_request(payload)
+        if isinstance(typed_request, JSONResponse):
+            return typed_request
+        runtime = http_request.app.state.pilot_runtime
+        created_new = typed_request.conversation_id in (None, 0)
+        title_latch: RuntimeSignalLatch | None = None
+        title_sink: ClosedAgentSignalSink | None = None
+        set_title_conversation_id: Callable[[int | None], None] | None = None
+        if created_new and title_model is not None:
+            title_latch, title_sink, set_title_conversation_id = _runtime_title_latch(
                 background_tasks,
                 title_model,
                 chat,
-                conversation_id,
-                message,
+                typed_request.message,
                 resolved_data_dir,
+                None,
             )
-        added, forced_reply = _with_write_error_followup(added, tool_records, tool_failures)
-        reply = forced_reply or _user_facing_assistant_content(reply)
-        write_status, write_error = _write_outcome(
-            tool_records, _has_write_attempt(added, catalog), tool_failures
-        )
-        if pending is not None:
-            missing_question = _pending_action_missing_question(pending, applications)
-            if missing_question:
-                persisted = _persist_ai_messages(chat, conversation_id, added)
-                chat.clear_pending_action(conversation_id)
-                chat.set_pending_clarification(conversation_id, pending, missing_question)
-                persisted.append(
-                    chat.append_message(conversation_id, "assistant", content=missing_question)
-                )
-                _record_persisted_messages(run_recorder, persisted)
-                _finish_journal(run_recorder, "completed")
-                return JSONResponse(
-                    {
-                        "type": "message",
-                        "conversation_id": conversation_id,
-                        "message": missing_question,
-                    }
-                )
-            if not chat.persist_pending_action(
-                conversation_id, pending, _persistable_ai_messages(added)
-            ):
-                _finish_journal(run_recorder, "failed", "unknown")
-                return error_response(409, "对话已归档，无法保存待确认操作。")
-            _suspend_journal(run_recorder, pending)
-            return JSONResponse(
-                {
-                    "type": "confirmation_required",
-                    "conversation_id": conversation_id,
-                    "pending_action": _pending_action_json(pending, applications),
-                }
+        control = InMemoryRuntimeInvocationControl()
+        try:
+            outcome = runtime.start_turn(
+                typed_request,
+                transport=RuntimeTransportContext(mode="sync"),
+                event_sink=None,
+                signal_sink=title_sink,
+                execution_host=SyncAgentExecutionHost(timeout_seconds=CHAT_AGENT_TIMEOUT_SECONDS),
+                invocation_control=control,
+                cancel_check=lambda: False,
             )
-        persisted = _persist_ai_messages(chat, conversation_id, added)
-        if forced_reply:
-            forced_pending = _pending_action_from_added_write_call(added, catalog)
-            if forced_pending is not None:
-                chat.set_pending_clarification(conversation_id, forced_pending, forced_reply)
-        if not forced_reply and clarification is not None and _looks_like_followup_question(reply):
-            pending_clarification, _ = clarification
-            chat.set_pending_clarification(conversation_id, pending_clarification, reply)
-        elif not forced_reply:
-            chat.clear_pending_clarification(conversation_id)
-        _record_persisted_messages(run_recorder, persisted)
-        _finish_journal(run_recorder, "completed")
-        response_payload: dict[str, Any] = {
-            "type": "message",
-            "conversation_id": conversation_id,
-            "message": reply,
-            "write_status": write_status,
-        }
-        if write_error:
-            response_payload["write_error"] = write_error
-        return JSONResponse(response_payload)
+            if set_title_conversation_id is not None:
+                set_title_conversation_id(getattr(outcome, "conversation_id", None))
+            return _runtime_http_response(outcome)
+        except RuntimeAgentTimedOut:
+            return error_response(504, CHAT_TIMEOUT_MESSAGE, code="chat_agent_timeout")
+        except (RuntimeCancelled, RuntimeTransportAborted) as exc:
+            return _runtime_error_response(exc)
+        finally:
+            if title_latch is not None:
+                title_latch.finalize()
 
     @app.post("/api/chat/stream")
     def send_chat_stream(
+        http_request: Request,
         background_tasks: BackgroundTasks,
         payload: dict[str, Any] = Body(...),
     ) -> Response:
-        try:
-            page_context = _normalize_chat_page_context(payload.get("page_context"))
-            attachments = (
-                _normalize_chat_attachments(payload["attachments"])
-                if "attachments" in payload
-                else None
+        typed_request = _normalize_runtime_start_request(payload)
+        if isinstance(typed_request, JSONResponse):
+            return typed_request
+        runtime = http_request.app.state.pilot_runtime
+        run_uuid = uuid4()
+        transport = RuntimeTransportContext(
+            mode="stream",
+            transport_run_id=run_uuid,
+            stream_version=cast(StreamVersion, STREAM_VERSION),
+        )
+        control = InMemoryRuntimeInvocationControl()
+        created_new = typed_request.conversation_id in (None, 0)
+        title_latch: RuntimeSignalLatch | None = None
+        title_sink: ClosedAgentSignalSink | None = None
+        set_title_conversation_id: Callable[[int | None], None] | None = None
+        if created_new and title_model is not None:
+            title_latch, title_sink, set_title_conversation_id = _runtime_title_latch(
+                background_tasks,
+                title_model,
+                chat,
+                typed_request.message,
+                resolved_data_dir,
+                None,
             )
-        except ValueError as exc:
-            return error_response(422, str(exc))
-        message = str(payload.get("message") or "")
-        if not message:
-            return error_response(400, "message is required")
-        if "pilot_action" in payload:
-            try:
-                parse_pilot_action(payload["pilot_action"])
-            except ValueError as exc:
-                return error_response(422, str(exc))
-        conversation_id = int(payload.get("conversation_id") or 0)
-        created_new = conversation_id == 0
-        if created_new:
-            context_error = _new_deterministic_context_error(payload, message)
-            if context_error is not None:
-                return context_error
-        conversation = None
-        if conversation_id == 0:
-            context_type = str(payload.get("context_type") or "workspace").strip() or "workspace"
-            context_ref = str(payload.get("context_ref") or "").strip()
-            mode = str(payload.get("mode") or "general").strip() or "general"
-            title = _title_from_message(message)
-            conversation = chat.create_conversation(
-                title,
-                mode=mode,
+        try:
+            prepared = runtime.prepare_stream(
+                typed_request,
+                transport=transport,
+                invocation_control=control,
+            )
+            if isinstance(prepared, ImmediateHttpOutcome):
+                if title_latch is not None:
+                    title_latch.finalize()
+                return outcome_http_response(prepared)
+            conversation_id, context_type, context_ref, mode = _prepared_stream_metadata(
+                prepared, typed_request
+            )
+            if set_title_conversation_id is not None:
+                set_title_conversation_id(conversation_id)
+            envelope = _runtime_sse_envelope(
+                run_id=str(run_uuid),
+                conversation_id=conversation_id,
                 context_type=context_type,
                 context_ref=context_ref,
+                mode=mode,
             )
-            conversation_id = conversation.id
-        else:
-            conversation = chat.get_conversation(conversation_id)
-            if conversation is None:
-                return error_response(404, "conversation not found")
 
-        if _is_deterministic_pilot_route(payload, message, conversation):
-            deterministic_sse_run = SseRun(
-                run_id=str(uuid4()),
-                conversation_id=conversation_id,
-                context_type=str(conversation.context_type or "workspace"),
-                context_ref=str(conversation.context_ref or ""),
-                mode=str(conversation.mode or "general"),
-            )
-            replay_pending = chat.get_pending_action(conversation_id)
-            if replay_pending is not None:
-                deterministic_recorder = _resume_journal_replay(
-                    conversation_id,
-                    replay_pending,
-                    transport_mode="stream",
-                    transport_run_id=deterministic_sse_run.run_id,
-                )
-                route_reason = "pending_action_replay"
-            else:
-                deterministic_recorder = _start_journal_run(
-                    conversation,
-                    input_message_id=None,
-                    origin_kind="pilot_action",
-                    route_kind="deterministic",
-                    transport_mode="stream",
-                    transport_run_id=deterministic_sse_run.run_id,
-                )
-                route_reason = "deterministic_action_match"
-            _record_journal_route(
-                deterministic_recorder,
-                route_kind="deterministic",
-                route_reason_code=route_reason,
-            )
-            _capture_initial_journal_context(deterministic_recorder, conversation)
-            deterministic_response = _deterministic_pilot_chat(
-                payload,
-                message,
-                conversation_id,
-                conversation,
-                on_user_message_persisted=lambda persisted: _journal_call(
-                    lambda: deterministic_recorder.attach_input_message(int(persisted.id))
-                ),
-            )
-            if replay_pending is not None:
-                _finish_journal_replay(deterministic_recorder)
-            elif isinstance(deterministic_response, JSONResponse):
-                _finish_journal(deterministic_recorder, "failed", "unknown")
-            elif deterministic_response is not None:
-                persisted_pending = chat.get_pending_action(conversation_id)
-                if (
-                    deterministic_response.get("type") == "confirmation_required"
-                    and persisted_pending is not None
-                ):
-                    _suspend_journal(deterministic_recorder, persisted_pending)
-                else:
-                    _finish_journal(deterministic_recorder, "completed")
-            if isinstance(deterministic_response, JSONResponse):
-                return deterministic_response
-            if deterministic_response is not None:
-                return _deterministic_pilot_stream_response(
-                    conversation,
-                    deterministic_response,
-                    run=deterministic_sse_run,
+            def set_stream_outcome(outcome: object) -> None:
+                if set_title_conversation_id is not None:
+                    set_title_conversation_id(getattr(outcome, "conversation_id", None))
+
+            def body() -> Generator[str, None, None]:
+                return _runtime_sse_content(
+                    runtime,
+                    prepared,
+                    control,
+                    title_sink,
+                    str(run_uuid),
+                    envelope,
+                    set_stream_outcome,
                 )
 
-        existing_pending = chat.get_pending_action(conversation_id)
-        if existing_pending is not None:
-            return error_response(
-                409,
-                "当前写入仍待确认，请先处理确认卡。",
-                code="pending_confirmation_required",
-                details={"pending_action": _pending_action_json(existing_pending, applications)},
+            guard = PreparedStreamGuard(prepared=prepared, on_execute=body)
+            return build_guarded_streaming_response(
+                (),
+                guard=guard,
+                background=(lambda: title_latch.finalize()) if title_latch is not None else None,
+                headers=sse_headers(),
             )
-        model = _chat_model(chat_model, resolved_data_dir)
-        if isinstance(model, JSONResponse):
-            return model
-
-        clarification = chat.get_pending_clarification(conversation_id)
-        input_message = chat.append_message(conversation_id, "user", content=message)
-        title_signal = RuntimeSignalSink[str]() if created_new else None
-        try:
-            source_messages = _load_chat_source_messages(
-                context_source_loader, conversation, attachments
-            )
-        except ProjectionError:
-            if title_signal is not None:
-                title_signal.drain()
-                title_signal.close()
-            return error_response(503, "上下文暂时无法加载，请稍后重试。", code="source_load_failed")
-        page_context_messages = _chat_page_context_messages(page_context)
-        clarification_message = _chat_clarification_message(clarification, message)
-        history = [
-            _chat_response_system_message(),
-            *([clarification_message] if clarification_message is not None else []),
-            *(
-                [source_messages.context_message]
-                if source_messages.context_message is not None
-                else []
-            ),
-            *page_context_messages,
-            *source_messages.attachment_messages,
-            *source_messages.history,
-        ]
-        catalog = MODEL_TOOL_CATALOG
-        run = SseRun(
-            run_id=str(uuid4()),
-            conversation_id=conversation_id,
-            context_type=str(conversation.context_type or "workspace"),
-            context_ref=str(conversation.context_ref or ""),
-            mode=str(conversation.mode or "general"),
-        )
-        run_recorder = _start_journal_run(
-            conversation,
-            input_message_id=int(input_message.id),
-            origin_kind="user_message",
-            route_kind="model",
-            transport_mode="stream",
-            transport_run_id=run.run_id,
-        )
-        _record_journal_route(
-            run_recorder,
-            route_kind="model",
-            route_reason_code="model_default",
-        )
-        _capture_initial_journal_context(
-            run_recorder,
-            conversation,
-            tool_names=tuple(contract.name for contract in catalog.provider_contracts()),
-        )
-
-        def emit(event: str, data: dict[str, Any] | None = None) -> str:
-            envelope = run.envelope(event, data)
-            return format_sse(event, f"{run.run_id}:{envelope['seq']}", envelope)
-
-        def stream() -> Any:
-            yield emit(
-                "meta",
-                {
-                    "stream_version": STREAM_VERSION,
-                    "supports_delta": _chat_model_supports_delta(model),
-                    "supports_tool_events": True,
-                    "supports_confirmation": True,
-                },
-            )
-            yield emit("user_message_saved", {"role": "user"})
-            yield emit("status", {"phase": "model_running", "label": "正在思考"})
-            try:
-                turn_result = yield from _run_chat_agent_with_sse_events(
-                    lambda event_sink, cancel_check: run_turn(
-                        model,
-                        catalog,
-                        history,
-                        auto_approve=load_config(resolved_data_dir).chat_auto_approve_writes,
-                        max_iter=DEFAULT_MAX_ITERATIONS,
-                        thread_id=_agent_thread_id(conversation_id),
-                        event_sink=event_sink,
-                        cancel_check=cancel_check,
-                        run_recorder=run_recorder,
-                        runtime_signal_sink=title_signal,
-                        tool_context=_model_tool_context(
-                            conversation,
-                            applications,
-                            events,
-                            notes,
-                            offers,
-                            resumes,
-                            jd_analyses,
-                            run_recorder,
-                        ),
-                    ),
-                    emit,
-                )
-                added, reply, pending = turn_result
-                tool_records = turn_result.records
-                tool_failures = turn_result.failures
-                _register_title_signal(
-                    title_signal,
-                    background_tasks,
-                    title_model,
-                    chat,
-                    conversation_id,
-                    message,
-                    resolved_data_dir,
-                )
-            except ChatRunCancelled:
-                if title_signal is not None:
-                    title_signal.close()
-                _finish_journal(run_recorder, "cancelled", "cancelled")
-                return
-            except ChatAgentTimedOut:
-                _register_title_signal(
-                    title_signal,
-                    background_tasks,
-                    title_model,
-                    chat,
-                    conversation_id,
-                    message,
-                    resolved_data_dir,
-                )
-                timeout_message = chat.append_message(
-                    conversation_id, "assistant", content=CHAT_TIMEOUT_MESSAGE
-                )
-                chat.clear_pending_clarification(conversation_id)
-                _record_persisted_messages(run_recorder, [timeout_message])
-                _finish_journal(run_recorder, "timed_out", "timeout")
-                yield emit(
-                    "error",
-                    {
-                        "code": "chat_agent_timeout",
-                        "message": CHAT_TIMEOUT_MESSAGE,
-                        "retryable": True,
-                        "degraded": False,
-                    },
-                )
-                return
-            except Exception as exc:
-                _register_title_signal(
-                    title_signal,
-                    background_tasks,
-                    title_model,
-                    chat,
-                    conversation_id,
-                    message,
-                    resolved_data_dir,
-                )
-                _finish_journal(run_recorder, "failed", "provider_error")
-                yield emit(
-                    "error",
-                    {
-                        "code": "ai_provider_error",
-                        "message": _safe_stream_error(exc, resolved_data_dir),
-                        "retryable": True,
-                        "degraded": False,
-                    },
-                )
-                return
-
-            added, forced_reply = _with_write_error_followup(added, tool_records, tool_failures)
-            reply = forced_reply or _user_facing_assistant_content(reply)
-            write_status, write_error = _write_outcome(
-                tool_records, _has_write_attempt(added, catalog), tool_failures
-            )
-            if pending is not None:
-                missing_question = _pending_action_missing_question(pending, applications)
-                if missing_question:
-                    persisted = _persist_ai_messages(chat, conversation_id, added)
-                    chat.clear_pending_action(conversation_id)
-                    chat.set_pending_clarification(conversation_id, pending, missing_question)
-                    persisted.append(
-                        chat.append_message(conversation_id, "assistant", content=missing_question)
-                    )
-                    _record_persisted_messages(run_recorder, persisted)
-                    _finish_journal(run_recorder, "completed")
-                    response = {
-                        "type": "message",
-                        "conversation_id": conversation_id,
-                        "message": missing_question,
-                    }
-                    yield emit("assistant_message", {"message": missing_question})
-                    yield emit("completed", {"response": response, "persisted": True})
-                    return
-                if not chat.persist_pending_action(
-                    conversation_id, pending, _persistable_ai_messages(added)
-                ):
-                    _finish_journal(run_recorder, "failed", "unknown")
-                    yield emit(
-                        "error",
-                        {
-                            "code": "conversation_archived",
-                            "message": "对话已归档，无法保存待确认操作。",
-                            "retryable": False,
-                            "degraded": False,
-                        },
-                    )
-                    return
-                _suspend_journal(run_recorder, pending)
-                pending_payload = _pending_action_json(pending, applications)
-                response = {
-                    "type": "confirmation_required",
-                    "conversation_id": conversation_id,
-                    "pending_action": pending_payload,
-                }
-                yield emit("status", {"phase": "waiting_confirmation", "label": "需要确认"})
-                yield emit("confirmation_required", {"pending_action": pending_payload})
-                yield emit("completed", {"response": response, "persisted": True})
-                return
-            persisted = _persist_ai_messages(chat, conversation_id, added)
-            if forced_reply:
-                forced_pending = _pending_action_from_added_write_call(added, catalog)
-                if forced_pending is not None:
-                    chat.set_pending_clarification(conversation_id, forced_pending, forced_reply)
-            if (
-                not forced_reply
-                and clarification is not None
-                and _looks_like_followup_question(reply)
-            ):
-                pending_clarification, _ = clarification
-                chat.set_pending_clarification(conversation_id, pending_clarification, reply)
-            elif not forced_reply:
-                chat.clear_pending_clarification(conversation_id)
-            _record_persisted_messages(run_recorder, persisted)
-            _finish_journal(run_recorder, "completed")
-            response = {
-                "type": "message",
-                "conversation_id": conversation_id,
-                "message": reply,
-                "write_status": write_status,
-            }
-            if write_error:
-                response["write_error"] = write_error
-            yield emit("assistant_message", {"message": reply})
-            yield emit("completed", {"response": response, "persisted": True})
-
-        return StreamingResponse(
-            stream(), media_type="text/event-stream; charset=utf-8", headers=sse_headers()
-        )
+        except (RuntimeAgentTimedOut, RuntimeCancelled, RuntimeTransportAborted) as exc:
+            if title_latch is not None:
+                title_latch.finalize()
+            return _runtime_error_response(exc)
+        except BaseException:
+            if title_latch is not None:
+                title_latch.finalize()
+            raise
 
     @app.post("/api/chat/confirm")
-    def confirm_chat(payload: dict[str, Any] = Body(...)) -> JSONResponse:
-        confirmation = _confirmation_input(payload)
-        if isinstance(confirmation, JSONResponse):
-            return confirmation
-        approved, edited_args, rejection_feedback, confirmation_token = confirmation
-        conversation_id = _confirmation_conversation_id(payload)
-        if isinstance(conversation_id, JSONResponse):
-            return conversation_id
-        conversation = chat.get_conversation(conversation_id)
-        if conversation is None:
-            return error_response(404, "conversation not found")
-        requested_operation_id = payload.get("operation_id")
-        if isinstance(requested_operation_id, str) and write_operations is not None:
-            terminal = write_operations.get(requested_operation_id)
-            if terminal is not None and terminal.status != "proposed":
-                if terminal.conversation_id != conversation_id or confirmation_token is None:
-                    return error_response(
-                        409, "operation identity conflict", code="operation_identity_conflict"
-                    )
-                synthetic = PendingAction(
-                    tool_call_id=terminal.tool_call_id or "",
-                    tool_name=terminal.tool_name,
-                    args="",
-                    human=terminal.tool_name,
-                    operation_id=terminal.id,
-                )
-                try:
-                    fingerprint = _ledger_confirmation_request_fingerprint(
-                        write_operations,
-                        synthetic,
-                        payload,
-                        approved=approved,
-                        edited_args=edited_args,
-                        rejection_feedback=rejection_feedback,
-                        confirmation_token=confirmation_token,
-                    )
-                    return JSONResponse(
-                        _operation_replay_response(
-                            conversation_id,
-                            _converged_operation_replay(write_operations, terminal, fingerprint),
-                            chat,
-                            applications,
-                        )
-                    )
-                except WriteOperationError as exc:
-                    return error_response(
-                        _write_operation_error_status(exc),
-                        "无法确认写入结果，请保留原请求后重试。",
-                        code=exc.code,
-                    )
-        stored = chat.list_messages(conversation_id) if approved else []
-        if approved and not stored:
-            return error_response(404, "conversation not found")
-        pending = chat.get_pending_action(conversation_id)
-        if pending is None:
-            return error_response(409, "待确认操作已过期，请刷新对话后重试。")
-        if confirmation_token is None:
-            if edited_args is not None or rejection_feedback:
-                return error_response(
-                    422, "confirmation_token is required when changing confirmation details"
-                )
-            confirmation_token = _confirmation_token(pending)
-        if not compare_digest(confirmation_token, _confirmation_token(pending)):
-            return error_response(409, "待确认操作已被更新，请刷新对话后重试。")
-        if write_operations is None or write_coordinator is None:
-            return error_response(
-                503, "写入账本暂不可用，请保留确认卡后重试。", code="operation_unavailable"
-            )
+    def confirm_chat(
+        http_request: Request,
+        payload: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        typed_request = _normalize_runtime_confirmation_request(payload)
+        if isinstance(typed_request, JSONResponse):
+            return typed_request
+        runtime = http_request.app.state.pilot_runtime
+        control = InMemoryRuntimeInvocationControl()
         try:
-            request_fingerprint = _ledger_confirmation_request_fingerprint(
-                write_operations,
-                pending,
-                payload,
-                approved=approved,
-                edited_args=edited_args,
-                rejection_feedback=rejection_feedback,
-                confirmation_token=confirmation_token,
+            outcome = runtime.continue_confirmation(
+                typed_request,
+                transport=RuntimeTransportContext(mode="sync"),
+                invocation_control=control,
+                event_sink=None,
+                signal_sink=None,
+                execution_host=SyncAgentExecutionHost(timeout_seconds=CHAT_AGENT_TIMEOUT_SECONDS),
+                cancel_check=lambda: False,
             )
-            existing_operation = write_operations.get(pending.operation_id)
-            if existing_operation is not None and existing_operation.status != "proposed":
-                return JSONResponse(
-                    _operation_replay_response(
-                        conversation_id,
-                        _converged_operation_replay(
-                            write_operations, existing_operation, request_fingerprint
-                        ),
-                        chat,
-                        applications,
-                    )
-                )
-        except WriteOperationError as exc:
-            return error_response(
-                _write_operation_error_status(exc), "无法确认写入结果。", code=exc.code
-            )
-        if pending.tool_name in {
-            "save_application_jd_version",
-            "create_application_submission_snapshot",
-            "record_application_outcome",
-        }:
-            if not compare_digest(confirmation_token, _confirmation_token(pending)):
-                return error_response(409, "stale pending action")
-            (
-                deterministic_journal,
-                deterministic_attempt,
-                deterministic_result,
-            ) = _deterministic_confirmation_journal_callbacks(
-                conversation,
-                pending,
-                edited=edited_args is not None,
-                transport_mode="sync",
-                transport_run_id=None,
-            )
-            deterministic_response = _deterministic_pilot_confirmation(
-                conversation_id,
-                pending,
-                approved=approved,
-                edited_args=edited_args,
-                rejection_feedback=rejection_feedback,
-                request_fingerprint=request_fingerprint,
-                on_confirmation_attempt=deterministic_attempt,
-                on_tool_result=deterministic_result,
-            )
-            _finish_deterministic_confirmation_journal(
-                deterministic_journal,
-                pending,
-                deterministic_response,
-                conversation_id,
-            )
-            if isinstance(deterministic_response, JSONResponse):
-                return deterministic_response
-            return JSONResponse(deterministic_response)
-        if not compare_digest(confirmation_token, _confirmation_token(pending)):
-            return error_response(409, "待确认操作已被更新，请刷新对话后重试。")
-        if write_operations is None or write_coordinator is None:
-            return error_response(
-                503, "写入账本暂不可用，请保留确认卡后重试。", code="operation_unavailable"
-            )
-        try:
-            request_fingerprint = _ledger_confirmation_request_fingerprint(
-                write_operations,
-                pending,
-                payload,
-                approved=approved,
-                edited_args=edited_args,
-                rejection_feedback=rejection_feedback,
-                confirmation_token=confirmation_token,
-            )
-            existing_operation = write_operations.get(pending.operation_id)
-            if existing_operation is not None and existing_operation.status != "proposed":
-                replay = _converged_operation_replay(
-                    write_operations, existing_operation, request_fingerprint
-                )
-                return JSONResponse(
-                    _operation_replay_response(conversation_id, replay, chat, applications)
-                )
-        except WriteOperationError as exc:
-            return error_response(
-                _write_operation_error_status(exc),
-                "无法确认写入结果，请保留原请求后重试。",
-                code=exc.code,
-            )
-        model: ChatModel | None = None
-        if approved:
-            resolved_model = _chat_model(chat_model, resolved_data_dir)
-            if isinstance(resolved_model, JSONResponse):
-                return resolved_model
-            model = resolved_model
-        catalog = MODEL_TOOL_CATALOG
-        try:
-            effective_pending = (
-                prepare_pending_action(pending, catalog, edited_args) if approved else pending
-            )
-        except ValueError as exc:
-            return error_response(422, f"invalid confirmation edits: {exc}")
-        confirmation_attempt_id = str(uuid4())
-        confirmation_recorder = _resume_journal_confirmation(
-            conversation_id,
-            pending,
-            transport_mode="sync",
-            transport_run_id=None,
-            execution_path="agent_resume",
-        )
-        if approved:
-            _capture_confirmation_journal_context(
-                confirmation_recorder,
-                conversation,
-                tool_names=tuple(contract.name for contract in catalog.provider_contracts()),
-            )
-        undo_seed = _undo_seed_for_pending(effective_pending, applications) if approved else {}
-        confirmation_claim: dict[str, str] = {}
-        (
-            confirmed_outcome,
-            confirmation_result_sink,
-            cancel_confirmation_result,
-            finalize_confirmation_timeout,
-        ) = _confirmation_result_recorder(
-            chat,
-            conversation_id,
-            pending,
-            undo_seed,
-            lambda: confirmation_claim.get("id"),
-        )
-        confirmation_attempted = Event()
-        confirmation_cancelled = Event()
-        confirmation_timed_out = Event()
-        confirmation_attempt_lock = Lock()
-
-        def reload_confirmation_messages() -> list[Message]:
-            refreshed = _load_chat_source_messages(
-                context_source_loader,
-                conversation,
-                None,
-                pending_tool_call_id=pending.tool_call_id,
-            )
-            return [
-                _chat_response_system_message(),
-                *(
-                    [refreshed.context_message]
-                    if refreshed.context_message is not None
-                    else []
-                ),
-                *refreshed.history,
-            ]
-
-        def execute_ledger_operation(
-            prepared: PreparedToolCall[Any, Any],
-            tool_context: ToolExecutionContext,
-            authorization: ExecutionAuthorization,
-        ) -> ToolExecutionRecord[Any, Any]:
-            execution, record = write_coordinator.execute_primary(
-                operation_id=pending.operation_id,
-                conversation_id=conversation_id,
-                prepared=prepared,
-                context=tool_context,
-                authorization=authorization,
-                request_fingerprint=request_fingerprint,
-                undo_seed_builder=lambda _prepared, current_context: _undo_seed_for_pending(
-                    effective_pending, current_context.applications
-                ),
-                undo_builder=lambda _prepared, current, transactional_seed: (
-                    _build_write_undo(effective_pending, current, dict(transactional_seed)) or None
-                ),
-            )
-            if isinstance(execution, (OperationCommitted, OperationFailed)):
-                if execution.payload.undo_json:
-                    confirmed_outcome["ledger_undo"] = json.loads(execution.payload.undo_json)
-                confirmed_outcome["delivery_ownership"] = execution.ownership
-                if execution.ownership is not None:
-                    confirmed_outcome["delivery_heartbeat"] = DeliveryHeartbeat(
-                        write_operations, execution.ownership
-                    ).start()
-            if record is not None:
-                return record
-            if isinstance(execution, OperationReplay):
-                current = write_operations.get(pending.operation_id)
-                if current is None:
-                    raise WriteOperationError("operation_result_unknown", retryable=True)
-                raise ChatOperationReplay(
-                    _converged_operation_replay(write_operations, current, request_fingerprint)
-                )
-            assert isinstance(execution, OperationUnknown)
-            raise WriteOperationError(
-                execution.code,
-                retryable=execution.retryable,
-            )
-
-        def persist_confirmation_result(
-            action: PendingAction,
-            result_approved: bool,
-            tool_message: Message,
-            execution_record: ToolExecutionRecord[Any, Any] | None,
-        ) -> None:
-            try:
-                confirmation_result_sink(action, result_approved, tool_message, execution_record)
-            except Exception:
-                if confirmation_timed_out.is_set():
-                    _abandon_journal_segment(confirmation_recorder)
-                raise
-            if confirmation_timed_out.is_set() and confirmed_outcome.get("fallback_persisted"):
-                _finish_journal(confirmation_recorder, "completed")
-
-        def start_confirmation_attempt(
-            action: PendingAction,
-            prepared: PreparedToolCall[Any, Any] | None,
-        ) -> ExecutionAuthorization | ToolFailure | None:
-            with confirmation_attempt_lock:
-                if prepared is not None and (
-                    prepared.pending_identity is None or prepared.pending_action_revision is None
-                ):
-                    return ToolFailure("conflict", "confirmation_claim_failed")
-                current = chat.get_pending_action(conversation_id)
-                if (
-                    confirmation_cancelled.is_set()
-                    or current is None
-                    or not compare_digest(confirmation_token, _confirmation_token(current))
-                ):
-                    return ToolFailure(
-                        "stale_state",
-                        "confirmation_claim_lost",
-                    )
-                confirmation_claim["id"] = pending.operation_id
-                _record_journal_approval(
-                    confirmation_recorder,
-                    confirmation_attempt_id=confirmation_attempt_id,
-                    original_pending=pending,
-                    effective_pending=action,
-                    approved=prepared is not None,
-                    edited=prepared is not None and edited_args is not None,
-                )
-                confirmation_attempted.set()
-                if prepared is None:
-                    rejection = write_coordinator.reject_primary(
-                        operation_id=pending.operation_id,
-                        conversation_id=conversation_id,
-                        tool_call_id=pending.tool_call_id,
-                        tool_name=pending.tool_name,
-                        request_fingerprint=request_fingerprint,
-                        visible_result=_rejection_result(rejection_feedback),
-                    )
-                    if isinstance(rejection, (OperationCommitted, OperationFailed)):
-                        confirmed_outcome["delivery_ownership"] = rejection.ownership
-                        if rejection.ownership is not None:
-                            confirmed_outcome["delivery_heartbeat"] = DeliveryHeartbeat(
-                                write_operations, rejection.ownership
-                            ).start()
-                    if isinstance(rejection, OperationUnknown):
-                        raise WriteOperationError(
-                            rejection.code,
-                            retryable=rejection.retryable,
-                        )
-                    return None
-                return ExecutionAuthorization(
-                    pending_identity=prepared.pending_identity,
-                    pending_action_revision=cast(int, prepared.pending_action_revision),
-                    tool_call_id=prepared.tool_call_id,
-                    tool_name=prepared.spec.name,
-                    arguments_digest=prepared.arguments_digest,
-                    operation_id=pending.operation_id,
-                )
-
-        try:
-            turn_result = _run_chat_agent_with_timeout(
-                lambda: resume_after_confirm(
-                    cast(ChatModel, model),
-                    catalog,
-                    [],
-                    effective_pending,
-                    approved=approved,
-                    auto_approve=load_config(resolved_data_dir).chat_auto_approve_writes,
-                    max_iter=DEFAULT_MAX_ITERATIONS,
-                    rejection_feedback=rejection_feedback,
-                    thread_id=_agent_thread_id(conversation_id),
-                    confirmation_result_sink=persist_confirmation_result,
-                    confirmation_attempt_sink=start_confirmation_attempt,
-                    cancel_check=confirmation_cancelled.is_set,
-                    run_recorder=confirmation_recorder,
-                    delivery_fence=lambda: _confirmation_delivery_fence(confirmed_outcome),
-                    continuation_message_loader=(
-                        reload_confirmation_messages if approved else None
-                    ),
-                    tool_context=_model_tool_context(
-                        conversation,
-                        applications,
-                        events,
-                        notes,
-                        offers,
-                        resumes,
-                        jd_analyses,
-                        confirmation_recorder,
-                        execute_ledger_operation,
-                    ),
-                )
-            )
-            added, reply, new_pending = turn_result
-            tool_records = turn_result.records
-            tool_failures = turn_result.failures
-        except ChatAgentTimedOut:
-            _stop_confirmation_delivery_heartbeat(confirmed_outcome)
-            if confirmed_outcome.get("cas_lost"):
-                _abandon_journal_segment(confirmation_recorder)
-                return error_response(409, "待确认操作已被更新，请刷新对话后重试。")
-            with confirmation_attempt_lock:
-                attempt_in_progress = confirmation_attempted.is_set()
-                confirmation_cancelled.set()
-                confirmation_timed_out.set()
-            fallback = finalize_confirmation_timeout()
-            if fallback is not None:
-                _finish_journal(confirmation_recorder, "completed")
-                return JSONResponse(fallback)
-            if confirmed_outcome.get("cas_lost"):
-                _abandon_journal_segment(confirmation_recorder)
-                return error_response(409, "待确认操作已被更新，请刷新对话后重试。")
-            if attempt_in_progress:
-                return error_response(
-                    409, "确认操作仍在后台执行，请刷新对话查看结果，不要重复提交。"
-                )
-            cancel_confirmation_result()
-            _finish_journal(confirmation_recorder, "timed_out", "timeout")
-            return error_response(504, "这次确认处理时间过长，已停止。请重试或取消这次写入。")
-        except ChatOperationReplay as exc:
-            _stop_confirmation_delivery_heartbeat(confirmed_outcome)
-            _abandon_journal_segment(confirmation_recorder)
-            return JSONResponse(
-                _operation_replay_response(conversation_id, exc.replay, chat, applications)
-            )
-        except WriteOperationError as exc:
-            _stop_confirmation_delivery_heartbeat(confirmed_outcome)
-            _abandon_journal_segment(confirmation_recorder)
-            return error_response(
-                _write_operation_error_status(exc),
-                "无法确认写入结果，请保留原请求后重试。",
-                code=exc.code,
-            )
-        except PendingActionValidationError as exc:
-            _stop_confirmation_delivery_heartbeat(confirmed_outcome)
-            _abandon_journal_segment(confirmation_recorder)
-            return error_response(422, f"确认参数无效：{exc}")
-        except StalePendingActionError:
-            _stop_confirmation_delivery_heartbeat(confirmed_outcome)
-            _abandon_journal_segment(confirmation_recorder)
-            return error_response(409, "待确认操作已过期或正在处理中，请刷新对话后重试。")
-        except Exception as exc:
-            _stop_confirmation_delivery_heartbeat(confirmed_outcome)
-            if confirmed_outcome.get("cas_lost"):
-                _abandon_journal_segment(confirmation_recorder)
-                return error_response(409, "待确认操作已被更新，请刷新对话后重试。")
-            fallback = _persist_confirmation_fallback(chat, conversation_id, confirmed_outcome)
-            if fallback is not None:
-                _finish_journal(confirmation_recorder, "completed")
-                return JSONResponse(fallback)
-            if confirmed_outcome.get("cas_lost"):
-                _abandon_journal_segment(confirmation_recorder)
-                return error_response(409, "待确认操作已被更新，请刷新对话后重试。")
-            _finish_journal(confirmation_recorder, "failed", "provider_error")
-            return _ai_provider_error(exc, resolved_data_dir)
-        if confirmed_outcome.get("cas_lost"):
-            _abandon_journal_segment(confirmation_recorder)
-            return error_response(409, "待确认操作已被更新，请刷新对话后重试。")
-        added, forced_reply = _with_write_error_followup(added, tool_records, tool_failures)
-        persisted_added = _without_persisted_confirmation_result(added, confirmed_outcome)
-        reply = forced_reply or _user_facing_assistant_content(reply)
-        forced_pending: PendingAction | None = None
-        if forced_reply and new_pending is None:
-            forced_pending = _pending_action_from_added_write_call(added, catalog)
-        if new_pending is not None:
-            missing_question = _pending_action_missing_question(new_pending, applications)
-            if missing_question:
-                if confirmed_outcome:
-                    clarification_messages = [
-                        *persisted_added,
-                        Message(role="assistant", content=missing_question),
-                    ]
-                    if not _persist_confirmation_continuation(
-                        chat,
-                        conversation_id,
-                        confirmed_outcome,
-                        clarification_messages,
-                        clarification=(new_pending, missing_question),
-                    ):
-                        _abandon_journal_segment(confirmation_recorder)
-                        return error_response(409, "待确认操作已被更新，请刷新对话后重试。")
-                else:
-                    persisted = _persist_ai_messages(chat, conversation_id, persisted_added)
-                    chat.set_pending_clarification(conversation_id, new_pending, missing_question)
-                    persisted.append(
-                        chat.append_message(conversation_id, "assistant", content=missing_question)
-                    )
-                    chat.clear_pending_action(conversation_id)
-                    _record_persisted_messages(confirmation_recorder, persisted)
-                _finish_journal(confirmation_recorder, "completed")
-                return JSONResponse(
-                    {
-                        "type": "message",
-                        "conversation_id": conversation_id,
-                        "message": missing_question,
-                    }
-                )
-            if confirmed_outcome:
-                if not _persist_confirmation_continuation(
-                    chat,
-                    conversation_id,
-                    confirmed_outcome,
-                    persisted_added,
-                    pending=new_pending,
-                ):
-                    _abandon_journal_segment(confirmation_recorder)
-                    return error_response(409, "待确认操作已被更新，请刷新对话后重试。")
-            else:
-                if not chat.persist_pending_action(
-                    conversation_id,
-                    new_pending,
-                    _persistable_ai_messages(persisted_added),
-                ):
-                    _finish_journal(confirmation_recorder, "failed", "unknown")
-                    return error_response(409, "对话已归档，无法保存待确认操作。")
-            _suspend_journal(confirmation_recorder, new_pending)
-            return JSONResponse(
-                {
-                    "type": "confirmation_required",
-                    "conversation_id": conversation_id,
-                    "pending_action": _pending_action_json(new_pending, applications),
-                }
-            )
-        if confirmed_outcome:
-            clarification = (
-                (forced_pending, forced_reply)
-                if forced_pending is not None and forced_reply
-                else None
-            )
-            if not _persist_confirmation_continuation(
-                chat,
-                conversation_id,
-                confirmed_outcome,
-                persisted_added,
-                clarification=clarification,
-            ):
-                _abandon_journal_segment(confirmation_recorder)
-                return error_response(409, "待确认操作已被更新，请刷新对话后重试。")
-        else:
-            persisted = _persist_ai_messages(chat, conversation_id, persisted_added)
-            chat.clear_pending_action(conversation_id)
-            if forced_pending is not None and forced_reply:
-                chat.set_pending_clarification(conversation_id, forced_pending, forced_reply)
-            elif not forced_reply:
-                chat.clear_pending_clarification(conversation_id)
-            _record_persisted_messages(confirmation_recorder, persisted)
-        undo = (
-            dict(confirmed_outcome.get("undo") or {})
-            if confirmed_outcome
-            else _build_write_undo(effective_pending, _last_record(tool_records), undo_seed)
-            if approved
-            else {}
-        )
-        if approved and (not confirmed_outcome or confirmed_outcome.get("succeeded") is True):
-            if not confirmed_outcome:
-                if undo:
-                    chat.set_last_write_undo(conversation_id, undo)
-                else:
-                    chat.clear_last_write_undo(conversation_id)
-            reply = _prepend_write_success(reply, effective_pending, tool_records)
-        write_status, write_error = (
-            _write_outcome(tool_records, attempted=True, failures=tool_failures)
-            if approved
-            else ("cancelled", "")
-        )
-        response_payload: dict[str, Any] = {
-            "type": "message",
-            "conversation_id": conversation_id,
-            "message": reply,
-            "write_status": write_status,
-        }
-        if write_error:
-            response_payload["write_error"] = write_error
-        if undo:
-            if confirmed_outcome.get("undo_operation_id"):
-                undo["parent_operation_id"] = confirmed_outcome["undo_operation_id"]
-            response_payload["undo"] = undo
-        if confirmed_outcome.get("operation_id"):
-            response_payload["operation_id"] = confirmed_outcome["operation_id"]
-            response_payload["replayed"] = bool(confirmed_outcome.get("replayed"))
-        _finish_journal(confirmation_recorder, "completed")
-        return JSONResponse(response_payload)
-
+            return _runtime_http_response(outcome)
+        except (RuntimeAgentTimedOut, RuntimeCancelled, RuntimeTransportAborted) as exc:
+            return _runtime_error_response(exc)
     @app.post("/api/chat/undo-last-write")
     def undo_last_write(payload: dict[str, Any] = Body(...)) -> JSONResponse:
         conversation_id = _confirmation_conversation_id(payload)
@@ -6750,782 +4656,65 @@ def create_app(
         )
 
     @app.post("/api/chat/confirm/stream")
-    def confirm_chat_stream(payload: dict[str, Any] = Body(...)) -> Response:
-        confirmation = _confirmation_input(payload)
-        if isinstance(confirmation, JSONResponse):
-            return confirmation
-        approved, edited_args, rejection_feedback, confirmation_token = confirmation
-        conversation_id = _confirmation_conversation_id(payload)
-        if isinstance(conversation_id, JSONResponse):
-            return conversation_id
-        conversation = chat.get_conversation(conversation_id)
-        if conversation is None:
-            return error_response(404, "conversation not found")
-        run = SseRun(
-            run_id=str(uuid4()),
-            conversation_id=conversation_id,
-            context_type=str(conversation.context_type or "workspace"),
-            context_ref=str(conversation.context_ref or ""),
-            mode=str(conversation.mode or "general"),
+    def confirm_chat_stream(
+        http_request: Request,
+        payload: dict[str, Any] = Body(...),
+    ) -> Response:
+        typed_request = _normalize_runtime_confirmation_request(payload)
+        if isinstance(typed_request, JSONResponse):
+            return typed_request
+        runtime = http_request.app.state.pilot_runtime
+        run_uuid = uuid4()
+        transport = RuntimeTransportContext(
+            mode="stream",
+            transport_run_id=run_uuid,
+            stream_version=cast(StreamVersion, STREAM_VERSION),
         )
-
-        def emit(event: str, data: dict[str, Any] | None = None) -> str:
-            envelope = run.envelope(event, data)
-            return format_sse(event, f"{run.run_id}:{envelope['seq']}", envelope)
-
-        def stale_response() -> StreamingResponse:
-            def stale_stream() -> Any:
-                yield emit(
-                    "error",
-                    {
-                        "code": "stale_pending_action",
-                        "message": "待确认操作已被更新，请刷新对话后重试。",
-                        "retryable": True,
-                        "degraded": False,
-                    },
-                )
-
-            return StreamingResponse(
-                stale_stream(), media_type="text/event-stream; charset=utf-8", headers=sse_headers()
-            )
-
-        requested_operation_id = payload.get("operation_id")
-        if isinstance(requested_operation_id, str) and write_operations is not None:
-            terminal = write_operations.get(requested_operation_id)
-            if terminal is not None and terminal.status != "proposed":
-                if terminal.conversation_id != conversation_id or confirmation_token is None:
-                    return error_response(
-                        409, "operation identity conflict", code="operation_identity_conflict"
-                    )
-                synthetic = PendingAction(
-                    tool_call_id=terminal.tool_call_id or "",
-                    tool_name=terminal.tool_name,
-                    args="",
-                    human=terminal.tool_name,
-                    operation_id=terminal.id,
-                )
-                try:
-                    fingerprint = _ledger_confirmation_request_fingerprint(
-                        write_operations,
-                        synthetic,
-                        payload,
-                        approved=approved,
-                        edited_args=edited_args,
-                        rejection_feedback=rejection_feedback,
-                        confirmation_token=confirmation_token,
-                    )
-                    replay_response = _operation_replay_response(
-                        conversation_id,
-                        _converged_operation_replay(write_operations, terminal, fingerprint),
-                        chat,
-                        applications,
-                    )
-                    return _deterministic_pilot_confirmation_stream_response(
-                        conversation, replay_response, run=run
-                    )
-                except WriteOperationError as exc:
-                    return error_response(
-                        _write_operation_error_status(exc),
-                        "无法确认写入结果，请保留原请求后重试。",
-                        code=exc.code,
-                    )
-
-        stored = chat.list_messages(conversation_id) if approved else []
-        if approved and not stored:
-            return error_response(404, "conversation not found")
-
-        pending = chat.get_pending_action(conversation_id)
-        if pending is None:
-            return stale_response()
-        if confirmation_token is None:
-            if edited_args is not None or rejection_feedback:
-                return error_response(
-                    422, "confirmation_token is required when changing confirmation details"
-                )
-            confirmation_token = _confirmation_token(pending)
-        if not compare_digest(confirmation_token, _confirmation_token(pending)):
-            return stale_response()
-        if write_operations is None or write_coordinator is None:
-            return error_response(
-                503, "写入账本暂不可用，请保留确认卡后重试。", code="operation_unavailable"
-            )
+        control = InMemoryRuntimeInvocationControl()
         try:
-            request_fingerprint = _ledger_confirmation_request_fingerprint(
-                write_operations,
-                pending,
-                payload,
-                approved=approved,
-                edited_args=edited_args,
-                rejection_feedback=rejection_feedback,
-                confirmation_token=confirmation_token,
+            prepared = runtime.prepare_stream(
+                typed_request,
+                transport=transport,
+                invocation_control=control,
             )
-            existing_operation = write_operations.get(pending.operation_id)
-            if existing_operation is not None and existing_operation.status != "proposed":
-                replay_response = _operation_replay_response(
-                    conversation_id,
-                    _converged_operation_replay(
-                        write_operations, existing_operation, request_fingerprint
-                    ),
-                    chat,
-                    applications,
+            if isinstance(prepared, ImmediateHttpOutcome):
+                if prepared.response_payload.get("_runtime_stream_direct") is True:
+                    return outcome_http_response(prepared)
+                if prepared.response_payload.get("_runtime_stream_retryable") is not True:
+                    return outcome_http_response(prepared)
+                return _runtime_stream_immediate_response(
+                    prepared,
+                    run_id=str(run_uuid),
+                    request=typed_request,
                 )
-                return _deterministic_pilot_confirmation_stream_response(
-                    conversation, replay_response, run=run
-                )
-        except WriteOperationError as exc:
-            return error_response(
-                _write_operation_error_status(exc), "无法确认写入结果。", code=exc.code
+            conversation_id, context_type, context_ref, mode = _prepared_stream_metadata(
+                prepared, typed_request
             )
-        if pending.tool_name in {
-            "save_application_jd_version",
-            "create_application_submission_snapshot",
-            "record_application_outcome",
-        }:
-            if not compare_digest(confirmation_token, _confirmation_token(pending)):
-                return stale_response()
-            (
-                deterministic_journal,
-                deterministic_attempt,
-                deterministic_result,
-            ) = _deterministic_confirmation_journal_callbacks(
-                conversation,
-                pending,
-                edited=edited_args is not None,
-                transport_mode="stream",
-                transport_run_id=run.run_id,
-            )
-            deterministic_response = _deterministic_pilot_confirmation(
-                conversation_id,
-                pending,
-                approved=approved,
-                edited_args=edited_args,
-                rejection_feedback=rejection_feedback,
-                request_fingerprint=request_fingerprint,
-                on_confirmation_attempt=deterministic_attempt,
-                on_tool_result=deterministic_result,
-            )
-            _finish_deterministic_confirmation_journal(
-                deterministic_journal,
-                pending,
-                deterministic_response,
-                conversation_id,
-            )
-            if isinstance(deterministic_response, JSONResponse):
-                return deterministic_response
-            return _deterministic_pilot_confirmation_stream_response(
-                conversation,
-                deterministic_response,
-                run=run,
-            )
-        model: ChatModel | None = None
-        if approved:
-            resolved_model = _chat_model(chat_model, resolved_data_dir)
-            if isinstance(resolved_model, JSONResponse):
-                return resolved_model
-            model = resolved_model
-        if not compare_digest(confirmation_token, _confirmation_token(pending)):
-            return stale_response()
-
-        catalog = MODEL_TOOL_CATALOG
-        try:
-            effective_pending = (
-                prepare_pending_action(pending, catalog, edited_args) if approved else pending
-            )
-        except ValueError as exc:
-            return error_response(422, f"invalid confirmation edits: {exc}")
-
-        confirmation_attempt_id = str(uuid4())
-        confirmation_recorder = _resume_journal_confirmation(
-            conversation_id,
-            pending,
-            transport_mode="stream",
-            transport_run_id=run.run_id,
-            execution_path="agent_resume",
-        )
-        if approved:
-            _capture_confirmation_journal_context(
-                confirmation_recorder,
-                conversation,
-                tool_names=tuple(contract.name for contract in catalog.provider_contracts()),
-            )
-        undo_seed = _undo_seed_for_pending(effective_pending, applications) if approved else {}
-        confirmation_claim: dict[str, str] = {}
-        (
-            confirmed_outcome,
-            confirmation_result_sink,
-            cancel_confirmation_result,
-            finalize_confirmation_timeout,
-        ) = _confirmation_result_recorder(
-            chat,
-            conversation_id,
-            pending,
-            undo_seed,
-            lambda: confirmation_claim.get("id"),
-        )
-        confirmation_attempted = Event()
-        confirmation_cancelled = Event()
-        confirmation_timed_out = Event()
-        confirmation_attempt_lock = Lock()
-
-        def reload_stream_confirmation_messages() -> list[Message]:
-            refreshed = _load_chat_source_messages(
-                context_source_loader,
-                conversation,
-                None,
-                pending_tool_call_id=pending.tool_call_id,
-            )
-            return [
-                _chat_response_system_message(),
-                *(
-                    [refreshed.context_message]
-                    if refreshed.context_message is not None
-                    else []
-                ),
-                *refreshed.history,
-            ]
-
-        def persist_confirmation_result(
-            action: PendingAction,
-            result_approved: bool,
-            tool_message: Message,
-            execution_record: ToolExecutionRecord[Any, Any] | None,
-        ) -> None:
-            try:
-                confirmation_result_sink(action, result_approved, tool_message, execution_record)
-            except Exception:
-                if confirmation_timed_out.is_set():
-                    _abandon_journal_segment(confirmation_recorder)
-                raise
-            if confirmation_timed_out.is_set() and confirmed_outcome.get("fallback_persisted"):
-                _finish_journal(confirmation_recorder, "completed")
-
-        def start_confirmation_attempt(
-            action: PendingAction,
-            prepared: PreparedToolCall[Any, Any] | None,
-        ) -> ExecutionAuthorization | ToolFailure | None:
-            with confirmation_attempt_lock:
-                if prepared is not None and (
-                    prepared.pending_identity is None or prepared.pending_action_revision is None
-                ):
-                    return ToolFailure("conflict", "confirmation_claim_failed")
-                current = chat.get_pending_action(conversation_id)
-                if (
-                    confirmation_cancelled.is_set()
-                    or current is None
-                    or not compare_digest(confirmation_token, _confirmation_token(current))
-                ):
-                    return ToolFailure(
-                        "stale_state",
-                        "confirmation_claim_lost",
-                    )
-                confirmation_claim["id"] = pending.operation_id
-                _record_journal_approval(
-                    confirmation_recorder,
-                    confirmation_attempt_id=confirmation_attempt_id,
-                    original_pending=pending,
-                    effective_pending=action,
-                    approved=prepared is not None,
-                    edited=prepared is not None and edited_args is not None,
-                )
-                confirmation_attempted.set()
-                if prepared is None:
-                    rejection = write_coordinator.reject_primary(
-                        operation_id=pending.operation_id,
-                        conversation_id=conversation_id,
-                        tool_call_id=pending.tool_call_id,
-                        tool_name=pending.tool_name,
-                        request_fingerprint=request_fingerprint,
-                        visible_result=_rejection_result(rejection_feedback),
-                    )
-                    if isinstance(rejection, (OperationCommitted, OperationFailed)):
-                        confirmed_outcome["delivery_ownership"] = rejection.ownership
-                        if rejection.ownership is not None:
-                            confirmed_outcome["delivery_heartbeat"] = DeliveryHeartbeat(
-                                write_operations, rejection.ownership
-                            ).start()
-                    if isinstance(rejection, OperationUnknown):
-                        raise WriteOperationError(
-                            rejection.code,
-                            retryable=rejection.retryable,
-                        )
-                    return None
-                return ExecutionAuthorization(
-                    pending_identity=prepared.pending_identity,
-                    pending_action_revision=cast(int, prepared.pending_action_revision),
-                    tool_call_id=prepared.tool_call_id,
-                    tool_name=prepared.spec.name,
-                    arguments_digest=prepared.arguments_digest,
-                    operation_id=pending.operation_id,
-                )
-
-        def execute_stream_ledger_operation(
-            prepared: PreparedToolCall[Any, Any],
-            tool_context: ToolExecutionContext,
-            authorization: ExecutionAuthorization,
-        ) -> ToolExecutionRecord[Any, Any]:
-            execution, record = write_coordinator.execute_primary(
-                operation_id=pending.operation_id,
+            envelope = _runtime_sse_envelope(
+                run_id=str(run_uuid),
                 conversation_id=conversation_id,
-                prepared=prepared,
-                context=tool_context,
-                authorization=authorization,
-                request_fingerprint=request_fingerprint,
-                undo_seed_builder=lambda _prepared, current_context: _undo_seed_for_pending(
-                    effective_pending, current_context.applications
-                ),
-                undo_builder=lambda _prepared, current, transactional_seed: (
-                    _build_write_undo(effective_pending, current, dict(transactional_seed)) or None
-                ),
-            )
-            if isinstance(execution, (OperationCommitted, OperationFailed)):
-                if execution.payload.undo_json:
-                    confirmed_outcome["ledger_undo"] = json.loads(execution.payload.undo_json)
-                confirmed_outcome["delivery_ownership"] = execution.ownership
-                if execution.ownership is not None:
-                    confirmed_outcome["delivery_heartbeat"] = DeliveryHeartbeat(
-                        write_operations, execution.ownership
-                    ).start()
-            if record is not None:
-                return record
-            if isinstance(execution, OperationReplay):
-                current = write_operations.get(pending.operation_id)
-                if current is None:
-                    raise WriteOperationError("operation_result_unknown", retryable=True)
-                raise ChatOperationReplay(
-                    _converged_operation_replay(write_operations, current, request_fingerprint)
-                )
-            assert isinstance(execution, OperationUnknown)
-            raise WriteOperationError(
-                execution.code,
-                retryable=execution.retryable,
+                context_type=context_type,
+                context_ref=context_ref,
+                mode=mode,
             )
 
-        def stream() -> Any:
-            deferred_origin_events: list[tuple[str, dict[str, Any]]] = []
+            def body() -> Generator[str, None, None]:
+                return _runtime_sse_content(
+                    runtime,
+                    prepared,
+                    control,
+                    None,
+                    str(run_uuid),
+                    envelope,
+                    lambda _outcome: None,
+                )
 
-            def emit_agent_event(event: str, data: dict[str, Any] | None = None) -> str:
-                payload_data = dict(data or {})
-                if (
-                    event == "tool_result"
-                    and str(payload_data.get("tool_call_id") or "") == pending.tool_call_id
-                ):
-                    deferred_origin_events.append((event, payload_data))
-                    return ""
-                return emit(event, payload_data)
-
-            def release_origin_events() -> list[str]:
-                operation_id = str(confirmed_outcome.get("operation_id") or pending.operation_id)
-                released: list[str] = []
-                for event, payload_data in deferred_origin_events:
-                    payload_data["operation_id"] = operation_id
-                    released.append(emit(event, payload_data))
-                deferred_origin_events.clear()
-                return released
-
-            yield emit(
-                "meta",
-                {
-                    "stream_version": STREAM_VERSION,
-                    "supports_delta": _chat_model_supports_delta(cast(ChatModel, model)),
-                    "supports_tool_events": True,
-                    "supports_confirmation": True,
-                },
+            guard = PreparedStreamGuard(prepared=prepared, on_execute=body)
+            return build_guarded_streaming_response(
+                (), guard=guard, headers=sse_headers()
             )
-            if approved:
-                yield emit("status", {"phase": "tool_running", "label": "正在执行确认操作"})
-            else:
-                yield emit("status", {"phase": "thinking", "label": "正在根据你的反馈继续"})
-            try:
-                turn_result = yield from _run_chat_agent_with_sse_events(
-                    lambda event_sink, cancel_check: resume_after_confirm(
-                        cast(ChatModel, model),
-                        catalog,
-                        [],
-                        effective_pending,
-                        approved=approved,
-                        auto_approve=load_config(resolved_data_dir).chat_auto_approve_writes,
-                        max_iter=DEFAULT_MAX_ITERATIONS,
-                        rejection_feedback=rejection_feedback,
-                        thread_id=_agent_thread_id(conversation_id),
-                        event_sink=event_sink,
-                        cancel_check=lambda: confirmation_cancelled.is_set() or cancel_check(),
-                        confirmation_result_sink=persist_confirmation_result,
-                        confirmation_attempt_sink=start_confirmation_attempt,
-                        run_recorder=confirmation_recorder,
-                        delivery_fence=lambda: _confirmation_delivery_fence(confirmed_outcome),
-                        continuation_message_loader=(
-                            reload_stream_confirmation_messages if approved else None
-                        ),
-                        tool_context=_model_tool_context(
-                            conversation,
-                            applications,
-                            events,
-                            notes,
-                            offers,
-                            resumes,
-                            jd_analyses,
-                            confirmation_recorder,
-                            execute_stream_ledger_operation,
-                        ),
-                    ),
-                    emit_agent_event,
-                )
-                added, reply, new_pending = turn_result
-                tool_records = turn_result.records
-                tool_failures = turn_result.failures
-            except ChatRunCancelled:
-                _stop_confirmation_delivery_heartbeat(confirmed_outcome)
-                cancel_confirmation_result()
-                _finish_journal(confirmation_recorder, "cancelled", "cancelled")
-                return
-            except ChatAgentTimedOut:
-                _stop_confirmation_delivery_heartbeat(confirmed_outcome)
-                if confirmed_outcome.get("cas_lost"):
-                    _abandon_journal_segment(confirmation_recorder)
-                    yield emit(
-                        "error",
-                        {
-                            "code": "stale_pending_action",
-                            "message": "待确认操作已被更新，请刷新对话后重试。",
-                            "retryable": True,
-                            "degraded": False,
-                        },
-                    )
-                    return
-                with confirmation_attempt_lock:
-                    attempt_in_progress = confirmation_attempted.is_set()
-                    confirmation_cancelled.set()
-                    confirmation_timed_out.set()
-                fallback = finalize_confirmation_timeout()
-                if fallback is not None:
-                    _finish_journal(confirmation_recorder, "completed")
-                    yield from release_origin_events()
-                    yield emit("assistant_message", {"message": fallback["message"]})
-                    yield emit("completed", {"response": fallback, "persisted": True})
-                    return
-                if confirmed_outcome.get("cas_lost"):
-                    _abandon_journal_segment(confirmation_recorder)
-                    yield emit(
-                        "error",
-                        {
-                            "code": "stale_pending_action",
-                            "message": "待确认操作已被更新，请刷新对话后重试。",
-                            "retryable": True,
-                            "degraded": False,
-                        },
-                    )
-                    return
-                if attempt_in_progress:
-                    yield emit(
-                        "error",
-                        {
-                            "code": "confirmation_in_progress",
-                            "message": "确认操作仍在后台执行，请刷新对话查看结果，不要重复提交。",
-                            "retryable": False,
-                            "degraded": False,
-                        },
-                    )
-                    return
-                cancel_confirmation_result()
-                _finish_journal(confirmation_recorder, "timed_out", "timeout")
-                yield emit(
-                    "error",
-                    {
-                        "code": "chat_agent_timeout",
-                        "message": "这次确认处理时间过长，已停止。请重试或取消这次写入。",
-                        "retryable": True,
-                        "degraded": False,
-                    },
-                )
-                return
-            except ChatOperationReplay as exc:
-                _stop_confirmation_delivery_heartbeat(confirmed_outcome)
-                _abandon_journal_segment(confirmation_recorder)
-                replay_response = _operation_replay_response(
-                    conversation_id, exc.replay, chat, applications
-                )
-                if replay_response.get("type") == "confirmation_required":
-                    yield emit(
-                        "confirmation_required",
-                        {"pending_action": replay_response["pending_action"]},
-                    )
-                else:
-                    yield emit(
-                        "assistant_message",
-                        {"message": replay_response.get("message", "")},
-                    )
-                yield emit("completed", {"response": replay_response, "persisted": True})
-                return
-            except WriteOperationError as exc:
-                _stop_confirmation_delivery_heartbeat(confirmed_outcome)
-                _abandon_journal_segment(confirmation_recorder)
-                yield emit(
-                    "error",
-                    {
-                        "code": exc.code,
-                        "message": "无法确认写入结果，请保留原请求后重试。",
-                        "retryable": exc.retryable,
-                        "degraded": False,
-                    },
-                )
-                return
-            except PendingActionValidationError as exc:
-                _stop_confirmation_delivery_heartbeat(confirmed_outcome)
-                _abandon_journal_segment(confirmation_recorder)
-                yield emit(
-                    "error",
-                    {
-                        "code": "invalid_confirmation",
-                        "message": f"确认参数无效：{exc}",
-                        "retryable": True,
-                        "degraded": False,
-                    },
-                )
-                return
-            except StalePendingActionError:
-                _stop_confirmation_delivery_heartbeat(confirmed_outcome)
-                _abandon_journal_segment(confirmation_recorder)
-                yield emit(
-                    "error",
-                    {
-                        "code": "stale_pending_action",
-                        "message": "待确认操作已过期或正在处理中，请刷新对话后重试。",
-                        "retryable": True,
-                        "degraded": False,
-                    },
-                )
-                return
-            except Exception as exc:
-                _stop_confirmation_delivery_heartbeat(confirmed_outcome)
-                if confirmed_outcome.get("cas_lost"):
-                    _abandon_journal_segment(confirmation_recorder)
-                    yield emit(
-                        "error",
-                        {
-                            "code": "stale_pending_action",
-                            "message": "待确认操作已被更新，请刷新对话后重试。",
-                            "retryable": True,
-                            "degraded": False,
-                        },
-                    )
-                    return
-                fallback = _persist_confirmation_fallback(chat, conversation_id, confirmed_outcome)
-                if fallback is not None:
-                    _finish_journal(confirmation_recorder, "completed")
-                    yield from release_origin_events()
-                    yield emit("assistant_message", {"message": fallback["message"]})
-                    yield emit("completed", {"response": fallback, "persisted": True})
-                    return
-                if confirmed_outcome.get("cas_lost"):
-                    _abandon_journal_segment(confirmation_recorder)
-                    yield emit(
-                        "error",
-                        {
-                            "code": "stale_pending_action",
-                            "message": "待确认操作已被更新，请刷新对话后重试。",
-                            "retryable": True,
-                            "degraded": False,
-                        },
-                    )
-                    return
-                _finish_journal(confirmation_recorder, "failed", "provider_error")
-                yield emit(
-                    "error",
-                    {
-                        "code": "ai_provider_error",
-                        "message": _safe_stream_error(exc, resolved_data_dir),
-                        "retryable": True,
-                        "degraded": False,
-                    },
-                )
-                return
-
-            if confirmed_outcome.get("cas_lost"):
-                _abandon_journal_segment(confirmation_recorder)
-                yield emit(
-                    "error",
-                    {
-                        "code": "stale_pending_action",
-                        "message": "待确认操作已被更新，请刷新对话后重试。",
-                        "retryable": True,
-                        "degraded": False,
-                    },
-                )
-                return
-            added, forced_reply = _with_write_error_followup(added, tool_records, tool_failures)
-            persisted_added = _without_persisted_confirmation_result(added, confirmed_outcome)
-            reply = forced_reply or _user_facing_assistant_content(reply)
-            forced_pending: PendingAction | None = None
-            if forced_reply and new_pending is None:
-                forced_pending = _pending_action_from_added_write_call(added, catalog)
-            if new_pending is not None:
-                missing_question = _pending_action_missing_question(new_pending, applications)
-                if missing_question:
-                    if confirmed_outcome:
-                        clarification_messages = [
-                            *persisted_added,
-                            Message(role="assistant", content=missing_question),
-                        ]
-                        if not _persist_confirmation_continuation(
-                            chat,
-                            conversation_id,
-                            confirmed_outcome,
-                            clarification_messages,
-                            clarification=(new_pending, missing_question),
-                        ):
-                            _abandon_journal_segment(confirmation_recorder)
-                            yield emit(
-                                "error",
-                                {
-                                    "code": "stale_pending_action",
-                                    "message": "待确认操作已被更新，请刷新对话后重试。",
-                                    "retryable": True,
-                                    "degraded": False,
-                                },
-                            )
-                            return
-                    else:
-                        persisted = _persist_ai_messages(chat, conversation_id, persisted_added)
-                        chat.set_pending_clarification(
-                            conversation_id, new_pending, missing_question
-                        )
-                        persisted.append(
-                            chat.append_message(
-                                conversation_id,
-                                "assistant",
-                                content=missing_question,
-                            )
-                        )
-                        chat.clear_pending_action(conversation_id)
-                        _record_persisted_messages(confirmation_recorder, persisted)
-                    _finish_journal(confirmation_recorder, "completed")
-                    response = {
-                        "type": "message",
-                        "conversation_id": conversation_id,
-                        "message": missing_question,
-                    }
-                    yield from release_origin_events()
-                    yield emit("assistant_message", {"message": missing_question})
-                    yield emit("completed", {"response": response, "persisted": True})
-                    return
-                if confirmed_outcome:
-                    if not _persist_confirmation_continuation(
-                        chat,
-                        conversation_id,
-                        confirmed_outcome,
-                        persisted_added,
-                        pending=new_pending,
-                    ):
-                        _abandon_journal_segment(confirmation_recorder)
-                        yield emit(
-                            "error",
-                            {
-                                "code": "stale_pending_action",
-                                "message": "待确认操作已被更新，请刷新对话后重试。",
-                                "retryable": True,
-                                "degraded": False,
-                            },
-                        )
-                        return
-                else:
-                    if not chat.persist_pending_action(
-                        conversation_id,
-                        new_pending,
-                        _persistable_ai_messages(persisted_added),
-                    ):
-                        _finish_journal(confirmation_recorder, "failed", "unknown")
-                        yield emit(
-                            "error",
-                            {
-                                "code": "conversation_archived",
-                                "message": "对话已归档，无法保存待确认操作。",
-                                "retryable": False,
-                                "degraded": False,
-                            },
-                        )
-                        return
-                _suspend_journal(confirmation_recorder, new_pending)
-                pending_payload = _pending_action_json(new_pending, applications)
-                response = {
-                    "type": "confirmation_required",
-                    "conversation_id": conversation_id,
-                    "pending_action": pending_payload,
-                }
-                yield from release_origin_events()
-                yield emit("status", {"phase": "waiting_confirmation", "label": "需要确认"})
-                yield emit("confirmation_required", {"pending_action": pending_payload})
-                yield emit("completed", {"response": response, "persisted": True})
-                return
-            if confirmed_outcome:
-                clarification = (
-                    (forced_pending, forced_reply)
-                    if forced_pending is not None and forced_reply
-                    else None
-                )
-                if not _persist_confirmation_continuation(
-                    chat,
-                    conversation_id,
-                    confirmed_outcome,
-                    persisted_added,
-                    clarification=clarification,
-                ):
-                    _abandon_journal_segment(confirmation_recorder)
-                    yield emit(
-                        "error",
-                        {
-                            "code": "stale_pending_action",
-                            "message": "待确认操作已被更新，请刷新对话后重试。",
-                            "retryable": True,
-                            "degraded": False,
-                        },
-                    )
-                    return
-            else:
-                persisted = _persist_ai_messages(chat, conversation_id, persisted_added)
-                chat.clear_pending_action(conversation_id)
-                if forced_pending is not None and forced_reply:
-                    chat.set_pending_clarification(conversation_id, forced_pending, forced_reply)
-                elif not forced_reply:
-                    chat.clear_pending_clarification(conversation_id)
-                _record_persisted_messages(confirmation_recorder, persisted)
-            undo = (
-                dict(confirmed_outcome.get("undo") or {})
-                if confirmed_outcome
-                else _build_write_undo(effective_pending, _last_record(tool_records), undo_seed)
-                if approved
-                else {}
-            )
-            if approved and (not confirmed_outcome or confirmed_outcome.get("succeeded") is True):
-                if not confirmed_outcome:
-                    if undo:
-                        chat.set_last_write_undo(conversation_id, undo)
-                    else:
-                        chat.clear_last_write_undo(conversation_id)
-                reply = _prepend_write_success(reply, effective_pending, tool_records)
-            response = {"type": "message", "conversation_id": conversation_id, "message": reply}
-            if undo:
-                if confirmed_outcome.get("undo_operation_id"):
-                    undo["parent_operation_id"] = confirmed_outcome["undo_operation_id"]
-                response["undo"] = undo
-            if confirmed_outcome.get("operation_id"):
-                response["operation_id"] = confirmed_outcome["operation_id"]
-                response["replayed"] = bool(confirmed_outcome.get("replayed"))
-            write_status, write_error = (
-                _write_outcome(tool_records, attempted=True, failures=tool_failures)
-                if approved
-                else ("cancelled", "")
-            )
-            response["write_status"] = write_status
-            if write_error:
-                response["write_error"] = write_error
-            _finish_journal(confirmation_recorder, "completed")
-            yield from release_origin_events()
-            yield emit("assistant_message", {"message": reply})
-            yield emit("completed", {"response": response, "persisted": True})
-
-        return StreamingResponse(
-            stream(), media_type="text/event-stream; charset=utf-8", headers=sse_headers()
-        )
+        except (RuntimeAgentTimedOut, RuntimeCancelled, RuntimeTransportAborted) as exc:
+            return _runtime_error_response(exc)
 
     @app.get("/api/chat/conversations")
     def list_conversations(include_archived: bool = False) -> list[dict[str, Any]]:
@@ -10300,6 +7489,278 @@ def _confirmation_conversation_id(payload: dict[str, Any]) -> int | JSONResponse
     return value
 
 
+def _normalize_runtime_start_request(
+    payload: dict[str, Any],
+) -> StartTurnRequest | JSONResponse:
+    try:
+        page_context = _normalize_chat_page_context(payload.get("page_context"))
+        raw_attachments = (
+            _normalize_chat_attachments(payload["attachments"])
+            if "attachments" in payload
+            else []
+        )
+    except ValueError as exc:
+        return error_response(422, str(exc))
+    message = str(payload.get("message") or "")
+    if not message:
+        return error_response(400, "message is required")
+    raw_conversation_id = payload.get("conversation_id", 0)
+    if raw_conversation_id is None:
+        raw_conversation_id = 0
+    if isinstance(raw_conversation_id, bool) or not isinstance(raw_conversation_id, int):
+        return error_response(422, "conversation_id must be a non-negative integer")
+    if raw_conversation_id < 0:
+        return error_response(422, "conversation_id must be a non-negative integer")
+    try:
+        if "pilot_action" in payload:
+            parsed_action = parse_pilot_action(payload["pilot_action"])
+            del parsed_action
+        descriptor = (
+            PilotActionDescriptor(
+                kind=str(payload["pilot_action"].get("type") or ""),
+                value=json.dumps(
+                    payload["pilot_action"],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
+            if "pilot_action" in payload
+            else None
+        )
+        context_type = str(payload.get("context_type") or "workspace").strip() or "workspace"
+        context_ref = str(payload.get("context_ref") or "").strip()
+        mode = str(payload.get("mode") or "general").strip() or "general"
+        immutable_page = freeze_json_mapping(page_context) if page_context is not None else None
+        attachments = tuple(
+            AttachmentReference(item["kind"], item["id"]) for item in raw_attachments
+        )
+        return StartTurnRequest(
+            message=message,
+            conversation_id=raw_conversation_id,
+            mode=mode,
+            context_type=context_type,
+            context_ref=context_ref,
+            page_context=immutable_page,
+            attachments=attachments,
+            pilot_action=descriptor,
+        )
+    except (TypeError, ValueError, KeyError) as exc:
+        return error_response(422, str(exc))
+
+
+def _normalize_runtime_confirmation_request(
+    payload: dict[str, Any],
+) -> ConfirmationRequest | JSONResponse:
+    confirmation = _confirmation_input(payload)
+    if isinstance(confirmation, JSONResponse):
+        return confirmation
+    approved, edited_args, rejection_feedback, confirmation_token = confirmation
+    conversation_id = _confirmation_conversation_id(payload)
+    if isinstance(conversation_id, JSONResponse):
+        return conversation_id
+    operation_id = payload.get("operation_id")
+    if operation_id is not None and not isinstance(operation_id, str):
+        return error_response(422, "operation_id must be a string")
+    try:
+        edited = (
+            EditedArgs.from_mapping(cast(Mapping[str, Any], freeze_json_mapping(edited_args)))
+            if edited_args is not None
+            else EditedArgs.missing()
+        )
+        return ConfirmationRequest(
+            conversation_id=conversation_id,
+            approved=approved,
+            confirmation_token=confirmation_token or "",
+            operation_id=operation_id,
+            edited_args=edited,
+            rejection_feedback=rejection_feedback,
+            rejection_feedback_present="rejection_feedback" in payload,
+        )
+    except (TypeError, ValueError) as exc:
+        return error_response(422, str(exc))
+
+
+def _runtime_title_latch(
+    background_tasks: BackgroundTasks,
+    injected: Optional[ChatModel],
+    chat: ChatRepository,
+    first_message: str,
+    data_dir: Path,
+    conversation_id: int | None,
+) -> tuple[RuntimeSignalLatch, ClosedAgentSignalSink, Callable[[int | None], None]]:
+    holder = {"conversation_id": conversation_id}
+
+    def register(_signal: object) -> None:
+        current = holder["conversation_id"]
+        if type(current) is not int or current <= 0:
+            return
+        background_tasks.add_task(
+            _generate_conversation_title,
+            injected,
+            chat,
+            current,
+            first_message,
+            data_dir,
+        )
+
+    latch = RuntimeSignalLatch(register=register)
+    def set_conversation_id(value: int | None) -> None:
+        holder["conversation_id"] = value
+
+    return latch, ClosedAgentSignalSink(latch), set_conversation_id
+
+
+def _runtime_sse_envelope(
+    *,
+    run_id: str,
+    conversation_id: int,
+    context_type: str,
+    context_ref: str,
+    mode: str,
+) -> dict[str, object]:
+    return {
+        "run_id": run_id,
+        "conversation_id": conversation_id,
+        "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "context_type": context_type,
+        "context_ref": context_ref,
+        "mode": mode,
+    }
+
+
+def _prepared_stream_metadata(
+    prepared: PreparedStreamExecution,
+    request: StartTurnRequest | ConfirmationRequest,
+) -> tuple[int, str, str, str]:
+    state = getattr(prepared, "opaque_state", None)
+    conversation = getattr(state, "conversation", None)
+    conversation_id = getattr(state, "conversation_id", None)
+    if type(conversation_id) is not int or conversation_id <= 0:
+        conversation_id = getattr(conversation, "conversation_id", None)
+    if type(conversation_id) is not int or conversation_id <= 0:
+        conversation_id = request.conversation_id if isinstance(request, ConfirmationRequest) else 0
+    return (
+        conversation_id,
+        str(getattr(conversation, "context_type", "workspace") or "workspace"),
+        str(getattr(conversation, "context_ref", "") or ""),
+        str(getattr(conversation, "mode", "general") or "general"),
+    )
+
+
+def _runtime_sse_content(
+    runtime: Any,
+    prepared: PreparedStreamExecution,
+    control: InMemoryRuntimeInvocationControl,
+    signal_sink: Any,
+    run_id: str,
+    envelope_metadata: Mapping[str, object],
+    set_outcome: Callable[[object], None],
+) -> Generator[str, None, None]:
+    outer_host: SseAgentExecutionHost[object] = SseAgentExecutionHost(
+        timeout_seconds=CHAT_AGENT_TIMEOUT_SECONDS + 1.0
+    )
+    outer_control = InMemoryRuntimeInvocationControl()
+    inner_host: SyncAgentExecutionHost[object] = SyncAgentExecutionHost(
+        timeout_seconds=CHAT_AGENT_TIMEOUT_SECONDS
+    )
+
+    def execute(agent_events: Any) -> object:
+        return runtime.execute_prepared_stream(
+            prepared,
+            event_sink=agent_events,
+            signal_sink=signal_sink,
+            execution_host=inner_host,
+            cancel_check=lambda: not outer_control.is_active(),
+        )
+
+    streamed = outer_host.run(execute, cast(Any, outer_control))
+    sequence = 0
+    try:
+        for event in streamed:
+            sequence += 1
+            yield encode_sse_event(
+                event,
+                seq=sequence,
+                run_id=run_id,
+                envelope=envelope_metadata,
+            )
+        result = streamed.result
+        set_outcome(result)
+        outer_control.mark_completed()
+    finally:
+        close = getattr(streamed, "close", None)
+        if callable(close):
+            close()
+
+
+def _runtime_stream_immediate_response(
+    outcome: ImmediateHttpOutcome,
+    *,
+    run_id: str,
+    request: StartTurnRequest | ConfirmationRequest,
+) -> Response:
+    payload = outcome.response_payload
+    raw_code = payload.get("error_code", RuntimeFailureCode.AI_PROVIDER_ERROR.value)
+    if (
+        raw_code == RuntimeFailureCode.OPERATION_INPUT_CONFLICT.value
+        and isinstance(request, ConfirmationRequest)
+        and request.approved
+        and request.edited_args.is_missing()
+        and not request.rejection_feedback_present
+    ):
+        raw_code = RuntimeFailureCode.STALE_PENDING_ACTION.value
+    try:
+        code = RuntimeFailureCode(str(raw_code))
+    except ValueError:
+        code = RuntimeFailureCode.AI_PROVIDER_ERROR
+    conversation_id = request.conversation_id or 0
+    context_type = getattr(request, "context_type", "workspace")
+    context_ref = getattr(request, "context_ref", "")
+    mode = getattr(request, "mode", "general")
+    event = ErrorEvent(
+        code=code,
+        message=str(payload.get("error", "")),
+        retryable=bool(payload.get("_runtime_stream_retryable", False)),
+        degraded=bool(payload.get("_runtime_stream_degraded", False)),
+    )
+    envelope = _runtime_sse_envelope(
+        run_id=run_id,
+        conversation_id=conversation_id,
+        context_type=str(context_type or "workspace"),
+        context_ref=str(context_ref or ""),
+        mode=str(mode or "general"),
+    )
+    content = encode_sse_event(event, seq=1, run_id=run_id, envelope=envelope)
+    return Response(
+        content=content,
+        status_code=200,
+        media_type="text/event-stream; charset=utf-8",
+        headers=sse_headers(),
+    )
+
+
+def _runtime_error_response(exc: BaseException) -> JSONResponse:
+    if isinstance(exc, RuntimeAgentTimedOut):
+        return error_response(504, CHAT_TIMEOUT_MESSAGE, code="chat_agent_timeout")
+    if isinstance(exc, RuntimeCancelled):
+        return error_response(499, CHAT_CANCELLED_MESSAGE, code="chat_cancelled")
+    if isinstance(exc, RuntimeTransportAborted):
+        return error_response(499, "请求已中止。", code="transport_aborted")
+    raise exc
+
+
+def _runtime_http_response(outcome: object) -> JSONResponse:
+    """Render sync Chat outcomes with the legacy provider-error body shape."""
+
+    suppress_code = isinstance(outcome, RuntimeFailureOutcome) and (
+        outcome.code is RuntimeFailureCode.AI_PROVIDER_ERROR
+    )
+    return outcome_http_response(
+        cast(Any, outcome),
+        include_error_code=not suppress_code,
+    )
+
+
 def _ledger_confirmation_request_fingerprint(
     repository: WriteOperationRepository,
     pending: PendingAction,
@@ -10410,54 +7871,6 @@ def _operation_replay_response(
     if status == "failed":
         response["write_error"] = replay.payload.failure_code or "operation_failed"
     return response
-
-
-def _run_chat_agent_with_timeout(call: Any) -> Any:
-    executor = ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(call)
-    try:
-        result = future.result(timeout=CHAT_AGENT_TIMEOUT_SECONDS)
-    except FutureTimeoutError as exc:
-        future.cancel()
-        executor.shutdown(wait=False, cancel_futures=True)
-        raise ChatAgentTimedOut() from exc
-    except Exception:
-        executor.shutdown(wait=False, cancel_futures=True)
-        raise
-    executor.shutdown(wait=False)
-    return result
-
-
-def _run_chat_agent_with_sse_events(
-    call: Callable[[Callable[[dict[str, Any]], None], Callable[[], bool]], Any],
-    emit: Callable[[str, dict[str, Any] | None], str],
-) -> Generator[str, None, Any]:
-    completion_marker = object()
-    event_queue: Queue[dict[str, Any] | object] = Queue()
-    cancel_event = Event()
-    executor = ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(lambda: call(event_queue.put, cancel_event.is_set))
-    future.add_done_callback(lambda _future: event_queue.put(completion_marker))
-    deadline = perf_counter() + CHAT_AGENT_TIMEOUT_SECONDS
-    cancel_futures = True
-    try:
-        while True:
-            try:
-                agent_event = event_queue.get(timeout=0.1)
-            except Empty as exc:
-                if perf_counter() >= deadline:
-                    future.cancel()
-                    raise ChatAgentTimedOut() from exc
-                continue
-            if agent_event is completion_marker:
-                break
-            assert isinstance(agent_event, dict)
-            yield emit(str(agent_event["event"]), dict(agent_event["data"]))
-        cancel_futures = False
-        return future.result()
-    finally:
-        cancel_event.set()
-        executor.shutdown(wait=False, cancel_futures=cancel_futures)
 
 
 def _ai_provider_error(exc: Exception, data_dir: Path) -> JSONResponse:
@@ -10725,242 +8138,6 @@ def _chat_clarification_message(
             "如果仍缺关键字段，只追问一个最关键的问题。"
         ),
     )
-
-
-def _confirmation_result_recorder(
-    repo: ChatRepository,
-    conversation_id: int,
-    expected_pending: PendingAction,
-    undo_seed: dict[str, Any],
-    confirmation_claim_id: Callable[[], str | None],
-) -> tuple[
-    dict[str, Any],
-    Callable[[PendingAction, bool, Message, ToolExecutionRecord[Any, Any] | None], None],
-    Callable[[], None],
-    Callable[[], dict[str, Any] | None],
-]:
-    outcome: dict[str, Any] = {}
-    active = True
-    timed_out = False
-    lock = Lock()
-
-    def record(
-        effective_pending: PendingAction,
-        approved: bool,
-        tool_message: Message,
-        execution_record: ToolExecutionRecord[Any, Any] | None,
-    ) -> None:
-        persist_timeout_fallback = False
-        with lock:
-            if not active:
-                return
-            succeeded = approved and _record_succeeded(execution_record)
-            undo = (
-                _build_write_undo(effective_pending, execution_record, undo_seed)
-                if succeeded
-                else {}
-            )
-            ledger_undo = outcome.get("ledger_undo")
-            if succeeded and isinstance(ledger_undo, dict):
-                undo = dict(ledger_undo)
-            # Rejection never attempts a handler, so it preserves the previous undo. Every
-            # approved sink call follows a handler attempt; errors are mutation-ambiguous and
-            # therefore clear the previous undo fail-closed.
-            undo_update = undo if approved else None
-            claim_id = confirmation_claim_id()
-            if claim_id is None:
-                outcome["cas_lost"] = True
-                raise StalePendingActionError(
-                    "stale pending action: confirmation result has no successful claim"
-                )
-            current = repo.get_conversation(conversation_id)
-            if current is None:
-                outcome["cas_lost"] = True
-                raise StalePendingActionError(
-                    "stale pending action: confirmation conversation disappeared"
-                )
-            response_undo = undo if approved else repo.get_last_write_undo(conversation_id) or {}
-            undo_operation_id = (
-                expected_pending.operation_id
-                if approved and succeeded and undo
-                else repo.get_last_write_operation_id(conversation_id)
-                if not approved and response_undo
-                else ""
-            )
-            outcome.update(
-                {
-                    "pending": effective_pending,
-                    "expected_pending": expected_pending,
-                    "approved": approved,
-                    "succeeded": succeeded,
-                    "tool_call_id": tool_message.tool_call_id,
-                    "operation_id": expected_pending.operation_id,
-                    "undo_operation_id": undo_operation_id,
-                    "replayed": bool(execution_record and execution_record.replayed),
-                    "undo": response_undo,
-                    "undo_update": undo_update,
-                    "origin_tool_message": tool_message,
-                    "confirmation_claim_id": claim_id,
-                    "continuation_generation": current.updated_at,
-                }
-            )
-            persist_timeout_fallback = timed_out
-        if persist_timeout_fallback:
-            fallback_response = _persist_confirmation_fallback(repo, conversation_id, outcome)
-            if fallback_response is not None:
-                outcome["fallback_response"] = fallback_response
-
-    def cancel() -> None:
-        nonlocal active
-        with lock:
-            active = False
-
-    def finalize_timeout() -> dict[str, Any] | None:
-        nonlocal timed_out
-        with lock:
-            timed_out = True
-            existing = outcome.get("fallback_response")
-            if isinstance(existing, dict):
-                return dict(existing)
-            fallback = _persist_confirmation_fallback(repo, conversation_id, outcome)
-            if fallback is not None:
-                outcome["fallback_response"] = fallback
-            return fallback
-
-    return outcome, record, cancel, finalize_timeout
-
-
-def _without_persisted_confirmation_result(
-    messages: list[Message],
-    outcome: dict[str, Any],
-) -> list[Message]:
-    if not outcome:
-        return messages
-    tool_call_id = str(outcome.get("tool_call_id") or "")
-    return [
-        message
-        for message in messages
-        if not (message.role == "tool" and message.tool_call_id == tool_call_id)
-    ]
-
-
-def _persist_confirmation_continuation(
-    repo: ChatRepository,
-    conversation_id: int,
-    outcome: dict[str, Any],
-    messages: list[Message],
-    *,
-    pending: PendingAction | None = None,
-    clarification: tuple[PendingAction, str] | None = None,
-) -> bool:
-    generation = outcome.get("continuation_generation")
-    if not isinstance(generation, datetime):
-        return False
-    next_generation = repo.persist_confirmation_continuation(
-        conversation_id,
-        generation,
-        _persistable_ai_messages(messages),
-        pending=pending,
-        clarification=clarification,
-        delivery_ownership=outcome.get("delivery_ownership"),
-        expected_pending=outcome.get("expected_pending"),
-        claim_id=outcome.get("confirmation_claim_id"),
-        origin_message=outcome.get("origin_tool_message"),
-        undo=outcome.get("undo_update"),
-    )
-    if next_generation is None:
-        _stop_confirmation_delivery_heartbeat(outcome)
-        return False
-    _stop_confirmation_delivery_heartbeat(outcome)
-    outcome["continuation_generation"] = next_generation
-    return True
-
-
-def _persist_confirmation_fallback(
-    repo: ChatRepository,
-    conversation_id: int,
-    outcome: dict[str, Any],
-) -> dict[str, Any] | None:
-    if "approved" not in outcome or outcome.get("fallback_persisted"):
-        return None
-    approved = outcome.get("approved") is True
-    succeeded = outcome.get("succeeded") is True
-    message = _confirmation_fallback_message(approved, succeeded)
-    generation = outcome.get("continuation_generation")
-    if not isinstance(generation, datetime):
-        outcome["cas_lost"] = True
-        return None
-    next_generation = repo.persist_confirmation_continuation(
-        conversation_id,
-        generation,
-        _persistable_ai_messages([Message(role="assistant", content=message)]),
-        delivery_ownership=outcome.get("delivery_ownership"),
-        delivery_failure_code="operation_delivery_failed",
-        expected_pending=outcome.get("expected_pending"),
-        claim_id=outcome.get("confirmation_claim_id"),
-        origin_message=outcome.get("origin_tool_message"),
-        undo=outcome.get("undo_update"),
-    )
-    if next_generation is None:
-        _stop_confirmation_delivery_heartbeat(outcome)
-        outcome["cas_lost"] = True
-        return None
-    _stop_confirmation_delivery_heartbeat(outcome)
-    outcome["continuation_generation"] = next_generation
-    outcome["fallback_persisted"] = True
-    undo = outcome.get("undo")
-    public_undo = dict(undo) if isinstance(undo, dict) else {}
-    operation_id = outcome.get("undo_operation_id")
-    if public_undo and isinstance(operation_id, str) and operation_id:
-        public_undo["parent_operation_id"] = operation_id
-    return _confirmation_fallback_response(
-        conversation_id,
-        message,
-        public_undo,
-        operation_id=str(outcome.get("operation_id") or ""),
-        replayed=bool(outcome.get("replayed")),
-    )
-
-
-def _confirmation_delivery_fence(outcome: dict[str, Any]) -> bool:
-    heartbeat = outcome.get("delivery_heartbeat")
-    return not isinstance(heartbeat, DeliveryHeartbeat) or heartbeat.fence()
-
-
-def _stop_confirmation_delivery_heartbeat(outcome: dict[str, Any]) -> None:
-    heartbeat = outcome.pop("delivery_heartbeat", None)
-    if isinstance(heartbeat, DeliveryHeartbeat):
-        heartbeat.stop()
-
-
-def _confirmation_fallback_message(approved: bool, succeeded: bool) -> str:
-    return (
-        CHAT_CONFIRMED_WRITE_FALLBACK
-        if succeeded
-        else CHAT_CONFIRMED_WRITE_ERROR_FALLBACK
-        if approved
-        else CHAT_REJECTION_FALLBACK
-    )
-
-
-def _confirmation_fallback_response(
-    conversation_id: int,
-    message: str,
-    undo: dict[str, Any],
-    *,
-    operation_id: str,
-    replayed: bool,
-) -> dict[str, Any]:
-    response: dict[str, Any] = {
-        "type": "message",
-        "conversation_id": conversation_id,
-        "message": message,
-        "operation_id": operation_id,
-        "replayed": replayed,
-    }
-    if undo:
-        response["undo"] = undo
-    return response
 
 
 def _chat_context_message(
@@ -12064,49 +9241,6 @@ def _pending_action_details(
         "proposed_changes": proposed_changes,
         "evidence": [target],
     }
-
-
-def _prepend_write_success(
-    reply: str,
-    pending: PendingAction,
-    records: tuple[ToolExecutionRecord[Any, Any], ...],
-) -> str:
-    if pending.tool_name not in {"create_application", "add_note", "create_application_event"}:
-        return reply
-    summary = _write_success_summary(pending.tool_name, records)
-    if not summary:
-        return reply
-    if summary in reply:
-        return reply
-    return f"{summary}\n\n{reply}".strip()
-
-
-def _write_success_summary(
-    tool_name: str,
-    records: tuple[ToolExecutionRecord[Any, Any], ...],
-) -> str:
-    payload = _last_successful_tool_payload(records)
-    if not payload:
-        return ""
-    if tool_name == "create_application":
-        record_id = payload.get("application_id") or payload.get("id")
-        company = str(payload.get("company_name") or "").strip()
-        position = str(payload.get("position_name") or "").strip()
-        meta = " · ".join(value for value in [company, position] if value)
-        suffix = f"（{meta}）。" if meta else "。"
-        return f"✅ 创建成功：投递记录 #{record_id} 已保存{suffix}" if record_id else ""
-    if tool_name == "add_note":
-        record_id = payload.get("note_id") or payload.get("id")
-        company = str(payload.get("company") or "").strip()
-        position = str(payload.get("position") or "").strip()
-        round_name = str(payload.get("round") or "").strip()
-        meta = " · ".join(value for value in [company, position, round_name] if value)
-        suffix = f"（{meta}）。" if meta else "。"
-        return f"✅ 保存成功：复盘记录 #{record_id} 已保存{suffix}" if record_id else ""
-    if tool_name == "create_application_event":
-        record_id = payload.get("application_event_id") or payload.get("id")
-        return f"✅ 创建成功：日程 #{record_id} 已保存。" if record_id else ""
-    return ""
 
 
 def _last_successful_tool_payload(

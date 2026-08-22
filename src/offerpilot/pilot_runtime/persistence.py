@@ -511,6 +511,21 @@ class ChatPersistenceCoordinator:
         pending = self._chat.get_pending_action(conversation_id)
         return None if pending is None else _snapshot_pending_action(pending)
 
+    def get_last_write_undo(self, conversation_id: int) -> ImmutablePayload | None:
+        """Read the public undo projection without exposing a Conversation row."""
+
+        conversation = self._chat.get_conversation(conversation_id)
+        if conversation is None:
+            return None
+        raw = conversation.last_write_undo
+        if not isinstance(raw, Mapping) or not raw:
+            return None
+        value = dict(raw)
+        operation_id = conversation.last_write_operation_id
+        if isinstance(operation_id, str) and operation_id:
+            value["parent_operation_id"] = operation_id
+        return freeze_json_mapping(value)
+
     def get_pending_clarification(
         self, conversation_id: int
     ) -> PendingClarificationView | None:

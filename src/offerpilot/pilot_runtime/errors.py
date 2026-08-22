@@ -79,8 +79,8 @@ class RuntimeAgentTimedOut(Exception):
 class ModelUnconfiguredError(Exception):
     """Closed resolver signal for an intentionally absent model configuration."""
 
-    def __init__(self) -> None:
-        super().__init__("model unconfigured")
+    def __init__(self, message: str = "model unconfigured") -> None:
+        super().__init__(message)
 
     def __repr__(self) -> str:
         return "ModelUnconfiguredError()"

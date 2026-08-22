@@ -54,6 +54,12 @@ from offerpilot.models import (
     WriteOperation,
     WriteOperationTransition,
 )
+from offerpilot.pilot_runtime.contracts import (
+    MessageOutcome,
+    PreparedStreamExecution,
+    PreparationKind,
+    StreamExecutionMode,
+)
 from offerpilot.repositories.applications import ApplicationsRepository
 from offerpilot.repositories.agent_runs import AgentRunRepository, JournalConflictError
 from offerpilot.repositories.chat import ChatRepository
@@ -596,6 +602,86 @@ def test_chat_ingress_rejection_does_not_create_journal_run(
 
     assert response.status_code == expected_status
     assert _journal_rows(tmp_path) == ([], [], [])
+
+
+class _RouteSpyRuntime:
+    def __init__(self) -> None:
+        self.calls: Counter[str] = Counter()
+
+    @staticmethod
+    def _outcome(conversation_id: int = 1) -> MessageOutcome:
+        return MessageOutcome(message="spy reply", conversation_id=conversation_id)
+
+    @staticmethod
+    def _prepared() -> PreparedStreamExecution:
+        return PreparedStreamExecution(
+            invocation_id="route-spy",
+            preparation_kind=PreparationKind.MODEL,
+            execution_mode=StreamExecutionMode.AGENT_HOST,
+            opaque_state=(),
+        )
+
+    def start_turn(self, *_args: object, **_kwargs: object) -> MessageOutcome:
+        self.calls["start_turn"] += 1
+        return self._outcome()
+
+    def prepare_stream(self, *_args: object, **_kwargs: object) -> PreparedStreamExecution:
+        self.calls["prepare_stream"] += 1
+        return self._prepared()
+
+    def continue_confirmation(self, *_args: object, **_kwargs: object) -> MessageOutcome:
+        self.calls["continue_confirmation"] += 1
+        return self._outcome()
+
+    def execute_prepared_stream(self, *_args: object, **_kwargs: object) -> MessageOutcome:
+        self.calls["execute_prepared_stream"] += 1
+        return self._outcome()
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "payload", "expected_calls"),
+    [
+        (
+            "/api/chat",
+            {"message": "hello", "conversation_id": 1},
+            {"start_turn": 1},
+        ),
+        (
+            "/api/chat/stream",
+            {"message": "hello", "conversation_id": 1},
+            {"prepare_stream": 1, "execute_prepared_stream": 1},
+        ),
+        (
+            "/api/chat/confirm",
+            {
+                "conversation_id": 1,
+                "approved": False,
+                "confirmation_token": "a" * 64,
+            },
+            {"continue_confirmation": 1},
+        ),
+        (
+            "/api/chat/confirm/stream",
+            {
+                "conversation_id": 1,
+                "approved": False,
+                "confirmation_token": "a" * 64,
+            },
+            {"prepare_stream": 1, "execute_prepared_stream": 1},
+        ),
+    ],
+)
+def test_chat_routes_delegate_to_pilot_runtime_once(
+    tmp_path, endpoint, payload, expected_calls
+):
+    app = create_app(data_dir=tmp_path)
+    spy = _RouteSpyRuntime()
+    app.state.pilot_runtime = spy
+
+    response = TestClient(app).post(endpoint, json=payload)
+
+    assert response.status_code == 200
+    assert dict(spy.calls) == expected_calls
 
 
 def test_chat_sync_records_complete_journal_lifecycle(tmp_path):

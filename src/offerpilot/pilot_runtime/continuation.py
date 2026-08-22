@@ -356,6 +356,7 @@ class ConfirmationDependencies:
     context_assembler: ConfirmationContextAssembler | Callable[..., object] | None = None
     journal: object | None = None
     applications: object | None = None
+    transactional_delivery: object | None = field(default=None, repr=False, compare=False)
     clock: Callable[[], datetime] = field(
         default=lambda: datetime.now(timezone.utc), repr=False, compare=False
     )
@@ -410,6 +411,7 @@ class ConfirmationState:
     delivered: bool = False
     delivery_in_progress: bool = field(default=False, repr=False, compare=False)
     delivery_result: PersistenceResult | None = field(default=None, repr=False, compare=False)
+    transactional_delivery_persisted: bool = field(default=False, repr=False, compare=False)
     active: bool = True
     lock: RLock = field(default_factory=RLock, repr=False, compare=False)
 
@@ -975,7 +977,9 @@ class ConfirmationCoordinator:
                     # Reject is deliberately a token/Pending/Ledger identity
                     # path.  Compare the persisted argument bytes directly so
                     # a malformed proposal cannot enter schema/JSON decoding.
-                    or not compare_digest(current.args, state.pending.args)
+                    or not compare_digest(
+                        current.args.encode("utf-8"), state.pending.args.encode("utf-8")
+                    )
                 ):
                     state.cas_lost = True
                     return ToolFailure("stale_state", "confirmation_claim_lost")
@@ -1259,6 +1263,13 @@ class ConfirmationCoordinator:
                 )
                 return dict(value) if isinstance(value, Mapping) else None
 
+        transactional_delivery = self.dependencies.transactional_delivery
+        register_delivery = _callable(transactional_delivery, ("register",))
+        unregister_delivery = _callable(transactional_delivery, ("unregister",))
+        registered_delivery = False
+        if register_delivery is not None:
+            _invoke(register_delivery, {"state": state}, (state,))
+            registered_delivery = True
         values: dict[str, object] = {
             "operation_id": state.identity.operation_id,
             "conversation_id": state.identity.conversation_id,
@@ -1270,14 +1281,18 @@ class ConfirmationCoordinator:
         }
         if undo_builder is not None:
             values["undo_builder"] = undo_builder
-        execution, record = cast(
-            tuple[OperationExecution, ToolExecutionRecord[Any, Any] | None],
-            _invoke(
-                coordinator,
-                values,
-                (),
-            ),
-        )
+        try:
+            execution, record = cast(
+                tuple[OperationExecution, ToolExecutionRecord[Any, Any] | None],
+                _invoke(
+                    coordinator,
+                    values,
+                    (),
+                ),
+            )
+        finally:
+            if registered_delivery and unregister_delivery is not None:
+                _invoke(unregister_delivery, {"state": state}, (state,))
         if _terminal(execution):
             state.terminal_execution = execution
             self._set_ownership(state, execution)
@@ -1330,6 +1345,11 @@ class ConfirmationCoordinator:
                 state.undo_update = dict(decoded)
             if not approved:
                 state.undo_update = None
+            elif not state.succeeded:
+                # An approved write that failed is terminal and must clear any
+                # previously exposed undo atom rather than leaving stale
+                # recovery data attached to the conversation.
+                state.undo_update = {}
             if state.continuation_generation is None:
                 state.continuation_generation = self._conversation_generation(None, state.identity.conversation_id)
             return None
@@ -1368,7 +1388,8 @@ class ConfirmationCoordinator:
             if state.cancelled or state.cas_lost or not state.active:
                 return False
             heartbeat = state.delivery_heartbeat
-        return heartbeat is not None and heartbeat.fence()
+        result = heartbeat is not None and heartbeat.fence()
+        return result
 
     def stop_heartbeat(self, state: ConfirmationState | ConfirmationSession) -> None:
         if isinstance(state, ConfirmationSession):
@@ -1701,9 +1722,9 @@ class ConfirmationCoordinator:
     @staticmethod
     def _fallback_message(state: ConfirmationState) -> str:
         if state.succeeded:
-            return "操作已提交，但后续说明生成失败。"
+            return "写入已完成，但暂时无法生成后续说明。你可以刷新数据查看结果。"
         if state.approved:
-            return "操作未完成，请查看工具结果后重试。"
+            return "写入未完成，错误结果已记录。请检查输入后重试。"
         return ConfirmationCoordinator._rejection_result(state.rejection_feedback)
 
 

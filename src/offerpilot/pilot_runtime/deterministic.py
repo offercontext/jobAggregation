@@ -15,6 +15,7 @@ Agent worker or running the operation a second time.
 
 from __future__ import annotations
 
+import inspect
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -93,6 +94,10 @@ _CANCELLED_TOOL_RESULT = json.dumps(
     ensure_ascii=False,
 )
 
+# Task8 closed compatibility source: ``build_legacy_deterministic_catalog``
+# currently keeps these schemas inside its builder and exposes no public,
+# immutable editable-fields constant.  Keep this bridge-local projection
+# closed and lock it against that legacy source in the focused test suite.
 _LEGACY_EDITABLE_FIELDS: dict[str, tuple[dict[str, JSONValue], ...]] = {
     "save_application_jd_version": (
         {"field": "jd_text", "type": "long_text"},
@@ -218,15 +223,73 @@ def _callable(value: object | None, names: tuple[str, ...]) -> Callable[..., obj
 
 
 def _invoke(function: Callable[..., object], named: Mapping[str, object], positional: tuple[object, ...]) -> object:
-    """Call small fakes and production adapters without signature probing loops."""
+    """Call an injected seam once after binding a supported argument shape.
+
+    Binding is completed before entering the callable.  Consequently a
+    ``TypeError`` (or any other exception) raised by the body is its own
+    failure and is never mistaken for an argument-shape mismatch or retried.
+    """
 
     try:
-        return function(**named)
-    except TypeError as named_error:
+        signature = inspect.signature(function)
+    except (TypeError, ValueError):
+        return function(*positional)
+
+    parameters = tuple(signature.parameters.values())
+
+    def composed_call() -> tuple[tuple[object, ...], dict[str, object]]:
+        args: list[object] = []
+        kwargs: dict[str, object] = {}
+        fallback_index = 0
+        for parameter in parameters:
+            if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+                args.extend(positional[fallback_index:])
+                fallback_index = len(positional)
+                continue
+            if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+                continue
+            if parameter.name in named:
+                value = named[parameter.name]
+            elif fallback_index < len(positional):
+                value = positional[fallback_index]
+                fallback_index += 1
+            elif parameter.default is inspect.Parameter.empty:
+                continue
+            else:
+                continue
+            if parameter.kind is inspect.Parameter.KEYWORD_ONLY:
+                kwargs[parameter.name] = value
+            else:
+                args.append(value)
+        return tuple(args), kwargs
+
+    def named_call() -> tuple[tuple[object, ...], dict[str, object]]:
+        args: list[object] = []
+        kwargs: dict[str, object] = {}
+        for parameter in parameters:
+            if parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
+                if parameter.name in named:
+                    args.append(named[parameter.name])
+                continue
+            if parameter.kind in {
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            } and parameter.name in named:
+                kwargs[parameter.name] = named[parameter.name]
+        return tuple(args), kwargs
+
+    candidates: tuple[tuple[tuple[object, ...], dict[str, object]], ...] = (
+        composed_call(),
+        named_call(),
+        (tuple(positional), {}),
+    )
+    for args, kwargs in candidates:
         try:
-            return function(*positional)
+            signature.bind(*args, **kwargs)
         except TypeError:
-            raise named_error
+            continue
+        return function(*args, **kwargs)
+    raise TypeError("injected callable does not accept a supported argument shape")
 
 
 def _safe_args(raw: object) -> dict[str, Any]:

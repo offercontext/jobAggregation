@@ -42,7 +42,11 @@ from offerpilot.chat_transport import (
     event_sse_payload,
     outcome_http_payload,
 )
-from offerpilot.pilot_runtime.deterministic import _LEGACY_EDITABLE_FIELDS, _confirmation_token
+from offerpilot.pilot_runtime.deterministic import (
+    _LEGACY_EDITABLE_FIELDS,
+    _confirmation_token,
+    _invoke as deterministic_invoke,
+)
 from offerpilot.pilot_runtime.event_sink import InMemoryRuntimeInvocationControl
 from offerpilot.pilot_runtime.service import PilotRuntime, RuntimeDependencies, _invoke
 
@@ -584,6 +588,24 @@ def test_invoke_does_not_retry_a_body_type_error() -> None:
     with pytest.raises(TypeError, match="body failure"):
         _invoke(body_failure, {"value": "payload"}, ("fallback",))
     assert calls == 1
+
+
+@pytest.mark.parametrize("error", (TypeError("body type error"), RuntimeError("body failure")))
+def test_deterministic_invoke_does_not_retry_varargs_body_exception(error: Exception) -> None:
+    calls = 0
+    secondary_effects: list[object] = []
+
+    def body_failure(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        secondary_effects.append((args, kwargs))
+        raise error
+
+    with pytest.raises(type(error), match=str(error)):
+        deterministic_invoke(body_failure, {"request": "payload"}, ("fallback",))
+
+    assert calls == 1
+    assert len(secondary_effects) == 1
 
 
 def test_initial_and_clarification_are_provider_free_and_typed() -> None:

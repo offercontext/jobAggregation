@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import delete, select, update
 from sqlalchemy.exc import OperationalError
 
+import offerpilot.api as api_module
 import offerpilot.agent_runtime.journal as journal_module
 from offerpilot.ai.types import Assistant, Message, ToolCall
 from offerpilot.ai.agent import PendingAction, StalePendingActionError
@@ -31,13 +32,7 @@ from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 from offerpilot.agent_runtime.journal import NullRunRecorderFactory, RunRecorderFactory
 from offerpilot.agent_runtime.keyring import load_or_create_journal_key
 from offerpilot.agent_runtime.trace import reconstruct_agent_run
-from offerpilot.api import (
-    _has_write_attempt,
-    _stored_messages_to_ai,
-    _title_from_message,
-    _write_outcome,
-    create_app,
-)
+from offerpilot.api import _stored_messages_to_ai, _title_from_message, create_app
 from offerpilot.config import Config, save_config
 from offerpilot.db import journal_session_factory_for_data_dir, session_factory_for_data_dir
 from offerpilot.models import (
@@ -60,9 +55,11 @@ from offerpilot.pilot_runtime.contracts import (
     PreparationKind,
     StreamExecutionMode,
 )
+from offerpilot.pilot_runtime import InMemoryRuntimeInvocationControl
 from offerpilot.repositories.applications import ApplicationsRepository
 from offerpilot.repositories.agent_runs import AgentRunRepository, JournalConflictError
 from offerpilot.repositories.chat import ChatRepository
+from offerpilot.pilot_runtime.service import _has_write_attempt, _write_outcome
 
 
 def _force_replace_claimed_pending_for_cas_test(
@@ -682,6 +679,42 @@ def test_chat_routes_delegate_to_pilot_runtime_once(
 
     assert response.status_code == 200
     assert dict(spy.calls) == expected_calls
+
+
+def test_runtime_sse_direct_does_not_construct_agent_hosts(monkeypatch):
+    prepared = PreparedStreamExecution(
+        invocation_id="direct-route-spy",
+        preparation_kind=PreparationKind.DETERMINISTIC_INITIAL,
+        execution_mode=StreamExecutionMode.DIRECT,
+        opaque_state=(),
+    )
+    calls: list[str] = []
+
+    def fail_host(*_args: object, **_kwargs: object) -> object:
+        calls.append("host")
+        raise AssertionError("direct execution must not construct an Agent host")
+
+    monkeypatch.setattr(api_module, "SseAgentExecutionHost", fail_host)
+    monkeypatch.setattr(api_module, "SyncAgentExecutionHost", fail_host)
+
+    class Runtime:
+        def execute_prepared_stream(self, *_args: object, **_kwargs: object) -> MessageOutcome:
+            return MessageOutcome(message="direct", conversation_id=1)
+
+    outcome: list[object] = []
+    content = api_module._runtime_sse_content(
+        Runtime(),
+        prepared,
+        InMemoryRuntimeInvocationControl(),
+        None,
+        "run-direct",
+        {"run_id": "run-direct"},
+        outcome.append,
+    )
+
+    assert list(content) == []
+    assert outcome == [MessageOutcome(message="direct", conversation_id=1)]
+    assert calls == []
 
 
 def test_chat_sync_records_complete_journal_lifecycle(tmp_path):
@@ -1767,7 +1800,7 @@ def test_write_status_uses_registry_metadata_for_all_write_tools():
 
     record = _successful_tool_record("update_offer", {"offer_id": 1})
 
-    assert _has_write_attempt(added, MODEL_TOOL_CATALOG) is True
+    assert _has_write_attempt(added, (), MODEL_TOOL_CATALOG) is True
     assert _write_outcome((record,), attempted=True) == ("success", "")
 
 

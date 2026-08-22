@@ -509,6 +509,87 @@ def test_guarded_response_receive_barrier_base_exception_aborts_and_rethrows() -
     assert calls["cleanup"] == 1
 
 
+def test_guarded_response_receive_disconnect_runs_original_background_once() -> None:
+    lifecycle = PreparedLifecycle()
+    calls = {"background": 0, "send": 0}
+
+    def background() -> None:
+        calls["background"] += 1
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.disconnect"}
+
+    async def send(_message: dict[str, object]) -> None:
+        calls["send"] += 1
+
+    response = GuardedStreamingResponse(
+        [b"never"],
+        PreparedStreamGuard(lifecycle=lifecycle),
+        background=background,
+    )
+    asyncio.run(
+        response(
+            {"type": "http", "method": "GET", "path": "/", "headers": [], "asgi": {"spec_version": "2.0"}},
+            receive,
+            send,
+        )
+    )
+
+    assert calls == {"background": 1, "send": 0}
+    assert lifecycle.state is PreparedLifecycleState.ABORTED
+
+
+def test_guarded_response_missing_spec_version_uses_receive_barrier() -> None:
+    lifecycle = PreparedLifecycle()
+    calls = {"send": 0}
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.disconnect"}
+
+    async def send(_message: dict[str, object]) -> None:
+        calls["send"] += 1
+
+    response = GuardedStreamingResponse([b"never"], PreparedStreamGuard(lifecycle=lifecycle))
+    asyncio.run(
+        response(
+            {"type": "http", "method": "GET", "path": "/", "headers": [], "asgi": {}},
+            receive,
+            send,
+        )
+    )
+
+    assert calls["send"] == 0
+    assert lifecycle.state is PreparedLifecycleState.ABORTED
+
+
+def test_guarded_response_missing_spec_version_waits_for_slow_first_receive() -> None:
+    lifecycle = PreparedLifecycle()
+    calls = {"receive": 0, "body": 0}
+
+    async def receive() -> dict[str, object]:
+        calls["receive"] += 1
+        await asyncio.sleep(0.01)
+        if calls["receive"] == 1:
+            return {"type": "http.request", "body": b"", "more_body": False}
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, object]) -> None:
+        if message["type"] == "http.response.body" and message.get("more_body"):
+            calls["body"] += 1
+
+    response = GuardedStreamingResponse([b"hello"], PreparedStreamGuard(lifecycle=lifecycle))
+    asyncio.run(
+        response(
+            {"type": "http", "method": "GET", "path": "/", "headers": [], "asgi": {}},
+            receive,
+            send,
+        )
+    )
+
+    assert calls == {"receive": 2, "body": 1}
+    assert lifecycle.state is PreparedLifecycleState.COMPLETED
+
+
 def test_guarded_response_consumer_failure_maps_transport_aborted() -> None:
     lifecycle = PreparedLifecycle()
     guard = PreparedStreamGuard(lifecycle=lifecycle)

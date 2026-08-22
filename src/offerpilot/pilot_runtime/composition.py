@@ -19,7 +19,7 @@ from typing import Any, cast
 
 from sqlalchemy import event as sqlalchemy_event, select
 
-from offerpilot.ai.agent import ChatModel, PendingAction, resume_after_confirm, run_turn
+from offerpilot.ai.agent import ChatModel, PendingAction
 from offerpilot.ai.client import ConfiguredAIClient
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 from offerpilot.ai.tool_specs.legacy import build_legacy_deterministic_catalog
@@ -367,9 +367,11 @@ class _AgentDriver:
         self,
         tool_context: Callable[[object, object], object],
         *,
-        run: Callable[..., object] = run_turn,
-        resume: Callable[..., object] = resume_after_confirm,
+        run: Callable[..., object],
+        resume: Callable[..., object],
     ) -> None:
+        if not callable(run) or not callable(resume):
+            raise TypeError("Agent driver dependencies must be callable")
         self._run = run
         self._resume = resume
         self._tool_context = tool_context
@@ -645,7 +647,8 @@ def build_pilot_runtime(
     ],
     page_context_messages: Callable[[Mapping[str, object] | None], Sequence[object]],
     model_tool_context: Callable[[object, object], object],
-    resume_after_confirm_fn: Callable[..., object] | None = None,
+    run_turn_fn: Callable[..., object],
+    resume_after_confirm_fn: Callable[..., object],
     missing_target_question: Callable[..., str | None] | None = None,
     pending_action_details: Callable[[PendingAction], Mapping[str, object]] | None = None,
     undo_seed_for_pending: Callable[[PendingAction, object], Mapping[str, object]] | None = None,
@@ -672,7 +675,8 @@ def build_pilot_runtime(
     )
     driver = _AgentDriver(
         model_tool_context,
-        resume=resume_after_confirm_fn or resume_after_confirm,
+        run=run_turn_fn,
+        resume=resume_after_confirm_fn,
     )
     resolver = _ModelResolver(chat_model, data_dir, catalog, model_tool_context)
     deterministic = DeterministicPilotAdapter(

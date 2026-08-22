@@ -1106,6 +1106,7 @@ class GuardedStreamingResponse(StreamingResponse):
                 raise RuntimeTransportAborted() from exc
 
         guarded_receive = receive
+        primary_error: BaseException | None = None
         try:
             # Starlette's pre-2.4 implementation races body iteration against
             # the disconnect listener.  A receive-first barrier makes an
@@ -1120,9 +1121,12 @@ class GuardedStreamingResponse(StreamingResponse):
             spec_version = (
                 tuple(map(int, spec_text.split(".")))
                 if isinstance(spec_text, str)
-                else (2, 4)
+                else (2, 0)
             )
-            if spec_version < (2, 4):
+            if (
+                spec_version < (2, 4)
+                and scope.get("_offerpilot_request_body_consumed") is not True
+            ):
                 first_message = await receive()
                 if first_message.get("type") == "http.disconnect":
                     self._finalize_owner(CompletionReason.TRANSPORT_ABORTED)
@@ -1138,26 +1142,32 @@ class GuardedStreamingResponse(StreamingResponse):
 
                 guarded_receive = replay_receive
             await super().__call__(scope, guarded_receive, tracked_send)
-        except (asyncio.CancelledError, ClientDisconnect):
+        except (asyncio.CancelledError, ClientDisconnect) as exc:
+            primary_error = exc
             self._finalize_owner_preserving(CompletionReason.CANCELLED)
             raise
-        except RuntimeCancelled:
+        except RuntimeCancelled as exc:
+            primary_error = exc
             self._finalize_owner_preserving(CompletionReason.CANCELLED)
             raise
-        except RuntimeTransportAborted:
+        except RuntimeTransportAborted as exc:
+            primary_error = exc
             self._finalize_owner_preserving(CompletionReason.TRANSPORT_ABORTED)
             raise
-        except RuntimeAgentTimedOut:
+        except RuntimeAgentTimedOut as exc:
+            primary_error = exc
             self._finalize_owner_preserving(CompletionReason.CANCELLED)
             raise
         except Exception as exc:
+            primary_error = exc
             self._finalize_owner_preserving(
                 CompletionReason.CANCELLED
                 if self.guard.response_started
                 else CompletionReason.TRANSPORT_ABORTED
             )
             raise RuntimeTransportAborted() from exc
-        except BaseException:
+        except BaseException as exc:
+            primary_error = exc
             self._finalize_owner_preserving(CompletionReason.TRANSPORT_ABORTED)
             raise
         finally:
@@ -1170,6 +1180,15 @@ class GuardedStreamingResponse(StreamingResponse):
                 if self._body_entered
                 else CompletionReason.TRANSPORT_ABORTED
             )
+            try:
+                # A pre-2.4 receive barrier and body/send failures bypass
+                # Starlette's normal BackgroundTask call.  Invoke the same
+                # idempotent owner here so title/persistence finalizers run
+                # on every ASGI exit; normal Starlette execution is a no-op.
+                await self._background_finalizer()
+            except BaseException as cleanup_error:
+                if primary_error is None:
+                    raise cleanup_error
 
 
 def build_guarded_streaming_response(

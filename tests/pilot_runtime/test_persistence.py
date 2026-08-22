@@ -20,7 +20,6 @@ from offerpilot.ai.write_operations import (
     ledger_fingerprint,
     load_or_create_ledger_key,
 )
-from offerpilot.api import _persistable_ai_messages
 from offerpilot.db import init_database
 from offerpilot.repositories.chat import ChatRepository
 from offerpilot.pilot_runtime.persistence import (
@@ -31,6 +30,7 @@ from offerpilot.pilot_runtime.persistence import (
     PersistedMessageView,
     PersistedToolCallView,
     PersistenceStatus,
+    _persistable_ai_messages,
 )
 
 

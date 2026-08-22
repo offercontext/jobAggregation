@@ -308,14 +308,14 @@ def _error(
     status: int,
     *,
     retryable: bool = False,
-    details: Mapping[str, object] | None = None,
+    pending_action: PendingActionPayload | None = None,
 ) -> RuntimeFailureOutcome:
     return RuntimeFailureOutcome(
         code,
         message,
         status,
         retryable=retryable,
-        details=freeze_json_mapping(details) if details else None,
+        pending_action=pending_action,
     )
 
 
@@ -410,8 +410,8 @@ class DeterministicPilotAdapter:
         raw: object
         try:
             raw = json.loads(descriptor.value) if descriptor.value else {}
-        except json.JSONDecodeError:
-            raw = {"jdText": descriptor.value} if kind == "application_jd_save" else {}
+        except json.JSONDecodeError as exc:
+            raise ValueError("pilot_action must be valid JSON") from exc
         if not isinstance(raw, dict):
             raise ValueError("pilot action must be an object")
         if "type" not in raw:
@@ -426,12 +426,6 @@ class DeterministicPilotAdapter:
         return parse_pilot_action(raw)
 
     def matches(self, request: StartTurnRequest, conversation: object) -> bool:
-        pending = self._pending_for(conversation)
-        if pending is not None and pending.tool_name in LEGACY_DETERMINISTIC_NAMES:
-            return True
-        clarification = self._clarification_for(conversation)
-        if clarification is not None and clarification[0].tool_name == "save_application_jd_version":
-            return True
         if request.pilot_action is not None:
             self._action_from_request(request)
             return True
@@ -490,6 +484,10 @@ class DeterministicPilotAdapter:
         """
 
         if isinstance(request, ConfirmationRequest):
+            if not request.approved and not request.edited_args.is_missing():
+                raise ValueError("edited_args is only allowed when approved is true")
+            if request.approved and request.rejection_feedback_present:
+                raise ValueError("rejection_feedback is only allowed when approved is false")
             return
         self._action_from_request(request)
 
@@ -525,7 +523,11 @@ class DeterministicPilotAdapter:
         action = self._action_from_request(request)
         existing = self._pending_for(conversation)
         if existing is not None and existing.tool_name in LEGACY_DETERMINISTIC_NAMES:
-            execution = self._confirmation_required(existing, conversation_id, replayed=True)
+            execution = self._confirmation_required(
+                existing,
+                conversation_id,
+                pending_replay=True,
+            )
             return self._with_transport_initial(execution, transport)
 
         application = self._application(conversation)
@@ -539,7 +541,7 @@ class DeterministicPilotAdapter:
                 return self._confirmation_required(
                     existing,
                     conversation_id,
-                    replayed=existing.tool_name in LEGACY_DETERMINISTIC_NAMES,
+                    pending_replay=True,
                 )
             pending = (
                 build_submission_snapshot_pending_action(
@@ -584,7 +586,11 @@ class DeterministicPilotAdapter:
 
         if existing is not None:
             if existing.tool_name == "save_application_jd_version":
-                return self._confirmation_required(existing, conversation_id, replayed=True)
+                return self._confirmation_required(
+                    existing,
+                    conversation_id,
+                    pending_replay=True,
+                )
             return DeterministicExecution(
                 _error(
                     RuntimeFailureCode.PENDING_CONFIRMATION_REQUIRED,
@@ -693,6 +699,24 @@ class DeterministicPilotAdapter:
         on_tool_result: Callable[[PendingAction, str, bool], object] | None = None,
     ) -> DeterministicExecution:
         conversation_id = self._conversation_id(conversation)
+        if not request.approved and not request.edited_args.is_missing():
+            return DeterministicExecution(
+                _error(
+                    RuntimeFailureCode.INVALID_CONFIRMATION,
+                    "edited_args is only allowed when approved is true",
+                    422,
+                ),
+                preparation_kind=PreparationKind.DETERMINISTIC_CONFIRMATION,
+            )
+        if request.approved and request.rejection_feedback_present:
+            return DeterministicExecution(
+                _error(
+                    RuntimeFailureCode.INVALID_CONFIRMATION,
+                    "rejection_feedback is only allowed when approved is false",
+                    422,
+                ),
+                preparation_kind=PreparationKind.DETERMINISTIC_CONFIRMATION,
+            )
         terminal = self._terminal_replay(
             request,
             conversation_id,
@@ -1070,14 +1094,15 @@ class DeterministicPilotAdapter:
         pending: PendingAction,
         conversation_id: int,
         *,
+        operation_id: str | None = None,
         replayed: bool = False,
+        pending_replay: bool | None = None,
     ) -> DeterministicExecution:
         payload = _confirmation_payload(pending, details=self._pending_details(pending))
         outcome = ConfirmationRequiredOutcome(
             confirmation_token=payload.confirmation_token,
             conversation_id=conversation_id,
-            operation_id=pending.operation_id or pending.tool_call_id,
-            message=pending.human,
+            operation_id=operation_id,
             pending_action=payload,
             replayed=replayed,
         )
@@ -1089,11 +1114,10 @@ class DeterministicPilotAdapter:
                 StatusEvent(phase="waiting_confirmation", label="需要确认"),
                 ConfirmationRequiredEvent(
                     confirmation_token=payload.confirmation_token,
-                    operation_id=pending.operation_id or None,
                     pending_action=payload,
                 ),
             ),
-            pending_replay=replayed,
+            pending_replay=replayed if pending_replay is None else pending_replay,
         )
 
     def _pending_details(self, pending: PendingAction) -> dict[str, object]:
@@ -1250,7 +1274,7 @@ class DeterministicPilotAdapter:
             approved=request.approved,
             edited_args_present=not request.edited_args.is_missing(),
             edited_args=edited,
-            rejection_feedback_present=bool(request.rejection_feedback),
+            rejection_feedback_present=request.rejection_feedback_present,
             rejection_feedback=request.rejection_feedback,
             confirmation_token_fingerprint=token_fingerprint,
             proposal_fingerprint=str(_attribute(operation, "proposal_fingerprint", "") or ""),
@@ -1423,12 +1447,19 @@ class DeterministicPilotAdapter:
                                 RuntimeFailureCode(code),
                                 "当前岗位资料已变化，请重新确认保存。",
                                 409,
-                                details={
-                                    "pending_action": _confirmation_payload(
-                                        replacement,
-                                        details=self._pending_details(replacement),
-                                    ).as_mapping()
-                                },
+                                pending_action=_confirmation_payload(
+                                    replacement,
+                                    details=self._pending_details(replacement),
+                                ),
+                            ),
+                            preparation_kind=PreparationKind.DETERMINISTIC_CONFIRMATION,
+                        )
+                    if replaced is None:
+                        return DeterministicExecution(
+                            _error(
+                                RuntimeFailureCode.STALE_PENDING_ACTION,
+                                "待确认操作已被更新，请刷新对话后重试。",
+                                409,
                             ),
                             preparation_kind=PreparationKind.DETERMINISTIC_CONFIRMATION,
                         )
@@ -1562,7 +1593,12 @@ class DeterministicPilotAdapter:
                     self.dependencies.persistence.get_pending_action(conversation_id)
                 )
                 if pending is not None:
-                    confirmation = self._confirmation_required(pending, conversation_id, replayed=True)
+                    confirmation = self._confirmation_required(
+                        pending,
+                        conversation_id,
+                        operation_id=replay.operation_id,
+                        replayed=True,
+                    )
                     return DeterministicExecution(
                         confirmation.outcome,
                         events=confirmation.events,

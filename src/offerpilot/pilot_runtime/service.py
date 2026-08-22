@@ -1377,6 +1377,31 @@ class PilotRuntime:
 
         route = self._select_route(request, conversation)
         self._phase(f"route:{route.value}")
+        self._phase("pending_guard")
+        try:
+            pending_guard = self._pending_guard(conversation_id, conversation, request)
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception:
+            return complete_early(
+                self._failure(
+                    RuntimeFailureCode.OPERATION_FAILED,
+                    "对话当前不可读取。",
+                    503,
+                    retryable=True,
+                )
+            )
+        except BaseException:
+            raise
+        if pending_guard is not None and pending_guard is not False:
+            return complete_early(
+                self._failure(
+                    RuntimeFailureCode.PENDING_CONFIRMATION_REQUIRED,
+                    "当前写入仍待确认，请先处理确认卡。",
+                    409,
+                )
+            )
+
         if route is not RouteKind.MODEL:
             adapter = self._dependencies.deterministic
             if adapter is None:
@@ -1422,31 +1447,6 @@ class PilotRuntime:
                     self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话结果暂时无法保存。", 503, retryable=True)
                 )
             raise AssertionError("unreachable deterministic dispatch")
-
-        self._phase("pending_guard")
-        try:
-            pending_guard = self._pending_guard(conversation_id, conversation, request)
-        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
-            raise
-        except Exception:
-            return complete_early(
-                self._failure(
-                    RuntimeFailureCode.OPERATION_FAILED,
-                    "对话当前不可读取。",
-                    503,
-                    retryable=True,
-                )
-            )
-        except BaseException:
-            raise
-        if pending_guard is not None and pending_guard is not False:
-            return complete_early(
-                self._failure(
-                    RuntimeFailureCode.PENDING_CONFIRMATION_REQUIRED,
-                    "当前写入仍待确认，请先处理确认卡。",
-                    409,
-                )
-            )
 
         self._phase("model_resolve")
         resolved = self._resolve_model(request, conversation)
@@ -1862,6 +1862,13 @@ class PilotRuntime:
         if adapter is None:
             self._mark_completed_if_active(control)
             return self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400)
+        validate_action = _callable(adapter, ("validate_action",))
+        if validate_action is not None:
+            try:
+                _invoke(validate_action, {"request": request}, (request,))
+            except ValueError as exc:
+                self._mark_completed_if_active(control)
+                return self._failure(RuntimeFailureCode.INVALID_CONFIRMATION, str(exc), 422)
         terminal_probe = _callable(adapter, ("is_terminal_replay",))
         terminal_replay = (
             bool(_invoke(terminal_probe, {"request": request}, (request,)))
@@ -2168,6 +2175,33 @@ class PilotRuntime:
                 invocation_control,
             )
         self._phase(f"route:{route.value}")
+        if isinstance(request, StartTurnRequest):
+            self._phase("pending_guard")
+            try:
+                pending_guard = self._pending_guard(conversation_id, conversation, request)
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                raise
+            except Exception:
+                return self._stream_immediate(
+                    self._failure(
+                        RuntimeFailureCode.OPERATION_FAILED,
+                        "对话当前不可读取。",
+                        503,
+                        retryable=True,
+                    ),
+                    invocation_control,
+                )
+            except BaseException:
+                raise
+            if pending_guard is not None and pending_guard is not False:
+                return self._stream_immediate(
+                    self._failure(
+                        RuntimeFailureCode.PENDING_CONFIRMATION_REQUIRED,
+                        "当前写入仍待确认，请先处理确认卡。",
+                        409,
+                    ),
+                    invocation_control,
+                )
         if route is not RouteKind.MODEL:
             if adapter is None:
                 return self._stream_immediate(
@@ -2276,31 +2310,6 @@ class PilotRuntime:
                 invocation_control=invocation_control,
                 recorder=recorder,
                 journal_started=journal_started,
-            )
-
-        self._phase("pending_guard")
-        try:
-            pending_guard = self._pending_guard(conversation_id, conversation, request)
-        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
-            raise
-        except Exception:
-            return self._stream_immediate(
-                self._failure(
-                    RuntimeFailureCode.OPERATION_FAILED,
-                    "对话当前不可读取。",
-                    503,
-                    retryable=True,
-                ),
-                invocation_control,
-            )
-        if pending_guard is not None and pending_guard is not False:
-            return self._stream_immediate(
-                self._failure(
-                    RuntimeFailureCode.PENDING_CONFIRMATION_REQUIRED,
-                    "当前写入仍待确认，请先处理确认卡。",
-                    409,
-                ),
-                invocation_control,
             )
 
         self._phase("model_resolve")
@@ -2939,7 +2948,16 @@ class PilotRuntime:
                 self._finish(state.recorder, state.journal_started, "failed", "unknown", state.control)
                 close_terminal_owner()
                 self._mark_completed_if_active(state.control)
-                emit_runtime_event(safe_event_sink, ErrorEvent(outcome.code, outcome.message, outcome.retryable, outcome.degraded))
+                emit_runtime_event(
+                    safe_event_sink,
+                    ErrorEvent(
+                        outcome.code,
+                        outcome.message,
+                        outcome.retryable,
+                        outcome.degraded,
+                        pending_action=outcome.pending_action,
+                    ),
+                )
             else:
                 self._finish(state.recorder, state.journal_started, "completed", None, state.control)
                 close_terminal_owner()
@@ -2988,8 +3006,8 @@ class PilotRuntime:
             "error": outcome.message,
             "error_code": outcome.code.value,
         }
-        if outcome.details is not None:
-            payload.update(outcome.details)
+        if outcome.pending_action is not None:
+            payload["pending_action"] = outcome.pending_action.as_mapping()
         return ImmediateHttpOutcome(
             status_code=outcome.status_code,
             payload=freeze_json_mapping(payload),

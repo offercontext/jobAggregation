@@ -490,6 +490,8 @@ def outcome_http_payload(outcome: RuntimeOutcome | ImmediateHttpOutcome) -> dict
     if type(outcome) is RuntimeFailureOutcome:
         payload: dict[str, object] = {"error": outcome.message}
         payload["error_code"] = outcome.code.value
+        if outcome.pending_action is not None:
+            payload["pending_action"] = _plain(outcome.pending_action.as_mapping())
         return payload
     if type(outcome) is OperationPendingOutcome:
         payload = {

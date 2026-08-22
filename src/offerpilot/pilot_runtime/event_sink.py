@@ -133,12 +133,15 @@ def runtime_event_payload(event: RuntimeEvent) -> dict[str, object]:
     if isinstance(event, AssistantMessageEvent):
         return {"message": event.message}
     if isinstance(event, ErrorEvent):
-        return {
+        payload = {
             "code": event.code.value,
             "message": event.message,
             "retryable": event.retryable,
             "degraded": event.degraded,
         }
+        if event.pending_action is not None:
+            payload["pending_action"] = _pending_action_payload(event.pending_action)
+        return payload
     if isinstance(event, CompletedEvent):
         payload = {"persisted": event.persisted}
         if event.response is not None:
@@ -191,12 +194,15 @@ def runtime_outcome_payload(outcome: object) -> dict[str, object]:
             payload["replayed"] = True
         return payload
     if type(outcome) is RuntimeFailureOutcome:
-        return {
+        payload = {
             "error_code": outcome.code.value,
             "error": outcome.message,
             "retryable": outcome.retryable,
             "degraded": outcome.degraded,
         }
+        if outcome.pending_action is not None:
+            payload["pending_action"] = _pending_action_payload(outcome.pending_action)
+        return payload
     if type(outcome) is OperationPendingOutcome:
         payload = {
             "type": "operation_pending",

@@ -486,6 +486,7 @@ class ConfirmationRequest:
     operation_id: str | None = None
     edited_args: EditedArgs = field(default_factory=EditedArgs.missing)
     rejection_feedback: str = ""
+    rejection_feedback_present: bool = False
 
     def __post_init__(self) -> None:
         _require_int(self.conversation_id, field_name="conversation_id")
@@ -508,6 +509,9 @@ class ConfirmationRequest:
         else:
             raise TypeError("edited_args must be omitted or an immutable mapping")
         _require_text(self.rejection_feedback, field_name="rejection_feedback")
+        _require_bool(self.rejection_feedback_present, field_name="rejection_feedback_present")
+        if self.rejection_feedback and not self.rejection_feedback_present:
+            object.__setattr__(self, "rejection_feedback_present", True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -619,7 +623,7 @@ class RuntimeFailureOutcome:
     status_code: int = 500
     retryable: bool = False
     degraded: bool = False
-    details: ImmutablePayload | None = field(default=None, repr=False)
+    pending_action: PendingActionPayload | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.code, RuntimeFailureCode):
@@ -630,12 +634,10 @@ class RuntimeFailureOutcome:
             raise ValueError("status_code must be a valid HTTP status")
         _require_bool(self.retryable, field_name="retryable")
         _require_bool(self.degraded, field_name="degraded")
-        if self.details is not None:
-            object.__setattr__(
-                self,
-                "details",
-                _require_immutable_mapping(self.details, field_name="details"),
-            )
+        if self.pending_action is not None and not isinstance(
+            self.pending_action, PendingActionPayload
+        ):
+            raise TypeError("pending_action must be a PendingActionPayload")
 
 
 @dataclass(frozen=True, slots=True)
@@ -992,6 +994,7 @@ class ErrorEvent:
     message: str
     retryable: bool = False
     degraded: bool = False
+    pending_action: PendingActionPayload | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.code, RuntimeFailureCode):
@@ -999,6 +1002,10 @@ class ErrorEvent:
         _require_text(self.message, field_name="message")
         _require_bool(self.retryable, field_name="retryable")
         _require_bool(self.degraded, field_name="degraded")
+        if self.pending_action is not None and not isinstance(
+            self.pending_action, PendingActionPayload
+        ):
+            raise TypeError("pending_action must be a PendingActionPayload")
 
 
 @dataclass(frozen=True, slots=True)

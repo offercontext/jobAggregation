@@ -12,6 +12,7 @@ import inspect
 import json
 from collections.abc import AsyncIterable, Awaitable, Callable, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from datetime import datetime, timezone
 from math import isfinite
 from queue import Empty, Queue
 from threading import Event, Lock
@@ -21,7 +22,7 @@ from typing import Any, Final, Generic, Iterator, NoReturn, TypeAlias, TypeVar, 
 from starlette.background import BackgroundTask
 from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
 from starlette.requests import ClientDisconnect
-from starlette.responses import JSONResponse, StreamingResponse
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.types import Receive, Scope, Send
 
 from offerpilot.pilot_runtime.contracts import (
@@ -31,6 +32,7 @@ from offerpilot.pilot_runtime.contracts import (
     CancelReason,
     CompletionReason,
     CompletedEvent,
+    ConfirmationRequest,
     ConfirmationRequiredEvent,
     ConfirmationRequiredOutcome,
     ErrorEvent,
@@ -48,7 +50,9 @@ from offerpilot.pilot_runtime.contracts import (
     RuntimeInvocationControl,
     RuntimeOutcome,
     InvocationState,
+    StartTurnRequest,
     StatusEvent,
+    StreamExecutionMode,
     ToolCallEvent,
     ToolResultEvent,
     UserMessageSavedEvent,
@@ -56,9 +60,15 @@ from offerpilot.pilot_runtime.contracts import (
 from offerpilot.pilot_runtime.errors import (
     RuntimeAgentTimedOut,
     RuntimeCancelled,
+    RuntimeFailureCode,
     RuntimeTransportAborted,
 )
-from offerpilot.pilot_runtime.event_sink import runtime_event_payload, runtime_outcome_payload
+from offerpilot.pilot_runtime.event_sink import (
+    InMemoryRuntimeInvocationControl,
+    runtime_event_payload,
+    runtime_outcome_payload,
+)
+from offerpilot.sse import sse_headers
 
 
 Content: TypeAlias = Iterable[bytes | str] | AsyncIterable[bytes | str]
@@ -585,6 +595,181 @@ def encode_sse_event(
     event_name = event_sse_name(event)
     event_id = f"{run_id}:{seq}" if run_id else str(seq)
     return f"event: {event_name}\nid: {event_id}\ndata: {body}\n\n"
+
+
+def runtime_sse_envelope(
+    *,
+    run_id: str,
+    conversation_id: int,
+    context_type: str,
+    context_ref: str,
+    mode: str,
+) -> dict[str, object]:
+    """Build the existing SSE envelope at the transport boundary."""
+
+    return {
+        "run_id": run_id,
+        "conversation_id": conversation_id,
+        "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "context_type": context_type,
+        "context_ref": context_ref,
+        "mode": mode,
+    }
+
+
+def prepared_stream_metadata(
+    prepared: PreparedStreamExecution,
+    request: StartTurnRequest | ConfirmationRequest,
+) -> tuple[int, str, str, str]:
+    """Read only the safe stream envelope fields from a prepared handle."""
+
+    state = getattr(prepared, "opaque_state", None)
+    conversation = getattr(state, "conversation", None)
+    conversation_id = getattr(state, "conversation_id", None)
+    if type(conversation_id) is not int or conversation_id <= 0:
+        conversation_id = getattr(conversation, "conversation_id", None)
+    if type(conversation_id) is not int or conversation_id <= 0:
+        conversation_id = request.conversation_id if isinstance(request, ConfirmationRequest) else 0
+    return (
+        conversation_id,
+        str(getattr(conversation, "context_type", "workspace") or "workspace"),
+        str(getattr(conversation, "context_ref", "") or ""),
+        str(getattr(conversation, "mode", "general") or "general"),
+    )
+
+
+class _RejectingDirectExecutionHost:
+    """Closed host marker that prevents accidental worker use for DIRECT."""
+
+    def run(self, *_args: object, **_kwargs: object) -> object:
+        raise RuntimeTransportAborted()
+
+
+def runtime_sse_content(
+    runtime: Any,
+    prepared: PreparedStreamExecution,
+    control: Any,
+    signal_sink: Any,
+    run_id: str,
+    envelope_metadata: Mapping[str, object],
+    set_outcome: Callable[[object], None],
+    *,
+    agent_timeout_seconds: float = CHAT_AGENT_TIMEOUT_SECONDS,
+) -> Iterator[str]:
+    """Execute one prepared stream and encode its typed events as SSE."""
+
+    if prepared.execution_mode is StreamExecutionMode.DIRECT:
+        events: list[RuntimeEvent] = []
+
+        class _DirectEventSink:
+            def emit(self, event: RuntimeEvent) -> None:
+                events.append(event)
+
+            def __call__(self, event: object) -> None:
+                self.emit(cast(RuntimeEvent, event))
+
+        result = runtime.execute_prepared_stream(
+            prepared,
+            event_sink=_DirectEventSink(),
+            signal_sink=signal_sink,
+            execution_host=_RejectingDirectExecutionHost(),
+            cancel_check=lambda: not control.is_active(),
+        )
+        sequence = 0
+        for event in events:
+            sequence += 1
+            yield encode_sse_event(
+                event,
+                seq=sequence,
+                run_id=run_id,
+                envelope=envelope_metadata,
+            )
+        set_outcome(result)
+        return
+
+    outer_host: SseAgentExecutionHost[object] = SseAgentExecutionHost(
+        timeout_seconds=agent_timeout_seconds + 1.0
+    )
+    outer_control = InMemoryRuntimeInvocationControl()
+    inner_host: SyncAgentExecutionHost[object] = SyncAgentExecutionHost(
+        timeout_seconds=agent_timeout_seconds
+    )
+
+    def execute(agent_events: Any) -> object:
+        return runtime.execute_prepared_stream(
+            prepared,
+            event_sink=agent_events,
+            signal_sink=signal_sink,
+            execution_host=inner_host,
+            cancel_check=lambda: not outer_control.is_active(),
+        )
+
+    streamed = outer_host.run(execute, cast(Any, outer_control))
+    sequence = 0
+    try:
+        for event in streamed:
+            sequence += 1
+            yield encode_sse_event(
+                event,
+                seq=sequence,
+                run_id=run_id,
+                envelope=envelope_metadata,
+            )
+        result = streamed.result
+        set_outcome(result)
+        outer_control.mark_completed()
+    finally:
+        close = getattr(streamed, "close", None)
+        if callable(close):
+            close()
+
+
+def runtime_stream_immediate_response(
+    outcome: ImmediateHttpOutcome,
+    *,
+    run_id: str,
+    request: StartTurnRequest | ConfirmationRequest,
+) -> Response:
+    """Render a retryable pre-header outcome using the existing SSE shape."""
+
+    payload = outcome.response_payload
+    raw_code = payload.get("error_code", RuntimeFailureCode.AI_PROVIDER_ERROR.value)
+    if (
+        raw_code == RuntimeFailureCode.OPERATION_INPUT_CONFLICT.value
+        and isinstance(request, ConfirmationRequest)
+        and request.approved
+        and request.edited_args.is_missing()
+        and not request.rejection_feedback_present
+    ):
+        raw_code = RuntimeFailureCode.STALE_PENDING_ACTION.value
+    try:
+        code = RuntimeFailureCode(str(raw_code))
+    except ValueError:
+        code = RuntimeFailureCode.AI_PROVIDER_ERROR
+    conversation_id = request.conversation_id or 0
+    context_type = getattr(request, "context_type", "workspace")
+    context_ref = getattr(request, "context_ref", "")
+    mode = getattr(request, "mode", "general")
+    event = ErrorEvent(
+        code=code,
+        message=str(payload.get("error", "")),
+        retryable=bool(payload.get("_runtime_stream_retryable", False)),
+        degraded=bool(payload.get("_runtime_stream_degraded", False)),
+    )
+    envelope = runtime_sse_envelope(
+        run_id=run_id,
+        conversation_id=conversation_id,
+        context_type=str(context_type or "workspace"),
+        context_ref=str(context_ref or ""),
+        mode=str(mode or "general"),
+    )
+    content = encode_sse_event(event, seq=1, run_id=run_id, envelope=envelope)
+    return Response(
+        content=content,
+        status_code=200,
+        media_type="text/event-stream; charset=utf-8",
+        headers=sse_headers(),
+    )
 
 
 def _adapt_cleanup_callback(callback: Callable[..., object] | None) -> CleanupCallback | None:
@@ -1335,4 +1520,8 @@ __all__ = [
     "outcome_http_payload",
     "outcome_http_response",
     "outcome_http_status",
+    "prepared_stream_metadata",
+    "runtime_sse_content",
+    "runtime_sse_envelope",
+    "runtime_stream_immediate_response",
 ]

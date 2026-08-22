@@ -12,7 +12,7 @@ from io import BytesIO
 from pathlib import Path
 from secrets import compare_digest
 from time import perf_counter
-from typing import Any, Callable, Generator, Literal, Mapping, Optional, cast
+from typing import Any, Callable, Literal, Mapping, Optional, cast
 from uuid import UUID, uuid4
 
 from fastapi import BackgroundTasks, Body, FastAPI, File, Form, Query, Request, UploadFile
@@ -102,17 +102,12 @@ from offerpilot.pilot_runtime import (
     AttachmentReference,
     ConfirmationRequest,
     EditedArgs,
-    ErrorEvent,
     ImmediateHttpOutcome,
     InMemoryRuntimeInvocationControl,
     PilotActionDescriptor,
-    PreparedStreamExecution,
-    RuntimeFailureCode,
     RuntimeFailureOutcome,
-    RuntimeEvent,
     RuntimeTransportContext,
     StreamVersion,
-    StreamExecutionMode,
     StartTurnRequest,
     build_pilot_runtime,
     freeze_json_mapping,
@@ -124,6 +119,7 @@ from offerpilot.pilot_runtime.event_sink import (
 from offerpilot.pilot_runtime.errors import (
     RuntimeAgentTimedOut,
     RuntimeCancelled,
+    RuntimeFailureCode,
     RuntimeTransportAborted,
 )
 from offerpilot.db import journal_session_factory_for_data_dir, session_factory_for_data_dir
@@ -316,11 +312,13 @@ from offerpilot.skills import SkillRegistryError, register_skill, skills_payload
 from offerpilot.sse import STREAM_VERSION, sse_headers
 from offerpilot.chat_transport import (
     PreparedStreamGuard,
-    SseAgentExecutionHost,
     SyncAgentExecutionHost,
     build_guarded_streaming_response,
-    encode_sse_event,
     outcome_http_response,
+    prepared_stream_metadata,
+    runtime_sse_content,
+    runtime_sse_envelope,
+    runtime_stream_immediate_response,
 )
 
 _MOCK_INTERVIEW_TRACE_RUN_ID = uuid4().hex
@@ -4574,12 +4572,12 @@ def create_app(
                 if title_latch is not None:
                     title_latch.finalize()
                 return outcome_http_response(prepared)
-            conversation_id, context_type, context_ref, mode = _prepared_stream_metadata(
+            conversation_id, context_type, context_ref, mode = prepared_stream_metadata(
                 prepared, typed_request
             )
             if set_title_conversation_id is not None:
                 set_title_conversation_id(conversation_id)
-            envelope = _runtime_sse_envelope(
+            envelope = runtime_sse_envelope(
                 run_id=str(run_uuid),
                 conversation_id=conversation_id,
                 context_type=context_type,
@@ -4591,8 +4589,8 @@ def create_app(
                 if set_title_conversation_id is not None:
                     set_title_conversation_id(getattr(outcome, "conversation_id", None))
 
-            def body() -> Generator[str, None, None]:
-                return _runtime_sse_content(
+            def body() -> object:
+                return runtime_sse_content(
                     runtime,
                     prepared,
                     control,
@@ -4600,6 +4598,7 @@ def create_app(
                     str(run_uuid),
                     envelope,
                     set_stream_outcome,
+                    agent_timeout_seconds=CHAT_AGENT_TIMEOUT_SECONDS,
                 )
 
             guard = PreparedStreamGuard(prepared=prepared, on_execute=body)
@@ -4748,15 +4747,15 @@ def create_app(
                     return outcome_http_response(prepared)
                 if prepared.response_payload.get("_runtime_stream_retryable") is not True:
                     return outcome_http_response(prepared)
-                return _runtime_stream_immediate_response(
+                return runtime_stream_immediate_response(
                     prepared,
                     run_id=str(run_uuid),
                     request=typed_request,
                 )
-            conversation_id, context_type, context_ref, mode = _prepared_stream_metadata(
+            conversation_id, context_type, context_ref, mode = prepared_stream_metadata(
                 prepared, typed_request
             )
-            envelope = _runtime_sse_envelope(
+            envelope = runtime_sse_envelope(
                 run_id=str(run_uuid),
                 conversation_id=conversation_id,
                 context_type=context_type,
@@ -4764,8 +4763,8 @@ def create_app(
                 mode=mode,
             )
 
-            def body() -> Generator[str, None, None]:
-                return _runtime_sse_content(
+            def body() -> object:
+                return runtime_sse_content(
                     runtime,
                     prepared,
                     control,
@@ -4773,6 +4772,7 @@ def create_app(
                     str(run_uuid),
                     envelope,
                     lambda _outcome: None,
+                    agent_timeout_seconds=CHAT_AGENT_TIMEOUT_SECONDS,
                 )
 
             guard = PreparedStreamGuard(prepared=prepared, on_execute=body)
@@ -7695,171 +7695,6 @@ def _runtime_stream_background(
         await background_tasks()
 
     return finalize
-
-
-def _runtime_sse_envelope(
-    *,
-    run_id: str,
-    conversation_id: int,
-    context_type: str,
-    context_ref: str,
-    mode: str,
-) -> dict[str, object]:
-    return {
-        "run_id": run_id,
-        "conversation_id": conversation_id,
-        "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "context_type": context_type,
-        "context_ref": context_ref,
-        "mode": mode,
-    }
-
-
-def _prepared_stream_metadata(
-    prepared: PreparedStreamExecution,
-    request: StartTurnRequest | ConfirmationRequest,
-) -> tuple[int, str, str, str]:
-    state = getattr(prepared, "opaque_state", None)
-    conversation = getattr(state, "conversation", None)
-    conversation_id = getattr(state, "conversation_id", None)
-    if type(conversation_id) is not int or conversation_id <= 0:
-        conversation_id = getattr(conversation, "conversation_id", None)
-    if type(conversation_id) is not int or conversation_id <= 0:
-        conversation_id = request.conversation_id if isinstance(request, ConfirmationRequest) else 0
-    return (
-        conversation_id,
-        str(getattr(conversation, "context_type", "workspace") or "workspace"),
-        str(getattr(conversation, "context_ref", "") or ""),
-        str(getattr(conversation, "mode", "general") or "general"),
-    )
-
-
-class _RejectingDirectExecutionHost:
-    """Closed host marker that prevents accidental worker use for DIRECT."""
-
-    def run(self, *_args: object, **_kwargs: object) -> object:
-        raise RuntimeTransportAborted()
-
-
-def _runtime_sse_content(
-    runtime: Any,
-    prepared: PreparedStreamExecution,
-    control: InMemoryRuntimeInvocationControl,
-    signal_sink: Any,
-    run_id: str,
-    envelope_metadata: Mapping[str, object],
-    set_outcome: Callable[[object], None],
-) -> Generator[str, None, None]:
-    if prepared.execution_mode is StreamExecutionMode.DIRECT:
-        events: list[RuntimeEvent] = []
-
-        class _DirectEventSink:
-            def emit(self, event: RuntimeEvent) -> None:
-                events.append(event)
-
-            def __call__(self, event: object) -> None:
-                self.emit(cast(RuntimeEvent, event))
-
-        result = runtime.execute_prepared_stream(
-            prepared,
-            event_sink=_DirectEventSink(),
-            signal_sink=signal_sink,
-            execution_host=_RejectingDirectExecutionHost(),
-            cancel_check=lambda: not control.is_active(),
-        )
-        sequence = 0
-        for event in events:
-            sequence += 1
-            yield encode_sse_event(
-                event,
-                seq=sequence,
-                run_id=run_id,
-                envelope=envelope_metadata,
-            )
-        set_outcome(result)
-        return
-
-    outer_host: SseAgentExecutionHost[object] = SseAgentExecutionHost(
-        timeout_seconds=CHAT_AGENT_TIMEOUT_SECONDS + 1.0
-    )
-    outer_control = InMemoryRuntimeInvocationControl()
-    inner_host: SyncAgentExecutionHost[object] = SyncAgentExecutionHost(
-        timeout_seconds=CHAT_AGENT_TIMEOUT_SECONDS
-    )
-
-    def execute(agent_events: Any) -> object:
-        return runtime.execute_prepared_stream(
-            prepared,
-            event_sink=agent_events,
-            signal_sink=signal_sink,
-            execution_host=inner_host,
-            cancel_check=lambda: not outer_control.is_active(),
-        )
-
-    streamed = outer_host.run(execute, cast(Any, outer_control))
-    sequence = 0
-    try:
-        for event in streamed:
-            sequence += 1
-            yield encode_sse_event(
-                event,
-                seq=sequence,
-                run_id=run_id,
-                envelope=envelope_metadata,
-            )
-        result = streamed.result
-        set_outcome(result)
-        outer_control.mark_completed()
-    finally:
-        close = getattr(streamed, "close", None)
-        if callable(close):
-            close()
-
-
-def _runtime_stream_immediate_response(
-    outcome: ImmediateHttpOutcome,
-    *,
-    run_id: str,
-    request: StartTurnRequest | ConfirmationRequest,
-) -> Response:
-    payload = outcome.response_payload
-    raw_code = payload.get("error_code", RuntimeFailureCode.AI_PROVIDER_ERROR.value)
-    if (
-        raw_code == RuntimeFailureCode.OPERATION_INPUT_CONFLICT.value
-        and isinstance(request, ConfirmationRequest)
-        and request.approved
-        and request.edited_args.is_missing()
-        and not request.rejection_feedback_present
-    ):
-        raw_code = RuntimeFailureCode.STALE_PENDING_ACTION.value
-    try:
-        code = RuntimeFailureCode(str(raw_code))
-    except ValueError:
-        code = RuntimeFailureCode.AI_PROVIDER_ERROR
-    conversation_id = request.conversation_id or 0
-    context_type = getattr(request, "context_type", "workspace")
-    context_ref = getattr(request, "context_ref", "")
-    mode = getattr(request, "mode", "general")
-    event = ErrorEvent(
-        code=code,
-        message=str(payload.get("error", "")),
-        retryable=bool(payload.get("_runtime_stream_retryable", False)),
-        degraded=bool(payload.get("_runtime_stream_degraded", False)),
-    )
-    envelope = _runtime_sse_envelope(
-        run_id=run_id,
-        conversation_id=conversation_id,
-        context_type=str(context_type or "workspace"),
-        context_ref=str(context_ref or ""),
-        mode=str(mode or "general"),
-    )
-    content = encode_sse_event(event, seq=1, run_id=run_id, envelope=envelope)
-    return Response(
-        content=content,
-        status_code=200,
-        media_type="text/event-stream; charset=utf-8",
-        headers=sse_headers(),
-    )
 
 
 def _runtime_error_response(exc: BaseException) -> JSONResponse:

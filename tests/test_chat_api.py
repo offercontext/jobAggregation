@@ -17,8 +17,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy import delete, select, update
 from sqlalchemy.exc import OperationalError
 
-import offerpilot.api as api_module
 import offerpilot.agent_runtime.journal as journal_module
+import offerpilot.chat_transport as transport_module
 from offerpilot.ai.types import Assistant, Message, ToolCall
 from offerpilot.ai.agent import PendingAction, StalePendingActionError
 from offerpilot.ai.tool_runtime.contracts import (
@@ -694,15 +694,15 @@ def test_runtime_sse_direct_does_not_construct_agent_hosts(monkeypatch):
         calls.append("host")
         raise AssertionError("direct execution must not construct an Agent host")
 
-    monkeypatch.setattr(api_module, "SseAgentExecutionHost", fail_host)
-    monkeypatch.setattr(api_module, "SyncAgentExecutionHost", fail_host)
+    monkeypatch.setattr(transport_module, "SseAgentExecutionHost", fail_host)
+    monkeypatch.setattr(transport_module, "SyncAgentExecutionHost", fail_host)
 
     class Runtime:
         def execute_prepared_stream(self, *_args: object, **_kwargs: object) -> MessageOutcome:
             return MessageOutcome(message="direct", conversation_id=1)
 
     outcome: list[object] = []
-    content = api_module._runtime_sse_content(
+    content = transport_module.runtime_sse_content(
         Runtime(),
         prepared,
         InMemoryRuntimeInvocationControl(),

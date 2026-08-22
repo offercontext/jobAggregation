@@ -674,6 +674,13 @@ class OperationReplayOutcome:
     undo: ImmutablePayload | None = None
     replayed: bool = True
     persisted: bool = True
+    tool_call_id: str | None = None
+    tool_name: str | None = None
+    visible_result: str = ""
+    summary: str = ""
+    evidence: tuple[ImmutablePayload, ...] = field(default=(), repr=False)
+    affected_resources: tuple[ImmutablePayload, ...] = field(default=(), repr=False)
+    changed_entities: tuple[ImmutablePayload, ...] = field(default=(), repr=False)
 
     def __post_init__(self) -> None:
         _require_text(self.operation_id, field_name="operation_id", allow_empty=False)
@@ -701,6 +708,27 @@ class OperationReplayOutcome:
             )
         _require_bool(self.replayed, field_name="replayed")
         _require_bool(self.persisted, field_name="persisted")
+        if self.tool_call_id is not None:
+            _require_text(self.tool_call_id, field_name="tool_call_id", allow_empty=False)
+        if self.tool_name is not None:
+            _require_text(self.tool_name, field_name="tool_name", allow_empty=False)
+        _require_text(self.visible_result, field_name="visible_result")
+        _require_text(self.summary, field_name="summary")
+        object.__setattr__(
+            self,
+            "evidence",
+            _require_payload_tuple(self.evidence, field_name="evidence"),
+        )
+        object.__setattr__(
+            self,
+            "affected_resources",
+            _require_payload_tuple(self.affected_resources, field_name="affected_resources"),
+        )
+        object.__setattr__(
+            self,
+            "changed_entities",
+            _require_payload_tuple(self.changed_entities, field_name="changed_entities"),
+        )
 
 
 RuntimeOutcome: TypeAlias = (

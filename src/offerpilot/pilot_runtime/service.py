@@ -604,6 +604,47 @@ def _legacy_runtime_event(value: Mapping[object, object]) -> RuntimeEvent | None
     return None
 
 
+class _ConfirmationEventSink:
+    """Bridge Agent legacy callbacks to typed confirmation events.
+
+    The Agent still calls its sink with ``{"event": ..., "data": ...}``
+    dictionaries.  SSE hosts, however, inject a typed queue sink into the
+    thunk.  Keeping this bridge between the two boundaries both preserves the
+    legacy Agent contract and keeps the origin tool result fenced until the
+    Ledger delivery atom succeeds.
+    """
+
+    __slots__ = ("_sink", "_origin_tool_call_id", "_deferred")
+
+    def __init__(
+        self,
+        sink: RuntimeEventSink,
+        origin_tool_call_id: str,
+        deferred: list[RuntimeEvent],
+    ) -> None:
+        self._sink = sink
+        self._origin_tool_call_id = origin_tool_call_id
+        self._deferred = deferred
+
+    def emit(self, event: RuntimeEvent) -> None:
+        if (
+            isinstance(event, ToolResultEvent)
+            and event.tool_call_id == self._origin_tool_call_id
+        ):
+            if event not in self._deferred:
+                self._deferred.append(event)
+            return
+        emit_runtime_event(self._sink, event)
+
+    def __call__(self, event: object) -> None:
+        if not isinstance(event, Mapping):
+            raise TypeError("Agent event sink requires a legacy event mapping")
+        typed = _legacy_runtime_event(event)
+        if typed is None:
+            raise TypeError("unsupported Agent event")
+        self.emit(typed)
+
+
 def _legacy_payload_tuple(value: object) -> tuple[ImmutablePayload, ...]:
     """Snapshot legacy tool-result payload arrays into immutable mappings."""
 
@@ -2181,6 +2222,7 @@ class PilotRuntime:
         pending: PendingAction | None = None,
         catalog: object | None = None,
         allow_timeout: bool = False,
+        delivery_succeeded: bool = False,
     ) -> None:
         if not started:
             return
@@ -2191,7 +2233,11 @@ class PilotRuntime:
             RuntimeFailureCode.OPERATION_INTEGRITY_ERROR,
         }:
             self._abandon(recorder, True)
-        elif pending is not None:
+        elif (
+            pending is not None
+            and delivery_succeeded
+            and not isinstance(outcome, RuntimeFailureOutcome)
+        ):
             # A chained Pending is a real Ledger proposal.  Passing the live
             # catalog keeps the journal suspension on the typed write-tool
             # boundary; ``catalog=None`` would silently skip
@@ -2216,6 +2262,91 @@ class PilotRuntime:
                 control,
                 allow_timeout=allow_timeout,
             )
+
+    @staticmethod
+    def _confirmation_delivery_succeeded(
+        session: ConfirmationSession,
+        outcome: RuntimeOutcome | None,
+    ) -> bool:
+        """Return true only for an authoritative final-delivery result.
+
+        ``state.delivered`` is set by the coordinator only after the
+        persistence atom returns ``persisted``/``duplicate``.  Looking at the
+        state rather than a route-local fallback result keeps sync and SSE
+        from releasing the origin ToolResult or suspending a chained Pending
+        on a CAS/closed/unknown delivery response.
+        """
+
+        if isinstance(outcome, RuntimeFailureOutcome):
+            return False
+        state = session.state
+        return bool(
+            state.delivered
+            and _failure_status(state.delivery_result)
+            in {PersistenceStatus.PERSISTED.value, PersistenceStatus.DUPLICATE.value}
+        )
+
+    @staticmethod
+    def _release_confirmation_origin_events(
+        event_sink: RuntimeEventSink | None,
+        deferred_origin_events: list[RuntimeEvent],
+        *,
+        delivery_succeeded: bool,
+    ) -> None:
+        """Release deferred origin events only after durable delivery."""
+
+        if not delivery_succeeded or event_sink is None:
+            deferred_origin_events.clear()
+            return
+        while deferred_origin_events:
+            emit_runtime_event(event_sink, deferred_origin_events.pop(0))
+
+    def _finalize_confirmation_result(
+        self,
+        recorder: object,
+        started: bool,
+        session: ConfirmationSession,
+        outcome: RuntimeOutcome | None,
+        control: RuntimeInvocationControl,
+        *,
+        pending: PendingAction | None = None,
+        catalog: object | None = None,
+        allow_timeout: bool = False,
+        event_sink: RuntimeEventSink | None = None,
+        deferred_origin_events: list[RuntimeEvent] | None = None,
+    ) -> bool:
+        """Close Journal and release origin events from one shared atom.
+
+        Both confirmation transports call this after normal, timeout, and
+        ordinary-exception convergence.  The only success signal is the
+        coordinator's authoritative ``final_delivery`` result.
+        """
+
+        delivery_succeeded = self._confirmation_delivery_succeeded(session, outcome)
+        self._record_ledger_delivery_journal(
+            recorder,
+            started,
+            session,
+            control,
+            allow_timeout=allow_timeout,
+        )
+        self._close_ledger_journal(
+            recorder,
+            started,
+            outcome,
+            control,
+            pending=pending,
+            catalog=catalog,
+            allow_timeout=allow_timeout,
+            delivery_succeeded=delivery_succeeded,
+        )
+        if deferred_origin_events is not None:
+            self._release_confirmation_origin_events(
+                event_sink,
+                deferred_origin_events,
+                delivery_succeeded=delivery_succeeded,
+            )
+        return delivery_succeeded
 
     def _record_ledger_delivery_journal(
         self,
@@ -2625,27 +2756,10 @@ class PilotRuntime:
         deferred_origin_events: list[RuntimeEvent] = []
         origin_tool_call_id = session.pending.tool_call_id
 
-        def release_origin_events() -> None:
-            if event_sink is None:
-                deferred_origin_events.clear()
-                return
-            while deferred_origin_events:
-                emit_runtime_event(event_sink, deferred_origin_events.pop(0))
-
-        class _ConfirmationEventSink:
-            def emit(self, event: RuntimeEvent) -> None:
-                if (
-                    isinstance(event, ToolResultEvent)
-                    and event.tool_call_id == origin_tool_call_id
-                ):
-                    if event not in deferred_origin_events:
-                        deferred_origin_events.append(event)
-                    return
-                if event_sink is not None:
-                    emit_runtime_event(event_sink, event)
-
         confirmation_event_sink: RuntimeEventSink | None = (
-            _ConfirmationEventSink() if event_sink is not None else None
+            _ConfirmationEventSink(event_sink, origin_tool_call_id, deferred_origin_events)
+            if event_sink is not None
+            else None
         )
         model = resolved_model.model if resolved_model is not None else None
         auto_approve = resolved_model.auto_approve if resolved_model is not None else False
@@ -2667,6 +2781,7 @@ class PilotRuntime:
             "catalog": catalog,
             "tool_catalog": catalog,
             "tool_context": tool_context,
+            "run_recorder": recorder,
             "conversation": conversation,
             "request": request,
             "event_sink": confirmation_event_sink,
@@ -2719,18 +2834,17 @@ class PilotRuntime:
                 request,
                 control,
             )
-            self._record_ledger_delivery_journal(
-                recorder, journal_started, session, control
-            )
-            self._close_ledger_journal(
+            self._finalize_confirmation_result(
                 recorder,
                 journal_started,
+                session,
                 outcome,
                 control,
                 pending=normalized.pending,
                 catalog=catalog,
+                event_sink=event_sink,
+                deferred_origin_events=deferred_origin_events,
             )
-            release_origin_events()
             coordinator.stop_heartbeat(session)
             return outcome
         except RuntimeAgentTimedOut:
@@ -2745,9 +2859,6 @@ class PilotRuntime:
                 timeout_error = None
             coordinator.stop_heartbeat(session)
             state = session.state
-            self._record_ledger_delivery_journal(
-                recorder, journal_started, session, control, allow_timeout=True
-            )
             if timeout_error is not None:
                 outcome = self._confirmation_failure(timeout_error)
             elif state.cas_lost:
@@ -2794,16 +2905,17 @@ class PilotRuntime:
                     504,
                     retryable=True,
                 )
-            self._close_ledger_journal(
+            self._finalize_confirmation_result(
                 recorder,
                 journal_started,
+                session,
                 outcome,
                 control,
                 allow_timeout=True,
+                event_sink=event_sink,
+                deferred_origin_events=deferred_origin_events,
             )
             self._mark_completed_if_active(control)
-            if isinstance(outcome, MessageOutcome):
-                release_origin_events()
             return outcome
         except RuntimeCancelled:
             coordinator.cancel_cleanup(session)
@@ -2841,9 +2953,6 @@ class PilotRuntime:
                 delivery_error_value: BaseException | None = delivery_error
             else:
                 delivery_error_value = None
-            self._record_ledger_delivery_journal(
-                recorder, journal_started, session, control
-            )
             if delivery_error_value is not None:
                 outcome = self._confirmation_failure(delivery_error_value)
             elif _failure_status(failure_delivery) in {
@@ -2859,10 +2968,16 @@ class PilotRuntime:
                 )
             else:
                 outcome = self._provider_confirmation_failure(exc)
-            self._close_ledger_journal(recorder, journal_started, outcome, control)
+            self._finalize_confirmation_result(
+                recorder,
+                journal_started,
+                session,
+                outcome,
+                control,
+                event_sink=event_sink,
+                deferred_origin_events=deferred_origin_events,
+            )
             self._mark_completed_if_active(control)
-            if isinstance(outcome, MessageOutcome):
-                release_origin_events()
             return outcome
         except BaseException:
             coordinator.cancel_cleanup(session)
@@ -4280,8 +4395,23 @@ class PilotRuntime:
         """Build the complete typed event prefix for provider-free branches."""
 
         operation_id = _attribute(outcome, "operation_id")
-        call_id = pending.tool_call_id if pending is not None else str(tool_call_id or "replay-tool")
-        name = pending.tool_name if pending is not None else str(tool_name or "replayed_write")
+        replay = outcome if isinstance(outcome, OperationReplayOutcome) else None
+        call_id = (
+            replay.tool_call_id
+            if replay is not None
+            else pending.tool_call_id
+            if pending is not None
+            else tool_call_id
+        )
+        name = (
+            replay.tool_name
+            if replay is not None
+            else pending.tool_name
+            if pending is not None
+            else tool_name
+        )
+        if not call_id or not name:
+            raise WriteOperationError("operation_integrity_error")
         write_status = _attribute(outcome, "write_status")
         result_status = (
             # The baseline SSE contract represents a rejected write as a
@@ -4299,6 +4429,13 @@ class PilotRuntime:
         )
         confirmation_mode = "rejected" if rejected else "approved"
         message = str(_attribute(outcome, "message", "") or "")
+        summary = replay.summary if replay is not None else (
+            "用户已拒绝，操作未执行。" if rejected else message
+        )
+        visible_result = replay.visible_result if replay is not None else message
+        evidence = replay.evidence if replay is not None else ()
+        affected_resources = replay.affected_resources if replay is not None else ()
+        changed_entities = replay.changed_entities if replay is not None else ()
         return (
             MetaEvent(supports_delta=False, supports_tool_events=True),
             StatusEvent(
@@ -4311,15 +4448,18 @@ class PilotRuntime:
                 public_label="已取消的写入操作" if rejected else name,
                 kind="write",
                 confirm_mode=cast(Any, confirmation_mode),
-                summary=("用户已拒绝，操作未执行。" if rejected else message),
+                summary=summary,
             ),
             ToolResultEvent(
                 tool_call_id=call_id,
                 tool_name=name,
                 status=cast(Any, result_status),
-                summary=message[:500],
-                message=message,
-                visible_result=message,
+                summary=summary,
+                evidence=evidence,
+                affected_resources=affected_resources,
+                changed_entities=changed_entities,
+                message=visible_result,
+                visible_result=visible_result,
                 operation_id=str(operation_id) if operation_id else None,
                 write_status=cast(Any, write_status) if write_status else None,
             ),
@@ -4783,25 +4923,9 @@ class PilotRuntime:
         deferred_origin_events: list[RuntimeEvent] = []
         origin_tool_call_id = session.pending.tool_call_id
 
-        def release_origin_events() -> None:
-            # The origin result is held until the atomic delivery decision so
-            # a provider failure/timeout cannot expose a tool result before
-            # its fenced fallback or continuation has been persisted.
-            while deferred_origin_events:
-                emit_runtime_event(event_sink, deferred_origin_events.pop(0))
-
-        class _ConfirmationEventSink:
-            def emit(self, event: RuntimeEvent) -> None:
-                if (
-                    isinstance(event, ToolResultEvent)
-                    and event.tool_call_id == origin_tool_call_id
-                ):
-                    if event not in deferred_origin_events:
-                        deferred_origin_events.append(event)
-                    return
-                emit_runtime_event(event_sink, event)
-
-        confirmation_event_sink: RuntimeEventSink = _ConfirmationEventSink()
+        confirmation_event_sink: RuntimeEventSink = _ConfirmationEventSink(
+            event_sink, origin_tool_call_id, deferred_origin_events
+        )
         emit_runtime_event(
             event_sink,
             MetaEvent(
@@ -4828,6 +4952,7 @@ class PilotRuntime:
             "catalog": catalog,
             "tool_catalog": catalog,
             "tool_context": tool_context,
+            "run_recorder": recorder,
             "conversation": state.conversation,
             "request": request,
             "event_sink": confirmation_event_sink,
@@ -4849,9 +4974,11 @@ class PilotRuntime:
             not in {"messages", "pending", "approved", "auto_approve", "max_iter", "max_iterations", "rejection_feedback"}
         }
 
-        def invoke_resume(agent_events: RuntimeEventSink | None = None) -> object:
+        def invoke_resume(agent_events: RuntimeEventSink) -> object:
             values = dict(resume_values)
-            values["event_sink"] = agent_events or confirmation_event_sink
+            values["event_sink"] = _ConfirmationEventSink(
+                agent_events, origin_tool_call_id, deferred_origin_events
+            )
             return _invoke(
                 resume,
                 values,
@@ -4896,7 +5023,9 @@ class PilotRuntime:
                 else:
                     raw_result = streamed
             else:
-                raw_result = execution_host.run(lambda: invoke_resume(), state.control)
+                raw_result = execution_host.run(
+                    lambda: invoke_resume(event_sink), state.control
+                )
             normalized = _normalize_agent_result(raw_result)
             outcome: RuntimeOutcome = self._finish_ledger_confirmation(
                 coordinator,
@@ -4905,19 +5034,17 @@ class PilotRuntime:
                 request,
                 state.control,
             )
-            self._record_ledger_delivery_journal(
-                recorder, journal_started, session, state.control
-            )
-            self._close_ledger_journal(
+            self._finalize_confirmation_result(
                 recorder,
                 journal_started,
+                session,
                 outcome,
                 state.control,
                 pending=normalized.pending,
                 catalog=catalog,
+                event_sink=event_sink,
+                deferred_origin_events=deferred_origin_events,
             )
-            if not isinstance(outcome, RuntimeFailureOutcome):
-                release_origin_events()
             if isinstance(outcome, (MessageOutcome, OperationReplayOutcome)):
                 emit_runtime_event(event_sink, AssistantMessageEvent(message=outcome.message))
             return outcome
@@ -4933,9 +5060,6 @@ class PilotRuntime:
                 timeout_error = None
             state_value = session.state
             coordinator.stop_heartbeat(session)
-            self._record_ledger_delivery_journal(
-                recorder, journal_started, session, state.control, allow_timeout=True
-            )
             if timeout_error is not None:
                 outcome = self._confirmation_failure(timeout_error)
             elif state_value.cas_lost:
@@ -4978,15 +5102,17 @@ class PilotRuntime:
                     504,
                     retryable=True,
                 )
-            self._close_ledger_journal(
+            self._finalize_confirmation_result(
                 recorder,
                 journal_started,
+                session,
                 outcome,
                 state.control,
                 allow_timeout=True,
+                event_sink=event_sink,
+                deferred_origin_events=deferred_origin_events,
             )
             if isinstance(outcome, MessageOutcome):
-                release_origin_events()
                 emit_runtime_event(event_sink, AssistantMessageEvent(message=outcome.message))
             else:
                 emit_runtime_event(
@@ -5034,9 +5160,6 @@ class PilotRuntime:
                 delivery_error_value: BaseException | None = delivery_error
             else:
                 delivery_error_value = None
-            self._record_ledger_delivery_journal(
-                recorder, journal_started, session, state.control
-            )
             if delivery_error_value is not None:
                 outcome = self._confirmation_failure(delivery_error_value)
             elif _failure_status(failure_delivery) in {
@@ -5052,9 +5175,15 @@ class PilotRuntime:
                 )
             else:
                 outcome = self._provider_confirmation_failure(exc)
-            self._close_ledger_journal(recorder, journal_started, outcome, state.control)
-            if not isinstance(outcome, RuntimeFailureOutcome):
-                release_origin_events()
+            self._finalize_confirmation_result(
+                recorder,
+                journal_started,
+                session,
+                outcome,
+                state.control,
+                event_sink=event_sink,
+                deferred_origin_events=deferred_origin_events,
+            )
             emit_runtime_event(
                 event_sink,
                 ErrorEvent(outcome.code, outcome.message, outcome.retryable, outcome.degraded)

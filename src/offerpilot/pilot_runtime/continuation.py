@@ -55,6 +55,7 @@ from .contracts import (
     ConfirmationRequiredOutcome,
     ConfirmationRequest,
     EditedArgs,
+    ImmutablePayload,
     OperationReplayOutcome,
     PendingActionPayload,
     freeze_json_mapping,
@@ -479,6 +480,7 @@ def _runtime_replay(
     conversation_id: int,
     *,
     pending: PendingAction | None = None,
+    operation: object | None = None,
 ) -> OperationReplayOutcome | ConfirmationRequiredOutcome:
     payload = replay.payload
     if payload.status not in {"committed", "rejected", "failed"}:
@@ -498,12 +500,52 @@ def _runtime_replay(
         )
     if replay.delivery_outcome not in {None, "final_response", "fallback"}:
         raise WriteOperationError("operation_integrity_error")
+
+    try:
+        transport = json.loads(payload.transport_json or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise WriteOperationError("operation_integrity_error") from exc
+    if not isinstance(transport, Mapping):
+        raise WriteOperationError("operation_integrity_error")
+    tool_call_id = str(
+        transport.get("tool_call_id")
+        or _attribute(operation, "tool_call_id", "")
+        or _attribute(pending, "tool_call_id", "")
+        or ""
+    )
+    tool_name = str(
+        transport.get("tool_name")
+        or _attribute(operation, "tool_name", "")
+        or _attribute(pending, "tool_name", "")
+        or ""
+    )
+    if not tool_call_id or not tool_name:
+        raise WriteOperationError("operation_integrity_error")
+
+    def payload_tuple(name: str) -> tuple[ImmutablePayload, ...]:
+        value = transport.get(name, ())
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+            raise WriteOperationError("operation_integrity_error")
+        items: list[ImmutablePayload] = []
+        for item in value:
+            if not isinstance(item, Mapping):
+                raise WriteOperationError("operation_integrity_error")
+            try:
+                items.append(freeze_json_mapping(cast(Mapping[str, object], item)))
+            except (TypeError, ValueError) as exc:
+                raise WriteOperationError("operation_integrity_error") from exc
+        return tuple(items)
+
+    summary = str(transport.get("summary", payload.visible_result) or "")
+    evidence = payload_tuple("evidence")
+    affected_resources = payload_tuple("affected_resources")
+    changed_entities = payload_tuple("changed_entities")
     if payload.status == "committed":
         write_status = "success"
-        message = replay.final_message or payload.visible_result
+        message = replay.final_message or "操作已完成。"
     elif payload.status == "rejected":
         write_status = "cancelled"
-        message = replay.final_message or payload.visible_result
+        message = replay.final_message or "已取消本次操作。"
     else:
         write_status = "failed"
         message = replay.final_message or payload.visible_result
@@ -525,6 +567,13 @@ def _runtime_replay(
         write_error=payload.failure_code,
         undo=freeze_json_mapping(undo) if undo is not None else None,
         replayed=True,
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+        visible_result=payload.visible_result,
+        summary=summary,
+        evidence=evidence,
+        affected_resources=affected_resources,
+        changed_entities=changed_entities,
     )
 
 
@@ -734,6 +783,13 @@ class ConfirmationCoordinator:
         replay = self.terminal_replay(request)
         if replay is None:
             return None
+        operation: object | None = None
+        try:
+            transport = json.loads(replay.payload.transport_json or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            transport = None
+        if not isinstance(transport, Mapping) or not transport.get("tool_call_id") or not transport.get("tool_name"):
+            operation = self._operation(replay.operation_id)
         pending: PendingAction | None = None
         if replay.delivery_outcome == "chained_pending":
             try:
@@ -742,7 +798,12 @@ class ConfirmationCoordinator:
                 if exc.code == "stale_pending_action":
                     raise WriteOperationError("operation_delivery_unknown") from exc
                 raise
-        return _runtime_replay(replay, request.conversation_id, pending=pending)
+        return _runtime_replay(
+            replay,
+            request.conversation_id,
+            pending=pending,
+            operation=operation,
+        )
 
     def preflight_live(
         self,
@@ -894,6 +955,13 @@ class ConfirmationCoordinator:
             with state.lock:
                 if not state.active or state.cancelled or state.timed_out:
                     return ToolFailure("stale_state", "confirmation_claim_lost")
+                # A Ledger confirmation must acquire a real delivery lease
+                # before it can claim Pending or reach the executor.  The
+                # legacy deterministic adapters have their own explicit
+                # bridge; this model confirmation path never falls back to an
+                # unfenced ownership=None delivery.
+                if not callable(_attribute(self.dependencies.write_operations, "heartbeat")):
+                    raise WriteOperationError("operation_unavailable")
                 if prepared is not None and (
                     _attribute(prepared, "pending_identity") is None
                     or _attribute(prepared, "pending_action_revision") is None
@@ -1399,6 +1467,8 @@ class ConfirmationCoordinator:
             delivery = bundle
         else:
             delivery = DeliveryBundle(tuple(_message(item) for item in bundle), pending, clarification)
+        fence_lost = False
+        ownership_missing = False
         with state.lock:
             if (
                 state.delivered
@@ -1410,17 +1480,35 @@ class ConfirmationCoordinator:
             if state.origin_tool_message is None:
                 # A terminal replay has no continuation owner and must not
                 # fabricate operation-bound messages.
-                return None
-            if state.delivery_ownership is not None and not self.delivery_fence(state):
-                state.cas_lost = True
                 self.stop_heartbeat(state)
                 return None
-            generation = state.continuation_generation
-            ownership = state.delivery_ownership
-            expected_pending = state.pending
-            claim_id = state.claim_id
-            undo = dict(state.undo_update) if state.undo_update is not None else None
-            state.delivery_in_progress = True
+            if not isinstance(state.delivery_ownership, DeliveryOwnership):
+                # Model confirmations are never allowed to use the old
+                # ownership=None persistence atom.  The deterministic legacy
+                # bridge is explicit and does not enter this coordinator.
+                ownership_missing = True
+            elif not self.delivery_fence(state):
+                state.cas_lost = True
+                fence_lost = True
+            if ownership_missing or fence_lost:
+                generation = None
+                ownership = None
+                expected_pending = None
+                claim_id = None
+                undo = None
+            else:
+                generation = state.continuation_generation
+                ownership = state.delivery_ownership
+                expected_pending = state.pending
+                claim_id = state.claim_id
+                undo = dict(state.undo_update) if state.undo_update is not None else None
+                state.delivery_in_progress = True
+        if ownership_missing:
+            self.stop_heartbeat(state)
+            raise WriteOperationError("operation_unavailable")
+        if fence_lost:
+            self.stop_heartbeat(state)
+            return None
         persistence_object = self.dependencies.persistence
         if persistence_object is None:
             with state.lock:
@@ -1430,39 +1518,47 @@ class ConfirmationCoordinator:
         values = tuple(delivery.messages)
         chained_pending = pending if pending is not None else delivery.pending
         clarification_value = clarification if clarification is not None else delivery.clarification
-        persistence = _attribute(persistence_object, "persist_confirmation_delivery")
-        if callable(persistence):
-            kwargs: dict[str, object] = {
-                "conversation_id": state.identity.conversation_id,
-                "ownership": ownership,
-                "origin_tool_message": state.origin_tool_message,
-                "continuation": values,
-                "chained_pending": chained_pending,
-                "clarification": clarification_value,
-                "expected_generation": generation,
-                "expected_pending": expected_pending,
-                "claim_id": claim_id,
-                "undo": undo,
-                "delivery_failure_code": failure_code,
-            }
-        else:
-            persistence = _attribute(persistence_object, "persist_confirmation_continuation")
-            if not callable(persistence):
-                self.stop_heartbeat(state)
-                raise WriteOperationError("operation_unavailable")
-            kwargs = {
-                "conversation_id": state.identity.conversation_id,
-                "expected_generation": generation,
-                "messages": values,
-                "pending": chained_pending,
-                "clarification": clarification_value,
-                "delivery_ownership": ownership,
-                "delivery_failure_code": failure_code,
-                "expected_pending": expected_pending,
-                "claim_id": claim_id,
-                "origin_message": state.origin_tool_message,
-                "undo": undo,
-            }
+        try:
+            persistence = _attribute(persistence_object, "persist_confirmation_delivery")
+            if callable(persistence):
+                kwargs: dict[str, object] = {
+                    "conversation_id": state.identity.conversation_id,
+                    "ownership": ownership,
+                    "origin_tool_message": state.origin_tool_message,
+                    "continuation": values,
+                    "chained_pending": chained_pending,
+                    "clarification": clarification_value,
+                    "expected_generation": generation,
+                    "expected_pending": expected_pending,
+                    "claim_id": claim_id,
+                    "undo": undo,
+                    "delivery_failure_code": failure_code,
+                }
+            else:
+                persistence = _attribute(persistence_object, "persist_confirmation_continuation")
+                if not callable(persistence):
+                    with state.lock:
+                        state.delivery_in_progress = False
+                    self.stop_heartbeat(state)
+                    raise WriteOperationError("operation_unavailable")
+                kwargs = {
+                    "conversation_id": state.identity.conversation_id,
+                    "expected_generation": generation,
+                    "messages": values,
+                    "pending": chained_pending,
+                    "clarification": clarification_value,
+                    "delivery_ownership": ownership,
+                    "delivery_failure_code": failure_code,
+                    "expected_pending": expected_pending,
+                    "claim_id": claim_id,
+                    "origin_message": state.origin_tool_message,
+                    "undo": undo,
+                }
+        except BaseException:
+            with state.lock:
+                state.delivery_in_progress = False
+            self.stop_heartbeat(state)
+            raise
         try:
             raw = _invoke(cast(Callable[..., object], persistence), kwargs, ())
         except Exception:
@@ -1475,23 +1571,31 @@ class ConfirmationCoordinator:
                 state.delivery_in_progress = False
             self.stop_heartbeat(state)
             raise
-        status = _attribute(raw, "status")
-        status_value = str(getattr(status, "value", status or ""))
+        try:
+            status = _attribute(raw, "status")
+            status_value = str(getattr(status, "value", status or ""))
+        except BaseException:
+            with state.lock:
+                state.delivery_in_progress = False
+            self.stop_heartbeat(state)
+            raise
         if status_value == "":
             with state.lock:
                 state.delivery_in_progress = False
             self.stop_heartbeat(state)
             raise WriteOperationError("operation_delivery_unknown", retryable=True)
         if status_value in {PersistenceStatus.CAS_LOST.value, "cas_lost"}:
-            state.cas_lost = True
-            state.delivery_in_progress = False
+            with state.lock:
+                state.cas_lost = True
+                state.delivery_in_progress = False
             self.stop_heartbeat(state)
             return raw
         if status_value in {
             PersistenceStatus.CLOSED.value,
             PersistenceStatus.NOT_FOUND.value,
         }:
-            state.delivery_in_progress = False
+            with state.lock:
+                state.delivery_in_progress = False
             self.stop_heartbeat(state)
             return raw
         if status_value not in {
@@ -1502,10 +1606,16 @@ class ConfirmationCoordinator:
                 state.delivery_in_progress = False
             self.stop_heartbeat(state)
             raise WriteOperationError("operation_delivery_unknown", retryable=True)
-        next_generation = _attribute(raw, "generation")
-        if isinstance(next_generation, datetime):
-            state.continuation_generation = next_generation
+        try:
+            next_generation = _attribute(raw, "generation")
+        except BaseException:
+            with state.lock:
+                state.delivery_in_progress = False
+            self.stop_heartbeat(state)
+            raise
         with state.lock:
+            if isinstance(next_generation, datetime):
+                state.continuation_generation = next_generation
             state.delivered = True
             state.delivery_in_progress = False
             state.delivery_result = raw if isinstance(raw, PersistenceResult) else None

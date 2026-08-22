@@ -18,6 +18,7 @@ from queue import Empty, Queue
 from threading import Event, Lock
 from time import perf_counter
 from typing import Any, Final, Generic, Iterator, NoReturn, TypeAlias, TypeVar, cast
+from uuid import uuid4
 
 from starlette.background import BackgroundTask
 from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
@@ -49,6 +50,7 @@ from offerpilot.pilot_runtime.contracts import (
     RuntimeFailureOutcome,
     RuntimeInvocationControl,
     RuntimeOutcome,
+    RuntimeTransportContext,
     InvocationState,
     StartTurnRequest,
     StatusEvent,
@@ -768,6 +770,125 @@ def runtime_stream_immediate_response(
         content=content,
         status_code=200,
         media_type="text/event-stream; charset=utf-8",
+        headers=sse_headers(),
+    )
+
+
+def execute_runtime_sync(
+    runtime: Any,
+    request: StartTurnRequest | ConfirmationRequest,
+    *,
+    signal_sink: Any = None,
+    timeout_seconds: float = CHAT_AGENT_TIMEOUT_SECONDS,
+) -> RuntimeOutcome:
+    """Own the synchronous Agent host/control boundary for one Runtime call."""
+
+    control = InMemoryRuntimeInvocationControl()
+    host: SyncAgentExecutionHost[object] = SyncAgentExecutionHost(
+        timeout_seconds=timeout_seconds
+    )
+    if isinstance(request, StartTurnRequest):
+        return cast(
+            RuntimeOutcome,
+            runtime.start_turn(
+                request,
+                transport=RuntimeTransportContext(mode="sync"),
+                event_sink=None,
+                signal_sink=signal_sink,
+                execution_host=host,
+                invocation_control=control,
+                cancel_check=lambda: False,
+            ),
+        )
+    if isinstance(request, ConfirmationRequest):
+        return cast(
+            RuntimeOutcome,
+            runtime.continue_confirmation(
+                request,
+                transport=RuntimeTransportContext(mode="sync"),
+                invocation_control=control,
+                event_sink=None,
+                signal_sink=signal_sink,
+                execution_host=host,
+                cancel_check=lambda: False,
+            ),
+        )
+    raise TypeError("request must be a StartTurnRequest or ConfirmationRequest")
+
+
+def runtime_stream_response(
+    runtime: Any,
+    request: StartTurnRequest | ConfirmationRequest,
+    *,
+    signal_sink: Any = None,
+    on_conversation_id: Callable[[int | None], None] | None = None,
+    on_immediate: Callable[[], object] | None = None,
+    background: Callable[[], object] | BackgroundTask | None = None,
+    timeout_seconds: float = CHAT_AGENT_TIMEOUT_SECONDS,
+) -> Response:
+    """Prepare and render one guarded stream, owning all transport resources."""
+
+    run_uuid = uuid4()
+    transport = RuntimeTransportContext(
+        mode="stream",
+        transport_run_id=run_uuid,
+        stream_version="pilot-sse-v1",
+    )
+    control = InMemoryRuntimeInvocationControl()
+    prepared = runtime.prepare_stream(
+        request,
+        transport=transport,
+        invocation_control=control,
+    )
+    if isinstance(prepared, ImmediateHttpOutcome):
+        if on_immediate is not None:
+            on_immediate()
+        if (
+            isinstance(request, ConfirmationRequest)
+            and prepared.response_payload.get("_runtime_stream_direct") is not True
+            and prepared.response_payload.get("_runtime_stream_retryable") is True
+        ):
+            return runtime_stream_immediate_response(
+                prepared,
+                run_id=str(run_uuid),
+                request=request,
+            )
+        return outcome_http_response(prepared)
+
+    conversation_id, context_type, context_ref, mode = prepared_stream_metadata(
+        prepared, request
+    )
+    if on_conversation_id is not None:
+        on_conversation_id(conversation_id)
+    envelope = runtime_sse_envelope(
+        run_id=str(run_uuid),
+        conversation_id=conversation_id,
+        context_type=context_type,
+        context_ref=context_ref,
+        mode=mode,
+    )
+
+    def set_stream_outcome(outcome: object) -> None:
+        if on_conversation_id is not None:
+            on_conversation_id(getattr(outcome, "conversation_id", None))
+
+    def body() -> object:
+        return runtime_sse_content(
+            runtime,
+            prepared,
+            control,
+            signal_sink,
+            str(run_uuid),
+            envelope,
+            set_stream_outcome,
+            agent_timeout_seconds=timeout_seconds,
+        )
+
+    guard = PreparedStreamGuard(prepared=prepared, on_execute=body)
+    return build_guarded_streaming_response(
+        (),
+        guard=guard,
+        background=background,
         headers=sse_headers(),
     )
 
@@ -1515,6 +1636,7 @@ __all__ = [
     "PreparedStreamGuard",
     "build_guarded_streaming_response",
     "encode_sse_event",
+    "execute_runtime_sync",
     "event_sse_name",
     "event_sse_payload",
     "outcome_http_payload",
@@ -1523,5 +1645,6 @@ __all__ = [
     "prepared_stream_metadata",
     "runtime_sse_content",
     "runtime_sse_envelope",
+    "runtime_stream_response",
     "runtime_stream_immediate_response",
 ]

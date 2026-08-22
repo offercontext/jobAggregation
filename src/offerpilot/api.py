@@ -102,12 +102,8 @@ from offerpilot.pilot_runtime import (
     AttachmentReference,
     ConfirmationRequest,
     EditedArgs,
-    ImmediateHttpOutcome,
-    InMemoryRuntimeInvocationControl,
     PilotActionDescriptor,
     RuntimeFailureOutcome,
-    RuntimeTransportContext,
-    StreamVersion,
     StartTurnRequest,
     build_pilot_runtime,
     freeze_json_mapping,
@@ -309,16 +305,10 @@ from offerpilot.schemas import (
     resume_payload,
 )
 from offerpilot.skills import SkillRegistryError, register_skill, skills_payload, update_skill
-from offerpilot.sse import STREAM_VERSION, sse_headers
 from offerpilot.chat_transport import (
-    PreparedStreamGuard,
-    SyncAgentExecutionHost,
-    build_guarded_streaming_response,
+    execute_runtime_sync,
     outcome_http_response,
-    prepared_stream_metadata,
-    runtime_sse_content,
-    runtime_sse_envelope,
-    runtime_stream_immediate_response,
+    runtime_stream_response,
 )
 
 _MOCK_INTERVIEW_TRACE_RUN_ID = uuid4().hex
@@ -4510,16 +4500,12 @@ def create_app(
                 resolved_data_dir,
                 None,
             )
-        control = InMemoryRuntimeInvocationControl()
         try:
-            outcome = runtime.start_turn(
+            outcome = execute_runtime_sync(
+                runtime,
                 typed_request,
-                transport=RuntimeTransportContext(mode="sync"),
-                event_sink=None,
                 signal_sink=title_sink,
-                execution_host=SyncAgentExecutionHost(timeout_seconds=CHAT_AGENT_TIMEOUT_SECONDS),
-                invocation_control=control,
-                cancel_check=lambda: False,
+                timeout_seconds=CHAT_AGENT_TIMEOUT_SECONDS,
             )
             if set_title_conversation_id is not None:
                 set_title_conversation_id(getattr(outcome, "conversation_id", None))
@@ -4542,13 +4528,6 @@ def create_app(
         if isinstance(typed_request, JSONResponse):
             return typed_request
         runtime = http_request.app.state.pilot_runtime
-        run_uuid = uuid4()
-        transport = RuntimeTransportContext(
-            mode="stream",
-            transport_run_id=run_uuid,
-            stream_version=cast(StreamVersion, STREAM_VERSION),
-        )
-        control = InMemoryRuntimeInvocationControl()
         created_new = typed_request.conversation_id in (None, 0)
         title_latch: RuntimeSignalLatch | None = None
         title_sink: ClosedAgentSignalSink | None = None
@@ -4563,50 +4542,14 @@ def create_app(
                 None,
             )
         try:
-            prepared = runtime.prepare_stream(
+            return runtime_stream_response(
+                runtime,
                 typed_request,
-                transport=transport,
-                invocation_control=control,
-            )
-            if isinstance(prepared, ImmediateHttpOutcome):
-                if title_latch is not None:
-                    title_latch.finalize()
-                return outcome_http_response(prepared)
-            conversation_id, context_type, context_ref, mode = prepared_stream_metadata(
-                prepared, typed_request
-            )
-            if set_title_conversation_id is not None:
-                set_title_conversation_id(conversation_id)
-            envelope = runtime_sse_envelope(
-                run_id=str(run_uuid),
-                conversation_id=conversation_id,
-                context_type=context_type,
-                context_ref=context_ref,
-                mode=mode,
-            )
-
-            def set_stream_outcome(outcome: object) -> None:
-                if set_title_conversation_id is not None:
-                    set_title_conversation_id(getattr(outcome, "conversation_id", None))
-
-            def body() -> object:
-                return runtime_sse_content(
-                    runtime,
-                    prepared,
-                    control,
-                    title_sink,
-                    str(run_uuid),
-                    envelope,
-                    set_stream_outcome,
-                    agent_timeout_seconds=CHAT_AGENT_TIMEOUT_SECONDS,
-                )
-
-            guard = PreparedStreamGuard(prepared=prepared, on_execute=body)
-            return build_guarded_streaming_response(
-                (),
-                guard=guard,
+                signal_sink=title_sink,
+                on_conversation_id=set_title_conversation_id,
+                on_immediate=title_latch.finalize if title_latch is not None else None,
                 background=_runtime_stream_background(background_tasks, title_latch),
-                headers=sse_headers(),
+                timeout_seconds=CHAT_AGENT_TIMEOUT_SECONDS,
             )
         except (RuntimeAgentTimedOut, RuntimeCancelled, RuntimeTransportAborted) as exc:
             if title_latch is not None:
@@ -4626,16 +4569,12 @@ def create_app(
         if isinstance(typed_request, JSONResponse):
             return typed_request
         runtime = http_request.app.state.pilot_runtime
-        control = InMemoryRuntimeInvocationControl()
         try:
-            outcome = runtime.continue_confirmation(
+            outcome = execute_runtime_sync(
+                runtime,
                 typed_request,
-                transport=RuntimeTransportContext(mode="sync"),
-                invocation_control=control,
-                event_sink=None,
                 signal_sink=None,
-                execution_host=SyncAgentExecutionHost(timeout_seconds=CHAT_AGENT_TIMEOUT_SECONDS),
-                cancel_check=lambda: False,
+                timeout_seconds=CHAT_AGENT_TIMEOUT_SECONDS,
             )
             return _runtime_http_response(outcome)
         except (RuntimeAgentTimedOut, RuntimeCancelled, RuntimeTransportAborted) as exc:
@@ -4729,55 +4668,11 @@ def create_app(
         if isinstance(typed_request, JSONResponse):
             return typed_request
         runtime = http_request.app.state.pilot_runtime
-        run_uuid = uuid4()
-        transport = RuntimeTransportContext(
-            mode="stream",
-            transport_run_id=run_uuid,
-            stream_version=cast(StreamVersion, STREAM_VERSION),
-        )
-        control = InMemoryRuntimeInvocationControl()
         try:
-            prepared = runtime.prepare_stream(
+            return runtime_stream_response(
+                runtime,
                 typed_request,
-                transport=transport,
-                invocation_control=control,
-            )
-            if isinstance(prepared, ImmediateHttpOutcome):
-                if prepared.response_payload.get("_runtime_stream_direct") is True:
-                    return outcome_http_response(prepared)
-                if prepared.response_payload.get("_runtime_stream_retryable") is not True:
-                    return outcome_http_response(prepared)
-                return runtime_stream_immediate_response(
-                    prepared,
-                    run_id=str(run_uuid),
-                    request=typed_request,
-                )
-            conversation_id, context_type, context_ref, mode = prepared_stream_metadata(
-                prepared, typed_request
-            )
-            envelope = runtime_sse_envelope(
-                run_id=str(run_uuid),
-                conversation_id=conversation_id,
-                context_type=context_type,
-                context_ref=context_ref,
-                mode=mode,
-            )
-
-            def body() -> object:
-                return runtime_sse_content(
-                    runtime,
-                    prepared,
-                    control,
-                    None,
-                    str(run_uuid),
-                    envelope,
-                    lambda _outcome: None,
-                    agent_timeout_seconds=CHAT_AGENT_TIMEOUT_SECONDS,
-                )
-
-            guard = PreparedStreamGuard(prepared=prepared, on_execute=body)
-            return build_guarded_streaming_response(
-                (), guard=guard, headers=sse_headers()
+                timeout_seconds=CHAT_AGENT_TIMEOUT_SECONDS,
             )
         except (RuntimeAgentTimedOut, RuntimeCancelled, RuntimeTransportAborted) as exc:
             return _runtime_error_response(exc)

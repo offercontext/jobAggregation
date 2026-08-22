@@ -278,6 +278,132 @@ def test_initial_and_clarification_are_provider_free_and_typed() -> None:
     assert coordinator.execute_calls == 0
 
 
+@pytest.mark.parametrize(
+    ("message", "outcome_type"),
+    (("职位：后端工程师\n负责 API", ConfirmationRequiredOutcome), ("取消", MessageOutcome)),
+)
+def test_runtime_clarification_text_and_cancel_use_deterministic_sync_route(
+    message: str,
+    outcome_type: type[object],
+) -> None:
+    class _NoProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def resolve(self, *_args: object, **_kwargs: object) -> object:
+            self.calls += 1
+            raise AssertionError("pending clarification must not resolve a model")
+
+    class _Host:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run(self, *_args: object, **_kwargs: object) -> object:
+            self.calls += 1
+            raise AssertionError("deterministic clarification must not enter an Agent host")
+
+    persistence = _Persistence()
+    adapter, _operations, coordinator = _adapter(persistence)
+    adapter.start_turn(StartTurnRequest(message="保存 JD"), _Conversation())
+    provider = _NoProvider()
+    host = _Host()
+    runtime = PilotRuntime(
+        RuntimeDependencies(
+            conversations=_Gateway(),
+            persistence=persistence,
+            deterministic=adapter,
+            model_resolver=provider,
+            route_selector=lambda _request, _conversation: "model",
+        )
+    )
+
+    outcome = runtime.start_turn(
+        StartTurnRequest(message=message, conversation_id=7),
+        execution_host=host,
+        invocation_control=InMemoryRuntimeInvocationControl(),
+        cancel_check=lambda: False,
+    )
+
+    assert isinstance(outcome, outcome_type)
+    assert provider.calls == 0
+    assert host.calls == 0
+    assert coordinator.execute_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("message", "outcome_type"),
+    (("职位：后端工程师\n负责 API", ConfirmationRequiredOutcome), ("取消", MessageOutcome)),
+)
+def test_runtime_clarification_text_and_cancel_use_deterministic_stream_route(
+    message: str,
+    outcome_type: type[object],
+) -> None:
+    class _NoProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def resolve(self, *_args: object, **_kwargs: object) -> object:
+            self.calls += 1
+            raise AssertionError("pending clarification must not resolve a model")
+
+    class _Host:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run(self, *_args: object, **_kwargs: object) -> object:
+            self.calls += 1
+            raise AssertionError("deterministic clarification must not enter an Agent host")
+
+    class _Sink:
+        def emit(self, _event: object) -> None:
+            return None
+
+    persistence = _Persistence()
+    adapter, _operations, coordinator = _adapter(persistence)
+    adapter.start_turn(StartTurnRequest(message="保存 JD"), _Conversation())
+    provider = _NoProvider()
+    host = _Host()
+    runtime = PilotRuntime(
+        RuntimeDependencies(
+            conversations=_Gateway(),
+            persistence=persistence,
+            deterministic=adapter,
+            model_resolver=provider,
+            route_selector=lambda _request, _conversation: "model",
+        )
+    )
+    control = InMemoryRuntimeInvocationControl()
+    prepared = runtime.prepare_stream(
+        StartTurnRequest(message=message, conversation_id=7),
+        transport=RuntimeTransportContext(
+            mode="stream",
+            transport_run_id=uuid4(),
+            stream_version="pilot-sse-v1",
+        ),
+        invocation_control=control,
+    )
+
+    assert isinstance(prepared, PreparedStreamExecution)
+    assert prepared.execution_mode is StreamExecutionMode.DIRECT
+    assert provider.calls == 0
+    assert coordinator.execute_calls == 0
+
+    guard = PreparedStreamGuard(prepared=prepared)
+    assert guard.begin_execution() is True
+    guard._execute = lambda: runtime.execute_prepared_stream(
+        prepared,
+        event_sink=_Sink(),
+        signal_sink=None,
+        execution_host=host,
+        cancel_check=lambda: False,
+    )
+    outcome = guard.execute_once()
+    assert isinstance(outcome, outcome_type)
+    assert host.calls == 0
+    assert provider.calls == 0
+    assert coordinator.execute_calls == 0
+
+
 def test_deterministic_confirmation_shape_keeps_pending_nested_only() -> None:
     persistence = _Persistence()
     adapter, _operations, _coordinator = _adapter(persistence)

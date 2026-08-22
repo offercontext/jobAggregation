@@ -429,6 +429,9 @@ class DeterministicPilotAdapter:
         if request.pilot_action is not None:
             self._action_from_request(request)
             return True
+        clarification = self._clarification_for(conversation)
+        if clarification is not None and clarification[0].tool_name == "save_application_jd_version":
+            return True
         application = self._application(conversation, missing_ok=True)
         if application is None:
             return decide_pilot_action(

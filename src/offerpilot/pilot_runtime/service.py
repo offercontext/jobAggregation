@@ -1897,7 +1897,7 @@ class PilotRuntime:
                 abandon_once()
                 raise RuntimeCancelled() from exc
             finish_or_raise("failed", "provider_error")
-            return self._provider_failure(resolved, exc)
+            return self._provider_failure(resolved, exc, conversation_id=conversation_id)
         except BaseException:
             abandon_once()
             raise
@@ -1913,7 +1913,7 @@ class PilotRuntime:
             raise
         except Exception as exc:
             finish_or_raise("failed", "provider_error")
-            return self._provider_failure(resolved, exc)
+            return self._provider_failure(resolved, exc, conversation_id=conversation_id)
         except BaseException:
             abandon_once()
             raise
@@ -3346,6 +3346,8 @@ class PilotRuntime:
     def _provider_failure(
         resolved: ResolvedModel | None,
         error: Exception,
+        *,
+        conversation_id: int | None = None,
     ) -> RuntimeFailureOutcome:
         formatter = _attribute(resolved, "provider_error_message")
         message = None
@@ -3361,6 +3363,7 @@ class PilotRuntime:
             message or "AI 连接失败。请检查 AI 设置或稍后重试。",
             502,
             retryable=True,
+            conversation_id=conversation_id,
         )
 
     @staticmethod
@@ -4508,7 +4511,11 @@ class PilotRuntime:
             abort(CompletionReason.TRANSPORT_ABORTED)
             raise
         except Exception as exc:
-            outcome = self._provider_failure(resolved_model, exc)
+            outcome = self._provider_failure(
+                resolved_model,
+                exc,
+                conversation_id=state.conversation_id,
+            )
             self._finish(
                 state.recorder,
                 state.journal_started,
@@ -7376,6 +7383,7 @@ class PilotRuntime:
         *,
         retryable: bool = False,
         degraded: bool = False,
+        conversation_id: int | None = None,
     ) -> RuntimeFailureOutcome:
         return RuntimeFailureOutcome(
             code=code,
@@ -7383,6 +7391,7 @@ class PilotRuntime:
             status_code=status_code,
             retryable=retryable,
             degraded=degraded,
+            conversation_id=conversation_id,
         )
 
     def _finish(

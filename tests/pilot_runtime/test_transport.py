@@ -301,6 +301,100 @@ def test_guarded_response_midstream_send_oserror_becomes_client_disconnect_cance
     assert lifecycle.completion_reason is CompletionReason.CANCELLED
 
 
+def test_guarded_response_closes_replacement_source_after_send_disconnect() -> None:
+    lifecycle = PreparedLifecycle()
+    guard = PreparedStreamGuard(lifecycle=lifecycle)
+    calls = {"close": 0}
+
+    class Source:
+        def __iter__(self):
+            yield b"first"
+            yield b"second"
+
+        def close(self) -> None:
+            calls["close"] += 1
+
+    source = Source()
+    response = GuardedStreamingResponse(
+        [],
+        guard,
+        execute=lambda: source,
+    )
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict[str, object]) -> None:
+        if message["type"] == "http.response.body" and message.get("body"):
+            raise OSError("client disconnected")
+
+    with pytest.raises(ClientDisconnect):
+        asyncio.run(
+            response(
+                {
+                    "type": "http",
+                    "method": "GET",
+                    "path": "/",
+                    "headers": [],
+                    "asgi": {"spec_version": "2.4"},
+                },
+                receive,
+                send,
+            )
+        )
+
+    assert calls["close"] == 1
+
+
+def test_guarded_response_acloses_async_replacement_source_after_send_disconnect() -> None:
+    lifecycle = PreparedLifecycle()
+    guard = PreparedStreamGuard(lifecycle=lifecycle)
+    calls = {"aclose": 0}
+
+    class Source:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self) -> bytes:
+            if calls["aclose"]:
+                raise StopAsyncIteration
+            return b"first"
+
+        async def aclose(self) -> None:
+            calls["aclose"] += 1
+
+    source = Source()
+    response = GuardedStreamingResponse(
+        [],
+        guard,
+        execute=lambda: source,
+    )
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict[str, object]) -> None:
+        if message["type"] == "http.response.body" and message.get("body"):
+            raise OSError("client disconnected")
+
+    with pytest.raises(ClientDisconnect):
+        asyncio.run(
+            response(
+                {
+                    "type": "http",
+                    "method": "GET",
+                    "path": "/",
+                    "headers": [],
+                    "asgi": {"spec_version": "2.4"},
+                },
+                receive,
+                send,
+            )
+        )
+
+    assert calls["aclose"] == 1
+
+
 @pytest.mark.parametrize(
     "background_error, expected_reason",
     [

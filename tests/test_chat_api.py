@@ -7824,6 +7824,64 @@ def test_chat_new_stream_runs_late_registered_generated_title_task(tmp_path):
     assert conversation["title_source"] == "generated"
 
 
+@pytest.mark.parametrize("endpoint", ["/api/chat", "/api/chat/stream"])
+def test_first_model_signal_keeps_title_id_when_later_provider_fails(tmp_path, endpoint):
+    class LaterFailureModel:
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, messages, tools):
+            del messages, tools
+            self.calls += 1
+            if self.calls == 1:
+                return Assistant(
+                    tool_calls=[
+                        ToolCall(id="title-read", name="list_applications", args="{}")
+                    ]
+                )
+            raise RuntimeError("provider failed after first model")
+
+        def stream_complete(self, messages, tools, on_delta):
+            del on_delta
+            return self.complete(messages, tools)
+
+    class CountingTitleModel:
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, messages, tools):
+            del messages, tools
+            self.calls += 1
+            return Assistant(content="后续失败仍生成标题")
+
+    title_model = CountingTitleModel()
+    client = TestClient(
+        create_app(
+            data_dir=tmp_path,
+            chat_model=LaterFailureModel(),
+            title_model=title_model,
+        )
+    )
+
+    response = client.post(
+        endpoint,
+        json={"message": "首个模型成功后再失败", "conversation_id": 0},
+    )
+
+    assert response.status_code in {200, 502}
+    if endpoint.endswith("/stream"):
+        error_event = next(
+            event for event in _parse_sse_events(response.text) if event["event"] == "error"
+        )
+        assert "conversation_id" not in error_event["data"]["data"]
+    else:
+        assert "conversation_id" not in response.json()
+    conversation = client.get("/api/chat/conversations").json()[0]
+    assert title_model.calls == 1
+    assert conversation["title"] == "后续失败仍生成标题"
+    assert conversation["title_source"] == "generated"
+
+
 def test_chat_conversations_detail_and_delete(tmp_path):
     model = ScriptedModel([Assistant(content="你好")])
     client = TestClient(create_app(data_dir=tmp_path, chat_model=model))

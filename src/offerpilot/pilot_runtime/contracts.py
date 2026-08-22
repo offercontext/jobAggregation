@@ -626,6 +626,7 @@ class RuntimeFailureOutcome:
     retryable: bool = False
     degraded: bool = False
     pending_action: PendingActionPayload | None = field(default=None, repr=False)
+    conversation_id: int | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.code, RuntimeFailureCode):
@@ -640,6 +641,10 @@ class RuntimeFailureOutcome:
             self.pending_action, PendingActionPayload
         ):
             raise TypeError("pending_action must be a PendingActionPayload")
+        if self.conversation_id is not None:
+            _require_int(self.conversation_id, field_name="conversation_id")
+            if self.conversation_id <= 0:
+                raise ValueError("conversation_id must be positive")
 
 
 @dataclass(frozen=True, slots=True)

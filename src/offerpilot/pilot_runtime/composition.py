@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import inspect
 from collections.abc import Callable, Mapping, Sequence
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
@@ -54,6 +55,12 @@ from offerpilot.pilot_runtime.service import (
     ResolvedModel,
     RuntimeDependencies,
     SourceLoader,
+)
+
+
+_ACTIVE_TIMEOUT_DELIVERY: ContextVar[tuple[object, object] | None] = ContextVar(
+    "offerpilot_active_timeout_delivery",
+    default=None,
 )
 
 
@@ -457,15 +464,19 @@ class _AtomicTimeoutDelivery:
     def __init__(self, chat: object, repository: WriteOperationRepository) -> None:
         self._chat = chat
         self._repository = repository
-        self._states: dict[str, object] = {}
-        self._owners: dict[str, object] = {}
+        self._states: dict[object, object] = {}
+        self._owners: dict[object, object] = {}
         self._lock = RLock()
         self._prepare_owner = repository.prepare_owner
 
         def capture_owner(operation_id: str, generation: int = 1) -> object:
             owner = self._prepare_owner(operation_id, generation)
-            with self._lock:
-                self._owners[operation_id] = owner
+            active = _ACTIVE_TIMEOUT_DELIVERY.get()
+            if active is not None and active[0] is self:
+                handle = active[1]
+                with self._lock:
+                    if handle in self._states:
+                        self._owners[handle] = owner
             return owner
 
         setattr(repository, "prepare_owner", capture_owner)
@@ -473,31 +484,41 @@ class _AtomicTimeoutDelivery:
             repository.session_factory, "before_commit", self._before_commit
         )
 
-    def register(self, state: object) -> None:
-        identity = _attribute(state, "identity")
-        operation_id = str(_attribute(identity, "operation_id", "") or "")
-        if not operation_id:
-            return
+    def register(self, state: object) -> object:
+        handle = object()
         with self._lock:
-            self._states[operation_id] = state
+            self._states[handle] = state
+        _ACTIVE_TIMEOUT_DELIVERY.set((self, handle))
+        return handle
 
-    def unregister(self, state: object) -> None:
-        identity = _attribute(state, "identity")
-        operation_id = str(_attribute(identity, "operation_id", "") or "")
-        if not operation_id:
+    def unregister(self, state: object, handle: object | None = None) -> None:
+        active = _ACTIVE_TIMEOUT_DELIVERY.get()
+        if handle is None and active is not None and active[0] is self:
+            handle = active[1]
+        if handle is None:
             return
+        removed = False
         with self._lock:
-            if self._states.get(operation_id) is state:
-                self._states.pop(operation_id, None)
-            self._owners.pop(operation_id, None)
+            if self._states.get(handle) is state:
+                self._states.pop(handle, None)
+                self._owners.pop(handle, None)
+                removed = True
+        if removed and active is not None and active[0] is self and active[1] is handle:
+            _ACTIVE_TIMEOUT_DELIVERY.set(None)
 
     def _before_commit(self, session: object) -> None:
         with self._lock:
             candidates = tuple(self._states.items())
-            owners = dict(self._owners)
-        for operation_id, state in candidates:
-            owner = owners.get(operation_id)
+        for handle, state in candidates:
+            with self._lock:
+                if self._states.get(handle) is not state:
+                    continue
+                owner = self._owners.get(handle)
             if owner is None:
+                continue
+            identity = _attribute(state, "identity")
+            operation_id = str(_attribute(identity, "operation_id", "") or "")
+            if not operation_id:
                 continue
             lock = _attribute(state, "lock")
             if lock is None or not hasattr(lock, "__enter__"):

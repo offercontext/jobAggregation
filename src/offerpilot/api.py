@@ -7671,7 +7671,8 @@ def _runtime_title_latch(
 
     latch = RuntimeSignalLatch(register=register)
     def set_conversation_id(value: int | None) -> None:
-        holder["conversation_id"] = value
+        if type(value) is int and value > 0:
+            holder["conversation_id"] = value
 
     return latch, ClosedAgentSignalSink(latch), set_conversation_id
 

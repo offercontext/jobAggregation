@@ -19,7 +19,7 @@ from time import perf_counter
 from typing import Any, Final, Generic, Iterator, NoReturn, TypeAlias, TypeVar, cast
 
 from starlette.background import BackgroundTask
-from starlette.concurrency import iterate_in_threadpool
+from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
 from starlette.requests import ClientDisconnect
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.types import Receive, Scope, Send
@@ -1040,11 +1040,13 @@ class GuardedStreamingResponse(StreamingResponse):
         if not self.guard.begin_execution():
             return
         self._body_entered = True
+        source: Any | None = None
+        body_error: BaseException | None = None
         try:
             replacement = self.guard.execute_once()
             if replacement is None and self.guard.lifecycle_state is not PreparedLifecycleState.EXECUTING:
                 return
-            source: Any = replacement if replacement is not None else content
+            source = replacement if replacement is not None else content
             if hasattr(source, "__aiter__"):
                 async for chunk in cast(AsyncIterable[bytes | str], source):
                     yield chunk
@@ -1052,30 +1054,56 @@ class GuardedStreamingResponse(StreamingResponse):
                 async for chunk in iterate_in_threadpool(cast(Iterable[bytes | str], source)):
                     yield chunk
             self._body_exhausted = True
-        except (RuntimeCancelled, RuntimeAgentTimedOut, asyncio.CancelledError, ClientDisconnect):
+        except (RuntimeCancelled, RuntimeAgentTimedOut, asyncio.CancelledError, ClientDisconnect) as exc:
+            body_error = exc
             self.guard._mark_execution_owner_exit()
             self._complete_preserving(CompletionReason.CANCELLED)
             raise
-        except RuntimeTransportAborted:
+        except RuntimeTransportAborted as exc:
+            body_error = exc
             self.guard._mark_execution_owner_exit()
             self._complete_preserving(CompletionReason.TRANSPORT_ABORTED)
             raise
         except Exception as exc:
+            body_error = exc
             self.guard._mark_execution_owner_exit()
             self._complete_preserving(CompletionReason.TRANSPORT_ABORTED)
             raise RuntimeTransportAborted() from exc
-        except GeneratorExit:
+        except GeneratorExit as exc:
+            body_error = exc
             self.guard._mark_execution_owner_exit()
             self._complete_preserving(CompletionReason.CANCELLED)
             raise
-        except BaseException:
+        except BaseException as exc:
+            body_error = exc
             # Cleanup is owned by the CAS winner; never suppress the original
             # BaseException (including KeyboardInterrupt/SystemExit).
             self.guard._mark_execution_owner_exit()
             self._complete_preserving(CompletionReason.TRANSPORT_ABORTED)
             raise
         finally:
-            self.guard._mark_execution_owner_exit()
+            try:
+                if source is not None:
+                    await self._close_source(source)
+            except BaseException:
+                if body_error is None:
+                    raise
+            finally:
+                self.guard._mark_execution_owner_exit()
+
+    @staticmethod
+    async def _close_source(source: object) -> None:
+        aclose = getattr(source, "aclose", None)
+        if callable(aclose):
+            result = aclose()
+            if inspect.isawaitable(result):
+                await cast(Awaitable[object], result)
+            return
+        close = getattr(source, "close", None)
+        if callable(close):
+            result = await run_in_threadpool(close)
+            if inspect.isawaitable(result):
+                await cast(Awaitable[object], result)
 
     def _complete_preserving(self, reason: CompletionReason) -> None:
         try:

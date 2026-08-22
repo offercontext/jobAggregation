@@ -1267,8 +1267,9 @@ class ConfirmationCoordinator:
         register_delivery = _callable(transactional_delivery, ("register",))
         unregister_delivery = _callable(transactional_delivery, ("unregister",))
         registered_delivery = False
+        registered_delivery_handle: object | None = None
         if register_delivery is not None:
-            _invoke(register_delivery, {"state": state}, (state,))
+            registered_delivery_handle = _invoke(register_delivery, {"state": state}, (state,))
             registered_delivery = True
         values: dict[str, object] = {
             "operation_id": state.identity.operation_id,
@@ -1292,7 +1293,15 @@ class ConfirmationCoordinator:
             )
         finally:
             if registered_delivery and unregister_delivery is not None:
-                _invoke(unregister_delivery, {"state": state}, (state,))
+                _invoke(
+                    unregister_delivery,
+                    {
+                        "state": state,
+                        "handle": registered_delivery_handle,
+                        "registration": registered_delivery_handle,
+                    },
+                    (state, registered_delivery_handle),
+                )
         if _terminal(execution):
             state.terminal_execution = execution
             self._set_ownership(state, execution)

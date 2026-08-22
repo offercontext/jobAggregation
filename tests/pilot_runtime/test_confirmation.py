@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event, Lock
+from threading import Event, Lock, RLock
 from types import SimpleNamespace
 from typing import Any, cast
 from uuid import uuid4
@@ -62,6 +62,7 @@ from offerpilot.pilot_runtime.continuation import (
 from offerpilot.pilot_runtime.event_sink import InMemoryRuntimeInvocationControl
 from offerpilot.pilot_runtime.errors import RuntimeAgentTimedOut, RuntimeFailureCode
 from offerpilot.pilot_runtime.persistence import PersistenceResult, PersistenceStatus
+import offerpilot.pilot_runtime.composition as composition_module
 from offerpilot.pilot_runtime.service import PilotRuntime, RuntimeDependencies
 from offerpilot.pilot_runtime.service import ResolvedModel
 
@@ -2248,3 +2249,73 @@ def test_confirmation_journal_base_exception_is_propagated_unchanged() -> None:
     assert cast(Any, recorder).calls == ["capture_context"]
     assert persistence.pending is pending
     assert operations.operation.status == "proposed"
+
+
+def test_atomic_timeout_delivery_keeps_concurrent_same_operation_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(composition_module.sqlalchemy_event, "listen", lambda *_args: None)
+
+    class Repository:
+        session_factory = object()
+
+        def __init__(self) -> None:
+            self.owner_calls = 0
+
+        def prepare_owner(self, operation_id: str, generation: int = 1) -> object:
+            self.owner_calls += 1
+            return SimpleNamespace(operation_id=operation_id, generation=generation, call=self.owner_calls)
+
+    class Chat:
+        def __init__(self) -> None:
+            self.resolved: list[object] = []
+
+        def bind(self, _session: object) -> "Chat":
+            return self
+
+        def resolve_pending_confirmation(self, *args: object, **kwargs: object) -> object:
+            self.resolved.append(kwargs["delivery_ownership"])
+            return object()
+
+    class Session:
+        def get(self, _model: object, _operation_id: str) -> object:
+            return SimpleNamespace(
+                status="committed",
+                undo_json=None,
+                visible_result="saved",
+            )
+
+        def scalars(self, _statement: object) -> list[int]:
+            return []
+
+    repository = Repository()
+    chat = Chat()
+    delivery = composition_module._AtomicTimeoutDelivery(chat, repository)
+
+    def state() -> SimpleNamespace:
+        return SimpleNamespace(
+            identity=SimpleNamespace(operation_id="same-operation", conversation_id=7),
+            lock=RLock(),
+            timed_out=True,
+            active=True,
+            confirmation_attempted=True,
+            origin_tool_message=None,
+            transactional_delivery_persisted=False,
+            pending=SimpleNamespace(tool_call_id="tool-1"),
+            claim_id="claim",
+        )
+
+    state_a = state()
+    state_b = state()
+    handle_a = delivery.register(state_a)
+    owner_a = repository.prepare_owner("same-operation")
+    handle_b = delivery.register(state_b)
+    owner_b = repository.prepare_owner("same-operation")
+
+    assert handle_a is not handle_b
+    assert owner_a is not owner_b
+    delivery.unregister(state_a, handle_a)
+
+    delivery._before_commit(Session())
+
+    assert chat.resolved == [owner_b]

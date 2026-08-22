@@ -508,6 +508,134 @@ def test_guarded_response_closes_real_sse_host_when_send_exits(
     )
 
 
+@pytest.mark.parametrize("_attempt", range(3))
+@pytest.mark.parametrize("termination", ["disconnect", "manual"])
+def test_guarded_response_closes_real_sse_host_on_pre24_disconnect_cancellation(
+    _attempt: int,
+    termination: str,
+) -> None:
+    release = threading.Event()
+    started = threading.Event()
+    finished = threading.Event()
+    shutdown_calls: list[bool] = []
+
+    class SpyExecutor(ThreadPoolExecutor):
+        def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+            shutdown_calls.append(cancel_futures)
+            super().shutdown(wait=wait, cancel_futures=cancel_futures)
+
+    control = InMemoryRuntimeInvocationControl()
+    host = SseAgentExecutionHost[str](
+        timeout_seconds=2.0,
+        poll_seconds=0.01,
+        executor_factory=lambda **kwargs: SpyExecutor(**kwargs),
+    )
+
+    def thunk(sink: RuntimeEventSink) -> str:
+        sink.emit(MetaEvent())
+        started.set()
+        try:
+            release.wait(2.0)
+            return "done"
+        finally:
+            finished.set()
+
+    stream = host.run(thunk, control)
+
+    class NestedHostIterator:
+        close_calls = 0
+
+        def __init__(self) -> None:
+            self._generator = self._events()
+
+        def _events(self):
+            for _event in stream:
+                yield b"first"
+
+        def __iter__(self):
+            return self
+
+        def __next__(self) -> bytes:
+            return next(self._generator)
+
+        def close(self) -> None:
+            type(self).close_calls += 1
+            self._generator.close()
+            stream.close()
+
+    response = GuardedStreamingResponse(
+        [],
+        PreparedStreamGuard(lifecycle=PreparedLifecycle()),
+        execute=NestedHostIterator,
+    )
+
+    async def run_request() -> None:
+        body_sent = asyncio.Event()
+        response_task: asyncio.Task[None] | None = None
+        receive_calls = 0
+
+        async def receive() -> dict[str, object]:
+            nonlocal receive_calls
+            receive_calls += 1
+            if receive_calls == 1:
+                return {"type": "http.request", "body": b"", "more_body": False}
+            if termination == "manual":
+                return {"type": "http.request", "body": b"", "more_body": False}
+            await body_sent.wait()
+            assert response_task is not None
+            response_task.cancel()
+            asyncio.get_running_loop().call_soon(response_task.cancel)
+            return {"type": "http.disconnect"}
+
+        async def send(message: dict[str, object]) -> None:
+            if message["type"] == "http.response.body" and message.get("body"):
+                body_sent.set()
+                if termination == "manual":
+                    assert response_task is not None
+                    response_task.cancel()
+                    asyncio.get_running_loop().call_soon(response_task.cancel)
+                await asyncio.Event().wait()
+
+        response_task = asyncio.create_task(
+            response(
+                {
+                    "type": "http",
+                    "method": "GET",
+                    "path": "/",
+                    "headers": [],
+                    "asgi": {
+                        "spec_version": "2.0" if termination == "disconnect" else "2.4"
+                    },
+                },
+                receive,
+                send,
+            )
+        )
+        await response_task
+
+    shutdown_before_cleanup: list[bool] = []
+    started_before_cleanup = False
+    finished_before_cleanup = False
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(asyncio.wait_for(run_request(), timeout=1.0))
+    finally:
+        started_before_cleanup = started.is_set()
+        release.set()
+        finished_before_cleanup = finished.wait(0.2)
+        shutdown_before_cleanup = list(shutdown_calls)
+        if not stream._closed:
+            stream.close()
+
+    assert NestedHostIterator.close_calls == 1
+    assert started_before_cleanup
+    assert finished_before_cleanup
+    assert shutdown_before_cleanup == [True], (
+        shutdown_before_cleanup,
+        started_before_cleanup,
+    )
+
+
 @pytest.mark.parametrize(
     "background_error, expected_reason",
     [

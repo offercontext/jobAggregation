@@ -1116,6 +1116,29 @@ class GuardedStreamingResponse(StreamingResponse):
         if source is not None:
             await self._close_source(source)
 
+    async def _close_active_source_uncancellable(self) -> BaseException | None:
+        """Close the active source in an independent task before propagating cancellation."""
+
+        cleanup_task = asyncio.create_task(self._close_active_source())
+        cancellation: BaseException | None = None
+        while True:
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError as exc:
+                if cleanup_task.done():
+                    try:
+                        cleanup_task.result()
+                    except BaseException:
+                        raise
+                    if cancellation is None:
+                        cancellation = exc
+                    break
+                if cancellation is None:
+                    cancellation = exc
+                continue
+            break
+        return cancellation
+
     @staticmethod
     async def _close_source(source: object) -> None:
         aclose = getattr(source, "aclose", None)
@@ -1230,7 +1253,9 @@ class GuardedStreamingResponse(StreamingResponse):
                 # consumer's send.  In that case the nested body generator's
                 # ``finally`` is not authoritative, so close the active
                 # runtime source from this outer response owner as well.
-                await self._close_active_source()
+                cleanup_cancellation = await self._close_active_source_uncancellable()
+                if cleanup_cancellation is not None:
+                    source_error = cleanup_cancellation
             except BaseException as cleanup_error:
                 source_error = cleanup_error
             # This is authoritative for a response whose body iterator was

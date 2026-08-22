@@ -485,7 +485,7 @@ class ConfirmationRequest:
     confirmation_token: str = field(default="", repr=False)
     operation_id: str | None = None
     edited_args: EditedArgs = field(default_factory=EditedArgs.missing)
-    rejection_feedback: str = ""
+    rejection_feedback: str = field(default="", repr=False)
     rejection_feedback_present: bool = False
 
     def __post_init__(self) -> None:
@@ -568,6 +568,7 @@ class MessageOutcome:
     operation_id: str | None = None
     replayed: bool = False
     persisted: bool = True
+    legacy_projection: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         _require_text(self.message, field_name="message")
@@ -591,6 +592,7 @@ class MessageOutcome:
             _require_text(self.operation_id, field_name="operation_id")
         _require_bool(self.replayed, field_name="replayed")
         _require_bool(self.persisted, field_name="persisted")
+        _require_bool(self.legacy_projection, field_name="legacy_projection")
 
 
 @dataclass(frozen=True, slots=True)

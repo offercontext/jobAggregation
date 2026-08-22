@@ -22,6 +22,7 @@ from uuid import uuid4
 
 from offerpilot.ai.agent import PendingAction
 from offerpilot.ai.tool_runtime.contracts import ToolFailure, ToolSuccess
+from offerpilot.ai.tool_runtime.legacy import LEGACY_DETERMINISTIC_NAMES
 from offerpilot.ai.tool_runtime.journal import journal_shape_digest
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.agent_runtime.events import (
@@ -642,37 +643,73 @@ def _invoke(
     except (TypeError, ValueError):
         return function(*positional_fallback)
 
-    args: list[object] = []
-    kwargs: dict[str, object] = {}
-    fallback_index = 0
-    has_var_keyword = False
-    for parameter in signature.parameters.values():
-        if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
-            args.extend(positional_fallback[fallback_index:])
-            fallback_index = len(positional_fallback)
-            continue
-        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
-            has_var_keyword = True
-            continue
-        if parameter.name in values:
-            value = values[parameter.name]
-        elif fallback_index < len(positional_fallback):
-            value = positional_fallback[fallback_index]
-            fallback_index += 1
-        elif parameter.default is inspect.Parameter.empty:
-            raise TypeError(f"injected callable requires unsupported parameter {parameter.name}")
-        else:
-            continue
-        if parameter.kind is inspect.Parameter.KEYWORD_ONLY:
-            kwargs[parameter.name] = value
-        else:
-            args.append(value)
+    parameters = tuple(signature.parameters.values())
 
-    if has_var_keyword and var_keyword_values:
-        for name, value in var_keyword_values.items():
-            if name not in kwargs and name not in signature.parameters:
-                kwargs[name] = value
-    return function(*args, **kwargs)
+    def composed_call() -> tuple[tuple[object, ...], dict[str, object]]:
+        args: list[object] = []
+        kwargs: dict[str, object] = {}
+        fallback_index = 0
+        has_var_keyword = False
+        for parameter in parameters:
+            if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+                args.extend(positional_fallback[fallback_index:])
+                fallback_index = len(positional_fallback)
+                continue
+            if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+                has_var_keyword = True
+                continue
+            if parameter.name in values:
+                value = values[parameter.name]
+            elif fallback_index < len(positional_fallback):
+                value = positional_fallback[fallback_index]
+                fallback_index += 1
+            elif parameter.default is inspect.Parameter.empty:
+                continue
+            else:
+                continue
+            if parameter.kind is inspect.Parameter.KEYWORD_ONLY:
+                kwargs[parameter.name] = value
+            else:
+                args.append(value)
+        if has_var_keyword and var_keyword_values:
+            for name, value in var_keyword_values.items():
+                if name not in kwargs and name not in signature.parameters:
+                    kwargs[name] = value
+        return tuple(args), kwargs
+
+    def named_call() -> tuple[tuple[object, ...], dict[str, object]]:
+        args: list[object] = []
+        kwargs: dict[str, object] = {}
+        for parameter in parameters:
+            if parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
+                if parameter.name in values:
+                    args.append(values[parameter.name])
+                continue
+            if parameter.kind in {
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            } and parameter.name in values:
+                kwargs[parameter.name] = values[parameter.name]
+        if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters):
+            for name, value in (var_keyword_values or {}).items():
+                if name not in signature.parameters:
+                    kwargs[name] = value
+        return tuple(args), kwargs
+
+    candidates: tuple[tuple[tuple[object, ...], dict[str, object]], ...] = (
+        composed_call(),
+        named_call(),
+        (tuple(positional_fallback), {}),
+    )
+    for args, kwargs in candidates:
+        try:
+            signature.bind(*args, **kwargs)
+        except TypeError:
+            continue
+        # The injected body is entered exactly once.  In particular, a body
+        # TypeError is never mistaken for a binding failure and retried.
+        return function(*args, **kwargs)
+    raise TypeError("injected callable does not accept a supported argument shape")
 
 
 def _conversation_id(conversation: object) -> int | None:
@@ -705,8 +742,14 @@ def _route_kind(value: object, request: StartTurnRequest) -> RouteKind:
     if isinstance(value, RouteKind):
         return value
     raw = _attribute(value, "kind", _attribute(value, "route", value))
-    text = str(getattr(raw, "value", raw)).lower()
-    return RouteKind.DETERMINISTIC if text in {"deterministic", "confirmation"} or "deterministic" in text else RouteKind.MODEL
+    text = getattr(raw, "value", raw)
+    if type(text) is not str:
+        raise ValueError("unsupported runtime route")
+    if text == RouteKind.MODEL.value:
+        return RouteKind.MODEL
+    if text == RouteKind.DETERMINISTIC.value:
+        return RouteKind.DETERMINISTIC
+    raise ValueError("unsupported runtime route")
 
 
 def _result_persisted(result: object) -> bool:
@@ -1077,6 +1120,7 @@ def _valid_pending_action(
     catalog: object | None,
     *,
     require_operation_id: bool = True,
+    trusted_legacy: bool = False,
 ) -> bool:
     """Validate the closed pending boundary before persistence or suspension."""
 
@@ -1094,7 +1138,10 @@ def _valid_pending_action(
         freeze_json_mapping(cast(Mapping[str, object], parsed))
     except (TypeError, ValueError, json.JSONDecodeError):
         return False
-    if not _catalog_exposes_write(catalog, pending.tool_name):
+    if trusted_legacy:
+        if pending.tool_name not in LEGACY_DETERMINISTIC_NAMES:
+            return False
+    elif not _catalog_exposes_write(catalog, pending.tool_name):
         return False
     return bool(_confirmation_token(pending))
 
@@ -1375,7 +1422,12 @@ class PilotRuntime:
                 self._failure(RuntimeFailureCode.CONVERSATION_ARCHIVED, "conversation is archived", 409)
             )
 
+        route_validation = self._validate_route_action(request)
+        if route_validation is not None:
+            return complete_early(route_validation)
         route = self._select_route(request, conversation)
+        if isinstance(route, RuntimeFailureOutcome):
+            return complete_early(route)
         self._phase(f"route:{route.value}")
         self._phase("pending_guard")
         try:
@@ -2161,6 +2213,9 @@ class PilotRuntime:
                 invocation_control=invocation_control,
             )
 
+        route_validation = self._validate_route_action(request)
+        if route_validation is not None:
+            return self._stream_immediate(route_validation, invocation_control)
         try:
             route = self._select_route(request, conversation)
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
@@ -2170,10 +2225,13 @@ class PilotRuntime:
                 self._failure(
                     RuntimeFailureCode.OPERATION_UNAVAILABLE,
                     "unsupported runtime route",
-                    400,
+                    503,
+                    retryable=True,
                 ),
                 invocation_control,
             )
+        if isinstance(route, RuntimeFailureOutcome):
+            return self._stream_immediate(route, invocation_control)
         self._phase(f"route:{route.value}")
         if isinstance(request, StartTurnRequest):
             self._phase("pending_guard")
@@ -2276,7 +2334,14 @@ class PilotRuntime:
                     raise
             elif isinstance(execution.outcome, ConfirmationRequiredOutcome):
                 try:
-                    self._suspend(recorder, journal_started, adapter.pending_action(conversation), invocation_control, catalog=None)
+                    self._suspend(
+                        recorder,
+                        journal_started,
+                        adapter.pending_action(conversation),
+                        invocation_control,
+                        catalog=None,
+                        trusted_legacy=True,
+                    )
                 except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
                     self._abandon(recorder, journal_started)
                     raise
@@ -3186,34 +3251,64 @@ class PilotRuntime:
             return False
         return bool(value)
 
-    def _select_route(self, request: StartTurnRequest, conversation: object) -> RouteKind:
-        adapter = self._dependencies.deterministic
-        if adapter is not None:
-            try:
-                if adapter.matches(request, conversation):
-                    return RouteKind.DETERMINISTIC
-            except (ValueError, LookupError):
-                # The bridge owns the final validation response; a trusted
-                # route error must never fall through to a model.  This also
-                # keeps repository/context failures on the deterministic
-                # safety boundary instead of turning them into AI work.
+    def _select_route(
+        self,
+        request: StartTurnRequest,
+        conversation: object,
+    ) -> RouteKind | RuntimeFailureOutcome:
+        try:
+            adapter = self._dependencies.deterministic
+            if adapter is not None and adapter.matches(request, conversation):
                 return RouteKind.DETERMINISTIC
-        selector = self._dependencies.route_selector
-        if selector is None:
-            return _route_kind(None, request)
-        function = _callable(selector, ("select", "select_route", "route"))
+            selector = self._dependencies.route_selector
+            if selector is None:
+                return _route_kind(None, request)
+            function = _callable(selector, ("select", "select_route", "route"))
+            if function is None:
+                return _route_kind(None, request)
+            value = _invoke(
+                function,
+                {
+                    "request": request,
+                    "conversation": conversation,
+                    "conversation_id": _conversation_id(conversation),
+                },
+                (request, conversation),
+            )
+            return _route_kind(value, request)
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception:
+            return self._failure(
+                RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                "unsupported runtime route",
+                503,
+                retryable=True,
+            )
+
+    def _validate_route_action(self, request: StartTurnRequest) -> RuntimeFailureOutcome | None:
+        if request.pilot_action is None:
+            return None
+        adapter = self._dependencies.deterministic
+        if adapter is None:
+            return None
+        function = _callable(adapter, ("validate_action",))
         if function is None:
-            return _route_kind(None, request)
-        value = _invoke(
-            function,
-            {
-                "request": request,
-                "conversation": conversation,
-                "conversation_id": _conversation_id(conversation),
-            },
-            (request, conversation),
-        )
-        return _route_kind(value, request)
+            return None
+        try:
+            _invoke(function, {"request": request}, (request,))
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except ValueError as exc:
+            return self._failure(RuntimeFailureCode.INVALID_CONFIRMATION, str(exc), 422)
+        except Exception:
+            return self._failure(
+                RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                "unsupported runtime route",
+                503,
+                retryable=True,
+            )
+        return None
 
     def _pending_guard(self, conversation_id: int, conversation: object, request: StartTurnRequest) -> object | None:
         target = self._dependencies.pending_guard or self._dependencies.persistence
@@ -3668,7 +3763,7 @@ class PilotRuntime:
         if isinstance(outcome, RuntimeFailureOutcome) and outcome.code is RuntimeFailureCode.STALE_PENDING_ACTION:
             self._abandon(recorder, True)
         elif original is not None and current is not None and current.tool_call_id != original.tool_call_id:
-            self._suspend(recorder, True, current, control, catalog=None)
+            self._suspend(recorder, True, current, control, catalog=None, trusted_legacy=True)
         elif isinstance(outcome, RuntimeFailureOutcome):
             self._finish(recorder, True, "failed", "unknown", control)
         else:
@@ -3836,11 +3931,7 @@ class PilotRuntime:
         if conversation_id is None:
             raise LookupError("conversation not found")
         pending_before = adapter.pending_action(conversation)
-        replay = pending_before is not None and pending_before.tool_name in {
-            "save_application_jd_version",
-            "create_application_submission_snapshot",
-            "record_application_outcome",
-        }
+        replay = pending_before is not None and pending_before.tool_name in LEGACY_DETERMINISTIC_NAMES
         if replay:
             assert pending_before is not None
             recorder, started = self._resume_journal_replay(conversation_id, pending_before, transport)
@@ -3912,7 +4003,7 @@ class PilotRuntime:
         elif isinstance(execution.outcome, ConfirmationRequiredOutcome):
             try:
                 pending = adapter.pending_action(conversation)
-                self._suspend(recorder, started, pending, control, catalog=None)
+                self._suspend(recorder, started, pending, control, catalog=None, trusted_legacy=True)
             except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
                 self._abandon(recorder, started)
                 raise
@@ -3951,11 +4042,7 @@ class PilotRuntime:
         if conversation_id is None:
             raise LookupError("conversation not found")
         pending = adapter.pending_action(conversation)
-        replay = pending is not None and pending.tool_name in {
-            "save_application_jd_version",
-            "create_application_submission_snapshot",
-            "record_application_outcome",
-        }
+        replay = pending is not None and pending.tool_name in LEGACY_DETERMINISTIC_NAMES
         if replay:
             assert pending is not None
             recorder, started = self._resume_journal_replay(conversation_id, pending, transport)
@@ -4984,10 +5071,11 @@ class PilotRuntime:
         control: RuntimeInvocationControl,
         *,
         catalog: object | None,
+        trusted_legacy: bool = False,
     ) -> None:
         if not started or pending is None:
             return
-        if not _valid_pending_action(pending, catalog):
+        if not _valid_pending_action(pending, catalog, trusted_legacy=trusted_legacy):
             return
         require_runtime_active(control)
         self._phase("run_suspend")

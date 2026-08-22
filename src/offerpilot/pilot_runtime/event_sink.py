@@ -179,8 +179,8 @@ def runtime_outcome_payload(outcome: object) -> dict[str, object]:
         _optional(payload, "write_error", outcome.write_error)
         _optional(payload, "undo", outcome.undo)
         _optional(payload, "operation_id", outcome.operation_id)
-        if outcome.replayed:
-            payload["replayed"] = True
+        if outcome.replayed or outcome.legacy_projection:
+            payload["replayed"] = outcome.replayed
         return payload
     if type(outcome) is ConfirmationRequiredOutcome:
         payload = {"type": "confirmation_required"}

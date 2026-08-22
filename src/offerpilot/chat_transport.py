@@ -473,8 +473,8 @@ def _http_message_payload(outcome: MessageOutcome) -> dict[str, object]:
         payload["undo"] = _plain(outcome.undo)
     if outcome.operation_id is not None:
         payload["operation_id"] = outcome.operation_id
-    if outcome.replayed:
-        payload["replayed"] = True
+    if outcome.replayed or outcome.legacy_projection:
+        payload["replayed"] = outcome.replayed
     return payload
 
 

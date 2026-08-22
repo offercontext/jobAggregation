@@ -39,6 +39,7 @@ from offerpilot.ai.tool_runtime.contracts import JSONValue
 from offerpilot.ai.tool_runtime.legacy import (
     LegacyDeterministicAdapter,
     LegacyDeterministicCatalog,
+    LEGACY_DETERMINISTIC_NAMES,
     prepare_legacy_arguments,
 )
 from offerpilot.ai.tool_specs.legacy import build_legacy_deterministic_catalog
@@ -78,14 +79,6 @@ from .contracts import (
 from .errors import RuntimeFailureCode
 from .persistence import PersistenceResult, PersistenceStatus
 
-
-LEGACY_DETERMINISTIC_NAMES = frozenset(
-    {
-        "save_application_jd_version",
-        "create_application_submission_snapshot",
-        "record_application_outcome",
-    }
-)
 
 _DETERMINISTIC_ACTION_KINDS = frozenset(
     {
@@ -1336,6 +1329,7 @@ class DeterministicPilotAdapter:
             conversation_id=conversation_id,
             write_status=write_status,
             operation_id=pending.operation_id,
+            legacy_projection=True,
         )
         events = (
             MetaEvent(supports_delta=False, supports_tool_events=False),

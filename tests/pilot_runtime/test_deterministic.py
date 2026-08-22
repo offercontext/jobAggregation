@@ -15,13 +15,16 @@ from offerpilot.ai.write_operations import (
     ledger_fingerprint,
 )
 from offerpilot.pilot_runtime import (
+    CompletedEvent,
     CompletionReason,
     ConfirmationRequiredEvent,
     ConfirmationRequiredOutcome,
     DeterministicPilotAdapter,
     ErrorEvent,
     ImmediateHttpOutcome,
+    InvocationState,
     MessageOutcome,
+    OperationReplayOutcome,
     PreparationKind,
     PreparedStreamExecution,
     RuntimeFailureCode,
@@ -33,14 +36,15 @@ from offerpilot.pilot_runtime import (
     StreamExecutionMode,
     freeze_json_mapping,
 )
+from offerpilot.ai.tool_specs.legacy import build_legacy_deterministic_catalog
 from offerpilot.chat_transport import (
     PreparedStreamGuard,
     event_sse_payload,
     outcome_http_payload,
 )
-from offerpilot.pilot_runtime.deterministic import _confirmation_token
+from offerpilot.pilot_runtime.deterministic import _LEGACY_EDITABLE_FIELDS, _confirmation_token
 from offerpilot.pilot_runtime.event_sink import InMemoryRuntimeInvocationControl
-from offerpilot.pilot_runtime.service import PilotRuntime, RuntimeDependencies
+from offerpilot.pilot_runtime.service import PilotRuntime, RuntimeDependencies, _invoke
 
 
 class _Conversation:
@@ -256,6 +260,330 @@ def _adapter(persistence: _Persistence, *, execute_counter: list[int] | None = N
         key_factory=lambda: "key-deterministic-jd-1",
     )
     return adapter, operations, coordinator
+
+
+class _JournalPersistence(_Persistence):
+    def list_messages(self, _conversation_id: int) -> tuple[object, ...]:
+        return tuple(SimpleNamespace(id=index + 1, role="assistant") for index in range(self.message_ids))
+
+
+class _StrictRecorder:
+    run_id = "deterministic-run"
+    segment_id = "deterministic-segment"
+
+    def __init__(self) -> None:
+        self.events: list[object] = []
+        self.suspends: list[object] = []
+
+    def append_event(self, event: object) -> None:
+        self.events.append(event)
+
+    def capture_context(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+    def attach_input_message(self, _message_id: int) -> None:
+        return None
+
+    def fingerprint_pending_identity(self, _identity: object) -> str:
+        return "pending-fingerprint"
+
+    def suspend(self, command: object) -> None:
+        self.suspends.append(command)
+
+    def finish(self, _command: object) -> None:
+        return None
+
+    def abandon(self) -> None:
+        return None
+
+
+class _StrictJournal:
+    def __init__(self) -> None:
+        self.recorder = _StrictRecorder()
+        self.resume_calls = 0
+
+    def start_run(self, _command: object) -> _StrictRecorder:
+        return self.recorder
+
+    def resume_waiting_run(
+        self,
+        _conversation_id: int,
+        _tool_call_id: str,
+        _build_segment: object,
+    ) -> _StrictRecorder:
+        self.resume_calls += 1
+        return self.recorder
+
+
+def test_deterministic_initial_journal_suspends_closed_legacy_pending() -> None:
+    persistence = _JournalPersistence()
+    adapter, _operations, coordinator = _adapter(persistence)
+    journal = _StrictJournal()
+    runtime = PilotRuntime(
+        RuntimeDependencies(
+            conversations=_Gateway(),
+            persistence=persistence,
+            deterministic=adapter,
+            journal=journal,
+        )
+    )
+
+    outcome = runtime.start_turn(
+        StartTurnRequest(
+            message="保存 JD：岗位",
+            context_type="application",
+            context_ref="11",
+        ),
+        execution_host=object(),  # deterministic route must not inspect the host
+        invocation_control=InMemoryRuntimeInvocationControl(),
+        cancel_check=lambda: False,
+    )
+
+    assert isinstance(outcome, ConfirmationRequiredOutcome)
+    assert coordinator.execute_calls == 0
+    assert len(journal.recorder.suspends) == 1
+    assert journal.recorder.suspends[0].tool_name == "save_application_jd_version"
+
+
+def test_deterministic_chained_journal_suspends_replacement_on_same_run() -> None:
+    persistence = _JournalPersistence()
+    adapter, _operations, _coordinator = _adapter(persistence)
+    old_pending = SimpleNamespace(
+        tool_call_id="old-call",
+        tool_name="save_application_jd_version",
+        args='{"application_id":11,"jd_text":"old","idempotency_key":"key-old"}',
+        human="old",
+        operation_id="old-operation",
+    )
+    new_pending = SimpleNamespace(
+        tool_call_id="new-call",
+        tool_name="save_application_jd_version",
+        args='{"application_id":11,"jd_text":"new","idempotency_key":"key-new"}',
+        human="new",
+        operation_id="new-operation",
+    )
+    persistence.pending = old_pending
+    original = adapter.pending_action(_Conversation())
+    assert original is not None
+    journal = _StrictJournal()
+    runtime = PilotRuntime(RuntimeDependencies(persistence=persistence, deterministic=adapter))
+    control = InMemoryRuntimeInvocationControl()
+
+    persistence.pending = new_pending
+    runtime._finish_deterministic_confirmation_journal(  # type: ignore[attr-defined]
+        {"recorder": journal.recorder, "started": True},
+        original,
+        _Conversation(),
+        MessageOutcome("继续确认", conversation_id=7),
+        control,
+    )
+
+    assert len(journal.recorder.suspends) == 1
+    assert journal.recorder.suspends[0].tool_call_id == "new-call"
+
+
+@pytest.mark.parametrize("route_value", ("unknown", "deterministic-default", "confirmation"))
+def test_sync_unknown_route_fails_closed_before_model_side_effects(route_value: str) -> None:
+    class _NoProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def resolve(self, *_args: object, **_kwargs: object) -> object:
+            self.calls += 1
+            raise AssertionError("unknown route must not resolve a model")
+
+    provider = _NoProvider()
+    runtime = PilotRuntime(
+        RuntimeDependencies(
+            conversations=_Gateway(),
+            model_resolver=provider,
+            route_selector=lambda _request, _conversation: route_value,
+        )
+    )
+    control = InMemoryRuntimeInvocationControl()
+
+    outcome = runtime.start_turn(
+        StartTurnRequest(message="普通消息", conversation_id=7),
+        execution_host=object(),
+        invocation_control=control,
+        cancel_check=lambda: False,
+    )
+
+    assert isinstance(outcome, RuntimeFailureOutcome)
+    assert outcome.code is RuntimeFailureCode.OPERATION_UNAVAILABLE
+    assert outcome.status_code == 503
+    assert provider.calls == 0
+    assert control.state is InvocationState.COMPLETED
+
+
+@pytest.mark.parametrize("route_value", ("unknown", "deterministic-default", "confirmation"))
+def test_stream_unknown_route_matches_sync_fail_closed_boundary(route_value: str) -> None:
+    class _NoProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def resolve(self, *_args: object, **_kwargs: object) -> object:
+            self.calls += 1
+            raise AssertionError("unknown route must not resolve a model")
+
+    provider = _NoProvider()
+    runtime = PilotRuntime(
+        RuntimeDependencies(
+            conversations=_Gateway(),
+            model_resolver=provider,
+            route_selector=lambda _request, _conversation: route_value,
+        )
+    )
+    control = InMemoryRuntimeInvocationControl()
+    prepared = runtime.prepare_stream(
+        StartTurnRequest(message="普通消息", conversation_id=7),
+        transport=RuntimeTransportContext(
+            mode="stream",
+            transport_run_id=uuid4(),
+            stream_version="pilot-sse-v1",
+        ),
+        invocation_control=control,
+    )
+
+    assert isinstance(prepared, ImmediateHttpOutcome)
+    assert prepared.status_code == 503
+    assert prepared.payload["error_code"] == RuntimeFailureCode.OPERATION_UNAVAILABLE.value
+    assert provider.calls == 0
+    assert control.state is InvocationState.COMPLETED
+
+
+def test_route_selector_exception_is_typed_and_terminal_in_both_transports() -> None:
+    class _NoProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def resolve(self, *_args: object, **_kwargs: object) -> object:
+            self.calls += 1
+            raise AssertionError("route failure must not resolve a model")
+
+    def broken_selector(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("route selector failed")
+
+    provider = _NoProvider()
+    runtime = PilotRuntime(
+        RuntimeDependencies(
+            conversations=_Gateway(),
+            model_resolver=provider,
+            route_selector=broken_selector,
+        )
+    )
+    sync_control = InMemoryRuntimeInvocationControl()
+    sync_outcome = runtime.start_turn(
+        StartTurnRequest(message="普通消息", conversation_id=7),
+        execution_host=object(),
+        invocation_control=sync_control,
+        cancel_check=lambda: False,
+    )
+    stream_control = InMemoryRuntimeInvocationControl()
+    stream_outcome = runtime.prepare_stream(
+        StartTurnRequest(message="普通消息", conversation_id=7),
+        transport=RuntimeTransportContext(
+            mode="stream",
+            transport_run_id=uuid4(),
+            stream_version="pilot-sse-v1",
+        ),
+        invocation_control=stream_control,
+    )
+
+    assert isinstance(sync_outcome, RuntimeFailureOutcome)
+    assert sync_outcome.code is RuntimeFailureCode.OPERATION_UNAVAILABLE
+    assert sync_outcome.status_code == 503
+    assert isinstance(stream_outcome, ImmediateHttpOutcome)
+    assert stream_outcome.status_code == 503
+    assert stream_outcome.payload["error_code"] == RuntimeFailureCode.OPERATION_UNAVAILABLE.value
+    assert provider.calls == 0
+    assert sync_control.state is InvocationState.COMPLETED
+    assert stream_control.state is InvocationState.COMPLETED
+
+
+def test_deterministic_success_keeps_closed_replayed_false_projection() -> None:
+    deterministic = MessageOutcome(
+        "岗位资料已保存。",
+        conversation_id=7,
+        operation_id="operation-1",
+        write_status="success",
+        legacy_projection=True,
+    )
+    model = MessageOutcome("普通回复", conversation_id=7)
+    replay = OperationReplayOutcome("operation-1", conversation_id=7, message="岗位资料已保存。")
+
+    assert outcome_http_payload(deterministic) == {
+        "type": "message",
+        "message": "岗位资料已保存。",
+        "conversation_id": 7,
+        "write_status": "success",
+        "operation_id": "operation-1",
+        "replayed": False,
+    }
+    assert outcome_http_payload(model) == {
+        "type": "message",
+        "message": "普通回复",
+        "conversation_id": 7,
+    }
+    assert outcome_http_payload(replay) == {
+        "type": "message",
+        "operation_id": "operation-1",
+        "message": "岗位资料已保存。",
+        "replayed": True,
+        "conversation_id": 7,
+    }
+    assert event_sse_payload(CompletedEvent(response=deterministic)) == {
+        "persisted": True,
+        "response": {
+            "type": "message",
+            "message": "岗位资料已保存。",
+            "conversation_id": 7,
+            "write_status": "success",
+            "operation_id": "operation-1",
+            "replayed": False,
+        },
+    }
+    assert event_sse_payload(CompletedEvent(response=model)) == {
+        "persisted": True,
+        "response": {
+            "type": "message",
+            "message": "普通回复",
+            "conversation_id": 7,
+        },
+    }
+
+
+def test_confirmation_feedback_is_not_in_repr_but_presence_is_retained() -> None:
+    request = ConfirmationRequest(
+        conversation_id=7,
+        approved=False,
+        rejection_feedback="secret feedback",
+        rejection_feedback_present=True,
+    )
+
+    assert request.rejection_feedback_present is True
+    assert "secret feedback" not in repr(request)
+
+
+def test_legacy_editable_projection_matches_closed_source_catalog() -> None:
+    catalog = build_legacy_deterministic_catalog(object(), object())
+    for name, expected in _LEGACY_EDITABLE_FIELDS.items():
+        adapter = catalog.resolve_server_loaded(SimpleNamespace(tool_name=name))
+        assert adapter is not None
+        assert tuple(dict(item) for item in adapter.editable_fields) == expected
+
+
+def test_invoke_does_not_retry_a_body_type_error() -> None:
+    calls = 0
+
+    def body_failure(*, value: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise TypeError("body failure")
+
+    with pytest.raises(TypeError, match="body failure"):
+        _invoke(body_failure, {"value": "payload"}, ("fallback",))
+    assert calls == 1
 
 
 def test_initial_and_clarification_are_provider_free_and_typed() -> None:

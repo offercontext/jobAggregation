@@ -969,6 +969,8 @@ class GuardedStreamingResponse(StreamingResponse):
         self._original_background = background
         self._background_finalizer_lock = Lock()
         self._background_finalized = False
+        self._source_lock = Lock()
+        self._active_source: object | None = None
         wrapped_content = self._wrap_content(content)
         wrapped_background = BackgroundTask(self._background_finalizer)
         super().__init__(
@@ -1047,6 +1049,7 @@ class GuardedStreamingResponse(StreamingResponse):
             if replacement is None and self.guard.lifecycle_state is not PreparedLifecycleState.EXECUTING:
                 return
             source = replacement if replacement is not None else content
+            self._set_active_source(source)
             if hasattr(source, "__aiter__"):
                 async for chunk in cast(AsyncIterable[bytes | str], source):
                     yield chunk
@@ -1084,12 +1087,34 @@ class GuardedStreamingResponse(StreamingResponse):
         finally:
             try:
                 if source is not None:
-                    await self._close_source(source)
+                    await self._close_source_once(source)
             except BaseException:
                 if body_error is None:
                     raise
             finally:
                 self.guard._mark_execution_owner_exit()
+
+    def _set_active_source(self, source: object) -> None:
+        with self._source_lock:
+            self._active_source = source
+
+    def _claim_active_source(self, source: object | None = None) -> object | None:
+        with self._source_lock:
+            active = self._active_source
+            if active is None or (source is not None and active is not source):
+                return None
+            self._active_source = None
+            return active
+
+    async def _close_source_once(self, source: object) -> None:
+        claimed = self._claim_active_source(source)
+        if claimed is not None:
+            await self._close_source(claimed)
+
+    async def _close_active_source(self) -> None:
+        source = self._claim_active_source()
+        if source is not None:
+            await self._close_source(source)
 
     @staticmethod
     async def _close_source(source: object) -> None:
@@ -1199,6 +1224,15 @@ class GuardedStreamingResponse(StreamingResponse):
             self._finalize_owner_preserving(CompletionReason.TRANSPORT_ABORTED)
             raise
         finally:
+            source_error: BaseException | None = None
+            try:
+                # Starlette may cancel its body task while it is awaiting the
+                # consumer's send.  In that case the nested body generator's
+                # ``finally`` is not authoritative, so close the active
+                # runtime source from this outer response owner as well.
+                await self._close_active_source()
+            except BaseException as cleanup_error:
+                source_error = cleanup_error
             # This is authoritative for a response whose body iterator was
             # never entered.  BackgroundTask calls the same operation again.
             self._finalize_owner_preserving(
@@ -1215,8 +1249,23 @@ class GuardedStreamingResponse(StreamingResponse):
                 # on every ASGI exit; normal Starlette execution is a no-op.
                 await self._background_finalizer()
             except BaseException as cleanup_error:
-                if primary_error is None:
+                if primary_error is None and source_error is None:
                     raise cleanup_error
+            if primary_error is None and source_error is not None:
+                if isinstance(
+                    source_error,
+                    (
+                        RuntimeCancelled,
+                        RuntimeTransportAborted,
+                        RuntimeAgentTimedOut,
+                        ClientDisconnect,
+                        asyncio.CancelledError,
+                    ),
+                ):
+                    raise source_error
+                if isinstance(source_error, Exception):
+                    raise RuntimeTransportAborted() from source_error
+                raise source_error
 
 
 def build_guarded_streaming_response(

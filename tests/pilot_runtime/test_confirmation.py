@@ -2319,3 +2319,26 @@ def test_atomic_timeout_delivery_keeps_concurrent_same_operation_registration(
     delivery._before_commit(Session())
 
     assert chat.resolved == [owner_b]
+    delivery.unregister(state_b, handle_b)
+
+
+def test_atomic_timeout_delivery_restores_nested_registration_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(composition_module.sqlalchemy_event, "listen", lambda *_args: None)
+    repository = SimpleNamespace(
+        session_factory=object(),
+        prepare_owner=lambda _operation_id, _generation=1: object(),
+    )
+    delivery = composition_module._AtomicTimeoutDelivery(object(), repository)
+    state_a = object()
+    state_b = object()
+    handle_a = delivery.register(state_a)
+    handle_b = delivery.register(state_b)
+    try:
+        delivery.unregister(state_b, handle_b)
+        assert composition_module._ACTIVE_TIMEOUT_DELIVERY.get() == (delivery, handle_a)
+    finally:
+        delivery.unregister(state_b, handle_b)
+        delivery.unregister(state_a, handle_a)
+    assert composition_module._ACTIVE_TIMEOUT_DELIVERY.get() is None

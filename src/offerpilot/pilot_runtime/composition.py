@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import inspect
 from collections.abc import Callable, Mapping, Sequence
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
@@ -457,6 +457,7 @@ class _AtomicTimeoutDelivery:
         "_repository",
         "_states",
         "_owners",
+        "_tokens",
         "_lock",
         "_prepare_owner",
     )
@@ -466,6 +467,7 @@ class _AtomicTimeoutDelivery:
         self._repository = repository
         self._states: dict[object, object] = {}
         self._owners: dict[object, object] = {}
+        self._tokens: dict[object, Token[tuple[object, object] | None]] = {}
         self._lock = RLock()
         self._prepare_owner = repository.prepare_owner
 
@@ -486,9 +488,10 @@ class _AtomicTimeoutDelivery:
 
     def register(self, state: object) -> object:
         handle = object()
+        token = _ACTIVE_TIMEOUT_DELIVERY.set((self, handle))
         with self._lock:
             self._states[handle] = state
-        _ACTIVE_TIMEOUT_DELIVERY.set((self, handle))
+            self._tokens[handle] = token
         return handle
 
     def unregister(self, state: object, handle: object | None = None) -> None:
@@ -498,13 +501,28 @@ class _AtomicTimeoutDelivery:
         if handle is None:
             return
         removed = False
+        token: Token[tuple[object, object] | None] | None = None
         with self._lock:
             if self._states.get(handle) is state:
                 self._states.pop(handle, None)
                 self._owners.pop(handle, None)
+                token = self._tokens.pop(handle, None)
                 removed = True
         if removed and active is not None and active[0] is self and active[1] is handle:
-            _ACTIVE_TIMEOUT_DELIVERY.set(None)
+            if token is None:
+                _ACTIVE_TIMEOUT_DELIVERY.set(None)
+                return
+            try:
+                _ACTIVE_TIMEOUT_DELIVERY.reset(token)
+            except ValueError:
+                _ACTIVE_TIMEOUT_DELIVERY.set(None)
+                return
+            restored = _ACTIVE_TIMEOUT_DELIVERY.get()
+            if restored is not None and isinstance(restored[0], _AtomicTimeoutDelivery):
+                with restored[0]._lock:
+                    restored_registered = restored[1] in restored[0]._states
+                if not restored_registered:
+                    _ACTIVE_TIMEOUT_DELIVERY.set(None)
 
     def _before_commit(self, session: object) -> None:
         with self._lock:

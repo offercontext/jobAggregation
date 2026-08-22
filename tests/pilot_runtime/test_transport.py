@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from starlette.requests import ClientDisconnect
@@ -12,11 +14,13 @@ from offerpilot.pilot_runtime.contracts import (
     AssistantMessageEvent,
     CompletionReason,
     CompletedEvent,
+    MetaEvent,
     MessageOutcome,
     PreparedLifecycle,
     PreparedLifecycleState,
     RuntimeFailureOutcome,
     RuntimeFailureCode,
+    RuntimeEventSink,
 )
 from offerpilot.pilot_runtime.errors import (
     RuntimeAgentTimedOut,
@@ -28,10 +32,12 @@ from offerpilot.chat_transport import (
     encode_sse_event,
     GuardedStreamingResponse,
     PreparedStreamGuard,
+    SseAgentExecutionHost,
     event_sse_payload,
     outcome_http_payload,
     outcome_http_response,
 )
+from offerpilot.pilot_runtime.event_sink import InMemoryRuntimeInvocationControl
 
 
 def test_outcome_http_and_event_sse_renderers_are_pure_and_safe() -> None:
@@ -393,6 +399,113 @@ def test_guarded_response_acloses_async_replacement_source_after_send_disconnect
         )
 
     assert calls["aclose"] == 1
+
+
+@pytest.mark.parametrize("_attempt", range(3))
+@pytest.mark.parametrize("send_error_type", [ClientDisconnect, GeneratorExit])
+def test_guarded_response_closes_real_sse_host_when_send_exits(
+    _attempt: int,
+    send_error_type: type[BaseException],
+) -> None:
+    release = threading.Event()
+    started = threading.Event()
+    finished = threading.Event()
+    shutdown_calls: list[bool] = []
+
+    class SpyExecutor(ThreadPoolExecutor):
+        def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+            shutdown_calls.append(cancel_futures)
+            super().shutdown(wait=wait, cancel_futures=cancel_futures)
+
+    control = InMemoryRuntimeInvocationControl()
+    host = SseAgentExecutionHost[str](
+        timeout_seconds=2.0,
+        poll_seconds=0.01,
+        executor_factory=lambda **kwargs: SpyExecutor(**kwargs),
+    )
+
+    def thunk(sink: RuntimeEventSink) -> str:
+        sink.emit(MetaEvent())
+        started.set()
+        try:
+            release.wait(2.0)
+            return "done"
+        finally:
+            finished.set()
+
+    stream = host.run(thunk, control)
+
+    class NestedHostIterator:
+        close_calls = 0
+
+        def __init__(self) -> None:
+            self._generator = self._events()
+
+        def _events(self):
+            for _event in stream:
+                yield b"first"
+
+        def __iter__(self):
+            return self
+
+        def __next__(self) -> bytes:
+            return next(self._generator)
+
+        def close(self) -> None:
+            type(self).close_calls += 1
+            self._generator.close()
+            stream.close()
+
+    response = GuardedStreamingResponse(
+        [],
+        PreparedStreamGuard(lifecycle=PreparedLifecycle()),
+        execute=NestedHostIterator,
+    )
+
+    async def run_request() -> None:
+        async def receive() -> dict[str, object]:
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message: dict[str, object]) -> None:
+            if message["type"] == "http.response.body" and message.get("body"):
+                raise send_error_type()
+
+        await asyncio.wait_for(
+            response(
+                {
+                    "type": "http",
+                    "method": "GET",
+                    "path": "/",
+                    "headers": [],
+                    "asgi": {"spec_version": "2.4"},
+                },
+                receive,
+                send,
+            ),
+            timeout=1.0,
+        )
+
+    shutdown_before_cleanup: list[bool] = []
+    started_before_cleanup = False
+    finished_before_cleanup = False
+    try:
+        with pytest.raises(send_error_type):
+            asyncio.run(run_request())
+    finally:
+        started_before_cleanup = started.is_set()
+        release.set()
+        finished_before_cleanup = finished.wait(0.2)
+        shutdown_before_cleanup = list(shutdown_calls)
+        if not stream._closed:
+            stream.close()
+
+    assert NestedHostIterator.close_calls == 1
+    assert started_before_cleanup
+    assert finished_before_cleanup
+    assert shutdown_before_cleanup == [True], (
+        shutdown_before_cleanup,
+        started_before_cleanup,
+    )
 
 
 @pytest.mark.parametrize(

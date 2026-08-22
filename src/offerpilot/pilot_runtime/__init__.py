@@ -59,6 +59,12 @@ from .errors import (
     RuntimeFailureCode,
     RuntimeTransportAborted,
 )
+from .deterministic import (
+    DeterministicDependencies,
+    DeterministicExecution,
+    DeterministicPilotAdapter,
+    LEGACY_DETERMINISTIC_NAMES,
+)
 from .persistence import (
     ChatPersistenceCoordinator,
     DeliveryOutcome,
@@ -100,6 +106,10 @@ __all__ = [
     "AttachmentReference",
     "CancelReason",
     "ChatPersistenceCoordinator",
+    "DeterministicDependencies",
+    "DeterministicExecution",
+    "DeterministicPilotAdapter",
+    "LEGACY_DETERMINISTIC_NAMES",
     "ContextAssembler",
     "CompletedEvent",
     "CompletionReason",

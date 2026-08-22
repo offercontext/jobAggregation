@@ -32,11 +32,12 @@ from offerpilot.agent_runtime.events import (
 from offerpilot.agent_runtime.journal import (
     EventInput,
     NullRunRecorder,
+    ResumedDisposition,
     StartRunBuilder,
     SuspendedDisposition,
     TerminalDisposition,
 )
-from offerpilot.repositories.agent_runs import StartRunCommand
+from offerpilot.repositories.agent_runs import StartRunCommand, StartSegmentCommand
 
 from .contracts import (
     AgentExecutionHost,
@@ -53,6 +54,7 @@ from .contracts import (
     MessageOutcome,
     MetaEvent,
     OperationReplayOutcome,
+    OperationPendingOutcome,
     PreparationKind,
     PreparedLifecycleState,
     PreparedStreamExecution,
@@ -81,6 +83,7 @@ from .errors import (
     RuntimeFailureCode,
     RuntimeTransportAborted,
 )
+from .deterministic import DeterministicExecution, DeterministicPilotAdapter
 from .event_sink import emit_runtime_event, require_runtime_active
 from .persistence import (
     PendingActionView,
@@ -427,6 +430,7 @@ class RuntimeDependencies:
     validator: Callable[..., object] | None = None
     phase_sink: Callable[[str], None] | None = None
     application_visible: Callable[[int], bool] | None = None
+    deterministic: DeterministicPilotAdapter | None = None
 
 
 RuntimeDependenciesLike: TypeAlias = RuntimeDependencies | Mapping[str, object]
@@ -691,8 +695,13 @@ def _is_archived(conversation: object) -> bool:
 
 
 def _route_kind(value: object, request: StartTurnRequest) -> RouteKind:
+    # An explicit client action is always handled by the trusted bridge.  The
+    # bridge performs the closed-name/schema check; routing it to a model on a
+    # selector mistake would turn an invalid client control into a fallback.
+    if request.pilot_action is not None:
+        return RouteKind.DETERMINISTIC
     if value is None:
-        return RouteKind.DETERMINISTIC if request.pilot_action is not None else RouteKind.MODEL
+        return RouteKind.MODEL
     if isinstance(value, RouteKind):
         return value
     raw = _attribute(value, "kind", _attribute(value, "route", value))
@@ -1320,6 +1329,36 @@ class PilotRuntime:
         self._validate(request)
         self._check_cancel(cancel, invocation_control)
 
+        deterministic_adapter = self._dependencies.deterministic
+        if request.conversation_id in (None, 0) and deterministic_adapter is not None:
+            preflight = _callable(deterministic_adapter, ("validate_new_request",))
+            if preflight is not None:
+                try:
+                    _invoke(preflight, {"request": request}, (request,))
+                except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                    raise
+                except ValueError as exc:
+                    text = str(exc)
+                    code = (
+                        RuntimeFailureCode.OPERATION_UNAVAILABLE
+                        if "context" in text
+                        else RuntimeFailureCode.INVALID_CONFIRMATION
+                    )
+                    return complete_early(self._failure(code, text, 422))
+                except LookupError:
+                    return complete_early(
+                        self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "application not found", 404)
+                    )
+                except Exception:
+                    return complete_early(
+                        self._failure(
+                            RuntimeFailureCode.OPERATION_FAILED,
+                            "对话结果暂时无法保存。",
+                            503,
+                            retryable=True,
+                        )
+                    )
+
         self._phase("conversation")
         conversation = self._load_conversation(request)
         if conversation is None:
@@ -1339,12 +1378,50 @@ class PilotRuntime:
         route = self._select_route(request, conversation)
         self._phase(f"route:{route.value}")
         if route is not RouteKind.MODEL:
-            # Deterministic and confirmation orchestration is intentionally
-            # private to later extraction tasks.  Return before user/Run/
-            # Source/Agent side effects.
-            return complete_early(
-                self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400)
-            )
+            adapter = self._dependencies.deterministic
+            if adapter is None:
+                # Keep the pre-Task-8 closed boundary when a composition root
+                # has not installed the trusted deterministic bridge.
+                return complete_early(
+                    self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400)
+                )
+            validate_action = _callable(adapter, ("validate_action",))
+            if validate_action is not None:
+                try:
+                    _invoke(validate_action, {"request": request}, (request,))
+                except ValueError as exc:
+                    return complete_early(
+                        self._failure(RuntimeFailureCode.INVALID_CONFIRMATION, str(exc), 422)
+                    )
+            self._phase("deterministic")
+            try:
+                return complete_early(
+                    self._start_deterministic_turn(
+                        adapter,
+                        request,
+                        conversation,
+                        resolved_transport,
+                        invocation_control,
+                    )
+                )
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                raise
+            except ValueError as exc:
+                text = str(exc)
+                if "context is required" in text or "context is invalid" in text:
+                    deterministic_outcome = self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, text, 422)
+                else:
+                    deterministic_outcome = self._failure(RuntimeFailureCode.INVALID_CONFIRMATION, text, 422)
+                return complete_early(deterministic_outcome)
+            except LookupError:
+                return complete_early(
+                    self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "application not found", 404)
+                )
+            except Exception:
+                return complete_early(
+                    self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话结果暂时无法保存。", 503, retryable=True)
+                )
+            raise AssertionError("unreachable deterministic dispatch")
 
         self._phase("pending_guard")
         try:
@@ -1745,6 +1822,113 @@ class PilotRuntime:
                 finish_or_raise("completed", None)
         return outcome
 
+    def continue_confirmation(
+        self,
+        request: ConfirmationRequest,
+        *,
+        transport: RuntimeTransportContext | None = None,
+        invocation_control: RuntimeInvocationControl | None = None,
+    ) -> RuntimeOutcome:
+        """Dispatch a confirmation to the trusted deterministic bridge.
+
+        General Agent confirmation remains owned by the later continuation
+        extraction.  Keeping this narrow method here prevents a deterministic
+        confirmation from accidentally resolving a model/provider dependency.
+        """
+
+        if not isinstance(request, ConfirmationRequest):
+            raise TypeError("request must be a ConfirmationRequest")
+        control = invocation_control
+        if control is None:
+            raise TypeError("invocation_control is required")
+        resolved_transport = transport or RuntimeTransportContext(mode="sync")
+        if resolved_transport.mode != "sync":
+            return self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400)
+        self._phase("validate")
+        self._validate(request)
+        self._check_cancel(lambda: False, control)
+        conversation = self._load_confirmation_conversation(request)
+        if conversation is None:
+            self._mark_completed_if_active(control)
+            return self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404)
+        conversation_id = _conversation_id(conversation)
+        if conversation_id is None:
+            self._mark_completed_if_active(control)
+            return self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404)
+        if _is_archived(conversation):
+            self._mark_completed_if_active(control)
+            return self._failure(RuntimeFailureCode.CONVERSATION_ARCHIVED, "conversation is archived", 409)
+        adapter = self._dependencies.deterministic
+        if adapter is None:
+            self._mark_completed_if_active(control)
+            return self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400)
+        terminal_probe = _callable(adapter, ("is_terminal_replay",))
+        terminal_replay = (
+            bool(_invoke(terminal_probe, {"request": request}, (request,)))
+            if terminal_probe is not None
+            else False
+        )
+        if not terminal_replay and request.approved and not self._confirmation_messages_exist(conversation_id):
+            self._mark_completed_if_active(control)
+            return self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404)
+        original_pending = None if terminal_replay else adapter.pending_action(conversation)
+        original, journal_holder, on_attempt, on_result = self._deterministic_confirmation_callbacks(
+            adapter,
+            conversation,
+            resolved_transport,
+            control,
+            original=original_pending,
+            edited=not request.edited_args.is_missing(),
+        )
+        try:
+            execution = adapter.confirm(
+                request,
+                conversation,
+                transport=resolved_transport,
+                on_confirmation_attempt=on_attempt,
+                on_tool_result=on_result,
+            )
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            recorder = journal_holder.get("recorder")
+            if recorder is not None:
+                self._abandon(recorder, journal_holder.get("started") is True)
+            raise
+        except Exception:
+            recorder = journal_holder.get("recorder")
+            if recorder is not None:
+                self._finish(recorder, journal_holder.get("started") is True, "failed", "unknown", control)
+            self._mark_completed_if_active(control)
+            return self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话结果暂时无法保存。", 503, retryable=True)
+        except BaseException:
+            recorder = journal_holder.get("recorder")
+            if recorder is not None:
+                self._abandon(recorder, journal_holder.get("started") is True)
+            raise
+        outcome = execution.outcome if isinstance(execution, DeterministicExecution) else cast(RuntimeOutcome, execution)
+        try:
+            self._finish_deterministic_confirmation_journal(
+                journal_holder,
+                original,
+                conversation,
+                outcome,
+                control,
+            )
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            recorder = journal_holder.get("recorder")
+            if recorder is not None:
+                self._abandon(recorder, journal_holder.get("started") is True)
+            raise
+        except BaseException:
+            recorder = journal_holder.get("recorder")
+            if recorder is not None:
+                self._abandon(recorder, journal_holder.get("started") is True)
+            raise
+        self._mark_completed_if_active(control)
+        return outcome
+
+    confirmation = continue_confirmation
+    execute_confirmation = continue_confirmation
+
     # ---- stream preparation/execution --------------------------------------
 
     def prepare_stream(
@@ -1783,18 +1967,46 @@ class PilotRuntime:
         self._validate(cast(StartTurnRequest, request))
         self._check_cancel(lambda: False, invocation_control)
 
-        # Task 8/9 own these branches.  Keeping them before conversation and
-        # persistence makes the unsupported boundary deterministic and safe.
-        if isinstance(request, ConfirmationRequest):
-            return self._stream_immediate(
-                self._failure(
-                    RuntimeFailureCode.OPERATION_UNAVAILABLE,
-                    "unsupported runtime route",
-                    400,
-                ),
-                invocation_control,
-            )
-        if request.pilot_action is not None:
+        if (
+            isinstance(request, StartTurnRequest)
+            and request.conversation_id in (None, 0)
+            and self._dependencies.deterministic is not None
+        ):
+            preflight = _callable(self._dependencies.deterministic, ("validate_new_request",))
+            if preflight is not None:
+                try:
+                    _invoke(preflight, {"request": request}, (request,))
+                except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                    raise
+                except ValueError as exc:
+                    text = str(exc)
+                    code = (
+                        RuntimeFailureCode.OPERATION_UNAVAILABLE
+                        if "context" in text
+                        else RuntimeFailureCode.INVALID_CONFIRMATION
+                    )
+                    return self._stream_immediate(self._failure(code, text, 422), invocation_control)
+                except LookupError:
+                    return self._stream_immediate(
+                        self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "application not found", 404),
+                        invocation_control,
+                    )
+                except Exception:
+                    return self._stream_immediate(
+                        self._failure(
+                            RuntimeFailureCode.OPERATION_FAILED,
+                            "对话结果暂时无法保存。",
+                            503,
+                            retryable=True,
+                        ),
+                        invocation_control,
+                    )
+
+        # An uninstalled bridge keeps the old closed boundary: invalid
+        # deterministic requests fail before Conversation creation.  Once the
+        # trusted bridge is installed, the branch is prepared below so all
+        # pre-header deterministic effects happen exactly once.
+        if (isinstance(request, ConfirmationRequest) or request.pilot_action is not None) and self._dependencies.deterministic is None:
             return self._stream_immediate(
                 self._failure(
                     RuntimeFailureCode.OPERATION_UNAVAILABLE,
@@ -1806,7 +2018,11 @@ class PilotRuntime:
 
         self._phase("conversation")
         try:
-            conversation = self._load_conversation(request)
+            conversation = (
+                self._load_confirmation_conversation(request)
+                if isinstance(request, ConfirmationRequest)
+                else self._load_conversation(request)
+            )
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
             raise
         except Exception:
@@ -1838,6 +2054,106 @@ class PilotRuntime:
                 invocation_control,
             )
 
+        adapter = self._dependencies.deterministic
+        if isinstance(request, ConfirmationRequest):
+            if adapter is None:
+                return self._stream_immediate(
+                    self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400),
+                    invocation_control,
+                )
+            validate_action = _callable(adapter, ("validate_action",))
+            if validate_action is not None:
+                try:
+                    _invoke(validate_action, {"request": request}, (request,))
+                except ValueError as exc:
+                    return self._stream_immediate(
+                        self._failure(RuntimeFailureCode.INVALID_CONFIRMATION, str(exc), 422),
+                        invocation_control,
+                    )
+            terminal_probe = _callable(adapter, ("is_terminal_replay",))
+            terminal_replay = (
+                bool(_invoke(terminal_probe, {"request": request}, (request,)))
+                if terminal_probe is not None
+                else False
+            )
+            if not terminal_replay and request.approved and not self._confirmation_messages_exist(conversation_id):
+                return self._stream_immediate(
+                    self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404),
+                    invocation_control,
+                )
+            original_pending = None if terminal_replay else adapter.pending_action(conversation)
+            original, journal_holder, on_attempt, on_result = self._deterministic_confirmation_callbacks(
+                adapter,
+                conversation,
+                transport,
+                invocation_control,
+                original=original_pending,
+                edited=not request.edited_args.is_missing(),
+            )
+            try:
+                execution = adapter.confirm(
+                    request,
+                    conversation,
+                    transport=transport,
+                    on_confirmation_attempt=on_attempt,
+                    on_tool_result=on_result,
+                )
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                recorder = journal_holder.get("recorder")
+                if recorder is not None:
+                    self._abandon(recorder, journal_holder.get("started") is True)
+                raise
+            except Exception:
+                recorder = journal_holder.get("recorder")
+                if recorder is not None:
+                    self._finish(
+                        recorder,
+                        journal_holder.get("started") is True,
+                        "failed",
+                        "unknown",
+                        invocation_control,
+                    )
+                return self._stream_immediate(
+                    self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话结果暂时无法保存。", 503, retryable=True),
+                    invocation_control,
+                )
+            except BaseException:
+                recorder = journal_holder.get("recorder")
+                if recorder is not None:
+                    self._abandon(recorder, journal_holder.get("started") is True)
+                raise
+            if not isinstance(execution, DeterministicExecution):
+                return self._stream_immediate(
+                    self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话结果暂时无法保存。", 503, retryable=True),
+                    invocation_control,
+                )
+            try:
+                self._finish_deterministic_confirmation_journal(
+                    journal_holder,
+                    original,
+                    conversation,
+                    execution.outcome,
+                    invocation_control,
+                )
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                recorder = journal_holder.get("recorder")
+                if recorder is not None:
+                    self._abandon(recorder, journal_holder.get("started") is True)
+                raise
+            except BaseException:
+                recorder = journal_holder.get("recorder")
+                if recorder is not None:
+                    self._abandon(recorder, journal_holder.get("started") is True)
+                raise
+            return self._prepare_deterministic_stream(
+                execution,
+                request=request,
+                conversation=conversation,
+                conversation_id=conversation_id,
+                transport=transport,
+                invocation_control=invocation_control,
+            )
+
         try:
             route = self._select_route(request, conversation)
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
@@ -1853,13 +2169,113 @@ class PilotRuntime:
             )
         self._phase(f"route:{route.value}")
         if route is not RouteKind.MODEL:
-            return self._stream_immediate(
-                self._failure(
-                    RuntimeFailureCode.OPERATION_UNAVAILABLE,
-                    "unsupported runtime route",
-                    400,
-                ),
-                invocation_control,
+            if adapter is None:
+                return self._stream_immediate(
+                    self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400),
+                    invocation_control,
+                )
+            validate_action = _callable(adapter, ("validate_action",))
+            if validate_action is not None:
+                try:
+                    _invoke(validate_action, {"request": request}, (request,))
+                except ValueError as exc:
+                    return self._stream_immediate(
+                        self._failure(RuntimeFailureCode.INVALID_CONFIRMATION, str(exc), 422),
+                        invocation_control,
+                    )
+            try:
+                recorder, journal_started, replay = self._prepare_deterministic_journal(
+                    adapter,
+                    request,
+                    conversation,
+                    transport,
+                    invocation_control,
+                )
+                execution = adapter.prepare_stream(
+                    request,
+                    conversation,
+                    transport=transport,
+                    on_user_message_persisted=lambda message_id: self._journal_call(
+                        recorder,
+                        "attach_input_message",
+                        message_id,
+                        control=invocation_control,
+                    ),
+                )
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                if "journal_started" in locals():
+                    self._abandon(recorder, journal_started)
+                raise
+            except ValueError as exc:
+                text = str(exc)
+                code = RuntimeFailureCode.OPERATION_UNAVAILABLE if "context" in text else RuntimeFailureCode.INVALID_CONFIRMATION
+                status_code = 422
+                if "journal_started" in locals():
+                    self._finish(recorder, journal_started, "failed", "unknown", invocation_control)
+                return self._stream_immediate(self._failure(code, text, status_code), invocation_control)
+            except LookupError:
+                if "journal_started" in locals():
+                    self._finish(recorder, journal_started, "failed", "unknown", invocation_control)
+                return self._stream_immediate(
+                    self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "application not found", 404),
+                    invocation_control,
+                )
+            except Exception:
+                if "journal_started" in locals():
+                    self._finish(recorder, journal_started, "failed", "unknown", invocation_control)
+                return self._stream_immediate(
+                    self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话结果暂时无法保存。", 503, retryable=True),
+                    invocation_control,
+                )
+            except BaseException:
+                if "journal_started" in locals():
+                    self._abandon(recorder, journal_started)
+                raise
+            if replay or execution.pending_replay:
+                try:
+                    self._finish_journal_replay(recorder, invocation_control)
+                except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                    self._abandon(recorder, journal_started)
+                    raise
+                except BaseException:
+                    self._abandon(recorder, journal_started)
+                    raise
+            elif isinstance(execution.outcome, ConfirmationRequiredOutcome):
+                try:
+                    self._suspend(recorder, journal_started, adapter.pending_action(conversation), invocation_control, catalog=None)
+                except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                    self._abandon(recorder, journal_started)
+                    raise
+                except BaseException:
+                    self._abandon(recorder, journal_started)
+                    raise
+            elif isinstance(execution.outcome, RuntimeFailureOutcome):
+                try:
+                    self._finish(recorder, journal_started, "failed", "unknown", invocation_control)
+                except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                    self._abandon(recorder, journal_started)
+                    raise
+                except BaseException:
+                    self._abandon(recorder, journal_started)
+                    raise
+            else:
+                try:
+                    self._finish(recorder, journal_started, "completed", None, invocation_control)
+                except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                    self._abandon(recorder, journal_started)
+                    raise
+                except BaseException:
+                    self._abandon(recorder, journal_started)
+                    raise
+            return self._prepare_deterministic_stream(
+                execution,
+                request=request,
+                conversation=conversation,
+                conversation_id=conversation_id,
+                transport=transport,
+                invocation_control=invocation_control,
+                recorder=recorder,
+                journal_started=journal_started,
             )
 
         self._phase("pending_guard")
@@ -2568,12 +2984,91 @@ class PilotRuntime:
         control: RuntimeInvocationControl,
     ) -> ImmediateHttpOutcome:
         self._mark_completed_if_active(control)
+        payload: dict[str, object] = {
+            "error": outcome.message,
+            "error_code": outcome.code.value,
+        }
+        if outcome.details is not None:
+            payload.update(outcome.details)
         return ImmediateHttpOutcome(
             status_code=outcome.status_code,
-            payload=freeze_json_mapping(
-                {"error": outcome.message, "error_code": outcome.code.value}
-            ),
+            payload=freeze_json_mapping(payload),
         )
+
+    def _prepare_deterministic_stream(
+        self,
+        execution: DeterministicExecution,
+        *,
+        request: StartTurnRequest | ConfirmationRequest,
+        conversation: object,
+        conversation_id: int,
+        transport: RuntimeTransportContext,
+        invocation_control: RuntimeInvocationControl,
+        recorder: object | None = None,
+        journal_started: bool = False,
+    ) -> ImmediateHttpOutcome | PreparedStreamExecution:
+        """Freeze a provider-free result before SSE headers are sent."""
+
+        outcome = execution.outcome
+        if isinstance(outcome, RuntimeFailureOutcome):
+            return self._stream_immediate(outcome, invocation_control)
+        if isinstance(outcome, OperationPendingOutcome):
+            status = 409 if outcome.code is RuntimeFailureCode.OPERATION_DELIVERY_PENDING else 503
+            self._mark_completed_if_active(invocation_control)
+            return ImmediateHttpOutcome(
+                status_code=status,
+                payload=freeze_json_mapping(
+                    {
+                        "error": outcome.message,
+                        "error_code": outcome.code.value,
+                        "operation_id": outcome.operation_id,
+                    }
+                ),
+            )
+        transport_run_id = transport.transport_run_id
+        if transport_run_id is None:  # pragma: no cover - transport validates this
+            return self._stream_immediate(
+                self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400),
+                invocation_control,
+            )
+        cell = _PreparedExecutionCell(run_open=False)
+
+        def on_abort() -> None:
+            with cell.lock:
+                if cell.aborted or cell.completed:
+                    return
+                cell.aborted = True
+                cell.run_open = False
+            if invocation_control.state is InvocationState.ACTIVE:
+                invocation_control.mark_completed()
+
+        state = _PreparedStreamState(
+            owner_token=self._owner_token,
+            preparation_kind=execution.preparation_kind,
+            execution_mode=StreamExecutionMode.DIRECT,
+            control=invocation_control,
+            request=request,
+            conversation=_prepared_conversation(conversation, conversation_id),
+            conversation_id=conversation_id,
+            transport=transport,
+            recorder=recorder or _NoopRecorder(),
+            journal_started=journal_started,
+            cell=cell,
+            events=execution.events,
+            outcome=outcome,
+            on_abort=on_abort,
+        )
+        try:
+            prepared = PreparedStreamExecution(
+                invocation_id=transport_run_id,
+                preparation_kind=execution.preparation_kind,
+                execution_mode=StreamExecutionMode.DIRECT,
+                opaque_state=state,
+            )
+        except BaseException:
+            raise
+        self._phase("prepared")
+        return prepared
 
     @staticmethod
     def _mark_completed_if_active(control: RuntimeInvocationControl) -> None:
@@ -2638,7 +3133,53 @@ class PilotRuntime:
             raise TypeError("conversation gateway does not provide load")
         return _invoke(function, {"conversation_id": request.conversation_id, "id": request.conversation_id}, (request.conversation_id,))
 
+    def _load_confirmation_conversation(self, request: ConfirmationRequest) -> object | None:
+        """Load-only conversation path for confirmation preheader checks."""
+
+        gateway = self._require_dependency("conversation_gateway")
+        function = _callable(gateway, ("load", "get", "get_conversation", "create_or_load"))
+        if function is None:
+            raise TypeError("conversation gateway does not provide load")
+        return _invoke(
+            function,
+            {"conversation_id": request.conversation_id, "id": request.conversation_id},
+            (request.conversation_id,),
+        )
+
+    def _confirmation_messages_exist(self, conversation_id: int) -> bool:
+        """Mirror the legacy approved-confirmation message existence guard."""
+
+        persistence = self._dependencies.persistence
+        getter = _callable(persistence, ("list_messages",))
+        if getter is None:
+            # Narrow fakes and persistence implementations that expose only
+            # the confirmation atoms remain valid; the loaded Conversation is
+            # the available existence proof in that case.
+            return True
+        try:
+            value = _invoke(
+                getter,
+                {"conversation_id": conversation_id},
+                (conversation_id,),
+            )
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception:
+            return False
+        return bool(value)
+
     def _select_route(self, request: StartTurnRequest, conversation: object) -> RouteKind:
+        adapter = self._dependencies.deterministic
+        if adapter is not None:
+            try:
+                if adapter.matches(request, conversation):
+                    return RouteKind.DETERMINISTIC
+            except (ValueError, LookupError):
+                # The bridge owns the final validation response; a trusted
+                # route error must never fall through to a model.  This also
+                # keeps repository/context failures on the deterministic
+                # safety boundary instead of turning them into AI work.
+                return RouteKind.DETERMINISTIC
         selector = self._dependencies.route_selector
         if selector is None:
             return _route_kind(None, request)
@@ -2813,6 +3354,11 @@ class PilotRuntime:
         input_message_id: object,
         request: StartTurnRequest,
         transport: RuntimeTransportContext,
+        *,
+        origin_kind: str = "user_message",
+        route_kind: str = "model",
+        request_kind: str = "initial",
+        execution_path: str | None = None,
     ) -> tuple[object, bool]:
         factory = self._dependencies.journal
         if factory is None:
@@ -2847,7 +3393,7 @@ class PilotRuntime:
                 execution_segment_id=segment_id,
                 facts={
                     "agent_run_id": run_id,
-                    "origin_kind": "user_message",
+                    "origin_kind": origin_kind,
                     "conversation_id": conversation_id,
                     "context_type": normalized.context_type,
                     "transport_mode": transport.mode,
@@ -2858,9 +3404,9 @@ class PilotRuntime:
                 event_type="segment.started",
                 execution_segment_id=segment_id,
                 facts={
-                    "request_kind": "initial",
+                    "request_kind": request_kind,
                     "transport_mode": transport.mode,
-                    "execution_path": "model_turn",
+                    "execution_path": execution_path or ("model_turn" if route_kind == "model" else "deterministic_action"),
                     "transport_run_id": (
                         str(transport.transport_run_id)
                         if transport.transport_run_id is not None
@@ -2874,7 +3420,7 @@ class PilotRuntime:
                 run_id=run_id,
                 conversation_id=conversation_id,
                 input_message_id=input_message_id if type(input_message_id) is int else None,
-                origin_kind="user_message",
+                origin_kind=origin_kind,
                 initial_context_type=normalized.context_type,
                 initial_context_entity_id=(
                     str(normalized.entity_id) if normalized.entity_id is not None else None
@@ -2882,7 +3428,7 @@ class PilotRuntime:
                 initial_context_ref_fingerprint=normalized.ref_fingerprint,
                 fingerprint_key_id=str(getattr(key, "key_id")),
                 initial_transport_mode=transport.mode,
-                initial_route_kind="model",
+                initial_route_kind=route_kind,
                 run_started=run_started,
                 segment_started=segment_started,
             )
@@ -2902,6 +3448,532 @@ class PilotRuntime:
         if isinstance(recorder, NullRunRecorder):
             return recorder, False
         return recorder, True
+
+    def _resume_journal_replay(
+        self,
+        conversation_id: int,
+        pending: PendingAction,
+        transport: RuntimeTransportContext,
+    ) -> tuple[object, bool]:
+        factory = self._dependencies.journal
+        if factory is None:
+            return _NoopRecorder(), False
+        function = getattr(factory, "resume_waiting_run", None)
+        if not callable(function):
+            return _NoopRecorder(), False
+
+        def build_segment(
+            run_id: str,
+            _key: object,
+            budget_check: Callable[[], None],
+        ) -> StartSegmentCommand:
+            segment_id = str(uuid4())
+            segment_started = prepare_event(
+                event_type="segment.started",
+                execution_segment_id=segment_id,
+                facts={
+                    "request_kind": "pending_replay",
+                    "transport_mode": transport.mode,
+                    "execution_path": "deterministic_action",
+                    "transport_run_id": (
+                        str(transport.transport_run_id)
+                        if transport.transport_run_id is not None
+                        else None
+                    ),
+                },
+                budget_check=budget_check,
+            )
+            return StartSegmentCommand(run_id=run_id, segment_started=segment_started)
+
+        try:
+            recorder = function(conversation_id, pending.tool_call_id, build_segment)
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception:
+            return _NoopRecorder(), False
+        if recorder is None or isinstance(recorder, NullRunRecorder):
+            return _NoopRecorder() if recorder is None else recorder, False
+        return recorder, True
+
+    def _finish_journal_replay(self, recorder: object, control: RuntimeInvocationControl) -> None:
+        self._journal_call(
+            recorder,
+            "append_event",
+            EventInput(
+                event_type="segment.finished",
+                facts={"outcome": "noop", "terminal_run_status": None},
+            ),
+            control=control,
+        )
+
+    def _resume_journal_confirmation(
+        self,
+        conversation_id: int,
+        pending: PendingAction,
+        transport: RuntimeTransportContext,
+    ) -> tuple[object, bool]:
+        factory = self._dependencies.journal
+        if factory is None:
+            return _NoopRecorder(), False
+        function = getattr(factory, "resume_waiting_run", None)
+        if not callable(function):
+            return _NoopRecorder(), False
+
+        def build_segment(
+            run_id: str,
+            _key: object,
+            budget_check: Callable[[], None],
+        ) -> StartSegmentCommand:
+            segment_id = str(uuid4())
+            segment_started = prepare_event(
+                event_type="segment.started",
+                execution_segment_id=segment_id,
+                facts={
+                    "request_kind": "confirmation",
+                    "transport_mode": transport.mode,
+                    "execution_path": "deterministic_confirmation",
+                    "transport_run_id": (
+                        str(transport.transport_run_id)
+                        if transport.transport_run_id is not None
+                        else None
+                    ),
+                },
+                budget_check=budget_check,
+            )
+            return StartSegmentCommand(run_id=run_id, segment_started=segment_started)
+
+        try:
+            recorder = function(conversation_id, pending.tool_call_id, build_segment)
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception:
+            return _NoopRecorder(), False
+        if recorder is None or isinstance(recorder, NullRunRecorder):
+            return _NoopRecorder() if recorder is None else recorder, False
+        return recorder, True
+
+    def _deterministic_confirmation_callbacks(
+        self,
+        adapter: DeterministicPilotAdapter,
+        conversation: object,
+        transport: RuntimeTransportContext,
+        control: RuntimeInvocationControl,
+        *,
+        original: PendingAction | None,
+        edited: bool,
+    ) -> tuple[
+        PendingAction | None,
+        dict[str, object],
+        Callable[[PendingAction, bool], object],
+        Callable[[PendingAction, str, bool], object],
+    ]:
+        holder: dict[str, object] = {}
+        attempt_id = str(uuid4())
+
+        def attempt(effective: PendingAction, approved: bool) -> None:
+            if original is None:
+                return
+            recorder, started = self._resume_journal_confirmation(
+                _conversation_id(conversation) or 0,
+                original,
+                transport,
+            )
+            holder["recorder"] = recorder
+            holder["started"] = started
+            self._capture_confirmation_journal_context(
+                recorder,
+                started,
+                conversation,
+                _conversation_id(conversation) or 0,
+                self._require_dependency("persistence"),
+                control,
+                tool_names=(original.tool_name,),
+            )
+            self._record_journal_approval(
+                recorder,
+                started,
+                attempt_id,
+                original,
+                effective,
+                approved,
+                edited=edited,
+                control=control,
+            )
+            if approved:
+                self._record_journal_tool_start(recorder, started, effective, control)
+
+        def result(effective: PendingAction, value: str, succeeded: bool) -> None:
+            recorder = holder.get("recorder")
+            started = holder.get("started") is True
+            if recorder is not None:
+                self._record_journal_tool_result(
+                    recorder,
+                    started,
+                    effective,
+                    value,
+                    succeeded,
+                    control,
+                )
+
+        return original, holder, attempt, result
+
+    def _finish_deterministic_confirmation_journal(
+        self,
+        holder: Mapping[str, object],
+        original: PendingAction | None,
+        conversation: object,
+        outcome: RuntimeOutcome,
+        control: RuntimeInvocationControl,
+    ) -> None:
+        recorder = holder.get("recorder")
+        if recorder is None or holder.get("started") is not True:
+            return
+        persistence = self._require_dependency("persistence")
+        getter = _callable(persistence, ("get_pending_action",))
+        current = None
+        if getter is not None:
+            try:
+                current = _pending(
+                    _invoke(
+                        getter,
+                        {"conversation_id": _conversation_id(conversation)},
+                        (_conversation_id(conversation),),
+                    )
+                )
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                raise
+            except Exception:
+                # Journal readback is diagnostic/fail-open.  If the pending
+                # snapshot cannot be read, close this resumed segment rather
+                # than changing the already-committed product outcome.
+                current = None
+        if isinstance(outcome, RuntimeFailureOutcome) and outcome.code is RuntimeFailureCode.STALE_PENDING_ACTION:
+            self._abandon(recorder, True)
+        elif original is not None and current is not None and current.tool_call_id != original.tool_call_id:
+            self._suspend(recorder, True, current, control, catalog=None)
+        elif isinstance(outcome, RuntimeFailureOutcome):
+            self._finish(recorder, True, "failed", "unknown", control)
+        else:
+            self._finish(recorder, True, "completed", None, control)
+
+    def _capture_confirmation_journal_context(
+        self,
+        recorder: object,
+        started: bool,
+        conversation: object,
+        conversation_id: int,
+        persistence: object,
+        control: RuntimeInvocationControl,
+        *,
+        tool_names: tuple[str, ...],
+    ) -> None:
+        if not started:
+            return
+        message_ids = self._snapshot_message_ids(persistence, conversation_id)
+        logical_input = {
+            "conversation_id": conversation_id,
+            "context_type": str(_attribute(conversation, "context_type", "workspace") or "workspace"),
+            "context_ref": str(_attribute(conversation, "context_ref", "") or ""),
+            "message_count": len(message_ids),
+            "tool_names": list(tool_names),
+        }
+        manifest = ContextManifestInput(
+            conversation_message_ids=message_ids,
+            tool_names=tool_names,
+            attachment_refs=(),
+            domain_source_refs=(),
+        )
+        self._journal_call(
+            recorder,
+            "capture_context",
+            logical_input,
+            manifest,
+            snapshot_kind="confirmation_resume",
+            control=control,
+        )
+
+    def _record_journal_approval(
+        self,
+        recorder: object,
+        started: bool,
+        attempt_id: str,
+        original: PendingAction,
+        effective: PendingAction,
+        approved: bool,
+        *,
+        edited: bool,
+        control: RuntimeInvocationControl,
+    ) -> None:
+        if not started:
+            return
+        original_fingerprint = self._journal_call(
+            recorder,
+            "fingerprint_pending_identity",
+            {"tool_call_id": original.tool_call_id, "tool_name": original.tool_name, "args": original.args},
+            control=control,
+        )
+        decided_fingerprint = self._journal_call(
+            recorder,
+            "fingerprint_pending_identity",
+            {"tool_call_id": effective.tool_call_id, "tool_name": effective.tool_name, "args": effective.args},
+            control=control,
+        )
+        if not isinstance(original_fingerprint, str) or not isinstance(decided_fingerprint, str):
+            return
+        self._journal_call(
+            recorder,
+            "append_event",
+            EventInput(
+                event_type="approval.decided",
+                facts={
+                    "confirmation_attempt_id": attempt_id,
+                    "decision": "rejected" if not approved else "edited" if edited else "approved",
+                    "tool_call_id": original.tool_call_id,
+                    "original_input_fingerprint": original_fingerprint,
+                    "decided_input_fingerprint": decided_fingerprint,
+                },
+                source_ref_type="tool_call",
+                source_ref_id=original.tool_call_id,
+            ),
+            control=control,
+        )
+        self._journal_call(
+            recorder,
+            "resume",
+            ResumedDisposition(
+                confirmation_attempt_id=attempt_id,
+                tool_call_id=original.tool_call_id,
+            ),
+            control=control,
+        )
+
+    def _record_journal_tool_start(
+        self,
+        recorder: object,
+        started: bool,
+        pending: PendingAction,
+        control: RuntimeInvocationControl,
+    ) -> None:
+        if not started:
+            return
+        self._journal_call(
+            recorder,
+            "append_event",
+            EventInput(
+                event_type="tool.started",
+                facts={
+                    "tool_call_id": pending.tool_call_id,
+                    "tool_name": pending.tool_name,
+                    "result_contract": "legacy_string_v1",
+                },
+                source_ref_type="tool_call",
+                source_ref_id=pending.tool_call_id,
+            ),
+            control=control,
+        )
+
+    def _record_journal_tool_result(
+        self,
+        recorder: object,
+        started: bool,
+        pending: PendingAction,
+        result: str,
+        succeeded: bool,
+        control: RuntimeInvocationControl,
+    ) -> None:
+        if not started:
+            return
+        self._journal_call(
+            recorder,
+            "append_event",
+            EventInput(
+                event_type="tool.completed" if succeeded else "tool.failed",
+                facts={
+                    "tool_call_id": pending.tool_call_id,
+                    "tool_name": pending.tool_name,
+                    **(
+                        {
+                            "outcome": "completed",
+                            "result_shape_digest": journal_shape_digest(result),
+                        }
+                        if succeeded
+                        else {"failure_category": "tool_error"}
+                    ),
+                },
+                source_ref_type="tool_call",
+                source_ref_id=pending.tool_call_id,
+            ),
+            control=control,
+        )
+
+    def _start_deterministic_turn(
+        self,
+        adapter: DeterministicPilotAdapter,
+        request: StartTurnRequest,
+        conversation: object,
+        transport: RuntimeTransportContext,
+        control: RuntimeInvocationControl,
+    ) -> RuntimeOutcome:
+        conversation_id = _conversation_id(conversation)
+        if conversation_id is None:
+            raise LookupError("conversation not found")
+        pending_before = adapter.pending_action(conversation)
+        replay = pending_before is not None and pending_before.tool_name in {
+            "save_application_jd_version",
+            "create_application_submission_snapshot",
+            "record_application_outcome",
+        }
+        if replay:
+            assert pending_before is not None
+            recorder, started = self._resume_journal_replay(conversation_id, pending_before, transport)
+        else:
+            recorder, started = self._start_journal(
+                conversation,
+                conversation_id,
+                None,
+                request,
+                transport,
+                origin_kind="pilot_action",
+                route_kind="deterministic",
+                request_kind="initial",
+                execution_path="deterministic_action",
+            )
+        self._record_journal_route(
+            recorder,
+            started,
+            route_kind="deterministic",
+            route_reason_code="pending_action_replay" if replay else "deterministic_action_match",
+            control=control,
+        )
+        try:
+            self._capture_initial_journal_context(
+                recorder,
+                started,
+                conversation,
+                conversation_id,
+                None,
+                None,
+                self._require_dependency("persistence"),
+                control,
+            )
+            execution = adapter.start_turn(
+                request,
+                conversation,
+                transport=transport,
+                on_user_message_persisted=lambda message_id: self._journal_call(
+                    recorder,
+                    "attach_input_message",
+                    message_id,
+                    control=control,
+                ),
+            )
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            self._abandon(recorder, started)
+            raise
+        except LookupError:
+            self._finish(recorder, started, "failed", "unknown", control)
+            return self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "application not found", 404)
+        except ValueError as exc:
+            self._finish(recorder, started, "failed", "unknown", control)
+            return self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, str(exc), 422)
+        except Exception:
+            self._finish(recorder, started, "failed", "unknown", control)
+            return self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话结果暂时无法保存。", 503, retryable=True)
+        except BaseException:
+            self._abandon(recorder, started)
+            raise
+        if replay or execution.pending_replay:
+            try:
+                self._finish_journal_replay(recorder, control)
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                self._abandon(recorder, started)
+                raise
+            except BaseException:
+                self._abandon(recorder, started)
+                raise
+        elif isinstance(execution.outcome, ConfirmationRequiredOutcome):
+            try:
+                pending = adapter.pending_action(conversation)
+                self._suspend(recorder, started, pending, control, catalog=None)
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                self._abandon(recorder, started)
+                raise
+            except BaseException:
+                self._abandon(recorder, started)
+                raise
+        elif isinstance(execution.outcome, RuntimeFailureOutcome):
+            try:
+                self._finish(recorder, started, "failed", "unknown", control)
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                self._abandon(recorder, started)
+                raise
+            except BaseException:
+                self._abandon(recorder, started)
+                raise
+        else:
+            try:
+                self._finish(recorder, started, "completed", None, control)
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                self._abandon(recorder, started)
+                raise
+            except BaseException:
+                self._abandon(recorder, started)
+                raise
+        return execution.outcome
+
+    def _prepare_deterministic_journal(
+        self,
+        adapter: DeterministicPilotAdapter,
+        request: StartTurnRequest,
+        conversation: object,
+        transport: RuntimeTransportContext,
+        control: RuntimeInvocationControl,
+    ) -> tuple[object, bool, bool]:
+        conversation_id = _conversation_id(conversation)
+        if conversation_id is None:
+            raise LookupError("conversation not found")
+        pending = adapter.pending_action(conversation)
+        replay = pending is not None and pending.tool_name in {
+            "save_application_jd_version",
+            "create_application_submission_snapshot",
+            "record_application_outcome",
+        }
+        if replay:
+            assert pending is not None
+            recorder, started = self._resume_journal_replay(conversation_id, pending, transport)
+        else:
+            recorder, started = self._start_journal(
+                conversation,
+                conversation_id,
+                None,
+                request,
+                transport,
+                origin_kind="pilot_action",
+                route_kind="deterministic",
+                request_kind="initial",
+                execution_path="deterministic_action",
+            )
+        self._record_journal_route(
+            recorder,
+            started,
+            route_kind="deterministic",
+            route_reason_code="pending_action_replay" if replay else "deterministic_action_match",
+            control=control,
+        )
+        try:
+            self._capture_initial_journal_context(
+                recorder,
+                started,
+                conversation,
+                conversation_id,
+                None,
+                None,
+                self._require_dependency("persistence"),
+                control,
+            )
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        return recorder, started, replay
 
     @staticmethod
     def _journal_call(

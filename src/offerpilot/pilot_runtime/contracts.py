@@ -619,6 +619,7 @@ class RuntimeFailureOutcome:
     status_code: int = 500
     retryable: bool = False
     degraded: bool = False
+    details: ImmutablePayload | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.code, RuntimeFailureCode):
@@ -629,6 +630,12 @@ class RuntimeFailureOutcome:
             raise ValueError("status_code must be a valid HTTP status")
         _require_bool(self.retryable, field_name="retryable")
         _require_bool(self.degraded, field_name="degraded")
+        if self.details is not None:
+            object.__setattr__(
+                self,
+                "details",
+                _require_immutable_mapping(self.details, field_name="details"),
+            )
 
 
 @dataclass(frozen=True, slots=True)

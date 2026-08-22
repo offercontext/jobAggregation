@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from secrets import compare_digest
 from threading import RLock
-from typing import Any, cast
+from typing import Any, Protocol, cast
 from uuid import UUID
 
 from offerpilot.ai.agent import PendingAction, prepare_pending_action
@@ -52,9 +52,11 @@ from offerpilot.ai.write_operations import (
 )
 
 from .contracts import (
+    ConfirmationRequiredOutcome,
     ConfirmationRequest,
     EditedArgs,
     OperationReplayOutcome,
+    PendingActionPayload,
     freeze_json_mapping,
 )
 from .persistence import PersistenceResult, PersistenceStatus
@@ -73,6 +75,50 @@ LedgerExecutor = Callable[
     ToolExecutionRecord[Any, Any],
 ]
 ContinuationLoader = Callable[[], Sequence[Message]]
+
+
+class ConfirmationPendingReader(Protocol):
+    """The only persistence read needed before a confirmation claim."""
+
+    def get_pending_action(self, conversation_id: int) -> object | None: ...
+
+
+class ConfirmationPersistenceAdapter(ConfirmationPendingReader, Protocol):
+    """Typed read/delivery boundary; implementations own the SQL atom."""
+
+    def list_messages(self, conversation_id: int) -> Sequence[object]: ...
+
+    def persist_confirmation_delivery(self, **kwargs: object) -> PersistenceResult: ...
+
+
+class ConfirmationOperationRepository(Protocol):
+    """Typed Ledger read/replay/lease surface used by this state machine."""
+
+    key: object
+
+    def get(self, operation_id: str) -> object | None: ...
+
+    def replay(self, operation: object, request_fingerprint: str) -> OperationReplay: ...
+
+    def converge_expired_delivery(self, operation_id: str) -> OperationReplay | OperationUnknown: ...
+
+    def heartbeat(self, ownership: DeliveryOwnership) -> bool: ...
+
+
+class ConfirmationWriteCoordinator(Protocol):
+    """Existing transaction atoms; SQL remains outside this module."""
+
+    def reject_primary(self, **kwargs: object) -> OperationExecution: ...
+
+    def execute_primary(self, **kwargs: object) -> tuple[OperationExecution, ToolExecutionRecord[Any, Any] | None]: ...
+
+
+class ConfirmationSourceAdapter(Protocol):
+    def load(self, *args: object, **kwargs: object) -> object: ...
+
+
+class ConfirmationContextAssembler(Protocol):
+    def assemble(self, *args: object, **kwargs: object) -> object: ...
 
 
 def _attribute(value: object | None, name: str, default: object = None) -> object:
@@ -209,6 +255,11 @@ def _message(value: object) -> Message:
             tool_calls=list(calls),
             tool_call_id=str(value.get("tool_call_id") or ""),
             provider_blocks=dict(blocks) if isinstance(blocks, Mapping) else {},
+            surface_contributor=str(value.get("surface_contributor") or ""),
+            surface_signal=str(value.get("surface_signal") or ""),
+            surface_revision=str(value.get("surface_revision") or ""),
+            surface_page_kind=str(value.get("surface_page_kind") or ""),
+            surface_attachment_kinds=str(value.get("surface_attachment_kinds") or ""),
         )
     raw_calls = _attribute(value, "tool_calls", ())
     call_values = (
@@ -231,6 +282,11 @@ def _message(value: object) -> Message:
         tool_calls=list(calls),
         tool_call_id=str(_attribute(value, "tool_call_id", "") or ""),
         provider_blocks=dict(blocks) if isinstance(blocks, Mapping) else {},
+        surface_contributor=str(_attribute(value, "surface_contributor", "") or ""),
+        surface_signal=str(_attribute(value, "surface_signal", "") or ""),
+        surface_revision=str(_attribute(value, "surface_revision", "") or ""),
+        surface_page_kind=str(_attribute(value, "surface_page_kind", "") or ""),
+        surface_attachment_kinds=str(_attribute(value, "surface_attachment_kinds", "") or ""),
     )
 
 
@@ -283,9 +339,9 @@ class ConfirmationDependencies:
     reached through existing coordinator/driver methods.
     """
 
-    persistence: object | None = None
-    write_operations: object | None = None
-    write_coordinator: object | None = None
+    persistence: ConfirmationPersistenceAdapter | None = None
+    write_operations: ConfirmationOperationRepository | None = None
+    write_coordinator: ConfirmationWriteCoordinator | None = None
     conversations: object | None = None
     catalog: object | None = None
     prepare_call: Callable[..., object] | None = field(default=None, repr=False, compare=False)
@@ -295,8 +351,8 @@ class ConfirmationDependencies:
     undo_builder: Callable[..., Mapping[str, Any] | None] | None = field(
         default=None, repr=False, compare=False
     )
-    source_loader: object | None = None
-    context_assembler: object | None = None
+    source_loader: ConfirmationSourceAdapter | Callable[..., object] | None = None
+    context_assembler: ConfirmationContextAssembler | Callable[..., object] | None = None
     journal: object | None = None
     applications: object | None = None
     clock: Callable[[], datetime] = field(
@@ -351,6 +407,8 @@ class ConfirmationState:
     timed_out: bool = False
     cancelled: bool = False
     delivered: bool = False
+    delivery_in_progress: bool = field(default=False, repr=False, compare=False)
+    delivery_result: PersistenceResult | None = field(default=None, repr=False, compare=False)
     active: bool = True
     lock: RLock = field(default_factory=RLock, repr=False, compare=False)
 
@@ -400,8 +458,46 @@ class ConfirmationReplayError(RuntimeError):
         self.replay = replay
 
 
-def _runtime_replay(replay: OperationReplay, conversation_id: int) -> OperationReplayOutcome:
+def _replayed_pending_payload(pending: PendingAction) -> PendingActionPayload:
+    try:
+        decoded = json.loads(pending.args or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise WriteOperationError("operation_integrity_error") from exc
+    if not isinstance(decoded, Mapping):
+        raise WriteOperationError("operation_integrity_error")
+    return PendingActionPayload(
+        tool_name=pending.tool_name,
+        operation_id=pending.operation_id,
+        human=pending.human,
+        args=freeze_json_mapping(cast(Mapping[str, object], decoded)),
+        confirmation_token=_confirmation_token(pending),
+    )
+
+
+def _runtime_replay(
+    replay: OperationReplay,
+    conversation_id: int,
+    *,
+    pending: PendingAction | None = None,
+) -> OperationReplayOutcome | ConfirmationRequiredOutcome:
     payload = replay.payload
+    if payload.status not in {"committed", "rejected", "failed"}:
+        raise WriteOperationError("operation_integrity_error")
+    if replay.delivery_status not in {"pending", "completed", "failed"}:
+        raise WriteOperationError("operation_integrity_error")
+    if replay.delivery_outcome == "chained_pending":
+        if pending is None:
+            raise WriteOperationError("operation_delivery_unknown")
+        pending_payload = _replayed_pending_payload(pending)
+        return ConfirmationRequiredOutcome(
+            confirmation_token=pending_payload.confirmation_token,
+            conversation_id=conversation_id,
+            operation_id=replay.operation_id,
+            pending_action=pending_payload,
+            replayed=True,
+        )
+    if replay.delivery_outcome not in {None, "final_response", "fallback"}:
+        raise WriteOperationError("operation_integrity_error")
     if payload.status == "committed":
         write_status = "success"
         message = replay.final_message or payload.visible_result
@@ -413,9 +509,13 @@ def _runtime_replay(replay: OperationReplay, conversation_id: int) -> OperationR
         message = replay.final_message or payload.visible_result
     undo: Mapping[str, JSONValue] | None = None
     if payload.undo_json:
-        decoded = json.loads(payload.undo_json)
-        if isinstance(decoded, Mapping):
-            undo = cast(Mapping[str, JSONValue], dict(decoded))
+        try:
+            decoded = json.loads(payload.undo_json)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise WriteOperationError("operation_integrity_error") from exc
+        if not isinstance(decoded, Mapping):
+            raise WriteOperationError("operation_integrity_error")
+        undo = cast(Mapping[str, JSONValue], dict(decoded))
     return OperationReplayOutcome(
         operation_id=replay.operation_id,
         conversation_id=conversation_id,
@@ -456,9 +556,10 @@ class ConfirmationCoordinator:
     # ---- Ledger-first request identity ---------------------------------
 
     def _operation(self, operation_id: str) -> object | None:
-        getter = _callable(self.dependencies.write_operations, ("get",))
+        repository = self.dependencies.write_operations
+        getter = _callable(repository, ("get",))
         if getter is None:
-            return None
+            raise WriteOperationError("operation_unavailable")
         return _invoke(getter, {"operation_id": operation_id, "id": operation_id}, (operation_id,))
 
     def _fingerprint(
@@ -475,18 +576,20 @@ class ConfirmationCoordinator:
         requested_operation_id = request.operation_id or pending.operation_id
         if not isinstance(requested_operation_id, str) or not requested_operation_id:
             raise WriteOperationError("operation_identity_conflict")
-        if requested_operation_id != pending.operation_id:
-            raise WriteOperationError("operation_identity_conflict")
         try:
             normalized_id = str(UUID(requested_operation_id))
         except (TypeError, ValueError) as exc:
             raise WriteOperationError("operation_identity_conflict") from exc
-        if normalized_id != requested_operation_id:
+        if normalized_id != pending.operation_id:
             raise WriteOperationError("operation_identity_conflict")
+        try:
+            token_bytes = token.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise WriteOperationError("invalid_confirmation") from exc
         token_fingerprint = ledger_fingerprint(
             cast(Any, key),
             "write-operation-confirmation-token-v1",
-            token.encode("ascii"),
+            token_bytes,
         )
         stored_token_fingerprint = str(
             _attribute(operation, "confirmation_token_fingerprint", "") or ""
@@ -511,7 +614,11 @@ class ConfirmationCoordinator:
         if token:
             return token
         if not request.edited_args.is_missing() or request.rejection_feedback_present:
-            raise WriteOperationError("operation_input_conflict")
+            # The public route treats an omitted token together with edited
+            # arguments/feedback as request validation, not as a stale
+            # Ledger identity.  A supplied-but-wrong token remains the
+            # 409/input-conflict path below.
+            raise WriteOperationError("invalid_confirmation")
         return _confirmation_token(pending)
 
     def _pending_for(self, conversation_id: int, supplied: PendingAction | None) -> PendingAction:
@@ -551,14 +658,39 @@ class ConfirmationCoordinator:
         if request.approved and request.rejection_feedback_present:
             raise WriteOperationError("operation_input_conflict")
         operation_id = request.operation_id
-        if not operation_id:
+        if operation is None and not operation_id:
             return None
+        if not operation_id and operation is not None:
+            operation_id = str(_attribute(operation, "id", "") or "")
+        if not operation_id:
+            raise WriteOperationError("operation_result_unknown", retryable=True)
+        try:
+            normalized_operation_id = str(UUID(operation_id))
+        except (TypeError, ValueError) as exc:
+            # An explicitly supplied operation id is part of the Ledger
+            # identity.  Reject malformed ids before the repository lookup so
+            # a bad terminal-replay request cannot be reported as an infra
+            # miss.
+            raise WriteOperationError("operation_identity_conflict") from exc
+        # Ledger ids are canonical UUID strings.  Accept an equivalent UUID
+        # spelling from the transport, then use the canonical value for the
+        # repository lookup and every downstream fingerprint.
+        operation_id = normalized_operation_id
         operation = operation if operation is not None else self._operation(operation_id)
         if operation is None:
             raise WriteOperationError("operation_result_unknown", retryable=True)
         status = _status(operation)
+        if status not in {"proposed", "committed", "rejected", "failed"}:
+            raise WriteOperationError("operation_integrity_error")
         if status == "proposed":
             return None
+        if not request.confirmation_token:
+            # A terminal operation has no Pending row from which to derive a
+            # token.  Keep the old route's identity-conflict response instead
+            # of treating a replay without proof as a live request.
+            raise WriteOperationError("operation_identity_conflict")
+        if str(_attribute(operation, "id", "") or "") != normalized_operation_id:
+            raise WriteOperationError("operation_identity_conflict")
         if _attribute(operation, "conversation_id") != request.conversation_id:
             raise WriteOperationError("operation_identity_conflict")
         pending = PendingAction(
@@ -596,9 +728,70 @@ class ConfirmationCoordinator:
     # Friendly alias used by Runtime and tests.
     replay_terminal = terminal_replay
 
-    def replay_outcome(self, request: ConfirmationRequest) -> OperationReplayOutcome | None:
+    def replay_outcome(
+        self, request: ConfirmationRequest
+    ) -> OperationReplayOutcome | ConfirmationRequiredOutcome | None:
         replay = self.terminal_replay(request)
-        return None if replay is None else _runtime_replay(replay, request.conversation_id)
+        if replay is None:
+            return None
+        pending: PendingAction | None = None
+        if replay.delivery_outcome == "chained_pending":
+            try:
+                pending = self._pending_for(request.conversation_id, None)
+            except WriteOperationError as exc:
+                if exc.code == "stale_pending_action":
+                    raise WriteOperationError("operation_delivery_unknown") from exc
+                raise
+        return _runtime_replay(replay, request.conversation_id, pending=pending)
+
+    def preflight_live(
+        self,
+        request: ConfirmationRequest,
+        *,
+        catalog: object | None = None,
+    ) -> PendingAction:
+        """Validate a live approval before any Conversation/model work.
+
+        The returned Pending is only a detached identity snapshot.  The
+        session constructor repeats the Ledger read immediately before the
+        claim, so this probe never becomes an authority for execution.
+        """
+
+        if not isinstance(request, ConfirmationRequest) or not request.approved:
+            raise ValueError("live preflight requires an approved confirmation")
+        replay = self.terminal_replay(request)
+        if replay is not None:
+            raise ConfirmationReplayError(replay)
+        live = self._pending_for(request.conversation_id, None)
+        operation_id = request.operation_id or live.operation_id
+        try:
+            operation_id = str(UUID(operation_id))
+        except (TypeError, ValueError) as exc:
+            raise WriteOperationError("operation_identity_conflict") from exc
+        if operation_id != live.operation_id:
+            raise WriteOperationError("operation_identity_conflict")
+        operation = self._operation(operation_id)
+        if operation is None:
+            if request.operation_id and request.operation_id != live.operation_id:
+                raise WriteOperationError("operation_identity_conflict")
+            raise WriteOperationError("operation_result_unknown", retryable=True)
+        self._validate_live_identity(request.conversation_id, live, operation)
+        if _status(operation) != "proposed":
+            changed = self.terminal_replay(request, operation=operation)
+            if changed is not None:
+                raise ConfirmationReplayError(changed)
+            raise WriteOperationError("operation_result_unknown", retryable=True)
+        token = self._token(live, request)
+        if request.confirmation_token and not compare_digest(token, request.confirmation_token):
+            raise WriteOperationError("operation_input_conflict")
+        self._fingerprint(live, request, token, operation)
+        if catalog is not None:
+            edited = None if request.edited_args.is_missing() else dict(request.edited_args.as_mapping)
+            try:
+                prepare_pending_action(live, cast(Any, catalog), cast(Any, edited))
+            except ValueError as exc:
+                raise WriteOperationError("invalid_confirmation") from exc
+        return live
 
     # ---- Live Pending/session construction ------------------------------
 
@@ -618,8 +811,16 @@ class ConfirmationCoordinator:
             raise ConfirmationReplayError(replay)
         live = self._pending_for(request.conversation_id, pending)
         operation_id = request.operation_id or live.operation_id
+        try:
+            operation_id = str(UUID(operation_id))
+        except (TypeError, ValueError) as exc:
+            raise WriteOperationError("operation_identity_conflict") from exc
+        if operation_id != live.operation_id:
+            raise WriteOperationError("operation_identity_conflict")
         operation = self._operation(operation_id)
         if operation is None:
+            if request.operation_id and request.operation_id != live.operation_id:
+                raise WriteOperationError("operation_identity_conflict")
             raise WriteOperationError("operation_result_unknown", retryable=True)
         self._validate_live_identity(request.conversation_id, live, operation)
         if _status(operation) != "proposed":
@@ -632,6 +833,13 @@ class ConfirmationCoordinator:
         fingerprint = self._fingerprint(live, request, token, operation)
         edited = request.edited_args
         effective = live
+        # The Agent's unchanged ``resume_after_confirm`` path is the single
+        # schema/decode/capability/binding/preflight boundary.  Running
+        # ``prepare_call`` here as well would duplicate provider-side
+        # preparation and, more importantly, would let a direct confirmation
+        # route execute a different context than the one used by the Ledger
+        # coordinator.  ``prepare_pending_action`` above only validates the
+        # public editable-field projection.
         preflight_result: object | None = None
         if approved:
             edited_mapping = (
@@ -640,44 +848,12 @@ class ConfirmationCoordinator:
             selected_catalog = catalog if catalog is not None else self.dependencies.catalog
             if selected_catalog is not None:
                 # This is the schema/edit boundary.  Reject never enters it.
-                effective = prepare_pending_action(
-                    live, cast(Any, selected_catalog), edited_mapping
-                )
-            prepare_function = self.dependencies.prepare_call
-            if prepare_function is not None:
-                # The coordinator may be used without the Agent driver in
-                # tests and in direct control routes.  When a composition
-                # root supplies the existing ``prepare_call`` atom, run it
-                # once at the approved boundary; rejection never enters this
-                # hook.  The result is retained for diagnostics, while the
-                # unchanged Agent resume path may supply its own prepared
-                # call to the claim callback.
-                prepared_tool_call = ToolCall(
-                    live.tool_call_id,
-                    live.tool_name,
-                    effective.args,
-                )
-                context = _attribute(self.dependencies.applications, "tool_context")
-                preflight_result = _invoke(
-                    prepare_function,
-                    {
-                        "catalog": selected_catalog,
-                        "context": context,
-                        "tool_context": context,
-                        "call": prepared_tool_call,
-                        "tool_call": prepared_tool_call,
-                        "pending": effective,
-                        "pending_identity": f"{live.tool_call_id}:{live.tool_name}",
-                        "record_proposal": False,
-                    },
-                    (selected_catalog, context, prepared_tool_call),
-                )
-                rejected = _attribute(preflight_result, "failure")
-                if rejected is None and _status(preflight_result) in {"rejected", "failure"}:
-                    rejected = preflight_result
-                if rejected is not None:
-                    code = str(_attribute(rejected, "code", "operation_input_conflict") or "operation_input_conflict")
-                    raise WriteOperationError(code)
+                try:
+                    effective = prepare_pending_action(
+                        live, cast(Any, selected_catalog), edited_mapping
+                    )
+                except ValueError as exc:
+                    raise WriteOperationError("invalid_confirmation") from exc
         identity = ConfirmationIdentity(
             conversation_id=request.conversation_id,
             operation_id=operation_id,
@@ -687,7 +863,17 @@ class ConfirmationCoordinator:
             confirmation_token=token,
             proposal_fingerprint=str(_attribute(operation, "proposal_fingerprint", "") or ""),
         )
-        generation = self._conversation_generation(conversation, request.conversation_id)
+        # Rejection is intentionally a Ledger/Pending-only path.  When the
+        # caller did not already provide a trusted Conversation snapshot,
+        # leave the generation unset and let the atomic delivery adapter read
+        # it under its own transaction.  Loading a Conversation here would
+        # violate the preheader rejection boundary and could turn a valid
+        # Ledger CAS into a model/conversation failure.
+        if approved:
+            generation = self._conversation_generation(conversation, request.conversation_id)
+        else:
+            candidate_generation = _attribute(conversation, "updated_at")
+            generation = candidate_generation if isinstance(candidate_generation, datetime) else None
         state = ConfirmationState(
             identity=identity,
             pending=live,
@@ -699,6 +885,7 @@ class ConfirmationCoordinator:
             prepared_call=preflight_result,
             continuation_generation=generation,
         )
+        live_session: ConfirmationSession | None = None
 
         def attempt(
             action: PendingAction,
@@ -730,6 +917,14 @@ class ConfirmationCoordinator:
                     visible = self._rejection_result(state.rejection_feedback)
                     execution = self._reject(state, visible)
                     state.terminal_execution = execution
+                    if isinstance(execution, OperationReplay):
+                        # The rejection CAS can race a worker that terminalizes
+                        # the same operation after the Ledger-first probe.  A
+                        # replay has no delivery ownership to lease; leave it
+                        # for the Runtime replay branch instead of treating
+                        # the missing owner as an infrastructure failure.
+                        state.replayed = True
+                        return None
                     self._set_ownership(state, execution)
                     return None
                 return ExecutionAuthorization(
@@ -747,7 +942,39 @@ class ConfirmationCoordinator:
             tool_message: Message,
             execution_record: ToolExecutionRecord[Any, Any] | None,
         ) -> object:
-            return self.record_result(state, action, approved_result, tool_message, execution_record)
+            value = self.record_result(
+                state, action, approved_result, tool_message, execution_record
+            )
+            # A timeout can return while the provider/transaction worker is
+            # still inside ``execute_primary``.  Once that late worker has a
+            # terminal payload, converge the fenced fallback here before the
+            # unchanged Agent can load history or start a follow-up model
+            # turn.  A timeout that already delivered its fallback is
+            # inactive and therefore remains idempotent.
+            if live_session is not None:
+                with state.lock:
+                    late_terminal = (
+                        state.timed_out
+                        and state.active
+                        and state.origin_tool_message is not None
+                        and state.delivery_ownership is not None
+                    )
+                if late_terminal:
+                    try:
+                        late_delivery = self.fallback(live_session)
+                        if _status(late_delivery) in {
+                            PersistenceStatus.PERSISTED.value,
+                            PersistenceStatus.DUPLICATE.value,
+                        }:
+                            with state.lock:
+                                state.fallback_persisted = True
+                    except Exception:
+                        # The Ledger terminal is authoritative even when this
+                        # late delivery attempt cannot acquire its fence.  A
+                        # subsequent replay/takeover converges the pending
+                        # delivery without rerunning the provider.
+                        pass
+            return value
 
         def execute(
             prepared: PreparedToolCall[Any, Any],
@@ -756,17 +983,61 @@ class ConfirmationCoordinator:
         ) -> ToolExecutionRecord[Any, Any]:
             return self.execute_operation(state, prepared, tool_context, authorization)
 
-        loader = source_loader or self._source_loader(
+        source = source_loader or self._source_loader(
             conversation, request.conversation_id, request
         )
-        return ConfirmationSession(
+
+        # Source is a post-commit continuation input.  The loader is handed to
+        # the Agent, never eagerly called by the Runtime, and is idempotent at
+        # the boundary so a misbehaving adapter cannot reload mutable history
+        # twice.  The first call is legal only after the primary Ledger row is
+        # terminal and a delivery owner/heartbeat has been acquired.
+        loaded_source: tuple[Message, ...] | None = None
+        load_failure: BaseException | None = None
+        loader_lock = RLock()
+
+        def load_once() -> tuple[Message, ...]:
+            nonlocal loaded_source, load_failure
+            with loader_lock:
+                if loaded_source is not None:
+                    return loaded_source
+                if load_failure is not None:
+                    raise load_failure
+                with state.lock:
+                    terminal = state.terminal_execution
+                    owned = state.delivery_ownership is not None
+                    approved_state = state.approved
+                    cancelled = state.cancelled
+                    timed_out = state.timed_out
+                    active = state.active
+                if (
+                    not approved_state
+                    or cancelled
+                    or timed_out
+                    or not active
+                    or not _terminal(terminal)
+                    or not owned
+                ):
+                    raise WriteOperationError("operation_delivery_unknown", retryable=True)
+                try:
+                    loaded_source = tuple(_message(item) for item in source())
+                except BaseException as exc:
+                    # A single confirmation owns one mutable source snapshot.
+                    # Cache failures too so a driver retry cannot observe a
+                    # second history version or call the source twice.
+                    load_failure = exc
+                    raise
+                return loaded_source
+
+        live_session = ConfirmationSession(
             state=state,
             on_confirmation_attempt=attempt,
             on_confirmation_result=result,
             execute_operation=execute,
-            continuation_message_loader=loader,
+            continuation_message_loader=load_once,
             delivery_fence=lambda: self.delivery_fence(state),
         )
+        return live_session
 
     def approve_modify(
         self,
@@ -960,7 +1231,7 @@ class ConfirmationCoordinator:
         execution_record: ToolExecutionRecord[Any, Any] | None,
     ) -> object:
         with state.lock:
-            if not state.active or state.cancelled or state.timed_out:
+            if not state.active or state.cancelled:
                 return None
             if state.claim_id is None:
                 state.cas_lost = True
@@ -968,7 +1239,13 @@ class ConfirmationCoordinator:
             state.origin_tool_message = tool_message
             state.execution_record = execution_record
             state.approved = approved
-            state.succeeded = approved and _record_succeeded(execution_record)
+            terminal_status = str(
+                _attribute(_attribute(state.terminal_execution, "payload"), "status", "")
+                or ""
+            )
+            state.succeeded = approved and (
+                terminal_status == "committed" or _record_succeeded(execution_record)
+            )
             state.replayed = bool(_attribute(execution_record, "replayed", False))
             state.undo_update = dict(state.undo) if state.succeeded and state.undo else None
             if state.terminal_execution is not None and _attribute(
@@ -977,11 +1254,12 @@ class ConfirmationCoordinator:
                 raw_undo = _attribute(_attribute(state.terminal_execution, "payload"), "undo_json")
                 try:
                     decoded = json.loads(cast(str, raw_undo))
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    decoded = {}
-                if isinstance(decoded, Mapping):
-                    state.undo = dict(decoded)
-                    state.undo_update = dict(decoded)
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise WriteOperationError("operation_integrity_error") from exc
+                if not isinstance(decoded, Mapping):
+                    raise WriteOperationError("operation_integrity_error")
+                state.undo = dict(decoded)
+                state.undo_update = dict(decoded)
             if not approved:
                 state.undo_update = None
             if state.continuation_generation is None:
@@ -993,12 +1271,26 @@ class ConfirmationCoordinator:
     def _set_ownership(self, state: ConfirmationState, execution: object) -> None:
         ownership = _attribute(execution, "ownership")
         if not isinstance(ownership, DeliveryOwnership):
-            return
-        state.delivery_ownership = ownership
+            raise WriteOperationError("operation_delivery_unknown", retryable=True)
         heartbeat = _attribute(self.dependencies.write_operations, "heartbeat")
-        if callable(heartbeat):
-            # Existing DeliveryHeartbeat owns its own retry/stop loop.  It is
-            # started before source loading by the owning Runtime request.
+        if not callable(heartbeat):
+            # A terminal Ledger row without a lease heartbeat is not safe to
+            # deliver: a second worker could take over while this worker is
+            # still publishing messages.  Production composition must expose
+            # the existing repository atom; test adapters must implement it
+            # explicitly rather than receiving an un-fenced fallback.
+            raise WriteOperationError("operation_unavailable")
+        with state.lock:
+            if (
+                state.cancelled
+                or state.delivery_ownership is not None
+            ):
+                return
+            state.delivery_ownership = ownership
+            # Existing DeliveryHeartbeat owns its own retry/stop loop. It is
+            # installed and started while the state lock is held, so a
+            # concurrent timeout/cancel cannot miss it between ownership
+            # assignment and thread creation.
             state.delivery_heartbeat = DeliveryHeartbeat(
                 cast(Any, self.dependencies.write_operations), ownership
             ).start()
@@ -1008,11 +1300,14 @@ class ConfirmationCoordinator:
             if state.cancelled or state.cas_lost or not state.active:
                 return False
             heartbeat = state.delivery_heartbeat
-        return heartbeat is None or heartbeat.fence()
+        return heartbeat is not None and heartbeat.fence()
 
-    def stop_heartbeat(self, state: ConfirmationState) -> None:
-        heartbeat = state.delivery_heartbeat
-        state.delivery_heartbeat = None
+    def stop_heartbeat(self, state: ConfirmationState | ConfirmationSession) -> None:
+        if isinstance(state, ConfirmationSession):
+            state = state.state
+        with state.lock:
+            heartbeat = state.delivery_heartbeat
+            state.delivery_heartbeat = None
         if heartbeat is not None:
             heartbeat.stop()
 
@@ -1024,6 +1319,7 @@ class ConfirmationCoordinator:
             state.timed_out = True
             if state.cancelled or state.fallback_persisted:
                 return None
+            self._hydrate_terminal_undo(state)
             if state.origin_tool_message is None and state.terminal_execution is not None:
                 terminal_payload = _attribute(state.terminal_execution, "payload")
                 visible = str(_attribute(terminal_payload, "visible_result", "") or "")
@@ -1032,8 +1328,17 @@ class ConfirmationCoordinator:
                     content=visible,
                     tool_call_id=state.identity.tool_call_id,
                 )
-            ready = state.confirmation_attempted and state.origin_tool_message is not None
+            attempted = state.confirmation_attempted
+            ready = attempted and state.origin_tool_message is not None
         if not ready:
+            # No claim means there cannot be a late executor callback.  Close
+            # this session now; a subsequent confirmation request will read
+            # the still-proposed Ledger row as a fresh attempt.  Once a claim
+            # exists, keep the session active so a worker that is already in
+            # the transaction can publish its late terminal/fallback bundle.
+            if not attempted:
+                with state.lock:
+                    state.active = False
             return None
         result = self.final_delivery(
             session,
@@ -1050,11 +1355,30 @@ class ConfirmationCoordinator:
     def cancel_cleanup(self, session: ConfirmationSession) -> None:
         state = session.state
         with state.lock:
-            if not state.active:
-                return
-            state.cancelled = True
-            state.active = False
+            if state.active:
+                state.cancelled = True
+                state.active = False
         self.stop_heartbeat(state)
+
+    @staticmethod
+    def _hydrate_terminal_undo(state: ConfirmationState) -> None:
+        terminal = state.terminal_execution
+        terminal_payload = _attribute(terminal, "payload")
+        terminal_status = str(_attribute(terminal_payload, "status", "") or "")
+        if terminal_status in {"committed", "failed", "rejected"}:
+            state.succeeded = terminal_status == "committed"
+        raw_undo = _attribute(_attribute(terminal, "payload"), "undo_json")
+        if not raw_undo:
+            return
+        try:
+            decoded = json.loads(cast(str, raw_undo))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise WriteOperationError("operation_integrity_error") from exc
+        if not isinstance(decoded, Mapping):
+            raise WriteOperationError("operation_integrity_error")
+        state.undo = dict(decoded)
+        if state.succeeded or terminal_status == "committed":
+            state.undo_update = dict(decoded)
 
     cancel = cancel_cleanup
     cleanup_cancel = cancel_cleanup
@@ -1076,7 +1400,12 @@ class ConfirmationCoordinator:
         else:
             delivery = DeliveryBundle(tuple(_message(item) for item in bundle), pending, clarification)
         with state.lock:
-            if state.delivered or state.cancelled or state.cas_lost:
+            if (
+                state.delivered
+                or state.cancelled
+                or state.cas_lost
+                or state.delivery_in_progress
+            ):
                 return None
             if state.origin_tool_message is None:
                 # A terminal replay has no continuation owner and must not
@@ -1091,8 +1420,11 @@ class ConfirmationCoordinator:
             expected_pending = state.pending
             claim_id = state.claim_id
             undo = dict(state.undo_update) if state.undo_update is not None else None
+            state.delivery_in_progress = True
         persistence_object = self.dependencies.persistence
         if persistence_object is None:
+            with state.lock:
+                state.delivery_in_progress = False
             self.stop_heartbeat(state)
             raise WriteOperationError("operation_unavailable")
         values = tuple(delivery.messages)
@@ -1134,22 +1466,49 @@ class ConfirmationCoordinator:
         try:
             raw = _invoke(cast(Callable[..., object], persistence), kwargs, ())
         except Exception:
+            with state.lock:
+                state.delivery_in_progress = False
+            self.stop_heartbeat(state)
+            raise
+        except BaseException:
+            with state.lock:
+                state.delivery_in_progress = False
             self.stop_heartbeat(state)
             raise
         status = _attribute(raw, "status")
         status_value = str(getattr(status, "value", status or ""))
+        if status_value == "":
+            with state.lock:
+                state.delivery_in_progress = False
+            self.stop_heartbeat(state)
+            raise WriteOperationError("operation_delivery_unknown", retryable=True)
         if status_value in {PersistenceStatus.CAS_LOST.value, "cas_lost"}:
             state.cas_lost = True
+            state.delivery_in_progress = False
             self.stop_heartbeat(state)
             return raw
-        if status_value in {PersistenceStatus.CLOSED.value, PersistenceStatus.NOT_FOUND.value}:
+        if status_value in {
+            PersistenceStatus.CLOSED.value,
+            PersistenceStatus.NOT_FOUND.value,
+        }:
+            state.delivery_in_progress = False
             self.stop_heartbeat(state)
             return raw
+        if status_value not in {
+            PersistenceStatus.PERSISTED.value,
+            PersistenceStatus.DUPLICATE.value,
+        }:
+            with state.lock:
+                state.delivery_in_progress = False
+            self.stop_heartbeat(state)
+            raise WriteOperationError("operation_delivery_unknown", retryable=True)
         next_generation = _attribute(raw, "generation")
         if isinstance(next_generation, datetime):
             state.continuation_generation = next_generation
         with state.lock:
             state.delivered = True
+            state.delivery_in_progress = False
+            state.delivery_result = raw if isinstance(raw, PersistenceResult) else None
             state.active = False
         self.stop_heartbeat(state)
         return raw
@@ -1192,7 +1551,7 @@ class ConfirmationCoordinator:
 
         def load() -> tuple[Message, ...]:
             if loader is None:
-                return ()
+                raise WriteOperationError("operation_unavailable")
             source = _invoke(
                 loader,
                 {
@@ -1218,7 +1577,7 @@ class ConfirmationCoordinator:
                 assembled = source
             values = _attribute(assembled, "messages", assembled)
             if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
-                return ()
+                raise WriteOperationError("operation_unavailable")
             return tuple(_message(item) for item in values)
 
         return load
@@ -1242,11 +1601,17 @@ __all__ = [
     "ConfirmationAttempt",
     "ConfirmationCoordinator",
     "ConfirmationDependencies",
+    "ConfirmationContextAssembler",
     "ConfirmationIdentity",
+    "ConfirmationOperationRepository",
+    "ConfirmationPendingReader",
+    "ConfirmationPersistenceAdapter",
     "ConfirmationReplayError",
     "ConfirmationResult",
     "ConfirmationSession",
+    "ConfirmationSourceAdapter",
     "ConfirmationState",
+    "ConfirmationWriteCoordinator",
     "ContinuationLoader",
     "DeliveryBundle",
 ]

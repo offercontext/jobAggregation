@@ -1,33 +1,69 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event, Lock
 from types import SimpleNamespace
 from typing import Any, cast
 from uuid import uuid4
+from dataclasses import replace
 
 import pytest
 
 from offerpilot.ai.agent import PendingAction
+from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
+from offerpilot.ai.tool_runtime.pipeline import prepare_call
 from offerpilot.ai.tool_runtime.contracts import ToolFailure, ToolSuccess
-from offerpilot.ai.types import Message
+from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.ai.types import Message, ToolCall
 from offerpilot.ai.write_operations import (
+    DeliveryOwnership,
     OperationCommitted,
     OperationReplay,
     TerminalPayload,
     ledger_fingerprint,
+    WriteOperationCoordinator,
+    WriteOperationError,
+    WriteOperationRepository,
+    load_or_create_ledger_key,
 )
-from offerpilot.pilot_runtime.contracts import ConfirmationRequest
+from offerpilot.agent_runtime.journal import NullRunRecorder
+from offerpilot.chat_transport import SseAgentExecutionHost
+from offerpilot.db import init_database
+from offerpilot.pilot_runtime.persistence import ChatPersistenceCoordinator
+from offerpilot.repositories.application_events import ApplicationEventsRepository
+from offerpilot.repositories.applications import ApplicationsRepository
+from offerpilot.repositories.chat import ChatRepository
+from offerpilot.repositories.jd import JDAnalysesRepository
+from offerpilot.repositories.notes import NotesRepository
+from offerpilot.repositories.offers import OffersRepository
+from offerpilot.repositories.resumes import ResumesRepository
+from offerpilot.pilot_runtime.contracts import (
+    AssistantMessageEvent,
+    CompletedEvent,
+    ConfirmationRequest,
+    ConfirmationRequiredOutcome,
+    MetaEvent,
+    PreparedStreamExecution,
+    RuntimeTransportContext,
+    StatusEvent,
+    ToolCallEvent,
+    ToolResultEvent,
+)
 from offerpilot.pilot_runtime.continuation import (
     ConfirmationCoordinator,
     ConfirmationDependencies,
+    ConfirmationReplayError,
     DeliveryBundle,
+    _confirmation_token,
 )
 from offerpilot.pilot_runtime.event_sink import InMemoryRuntimeInvocationControl
 from offerpilot.pilot_runtime.persistence import PersistenceResult, PersistenceStatus
 from offerpilot.pilot_runtime.service import PilotRuntime, RuntimeDependencies
+from offerpilot.pilot_runtime.service import ResolvedModel
 
 
 class _Operations:
-    def __init__(self, *, status: str = "proposed") -> None:
+    def __init__(self, *, status: str = "proposed", delivery_outcome: str = "final_response") -> None:
         self.key = SimpleNamespace(key_id="test", secret=b"k" * 32)
         self.operation_id = str(uuid4())
         self.operation = SimpleNamespace(
@@ -40,6 +76,7 @@ class _Operations:
             confirmation_token_fingerprint="",
             delivery_status="completed",
         )
+        self.delivery_outcome = delivery_outcome
         token = "t" * 64
         self.operation.confirmation_token_fingerprint = ledger_fingerprint(
             self.key,
@@ -49,6 +86,7 @@ class _Operations:
         self.token = token
         self.replay_calls = 0
         self.converge_calls = 0
+        self.heartbeat_calls = 0
 
     def get(self, _operation_id: str) -> object:
         return self.operation
@@ -71,13 +109,17 @@ class _Operations:
             "completed",
             1,
             None,
-            "final_response",
+            self.delivery_outcome,
             "saved",
         )
 
     def converge_expired_delivery(self, _operation_id: str) -> OperationReplay:
         self.converge_calls += 1
         return self.replay(self.operation, "ignored")
+
+    def heartbeat(self, _ownership: DeliveryOwnership) -> bool:
+        self.heartbeat_calls += 1
+        return True
 
 
 class _Persistence:
@@ -99,7 +141,7 @@ class _WriteCoordinator:
         self.reject_calls += 1
         return SimpleNamespace(
             operation_id="operation",
-            ownership=None,
+            ownership=DeliveryOwnership(str(_kwargs["operation_id"]), 1, b"owner", "owner"),
             payload=SimpleNamespace(
                 status="rejected",
                 visible_result="已取消这次操作。",
@@ -123,7 +165,7 @@ class _WriteCoordinator:
                     failure_code=None,
                     digest="sha256:result",
                 ),
-                None,
+                DeliveryOwnership(str(_kwargs["operation_id"]), 1, b"owner", "owner"),
             ),
             SimpleNamespace(
                 outcome=ToolSuccess({"ok": True}),
@@ -181,6 +223,34 @@ def test_terminal_replay_rejects_wrong_token_without_pending_or_runtime_calls() 
     assert getattr(raised.value, "code", None) == "operation_input_conflict"
     assert operations.replay_calls == 0
     assert persistence.pending_reads == 0
+
+
+def test_chained_terminal_replay_loads_child_pending_only_after_ledger_replay() -> None:
+    operations = _Operations(status="committed", delivery_outcome="chained_pending")
+    child = PendingAction(
+        "child-call",
+        "create_application",
+        '{"company_name":"child"}',
+        "child",
+        str(uuid4()),
+    )
+    persistence = _Persistence(child)
+    coordinator = ConfirmationCoordinator(_deps(persistence, operations))
+    request = ConfirmationRequest(
+        conversation_id=7,
+        approved=True,
+        operation_id=operations.operation_id,
+        confirmation_token=operations.token,
+    )
+
+    outcome = coordinator.replay_outcome(request)
+
+    assert isinstance(outcome, ConfirmationRequiredOutcome)
+    assert outcome.replayed is True
+    assert outcome.pending_action is not None
+    assert outcome.pending_action.tool_name == child.tool_name
+    assert operations.replay_calls == 1
+    assert persistence.pending_reads == 1
 
 
 def test_reject_uses_ledger_cas_without_decoding_or_catalog() -> None:
@@ -334,6 +404,63 @@ def test_cancel_before_claim_never_reaches_rejection_cas() -> None:
     assert write.reject_calls == 0
 
 
+def test_reject_claim_race_keeps_terminal_replay_without_delivery_lease() -> None:
+    operations = _Operations(status="proposed")
+    pending = PendingAction(
+        "call-1", "create_application", "{}", "create", operations.operation_id
+    )
+
+    class ReplayRejectCoordinator(_WriteCoordinator):
+        def reject_primary(self, **kwargs: object) -> object:
+            self.reject_calls += 1
+            operations.operation.status = "rejected"
+            return operations.replay(operations.operation, str(kwargs["request_fingerprint"]))
+
+    persistence = _Persistence(pending)
+    coordinator = ConfirmationCoordinator(
+        _deps(persistence, operations, ReplayRejectCoordinator())
+    )
+    request = ConfirmationRequest(
+        conversation_id=7,
+        approved=False,
+        operation_id=operations.operation_id,
+        confirmation_token=operations.token,
+    )
+    session = coordinator.reject(request, pending=pending)
+
+    assert session.on_confirmation_attempt(pending, None) is None
+    assert isinstance(session.state.terminal_execution, OperationReplay)
+    assert session.state.delivery_heartbeat is None
+
+
+def test_timeout_before_claim_closes_session_without_delivery_or_late_work() -> None:
+    operations = _Operations(status="proposed")
+    pending = PendingAction(
+        "call-1", "create_application", "{}", "create", operations.operation_id
+    )
+    persistence = _Persistence(pending)
+    deliveries: list[object] = []
+    persistence.persist_confirmation_delivery = lambda **kwargs: (  # type: ignore[attr-defined]
+        deliveries.append(kwargs) or PersistenceResult(PersistenceStatus.PERSISTED)
+    )
+    coordinator = ConfirmationCoordinator(_deps(persistence, operations, _WriteCoordinator()))
+    session = coordinator.approve_modify(
+        ConfirmationRequest(
+            conversation_id=7,
+            approved=True,
+            operation_id=operations.operation_id,
+            confirmation_token=operations.token,
+        ),
+        pending=pending,
+    )
+
+    assert coordinator.timeout_convergence(session) is None
+    assert session.state.timed_out is True
+    assert session.state.active is False
+    assert session.state.confirmation_attempted is False
+    assert deliveries == []
+
+
 def test_service_reject_routes_directly_without_agent_driver() -> None:
     operations = _Operations(status="proposed")
     pending = PendingAction("call-1", "create_application", "{}", "create", operations.operation_id)
@@ -368,3 +495,943 @@ def test_service_reject_routes_directly_without_agent_driver() -> None:
 
     assert getattr(outcome, "write_status", None) == "cancelled"
     assert write.reject_calls == 1
+
+
+def test_approved_resume_injects_session_executor_and_loads_source_once_after_terminal() -> None:
+    """RED: the driver must receive the Ledger executor and a single-use loader.
+
+    The old extracted route eagerly loaded source before ``resume_after_confirm``
+    and passed the resolver's context unchanged.  A real driver consequently
+    either executed the provider directly or loaded the source twice.
+    """
+
+    operations = _Operations(status="proposed")
+    pending = PendingAction(
+        "call-1", "create_application", "{}", "create", operations.operation_id
+    )
+    persistence = _Persistence(pending)
+    persistence.persist_confirmation_delivery = lambda **_kwargs: PersistenceResult(  # type: ignore[attr-defined]
+        PersistenceStatus.PERSISTED
+    )
+    write = _WriteCoordinator()
+    sources = SimpleNamespace(calls=0)
+
+    def load_source(*_args: object, **_kwargs: object) -> tuple[Message, ...]:
+        sources.calls += 1
+        return (Message(role="assistant", content="history"),)
+
+    context = SimpleNamespace(operation_executor=None)
+    observed: dict[str, object] = {}
+
+    class Driver:
+        def resume_after_confirm(self, messages: list[Message], pending: PendingAction, approved: bool, auto_approve: bool, max_iter: int, **kwargs: object) -> object:
+            del approved, auto_approve, max_iter
+            observed["messages"] = messages
+            tool_context = kwargs["tool_context"]
+            executor = getattr(tool_context, "operation_executor", None)
+            observed["executor"] = executor
+            assert callable(executor)
+            prepared = SimpleNamespace(
+                pending_identity="call-1:create_application",
+                pending_action_revision=1,
+                tool_call_id="call-1",
+                spec=SimpleNamespace(name="create_application"),
+                arguments_digest="digest",
+            )
+            authorization = kwargs["confirmation_attempt_sink"](pending, prepared)
+            assert not isinstance(authorization, ToolFailure)
+            record = executor(prepared, tool_context, authorization)
+            origin = Message(role="tool", content="saved", tool_call_id="call-1")
+            kwargs["confirmation_result_sink"](pending, True, origin, record)
+            loader = kwargs["continuation_message_loader"]
+            assert loader() == (Message(role="assistant", content="history"),)
+            assert loader() == (Message(role="assistant", content="history"),)
+            return SimpleNamespace(
+                added=(origin, Message(role="assistant", content="done")),
+                reply="done",
+                pending=None,
+                records=(record,),
+                failures=(),
+            )
+
+    coordinator = ConfirmationCoordinator(_deps(persistence, operations, write))
+
+    class Conversations:
+        def load(self, _conversation_id: int) -> object:
+            return SimpleNamespace(id=7, archived_at=None)
+
+    def resolve(_request: object, _conversation: object) -> ResolvedModel:
+        return ResolvedModel(model=object(), tool_context=context)
+
+    runtime = PilotRuntime(
+        RuntimeDependencies(
+            conversations=Conversations(),
+            persistence=persistence,  # type: ignore[arg-type]
+            confirmation_coordinator=coordinator,
+            model_resolver=resolve,
+            agent_driver=Driver(),
+            source_loader=SimpleNamespace(load=load_source),  # type: ignore[arg-type]
+        )
+    )
+    outcome = runtime.continue_confirmation(
+        ConfirmationRequest(
+            conversation_id=7,
+            approved=True,
+            operation_id=operations.operation_id,
+            confirmation_token=operations.token,
+        ),
+        invocation_control=InMemoryRuntimeInvocationControl(),
+    )
+
+    assert getattr(outcome, "message", None) == "done"
+    assert callable(observed["executor"])
+    assert observed["messages"] == []
+    assert sources.calls == 1
+
+
+def test_reject_preheader_does_not_touch_conversation_or_model() -> None:
+    """RED: rejection is the direct Ledger worker path."""
+
+    operations = _Operations(status="proposed")
+    pending = PendingAction(
+        "call-1", "create_application", '{"malformed":', "create", operations.operation_id
+    )
+    persistence = _Persistence(pending)
+    persistence.persist_confirmation_delivery = lambda **_kwargs: PersistenceResult(  # type: ignore[attr-defined]
+        PersistenceStatus.PERSISTED
+    )
+    write = _WriteCoordinator()
+    coordinator = ConfirmationCoordinator(_deps(persistence, operations, write))
+    calls = {"conversation": 0, "model": 0}
+
+    class Conversations:
+        def load(self, _conversation_id: int) -> object:
+            calls["conversation"] += 1
+            raise AssertionError("rejection must not load conversation")
+
+    def resolve(_request: object, _conversation: object) -> ResolvedModel:
+        calls["model"] += 1
+        raise AssertionError("rejection must not resolve model")
+
+    runtime = PilotRuntime(
+        RuntimeDependencies(
+            conversations=Conversations(),
+            persistence=persistence,  # type: ignore[arg-type]
+            confirmation_coordinator=coordinator,
+            model_resolver=resolve,
+        )
+    )
+    outcome = runtime.continue_confirmation(
+        ConfirmationRequest(
+            conversation_id=7,
+            approved=False,
+            operation_id=operations.operation_id,
+            confirmation_token=operations.token,
+        ),
+        invocation_control=InMemoryRuntimeInvocationControl(),
+    )
+
+    assert getattr(outcome, "write_status", None) == "cancelled"
+    assert calls == {"conversation": 0, "model": 0}
+
+
+def test_reject_session_does_not_load_conversation_for_generation() -> None:
+    """Rejection must stay Ledger/Pending-only through session construction."""
+
+    operations = _Operations(status="proposed")
+    pending = PendingAction(
+        "call-1", "create_application", '{"malformed":', "create", operations.operation_id
+    )
+    persistence = _Persistence(pending)
+    persistence.persist_confirmation_delivery = lambda **_kwargs: PersistenceResult(  # type: ignore[attr-defined]
+        PersistenceStatus.PERSISTED
+    )
+
+    class Conversations:
+        def load(self, _conversation_id: int) -> object:
+            raise AssertionError("rejection session must not load conversation")
+
+    coordinator = ConfirmationCoordinator(
+        ConfirmationDependencies(
+            persistence=persistence,
+            conversations=Conversations(),
+            write_operations=operations,
+            write_coordinator=_WriteCoordinator(),
+        )
+    )
+
+    session = coordinator.reject(
+        ConfirmationRequest(
+            conversation_id=7,
+            approved=False,
+            operation_id=operations.operation_id,
+            confirmation_token=operations.token,
+        ),
+        pending=pending,
+    )
+
+    assert session.state.continuation_generation is None
+
+
+def test_real_sqlite_coordinator_executes_prepared_call_once_and_persists_delivery(
+    tmp_path: Any,
+) -> None:
+    """The confirmation seam must exercise the production Ledger coordinator."""
+
+    sessions = init_database(tmp_path / "offerpilot.db")
+    key = load_or_create_ledger_key(tmp_path, sessions)
+    operations = WriteOperationRepository(sessions, key)
+    chat = ChatRepository(sessions, operations)
+    persistence = ChatPersistenceCoordinator(chat)
+    conversation = chat.create_conversation("workspace", "", "general")
+    operation_id = str(uuid4())
+    pending = PendingAction(
+        "real-call",
+        "save_offer_assessment",
+        '{"id":1,"assessment":"ok"}',
+        "save assessment",
+        operation_id,
+    )
+    assert chat.persist_pending_action(conversation.id, pending, [])
+    calls: list[str] = []
+    base_spec = MODEL_TOOL_CATALOG.resolve("save_offer_assessment")
+    assert base_spec is not None
+
+    def execute(_args: object, _context: object) -> dict[str, object]:
+        calls.append("executor")
+        return {"ok": True}
+
+    spec = replace(base_spec, binding_resolvers=(), executor=execute)
+
+    class Catalog:
+        def resolve(self, name: str) -> object | None:
+            return spec if name == spec.name else None
+
+        def validator_for(self, _name: str) -> object:
+            return MODEL_TOOL_CATALOG.validator_for(spec.name)
+
+        def provider_contracts(self) -> tuple[object, ...]:
+            return (spec.contract,)
+
+    context = ToolExecutionContext(
+        capabilities=frozenset(ToolCapability),
+        current_bindings={},
+        applications=ApplicationsRepository(sessions),
+        events=ApplicationEventsRepository(sessions),
+        notes=NotesRepository(sessions),
+        offers=OffersRepository(sessions),
+        resumes=ResumesRepository(sessions),
+        jd_analyses=JDAnalysesRepository(sessions),
+        run_recorder=NullRunRecorder(),
+    )
+    prepared_result = prepare_call(
+        Catalog(),
+        context,
+        ToolCall("real-call", spec.name, pending.args),
+        pending_identity="real-call:save_offer_assessment",
+        pending_action_revision=1,
+        record_proposal=False,
+    )
+    prepared = getattr(prepared_result, "prepared", None)
+    assert prepared is not None
+
+    coordinator = ConfirmationCoordinator(
+        ConfirmationDependencies(
+            persistence=persistence,
+            conversations=chat,
+            write_operations=operations,
+            write_coordinator=WriteOperationCoordinator(operations),
+            catalog=Catalog(),
+        )
+    )
+    request = ConfirmationRequest(
+        conversation_id=conversation.id,
+        approved=True,
+        operation_id=operation_id,
+        confirmation_token=_confirmation_token(pending),
+    )
+    session = coordinator.approve_modify(request, pending=pending, catalog=Catalog())
+    authorization = session.on_confirmation_attempt(pending, prepared)
+    assert not isinstance(authorization, ToolFailure)
+    record = session.execute_operation(prepared, context, cast(Any, authorization))
+    session.on_confirmation_result(
+        pending,
+        True,
+        Message(role="tool", content="saved", tool_call_id=pending.tool_call_id),
+        record,
+    )
+    delivered = coordinator.final_delivery(
+        session,
+        DeliveryBundle((Message(role="assistant", content="done"),)),
+    )
+
+    assert calls == ["executor"]
+    assert getattr(delivered, "status", None) == PersistenceStatus.PERSISTED
+    operation = operations.get(operation_id)
+    assert operation is not None
+    assert operation.status == "committed"
+    assert operation.delivery_status == "completed"
+
+
+def test_real_sqlite_two_connections_have_one_claim_and_one_executor(
+    tmp_path: Any,
+) -> None:
+    """Two confirmation workers must converge on one Ledger executor."""
+
+    sessions = init_database(tmp_path / "race.db")
+    key = load_or_create_ledger_key(tmp_path, sessions)
+    operations = WriteOperationRepository(sessions, key)
+    chat = ChatRepository(sessions, operations)
+    persistence = ChatPersistenceCoordinator(chat)
+    conversation = chat.create_conversation("workspace", "", "general")
+    operation_id = str(uuid4())
+    pending = PendingAction(
+        "race-call",
+        "save_offer_assessment",
+        '{"id":1,"assessment":"race"}',
+        "save assessment",
+        operation_id,
+    )
+    assert chat.persist_pending_action(conversation.id, pending, [])
+    base_spec = MODEL_TOOL_CATALOG.resolve("save_offer_assessment")
+    assert base_spec is not None
+    calls = 0
+    calls_lock = Lock()
+    first_executor_entered = Event()
+    release_first_executor = Event()
+
+    def execute(_args: object, _context: object) -> dict[str, object]:
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            ordinal = calls
+        if ordinal == 1:
+            first_executor_entered.set()
+            assert release_first_executor.wait(10)
+        return {"ok": True}
+
+    spec = replace(base_spec, binding_resolvers=(), executor=execute)
+
+    class Catalog:
+        def resolve(self, name: str) -> object | None:
+            return spec if name == spec.name else None
+
+        def validator_for(self, _name: str) -> object:
+            return MODEL_TOOL_CATALOG.validator_for(spec.name)
+
+        def provider_contracts(self) -> tuple[object, ...]:
+            return (spec.contract,)
+
+    catalog = Catalog()
+
+    def context() -> ToolExecutionContext:
+        return ToolExecutionContext(
+            capabilities=frozenset(ToolCapability),
+            current_bindings={},
+            applications=ApplicationsRepository(sessions),
+            events=ApplicationEventsRepository(sessions),
+            notes=NotesRepository(sessions),
+            offers=OffersRepository(sessions),
+            resumes=ResumesRepository(sessions),
+            jd_analyses=JDAnalysesRepository(sessions),
+            run_recorder=NullRunRecorder(),
+        )
+
+    prepared_result = prepare_call(
+        catalog,
+        context(),
+        ToolCall("race-call", spec.name, pending.args),
+        pending_identity="race-call:save_offer_assessment",
+        pending_action_revision=1,
+        record_proposal=False,
+    )
+    prepared = getattr(prepared_result, "prepared", None)
+    assert prepared is not None
+    request = ConfirmationRequest(
+        conversation_id=conversation.id,
+        approved=True,
+        operation_id=operation_id,
+        confirmation_token=_confirmation_token(pending),
+    )
+
+    def worker() -> str:
+        coordinator = ConfirmationCoordinator(
+            ConfirmationDependencies(
+                persistence=persistence,
+                conversations=chat,
+                write_operations=operations,
+                write_coordinator=WriteOperationCoordinator(operations),
+                catalog=catalog,
+            )
+        )
+        try:
+            session = coordinator.approve_modify(request, pending=pending, catalog=catalog)
+        except ConfirmationReplayError:
+            return "replay"
+        except WriteOperationError as exc:
+            # The second connection may observe the first owner's live
+            # delivery lease.  The production route maps this exact Ledger
+            # state to HTTP 409; it must not claim or execute a second write.
+            if exc.code == "operation_delivery_pending":
+                return "in_progress"
+            raise
+        authorization = session.on_confirmation_attempt(pending, prepared)
+        assert not isinstance(authorization, ToolFailure)
+        try:
+            record = session.execute_operation(prepared, context(), cast(Any, authorization))
+        except ConfirmationReplayError:
+            return "replay"
+        session.on_confirmation_result(
+            pending,
+            True,
+            Message(role="tool", content="saved", tool_call_id=pending.tool_call_id),
+            record,
+        )
+        delivered = coordinator.final_delivery(
+            session,
+            DeliveryBundle((Message(role="assistant", content="done"),)),
+        )
+        assert getattr(delivered, "status", None) is PersistenceStatus.PERSISTED
+        return "committed"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(worker)
+        assert first_executor_entered.wait(10)
+        second = pool.submit(worker)
+        release_first_executor.set()
+        results = {first.result(timeout=15), second.result(timeout=15)}
+
+    assert results <= {"committed", "replay", "in_progress"}
+    assert "committed" in results
+    assert len(results) == 2
+    assert calls == 1
+    operation = operations.get(operation_id)
+    assert operation is not None
+    assert operation.status == "committed"
+    assert operation.delivery_status == "completed"
+
+
+def test_delivery_race_has_one_active_owner_call() -> None:
+    operations = _Operations(status="proposed")
+    pending = PendingAction("call-1", "create_application", "{}", "create", operations.operation_id)
+
+    class BlockingPersistence(_Persistence):
+        def __init__(self) -> None:
+            super().__init__(pending)
+            self.entered = Event()
+            self.release = Event()
+            self.calls = 0
+            self.payloads: list[dict[str, object]] = []
+
+        def persist_confirmation_delivery(self, **kwargs: object) -> PersistenceResult:
+            self.calls += 1
+            self.payloads.append(kwargs)
+            self.entered.set()
+            assert self.release.wait(10)
+            return PersistenceResult(PersistenceStatus.PERSISTED)
+
+    persistence = BlockingPersistence()
+    write = _WriteCoordinator()
+    coordinator = ConfirmationCoordinator(_deps(persistence, operations, write))
+    session = coordinator.reject(
+        ConfirmationRequest(
+            conversation_id=7,
+            approved=False,
+            operation_id=operations.operation_id,
+            confirmation_token=operations.token,
+        ),
+        pending=pending,
+    )
+    assert session.on_confirmation_attempt(pending, None) is None
+    session.on_confirmation_result(
+        pending,
+        False,
+        Message(role="tool", content="cancelled", tool_call_id=pending.tool_call_id),
+        None,
+    )
+
+    def deliver() -> object:
+        return coordinator.final_delivery(
+            session,
+            DeliveryBundle((Message(role="assistant", content="done"),)),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(deliver)
+        assert persistence.entered.wait(10)
+        second = pool.submit(deliver)
+        assert second.result(timeout=10) is None
+        persistence.release.set()
+        assert getattr(first.result(timeout=10), "status", None) is PersistenceStatus.PERSISTED
+    assert persistence.calls == 1
+
+
+def test_timeout_after_terminal_preserves_authoritative_undo_payload() -> None:
+    operations = _Operations(status="proposed")
+    pending = PendingAction("call-1", "create_application", "{}", "create", operations.operation_id)
+    persistence = _Persistence(pending)
+    captured: list[dict[str, object]] = []
+
+    def persist_confirmation_delivery(**kwargs: object) -> PersistenceResult:
+        captured.append(kwargs)
+        return PersistenceResult(PersistenceStatus.PERSISTED)
+
+    persistence.persist_confirmation_delivery = persist_confirmation_delivery  # type: ignore[attr-defined]
+
+    class UndoWriteCoordinator(_WriteCoordinator):
+        def execute_primary(self, **kwargs: object) -> object:
+            self.execute_calls += 1
+            payload = TerminalPayload(
+                status="committed",
+                result_contract="typed_json_v1",
+                result_json='{"id":1}',
+                visible_result="created",
+                transport_json="{}",
+                undo_json='{"kind":"delete_application","id":1}',
+                failure_category=None,
+                failure_code=None,
+                digest="sha256:undo",
+            )
+            return (
+                OperationCommitted(
+                    str(kwargs["operation_id"]),
+                    payload,
+                    DeliveryOwnership(str(kwargs["operation_id"]), 1, b"owner", "owner"),
+                ),
+                SimpleNamespace(
+                    outcome=ToolSuccess({"id": 1}),
+                    terminal_persisted=True,
+                    replayed=False,
+                ),
+            )
+
+    write = UndoWriteCoordinator()
+    coordinator = ConfirmationCoordinator(_deps(persistence, operations, write))
+    request = ConfirmationRequest(
+        conversation_id=7,
+        approved=True,
+        operation_id=operations.operation_id,
+        confirmation_token=operations.token,
+    )
+    session = coordinator.approve_modify(request, pending=pending)
+    prepared = SimpleNamespace(
+        pending_identity="call-1:create_application",
+        pending_action_revision=1,
+        tool_call_id="call-1",
+        spec=SimpleNamespace(name="create_application"),
+        arguments_digest="digest",
+    )
+    authorization = session.on_confirmation_attempt(pending, prepared)
+    assert not isinstance(authorization, ToolFailure)
+    session.execute_operation(prepared, object(), cast(Any, authorization))
+
+    fallback = coordinator.timeout_convergence(session)
+
+    assert getattr(fallback, "status", None) is PersistenceStatus.PERSISTED
+    assert session.state.succeeded is True
+    assert captured[0]["undo"] == {"kind": "delete_application", "id": 1}
+
+
+def test_timeout_during_executor_late_terminal_fallback_clears_once() -> None:
+    operations = _Operations(status="proposed")
+    pending = PendingAction("call-1", "create_application", "{}", "create", operations.operation_id)
+    persistence = _Persistence(pending)
+    deliveries: list[dict[str, object]] = []
+    persistence.persist_confirmation_delivery = lambda **kwargs: (  # type: ignore[attr-defined]
+        deliveries.append(kwargs) or PersistenceResult(PersistenceStatus.PERSISTED)
+    )
+    entered = Event()
+    release = Event()
+
+    class LateWriteCoordinator(_WriteCoordinator):
+        def execute_primary(self, **kwargs: object) -> object:
+            entered.set()
+            assert release.wait(10)
+            return super().execute_primary(**kwargs)
+
+    write = LateWriteCoordinator()
+    coordinator = ConfirmationCoordinator(_deps(persistence, operations, write))
+    request = ConfirmationRequest(
+        conversation_id=7,
+        approved=True,
+        operation_id=operations.operation_id,
+        confirmation_token=operations.token,
+    )
+    session = coordinator.approve_modify(request, pending=pending)
+    prepared = SimpleNamespace(
+        pending_identity="call-1:create_application",
+        pending_action_revision=1,
+        tool_call_id="call-1",
+        spec=SimpleNamespace(name="create_application"),
+        arguments_digest="digest",
+    )
+    authorization = session.on_confirmation_attempt(pending, prepared)
+    assert not isinstance(authorization, ToolFailure)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(session.execute_operation, prepared, object(), authorization)
+        assert entered.wait(10)
+        assert coordinator.timeout_convergence(session) is None
+        release.set()
+        record = future.result(timeout=10)
+
+    session.on_confirmation_result(
+        pending,
+        True,
+        Message(role="tool", content="saved", tool_call_id=pending.tool_call_id),
+        record,
+    )
+
+    assert session.state.fallback_persisted is True
+    assert session.state.active is False
+    assert len(deliveries) == 1
+    with pytest.raises(Exception):
+        session.continuation_message_loader()
+
+
+def test_rejection_stream_uses_complete_typed_events_without_user_message_saved() -> None:
+    operations = _Operations(status="proposed")
+    pending = PendingAction("call-1", "create_application", "{}", "create", operations.operation_id)
+    persistence = _Persistence(pending)
+    persistence.persist_confirmation_delivery = lambda **_kwargs: PersistenceResult(  # type: ignore[attr-defined]
+        PersistenceStatus.PERSISTED
+    )
+    write = _WriteCoordinator()
+    coordinator = ConfirmationCoordinator(_deps(persistence, operations, write))
+
+    class Conversations:
+        def load(self, _conversation_id: int) -> object:
+            raise AssertionError("rejection stream must not load conversation")
+
+    runtime = PilotRuntime(
+        RuntimeDependencies(
+            conversations=Conversations(),
+            persistence=persistence,  # type: ignore[arg-type]
+            confirmation_coordinator=coordinator,
+        )
+    )
+    prepared = runtime.prepare_stream(
+        ConfirmationRequest(
+            conversation_id=7,
+            approved=False,
+            operation_id=operations.operation_id,
+            confirmation_token=operations.token,
+        ),
+        transport=RuntimeTransportContext(
+            mode="stream",
+            transport_run_id=uuid4(),
+            stream_version="pilot-sse-v1",
+        ),
+        invocation_control=InMemoryRuntimeInvocationControl(),
+    )
+
+    assert isinstance(prepared, PreparedStreamExecution)
+    state = cast(Any, prepared.opaque_state)
+    assert [type(event) for event in state.events] == [
+        MetaEvent,
+        StatusEvent,
+        ToolCallEvent,
+        ToolResultEvent,
+        AssistantMessageEvent,
+    ]
+    assert cast(Any, state.events[2]).confirm_mode == "rejected"
+    assert cast(Any, state.events[3]).status == "error"
+    assert not any(type(event).__name__ == "UserMessageSavedEvent" for event in state.events)
+
+
+def test_approved_stream_orders_meta_status_tool_result_assistant_completed() -> None:
+    operations = _Operations(status="proposed")
+    pending = PendingAction("call-1", "create_application", "{}", "create", operations.operation_id)
+    persistence = _Persistence(pending)
+    persistence.persist_confirmation_delivery = lambda **_kwargs: PersistenceResult(  # type: ignore[attr-defined]
+        PersistenceStatus.PERSISTED
+    )
+    write = _WriteCoordinator()
+    coordinator = ConfirmationCoordinator(_deps(persistence, operations, write))
+    context = SimpleNamespace(operation_executor=None)
+    sources = SimpleNamespace(calls=0)
+
+    def load_source(*_args: object, **_kwargs: object) -> tuple[Message, ...]:
+        sources.calls += 1
+        return (Message(role="assistant", content="history"),)
+
+    class Conversations:
+        def load(self, _conversation_id: int) -> object:
+            return SimpleNamespace(id=7, archived_at=None)
+
+    class Driver:
+        def resume_after_confirm(self, messages: list[Message], pending: PendingAction, approved: bool, auto_approve: bool, max_iter: int, **kwargs: object) -> object:
+            del messages, approved, auto_approve, max_iter
+            sink = kwargs["event_sink"]
+            sink.emit(ToolCallEvent("call-1", "create_application", kind="write", confirm_mode="approved"))
+            prepared = SimpleNamespace(
+                pending_identity="call-1:create_application",
+                pending_action_revision=1,
+                tool_call_id="call-1",
+                spec=SimpleNamespace(name="create_application"),
+                arguments_digest="digest",
+            )
+            authorization = kwargs["confirmation_attempt_sink"](pending, prepared)
+            record = kwargs["tool_context"].operation_executor(
+                prepared, kwargs["tool_context"], authorization
+            )
+            origin = Message(role="tool", content="saved", tool_call_id="call-1")
+            kwargs["confirmation_result_sink"](pending, True, origin, record)
+            sink.emit(
+                ToolResultEvent(
+                    "call-1",
+                    "create_application",
+                    "success",
+                    "saved",
+                    visible_result="saved",
+                    operation_id=operations.operation_id,
+                    write_status="success",
+                )
+            )
+            assert kwargs["continuation_message_loader"]() == (
+                Message(role="assistant", content="history"),
+            )
+            return SimpleNamespace(
+                added=(origin, Message(role="assistant", content="done")),
+                reply="done",
+                pending=None,
+                records=(record,),
+                failures=(),
+            )
+
+    runtime = PilotRuntime(
+        RuntimeDependencies(
+            conversations=Conversations(),
+            persistence=persistence,  # type: ignore[arg-type]
+            confirmation_coordinator=coordinator,
+            model_resolver=lambda _request, _conversation: ResolvedModel(
+                model=object(), tool_context=context
+            ),
+            agent_driver=Driver(),
+            source_loader=SimpleNamespace(load=load_source),  # type: ignore[arg-type]
+        )
+    )
+    transport = RuntimeTransportContext(
+        mode="stream", transport_run_id=uuid4(), stream_version="pilot-sse-v1"
+    )
+    control = InMemoryRuntimeInvocationControl()
+    prepared = runtime.prepare_stream(
+        ConfirmationRequest(
+            conversation_id=7,
+            approved=True,
+            operation_id=operations.operation_id,
+            confirmation_token=operations.token,
+        ),
+        transport=transport,
+        invocation_control=control,
+    )
+    assert isinstance(prepared, PreparedStreamExecution)
+    assert prepared.begin()
+    cast(Any, prepared.opaque_state).cell.execution_owner = object()
+    events: list[object] = []
+
+    class Sink:
+        def emit(self, event: object) -> None:
+            events.append(event)
+
+    class Host:
+        def run(self, thunk: object, _control: object) -> object:
+            return cast(Any, thunk)()
+
+    outcome = runtime.execute_prepared_stream(
+        prepared,
+        event_sink=Sink(),
+        signal_sink=None,
+        execution_host=Host(),  # type: ignore[arg-type]
+        cancel_check=lambda: False,
+    )
+
+    assert getattr(outcome, "message", None) == "done"
+    assert [type(event) for event in events] == [
+        MetaEvent,
+        StatusEvent,
+        ToolCallEvent,
+        ToolResultEvent,
+        AssistantMessageEvent,
+        CompletedEvent,
+    ]
+    assert sources.calls == 1
+
+
+def test_slow_stream_drops_late_chained_pending_after_fallback_delivery() -> None:
+    """A timed-out continuation must not leave a late Pending card behind."""
+
+    operations = _Operations(status="proposed")
+    pending = PendingAction(
+        "call-1", "create_application", "{}", "create", operations.operation_id
+    )
+    persistence = _Persistence(pending)
+    deliveries: list[dict[str, object]] = []
+
+    def persist_confirmation_delivery(**kwargs: object) -> PersistenceResult:
+        deliveries.append(kwargs)
+        return PersistenceResult(PersistenceStatus.PERSISTED)
+
+    persistence.persist_confirmation_delivery = persist_confirmation_delivery  # type: ignore[attr-defined]
+    write = _WriteCoordinator()
+    coordinator = ConfirmationCoordinator(_deps(persistence, operations, write))
+    entered = Event()
+    release = Event()
+    finished = Event()
+    context = SimpleNamespace(operation_executor=None)
+
+    class Conversations:
+        def load(self, _conversation_id: int) -> object:
+            return SimpleNamespace(id=7, archived_at=None)
+
+    class Driver:
+        def resume_after_confirm(
+            self,
+            _messages: list[Message],
+            current: PendingAction,
+            _approved: bool,
+            _auto_approve: bool,
+            _max_iter: int,
+            **kwargs: object,
+        ) -> object:
+            prepared = SimpleNamespace(
+                pending_identity="call-1:create_application",
+                pending_action_revision=1,
+                tool_call_id=current.tool_call_id,
+                spec=SimpleNamespace(name=current.tool_name),
+                arguments_digest="digest",
+            )
+            authorization = kwargs["confirmation_attempt_sink"](current, prepared)
+            record = kwargs["tool_context"].operation_executor(
+                prepared, kwargs["tool_context"], authorization
+            )
+            origin = Message(role="tool", content="saved", tool_call_id=current.tool_call_id)
+            kwargs["confirmation_result_sink"](current, True, origin, record)
+            entered.set()
+            assert release.wait(10)
+            child = PendingAction(
+                "late-child", "create_application", "{}", "late", str(uuid4())
+            )
+            try:
+                return SimpleNamespace(
+                    added=(origin,),
+                    reply="",
+                    pending=child,
+                    records=(record,),
+                    failures=(),
+                )
+            finally:
+                finished.set()
+
+    runtime = PilotRuntime(
+        RuntimeDependencies(
+            conversations=Conversations(),
+            persistence=persistence,  # type: ignore[arg-type]
+            confirmation_coordinator=coordinator,
+            model_resolver=lambda _request, _conversation: ResolvedModel(
+                model=object(), tool_context=context
+            ),
+            agent_driver=Driver(),
+        )
+    )
+    request = ConfirmationRequest(
+        conversation_id=7,
+        approved=True,
+        operation_id=operations.operation_id,
+        confirmation_token=operations.token,
+    )
+    prepared = runtime.prepare_stream(
+        request,
+        transport=RuntimeTransportContext(
+            mode="stream", transport_run_id=uuid4(), stream_version="pilot-sse-v1"
+        ),
+        invocation_control=InMemoryRuntimeInvocationControl(),
+    )
+    assert isinstance(prepared, PreparedStreamExecution)
+    assert prepared.begin()
+    cast(Any, prepared.opaque_state).cell.execution_owner = object()
+
+    class Sink:
+        def emit(self, _event: object) -> None:
+            return None
+
+    outcome = runtime.execute_prepared_stream(
+        prepared,
+        event_sink=Sink(),
+        signal_sink=None,
+        execution_host=SseAgentExecutionHost(timeout_seconds=0.05, poll_seconds=0.005),
+        cancel_check=lambda: False,
+    )
+
+    assert entered.is_set()
+    assert getattr(outcome, "persisted", False) is True
+    assert len(deliveries) == 1
+    assert deliveries[0]["chained_pending"] is None
+    release.set()
+    assert finished.wait(10)
+
+
+def test_stream_provider_failure_is_502_and_does_not_clear_pending() -> None:
+    operations = _Operations(status="proposed")
+    pending = PendingAction("call-1", "create_application", "{}", "create", operations.operation_id)
+    persistence = _Persistence(pending)
+    persistence.persist_confirmation_delivery = lambda **_kwargs: PersistenceResult(  # type: ignore[attr-defined]
+        PersistenceStatus.PERSISTED
+    )
+    coordinator = ConfirmationCoordinator(_deps(persistence, operations, _WriteCoordinator()))
+    context = SimpleNamespace(operation_executor=None)
+
+    class Conversations:
+        def load(self, _conversation_id: int) -> object:
+            return SimpleNamespace(id=7, archived_at=None)
+
+    class Driver:
+        def resume_after_confirm(self, *_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("provider down")
+
+    runtime = PilotRuntime(
+        RuntimeDependencies(
+            conversations=Conversations(),
+            persistence=persistence,  # type: ignore[arg-type]
+            confirmation_coordinator=coordinator,
+            model_resolver=lambda _request, _conversation: ResolvedModel(
+                model=object(), tool_context=context
+            ),
+            agent_driver=Driver(),
+        )
+    )
+    prepared = runtime.prepare_stream(
+        ConfirmationRequest(
+            conversation_id=7,
+            approved=True,
+            operation_id=operations.operation_id,
+            confirmation_token=operations.token,
+        ),
+        transport=RuntimeTransportContext(
+            mode="stream", transport_run_id=uuid4(), stream_version="pilot-sse-v1"
+        ),
+        invocation_control=InMemoryRuntimeInvocationControl(),
+    )
+    assert isinstance(prepared, PreparedStreamExecution)
+    assert prepared.begin()
+    cast(Any, prepared.opaque_state).cell.execution_owner = object()
+
+    class Sink:
+        def emit(self, _event: object) -> None:
+            return None
+
+    class Host:
+        def run(self, thunk: object, _control: object) -> object:
+            return cast(Any, thunk)()
+
+    outcome = runtime.execute_prepared_stream(
+        prepared,
+        event_sink=Sink(),
+        signal_sink=None,
+        execution_host=Host(),  # type: ignore[arg-type]
+        cancel_check=lambda: False,
+    )
+
+    assert getattr(outcome, "code", None).value == "ai_provider_error"
+    assert getattr(outcome, "status_code", None) == 502
+    assert persistence.pending is not None

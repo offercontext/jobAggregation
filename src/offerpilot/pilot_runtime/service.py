@@ -11,21 +11,24 @@ from __future__ import annotations
 
 import inspect
 import json
+from copy import copy
 from hashlib import sha256
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from math import isfinite
+from types import SimpleNamespace
 from typing import Any, Protocol, TypeAlias, cast
 from threading import Lock
 from uuid import uuid4
 
-from offerpilot.ai.agent import PendingAction
+from offerpilot.ai.agent import PendingAction, PendingActionValidationError, StalePendingActionError
+from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import ToolFailure, ToolSuccess
 from offerpilot.ai.tool_runtime.legacy import LEGACY_DETERMINISTIC_NAMES
 from offerpilot.ai.tool_runtime.journal import journal_shape_digest
 from offerpilot.ai.types import Message, ToolCall
-from offerpilot.ai.write_operations import OperationReplay
+from offerpilot.ai.write_operations import OperationReplay, WriteOperationError
 from offerpilot.agent_runtime.events import (
     ContextManifestInput,
     normalize_context_identity,
@@ -90,6 +93,7 @@ from .event_sink import emit_runtime_event, require_runtime_active
 from .continuation import (
     ConfirmationCoordinator,
     ConfirmationReplayError,
+    ConfirmationSession,
     DeliveryBundle,
 )
 from .persistence import (
@@ -1931,6 +1935,7 @@ class PilotRuntime:
                 signal_sink=signal_sink,
                 execution_host=execution_host,
                 cancel_check=cancel_check or (lambda: False),
+                transport=resolved_transport,
             )
         self._phase("validate")
         self._validate(request)
@@ -2024,6 +2029,402 @@ class PilotRuntime:
     def _confirmation_coordinator(self) -> ConfirmationCoordinator | None:
         return self._dependencies.confirmation_coordinator or self._dependencies.continuation
 
+    @staticmethod
+    def _bind_confirmation_context(
+        raw_context: object | None,
+        session: ConfirmationSession,
+        recorder: object,
+    ) -> object:
+        """Bind the live Ledger executor to the existing tool context.
+
+        ``execute_prepared`` deliberately chooses ``context.operation_executor``
+        before it can ever call a provider executor.  A confirmation resume
+        therefore cannot pass the resolver's context through unchanged: doing
+        so silently bypasses ``WriteOperationCoordinator`` whenever the
+        resolver supplied a context without an executor.  The concrete
+        production context is frozen and gets a typed dataclass replacement;
+        small adapters used by transport tests must explicitly support the two
+        attributes or fail closed.
+        """
+
+        if isinstance(raw_context, ToolExecutionContext):
+            return replace(
+                raw_context,
+                run_recorder=cast(Any, recorder),
+                operation_executor=session.execute_operation,
+            )
+        if raw_context is None:
+            raise TypeError("confirmation tool context is required")
+        try:
+            candidate = copy(raw_context)
+            setattr(candidate, "run_recorder", recorder)
+            setattr(candidate, "operation_executor", session.execute_operation)
+        except (AttributeError, TypeError) as exc:
+            raise TypeError("confirmation tool context cannot be bound") from exc
+        if not callable(getattr(candidate, "operation_executor", None)):
+            raise TypeError("confirmation tool context is missing operation executor")
+        return candidate
+
+    def _open_ledger_journal(
+        self,
+        session: ConfirmationSession,
+        conversation: object,
+        transport: RuntimeTransportContext,
+        control: RuntimeInvocationControl,
+        *,
+        execution_path: str = "agent_resume",
+        tool_names: tuple[str, ...] | None = None,
+    ) -> tuple[object, bool]:
+        """Resume the waiting run and install typed confirmation journal hooks."""
+
+        try:
+            recorder, started = self._resume_journal_confirmation(
+                session.state.identity.conversation_id,
+                session.state.pending,
+                transport,
+                execution_path=execution_path,
+            )
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception:
+            recorder, started = _NoopRecorder(), False
+        if started and session.state.approved:
+            try:
+                persistence = self._require_dependency("persistence")
+                self._capture_confirmation_journal_context(
+                    recorder,
+                    started,
+                    conversation,
+                    session.state.identity.conversation_id,
+                    persistence,
+                    control,
+                    tool_names=tool_names or (session.state.pending.tool_name,),
+                )
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                self._abandon(recorder, started)
+                raise
+            except Exception:
+                # Journal is explicitly fail-open.  Product persistence and
+                # Ledger ownership remain authoritative when a diagnostic
+                # snapshot cannot be captured.
+                self._abandon(recorder, started)
+                recorder, started = _NoopRecorder(), False
+
+        base_attempt = session.on_confirmation_attempt
+        base_result = session.on_confirmation_result
+        attempt_id = str(uuid4())
+
+        def attempt(action: PendingAction, prepared: object | None) -> object:
+            # Decision/resume is recorded before the CAS atom.  If the CAS is
+            # lost the segment is later abandoned, while the Ledger remains
+            # authoritative and no provider is reached.
+            self._record_journal_approval(
+                recorder,
+                started,
+                attempt_id,
+                session.state.pending,
+                action,
+                prepared is not None,
+                edited=str(_attribute(action, "args", session.state.pending.args))
+                != session.state.pending.args,
+                control=control,
+            )
+            return base_attempt(action, cast(Any, prepared))
+
+        def result(
+            action: PendingAction,
+            approved: bool,
+            tool_message: Message,
+            execution_record: object | None,
+        ) -> object:
+            value = base_result(
+                action,
+                approved,
+                tool_message,
+                cast(Any, execution_record),
+            )
+            # The production ``execute_prepared`` atom projects terminal
+            # success/failure inside its Ledger transaction.  Re-projecting
+            # it from this callback would create duplicate tool.completed or
+            # tool.failed journal rows.  Rejection has no tool terminal at
+            # all, and is represented only by approval.decided.
+            if (
+                not approved
+                or (
+                    _attribute(execution_record, "terminal_persisted") is True
+                    and _attribute(execution_record, "journal_started_recorded") is True
+                )
+            ):
+                return value
+            succeeded = isinstance(_attribute(execution_record, "outcome"), ToolSuccess)
+            self._record_journal_tool_result(
+                recorder,
+                started,
+                action,
+                tool_message.content,
+                succeeded,
+                control,
+            )
+            return value
+
+        session.on_confirmation_attempt = cast(Any, attempt)
+        session.on_confirmation_result = cast(Any, result)
+        return recorder, started
+
+    def _close_ledger_journal(
+        self,
+        recorder: object,
+        started: bool,
+        outcome: RuntimeOutcome | None,
+        control: RuntimeInvocationControl,
+        *,
+        pending: PendingAction | None = None,
+        catalog: object | None = None,
+        allow_timeout: bool = False,
+    ) -> None:
+        if not started:
+            return
+        if isinstance(outcome, RuntimeFailureOutcome) and outcome.code in {
+            RuntimeFailureCode.STALE_PENDING_ACTION,
+            RuntimeFailureCode.OPERATION_IDENTITY_CONFLICT,
+            RuntimeFailureCode.OPERATION_INPUT_CONFLICT,
+            RuntimeFailureCode.OPERATION_INTEGRITY_ERROR,
+        }:
+            self._abandon(recorder, True)
+        elif pending is not None:
+            # A chained Pending is a real Ledger proposal.  Passing the live
+            # catalog keeps the journal suspension on the typed write-tool
+            # boundary; ``catalog=None`` would silently skip
+            # ``run.waiting_confirmation`` and leave the resumed segment
+            # running forever.
+            self._suspend(recorder, True, pending, control, catalog=catalog)
+        elif isinstance(outcome, RuntimeFailureOutcome):
+            self._finish(
+                recorder,
+                True,
+                "timed_out" if allow_timeout else "failed",
+                outcome.code.value,
+                control,
+                allow_timeout=allow_timeout,
+            )
+        else:
+            self._finish(
+                recorder,
+                True,
+                "timed_out" if allow_timeout else "completed",
+                None,
+                control,
+                allow_timeout=allow_timeout,
+            )
+
+    def _record_ledger_delivery_journal(
+        self,
+        recorder: object,
+        started: bool,
+        session: ConfirmationSession,
+        control: RuntimeInvocationControl,
+        *,
+        allow_timeout: bool = False,
+    ) -> None:
+        """Project the atomic Ledger delivery after it has actually committed."""
+
+        if not started:
+            return
+        result = session.state.delivery_result
+        if result is None or not result.message_ids:
+            return
+        persistence = self._dependencies.persistence
+        if persistence is None:
+            return
+        self._record_journal_persisted(
+            recorder,
+            started,
+            persistence,
+            session.state.identity.conversation_id,
+            result.message_ids,
+            control,
+            allow_timeout=allow_timeout,
+        )
+
+    def _continue_ledger_rejection(
+        self,
+        coordinator: ConfirmationCoordinator,
+        request: ConfirmationRequest,
+        *,
+        control: RuntimeInvocationControl,
+        transport: RuntimeTransportContext | None = None,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> RuntimeOutcome:
+        """Complete rejection from Pending/Ledger atoms only."""
+
+        session = coordinator.reject(request)
+        recorder: object = _NoopRecorder()
+        journal_started = False
+        try:
+            if transport is not None:
+                recorder, journal_started = self._open_ledger_journal(
+                    session,
+                    SimpleNamespace(
+                        id=request.conversation_id,
+                        context_type="workspace",
+                        context_ref="",
+                        mode="general",
+                    ),
+                    transport,
+                    control,
+                    execution_path="rejection",
+                )
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            coordinator.cancel_cleanup(session)
+            self._abandon(recorder, journal_started)
+            raise
+        except BaseException:
+            coordinator.cancel_cleanup(session)
+            self._abandon(recorder, journal_started)
+            raise
+        try:
+            claimed = session.on_confirmation_attempt(session.pending, None)
+        except BaseException:
+            coordinator.cancel_cleanup(session)
+            self._abandon(recorder, journal_started)
+            raise
+        if isinstance(session.state.terminal_execution, OperationReplay):
+            # Another worker may have terminalized the operation between the
+            # Ledger-first probe and this reject CAS.  Do not fabricate a
+            # second delivery; converge through the repository replay atom.
+            coordinator.cancel_cleanup(session)
+            self._abandon(recorder, journal_started)
+            try:
+                replay = coordinator.replay_outcome(request)
+            except Exception as exc:
+                self._mark_completed_if_active(control)
+                return self._confirmation_failure(exc)
+            self._mark_completed_if_active(control)
+            return replay or self._failure(
+                RuntimeFailureCode.OPERATION_RESULT_UNKNOWN,
+                "operation result is unavailable",
+                503,
+                retryable=True,
+            )
+        if isinstance(claimed, ToolFailure):
+            self._abandon(recorder, journal_started)
+            self._mark_completed_if_active(control)
+            return self._failure(RuntimeFailureCode.STALE_PENDING_ACTION, claimed.code, 409)
+        if cancel_check is not None:
+            try:
+                self._check_cancel(cancel_check, control)
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                coordinator.cancel_cleanup(session)
+                self._abandon(recorder, journal_started)
+                raise
+        visible = str(
+            _attribute(
+                _attribute(session.state.terminal_execution, "payload"),
+                "visible_result",
+                "已取消这次操作。",
+            )
+            or "已取消这次操作。"
+        )
+        origin = Message(
+            role="tool",
+            content=visible,
+            tool_call_id=session.pending.tool_call_id,
+        )
+        try:
+            session.on_confirmation_result(session.pending, False, origin, None)
+            delivered = coordinator.final_delivery(
+                session,
+                DeliveryBundle((Message(role="assistant", content=visible),)),
+            )
+            self._record_ledger_delivery_journal(
+                recorder, journal_started, session, control
+            )
+        except BaseException:
+            coordinator.cancel_cleanup(session)
+            self._abandon(recorder, journal_started)
+            raise
+        delivered_status = _failure_status(delivered)
+        if delivered is None or delivered_status in {"cas_lost", "closed", "not_found"}:
+            self._abandon(recorder, journal_started)
+            self._mark_completed_if_active(control)
+            if delivered_status == "cas_lost":
+                return self._failure(
+                    RuntimeFailureCode.STALE_PENDING_ACTION,
+                    "待确认操作已被更新，请刷新对话后重试。",
+                    409,
+                    retryable=True,
+                )
+            return self._failure(
+                RuntimeFailureCode.OPERATION_DELIVERY_PENDING
+                if delivered is None
+                else RuntimeFailureCode.OPERATION_DELIVERY_FAILED,
+                "确认结果正在处理中，请刷新对话查看结果。"
+                if delivered is None
+                else "对话结果暂时无法保存。",
+                409 if delivered is None else 503,
+                retryable=True,
+            )
+        outcome = MessageOutcome(
+            message=visible,
+            conversation_id=request.conversation_id,
+            write_status="cancelled",
+            operation_id=request.operation_id or session.state.identity.operation_id,
+            persisted=True,
+        )
+        self._close_ledger_journal(recorder, journal_started, outcome, control)
+        self._mark_completed_if_active(control)
+        return outcome
+
+    def _confirmation_source_loader(
+        self,
+        conversation: object,
+        request: ConfirmationRequest,
+    ) -> Callable[[], Sequence[Message]]:
+        """Adapt the Runtime source/context atoms for one confirmation load."""
+
+        source_adapter = self._dependencies.source_loader
+        assembler = self._dependencies.context_assembler
+
+        def load() -> Sequence[Message]:
+            if source_adapter is None:
+                raise WriteOperationError("operation_unavailable")
+            function = _callable(source_adapter, ("load", "load_sources", "load_chat_source_messages"))
+            if function is None:
+                raise TypeError("source loader does not provide load")
+            source = _invoke(
+                function,
+                {
+                    "conversation": conversation,
+                    "request": request,
+                    "conversation_id": request.conversation_id,
+                    "attachments": (),
+                    "page_context": None,
+                },
+                (conversation, request),
+            )
+            assembled = source
+            if assembler is not None:
+                assemble = _callable(assembler, ("assemble", "assemble_context", "build_messages"))
+                if assemble is None:
+                    raise TypeError("context assembler does not provide assemble")
+                assembled = _invoke(
+                    assemble,
+                    {
+                        "source": source,
+                        "sources": source,
+                        "conversation": conversation,
+                        "request": request,
+                        "conversation_id": request.conversation_id,
+                    },
+                    (source, conversation, request),
+                )
+            values = _attribute(assembled, "messages", _attribute(assembled, "history", assembled))
+            if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+                raise WriteOperationError("operation_unavailable")
+            return tuple(_message(item) for item in values)
+
+        return load
+
     def _continue_ledger_confirmation(
         self,
         coordinator: ConfirmationCoordinator,
@@ -2034,6 +2435,7 @@ class PilotRuntime:
         signal_sink: RuntimeSignalSink[str] | None,
         execution_host: AgentExecutionHost[object] | None,
         cancel_check: Callable[[], bool],
+        transport: RuntimeTransportContext,
     ) -> RuntimeOutcome:
         """Run a Ledger-backed confirmation without opening the old route state.
 
@@ -2044,17 +2446,78 @@ class PilotRuntime:
         """
 
         self._phase("validate")
-        self._validate(request)
+        try:
+            self._validate(request)
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except (PendingActionValidationError, ValueError):
+            self._mark_completed_if_active(control)
+            return self._confirmation_failure(
+                WriteOperationError("invalid_confirmation")
+            )
+        except Exception as exc:
+            self._mark_completed_if_active(control)
+            return self._confirmation_failure(exc)
         self._check_cancel(cancel_check, control)
 
         try:
             replay = coordinator.replay_outcome(request)
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
         except Exception as exc:
             self._mark_completed_if_active(control)
             return self._confirmation_failure(exc)
         if replay is not None:
             self._mark_completed_if_active(control)
             return replay
+
+        # Rejection is the direct worker path.  It must not load a Conversation
+        # or resolve a model before the Pending/Ledger CAS has converged.
+        if not request.approved:
+            try:
+                return self._continue_ledger_rejection(
+                    coordinator,
+                    request,
+                    control=control,
+                    transport=transport,
+                    cancel_check=cancel_check,
+                )
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                raise
+            except Exception as exc:
+                self._mark_completed_if_active(control)
+                return self._confirmation_failure(exc)
+            except BaseException:
+                raise
+
+        # Validate the live Pending/Ledger identity before touching a
+        # Conversation or resolving a model.  The session constructor repeats
+        # this read at the claim boundary; this detached probe only closes the
+        # preheader race and is never used as execution authority.
+        preflight_pending: PendingAction | None = None
+        try:
+            preflight_pending = coordinator.preflight_live(
+                request,
+                catalog=self._dependencies.catalog,
+            )
+        except ConfirmationReplayError:
+            try:
+                replayed = coordinator.replay_outcome(request)
+            except Exception as exc:
+                self._mark_completed_if_active(control)
+                return self._confirmation_failure(exc)
+            self._mark_completed_if_active(control)
+            return replayed or self._failure(
+                RuntimeFailureCode.OPERATION_RESULT_UNKNOWN,
+                "operation result is unavailable",
+                503,
+                retryable=True,
+            )
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception as exc:
+            self._mark_completed_if_active(control)
+            return self._confirmation_failure(exc)
 
         try:
             conversation = self._load_confirmation_conversation(request)
@@ -2069,52 +2532,6 @@ class PilotRuntime:
         if _is_archived(conversation):
             self._mark_completed_if_active(control)
             return self._failure(RuntimeFailureCode.CONVERSATION_ARCHIVED, "conversation is archived", 409)
-
-        # Rejection is a direct Ledger worker path.  It must not resolve a
-        # model, decode the proposal, invoke a provider, or start an Agent.
-        if not request.approved:
-            try:
-                session = coordinator.reject(request, conversation=conversation)
-                claimed = session.on_confirmation_attempt(session.pending, None)
-                if isinstance(claimed, ToolFailure):
-                    self._mark_completed_if_active(control)
-                    return self._failure(RuntimeFailureCode.STALE_PENDING_ACTION, claimed.code, 409)
-                visible = str(
-                    _attribute(
-                        _attribute(session.state.terminal_execution, "payload"),
-                        "visible_result",
-                        "已取消这次操作。",
-                    )
-                    or "已取消这次操作。"
-                )
-                origin = Message(
-                    role="tool",
-                    content=visible,
-                    tool_call_id=session.pending.tool_call_id,
-                )
-                session.on_confirmation_result(session.pending, False, origin, None)
-                self._check_cancel(cancel_check, control)
-                delivered = coordinator.final_delivery(
-                    session,
-                    DeliveryBundle((Message(role="assistant", content=visible),)),
-                )
-                if _failure_status(delivered) in {"cas_lost", "closed", "not_found"}:
-                    self._mark_completed_if_active(control)
-                    return self._failure(RuntimeFailureCode.OPERATION_DELIVERY_FAILED, "对话结果暂时无法保存。", 503, retryable=True)
-                self._mark_completed_if_active(control)
-                return MessageOutcome(
-                    message=visible,
-                    conversation_id=request.conversation_id,
-                    write_status="cancelled",
-                    operation_id=request.operation_id or session.state.identity.operation_id,
-                    persisted=True,
-                )
-            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
-                coordinator.cancel_cleanup(session) if "session" in locals() else None
-                raise
-            except Exception as exc:
-                self._mark_completed_if_active(control)
-                return self._confirmation_failure(exc)
 
         resolved_model: ResolvedModel | None = None
         if self._dependencies.model_resolver is not None:
@@ -2131,12 +2548,18 @@ class PilotRuntime:
         try:
             session_or_replay = coordinator.approve_modify(
                 request,
+                pending=preflight_pending,
                 conversation=conversation,
                 catalog=catalog,
+                source_loader=self._confirmation_source_loader(conversation, request),
             )
             if isinstance(session_or_replay, OperationReplay):
                 self._mark_completed_if_active(control)
-                return coordinator.replay_outcome(request) or self._failure(
+                try:
+                    replayed = coordinator.replay_outcome(request)
+                except Exception as exc:
+                    return self._confirmation_failure(exc)
+                return replayed or self._failure(
                     RuntimeFailureCode.OPERATION_RESULT_UNKNOWN,
                     "operation result is unavailable",
                     503,
@@ -2145,7 +2568,11 @@ class PilotRuntime:
             session = session_or_replay
         except ConfirmationReplayError:
             self._mark_completed_if_active(control)
-            return coordinator.replay_outcome(request) or self._failure(
+            try:
+                replayed = coordinator.replay_outcome(request)
+            except Exception as exc:
+                return self._confirmation_failure(exc)
+            return replayed or self._failure(
                 RuntimeFailureCode.OPERATION_RESULT_UNKNOWN,
                 "operation result is unavailable",
                 503,
@@ -2163,7 +2590,63 @@ class PilotRuntime:
             coordinator.cancel_cleanup(session)
             self._mark_completed_if_active(control)
             return self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400)
-        messages = list(session.continuation_message_loader())
+        recorder: object = _NoopRecorder()
+        journal_started = False
+        try:
+            recorder, journal_started = self._open_ledger_journal(
+                session,
+                conversation,
+                transport,
+                control,
+                tool_names=self._journal_tool_names(catalog),
+            )
+            tool_context = self._bind_confirmation_context(
+                resolved_model.tool_context if resolved_model is not None else None,
+                session,
+                recorder,
+            )
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            coordinator.cancel_cleanup(session)
+            self._abandon(recorder, journal_started)
+            raise
+        except Exception as exc:
+            coordinator.cancel_cleanup(session)
+            self._abandon(recorder, journal_started)
+            self._mark_completed_if_active(control)
+            return self._confirmation_failure(exc)
+        except BaseException:
+            coordinator.cancel_cleanup(session)
+            self._abandon(recorder, journal_started)
+            raise
+        # The Agent owns the sole post-terminal source reload.  Passing an
+        # empty initial list is intentional; eagerly materializing here would
+        # race delivery ownership and cause a second provider-context load.
+        messages: list[Message] = []
+        deferred_origin_events: list[RuntimeEvent] = []
+        origin_tool_call_id = session.pending.tool_call_id
+
+        def release_origin_events() -> None:
+            if event_sink is None:
+                deferred_origin_events.clear()
+                return
+            while deferred_origin_events:
+                emit_runtime_event(event_sink, deferred_origin_events.pop(0))
+
+        class _ConfirmationEventSink:
+            def emit(self, event: RuntimeEvent) -> None:
+                if (
+                    isinstance(event, ToolResultEvent)
+                    and event.tool_call_id == origin_tool_call_id
+                ):
+                    if event not in deferred_origin_events:
+                        deferred_origin_events.append(event)
+                    return
+                if event_sink is not None:
+                    emit_runtime_event(event_sink, event)
+
+        confirmation_event_sink: RuntimeEventSink | None = (
+            _ConfirmationEventSink() if event_sink is not None else None
+        )
         model = resolved_model.model if resolved_model is not None else None
         auto_approve = resolved_model.auto_approve if resolved_model is not None else False
         max_iter = resolved_model.max_iter if resolved_model is not None else DEFAULT_MAX_ITERATIONS
@@ -2183,10 +2666,10 @@ class PilotRuntime:
             "model": model,
             "catalog": catalog,
             "tool_catalog": catalog,
-            "tool_context": resolved_model.tool_context if resolved_model is not None else None,
+            "tool_context": tool_context,
             "conversation": conversation,
             "request": request,
-            "event_sink": event_sink,
+            "event_sink": confirmation_event_sink,
             "signal_sink": signal_sink,
             "runtime_signal_sink": signal_sink,
             "cancel_check": cancel_check,
@@ -2229,33 +2712,166 @@ class PilotRuntime:
             )
             self._check_cancel(cancel_check, control)
             normalized = _normalize_agent_result(raw_result)
-            return self._finish_ledger_confirmation(
+            outcome: RuntimeOutcome = self._finish_ledger_confirmation(
                 coordinator,
                 session,
                 normalized,
                 request,
                 control,
             )
+            self._record_ledger_delivery_journal(
+                recorder, journal_started, session, control
+            )
+            self._close_ledger_journal(
+                recorder,
+                journal_started,
+                outcome,
+                control,
+                pending=normalized.pending,
+                catalog=catalog,
+            )
+            release_origin_events()
+            coordinator.stop_heartbeat(session)
+            return outcome
         except RuntimeAgentTimedOut:
-            coordinator.timeout_convergence(session)
+            try:
+                fallback = coordinator.timeout_convergence(session)
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                raise
+            except Exception as exc:
+                fallback = None
+                timeout_error: BaseException | None = exc
+            else:
+                timeout_error = None
+            coordinator.stop_heartbeat(session)
+            state = session.state
+            self._record_ledger_delivery_journal(
+                recorder, journal_started, session, control, allow_timeout=True
+            )
+            if timeout_error is not None:
+                outcome = self._confirmation_failure(timeout_error)
+            elif state.cas_lost:
+                outcome = self._failure(
+                    RuntimeFailureCode.STALE_PENDING_ACTION,
+                    "待确认操作已被更新，请刷新对话后重试。",
+                    409,
+                    retryable=True,
+                )
+            elif state.delivered:
+                # The deadline can race the final delivery commit.  Once the
+                # owner has atomically marked delivery complete, report a
+                # durable terminal result instead of incorrectly returning
+                # ``confirmation_in_progress``.
+                outcome = MessageOutcome(
+                    message=coordinator._fallback_message(state),
+                    conversation_id=request.conversation_id,
+                    write_status="success" if state.succeeded else "failed",
+                    operation_id=state.identity.operation_id,
+                    persisted=True,
+                )
+            elif _failure_status(fallback) in {
+                PersistenceStatus.PERSISTED.value,
+                PersistenceStatus.DUPLICATE.value,
+            }:
+                outcome = MessageOutcome(
+                    message=coordinator._fallback_message(state),
+                    conversation_id=request.conversation_id,
+                    write_status="success" if state.succeeded else "failed",
+                    operation_id=state.identity.operation_id,
+                    persisted=True,
+                )
+            elif state.confirmation_attempted:
+                outcome = self._failure(
+                    RuntimeFailureCode.CONFIRMATION_IN_PROGRESS,
+                    "确认操作仍在后台执行，请刷新对话查看结果，不要重复提交。",
+                    409,
+                    retryable=False,
+                )
+            else:
+                outcome = self._failure(
+                    RuntimeFailureCode.CHAT_AGENT_TIMEOUT,
+                    CHAT_TIMEOUT_MESSAGE,
+                    504,
+                    retryable=True,
+                )
+            self._close_ledger_journal(
+                recorder,
+                journal_started,
+                outcome,
+                control,
+                allow_timeout=True,
+            )
             self._mark_completed_if_active(control)
-            return self._failure(RuntimeFailureCode.CHAT_AGENT_TIMEOUT, CHAT_TIMEOUT_MESSAGE, 504, retryable=True)
+            if isinstance(outcome, MessageOutcome):
+                release_origin_events()
+            return outcome
         except RuntimeCancelled:
             coordinator.cancel_cleanup(session)
+            self._abandon(recorder, journal_started)
             raise
         except RuntimeTransportAborted:
             coordinator.cancel_cleanup(session)
+            self._abandon(recorder, journal_started)
             raise
         except ConfirmationReplayError:
-            replay = coordinator.replay_outcome(request)
+            coordinator.stop_heartbeat(session)
+            self._abandon(recorder, journal_started)
+            try:
+                replay = coordinator.replay_outcome(request)
+            except Exception as exc:
+                self._mark_completed_if_active(control)
+                return self._confirmation_failure(exc)
             if replay is not None:
                 self._mark_completed_if_active(control)
                 return replay
             raise
         except Exception as exc:
-            coordinator.timeout_convergence(session)
+            coordinator.stop_heartbeat(session)
+            if _attribute(exc, "code") == RuntimeFailureCode.OPERATION_INTEGRITY_ERROR.value:
+                coordinator.cancel_cleanup(session)
+                self._abandon(recorder, journal_started)
+                outcome = self._confirmation_failure(exc)
+                self._mark_completed_if_active(control)
+                return outcome
+            state = session.state
+            try:
+                failure_delivery: object = coordinator.fallback(session)
+            except Exception as delivery_error:
+                failure_delivery = None
+                delivery_error_value: BaseException | None = delivery_error
+            else:
+                delivery_error_value = None
+            self._record_ledger_delivery_journal(
+                recorder, journal_started, session, control
+            )
+            if delivery_error_value is not None:
+                outcome = self._confirmation_failure(delivery_error_value)
+            elif _failure_status(failure_delivery) in {
+                PersistenceStatus.PERSISTED.value,
+                PersistenceStatus.DUPLICATE.value,
+            }:
+                outcome = MessageOutcome(
+                    message=coordinator._fallback_message(state),
+                    conversation_id=request.conversation_id,
+                    write_status="success" if state.succeeded else "failed",
+                    operation_id=state.identity.operation_id,
+                    persisted=True,
+                )
+            else:
+                outcome = self._provider_confirmation_failure(exc)
+            self._close_ledger_journal(recorder, journal_started, outcome, control)
             self._mark_completed_if_active(control)
-            return self._confirmation_failure(exc)
+            if isinstance(outcome, MessageOutcome):
+                release_origin_events()
+            return outcome
+        except BaseException:
+            coordinator.cancel_cleanup(session)
+            self._abandon(recorder, journal_started)
+            raise
+        finally:
+            # ``stop_heartbeat`` is idempotent and is the final safety net for
+            # provider failures, sink aborts, and uncancellable late results.
+            coordinator.stop_heartbeat(session)
 
     def _finish_ledger_confirmation(
         self,
@@ -2293,9 +2909,26 @@ class PilotRuntime:
             typed_session,
             DeliveryBundle(tuple(continuation), pending=pending),
         )
-        if _failure_status(delivery) in {"cas_lost", "closed", "not_found"}:
+        delivery_status = _failure_status(delivery)
+        if delivery is None or delivery_status in {"cas_lost", "closed", "not_found"}:
             self._mark_completed_if_active(control)
-            return self._failure(RuntimeFailureCode.OPERATION_DELIVERY_FAILED, "对话结果暂时无法保存。", 503, retryable=True)
+            if delivery_status == "cas_lost":
+                return self._failure(
+                    RuntimeFailureCode.STALE_PENDING_ACTION,
+                    "待确认操作已被更新，请刷新对话后重试。",
+                    409,
+                    retryable=True,
+                )
+            return self._failure(
+                RuntimeFailureCode.OPERATION_DELIVERY_PENDING
+                if delivery is None
+                else RuntimeFailureCode.OPERATION_DELIVERY_FAILED,
+                "确认结果正在处理中，请刷新对话查看结果。"
+                if delivery is None
+                else "对话结果暂时无法保存。",
+                409 if delivery is None else 503,
+                retryable=True,
+            )
         self._mark_completed_if_active(control)
         if pending is not None:
             args, token = _safe_pending_payload(pending)
@@ -2305,7 +2938,7 @@ class PilotRuntime:
                 confirmation_token=token,
                 conversation_id=request.conversation_id,
                 operation_id=pending.operation_id or state.identity.operation_id,
-                message=normalized.reply,
+                message=_user_facing_assistant_content(normalized.reply),
                 pending_action=PendingActionPayload(
                     tool_name=pending.tool_name,
                     operation_id=pending.operation_id or state.identity.operation_id,
@@ -2321,8 +2954,11 @@ class PilotRuntime:
         if not state.approved:
             write_status = "cancelled"
         undo = state.undo_update
+        visible_reply = _user_facing_assistant_content(
+            normalized.reply or continuation[-1].content if continuation else ""
+        )
         return MessageOutcome(
-            message=normalized.reply or continuation[-1].content if continuation else "",
+            message=visible_reply,
             conversation_id=request.conversation_id,
             write_status=write_status,
             write_error=str(payload) if payload else None,
@@ -2339,28 +2975,56 @@ class PilotRuntime:
         try:
             failure_code = RuntimeFailureCode(code)
         except ValueError:
-            if code == "stale_pending_action":
+            if code in {"stale_pending_action", "confirmation_claim_lost"}:
                 failure_code = RuntimeFailureCode.STALE_PENDING_ACTION
                 status_code = 409
             elif code == "operation_identity_conflict":
                 failure_code = RuntimeFailureCode.OPERATION_IDENTITY_CONFLICT
                 status_code = 409
-            elif code == "operation_input_conflict":
-                failure_code = RuntimeFailureCode.INVALID_CONFIRMATION
-                status_code = 422
             else:
                 failure_code = RuntimeFailureCode.OPERATION_FAILED
         if failure_code in {
             RuntimeFailureCode.STALE_PENDING_ACTION,
             RuntimeFailureCode.OPERATION_IDENTITY_CONFLICT,
             RuntimeFailureCode.OPERATION_INPUT_CONFLICT,
-            RuntimeFailureCode.INVALID_CONFIRMATION,
+            RuntimeFailureCode.OPERATION_DELIVERY_PENDING,
+            RuntimeFailureCode.CONFIRMATION_IN_PROGRESS,
+            RuntimeFailureCode.OPERATION_INTEGRITY_ERROR,
         }:
-            status_code = 409 if failure_code is not RuntimeFailureCode.INVALID_CONFIRMATION else 422
+            status_code = 409
+        elif failure_code is RuntimeFailureCode.INVALID_CONFIRMATION:
+            status_code = 422
         return PilotRuntime._failure(
             failure_code,
             "对话结果暂时无法保存。",
             status_code,
+            retryable=True,
+        )
+
+    @staticmethod
+    def _provider_confirmation_failure(error: BaseException) -> RuntimeFailureOutcome:
+        """Map an uncategorized Agent/provider exception to the baseline 502."""
+
+        if isinstance(error, PendingActionValidationError):
+            return PilotRuntime._failure(
+                RuntimeFailureCode.INVALID_CONFIRMATION,
+                f"确认参数无效：{error}",
+                422,
+                retryable=True,
+            )
+        if isinstance(error, StalePendingActionError):
+            return PilotRuntime._failure(
+                RuntimeFailureCode.STALE_PENDING_ACTION,
+                "待确认操作已过期或正在处理中，请刷新对话后重试。",
+                409,
+                retryable=True,
+            )
+        if _attribute(error, "code") not in (None, ""):
+            return PilotRuntime._confirmation_failure(error)
+        return PilotRuntime._failure(
+            RuntimeFailureCode.AI_PROVIDER_ERROR,
+            "AI 连接失败。请检查 AI 设置或稍后重试。",
+            502,
             retryable=True,
         )
 
@@ -2402,14 +3066,29 @@ class PilotRuntime:
             )
 
         self._phase("validate")
-        self._validate(cast(StartTurnRequest, request))
+        try:
+            self._validate(cast(StartTurnRequest, request))
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except (PendingActionValidationError, ValueError):
+            return self._stream_immediate(
+                self._confirmation_failure(WriteOperationError("invalid_confirmation")),
+                invocation_control,
+            )
+        except Exception as exc:
+            return self._stream_immediate(
+                self._confirmation_failure(exc), invocation_control
+            )
         self._check_cancel(lambda: False, invocation_control)
 
         confirmation_coordinator = self._confirmation_coordinator()
-        stream_replay: OperationReplayOutcome | None = None
+        stream_replay: RuntimeOutcome | None = None
+        preflight_pending: PendingAction | None = None
         if isinstance(request, ConfirmationRequest) and confirmation_coordinator is not None:
             try:
                 stream_replay = confirmation_coordinator.replay_outcome(request)
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                raise
             except Exception as exc:
                 return self._stream_immediate(
                     self._confirmation_failure(exc), invocation_control
@@ -2427,6 +3106,58 @@ class PilotRuntime:
                     conversation_id=request.conversation_id,
                     transport=transport,
                     invocation_control=invocation_control,
+                )
+            if not request.approved:
+                # Rejection is already a complete direct Ledger worker path;
+                # do not load Conversation/model state just to prepare SSE.
+                return self._prepare_ledger_confirmation_stream(
+                    confirmation_coordinator,
+                    request,
+                    None,
+                    request.conversation_id,
+                    transport,
+                    invocation_control,
+                    replay=None,
+                    terminal_checked=True,
+                )
+            try:
+                preflight_pending = confirmation_coordinator.preflight_live(
+                    request,
+                    catalog=self._dependencies.catalog,
+                )
+            except ConfirmationReplayError:
+                try:
+                    replayed = confirmation_coordinator.replay_outcome(request)
+                except Exception as exc:
+                    return self._stream_immediate(
+                        self._confirmation_failure(exc), invocation_control
+                    )
+                if replayed is not None:
+                    return self._prepare_deterministic_stream(
+                        DeterministicExecution(
+                            replayed,
+                            preparation_kind=PreparationKind.REPLAY,
+                        ),
+                        request=request,
+                        conversation=None,
+                        conversation_id=request.conversation_id,
+                        transport=transport,
+                        invocation_control=invocation_control,
+                    )
+                return self._stream_immediate(
+                    self._failure(
+                        RuntimeFailureCode.OPERATION_RESULT_UNKNOWN,
+                        "operation result is unavailable",
+                        503,
+                        retryable=True,
+                    ),
+                    invocation_control,
+                )
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                raise
+            except Exception as exc:
+                return self._stream_immediate(
+                    self._confirmation_failure(exc), invocation_control
                 )
 
         if (
@@ -2531,6 +3262,7 @@ class PilotRuntime:
                 invocation_control,
                 replay=stream_replay,
                 terminal_checked=True,
+                preflight_pending=preflight_pending,
             )
 
         adapter = self._dependencies.deterministic
@@ -3536,6 +4268,64 @@ class PilotRuntime:
             payload=freeze_json_mapping(payload),
         )
 
+    @staticmethod
+    def _ledger_direct_events(
+        outcome: RuntimeOutcome,
+        *,
+        pending: PendingAction | None = None,
+        tool_call_id: str | None = None,
+        tool_name: str | None = None,
+        rejected: bool = False,
+    ) -> tuple[RuntimeEvent, ...]:
+        """Build the complete typed event prefix for provider-free branches."""
+
+        operation_id = _attribute(outcome, "operation_id")
+        call_id = pending.tool_call_id if pending is not None else str(tool_call_id or "replay-tool")
+        name = pending.tool_name if pending is not None else str(tool_name or "replayed_write")
+        write_status = _attribute(outcome, "write_status")
+        result_status = (
+            # The baseline SSE contract represents a rejected write as a
+            # failed tool result even though the HTTP write status is
+            # ``cancelled``.  Keep that distinction on the typed event
+            # boundary; clients use ``confirm_mode=rejected`` to explain the
+            # cancellation and ``status=error`` to match the old route.
+            "error"
+            if rejected
+            else "cancelled"
+            if write_status == "cancelled"
+            else "success"
+            if write_status == "success"
+            else "error"
+        )
+        confirmation_mode = "rejected" if rejected else "approved"
+        message = str(_attribute(outcome, "message", "") or "")
+        return (
+            MetaEvent(supports_delta=False, supports_tool_events=True),
+            StatusEvent(
+                phase="thinking" if rejected else "completed",
+                label="正在根据你的反馈继续" if rejected else "已完成",
+            ),
+            ToolCallEvent(
+                tool_call_id=call_id,
+                tool_name=name,
+                public_label="已取消的写入操作" if rejected else name,
+                kind="write",
+                confirm_mode=cast(Any, confirmation_mode),
+                summary=("用户已拒绝，操作未执行。" if rejected else message),
+            ),
+            ToolResultEvent(
+                tool_call_id=call_id,
+                tool_name=name,
+                status=cast(Any, result_status),
+                summary=message[:500],
+                message=message,
+                visible_result=message,
+                operation_id=str(operation_id) if operation_id else None,
+                write_status=cast(Any, write_status) if write_status else None,
+            ),
+            AssistantMessageEvent(message=message),
+        )
+
     def _prepare_deterministic_stream(
         self,
         execution: DeterministicExecution,
@@ -3551,6 +4341,30 @@ class PilotRuntime:
         """Freeze a provider-free result before SSE headers are sent."""
 
         outcome = execution.outcome
+        events = execution.events
+        if isinstance(request, ConfirmationRequest):
+            # Confirmation/replay never represents a new user message.  Keep
+            # the direct branch as complete as the Agent branch by projecting
+            # the typed meta/status/tool/result/assistant sequence.
+            events = tuple(
+                event for event in events if not isinstance(event, UserMessageSavedEvent)
+            )
+            if not events and isinstance(outcome, ConfirmationRequiredOutcome):
+                if outcome.pending_action is not None:
+                    events = (
+                        MetaEvent(supports_delta=False, supports_tool_events=True),
+                        StatusEvent(phase="waiting_confirmation", label="需要确认"),
+                        ConfirmationRequiredEvent(
+                            confirmation_token=outcome.confirmation_token,
+                            operation_id=outcome.operation_id,
+                            pending_action=outcome.pending_action,
+                        ),
+                    )
+            if not events and isinstance(outcome, (MessageOutcome, OperationReplayOutcome)):
+                events = self._ledger_direct_events(
+                    outcome,
+                    rejected=outcome.write_status == "cancelled",
+                )
         if isinstance(outcome, RuntimeFailureOutcome):
             return self._stream_immediate(outcome, invocation_control)
         if isinstance(outcome, OperationPendingOutcome):
@@ -3595,7 +4409,7 @@ class PilotRuntime:
             recorder=recorder or _NoopRecorder(),
             journal_started=journal_started,
             cell=cell,
-            events=execution.events,
+            events=events,
             outcome=outcome,
             on_abort=on_abort,
         )
@@ -3620,14 +4434,17 @@ class PilotRuntime:
         transport: RuntimeTransportContext,
         invocation_control: RuntimeInvocationControl,
         *,
-        replay: OperationReplayOutcome | None = None,
+        replay: RuntimeOutcome | None = None,
         terminal_checked: bool = False,
+        preflight_pending: PendingAction | None = None,
     ) -> ImmediateHttpOutcome | PreparedStreamExecution:
         """Freeze Ledger replay/rejection, or lease approved Agent work."""
 
         if not terminal_checked:
             try:
                 replay = coordinator.replay_outcome(request)
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                raise
             except Exception as exc:
                 return self._stream_immediate(self._confirmation_failure(exc), invocation_control)
         if replay is not None:
@@ -3644,14 +4461,63 @@ class PilotRuntime:
             )
 
         if not request.approved:
+            session: ConfirmationSession | None = None
+            recorder: object = _NoopRecorder()
+            journal_started = False
             try:
                 session = coordinator.reject(request, conversation=conversation)
+                recorder, journal_started = self._open_ledger_journal(
+                    session,
+                    conversation
+                    if conversation is not None
+                    else SimpleNamespace(
+                        id=conversation_id,
+                        context_type="workspace",
+                        context_ref="",
+                        mode="general",
+                    ),
+                    transport,
+                    invocation_control,
+                    execution_path="rejection",
+                )
                 claimed = session.on_confirmation_attempt(session.pending, None)
+                if isinstance(session.state.terminal_execution, OperationReplay):
+                    coordinator.cancel_cleanup(session)
+                    self._abandon(recorder, journal_started)
+                    try:
+                        replayed = coordinator.replay_outcome(request)
+                    except Exception as exc:
+                        return self._stream_immediate(
+                            self._confirmation_failure(exc), invocation_control
+                        )
+                    if replayed is not None:
+                        return self._prepare_deterministic_stream(
+                            DeterministicExecution(
+                                replayed,
+                                preparation_kind=PreparationKind.REPLAY,
+                            ),
+                            request=request,
+                            conversation=conversation,
+                            conversation_id=conversation_id,
+                            transport=transport,
+                            invocation_control=invocation_control,
+                        )
+                    return self._stream_immediate(
+                        self._failure(
+                            RuntimeFailureCode.OPERATION_RESULT_UNKNOWN,
+                            "operation result is unavailable",
+                            503,
+                            retryable=True,
+                        ),
+                        invocation_control,
+                    )
                 if isinstance(claimed, ToolFailure):
+                    self._abandon(recorder, journal_started)
                     return self._stream_immediate(
                         self._failure(RuntimeFailureCode.STALE_PENDING_ACTION, claimed.code, 409),
                         invocation_control,
                     )
+                self._check_cancel(lambda: False, invocation_control)
                 visible = str(
                     _attribute(
                         _attribute(session.state.terminal_execution, "payload"),
@@ -3670,18 +4536,54 @@ class PilotRuntime:
                     session,
                     DeliveryBundle((Message(role="assistant", content=visible),)),
                 )
-                if _failure_status(delivered) in {"cas_lost", "closed", "not_found"}:
+                self._record_ledger_delivery_journal(
+                    recorder, journal_started, session, invocation_control
+                )
+                delivered_status = _failure_status(delivered)
+                if delivered is None or delivered_status in {"cas_lost", "closed", "not_found"}:
+                    self._abandon(recorder, journal_started)
+                    if delivered_status == "cas_lost":
+                        return self._stream_immediate(
+                            self._failure(
+                                RuntimeFailureCode.STALE_PENDING_ACTION,
+                                "待确认操作已被更新，请刷新对话后重试。",
+                                409,
+                                retryable=True,
+                            ),
+                            invocation_control,
+                        )
                     return self._stream_immediate(
-                        self._failure(RuntimeFailureCode.OPERATION_DELIVERY_FAILED, "对话结果暂时无法保存。", 503, retryable=True),
+                        self._failure(
+                            RuntimeFailureCode.OPERATION_DELIVERY_PENDING
+                            if delivered is None
+                            else RuntimeFailureCode.OPERATION_DELIVERY_FAILED,
+                            "确认结果正在处理中，请刷新对话查看结果。"
+                            if delivered is None
+                            else "对话结果暂时无法保存。",
+                            409 if delivered is None else 503,
+                            retryable=True,
+                        ),
                         invocation_control,
                     )
+                outcome = MessageOutcome(
+                    message=visible,
+                    conversation_id=conversation_id,
+                    write_status="cancelled",
+                    operation_id=session.state.identity.operation_id,
+                )
+                self._close_ledger_journal(
+                    recorder,
+                    journal_started,
+                    outcome,
+                    invocation_control,
+                )
                 return self._prepare_deterministic_stream(
                     DeterministicExecution(
-                        MessageOutcome(
-                            message=visible,
-                            conversation_id=conversation_id,
-                            write_status="cancelled",
-                            operation_id=session.state.identity.operation_id,
+                        outcome,
+                        events=self._ledger_direct_events(
+                            outcome,
+                            pending=session.pending,
+                            rejected=True,
                         ),
                         preparation_kind=PreparationKind.CONFIRMATION,
                     ),
@@ -3692,9 +4594,20 @@ class PilotRuntime:
                     invocation_control=invocation_control,
                 )
             except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                if session is not None:
+                    coordinator.cancel_cleanup(session)
+                self._abandon(recorder, journal_started)
                 raise
             except Exception as exc:
+                if session is not None:
+                    coordinator.cancel_cleanup(session)
+                self._abandon(recorder, journal_started)
                 return self._stream_immediate(self._confirmation_failure(exc), invocation_control)
+            except BaseException:
+                if session is not None:
+                    coordinator.cancel_cleanup(session)
+                self._abandon(recorder, journal_started)
+                raise
 
         resolved_model: ResolvedModel | None = None
         if self._dependencies.model_resolver is not None:
@@ -3708,11 +4621,18 @@ class PilotRuntime:
         try:
             session_or_replay = coordinator.approve_modify(
                 request,
+                pending=preflight_pending,
                 conversation=conversation,
                 catalog=(resolved_model.catalog if resolved_model is not None else self._dependencies.catalog),
+                source_loader=self._confirmation_source_loader(conversation, request),
             )
         except ConfirmationReplayError:
-            replay = coordinator.replay_outcome(request)
+            try:
+                replay = coordinator.replay_outcome(request)
+            except Exception as exc:
+                return self._stream_immediate(
+                    self._confirmation_failure(exc), invocation_control
+                )
             if replay is not None:
                 return self._prepare_deterministic_stream(
                     DeterministicExecution(replay, preparation_kind=PreparationKind.REPLAY),
@@ -3729,7 +4649,14 @@ class PilotRuntime:
         except Exception as exc:
             return self._stream_immediate(self._confirmation_failure(exc), invocation_control)
         if isinstance(session_or_replay, OperationReplay):
-            replay = coordinator.replay_outcome(request)
+            try:
+                replay = coordinator.replay_outcome(request)
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                raise
+            except Exception as exc:
+                return self._stream_immediate(
+                    self._confirmation_failure(exc), invocation_control
+                )
             if replay is None:
                 return self._stream_immediate(
                     self._failure(RuntimeFailureCode.OPERATION_RESULT_UNKNOWN, "operation result is unavailable", 503, retryable=True),
@@ -3744,7 +4671,6 @@ class PilotRuntime:
                 invocation_control=invocation_control,
             )
         session = session_or_replay
-        assembled = tuple(session.continuation_message_loader())
         cell = _PreparedExecutionCell(run_open=False)
 
         def on_abort() -> None:
@@ -3765,7 +4691,9 @@ class PilotRuntime:
             request=request,
             conversation=_prepared_conversation(conversation, conversation_id),
             conversation_id=conversation_id,
-            assembled=cast(tuple[object, ...], _freeze_stream_value(assembled)),
+            # The Agent callback is the only owner of continuation source
+            # loading, after terminal commit and delivery ownership.
+            assembled=(),
             cell=cell,
             transport=transport,
             confirmation_session=session,
@@ -3799,13 +4727,51 @@ class PilotRuntime:
         driver = self._dependencies.agent_driver
         resume = _callable(driver, ("resume_after_confirm",))
         if resume is None:
+            coordinator = cast(ConfirmationCoordinator, self._confirmation_coordinator())
+            coordinator.cancel_cleanup(session)
             return self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400)
+        self._check_cancel(cancel_check, state.control)
         model_view = state.confirmation_model
         catalog = model_view.catalog if model_view is not None else self._dependencies.catalog
-        messages = [
-            _materialize_stream_value(item)
-            for item in state.assembled
-        ]
+        recorder: object = _NoopRecorder()
+        journal_started = False
+        try:
+            recorder, journal_started = self._open_ledger_journal(
+                session,
+                state.conversation,
+                state.transport or RuntimeTransportContext(mode="stream"),
+                state.control,
+                tool_names=self._journal_tool_names(catalog),
+            )
+            tool_context = self._bind_confirmation_context(
+                model_view.tool_context if model_view is not None else None,
+                session,
+                recorder,
+            )
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            coordinator = cast(ConfirmationCoordinator, self._confirmation_coordinator())
+            coordinator.cancel_cleanup(session)
+            self._abandon(recorder, journal_started)
+            raise
+        except Exception as exc:
+            coordinator = cast(ConfirmationCoordinator, self._confirmation_coordinator())
+            coordinator.cancel_cleanup(session)
+            self._abandon(recorder, journal_started)
+            bind_outcome = self._confirmation_failure(exc)
+            emit_runtime_event(
+                event_sink,
+                ErrorEvent(bind_outcome.code, bind_outcome.message, bind_outcome.retryable, bind_outcome.degraded),
+            )
+            return bind_outcome
+        except BaseException:
+            coordinator = cast(ConfirmationCoordinator, self._confirmation_coordinator())
+            coordinator.cancel_cleanup(session)
+            self._abandon(recorder, journal_started)
+            raise
+        # Source reload is deliberately deferred to the Agent's unchanged
+        # continuation callback.  ``state.assembled`` remains empty across
+        # the response-header boundary.
+        messages: list[Message] = []
         auto_approve = model_view.auto_approve if model_view is not None else False
         max_iter = model_view.max_iter if model_view is not None else DEFAULT_MAX_ITERATIONS
         thread_id = (
@@ -3817,17 +4783,39 @@ class PilotRuntime:
         deferred_origin_events: list[RuntimeEvent] = []
         origin_tool_call_id = session.pending.tool_call_id
 
+        def release_origin_events() -> None:
+            # The origin result is held until the atomic delivery decision so
+            # a provider failure/timeout cannot expose a tool result before
+            # its fenced fallback or continuation has been persisted.
+            while deferred_origin_events:
+                emit_runtime_event(event_sink, deferred_origin_events.pop(0))
+
         class _ConfirmationEventSink:
             def emit(self, event: RuntimeEvent) -> None:
                 if (
                     isinstance(event, ToolResultEvent)
                     and event.tool_call_id == origin_tool_call_id
                 ):
-                    deferred_origin_events.append(event)
+                    if event not in deferred_origin_events:
+                        deferred_origin_events.append(event)
                     return
                 emit_runtime_event(event_sink, event)
 
         confirmation_event_sink: RuntimeEventSink = _ConfirmationEventSink()
+        emit_runtime_event(
+            event_sink,
+            MetaEvent(
+                supports_delta=callable(
+                    getattr(model_view.model, "stream_complete", None)
+                    if model_view is not None
+                    else None
+                )
+            ),
+        )
+        emit_runtime_event(
+            event_sink,
+            StatusEvent(phase="tool_running", label="正在执行确认操作"),
+        )
         resume_values: dict[str, object] = {
             "messages": messages,
             "pending": session.pending,
@@ -3839,7 +4827,7 @@ class PilotRuntime:
             "model": model_view.model if model_view is not None else None,
             "catalog": catalog,
             "tool_catalog": catalog,
-            "tool_context": model_view.tool_context if model_view is not None else None,
+            "tool_context": tool_context,
             "conversation": state.conversation,
             "request": request,
             "event_sink": confirmation_event_sink,
@@ -3878,43 +4866,208 @@ class PilotRuntime:
                 var_keyword_values=optional,
             )
 
-        if callable(getattr(execution_host, "iter_events", None)):
-            streamed = cast(Any, execution_host).run(invoke_resume, state.control)
-            if hasattr(streamed, "__next__"):
-                try:
-                    for agent_event in cast(Iterable[object], streamed):
-                        typed_agent_event = cast(RuntimeEvent, agent_event)
-                        if (
-                            isinstance(typed_agent_event, ToolResultEvent)
-                            and typed_agent_event.tool_call_id == origin_tool_call_id
-                        ):
-                            deferred_origin_events.append(typed_agent_event)
-                        else:
-                            emit_runtime_event(event_sink, typed_agent_event)
-                    result_reader = getattr(streamed, "result", None)
-                    raw_result = result_reader() if callable(result_reader) else result_reader
-                finally:
-                    close = getattr(streamed, "close", None)
-                    if callable(close):
-                        close()
+        coordinator = cast(ConfirmationCoordinator, self._confirmation_coordinator())
+        try:
+            if callable(getattr(execution_host, "iter_events", None)):
+                streamed = cast(Any, execution_host).run(invoke_resume, state.control)
+                if hasattr(streamed, "__next__"):
+                    try:
+                        for agent_event in cast(Iterable[object], streamed):
+                            typed_agent_event = cast(RuntimeEvent, agent_event)
+                            if (
+                                isinstance(typed_agent_event, ToolResultEvent)
+                                and typed_agent_event.tool_call_id == origin_tool_call_id
+                            ):
+                                # ``SseAgentExecutionHost`` yields the same
+                                # typed event that the injected sink already
+                                # observed.  Keep one origin result in the
+                                # post-delivery release queue while still
+                                # accepting hosts that only yield events.
+                                if typed_agent_event not in deferred_origin_events:
+                                    deferred_origin_events.append(typed_agent_event)
+                            else:
+                                emit_runtime_event(event_sink, typed_agent_event)
+                        result_reader = getattr(streamed, "result", None)
+                        raw_result = result_reader() if callable(result_reader) else result_reader
+                    finally:
+                        close = getattr(streamed, "close", None)
+                        if callable(close):
+                            close()
+                else:
+                    raw_result = streamed
             else:
-                raw_result = streamed
-        else:
-            raw_result = execution_host.run(lambda: invoke_resume(), state.control)
-        normalized = _normalize_agent_result(raw_result)
-        outcome = self._finish_ledger_confirmation(
-            cast(ConfirmationCoordinator, self._confirmation_coordinator()),
-            session,
-            normalized,
-            request,
-            state.control,
-        )
-        if not isinstance(outcome, RuntimeFailureOutcome):
-            for deferred_event in deferred_origin_events:
-                emit_runtime_event(event_sink, deferred_event)
-        if isinstance(outcome, (MessageOutcome, OperationReplayOutcome)):
-            emit_runtime_event(event_sink, AssistantMessageEvent(message=outcome.message))
-        return outcome
+                raw_result = execution_host.run(lambda: invoke_resume(), state.control)
+            normalized = _normalize_agent_result(raw_result)
+            outcome: RuntimeOutcome = self._finish_ledger_confirmation(
+                coordinator,
+                session,
+                normalized,
+                request,
+                state.control,
+            )
+            self._record_ledger_delivery_journal(
+                recorder, journal_started, session, state.control
+            )
+            self._close_ledger_journal(
+                recorder,
+                journal_started,
+                outcome,
+                state.control,
+                pending=normalized.pending,
+                catalog=catalog,
+            )
+            if not isinstance(outcome, RuntimeFailureOutcome):
+                release_origin_events()
+            if isinstance(outcome, (MessageOutcome, OperationReplayOutcome)):
+                emit_runtime_event(event_sink, AssistantMessageEvent(message=outcome.message))
+            return outcome
+        except RuntimeAgentTimedOut:
+            try:
+                fallback = coordinator.timeout_convergence(session)
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                raise
+            except Exception as exc:
+                fallback = None
+                timeout_error: BaseException | None = exc
+            else:
+                timeout_error = None
+            state_value = session.state
+            coordinator.stop_heartbeat(session)
+            self._record_ledger_delivery_journal(
+                recorder, journal_started, session, state.control, allow_timeout=True
+            )
+            if timeout_error is not None:
+                outcome = self._confirmation_failure(timeout_error)
+            elif state_value.cas_lost:
+                outcome = self._failure(
+                    RuntimeFailureCode.STALE_PENDING_ACTION,
+                    "待确认操作已被更新，请刷新对话后重试。",
+                    409,
+                    retryable=True,
+                )
+            elif state_value.delivered:
+                outcome = MessageOutcome(
+                    message=coordinator._fallback_message(state_value),
+                    conversation_id=request.conversation_id,
+                    write_status="success" if state_value.succeeded else "failed",
+                    operation_id=state_value.identity.operation_id,
+                    persisted=True,
+                )
+            elif _failure_status(fallback) in {
+                PersistenceStatus.PERSISTED.value,
+                PersistenceStatus.DUPLICATE.value,
+            }:
+                outcome = MessageOutcome(
+                    message=coordinator._fallback_message(state_value),
+                    conversation_id=request.conversation_id,
+                    write_status="success" if state_value.succeeded else "failed",
+                    operation_id=state_value.identity.operation_id,
+                    persisted=True,
+                )
+            elif state_value.confirmation_attempted:
+                outcome = self._failure(
+                    RuntimeFailureCode.CONFIRMATION_IN_PROGRESS,
+                    "确认操作仍在后台执行，请刷新对话查看结果，不要重复提交。",
+                    409,
+                    retryable=False,
+                )
+            else:
+                outcome = self._failure(
+                    RuntimeFailureCode.CHAT_AGENT_TIMEOUT,
+                    CHAT_TIMEOUT_MESSAGE,
+                    504,
+                    retryable=True,
+                )
+            self._close_ledger_journal(
+                recorder,
+                journal_started,
+                outcome,
+                state.control,
+                allow_timeout=True,
+            )
+            if isinstance(outcome, MessageOutcome):
+                release_origin_events()
+                emit_runtime_event(event_sink, AssistantMessageEvent(message=outcome.message))
+            else:
+                emit_runtime_event(
+                    event_sink,
+                    ErrorEvent(outcome.code, outcome.message, outcome.retryable, outcome.degraded),
+                )
+            return outcome
+        except (RuntimeCancelled, RuntimeTransportAborted):
+            coordinator.cancel_cleanup(session)
+            self._abandon(recorder, journal_started)
+            raise
+        except ConfirmationReplayError:
+            coordinator.stop_heartbeat(session)
+            self._abandon(recorder, journal_started)
+            try:
+                replay = coordinator.replay_outcome(request)
+            except Exception as exc:
+                outcome = self._confirmation_failure(exc)
+                emit_runtime_event(
+                    event_sink,
+                    ErrorEvent(outcome.code, outcome.message, outcome.retryable, outcome.degraded),
+                )
+                return outcome
+            if replay is not None:
+                if isinstance(replay, OperationReplayOutcome):
+                    emit_runtime_event(event_sink, AssistantMessageEvent(message=replay.message))
+                return replay
+            raise
+        except Exception as exc:
+            coordinator.stop_heartbeat(session)
+            if _attribute(exc, "code") == RuntimeFailureCode.OPERATION_INTEGRITY_ERROR.value:
+                coordinator.cancel_cleanup(session)
+                self._abandon(recorder, journal_started)
+                outcome = self._confirmation_failure(exc)
+                emit_runtime_event(
+                    event_sink,
+                    ErrorEvent(outcome.code, outcome.message, outcome.retryable, outcome.degraded),
+                )
+                return outcome
+            state_value = session.state
+            try:
+                failure_delivery: object = coordinator.fallback(session)
+            except Exception as delivery_error:
+                failure_delivery = None
+                delivery_error_value: BaseException | None = delivery_error
+            else:
+                delivery_error_value = None
+            self._record_ledger_delivery_journal(
+                recorder, journal_started, session, state.control
+            )
+            if delivery_error_value is not None:
+                outcome = self._confirmation_failure(delivery_error_value)
+            elif _failure_status(failure_delivery) in {
+                PersistenceStatus.PERSISTED.value,
+                PersistenceStatus.DUPLICATE.value,
+            }:
+                outcome = MessageOutcome(
+                    message=coordinator._fallback_message(state_value),
+                    conversation_id=request.conversation_id,
+                    write_status="success" if state_value.succeeded else "failed",
+                    operation_id=state_value.identity.operation_id,
+                    persisted=True,
+                )
+            else:
+                outcome = self._provider_confirmation_failure(exc)
+            self._close_ledger_journal(recorder, journal_started, outcome, state.control)
+            if not isinstance(outcome, RuntimeFailureOutcome):
+                release_origin_events()
+            emit_runtime_event(
+                event_sink,
+                ErrorEvent(outcome.code, outcome.message, outcome.retryable, outcome.degraded)
+                if isinstance(outcome, RuntimeFailureOutcome)
+                else AssistantMessageEvent(message=outcome.message),
+            )
+            return outcome
+        except BaseException:
+            coordinator.cancel_cleanup(session)
+            self._abandon(recorder, journal_started)
+            raise
+        finally:
+            coordinator.stop_heartbeat(session)
 
     @staticmethod
     def _mark_completed_if_active(control: RuntimeInvocationControl) -> None:
@@ -4387,6 +5540,8 @@ class PilotRuntime:
         conversation_id: int,
         pending: PendingAction,
         transport: RuntimeTransportContext,
+        *,
+        execution_path: str = "deterministic_confirmation",
     ) -> tuple[object, bool]:
         factory = self._dependencies.journal
         if factory is None:
@@ -4407,7 +5562,7 @@ class PilotRuntime:
                 facts={
                     "request_kind": "confirmation",
                     "transport_mode": transport.mode,
-                    "execution_path": "deterministic_confirmation",
+                    "execution_path": execution_path,
                     "transport_run_id": (
                         str(transport.transport_run_id)
                         if transport.transport_run_id is not None

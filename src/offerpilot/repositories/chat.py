@@ -11,7 +11,7 @@ from sqlalchemy import delete, or_, select, text, update
 from sqlalchemy.orm import Session, sessionmaker
 from uuid import uuid4
 
-from offerpilot.ai.agent import PendingAction
+from offerpilot.ai.agent_contracts import PendingAction
 from offerpilot.ai.write_operations import (
     DeliveryOwnership,
     LEGACY_WRITE_OPERATION_NAMES,

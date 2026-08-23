@@ -4,6 +4,7 @@ from typing import Any, cast
 
 import pytest
 
+from offerpilot.ai.agent_contracts import AgentLoopControlError, ChatRunCancelled
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import (
@@ -19,6 +20,7 @@ from offerpilot.ai.tool_runtime.contracts import (
 )
 from offerpilot.ai.tool_runtime.pipeline import Rejected, execute_prepared, prepare_call
 from offerpilot.ai.types import ToolCall
+from offerpilot.pilot_runtime.errors import RuntimeCancelled, RuntimeTransportAborted
 
 
 class Recorder:
@@ -55,6 +57,7 @@ def _spec(
     *,
     kind: str = "read",
     decoder: Any | None = None,
+    binding_resolvers: tuple[Any, ...] | None = None,
     executor: Any | None = None,
     preflight: Any | None = None,
     mutable_validator: Any | None = None,
@@ -85,6 +88,7 @@ def _spec(
         ),
         declared_failure_categories=frozenset(mapping.category for mapping in exception_map),
         decoder=decoder or (lambda values: dict(values)),
+        binding_resolvers=binding_resolvers or (),
         exception_map=exception_map,
         executor=executor or (lambda args, context: args),
         kind=cast(Any, kind),
@@ -323,6 +327,140 @@ def test_executor_exception_is_called_once_and_mapped_by_spec() -> None:
     assert calls == 1
     assert [event.event_type for event in recorder.events][-2:] == ["tool.started", "tool.failed"]
     assert "private database detail" not in repr(record)
+
+
+@pytest.mark.parametrize(
+    ("stage", "control_factory"),
+    (
+        ("decoder", lambda: ChatRunCancelled("decoder control")),
+        ("decoder", lambda: RuntimeCancelled()),
+        ("decoder", lambda: RuntimeTransportAborted()),
+        ("binding", lambda: ChatRunCancelled("binding control")),
+        ("binding", lambda: RuntimeCancelled()),
+        ("binding", lambda: RuntimeTransportAborted()),
+        ("preflight", lambda: ChatRunCancelled("preflight control")),
+        ("preflight", lambda: RuntimeCancelled()),
+        ("preflight", lambda: RuntimeTransportAborted()),
+    ),
+    ids=lambda value: value if isinstance(value, str) else type(value()).__name__.lower(),
+)
+def test_prepare_stage_control_error_propagates_without_rejected_mapping(
+    stage: str,
+    control_factory: Any,
+) -> None:
+    control = control_factory()
+
+    def raise_control(*_args: Any) -> Any:
+        raise control
+
+    spec = _spec(
+        decoder=raise_control if stage == "decoder" else None,
+        binding_resolvers=(raise_control,) if stage == "binding" else None,
+        preflight=raise_control if stage == "preflight" else None,
+    )
+
+    with pytest.raises(AgentLoopControlError) as raised:
+        prepare_call(
+            _catalog(spec),
+            _context(Recorder()),
+            ToolCall(id="read-1", name=spec.name, args='{"id":1}'),
+        )
+    assert raised.value is control
+
+
+@pytest.mark.parametrize(
+    "control_factory",
+    (
+        lambda: ChatRunCancelled("mutable control"),
+        lambda: RuntimeCancelled(),
+        lambda: RuntimeTransportAborted(),
+    ),
+    ids=("chat_run_cancelled", "runtime_cancelled", "runtime_transport_aborted"),
+)
+def test_mutable_validator_control_error_propagates_without_tool_failure(
+    control_factory: Any,
+) -> None:
+    control = control_factory()
+
+    def raise_control(*_args: Any) -> Any:
+        raise control
+
+    spec = _spec(mutable_validator=raise_control)
+    prepared = prepare_call(
+        _catalog(spec),
+        _context(Recorder()),
+        ToolCall(id="read-1", name=spec.name, args='{"id":1}'),
+    )
+    assert isinstance(prepared, ReadyToExecute)
+
+    with pytest.raises(AgentLoopControlError) as raised:
+        execute_prepared(prepared.prepared, _context(Recorder()))
+    assert raised.value is control
+
+
+@pytest.mark.parametrize(
+    "control_factory",
+    (
+        lambda: ChatRunCancelled("cancelled"),
+        lambda: RuntimeCancelled(),
+        lambda: RuntimeTransportAborted(),
+    ),
+    ids=("chat_run_cancelled", "runtime_cancelled", "runtime_transport_aborted"),
+)
+def test_confirmation_claimer_control_error_propagates_without_tool_failure(
+    control_factory: Any,
+) -> None:
+    spec = _spec(kind="write")
+    prepared = prepare_call(
+        _catalog(spec),
+        _context(Recorder()),
+        ToolCall(id="write-1", name=spec.name, args='{"id":1}'),
+        pending_action_revision=4,
+        pending_identity="trusted-pending",
+    )
+    assert isinstance(prepared, ConfirmationRequired)
+    control = control_factory()
+
+    def claim(_prepared: Any) -> ExecutionAuthorization:
+        raise control
+
+    with pytest.raises(AgentLoopControlError) as raised:
+        execute_prepared(
+            prepared.prepared,
+            _context(Recorder()),
+            confirmation_claimer=claim,
+        )
+    assert raised.value is control
+
+
+@pytest.mark.parametrize(
+    "control_factory",
+    (
+        lambda: ChatRunCancelled("cancelled"),
+        lambda: RuntimeCancelled(),
+        lambda: RuntimeTransportAborted(),
+    ),
+    ids=("chat_run_cancelled", "runtime_cancelled", "runtime_transport_aborted"),
+)
+def test_executor_control_error_propagates_without_tool_failure(
+    control_factory: Any,
+) -> None:
+    control = control_factory()
+
+    def executor(_args: dict[str, Any], _context: ToolExecutionContext) -> dict[str, Any]:
+        raise control
+
+    spec = _spec(executor=executor)
+    prepared = prepare_call(
+        _catalog(spec),
+        _context(Recorder()),
+        ToolCall(id="read-1", name=spec.name, args='{"id":1}'),
+    )
+    assert isinstance(prepared, ReadyToExecute)
+
+    with pytest.raises(AgentLoopControlError) as raised:
+        execute_prepared(prepared.prepared, _context(Recorder()))
+    assert raised.value is control
 
 
 @pytest.mark.parametrize("base_error", (KeyboardInterrupt(), SystemExit(), BaseException("stop")))

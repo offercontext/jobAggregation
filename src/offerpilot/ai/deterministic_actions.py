@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Literal
 from uuid import uuid4
 
-from offerpilot.ai.agent import PendingAction
+from offerpilot.ai.agent_contracts import PendingAction
 
 
 MAX_JD_UTF8_BYTES = 60_000

@@ -5,6 +5,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, TypeAlias, cast
 
+from offerpilot.ai.control import AgentLoopControlError
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.context import (
     ToolExecutionContext,
@@ -93,6 +94,8 @@ def prepare_call(
         typed_args = spec.decoder(cast(Mapping[str, JSONValue], copied))
     except ArgumentValidationError as exc:
         return Rejected(_validation_failure(exc.code))
+    except AgentLoopControlError:
+        raise
     except Exception:
         return Rejected(ToolFailure("internal_error", "argument_decode_failed"))
 
@@ -104,6 +107,8 @@ def prepare_call(
     _stage(stage_sink, "binding")
     try:
         binding = audit_bindings(spec, typed_args, context)
+    except AgentLoopControlError:
+        raise
     except Exception:
         return Rejected(ToolFailure("internal_error", "binding_resolution_failed"))
 
@@ -111,6 +116,8 @@ def prepare_call(
     if spec.preflight is not None:
         try:
             preflight_failure = spec.preflight(typed_args, context)
+        except AgentLoopControlError:
+            raise
         except Exception as exc:
             return Rejected(_map_exception(spec, exc))
         if preflight_failure is not None:
@@ -150,6 +157,8 @@ def execute_prepared(
     if spec.mutable_validator is not None:
         try:
             mutable_failure = spec.mutable_validator(prepared.typed_args, context)
+        except AgentLoopControlError:
+            raise
         except Exception as exc:
             return _failed_record(prepared, _map_exception(spec, exc))
         if mutable_failure is not None:
@@ -164,6 +173,8 @@ def execute_prepared(
             )
         try:
             authorization = confirmation_claimer(prepared)
+        except AgentLoopControlError:
+            raise
         except Exception:
             return _failed_record(prepared, ToolFailure("conflict", "confirmation_claim_failed"))
         if isinstance(authorization, ToolFailure):
@@ -198,6 +209,8 @@ def execute_prepared(
     _stage(stage_sink, "executor")
     try:
         result = spec.executor(prepared.typed_args, context)
+    except AgentLoopControlError:
+        raise
     except Exception as exc:
         record = ToolExecutionRecord(
             execution_started=True,

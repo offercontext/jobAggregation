@@ -20,7 +20,7 @@ from sqlalchemy.exc import OperationalError
 import offerpilot.agent_runtime.journal as journal_module
 import offerpilot.chat_transport as transport_module
 from offerpilot.ai.types import Assistant, Message, ToolCall
-from offerpilot.ai.agent import PendingAction, StalePendingActionError
+from offerpilot.ai.agent_contracts import PendingAction, StalePendingActionError
 from offerpilot.ai.tool_runtime.contracts import (
     BindingAudit,
     PreparedToolCall,
@@ -6179,7 +6179,8 @@ def test_chat_confirm_prehandler_validation_preserves_pending_and_undo(
     monkeypatch,
     endpoint,
 ):
-    import offerpilot.ai.agent as agent_module
+    import offerpilot.ai.agent_loop as agent_loop_module
+    from offerpilot.ai.tool_runtime.pipeline import Rejected
 
     model = ScriptedModel(
         [
@@ -6201,9 +6202,15 @@ def test_chat_confirm_prehandler_validation_preserves_pending_and_undo(
         pending["conversation_id"], previous_undo
     )
     monkeypatch.setattr(
-        agent_module,
-        "_parse_json_object",
-        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("pre-handler invalid")),
+        agent_loop_module,
+        "prepare_call",
+        lambda *args, **kwargs: Rejected(
+            ToolFailure(
+                "validation_error",
+                "invalid_arguments",
+                "pre-handler invalid",
+            )
+        ),
     )
 
     response = client.post(
@@ -6394,7 +6401,7 @@ def test_chat_confirm_stream_rejection_is_normal_followup_and_preserves_previous
 
 @pytest.mark.parametrize("endpoint", ["/api/chat/confirm", "/api/chat/confirm/stream"])
 def test_chat_confirm_stale_resume_preserves_pending(tmp_path, monkeypatch, endpoint):
-    import offerpilot.api as api_module
+    import offerpilot.pilot_runtime.continuation as continuation_module
 
     model = ScriptedModel(
         [
@@ -6414,7 +6421,11 @@ def test_chat_confirm_stale_resume_preserves_pending(tmp_path, monkeypatch, endp
     def stale(*args, **kwargs):
         raise StalePendingActionError("internal checkpoint detail")
 
-    monkeypatch.setattr(api_module, "resume_after_confirm", stale)
+    monkeypatch.setattr(
+        continuation_module.ConfirmationApprovedWritePort,
+        "claim",
+        stale,
+    )
     response = client.post(
         endpoint,
         json={"conversation_id": pending["conversation_id"], "approved": True, "confirmation_token": pending["pending_action"]["confirmation_token"]},
@@ -7107,6 +7118,7 @@ def test_chat_confirm_rejection_timeout_returns_recorded_fallback(tmp_path, monk
 @pytest.mark.parametrize("endpoint", ["/api/chat/confirm", "/api/chat/confirm/stream"])
 def test_chat_confirm_timeout_before_result_sink_keeps_pending(tmp_path, monkeypatch, endpoint):
     import offerpilot.api as api_module
+    import offerpilot.pilot_runtime.composition as composition_module
 
     model = ScriptedModel(
         [
@@ -7124,18 +7136,13 @@ def test_chat_confirm_timeout_before_result_sink_keeps_pending(tmp_path, monkeyp
     _, client, _, pending = _create_status_confirmation(tmp_path, model)
     monkeypatch.setattr(api_module, "CHAT_AGENT_TIMEOUT_SECONDS", 0.01)
 
-    def late_result(*args, **kwargs):
-        time.sleep(0.2)
-        kwargs["confirmation_result_sink"](
-            args[3],
-            True,
-            Message(
-                role="tool", content='{"id":1,"status":"offer"}', tool_call_id="late-result-sink"
-            ),
-        )
-        return [], "late", None
+    original_execute = composition_module._AgentDriver.execute
 
-    monkeypatch.setattr(api_module, "resume_after_confirm", late_result)
+    def late_execute(driver, invocation):
+        time.sleep(0.2)
+        return original_execute(driver, invocation)
+
+    monkeypatch.setattr(composition_module._AgentDriver, "execute", late_execute)
     response = client.post(
         endpoint,
         json={"conversation_id": pending["conversation_id"], "approved": True, "confirmation_token": pending["pending_action"]["confirmation_token"]},
@@ -7157,7 +7164,7 @@ def test_chat_confirm_fallback_timeout_before_handler_keeps_retry_claim(
     monkeypatch,
     endpoint,
 ):
-    import offerpilot.ai.agent as agent_module
+    import offerpilot.ai.agent_loop as agent_module
     import offerpilot.api as api_module
 
     model = ScriptedModel(
@@ -7418,7 +7425,7 @@ def test_chat_confirm_keeps_application_context_for_model(tmp_path):
     assert "启明智能" in model.calls[1][1].content
 
 
-def test_chat_confirm_resumes_pending_write_from_langgraph_checkpoint(tmp_path):
+def test_chat_confirm_resumes_pending_write_through_agent_loop(tmp_path):
     app_client = TestClient(create_app(data_dir=tmp_path))
     application = app_client.post(
         "/api/applications",

@@ -57,7 +57,8 @@ STALE_JOURNAL_NAMES = frozenset(
 # Journal's active-work budget implementation.  Keep this list explicit so a
 # new runtime module cannot silently become part of the contract by filename.
 ARCHITECTURE_BOUNDARY_FILES = (
-    ROOT / "src/offerpilot/ai/agent.py",  # Graph + pending action state
+    ROOT / "src/offerpilot/ai/agent_contracts.py",  # Agent Loop contracts
+    ROOT / "src/offerpilot/ai/agent_loop.py",  # Agent Loop execution
     ROOT / "src/offerpilot/ai/deterministic_actions.py",  # Pending action parser
     ROOT / "src/offerpilot/ai/write_operations.py",  # write-operation ledger
     ROOT / "src/offerpilot/ai/tool_runtime/contracts.py",  # tool/API contracts

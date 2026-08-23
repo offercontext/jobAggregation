@@ -12,7 +12,7 @@ from sqlalchemy import select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
-from offerpilot.ai.agent import ChatModel
+from offerpilot.ai.agent_contracts import ChatModel
 from offerpilot.ai.interview_preparation_proposals import (
     InterviewPreparationModelError,
     generate_interview_preparation_proposal,

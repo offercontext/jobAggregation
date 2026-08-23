@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import inspect
+from dataclasses import replace
 from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar, Token
 from datetime import datetime, timezone
@@ -20,8 +21,23 @@ from typing import Any, cast
 
 from sqlalchemy import event as sqlalchemy_event, select
 
-from offerpilot.ai.agent import ChatModel, PendingAction
+from offerpilot.ai.agent_contracts import (
+    AgentAssistantDelta,
+    AgentLoopEvent,
+    AgentToolCall,
+    AgentToolResult,
+    AgentTurnResult,
+    ChatModel,
+    ChatRunCancelled,
+    PendingAction,
+)
+from offerpilot.ai.agent_loop import (
+    AgentLoopInvocation,
+    AgentLoopRunner,
+    NewTurnSeed,
+)
 from offerpilot.ai.client import ConfiguredAIClient
+from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 from offerpilot.ai.tool_specs.legacy import build_legacy_deterministic_catalog
 from offerpilot.ai.write_operations import WriteOperationCoordinator, WriteOperationRepository
@@ -34,14 +50,26 @@ from offerpilot.pilot_runtime.continuation import (
     ConfirmationDependencies,
 )
 from offerpilot.pilot_runtime.contracts import (
+    AssistantDeltaEvent,
     ConfirmationRequest,
+    JsonValue,
+    RuntimeEvent,
+    RuntimeEventSink,
     StartTurnRequest,
+    ToolCallEvent,
+    ToolResultEvent,
+    freeze_json_mapping,
 )
 from offerpilot.pilot_runtime.deterministic import (
     DeterministicDependencies,
     DeterministicPilotAdapter,
 )
-from offerpilot.pilot_runtime.errors import ModelUnconfiguredError
+from offerpilot.pilot_runtime.errors import (
+    ModelUnconfiguredError,
+    RuntimeAgentTimedOut,
+    RuntimeCancelled,
+    RuntimeTransportAborted,
+)
 from offerpilot.pilot_runtime.persistence import (
     ChatPersistenceCoordinator,
     DeliveryOutcome,
@@ -49,7 +77,6 @@ from offerpilot.pilot_runtime.persistence import (
     PersistenceStatus,
 )
 from offerpilot.pilot_runtime.service import (
-    AgentInvocation,
     ContextAssembler,
     PilotRuntime,
     ResolvedModel,
@@ -197,22 +224,15 @@ class _ModelResolver:
         else:
             model = self._injected
             config = load_config(self._data_dir)
-        conversation_id_value = _attribute(conversation, "id")
-
         def provider_error(error: Exception, current_config: Config = config) -> str:
             return _provider_error_message(error, current_config)
 
         return ResolvedModel(
-            model=model,
+            model=cast(ChatModel, model),
             catalog=self._catalog,
             config=config,
             tool_context=self._tool_context(conversation, NullRunRecorder()),
             auto_approve=config.chat_auto_approve_writes is True,
-            thread_id=(
-                f"conversation:{conversation_id_value}"
-                if type(conversation_id_value) is int
-                else None
-            ),
             provider_error_message=provider_error,
         )
 
@@ -367,77 +387,104 @@ class _ProposalJournalGate:
         return getattr(self._delegate, name)
 
 
+class _AgentEventAdapter:
+    __slots__ = ("_sink",)
+
+    def __init__(self, sink: RuntimeEventSink) -> None:
+        self._sink = sink
+
+    def emit(self, event: AgentLoopEvent) -> None:
+        projected: RuntimeEvent
+        if isinstance(event, AgentAssistantDelta):
+            projected = AssistantDeltaEvent(delta=event.delta)
+        elif isinstance(event, AgentToolCall):
+            projected = ToolCallEvent(
+                tool_call_id=event.tool_call_id,
+                tool_name=event.tool_name,
+                public_label=event.public_label,
+                kind=event.kind,
+                confirm_mode=event.confirm_mode,
+                summary=event.summary,
+                args_summary=freeze_json_mapping(cast(Mapping[str, object], event.args_summary)),
+            )
+        elif isinstance(event, AgentToolResult):
+            payload = event.payload
+            status = str(payload.get("status") or "error")
+            if status not in {"success", "error", "cancelled"}:
+                status = "error"
+            write_status = payload.get("write_status")
+            if write_status not in {None, "none", "success", "failed", "cancelled"}:
+                write_status = None
+            projected = ToolResultEvent(
+                tool_call_id=event.tool_call_id,
+                tool_name=str(payload.get("tool_name") or "unknown"),
+                status=cast(Any, status),
+                summary=str(payload.get("summary") or ""),
+                evidence=_agent_payload_tuple(payload.get("evidence")),
+                affected_resources=_agent_payload_tuple(payload.get("affected_resources")),
+                changed_entities=_agent_payload_tuple(payload.get("changed_entities")),
+                message=str(payload.get("message") or ""),
+                visible_result=str(payload.get("visible_result") or ""),
+                operation_id=event.operation_id or None,
+                write_status=cast(Any, write_status),
+            )
+        else:
+            raise TypeError("unknown Agent Loop event")
+        try:
+            self._sink.emit(projected)
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception as exc:
+            raise RuntimeTransportAborted() from exc
+        except BaseException:
+            raise
+
+
+def _agent_payload_tuple(value: object) -> tuple[Mapping[str, JsonValue], ...]:
+    if not isinstance(value, (tuple, list)):
+        return ()
+    projected: list[Mapping[str, JsonValue]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        try:
+            projected.append(freeze_json_mapping(cast(Mapping[str, object], item)))
+        except (TypeError, ValueError):
+            continue
+    return tuple(projected)
+
+
 class _AgentDriver:
-    __slots__ = ("_run", "_resume", "_tool_context")
+    __slots__ = ("_runner",)
 
-    def __init__(
-        self,
-        tool_context: Callable[[object, object], object],
-        *,
-        run: Callable[..., object],
-        resume: Callable[..., object],
-    ) -> None:
-        if not callable(run) or not callable(resume):
-            raise TypeError("Agent driver dependencies must be callable")
-        self._run = run
-        self._resume = resume
-        self._tool_context = tool_context
+    def __init__(self) -> None:
+        self._runner = AgentLoopRunner()
 
-    def run_turn(self, invocation: AgentInvocation) -> object:
-        recorder = _ProposalJournalGate(invocation.run_recorder)
-        object.__setattr__(invocation, "run_recorder", recorder)
-        context = self._tool_context(invocation.conversation, recorder)
-        return self._run(
-            invocation.model,
-            invocation.catalog,
-            list(invocation.messages),
-            auto_approve=invocation.auto_approve,
-            max_iter=invocation.max_iter,
-            thread_id=invocation.thread_id,
-            run_recorder=recorder,
-            runtime_signal_sink=invocation.signal_sink,
-            tool_context=context,
-            event_sink=invocation.event_sink,
-            cancel_check=invocation.cancel_check,
+    def execute(self, invocation: AgentLoopInvocation) -> AgentTurnResult:
+        recorder = (
+            _ProposalJournalGate(invocation.run_recorder)
+            if isinstance(invocation.seed, NewTurnSeed)
+            else invocation.run_recorder
         )
-
-    def resume_after_confirm(
-        self,
-        messages: Sequence[object],
-        pending: object,
-        approved: bool,
-        auto_approve: bool,
-        max_iter: int,
-        rejection_feedback: str = "",
-        **kwargs: object,
-    ) -> object:
-        values = dict(kwargs)
-        values.update(
-            {
-                "messages": messages,
-                "pending": pending,
-                "approved": approved,
-                "auto_approve": auto_approve,
-                "max_iter": max_iter,
-                "rejection_feedback": rejection_feedback,
-            }
-        )
-        return _invoke(
-            self._resume,
-            {
-                **values,
-                "max_iterations": max_iter,
-                "tool_catalog": values.get("catalog"),
-            },
-            (
-                messages,
-                pending,
-                approved,
-                auto_approve,
-                max_iter,
-                rejection_feedback,
-            ),
-        )
+        context = invocation.tool_context
+        if not isinstance(context, ToolExecutionContext):
+            raise TypeError("Agent Loop requires ToolExecutionContext")
+        bound_context = replace(context, run_recorder=cast(Any, recorder))
+        runtime_sink = cast(RuntimeEventSink | None, invocation.event_sink)
+        agent_sink = _AgentEventAdapter(runtime_sink) if runtime_sink is not None else None
+        try:
+            return self._runner.run(
+                replace(
+                    invocation,
+                    tool_context=bound_context,
+                    run_recorder=cast(Any, recorder),
+                    event_sink=agent_sink,
+                )
+            )
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except ChatRunCancelled as exc:
+            raise RuntimeCancelled() from exc
 
 
 class _AtomicTimeoutDelivery:
@@ -686,8 +733,6 @@ def build_pilot_runtime(
     ],
     page_context_messages: Callable[[Mapping[str, object] | None], Sequence[object]],
     model_tool_context: Callable[[object, object], object],
-    run_turn_fn: Callable[..., object],
-    resume_after_confirm_fn: Callable[..., object],
     missing_target_question: Callable[..., str | None] | None = None,
     pending_action_details: Callable[[PendingAction], Mapping[str, object]] | None = None,
     undo_seed_for_pending: Callable[[PendingAction, object], Mapping[str, object]] | None = None,
@@ -712,11 +757,7 @@ def build_pilot_runtime(
         clarification_message=clarification_message,
         page_messages=page_context_messages,
     )
-    driver = _AgentDriver(
-        model_tool_context,
-        run=run_turn_fn,
-        resume=resume_after_confirm_fn,
-    )
+    driver = _AgentDriver()
     resolver = _ModelResolver(chat_model, data_dir, catalog, model_tool_context)
     deterministic = DeterministicPilotAdapter(
         DeterministicDependencies(

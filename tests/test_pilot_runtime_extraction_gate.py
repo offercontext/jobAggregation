@@ -1646,7 +1646,8 @@ def test_boundary_modules_do_not_serialize_runtime_private_types() -> None:
     boundary_paths = (
         SRC / "models.py",
         SRC / "schemas.py",
-        SRC / "ai" / "agent.py",
+        SRC / "ai" / "agent_contracts.py",
+        SRC / "ai" / "agent_loop.py",
         SRC / "ai" / "tool_runtime" / "rendering.py",
         SRC / "ai" / "tool_runtime" / "transport.py",
         SRC / "repositories" / "chat.py",
@@ -1935,7 +1936,7 @@ def test_canary_private_values_do_not_enter_journal_trace_sse_or_error_log_paylo
         TerminalDisposition,
     )
     from offerpilot.agent_runtime.keyring import JournalKeyDomain
-    from offerpilot.ai.agent import PendingAction
+    from offerpilot.ai.agent_contracts import PendingAction
     from offerpilot.ai.write_operations import LedgerKeyDomain, WriteOperationRepository
     from offerpilot.chat_transport import (
         SyncAgentExecutionHost,
@@ -2212,26 +2213,20 @@ def test_canary_private_values_do_not_enter_journal_trace_sse_or_error_log_paylo
             conversation_id = int(conversation.id)
             seed.commit()
 
-        # Exercise the real Graph/ORM/Pending/Ledger boundaries.  The opaque
+        # Exercise the real Loop/ORM/Pending/Ledger boundaries.  The opaque
         # prepared handle is allowed to exist in Runtime state, but each
         # domain surface either rejects it or receives only its public string
         # projection.
-        from offerpilot.ai.agent import _GraphState, _message_from_dict
+        from offerpilot.ai.agent_contracts import AgentAssistantDelta
         from offerpilot.ai.write_operations import WriteOperationError
 
         for _internal_name, internal_value in private_state.internal.items():
             with pytest.raises(TypeError):
                 json.dumps({"internal": internal_value})
 
-        graph_state: _GraphState = {
-            "messages": [{"role": "assistant", "content": prepared}],
-        }
+        loop_event = AgentAssistantDelta(delta="public delta")
         with pytest.raises(TypeError):
-            json.dumps(graph_state)
-        graph_message = _message_from_dict(
-            {"role": "assistant", "content": prepared}
-        )
-        assert sentinel not in graph_message.content
+            json.dumps({"event": loop_event})
 
         chat_repository = ChatRepository(session_factory)
         with pytest.raises((SQLAlchemyError, TypeError, ValueError)):
@@ -2240,14 +2235,13 @@ def test_canary_private_values_do_not_enter_journal_trace_sse_or_error_log_paylo
                 "assistant",
                 content=prepared,  # type: ignore[arg-type]
             )
-        private_pending = PendingAction(
-            tool_call_id="call-private-boundary",
-            tool_name="get_offer",
-            args=prepared,  # type: ignore[arg-type]
-            human="public pending",
-        )
-        with pytest.raises((SQLAlchemyError, TypeError, ValueError)):
-            chat_repository.set_pending_action(conversation_id, private_pending)
+        with pytest.raises(TypeError):
+            PendingAction(
+                tool_call_id="call-private-boundary",
+                tool_name="get_offer",
+                args=prepared,  # type: ignore[arg-type]
+                human="public pending",
+            )
         assert chat_repository.get_pending_action(conversation_id) is None
 
         with session_factory() as ledger_session:

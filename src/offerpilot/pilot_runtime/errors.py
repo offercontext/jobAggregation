@@ -11,6 +11,8 @@ from enum import Enum
 from typing import TYPE_CHECKING, NoReturn
 from typing import final
 
+from offerpilot.ai.agent_contracts import AgentLoopControlError
+
 
 if TYPE_CHECKING:
     class StrEnum(str, Enum):
@@ -25,7 +27,7 @@ else:
 
 
 @final
-class RuntimeCancelled(Exception):
+class RuntimeCancelled(AgentLoopControlError):
     """The invocation was cancelled by the user or client lifecycle."""
 
     def __init__(self, _reason: object | None = None) -> None:
@@ -42,7 +44,7 @@ class RuntimeCancelled(Exception):
 
 
 @final
-class RuntimeTransportAborted(Exception):
+class RuntimeTransportAborted(AgentLoopControlError):
     """The transport can no longer receive a runtime result."""
 
     def __init__(self, _reason: object | None = None) -> None:
@@ -59,7 +61,7 @@ class RuntimeTransportAborted(Exception):
 
 
 @final
-class RuntimeAgentTimedOut(Exception):
+class RuntimeAgentTimedOut(AgentLoopControlError):
     """The Agent execution deadline elapsed before the invocation completed."""
 
     def __init__(self, _reason: object | None = None) -> None:

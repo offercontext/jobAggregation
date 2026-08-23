@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 
 from offerpilot.agent_runtime.journal import NullRunRecorder
-from offerpilot.ai.agent import PendingAction
+from offerpilot.ai.agent_contracts import PendingAction
 from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import (
     BindingAudit,

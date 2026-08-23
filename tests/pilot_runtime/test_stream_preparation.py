@@ -11,7 +11,7 @@ from uuid import uuid4
 import pytest
 
 from offerpilot.chat_transport import PreparedStreamGuard, SseAgentExecutionHost
-from offerpilot.ai.agent import PendingAction
+from offerpilot.ai.agent_contracts import AgentTurnResult, PendingAction
 from offerpilot.agent_runtime.journal import NullRunRecorder, RunRecorderFactory
 from offerpilot.agent_runtime.keyring import JournalKeyDomain
 from offerpilot.db import init_database
@@ -47,7 +47,6 @@ from offerpilot.pilot_runtime.service import (
     RuntimeDependencies,
     _PreparedExecutionCell,
     _PreparedStreamState,
-    _legacy_runtime_event,
     _freeze_stream_value,
     _materialize_stream_value,
 )
@@ -194,14 +193,14 @@ class Driver:
         self.error: BaseException | None = None
         self.result: object | None = None
 
-    def run_turn(self, model: object, messages: object, **kwargs: object) -> object:
-        del model, messages, kwargs
+    def execute(self, invocation: object) -> object:
+        del invocation
         self.calls += 1
         if self.error is not None:
             raise self.error
         if self.result is not None:
             return self.result
-        return SimpleNamespace(added=[], reply="hello", pending=None)
+        return AgentTurnResult([], "hello", None)
 
 
 class Host:
@@ -1254,29 +1253,6 @@ def test_materialize_stream_value_rejects_unknown_detached_values() -> None:
         _materialize_stream_value(object())
 
 
-def test_legacy_tool_result_maps_structured_payloads_immutably() -> None:
-    event = _legacy_runtime_event(
-        {
-            "event": "tool_result",
-            "data": {
-                "tool_call_id": "call-1",
-                "tool_name": "list_applications",
-                "status": "success",
-                "summary": "listed",
-                "evidence": [{"id": "e-1", "kind": "application"}],
-                "affected_resources": [{"id": "a-1", "kind": "application"}],
-                "changed_entities": [{"id": "c-1", "kind": "application"}],
-            },
-        }
-    )
-    assert event is not None
-    assert event.evidence == ({"id": "e-1", "kind": "application"},)
-    assert event.affected_resources == ({"id": "a-1", "kind": "application"},)
-    assert event.changed_entities == ({"id": "c-1", "kind": "application"},)
-    with pytest.raises(TypeError):
-        event.evidence[0]["id"] = "mutated"  # type: ignore[index]
-
-
 def test_stream_pending_emits_waiting_status_before_confirmation() -> None:
     class Catalog:
         def resolve(self, name: str) -> object:
@@ -1293,10 +1269,10 @@ def test_stream_pending_emits_waiting_status_before_confirmation() -> None:
         phases,
         catalog=Catalog(),
     )
-    driver.result = SimpleNamespace(
-        added=[],
-        reply="",
-        pending=PendingAction(
+    driver.result = AgentTurnResult(
+        [],
+        "",
+        PendingAction(
             "call-1",
             "update_application_status",
             "{}",

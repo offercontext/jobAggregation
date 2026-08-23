@@ -11,8 +11,7 @@ There are two important boundaries in this file:
   replayed without looking at Pending, the model, the projector, or a tool.
 * ``ConfirmationSession`` is the only object that can claim a live Pending,
   record a tool result, and submit a fenced delivery bundle.  Its callbacks are
-  intentionally narrow so ``resume_after_confirm`` remains behind the Agent
-  Driver boundary.
+  intentionally narrow so the Agent Driver remains the only execution entry.
 """
 
 from __future__ import annotations
@@ -28,7 +27,8 @@ from threading import RLock
 from typing import Any, Protocol, cast
 from uuid import UUID
 
-from offerpilot.ai.agent import PendingAction, prepare_pending_action
+from offerpilot.ai.agent_contracts import PendingAction, _ASDICT_GUARD
+from offerpilot.ai.confirmation import prepare_pending_action
 from offerpilot.ai.tool_runtime.contracts import (
     ExecutionAuthorization,
     JSONValue,
@@ -36,6 +36,7 @@ from offerpilot.ai.tool_runtime.contracts import (
     ToolExecutionRecord,
     ToolFailure,
     ToolSuccess,
+    TransientToolRuntimeValue,
 )
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.ai.write_operations import (
@@ -435,7 +436,7 @@ class DeliveryBundle:
 
 @dataclass(slots=True, repr=False)
 class ConfirmationSession:
-    """Callbacks passed to the unchanged Agent ``resume_after_confirm`` path."""
+    """Ledger-backed state and callbacks for an approved continuation."""
 
     state: ConfirmationState
     on_confirmation_attempt: ConfirmationAttempt
@@ -451,6 +452,50 @@ class ConfirmationSession:
     @property
     def request_fingerprint(self) -> str:
         return self.state.identity.request_fingerprint
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ConfirmationApprovedWritePort(TransientToolRuntimeValue):
+    """Expose one session through the Agent Loop's narrow approved port."""
+
+    session: ConfirmationSession
+    _serialization_guard: object = field(
+        default=_ASDICT_GUARD,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+
+    def __repr__(self) -> str:
+        return "<ConfirmationApprovedWritePort transient>"
+
+    @property
+    def pending(self) -> PendingAction:
+        return self.session.pending
+
+    def claim(
+        self,
+        pending: PendingAction,
+        prepared: PreparedToolCall[Any, Any],
+    ) -> ExecutionAuthorization | ToolFailure:
+        claimed = self.session.on_confirmation_attempt(pending, prepared)
+        if not isinstance(claimed, (ExecutionAuthorization, ToolFailure)):
+            raise WriteOperationError("confirmation_claim_lost")
+        return claimed
+
+    def record_result(
+        self,
+        pending: PendingAction,
+        tool_message: Message,
+        record: ToolExecutionRecord[Any, Any],
+    ) -> None:
+        self.session.on_confirmation_result(pending, True, tool_message, record)
+
+    def load_continuation_messages(self) -> tuple[Message, ...]:
+        return tuple(self.session.continuation_message_loader())
+
+    def delivery_fence(self) -> bool:
+        return self.session.delivery_fence()
 
 
 class ConfirmationReplayError(RuntimeError):
@@ -896,7 +941,7 @@ class ConfirmationCoordinator:
         fingerprint = self._fingerprint(live, request, token, operation)
         edited = request.edited_args
         effective = live
-        # The Agent's unchanged ``resume_after_confirm`` path is the single
+        # The Agent Loop's approved continuation is the single
         # schema/decode/capability/binding/preflight boundary.  Running
         # ``prepare_call`` here as well would duplicate provider-side
         # preparation and, more importantly, would let a direct confirmation

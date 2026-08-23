@@ -32,8 +32,11 @@ from offerpilot.pilot_runtime.service import (
     RuntimeDependencies,
     _result_persisted,
 )
-from offerpilot.ai.agent import PendingAction
+from offerpilot.pilot_runtime.service import _normalize_agent_result
+from offerpilot.ai.agent_contracts import AgentTurnResult, PendingAction
+from offerpilot.ai.agent_loop import NewTurnSeed
 from offerpilot.ai.tool_runtime.contracts import ToolFailure
+from offerpilot.ai.types import Message, ToolCall
 from offerpilot.api import _confirmation_token as baseline_confirmation_token
 from offerpilot.pilot_runtime.service import _confirmation_token
 from offerpilot.agent_runtime.journal import SuspendedDisposition, TerminalDisposition
@@ -271,12 +274,14 @@ class _Assembler:
 class _Driver:
     def __init__(self, phases: _Phases, result: object | None = None, error: BaseException | None = None) -> None:
         self.phases = phases
-        self.result = result or SimpleNamespace(added=[], reply="hello", pending=None)
+        self.result = result or AgentTurnResult([], "hello", None)
         self.error = error
         self.provider_calls = 0
+        self.invocations: list[object] = []
 
-    def run_turn(self, model: object, messages: object, **kwargs: object) -> object:
-        del model, messages, kwargs
+    def execute(self, invocation: object) -> object:
+        self.invocations.append(invocation)
+        assert isinstance(getattr(invocation, "seed", None), NewTurnSeed)
         self.provider_calls += 1
         if self.error is not None:
             raise self.error
@@ -294,6 +299,20 @@ class _Host:
             raise self.error
         assert callable(thunk)
         return thunk()
+
+
+def test_agent_driver_result_boundary_rejects_structural_namespace() -> None:
+    class NamespaceDriver:
+        def execute(self, invocation: object) -> object:
+            del invocation
+            return SimpleNamespace(added=[], reply="done", pending=None)
+
+    runtime = PilotRuntime.__new__(PilotRuntime)
+    with pytest.raises(TypeError, match="Agent.*AgentTurnResult"):
+        runtime._run_driver(NamespaceDriver(), object())
+
+    with pytest.raises(TypeError, match="sealed turn result"):
+        _normalize_agent_result({"added": [], "reply": "done", "pending": None})
 
 
 def _runtime(
@@ -360,11 +379,13 @@ def _start(
 
 def test_start_turn_sync_sequence_is_frozen() -> None:
     phases = _Phases()
-    runtime, persistence, _journal = _runtime(phases)
+    driver = _Driver(phases)
+    runtime, persistence, _journal = _runtime(phases, driver=driver)
     result = _start(runtime, _Host(phases))
 
     assert isinstance(result, MessageOutcome)
     assert result.message == "hello"
+    assert len(driver.invocations) == 1
     assert phases.items == [
         "validate",
         "conversation",
@@ -449,7 +470,7 @@ def test_pending_outcome_uses_confirmation_token_from_persisted_pending() -> Non
     runtime, _, _journal = _runtime(
         phases,
         persistence=persistence,
-        driver=_Driver(phases, result=SimpleNamespace(added=[], reply="", pending=pending)),
+        driver=_Driver(phases, result=AgentTurnResult([], "", pending)),
     )
 
     result = _start(runtime, _Host(phases), control=control)
@@ -937,12 +958,12 @@ def test_forced_clarification_requires_exact_pending_readback() -> None:
             )
 
     persistence = MismatchClarification(phases)
-    result_value = SimpleNamespace(
+    result_value = AgentTurnResult(
         added=[
-            SimpleNamespace(
+            Message(
                 role="assistant",
                 content="",
-                tool_calls=[SimpleNamespace(id="call-1", name="write", args="{}")],
+                tool_calls=[ToolCall("call-1", "write", "{}")],
             )
         ],
         reply="",
@@ -1058,20 +1079,32 @@ def test_provider_failure_is_safe_and_finishes_provider_error() -> None:
     assert journal.recorder.dispositions == [("failed", "provider_error")]
 
 
+def test_same_named_ordinary_exception_is_not_runtime_cancellation() -> None:
+    class ChatRunCancelled(Exception):
+        pass
+
+    phases = _Phases()
+    runtime, persistence, journal = _runtime(
+        phases,
+        driver=_Driver(phases, error=ChatRunCancelled("ordinary provider failure")),
+    )
+
+    result = _start(runtime, _Host(phases))
+
+    assert isinstance(result, RuntimeFailureOutcome)
+    assert result.code is RuntimeFailureCode.AI_PROVIDER_ERROR
+    assert persistence.message_count == 0
+    assert journal.recorder.dispositions == [("failed", "provider_error")]
+
+
 def test_pending_result_is_atomically_persisted_and_suspended() -> None:
     phases = _Phases()
-    pending = SimpleNamespace(
-        tool_call_id="call-1",
-        tool_name="write",
-        args='{"id": 1}',
-        human="write",
-        operation_id="op-1",
-    )
+    pending = PendingAction("call-1", "write", '{"id": 1}', "write", "op-1")
     persistence = _Persistence(phases)
     runtime, _, journal = _runtime(
         phases,
         persistence=persistence,
-        driver=_Driver(phases, result=SimpleNamespace(added=[], reply="", pending=pending)),
+        driver=_Driver(phases, result=AgentTurnResult([], "", pending)),
     )
 
     result = _start(runtime, _Host(phases))
@@ -1085,13 +1118,13 @@ def test_pending_result_is_atomically_persisted_and_suspended() -> None:
 @pytest.mark.parametrize(
     "pending",
     [
-        SimpleNamespace(tool_call_id="", tool_name="write", args="{}", human="write", operation_id="op-1"),
-        SimpleNamespace(tool_call_id="call-1", tool_name="", args="{}", human="write", operation_id="op-1"),
-        SimpleNamespace(tool_call_id="call-1", tool_name="write", args="{}", human="write", operation_id=""),
-        SimpleNamespace(tool_call_id="call-1", tool_name="unknown", args="{}", human="write", operation_id="op-1"),
-        SimpleNamespace(tool_call_id="call-1", tool_name="read_tool", args="{}", human="read", operation_id="op-1"),
-        SimpleNamespace(tool_call_id="call-1", tool_name="write", args="[]", human="write", operation_id="op-1"),
-        SimpleNamespace(tool_call_id="call-1", tool_name="write", args='{"x": NaN}', human="write", operation_id="op-1"),
+        PendingAction("", "write", "{}", "write", "op-1"),
+        PendingAction("call-1", "", "{}", "write", "op-1"),
+        PendingAction("call-1", "write", "{}", "write", ""),
+        PendingAction("call-1", "unknown", "{}", "write", "op-1"),
+        PendingAction("call-1", "read_tool", "{}", "read", "op-1"),
+        PendingAction("call-1", "write", "[]", "write", "op-1"),
+        PendingAction("call-1", "write", '{"x": NaN}', "write", "op-1"),
     ],
 )
 def test_invalid_pending_is_rejected_before_any_pending_persistence(pending: object) -> None:
@@ -1100,7 +1133,7 @@ def test_invalid_pending_is_rejected_before_any_pending_persistence(pending: obj
     runtime, _, journal = _runtime(
         phases,
         persistence=persistence,
-        driver=_Driver(phases, result=SimpleNamespace(added=[], reply="", pending=pending)),
+        driver=_Driver(phases, result=AgentTurnResult([], "", pending)),
     )
 
     result = _start(runtime, _Host(phases))
@@ -1121,7 +1154,7 @@ def test_pending_uses_resolved_catalog_not_global_dependency_catalog() -> None:
         persistence=persistence,
         catalog=_Catalog(write_names=()),
         dependency_catalog=_Catalog(write_names=("write",)),
-        driver=_Driver(phases, result=SimpleNamespace(added=[], reply="", pending=pending)),
+        driver=_Driver(phases, result=AgentTurnResult([], "", pending)),
     )
 
     result = _start(runtime, _Host(phases))
@@ -1158,7 +1191,7 @@ def test_pending_readback_identity_mismatch_is_safe_after_persistence() -> None:
     runtime, _, journal = _runtime(
         phases,
         persistence=persistence,
-        driver=_Driver(phases, result=SimpleNamespace(added=[], reply="", pending=pending)),
+        driver=_Driver(phases, result=AgentTurnResult([], "", pending)),
     )
 
     result = _start(runtime, _Host(phases))
@@ -1200,9 +1233,9 @@ def test_persistence_failure_finishes_failed_not_completed(
 
     persistence = FailingPersistence(phases)
     result_value = (
-        SimpleNamespace(added=[], reply="", pending=action)
+        AgentTurnResult([], "", action)
         if pending
-        else SimpleNamespace(added=[], reply="final", pending=None)
+        else AgentTurnResult([], "final", None)
     )
     runtime, _, journal = _runtime(
         phases,
@@ -1220,18 +1253,12 @@ def test_persistence_failure_finishes_failed_not_completed(
 
 def test_missing_target_uses_clarification_without_pending_outcome() -> None:
     phases = _Phases()
-    pending = SimpleNamespace(
-        tool_call_id="call-1",
-        tool_name="write",
-        args="{}",
-        human="write",
-        operation_id="op-1",
-    )
+    pending = PendingAction("call-1", "write", "{}", "write", "op-1")
     persistence = _Persistence(phases)
     runtime, _, journal = _runtime(
         phases,
         persistence=persistence,
-        driver=_Driver(phases, result=SimpleNamespace(added=[], reply="", pending=pending)),
+        driver=_Driver(phases, result=AgentTurnResult([], "", pending)),
         missing_target_question=lambda pending, conversation_id: "请先选择投递目标。",
     )
 
@@ -1248,13 +1275,7 @@ def test_non_atomic_clarification_set_failure_stops_before_assistant_and_complet
     failure_mode: str,
 ) -> None:
     phases = _Phases()
-    pending = SimpleNamespace(
-        tool_call_id="call-1",
-        tool_name="write",
-        args="{}",
-        human="write",
-        operation_id="op-1",
-    )
+    pending = PendingAction("call-1", "write", "{}", "write", "op-1")
 
     class FallbackPersistence(_Persistence):
         def __init__(self, phases: _Phases) -> None:
@@ -1286,7 +1307,7 @@ def test_non_atomic_clarification_set_failure_stops_before_assistant_and_complet
     runtime, _, journal = _runtime(
         phases,
         persistence=persistence,
-        driver=_Driver(phases, result=SimpleNamespace(added=[], reply="", pending=pending)),
+        driver=_Driver(phases, result=AgentTurnResult([], "", pending)),
         missing_target_question=lambda pending, conversation_id: "请先选择投递目标。",
     )
 
@@ -1317,7 +1338,7 @@ def test_final_projection_redacts_internal_tool_names_and_uses_safe_write_error(
         prepared=SimpleNamespace(spec=SimpleNamespace(kind="write")),
         outcome=SimpleNamespace(code="company_required", compatibility_detail="company_required"),
     )
-    result_value = SimpleNamespace(
+    result_value = AgentTurnResult(
         added=[],
         reply="请继续调用 update_application_status。",
         pending=None,
@@ -1468,13 +1489,11 @@ def test_event_sink_transport_failure_is_not_provider_failure() -> None:
     phases = _Phases()
 
     class EmittingDriver(_Driver):
-        def run_turn(self, model: object, messages: object, **kwargs: object) -> object:
-            del model, messages
-            sink = kwargs.get("event_sink")
-            assert callable(sink)
-            cast_sink = sink
-            cast_sink(AssistantMessageEvent(message="hi"))
-            return SimpleNamespace(added=[], reply="hello", pending=None)
+        def execute(self, invocation: object) -> object:
+            sink = getattr(invocation, "event_sink", None)
+            assert sink is not None
+            sink.emit(AssistantMessageEvent(message="hi"))
+            return AgentTurnResult([], "hello", None)
 
     class FailingSink:
         def emit(self, event: object) -> None:

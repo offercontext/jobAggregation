@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from offerpilot.ai.agent import ChatModel
+from offerpilot.ai.agent_contracts import ChatModel
 from offerpilot.ai.types import Message
 from offerpilot.repositories.jd import JDAnalysesRepository, JDAnalysisCreate
 from offerpilot.repositories.notes import NotesRepository

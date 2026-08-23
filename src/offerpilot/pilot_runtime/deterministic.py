@@ -24,7 +24,7 @@ from secrets import compare_digest
 from typing import Any, Protocol, cast
 from uuid import UUID, uuid4
 
-from offerpilot.ai.agent import PendingAction
+from offerpilot.ai.agent_contracts import PendingAction
 from offerpilot.ai.deterministic_actions import (
     PilotAction,
     PilotActionDecision,

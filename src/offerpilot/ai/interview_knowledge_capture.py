@@ -4,7 +4,7 @@ import json
 from time import perf_counter
 from typing import Any, Callable
 
-from offerpilot.ai.agent import ChatModel
+from offerpilot.ai.agent_contracts import ChatModel
 from offerpilot.ai.types import Message
 from offerpilot.ai.workflows import parse_json_reply
 from offerpilot.knowledge.interview_capture import CanonicalFragment

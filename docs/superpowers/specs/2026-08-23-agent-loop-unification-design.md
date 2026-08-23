@@ -2,7 +2,7 @@
 
 日期：2026-08-23
 
-状态：**待复审**
+状态：**已复审通过**
 
 固定 baseline：`aaecf5dfa6ce913ecaf00b25a0e88bcf46096eeb`
 
@@ -1027,5 +1027,6 @@ worktree 干净均必须通过。外部 release-orchestrator 变量缺失必须�
 - 发布报告明确这是内部破坏性 Loop 切换，不声明全局 exactly-once；
 - 独立 CR 无未关闭 P0/P1/P2。
 
-本设计批准前只允许修改设计文档和设计阶段机械资产，不得修改生产代码或编写实施计划。设计
-书面复审通过后，再使用测试先行方式单独编写详细实施计划。
+本设计已于 2026-08-23 完成书面复审，无剩余 P0/P1/P2。实施必须先使用测试先行方式编写
+详细实施计划，再按 characterization → red → green → deletion gate → release gate 的顺序切换；
+不得跳过 baseline golden、机械删除门禁、完整验证或独立 CR。

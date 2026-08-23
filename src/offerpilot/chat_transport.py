@@ -279,6 +279,7 @@ class _SseInvocationIterator(Generic[_ResultT], Iterator[RuntimeEvent]):
         "_result",
         "_result_set",
         "_shutdown_called",
+        "_on_cancel",
     )
 
     def __init__(
@@ -286,9 +287,10 @@ class _SseInvocationIterator(Generic[_ResultT], Iterator[RuntimeEvent]):
         thunk: Callable[..., _ResultT],
         control: RuntimeInvocationControl,
         *,
-        timeout_seconds: float,
+        timeout_seconds: float | None,
         poll_seconds: float,
         executor_factory: Callable[..., ThreadPoolExecutor],
+        on_cancel: Callable[[], object] | None = None,
     ) -> None:
         self.event_queue: Queue[RuntimeEvent | object] = Queue()
         self.poll_seconds = poll_seconds
@@ -299,6 +301,7 @@ class _SseInvocationIterator(Generic[_ResultT], Iterator[RuntimeEvent]):
         self._result: _ResultT | None = None
         self._result_set = False
         self._shutdown_called = False
+        self._on_cancel = on_cancel
         self._executor = executor_factory(max_workers=1)
         sink = _QueueRuntimeEventSink(self.event_queue, self.cancel_event, control)
         self._future: Future[_ResultT] = self._executor.submit(
@@ -307,7 +310,9 @@ class _SseInvocationIterator(Generic[_ResultT], Iterator[RuntimeEvent]):
             sink,
             self.cancel_event.is_set,
         )
-        self._deadline = perf_counter() + timeout_seconds
+        self._deadline = (
+            None if timeout_seconds is None else perf_counter() + timeout_seconds
+        )
 
         def on_done(_future: Future[_ResultT]) -> None:
             self.event_queue.put_nowait(self._sentinel)
@@ -315,7 +320,7 @@ class _SseInvocationIterator(Generic[_ResultT], Iterator[RuntimeEvent]):
         self._future.add_done_callback(on_done)
 
     def _deadline_expired(self) -> bool:
-        return perf_counter() >= self._deadline
+        return self._deadline is not None and perf_counter() >= self._deadline
 
     def _finish(self) -> None:
         try:
@@ -391,10 +396,16 @@ class _SseInvocationIterator(Generic[_ResultT], Iterator[RuntimeEvent]):
         if self._closed:
             return
         self._closed = True
-        self.cancel_event.set()
-        self._control.request_cancel(CancelReason.EXPLICIT_CANCEL)
-        self._future.cancel()
-        self._shutdown(cancel_futures=True)
+        try:
+            if self._on_cancel is not None:
+                self._on_cancel()
+        except BaseException:
+            pass
+        finally:
+            self.cancel_event.set()
+            self._control.request_cancel(CancelReason.EXPLICIT_CANCEL)
+            self._future.cancel()
+            self._shutdown(cancel_futures=True)
 
     @property
     def result(self) -> _ResultT:
@@ -450,6 +461,7 @@ class SseAgentExecutionHost(Generic[_ResultT]):
             timeout_seconds=self.timeout_seconds,
             poll_seconds=self.poll_seconds,
             executor_factory=self._executor_factory,
+            on_cancel=None,
         )
 
     def iter_events(
@@ -460,6 +472,65 @@ class SseAgentExecutionHost(Generic[_ResultT]):
         return self.run(thunk, invocation_control)
 
     stream = iter_events
+
+
+class _SseRuntimePump(Generic[_ResultT]):
+    """Forward Runtime events from one transport-owned worker without a deadline.
+
+    The injected Agent host owns the only Agent deadline.  This outer pump
+    exists solely because a synchronous Runtime call must run while the SSE
+    consumer drains its unbounded event queue; it must never classify
+    post-Agent persistence or Journal finalization as an Agent timeout.
+    """
+
+    __slots__ = (
+        "poll_seconds",
+        "_executor_factory",
+        "_on_cancel",
+        "_started",
+        "_lock",
+    )
+
+    def __init__(
+        self,
+        *,
+        on_cancel: Callable[[], object],
+        poll_seconds: float = SSE_POLL_SECONDS,
+        executor_factory: Callable[..., ThreadPoolExecutor] | None = None,
+    ) -> None:
+        if not callable(on_cancel):
+            raise TypeError("on_cancel must be callable")
+        if isinstance(poll_seconds, bool) or not isinstance(poll_seconds, (int, float)):
+            raise TypeError("poll_seconds must be a number")
+        poll = float(poll_seconds)
+        if not isfinite(poll) or poll <= 0:
+            raise ValueError("poll_seconds must be a finite positive number")
+        self.poll_seconds = poll
+        self._executor_factory = ThreadPoolExecutor if executor_factory is None else executor_factory
+        self._on_cancel = on_cancel
+        self._started = False
+        self._lock = Lock()
+
+    def run(
+        self,
+        thunk: Callable[..., _ResultT],
+        invocation_control: RuntimeInvocationControl,
+    ) -> _SseInvocationIterator[_ResultT]:
+        if not callable(thunk):
+            raise TypeError("thunk must be callable")
+        with self._lock:
+            if self._started:
+                raise RuntimeTransportAborted()
+            self._started = True
+        _require_host_active(invocation_control)
+        return _SseInvocationIterator(
+            thunk,
+            invocation_control,
+            timeout_seconds=None,
+            poll_seconds=self.poll_seconds,
+            executor_factory=self._executor_factory,
+            on_cancel=self._on_cancel,
+        )
 
 
 def _plain(value: object) -> object:
@@ -689,8 +760,8 @@ def runtime_sse_content(
         set_outcome(result)
         return
 
-    outer_host: SseAgentExecutionHost[object] = SseAgentExecutionHost(
-        timeout_seconds=agent_timeout_seconds + 1.0
+    runtime_pump: _SseRuntimePump[object] = _SseRuntimePump(
+        on_cancel=lambda: control.request_cancel(CancelReason.TRANSPORT_ABORTED)
     )
     outer_control = InMemoryRuntimeInvocationControl()
     inner_host: SyncAgentExecutionHost[object] = SyncAgentExecutionHost(
@@ -706,7 +777,7 @@ def runtime_sse_content(
             cancel_check=lambda: not outer_control.is_active(),
         )
 
-    streamed = outer_host.run(execute, cast(Any, outer_control))
+    streamed = runtime_pump.run(execute, cast(Any, outer_control))
     sequence = 0
     try:
         for event in streamed:

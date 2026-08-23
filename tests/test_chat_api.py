@@ -717,6 +717,98 @@ def test_runtime_sse_direct_does_not_construct_agent_hosts(monkeypatch):
     assert calls == []
 
 
+def test_runtime_sse_uses_one_agent_host_and_does_not_time_post_agent_work(monkeypatch):
+    prepared = PreparedStreamExecution(
+        invocation_id="single-agent-host",
+        preparation_kind=PreparationKind.MODEL,
+        execution_mode=StreamExecutionMode.AGENT_HOST,
+        opaque_state=(),
+    )
+    constructed: list[float] = []
+    original_sync_host = transport_module.SyncAgentExecutionHost
+
+    class CountingSyncHost(original_sync_host):
+        def __init__(self, timeout_seconds: float) -> None:
+            constructed.append(timeout_seconds)
+            super().__init__(timeout_seconds=timeout_seconds)
+
+    def reject_nested_sse_host(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("the Runtime transport pump must not be an Agent host")
+
+    monkeypatch.setattr(transport_module, "SyncAgentExecutionHost", CountingSyncHost)
+    monkeypatch.setattr(transport_module, "SseAgentExecutionHost", reject_nested_sse_host)
+
+    expected = MessageOutcome(message="persisted after Agent", conversation_id=1)
+
+    class Runtime:
+        def execute_prepared_stream(self, *_args: object, **kwargs: object) -> MessageOutcome:
+            host = kwargs["execution_host"]
+            agent_control = InMemoryRuntimeInvocationControl()
+            assert host.run(lambda: "agent result", agent_control) == "agent result"
+            time.sleep(0.05)
+            return expected
+
+    outcomes: list[object] = []
+    content = transport_module.runtime_sse_content(
+        Runtime(),
+        prepared,
+        InMemoryRuntimeInvocationControl(),
+        None,
+        "single-agent-host",
+        {"run_id": "single-agent-host"},
+        outcomes.append,
+        agent_timeout_seconds=0.01,
+    )
+
+    assert list(content) == []
+    assert outcomes == [expected]
+    assert constructed == [0.01]
+
+
+def test_runtime_sse_disconnect_cancels_prepared_control_before_agent_deadline():
+    prepared = PreparedStreamExecution(
+        invocation_id="disconnect-control",
+        preparation_kind=PreparationKind.MODEL,
+        execution_mode=StreamExecutionMode.AGENT_HOST,
+        opaque_state=(),
+    )
+    control = InMemoryRuntimeInvocationControl()
+    agent_started = Event()
+    release_agent = Event()
+
+    class Runtime:
+        def execute_prepared_stream(self, *_args: object, **kwargs: object) -> MessageOutcome:
+            sink = kwargs["event_sink"]
+            sink.emit(transport_module.StatusEvent(phase="model_running", label="running"))
+
+            def blocked_agent() -> str:
+                agent_started.set()
+                release_agent.wait(2)
+                return "late result"
+
+            kwargs["execution_host"].run(blocked_agent, control)
+            return MessageOutcome(message="must not persist", conversation_id=1)
+
+    content = transport_module.runtime_sse_content(
+        Runtime(),
+        prepared,
+        control,
+        None,
+        "disconnect-control",
+        {"run_id": "disconnect-control"},
+        lambda _outcome: None,
+        agent_timeout_seconds=1.0,
+    )
+    try:
+        assert "event: status" in next(content)
+        assert agent_started.wait(1)
+        content.close()
+        assert control.state is transport_module.InvocationState.CANCELLED
+        assert control.cancel_reason is transport_module.CancelReason.TRANSPORT_ABORTED
+    finally:
+        release_agent.set()
+
+
 def test_chat_sync_records_complete_journal_lifecycle(tmp_path):
     client = TestClient(
         create_app(

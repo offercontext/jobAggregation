@@ -94,6 +94,13 @@ PilotRuntime
 合成 Provider 输出，本期要求最终字符串、消息、事件和副作用与 baseline 等价；不以真实模型
 回答文本的字节一致作为验收标准。
 
+唯一明确的 failure-only 兼容例外是 Agent Event Sink：baseline 的 Agent 私有 emitter 会吞掉
+普通 Sink 异常并继续执行，新实现改为由 composition adapter 将其转换为
+`RuntimeTransportAborted` 并立即停止本次 Loop。这一变化只发生在 Transport/Event Sink 已经
+故障的请求中，不改变成功路径的 HTTP/SSE payload；它用于落实 Pilot Runtime 已批准的
+Transport ownership 契约。Sink 故障绝不能触发 Provider fallback、第二次 Provider 调用或
+额外 Tool 执行。
+
 ### 1.4 非目标
 
 本期明确不做：
@@ -126,7 +133,7 @@ bootstrap seed
     → 无 ToolCall：final
     → 选择 baseline ToolCall batch
     → dispatch batch
-       → read/unknown/pre-executor failure：生成 ToolMessage，continue
+       → read/pre-executor Tool failure：生成 ToolMessage，continue
        → write confirmation：返回 Pending，suspend
 ```
 
@@ -425,7 +432,7 @@ ToolCall、Pending/Operation proposal 和 Journal suspend。
 选择规则保持当前实现，不在本期“修正”：
 
 ```text
-全部调用均为 read 或 unknown
+全部已通过 Surface Binding 的调用均为 read
   → 按 Provider 原顺序保留全部
 
 只要任一调用解析为 write
@@ -437,24 +444,35 @@ ToolCall、Pending/Operation proposal 和 Journal suspend。
 | Provider 返回 | 本期处理 |
 |---|---|
 | read + read | 依次执行两个 |
-| unknown + read | 依次生成 unknown 失败并执行 read |
 | write + read | 只处理第一个 write |
 | read + write | 只处理第一个 read，第二个 write 被丢弃 |
 | write + write | 只处理第一个 write |
 
+该矩阵只对已经通过 `ModelCallSurfaceBinding.validate_response()` 的 ToolCall 生效。只要一个
+Provider response 含有未暴露名称，整个 response 会在进入本选择函数前 fail-closed，不能用
+“unknown 是 read-like”规则保留其余调用。
+
 选定 batch 后，assistant Message 中只保存选定 ToolCall，与 baseline 一致。sync 与 stream
 必须使用同一个纯选择函数。
 
-### 4.2 unknown 与未暴露工具
+### 4.2 未暴露工具与 Catalog 完整性
 
-Dispatcher 使用本次 `BoundProviderResponse` 对应的冻结 Surface binding：
+`ModelCallSurfaceBinding.validate_response()` 必须在增加 `model_steps`、追加 assistant Message、
+发出 ToolCall event 或进入 Dispatcher 前验证完整 response：
 
-- 未在本次 `allowed_tool_names` 中的名称视为 `unknown_tool`；
-- 即使完整 Typed Catalog 能解析该工具，也不得执行；
-- Typed Catalog 本身未知的名称同样为 `validation_error / unknown_tool`；
+- 任一 ToolCall 名称不在本次 `exposed_tool_names` 时，整个 logical response 以现有
+  `ProjectionError("unknown_tool")` fail-closed；
+- 即使完整 Typed Catalog 能解析该名称，也不得进入 Dispatcher；
+- assistant Message、ToolCall/ToolResult event、兼容 ToolMessage 均为 0；
 - capability、binding、preflight、executor 均为 0；
-- 生成现有兼容 ToolMessage 并继续处理同一 read-like batch 的后续调用；
-- 不重新运行 Tool Selector，也不回退完整 Catalog。
+- 不保留同一 response 中其他合法 ToolCall，不重新运行 Tool Selector，也不回退完整 Catalog；
+- Journal 继续按 baseline 将该 logical model call 记录为 `model.failed`，不伪造
+  `model.completed` 或 tool events。
+
+Tool Pipeline 的 `validation_error / unknown_tool` 分类继续存在，供直接 Catalog/Dispatcher
+契约和防御性测试使用；它不能被 Agent Loop 用来把 Phase 4 的 Surface provenance violation
+降级成可继续的 ToolMessage。生产 Agent Provider 必须全部经过 Frozen Surface/Gateway，不保留
+绕过 Binding 的 non-surface-aware 模型路径。
 
 ### 4.3 只读工具
 
@@ -536,17 +554,27 @@ executor 调用恰好 1 次
 ### 5.2 Provider 边界不变
 
 Agent Loop 只能调用现有 Agent Provider Gateway/Frozen Provider Chain，不能直接访问多 Provider
-client、LiteLLM、SDK 或 HTTP transport。`BoundProviderResponse` 必须与当前
-`ModelCallSurfaceBinding` 的下列字段完全一致：
+client、LiteLLM、SDK 或 HTTP transport。Surface 冻结时尚未发生真实 Provider attempt，因此
+不得预先发明一个 expected candidate ordinal 或 attempt ID。`BoundProviderResponse` 的验证
+固定为：
 
 ```text
-model_call_id
-provider candidate ordinal / attempt identity
-runtime surface fingerprint
-allowed tool names
+response.model_call_id == binding.model_call_id
+response.runtime_surface_fingerprint == binding.runtime_surface_fingerprint
+0 <= response.candidate_ordinal < binding.provider_candidate_count
+response.provider_attempt_id 为非空、由本次 AgentProviderGatewaySession 创建的 attempt identity
+response 中每个 ToolCall.name ∈ binding.exposed_tool_names
 ```
 
-不匹配时 executor 为 0，不读取 response 中的工具名称做自我授权。
+`candidate_ordinal` 与 `provider_attempt_id` 在 Gateway 实际开始每个候选 attempt 时生成；它们不与
+投影前不存在的“预期值”比较。Gateway Session 必须是生产代码中
+`BoundProviderResponse` 的唯一构造者：Runner 和 Provider transport 只能接收 Gateway 创建的
+attempt handle，不能自行填写 ordinal/attempt ID。`provider_attempt_id` 只存在于当前调用栈，
+不得进入 Surface、Journal、Trace、日志或持久化消息。AST 门禁必须证明生产构造点封闭；测试
+注入也必须通过单候选 Gateway Session，而不是直接伪造 Bound response。
+
+上述任一 provenance 或 Tool Surface 校验失败时，整个 logical response fail-closed，executor
+为 0，不读取 response 中的工具名称做自我授权。
 
 流式候选一旦已经产生首个对外可观察 delta，后续 Provider failure 不得 fallback 到下一候选；
 只有现有 Gateway 允许的 pre-output failure 才能按冻结顺序 fallback。Sink abort、request
@@ -587,6 +615,40 @@ assistant_delta / tool_call / tool_result ...
 
 确认 origin `AgentToolResult` 投影后仍先进入 `_ConfirmationEventSink` 的延迟队列，只有权威
 delivery transaction 成功后才向外释放。Loop 不因内部统一提前交付 terminal 结果。
+
+Event Sink 的兼容例外按执行阶段固定：
+
+```text
+首个 delta emit 失败
+  → RuntimeTransportAborted
+  → Provider fallback 0，Tool 0，后续 Runtime event 0
+
+已经成功 emit 一个或多个 delta 后失败
+  → RuntimeTransportAborted
+  → 不向下一候选 fallback，不补 error/completed
+
+AgentToolCall emit 失败
+  → Dispatcher 尚未开始
+  → prepare/capability/binding/executor 0
+
+AgentToolResult emit 失败
+  → 已经发生的 executor/terminal 不回滚、不重跑
+  → 后续 ToolCall 与 Provider loop 0
+  → write terminal 只允许既有 Ledger replay/delivery recovery 收敛
+```
+
+composition adapter 的异常阶梯固定为：
+
+```text
+RuntimeCancelled / RuntimeTransportAborted / RuntimeAgentTimedOut
+  → 原样传播
+普通 Exception
+  → RuntimeTransportAborted
+KeyboardInterrupt / SystemExit / 其他 BaseException
+  → 原样传播
+```
+
+Agent Loop 在任一 Sink failure 后不得尝试向同一 Sink 发送 `error` 或 `completed`。
 
 标题资格仍由第一个完整有效模型响应触发一次；RuntimeSignalSink 的容量 1、非阻塞、
 fail-open 协议不变。
@@ -789,9 +851,9 @@ Extraction 已有 golden。至少覆盖：
 - final answer，无 ToolCall；
 - read + read；
 - read failure + read，后一个仍执行；
-- unknown + read；
+- unexposed + read：整个 response 在 Binding 处 fail-closed，其余 read 不执行；
 - write + read、read + write、write + write；
-- 未暴露但完整 Catalog 可解析的 tool；
+- 未暴露但完整 Catalog 可解析的 tool，仍在 Binding 处 fail-closed；
 - write 参数 validation failure 后继续 Provider；
 - write proposal → Pending，executor 0；
 - `auto_approve=True` 仍产生 Pending；
@@ -843,11 +905,15 @@ Golden 只保存 canonical 合成投影，不保存 SQLite、真实用户内容�
 - max iteration 在下一次 Provider 前失败；
 - 所有多 ToolCall 矩阵；
 - read batch 前项失败后继续；
-- unknown/unexposed 工具 executor 0；
+- unexposed tool response 在 Dispatcher 前失败，assistant/ToolMessage/event/executor 均为 0；
+- direct Tool Pipeline unknown-tool 契约保持 `validation_error / unknown_tool`，但 Agent Loop
+  不把它用作 Surface violation 的兼容恢复；
 - write Pending 不产生 ToolMessage/tool.started；
 - chained Pending 返回完整 added messages；
 - BaseException 不被 ToolFailure/Provider failure 吞掉；
-- event sink/renderer/projector failure 不重跑 Provider/executor。
+- Event Sink 在首个 delta、后续 delta、ToolCall 与 ToolResult 四个阶段失败的精确收敛；
+- Event Sink failure 不 fallback、不发送后续 event、不重跑 Provider/executor；
+- renderer/projector failure 不重跑 Provider/executor。
 
 ### 10.2 Runtime 与并发测试
 
@@ -866,6 +932,9 @@ Golden 只保存 canonical 合成投影，不保存 SQLite、真实用户内容�
 - 已进入 write transaction 的迟到结果仍服从 Ledger fencing；
 - Journal fail-open 不改变数据库、Outcome 或调用次数；
 - sync/SSE exact event golden；
+- 首个 delta Sink failure 与可见 delta 后 Sink failure 均不切换 Provider candidate；
+- ToolCall Sink failure 时 Tool prepare/executor 为 0；ToolResult Sink failure 时已发生的 executor
+  恰好 1 次，后续 Provider/Tool 为 0；
 - 标题信号所有退出路径仍恰好 finalizer 一次。
 
 ### 10.3 AST / Source gates
@@ -883,6 +952,10 @@ Golden 只保存 canonical 合成投影，不保存 SQLite、真实用户内容�
 - model dispatcher 不引用 Legacy deterministic adapter；
 - Agent Loop 不导入 FastAPI、Starlette、Repository、PilotRuntime 或 SSE renderer；
 - Agent Event Sink 不再接受任意 dict，legacy event mapping bridge 已删除；
+- `BoundProviderResponse` 的生产构造点只存在于 `AgentProviderGatewaySession`；Runner、
+  SingleCandidate transport 和 test injection seam 均不能直接构造；
+- provenance validator 只要求 model-call/surface fingerprint 相等、candidate ordinal 在冻结范围、
+  Gateway attempt ID 非空且属于当前 Session，不比较投影前不存在的 ordinal/attempt 值；
 - Provider SDK/network boundary manifest 不扩大；
 - 25/3 工具 manifest、Provider Tool golden 与 Schema fingerprint 不变；
 - `startswith("错误：")` 等兼容字符串解析 allowlist 不扩大；

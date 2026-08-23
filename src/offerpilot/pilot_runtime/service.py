@@ -4,7 +4,7 @@ The service owns the causal order around the existing Agent driver, including
 the response-header preparation boundary.  The transport owns the
 ``AgentExecutionHost`` (and therefore the worker and deadline).  All external
 objects are injected through small structural seams so this module does not
-need to know about FastAPI, ORM rows, or LangGraph state.
+need to know about FastAPI, ORM rows, or Agent Loop internals.
 """
 
 from __future__ import annotations
@@ -22,7 +22,17 @@ from typing import Any, Protocol, TypeAlias, cast
 from threading import Lock
 from uuid import uuid4
 
-from offerpilot.ai.agent import PendingAction, PendingActionValidationError, StalePendingActionError
+from offerpilot.ai.agent_contracts import (
+    AgentLoopControlError,
+    AgentDriver,
+    AgentTurnResult,
+    ChatModel,
+    ChatRunCancelled,
+    PendingAction,
+    PendingActionValidationError,
+    StalePendingActionError,
+)
+from offerpilot.ai.agent_loop import AgentLoopInvocation, ApprovedWriteSeed, NewTurnSeed
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import ToolFailure, ToolSuccess
 from offerpilot.ai.tool_runtime.legacy import LEGACY_DETERMINISTIC_NAMES
@@ -47,7 +57,6 @@ from offerpilot.repositories.agent_runs import StartRunCommand, StartSegmentComm
 
 from .contracts import (
     AgentExecutionHost,
-    AssistantDeltaEvent,
     AssistantMessageEvent,
     ConfirmationRequiredOutcome,
     ConfirmationRequest,
@@ -92,6 +101,7 @@ from .errors import (
 from .deterministic import DeterministicExecution, DeterministicPilotAdapter
 from .event_sink import emit_runtime_event, require_runtime_active
 from .continuation import (
+    ConfirmationApprovedWritePort,
     ConfirmationCoordinator,
     ConfirmationReplayError,
     ConfirmationSession,
@@ -144,12 +154,6 @@ class ContextAssembler(Protocol):
         conversation: object,
         request: StartTurnRequest,
     ) -> object: ...
-
-
-class AgentDriver(Protocol):
-    def run_turn(self, *args: object, **kwargs: object) -> object: ...
-
-    def resume_after_confirm(self, *args: object, **kwargs: object) -> object: ...
 
 
 class ToolCatalog(Protocol):
@@ -249,36 +253,15 @@ class ResolvedModel:
     internals.
     """
 
-    model: object
+    model: ChatModel | None
     catalog: object | None = None
     config: object | None = None
     tool_context: object | None = None
     auto_approve: bool = False
     max_iter: int = DEFAULT_MAX_ITERATIONS
-    thread_id: str | None = None
     provider_error_message: Callable[[Exception], str] | None = field(
         default=None, repr=False, compare=False
     )
-
-
-@dataclass(frozen=True, slots=True)
-class AgentInvocation:
-    """The only context the Runtime exposes to an injected Agent driver."""
-
-    model: object
-    catalog: object | None
-    messages: tuple[object, ...]
-    config: object | None
-    conversation: object
-    request: StartTurnRequest
-    tool_context: object | None
-    auto_approve: bool
-    max_iter: int
-    thread_id: str
-    run_recorder: object
-    event_sink: RuntimeEventSink
-    signal_sink: RuntimeSignalSink[str] | None
-    cancel_check: Callable[[], bool]
 
 
 @dataclass(frozen=True, slots=True)
@@ -488,9 +471,6 @@ class _NoopEventSink:
     def emit(self, _event: RuntimeEvent) -> None:
         return None
 
-    def __call__(self, _event: object) -> None:
-        return None
-
 
 class _SafeEventSink:
     __slots__ = ("_sink",)
@@ -500,14 +480,6 @@ class _SafeEventSink:
 
     def emit(self, event: RuntimeEvent) -> None:
         emit_runtime_event(self._sink, event)
-
-    def __call__(self, event: object) -> None:
-        if isinstance(event, Mapping):
-            typed = _legacy_runtime_event(event)
-            if typed is not None:
-                self.emit(typed)
-            return None
-        self.emit(cast(RuntimeEvent, event))
 
 
 class _SafeSignalSink:
@@ -525,103 +497,8 @@ class _SafeSignalSink:
             return SignalEmitResult.DEGRADED
 
 
-def _legacy_runtime_event(value: Mapping[object, object]) -> RuntimeEvent | None:
-    """Project the existing Agent callback dictionaries into typed events."""
-
-    name = value.get("event")
-    data = value.get("data")
-    if not isinstance(name, str) or not isinstance(data, Mapping):
-        return None
-    if name == "assistant_delta":
-        return AssistantDeltaEvent(delta=str(data.get("delta") or ""))
-    if name == "assistant_message":
-        return AssistantMessageEvent(message=str(data.get("message") or ""))
-    if name == "status":
-        return StatusEvent(
-            phase=str(data.get("phase") or "model_running"),
-            label=str(data.get("label") or ""),
-        )
-    if name == "tool_call":
-        try:
-            args_summary = freeze_json_mapping(
-                cast(Mapping[str, object], data.get("args_summary") or {})
-            )
-        except (TypeError, ValueError):
-            args_summary = freeze_json_mapping({})
-        kind = str(data.get("kind") or "read")
-        if kind not in {"read", "write"}:
-            kind = "read"
-        confirm_mode = str(data.get("confirm_mode") or "none")
-        if confirm_mode not in {"none", "hitl", "approved", "rejected"}:
-            confirm_mode = "none"
-        return ToolCallEvent(
-            tool_call_id=str(data.get("tool_call_id") or "unknown"),
-            tool_name=str(data.get("tool_name") or "unknown"),
-            public_label=str(data.get("public_label") or ""),
-            kind=cast(Any, kind),
-            confirm_mode=cast(Any, confirm_mode),
-            summary=str(data.get("summary") or ""),
-            args_summary=args_summary,
-        )
-    if name == "tool_result":
-        status = str(data.get("status") or "error")
-        if status not in {"success", "error", "cancelled"}:
-            status = "error"
-        write_status = data.get("write_status")
-        if write_status not in {None, "none", "success", "failed", "cancelled"}:
-            write_status = None
-        return ToolResultEvent(
-            tool_call_id=str(data.get("tool_call_id") or "unknown"),
-            tool_name=str(data.get("tool_name") or "unknown"),
-            status=cast(Any, status),
-            summary=str(data.get("summary") or ""),
-            evidence=_legacy_payload_tuple(data.get("evidence")),
-            affected_resources=_legacy_payload_tuple(data.get("affected_resources")),
-            changed_entities=_legacy_payload_tuple(data.get("changed_entities")),
-            message=str(data.get("message") or ""),
-            visible_result=str(data.get("visible_result") or ""),
-            operation_id=(
-                str(data["operation_id"])
-                if data.get("operation_id") not in (None, "")
-                else None
-            ),
-            write_status=cast(Any, write_status),
-        )
-    if name == "confirmation_required":
-        token = str(data.get("confirmation_token") or data.get("token") or "")
-        if not token:
-            return None
-        return ConfirmationRequiredEvent(
-            confirmation_token=token,
-            operation_id=(
-                str(data["operation_id"])
-                if data.get("operation_id") not in (None, "")
-                else None
-            ),
-        )
-    if name == "error":
-        try:
-            code = RuntimeFailureCode(str(data.get("code") or "operation_failed"))
-        except ValueError:
-            code = RuntimeFailureCode.OPERATION_FAILED
-        return ErrorEvent(
-            code=code,
-            message=str(data.get("message") or ""),
-            retryable=data.get("retryable") is True,
-            degraded=data.get("degraded") is True,
-        )
-    return None
-
-
 class _ConfirmationEventSink:
-    """Bridge Agent legacy callbacks to typed confirmation events.
-
-    The Agent still calls its sink with ``{"event": ..., "data": ...}``
-    dictionaries.  SSE hosts, however, inject a typed queue sink into the
-    thunk.  Keeping this bridge between the two boundaries both preserves the
-    legacy Agent contract and keeps the origin tool result fenced until the
-    Ledger delivery atom succeeds.
-    """
+    """Fence the approved origin ToolResult until delivery succeeds."""
 
     __slots__ = ("_sink", "_origin_tool_call_id", "_deferred")
 
@@ -644,31 +521,6 @@ class _ConfirmationEventSink:
                 self._deferred.append(event)
             return
         emit_runtime_event(self._sink, event)
-
-    def __call__(self, event: object) -> None:
-        if not isinstance(event, Mapping):
-            raise TypeError("Agent event sink requires a legacy event mapping")
-        typed = _legacy_runtime_event(event)
-        if typed is None:
-            raise TypeError("unsupported Agent event")
-        self.emit(typed)
-
-
-def _legacy_payload_tuple(value: object) -> tuple[ImmutablePayload, ...]:
-    """Snapshot legacy tool-result payload arrays into immutable mappings."""
-
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
-        return ()
-    items: list[ImmutablePayload] = []
-    for item in value:
-        if not isinstance(item, Mapping):
-            continue
-        try:
-            items.append(freeze_json_mapping(cast(Mapping[str, object], item)))
-        except (TypeError, ValueError):
-            continue
-    return tuple(items)
-
 
 def _callable(target: object | None, names: tuple[str, ...]) -> Callable[..., object] | None:
     if target is None:
@@ -1295,41 +1147,22 @@ def _looks_like_followup_question(reply: str) -> bool:
 
 
 def _normalize_agent_result(value: object) -> NormalizedAgentTurn:
-    if isinstance(value, NormalizedAgentTurn):
-        return value
-    if isinstance(value, Mapping):
-        # Only the sealed AgentTurn-like fields are accepted.  In particular,
-        # a LangGraph state mapping (``messages``, ``__interrupt__`` etc.) is
-        # never interpreted here.
-        allowed = {"added", "reply", "pending", "records", "failures"}
-        if set(value) - allowed or "added" not in value or "reply" not in value:
-            raise TypeError("Agent result is not a sealed turn result")
-        added_value = value["added"]
-        if not isinstance(added_value, Sequence) or isinstance(added_value, (str, bytes)):
-            raise TypeError("Agent result added must be a sequence")
-        return NormalizedAgentTurn(
-            tuple(added_value),
-            str(value["reply"] or ""),
-            _pending(value.get("pending")),
-            tuple(cast(Sequence[object], value.get("records") or ())),
-            tuple(cast(Sequence[object], value.get("failures") or ())),
-        )
-    added_value = _attribute(value, "added")
-    reply_value = _attribute(value, "reply")
-    if not isinstance(added_value, Sequence) or isinstance(added_value, (str, bytes)) or not isinstance(reply_value, str):
+    if not isinstance(value, AgentTurnResult):
+        # A mapping, namespace, or arbitrary object is never a turn result.
+        # The Agent Driver boundary is intentionally nominal and fail-closed.
         raise TypeError("Agent result is not a sealed turn result")
     return NormalizedAgentTurn(
-        tuple(added_value),
-        reply_value,
-        _pending(_attribute(value, "pending")),
-        tuple(cast(Sequence[object], _attribute(value, "records", ()) or ())),
-        tuple(cast(Sequence[object], _attribute(value, "failures", ()) or ())),
+        tuple(value.added),
+        value.reply,
+        value.pending,
+        tuple(value.records),
+        tuple(value.failures),
     )
 
 
 def _resolved_model(value: object) -> ResolvedModel | None:
     if isinstance(value, ResolvedModel):
-        if value.model is None or value.model is False:
+        if value.model is None:
             return None
         return value
     if value is None or isinstance(value, RuntimeFailureOutcome):
@@ -1376,15 +1209,13 @@ def _resolved_model_parts(model: object, config: object | None, *, source: objec
     tool_context = _attribute(origin, "tool_context")
     auto_approve = _attribute(config, "chat_auto_approve_writes", _attribute(config, "auto_approve", False))
     max_iter = _attribute(config, "max_iter", _attribute(config, "max_iterations", DEFAULT_MAX_ITERATIONS))
-    thread_id = _attribute(config, "thread_id")
     return ResolvedModel(
-        model=model,
+        model=cast(ChatModel, model),
         catalog=catalog,
         config=config,
         tool_context=tool_context,
         auto_approve=auto_approve is True,
         max_iter=max_iter if type(max_iter) is int and max_iter > 0 else DEFAULT_MAX_ITERATIONS,
-        thread_id=thread_id if isinstance(thread_id, str) else None,
         provider_error_message=(
             cast(Callable[[Exception], str], _attribute(origin, "provider_error_message"))
             if callable(_attribute(origin, "provider_error_message"))
@@ -1422,10 +1253,6 @@ def _write_status(result: NormalizedAgentTurn) -> WriteStatus:
     if not attempted:
         return "none"
     return "failed" if failed or result.failures else "success"
-
-
-def _is_agent_cancelled(exc: BaseException) -> bool:
-    return type(exc).__name__ == "ChatRunCancelled"
 
 
 class PilotRuntime:
@@ -1816,7 +1643,7 @@ class PilotRuntime:
             abandon_once()
             raise
 
-        driver = self._require_dependency("agent_driver")
+        driver = cast(AgentDriver, self._require_dependency("agent_driver"))
         safe_event_sink: RuntimeEventSink = _SafeEventSink(event_sink) if event_sink is not None else _NoopEventSink()
         safe_signal_sink: RuntimeSignalSink[str] | None = _SafeSignalSink(signal_sink) if signal_sink is not None else None
         def checked_cancel() -> bool:
@@ -1892,10 +1719,12 @@ class PilotRuntime:
         except (RuntimeCancelled, RuntimeTransportAborted):
             abandon_once()
             raise
-        except Exception as exc:
-            if _is_agent_cancelled(exc):
-                abandon_once()
+        except AgentLoopControlError as exc:
+            abandon_once()
+            if isinstance(exc, ChatRunCancelled):
                 raise RuntimeCancelled() from exc
+            raise
+        except Exception as exc:
             finish_or_raise("failed", "provider_error")
             return self._provider_failure(resolved, exc, conversation_id=conversation_id)
         except BaseException:
@@ -2692,8 +2521,8 @@ class PilotRuntime:
 
         Terminal replay and rejection are deliberately completed before any
         Conversation/model dependency is touched.  Only an approved live
-        Pending enters the Agent Driver's unchanged ``resume_after_confirm``
-        method; all result persistence remains a coordinator atom.
+        Pending enters the Agent Driver's typed ``execute`` entry; all result
+        persistence remains a coordinator atom.
         """
 
         self._phase("validate")
@@ -2836,8 +2665,7 @@ class PilotRuntime:
             return self._confirmation_failure(exc)
 
         driver = self._dependencies.agent_driver
-        resume = _callable(driver, ("resume_after_confirm",))
-        if resume is None:
+        if driver is None:
             coordinator.cancel_cleanup(session)
             self._mark_completed_if_active(control)
             return self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400)
@@ -2869,10 +2697,6 @@ class PilotRuntime:
             coordinator.cancel_cleanup(session)
             self._abandon(recorder, journal_started)
             raise
-        # The Agent owns the sole post-terminal source reload.  Passing an
-        # empty initial list is intentional; eagerly materializing here would
-        # race delivery ownership and cause a second provider-context load.
-        messages: list[Message] = []
         deferred_origin_events: list[RuntimeEvent] = []
         origin_tool_call_id = session.pending.tool_call_id
 
@@ -2881,69 +2705,32 @@ class PilotRuntime:
             if event_sink is not None
             else None
         )
-        model = resolved_model.model if resolved_model is not None else None
-        auto_approve = resolved_model.auto_approve if resolved_model is not None else False
-        max_iter = resolved_model.max_iter if resolved_model is not None else DEFAULT_MAX_ITERATIONS
-        thread_id = (
-            resolved_model.thread_id
-            if resolved_model is not None and resolved_model.thread_id is not None
-            else f"conversation:{request.conversation_id}"
+        invocation = AgentLoopInvocation(
+            seed=ApprovedWriteSeed(ConfirmationApprovedWritePort(session)),
+            model=resolved_model.model if resolved_model is not None else None,
+            catalog=cast(Any, catalog),
+            tool_context=cast(Any, tool_context),
+            auto_approve=(
+                resolved_model.auto_approve if resolved_model is not None else False
+            ),
+            max_iterations=(
+                resolved_model.max_iter
+                if resolved_model is not None
+                else DEFAULT_MAX_ITERATIONS
+            ),
+            run_recorder=cast(Any, recorder),
+            event_sink=cast(Any, confirmation_event_sink),
+            runtime_signal_sink=signal_sink,
+            cancel_check=self._confirmation_cancel_check(control, cancel_check),
         )
-        resume_values: dict[str, object] = {
-            "messages": messages,
-            "pending": session.pending,
-            "approved": True,
-            "auto_approve": auto_approve,
-            "max_iter": max_iter,
-            "max_iterations": max_iter,
-            "rejection_feedback": request.rejection_feedback,
-            "model": model,
-            "catalog": catalog,
-            "tool_catalog": catalog,
-            "tool_context": tool_context,
-            "run_recorder": recorder,
-            "conversation": conversation,
-            "request": request,
-            "event_sink": confirmation_event_sink,
-            "signal_sink": signal_sink,
-            "runtime_signal_sink": signal_sink,
-            "cancel_check": self._confirmation_cancel_check(control, cancel_check),
-            "confirmation_attempt_sink": session.on_confirmation_attempt,
-            "on_confirmation_attempt": session.on_confirmation_attempt,
-            "confirmation_result_sink": session.on_confirmation_result,
-            "on_confirmation_result": session.on_confirmation_result,
-            "delivery_fence": session.delivery_fence,
-            "continuation_message_loader": session.continuation_message_loader,
-            "thread_id": thread_id,
-        }
-        optional = {
-            key: value
-            for key, value in resume_values.items()
-            if key
-            not in {"messages", "pending", "approved", "auto_approve", "max_iter", "max_iterations", "rejection_feedback"}
-        }
         try:
             self._check_cancel(cancel_check, control)
-
-            def invoke_resume() -> object:
-                return _invoke(
-                    resume,
-                    resume_values,
-                    (
-                        messages,
-                        session.pending,
-                        True,
-                        auto_approve,
-                        max_iter,
-                        request.rejection_feedback,
-                    ),
-                    var_keyword_values=optional,
-                )
-
             raw_result = (
-                execution_host.run(invoke_resume, control)
+                execution_host.run(
+                    lambda: self._run_driver(driver, invocation), control
+                )
                 if execution_host is not None
-                else invoke_resume()
+                else self._run_driver(driver, invocation)
             )
             self._check_cancel(cancel_check, control)
             normalized = _normalize_agent_result(raw_result)
@@ -4377,10 +4164,10 @@ class PilotRuntime:
                 self._check_cancel(cancel_check, state.control)
                 return False
 
-            driver = self._require_dependency("agent_driver")
-            invocation_holder: dict[str, AgentInvocation] = {}
+            driver = cast(AgentDriver, self._require_dependency("agent_driver"))
+            invocation_holder: dict[str, AgentLoopInvocation] = {}
 
-            def build_invocation(agent_events: RuntimeEventSink) -> AgentInvocation:
+            def build_invocation(agent_events: RuntimeEventSink) -> AgentLoopInvocation:
                 invocation = self._agent_invocation(
                     resolved_model,
                     tuple(_materialize_stream_value(item) for item in state.assembled),
@@ -5153,8 +4940,7 @@ class PilotRuntime:
     ) -> RuntimeOutcome:
         session = cast(Any, state.confirmation_session)
         driver = self._dependencies.agent_driver
-        resume = _callable(driver, ("resume_after_confirm",))
-        if resume is None:
+        if driver is None:
             coordinator = cast(ConfirmationCoordinator, self._confirmation_coordinator())
             coordinator.cancel_cleanup(session)
             return self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400)
@@ -5192,24 +4978,12 @@ class PilotRuntime:
             coordinator.cancel_cleanup(session)
             self._abandon(recorder, journal_started)
             raise
-        # Source reload is deliberately deferred to the Agent's unchanged
-        # continuation callback.  ``state.assembled`` remains empty across
-        # the response-header boundary.
-        messages: list[Message] = []
         auto_approve = model_view.auto_approve if model_view is not None else False
         max_iter = model_view.max_iter if model_view is not None else DEFAULT_MAX_ITERATIONS
-        thread_id = (
-            model_view.thread_id
-            if model_view is not None and model_view.thread_id is not None
-            else f"conversation:{state.conversation_id}"
-        )
         request = cast(ConfirmationRequest, state.request)
         deferred_origin_events: list[RuntimeEvent] = []
         origin_tool_call_id = session.pending.tool_call_id
 
-        confirmation_event_sink: RuntimeEventSink = _ConfirmationEventSink(
-            event_sink, origin_tool_call_id, deferred_origin_events
-        )
         emit_runtime_event(
             event_sink,
             MetaEvent(
@@ -5224,63 +4998,32 @@ class PilotRuntime:
             event_sink,
             StatusEvent(phase="tool_running", label="正在执行确认操作"),
         )
-        resume_values: dict[str, object] = {
-            "messages": messages,
-            "pending": session.pending,
-            "approved": True,
-            "auto_approve": auto_approve,
-            "max_iter": max_iter,
-            "max_iterations": max_iter,
-            "rejection_feedback": request.rejection_feedback,
-            "model": model_view.model if model_view is not None else None,
-            "catalog": catalog,
-            "tool_catalog": catalog,
-            "tool_context": tool_context,
-            "run_recorder": recorder,
-            "conversation": state.conversation,
-            "request": request,
-            "event_sink": confirmation_event_sink,
-            "signal_sink": signal_sink,
-            "runtime_signal_sink": signal_sink,
-            "cancel_check": self._confirmation_cancel_check(state.control, cancel_check),
-            "confirmation_attempt_sink": session.on_confirmation_attempt,
-            "on_confirmation_attempt": session.on_confirmation_attempt,
-            "confirmation_result_sink": session.on_confirmation_result,
-            "on_confirmation_result": session.on_confirmation_result,
-            "delivery_fence": session.delivery_fence,
-            "continuation_message_loader": session.continuation_message_loader,
-            "thread_id": thread_id,
-        }
-        optional = {
-            key: value
-            for key, value in resume_values.items()
-            if key
-            not in {"messages", "pending", "approved", "auto_approve", "max_iter", "max_iterations", "rejection_feedback"}
-        }
-
-        def invoke_resume(agent_events: RuntimeEventSink) -> object:
-            values = dict(resume_values)
-            values["event_sink"] = _ConfirmationEventSink(
-                agent_events, origin_tool_call_id, deferred_origin_events
-            )
-            return _invoke(
-                resume,
-                values,
-                (
-                    messages,
-                    session.pending,
-                    True,
-                    auto_approve,
-                    max_iter,
-                    request.rejection_feedback,
+        def invoke_driver(agent_events: RuntimeEventSink) -> object:
+            invocation = AgentLoopInvocation(
+                seed=ApprovedWriteSeed(ConfirmationApprovedWritePort(session)),
+                model=model_view.model if model_view is not None else None,
+                catalog=cast(Any, catalog),
+                tool_context=cast(Any, tool_context),
+                auto_approve=auto_approve,
+                max_iterations=max_iter,
+                run_recorder=cast(Any, recorder),
+                event_sink=cast(
+                    Any,
+                    _ConfirmationEventSink(
+                        agent_events, origin_tool_call_id, deferred_origin_events
+                    ),
                 ),
-                var_keyword_values=optional,
+                runtime_signal_sink=signal_sink,
+                cancel_check=self._confirmation_cancel_check(
+                    state.control, cancel_check
+                ),
             )
+            return self._run_driver(driver, invocation)
 
         coordinator = cast(ConfirmationCoordinator, self._confirmation_coordinator())
         try:
             if callable(getattr(execution_host, "iter_events", None)):
-                streamed = cast(Any, execution_host).run(invoke_resume, state.control)
+                streamed = cast(Any, execution_host).run(invoke_driver, state.control)
                 if hasattr(streamed, "__next__"):
                     try:
                         for agent_event in cast(Iterable[object], streamed):
@@ -5308,7 +5051,7 @@ class PilotRuntime:
                     raw_result = streamed
             else:
                 raw_result = execution_host.run(
-                    lambda: invoke_resume(event_sink), state.control
+                    lambda: invoke_driver(event_sink), state.control
                 )
             normalized = _normalize_agent_result(raw_result)
             outcome: RuntimeOutcome = self._finish_ledger_confirmation(
@@ -6663,64 +6406,35 @@ class PilotRuntime:
         event_sink: RuntimeEventSink,
         signal_sink: RuntimeSignalSink[str] | None,
         cancel_check: Callable[[], bool],
-    ) -> AgentInvocation:
+    ) -> AgentLoopInvocation:
         if isinstance(assembled, Sequence) and not isinstance(assembled, (str, bytes)):
-            messages = tuple(assembled)
+            messages = tuple(_message(item) for item in assembled)
         else:
             raw = _attribute(assembled, "messages", _attribute(assembled, "history"))
-            messages = tuple(raw) if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)) else (assembled,)
-        return AgentInvocation(
+            messages = (
+                tuple(_message(item) for item in raw)
+                if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes))
+                else (_message(assembled),)
+            )
+        del conversation, request
+        return AgentLoopInvocation(
+            seed=NewTurnSeed(messages),
             model=resolved.model,
-            catalog=resolved.catalog,
-            messages=messages,
-            config=resolved.config,
-            conversation=conversation,
-            request=request,
-            tool_context=resolved.tool_context,
+            catalog=cast(Any, resolved.catalog),
+            tool_context=cast(Any, resolved.tool_context),
             auto_approve=resolved.auto_approve,
-            max_iter=resolved.max_iter,
-            thread_id=resolved.thread_id or f"conversation:{_conversation_id(conversation)}",
-            run_recorder=recorder,
-            event_sink=event_sink,
-            signal_sink=signal_sink,
+            max_iterations=resolved.max_iter,
+            run_recorder=cast(Any, recorder),
+            event_sink=cast(Any, event_sink),
+            runtime_signal_sink=signal_sink,
             cancel_check=cancel_check,
         )
 
-    def _run_driver(self, driver: object, invocation: AgentInvocation) -> object:
-        function = _callable(driver, ("run_turn", "run"))
-        if function is None:
-            raise TypeError("agent driver does not provide run_turn")
-        values: dict[str, object] = {
-            "invocation": invocation,
-            "agent_invocation": invocation,
-            "model": invocation.model,
-            "catalog": invocation.catalog,
-            "tool_catalog": invocation.catalog,
-            "messages": list(invocation.messages),
-            "history": list(invocation.messages),
-            "context": invocation,
-            "auto_approve": invocation.auto_approve,
-            "max_iter": invocation.max_iter,
-            "max_iterations": invocation.max_iter,
-            "thread_id": invocation.thread_id,
-            "run_recorder": invocation.run_recorder,
-            "runtime_signal_sink": invocation.signal_sink,
-            "signal_sink": invocation.signal_sink,
-            "tool_context": invocation.tool_context,
-            "event_sink": invocation.event_sink,
-            "cancel_check": invocation.cancel_check,
-        }
-        optional = {
-            "auto_approve": invocation.auto_approve,
-            "max_iter": invocation.max_iter,
-            "thread_id": invocation.thread_id,
-            "run_recorder": invocation.run_recorder,
-            "runtime_signal_sink": invocation.signal_sink,
-            "tool_context": invocation.tool_context,
-            "event_sink": invocation.event_sink,
-            "cancel_check": invocation.cancel_check,
-        }
-        return _invoke(function, values, (invocation,), var_keyword_values=optional)
+    def _run_driver(self, driver: AgentDriver, invocation: AgentLoopInvocation) -> AgentTurnResult:
+        result = driver.execute(invocation)
+        if not isinstance(result, AgentTurnResult):
+            raise TypeError("Agent Driver must return AgentTurnResult")
+        return result
 
     def _persist_timeout(
         self,
@@ -7542,7 +7256,6 @@ def _dependency_values(values: Mapping[str, object]) -> dict[str, object]:
 
 __all__ = [
     "AgentDriver",
-    "AgentInvocation",
     "ContextAssembler",
     "ConversationGateway",
     "JournalFactory",

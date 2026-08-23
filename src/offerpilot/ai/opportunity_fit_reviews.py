@@ -5,7 +5,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from offerpilot.ai.agent import ChatModel
+from offerpilot.ai.agent_contracts import ChatModel
 from offerpilot.ai.types import Message
 from offerpilot.ai.workflows import parse_json_reply
 from offerpilot.repositories.json_contract import canonical_json, sha256_text

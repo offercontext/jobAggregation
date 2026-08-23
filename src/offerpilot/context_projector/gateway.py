@@ -5,8 +5,10 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
+from threading import Lock
 from urllib.parse import urlsplit, urlunsplit
 
+from offerpilot.ai.control import AgentLoopControlError
 from offerpilot.ai.tool_runtime.contracts import ProviderToolContract
 from offerpilot.ai.types import Assistant, Message
 from offerpilot.config import AIProviderProfile
@@ -201,6 +203,27 @@ class AgentProviderGatewaySession:
     ):
         self._chain = chain
         self._transport = transport
+        self._attempts: set[str] = set()
+        self._attempt_lock = Lock()
+
+    def _begin_attempt(self) -> str:
+        attempt_id = uuid.uuid4().hex
+        with self._attempt_lock:
+            self._attempts.add(attempt_id)
+        return attempt_id
+
+    def _discard_attempt(self, attempt_id: str) -> None:
+        with self._attempt_lock:
+            self._attempts.discard(attempt_id)
+
+    def consume_attempt(self, attempt_id: str) -> bool:
+        if not attempt_id:
+            return False
+        with self._attempt_lock:
+            if attempt_id not in self._attempts:
+                return False
+            self._attempts.remove(attempt_id)
+            return True
 
     @property
     def budgets(self) -> tuple[ProviderBudget, ...]:
@@ -227,11 +250,17 @@ class AgentProviderGatewaySession:
         )
 
     def complete(
-        self, surface: FrozenModelSurface, response_format: dict[str, Any] | None = None
+        self,
+        surface: FrozenModelSurface,
+        response_format: dict[str, Any] | None = None,
+        *,
+        before_attempt: Callable[[], None] | None = None,
     ) -> BoundProviderResponse:
         last_error: Exception | None = None
         for ordinal, candidate in enumerate(self._chain.candidates):
-            attempt_id = uuid.uuid4().hex
+            if before_attempt is not None:
+                before_attempt()
+            attempt_id = self._begin_attempt()
             try:
                 response = self._transport.complete_one(candidate, surface, response_format)
                 return BoundProviderResponse(
@@ -241,17 +270,30 @@ class AgentProviderGatewaySession:
                     surface.runtime_surface_fingerprint,
                     response,
                 )
+            except AgentLoopControlError:
+                self._discard_attempt(attempt_id)
+                raise
             except Exception as exc:
+                self._discard_attempt(attempt_id)
                 last_error = exc
+            except BaseException:
+                self._discard_attempt(attempt_id)
+                raise
         assert last_error is not None
         raise last_error
 
     def stream(
-        self, surface: FrozenModelSurface, on_delta: Callable[[str], None]
+        self,
+        surface: FrozenModelSurface,
+        on_delta: Callable[[str], None],
+        *,
+        before_attempt: Callable[[], None] | None = None,
     ) -> BoundProviderResponse:
         last_error: Exception | None = None
         for ordinal, candidate in enumerate(self._chain.candidates):
-            attempt_id = uuid.uuid4().hex
+            if before_attempt is not None:
+                before_attempt()
+            attempt_id = self._begin_attempt()
             visible = False
 
             def emit(value: str) -> None:
@@ -269,9 +311,75 @@ class AgentProviderGatewaySession:
                     surface.runtime_surface_fingerprint,
                     response,
                 )
+            except AgentLoopControlError:
+                self._discard_attempt(attempt_id)
+                raise
             except Exception as exc:
+                self._discard_attempt(attempt_id)
                 if visible:
                     raise
                 last_error = exc
+            except BaseException:
+                self._discard_attempt(attempt_id)
+                raise
+        assert last_error is not None
+        raise last_error
+
+    def stream_deferred(
+        self,
+        surface: FrozenModelSurface,
+        on_delta: Callable[[str], None],
+        *,
+        before_attempt: Callable[[], None] | None = None,
+    ) -> BoundProviderResponse:
+        """Stream with provider-attempt-local delta buffers.
+
+        This variant is for the Agent Loop surface path.  A candidate's
+        partial output is committed to ``on_delta`` only after that candidate
+        has returned a bound response, so a provider failure can fall back
+        without leaking the failed candidate's deltas.  The commit is outside
+        the provider try/except boundary: a callback/sink failure is a
+        completed-attempt transport failure and must never trigger another
+        provider attempt.  ``stream`` intentionally retains its historical
+        visible-delta/no-fallback semantics for ordinary callers.
+        """
+        last_error: Exception | None = None
+        for ordinal, candidate in enumerate(self._chain.candidates):
+            if before_attempt is not None:
+                before_attempt()
+            attempt_id = self._begin_attempt()
+            deferred: list[str] = []
+
+            def defer(value: str) -> None:
+                if value:
+                    deferred.append(value)
+
+            try:
+                response = self._transport.stream_one(candidate, surface, defer)
+                bound = BoundProviderResponse(
+                    surface.model_call_id,
+                    ordinal,
+                    attempt_id,
+                    surface.runtime_surface_fingerprint,
+                    response,
+                )
+            except AgentLoopControlError:
+                self._discard_attempt(attempt_id)
+                raise
+            except Exception as exc:
+                self._discard_attempt(attempt_id)
+                last_error = exc
+                continue
+            except BaseException:
+                self._discard_attempt(attempt_id)
+                raise
+
+            try:
+                for value in deferred:
+                    on_delta(value)
+            except BaseException:
+                self._discard_attempt(attempt_id)
+                raise
+            return bound
         assert last_error is not None
         raise last_error

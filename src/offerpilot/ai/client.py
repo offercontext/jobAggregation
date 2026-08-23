@@ -73,15 +73,29 @@ class ConfiguredAIClient:
     def preflight_agent_surface(self, surface: FrozenModelSurface, *, stream: bool) -> None:
         self._agent_gateway.preflight(surface, stream=stream)
 
-    def complete_agent_surface(self, surface: FrozenModelSurface) -> BoundProviderResponse:
-        return self._agent_gateway.complete(surface)
+    def complete_agent_surface(
+        self,
+        surface: FrozenModelSurface,
+        *,
+        before_attempt: Callable[[], None] | None = None,
+    ) -> BoundProviderResponse:
+        return self._agent_gateway.complete(surface, before_attempt=before_attempt)
 
     def stream_agent_surface(
         self,
         surface: FrozenModelSurface,
         on_delta: Callable[[str], None],
+        *,
+        before_attempt: Callable[[], None] | None = None,
     ) -> BoundProviderResponse:
-        return self._agent_gateway.stream(surface, on_delta)
+        return self._agent_gateway.stream_deferred(
+            surface,
+            on_delta,
+            before_attempt=before_attempt,
+        )
+
+    def consume_agent_provider_attempt(self, attempt_id: str) -> bool:
+        return self._agent_gateway.consume_attempt(attempt_id)
 
     def _complete_with_frozen_candidate(
         self,

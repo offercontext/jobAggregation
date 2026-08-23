@@ -15,7 +15,7 @@ from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, cast
 
-from offerpilot.ai.agent import PendingAction
+from offerpilot.ai.agent_contracts import PendingAction
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.ai.write_operations import DeliveryOwnership
 from offerpilot.repositories.chat import ChatRepository

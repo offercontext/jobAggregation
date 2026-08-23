@@ -9,8 +9,6 @@ dependencies = [
   "fastapi>=0.115.0",
   "httpx>=0.27.0",
   "jsonschema==4.26.0",
-  "langgraph>=1.2.8",
-  "langgraph-checkpoint-sqlite>=3.1.0",
   "litellm>=1.91.0",
   "markdown-it-py>=3.0.0",
   "Pillow>=10.0.0",

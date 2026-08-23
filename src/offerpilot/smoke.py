@@ -19,7 +19,7 @@ import httpx
 import uvicorn
 from sqlalchemy import delete, func, select
 
-from offerpilot.ai.agent import ChatModel
+from offerpilot.ai.agent_contracts import ChatModel
 from offerpilot.ai.tool_runtime.contracts import ProviderToolContract
 from offerpilot.ai.interview_preparation_proposals import (
     InterviewPreparationModelError,

@@ -7,7 +7,7 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from offerpilot.ai.agent import ChatModel
+from offerpilot.ai.agent_contracts import ChatModel
 from offerpilot.ai.interview_review_proposals import (
     InterviewReviewDiagnosticSink,
     build_interview_review_snapshot,

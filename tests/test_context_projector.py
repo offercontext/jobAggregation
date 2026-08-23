@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -63,6 +64,11 @@ from offerpilot.context_projector.manifest import (
 from offerpilot.context_projector.projector import ModelSurfaceProjector, ProjectionRequest
 from offerpilot.context_projector.selector import ToolSelectionSignals, select_tools
 from offerpilot.context_projector.signals import RuntimeSignalSink
+from offerpilot.pilot_runtime.errors import (
+    RuntimeAgentTimedOut,
+    RuntimeCancelled,
+    RuntimeTransportAborted,
+)
 from offerpilot.config import AIProviderProfile, Config, save_config
 from offerpilot.db import init_database, journal_session_factory_for_data_dir
 from offerpilot.models import AgentContextSnapshot, AgentEvent, AgentRun, Conversation
@@ -389,7 +395,24 @@ def test_bound_response_rejects_unexposed_tool_without_executor() -> None:
         Assistant(tool_calls=[ToolCall("x", "delete_note", "{}")]),
     )
     with pytest.raises(ProjectionError, match="unknown_tool"):
-        binding.validate_response(response)
+        binding.validate_response(response, attempt_validator=lambda value: value == "attempt")
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        (1, 0, "attempt", "f" * 64, Assistant()),
+        ("call", True, "attempt", "f" * 64, Assistant()),
+        ("call", 0, 1, "f" * 64, Assistant()),
+        ("call", 0, "attempt", b"f" * 64, Assistant()),
+        ("call", 0, "attempt", "f" * 64, object()),
+    ],
+)
+def test_bound_provider_response_rejects_malformed_provenance_types(
+    values: tuple[object, object, object, object, object],
+) -> None:
+    with pytest.raises(ProjectionError, match="invalid_bound_provider_response"):
+        BoundProviderResponse(*values)  # type: ignore[arg-type]
 
 
 def test_gateway_reuses_surface_and_stops_stream_fallback_after_delta() -> None:
@@ -423,6 +446,335 @@ def test_gateway_reuses_surface_and_stops_stream_fallback_after_delta() -> None:
     with pytest.raises(RuntimeError, match="lost"):
         gateway.stream(surface, lambda _value: None)
     assert calls == ["a"]
+
+
+def test_gateway_deferred_stream_discards_failed_candidate_deltas_before_fallback() -> None:
+    chain = FrozenProviderExecutionChain.freeze(
+        [
+            AIProviderProfile(id="a", api_key="a", base_url="https://a.test/v1"),
+            AIProviderProfile(id="b", api_key="b", base_url="https://b.test/v1"),
+        ]
+    )
+    surface = ModelSurfaceProjector().project(
+        ProjectionRequest(
+            "call-deferred",
+            contributors(),
+            (),
+            MODEL_TOOL_CATALOG.provider_contracts(),
+            ToolSelectionSignals(page_kind="offers", current_request="offer"),
+            tuple(candidate.budget() for candidate in chain.candidates),
+        )
+    )
+    calls: list[str] = []
+
+    def complete(*_args: object) -> Assistant:
+        raise AssertionError("not used")
+
+    def stream(candidate: object, _messages: object, _tools: object, emit: object) -> Assistant:
+        provider_id = getattr(candidate, "provider_id")
+        calls.append(provider_id)
+        assert callable(emit)
+        if provider_id == "a":
+            emit("a-partial")
+            raise RuntimeError("a-lost")
+        emit("b-final")
+        return Assistant(content="winner")
+
+    gateway = AgentProviderGatewaySession(chain, SingleCandidateAgentTransport(complete, stream))
+    deltas: list[str] = []
+
+    response = gateway.stream_deferred(surface, deltas.append)
+
+    assert response.response.content == "winner"
+    assert calls == ["a", "b"]
+    assert deltas == ["b-final"]
+
+
+def test_gateway_deferred_stream_callback_failure_does_not_retry_completed_provider() -> None:
+    chain = FrozenProviderExecutionChain.freeze(
+        [
+            AIProviderProfile(id="a", api_key="a", base_url="https://a.test/v1"),
+            AIProviderProfile(id="b", api_key="b", base_url="https://b.test/v1"),
+        ]
+    )
+    surface = ModelSurfaceProjector().project(
+        ProjectionRequest(
+            "call-deferred-sink",
+            contributors(),
+            (),
+            MODEL_TOOL_CATALOG.provider_contracts(),
+            ToolSelectionSignals(page_kind="offers", current_request="offer"),
+            tuple(candidate.budget() for candidate in chain.candidates),
+        )
+    )
+    calls: list[str] = []
+
+    def complete(*_args: object) -> Assistant:
+        raise AssertionError("not used")
+
+    def stream(candidate: object, _messages: object, _tools: object, emit: object) -> Assistant:
+        calls.append(getattr(candidate, "provider_id"))
+        assert callable(emit)
+        emit("deferred")
+        return Assistant(content="ok")
+
+    gateway = AgentProviderGatewaySession(chain, SingleCandidateAgentTransport(complete, stream))
+
+    def failing_sink(_value: str) -> None:
+        raise RuntimeError("sink-failed")
+
+    with pytest.raises(RuntimeError, match="sink-failed"):
+        gateway.stream_deferred(surface, failing_sink)
+
+    assert calls == ["a"]
+
+
+@pytest.mark.parametrize("mode", ["complete", "stream", "deferred"])
+def test_gateway_checks_active_before_each_fallback_attempt(mode: str) -> None:
+    chain = FrozenProviderExecutionChain.freeze(
+        [
+            AIProviderProfile(id="a", api_key="a", base_url="https://a.test/v1"),
+            AIProviderProfile(id="b", api_key="b", base_url="https://b.test/v1"),
+        ]
+    )
+    surface = ModelSurfaceProjector().project(
+        ProjectionRequest(
+            "call-active",
+            contributors(),
+            (),
+            MODEL_TOOL_CATALOG.provider_contracts(),
+            ToolSelectionSignals(page_kind="offers", current_request="offer"),
+            tuple(candidate.budget() for candidate in chain.candidates),
+        )
+    )
+    calls: list[str] = []
+    active = True
+    checks: list[int] = []
+
+    def require_active() -> None:
+        checks.append(len(calls))
+        if not active:
+            raise RuntimeCancelled("delivery owner fenced")
+
+    def complete(candidate: object, *_args: object) -> Assistant:
+        nonlocal active
+        calls.append(getattr(candidate, "provider_id"))
+        active = False
+        raise RuntimeError("provider-lost")
+
+    def stream(candidate: object, *_args: object) -> Assistant:
+        nonlocal active
+        calls.append(getattr(candidate, "provider_id"))
+        active = False
+        raise RuntimeError("provider-lost")
+
+    gateway = AgentProviderGatewaySession(chain, SingleCandidateAgentTransport(complete, stream))
+    with pytest.raises(RuntimeCancelled):
+        if mode == "complete":
+            gateway.complete(surface, before_attempt=require_active)
+        elif mode == "stream":
+            gateway.stream(surface, lambda _value: None, before_attempt=require_active)
+        else:
+            gateway.stream_deferred(surface, lambda _value: None, before_attempt=require_active)
+
+    assert calls == ["a"]
+    assert checks == [0, 1]
+    assert gateway._attempts == set()
+
+
+@pytest.mark.parametrize("mode", ["complete", "stream", "deferred"])
+@pytest.mark.parametrize(
+    "error_factory",
+    [KeyboardInterrupt, SystemExit, asyncio.CancelledError],
+)
+def test_gateway_discards_attempt_on_raw_base_exception(
+    mode: str,
+    error_factory: type[BaseException],
+) -> None:
+    chain = FrozenProviderExecutionChain.freeze(
+        [
+            AIProviderProfile(id="a", api_key="a", base_url="https://a.test/v1"),
+            AIProviderProfile(id="b", api_key="b", base_url="https://b.test/v1"),
+        ]
+    )
+    surface = ModelSurfaceProjector().project(
+        ProjectionRequest(
+            "call-base-exception",
+            contributors(),
+            (),
+            MODEL_TOOL_CATALOG.provider_contracts(),
+            ToolSelectionSignals(page_kind="offers", current_request="offer"),
+            tuple(candidate.budget() for candidate in chain.candidates),
+        )
+    )
+    calls: list[str] = []
+    error = error_factory("provider-base-exception")
+
+    def complete(candidate: object, *_args: object) -> Assistant:
+        calls.append(getattr(candidate, "provider_id"))
+        raise error
+
+    def stream(candidate: object, *_args: object) -> Assistant:
+        calls.append(getattr(candidate, "provider_id"))
+        raise error
+
+    gateway = AgentProviderGatewaySession(chain, SingleCandidateAgentTransport(complete, stream))
+    with pytest.raises(type(error)) as raised:
+        if mode == "complete":
+            gateway.complete(surface)
+        elif mode == "stream":
+            gateway.stream(surface, lambda _value: None)
+        else:
+            gateway.stream_deferred(surface, lambda _value: None)
+
+    assert raised.value is error
+    assert calls == ["a"]
+    assert gateway._attempts == set()
+
+
+@pytest.mark.parametrize("mode", ["stream", "deferred"])
+@pytest.mark.parametrize(
+    "error_factory",
+    [KeyboardInterrupt, SystemExit, asyncio.CancelledError],
+)
+def test_gateway_discards_attempt_on_raw_sink_base_exception(
+    mode: str,
+    error_factory: type[BaseException],
+) -> None:
+    chain = FrozenProviderExecutionChain.freeze(
+        [
+            AIProviderProfile(id="a", api_key="a", base_url="https://a.test/v1"),
+            AIProviderProfile(id="b", api_key="b", base_url="https://b.test/v1"),
+        ]
+    )
+    surface = ModelSurfaceProjector().project(
+        ProjectionRequest(
+            "call-sink-base-exception",
+            contributors(),
+            (),
+            MODEL_TOOL_CATALOG.provider_contracts(),
+            ToolSelectionSignals(page_kind="offers", current_request="offer"),
+            tuple(candidate.budget() for candidate in chain.candidates),
+        )
+    )
+    calls: list[str] = []
+    error = error_factory("sink-base-exception")
+
+    def complete(*_args: object) -> Assistant:
+        raise AssertionError("not used")
+
+    def stream(candidate: object, _messages: object, _tools: object, emit: object) -> Assistant:
+        calls.append(getattr(candidate, "provider_id"))
+        assert callable(emit)
+        emit("partial")
+        return Assistant(content="ok")
+
+    gateway = AgentProviderGatewaySession(chain, SingleCandidateAgentTransport(complete, stream))
+
+    def failing_sink(_value: str) -> None:
+        raise error
+
+    with pytest.raises(type(error)) as raised:
+        if mode == "stream":
+            gateway.stream(surface, failing_sink)
+        else:
+            gateway.stream_deferred(surface, failing_sink)
+
+    assert raised.value is error
+    assert calls == ["a"]
+    assert gateway._attempts == set()
+
+
+@pytest.mark.parametrize(
+    "control_error",
+    [RuntimeCancelled(), RuntimeTransportAborted(), RuntimeAgentTimedOut()],
+)
+@pytest.mark.parametrize("mode", ["complete", "stream"])
+def test_gateway_never_falls_back_after_runtime_control_error(
+    control_error: Exception,
+    mode: str,
+) -> None:
+    chain = FrozenProviderExecutionChain.freeze(
+        [
+            AIProviderProfile(id="a", api_key="a", base_url="https://a.test/v1"),
+            AIProviderProfile(id="b", api_key="b", base_url="https://b.test/v1"),
+        ]
+    )
+    surface = ModelSurfaceProjector().project(
+        ProjectionRequest(
+            "call-control",
+            contributors(),
+            (),
+            MODEL_TOOL_CATALOG.provider_contracts(),
+            ToolSelectionSignals(page_kind="offers", current_request="offer"),
+            tuple(candidate.budget() for candidate in chain.candidates),
+        )
+    )
+    calls: list[str] = []
+
+    def complete(candidate: object, *_args: object) -> Assistant:
+        calls.append(getattr(candidate, "provider_id"))
+        raise control_error
+
+    def stream(candidate: object, *_args: object) -> Assistant:
+        calls.append(getattr(candidate, "provider_id"))
+        raise control_error
+
+    gateway = AgentProviderGatewaySession(
+        chain,
+        SingleCandidateAgentTransport(complete, stream),
+    )
+
+    with pytest.raises(type(control_error)) as raised:
+        if mode == "complete":
+            gateway.complete(surface)
+        else:
+            gateway.stream(surface, lambda _value: None)
+
+    assert raised.value is control_error
+    assert calls == ["a"]
+
+
+def test_gateway_attempt_identity_is_session_owned_and_single_use() -> None:
+    profile = AIProviderProfile(id="a", api_key="a", base_url="https://a.test/v1")
+    chain = FrozenProviderExecutionChain.freeze([profile])
+    surface = ModelSurfaceProjector().project(
+        ProjectionRequest(
+            "call-owned",
+            contributors(),
+            (),
+            MODEL_TOOL_CATALOG.provider_contracts(),
+            ToolSelectionSignals(page_kind="offers", current_request="offer"),
+            tuple(candidate.budget() for candidate in chain.candidates),
+        )
+    )
+
+    def complete(*_args: object) -> Assistant:
+        return Assistant(content="ok")
+
+    def stream(*_args: object) -> Assistant:
+        raise AssertionError("not used")
+
+    owner = AgentProviderGatewaySession(
+        chain,
+        SingleCandidateAgentTransport(complete, stream),
+    )
+    stranger = AgentProviderGatewaySession(
+        chain,
+        SingleCandidateAgentTransport(complete, stream),
+    )
+    response = owner.complete(surface)
+    binding = ModelCallSurfaceBinding.from_surface(surface)
+
+    with pytest.raises(ProjectionError, match="provider_response_attempt_mismatch"):
+        binding.validate_response(response, attempt_validator=stranger.consume_attempt)
+
+    assert binding.validate_response(
+        response,
+        attempt_validator=owner.consume_attempt,
+    ).content == "ok"
+    with pytest.raises(ProjectionError, match="provider_response_attempt_mismatch"):
+        binding.validate_response(response, attempt_validator=owner.consume_attempt)
 
 
 def test_runtime_signal_sink_is_capacity_one_and_fail_open() -> None:

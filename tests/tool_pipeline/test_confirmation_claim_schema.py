@@ -1,6 +1,6 @@
 from sqlalchemy import inspect, text
 
-from offerpilot.ai.agent import PendingAction
+from offerpilot.ai.agent_contracts import PendingAction
 from offerpilot.db import init_database
 from offerpilot.repositories.chat import ChatRepository
 

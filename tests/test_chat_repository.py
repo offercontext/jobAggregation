@@ -5,7 +5,7 @@ from threading import Barrier
 import pytest
 from sqlalchemy import update
 
-from offerpilot.ai.agent import PendingAction
+from offerpilot.ai.agent_contracts import PendingAction
 from offerpilot.ai.types import Message
 from offerpilot.db import init_database
 from offerpilot.models import Conversation

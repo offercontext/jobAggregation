@@ -8,7 +8,7 @@ from collections.abc import Callable
 from time import perf_counter
 from typing import Any
 
-from offerpilot.ai.agent import ChatModel
+from offerpilot.ai.agent_contracts import ChatModel
 from offerpilot.ai.types import Message
 from offerpilot.ai.workflows import parse_json_reply
 from offerpilot.repositories.json_contract import canonical_json

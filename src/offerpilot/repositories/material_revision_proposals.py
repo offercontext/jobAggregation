@@ -7,7 +7,7 @@ from typing import Any, Callable, List
 from sqlalchemy import desc, select, text, update
 from sqlalchemy.orm import Session, sessionmaker
 
-from offerpilot.ai.agent import ChatModel
+from offerpilot.ai.agent_contracts import ChatModel
 from offerpilot.ai.material_proposals import (
     generate_material_proposal,
     validate_material_proposal,

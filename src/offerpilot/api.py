@@ -21,12 +21,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pypdf import PdfReader
 from sqlalchemy.orm import Session
 
-from offerpilot.ai.agent import (
-    ChatModel,
-    PendingAction,
-    resume_after_confirm,
-    run_turn,
-)
+from offerpilot.ai.agent_contracts import ChatModel, PendingAction
 from offerpilot.ai.deterministic_actions import (
     parse_pilot_action,
 )
@@ -1386,46 +1381,6 @@ def create_app(
             cast(RunRecorder, run_recorder),
         )
 
-    def _runtime_resume_after_confirm(
-        model: object,
-        catalog: object,
-        messages: list[Message],
-        pending: PendingAction,
-        approved: bool,
-        auto_approve: bool,
-        max_iter: int,
-        rejection_feedback: str = "",
-        *,
-        thread_id: str = "conversation",
-        event_sink: object | None = None,
-        cancel_check: Callable[[], bool] | None = None,
-        confirmation_result_sink: object | None = None,
-        confirmation_attempt_sink: object | None = None,
-        run_recorder: object | None = None,
-        delivery_fence: object | None = None,
-        continuation_message_loader: object | None = None,
-        tool_context: object,
-    ) -> object:
-        return resume_after_confirm(
-            cast(ChatModel, model),
-            cast(Any, catalog),
-            messages,
-            pending,
-            approved=approved,
-            auto_approve=auto_approve,
-            max_iter=max_iter,
-            rejection_feedback=rejection_feedback,
-            thread_id=thread_id,
-            event_sink=cast(Any, event_sink),
-            cancel_check=cancel_check,
-            confirmation_result_sink=cast(Any, confirmation_result_sink),
-            confirmation_attempt_sink=cast(Any, confirmation_attempt_sink),
-            run_recorder=cast(Any, run_recorder),
-            delivery_fence=cast(Any, delivery_fence),
-            continuation_message_loader=cast(Any, continuation_message_loader),
-            tool_context=cast(Any, tool_context),
-        )
-
     app.state.pilot_runtime = build_pilot_runtime(
         data_dir=resolved_data_dir,
         chat=chat,
@@ -1449,8 +1404,6 @@ def create_app(
             dict(page) if page is not None else None
         ),
         model_tool_context=_runtime_tool_context,
-        run_turn_fn=run_turn,
-        resume_after_confirm_fn=_runtime_resume_after_confirm,
         missing_target_question=lambda pending, _conversation_id: _pending_action_missing_question(
             cast(PendingAction, pending),
             applications,

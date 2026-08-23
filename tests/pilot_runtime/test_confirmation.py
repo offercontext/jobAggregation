@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import pickle
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 from threading import Event, Lock, RLock
 from types import SimpleNamespace
 from typing import Any, cast
@@ -10,7 +12,8 @@ from dataclasses import replace
 
 import pytest
 
-from offerpilot.ai.agent import PendingAction
+from offerpilot.ai.agent_contracts import AgentTurnResult, PendingAction
+from offerpilot.ai.agent_loop import ApprovedWriteSeed
 from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
 from offerpilot.ai.tool_runtime.pipeline import prepare_call
 from offerpilot.ai.tool_runtime.contracts import ToolFailure, ToolSuccess
@@ -53,6 +56,7 @@ from offerpilot.pilot_runtime.contracts import (
     ToolResultEvent,
 )
 from offerpilot.pilot_runtime.continuation import (
+    ConfirmationApprovedWritePort,
     ConfirmationCoordinator,
     ConfirmationDependencies,
     ConfirmationReplayError,
@@ -65,6 +69,21 @@ from offerpilot.pilot_runtime.persistence import PersistenceResult, PersistenceS
 import offerpilot.pilot_runtime.composition as composition_module
 from offerpilot.pilot_runtime.service import PilotRuntime, RuntimeDependencies
 from offerpilot.pilot_runtime.service import ResolvedModel
+
+
+def test_confirmation_approved_port_is_transient_and_does_not_leak_session() -> None:
+    session = SimpleNamespace(secret="confirmation-private")
+    port = ConfirmationApprovedWritePort(session)  # type: ignore[arg-type]
+
+    assert "confirmation-private" not in repr(port)
+    with pytest.raises(TypeError, match="cannot be serialized"):
+        pickle.dumps(port)
+    with pytest.raises(TypeError, match="cannot be serialized"):
+        asdict(port)
+    with pytest.raises(TypeError, match="cannot be serialized"):
+        port.to_json()
+    with pytest.raises(TypeError, match="not JSON serializable"):
+        json.dumps(port)
 
 
 class _Operations:
@@ -579,9 +598,9 @@ def test_service_reject_routes_directly_without_agent_driver() -> None:
 def test_approved_resume_injects_session_executor_and_loads_source_once_after_terminal() -> None:
     """RED: the driver must receive the Ledger executor and a single-use loader.
 
-    The old extracted route eagerly loaded source before ``resume_after_confirm``
-    and passed the resolver's context unchanged.  A real driver consequently
-    either executed the provider directly or loaded the source twice.
+    The old extracted route eagerly loaded source before the approved Agent Loop
+    continuation and passed the resolver's context unchanged.  A real driver
+    consequently either executed the provider directly or loaded the source twice.
     """
 
     operations = _Operations(status="proposed")
@@ -631,11 +650,14 @@ def test_approved_resume_injects_session_executor_and_loads_source_once_after_te
             return recorder
 
     class Driver:
-        def resume_after_confirm(self, messages: list[Message], pending: PendingAction, approved: bool, auto_approve: bool, max_iter: int, **kwargs: object) -> object:
-            del approved, auto_approve, max_iter
-            observed["messages"] = messages
-            observed["run_recorder"] = kwargs["run_recorder"]
-            tool_context = kwargs["tool_context"]
+        def execute(self, invocation: object) -> object:
+            seed = getattr(invocation, "seed")
+            assert isinstance(seed, ApprovedWriteSeed)
+            continuation = seed.continuation
+            pending = continuation.pending
+            observed["seed"] = seed
+            observed["run_recorder"] = getattr(invocation, "run_recorder")
+            tool_context = getattr(invocation, "tool_context")
             executor = getattr(tool_context, "operation_executor", None)
             observed["executor"] = executor
             assert callable(executor)
@@ -646,16 +668,16 @@ def test_approved_resume_injects_session_executor_and_loads_source_once_after_te
                 spec=SimpleNamespace(name="create_application"),
                 arguments_digest="digest",
             )
-            authorization = kwargs["confirmation_attempt_sink"](pending, prepared)
+            authorization = continuation.claim(pending, prepared)
             assert not isinstance(authorization, ToolFailure)
             record = executor(prepared, tool_context, authorization)
             origin = Message(role="tool", content="saved", tool_call_id="call-1")
-            kwargs["confirmation_result_sink"](pending, True, origin, record)
-            loader = kwargs["continuation_message_loader"]
+            continuation.record_result(pending, origin, record)
+            loader = continuation.load_continuation_messages
             assert loader() == (Message(role="assistant", content="history"),)
             assert loader() == (Message(role="assistant", content="history"),)
-            return SimpleNamespace(
-                added=(origin, Message(role="assistant", content="done")),
+            return AgentTurnResult(
+                added=[origin, Message(role="assistant", content="done")],
                 reply="done",
                 pending=None,
                 records=(record,),
@@ -694,7 +716,7 @@ def test_approved_resume_injects_session_executor_and_loads_source_once_after_te
 
     assert getattr(outcome, "message", None) == "done"
     assert callable(observed["executor"])
-    assert observed["messages"] == []
+    assert isinstance(observed["seed"], ApprovedWriteSeed)
     assert observed["run_recorder"] is recorder
     assert "context" in recorder.events
     assert sources.calls == 1
@@ -718,25 +740,18 @@ def test_sync_confirmation_defers_origin_tool_result_until_authoritative_deliver
             return SimpleNamespace(id=7, archived_at=None)
 
     class Driver:
-        def resume_after_confirm(
-            self,
-            _messages: list[Message],
-            current: PendingAction,
-            _approved: bool,
-            _auto_approve: bool,
-            _max_iter: int,
-            **kwargs: object,
-        ) -> object:
-            sink = kwargs["event_sink"]
-            sink({
-                "event": "tool_call",
-                "data": {
-                    "tool_call_id": current.tool_call_id,
-                    "tool_name": current.tool_name,
-                    "kind": "write",
-                    "confirm_mode": "approved",
-                },
-            })
+        def execute(self, invocation: object) -> object:
+            seed = getattr(invocation, "seed")
+            assert isinstance(seed, ApprovedWriteSeed)
+            continuation = seed.continuation
+            current = continuation.pending
+            sink = getattr(invocation, "event_sink")
+            sink.emit(ToolCallEvent(
+                tool_call_id=current.tool_call_id,
+                tool_name=current.tool_name,
+                kind="write",
+                confirm_mode="approved",
+            ))
             prepared = SimpleNamespace(
                 pending_identity="call-1:create_application",
                 pending_action_revision=1,
@@ -744,26 +759,24 @@ def test_sync_confirmation_defers_origin_tool_result_until_authoritative_deliver
                 spec=SimpleNamespace(name=current.tool_name),
                 arguments_digest="digest",
             )
-            authorization = kwargs["confirmation_attempt_sink"](current, prepared)
-            record = kwargs["tool_context"].operation_executor(
-                prepared, kwargs["tool_context"], authorization
+            authorization = continuation.claim(current, prepared)
+            tool_context = getattr(invocation, "tool_context")
+            record = tool_context.operation_executor(
+                prepared, tool_context, authorization
             )
             origin = Message(role="tool", content="saved", tool_call_id=current.tool_call_id)
-            kwargs["confirmation_result_sink"](current, True, origin, record)
-            sink({
-                "event": "tool_result",
-                "data": {
-                    "tool_call_id": current.tool_call_id,
-                    "tool_name": current.tool_name,
-                    "status": "success",
-                    "summary": "saved",
-                    "visible_result": "saved",
-                    "operation_id": operations.operation_id,
-                    "write_status": "success",
-                },
-            })
-            return SimpleNamespace(
-                added=(origin,),
+            continuation.record_result(current, origin, record)
+            sink.emit(ToolResultEvent(
+                tool_call_id=current.tool_call_id,
+                tool_name=current.tool_name,
+                status="success",
+                summary="saved",
+                visible_result="saved",
+                operation_id=operations.operation_id,
+                write_status="success",
+            ))
+            return AgentTurnResult(
+                added=[origin],
                 reply="",
                 pending=None,
                 records=(record,),
@@ -865,15 +878,10 @@ def test_missing_delivery_heartbeat_maps_runtime_confirmation_to_503() -> None:
             return SimpleNamespace(id=7, archived_at=None)
 
     class Driver:
-        def resume_after_confirm(
-            self,
-            _messages: list[Message],
-            current: PendingAction,
-            _approved: bool,
-            _auto_approve: bool,
-            _max_iter: int,
-            **kwargs: object,
-        ) -> object:
+        def execute(self, invocation: object) -> object:
+            seed = getattr(invocation, "seed")
+            assert isinstance(seed, ApprovedWriteSeed)
+            current = seed.continuation.pending
             prepared = SimpleNamespace(
                 pending_identity="call-1:create_application",
                 pending_action_revision=1,
@@ -881,7 +889,7 @@ def test_missing_delivery_heartbeat_maps_runtime_confirmation_to_503() -> None:
                 spec=SimpleNamespace(name=current.tool_name),
                 arguments_digest="digest",
             )
-            kwargs["confirmation_attempt_sink"](current, prepared)
+            seed.continuation.claim(current, prepared)
             raise AssertionError("heartbeat guard must stop before Agent execution")
 
     runtime = PilotRuntime(
@@ -1623,19 +1631,19 @@ def test_approved_stream_orders_meta_status_tool_result_assistant_completed() ->
             return SimpleNamespace(id=7, archived_at=None)
 
     class Driver:
-        def resume_after_confirm(self, messages: list[Message], pending: PendingAction, approved: bool, auto_approve: bool, max_iter: int, **kwargs: object) -> object:
-            del messages, approved, auto_approve, max_iter
-            sink = kwargs["event_sink"]
-            assert kwargs["run_recorder"] is recorder
-            sink({
-                "event": "tool_call",
-                "data": {
-                    "tool_call_id": "call-1",
-                    "tool_name": "create_application",
-                    "kind": "write",
-                    "confirm_mode": "approved",
-                },
-            })
+        def execute(self, invocation: object) -> object:
+            seed = getattr(invocation, "seed")
+            assert isinstance(seed, ApprovedWriteSeed)
+            continuation = seed.continuation
+            pending = continuation.pending
+            sink = getattr(invocation, "event_sink")
+            assert getattr(invocation, "run_recorder") is recorder
+            sink.emit(ToolCallEvent(
+                tool_call_id="call-1",
+                tool_name="create_application",
+                kind="write",
+                confirm_mode="approved",
+            ))
             prepared = SimpleNamespace(
                 pending_identity="call-1:create_application",
                 pending_action_revision=1,
@@ -1643,30 +1651,28 @@ def test_approved_stream_orders_meta_status_tool_result_assistant_completed() ->
                 spec=SimpleNamespace(name="create_application"),
                 arguments_digest="digest",
             )
-            authorization = kwargs["confirmation_attempt_sink"](pending, prepared)
-            record = kwargs["tool_context"].operation_executor(
-                prepared, kwargs["tool_context"], authorization
+            authorization = continuation.claim(pending, prepared)
+            tool_context = getattr(invocation, "tool_context")
+            record = tool_context.operation_executor(
+                prepared, tool_context, authorization
             )
             origin = Message(role="tool", content="saved", tool_call_id="call-1")
-            kwargs["confirmation_result_sink"](pending, True, origin, record)
-            sink({
-                "event": "tool_result",
-                "data": {
-                    "tool_call_id": "call-1",
-                    "tool_name": "create_application",
-                    "status": "success",
-                    "summary": "saved",
-                    "visible_result": "saved",
-                    "operation_id": operations.operation_id,
-                    "write_status": "success",
-                },
-            })
-            sink({"event": "assistant_delta", "data": {"delta": "done"}})
-            assert kwargs["continuation_message_loader"]() == (
+            continuation.record_result(pending, origin, record)
+            sink.emit(ToolResultEvent(
+                tool_call_id="call-1",
+                tool_name="create_application",
+                status="success",
+                summary="saved",
+                visible_result="saved",
+                operation_id=operations.operation_id,
+                write_status="success",
+            ))
+            sink.emit(AssistantDeltaEvent(delta="done"))
+            assert continuation.load_continuation_messages() == (
                 Message(role="assistant", content="history"),
             )
-            return SimpleNamespace(
-                added=(origin, Message(role="assistant", content="done")),
+            return AgentTurnResult(
+                added=[origin, Message(role="assistant", content="done")],
                 reply="done",
                 pending=None,
                 records=(record,),
@@ -1758,15 +1764,11 @@ def test_slow_stream_drops_late_chained_pending_after_fallback_delivery() -> Non
             return SimpleNamespace(id=7, archived_at=None)
 
     class Driver:
-        def resume_after_confirm(
-            self,
-            _messages: list[Message],
-            current: PendingAction,
-            _approved: bool,
-            _auto_approve: bool,
-            _max_iter: int,
-            **kwargs: object,
-        ) -> object:
+        def execute(self, invocation: object) -> object:
+            seed = getattr(invocation, "seed")
+            assert isinstance(seed, ApprovedWriteSeed)
+            continuation = seed.continuation
+            current = continuation.pending
             prepared = SimpleNamespace(
                 pending_identity="call-1:create_application",
                 pending_action_revision=1,
@@ -1774,20 +1776,21 @@ def test_slow_stream_drops_late_chained_pending_after_fallback_delivery() -> Non
                 spec=SimpleNamespace(name=current.tool_name),
                 arguments_digest="digest",
             )
-            authorization = kwargs["confirmation_attempt_sink"](current, prepared)
-            record = kwargs["tool_context"].operation_executor(
-                prepared, kwargs["tool_context"], authorization
+            authorization = continuation.claim(current, prepared)
+            tool_context = getattr(invocation, "tool_context")
+            record = tool_context.operation_executor(
+                prepared, tool_context, authorization
             )
             origin = Message(role="tool", content="saved", tool_call_id=current.tool_call_id)
-            kwargs["confirmation_result_sink"](current, True, origin, record)
+            continuation.record_result(current, origin, record)
             entered.set()
             assert release.wait(10)
             child = PendingAction(
                 "late-child", "create_application", "{}", "late", str(uuid4())
             )
             try:
-                return SimpleNamespace(
-                    added=(origin,),
+                return AgentTurnResult(
+                    added=[origin],
                     reply="",
                     pending=child,
                     records=(record,),
@@ -1859,7 +1862,7 @@ def test_stream_provider_failure_is_502_and_does_not_clear_pending() -> None:
             return SimpleNamespace(id=7, archived_at=None)
 
     class Driver:
-        def resume_after_confirm(self, *_args: object, **_kwargs: object) -> object:
+        def execute(self, _invocation: object) -> object:
             raise RuntimeError("provider down")
 
     runtime = PilotRuntime(
@@ -2081,19 +2084,15 @@ def _run_confirmation_journal_case(
             return SimpleNamespace(id=7, archived_at=None)
 
     class Driver:
-        def resume_after_confirm(
-            self,
-            _messages: list[Message],
-            current: PendingAction,
-            _approved: bool,
-            _auto_approve: bool,
-            _max_iter: int,
-            **kwargs: object,
-        ) -> object:
+        def execute(self, invocation: object) -> object:
             nonlocal provider_calls
             provider_calls += 1
             if case == "timeout":
                 raise RuntimeAgentTimedOut()
+            seed = getattr(invocation, "seed")
+            assert isinstance(seed, ApprovedWriteSeed)
+            continuation = seed.continuation
+            current = continuation.pending
             prepared = SimpleNamespace(
                 pending_identity="call-1:create_application",
                 pending_action_revision=1,
@@ -2101,12 +2100,11 @@ def _run_confirmation_journal_case(
                 spec=SimpleNamespace(name=current.tool_name),
                 arguments_digest="digest",
             )
-            authorization = cast(Any, kwargs["confirmation_attempt_sink"])(
-                current, prepared
-            )
-            record = cast(Any, kwargs["tool_context"]).operation_executor(
+            authorization = continuation.claim(current, prepared)
+            tool_context = cast(Any, getattr(invocation, "tool_context"))
+            record = tool_context.operation_executor(
                 prepared,
-                kwargs["tool_context"],
+                tool_context,
                 authorization,
             )
             origin = Message(
@@ -2114,14 +2112,9 @@ def _run_confirmation_journal_case(
                 content="saved",
                 tool_call_id=current.tool_call_id,
             )
-            cast(Any, kwargs["confirmation_result_sink"])(
-                current,
-                True,
-                origin,
-                record,
-            )
-            return SimpleNamespace(
-                added=(origin, Message(role="assistant", content="done")),
+            continuation.record_result(current, origin, record)
+            return AgentTurnResult(
+                added=[origin, Message(role="assistant", content="done")],
                 reply="done",
                 pending=None,
                 records=(record,),
@@ -2218,7 +2211,7 @@ def test_confirmation_journal_base_exception_is_propagated_unchanged() -> None:
             return SimpleNamespace(id=7, archived_at=None)
 
     class Driver:
-        def resume_after_confirm(self, *_args: object, **_kwargs: object) -> object:
+        def execute(self, _invocation: object) -> object:
             raise AssertionError("Journal BaseException must abort before Agent")
 
     runtime = PilotRuntime(

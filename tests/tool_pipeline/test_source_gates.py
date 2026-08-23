@@ -90,7 +90,7 @@ def test_deleted_registry_symbols_and_modules_cannot_return() -> None:
 
 def test_agent_provider_and_api_have_no_dict_handler_protocol() -> None:
     findings: list[str] = []
-    for path in (AI / "agent.py", AI / "client.py", SRC / "api.py"):
+    for path in (AI / "agent_loop.py", AI / "agent_contracts.py", AI / "client.py", SRC / "api.py"):
         for node in ast.walk(_tree(path)):
             key = _literal_protocol_key(node)
             if key in BANNED_DICT_PROTOCOL_KEYS:
@@ -99,19 +99,22 @@ def test_agent_provider_and_api_have_no_dict_handler_protocol() -> None:
 
 
 def test_agent_tests_use_typed_tool_factory_not_legacy_dict_protocol() -> None:
-    path = ROOT / "tests" / "test_ai_agent.py"
-    findings: list[str] = []
-    for node in ast.walk(_tree(path)):
-        key = _literal_protocol_key(node)
-        if key in BANNED_DICT_PROTOCOL_KEYS:
-            findings.append(f"{path.relative_to(ROOT)}:{getattr(node, 'lineno', 0)}:{key}")
-        if isinstance(node, ast.Dict):
-            for key_node in node.keys:
-                if isinstance(key_node, ast.Constant) and key_node.value in BANNED_DICT_PROTOCOL_KEYS:
-                    findings.append(
-                        f"{path.relative_to(ROOT)}:{getattr(key_node, 'lineno', 0)}:{key_node.value}"
-                    )
-    assert findings == []
+    # The old monolithic Agent test module was deleted with the implementation.
+    # New loop tests live under tests/agent_loop and use typed ToolSpec factories.
+    assert not (ROOT / "tests" / "test_ai_agent.py").exists()
+    for path in sorted((ROOT / "tests" / "agent_loop").glob("*.py")):
+        findings: list[str] = []
+        for node in ast.walk(_tree(path)):
+            key = _literal_protocol_key(node)
+            if key in BANNED_DICT_PROTOCOL_KEYS:
+                findings.append(f"{path.relative_to(ROOT)}:{getattr(node, 'lineno', 0)}:{key}")
+            if isinstance(node, ast.Dict):
+                for key_node in node.keys:
+                    if isinstance(key_node, ast.Constant) and key_node.value in BANNED_DICT_PROTOCOL_KEYS:
+                        findings.append(
+                            f"{path.relative_to(ROOT)}:{getattr(key_node, 'lineno', 0)}:{key_node.value}"
+                        )
+        assert findings == []
 
 
 def test_runtime_dependency_direction_and_legacy_dispatch_are_closed() -> None:
@@ -120,9 +123,10 @@ def test_runtime_dependency_direction_and_legacy_dispatch_are_closed() -> None:
             module.startswith("offerpilot.ai.tool_specs")
             for module in _imported_modules(_tree(path))
         ), path
-    agent_imports = _imported_modules(_tree(AI / "agent.py"))
-    assert "offerpilot.ai.tool_runtime.legacy" not in agent_imports
-    assert "offerpilot.ai.tool_specs.legacy" not in agent_imports
+    for path in (AI / "agent_loop.py", AI / "agent_contracts.py", AI / "confirmation.py"):
+        agent_imports = _imported_modules(_tree(path))
+        assert "offerpilot.ai.tool_runtime.legacy" not in agent_imports
+        assert "offerpilot.ai.tool_specs.legacy" not in agent_imports
 
 
 def test_compatibility_string_inspection_is_confined_to_renderer() -> None:

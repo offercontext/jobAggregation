@@ -92,9 +92,9 @@ from .persistence import (
     PersistenceStatus,
 )
 from .event_sink import InMemoryRuntimeInvocationControl
+from offerpilot.ai.agent_contracts import AgentDriver
+from offerpilot.ai.agent_loop import AgentLoopInvocation
 from .service import (
-    AgentDriver,
-    AgentInvocation,
     ContextAssembler,
     ConversationGateway,
     JournalFactory,
@@ -118,7 +118,7 @@ __all__ = [
     "AgentExecutionHost",
     "AgentThunk",
     "AgentDriver",
-    "AgentInvocation",
+    "AgentLoopInvocation",
     "AssistantDeltaEvent",
     "AssistantMessageEvent",
     "AttachmentReference",

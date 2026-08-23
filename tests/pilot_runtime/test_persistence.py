@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import pytest
 
-from offerpilot.ai.agent import PendingAction
+from offerpilot.ai.agent_contracts import PendingAction
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.ai.write_operations import (
     DeliveryOwnership,

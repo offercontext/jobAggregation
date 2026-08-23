@@ -653,9 +653,11 @@ def test_model_prepared_stream_adapts_sse_host_queue_once() -> None:
 
 def test_real_stream_run_recorder_keeps_transport_uuid_and_terminal_events(
     tmp_path: Path,
+    request: pytest.FixtureRequest,
 ) -> None:
     data_dir = tmp_path
     sessions = init_database(data_dir / "offerpilot.db")
+    request.addfinalizer(lambda: sessions.kw["bind"].dispose())
     chat = ChatRepository(sessions)
     conversation = chat.create_conversation("real stream journal")
     persistence = ChatPersistenceCoordinator(chat)

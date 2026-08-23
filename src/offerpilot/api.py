@@ -1481,10 +1481,23 @@ def create_app(
 
     @app.on_event("shutdown")
     def _stop_knowledge_worker() -> None:
-        knowledge_runtime.stop(timeout=5)
-        context_source_loader.close()
-        if journal_engine is not None:
-            journal_engine.dispose()
+        shutdown_failed = False
+        try:
+            knowledge_runtime.stop(timeout=5)
+            context_source_loader.close()
+            if journal_engine is not None:
+                journal_engine.dispose()
+        except BaseException:
+            shutdown_failed = True
+            raise
+        finally:
+            primary_engine = app.state.db_engine
+            if primary_engine is not None:
+                try:
+                    primary_engine.dispose()
+                except BaseException:
+                    if not shutdown_failed:
+                        raise
 
     @app.get("/api/health")
     def health() -> dict[str, str]:

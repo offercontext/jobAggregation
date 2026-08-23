@@ -156,6 +156,59 @@ def _string_bindings(tree: ast.AST) -> dict[str, str]:
     return bindings
 
 
+def _constant_bindings(tree: ast.AST) -> dict[str, object]:
+    """Resolve the small literal subset needed for reachability checks."""
+
+    bindings: dict[str, object] = {}
+    for _ in range(3):
+        changed = False
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.value is None:
+                continue
+            value = node.value
+            if isinstance(value, ast.Constant) and (
+                value.value is None
+                or isinstance(value.value, (bool, int, float, str))
+            ):
+                resolved = value.value
+            elif isinstance(value, ast.Name) and value.id in bindings:
+                resolved = bindings[value.id]
+            else:
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name) and bindings.get(target.id) != resolved:
+                    bindings[target.id] = resolved
+                    changed = True
+        if not changed:
+            break
+    return bindings
+
+
+def _dynamic_call_terminal(
+    node: ast.Call,
+    aliases: dict[str, str],
+    bindings: dict[str, str],
+) -> str | None:
+    """Resolve direct calls and calls through ``getattr(value, name)``."""
+
+    terminal = _call_terminal(node, aliases)
+    if terminal is not None:
+        return terminal
+    if not (
+        isinstance(node.func, ast.Call)
+        and _call_terminal(node.func, aliases) == "getattr"
+        and len(node.func.args) >= 2
+    ):
+        return None
+    symbol = node.func.args[1]
+    if isinstance(symbol, ast.Constant) and isinstance(symbol.value, str):
+        return symbol.value.rsplit(".", 1)[-1]
+    if isinstance(symbol, ast.Name) and symbol.id in bindings:
+        return bindings[symbol.id].rsplit(".", 1)[-1]
+    return None
+
+
 def _dynamic_attribute_strings(
     tree: ast.AST,
     *,
@@ -426,10 +479,11 @@ def _validate_no_stream_primitive_in_api(tree: ast.AST) -> None:
 
 def _validate_unbounded_queue(tree: ast.AST) -> None:
     aliases = _binding_aliases(tree)
+    bindings = _string_bindings(tree)
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        if _call_terminal(node, aliases) != "Queue":
+        if _dynamic_call_terminal(node, aliases, bindings) != "Queue":
             continue
         assert not node.args and not any(keyword.arg == "maxsize" for keyword in node.keywords), (
             "Runtime transport Queue must stay unbounded"
@@ -476,10 +530,20 @@ def _validate_execution_host_boundary(tree: ast.AST) -> None:
     for node in ast.walk(tree):
         if not isinstance(node, ast.ClassDef) or not node.name.endswith("AgentExecutionHost"):
             continue
-        names = _resolved_names(node, _binding_aliases(tree))
+        aliases = _binding_aliases(tree)
+        names = _resolved_names(node, aliases)
+        dynamic_names = _dynamic_attribute_strings(
+            node,
+            bindings=string_bindings,
+            aliases=aliases,
+        )
         assert not names.intersection(forbidden_names), (
             f"{node.name} crosses persistence boundary: "
             f"{sorted(names.intersection(forbidden_names))}"
+        )
+        assert not dynamic_names.intersection(forbidden_names), (
+            f"{node.name} reaches persistence boundary through getattr: "
+            f"{sorted(dynamic_names.intersection(forbidden_names))}"
         )
         attrs = {
             child.attr.lower()
@@ -511,51 +575,146 @@ def _validate_prepared_streams_are_guarded(runtime_tree: ast.AST, api_tree: ast.
     ]
     assert prepared_calls, "the runtime must construct prepared stream handles"
     aliases = _binding_aliases(api_tree)
+    string_bindings = _string_bindings(api_tree)
 
     def dead_branch(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
+        constant_bindings = _constant_bindings(api_tree)
+
+        def constant_truth(value: ast.AST) -> bool | None:
+            if isinstance(value, ast.Constant) and (
+                value.value is None
+                or isinstance(value.value, (bool, int, float, str))
+            ):
+                return bool(value.value)
+            if isinstance(value, ast.Name) and value.id in constant_bindings:
+                return bool(constant_bindings[value.id])
+            return None
+
         current = node
         while current in parents:
             parent = parents[current]
             if isinstance(parent, ast.If):
-                if current in parent.body and isinstance(parent.test, ast.Constant):
-                    if not bool(parent.test.value):
+                truth = constant_truth(parent.test)
+                if truth is not None:
+                    if current in parent.body and not truth:
                         return True
-                if current in parent.orelse and isinstance(parent.test, ast.Constant):
-                    if bool(parent.test.value):
+                    if current in parent.orelse and truth:
                         return True
             if isinstance(parent, ast.While):
-                if current in parent.body and isinstance(parent.test, ast.Constant):
-                    if not bool(parent.test.value):
-                        return True
+                truth = constant_truth(parent.test)
+                if current in parent.body and truth is False:
+                    return True
             current = parent
         return False
 
-    def top_level_return_precedes(
-        function: ast.FunctionDef | ast.AsyncFunctionDef,
+    def nested_in_function(
         node: ast.AST,
+        function: ast.FunctionDef | ast.AsyncFunctionDef,
+        parents: dict[ast.AST, ast.AST],
     ) -> bool:
-        # The production shape has a single return of the guarded response.
-        # Reject the mechanically common ``return ...; Guard(...)`` bypass;
-        # nested branch reachability is handled by ``dead_branch`` above.
-        return any(
-            isinstance(statement, (ast.Return, ast.Raise))
-            and statement.lineno < getattr(node, "lineno", -1)
-            for statement in function.body
-        )
+        current = node
+        while current in parents:
+            parent = parents[current]
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return parent is not function
+            current = parent
+        return False
 
-    def prepared_argument(
-        guard_call: ast.Call,
-    ) -> ast.expr | None:
+    def immediate_branch(
+        node: ast.AST,
+        prepared_targets: set[str],
+        parents: dict[ast.AST, ast.AST],
+    ) -> bool:
+        current = node
+        while current in parents:
+            parent = parents[current]
+            if isinstance(parent, ast.If) and current in parent.body:
+                test = parent.test
+                if (
+                    isinstance(test, ast.Call)
+                    and _call_terminal(test, aliases) == "isinstance"
+                    and len(test.args) >= 2
+                    and isinstance(test.args[0], ast.Name)
+                    and test.args[0].id in prepared_targets
+                    and "ImmediateHttpOutcome"
+                    in _resolved_names(test.args[1], aliases)
+                ):
+                    return True
+            current = parent
+        return False
+
+    def conditional_path(
+        node: ast.AST,
+        parents: dict[ast.AST, ast.AST],
+    ) -> bool:
+        constant_bindings = _constant_bindings(api_tree)
+
+        def constant_truth(value: ast.AST) -> bool | None:
+            if isinstance(value, ast.Constant) and (
+                value.value is None
+                or isinstance(value.value, (bool, int, float, str))
+            ):
+                return bool(value.value)
+            if isinstance(value, ast.Name) and value.id in constant_bindings:
+                return bool(constant_bindings[value.id])
+            return None
+
+        current = node
+        while current in parents:
+            parent = parents[current]
+            if isinstance(parent, ast.If):
+                truth = constant_truth(parent.test)
+                if truth is None:
+                    return True
+                if current in parent.body and truth:
+                    current = parent
+                    continue
+                if current in parent.orelse and not truth:
+                    current = parent
+                    continue
+                return True
+            if isinstance(parent, (ast.For, ast.AsyncFor, ast.While)):
+                return True
+            current = parent
+        return False
+
+    def assigned_names(node: ast.AST) -> tuple[str, ...]:
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            targets = [node.target]
+        else:
+            return ()
+        return tuple(target.id for target in targets if isinstance(target, ast.Name))
+
+    def prepared_argument(guard_call: ast.Call) -> ast.expr | None:
         keyword = next(
             (keyword.value for keyword in guard_call.keywords if keyword.arg == "prepared"),
             None,
         )
         if keyword is not None:
             return keyword
-        # PreparedStreamGuard intentionally supports the reviewed positional
-        # form ``Guard(prepared, on_execute=...)``.  Other positional shapes
-        # are not inferred as a prepared handle.
+        # The reviewed transport contract also allows Guard(prepared, ...).
         return guard_call.args[0] if guard_call.args else None
+
+    def response_guard_value(response: ast.Call) -> ast.expr | None:
+        return next(
+            (keyword.value for keyword in response.keywords if keyword.arg == "guard"),
+            None,
+        )
+
+    def returned_guard_response(
+        node: ast.AST,
+        aliases: dict[str, str],
+    ) -> tuple[ast.Return, ast.Call, ast.expr] | None:
+        if not isinstance(node, ast.Return) or not isinstance(node.value, ast.Call):
+            return None
+        if _call_terminal(node.value, aliases) != "build_guarded_streaming_response":
+            return None
+        guard_value = response_guard_value(node.value)
+        if guard_value is None:
+            raise AssertionError("guarded response must receive a Guard result")
+        return node, node.value, guard_value
 
     guarded_functions = 0
     for function in ast.walk(api_tree):
@@ -566,40 +725,66 @@ def _validate_prepared_streams_are_guarded(runtime_tree: ast.AST, api_tree: ast.
             for parent in ast.walk(function)
             for child in ast.iter_child_nodes(parent)
         }
+        scoped_nodes = [
+            node
+            for node in ast.walk(function)
+            if not nested_in_function(node, function, parents)
+        ]
+        prepared_assignments: list[ast.Assign | ast.AnnAssign] = []
         prepared_targets: list[str] = []
-        for node in ast.walk(function):
+        for node in scoped_nodes:
             if not isinstance(node, (ast.Assign, ast.AnnAssign)):
                 continue
             if not isinstance(node.value, ast.Call):
                 continue
             if _call_terminal(node.value, aliases) != "prepare_stream":
                 continue
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            for target in targets:
-                if isinstance(target, ast.Name):
-                    prepared_targets.append(target.id)
+            prepared_assignments.append(node)
+            prepared_targets.extend(assigned_names(node))
         if not prepared_targets:
             continue
         assert len(prepared_targets) == len(set(prepared_targets)), (
             "a prepared handle cannot be rebound before its guard"
         )
+        prepared_target_set = set(prepared_targets)
+        prepare_assignment_ids = {id(node) for node in prepared_assignments}
+        for node in scoped_nodes:
+            if id(node) in prepare_assignment_ids:
+                continue
+            if prepared_target_set.intersection(assigned_names(node)):
+                raise AssertionError("prepared handle was rebound before its guard")
+
         guards_by_target: dict[str, int] = {target: 0 for target in prepared_targets}
         guard_targets: dict[str, str] = {}
-        for node in ast.walk(function):
-            if not isinstance(node, ast.Call) or _call_terminal(node, aliases) != "PreparedStreamGuard":
+        guard_assignments: dict[str, ast.Assign | ast.AnnAssign] = {}
+        guard_calls: list[tuple[ast.Call, str, str | None]] = []
+        for node in scoped_nodes:
+            if not isinstance(node, ast.Call):
+                continue
+            if _dynamic_call_terminal(node, aliases, string_bindings) != "PreparedStreamGuard":
                 continue
             assert not dead_branch(node, parents), "dead-branch PreparedStreamGuard is not a guard"
+            assert not conditional_path(node, parents), (
+                "PreparedStreamGuard must be reachable on every stream path"
+            )
             prepared_arg = prepared_argument(node)
             if not isinstance(prepared_arg, ast.Name) or prepared_arg.id not in guards_by_target:
                 raise AssertionError("PreparedStreamGuard must consume a prepared handle")
             guards_by_target[prepared_arg.id] += 1
             parent = parents.get(node)
+            owner_name: str | None = None
             if isinstance(parent, ast.Assign):
                 targets = [target for target in parent.targets if isinstance(target, ast.Name)]
                 assert len(targets) == 1, "a PreparedStreamGuard must have one owner"
-                guard_targets[targets[0].id] = prepared_arg.id
+                owner_name = targets[0].id
+                assert owner_name not in guard_targets, "guard variable was rebound"
+                guard_targets[owner_name] = prepared_arg.id
+                guard_assignments[owner_name] = parent
             elif isinstance(parent, ast.AnnAssign) and isinstance(parent.target, ast.Name):
-                guard_targets[parent.target.id] = prepared_arg.id
+                owner_name = parent.target.id
+                assert owner_name not in guard_targets, "guard variable was rebound"
+                guard_targets[owner_name] = prepared_arg.id
+                guard_assignments[owner_name] = parent
             elif isinstance(parent, ast.keyword):
                 owner = parents.get(parent)
                 if not (
@@ -609,43 +794,64 @@ def _validate_prepared_streams_are_guarded(runtime_tree: ast.AST, api_tree: ast.
                 ):
                     raise AssertionError("PreparedStreamGuard result is not response-owned")
             else:
-                # A direct positional/keyword guard is only valid when it is
-                # immediately passed as the response guard below.
                 if not (
                     isinstance(parent, ast.Call)
                     and _call_terminal(parent, aliases) == "build_guarded_streaming_response"
                 ):
                     raise AssertionError("PreparedStreamGuard result is not response-owned")
+            guard_calls.append((node, prepared_arg.id, owner_name))
         assert all(count == 1 for count in guards_by_target.values()), (
             "each prepared stream handle must have exactly one data-flow guard"
         )
 
-        response_returns: set[str] = set()
+        for node in scoped_nodes:
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            for target in assigned_names(node):
+                if target in guard_targets and node is not guard_assignments[target]:
+                    raise AssertionError("guard variable was rebound before response return")
+
+        response_returns: dict[str, ast.Return] = {}
         direct_guard_ids: set[int] = set()
-        for returned in ast.walk(function):
-            if not isinstance(returned, ast.Return) or not isinstance(returned.value, ast.Call):
+        returned_responses: list[tuple[ast.Return, ast.Call, ast.expr]] = []
+        for returned in scoped_nodes:
+            result = returned_guard_response(returned, aliases)
+            if result is None:
                 continue
-            if _call_terminal(returned.value, aliases) != "build_guarded_streaming_response":
-                continue
-            guard_value = next(
-                (keyword.value for keyword in returned.value.keywords if keyword.arg == "guard"),
-                None,
-            )
+            return_node, response, guard_value = result
+            returned_responses.append(result)
             if isinstance(guard_value, ast.Name):
-                response_returns.add(guard_value.id)
+                response_returns[guard_value.id] = return_node
             elif isinstance(guard_value, ast.Call):
                 direct_guard_ids.add(id(guard_value))
+
+        for guard_call, _prepared_name, owner_name in guard_calls:
+            if owner_name is not None:
+                assert owner_name in response_returns, (
+                    "each PreparedStreamGuard must flow into the returned guarded response"
+                )
             else:
-                raise AssertionError("guarded response must receive a Guard result")
-        assert all(
-            guard_name in response_returns
-            or any(id(node) in direct_guard_ids for node in ast.walk(function) if isinstance(node, ast.Call))
-            for guard_name in guard_targets
-        ), "each PreparedStreamGuard must flow into the returned guarded response"
-        for node in ast.walk(function):
-            if isinstance(node, ast.Call) and _call_terminal(node, aliases) == "PreparedStreamGuard":
-                if top_level_return_precedes(function, node):
-                    raise AssertionError("unreachable return precedes prepared stream guard")
+                assert id(guard_call) in direct_guard_ids, (
+                    "each PreparedStreamGuard must flow into the returned guarded response"
+                )
+
+        first_prepare_line = min(node.lineno for node in prepared_assignments)
+        returned_response_ids = {
+            id(return_node)
+            for return_node, _response, _guard_value in returned_responses
+        }
+        for node in scoped_nodes:
+            if not isinstance(node, (ast.Return, ast.Raise)):
+                continue
+            if node.lineno <= first_prepare_line or dead_branch(node, parents):
+                continue
+            if isinstance(node, ast.Return) and id(node) in returned_response_ids:
+                if conditional_path(node, parents):
+                    raise AssertionError("guarded response return is not reachable on every path")
+                continue
+            if immediate_branch(node, prepared_target_set, parents):
+                continue
+            raise AssertionError("prepared stream has an unguarded reachable return path")
         guarded_functions += 1
     assert guarded_functions, "prepared stream handles must have a transport guard"
 
@@ -691,10 +897,6 @@ def _validate_runtime_event_contract(tree: ast.AST) -> None:
 def _validate_no_legacy_switches(paths: tuple[Path, ...]) -> None:
     findings: list[str] = []
     for path in paths:
-        if path not in {API, TRANSPORT} and path.parent != RUNTIME:
-            source = path.read_text(encoding="utf-8")
-            if not any(marker in source for marker in CHAT_RUNTIME_SEMANTIC_MARKERS):
-                continue
         tree = _tree(path)
         aliases = _binding_aliases(tree)
         string_bindings = _string_bindings(tree)
@@ -707,7 +909,14 @@ def _validate_no_legacy_switches(paths: tuple[Path, ...]) -> None:
         in_chat_runtime_scope = (
             path in {API, TRANSPORT}
             or path.parent == RUNTIME
-            or bool(semantic_names & CHAT_RUNTIME_SEMANTIC_NAMES)
+            or bool(
+                (semantic_names | _dynamic_attribute_strings(
+                    tree,
+                    bindings=string_bindings,
+                    aliases=aliases,
+                ))
+                & CHAT_RUNTIME_SEMANTIC_NAMES
+            )
         )
         if not in_chat_runtime_scope:
             continue
@@ -730,6 +939,7 @@ def _validate_no_legacy_switches(paths: tuple[Path, ...]) -> None:
                 tree,
                 aliases=aliases,
                 prefix_aliases=error_prefix_aliases,
+                bindings=string_bindings,
             ) and path not in {
                 SRC / "ai" / "tool_runtime" / "rendering.py"
             }:
@@ -768,13 +978,15 @@ def _validate_model_dispatch_not_legacy(tree: ast.AST) -> None:
 
 def _validate_no_error_prefix_expansion(tree: ast.AST) -> None:
     aliases = _binding_aliases(tree)
-    prefix_aliases = _error_prefix_aliases(tree)
+    bindings = _string_bindings(tree)
+    prefix_aliases = _error_prefix_aliases(tree, bindings=bindings)
     for node in ast.walk(tree):
         if _is_error_prefix_call(
             node,
             tree,
             aliases=aliases,
             prefix_aliases=prefix_aliases,
+            bindings=bindings,
         ):
             raise AssertionError("compatibility error-prefix parsing is not allowed here")
 
@@ -798,17 +1010,22 @@ def _is_error_prefix_call(
     *,
     aliases: dict[str, str] | None = None,
     prefix_aliases: set[str] | None = None,
+    bindings: dict[str, str] | None = None,
 ) -> bool:
     aliases = _binding_aliases(tree) if aliases is None else aliases
-    prefix_aliases = _error_prefix_aliases(tree) if prefix_aliases is None else prefix_aliases
+    bindings = _string_bindings(tree) if bindings is None else bindings
+    prefix_aliases = (
+        _error_prefix_aliases(tree, bindings=bindings)
+        if prefix_aliases is None
+        else prefix_aliases
+    )
     if not (
         isinstance(node, ast.Call)
-        and _qualified_symbol(node.func, aliases) is not None
         and node.args
     ):
         return False
-    function_name = _qualified_symbol(node.func, aliases)
-    if function_name is None or function_name.rsplit(".", 1)[-1] != "startswith":
+    function_name = _dynamic_call_terminal(node, aliases, bindings)
+    if function_name != "startswith":
         return False
     prefix = node.args[0]
     return (
@@ -968,6 +1185,70 @@ def _validate_no_generic_asdict_boundary(tree: ast.AST) -> None:
                 raise AssertionError(
                     "runtime-private DTOs/outcomes cannot flow into generic asdict helpers"
                 )
+
+
+def _validate_no_asdict_in_extraction_scope(tree: ast.AST) -> None:
+    """Extraction modules must never invoke generic dataclass serialization."""
+
+    aliases = _binding_aliases(tree)
+    bindings = _string_bindings(tree)
+    asdict_aliases = {
+        name
+        for name, source in aliases.items()
+        if source.rsplit(".", 1)[-1] == "asdict"
+    }
+    asdict_aliases.add("asdict")
+
+    def dynamic_getattr_is_asdict(value: ast.AST) -> bool:
+        if not (
+            isinstance(value, ast.Call)
+            and _call_terminal(value, aliases) == "getattr"
+            and len(value.args) >= 2
+        ):
+            return False
+        symbol = value.args[1]
+        return (
+            isinstance(symbol, ast.Constant)
+            and symbol.value == "asdict"
+        ) or (
+            isinstance(symbol, ast.Name)
+            and bindings.get(symbol.id) == "asdict"
+        )
+
+    for _ in range(4):
+        changed = False
+        for assignment in ast.walk(tree):
+            if not isinstance(assignment, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = assignment.value
+            is_alias = (
+                isinstance(value, ast.Name) and value.id in asdict_aliases
+            ) or (
+                isinstance(value, ast.Call)
+                and (
+                    _dynamic_call_terminal(value, aliases, bindings) == "asdict"
+                    or dynamic_getattr_is_asdict(value)
+                )
+            )
+            if not is_alias:
+                continue
+            targets = assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
+            for target in targets:
+                if isinstance(target, ast.Name) and target.id not in asdict_aliases:
+                    asdict_aliases.add(target.id)
+                    changed = True
+        if not changed:
+            break
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if (
+            _dynamic_call_terminal(node, aliases, bindings) == "asdict"
+            or (isinstance(node.func, ast.Name) and node.func.id in asdict_aliases)
+        ):
+            raise AssertionError(
+                "Pilot Runtime extraction scope must use explicit public projections"
+            )
 
 
 def test_four_chat_routes_do_not_own_reliability_or_persistence() -> None:
@@ -1330,6 +1611,156 @@ def test_allowlisted_production_call_sites_do_not_asdict_private_runtime_values(
     allowlisted_production = (API, TRANSPORT, *tuple(sorted(RUNTIME.glob("*.py"))))
     for path in allowlisted_production:
         _validate_no_generic_asdict_boundary(_tree(path))
+
+
+def test_extraction_scope_has_no_generic_asdict_calls() -> None:
+    allowlisted_production = (API, TRANSPORT, *tuple(sorted(RUNTIME.glob("*.py"))))
+    for path in allowlisted_production:
+        _validate_no_asdict_in_extraction_scope(_tree(path))
+
+
+def test_asdict_comment_is_not_a_call_site() -> None:
+    _validate_no_asdict_in_extraction_scope(
+        ast.parse("# asdict(values[0]) must remain only a comment\nvalue = {'public': 1}\n")
+    )
+
+
+def test_task11_negative_fixtures_cover_dynamic_and_reachability_bypasses() -> None:
+    _expect_rejected(
+        "import queue\ngetattr(queue, 'Queue')(1)\n",
+        _validate_unbounded_queue,
+    )
+    _expect_rejected(
+        "import queue\nname = 'Queue'\ngetattr(queue, name)(1)\n",
+        _validate_unbounded_queue,
+    )
+    _expect_rejected(
+        "class SyncAgentExecutionHost:\n"
+        "    def __init__(self, value):\n"
+        "        self.store = getattr(value, 'AgentRunRepository')\n",
+        _validate_execution_host_boundary,
+    )
+    _expect_rejected(
+        "class SseAgentExecutionHost:\n"
+        "    def __init__(self, value):\n"
+        "        name = 'PendingAction'\n"
+        "        self.store = getattr(value, name)\n",
+        _validate_execution_host_boundary,
+    )
+    _expect_rejected(
+        "def render(value):\n    return getattr(value, 'startswith')('错误：')\n",
+        _validate_no_error_prefix_expansion,
+    )
+    _expect_rejected(
+        "def render(value):\n"
+        "    method_name = 'startswith'\n"
+        "    return getattr(value, method_name)('错误：')\n",
+        _validate_no_error_prefix_expansion,
+    )
+    _expect_rejected(
+        "from dataclasses import asdict\n"
+        "values = [object()]\n"
+        "asdict(values[0])\n",
+        _validate_no_asdict_in_extraction_scope,
+    )
+    _expect_rejected(
+        "from dataclasses import asdict\n"
+        "dump = asdict\n"
+        "values = [object()]\n"
+        "dump(values[0])\n",
+        _validate_no_asdict_in_extraction_scope,
+    )
+    _expect_rejected(
+        "import dataclasses\n"
+        "name = 'asdict'\n"
+        "values = [object()]\n"
+        "getattr(dataclasses, name)(values[0])\n",
+        _validate_no_asdict_in_extraction_scope,
+    )
+    _expect_rejected(
+        "import dataclasses\n"
+        "name = 'asdict'\n"
+        "dump = getattr(dataclasses, name)\n"
+        "values = [object()]\n"
+        "dump(values[0])\n",
+        _validate_no_asdict_in_extraction_scope,
+    )
+    _expect_rejected(
+        "from offerpilot.chat_transport import PreparedStreamGuard as Guard\n"
+        "from offerpilot.chat_transport import build_guarded_streaming_response\n"
+        "def send_chat_stream(runtime):\n"
+        "    prepared = runtime.prepare_stream()\n"
+        "    if condition:\n"
+        "        guard = Guard(prepared)\n"
+        "        return build_guarded_streaming_response((), guard=guard)\n"
+        "    return Response()\n",
+        lambda tree: _validate_prepared_streams_are_guarded(
+            ast.parse("PreparedStreamExecution('id', PreparationKind.REPLAY, StreamExecutionMode.DIRECT, {})"),
+            tree,
+        ),
+    )
+    _expect_rejected(
+        "from offerpilot.chat_transport import PreparedStreamGuard as Guard\n"
+        "from offerpilot.chat_transport import build_guarded_streaming_response\n"
+        "def send_chat_stream(runtime):\n"
+        "    prepared = runtime.prepare_stream()\n"
+        "    guard = Guard(prepared)\n"
+        "    guard = None\n"
+        "    return build_guarded_streaming_response((), guard=guard)\n",
+        lambda tree: _validate_prepared_streams_are_guarded(
+            ast.parse("PreparedStreamExecution('id', PreparationKind.REPLAY, StreamExecutionMode.DIRECT, {})"),
+            tree,
+        ),
+    )
+    _expect_rejected(
+        "from offerpilot.chat_transport import PreparedStreamGuard as Guard\n"
+        "from offerpilot.chat_transport import build_guarded_streaming_response\n"
+        "def send_chat_stream(runtime):\n"
+        "    prepared = runtime.prepare_stream()\n"
+        "    guard = Guard(prepared)\n"
+        "    return None\n",
+        lambda tree: _validate_prepared_streams_are_guarded(
+            ast.parse("PreparedStreamExecution('id', PreparationKind.REPLAY, StreamExecutionMode.DIRECT, {})"),
+            tree,
+        ),
+    )
+    _expect_rejected(
+        "from offerpilot.chat_transport import PreparedStreamGuard as Guard\n"
+        "from offerpilot.chat_transport import build_guarded_streaming_response\n"
+        "def send_chat_stream(runtime):\n"
+        "    truth = False\n"
+        "    prepared = runtime.prepare_stream()\n"
+        "    if truth:\n"
+        "        guard = Guard(prepared)\n"
+        "    return build_guarded_streaming_response((), guard=guard)\n",
+        lambda tree: _validate_prepared_streams_are_guarded(
+            ast.parse("PreparedStreamExecution('id', PreparationKind.REPLAY, StreamExecutionMode.DIRECT, {})"),
+            tree,
+        ),
+    )
+
+
+def test_task11_positive_fixtures_keep_dynamic_helpers_scoped() -> None:
+    _validate_unbounded_queue(ast.parse("import queue\ngetattr(queue, 'Queue')()\n"))
+    _validate_unbounded_queue(
+        ast.parse("import queue\nname = 'Queue'\ngetattr(queue, name)()\n")
+    )
+    _validate_execution_host_boundary(
+        ast.parse(
+            "class SyncAgentExecutionHost:\n"
+            "    def __init__(self, value):\n"
+            "        self.store = getattr(value, 'public_store')\n"
+            "class SseAgentExecutionHost:\n"
+            "    def __init__(self, value):\n"
+            "        self.store = getattr(value, 'public_store')\n"
+        )
+    )
+    _validate_no_error_prefix_expansion(
+        ast.parse("def render(value):\n    return getattr(value, 'endswith')('错误：')\n")
+    )
+    _validate_no_asdict_in_extraction_scope(
+        ast.parse("# asdict(values[0])\nvalue = {'public': 1}\n")
+    )
 
 
 def test_runtime_outcomes_and_events_are_safe_json_shapes() -> None:
@@ -1878,3 +2309,4 @@ def test_canary_private_values_do_not_enter_journal_trace_sse_or_error_log_paylo
         assert trace.segments and trace.segments[0].tools
     finally:
         session.close()
+        session_factory.kw["bind"].dispose()

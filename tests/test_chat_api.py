@@ -787,6 +787,73 @@ def test_chat_stream_records_journal_without_changing_sse_identity(tmp_path):
     assert [snapshot.snapshot_kind for snapshot in snapshots] == ["initial", "model_input"]
 
 
+def test_repeated_real_chat_stream_shutdown_disposes_primary_engine_once(
+    tmp_path, monkeypatch
+):
+    app = create_app(
+        data_dir=tmp_path,
+        chat_model=StreamingModel(),
+        title_model=ScriptedModel([Assistant(content="title")]),
+    )
+    primary_engine = app.state.db_engine
+    assert primary_engine is not None
+    original_dispose = primary_engine.dispose
+    dispose_calls = 0
+
+    def dispose_once(*args: object, **kwargs: object) -> None:
+        nonlocal dispose_calls
+        dispose_calls += 1
+        original_dispose(*args, **kwargs)
+
+    monkeypatch.setattr(primary_engine, "dispose", dispose_once)
+
+    with TestClient(app) as client:
+        for index in range(3):
+            response = client.post(
+                "/api/chat/stream",
+                json={"message": f"hello-{index}", "conversation_id": 0},
+            )
+            assert response.status_code == 200
+
+    assert dispose_calls == 1
+    assert primary_engine.pool.checkedout() == 0
+    db_path = tmp_path / "data.db"
+    db_path.unlink()
+    assert not db_path.exists()
+
+
+def test_shutdown_error_is_not_masked_by_primary_engine_dispose_error(
+    tmp_path, monkeypatch
+):
+    app = create_app(data_dir=tmp_path)
+    primary_engine = app.state.db_engine
+    journal_engine = app.state.journal_db_engine
+    assert primary_engine is not None
+    assert journal_engine is not None
+    original_primary_dispose = primary_engine.dispose
+    original_journal_dispose = journal_engine.dispose
+    primary_dispose_calls = 0
+
+    def fail_primary_dispose(*args: object, **kwargs: object) -> None:
+        nonlocal primary_dispose_calls
+        primary_dispose_calls += 1
+        original_primary_dispose(*args, **kwargs)
+        raise RuntimeError("primary dispose failed")
+
+    def fail_journal_dispose(*args: object, **kwargs: object) -> None:
+        original_journal_dispose(*args, **kwargs)
+        raise RuntimeError("journal shutdown failed")
+
+    monkeypatch.setattr(primary_engine, "dispose", fail_primary_dispose)
+    monkeypatch.setattr(journal_engine, "dispose", fail_journal_dispose)
+
+    with pytest.raises(RuntimeError, match="journal shutdown failed"):
+        with TestClient(app):
+            pass
+
+    assert primary_dispose_calls == 1
+
+
 @pytest.mark.parametrize("endpoint", ["/api/chat", "/api/chat/stream"])
 def test_journal_active_budget_ignores_slow_final_provider_gap(
     tmp_path, monkeypatch, endpoint

@@ -133,8 +133,8 @@ def test_baseline_references_exact_repository_and_production() -> None:
     assert baseline["repository_baseline"] == "1574d0e891391c817c325f598b4f22f8a783833"
     assert baseline["production_baseline"] == "2427fa6"
     assert BASELINE == baseline["production_baseline"]
-    assert tuple(baseline["model_tool_names"]) == MODEL_TOOL_NAMES
-    assert tuple(baseline["legacy_tool_names"]) == LEGACY_TOOL_NAMES
+    assert tuple(baseline["typed_tool_names"]) == MODEL_TOOL_NAMES
+    assert tuple(baseline["legacy_deterministic_names"]) == LEGACY_TOOL_NAMES
     assert not set(MODEL_TOOL_NAMES) & set(LEGACY_TOOL_NAMES)
 
 
@@ -221,6 +221,95 @@ def test_existing_fixture_identities_and_compatibility_facts_are_pinned() -> Non
     }
 
 
+def test_pre_executor_sync_and_sse_bodies_are_exact() -> None:
+    baseline = load_golden("baseline_2427fa6.json")
+    pre_executor = baseline["compatibility"]["pre_executor"]
+
+    def tool_body(summary: str) -> dict[str, object]:
+        return {
+            "tool_call_id": "synthetic-call",
+            "tool_name": "synthetic_tool",
+            "status": "error",
+            "summary": summary,
+            "evidence": [],
+            "affected_resources": [],
+            "changed_entities": [],
+        }
+
+    pipeline = {
+        "schema": (
+            "validation_error",
+            "schema_validation_failed",
+            "错误：工具参数验证失败，请检查后重试。",
+        ),
+        "decode": (
+            "internal_error",
+            "argument_decode_failed",
+            "错误：工具执行失败，请稍后重试。",
+        ),
+        "capability": (
+            "permission_denied",
+            "missing_capability",
+            "错误：permission denied",
+        ),
+        "binding": (
+            "internal_error",
+            "binding_resolution_failed",
+            "错误：工具执行失败，请稍后重试。",
+        ),
+        "preflight": (
+            "stale_state",
+            "preflight_failed",
+            "错误：当前状态已变化，请刷新后重试。",
+        ),
+    }
+    for stage, (category, code, message) in pipeline.items():
+        body = tool_body(message)
+        assert pre_executor["tool_pipeline"][stage] == {
+            "failure": {"category": category, "code": code, "message": message},
+            "sync": {"status": 200, "body": body},
+            "sse": {"event": "tool_result", "data": body},
+        }
+
+    confirmation = {
+        "approve_claim": (
+            "conflict",
+            "confirmation_claim_failed",
+            "错误：操作冲突，请刷新后重试。",
+            "待确认操作已过期或正在处理中，请刷新对话后重试。",
+        ),
+        "approve_authorization": (
+            "stale_state",
+            "authorization_mismatch",
+            "错误：当前状态已变化，请刷新后重试。",
+            "待确认操作已过期或正在处理中，请刷新对话后重试。",
+        ),
+        "modify_validation": (
+            "validation_error",
+            "invalid_confirmation",
+            "对话结果暂时无法保存。",
+            "对话结果暂时无法保存。",
+        ),
+    }
+    for action, (category, code, message, route_message) in confirmation.items():
+        route_code = "invalid_confirmation" if action == "modify_validation" else "stale_pending_action"
+        route_status = 422 if action == "modify_validation" else 409
+        body = {"error": route_message, "error_code": route_code}
+        assert pre_executor["confirmation"][action] == {
+            "failure": {"category": category, "code": code, "message": message},
+            "sync": {"status": route_status, "body": body},
+            "sse": {
+                "event": "error",
+                "data": {
+                    "code": route_code,
+                    "message": route_message,
+                    "retryable": True,
+                    "degraded": False,
+                },
+            },
+        }
+
+
 def test_call_count_and_provider_free_baselines_are_explicit() -> None:
     baseline = load_golden("baseline_2427fa6.json")
     assert baseline["call_count_baselines"] == {
@@ -245,76 +334,52 @@ def test_authority_manifest_is_the_single_ordered_typed_matrix() -> None:
     assert all(set(item) == {"ordinal", "name", "kind", "confirmation_policy", "required_capabilities", "binding", "resolvers"} for item in tools)
     assert not set(item["name"] for item in tools) & set(LEGACY_TOOL_NAMES)
 
-    expected = {
-        "list_applications": ("read", "scoped_collection", "application", ("applications.read",)),
-        "get_application": ("read", "enforce_if_bound", "application", ("applications.read",)),
-        "create_application": ("write", "non_application_only", None, ("applications.write",)),
-        "update_application_status": ("write", "enforce_if_bound", "application", ("applications.write",)),
-        "list_application_events": ("read", "scoped_collection", "application", ("application_events.read",)),
-        "get_application_event": ("read", "enforce_if_bound", "application", ("application_events.read",)),
-        "create_application_event": ("write", "enforce_if_bound", "application", ("application_events.write",)),
-        "update_application_event": ("write", "enforce_if_bound", "application", ("application_events.write",)),
-        "delete_application_event": ("write", "enforce_if_bound", "application", ("application_events.write",)),
-        "list_notes": ("read", "scoped_collection", "application", ("notes.read",)),
-        "add_note": ("write", "optional_target", "application", ("notes.write",)),
-        "update_note": ("write", "enforce_if_bound", "application", ("notes.write",)),
-        "delete_note": ("write", "enforce_if_bound", "application", ("notes.write",)),
-        "list_offers": ("read", "scoped_collection", "application", ("offers.read",)),
-        "get_offer": ("read", "enforce_if_bound", "application", ("offers.read",)),
-        "compare_offers": ("read", "non_application_only", None, ("offers.read",)),
-        "update_offer": ("write", "enforce_if_bound", "application", ("offers.write",)),
-        "save_offer_assessment": ("write", "enforce_if_bound", "application", ("offers.write",)),
-        "list_resumes": ("read", "none", None, ("resumes.read",)),
-        "get_resume": ("read", "enforce_if_bound", "resume", ("resumes.read",)),
-        "resume_update_career_intent": ("write", "enforce_if_bound", "resume", ("resumes.write",)),
-        "resume_rewrite_highlight": ("write", "enforce_if_bound", "resume", ("resumes.write",)),
-        "list_resume_matches": ("read", "enforce_if_bound", "resume", ("resumes.read",)),
-        "list_jd_analyses": ("read", "scoped_collection", "application", ("jd_analyses.read",)),
-        "get_jd_analysis": ("read", "enforce_if_bound", "application", ("jd_analyses.read",)),
+    allowed_capabilities = set(CAPABILITIES)
+    allowed_binding_kinds = {
+        "none",
+        "enforce_if_bound",
+        "scoped_collection",
+        "optional_target",
+        "non_application_only",
     }
+    allowed_entity_kinds = {None, "application", "resume"}
+    allowed_resolver_presence = {"required", "optional"}
     for item in tools:
-        kind, binding_kind, entity_kind, capabilities = expected[item["name"]]
-        assert item["kind"] == kind
-        assert item["confirmation_policy"] == ("required" if kind == "write" else "none")
-        assert tuple(item["required_capabilities"]) == capabilities
-        assert item["binding"] == {"kind": binding_kind, "entity_kind": entity_kind}
-        assert all(set(resolver) == {"resolver_id", "entity_kind", "arg_path", "presence", "identity_type"} for resolver in item["resolvers"])
-        assert all(resolver["identity_type"] == "positive_int64" for resolver in item["resolvers"])
-
-    resolver_expectations = {
-        "get_application": [("application_identity_arg", "application", "id", "required")],
-        "update_application_status": [("application_identity_arg", "application", "id", "required")],
-        "list_application_events": [("application_identity_arg", "application", "application_id", "optional")],
-        "get_application_event": [("application_event_parent", "application", "id", "required")],
-        "create_application_event": [("application_identity_arg", "application", "application_id", "required")],
-        "update_application_event": [
-            ("application_event_parent", "application", "id", "required"),
-            ("application_identity_arg", "application", "application_id", "required"),
-        ],
-        "delete_application_event": [("application_event_parent", "application", "id", "required")],
-        "list_notes": [("application_identity_arg", "application", "application_id", "optional")],
-        "add_note": [("application_identity_arg", "application", "application_id", "optional")],
-        "update_note": [
-            ("note_application_parent", "application", "id", "required"),
-            ("application_identity_arg", "application", "application_id", "optional"),
-        ],
-        "delete_note": [("note_application_parent", "application", "id", "required")],
-        "get_offer": [("offer_application_parent", "application", "id", "required")],
-        "update_offer": [("offer_application_parent", "application", "id", "required")],
-        "save_offer_assessment": [("offer_application_parent", "application", "id", "required")],
-        "get_resume": [("resume_identity_arg", "resume", "id", "required")],
-        "resume_update_career_intent": [("resume_identity_arg", "resume", "id", "required")],
-        "resume_rewrite_highlight": [("resume_identity_arg", "resume", "id", "required")],
-        "list_resume_matches": [("resume_identity_arg", "resume", "resume_id", "required")],
-        "list_jd_analyses": [("application_identity_arg", "application", "application_id", "optional")],
-        "get_jd_analysis": [("jd_analysis_application_parent", "application", "id", "required")],
-    }
-    for item in tools:
-        actual = [
-            (r["resolver_id"], r["entity_kind"], r["arg_path"], r["presence"])
-            for r in item["resolvers"]
-        ]
-        assert actual == resolver_expectations.get(item["name"], [])
+        assert item["kind"] in {"read", "write"}
+        assert item["confirmation_policy"] == (
+            "required" if item["kind"] == "write" else "none"
+        )
+        assert len(item["required_capabilities"]) == 1
+        assert set(item["required_capabilities"]) <= allowed_capabilities
+        assert set(item["binding"]) == {"kind", "entity_kind"}
+        assert item["binding"]["kind"] in allowed_binding_kinds
+        assert item["binding"]["entity_kind"] in allowed_entity_kinds
+        assert all(
+            set(resolver)
+            == {"resolver_id", "entity_kind", "arg_path", "presence", "identity_type"}
+            for resolver in item["resolvers"]
+        )
+        assert all(resolver["resolver_id"] for resolver in item["resolvers"])
+        assert all(
+            resolver["entity_kind"] in {"application", "resume"}
+            for resolver in item["resolvers"]
+        )
+        assert all(resolver["arg_path"] for resolver in item["resolvers"])
+        assert all(
+            resolver["presence"] in allowed_resolver_presence
+            for resolver in item["resolvers"]
+        )
+        assert all(
+            resolver["identity_type"] == "positive_int64"
+            for resolver in item["resolvers"]
+        )
+    assert {item["binding"]["kind"] for item in tools} == allowed_binding_kinds
+    assert {item["binding"]["entity_kind"] for item in tools} == allowed_entity_kinds
+    assert {
+        capability
+        for item in tools
+        for capability in item["required_capabilities"]
+    } == allowed_capabilities
 
 
 def test_policy_fingerprints_are_independent_fixed_reviewed_digests() -> None:

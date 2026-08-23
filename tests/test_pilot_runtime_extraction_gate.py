@@ -128,6 +128,85 @@ def _call_terminal(node: ast.Call, aliases: dict[str, str]) -> str | None:
     return source.rsplit(".", 1)[-1] if source else None
 
 
+def _string_bindings(tree: ast.AST) -> dict[str, str]:
+    """Resolve literal-string aliases used by dynamic compatibility escapes."""
+
+    bindings: dict[str, str] = {}
+    for _ in range(3):
+        changed = False
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = node.value
+            if value is None:
+                continue
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                resolved = value.value
+            elif isinstance(value, ast.Name) and value.id in bindings:
+                resolved = bindings[value.id]
+            else:
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name) and bindings.get(target.id) != resolved:
+                    bindings[target.id] = resolved
+                    changed = True
+        if not changed:
+            break
+    return bindings
+
+
+def _dynamic_attribute_strings(
+    tree: ast.AST,
+    *,
+    bindings: dict[str, str] | None = None,
+    aliases: dict[str, str] | None = None,
+) -> set[str]:
+    """Return symbols reached by ``getattr(value, name)`` in a source tree."""
+
+    bindings = _string_bindings(tree) if bindings is None else bindings
+    aliases = _binding_aliases(tree) if aliases is None else aliases
+    result: set[str] = set()
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and _call_terminal(node, aliases) == "getattr"
+            and len(node.args) >= 2
+        ):
+            continue
+        symbol = node.args[1]
+        if isinstance(symbol, ast.Constant) and isinstance(symbol.value, str):
+            result.add(symbol.value)
+        elif isinstance(symbol, ast.Name) and symbol.id in bindings:
+            result.add(bindings[symbol.id])
+    return result
+
+
+def _legacy_string_values(
+    tree: ast.AST,
+    *,
+    bindings: dict[str, str] | None = None,
+    aliases: dict[str, str] | None = None,
+) -> set[str]:
+    """Find exact/embedded legacy switch strings, including dynamic aliases."""
+
+    values = set(
+        _dynamic_attribute_strings(
+            tree,
+            bindings=bindings,
+            aliases=aliases,
+        )
+    )
+    values.update(
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and any(fragment in node.value.lower() for fragment in LEGACY_SWITCH_FRAGMENTS)
+    )
+    return values
+
+
 def _functions(tree: ast.AST, names: set[str]) -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
     return {
         node.name: node
@@ -166,6 +245,18 @@ ROUTE_OWNERSHIP_NAMES = frozenset(
         "context_source_loader",
         "run_recorder",
         "write_coordinator",
+        # Persistence/reliability nouns are forbidden in Route bodies even
+        # when they are imported or reached through a local alias.
+        "Pending",
+        "PendingAction",
+        "PendingActionPayload",
+        "Ledger",
+        "LedgerKeyDomain",
+        "Journal",
+        "JournalKeyDomain",
+        "AgentRunRepository",
+        "WriteOperationRepository",
+        "ChatRepository",
     }
 )
 ROUTE_TRANSPORT_NAMES = frozenset(
@@ -225,11 +316,32 @@ PRIVATE_BOUNDARY_NAMES = frozenset(
     }
 )
 
+# This is deliberately a fixed semantic marker set, not an allowlist of
+# source paths.  The production scan walks every Python source file and only
+# applies the old-Chat/Runtime switch rules to files that actually contain one
+# of these reviewed runtime symbols.  Unrelated config names such as
+# ``legacy_fallback`` therefore do not become a false positive.
+CHAT_RUNTIME_SEMANTIC_NAMES = frozenset(
+    {
+        *ROUTE_NAMES,
+        "PilotRuntime",
+        "RuntimeEvent",
+        "RuntimeOutcome",
+        "PreparedStreamExecution",
+        "PreparedStreamGuard",
+        "RuntimeTransportContext",
+        "runtime_sse_content",
+        "runtime_stream_response",
+        "execute_runtime_sync",
+    }
+)
+CHAT_RUNTIME_SEMANTIC_MARKERS = tuple(CHAT_RUNTIME_SEMANTIC_NAMES)
 
 def _validate_routes_are_runtime_only(tree: ast.AST) -> None:
     found = _functions(tree, set(ROUTE_NAMES))
     assert set(found) == set(ROUTE_NAMES)
     aliases = _binding_aliases(tree)
+    string_bindings = _string_bindings(tree)
     for name, node in found.items():
         forbidden = _resolved_names(node, aliases) & (ROUTE_OWNERSHIP_NAMES | ROUTE_TRANSPORT_NAMES)
         assert not forbidden, f"{name} owns reliability/persistence helpers: {sorted(forbidden)}"
@@ -239,6 +351,22 @@ def _validate_routes_are_runtime_only(tree: ast.AST) -> None:
             terminal = _call_terminal(child, aliases)
             if terminal in ROUTE_OWNERSHIP_NAMES | ROUTE_TRANSPORT_NAMES:
                 raise AssertionError(f"{name} directly constructs/owns {terminal}")
+            if (
+                _call_terminal(child, aliases) == "getattr"
+                and len(child.args) >= 2
+            ):
+                dynamic_names = _dynamic_attribute_strings(
+                    node,
+                    bindings=string_bindings,
+                    aliases=aliases,
+                )
+                forbidden_dynamic = dynamic_names & (
+                    ROUTE_OWNERSHIP_NAMES | ROUTE_TRANSPORT_NAMES
+                )
+                assert not forbidden_dynamic, (
+                    f"{name} reaches forbidden helper through getattr: "
+                    f"{sorted(forbidden_dynamic)}"
+                )
 
 
 def _validate_runtime_transport_boundary(tree: ast.AST) -> None:
@@ -286,6 +414,8 @@ def _validate_no_stream_primitive_in_api(tree: ast.AST) -> None:
     }
     found = sorted(_resolved_names(tree) & forbidden_names)
     assert not found, f"api owns transport primitive(s): {found}"
+    dynamic_found = sorted(_dynamic_attribute_strings(tree) & forbidden_names)
+    assert not dynamic_found, f"api reaches transport primitive through getattr: {dynamic_found}"
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in {
             "_runtime_sse_content",
@@ -319,13 +449,19 @@ def _validate_execution_host_boundary(tree: ast.AST) -> None:
     )
     host_names = {node.name for node in ast.walk(tree) if isinstance(node, ast.ClassDef)}
     assert {"SyncAgentExecutionHost", "SseAgentExecutionHost"} <= host_names
+    string_bindings = _string_bindings(tree)
     forbidden_names = {
         "Pending",
+        "PendingAction",
         "PendingActionPayload",
         "Ledger",
+        "Journal",
+        "JournalKeyDomain",
         "WriteOperationCoordinator",
         "RunRecorder",
         "AgentRunRepository",
+        "WriteOperationRepository",
+        "ChatRepository",
     }
     forbidden_attrs = {
         "pending",
@@ -350,6 +486,15 @@ def _validate_execution_host_boundary(tree: ast.AST) -> None:
             for child in ast.walk(node)
             if isinstance(child, ast.Attribute)
         }
+        attrs.update(
+            value.lower()
+            for value in _dynamic_attribute_strings(
+                node,
+                bindings=string_bindings,
+                aliases=_binding_aliases(tree),
+            )
+            if isinstance(value, str)
+        )
         assert not attrs.intersection(forbidden_attrs), (
             f"{node.name} holds forbidden boundary attributes: "
             f"{sorted(attrs.intersection(forbidden_attrs))}"
@@ -366,10 +511,61 @@ def _validate_prepared_streams_are_guarded(runtime_tree: ast.AST, api_tree: ast.
     ]
     assert prepared_calls, "the runtime must construct prepared stream handles"
     aliases = _binding_aliases(api_tree)
+
+    def dead_branch(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
+        current = node
+        while current in parents:
+            parent = parents[current]
+            if isinstance(parent, ast.If):
+                if current in parent.body and isinstance(parent.test, ast.Constant):
+                    if not bool(parent.test.value):
+                        return True
+                if current in parent.orelse and isinstance(parent.test, ast.Constant):
+                    if bool(parent.test.value):
+                        return True
+            if isinstance(parent, ast.While):
+                if current in parent.body and isinstance(parent.test, ast.Constant):
+                    if not bool(parent.test.value):
+                        return True
+            current = parent
+        return False
+
+    def top_level_return_precedes(
+        function: ast.FunctionDef | ast.AsyncFunctionDef,
+        node: ast.AST,
+    ) -> bool:
+        # The production shape has a single return of the guarded response.
+        # Reject the mechanically common ``return ...; Guard(...)`` bypass;
+        # nested branch reachability is handled by ``dead_branch`` above.
+        return any(
+            isinstance(statement, (ast.Return, ast.Raise))
+            and statement.lineno < getattr(node, "lineno", -1)
+            for statement in function.body
+        )
+
+    def prepared_argument(
+        guard_call: ast.Call,
+    ) -> ast.expr | None:
+        keyword = next(
+            (keyword.value for keyword in guard_call.keywords if keyword.arg == "prepared"),
+            None,
+        )
+        if keyword is not None:
+            return keyword
+        # PreparedStreamGuard intentionally supports the reviewed positional
+        # form ``Guard(prepared, on_execute=...)``.  Other positional shapes
+        # are not inferred as a prepared handle.
+        return guard_call.args[0] if guard_call.args else None
+
     guarded_functions = 0
     for function in ast.walk(api_tree):
         if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
+        parents = {
+            child: parent
+            for parent in ast.walk(function)
+            for child in ast.iter_child_nodes(parent)
+        }
         prepared_targets: list[str] = []
         for node in ast.walk(function):
             if not isinstance(node, (ast.Assign, ast.AnnAssign)):
@@ -388,19 +584,68 @@ def _validate_prepared_streams_are_guarded(runtime_tree: ast.AST, api_tree: ast.
             "a prepared handle cannot be rebound before its guard"
         )
         guards_by_target: dict[str, int] = {target: 0 for target in prepared_targets}
+        guard_targets: dict[str, str] = {}
         for node in ast.walk(function):
             if not isinstance(node, ast.Call) or _call_terminal(node, aliases) != "PreparedStreamGuard":
                 continue
-            prepared_arg = next(
-                (keyword.value for keyword in node.keywords if keyword.arg == "prepared"),
-                None,
-            )
+            assert not dead_branch(node, parents), "dead-branch PreparedStreamGuard is not a guard"
+            prepared_arg = prepared_argument(node)
             if not isinstance(prepared_arg, ast.Name) or prepared_arg.id not in guards_by_target:
                 raise AssertionError("PreparedStreamGuard must consume a prepared handle")
             guards_by_target[prepared_arg.id] += 1
+            parent = parents.get(node)
+            if isinstance(parent, ast.Assign):
+                targets = [target for target in parent.targets if isinstance(target, ast.Name)]
+                assert len(targets) == 1, "a PreparedStreamGuard must have one owner"
+                guard_targets[targets[0].id] = prepared_arg.id
+            elif isinstance(parent, ast.AnnAssign) and isinstance(parent.target, ast.Name):
+                guard_targets[parent.target.id] = prepared_arg.id
+            elif isinstance(parent, ast.keyword):
+                owner = parents.get(parent)
+                if not (
+                    parent.arg == "guard"
+                    and isinstance(owner, ast.Call)
+                    and _call_terminal(owner, aliases) == "build_guarded_streaming_response"
+                ):
+                    raise AssertionError("PreparedStreamGuard result is not response-owned")
+            else:
+                # A direct positional/keyword guard is only valid when it is
+                # immediately passed as the response guard below.
+                if not (
+                    isinstance(parent, ast.Call)
+                    and _call_terminal(parent, aliases) == "build_guarded_streaming_response"
+                ):
+                    raise AssertionError("PreparedStreamGuard result is not response-owned")
         assert all(count == 1 for count in guards_by_target.values()), (
             "each prepared stream handle must have exactly one data-flow guard"
         )
+
+        response_returns: set[str] = set()
+        direct_guard_ids: set[int] = set()
+        for returned in ast.walk(function):
+            if not isinstance(returned, ast.Return) or not isinstance(returned.value, ast.Call):
+                continue
+            if _call_terminal(returned.value, aliases) != "build_guarded_streaming_response":
+                continue
+            guard_value = next(
+                (keyword.value for keyword in returned.value.keywords if keyword.arg == "guard"),
+                None,
+            )
+            if isinstance(guard_value, ast.Name):
+                response_returns.add(guard_value.id)
+            elif isinstance(guard_value, ast.Call):
+                direct_guard_ids.add(id(guard_value))
+            else:
+                raise AssertionError("guarded response must receive a Guard result")
+        assert all(
+            guard_name in response_returns
+            or any(id(node) in direct_guard_ids for node in ast.walk(function) if isinstance(node, ast.Call))
+            for guard_name in guard_targets
+        ), "each PreparedStreamGuard must flow into the returned guarded response"
+        for node in ast.walk(function):
+            if isinstance(node, ast.Call) and _call_terminal(node, aliases) == "PreparedStreamGuard":
+                if top_level_return_precedes(function, node):
+                    raise AssertionError("unreachable return precedes prepared stream guard")
         guarded_functions += 1
     assert guarded_functions, "prepared stream handles must have a transport guard"
 
@@ -413,6 +658,20 @@ def _validate_runtime_event_contract(tree: ast.AST) -> None:
     }
     user_event = classes.get("UserMessageSavedEvent")
     assert user_event is not None
+    fields = [
+        node.target.id
+        for node in user_event.body
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+    ]
+    assert fields == ["role"], "UserMessageSavedEvent may expose only role"
+    role_field = next(
+        node
+        for node in user_event.body
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "role"
+    )
+    assert isinstance(role_field.value, ast.Constant) and role_field.value.value == "user"
     role_values = [
         node.value
         for node in ast.walk(user_event)
@@ -432,14 +691,46 @@ def _validate_runtime_event_contract(tree: ast.AST) -> None:
 def _validate_no_legacy_switches(paths: tuple[Path, ...]) -> None:
     findings: list[str] = []
     for path in paths:
+        if path not in {API, TRANSPORT} and path.parent != RUNTIME:
+            source = path.read_text(encoding="utf-8")
+            if not any(marker in source for marker in CHAT_RUNTIME_SEMANTIC_MARKERS):
+                continue
         tree = _tree(path)
-        identifiers = _resolved_names(tree)
+        aliases = _binding_aliases(tree)
+        string_bindings = _string_bindings(tree)
+        error_prefix_aliases = _error_prefix_aliases(tree, bindings=string_bindings)
+        semantic_names = _resolved_names(tree, aliases)
+        # Walk every production file, but scope old-path findings to files
+        # that are demonstrably part of Chat/Pilot Runtime.  This keeps an
+        # unrelated configuration knob named ``legacy_fallback`` from being
+        # mistaken for a second Chat route.
+        in_chat_runtime_scope = (
+            path in {API, TRANSPORT}
+            or path.parent == RUNTIME
+            or bool(semantic_names & CHAT_RUNTIME_SEMANTIC_NAMES)
+        )
+        if not in_chat_runtime_scope:
+            continue
+        identifiers = semantic_names
         for identifier in identifiers:
             lowered = identifier.lower()
             if any(fragment in lowered for fragment in LEGACY_SWITCH_FRAGMENTS):
                 findings.append(f"{path.relative_to(ROOT)}:{identifier}")
+        for value in _legacy_string_values(
+            tree,
+            bindings=string_bindings,
+            aliases=aliases,
+        ):
+            lowered = value.lower()
+            if any(fragment in lowered for fragment in LEGACY_SWITCH_FRAGMENTS):
+                findings.append(f"{path.relative_to(ROOT)}:{value}")
         for node in ast.walk(tree):
-            if _is_error_prefix_call(node, tree) and path not in {
+            if _is_error_prefix_call(
+                node,
+                tree,
+                aliases=aliases,
+                prefix_aliases=error_prefix_aliases,
+            ) and path not in {
                 SRC / "ai" / "tool_runtime" / "rendering.py"
             }:
                 findings.append(f"{path.relative_to(ROOT)}:{node.lineno}:错误前缀解析")
@@ -447,10 +738,19 @@ def _validate_no_legacy_switches(paths: tuple[Path, ...]) -> None:
 
 
 def _validate_no_legacy_switch_tree(tree: ast.AST) -> None:
-    identifiers = _resolved_names(tree)
+    aliases = _binding_aliases(tree)
+    identifiers = _resolved_names(tree, aliases)
     assert not any(
         any(fragment in identifier.lower() for fragment in LEGACY_SWITCH_FRAGMENTS)
         for identifier in identifiers
+    )
+    assert not any(
+        any(fragment in value.lower() for fragment in LEGACY_SWITCH_FRAGMENTS)
+        for value in _legacy_string_values(
+            tree,
+            bindings=_string_bindings(tree),
+            aliases=aliases,
+        )
     )
 
 
@@ -467,41 +767,61 @@ def _validate_model_dispatch_not_legacy(tree: ast.AST) -> None:
 
 
 def _validate_no_error_prefix_expansion(tree: ast.AST) -> None:
+    aliases = _binding_aliases(tree)
+    prefix_aliases = _error_prefix_aliases(tree)
     for node in ast.walk(tree):
-        if _is_error_prefix_call(node, tree):
+        if _is_error_prefix_call(
+            node,
+            tree,
+            aliases=aliases,
+            prefix_aliases=prefix_aliases,
+        ):
             raise AssertionError("compatibility error-prefix parsing is not allowed here")
 
 
-def _error_prefix_aliases(tree: ast.AST) -> set[str]:
-    result: set[str] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-            continue
-        value = node.value
-        if not isinstance(value, ast.Constant) or value.value != "错误：":
-            continue
-        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-        result.update(target.id for target in targets if isinstance(target, ast.Name))
-    return result
+def _error_prefix_aliases(
+    tree: ast.AST,
+    *,
+    bindings: dict[str, str] | None = None,
+) -> set[str]:
+    bindings = _string_bindings(tree) if bindings is None else bindings
+    return {
+        name
+        for name, value in bindings.items()
+        if value == "错误："
+    }
 
 
-def _is_error_prefix_call(node: ast.AST, tree: ast.AST) -> bool:
+def _is_error_prefix_call(
+    node: ast.AST,
+    tree: ast.AST,
+    *,
+    aliases: dict[str, str] | None = None,
+    prefix_aliases: set[str] | None = None,
+) -> bool:
+    aliases = _binding_aliases(tree) if aliases is None else aliases
+    prefix_aliases = _error_prefix_aliases(tree) if prefix_aliases is None else prefix_aliases
     if not (
         isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "startswith"
+        and _qualified_symbol(node.func, aliases) is not None
         and node.args
     ):
+        return False
+    function_name = _qualified_symbol(node.func, aliases)
+    if function_name is None or function_name.rsplit(".", 1)[-1] != "startswith":
         return False
     prefix = node.args[0]
     return (
         isinstance(prefix, ast.Constant)
         and prefix.value == "错误："
-    ) or (isinstance(prefix, ast.Name) and prefix.id in _error_prefix_aliases(tree))
+    ) or (isinstance(prefix, ast.Name) and prefix.id in prefix_aliases)
 
 
 def _validate_boundary_names_absent(tree: ast.AST) -> None:
-    assert not (_names(tree) & PRIVATE_BOUNDARY_NAMES)
+    aliases = _binding_aliases(tree)
+    resolved = _resolved_names(tree, aliases)
+    dynamic = _dynamic_attribute_strings(tree, aliases=aliases)
+    assert not ((resolved | dynamic) & PRIVATE_BOUNDARY_NAMES)
 
 
 def _validate_no_generic_asdict_boundary(tree: ast.AST) -> None:
@@ -512,12 +832,142 @@ def _validate_no_generic_asdict_boundary(tree: ast.AST) -> None:
         "OperationPendingOutcome",
         "OperationReplayOutcome",
     }
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or _call_terminal(node, aliases) != "asdict":
+
+    def direct_forbidden(value: ast.AST) -> bool:
+        return bool(_resolved_names(value, aliases) & forbidden)
+
+    def asdict_argument(node: ast.Call) -> ast.expr | None:
+        if _call_terminal(node, aliases) == "asdict":
+            return node.args[0] if node.args else None
+        if not (
+            isinstance(node.func, ast.Call)
+            and _call_terminal(node.func, aliases) == "getattr"
+            and len(node.func.args) >= 2
+            and isinstance(node.func.args[1], ast.Constant)
+            and node.func.args[1].value == "asdict"
+        ):
+            return None
+        return node.args[0] if node.args else None
+
+    def target_names(node: ast.Assign | ast.AnnAssign) -> tuple[str, ...]:
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        return tuple(target.id for target in targets if isinstance(target, ast.Name))
+
+    # Taint only values with a concrete runtime-private origin.  A generic
+    # logger/serializer parameter remains valid until a private value is
+    # actually passed into it; this avoids banning ordinary ``asdict(value)``
+    # helpers solely because they are generic.
+    tainted: set[str] = set()
+    for _ in range(4):
+        changed = False
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = node.value
+            if value is None:
+                if isinstance(node, ast.AnnAssign) and (
+                    _resolved_names(node.annotation, aliases) & forbidden
+                ):
+                    for target in target_names(node):
+                        if target not in tainted:
+                            tainted.add(target)
+                            changed = True
+                continue
+            value_tainted = direct_forbidden(value) or any(
+                isinstance(child, ast.Name) and child.id in tainted
+                for child in ast.walk(value)
+            )
+            if value_tainted:
+                for target in target_names(node):
+                    if target not in tainted:
+                        tainted.add(target)
+                        changed = True
+        if not changed:
+            break
+
+    asdict_parameter_names: dict[str, dict[str, int | None]] = {}
+    for function in ast.walk(tree):
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        assert not (_resolved_names(node, aliases) & forbidden), (
+        positional_parameters = (*function.args.posonlyargs, *function.args.args)
+        parameters = {parameter.arg for parameter in (*positional_parameters, *function.args.kwonlyargs)}
+        parameter_aliases = {parameter: parameter for parameter in parameters}
+        for _ in range(3):
+            changed = False
+            for assignment in ast.walk(function):
+                if not isinstance(assignment, (ast.Assign, ast.AnnAssign)):
+                    continue
+                value = assignment.value
+                if not isinstance(value, ast.Name) or value.id not in parameter_aliases:
+                    continue
+                root = parameter_aliases[value.id]
+                targets = assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
+                for target in targets:
+                    if isinstance(target, ast.Name) and target.id not in parameter_aliases:
+                        parameter_aliases[target.id] = root
+                        changed = True
+            if not changed:
+                break
+        found = {
+            parameter_aliases[argument.id]
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and (argument := asdict_argument(node)) is not None
+            and isinstance(argument, ast.Name)
+            and argument.id in parameter_aliases
+        }
+        if found:
+            asdict_parameter_names[function.name] = {
+                parameter: next(
+                    (
+                        index
+                        for index, candidate in enumerate(positional_parameters)
+                        if candidate.arg == parameter
+                    ),
+                    None,
+                )
+                for parameter in found
+            }
+        annotations = ast.unparse(function.args) if function.args else ""
+        if found and any(name in annotations for name in forbidden):
+            raise AssertionError("private runtime values cannot be annotated into generic asdict")
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        argument = asdict_argument(node)
+        if argument is None:
+            continue
+        assert not direct_forbidden(argument), (
             "runtime-private DTOs/outcomes must use explicit projections, not asdict"
         )
+        if isinstance(argument, ast.Name):
+            assert argument.id not in tainted, (
+                "runtime-private DTOs/outcomes must use explicit projections, not asdict"
+            )
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        function_name = _call_terminal(node, aliases)
+        parameters = asdict_parameter_names.get(function_name or "")
+        if not parameters:
+            continue
+        # Parameter-to-argument mapping is intentionally conservative: a
+        # positional parameter or an exact keyword name is enough to prove
+        # the private value reaches the helper.
+        for parameter, index in parameters.items():
+            if index is not None and index < len(node.args):
+                argument = node.args[index]
+                if isinstance(argument, ast.Name) and argument.id in tainted:
+                    raise AssertionError(
+                        "runtime-private DTOs/outcomes cannot flow into generic asdict helpers"
+                    )
+        for keyword in node.keywords:
+            if keyword.arg in parameters and isinstance(keyword.value, ast.Name) and keyword.value.id in tainted:
+                raise AssertionError(
+                    "runtime-private DTOs/outcomes cannot flow into generic asdict helpers"
+                )
 
 
 def test_four_chat_routes_do_not_own_reliability_or_persistence() -> None:
@@ -551,9 +1001,16 @@ def test_runtime_event_union_has_closed_user_message_event() -> None:
 
 
 def test_no_old_path_alias_shadow_or_fallback_is_present() -> None:
-    paths = (API, TRANSPORT, *tuple(sorted(RUNTIME.glob("*.py"))))
-    _validate_no_legacy_switches(paths)
+    # The validator must consume the complete production inventory; it then
+    # applies the fixed Chat/Runtime semantic scope internally.
+    _validate_no_legacy_switches(_production_files())
     _validate_model_dispatch_not_legacy(_tree(RUNTIME / "service.py"))
+
+
+def test_unrelated_config_legacy_fallback_is_outside_chat_runtime_semantics() -> None:
+    config = SRC / "config.py"
+    assert "legacy_fallback" in _names(_tree(config))
+    _validate_no_legacy_switches((config,))
 
 
 def test_negative_source_fixtures_prove_mechanical_validators_reject_forbidden_patterns() -> None:
@@ -595,6 +1052,10 @@ def test_negative_source_fixtures_prove_mechanical_validators_reject_forbidden_p
         "from offerpilot.chat_transport import encode_sse_event as Emit\nEmit({}, seq=1)",
         _validate_no_stream_primitive_in_api,
     )
+    _expect_rejected(
+        "name = 'runtime_sse_content'\ngetattr(transport, name)",
+        _validate_no_stream_primitive_in_api,
+    )
     _expect_rejected("from offerpilot.repositories.chat import ChatRepository", _validate_execution_host_boundary)
     _expect_rejected(
         "class SyncAgentExecutionHost:\n"
@@ -607,7 +1068,22 @@ def test_negative_source_fixtures_prove_mechanical_validators_reject_forbidden_p
         "    def __init__(self):\n        self.pending_store = P\n",
         _validate_execution_host_boundary,
     )
+    _expect_rejected(
+        "class SyncAgentExecutionHost:\n"
+        "    def __init__(self, value):\n"
+        "        self.store = getattr(value, 'journal')\n",
+        _validate_execution_host_boundary,
+    )
     _expect_rejected("def _runtime_sse_content():\n    return encode_sse_event({}, seq=1)", _validate_no_stream_primitive_in_api)
+    _expect_rejected(
+        "from dataclasses import dataclass\n"
+        "@dataclass\n"
+        "class UserMessageSavedEvent:\n"
+        "    role: str = 'user'\n"
+        "    internal: object = None\n"
+        "RuntimeEvent: object = UserMessageSavedEvent\n",
+        _validate_runtime_event_contract,
+    )
     _expect_rejected(
         "class X:\n    def dual_run(self):\n        pass",
         _validate_no_legacy_switch_tree,
@@ -615,6 +1091,23 @@ def test_negative_source_fixtures_prove_mechanical_validators_reject_forbidden_p
     _expect_rejected(
         "from old_path import dual_run as execute\nexecute()",
         _validate_no_legacy_switch_tree,
+    )
+    _expect_rejected(
+        "switch_name = 'dual_run'\ngetattr(runtime, switch_name)()",
+        _validate_no_legacy_switch_tree,
+    )
+    _expect_rejected(
+        "from builtins import getattr as fetch\n"
+        "switch_name = 'dual_run'\nfetch(runtime, switch_name)()",
+        _validate_no_legacy_switch_tree,
+    )
+    _expect_rejected(
+        "from offerpilot.models import Journal as J\n"
+        "def send_chat():\n    return J()\n"
+        "def send_chat_stream():\n    return None\n"
+        "def confirm_chat():\n    return None\n"
+        "def confirm_chat_stream():\n    return None\n",
+        _validate_routes_are_runtime_only,
     )
     _expect_rejected(
         "def _select_route():\n    return legacy_adapter()",
@@ -630,6 +1123,19 @@ def test_negative_source_fixtures_prove_mechanical_validators_reject_forbidden_p
         _validate_no_error_prefix_expansion,
     )
     _expect_rejected(
+        "ERROR_PREFIX = '错误：'\n"
+        "ALIAS = ERROR_PREFIX\n"
+        "def render(value):\n    return value.startswith(ALIAS)",
+        _validate_no_error_prefix_expansion,
+    )
+    _expect_rejected(
+        "ERROR_PREFIX = '错误：'\n"
+        "def render(value):\n"
+        "    starts = value.startswith\n"
+        "    return starts(ERROR_PREFIX)",
+        _validate_no_error_prefix_expansion,
+    )
+    _expect_rejected(
         "from dataclasses import asdict\n"
         "from offerpilot.pilot_runtime import RuntimeFailureOutcome\n"
         "asdict(RuntimeFailureOutcome(...))",
@@ -641,6 +1147,110 @@ def test_negative_source_fixtures_prove_mechanical_validators_reject_forbidden_p
         "    first = runtime.prepare_stream()\n"
         "    second = runtime.prepare_stream()\n"
         "    return Guard(prepared=first)",
+        lambda tree: _validate_prepared_streams_are_guarded(
+            ast.parse("PreparedStreamExecution('id', PreparationKind.REPLAY, StreamExecutionMode.DIRECT, {})"),
+            tree,
+        ),
+    )
+    _expect_rejected(
+        "def send_chat():\n"
+        "    method_name = 'run_turn'\n"
+        "    return getattr(runtime, method_name)()\n"
+        "def send_chat_stream():\n    return None\n"
+        "def confirm_chat():\n    return None\n"
+        "def confirm_chat_stream():\n    return None\n",
+        _validate_routes_are_runtime_only,
+    )
+    _expect_rejected(
+        "method_name = 'run_turn'\n"
+        "def send_chat():\n    return getattr(runtime, method_name)()\n"
+        "def send_chat_stream():\n    return None\n"
+        "def confirm_chat():\n    return None\n"
+        "def confirm_chat_stream():\n    return None\n",
+        _validate_routes_are_runtime_only,
+    )
+    _expect_rejected(
+        "from builtins import getattr as fetch\n"
+        "method_name = 'run_turn'\n"
+        "def send_chat():\n    return fetch(runtime, method_name)()\n"
+        "def send_chat_stream():\n    return None\n"
+        "def confirm_chat():\n    return None\n"
+        "def confirm_chat_stream():\n    return None\n",
+        _validate_routes_are_runtime_only,
+    )
+    _expect_rejected(
+        "from offerpilot.pilot_runtime import RuntimeFailureOutcome as Failure\n"
+        "def persist(value):\n"
+        "    return getattr(value, 'RuntimeFailureOutcome')\n",
+        _validate_boundary_names_absent,
+    )
+    _expect_rejected(
+        "from offerpilot.pilot_runtime import RuntimeFailureOutcome\n"
+        "from dataclasses import asdict\n"
+        "outcome = RuntimeFailureOutcome(...)\n"
+        "alias = outcome\n"
+        "asdict(alias)",
+        _validate_no_generic_asdict_boundary,
+    )
+    _expect_rejected(
+        "from offerpilot.pilot_runtime import RuntimeFailureOutcome\n"
+        "from dataclasses import asdict\n"
+        "outcome: RuntimeFailureOutcome\n"
+        "asdict(outcome)",
+        _validate_no_generic_asdict_boundary,
+    )
+    _expect_rejected(
+        "from offerpilot.pilot_runtime import RuntimeFailureOutcome\n"
+        "outcome = RuntimeFailureOutcome(...)\n"
+        "getattr(dataclasses, 'asdict')(outcome)",
+        _validate_no_generic_asdict_boundary,
+    )
+    _expect_rejected(
+        "from offerpilot.pilot_runtime import RuntimeFailureOutcome\n"
+        "from dataclasses import asdict\n"
+        "def dump(value):\n"
+        "    return asdict(value)\n"
+        "outcome = RuntimeFailureOutcome(...)\n"
+        "dump(outcome)",
+        _validate_no_generic_asdict_boundary,
+    )
+    _expect_rejected(
+        "from offerpilot.pilot_runtime import RuntimeFailureOutcome\n"
+        "from dataclasses import asdict\n"
+        "def dump(value):\n"
+        "    alias = value\n"
+        "    return asdict(alias)\n"
+        "outcome = RuntimeFailureOutcome(...)\n"
+        "dump(outcome)",
+        _validate_no_generic_asdict_boundary,
+    )
+    positional_guard_source = (
+        "from offerpilot.chat_transport import PreparedStreamGuard as Guard\n"
+        "from offerpilot.chat_transport import build_guarded_streaming_response\n"
+        "def send_chat_stream(runtime):\n"
+        "    prepared = runtime.prepare_stream()\n"
+        "    guard = Guard(prepared, on_execute=lambda: None)\n"
+        "    return build_guarded_streaming_response((), guard=guard)\n"
+    )
+    _validate_prepared_streams_are_guarded(
+        ast.parse("PreparedStreamExecution('id', PreparationKind.REPLAY, StreamExecutionMode.DIRECT, {})"),
+        ast.parse(positional_guard_source),
+    )
+    _expect_rejected(
+        positional_guard_source.replace(
+            "    guard = Guard(prepared, on_execute=lambda: None)\n",
+            "    if False:\n        guard = Guard(prepared, on_execute=lambda: None)\n",
+        ),
+        lambda tree: _validate_prepared_streams_are_guarded(
+            ast.parse("PreparedStreamExecution('id', PreparationKind.REPLAY, StreamExecutionMode.DIRECT, {})"),
+            tree,
+        ),
+    )
+    _expect_rejected(
+        positional_guard_source.replace(
+            "    guard = Guard(prepared, on_execute=lambda: None)\n",
+            "    return None\n    guard = Guard(prepared, on_execute=lambda: None)\n",
+        ),
         lambda tree: _validate_prepared_streams_are_guarded(
             ast.parse("PreparedStreamExecution('id', PreparationKind.REPLAY, StreamExecutionMode.DIRECT, {})"),
             tree,
@@ -706,6 +1316,22 @@ def test_boundary_modules_do_not_serialize_runtime_private_types() -> None:
     assert findings == []
 
 
+def test_generic_log_serializer_is_not_rejected_without_private_value_flow() -> None:
+    tree = ast.parse(
+        "from dataclasses import asdict\n"
+        "def append_log_entry(value):\n"
+        "    return asdict(value)\n"
+        "append_log_entry({'public': 1})\n"
+    )
+    _validate_no_generic_asdict_boundary(tree)
+
+
+def test_allowlisted_production_call_sites_do_not_asdict_private_runtime_values() -> None:
+    allowlisted_production = (API, TRANSPORT, *tuple(sorted(RUNTIME.glob("*.py"))))
+    for path in allowlisted_production:
+        _validate_no_generic_asdict_boundary(_tree(path))
+
+
 def test_runtime_outcomes_and_events_are_safe_json_shapes() -> None:
     from offerpilot.pilot_runtime import (
         AssistantMessageEvent,
@@ -743,6 +1369,7 @@ def test_runtime_outcomes_and_events_are_safe_json_shapes() -> None:
 
 def test_canary_private_values_do_not_enter_journal_trace_sse_or_error_log_payloads(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from datetime import datetime, timedelta, timezone
     from types import SimpleNamespace
@@ -755,17 +1382,16 @@ def test_canary_private_values_do_not_enter_journal_trace_sse_or_error_log_paylo
         TerminalDisposition,
     )
     from offerpilot.agent_runtime.keyring import JournalKeyDomain
-    from offerpilot.agent_runtime.trace import reconstruct_agent_run
     from offerpilot.ai.agent import PendingAction
     from offerpilot.ai.write_operations import LedgerKeyDomain, WriteOperationRepository
     from offerpilot.chat_transport import (
         SyncAgentExecutionHost,
-        encode_sse_event,
         prepared_stream_metadata,
+        runtime_sse_content,
         runtime_sse_envelope,
     )
     from offerpilot.db import init_database
-    from offerpilot.diagnostics import append_log_entry, read_recent_log_entries
+    from offerpilot.diagnostics import read_recent_log_entries
     from offerpilot.models import ChatMessage, Conversation
     from offerpilot.pilot_runtime import (
         CompletedEvent,
@@ -788,8 +1414,42 @@ def test_canary_private_values_do_not_enter_journal_trace_sse_or_error_log_paylo
         runtime_outcome_payload,
     )
     from offerpilot.repositories.agent_runs import AgentRunRepository, StartRunCommand
+    from offerpilot.repositories.chat import ChatRepository
+    from sqlalchemy.exc import SQLAlchemyError
 
     sentinel = "pilot-runtime-private-canary-6f4b"
+
+    import offerpilot.agent_runtime.trace as trace_module
+    import offerpilot.chat_transport as transport_module
+    import offerpilot.diagnostics as diagnostics_module
+
+    captured_sse: list[tuple[object, str]] = []
+    original_encode_sse_event = transport_module.encode_sse_event
+
+    def capture_sse_event(*args: object, **kwargs: object) -> str:
+        encoded = original_encode_sse_event(*args, **kwargs)
+        if args:
+            captured_sse.append((args[0], encoded))
+        return encoded
+
+    monkeypatch.setattr(transport_module, "encode_sse_event", capture_sse_event)
+    captured_traces: list[object] = []
+    original_reconstruct = trace_module.reconstruct_agent_run
+
+    def capture_trace(*args: object, **kwargs: object) -> object:
+        trace = original_reconstruct(*args, **kwargs)
+        captured_traces.append(trace)
+        return trace
+
+    monkeypatch.setattr(trace_module, "reconstruct_agent_run", capture_trace)
+    captured_log_calls: list[tuple[Path, str, str]] = []
+    original_append_log_entry = diagnostics_module.append_log_entry
+
+    def capture_log_entry(data_dir: Path, level: str, message: str) -> None:
+        captured_log_calls.append((data_dir, level, message))
+        original_append_log_entry(data_dir, level, message)
+
+    monkeypatch.setattr(diagnostics_module, "append_log_entry", capture_log_entry)
 
     class _PrivateCanary:
         def __repr__(self) -> str:
@@ -812,15 +1472,28 @@ def test_canary_private_values_do_not_enter_journal_trace_sse_or_error_log_paylo
             tool_name="get_offer",
             status="success",
             summary="public result",
-            evidence=(nested_private,),
+            evidence=(MappingProxyType({"nested": nested_private}),),
         )
     with pytest.raises(TypeError):
-        MessageOutcome(message="public outcome", undo=nested_private)
+        MessageOutcome(
+            message="public outcome",
+            undo=MappingProxyType({"nested": nested_private}),
+        )
     with pytest.raises(TypeError):
         RuntimeFailureOutcome(
             code=RuntimeFailureCode.AI_PROVIDER_ERROR,
             message="public failure",
             pending_action=_PrivateCanary(),  # type: ignore[arg-type]
+        )
+    from offerpilot.pilot_runtime import PendingActionPayload
+
+    with pytest.raises(TypeError):
+        PendingActionPayload(
+            tool_name="get_offer",
+            operation_id="operation-private",
+            human="public pending",
+            args=MappingProxyType({"nested": nested_private}),
+            confirmation_token="token-private",
         )
 
     # Every internal category is deliberately kept inside the opaque prepared
@@ -830,8 +1503,31 @@ def test_canary_private_values_do_not_enter_journal_trace_sse_or_error_log_paylo
     journal_repository = AgentRunRepository(session_factory)
     ledger_repository = WriteOperationRepository(
         session_factory,
-        LedgerKeyDomain("ledger-key", b"l" * 32),
+        LedgerKeyDomain("22222222-2222-4222-8222-222222222222", b"l" * 32),
     )
+
+    class _SpyJournalRepository:
+        """Capture the real Journal repository calls without changing storage."""
+
+        def __init__(self, delegate: AgentRunRepository) -> None:
+            self._delegate = delegate
+            self.appended: list[object] = []
+            self.dispositions: list[object] = []
+
+        def append_event(self, *args: object, **kwargs: object) -> object:
+            if len(args) >= 2:
+                self.appended.append(args[1])
+            return self._delegate.append_event(*args, **kwargs)  # type: ignore[arg-type]
+
+        def converge_disposition(self, *args: object, **kwargs: object) -> object:
+            if len(args) >= 2:
+                self.dispositions.append(args[1])
+            return self._delegate.converge_disposition(*args, **kwargs)  # type: ignore[arg-type]
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._delegate, name)
+
+    spy_journal = _SpyJournalRepository(journal_repository)
     private_state = SimpleNamespace(
         conversation=SimpleNamespace(
             conversation_id=7,
@@ -913,11 +1609,44 @@ def test_canary_private_values_do_not_enter_journal_trace_sse_or_error_log_paylo
             mode="general",
         )
         sse = "".join(
-            encode_sse_event(event, seq=index, run_id="transport-private", envelope=envelope)
+            transport_module.encode_sse_event(
+                event,
+                seq=index,
+                run_id="transport-private",
+                envelope=envelope,
+            )
             for index, event in enumerate((tool_call, tool_result, CompletedEvent(response=outcome)), 1)
         )
         assert "public tool call" in sse
         assert "public tool result" in sse
+
+        stream_outcomes: list[object] = []
+
+        class _Runtime:
+            def execute_prepared_stream(self, prepared_value: object, **kwargs: object) -> object:
+                del prepared_value
+                sink = kwargs["event_sink"]
+                assert hasattr(sink, "emit")
+                sink.emit(tool_call)  # type: ignore[union-attr]
+                sink.emit(tool_result)  # type: ignore[union-attr]
+                return outcome
+
+        stream_control = InMemoryRuntimeInvocationControl()
+        streamed = "".join(
+            runtime_sse_content(
+                _Runtime(),
+                prepared,
+                stream_control,
+                None,
+                "transport-private-runtime",
+                envelope,
+                stream_outcomes.append,
+            )
+        )
+        assert stream_outcomes == [outcome]
+        assert "public tool call" in streamed
+        assert "public tool result" in streamed
+        assert captured_sse and all(sentinel not in payload for _, payload in captured_sse)
 
         # Journal accepts only the closed fact projection.  A nested private
         # value is rejected; the real recorder/trace path stores safe facts.
@@ -929,6 +1658,76 @@ def test_canary_private_values_do_not_enter_journal_trace_sse_or_error_log_paylo
             seed.flush()
             conversation_id = int(conversation.id)
             seed.commit()
+
+        # Exercise the real Graph/ORM/Pending/Ledger boundaries.  The opaque
+        # prepared handle is allowed to exist in Runtime state, but each
+        # domain surface either rejects it or receives only its public string
+        # projection.
+        from offerpilot.ai.agent import _GraphState, _message_from_dict
+        from offerpilot.ai.write_operations import WriteOperationError
+
+        for _internal_name, internal_value in private_state.internal.items():
+            with pytest.raises(TypeError):
+                json.dumps({"internal": internal_value})
+
+        graph_state: _GraphState = {
+            "messages": [{"role": "assistant", "content": prepared}],
+        }
+        with pytest.raises(TypeError):
+            json.dumps(graph_state)
+        graph_message = _message_from_dict(
+            {"role": "assistant", "content": prepared}
+        )
+        assert sentinel not in graph_message.content
+
+        chat_repository = ChatRepository(session_factory)
+        with pytest.raises((SQLAlchemyError, TypeError, ValueError)):
+            chat_repository.append_message(
+                conversation_id,
+                "assistant",
+                content=prepared,  # type: ignore[arg-type]
+            )
+        private_pending = PendingAction(
+            tool_call_id="call-private-boundary",
+            tool_name="get_offer",
+            args=prepared,  # type: ignore[arg-type]
+            human="public pending",
+        )
+        with pytest.raises((SQLAlchemyError, TypeError, ValueError)):
+            chat_repository.set_pending_action(conversation_id, private_pending)
+        assert chat_repository.get_pending_action(conversation_id) is None
+
+        with session_factory() as ledger_session:
+            with pytest.raises(WriteOperationError):
+                ledger_repository.create_primary(
+                    ledger_session,
+                    operation_id=str(uuid4()),
+                    conversation_id=conversation_id,
+                    tool_call_id="call-private-ledger",
+                    tool_name=prepared,  # type: ignore[arg-type]
+                    adapter_kind="typed",
+                    proposal_fingerprint="hmac-sha256:" + "a" * 64,
+                    confirmation_token_fingerprint="hmac-sha256:" + "b" * 64,
+                )
+            ledger_operation = ledger_repository.create_primary(
+                ledger_session,
+                operation_id=str(uuid4()),
+                conversation_id=conversation_id,
+                tool_call_id="call-public-ledger",
+                tool_name="create_application",
+                adapter_kind="typed",
+                proposal_fingerprint="hmac-sha256:" + "c" * 64,
+                confirmation_token_fingerprint="hmac-sha256:" + "d" * 64,
+            )
+            ledger_session.commit()
+            assert ledger_operation.tool_name == "create_application"
+
+        safe_message = chat_repository.append_message(
+            conversation_id,
+            "assistant",
+            content=outcome.message,
+        )
+        assert safe_message.content == outcome.message
         run_started = prepare_event(
             event_type="run.started",
             execution_segment_id=segment_id,
@@ -966,9 +1765,11 @@ def test_canary_private_values_do_not_enter_journal_trace_sse_or_error_log_paylo
             segment_started=segment_started,
         )
         recorder = RunRecorderFactory(
-            journal_repository,
+            spy_journal,
             key=key,
             enabled=True,
+            segment_budget_seconds=10.0,
+            disposition_budget_seconds=2.0,
         ).start_run(
             command
         )
@@ -984,6 +1785,18 @@ def test_canary_private_values_do_not_enter_journal_trace_sse_or_error_log_paylo
                     "args_shape_digest": "sha256:" + "a" * 64,
                     "proposal_outcome": "execution_allowed",
                     "private": sentinel,
+                },
+            )
+        with pytest.raises(JournalEventValidationError):
+            prepare_event(
+                event_type="tool.proposed",
+                execution_segment_id=segment_id,
+                facts={
+                    "tool_call_id": "call-private-nested",
+                    "tool_name": "get_offer",
+                    "tool_kind": "read",
+                    "args_shape_digest": MappingProxyType({"nested": nested_private}),
+                    "proposal_outcome": "execution_allowed",
                 },
             )
         recorder.append_event(
@@ -1014,20 +1827,22 @@ def test_canary_private_values_do_not_enter_journal_trace_sse_or_error_log_paylo
             )
         )
         recorder.finish(TerminalDisposition(status="completed"))
-        trace = reconstruct_agent_run(
-            journal_repository,
+        trace = trace_module.reconstruct_agent_run(
+            spy_journal,
             run_id,
             as_of=datetime.now(timezone.utc),
             stale_after=timedelta(minutes=5),
         )
         trace_blob = json.dumps(asdict(trace), ensure_ascii=False, default=str)
 
-        append_log_entry(
+        import offerpilot.pilot_runtime.composition as composition_module
+
+        composition_module._append_log(
             tmp_path,
             "ERROR",
             repr(private_state.internal["exception"]),
         )
-        append_log_entry(
+        composition_module._append_log(
             tmp_path,
             "ERROR",
             "runtime_failure "
@@ -1045,6 +1860,12 @@ def test_canary_private_values_do_not_enter_journal_trace_sse_or_error_log_paylo
             ensure_ascii=False,
         )
         assert sentinel not in serialized
+        assert captured_traces == [trace]
+        assert spy_journal.appended
+        assert all(sentinel not in repr(item) for item in spy_journal.appended)
+        assert captured_log_calls
+        assert all(sentinel not in message for _, _, message in captured_log_calls)
+        assert all(sentinel not in encoded for _, encoded in captured_sse)
         assert set(event_payload["tool_call"]) == {
             "tool_call_id",
             "tool_name",

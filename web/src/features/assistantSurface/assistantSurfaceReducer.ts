@@ -26,6 +26,12 @@ export type AssistantSurfaceAction =
       type: 'task_state_changed';
       taskState: AssistantTaskState;
       conversationId?: number;
+      /**
+       * Lifecycle events that were observed while the conversation surface was
+       * visible must not manufacture a background notification.  The default
+       * remains the old behavior for direct task-state reports.
+       */
+      notify?: boolean;
     }
   | { type: 'dismiss_notice' };
 
@@ -51,10 +57,13 @@ export function assistantSurfaceReducer(
       return state.surface === 'mascot' ? state : { ...state, surface: 'mascot' };
     case 'task_state_changed': {
       const notice =
+        action.notify !== false &&
         (action.taskState === 'completed' || action.taskState === 'failed') &&
         action.conversationId !== undefined
           ? { status: action.taskState, conversationId: action.conversationId }
-          : null;
+          : action.notify === false
+            ? state.completionNotice
+            : null;
       if (
         state.taskState === action.taskState &&
         state.completionNotice?.status === notice?.status &&

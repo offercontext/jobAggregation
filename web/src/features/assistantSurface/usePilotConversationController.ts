@@ -26,6 +26,7 @@ import type {
   UITurn,
 } from '@/components/ChatPanel/model';
 import { buildChatRequestContext, pendingAutoSelectReducer } from '@/components/ChatPanel/model';
+import { pageContextKey } from '@/lib/pilotPageContext';
 import type { AssistantTaskState } from './assistantSurfaceReducer';
 
 export type SendMessageOutcome = 'sent' | 'stopped' | 'failed' | 'ignored';
@@ -33,6 +34,13 @@ export type SendMessageOutcome = 'sent' | 'stopped' | 'failed' | 'ignored';
 export interface ConfirmationExecution {
   conversationId: number;
   confirmationToken: string;
+}
+
+export interface ContextChangeNotice {
+  currentConversationLabel: string;
+  currentPageLabel: string;
+  currentContext: PilotPageContext;
+  followingContext: PilotPageContext;
 }
 
 export interface ActiveConversationRequest extends ActiveConversationRequestOwner {
@@ -59,6 +67,10 @@ interface BuildRequestContextInput {
   offerId?: number;
   pageContext?: PilotPageContext;
   attachments: PilotContextAttachment[];
+}
+
+function contextDisplayLabel(context: PilotPageContext): string {
+  return context.entity?.label || context.label;
 }
 
 const unavailableActions: PilotConversationActions = {
@@ -95,6 +107,7 @@ export function usePilotConversationControllerState() {
   const [composerResetKey, setComposerResetKey] = useState(0);
   const [followingContext, setFollowingContextState] = useState<PilotPageContext>();
   const [pinnedContext, setPinnedContext] = useState<PilotPageContext>();
+  const [contextChangeNotice, setContextChangeNotice] = useState<ContextChangeNotice | null>(null);
   const [requestContextSnapshot, setRequestContextSnapshot] = useState<PilotPageContext>();
   const [attachments, setAttachments] = useState<PilotContextAttachment[]>([]);
 
@@ -122,11 +135,17 @@ export function usePilotConversationControllerState() {
   const actionsOwnerRef = useRef<object | null>(null);
   const pinnedContextByConversationRef = useRef(new Map<number, PilotPageContext>());
   const stopFeedbackRef = useRef<(() => void) | null>(null);
-  const taskStateReporterRef = useRef<((taskState: AssistantTaskState) => void) | null>(null);
+  const taskStateReporterRef = useRef<((taskState: AssistantTaskState, conversationId?: number) => void) | null>(null);
+  const followingContextRef = useRef<PilotPageContext>();
+  const pinnedContextRef = useRef<PilotPageContext>();
+  const loadingRef = useRef(loading);
 
   showArchivedRef.current = showArchived;
   activeConversationIdRef.current = conversationId;
   activePendingRef.current = pending;
+  followingContextRef.current = followingContext;
+  pinnedContextRef.current = pinnedContext;
+  loadingRef.current = loading;
 
   const bindActions = useCallback((owner: object, actions: PilotConversationActions) => {
     actionsOwnerRef.current = owner;
@@ -139,27 +158,75 @@ export function usePilotConversationControllerState() {
     actionsRef.current = unavailableActions;
   }, []);
 
+  const updateContextChangeNotice = useCallback((
+    currentContext: PilotPageContext | undefined,
+    nextContext: PilotPageContext | undefined,
+  ) => {
+    if (
+      !currentContext
+      || !nextContext
+      || pageContextKey(currentContext) === pageContextKey(nextContext)
+    ) {
+      setContextChangeNotice(null);
+      return;
+    }
+    setContextChangeNotice({
+      currentConversationLabel: contextDisplayLabel(currentContext),
+      currentPageLabel: contextDisplayLabel(nextContext),
+      currentContext,
+      followingContext: nextContext,
+    });
+  }, []);
+
   const setFollowingContext = useCallback((next: PilotPageContext | undefined) => {
+    followingContextRef.current = next;
     setFollowingContextState((current) => (
       JSON.stringify(current) === JSON.stringify(next) ? current : next
     ));
-  }, []);
+    updateContextChangeNotice(pinnedContextRef.current, next);
+  }, [updateContextChangeNotice]);
 
   const pinConversationContext = useCallback((id: number, context?: PilotPageContext) => {
     if (context) pinnedContextByConversationRef.current.set(id, context);
     else pinnedContextByConversationRef.current.delete(id);
+    pinnedContextRef.current = context;
     setPinnedContext(context);
-  }, []);
+    updateContextChangeNotice(context, followingContextRef.current);
+  }, [updateContextChangeNotice]);
 
   const activateConversationContext = useCallback((id?: number) => {
-    setPinnedContext(id === undefined ? undefined : pinnedContextByConversationRef.current.get(id));
+    const context = id === undefined ? undefined : pinnedContextByConversationRef.current.get(id);
+    pinnedContextRef.current = context;
+    setPinnedContext(context);
+    updateContextChangeNotice(context, followingContextRef.current);
+  }, [updateContextChangeNotice]);
+
+  const switchToFollowingContext = useCallback(() => {
+    if (loadingRef.current || activeRequestRef.current || activePendingRef.current) return false;
+    const next = followingContextRef.current;
+    if (!next) {
+      setContextChangeNotice(null);
+      return true;
+    }
+    const id = activeConversationIdRef.current;
+    if (id !== undefined) {
+      pinnedContextByConversationRef.current.set(id, next);
+      pinnedContextRef.current = next;
+      setPinnedContext(next);
+    }
+    setContextChangeNotice(null);
+    return true;
+  }, []);
+
+  const dismissContextChangeNotice = useCallback(() => {
+    setContextChangeNotice(null);
   }, []);
 
   const bindStopFeedback = useCallback((callback: (() => void) | null) => {
     stopFeedbackRef.current = callback;
   }, []);
 
-  const bindTaskStateReporter = useCallback((callback: ((taskState: AssistantTaskState) => void) | null) => {
+  const bindTaskStateReporter = useCallback((callback: ((taskState: AssistantTaskState, conversationId?: number) => void) | null) => {
     taskStateReporterRef.current = callback;
   }, []);
 
@@ -177,6 +244,7 @@ export function usePilotConversationControllerState() {
     };
     activeRequestRef.current = request;
     setLoading(true);
+    taskStateReporterRef.current?.('running', conversationId);
     return request;
   }, []);
 
@@ -366,6 +434,9 @@ export function usePilotConversationControllerState() {
     pinnedContext,
     pinConversationContext,
     activateConversationContext,
+    contextChangeNotice,
+    switchToFollowingContext,
+    dismissContextChangeNotice,
     requestContextSnapshot,
     setRequestContextSnapshot,
     attachments,
@@ -429,6 +500,7 @@ export function usePilotConversationControllerState() {
     composerResetKey,
     confirmError,
     confirmPhase,
+    contextChangeNotice,
     conversationId,
     conversations,
     degraded,
@@ -456,6 +528,8 @@ export function usePilotConversationControllerState() {
     sendMessage,
     showArchived,
     setFollowingContext,
+    switchToFollowingContext,
+    dismissContextChangeNotice,
     startNewChat,
     stopActiveRequest,
     streamChatRequest,

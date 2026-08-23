@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type PointerEvent, type RefObject } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type PointerEvent, type RefObject } from 'react';
 import { CloseOutlined, MessageOutlined, MinusOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons';
 import {
   live2dPilotMascotRuntime,
@@ -15,6 +15,7 @@ import {
   resetPilotMascotPosition,
   positionPilotMascotOutsideSafeAreas,
   writePilotMascotPosition,
+  type PilotMascotAnimationLevel,
   type PilotMascotRect,
   type PilotMascotPlacement,
   type PilotMascotPosition,
@@ -22,6 +23,7 @@ import {
 import styles from './PilotMascot.module.css';
 
 export type { PilotMascotActivity, PilotMascotRuntime } from './live2dRuntime';
+export type { PilotMascotAnimationLevel } from './pilotMascotPreference';
 
 export interface PilotMascotNotification {
   status: 'success' | 'error';
@@ -35,6 +37,9 @@ interface Props {
   onTogglePilot: () => void;
   zoom?: number;
   onZoomChange?: (zoom: number) => void;
+  animationLevel?: PilotMascotAnimationLevel;
+  positionResetToken?: number;
+  onAnchorRectChange?: (rect: PilotMascotRect) => void;
   notification?: PilotMascotNotification | null;
   placement?: 'contextual' | 'pilot-page' | 'interview-studio';
   studioEvidenceOpen?: boolean;
@@ -77,6 +82,9 @@ export default function PilotMascot({
   onTogglePilot,
   zoom = 1,
   onZoomChange = () => undefined,
+  animationLevel = 'full',
+  positionResetToken,
+  onAnchorRectChange,
   notification,
   placement = 'contextual',
   studioEvidenceOpen = true,
@@ -103,6 +111,7 @@ export default function PilotMascot({
     height: typeof window === 'undefined' ? 900 : window.innerHeight,
   }));
   const [safeAreaRevision, setSafeAreaRevision] = useState(0);
+  const [reducedMotionRevision, setReducedMotionRevision] = useState(0);
   const dragRef = useRef<{ pointerId: number; startX: number; startY: number; startPosition: PilotMascotPosition; moved: boolean }>();
   const suppressClickRef = useRef(false);
   latestActivityRef.current = activity;
@@ -117,7 +126,8 @@ export default function PilotMascot({
     if (!canvas) return;
     const abortController = new AbortController();
     let disposed = false;
-    void runtime.mount(canvas, abortController.signal).then((controller) => {
+    setLoadFailed(false);
+    void runtime.mount(canvas, abortController.signal, animationLevel).then((controller) => {
       if (disposed) {
         controller.dispose();
         return;
@@ -136,7 +146,15 @@ export default function PilotMascot({
       runtimeControllerRef.current?.dispose();
       runtimeControllerRef.current = undefined;
     };
-  }, [runtime]);
+  }, [animationLevel, reducedMotionRevision, runtime]);
+
+  useEffect(() => {
+    if (typeof window.matchMedia !== 'function') return;
+    const media = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const remountRuntime = () => setReducedMotionRevision((revision) => revision + 1);
+    media.addEventListener('change', remountRuntime);
+    return () => media.removeEventListener('change', remountRuntime);
+  }, []);
 
   useEffect(() => {
     runtimeControllerRef.current?.setActivity(activity);
@@ -172,6 +190,7 @@ export default function PilotMascot({
     : placement === 'pilot-page'
       ? '聚焦 Pilot 输入框'
       : panelOpen ? '收起 OfferPilot 领航员' : '打开 OfferPilot 领航员';
+  const buttonLabel = loadFailed ? `${actionLabel}（Haru 暂时休息中）` : actionLabel;
 
   const frame = panelOpen || placement === 'pilot-page' || (studioPlacement && viewport.height < 740) ? MASCOT_FRAME.compact : MASCOT_FRAME.expanded;
   const frameWidth = Math.round(frame.width * normalizedZoom * 10) / 10;
@@ -197,11 +216,33 @@ export default function PilotMascot({
   const frameLeft = constrainedPosition.xRatio * viewport.width - frameWidth / 2;
   const frameTop = constrainedPosition.yRatio * viewport.height - frameHeight / 2;
 
+  const reportAnchorRect = useCallback(() => {
+    const anchor = triggerRef.current;
+    if (!anchor || !onAnchorRectChange) return;
+    const rect = anchor.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    onAnchorRectChange({
+      left: rect.left,
+      top: rect.top,
+      right: rect.right,
+      bottom: rect.bottom,
+    });
+  }, [onAnchorRectChange, triggerRef]);
+
   useEffect(() => {
     const resize = () => setViewport({ width: window.innerWidth, height: window.innerHeight });
     window.addEventListener('resize', resize);
     return () => window.removeEventListener('resize', resize);
   }, []);
+
+  useLayoutEffect(() => {
+    reportAnchorRect();
+    const anchor = triggerRef.current;
+    if (!anchor || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(() => reportAnchorRect());
+    observer.observe(anchor);
+    return () => observer.disconnect();
+  }, [frameHeight, frameLeft, frameTop, frameWidth, reportAnchorRect, safeAreaRevision, triggerRef, viewport.height, viewport.width]);
 
   useEffect(() => {
     if (!studioPlacement || typeof document === 'undefined' || typeof ResizeObserver === 'undefined') return;
@@ -218,6 +259,11 @@ export default function PilotMascot({
     ].forEach((element) => element && observer.observe(element));
     return () => observer.disconnect();
   }, [studioPlacement, studioEvidenceOpen]);
+
+  useEffect(() => {
+    if (positionResetToken === undefined || position !== undefined) return;
+    setLocalPosition(readPilotMascotPositions()[placementKey]);
+  }, [placementKey, position, positionResetToken]);
 
   const setPosition = (next: PilotMascotPosition) => {
     const safe = {
@@ -285,6 +331,7 @@ export default function PilotMascot({
       } ${studioPlacement ? styles.interviewStudio : styles.normalLayout} ${dragRef.current?.moved ? styles.dragging : ''}`}
       data-activity={activity}
       data-notification={notification?.status}
+      data-animation-level={animationLevel}
       data-interview-studio-companion={studioPlacement ? 'true' : undefined}
       aria-label="Haru 助手"
       style={{ width: frameWidth, height: frameHeight, left: `${frameLeft}px`, top: `${frameTop}px`, right: 'auto', bottom: 'auto' }}
@@ -299,10 +346,10 @@ export default function PilotMascot({
         type="button"
         className={styles.characterButton}
         ref={triggerRef}
-        aria-label={actionLabel}
+        aria-label={buttonLabel}
         aria-expanded={placement === 'pilot-page' ? undefined : panelOpen}
-        aria-haspopup="menu"
-        aria-controls={menuOpen ? 'pilot-mascot-menu' : undefined}
+        aria-haspopup={menuOpen ? 'menu' : placement === 'contextual' ? 'dialog' : undefined}
+        aria-controls={panelOpen ? 'haru-chat-window' : menuOpen ? 'pilot-mascot-menu' : undefined}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={(event) => finishDrag(event)}
@@ -322,13 +369,13 @@ export default function PilotMascot({
         <span className={styles.glow} aria-hidden="true" />
         <span className={styles.canvasHost} aria-hidden="true">
           <canvas ref={canvasRef} className={styles.canvas} />
-          {loadFailed ? (
-            <span className={styles.fallback}>
-              <MessageOutlined />
-              <span>Haru 暂时休息中</span>
-            </span>
-          ) : null}
         </span>
+        {loadFailed ? (
+          <span className={styles.fallback} role="status" aria-live="polite">
+            <MessageOutlined />
+            <span>Haru 暂时休息中</span>
+          </span>
+        ) : null}
         <span className={styles.nameplate} aria-hidden="true">
           <span className={styles.statusDot} />
           Haru

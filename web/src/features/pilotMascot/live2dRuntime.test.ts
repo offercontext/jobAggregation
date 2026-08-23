@@ -165,6 +165,45 @@ describe('createLive2dPilotMascotRuntime', () => {
     controller.dispose();
   });
 
+  it('treats off animation as a static runtime even without a system override', async () => {
+    const fixture = runtimeDependencies();
+    const host = document.createElement('div');
+    Object.defineProperties(host, {
+      clientWidth: { configurable: true, value: 240 },
+      clientHeight: { configurable: true, value: 360 },
+    });
+    const canvas = document.createElement('canvas');
+    host.appendChild(canvas);
+
+    const controller = await createLive2dPilotMascotRuntime(fixture.dependencies).mount(canvas, undefined, 'off');
+    expect(fixture.Application).toHaveBeenCalledWith(expect.objectContaining({ autoStart: false }));
+    expect(fixture.Live2DModel.from).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ autoUpdate: false }));
+    controller.setActivity('success');
+    expect(fixture.model.motion).not.toHaveBeenCalled();
+    expect(fixture.model.expression).not.toHaveBeenCalled();
+    controller.dispose();
+  });
+
+  it('keeps minimal animation free of the thinking loop while retaining one-shot feedback', async () => {
+    const fixture = runtimeDependencies();
+    const host = document.createElement('div');
+    Object.defineProperties(host, {
+      clientWidth: { configurable: true, value: 240 },
+      clientHeight: { configurable: true, value: 360 },
+    });
+    const canvas = document.createElement('canvas');
+    host.appendChild(canvas);
+
+    const controller = await createLive2dPilotMascotRuntime(fixture.dependencies).mount(canvas, undefined, 'minimal');
+    controller.setActivity('thinking');
+    await Promise.resolve();
+    expect(fixture.model.motion).not.toHaveBeenCalled();
+    controller.setActivity('success');
+    await Promise.resolve();
+    expect(fixture.model.motion).toHaveBeenCalledWith('Tap', 0, expect.any(Number));
+    controller.dispose();
+  });
+
   it('applies zoom to the stable auto-fit scale and keeps it after resize', async () => {
     const fixture = runtimeDependencies();
     const host = document.createElement('div');

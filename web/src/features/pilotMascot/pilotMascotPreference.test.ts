@@ -7,6 +7,9 @@ import {
   readPilotMascotVisible,
   writePilotMascotZoom,
   writePilotMascotVisible,
+  PILOT_MASCOT_ANIMATION_KEY,
+  readPilotMascotAnimationLevel,
+  writePilotMascotAnimationLevel,
 } from './pilotMascotPreference';
 import {
   PILOT_MASCOT_POSITION_KEY,
@@ -80,5 +83,16 @@ describe('pilot mascot preference', () => {
     expect(readPilotMascotPositions()).toEqual(DEFAULT_PILOT_MASCOT_POSITIONS);
     localStorage.setItem(PILOT_MASCOT_POSITION_KEY, '{not-json');
     expect(readPilotMascotPositions()).toEqual(DEFAULT_PILOT_MASCOT_POSITIONS);
+  });
+
+  it('persists supported animation levels and falls back for old or illegal values', () => {
+    expect(readPilotMascotAnimationLevel()).toBe('full');
+    writePilotMascotAnimationLevel('minimal');
+    expect(localStorage.getItem(PILOT_MASCOT_ANIMATION_KEY)).toBe('minimal');
+    expect(readPilotMascotAnimationLevel()).toBe('minimal');
+    writePilotMascotAnimationLevel('off');
+    expect(readPilotMascotAnimationLevel()).toBe('off');
+    localStorage.setItem(PILOT_MASCOT_ANIMATION_KEY, 'legacy');
+    expect(readPilotMascotAnimationLevel()).toBe('full');
   });
 });

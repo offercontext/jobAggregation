@@ -10,10 +10,10 @@ describe('positionPilotMascotOutsideSafeAreas', () => {
     const left = next.xRatio * viewport.width - frame.width / 2;
     const top = next.yRatio * viewport.height - frame.height / 2;
 
-    expect(left).toBeGreaterThanOrEqual(8);
-    expect(top).toBeGreaterThanOrEqual(8);
-    expect(left + frame.width).toBeLessThanOrEqual(viewport.width - 8);
-    expect(top + frame.height).toBeLessThanOrEqual(viewport.height - 8);
+    expect(left).toBeGreaterThanOrEqual(12);
+    expect(top).toBeGreaterThanOrEqual(12);
+    expect(left + frame.width).toBeLessThanOrEqual(viewport.width - 12);
+    expect(top + frame.height).toBeLessThanOrEqual(viewport.height - 12);
     expect(left >= evidenceRail.left && top < evidenceRail.bottom && left + frame.width > evidenceRail.left).toBe(false);
   });
 

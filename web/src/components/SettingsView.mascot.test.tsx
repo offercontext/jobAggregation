@@ -65,13 +65,20 @@ afterEach(() => {
 });
 
 describe('SettingsView Pilot mascot preference', () => {
-  it('exposes a keyboard-accessible restore switch', () => {
+  it('exposes complete local Haru appearance preferences', () => {
     const onChange = vi.fn();
+    const onResetPosition = vi.fn();
     act(() => {
       root.render(
         <SettingsView
           pilotMascotVisible={false}
           onPilotMascotVisibleChange={onChange}
+          pilotMascotZoom={1}
+          onPilotMascotZoomChange={vi.fn()}
+          pilotMascotAnimationLevel="minimal"
+          onPilotMascotAnimationLevelChange={vi.fn()}
+          onPilotMascotResetPosition={onResetPosition}
+          systemReducedMotion
         />,
       );
     });
@@ -79,6 +86,12 @@ describe('SettingsView Pilot mascot preference', () => {
     expect(toggle).not.toBeNull();
     act(() => toggle!.click());
     expect(onChange).toHaveBeenCalledWith(true, expect.anything());
-    expect(container.textContent).toContain('隐藏后将恢复默认 Pilot 侧边栏');
+    expect(container.querySelector('[aria-label="Haru 角色大小"]')).not.toBeNull();
+    expect(container.querySelector('[aria-label="Haru 动画级别"]')).not.toBeNull();
+    expect(container.textContent).toContain('简洁');
+    expect(container.textContent).toContain('系统已开启减少动态效果');
+    const reset = container.querySelector<HTMLButtonElement>('[aria-label="重置 Haru 位置"]');
+    act(() => reset?.click());
+    expect(onResetPosition).toHaveBeenCalledTimes(1);
   });
 });

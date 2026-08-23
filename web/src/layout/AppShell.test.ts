@@ -161,14 +161,12 @@ describe('AppShell source contract', () => {
     expect(source).toContain('[view, selectedApp, coachedOffer]');
   });
 
-  it('passes page context only to contextual Pilot panels', () => {
-    const fullPilotStart = source.indexOf("{view === 'pilot'");
-    const fullPilotEnd = source.indexOf("{view === 'settings'", fullPilotStart);
-    const fullPilotSource = source.slice(fullPilotStart, fullPilotEnd);
-
-    expect(fullPilotSource).toContain('<PilotWorkspace');
-    expect(fullPilotSource).not.toContain('pageContext=');
-    expect(source.match(/pageContext=\{pageContext\}/g)).toHaveLength(1);
+  it('routes page context through one stable Pilot owner', () => {
+    expect(source.match(/<PilotWorkspace/g)).toHaveLength(1);
+    expect(source).toContain("pageActive={view === 'pilot'}");
+    expect(source).toContain(
+      "pageContext={view === 'pilot' ? pilotController.followingContext : pageContext}",
+    );
   });
 
   it('shares one attachment provider across business surfaces and every Pilot panel', () => {
@@ -178,20 +176,13 @@ describe('AppShell source contract', () => {
     expect(source.indexOf('<PilotAttachmentProvider>')).toBeLessThan(source.indexOf('<Layout'));
   });
 
-  it('keeps card attachments on the selected keyed draft across every Pilot panel', () => {
-    const fullPilotStart = source.indexOf("{view === 'pilot'");
-    const fullPilotEnd = source.indexOf("{view === 'settings'", fullPilotStart);
-    const fullPilotSource = source.slice(fullPilotStart, fullPilotEnd);
-
-    expect(fullPilotSource).toContain('onAttachmentKeyChange={syncPilotAttachmentKey}');
+  it('keeps card attachments on the selected keyed draft across Pilot presentations', () => {
+    expect(source).toContain('onAttachmentKeyChange={syncPilotAttachmentKey}');
+    expect(source.match(/onAttachmentKeyChange=\{syncPilotAttachmentKey\}/g)).toHaveLength(1);
     expect(source).toContain('pendingAttachmentDraftKeyRef.current ?? pendingAttachmentDraftKey');
   });
 
-  it('hands the active rail attachment draft to drawer and Pilot page replacements', () => {
-    const fullPilotStart = source.indexOf("{view === 'pilot'");
-    const fullPilotEnd = source.indexOf("{view === 'settings'", fullPilotStart);
-    const fullPilotSource = source.slice(fullPilotStart, fullPilotEnd);
-
+  it('retains the active attachment draft while the stable Pilot owner changes presentation', () => {
     expect(source).toContain(
       'const pilotAttachmentDraftKey = pendingAttachmentDraftKey;',
     );
@@ -201,14 +192,37 @@ describe('AppShell source contract', () => {
     expect(source).toContain('setActivePilotAttachmentKey((currentKey) => retainPilotAttachmentKey(currentKey, key));');
     expect(source).toContain('const handoffPilotAttachmentDraft = () => {');
     expect(source).toContain('handoffPilotAttachmentDraft();');
-    expect(fullPilotSource).toContain('attachmentDraftKey={pilotAttachmentDraftKey}');
-    expect(source.match(/attachmentDraftKey=\{pilotAttachmentDraftKey\}/g)).toHaveLength(2);
+    expect(source).toContain('attachmentDraftKey={pilotAttachmentDraftKey}');
+    expect(source.match(/attachmentDraftKey=\{pilotAttachmentDraftKey\}/g)).toHaveLength(1);
+    expect(source).toContain("variant={view === 'pilot' ? 'page' : contextualPilotRailMode ? 'rail' : 'drawer'}");
   });
 
   it('registers one persistent dnd-kit target for the contextual Pilot owner', () => {
     expect(source).toContain("const contextualPilotOpen = assistantSurface.surface === 'pilot_workspace' || contextualPilotRailMode;");
-    expect(source).toContain("controllerActive={assistantSurface.surface === 'haru_chat'}");
+    expect(source).toContain('controllerActive');
     expect(source.match(/pilotDropTarget/g)).toHaveLength(1);
+  });
+
+  it('keeps the stable Pilot owner scope and focus target while presentations change', () => {
+    expect(source).toContain('data-pilot-surface-host');
+    expect(source).toContain(
+      "'[data-pilot-surface-host] [role=\"group\"][aria-label=\"AI 修改提议\"]'",
+    );
+    expect(source).toContain('offerId={coachOfferId}');
+    expect(source).not.toContain("offerId={view === 'pilot' ? undefined : coachOfferId}");
+    expect(source).toContain('nextPilotOnboardingFocusToken.current += 1;');
+  });
+
+  it('only clears an idle Offer scope and preserves it around active work', () => {
+    const workspaceStart = source.indexOf('<PilotWorkspace');
+    const closeStart = source.indexOf('onClose={() => {', workspaceStart);
+    const closeEnd = source.indexOf('offerId={coachOfferId}', closeStart);
+    const closeSource = source.slice(closeStart, closeEnd);
+    expect(closeSource).toContain("if (view !== 'pilot') assistantSurface.closeSurface();");
+    expect(closeSource).toContain('!pilotController.activeRequestRef.current');
+    expect(closeSource).toContain('!pilotController.pending');
+    expect(closeSource).toContain('!pilotController.activePendingRef.current');
+    expect(closeSource).toContain('setCoachOfferId(undefined);');
   });
 
   it('keeps a visible Pilot open state unchanged when a card is attached', () => {
@@ -237,7 +251,7 @@ describe('AppShell source contract', () => {
     expect(source).toContain("if (view === 'pilot' && !pilotRailAvailable) {");
     expect(source).toContain('assistantSurface.closeSurface();');
     expect(source).toContain('onOpenEvidence={openEvidence}');
-    expect(source.match(/onOpenEvidence=\{openEvidence\}/g)).toHaveLength(2);
+    expect(source.match(/onOpenEvidence=\{openEvidence\}/g)).toHaveLength(1);
   });
 
   it('passes exact evidence focus targets to their destination views', () => {

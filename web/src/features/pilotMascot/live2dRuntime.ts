@@ -1,4 +1,4 @@
-import { normalizePilotMascotZoom } from './pilotMascotPreference';
+import { normalizePilotMascotZoom, type PilotMascotAnimationLevel } from './pilotMascotPreference';
 
 export type PilotMascotActivity =
   | 'idle'
@@ -20,14 +20,18 @@ export interface PilotMascotRuntimeController {
 }
 
 export interface PilotMascotRuntime {
-  mount(canvas: HTMLCanvasElement, signal?: AbortSignal): Promise<PilotMascotRuntimeController>;
+  mount(
+    canvas: HTMLCanvasElement,
+    signal?: AbortSignal,
+    animationLevel?: PilotMascotAnimationLevel,
+  ): Promise<PilotMascotRuntimeController>;
 }
 
 export function serializePilotMascotRuntime(runtime: PilotMascotRuntime): PilotMascotRuntime {
   const canvasQueues = new WeakMap<HTMLCanvasElement, Promise<void>>();
 
   return {
-    async mount(canvas, signal) {
+    async mount(canvas, signal, animationLevel) {
       const previous = canvasQueues.get(canvas) ?? Promise.resolve();
       let releaseQueue!: () => void;
       const current = new Promise<void>((resolve) => {
@@ -48,7 +52,7 @@ export function serializePilotMascotRuntime(runtime: PilotMascotRuntime): PilotM
 
       try {
         if (signal?.aborted) throw new DOMException('Mascot mount aborted', 'AbortError');
-        mountedController = await runtime.mount(canvas, signal);
+        mountedController = await runtime.mount(canvas, signal, animationLevel);
         if (signal?.aborted) throw new DOMException('Mascot mount aborted', 'AbortError');
         return {
           setActivity: (activity) => mountedController?.setActivity(activity),
@@ -130,7 +134,7 @@ export function createLive2dPilotMascotRuntime(
   dependencies: Live2dRuntimeDependencies,
 ): PilotMascotRuntime {
   return {
-  async mount(canvas, signal) {
+  async mount(canvas, signal, animationLevel = 'full') {
     const { Application, Ticker, Live2DModel } = await dependencies.loadModules();
     if (signal?.aborted) throw new DOMException('Mascot mount aborted', 'AbortError');
     Live2DModel.registerTicker(Ticker);
@@ -138,6 +142,7 @@ export function createLive2dPilotMascotRuntime(
     if (!host) throw new Error('Pilot mascot host is unavailable');
 
     const reduceMotion = dependencies.prefersReducedMotion();
+    const staticRender = reduceMotion || animationLevel === 'off';
     let application: Live2dApplication | undefined;
     let model: Live2dModelInstance | undefined;
     let observer: Pick<ResizeObserver, 'observe' | 'disconnect'> | undefined;
@@ -166,7 +171,7 @@ export function createLive2dPilotMascotRuntime(
     try {
       application = new Application({
         view: canvas,
-        autoStart: !reduceMotion,
+        autoStart: !staticRender,
         backgroundAlpha: 0,
         antialias: true,
         resolution: Math.min(window.devicePixelRatio || 1, 2),
@@ -175,7 +180,7 @@ export function createLive2dPilotMascotRuntime(
       });
       model = await Live2DModel.from(MODEL_URL, {
         autoInteract: false,
-        autoUpdate: !reduceMotion,
+        autoUpdate: !staticRender,
       });
       if (signal?.aborted) throw new DOMException('Mascot mount aborted', 'AbortError');
       application.stage.addChild(model);
@@ -191,14 +196,14 @@ export function createLive2dPilotMascotRuntime(
         model!.scale.set(scale);
         model!.x = width * 0.5;
         model!.y = height * 0.5;
-        if (reduceMotion) application!.render();
+        if (staticRender) application!.render();
       };
       fit();
       observer = dependencies.createResizeObserver(fit);
       observer.observe(host);
 
       const runMotion = (group: string, index: number) => {
-        if (disposed || reduceMotion || !model?.motion) return Promise.resolve(false);
+        if (disposed || staticRender || !model?.motion) return Promise.resolve(false);
         try {
           return Promise.resolve(model.motion(group, index, 3)).catch(() => false);
         } catch {
@@ -206,7 +211,7 @@ export function createLive2dPilotMascotRuntime(
         }
       };
       const setExpression = (name: string) => {
-        if (disposed || reduceMotion || !model?.expression) return;
+        if (disposed || staticRender || !model?.expression) return;
         try {
           void Promise.resolve(model.expression(name)).catch(() => false);
         } catch {
@@ -215,7 +220,7 @@ export function createLive2dPilotMascotRuntime(
       };
       const isThinkingLoop = () => activity === 'thinking' || activity === 'preparing_voice' || activity === 'transcribing';
       const playThinking = () => {
-        if (disposed || !isThinkingLoop() || reduceMotion) return;
+        if (disposed || !isThinkingLoop() || staticRender || animationLevel !== 'full') return;
         void runMotion('Idle', 1).finally(() => {
           if (disposed || !isThinkingLoop()) return;
           thinkingTimer = window.setTimeout(playThinking, 160);
@@ -227,7 +232,7 @@ export function createLive2dPilotMascotRuntime(
           if (disposed || nextActivity === activity) return;
           activity = nextActivity;
           stopThinkingLoop();
-          if (reduceMotion) return;
+          if (staticRender) return;
           if (activity === 'thinking' || activity === 'preparing_voice' || activity === 'transcribing') {
             playThinking();
             return;

@@ -40,7 +40,10 @@ describe('assistant surface frontend golden', () => {
 
   it('does not turn an explicit stop into a Haru failure', async () => {
     const haru = await source('./HaruChatWindow.tsx');
-    expect(haru).toContain("outcome === 'failed'");
+    const controller = await source('./usePilotConversationController.ts');
+    expect(haru).not.toContain("reportTaskState('running'");
+    expect(haru).not.toContain("reportTaskState('failed'");
+    expect(controller).toContain("taskStateReporterRef.current?.('idle'");
     expect(haru).not.toContain('else if (!controller.loading)');
   });
 

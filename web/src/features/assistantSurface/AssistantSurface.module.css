@@ -1,7 +1,5 @@
 .window {
   position: fixed;
-  right: 32px;
-  bottom: 32px;
   z-index: 1050;
   width: min(392px, calc(100vw - 32px));
   height: min(620px, calc(100dvh - 64px));
@@ -16,6 +14,84 @@
   backdrop-filter: blur(18px);
   -webkit-font-smoothing: antialiased;
   animation: haru-window-enter 180ms var(--op-ease) both;
+}
+
+.pilotWorkspace {
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+}
+
+.pilotControllerSurface {
+  display: contents;
+}
+
+.pilotWorkspaceWithContext {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 12px;
+}
+
+.pilotContextChange {
+  min-height: 56px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 10px 8px 14px;
+  border-radius: 14px;
+  color: var(--op-ink);
+  background: color-mix(in srgb, var(--op-primary) 7%, var(--op-surface));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--op-primary) 18%, transparent);
+}
+
+.pilotContextChange > div {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 2px 8px;
+}
+
+.pilotContextChange span {
+  color: var(--op-muted);
+  font-size: 11px;
+}
+
+.pilotContextChange b {
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pilotContextChange button {
+  min-height: 40px;
+  padding: 8px 12px;
+  border: 0;
+  border-radius: 10px;
+  color: white;
+  background: var(--op-primary);
+  cursor: pointer;
+  transition-property: filter, scale;
+  transition-duration: 150ms;
+}
+
+.pilotContextChange button:last-child {
+  color: var(--op-muted);
+  background: transparent;
+}
+
+.pilotContextChange button:active:not(:disabled) {
+  scale: 0.96;
+}
+
+.pilotContextChange button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.contextStack {
+  min-width: 0;
 }
 .header {
   min-height: 64px;
@@ -98,6 +174,81 @@
   white-space: nowrap;
   font-size: 12px;
   font-weight: 600;
+}
+
+.contextChange {
+  margin: 0 16px 10px;
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border-radius: 14px;
+  color: var(--op-ink);
+  background: color-mix(in srgb, var(--op-primary) 7%, var(--op-surface));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--op-primary) 18%, transparent);
+}
+
+.contextRows {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 5px 10px;
+  align-items: baseline;
+}
+
+.contextRows span {
+  color: var(--op-muted);
+  font-size: 11px;
+}
+
+.contextRows b {
+  overflow: hidden;
+  color: var(--op-ink);
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.contextActions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.contextActions button {
+  min-height: 40px;
+  padding: 8px 12px;
+  border: 0;
+  border-radius: 10px;
+  color: white;
+  background: var(--op-primary);
+  cursor: pointer;
+  transition-property: filter, scale;
+  transition-duration: 150ms;
+}
+
+.contextActions button:last-child {
+  color: var(--op-muted);
+  background: transparent;
+}
+
+.contextActions button:active:not(:disabled) {
+  scale: 0.96;
+}
+
+.contextActions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.headerActions button:focus-visible,
+.composer button:focus-visible,
+.pending button:focus-visible,
+.error button:focus-visible,
+.contextActions button:focus-visible,
+.pilotContextChange button:focus-visible {
+  outline: 2px solid var(--op-primary);
+  outline-offset: 2px;
 }
 
 .messages {
@@ -238,6 +389,12 @@
   line-height: 1.5;
 }
 
+.composer:focus-within {
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--op-primary) 54%, transparent),
+    0 0 0 3px color-mix(in srgb, var(--op-primary) 16%, transparent);
+}
+
 .sendButton,
 .stopButton {
   color: white !important;
@@ -278,8 +435,6 @@
 
 @media (max-width: 767px) {
   .window {
-    right: 16px;
-    bottom: 16px;
     height: min(600px, calc(100dvh - 32px));
   }
 }
@@ -292,14 +447,18 @@
   .headerActions button,
   .composer button,
   .pending button,
-  .error button {
+  .error button,
+  .contextActions button,
+  .pilotContextChange button {
     transition: none;
   }
 
   .headerActions button:active,
   .composer button:active,
   .pending button:active,
-  .error button:active {
+  .error button:active,
+  .contextActions button:active,
+  .pilotContextChange button:active {
     scale: 1;
   }
 }

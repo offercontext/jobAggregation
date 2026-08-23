@@ -5,6 +5,7 @@ import { exportBackup, getLogs, getSettings, getSettingsBackup, type LogEntry, t
 import { ONBOARDING_QUERY_KEY, setOnboardingForceOpen } from '@/services/onboarding';
 import { buildDiagnosticsText } from '@/lib/diagnostics';
 import OfflineWhisperModelCard from '@/features/mockInterviewVoice/OfflineWhisperModelCard';
+import type { PilotMascotAnimationLevel } from '@/features/pilotMascot/pilotMascotPreference';
 import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
 
 const AISettingsDrawer = lazy(() => import('./AISettingsDrawer'));
@@ -12,6 +13,12 @@ const AISettingsDrawer = lazy(() => import('./AISettingsDrawer'));
 interface Props {
   pilotMascotVisible: boolean;
   onPilotMascotVisibleChange: (visible: boolean) => void;
+  pilotMascotZoom?: number;
+  onPilotMascotZoomChange?: (zoom: number) => void;
+  pilotMascotAnimationLevel?: PilotMascotAnimationLevel;
+  onPilotMascotAnimationLevelChange?: (level: PilotMascotAnimationLevel) => void;
+  onPilotMascotResetPosition?: () => void;
+  systemReducedMotion?: boolean;
 }
 
 const LOG_PAGE_SIZE = 20;
@@ -19,6 +26,12 @@ const LOG_PAGE_SIZE = 20;
 export default function SettingsView({
   pilotMascotVisible,
   onPilotMascotVisibleChange,
+  pilotMascotZoom = 1,
+  onPilotMascotZoomChange = () => undefined,
+  pilotMascotAnimationLevel = 'full',
+  onPilotMascotAnimationLevelChange = () => undefined,
+  onPilotMascotResetPosition = () => undefined,
+  systemReducedMotion = false,
 }: Props) {
   const queryClient = useQueryClient();
   const [logLevel, setLogLevel] = useState('');
@@ -206,7 +219,7 @@ export default function SettingsView({
                 Haru 与外观
               </Typography.Title>
               <Typography.Text style={{ color: 'var(--op-muted)' }}>
-                在桌面宽屏显示 Haru。隐藏后将恢复默认 Pilot 侧边栏。
+                调整 Haru 在桌面工作区的显示、大小、位置和动态效果。
               </Typography.Text>
             </div>
           </Space>
@@ -216,6 +229,56 @@ export default function SettingsView({
             onChange={onPilotMascotVisibleChange}
           />
         </Space>
+        <Divider style={{ margin: 0 }} />
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))',
+            gap: 12,
+          }}
+        >
+          <label style={preferenceFieldStyle}>
+            <span style={preferenceLabelStyle}>角色大小</span>
+            <Select
+              aria-label="Haru 角色大小"
+              value={pilotMascotZoom}
+              onChange={onPilotMascotZoomChange}
+              options={[0.8, 0.9, 1, 1.1, 1.2, 1.3].map((value) => ({
+                value,
+                label: `${Math.round(value * 100)}%`,
+              }))}
+              style={{ width: '100%' }}
+            />
+          </label>
+          <label style={preferenceFieldStyle}>
+            <span style={preferenceLabelStyle}>动画级别</span>
+            <Select
+              aria-label="Haru 动画级别"
+              value={pilotMascotAnimationLevel}
+              onChange={(value) => onPilotMascotAnimationLevelChange(value)}
+              options={[
+                { value: 'full', label: '完整' },
+                { value: 'minimal', label: '简洁' },
+                { value: 'off', label: '关闭' },
+              ]}
+              style={{ width: '100%' }}
+            />
+          </label>
+        </div>
+        <div>
+          <Button
+            icon={<ReloadOutlined />}
+            aria-label="重置 Haru 位置"
+            onClick={onPilotMascotResetPosition}
+          >
+            重置位置
+          </Button>
+        </div>
+        <Typography.Text role="status" style={{ color: 'var(--op-muted)', fontSize: 12 }}>
+          {systemReducedMotion
+            ? '系统已开启减少动态效果，Haru 将以静态方式显示。'
+            : 'Haru 会遵循系统的减少动态效果设置。'}
+        </Typography.Text>
         <Typography.Text style={{ color: 'var(--op-muted)', fontSize: 12 }}>
           Haru character © Live2D Inc.，依据官方样例数据条款使用。{' '}
           <a href="https://www.live2d.com/en/learn/sample/" target="_blank" rel="noreferrer">
@@ -351,6 +414,17 @@ const detailsStyle = {
 const detailsSummaryStyle = {
   color: 'var(--op-ink)',
   cursor: 'pointer',
+  fontWeight: 600,
+} as const;
+
+const preferenceFieldStyle = {
+  display: 'grid',
+  gap: 8,
+} as const;
+
+const preferenceLabelStyle = {
+  color: 'var(--op-ink)',
+  fontSize: 13,
   fontWeight: 600,
 } as const;
 

@@ -73,6 +73,26 @@ function contextDisplayLabel(context: PilotPageContext): string {
   return context.entity?.label || context.label;
 }
 
+function conversationPageContext(conversation: Conversation | undefined): PilotPageContext | undefined {
+  if (!conversation) return undefined;
+  if (conversation.context_type === 'application' && conversation.context_ref) {
+    const label = conversation.context_label || `投递 #${conversation.context_ref}`;
+    return {
+      view: 'applications-list',
+      label,
+      entity: {
+        kind: 'application',
+        id: conversation.context_ref,
+        label,
+      },
+    };
+  }
+  return {
+    view: 'dashboard',
+    label: conversation.context_label || '工作台',
+  };
+}
+
 const unavailableActions: PilotConversationActions = {
   sendMessage: async () => 'ignored',
   selectConversation: async () => undefined,
@@ -100,7 +120,7 @@ export function usePilotConversationControllerState() {
   const [lastError, setLastError] = useState<string | null>(null);
   const [lastFailedText, setLastFailedText] = useState('');
   const [confirmError, setConfirmError] = useState<string | null>(null);
-  const [confirmPhase, setConfirmPhase] = useState<'idle' | 'saving' | 'success' | 'error'>('idle');
+  const [confirmPhase, setConfirmPhaseState] = useState<'idle' | 'saving' | 'success' | 'error'>('idle');
   const [lastUndo, setLastUndo] = useState<ChatUndo | null>(null);
   const [loadingLabel, setLoadingLabel] = useState<string>();
   const [hasStreamingAssistantContent, setHasStreamingAssistantContent] = useState(false);
@@ -136,8 +156,10 @@ export function usePilotConversationControllerState() {
   const pinnedContextByConversationRef = useRef(new Map<number, PilotPageContext>());
   const stopFeedbackRef = useRef<(() => void) | null>(null);
   const taskStateReporterRef = useRef<((taskState: AssistantTaskState, conversationId?: number) => void) | null>(null);
+  const confirmPhaseRef = useRef(confirmPhase);
   const followingContextRef = useRef<PilotPageContext>();
   const pinnedContextRef = useRef<PilotPageContext>();
+  const conversationsRef = useRef(conversations);
   const loadingRef = useRef(loading);
 
   showArchivedRef.current = showArchived;
@@ -145,7 +167,13 @@ export function usePilotConversationControllerState() {
   activePendingRef.current = pending;
   followingContextRef.current = followingContext;
   pinnedContextRef.current = pinnedContext;
+  conversationsRef.current = conversations;
   loadingRef.current = loading;
+
+  const setConfirmPhase = useCallback((phase: 'idle' | 'saving' | 'success' | 'error') => {
+    confirmPhaseRef.current = phase;
+    setConfirmPhaseState(phase);
+  }, []);
 
   const bindActions = useCallback((owner: object, actions: PilotConversationActions) => {
     actionsOwnerRef.current = owner;
@@ -195,7 +223,11 @@ export function usePilotConversationControllerState() {
   }, [updateContextChangeNotice]);
 
   const activateConversationContext = useCallback((id?: number) => {
-    const context = id === undefined ? undefined : pinnedContextByConversationRef.current.get(id);
+    const context = id === undefined
+      ? undefined
+      : pinnedContextByConversationRef.current.get(id)
+        ?? conversationPageContext(conversationsRef.current.find((conversation) => conversation.id === id));
+    if (id !== undefined && context) pinnedContextByConversationRef.current.set(id, context);
     pinnedContextRef.current = context;
     setPinnedContext(context);
     updateContextChangeNotice(context, followingContextRef.current);
@@ -252,6 +284,14 @@ export function usePilotConversationControllerState() {
     if (activeRequestRef.current !== request) return false;
     activeRequestRef.current = null;
     setLoading(activeConversationSelectionRef.current !== null);
+    if (request.kind === 'confirmation' || request.kind === 'undo') {
+      if (confirmPhaseRef.current === 'success') {
+        taskStateReporterRef.current?.('completed', request.conversationId);
+      } else if (confirmPhaseRef.current === 'error') {
+        taskStateReporterRef.current?.('failed', request.conversationId);
+      }
+    }
+    taskStateReporterRef.current?.('idle', request.conversationId);
     return true;
   }, []);
 

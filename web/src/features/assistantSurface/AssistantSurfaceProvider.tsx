@@ -52,6 +52,7 @@ const PilotConversationContext = createContext<PilotConversationController | nul
 export function AssistantSurfaceProvider({ children }: { children: ReactNode }) {
   const controller = usePilotConversationControllerState();
   const [state, dispatch] = useReducer(assistantSurfaceReducer, initialAssistantSurfaceState);
+  const surfaceRef = useRef(state.surface);
   const [conversationRequest, setConversationRequest] = useState<AssistantConversationRequest>();
   const nextConversationRequestKeyRef = useRef(0);
   const requestGenerationRef = useRef(0);
@@ -61,6 +62,7 @@ export function AssistantSurfaceProvider({ children }: { children: ReactNode }) 
     terminal: boolean;
   } | null>(null);
   const reportedLifecycleGenerationRef = useRef<number | null>(null);
+  surfaceRef.current = state.surface;
   const openHaru = useCallback(() => dispatch({ type: 'open_haru' }), []);
   const openPilot = useCallback(() => dispatch({ type: 'open_pilot' }), []);
   const openPending = useCallback(() => dispatch({ type: 'open_pending' }), []);
@@ -112,14 +114,20 @@ export function AssistantSurfaceProvider({ children }: { children: ReactNode }) 
         type: 'task_state_changed',
         taskState,
         conversationId,
-        notify: !alreadyReported,
+        notify: !alreadyReported && surfaceRef.current === 'mascot',
       });
       return;
     } else if (taskState === 'idle') {
       const active = activeRequestRef.current;
+      if (
+        active?.terminal
+        && reportedLifecycleGenerationRef.current === active.generation
+      ) {
+        dispatch({ type: 'task_state_changed', taskState: 'idle', conversationId, notify: false });
+        return;
+      }
       if (active) {
         active.terminal = true;
-        reportedLifecycleGenerationRef.current = active.generation;
       }
     }
     dispatch({ type: 'task_state_changed', taskState, conversationId });

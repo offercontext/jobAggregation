@@ -48,10 +48,6 @@ import InterviewStoryDrawer, { createInterviewStoryDraft, type InterviewStoryDra
 import OfferNegotiationDrawer, { type OfferNegotiationDraft } from '@/components/OfferNegotiationDrawer';
 import { discardMockInterviewAttempt } from '@/services/mockInterviews';
 import ResumeUploadModal from '@/components/ResumeUploadModal';
-import ChatPanel, {
-  type PilotConversationRequest,
-  type PilotReplyLifecycleEvent,
-} from '@/components/ChatPanel';
 import type { EvidenceTarget } from '@/components/ChatPanel/model';
 import CommandPalette from './CommandPalette';
 import { moduleTabsForView, type ViewMode } from './navigation';
@@ -84,15 +80,16 @@ import {
   onboardingActionIntent,
 } from '@/features/onboarding/actionRouting';
 import dayjs from 'dayjs';
-import PilotMascot, {
-  type PilotMascotActivity,
-  type PilotMascotNotification,
-} from '@/features/pilotMascot/PilotMascot';
+import PilotMascot, { type PilotMascotActivity } from '@/features/pilotMascot/PilotMascot';
 import {
+  readPilotMascotAnimationLevel,
   readPilotMascotZoom,
   readPilotMascotVisible,
+  resetPilotMascotPosition,
+  writePilotMascotAnimationLevel,
   writePilotMascotZoom,
   writePilotMascotVisible,
+  type PilotMascotAnimationLevel,
 } from '@/features/pilotMascot/pilotMascotPreference';
 import {
   AssistantSurfaceProvider,
@@ -214,10 +211,12 @@ function AppShellContent() {
   const [resumeUploadOpen, setResumeUploadOpen] = useState(false);
   const [pilotMascotVisible, setPilotMascotVisible] = useState(readPilotMascotVisible);
   const [pilotMascotZoom, setPilotMascotZoom] = useState(readPilotMascotZoom);
+  const [pilotMascotAnimationLevel, setPilotMascotAnimationLevel] = useState(readPilotMascotAnimationLevel);
+  const [pilotMascotPositionResetToken, setPilotMascotPositionResetToken] = useState(0);
+  const [systemReducedMotion, setSystemReducedMotion] = useState(() =>
+    typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  );
   const [pilotMascotActivity, setPilotMascotActivity] = useState<PilotMascotActivity>('idle');
-  const [pilotMascotNotification, setPilotMascotNotification] = useState<PilotMascotNotification | null>(null);
-  const [pilotConversationRequest, setPilotConversationRequest] = useState<PilotConversationRequest>();
-  const nextPilotConversationRequestKey = useRef(0);
   const [pilotApplicationContext, setPilotApplicationContext] = useState<{ applicationId: number; pilotDraftKey: string } | null>(null);
   const pilotV2DraftsRef = useRef(new Map<number, PilotOpportunityFitV2Draft>());
   const [pilotV2Draft, setPilotV2Draft] = useState<PilotOpportunityFitV2Draft | null>(null);
@@ -539,6 +538,14 @@ function AppShellContent() {
   }, []);
 
   useEffect(() => {
+    const media = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const sync = () => setSystemReducedMotion(media.matches);
+    sync();
+    media.addEventListener('change', sync);
+    return () => media.removeEventListener('change', sync);
+  }, []);
+
+  useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault();
@@ -591,8 +598,22 @@ function AppShellContent() {
   const moduleTabs = moduleTabsForView(view);
 
   useEffect(() => {
-    pilotController.setFollowingContext(pageContext);
+    if (pageContext) pilotController.setFollowingContext(pageContext);
   }, [pageContext, pilotController.setFollowingContext]);
+
+  useEffect(() => {
+    if (view !== 'pilot' || !pilotController.pending) return;
+    const focusPending = window.setTimeout(() => {
+      const proposal = document.querySelector<HTMLElement>(
+        '[data-pilot-surface-host] [role="group"][aria-label="AI 修改提议"]',
+      );
+      const focusable = proposal?.querySelector<HTMLElement>(
+        'input:not(:disabled), textarea:not(:disabled), select:not(:disabled), button:not(:disabled), [tabindex]:not([tabindex="-1"])',
+      );
+      focusable?.focus();
+    }, 0);
+    return () => window.clearTimeout(focusPending);
+  }, [pilotController.pending, view]);
 
   useEffect(() => {
     window.scrollTo({ top: 0, left: 0 });
@@ -630,42 +651,14 @@ function AppShellContent() {
     setPilotMascotZoom(zoom);
   };
 
-  const handlePilotReplyLifecycle = (event: PilotReplyLifecycleEvent) => {
-    assistantSurface.reportTaskState(
-      event.status === 'success' ? 'completed' : 'failed',
-      event.conversationId,
-    );
-    if (!event.background) return;
-    setPilotMascotNotification({
-      status: event.status,
-      conversationId: event.conversationId,
-    });
+  const setPilotMascotAnimationPreference = (level: PilotMascotAnimationLevel) => {
+    writePilotMascotAnimationLevel(level);
+    setPilotMascotAnimationLevel(level);
   };
 
-  const requestPilotConversation = (conversationId: number) => {
-    setPilotConversationRequest({
-      requestKey: ++nextPilotConversationRequestKey.current,
-      conversationId,
-    });
-  };
-
-  const handlePilotMascotAction = () => {
-    const notificationConversationId = pilotMascotNotification?.conversationId;
-    if (notificationConversationId !== undefined) {
-      requestPilotConversation(notificationConversationId);
-      setPilotMascotNotification(null);
-      if (view !== 'pilot') {
-        assistantSurface.openHaru();
-      }
-      return;
-    }
-    if (view === 'pilot') {
-      nextPilotOnboardingFocusToken.current += 1;
-      setPilotOnboardingFocusToken(nextPilotOnboardingFocusToken.current);
-      return;
-    }
-    if (assistantSurface.surface === 'haru_chat') assistantSurface.closeSurface();
-    else assistantSurface.openHaru();
+  const resetPilotMascotPositionPreference = () => {
+    resetPilotMascotPosition('normal');
+    setPilotMascotPositionResetToken((token) => token + 1);
   };
 
   const attachToPilot = (attachment: PilotContextAttachment) => {
@@ -729,7 +722,6 @@ function AppShellContent() {
     setSelected(null);
     if (!preserveEvidenceFocus) setEvidenceFocus(null);
     if (nextView === 'pilot') {
-      setCoachOfferId(undefined);
       assistantSurface.openPilot();
     } else if (view === 'pilot' && assistantSurface.surface === 'pilot_workspace') {
       assistantSurface.closeSurface();
@@ -1621,7 +1613,7 @@ function AppShellContent() {
           </div>
         }
       >
-        <div className="op-view-enter">
+        <div className="op-view-enter" style={view === 'pilot' ? { display: 'contents' } : undefined}>
           {view === 'dashboard' && (
             <DashboardView
               applications={apps}
@@ -1739,7 +1731,7 @@ function AppShellContent() {
           {view === 'pilot' && (
             <div
               className="op-pilot-page-layout"
-              style={{ display: 'grid', gridTemplateColumns: pilotApplicationContext ? 'minmax(0, 1fr) minmax(320px, 0.7fr)' : '1fr', gap: 16 }}
+              style={{ display: 'contents' }}
             >
               {pilotApplicationContext ? (
                 <PilotOpportunityFitV2Card
@@ -1777,34 +1769,18 @@ function AppShellContent() {
                   }}
                 />
               ) : null}
-              <PilotWorkspace
-                onboardingFocusToken={pilotOnboardingFocusToken}
-                onOnboardingFocusConsumed={consumePilotOnboardingFocus}
-                onClose={() => undefined}
-                onOpenSettings={() => navigateToView('settings')}
-                startRequest={chatStartRequest}
-                onStartRequestConsumed={claimChatStartRequest}
-                onDataChanged={refreshWorkspaceData}
-                attachmentDraftKey={pilotAttachmentDraftKey}
-                onAttachmentKeyChange={syncPilotAttachmentKey}
-                onOpenEvidence={openEvidence}
-                onPrepareOfferNegotiation={(offer) => openOfferNegotiation(offer, 'pilot')}
-                onOpenInterviewStoryLibrary={() => openInterviewStoryDraft({ entrypoint: 'pilot' })}
-                onOpenVoiceCoachingGrowth={openVoiceCoachingGrowth}
-                onActivityChange={setPilotMascotActivity}
-                onReplyLifecycle={handlePilotReplyLifecycle}
-                conversationRequest={pilotConversationRequest}
-                onConversationRequestConsumed={(requestKey) => {
-                  setPilotConversationRequest((current) => current?.requestKey === requestKey ? undefined : current);
-                }}
-                offers={ofrs}
-              />
             </div>
           )}
           {view === 'settings' && (
             <SettingsView
               pilotMascotVisible={pilotMascotVisible}
               onPilotMascotVisibleChange={setPilotMascotPreference}
+              pilotMascotZoom={pilotMascotZoom}
+              onPilotMascotZoomChange={setPilotMascotZoomPreference}
+              pilotMascotAnimationLevel={pilotMascotAnimationLevel}
+              onPilotMascotAnimationLevelChange={setPilotMascotAnimationPreference}
+              onPilotMascotResetPosition={resetPilotMascotPositionPreference}
+              systemReducedMotion={systemReducedMotion}
             />
           )}
         </div>
@@ -1826,7 +1802,12 @@ function AppShellContent() {
       />
       <Layout
         className={`op-app-main${view === 'pilot' ? ' op-app-main-pilot' : ''}`}
-        style={{ background: 'var(--op-layout-bg)', minWidth: 0, width: '100%' }}
+        style={{
+          background: 'var(--op-layout-bg)',
+          minWidth: 0,
+          width: '100%',
+          paddingRight: contextualPilotRailMode ? 380 : undefined,
+        }}
       >
         <TopBar
           streakDays={streak}
@@ -1836,7 +1817,18 @@ function AppShellContent() {
         />
         <Content
           className={`op-app-content${view === 'pilot' ? ' op-app-content-pilot' : ''}`}
-          style={{ padding: '0 24px 24px' }}
+          style={{
+            padding: '0 24px 24px',
+            ...(view === 'pilot' && !isLoading && !appsError
+              ? {
+                  display: 'grid',
+                  gridTemplateColumns: pilotApplicationContext
+                    ? 'minmax(0, 1fr) minmax(320px, 0.7fr)'
+                    : 'minmax(0, 1fr)',
+                  gap: 16,
+                }
+              : {}),
+          }}
         >
           {isLoading ? (
             <div style={{ textAlign: 'center', padding: 48 }}>
@@ -1851,50 +1843,58 @@ function AppShellContent() {
               {workspaceContent}
             </ViewErrorBoundary>
           )}
+          <div
+            className={contextualPilotRailMode ? 'op-pilot-rail' : 'op-pilot-background-host'}
+            data-pilot-surface-host
+            aria-label={contextualPilotRailMode ? 'Pilot' : undefined}
+            style={contextualPilotRailMode ? { position: 'fixed', inset: '0 0 0 auto', zIndex: 1040 } : undefined}
+          >
+            <PilotWorkspace
+              pageActive={view === 'pilot'}
+              variant={view === 'pilot' ? 'page' : contextualPilotRailMode ? 'rail' : 'drawer'}
+              open={view === 'pilot' || contextualPilotOpen}
+              controllerActive
+              onboardingFocusToken={pilotOnboardingFocusToken}
+              onOnboardingFocusConsumed={consumePilotOnboardingFocus}
+              pilotDropTarget={view !== 'pilot'}
+              onClose={() => {
+                if (view !== 'pilot') assistantSurface.closeSurface();
+                if (
+                  !pilotController.loading
+                  && !pilotController.activeRequestRef.current
+                  && !pilotController.pending
+                  && !pilotController.activePendingRef.current
+                ) {
+                  setCoachOfferId(undefined);
+                }
+              }}
+              offerId={coachOfferId}
+              onOpenSettings={() => navigateToView('settings')}
+              onExpand={() => {
+                handoffPilotAttachmentDraft();
+                nextPilotOnboardingFocusToken.current += 1;
+                setPilotOnboardingFocusToken(nextPilotOnboardingFocusToken.current);
+                navigateToView('pilot');
+              }}
+              startRequest={chatStartRequest}
+              onStartRequestConsumed={claimChatStartRequest}
+              onDataChanged={refreshWorkspaceData}
+              pageContext={view === 'pilot' ? pilotController.followingContext : pageContext}
+              attachmentDraftKey={pilotAttachmentDraftKey}
+              onAttachmentKeyChange={syncPilotAttachmentKey}
+              onOpenEvidence={openEvidence}
+              onPrepareOfferNegotiation={(offer) => openOfferNegotiation(offer, 'pilot')}
+              onOpenInterviewStoryLibrary={() => openInterviewStoryDraft({ entrypoint: 'pilot' })}
+              onOpenVoiceCoachingGrowth={openVoiceCoachingGrowth}
+              onActivityChange={setPilotMascotActivity}
+              onReplyLifecycle={assistantSurface.reportReplyLifecycle}
+              conversationRequest={assistantSurface.conversationRequest}
+              onConversationRequestConsumed={assistantSurface.consumeConversationRequest}
+              offers={ofrs}
+            />
+          </div>
         </Content>
       </Layout>
-      {shouldShowContextualPilot ? (
-        <div
-          className={contextualPilotRailMode ? 'op-pilot-rail' : 'op-pilot-background-host'}
-          aria-label={contextualPilotRailMode ? 'Pilot' : undefined}
-        >
-          <ChatPanel
-            variant={contextualPilotRailMode ? 'rail' : 'drawer'}
-            open={contextualPilotOpen}
-            controllerActive={assistantSurface.surface === 'haru_chat'}
-            onboardingFocusToken={pilotOnboardingFocusToken}
-            onOnboardingFocusConsumed={consumePilotOnboardingFocus}
-            pilotDropTarget
-            onClose={() => {
-              assistantSurface.closeSurface();
-              setCoachOfferId(undefined);
-            }}
-            offerId={coachOfferId}
-            onOpenSettings={() => navigateToView('settings')}
-            onExpand={() => {
-              handoffPilotAttachmentDraft();
-              navigateToView('pilot');
-            }}
-            startRequest={chatStartRequest}
-            onStartRequestConsumed={claimChatStartRequest}
-            onDataChanged={refreshWorkspaceData}
-            pageContext={pageContext}
-            attachmentDraftKey={pilotAttachmentDraftKey}
-            onAttachmentKeyChange={syncPilotAttachmentKey}
-            onOpenEvidence={openEvidence}
-            onPrepareOfferNegotiation={(offer) => openOfferNegotiation(offer, 'pilot')}
-            onOpenInterviewStoryLibrary={() => openInterviewStoryDraft({ entrypoint: 'pilot' })}
-            onOpenVoiceCoachingGrowth={openVoiceCoachingGrowth}
-            onActivityChange={setPilotMascotActivity}
-            onReplyLifecycle={handlePilotReplyLifecycle}
-            conversationRequest={pilotConversationRequest}
-            onConversationRequestConsumed={(requestKey) => {
-              setPilotConversationRequest((current) => current?.requestKey === requestKey ? undefined : current);
-            }}
-            offers={ofrs}
-          />
-        </div>
-      ) : null}
 
       {view !== 'pilot' && !interviewStudioContext ? (
         <HaruDock
@@ -1903,8 +1903,8 @@ function AppShellContent() {
           onHide={() => setPilotMascotPreference(false)}
           zoom={pilotMascotZoom}
           onZoomChange={setPilotMascotZoomPreference}
-          notification={pilotMascotNotification}
-          onOpen={handlePilotMascotAction}
+          animationLevel={pilotMascotAnimationLevel}
+          positionResetToken={pilotMascotPositionResetToken}
           onExpand={() => {
             nextPilotOnboardingFocusToken.current += 1;
             setPilotOnboardingFocusToken(nextPilotOnboardingFocusToken.current);
@@ -1931,6 +1931,8 @@ function AppShellContent() {
           onHide={() => setInterviewStudioHaruVisible(false)}
           zoom={pilotMascotZoom}
           onZoomChange={setPilotMascotZoomPreference}
+          animationLevel={pilotMascotAnimationLevel}
+          positionResetToken={pilotMascotPositionResetToken}
           studioEvidenceOpen={interviewStudioEvidenceOpen}
           placement="interview-studio"
         />

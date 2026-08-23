@@ -3,6 +3,9 @@ export const PILOT_MASCOT_ZOOM_KEY = 'offerpilot:pilot-mascot-zoom';
 export const PILOT_MASCOT_MIN_ZOOM = 0.8;
 export const PILOT_MASCOT_MAX_ZOOM = 1.3;
 export const PILOT_MASCOT_POSITION_KEY = 'offerpilot:pilot-mascot-position';
+export const PILOT_MASCOT_ANIMATION_KEY = 'offerpilot:pilot-mascot-animation';
+
+export type PilotMascotAnimationLevel = 'full' | 'minimal' | 'off';
 
 export type PilotMascotPlacement = 'normal' | 'interview_studio';
 export interface PilotMascotPosition { xRatio: number; yRatio: number }
@@ -12,6 +15,8 @@ export interface PilotMascotRect { left: number; top: number; right: number; bot
 interface PilotMascotViewport { width: number; height: number }
 interface PilotMascotFrame { width: number; height: number }
 
+const PILOT_MASCOT_EDGE_GAP = 12;
+
 export const DEFAULT_PILOT_MASCOT_POSITIONS: PilotMascotPositions = {
   version: 1,
   normal: { xRatio: 0.96, yRatio: 0.9 },
@@ -19,10 +24,10 @@ export const DEFAULT_PILOT_MASCOT_POSITIONS: PilotMascotPositions = {
 };
 
 function boundedPosition(position: PilotMascotPosition, viewport: PilotMascotViewport, frame: PilotMascotFrame): PilotMascotPosition {
-  const minX = 8 + frame.width / 2;
-  const maxX = Math.max(minX, viewport.width - 8 - frame.width / 2);
-  const minY = 8 + frame.height / 2;
-  const maxY = Math.max(minY, viewport.height - 8 - frame.height / 2);
+  const minX = PILOT_MASCOT_EDGE_GAP + frame.width / 2;
+  const maxX = Math.max(minX, viewport.width - PILOT_MASCOT_EDGE_GAP - frame.width / 2);
+  const minY = PILOT_MASCOT_EDGE_GAP + frame.height / 2;
+  const maxY = Math.max(minY, viewport.height - PILOT_MASCOT_EDGE_GAP - frame.height / 2);
   return {
     xRatio: Math.min(0.98, Math.max(0.02, Math.min(maxX, Math.max(minX, position.xRatio * viewport.width)) / viewport.width)),
     yRatio: Math.min(0.98, Math.max(0.02, Math.min(maxY, Math.max(minY, position.yRatio * viewport.height)) / viewport.height)),
@@ -168,5 +173,28 @@ export function writePilotMascotZoom(
     target.setItem(PILOT_MASCOT_ZOOM_KEY, String(normalizePilotMascotZoom(zoom)));
   } catch {
     // A blocked storage backend must not affect Pilot availability.
+  }
+}
+
+export function readPilotMascotAnimationLevel(
+  storage?: Pick<Storage, 'getItem'>,
+): PilotMascotAnimationLevel {
+  try {
+    const value = (storage ?? window.localStorage).getItem(PILOT_MASCOT_ANIMATION_KEY);
+    return value === 'minimal' || value === 'off' || value === 'full' ? value : 'full';
+  } catch {
+    return 'full';
+  }
+}
+
+export function writePilotMascotAnimationLevel(
+  level: PilotMascotAnimationLevel,
+  storage?: Pick<Storage, 'setItem'>,
+): void {
+  if (level !== 'full' && level !== 'minimal' && level !== 'off') return;
+  try {
+    (storage ?? window.localStorage).setItem(PILOT_MASCOT_ANIMATION_KEY, level);
+  } catch {
+    // A blocked storage backend must not affect Haru availability.
   }
 }

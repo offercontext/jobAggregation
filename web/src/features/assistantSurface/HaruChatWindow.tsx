@@ -1,5 +1,6 @@
 import {
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type MutableRefObject,
@@ -15,6 +16,7 @@ import {
 import { useAssistantSurface, usePilotConversationController } from './AssistantSurfaceProvider';
 import { recentConversationTurns } from './assistantPresentation';
 import CompactMessageRenderer from './CompactMessageRenderer';
+import { positionHaruWindow, type HaruRect } from './haruWindowPosition';
 import styles from './AssistantSurface.module.css';
 
 const TASK_COPY = {
@@ -25,22 +27,62 @@ const TASK_COPY = {
   failed: '处理失败',
 } as const;
 
+function measureDesktopViewport() {
+  const width = typeof document === 'undefined'
+    ? window.innerWidth
+    : document.documentElement.clientWidth || window.innerWidth;
+  const height = typeof document === 'undefined'
+    ? window.innerHeight
+    : document.documentElement.clientHeight || window.innerHeight;
+  const navigation = typeof document === 'undefined'
+    ? null
+    : document.querySelector<HTMLElement>('.op-sidebar');
+  const navigationRect = navigation?.getBoundingClientRect();
+  const navigationRight = navigationRect
+    && navigationRect.height > height / 2
+    && navigationRect.right < width
+      ? navigationRect.right + 12
+      : 12;
+  return { width, height, navigationRight };
+}
+
 interface Props {
   returnFocusRef: MutableRefObject<HTMLElement | null>;
   onExpand?: () => void;
+  anchorRect?: HaruRect;
 }
 
-export default function HaruChatWindow({ returnFocusRef, onExpand }: Props) {
+export default function HaruChatWindow({ returnFocusRef, onExpand, anchorRect }: Props) {
   const surface = useAssistantSurface();
   const controller = usePilotConversationController();
   const [draft, setDraft] = useState('');
+  const [viewport, setViewport] = useState(() => (
+    typeof window === 'undefined'
+      ? { width: 1440, height: 900, navigationRight: 12 }
+      : measureDesktopViewport()
+  ));
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
+  const dialogRef = useRef<HTMLElement>(null);
+  const closingRef = useRef(false);
 
   useEffect(() => {
     if (surface.surface !== 'haru_chat') return;
-    inputRef.current?.focus();
-  }, [surface.surface]);
+    closingRef.current = false;
+    if (controller.hasKey && !controller.pending) inputRef.current?.focus();
+    else dialogRef.current?.focus();
+  }, [controller.hasKey, controller.pending, surface.surface]);
+
+  useLayoutEffect(() => {
+    const syncViewport = () => setViewport(measureDesktopViewport());
+    syncViewport();
+    window.addEventListener('resize', syncViewport);
+    window.visualViewport?.addEventListener('resize', syncViewport);
+    return () => {
+      window.removeEventListener('resize', syncViewport);
+      window.visualViewport?.removeEventListener('resize', syncViewport);
+    };
+  }, []);
 
   useEffect(() => {
     if (surface.surface !== 'haru_chat') return;
@@ -52,19 +94,20 @@ export default function HaruChatWindow({ returnFocusRef, onExpand }: Props) {
   if (surface.surface !== 'haru_chat') return null;
 
   const close = () => {
+    if (closingRef.current) return;
+    closingRef.current = true;
     surface.closeSurface();
     window.setTimeout(() => returnFocusRef.current?.focus(), 0);
   };
   const submit = async () => {
     if (!draft.trim() || controller.loading || controller.pending) return;
-    surface.reportTaskState('running', controller.conversationId);
     const outcome = await controller.sendMessage(draft);
     if (outcome === 'sent') setDraft('');
-    else if (outcome === 'failed') surface.reportTaskState('failed', controller.conversationId);
   };
   const onInputKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === 'Escape') {
       event.preventDefault();
+      event.stopPropagation();
       close();
       return;
     }
@@ -93,13 +136,47 @@ export default function HaruChatWindow({ returnFocusRef, onExpand }: Props) {
   const attachmentSuffix = controller.attachments.length > 0
     ? ` · ${controller.attachments.length} 个附件`
     : '';
+  const anchorPrefersLeft = anchorRect
+    ? (anchorRect.left + anchorRect.right) / 2 >= viewport.width / 2
+    : true;
+  const horizontalAnchorSpace = anchorRect
+    ? anchorPrefersLeft
+      ? anchorRect.left - 12 - viewport.navigationRight
+      : viewport.width - 24 - anchorRect.right
+    : viewport.width - viewport.navigationRight - 12;
+  const surfaceSize = {
+    width: Math.min(
+      392,
+      Math.max(0, viewport.width - viewport.navigationRight - 12),
+      Math.max(280, horizontalAnchorSpace),
+    ),
+    height: Math.min(620, Math.max(0, viewport.height - 24)),
+  };
+  const fallbackGap = viewport.width < 768 ? 16 : 32;
+  const windowPosition = anchorRect
+    ? positionHaruWindow({
+        anchor: anchorRect,
+        viewport,
+        surface: surfaceSize,
+        bounds: { left: viewport.navigationRight },
+      })
+    : {
+        left: Math.max(fallbackGap, viewport.width - surfaceSize.width - fallbackGap),
+        top: Math.max(fallbackGap, viewport.height - surfaceSize.height - fallbackGap),
+        direction: 'left-up' as const,
+      };
 
   return (
     <section
+      id="haru-chat-window"
+      ref={dialogRef}
       className={styles.window}
       role="dialog"
       aria-modal="false"
       aria-label="Haru 轻量对话"
+      tabIndex={-1}
+      data-expand-direction={windowPosition.direction}
+      style={{ left: windowPosition.left, top: windowPosition.top, width: surfaceSize.width }}
       onKeyDown={(event) => {
         if (event.key === 'Escape') {
           event.preventDefault();
@@ -110,7 +187,12 @@ export default function HaruChatWindow({ returnFocusRef, onExpand }: Props) {
       <header className={styles.header}>
         <div>
           <strong>Haru</strong>
-          <span data-task-state={controller.taskState === 'idle' ? surface.taskState : controller.taskState}>
+          <span
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+            data-task-state={controller.taskState === 'idle' ? surface.taskState : controller.taskState}
+          >
             {TASK_COPY[controller.taskState === 'idle' ? surface.taskState : controller.taskState]}
           </span>
         </div>
@@ -118,7 +200,10 @@ export default function HaruChatWindow({ returnFocusRef, onExpand }: Props) {
           <button
             type="button"
             aria-label="展开到 Pilot 工作区"
-            onClick={onExpand ?? surface.openPilot}
+            onClick={() => {
+              surface.openPilot();
+              onExpand?.();
+            }}
           >
             <ExpandAltOutlined />
           </button>
@@ -128,9 +213,34 @@ export default function HaruChatWindow({ returnFocusRef, onExpand }: Props) {
         </div>
       </header>
 
-      <div className={styles.context} aria-label="当前上下文">
-        <span>当前上下文</span>
-        <b>{contextLabel}{attachmentSuffix}</b>
+      <div className={styles.contextStack}>
+        <div className={styles.context} aria-label="当前上下文">
+          <span>当前上下文</span>
+          <b>{contextLabel}{attachmentSuffix}</b>
+        </div>
+
+        {controller.contextChangeNotice ? (
+          <div className={styles.contextChange} role="status" aria-label="页面上下文已变化">
+            <div className={styles.contextRows}>
+              <span>当前会话</span>
+              <b>{controller.contextChangeNotice.currentConversationLabel}</b>
+              <span>当前页面</span>
+              <b>{controller.contextChangeNotice.currentPageLabel}</b>
+            </div>
+            <div className={styles.contextActions}>
+              <button
+                type="button"
+                onClick={controller.switchToFollowingContext}
+                disabled={controller.loading || Boolean(controller.pending)}
+              >
+                切换到当前页面
+              </button>
+              <button type="button" onClick={controller.dismissContextChangeNotice}>
+                保持原上下文
+              </button>
+            </div>
+          </div>
+        ) : null}
       </div>
 
       <div className={styles.messages} aria-live="polite" aria-relevant="additions text">
@@ -155,7 +265,14 @@ export default function HaruChatWindow({ returnFocusRef, onExpand }: Props) {
       {controller.pending ? (
         <div className={styles.pending} role="status">
           <span>有一项操作等你确认</span>
-          <button type="button" data-testid="haru-open-pending" onClick={surface.openPending}>
+          <button
+            type="button"
+            data-testid="haru-open-pending"
+            onClick={() => {
+              surface.openPending();
+              onExpand?.();
+            }}
+          >
             到 Pilot 查看并确认
             <ArrowUpOutlined />
           </button>

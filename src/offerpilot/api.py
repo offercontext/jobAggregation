@@ -1481,23 +1481,25 @@ def create_app(
 
     @app.on_event("shutdown")
     def _stop_knowledge_worker() -> None:
-        shutdown_failed = False
-        try:
-            knowledge_runtime.stop(timeout=5)
-            context_source_loader.close()
-            if journal_engine is not None:
-                journal_engine.dispose()
-        except BaseException:
-            shutdown_failed = True
-            raise
-        finally:
-            primary_engine = app.state.db_engine
-            if primary_engine is not None:
-                try:
-                    primary_engine.dispose()
-                except BaseException:
-                    if not shutdown_failed:
-                        raise
+        first_error: BaseException | None = None
+
+        def attempt_cleanup(callback: Callable[[], object]) -> None:
+            nonlocal first_error
+            try:
+                callback()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+
+        attempt_cleanup(lambda: knowledge_runtime.stop(timeout=5))
+        attempt_cleanup(context_source_loader.close)
+        if journal_engine is not None:
+            attempt_cleanup(journal_engine.dispose)
+        primary_engine = app.state.db_engine
+        if primary_engine is not None:
+            attempt_cleanup(primary_engine.dispose)
+        if first_error is not None:
+            raise first_error
 
     @app.get("/api/health")
     def health() -> dict[str, str]:

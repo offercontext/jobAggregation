@@ -671,7 +671,9 @@ def test_real_stream_run_recorder_keeps_transport_uuid_and_terminal_events(
             self.recorder = super().start_run(command)  # type: ignore[arg-type]
             return self.recorder
 
-    journal = CapturingFactory(repository, key=key, enabled=True)
+    # Keep this repository integration assertion deterministic under full-suite
+    # load; the real-time budget is covered by dedicated budget tests.
+    journal = CapturingFactory(repository, key=key, enabled=True, clock=lambda: 0.0)
 
     class Gateway:
         def create(self, request: object) -> object:

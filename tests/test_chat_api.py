@@ -854,6 +854,52 @@ def test_shutdown_error_is_not_masked_by_primary_engine_dispose_error(
     assert primary_dispose_calls == 1
 
 
+def test_shutdown_cleanup_continues_after_knowledge_stop_failure(
+    tmp_path, monkeypatch
+):
+    app = create_app(data_dir=tmp_path)
+    primary_engine = app.state.db_engine
+    journal_engine = app.state.journal_db_engine
+    knowledge_runtime = app.state.knowledge_runtime
+    assert primary_engine is not None
+    assert journal_engine is not None
+    original_stop = knowledge_runtime.stop
+    original_primary_dispose = primary_engine.dispose
+    original_journal_dispose = journal_engine.dispose
+    primary_dispose_calls = 0
+    journal_dispose_calls = 0
+
+    def fail_knowledge_stop(*args: object, **kwargs: object) -> None:
+        original_stop(*args, **kwargs)
+        raise RuntimeError("knowledge stop failed")
+
+    def dispose_primary(*args: object, **kwargs: object) -> None:
+        nonlocal primary_dispose_calls
+        primary_dispose_calls += 1
+        original_primary_dispose(*args, **kwargs)
+
+    def dispose_journal(*args: object, **kwargs: object) -> None:
+        nonlocal journal_dispose_calls
+        journal_dispose_calls += 1
+        original_journal_dispose(*args, **kwargs)
+
+    monkeypatch.setattr(knowledge_runtime, "stop", fail_knowledge_stop)
+    monkeypatch.setattr(primary_engine, "dispose", dispose_primary)
+    monkeypatch.setattr(journal_engine, "dispose", dispose_journal)
+
+    with pytest.raises(RuntimeError, match="knowledge stop failed"):
+        with TestClient(app):
+            pass
+
+    assert primary_dispose_calls == 1
+    assert journal_dispose_calls == 1
+    assert primary_engine.pool.checkedout() == 0
+    assert journal_engine.pool.checkedout() == 0
+    db_path = tmp_path / "data.db"
+    db_path.unlink()
+    assert not db_path.exists()
+
+
 @pytest.mark.parametrize("endpoint", ["/api/chat", "/api/chat/stream"])
 def test_journal_active_budget_ignores_slow_final_provider_gap(
     tmp_path, monkeypatch, endpoint

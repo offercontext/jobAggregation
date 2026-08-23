@@ -195,18 +195,69 @@ def _dynamic_call_terminal(
     terminal = _call_terminal(node, aliases)
     if terminal is not None:
         return terminal
-    if not (
-        isinstance(node.func, ast.Call)
-        and _call_terminal(node.func, aliases) == "getattr"
-        and len(node.func.args) >= 2
-    ):
+    if not isinstance(node.func, ast.Call):
         return None
-    symbol = node.func.args[1]
+    symbol = node.func.args[1] if len(node.func.args) >= 2 else None
+    if _call_terminal(node.func, aliases) != "getattr" or symbol is None:
+        return None
     if isinstance(symbol, ast.Constant) and isinstance(symbol.value, str):
         return symbol.value.rsplit(".", 1)[-1]
     if isinstance(symbol, ast.Name) and symbol.id in bindings:
         return bindings[symbol.id].rsplit(".", 1)[-1]
     return None
+
+
+def _dynamic_getattr_terminal(
+    node: ast.AST,
+    aliases: dict[str, str],
+    bindings: dict[str, str],
+) -> str | None:
+    """Resolve the method name returned by a ``getattr`` expression."""
+
+    if not isinstance(node, ast.Call) or _call_terminal(node, aliases) != "getattr":
+        return None
+    if len(node.args) < 2:
+        return None
+    symbol = node.args[1]
+    if isinstance(symbol, ast.Constant) and isinstance(symbol.value, str):
+        return symbol.value.rsplit(".", 1)[-1]
+    if isinstance(symbol, ast.Name) and symbol.id in bindings:
+        return bindings[symbol.id].rsplit(".", 1)[-1]
+    return None
+
+
+def _callable_aliases(
+    tree: ast.AST,
+    aliases: dict[str, str],
+    bindings: dict[str, str],
+) -> dict[str, str]:
+    """Propagate reviewed callable aliases returned by dynamic ``getattr``."""
+
+    resolved = dict(aliases)
+    callable_terminals = {
+        "prepare_stream",
+        "PreparedStreamGuard",
+        "build_guarded_streaming_response",
+    }
+    for _ in range(4):
+        changed = False
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.value is None:
+                continue
+            source = _dynamic_getattr_terminal(node.value, resolved, bindings)
+            if source is None:
+                qualified = _qualified_symbol(node.value, resolved)
+                if qualified is None or qualified.rsplit(".", 1)[-1] not in callable_terminals:
+                    continue
+                source = qualified
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name) and resolved.get(target.id) != source:
+                    resolved[target.id] = source
+                    changed = True
+        if not changed:
+            break
+    return resolved
 
 
 def _dynamic_attribute_strings(
@@ -576,6 +627,7 @@ def _validate_prepared_streams_are_guarded(runtime_tree: ast.AST, api_tree: ast.
     assert prepared_calls, "the runtime must construct prepared stream handles"
     aliases = _binding_aliases(api_tree)
     string_bindings = _string_bindings(api_tree)
+    callable_aliases = _callable_aliases(api_tree, aliases, string_bindings)
 
     def dead_branch(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
         constant_bindings = _constant_bindings(api_tree)
@@ -730,19 +782,32 @@ def _validate_prepared_streams_are_guarded(runtime_tree: ast.AST, api_tree: ast.
             for node in ast.walk(function)
             if not nested_in_function(node, function, parents)
         ]
+        prepared_calls_in_function = [
+            node
+            for node in scoped_nodes
+            if isinstance(node, ast.Call)
+            and _dynamic_call_terminal(node, callable_aliases, string_bindings)
+            == "prepare_stream"
+        ]
+        if not prepared_calls_in_function:
+            continue
         prepared_assignments: list[ast.Assign | ast.AnnAssign] = []
         prepared_targets: list[str] = []
-        for node in scoped_nodes:
-            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-                continue
-            if not isinstance(node.value, ast.Call):
-                continue
-            if _call_terminal(node.value, aliases) != "prepare_stream":
-                continue
-            prepared_assignments.append(node)
-            prepared_targets.extend(assigned_names(node))
-        if not prepared_targets:
-            continue
+        for prepared_call in prepared_calls_in_function:
+            parent = parents.get(prepared_call)
+            if not (
+                isinstance(parent, (ast.Assign, ast.AnnAssign))
+                and parent.value is prepared_call
+            ):
+                raise AssertionError(
+                    "PreparedStreamExecution must be owned by a guarded handle"
+                )
+            targets = assigned_names(parent)
+            if not targets:
+                raise AssertionError("prepared stream handle must have a named owner")
+            prepared_assignments.append(parent)
+            prepared_targets.extend(targets)
+        assert prepared_targets, "prepared stream handles must have a named owner"
         assert len(prepared_targets) == len(set(prepared_targets)), (
             "a prepared handle cannot be rebound before its guard"
         )
@@ -761,7 +826,10 @@ def _validate_prepared_streams_are_guarded(runtime_tree: ast.AST, api_tree: ast.
         for node in scoped_nodes:
             if not isinstance(node, ast.Call):
                 continue
-            if _dynamic_call_terminal(node, aliases, string_bindings) != "PreparedStreamGuard":
+            if (
+                _dynamic_call_terminal(node, callable_aliases, string_bindings)
+                != "PreparedStreamGuard"
+            ):
                 continue
             assert not dead_branch(node, parents), "dead-branch PreparedStreamGuard is not a guard"
             assert not conditional_path(node, parents), (
@@ -790,13 +858,15 @@ def _validate_prepared_streams_are_guarded(runtime_tree: ast.AST, api_tree: ast.
                 if not (
                     parent.arg == "guard"
                     and isinstance(owner, ast.Call)
-                    and _call_terminal(owner, aliases) == "build_guarded_streaming_response"
+                    and _call_terminal(owner, callable_aliases)
+                    == "build_guarded_streaming_response"
                 ):
                     raise AssertionError("PreparedStreamGuard result is not response-owned")
             else:
                 if not (
                     isinstance(parent, ast.Call)
-                    and _call_terminal(parent, aliases) == "build_guarded_streaming_response"
+                    and _call_terminal(parent, callable_aliases)
+                    == "build_guarded_streaming_response"
                 ):
                     raise AssertionError("PreparedStreamGuard result is not response-owned")
             guard_calls.append((node, prepared_arg.id, owner_name))
@@ -815,7 +885,7 @@ def _validate_prepared_streams_are_guarded(runtime_tree: ast.AST, api_tree: ast.
         direct_guard_ids: set[int] = set()
         returned_responses: list[tuple[ast.Return, ast.Call, ast.expr]] = []
         for returned in scoped_nodes:
-            result = returned_guard_response(returned, aliases)
+            result = returned_guard_response(returned, callable_aliases)
             if result is None:
                 continue
             return_node, response, guard_value = result
@@ -1760,6 +1830,58 @@ def test_task11_positive_fixtures_keep_dynamic_helpers_scoped() -> None:
     )
     _validate_no_asdict_in_extraction_scope(
         ast.parse("# asdict(values[0])\nvalue = {'public': 1}\n")
+    )
+    dynamic_prepare_source = (
+        "from offerpilot.chat_transport import PreparedStreamGuard as Guard\n"
+        "from offerpilot.chat_transport import build_guarded_streaming_response\n"
+        "def send_chat_stream(runtime):\n"
+        "    method_name = 'prepare_stream'\n"
+        "    prepared = getattr(runtime, method_name)()\n"
+        "    guard = Guard(prepared)\n"
+        "    return build_guarded_streaming_response((), guard=guard)\n"
+    )
+    _validate_prepared_streams_are_guarded(
+        ast.parse(
+            "PreparedStreamExecution('id', PreparationKind.REPLAY, "
+            "StreamExecutionMode.DIRECT, {})"
+        ),
+        ast.parse(dynamic_prepare_source),
+    )
+
+
+def test_task11_prepared_gate_rejects_dynamic_prepare_aliases() -> None:
+    runtime_tree = ast.parse(
+        "PreparedStreamExecution('id', PreparationKind.REPLAY, "
+        "StreamExecutionMode.DIRECT, {})"
+    )
+    valid_then_dynamic = (
+        "from offerpilot.chat_transport import PreparedStreamGuard as Guard\n"
+        "from offerpilot.chat_transport import build_guarded_streaming_response\n"
+        "def send_chat_stream(runtime):\n"
+        "    prepared = runtime.prepare_stream()\n"
+        "    guard = Guard(prepared)\n"
+        "    hidden = getattr(runtime, 'prepare_stream')()\n"
+        "    return build_guarded_streaming_response((), guard=guard)\n"
+    )
+    _expect_rejected(
+        valid_then_dynamic,
+        lambda tree: _validate_prepared_streams_are_guarded(runtime_tree, tree),
+    )
+    _expect_rejected(
+        valid_then_dynamic.replace(
+            "hidden = getattr(runtime, 'prepare_stream')()\n",
+            "method_name = 'prepare_stream'\n"
+            "    hidden = getattr(runtime, method_name)()\n",
+        ),
+        lambda tree: _validate_prepared_streams_are_guarded(runtime_tree, tree),
+    )
+    _expect_rejected(
+        valid_then_dynamic.replace(
+            "hidden = getattr(runtime, 'prepare_stream')()\n",
+            "prepare = getattr(runtime, 'prepare_stream')\n"
+            "    hidden = prepare()\n",
+        ),
+        lambda tree: _validate_prepared_streams_are_guarded(runtime_tree, tree),
     )
 
 

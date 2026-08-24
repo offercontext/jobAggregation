@@ -66,7 +66,6 @@ def init_database(db_path: Path) -> SessionFactory:
     Base.metadata.create_all(engine)
     _ensure_context_projector_manifest_v2_schema(engine)
     _ensure_write_operation_ledger_schema(engine)
-    _ensure_scoped_tool_authority_schema(engine)
     _ensure_column(
         engine,
         "conversations",
@@ -317,6 +316,10 @@ def init_database(db_path: Path) -> SessionFactory:
     ]
     if any(chat_migrations):
         _record_migration(engine, "0002_chat_state_columns", "Add durable chat state columns")
+    # 0028 depends on the historical chat scope columns.  Very old databases
+    # acquire those columns above before the scoped-authority migration
+    # canonicalizes legacy mode values or installs scope triggers.
+    _ensure_scoped_tool_authority_schema(engine)
 
     resume_migrations = [
         _ensure_column(engine, "resumes", "name", "TEXT DEFAULT ''"),

@@ -2984,7 +2984,7 @@ class PilotRuntime:
             self._abandon(recorder, journal_started)
             raise
         except ConfirmationReplayError:
-            self._stop_confirmation_heartbeat(coordinator, session)
+            coordinator.cancel_cleanup(session)
             self._abandon(recorder, journal_started)
             try:
                 replay = coordinator.replay_outcome(request)
@@ -5367,7 +5367,7 @@ class PilotRuntime:
             self._abandon(recorder, journal_started)
             raise
         except ConfirmationReplayError:
-            coordinator.stop_heartbeat(session)
+            coordinator.cancel_cleanup(session)
             self._abandon(recorder, journal_started)
             try:
                 replay = coordinator.replay_outcome(request)

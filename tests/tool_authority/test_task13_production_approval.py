@@ -24,6 +24,8 @@ from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.ai.write_operations import (
     OperationCommitted,
+    OperationReplay,
+    TerminalPayload,
     WriteOperationCoordinator,
     WriteOperationRepository,
     ledger_fingerprint,
@@ -35,9 +37,14 @@ from offerpilot.pilot_runtime.continuation import (
     ConfirmationApprovedWritePort,
     ConfirmationCoordinator,
     ConfirmationDependencies,
+    ConfirmationReplayError,
 )
 from offerpilot.pilot_runtime.composition import _AgentDriver
-from offerpilot.pilot_runtime.contracts import ConfirmationRequest
+from offerpilot.pilot_runtime.contracts import (
+    ConfirmationRequest,
+    PreparedStreamExecution,
+    RuntimeTransportContext,
+)
 from offerpilot.pilot_runtime.event_sink import InMemoryRuntimeInvocationControl
 from offerpilot.pilot_runtime.persistence import ChatPersistenceCoordinator
 from offerpilot.pilot_runtime.service import PilotRuntime, RuntimeDependencies
@@ -506,3 +513,146 @@ def test_production_agent_driver_retains_approval_context_seals(tmp_path) -> Non
         assert rebound.operation_executor is session.execute_operation
     finally:
         origin.authority_factory.close()
+
+
+def test_unclaimed_timeout_closes_approval_authority(tmp_path) -> None:
+    harness = _approval_harness(tmp_path)
+    conversation = harness.chat.get_conversation(harness.conversation.id)
+    assert conversation is not None
+    coordinator = ConfirmationCoordinator(
+        ConfirmationDependencies(
+            persistence=ChatPersistenceCoordinator(harness.chat),
+            conversations=harness.chat,
+            write_operations=harness.repository,
+            write_coordinator=harness.coordinator,
+            catalog=MODEL_TOOL_CATALOG,
+            applications=harness.applications,
+            approval_context_resolver=_approval_context_resolver(harness),
+        )
+    )
+    session = coordinator.approve_modify(
+        ConfirmationRequest(
+            conversation_id=conversation.id,
+            operation_id=harness.operation_id,
+            approved=True,
+            confirmation_token="scoped-token",
+        ),
+        pending=harness.pending,
+        conversation=conversation,
+        catalog=MODEL_TOOL_CATALOG,
+    )
+    context = session.approval_context
+
+    assert coordinator.timeout_convergence(session) is None
+    assert session.state.active is False
+    with pytest.raises(AuthorityPhaseError, match="closed"):
+        _ = context.scope_constraint
+
+
+@pytest.mark.parametrize("transport_mode", ("sync", "stream"))
+def test_replay_exit_closes_approval_authority(
+    tmp_path,
+    transport_mode: str,
+) -> None:
+    harness = _approval_harness(tmp_path)
+    approval_contexts: list[ToolExecutionContext] = []
+    resolve_context = _approval_context_resolver(harness)
+
+    def tracked_approval_context(**kwargs) -> ToolExecutionContext:
+        context = resolve_context(**kwargs)
+        approval_contexts.append(context)
+        return context
+
+    coordinator = ConfirmationCoordinator(
+        ConfirmationDependencies(
+            persistence=ChatPersistenceCoordinator(harness.chat),
+            conversations=harness.chat,
+            write_operations=harness.repository,
+            write_coordinator=harness.coordinator,
+            catalog=MODEL_TOOL_CATALOG,
+            applications=harness.applications,
+            approval_context_resolver=tracked_approval_context,
+        )
+    )
+
+    class Conversations:
+        def load(self, conversation_id: int):
+            return harness.chat.get_conversation(conversation_id)
+
+    replay = OperationReplay(
+        operation_id=harness.operation_id,
+        payload=TerminalPayload(
+            status="committed",
+            result_contract="tool_success_v1",
+            result_json="{}",
+            visible_result="saved",
+            transport_json="{}",
+            undo_json=None,
+            failure_category=None,
+            failure_code=None,
+            digest="sha256:" + "0" * 64,
+        ),
+        delivery_status="pending",
+        delivery_generation=0,
+        delivery_lease_expires_at=None,
+    )
+
+    class ReplayDriver:
+        def execute(self, _invocation):
+            raise ConfirmationReplayError(replay)
+
+    runtime = PilotRuntime(
+        RuntimeDependencies(
+            conversations=Conversations(),
+            persistence=ChatPersistenceCoordinator(harness.chat),
+            confirmation_coordinator=coordinator,
+            agent_driver=ReplayDriver(),
+            catalog=MODEL_TOOL_CATALOG,
+        )
+    )
+    request = ConfirmationRequest(
+        conversation_id=harness.conversation.id,
+        operation_id=harness.operation_id,
+        approved=True,
+        confirmation_token="scoped-token",
+    )
+
+    with pytest.raises(ConfirmationReplayError):
+        if transport_mode == "sync":
+            runtime.continue_confirmation(
+                request,
+                invocation_control=InMemoryRuntimeInvocationControl(),
+            )
+        else:
+            prepared = runtime.prepare_stream(
+                request,
+                transport=RuntimeTransportContext(
+                    mode="stream",
+                    transport_run_id=uuid4(),
+                    stream_version="pilot-sse-v1",
+                ),
+                invocation_control=InMemoryRuntimeInvocationControl(),
+            )
+            assert isinstance(prepared, PreparedStreamExecution)
+            assert prepared.begin()
+            prepared.opaque_state.cell.execution_owner = object()
+
+            class Sink:
+                def emit(self, _event: object) -> None:
+                    return None
+
+            class Host:
+                def run(self, thunk, _control):
+                    return thunk()
+
+            runtime.execute_prepared_stream(
+                prepared,
+                event_sink=Sink(),
+                signal_sink=None,
+                execution_host=Host(),
+                cancel_check=lambda: False,
+            )
+
+    assert len(approval_contexts) == 1
+    with pytest.raises(AuthorityPhaseError, match="closed"):
+        _ = approval_contexts[0].scope_constraint

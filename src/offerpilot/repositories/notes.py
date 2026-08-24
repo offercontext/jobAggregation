@@ -7,12 +7,10 @@ from builtins import list as BuiltinList
 
 from sqlalchemy import (
     and_,
-    case,
     delete,
     exists,
     insert,
     literal,
-    literal_column,
     or_,
     select,
     update,
@@ -219,9 +217,27 @@ class NotesRepository:
             if constraint.mode == "restricted" or len(rows) > 1:
                 raise ScopeAccessDenied("application scope denied")
             if data.application_event_id is not None:
-                raise NoteBindingError(
-                    422,
-                    "application_event_id must reference an interview event for the application",
+                with binding.session.no_autoflush:
+                    classification = binding.session.execute(
+                        select(
+                            _valid_interview_event(
+                                data.application_event_id,
+                                data.application_id,
+                            ).label("event_allowed"),
+                            _note_event_available(data.application_event_id).label(
+                                "event_available"
+                            ),
+                        )
+                    ).one()
+                if not classification.event_allowed:
+                    raise NoteBindingError(
+                        422,
+                        "application_event_id must reference an interview event for the application",
+                    )
+                if not classification.event_available:
+                    raise NoteBindingError(409, "Interview event already has a note")
+                raise RuntimeError(
+                    "scoped note create returned no row after valid guards"
                 )
             raise ScopeAccessDenied("application scope denied")
         return rows[0]
@@ -396,7 +412,6 @@ class NotesRepository:
             application_allowed = literal(True)
         event_id: int | None = None
         event_allowed: ColumnElement[bool]
-        returned_event_allowed: ColumnElement[bool]
         duplicate_allowed: ColumnElement[bool]
         if data.application_event_id is not UNSET:
             event_id = cast(int | None, data.application_event_id)
@@ -404,44 +419,53 @@ class NotesRepository:
                 event_allowed = _valid_interview_event(
                     event_id, InterviewNote.application_id
                 )
-                returned_event_allowed = _valid_interview_event_returning(event_id)
                 duplicate_allowed = _note_event_available(
                     event_id,
                     excluding_note_id=note_id,
                 )
             else:
                 event_allowed = literal(True)
-                returned_event_allowed = literal(True)
                 duplicate_allowed = literal(True)
         else:
             event_allowed = literal(True)
-            returned_event_allowed = literal(True)
             duplicate_allowed = literal(True)
         domain_allowed = and_(application_allowed, event_allowed, duplicate_allowed)
-        guarded_values = {
-            key: case(
-                (domain_allowed, value),
-                else_=getattr(InterviewNote, key),
-            )
-            for key, value in values.items()
-        }
         statement = (
-            statement.values(**guarded_values)
-            .returning(
-                InterviewNote,
-                application_allowed.label("application_allowed"),
-                returned_event_allowed.label("event_allowed"),
-                duplicate_allowed.label("duplicate_allowed"),
-            )
+            statement.where(domain_allowed)
+            .values(**values)
+            .returning(InterviewNote)
             .execution_options(populate_existing=True, synchronize_session=False)
         )
         with binding.session.no_autoflush:
-            rows = list(binding.session.execute(statement))
+            rows = list(binding.session.scalars(statement))
         if len(rows) != 1:
             if constraint.mode == "restricted" or len(rows) > 1:
                 raise ScopeAccessDenied("application scope denied")
-            return None
-        note, application_is_allowed, event_is_allowed, duplicate_is_allowed = rows[0]
+            classification_statement = select(
+                InterviewNote.id,
+                application_allowed.label("application_allowed"),
+                event_allowed.label("event_allowed"),
+                duplicate_allowed.label("duplicate_allowed"),
+            ).where(
+                InterviewNote.id == note_id,
+                or_(InterviewNote.application_id.is_(None), visible_parent),
+            )
+            with binding.session.no_autoflush:
+                classification_rows = list(
+                    binding.session.execute(classification_statement)
+                )
+            if len(classification_rows) != 1:
+                if len(classification_rows) > 1:
+                    raise ScopeAccessDenied("application scope denied")
+                return None
+            (
+                _matched_note_id,
+                application_is_allowed,
+                event_is_allowed,
+                duplicate_is_allowed,
+            ) = classification_rows[0]
+        else:
+            return rows[0]
         if not application_is_allowed:
             raise NoteBindingError(422, "application_id cannot be changed")
         if not event_is_allowed:
@@ -451,7 +475,7 @@ class NotesRepository:
             )
         if not duplicate_is_allowed:
             raise NoteBindingError(409, "Interview event already has a note")
-        return cast(InterviewNote, note)
+        raise RuntimeError("scoped note update returned no row after valid guards")
 
     def delete(self, note_id: int) -> None:
         with repository_session(self._session_factory, self._session) as session:
@@ -622,28 +646,6 @@ def _valid_interview_event(
             ApplicationEvent.event_type == "interview",
             ApplicationEvent.application_id == application_id,
             Application.deleted_at.is_(None),
-        )
-    )
-
-
-def _valid_interview_event_returning(event_id: int) -> ColumnElement[bool]:
-    event_table = ApplicationEvent.__table__.alias("note_guard_event")
-    application_table = Application.__table__.alias("note_guard_application")
-    return exists(
-        select(literal_column("note_guard_event.id"))
-        .select_from(
-            event_table.join(
-                application_table,
-                literal_column("note_guard_application.id")
-                == literal_column("note_guard_event.application_id"),
-            )
-        )
-        .where(
-            literal_column("note_guard_event.id") == event_id,
-            literal_column("note_guard_event.event_type") == "interview",
-            literal_column("note_guard_event.application_id")
-            == literal_column("interview_notes.application_id"),
-            literal_column("note_guard_application.deleted_at").is_(None),
         )
     )
 

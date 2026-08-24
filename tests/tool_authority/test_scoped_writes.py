@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import inspect
 import sqlite3
 import textwrap
+from threading import Event, Thread
 from unittest.mock import patch
 
 import pytest
@@ -785,10 +786,8 @@ def test_scoped_note_write_preserves_stable_binding_domain_failures(seeded) -> N
                     company="duplicate",
                 ),
             )
-        assert duplicate_create_event.value.status_code == 422
-        assert str(duplicate_create_event.value) == (
-            "application_event_id must reference an interview event for the application"
-        )
+        assert duplicate_create_event.value.status_code == 409
+        assert str(duplicate_create_event.value) == "Interview event already has a note"
         with pytest.raises(NoteBindingError) as invalid_create_event:
             notes.create_note_scoped(
                 event_constraint,
@@ -808,7 +807,7 @@ def test_scoped_note_write_preserves_stable_binding_domain_failures(seeded) -> N
 
     with seeded["session_factory"]() as session:
         notes = _bind(seeded["notes"], session, factory, authority, constraint)
-        with pytest.raises(NoteBindingError) as invalid_event:
+        with pytest.raises(ScopeAccessDenied):
             notes.update_note_scoped(
                 constraint,
                 seeded["first_note_id"],
@@ -817,7 +816,6 @@ def test_scoped_note_write_preserves_stable_binding_domain_failures(seeded) -> N
                     company="A",
                 ),
             )
-        assert invalid_event.value.status_code == 422
         session.rollback()
 
     workspace_factory = AuthorityFactory()
@@ -1185,7 +1183,7 @@ def test_scoped_note_create_preserves_trigger_unique_from_another_table(seeded) 
 
 def test_scoped_note_update_classifies_duplicate_without_integrity_error(seeded) -> None:
     factory = AuthorityFactory()
-    authority, constraint = _scope(factory, seeded["first_id"])
+    authority, constraint = _scope(factory, None, context_type="workspace")
     with seeded["session_factory"]() as session:
         notes = _bind(seeded["notes"], session, factory, authority, constraint)
         notes.create_note_scoped(
@@ -1214,6 +1212,128 @@ def test_scoped_note_update_classifies_duplicate_without_integrity_error(seeded)
         current = session.get(InterviewNote, seeded["first_note_id"])
         assert current is not None
         assert current.application_event_id is None
+
+
+def test_workspace_note_update_domain_failure_does_not_fire_update_trigger(
+    seeded,
+) -> None:
+    factory = AuthorityFactory()
+    authority, constraint = _scope(factory, None, context_type="workspace")
+    with seeded["session_factory"]() as session:
+        notes = _bind(
+            seeded["notes"],
+            session,
+            factory,
+            authority,
+            constraint,
+        )
+        session.execute(text("CREATE TABLE note_update_audit (note_id INTEGER NOT NULL)"))
+        session.execute(
+            text(
+                """
+                CREATE TRIGGER audit_rejected_note_update
+                AFTER UPDATE ON interview_notes
+                BEGIN
+                    INSERT INTO note_update_audit(note_id) VALUES (NEW.id);
+                END
+                """
+            )
+        )
+        session.commit()
+
+        with pytest.raises(NoteBindingError) as raised:
+            notes.update_note_scoped(
+                constraint,
+                seeded["first_note_id"],
+                NoteUpdate(
+                    application_id=seeded["second_id"],
+                    application_event_id=seeded["second_event_id"],
+                    company="must not update",
+                ),
+            )
+
+        assert raised.value.status_code == 422
+        assert str(raised.value) == "application_id cannot be changed"
+        assert session.scalar(text("SELECT count(*) FROM note_update_audit")) == 0
+        assert session.scalar(select(func.count()).select_from(InterviewNote)) > 0
+        session.commit()
+
+    with seeded["session_factory"]() as session:
+        assert session.scalar(text("SELECT count(*) FROM note_update_audit")) == 0
+        current = session.get(InterviewNote, seeded["first_note_id"])
+        assert current is not None
+        assert current.company == "A"
+
+
+def test_workspace_note_update_classifies_after_guarded_mutation_under_write_lock(
+    seeded,
+) -> None:
+    factory = AuthorityFactory()
+    authority, constraint = _scope(factory, None, context_type="workspace")
+    writer_started = Event()
+    writer_finished = Event()
+    writer_errors: list[BaseException] = []
+    statements: list[str] = []
+
+    def competing_writer() -> None:
+        try:
+            with seeded["session_factory"]() as other_session:
+                writer_started.set()
+                other_session.execute(
+                    text(
+                        "UPDATE application_events SET notes = 'concurrent' "
+                        "WHERE id = :event_id"
+                    ),
+                    {"event_id": seeded["second_event_id"]},
+                )
+                other_session.commit()
+        except BaseException as exc:  # pragma: no cover - asserted below
+            writer_errors.append(exc)
+        finally:
+            writer_finished.set()
+
+    writer = Thread(target=competing_writer)
+    with seeded["session_factory"]() as session:
+        notes = _bind(
+            seeded["notes"],
+            session,
+            factory,
+            authority,
+            constraint,
+        )
+        main_connection = session.connection()
+
+        def capture(conn, _cursor, statement, _parameters, _context, _executemany):
+            if conn is not main_connection:
+                return
+            statements.append(statement)
+            if statement.lstrip().upper().startswith("UPDATE INTERVIEW_NOTES"):
+                writer.start()
+                assert writer_started.wait(2)
+
+        engine = seeded["session_factory"].kw["bind"]
+        event.listen(engine, "after_cursor_execute", capture)
+        try:
+            with pytest.raises(NoteBindingError) as raised:
+                notes.update_note_scoped(
+                    constraint,
+                    seeded["first_note_id"],
+                    NoteUpdate(
+                        application_event_id=seeded["second_event_id"],
+                        company="must not update",
+                    ),
+                )
+            assert raised.value.status_code == 422
+            assert not writer_finished.wait(0.1)
+            assert statements[0].lstrip().upper().startswith("UPDATE INTERVIEW_NOTES")
+            assert statements[1].lstrip().upper().startswith("SELECT")
+        finally:
+            event.remove(engine, "after_cursor_execute", capture)
+            session.rollback()
+
+    assert writer_finished.wait(5)
+    writer.join(timeout=1)
+    assert writer_errors == []
 
 
 def test_scoped_write_ports_have_no_unscoped_repository_or_orm_fallback() -> None:

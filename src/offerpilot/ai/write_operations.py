@@ -9,7 +9,7 @@ import secrets
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field, is_dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from threading import Event, Thread
@@ -529,6 +529,109 @@ def _pending_confirmation_token(
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
+def _legacy_pending_confirmation_token(
+    tool_call_id: str,
+    tool_name: str,
+    raw_arguments: str,
+) -> tuple[str, JSONValue]:
+    """Run the exact closed Legacy token codec and retain its decoded value."""
+
+    try:
+        decoded = cast(JSONValue, json.loads(raw_arguments))
+        canonical_arguments = json.dumps(
+            decoded,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (json.JSONDecodeError, TypeError, ValueError):
+        decoded = raw_arguments
+        canonical_arguments = raw_arguments
+    identity = json.dumps(
+        [tool_call_id, tool_name, canonical_arguments],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest(), decoded
+
+
+def _typed_pending_confirmation_human(
+    tool_name: str,
+    arguments: Mapping[str, JSONValue],
+) -> str:
+    """Render a replay card without Catalog, schema, Authority, or Tool access."""
+
+    values = dict(arguments)
+    if tool_name == "create_application":
+        return (
+            f"新建投递：{values.get('company_name', '')} - "
+            f"{values.get('position_name', '')}"
+        )
+    if tool_name == "update_application_status":
+        return (
+            f"将投递 #{values.get('id', '')} 的状态改为 "
+            f"{values.get('status', '')}"
+        )
+    if tool_name == "create_application_event":
+        labels = {
+            "written_test": "笔试",
+            "interview": "面试",
+            "offer_step": "Offer 进展",
+            "deadline": "截止",
+            "custom": "自定义",
+        }
+        title = labels.get(str(values.get("event_type") or ""), "日程")
+        raw_time = str(values.get("scheduled_at") or "")
+        try:
+            parsed = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(timezone(timedelta(hours=8)))
+            shown_time = parsed.strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            shown_time = raw_time
+        duration = values.get("duration_minutes")
+        shown_duration = f"{duration} 分钟" if duration not in (None, "") else ""
+        details = " · ".join(
+            value for value in (title, shown_time, shown_duration) if value
+        )
+        return f"新建日程：{details}" if details else "新建日程"
+    if tool_name == "add_note":
+        details = " · ".join(
+            str(values.get(key) or "").strip()
+            for key in ("company", "position", "round")
+            if str(values.get(key) or "").strip()
+        )
+        return f"新增复盘：{details}" if details else "新增复盘"
+    actions = {
+        "update_application_event": "更新日程",
+        "delete_application_event": "删除日程",
+        "update_note": "更新复盘",
+        "delete_note": "删除复盘",
+        "update_offer": "更新 Offer",
+        "save_offer_assessment": "保存 Offer 评估",
+        "resume_update_career_intent": "更新简历求职意向",
+        "resume_rewrite_highlight": "改写简历亮点",
+    }
+    action = actions.get(tool_name)
+    if action is None:
+        raise WriteOperationError("operation_delivery_unknown", retryable=True)
+    return f"{action} #{values.get('id', '')}"
+
+
+def _verified_pending_confirmation_human(
+    adapter_kind: Literal["typed", "legacy_deterministic"],
+    tool_name: str,
+    decoded_args: Mapping[str, JSONValue] | None,
+) -> str:
+    if adapter_kind == "typed":
+        if decoded_args is None:
+            raise WriteOperationError("operation_integrity_error")
+        return _typed_pending_confirmation_human(tool_name, decoded_args)
+    if tool_name != "save_application_jd_version":
+        raise WriteOperationError("operation_delivery_unknown", retryable=True)
+    return "请确认将这份岗位资料保存到当前投递。"
+
+
 def _valid_delivery_messages(
     operation: WriteOperation,
     messages: Sequence[ChatMessage],
@@ -842,6 +945,37 @@ class WriteOperationRepository:
             ):
                 raise WriteOperationError("operation_integrity_error")
 
+        if adapter_kind == "legacy_deterministic":
+            token, legacy_arguments = _legacy_pending_confirmation_token(
+                child.tool_call_id or "",
+                child.tool_name,
+                pending_row.pending_args,
+            )
+            expected_proposal = ledger_fingerprint(
+                self.key, "write-operation-proposal-v1", legacy_arguments
+            )
+            if not hmac.compare_digest(
+                expected_proposal, child.proposal_fingerprint or ""
+            ):
+                raise WriteOperationError("operation_integrity_error")
+            expected_token = ledger_fingerprint(
+                self.key,
+                "write-operation-confirmation-token-v1",
+                token.encode("ascii"),
+            )
+            if not hmac.compare_digest(
+                expected_token, child.confirmation_token_fingerprint or ""
+            ):
+                raise WriteOperationError("operation_integrity_error")
+
+        expected_human = _verified_pending_confirmation_human(
+            adapter_kind,
+            child.tool_name,
+            decoded_args,
+        )
+        if not _constant_time_text_equal(expected_human, pending_row.pending_human):
+            raise WriteOperationError("operation_integrity_error")
+
         return final, VerifiedPendingReplay(
             adapter_kind=adapter_kind,
             conversation_id=int(pending_row.id),
@@ -849,7 +983,7 @@ class WriteOperationRepository:
             tool_call_id=child.tool_call_id or "",
             tool_name=child.tool_name,
             raw_args=pending_row.pending_args,
-            human=pending_row.pending_human or child.tool_name,
+            human=expected_human,
             confirmation_token_fingerprint=child.confirmation_token_fingerprint or "",
             decoded_args=decoded_args,
         )

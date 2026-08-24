@@ -9,17 +9,54 @@ from sqlalchemy import event
 
 import offerpilot.ai.write_operations as write_operations
 from offerpilot.ai.agent_contracts import PendingAction
+from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 from offerpilot.ai.write_operations import (
     OperationReplay,
+    TYPED_WRITE_OPERATION_NAMES,
     WriteOperationError,
     WriteOperationRepository,
+    _typed_pending_confirmation_human,
     build_terminal_payload,
     ledger_fingerprint,
     load_or_create_ledger_key,
+    operation_request_fingerprint,
 )
 from offerpilot.db import init_database
 from offerpilot.models import ChatMessage, Conversation, WriteOperation
+from offerpilot.pilot_runtime import InMemoryRuntimeInvocationControl
+from offerpilot.pilot_runtime.continuation import (
+    ConfirmationCoordinator,
+    ConfirmationDependencies,
+)
+from offerpilot.pilot_runtime.contracts import (
+    ConfirmationRequest,
+    ConfirmationRequiredOutcome,
+    RuntimeFailureOutcome,
+)
+from offerpilot.pilot_runtime.errors import RuntimeFailureCode
+from offerpilot.pilot_runtime.service import PilotRuntime, RuntimeDependencies
 from offerpilot.repositories.chat import ChatRepository
+
+
+_LEGACY_PENDING_HUMAN = {
+    "save_application_jd_version": "请确认将这份岗位资料保存到当前投递。",
+    "create_application_submission_snapshot": (
+        "请确认冻结这次实际投递使用的简历、岗位资料和材料。"
+    ),
+    "record_application_outcome": "请确认记录这次投递进展、原始反馈和下一步行动。",
+}
+
+
+def _typed_pending_human(tool_name: str, args: dict[str, object]) -> str:
+    """Use the frozen production metadata only as an independent test oracle."""
+
+    spec = MODEL_TOOL_CATALOG.resolve(tool_name)
+    assert spec is not None
+    assert spec.confirmation_description is not None
+    return str(spec.confirmation_description(spec.decoder(args)))
+
+
+_ORIGIN_CONFIRMATION_TOKEN = "origin-replay-token"
 
 
 def _scope_fingerprint() -> str:
@@ -34,6 +71,7 @@ def _seed_completed_origin(
     child_adapter: str = "typed",
     child_name: str = "update_note",
     child_args: str = '{"id":1,"content":"next"}',
+    child_human: str | None = None,
     outcome: str = "chained_pending",
     complete_delivery: bool = True,
 ):
@@ -46,8 +84,15 @@ def _seed_completed_origin(
     child_id = str(uuid4())
     origin_args = {"id": 1, "content": "origin"}
     child_value = json.loads(child_args)
+    expected_child_human = child_human
+    if expected_child_human is None:
+        expected_child_human = (
+            _typed_pending_human(child_name, child_value)
+            if child_adapter == "typed"
+            else _LEGACY_PENDING_HUMAN[child_name]
+        )
     child_pending = PendingAction(
-        "child-call", child_name, child_args, "confirm child", child_id
+        "child-call", child_name, child_args, expected_child_human, child_id
     )
     child_token = __import__(
         "offerpilot.pilot_runtime.continuation", fromlist=["_confirmation_token"]
@@ -78,7 +123,9 @@ def _seed_completed_origin(
                 key, "write-operation-proposal-v1", origin_args
             ),
             confirmation_token_fingerprint=ledger_fingerprint(
-                key, "write-operation-confirmation-token-v1", b"origin-token"
+                key,
+                "write-operation-confirmation-token-v1",
+                _ORIGIN_CONFIRMATION_TOKEN.encode("ascii"),
             ),
             authorization_scope_fingerprint=(
                 _scope_fingerprint() if origin_adapter == "typed" else None
@@ -115,8 +162,19 @@ def _seed_completed_origin(
         origin = session.get(WriteOperation, origin_id)
         assert origin is not None
         origin.status = "committed"
-        origin.operation_request_fingerprint = ledger_fingerprint(
-            key, "test-origin-request-v1", {}
+        origin.operation_request_fingerprint = operation_request_fingerprint(
+            key,
+            operation_id=origin.id,
+            tool_call_id=origin.tool_call_id or "",
+            approved=True,
+            edited_args_present=False,
+            edited_args=None,
+            rejection_feedback_present=False,
+            rejection_feedback="",
+            confirmation_token_fingerprint=(
+                origin.confirmation_token_fingerprint or ""
+            ),
+            proposal_fingerprint=origin.proposal_fingerprint or "",
         )
         origin.input_fingerprint = ledger_fingerprint(key, "test-origin-input-v1", {})
         origin.result_contract = payload.result_contract
@@ -187,6 +245,153 @@ def test_typed_chained_replay_returns_one_verified_operation_owned_pending(tmp_p
     assert replay.chained_pending.decoded_args == {"id": 1, "content": "next"}
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "args"),
+    (
+        ("create_application", {"company_name": "A", "position_name": "B"}),
+        ("update_application_status", {"id": 1, "status": "offer"}),
+        (
+            "create_application_event",
+            {
+                "event_type": "interview",
+                "scheduled_at": "2026-08-24T02:00:00Z",
+                "duration_minutes": 30,
+            },
+        ),
+        ("update_application_event", {"id": 2}),
+        ("delete_application_event", {"id": 3}),
+        ("add_note", {"company": "A", "position": "B", "round": "一面"}),
+        ("update_note", {"id": 4}),
+        ("delete_note", {"id": 5}),
+        ("update_offer", {"id": 6}),
+        ("save_offer_assessment", {"id": 7, "assessment": "ok"}),
+        ("resume_update_career_intent", {"id": 8, "career_intent": {}}),
+        (
+            "resume_rewrite_highlight",
+            {
+                "id": 9,
+                "section": "work_experience",
+                "item_index": 0,
+                "highlight_index": 0,
+                "text": "rewritten",
+            },
+        ),
+    ),
+)
+def test_closed_replay_renderer_matches_frozen_typed_confirmation_projection(
+    tool_name: str,
+    args: dict[str, object],
+) -> None:
+    assert set(TYPED_WRITE_OPERATION_NAMES) == {
+        "create_application",
+        "update_application_status",
+        "create_application_event",
+        "update_application_event",
+        "delete_application_event",
+        "add_note",
+        "update_note",
+        "delete_note",
+        "update_offer",
+        "save_offer_assessment",
+        "resume_update_career_intent",
+        "resume_rewrite_highlight",
+    }
+    assert _typed_pending_confirmation_human(tool_name, args) == _typed_pending_human(
+        tool_name, args
+    )
+
+
+@pytest.mark.parametrize("tampered_human", (False, True))
+def test_typed_chained_replay_integrity_and_runtime_side_effect_boundary(
+    tmp_path,
+    tampered_human: bool,
+) -> None:
+    sessions, repository, origin_id, child_id, conversation_id = _seed_completed_origin(
+        tmp_path
+    )
+    if tampered_human:
+        with sessions() as session:
+            conversation = session.get(Conversation, conversation_id)
+            assert conversation is not None
+            conversation.pending_human = "FORGED RUNTIME CONFIRMATION TEXT"
+            session.commit()
+    counters = {
+        "provider": 0,
+        "authority": 0,
+        "tool": 0,
+        "executor": 0,
+        "conversation": 0,
+    }
+
+    def forbidden(name: str):
+        def call(*_args: object, **_kwargs: object) -> object:
+            counters[name] += 1
+            raise AssertionError(f"{name} must remain zero during replay")
+
+        return call
+
+    class ForbiddenConversationGateway:
+        def load(self, *_args: object, **_kwargs: object) -> object:
+            return forbidden("conversation")()
+
+    class ForbiddenCatalog:
+        def resolve(self, *_args: object, **_kwargs: object) -> object:
+            return forbidden("tool")()
+
+    class ForbiddenWriteCoordinator:
+        def execute_primary(self, *_args: object, **_kwargs: object) -> object:
+            return forbidden("executor")()
+
+        def reject_primary(self, *_args: object, **_kwargs: object) -> object:
+            return forbidden("executor")()
+
+    coordinator = ConfirmationCoordinator(
+        ConfirmationDependencies(
+            write_operations=repository,
+            write_coordinator=ForbiddenWriteCoordinator(),  # type: ignore[arg-type]
+            catalog=ForbiddenCatalog(),
+            prepare_call=forbidden("tool"),
+            approval_context_resolver=forbidden("authority"),
+        )
+    )
+    runtime = PilotRuntime(
+        RuntimeDependencies(
+            conversations=ForbiddenConversationGateway(),
+            confirmation_coordinator=coordinator,
+            catalog=ForbiddenCatalog(),  # type: ignore[arg-type]
+            model_resolver=forbidden("provider"),  # type: ignore[arg-type]
+            agent_driver=forbidden("provider"),  # type: ignore[arg-type]
+        )
+    )
+
+    outcome = runtime.continue_confirmation(
+        ConfirmationRequest(
+            conversation_id=conversation_id,
+            approved=True,
+            operation_id=origin_id,
+            confirmation_token=_ORIGIN_CONFIRMATION_TOKEN,
+        ),
+        invocation_control=InMemoryRuntimeInvocationControl(),
+    )
+
+    if tampered_human:
+        assert isinstance(outcome, RuntimeFailureOutcome)
+        assert outcome.code is RuntimeFailureCode.OPERATION_INTEGRITY_ERROR
+        assert outcome.status_code == 409
+        assert outcome.retryable is True
+    else:
+        assert isinstance(outcome, ConfirmationRequiredOutcome)
+        assert outcome.operation_id == origin_id
+        assert outcome.pending_action.operation_id == child_id
+    assert counters == {
+        "provider": 0,
+        "authority": 0,
+        "tool": 0,
+        "executor": 0,
+        "conversation": 0,
+    }
+
+
 def test_manifest_failure_wins_before_malformed_pending_decode(
     tmp_path, monkeypatch
 ) -> None:
@@ -222,6 +427,68 @@ def test_typed_replay_decoder_failure_is_integrity(tmp_path) -> None:
         session.commit()
     with pytest.raises(WriteOperationError) as caught:
         _replay(repository, origin_id)
+    assert caught.value.code == "operation_integrity_error"
+
+
+def test_typed_chained_replay_rejects_tampered_confirmation_projection(
+    tmp_path,
+) -> None:
+    sessions, repository, origin_id, _child_id, conversation_id = _seed_completed_origin(
+        tmp_path
+    )
+    with sessions() as session:
+        conversation = session.get(Conversation, conversation_id)
+        assert conversation is not None
+        conversation.pending_human = "FORGED CONFIRMATION TEXT"
+        session.commit()
+
+    with pytest.raises(WriteOperationError) as caught:
+        _replay(repository, origin_id)
+
+    assert caught.value.code == "operation_integrity_error"
+
+
+def test_typed_chained_replay_rejects_valid_json_with_wrong_proposal_hmac(
+    tmp_path,
+) -> None:
+    sessions, repository, origin_id, _child_id, conversation_id = _seed_completed_origin(
+        tmp_path
+    )
+    with sessions() as session:
+        conversation = session.get(Conversation, conversation_id)
+        assert conversation is not None
+        conversation.pending_args = '{"id":2,"content":"next"}'
+        conversation.pending_human = _typed_pending_human(
+            "update_note", {"id": 2, "content": "next"}
+        )
+        session.commit()
+
+    with pytest.raises(WriteOperationError) as caught:
+        _replay(repository, origin_id)
+
+    assert caught.value.code == "operation_integrity_error"
+
+
+def test_legacy_chained_replay_rejects_tampered_confirmation_projection(
+    tmp_path,
+) -> None:
+    sessions, repository, origin_id, _child_id, conversation_id = _seed_completed_origin(
+        tmp_path,
+        origin_adapter="legacy_deterministic",
+        origin_name="save_application_jd_version",
+        child_adapter="legacy_deterministic",
+        child_name="save_application_jd_version",
+        child_args='{"application_id":1,"jd_text":"next"}',
+    )
+    with sessions() as session:
+        conversation = session.get(Conversation, conversation_id)
+        assert conversation is not None
+        conversation.pending_human = "FORGED LEGACY CONFIRMATION TEXT"
+        session.commit()
+
+    with pytest.raises(WriteOperationError) as caught:
+        _replay(repository, origin_id)
+
     assert caught.value.code == "operation_integrity_error"
 
 

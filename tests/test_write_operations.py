@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 from dataclasses import asdict
 from types import SimpleNamespace
 from uuid import uuid4
@@ -34,6 +36,7 @@ from offerpilot.ai.write_operations import (
     DeliveryHeartbeat,
     DeliveryOwnership,
     OperationFailed,
+    OperationReplay,
     OperationUnknown,
     WriteOperationCoordinator,
     WriteOperationError,
@@ -262,6 +265,8 @@ def test_mapped_domain_failure_rolls_back_executor_savepoint(tmp_path) -> None:
         setup_conversation.pending_operation_id = operation_id
         setup_conversation.pending_tool_call_id = pending.tool_call_id
         setup_conversation.pending_tool_name = pending.tool_name
+        setup_conversation.pending_args = pending.args
+        setup_conversation.pending_human = pending.human
         repository.create_primary(
             setup_session,
             operation_id=operation_id,
@@ -283,13 +288,16 @@ def test_mapped_domain_failure_rolls_back_executor_savepoint(tmp_path) -> None:
     offers = OffersRepository(sessions)
     resumes = ResumesRepository(sessions)
     factory = AuthorityFactory()
-    arguments_digest = "sha256:" + __import__("hashlib").sha256(b"{}").hexdigest()
+    arguments_digest = "sha256:" + hashlib.sha256(b"{}").hexdigest()
+    pending_action_revision = _pending_revision(
+        pending.tool_call_id, pending.tool_name, pending.args
+    )
     pending_identity = SimpleNamespace(
         conversation_id=conversation.id,
         operation_id=operation_id,
         tool_call_id=pending.tool_call_id,
         tool_name=pending.tool_name,
-        pending_action_revision=1,
+        pending_action_revision=pending_action_revision,
         effective_args_digest=arguments_digest,
     )
     factory.register_pending(pending_identity)
@@ -299,7 +307,7 @@ def test_mapped_domain_failure_rolls_back_executor_savepoint(tmp_path) -> None:
         conversation_scope_revision=0,
         trusted_scope=TrustedContextScope("workspace", None, "general"),
         pending_identity=pending_identity,
-        pending_action_revision=1,
+        pending_action_revision=pending_action_revision,
         tool_call_id=pending.tool_call_id,
         tool_name=pending.tool_name,
         effective_args_digest=arguments_digest,
@@ -357,7 +365,7 @@ def test_mapped_domain_failure_rolls_back_executor_savepoint(tmp_path) -> None:
         ToolCall(pending.tool_call_id, pending.tool_name, pending.args),
         call_identity=prepare_identity,
         pending_identity=pending_identity,
-        pending_action_revision=1,
+        pending_action_revision=pending_action_revision,
         record_proposal=False,
     )
     assert isinstance(prepared_result, ConfirmationRequired)
@@ -388,3 +396,263 @@ def test_mapped_domain_failure_rolls_back_executor_savepoint(tmp_path) -> None:
     assert takeover.code == "operation_delivery_unknown"
     assert takeover.retryable is False
     factory.close()
+
+
+def _pending_revision(tool_call_id: str, tool_name: str, raw_args: str) -> int:
+    normalized = json.dumps(
+        json.loads(raw_args),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    canonical = json.dumps(
+        {"args": normalized, "tool_call_id": tool_call_id, "tool_name": tool_name},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return int.from_bytes(hashlib.sha256(canonical).digest()[:8], "big") & ((1 << 63) - 1)
+
+
+def _primary_execution_harness(tmp_path, executor):
+    sessions = init_database(tmp_path / "offerpilot.db")
+    key = load_or_create_ledger_key(tmp_path, sessions)
+    repository = WriteOperationRepository(sessions, key)
+    chat = ChatRepository(sessions, repository)
+    conversation = chat.create_conversation("workspace")
+    operation_id = str(uuid4())
+    pending = PendingAction(
+        tool_call_id="write-once",
+        tool_name="create_application",
+        args="{}",
+        human="create",
+        operation_id=operation_id,
+    )
+    revision = _pending_revision(pending.tool_call_id, pending.tool_name, pending.args)
+    with sessions() as setup_session:
+        setup_conversation = setup_session.get(Conversation, conversation.id)
+        assert setup_conversation is not None
+        setup_conversation.pending_operation_id = operation_id
+        setup_conversation.pending_tool_call_id = pending.tool_call_id
+        setup_conversation.pending_tool_name = pending.tool_name
+        setup_conversation.pending_args = pending.args
+        setup_conversation.pending_human = pending.human
+        repository.create_primary(
+            setup_session,
+            operation_id=operation_id,
+            conversation_id=conversation.id,
+            tool_call_id=pending.tool_call_id,
+            tool_name=pending.tool_name,
+            adapter_kind="typed",
+            proposal_fingerprint=ledger_fingerprint(key, "write-operation-proposal-v1", {}),
+            confirmation_token_fingerprint=ledger_fingerprint(
+                key, "write-operation-confirmation-token-v1", b"synthetic-token"
+            ),
+            authorization_scope_fingerprint="hmac-sha256:" + "b" * 64,
+        )
+        setup_session.commit()
+
+    applications = ApplicationsRepository(sessions)
+    events = ApplicationEventsRepository(sessions)
+    notes = NotesRepository(sessions)
+    offers = OffersRepository(sessions)
+    resumes = ResumesRepository(sessions)
+    factory = AuthorityFactory()
+    arguments_digest = "sha256:" + hashlib.sha256(b"{}").hexdigest()
+    pending_identity = SimpleNamespace(
+        conversation_id=conversation.id,
+        operation_id=operation_id,
+        tool_call_id=pending.tool_call_id,
+        tool_name=pending.tool_name,
+        pending_action_revision=revision,
+        effective_args_digest=arguments_digest,
+    )
+    factory.register_pending(pending_identity)
+    authority = factory.create_approval_authority(
+        operation_id=operation_id,
+        conversation_id=conversation.id,
+        conversation_scope_revision=0,
+        trusted_scope=TrustedContextScope("workspace", None, "general"),
+        pending_identity=pending_identity,
+        pending_action_revision=revision,
+        tool_call_id=pending.tool_call_id,
+        tool_name=pending.tool_name,
+        effective_args_digest=arguments_digest,
+        capabilities=frozenset({ToolCapability.APPLICATIONS_WRITE}),
+    )
+    context = ToolExecutionContext(
+        authority=authority,
+        applications=applications,
+        events=events,
+        notes=notes,
+        offers=offers,
+        resumes=resumes,
+        jd_analyses=JDAnalysesRepository(sessions),
+        run_recorder=NullRunRecorder(),
+    )
+    parameters = {"type": "object", "properties": {}}
+    contract = ProviderToolContract(
+        payload={
+            "type": "function",
+            "function": {
+                "name": pending.tool_name,
+                "description": "create",
+                "parameters": parameters,
+            },
+        },
+        name=pending.tool_name,
+        description="create",
+        parameters=parameters,
+    )
+    spec = ToolSpec(
+        contract=contract,
+        kind="write",
+        decoder=lambda values: values,
+        executor=executor,
+        confirmation_policy="required",
+        write_contract=WriteContract(),
+        binding_contract=BindingContract("none"),
+    )
+    catalog = ToolCatalog((spec,), expected_names=(spec.name,))
+    prepare_identity = factory.create_approved_write_prepare_identity(
+        authority,
+        approval_context=context,
+        request_identity=object(),
+    )
+    prepared_result = prepare_call(
+        catalog,
+        context,
+        ToolCall(pending.tool_call_id, pending.tool_name, pending.args),
+        call_identity=prepare_identity,
+        pending_identity=pending_identity,
+        pending_action_revision=revision,
+        record_proposal=False,
+    )
+    assert isinstance(prepared_result, ConfirmationRequired)
+    return SimpleNamespace(
+        sessions=sessions,
+        repository=repository,
+        conversation=conversation,
+        operation_id=operation_id,
+        pending=pending,
+        factory=factory,
+        context=context,
+        prepared=prepared_result.prepared,
+        prepare_identity=prepare_identity,
+        coordinator=WriteOperationCoordinator(repository),
+        request_fingerprint="hmac-sha256:" + "a" * 64,
+    )
+
+
+@pytest.mark.parametrize("failure_site", ("renderer", "transport", "undo"))
+def test_post_executor_projection_failure_terminalizes_without_rerun(
+    tmp_path, monkeypatch, failure_site: str
+) -> None:
+    calls = 0
+
+    def executor(_args, _context):
+        nonlocal calls
+        calls += 1
+        return {"ok": True}
+
+    harness = _primary_execution_harness(tmp_path, executor)
+    if failure_site == "renderer":
+        monkeypatch.setattr(
+            "offerpilot.ai.write_operations.render_compatibility",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("renderer failed")),
+        )
+    elif failure_site == "transport":
+        monkeypatch.setattr(
+            "offerpilot.ai.write_operations.project_transport_event",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("transport failed")),
+        )
+    undo_builder = (
+        (lambda *_args: (_ for _ in ()).throw(RuntimeError("undo failed")))
+        if failure_site == "undo"
+        else None
+    )
+    arguments = dict(
+        operation_id=harness.operation_id,
+        conversation_id=harness.conversation.id,
+        prepared=harness.prepared,
+        context=harness.context,
+        prepare_identity=harness.prepare_identity,
+        request_fingerprint=harness.request_fingerprint,
+        undo_builder=undo_builder,
+    )
+    try:
+        first, first_record = harness.coordinator.execute_primary(**arguments)
+        replay, replay_record = harness.coordinator.execute_primary(**arguments)
+        assert isinstance(first, OperationFailed)
+        assert first_record is not None and first_record.execution_started
+        assert first.payload.failure_code == "operation_projection_failed"
+        assert isinstance(replay, OperationReplay)
+        assert replay_record is None
+        assert calls == 1
+    finally:
+        harness.factory.close()
+
+
+def test_ordinary_executor_exception_terminalizes_without_rerun(tmp_path) -> None:
+    calls = 0
+
+    def executor(_args, _context):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("private executor failure")
+
+    harness = _primary_execution_harness(tmp_path, executor)
+    arguments = dict(
+        operation_id=harness.operation_id,
+        conversation_id=harness.conversation.id,
+        prepared=harness.prepared,
+        context=harness.context,
+        prepare_identity=harness.prepare_identity,
+        request_fingerprint=harness.request_fingerprint,
+    )
+    try:
+        first, first_record = harness.coordinator.execute_primary(**arguments)
+        replay, replay_record = harness.coordinator.execute_primary(**arguments)
+        assert isinstance(first, OperationFailed)
+        assert first_record is not None and first_record.execution_started
+        assert first.payload.failure_code == "executor_exception"
+        assert isinstance(replay, OperationReplay)
+        assert replay_record is None
+        assert calls == 1
+    finally:
+        harness.factory.close()
+
+
+def test_locked_pending_args_change_rejects_before_executor(tmp_path) -> None:
+    calls = 0
+
+    def executor(_args, _context):
+        nonlocal calls
+        calls += 1
+        return {"ok": True}
+
+    harness = _primary_execution_harness(tmp_path, executor)
+    with harness.sessions() as session:
+        conversation = session.get(Conversation, harness.conversation.id)
+        assert conversation is not None
+        conversation.pending_args = '{"changed":true}'
+        session.commit()
+    try:
+        execution, record = harness.coordinator.execute_primary(
+            operation_id=harness.operation_id,
+            conversation_id=harness.conversation.id,
+            prepared=harness.prepared,
+            context=harness.context,
+            prepare_identity=harness.prepare_identity,
+            request_fingerprint=harness.request_fingerprint,
+        )
+        assert isinstance(execution, OperationUnknown)
+        assert execution.code == "operation_identity_conflict"
+        assert record is None
+        assert calls == 0
+        with harness.sessions() as session:
+            operation = session.get(WriteOperation, harness.operation_id)
+            assert operation is not None and operation.status == "proposed"
+    finally:
+        harness.factory.close()

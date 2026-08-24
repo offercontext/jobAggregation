@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from offerpilot.agent_runtime.journal import RunRecorder
 from offerpilot.ai.tool_authority.contracts import (
     ApplicationScopeConstraint,
+    AuthorityPhaseError,
     BindingTargetResolution,
     ToolExecutionAuthority,
 )
@@ -94,6 +95,9 @@ class ToolExecutionContext(TransientToolRuntimeValue):
     _session_factory: sessionmaker[Session] = field(repr=False, compare=False)
     operation_executor: Any = field(default=None, repr=False, compare=False)
     _bound_session: Session | None = field(default=None, repr=False, compare=False)
+    _origin_context: "ToolExecutionContext | None" = field(
+        default=None, repr=False, compare=False
+    )
 
     def __init__(
         self,
@@ -128,6 +132,7 @@ class ToolExecutionContext(TransientToolRuntimeValue):
             authority_factory=factory,
             scope_constraint=constraint,
             bound_session=None,
+            origin_context=None,
             repository_factory=repository_factory,
         )
 
@@ -164,6 +169,7 @@ class ToolExecutionContext(TransientToolRuntimeValue):
         authority_factory: AuthorityFactory,
         scope_constraint: ApplicationScopeConstraint,
         bound_session: Session | None,
+        origin_context: "ToolExecutionContext | None",
         repository_factory: sessionmaker[Session],
     ) -> None:
         object.__setattr__(self, "authority", authority)
@@ -178,6 +184,7 @@ class ToolExecutionContext(TransientToolRuntimeValue):
         object.__setattr__(self, "_authority_factory", authority_factory)
         object.__setattr__(self, "_scope_constraint", scope_constraint)
         object.__setattr__(self, "_bound_session", bound_session)
+        object.__setattr__(self, "_origin_context", origin_context)
         object.__setattr__(self, "_session_factory", repository_factory)
 
     @property
@@ -198,6 +205,47 @@ class ToolExecutionContext(TransientToolRuntimeValue):
     @property
     def session_factory(self) -> sessionmaker[Session]:
         return self._session_factory
+
+    def require_bound_origin(
+        self,
+        origin: "ToolExecutionContext",
+        session: Session,
+    ) -> None:
+        """Require this context to be the exact transaction carrier derived from origin."""
+
+        if (
+            type(origin) is not ToolExecutionContext
+            or self._origin_context is not origin
+            or origin._origin_context is not None
+            or origin._bound_session is not None
+            or self._bound_session is not session
+            or self.authority is not origin.authority
+            or self._authority_factory is not origin._authority_factory
+            or self._scope_constraint is not origin._scope_constraint
+            or self._session_factory is not origin._session_factory
+            or self.operation_executor is not origin.operation_executor
+            or self.run_recorder is not origin.run_recorder
+        ):
+            raise AuthorityPhaseError(
+                "bound ToolExecutionContext does not match its approval origin"
+            )
+        for bound, source in (
+            (self.applications, origin.applications),
+            (self.events, origin.events),
+            (self.notes, origin.notes),
+            (self.offers, origin.offers),
+            (self.resumes, origin.resumes),
+            (self.jd_analyses, origin.jd_analyses),
+        ):
+            if (
+                type(bound) is not type(source)
+                or getattr(bound, "_session", None) is not session
+                or getattr(bound, "_session_factory", None)
+                is not getattr(source, "_session_factory", None)
+            ):
+                raise AuthorityPhaseError(
+                    "bound ToolExecutionContext repository carrier mismatch"
+                )
 
     def bind(self, session: Session) -> "ToolExecutionContext":
         if not isinstance(session, Session):
@@ -243,6 +291,7 @@ class ToolExecutionContext(TransientToolRuntimeValue):
             authority_factory=factory,
             scope_constraint=constraint,
             bound_session=session,
+            origin_context=self,
             repository_factory=self._session_factory,
         )
         return bound

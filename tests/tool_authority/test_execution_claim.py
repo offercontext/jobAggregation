@@ -310,3 +310,42 @@ def test_base_exception_revokes_claim_and_propagates(tmp_path) -> None:
             assert factory.claim_state(claim) is None
     finally:
         factory.close()
+
+
+def test_execute_identity_rejects_different_same_authority_context(tmp_path) -> None:
+    calls = 0
+
+    def executor(_args, _context):
+        nonlocal calls
+        calls += 1
+        return {"ok": True}
+
+    factory, authority, context, pending, prepared, prepare_identity, sessions = _setup(
+        tmp_path, executor
+    )
+    foreign_context = ToolExecutionContext(
+        authority=authority,
+        applications=context.applications,
+        events=context.events,
+        notes=context.notes,
+        offers=context.offers,
+        resumes=context.resumes,
+        jd_analyses=context.jd_analyses,
+        run_recorder=NullRunRecorder(),
+    )
+    try:
+        with sessions() as session:
+            claim, execute_identity = _issue(
+                factory, authority, pending, prepared, prepare_identity, session
+            )
+            with pytest.raises(AuthorityPhaseError):
+                execute_prepared(
+                    prepared,
+                    foreign_context.bind(session),
+                    call_identity=execute_identity,
+                    execution_claim=claim,
+                    locked_effective_args_digest=ARGUMENTS_DIGEST,
+                )
+        assert calls == 0
+    finally:
+        factory.close()

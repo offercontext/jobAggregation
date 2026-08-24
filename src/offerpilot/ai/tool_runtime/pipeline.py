@@ -322,6 +322,7 @@ def _execute_claimed_write(
             AuthorityUse.APPROVED_WRITE_EXECUTE,
             call_identity,
         )
+        _require_context_identity(context, call_identity)
         require_authority_spec(
             context.authority,
             AuthorityUse.APPROVED_WRITE_EXECUTE,
@@ -478,7 +479,9 @@ def _require_context_identity(
         raise AuthorityPhaseError("call identity belongs to another ToolExecutionContext")
     approval_context = getattr(call_identity, "approval_context", None)
     if approval_context is not None and approval_context is not context:
-        raise AuthorityPhaseError("approval identity belongs to another ToolExecutionContext")
+        if type(approval_context) is not ToolExecutionContext or context.bound_session is None:
+            raise AuthorityPhaseError("approval identity belongs to another ToolExecutionContext")
+        context.require_bound_origin(approval_context, context.bound_session)
 
 
 def _validation_failure(code: str) -> ToolFailure:

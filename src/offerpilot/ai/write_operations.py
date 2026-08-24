@@ -39,7 +39,11 @@ from offerpilot.ai.tool_runtime.pipeline import execute_prepared
 from offerpilot.ai.tool_runtime.rendering import render_compatibility
 from offerpilot.ai.tool_runtime.journal import project_tool_started_bound
 from offerpilot.ai.tool_runtime.transport import project_transport_event
-from offerpilot.ai.tool_runtime.validation import canonical_json
+from offerpilot.ai.tool_runtime.validation import (
+    ArgumentValidationError,
+    canonical_json,
+    parse_arguments,
+)
 from offerpilot.models import ChatMessage, Conversation, WriteOperation, WriteOperationTransition
 from offerpilot.context_projector.loader import WORK_DEADLINE_SECONDS, database_coordinator
 
@@ -902,6 +906,54 @@ class _ClaimedWriteFailure(Exception):
         self.record = record
 
 
+@dataclass(frozen=True)
+class _LockedPendingIdentity:
+    raw_args: str
+    arguments_digest: str
+    pending_action_revision: int
+
+
+def _constant_time_text_equal(left: object, right: object) -> bool:
+    if type(left) is not str or type(right) is not str or len(left) != len(right):
+        return False
+    return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
+
+
+def _locked_pending_identity(
+    tool_call_id: str,
+    tool_name: str,
+    raw_args: str,
+) -> _LockedPendingIdentity:
+    try:
+        arguments = parse_arguments(raw_args)
+        normalized_args = json.dumps(
+            arguments,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        arguments_digest = "sha256:" + hashlib.sha256(
+            canonical_json(cast(JSONValue, arguments)).encode("utf-8")
+        ).hexdigest()
+    except (ArgumentValidationError, TypeError, UnicodeError, ValueError) as exc:
+        raise WriteOperationError("operation_identity_conflict") from exc
+    revision_payload = json.dumps(
+        {
+            "args": normalized_args,
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    revision = int.from_bytes(hashlib.sha256(revision_payload).digest()[:8], "big") & (
+        (1 << 63) - 1
+    )
+    return _LockedPendingIdentity(raw_args, arguments_digest, revision)
+
+
 def compensation_request_fingerprint(
     key: LedgerKeyDomain,
     *,
@@ -951,7 +1003,24 @@ class WriteOperationCoordinator:
                     replay = self.repository.replay(operation, request_fingerprint)
                     session.rollback()
                     return replay, None
-                self._verify_primary(operation, conversation_id, prepared)
+                authority = context.authority
+                if type(authority) is not ApprovalExecutionAuthority:
+                    raise WriteOperationError("operation_identity_conflict")
+                if type(prepare_identity) is not ApprovedWritePrepareCallIdentity:
+                    raise WriteOperationError("operation_identity_conflict")
+                factory = context.authority_factory
+                conversation = session.get(Conversation, conversation_id)
+                if conversation is None:
+                    raise WriteOperationError("operation_identity_conflict")
+                locked_pending = self._verify_primary(
+                    operation,
+                    conversation,
+                    conversation_id,
+                    prepared,
+                    authority,
+                    prepare_identity,
+                    factory,
+                )
                 bound_context = context.bind(session)
                 if prepared.spec.mutable_validator is not None:
                     failure = prepared.spec.mutable_validator(prepared.typed_args, bound_context)
@@ -962,6 +1031,7 @@ class WriteOperationCoordinator:
                             .where(Conversation.pending_operation_id == operation_id)
                             .where(Conversation.pending_tool_call_id == prepared.tool_call_id)
                             .where(Conversation.pending_tool_name == prepared.spec.name)
+                            .where(Conversation.pending_args == locked_pending.raw_args)
                             .values(
                                 pending_confirmation_claim_id=operation_id,
                                 pending_confirmation_claimed_at=datetime.now(timezone.utc),
@@ -973,12 +1043,18 @@ class WriteOperationCoordinator:
                         operation.input_fingerprint = ledger_fingerprint(
                             self.repository.key,
                             "write-operation-input-v1",
-                            {"arguments_digest": prepared.arguments_digest},
+                            {"arguments_digest": locked_pending.arguments_digest},
                         )
                         self.repository.append_transition(session, operation_id, 2, "approved")
                         self.repository.append_transition(session, operation_id, 3, "claimed")
                         return self._commit_failure(
-                            session, operation, prepared, failure, request_fingerprint, owner
+                            session,
+                            operation,
+                            prepared,
+                            failure,
+                            request_fingerprint,
+                            owner,
+                            arguments_digest=locked_pending.arguments_digest,
                         )
                 claimed = session.execute(
                     update(Conversation)
@@ -986,6 +1062,7 @@ class WriteOperationCoordinator:
                     .where(Conversation.pending_operation_id == operation_id)
                     .where(Conversation.pending_tool_call_id == prepared.tool_call_id)
                     .where(Conversation.pending_tool_name == prepared.spec.name)
+                    .where(Conversation.pending_args == locked_pending.raw_args)
                     .values(
                         pending_confirmation_claim_id=operation_id,
                         pending_confirmation_claimed_at=datetime.now(timezone.utc),
@@ -995,12 +1072,6 @@ class WriteOperationCoordinator:
                     raise WriteOperationError("operation_identity_conflict")
                 self.repository.append_transition(session, operation_id, 2, "approved")
                 self.repository.append_transition(session, operation_id, 3, "claimed")
-                authority = context.authority
-                if type(authority) is not ApprovalExecutionAuthority:
-                    raise WriteOperationError("operation_identity_conflict")
-                if type(prepare_identity) is not ApprovedWritePrepareCallIdentity:
-                    raise WriteOperationError("operation_identity_conflict")
-                factory = context.authority_factory
                 execution_claim = None
                 try:
                     factory.register_transaction(session, authority=authority)
@@ -1011,8 +1082,8 @@ class WriteOperationCoordinator:
                         operation_id=operation_id,
                         tool_call_id=prepared.tool_call_id,
                         tool_name=prepared.spec.name,
-                        effective_args_digest=prepared.arguments_digest,
-                        pending_action_revision=prepared.pending_action_revision,
+                        effective_args_digest=locked_pending.arguments_digest,
+                        pending_action_revision=locked_pending.pending_action_revision,
                         transaction=session,
                     )
                     execute_identity = factory.create_approved_write_execute_identity(
@@ -1024,6 +1095,14 @@ class WriteOperationCoordinator:
                     if execution_claim is not None and factory.claim_state(execution_claim) is not None:
                         factory.revoke(execution_claim)
                     raise WriteOperationError("operation_identity_conflict") from exc
+                executor_started = False
+                started_recorded = False
+
+                def mark_execution_stage(stage: str) -> None:
+                    nonlocal executor_started
+                    if stage == "executor":
+                        executor_started = True
+
                 try:
                     with session.begin_nested():
                         started_recorded = project_tool_started_bound(
@@ -1039,13 +1118,10 @@ class WriteOperationCoordinator:
                             bound_context,
                             call_identity=execute_identity,
                             execution_claim=execution_claim,
-                            locked_effective_args_digest=prepared.arguments_digest,
+                            locked_effective_args_digest=locked_pending.arguments_digest,
+                            stage_sink=mark_execution_stage,
                         )
                         if isinstance(dispatched.outcome, ToolFailure):
-                            if dispatched.outcome.category == "internal_error":
-                                raise WriteOperationError(
-                                    "operation_not_committed", retryable=True
-                                )
                             raise _ClaimedWriteFailure(
                                 ToolExecutionRecord(
                                     prepared,
@@ -1097,7 +1173,7 @@ class WriteOperationCoordinator:
                         operation.input_fingerprint = ledger_fingerprint(
                             self.repository.key,
                             "write-operation-input-v1",
-                            {"arguments_digest": prepared.arguments_digest},
+                            {"arguments_digest": locked_pending.arguments_digest},
                         )
                         self._set_terminal(operation, payload, owner)
                         self.repository.append_transition(session, operation_id, 4, "committed")
@@ -1115,18 +1191,40 @@ class WriteOperationCoordinator:
                         )
                 except _ClaimedWriteFailure as exc:
                     failure = cast(ToolFailure, exc.record.outcome)
-                    return self._commit_failure(
-                        session,
-                        operation,
-                        prepared,
-                        failure,
-                        request_fingerprint,
-                        owner,
-                        record=exc.record,
-                    )
-                except WriteOperationError:
-                    raise
+                    try:
+                        return self._commit_failure(
+                            session,
+                            operation,
+                            prepared,
+                            failure,
+                            request_fingerprint,
+                            owner,
+                            arguments_digest=locked_pending.arguments_digest,
+                            record=exc.record,
+                        )
+                    except Exception:
+                        return self._commit_projection_failure(
+                            session,
+                            operation,
+                            prepared,
+                            request_fingerprint,
+                            owner,
+                            arguments_digest=locked_pending.arguments_digest,
+                            started_recorded=started_recorded,
+                        )
                 except Exception as exc:
+                    if executor_started:
+                        return self._commit_projection_failure(
+                            session,
+                            operation,
+                            prepared,
+                            request_fingerprint,
+                            owner,
+                            arguments_digest=locked_pending.arguments_digest,
+                            started_recorded=started_recorded,
+                        )
+                    if isinstance(exc, WriteOperationError):
+                        raise
                     failure = _map_exception(prepared, exc)
                     if failure.category == "internal_error":
                         raise WriteOperationError(
@@ -1135,7 +1233,7 @@ class WriteOperationCoordinator:
                     record = ToolExecutionRecord(
                         prepared,
                         failure,
-                        True,
+                        False,
                         operation_id,
                         False,
                         False,
@@ -1150,6 +1248,7 @@ class WriteOperationCoordinator:
                         failure,
                         request_fingerprint,
                         owner,
+                        arguments_digest=locked_pending.arguments_digest,
                         record=record,
                     )
                     return committed_failure
@@ -1617,18 +1716,73 @@ class WriteOperationCoordinator:
         operation.delivered_at = now
         operation.updated_at = now
 
-    @staticmethod
     def _verify_primary(
+        self,
         operation: WriteOperation,
+        conversation: Conversation,
         conversation_id: int,
         prepared: PreparedToolCall[Any, Any],
-    ) -> None:
+        authority: ApprovalExecutionAuthority,
+        prepare_identity: ApprovedWritePrepareCallIdentity,
+        factory: Any,
+    ) -> _LockedPendingIdentity:
+        locked = _locked_pending_identity(
+            conversation.pending_tool_call_id,
+            conversation.pending_tool_name,
+            conversation.pending_args,
+        )
+        try:
+            persisted_values = parse_arguments(conversation.pending_args)
+            prepared_arguments = canonical_json(cast(JSONValue, dict(prepared.arguments)))
+            persisted_arguments = canonical_json(cast(JSONValue, persisted_values))
+            prepared_pending_token = factory.pending_token(prepared.pending_identity)
+        except (ArgumentValidationError, AuthorityPhaseError) as exc:
+            raise WriteOperationError("operation_identity_conflict") from exc
         if (
-            operation.conversation_id != conversation_id
+            operation.operation_role != "primary"
+            or operation.adapter_kind != "typed"
+            or operation.status != "proposed"
+            or operation.fingerprint_key_id != self.repository.key.key_id
+            or operation.conversation_id != conversation_id
             or operation.tool_call_id != prepared.tool_call_id
             or operation.tool_name != prepared.spec.name
+            or conversation.id != conversation_id
+            or conversation.pending_operation_id != operation.id
+            or conversation.pending_tool_call_id != prepared.tool_call_id
+            or conversation.pending_tool_name != prepared.spec.name
+            or authority.operation_id != operation.id
+            or authority.conversation_id != conversation_id
+            or authority.tool_call_id != prepared.tool_call_id
+            or authority.tool_name != prepared.spec.name
+            or prepare_identity.operation_id != operation.id
+            or prepare_identity.tool_call_id != prepared.tool_call_id
+            or prepare_identity.tool_name != prepared.spec.name
+            or prepared.pending_action_revision != locked.pending_action_revision
+            or authority.pending_action_revision != locked.pending_action_revision
+            or prepare_identity.pending_action_revision != locked.pending_action_revision
+            or prepared_pending_token is not authority.pending_identity
+            or prepare_identity.pending_identity is not authority.pending_identity
+            or not _constant_time_text_equal(
+                prepared.arguments_digest, locked.arguments_digest
+            )
+            or not _constant_time_text_equal(
+                authority.effective_args_digest, locked.arguments_digest
+            )
+            or not _constant_time_text_equal(
+                prepare_identity.effective_args_digest, locked.arguments_digest
+            )
+            or not _constant_time_text_equal(prepared_arguments, persisted_arguments)
+            or not _constant_time_text_equal(
+                operation.proposal_fingerprint,
+                ledger_fingerprint(
+                    self.repository.key,
+                    "write-operation-proposal-v1",
+                    persisted_values,
+                ),
+            )
         ):
             raise WriteOperationError("operation_identity_conflict")
+        return locked
 
     def _commit_failure(
         self,
@@ -1639,9 +1793,12 @@ class WriteOperationCoordinator:
         request_fingerprint: str,
         owner: DeliveryOwnership,
         *,
+        arguments_digest: str,
         record: ToolExecutionRecord[Any, Any] | None = None,
     ) -> tuple[OperationExecution, ToolExecutionRecord[Any, Any] | None]:
-        if failure.category == "internal_error":
+        if failure.category == "internal_error" and (
+            record is None or not record.execution_started
+        ):
             raise WriteOperationError("operation_not_committed", retryable=True)
         # A validator failure discovered inside the ledger transaction already
         # owns a durable terminal and must flow through this request's delivery.
@@ -1663,7 +1820,7 @@ class WriteOperationCoordinator:
         operation.input_fingerprint = ledger_fingerprint(
             self.repository.key,
             "write-operation-input-v1",
-            {"arguments_digest": prepared.arguments_digest},
+            {"arguments_digest": arguments_digest},
         )
         self._set_terminal(operation, payload, owner)
         self.repository.append_transition(session, operation.id, 4, "failed")
@@ -1691,6 +1848,69 @@ class WriteOperationCoordinator:
             resolved.journal_started_recorded,
         )
         return OperationFailed(operation.id, payload, owner), persisted
+
+    def _commit_projection_failure(
+        self,
+        session: Session,
+        operation: WriteOperation,
+        prepared: PreparedToolCall[Any, Any],
+        request_fingerprint: str,
+        owner: DeliveryOwnership,
+        *,
+        arguments_digest: str,
+        started_recorded: bool,
+    ) -> tuple[OperationExecution, ToolExecutionRecord[Any, Any] | None]:
+        """Durably terminalize after dispatch without invoking fallible projections again."""
+
+        failure = ToolFailure("internal_error", "operation_projection_failed")
+        payload = build_terminal_payload(
+            status="failed",
+            result_contract="typed_json_v1",
+            result={"category": failure.category, "code": failure.code},
+            visible_result="错误：操作结果处理失败，操作未提交。",
+            transport={
+                "status": "error",
+                "tool_call_id": prepared.tool_call_id,
+                "tool_name": prepared.spec.name,
+                "category": failure.category,
+                "code": failure.code,
+            },
+            undo=None,
+            failure_category=failure.category,
+            failure_code=failure.code,
+        )
+        operation.operation_request_fingerprint = request_fingerprint
+        operation.input_fingerprint = ledger_fingerprint(
+            self.repository.key,
+            "write-operation-input-v1",
+            {"arguments_digest": arguments_digest},
+        )
+        self._set_terminal(operation, payload, owner)
+        self.repository.append_transition(session, operation.id, 4, "failed")
+        try:
+            session.commit()
+        except OperationalError:
+            return (
+                self._reconcile_commit_unknown(
+                    operation.id,
+                    request_fingerprint,
+                    absent_code="operation_result_unknown",
+                    proposed_code="operation_not_committed",
+                ),
+                None,
+            )
+        record = ToolExecutionRecord(
+            prepared,
+            failure,
+            True,
+            operation.id,
+            False,
+            True,
+            payload.visible_result,
+            cast(dict[str, JSONValue], json.loads(payload.transport_json)),
+            started_recorded,
+        )
+        return OperationFailed(operation.id, payload, owner), record
 
     @staticmethod
     def _set_terminal(

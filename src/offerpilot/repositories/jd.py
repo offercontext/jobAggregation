@@ -1,28 +1,30 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from builtins import list as BuiltinList
 
 from sqlalchemy import desc, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from offerpilot.ai.tool_authority import (
-    ApplicationScopeConstraint,
-    AuthorityFactory,
-    AuthorityPhaseError,
-    ToolExecutionAuthority,
-)
 from offerpilot.models import Application, ApplicationJDVersion, JDAnalysis
 from offerpilot.repositories.application_jd_versions import JDVersionConflictError
 from offerpilot.repositories.applications import _restricted_scope_id
 from offerpilot.repositories.session_binding import (
     ScopedRepositoryBinding,
     ScopeAccessDenied,
+    attach_scoped_repository,
     bind_scoped_repository,
+    require_scoped_optional_id,
+    require_scoped_positive_int64,
     repository_session,
+    scoped_authority_phase_error,
 )
+
+if TYPE_CHECKING:
+    from offerpilot.ai.tool_authority.contracts import ApplicationScopeConstraint, ToolExecutionAuthority
+    from offerpilot.repositories.session_binding import AuthorityFactoryProtocol
 
 
 @dataclass
@@ -39,11 +41,10 @@ class JDAnalysesRepository:
         self,
         session_factory: sessionmaker[Session],
         session: Session | None = None,
-        scope_binding: ScopedRepositoryBinding | None = None,
     ):
         self._session_factory = session_factory
         self._session = session
-        self._scope_binding = scope_binding
+        self._scope_binding: ScopedRepositoryBinding | None = None
 
     def bind(self, session: Session) -> "JDAnalysesRepository":
         return JDAnalysesRepository(self._session_factory, session)
@@ -53,7 +54,7 @@ class JDAnalysesRepository:
         session: Session,
         constraint: ApplicationScopeConstraint,
         *,
-        authority_factory: AuthorityFactory,
+        authority_factory: AuthorityFactoryProtocol,
         authority: ToolExecutionAuthority,
     ) -> "JDAnalysesRepository":
         binding = bind_scoped_repository(
@@ -62,12 +63,14 @@ class JDAnalysesRepository:
             authority_factory=authority_factory,
             authority=authority,
         )
-        return JDAnalysesRepository(self._session_factory, session, binding)
+        return attach_scoped_repository(JDAnalysesRepository(self._session_factory, session), binding)
 
     def _require_scoped(self, constraint: object) -> ScopedRepositoryBinding:
         binding = self._scope_binding
         if binding is None or self._session is None:
-            raise AuthorityPhaseError("scoped repository requires a caller-owned bound Session")
+            raise scoped_authority_phase_error(
+                "scoped repository requires a caller-owned bound Session"
+            )
         binding.require(constraint)
         return binding
 
@@ -125,13 +128,14 @@ class JDAnalysesRepository:
     def list_jd_analyses_scoped(
         self,
         constraint: ApplicationScopeConstraint,
-        application_id: int = 0,
+        application_id: int | None = None,
     ) -> BuiltinList[JDAnalysis]:
         binding = self._require_scoped(constraint)
+        require_scoped_optional_id(application_id, "application_id")
         session = binding.session
         if constraint.mode == "unrestricted":
             statement = select(JDAnalysis)
-            if application_id > 0:
+            if application_id is not None:
                 statement = statement.where(JDAnalysis.application_id == application_id)
             statement = statement.order_by(JDAnalysis.created_at.desc())
             with session.no_autoflush:
@@ -144,7 +148,7 @@ class JDAnalysesRepository:
             .cte("scoped_application")
         )
         join_condition = JDAnalysis.application_id == scope_parent.c._scope_application_id
-        if application_id > 0:
+        if application_id is not None:
             join_condition = join_condition & (JDAnalysis.application_id == application_id)
         statement = (
             select(JDAnalysis, scope_parent.c._scope_application_id)
@@ -163,6 +167,7 @@ class JDAnalysesRepository:
         analysis_id: int,
     ) -> Optional[JDAnalysis]:
         binding = self._require_scoped(constraint)
+        analysis_id = require_scoped_positive_int64(analysis_id, "JD analysis id")
         session = binding.session
         if constraint.mode == "unrestricted":
             with session.no_autoflush:

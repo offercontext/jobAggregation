@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import ast
 from datetime import datetime, timezone
+from pathlib import Path
+import subprocess
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -22,7 +26,7 @@ from offerpilot.repositories.applications import ApplicationCreate, Applications
 from offerpilot.repositories.jd import JDAnalysesRepository, JDAnalysisCreate
 from offerpilot.repositories.notes import NoteCreate, NotesRepository
 from offerpilot.repositories.offers import OfferCreate, OffersRepository
-from offerpilot.repositories.session_binding import ScopeAccessDenied
+from offerpilot.repositories.session_binding import ScopeAccessDenied, ScopedRepositoryBinding
 
 
 _DIGEST = "sha256:" + "a" * 64
@@ -184,6 +188,125 @@ def test_scoped_ports_require_caller_owned_session_and_registered_constraint(see
                 with pytest.raises(AuthorityPhaseError):
                     getattr(bound, method_name)(fabricated, *args)
             execute.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("module_name", "symbol"),
+    (
+        ("offerpilot.repositories.applications", "ApplicationsRepository"),
+        ("offerpilot.repositories.application_events", "ApplicationEventsRepository"),
+        ("offerpilot.repositories.notes", "NotesRepository"),
+        ("offerpilot.repositories.offers", "OffersRepository"),
+        ("offerpilot.repositories.jd", "JDAnalysesRepository"),
+    ),
+)
+def test_repository_cold_import_does_not_initialize_composition_cycle(
+    module_name: str, symbol: str
+) -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", f"from {module_name} import {symbol}"],
+        cwd=Path(__file__).parents[2],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_repository_modules_do_not_import_authority_aggregate_at_module_scope() -> None:
+    repository_root = Path(__file__).parents[2] / "src" / "offerpilot" / "repositories"
+    for module_name in (
+        "applications.py",
+        "application_events.py",
+        "notes.py",
+        "offers.py",
+        "jd.py",
+        "session_binding.py",
+    ):
+        tree = ast.parse((repository_root / module_name).read_text(encoding="utf-8"))
+        aggregate_imports = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            and node.module == "offerpilot.ai.tool_authority"
+        ]
+        assert aggregate_imports == [], module_name
+
+
+def test_scoped_binding_cannot_be_forged_or_subclass_factory_bypassed(seeded) -> None:
+    factory = AuthorityFactory()
+    _, authority, constraint = _constraint(factory)
+    engine = seeded["session_factory"].kw["bind"]
+    statements: list[str] = []
+
+    def capture(_conn, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement)
+
+    class EvilFactory(AuthorityFactory):
+        pass
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        with seeded["session_factory"]() as session:
+            with pytest.raises(AuthorityPhaseError):
+                ScopedRepositoryBinding(session, constraint, factory, authority)
+            with pytest.raises(AuthorityPhaseError):
+                _bind_scoped(
+                    seeded["applications"],
+                    session,
+                    EvilFactory(),
+                    authority,
+                    constraint,
+                )
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+    assert statements == []
+
+
+def test_scoped_point_and_application_filter_ids_are_exact_positive_int64(seeded) -> None:
+    factory = AuthorityFactory()
+    _, authority, constraint = _constraint(factory)
+    invalid_ids: tuple[object, ...] = (True, 1.5, "1", 0, -1, 2**63)
+    point_repositories = (
+        ("applications", "get_application_scoped", seeded["first"].id),
+        ("events", "get_application_event_scoped", seeded["first"].id),
+        ("notes", "get_note_scoped", seeded["first_note"].id),
+        ("offers", "get_offer_scoped", seeded["first_offer"].id),
+        ("analyses", "get_jd_analysis_scoped", seeded["first_analysis"].id),
+    )
+    filter_repositories = (
+        ("events", "list_application_events_scoped"),
+        ("notes", "list_notes_scoped"),
+        ("analyses", "list_jd_analyses_scoped"),
+    )
+    engine = seeded["session_factory"].kw["bind"]
+    statements: list[str] = []
+
+    def capture(_conn, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        with seeded["session_factory"]() as session:
+            bound = {
+                key: _bind_scoped(seeded[key], session, factory, authority, constraint)
+                for key in {key for key, _, _ in point_repositories}
+            }
+            for key, method_name, valid_id in point_repositories:
+                for value in invalid_ids:
+                    with pytest.raises(AuthorityPhaseError):
+                        getattr(bound[key], method_name)(constraint, value)
+                    assert statements == []
+                assert getattr(bound[key], method_name)(constraint, valid_id) is not None
+                statements.clear()
+
+            for key, method_name in filter_repositories:
+                for value in invalid_ids:
+                    with pytest.raises(AuthorityPhaseError):
+                        getattr(bound[key], method_name)(constraint, application_id=value)
+                    assert statements == []
+                statements.clear()
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
 
 
 def test_scoped_collection_ports_are_exact_and_filter_in_sql(seeded) -> None:

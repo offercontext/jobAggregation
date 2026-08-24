@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from builtins import list as BuiltinList
 
@@ -12,20 +12,22 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql import Select
 
 from offerpilot.models import Application, ApplicationEvent
-from offerpilot.ai.tool_authority import (
-    ApplicationScopeConstraint,
-    AuthorityFactory,
-    AuthorityPhaseError,
-    ToolExecutionAuthority,
-)
 from offerpilot.repositories.applications import _restricted_scope_id
 from offerpilot.repositories.session_binding import (
     ScopedRepositoryBinding,
     ScopeAccessDenied,
+    attach_scoped_repository,
     bind_scoped_repository,
     finish_repository_write,
+    require_scoped_optional_id,
+    require_scoped_positive_int64,
     repository_session,
+    scoped_authority_phase_error,
 )
+
+if TYPE_CHECKING:
+    from offerpilot.ai.tool_authority.contracts import ApplicationScopeConstraint, ToolExecutionAuthority
+    from offerpilot.repositories.session_binding import AuthorityFactoryProtocol
 
 
 @dataclass
@@ -55,11 +57,10 @@ class ApplicationEventsRepository:
         self,
         session_factory: sessionmaker[Session],
         session: Session | None = None,
-        scope_binding: ScopedRepositoryBinding | None = None,
     ):
         self._session_factory = session_factory
         self._session = session
-        self._scope_binding = scope_binding
+        self._scope_binding: ScopedRepositoryBinding | None = None
 
     def bind(self, session: Session) -> "ApplicationEventsRepository":
         return ApplicationEventsRepository(self._session_factory, session)
@@ -69,7 +70,7 @@ class ApplicationEventsRepository:
         session: Session,
         constraint: ApplicationScopeConstraint,
         *,
-        authority_factory: AuthorityFactory,
+        authority_factory: AuthorityFactoryProtocol,
         authority: ToolExecutionAuthority,
     ) -> "ApplicationEventsRepository":
         binding = bind_scoped_repository(
@@ -78,12 +79,16 @@ class ApplicationEventsRepository:
             authority_factory=authority_factory,
             authority=authority,
         )
-        return ApplicationEventsRepository(self._session_factory, session, binding)
+        return attach_scoped_repository(
+            ApplicationEventsRepository(self._session_factory, session), binding
+        )
 
     def _require_scoped(self, constraint: object) -> ScopedRepositoryBinding:
         binding = self._scope_binding
         if binding is None or self._session is None:
-            raise AuthorityPhaseError("scoped repository requires a caller-owned bound Session")
+            raise scoped_authority_phase_error(
+                "scoped repository requires a caller-owned bound Session"
+            )
         binding.require(constraint)
         return binding
 
@@ -147,10 +152,11 @@ class ApplicationEventsRepository:
         self,
         constraint: ApplicationScopeConstraint,
         month: str = "",
-        application_id: int = 0,
+        application_id: int | None = None,
         event_type: str = "",
     ) -> BuiltinList[ApplicationEventWithApplication]:
         binding = self._require_scoped(constraint)
+        require_scoped_optional_id(application_id, "application_id")
         session = binding.session
         if constraint.mode == "unrestricted":
             statement = (
@@ -178,7 +184,7 @@ class ApplicationEventsRepository:
             .cte("scoped_application")
         )
         join_condition = ApplicationEvent.application_id == scope_parent.c._scope_application_id
-        if application_id > 0:
+        if application_id is not None:
             join_condition = and_(join_condition, ApplicationEvent.application_id == application_id)
         if month:
             bounds = _month_bounds(month)
@@ -217,6 +223,7 @@ class ApplicationEventsRepository:
         event_id: int,
     ) -> Optional[ApplicationEvent]:
         binding = self._require_scoped(constraint)
+        event_id = require_scoped_positive_int64(event_id, "application event id")
         session = binding.session
         if constraint.mode == "unrestricted":
             return _get_visible_event(session, event_id)
@@ -306,7 +313,7 @@ def _get_visible_event(session: Session, event_id: int) -> Optional[ApplicationE
 def _event_filters(
     statement: Select[Any],
     month: str,
-    application_id: int,
+    application_id: int | None,
     event_type: str,
 ) -> Select[Any]:
     if month:
@@ -315,7 +322,7 @@ def _event_filters(
             start, end = bounds
             statement = statement.where(ApplicationEvent.scheduled_at >= start)
             statement = statement.where(ApplicationEvent.scheduled_at < end)
-    if application_id > 0:
+    if application_id is not None:
         statement = statement.where(ApplicationEvent.application_id == application_id)
     if event_type:
         statement = statement.where(ApplicationEvent.event_type == event_type)

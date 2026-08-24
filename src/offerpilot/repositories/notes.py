@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, cast
+from typing import TYPE_CHECKING, Optional, cast
 
 from builtins import list as BuiltinList
 
@@ -10,22 +10,24 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql import Select
 
-from offerpilot.ai.tool_authority import (
-    ApplicationScopeConstraint,
-    AuthorityFactory,
-    AuthorityPhaseError,
-    ToolExecutionAuthority,
-)
 from offerpilot.models import Application, ApplicationEvent, InterviewNote
 from offerpilot.repositories.applications import _restricted_scope_id
 from offerpilot.repositories.session_binding import (
     ScopedRepositoryBinding,
     ScopeAccessDenied,
+    attach_scoped_repository,
     bind_scoped_repository,
     finish_repository_write,
+    require_scoped_optional_id,
+    require_scoped_positive_int64,
     repository_session,
     rollback_repository_write,
+    scoped_authority_phase_error,
 )
+
+if TYPE_CHECKING:
+    from offerpilot.ai.tool_authority.contracts import ApplicationScopeConstraint, ToolExecutionAuthority
+    from offerpilot.repositories.session_binding import AuthorityFactoryProtocol
 
 
 class NoteBindingError(ValueError):
@@ -70,15 +72,10 @@ class NoteUpdate:
 
 
 class NotesRepository:
-    def __init__(
-        self,
-        session_factory: sessionmaker[Session],
-        session: Session | None = None,
-        scope_binding: ScopedRepositoryBinding | None = None,
-    ):
+    def __init__(self, session_factory: sessionmaker[Session], session: Session | None = None):
         self._session_factory = session_factory
         self._session = session
-        self._scope_binding = scope_binding
+        self._scope_binding: ScopedRepositoryBinding | None = None
 
     def bind(self, session: Session) -> "NotesRepository":
         return NotesRepository(self._session_factory, session)
@@ -88,7 +85,7 @@ class NotesRepository:
         session: Session,
         constraint: ApplicationScopeConstraint,
         *,
-        authority_factory: AuthorityFactory,
+        authority_factory: AuthorityFactoryProtocol,
         authority: ToolExecutionAuthority,
     ) -> "NotesRepository":
         binding = bind_scoped_repository(
@@ -97,12 +94,14 @@ class NotesRepository:
             authority_factory=authority_factory,
             authority=authority,
         )
-        return NotesRepository(self._session_factory, session, binding)
+        return attach_scoped_repository(NotesRepository(self._session_factory, session), binding)
 
     def _require_scoped(self, constraint: object) -> ScopedRepositoryBinding:
         binding = self._scope_binding
         if binding is None or self._session is None:
-            raise AuthorityPhaseError("scoped repository requires a caller-owned bound Session")
+            raise scoped_authority_phase_error(
+                "scoped repository requires a caller-owned bound Session"
+            )
         binding.require(constraint)
         return binding
 
@@ -156,9 +155,10 @@ class NotesRepository:
     def list_notes_scoped(
         self,
         constraint: ApplicationScopeConstraint,
-        application_id: int = 0,
+        application_id: int | None = None,
     ) -> BuiltinList[InterviewNote]:
         binding = self._require_scoped(constraint)
+        require_scoped_optional_id(application_id, "application_id")
         session = binding.session
         if constraint.mode == "unrestricted":
             statement = (
@@ -171,7 +171,7 @@ class NotesRepository:
                     )
                 )
             )
-            if application_id > 0:
+            if application_id is not None:
                 statement = statement.where(InterviewNote.application_id == application_id)
             statement = statement.order_by(InterviewNote.created_at.desc(), InterviewNote.id.desc())
             with session.no_autoflush:
@@ -184,7 +184,7 @@ class NotesRepository:
             .cte("scoped_application")
         )
         join_condition = InterviewNote.application_id == scope_parent.c._scope_application_id
-        if application_id > 0:
+        if application_id is not None:
             join_condition = and_(join_condition, InterviewNote.application_id == application_id)
         statement = (
             select(InterviewNote, scope_parent.c._scope_application_id)
@@ -203,6 +203,7 @@ class NotesRepository:
         note_id: int,
     ) -> Optional[InterviewNote]:
         binding = self._require_scoped(constraint)
+        note_id = require_scoped_positive_int64(note_id, "note id")
         session = binding.session
         if constraint.mode == "unrestricted":
             with session.no_autoflush:

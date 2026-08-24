@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from builtins import list as BuiltinList
 
@@ -15,19 +15,20 @@ from offerpilot.application_status import (
     normalize_application_status,
 )
 from offerpilot.models import APPLICATION_FOREIGN_KEY_MODELS, Application
-from offerpilot.ai.tool_authority import (
-    ApplicationScopeConstraint,
-    AuthorityFactory,
-    AuthorityPhaseError,
-    ToolExecutionAuthority,
-)
 from offerpilot.repositories.session_binding import (
     ScopedRepositoryBinding,
     ScopeAccessDenied,
+    attach_scoped_repository,
     bind_scoped_repository,
     finish_repository_write,
+    require_scoped_positive_int64,
     repository_session,
+    scoped_authority_phase_error,
 )
+
+if TYPE_CHECKING:
+    from offerpilot.ai.tool_authority.contracts import ApplicationScopeConstraint, ToolExecutionAuthority
+    from offerpilot.repositories.session_binding import AuthorityFactoryProtocol
 
 
 @dataclass
@@ -47,11 +48,10 @@ class ApplicationsRepository:
         self,
         session_factory: sessionmaker[Session],
         session: Session | None = None,
-        scope_binding: ScopedRepositoryBinding | None = None,
     ):
         self._session_factory = session_factory
         self._session = session
-        self._scope_binding = scope_binding
+        self._scope_binding: ScopedRepositoryBinding | None = None
 
     def bind(self, session: Session) -> "ApplicationsRepository":
         return ApplicationsRepository(self._session_factory, session)
@@ -61,7 +61,7 @@ class ApplicationsRepository:
         session: Session,
         constraint: ApplicationScopeConstraint,
         *,
-        authority_factory: AuthorityFactory,
+        authority_factory: AuthorityFactoryProtocol,
         authority: ToolExecutionAuthority,
     ) -> "ApplicationsRepository":
         binding = bind_scoped_repository(
@@ -70,12 +70,16 @@ class ApplicationsRepository:
             authority_factory=authority_factory,
             authority=authority,
         )
-        return ApplicationsRepository(self._session_factory, session, binding)
+        return attach_scoped_repository(
+            ApplicationsRepository(self._session_factory, session), binding
+        )
 
     def _require_scoped(self, constraint: object) -> ScopedRepositoryBinding:
         binding = self._scope_binding
         if binding is None or self._session is None:
-            raise AuthorityPhaseError("scoped repository requires a caller-owned bound Session")
+            raise scoped_authority_phase_error(
+                "scoped repository requires a caller-owned bound Session"
+            )
         binding.require(constraint)
         return binding
 
@@ -163,6 +167,7 @@ class ApplicationsRepository:
         app_id: int,
     ) -> Optional[Application]:
         binding = self._require_scoped(constraint)
+        app_id = require_scoped_positive_int64(app_id, "application id")
         session = binding.session
         if constraint.mode == "unrestricted":
             with session.no_autoflush:
@@ -295,8 +300,8 @@ def _normalize_model_status(app: Application) -> Application:
 
 def _restricted_scope_id(constraint: ApplicationScopeConstraint) -> int:
     if constraint.mode != "restricted" or len(constraint.allowed_identities) != 1:
-        raise AuthorityPhaseError("restricted Application scope must contain one identity")
+        raise scoped_authority_phase_error(
+            "restricted Application scope must contain one identity"
+        )
     identity = next(iter(constraint.allowed_identities))
-    if type(identity) is not int or identity <= 0:
-        raise AuthorityPhaseError("restricted Application scope identity is invalid")
-    return identity
+    return require_scoped_positive_int64(identity, "restricted Application scope identity")

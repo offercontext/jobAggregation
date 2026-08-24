@@ -9,8 +9,16 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.schema import CreateIndex, CreateTable
 
-from offerpilot.db import _ensure_scoped_tool_authority_schema, init_database
+from offerpilot.db import (
+    _ensure_schema_migrations,
+    _ensure_scoped_tool_authority_schema,
+    _ensure_write_operation_ledger_schema,
+    _record_migration,
+    init_database,
+)
+from offerpilot.models import Base
 from offerpilot.repositories.chat import ChatRepository
 
 
@@ -164,6 +172,68 @@ def _legacy_schema_engine() -> Engine:
             """
         )
     return engine
+
+
+def _create_real_0027_database(path: Path) -> None:
+    """Materialize the complete model schema immediately before 0028.
+
+    The two 0028 columns/checks are removed from the current additive model
+    DDL, while every unrelated table and the production 0026 trigger installer
+    are used unchanged.  The upgrade itself must then go through
+    ``init_database`` rather than calling the 0028 helper directly.
+    """
+
+    engine = create_engine(f"sqlite:///{path}")
+    conversations = Base.metadata.tables["conversations"]
+    operations = Base.metadata.tables["write_operations"]
+    other_tables = [
+        table
+        for table in Base.metadata.tables.values()
+        if table.name not in {"conversations", "write_operations"}
+    ]
+    Base.metadata.create_all(engine, tables=other_tables)
+
+    conversation_ddl = str(CreateTable(conversations).compile(engine)).replace(
+        "\n\tscope_revision INTEGER DEFAULT 0 NOT NULL, ",
+        "",
+    ).replace(
+        ", \n\tCONSTRAINT ck_conversations_scope_revision CHECK "
+        "(typeof(scope_revision) = 'integer' AND scope_revision BETWEEN 0 AND 9223372036854775807)",
+        "",
+    )
+    operation_ddl = str(CreateTable(operations).compile(engine)).replace(
+        "\n\tauthorization_scope_fingerprint VARCHAR, ",
+        "",
+    ).replace(
+        ", \n\tCONSTRAINT ck_write_operations_authorization_scope_fingerprint CHECK "
+        "(authorization_scope_fingerprint IS NULL OR "
+        "(length(authorization_scope_fingerprint) = 76 AND "
+        "substr(authorization_scope_fingerprint,1,12) = 'hmac-sha256:' AND "
+        "substr(authorization_scope_fingerprint,13) NOT GLOB '*[^0-9a-f]*'))",
+        "",
+    ).replace(
+        ", \n\tCONSTRAINT ck_write_operations_typed_primary_scope_bound CHECK "
+        "(NOT (operation_role = 'primary' AND adapter_kind = 'typed' AND "
+        "status = 'proposed' AND authorization_scope_fingerprint IS NULL))",
+        "",
+    )
+    assert "scope_revision" not in conversation_ddl
+    assert "authorization_scope_fingerprint" not in operation_ddl
+
+    with engine.begin() as conn:
+        conn.exec_driver_sql(conversation_ddl)
+        conn.exec_driver_sql(operation_ddl)
+        for index in operations.indexes:
+            conn.exec_driver_sql(str(CreateIndex(index).compile(engine)))
+
+    _ensure_schema_migrations(engine)
+    _ensure_write_operation_ledger_schema(engine)
+    _record_migration(
+        engine,
+        "0027_context_projector_manifest_v2",
+        "Allow privacy-bounded Context Projector manifests up to 64 KiB",
+    )
+    engine.dispose()
 
 
 def _legacy_operation(
@@ -523,6 +593,151 @@ def test_mode_trigger_rejects_control_edge_whitespace_and_bounds(tmp_path: Path,
                         "VALUES ('bad','fallback',:mode,'workspace','',0)"
                     ),
                     {"mode": mode},
+                )
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "invalid_text_sql",
+    [
+        "CAST(X'EDA080' AS TEXT)",  # UTF-8 encoding of a surrogate code point.
+        "CAST(X'FF' AS TEXT)",  # Invalid UTF-8 leading byte.
+    ],
+)
+@pytest.mark.parametrize("statement_kind", ["insert", "update"])
+def test_mode_trigger_rejects_non_unicode_text_bytes_fail_closed(
+    tmp_path: Path,
+    invalid_text_sql: str,
+    statement_kind: str,
+) -> None:
+    _sessions, engine = _engine(tmp_path)
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO conversations "
+                    "(title,title_source,mode,context_type,context_ref,scope_revision) "
+                    "VALUES ('valid','fallback','general','workspace','',0)"
+                )
+            )
+        sql = (
+            "INSERT INTO conversations "
+            "(title,title_source,mode,context_type,context_ref,scope_revision) "
+            f"VALUES ('bad','fallback',{invalid_text_sql},'workspace','',0)"
+            if statement_kind == "insert"
+            else "UPDATE conversations "
+            f"SET mode={invalid_text_sql}, scope_revision=1 WHERE title='valid'"
+        )
+        with pytest.raises(Exception, match="invalid conversation mode"):
+            with engine.begin() as conn:
+                conn.execute(text(sql))
+    finally:
+        engine.dispose()
+
+
+def test_mode_trigger_preserves_non_ascii_unicode_including_replacement_character(
+    tmp_path: Path,
+) -> None:
+    _sessions, engine = _engine(tmp_path)
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO conversations "
+                    "(title,title_source,mode,context_type,context_ref,scope_revision) "
+                    "VALUES ('unicode','fallback',:mode,'workspace','',0)"
+                ),
+                {"mode": "求职🚀\ufffd"},
+            )
+            conn.execute(
+                text(
+                    "UPDATE conversations SET mode=:mode, scope_revision=1 "
+                    "WHERE title='unicode'"
+                ),
+                {"mode": "面试准备🧭"},
+            )
+            assert conn.execute(
+                text("SELECT mode, scope_revision FROM conversations WHERE title='unicode'")
+            ).one() == ("面试准备🧭", 1)
+    finally:
+        engine.dispose()
+
+
+def test_init_database_upgrades_real_0027_schema_with_0026_triggers_intact(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "0027.db"
+    _create_real_0027_database(db_path)
+    operation_id = "00000000-0000-4000-8000-000000000001"
+
+    legacy_engine = create_engine(f"sqlite:///{db_path}")
+    try:
+        with legacy_engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO conversations(id,title,mode,context_type,context_ref) "
+                    "VALUES (1,'legacy','', 'workspace','legacy-ref')"
+                )
+            )
+            _legacy_operation(conn, operation_id=operation_id)
+            trigger_names = set(
+                conn.execute(
+                    text("SELECT name FROM sqlite_master WHERE type='trigger'")
+                ).scalars()
+            )
+            assert "trg_write_operation_delivery_generation" in trigger_names
+            assert "trg_write_operation_terminal_immutable" in trigger_names
+            assert "trg_write_operation_scope_insert" not in trigger_names
+            versions = set(conn.execute(text("SELECT version FROM schema_migrations")).scalars())
+            assert "0026_write_operation_ledger" in versions
+            assert "0027_context_projector_manifest_v2" in versions
+            assert "0028_scoped_tool_authority" not in versions
+    finally:
+        legacy_engine.dispose()
+
+    sessions = init_database(db_path)
+    engine = sessions.kw["bind"]
+    try:
+        with engine.connect() as conn:
+            assert conn.execute(
+                text(
+                    "SELECT mode, context_ref, scope_revision FROM conversations WHERE id=1"
+                )
+            ).one() == ("general", "legacy-ref", 0)
+            trigger_names = set(
+                conn.execute(
+                    text("SELECT name FROM sqlite_master WHERE type='trigger'")
+                ).scalars()
+            )
+            assert {
+                "trg_write_operation_delivery_generation",
+                "trg_write_operation_terminal_immutable",
+                "trg_write_operation_scope_insert",
+                "trg_write_operation_scope_status",
+                "trg_conversations_mode_insert",
+                "trg_conversations_mode_update",
+            } <= trigger_names
+            versions = set(conn.execute(text("SELECT version FROM schema_migrations")).scalars())
+            assert {
+                "0026_write_operation_ledger",
+                "0027_context_projector_manifest_v2",
+                "0028_scoped_tool_authority",
+            } <= versions
+
+        with pytest.raises(Exception, match="invalid delivery generation"):
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "UPDATE write_operations SET delivery_generation=2 WHERE id=:id"
+                    ),
+                    {"id": operation_id},
+                )
+        with pytest.raises(Exception, match="unbound typed operation"):
+            with engine.begin() as conn:
+                conn.execute(
+                    text("UPDATE write_operations SET status='committed' WHERE id=:id"),
+                    {"id": operation_id},
                 )
     finally:
         engine.dispose()

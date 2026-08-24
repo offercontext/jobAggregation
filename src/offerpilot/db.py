@@ -1638,6 +1638,92 @@ def _ensure_write_operation_ledger_schema(engine) -> None:  # type: ignore[no-un
     )
 
 
+def _conversation_mode_is_valid_sql(value_sql: str) -> str:
+    """Return a SQLite-only, fail-closed Unicode mode predicate.
+
+    SQLite's TEXT functions replace malformed UTF-8 while retaining the raw
+    bytes.  Consequently ``length()``, ``unicode()`` and ``GLOB`` alone accept
+    values such as ``CAST(X'EDA080' AS TEXT)``.  Scan the underlying bytes as
+    canonical UTF-8 before applying the product's code-point and edge-space
+    rules.  The scanner deliberately accepts all valid non-control Unicode,
+    including U+FFFD; this is not an ASCII allowlist.
+    """
+
+    edge_whitespace = (
+        "160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, "
+        "8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288"
+    )
+    return f"""
+        typeof({value_sql}) = 'text'
+        AND EXISTS (
+            WITH RECURSIVE
+              mode_input(hex_bytes) AS (
+                SELECT hex(CAST({value_sql} AS BLOB))
+              ),
+              mode_scan(byte_pos, code_points, is_valid) AS (
+                SELECT 1, 0, 1
+                UNION ALL
+                SELECT
+                  byte_pos + CASE
+                    WHEN substr(hex_bytes, byte_pos, 2) BETWEEN '20' AND '7E' THEN 2
+                    WHEN substr(hex_bytes, byte_pos, 2) BETWEEN 'C2' AND 'DF' THEN 4
+                    WHEN substr(hex_bytes, byte_pos, 2) BETWEEN 'E0' AND 'EF' THEN 6
+                    WHEN substr(hex_bytes, byte_pos, 2) BETWEEN 'F0' AND 'F4' THEN 8
+                    ELSE 2
+                  END,
+                  code_points + 1,
+                  CASE
+                    WHEN substr(hex_bytes, byte_pos, 2) BETWEEN '20' AND '7E'
+                      THEN 1
+                    WHEN substr(hex_bytes, byte_pos, 2) = 'C2'
+                      THEN substr(hex_bytes, byte_pos + 2, 2) BETWEEN 'A0' AND 'BF'
+                    WHEN substr(hex_bytes, byte_pos, 2) BETWEEN 'C3' AND 'DF'
+                      THEN substr(hex_bytes, byte_pos + 2, 2) BETWEEN '80' AND 'BF'
+                    WHEN substr(hex_bytes, byte_pos, 2) = 'E0'
+                      THEN substr(hex_bytes, byte_pos + 2, 2) BETWEEN 'A0' AND 'BF'
+                       AND substr(hex_bytes, byte_pos + 4, 2) BETWEEN '80' AND 'BF'
+                    WHEN substr(hex_bytes, byte_pos, 2) BETWEEN 'E1' AND 'EC'
+                      THEN substr(hex_bytes, byte_pos + 2, 2) BETWEEN '80' AND 'BF'
+                       AND substr(hex_bytes, byte_pos + 4, 2) BETWEEN '80' AND 'BF'
+                    WHEN substr(hex_bytes, byte_pos, 2) = 'ED'
+                      THEN substr(hex_bytes, byte_pos + 2, 2) BETWEEN '80' AND '9F'
+                       AND substr(hex_bytes, byte_pos + 4, 2) BETWEEN '80' AND 'BF'
+                    WHEN substr(hex_bytes, byte_pos, 2) BETWEEN 'EE' AND 'EF'
+                      THEN substr(hex_bytes, byte_pos + 2, 2) BETWEEN '80' AND 'BF'
+                       AND substr(hex_bytes, byte_pos + 4, 2) BETWEEN '80' AND 'BF'
+                    WHEN substr(hex_bytes, byte_pos, 2) = 'F0'
+                      THEN substr(hex_bytes, byte_pos + 2, 2) BETWEEN '90' AND 'BF'
+                       AND substr(hex_bytes, byte_pos + 4, 2) BETWEEN '80' AND 'BF'
+                       AND substr(hex_bytes, byte_pos + 6, 2) BETWEEN '80' AND 'BF'
+                    WHEN substr(hex_bytes, byte_pos, 2) BETWEEN 'F1' AND 'F3'
+                      THEN substr(hex_bytes, byte_pos + 2, 2) BETWEEN '80' AND 'BF'
+                       AND substr(hex_bytes, byte_pos + 4, 2) BETWEEN '80' AND 'BF'
+                       AND substr(hex_bytes, byte_pos + 6, 2) BETWEEN '80' AND 'BF'
+                    WHEN substr(hex_bytes, byte_pos, 2) = 'F4'
+                      THEN substr(hex_bytes, byte_pos + 2, 2) BETWEEN '80' AND '8F'
+                       AND substr(hex_bytes, byte_pos + 4, 2) BETWEEN '80' AND 'BF'
+                       AND substr(hex_bytes, byte_pos + 6, 2) BETWEEN '80' AND 'BF'
+                    ELSE 0
+                  END
+                FROM mode_scan, mode_input
+                WHERE is_valid
+                  AND byte_pos <= length(hex_bytes)
+                  AND code_points < 64
+                  AND length(hex_bytes) <= 512
+              )
+            SELECT 1
+            FROM mode_scan, mode_input
+            WHERE is_valid
+              AND byte_pos = length(hex_bytes) + 1
+              AND code_points BETWEEN 1 AND 64
+              AND length(hex_bytes) <= 512
+        )
+        AND {value_sql} = trim({value_sql})
+        AND unicode(substr({value_sql}, 1, 1)) NOT IN ({edge_whitespace})
+        AND unicode(substr({value_sql}, -1, 1)) NOT IN ({edge_whitespace})
+    """
+
+
 def _ensure_scoped_tool_authority_schema(engine) -> None:  # type: ignore[no-untyped-def]
     """Install the additive Conversation scope and authorization guards (0028)."""
 
@@ -1735,52 +1821,27 @@ def _ensure_scoped_tool_authority_schema(engine) -> None:  # type: ignore[no-unt
                 """
             )
         )
+        mode_is_valid = _conversation_mode_is_valid_sql("NEW.mode")
         conn.execute(
             text(
-                """
+                f"""
                 CREATE TRIGGER trg_conversations_mode_insert
                 BEFORE INSERT ON conversations
-                WHEN typeof(NEW.mode) <> 'text'
-                  OR NEW.mode IS NULL
-                  OR length(CAST(NEW.mode AS BLOB)) = 0
-                  OR length(NEW.mode) > 64
-                  OR length(CAST(NEW.mode AS BLOB)) > 256
-                  OR NEW.mode <> trim(NEW.mode)
-                  OR unicode(substr(NEW.mode, 1, 1)) IN
-                     (160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198,
-                      8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288)
-                  OR unicode(substr(NEW.mode, -1, 1)) IN
-                     (160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198,
-                      8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288)
-                  OR instr(NEW.mode, char(0)) > 0
-                  OR NEW.mode GLOB ('*[' || char(1) || '-' || char(31) || char(127) || '-' || char(159) || ']*')
                 BEGIN
-                    SELECT RAISE(ABORT, 'invalid conversation mode');
+                    SELECT CASE WHEN NOT ({mode_is_valid})
+                      THEN RAISE(ABORT, 'invalid conversation mode') END;
                 END
                 """
             )
         )
         conn.execute(
             text(
-                """
+                f"""
                 CREATE TRIGGER trg_conversations_mode_update
                 BEFORE UPDATE OF mode ON conversations
-                WHEN typeof(NEW.mode) <> 'text'
-                  OR NEW.mode IS NULL
-                  OR length(CAST(NEW.mode AS BLOB)) = 0
-                  OR length(NEW.mode) > 64
-                  OR length(CAST(NEW.mode AS BLOB)) > 256
-                  OR NEW.mode <> trim(NEW.mode)
-                  OR unicode(substr(NEW.mode, 1, 1)) IN
-                     (160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198,
-                      8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288)
-                  OR unicode(substr(NEW.mode, -1, 1)) IN
-                     (160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198,
-                      8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288)
-                  OR instr(NEW.mode, char(0)) > 0
-                  OR NEW.mode GLOB ('*[' || char(1) || '-' || char(31) || char(127) || '-' || char(159) || ']*')
                 BEGIN
-                    SELECT RAISE(ABORT, 'invalid conversation mode');
+                    SELECT CASE WHEN NOT ({mode_is_valid})
+                      THEN RAISE(ABORT, 'invalid conversation mode') END;
                 END
                 """
             )

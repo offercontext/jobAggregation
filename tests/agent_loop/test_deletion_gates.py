@@ -24,6 +24,12 @@ _LEGACY_AGENT_SYMBOLS = {
     "_runtime_resume_after_confirm",
     "resume_after_confirm",
     "resume_after_confirm_fn",
+    "_bind_confirmation_context",
+    "_confirmation_source_loader",
+    "_resolve_model",
+    "confirmation_model",
+    "load_continuation_messages",
+    "model_resolver",
 }
 _LOOP_FORBIDDEN_IMPORT_PREFIXES = (
     "fastapi",
@@ -74,20 +80,113 @@ def _symbols(tree: ast.AST) -> set[str]:
         elif isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
             result.add(node.name)
         elif isinstance(node, ast.alias):
-            result.add(node.asname or node.name.rsplit(".", 1)[-1])
+            result.add(node.name.rsplit(".", 1)[-1])
+            if node.asname is not None:
+                result.add(node.asname)
     return result
 
 
+def _constant_string(node: ast.AST, bindings: dict[str, str]) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return bindings.get(node.id)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _constant_string(node.left, bindings)
+        right = _constant_string(node.right, bindings)
+        return None if left is None or right is None else left + right
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "join"
+        and len(node.args) == 1
+    ):
+        separator = _constant_string(node.func.value, bindings)
+        values = node.args[0]
+        if separator is None or not isinstance(values, (ast.List, ast.Tuple)):
+            return None
+        parts = [_constant_string(value, bindings) for value in values.elts]
+        if any(part is None for part in parts):
+            return None
+        return separator.join(part for part in parts if part is not None)
+    return None
+
+
 def _calls_named(tree: ast.AST, name: str) -> list[ast.Call]:
-    return [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and (
-            (isinstance(node.func, ast.Name) and node.func.id == name)
-            or (isinstance(node.func, ast.Attribute) and node.func.attr == name)
-        )
-    ]
+    aliases: dict[str, str] = {}
+    seen: set[tuple[tuple[str, str], ...]] = set()
+    while True:
+        before = tuple(sorted(aliases.items()))
+        if before in seen:
+            break
+        seen.add(before)
+        changed = False
+        for node in ast.walk(tree):
+            bindings: tuple[tuple[str, str], ...] = ()
+            if isinstance(node, ast.ImportFrom):
+                bindings = tuple(
+                    (item.asname or item.name, item.name) for item in node.names
+                )
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+                if isinstance(node.value, ast.Name):
+                    resolved = aliases.get(node.value.id, node.value.id)
+                    targets = (
+                        node.targets
+                        if isinstance(node, ast.Assign)
+                        else [node.target]
+                    )
+                    bindings = tuple(
+                        (target.id, resolved)
+                        for target in targets
+                        if isinstance(target, ast.Name)
+                    )
+            for local, source in bindings:
+                if aliases.get(local) != source:
+                    aliases[local] = source
+                    changed = True
+        if not changed:
+            break
+    strings: dict[str, str] = {}
+    string_states: set[tuple[tuple[str, str], ...]] = set()
+    while True:
+        before = tuple(sorted(strings.items()))
+        if before in string_states:
+            break
+        string_states.add(before)
+        changed = False
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.value is None:
+                continue
+            resolved = _constant_string(node.value, strings)
+            if resolved is None:
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name) and strings.get(target.id) != resolved:
+                    strings[target.id] = resolved
+                    changed = True
+        if not changed:
+            break
+    result: list[ast.Call] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        matched = (
+            isinstance(node.func, ast.Name)
+            and aliases.get(node.func.id, node.func.id) == name
+        ) or (isinstance(node.func, ast.Attribute) and node.func.attr == name)
+        if not matched and isinstance(node.func, ast.Call):
+            dynamic = node.func
+            if (
+                isinstance(dynamic.func, ast.Name)
+                and aliases.get(dynamic.func.id, dynamic.func.id) == "getattr"
+                and len(dynamic.args) >= 2
+            ):
+                symbol = dynamic.args[1]
+                matched = _constant_string(symbol, strings) == name
+        if matched:
+            result.append(node)
+    return result
 
 
 def _function(tree: ast.Module, name: str) -> ast.FunctionDef:
@@ -108,10 +207,25 @@ def _validate_common_source(source: str) -> None:
     found = _symbols(tree) & _LEGACY_AGENT_SYMBOLS
     if found:
         raise GateViolation(f"legacy:symbol:{sorted(found)[0]}")
+    reflected = {
+        symbol for symbol in _LEGACY_AGENT_SYMBOLS if _calls_named(tree, symbol)
+    }
+    if reflected:
+        raise GateViolation(f"legacy:symbol:{sorted(reflected)[0]}")
     lowered = {name.lower() for name in _symbols(tree)}
     for fragment in sorted(_OLD_PATH_SWITCH_FRAGMENTS):
         if any(fragment in name for name in lowered):
             raise GateViolation(f"cutover-switch:{fragment}")
+
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id
+            in {"ResolvedModel", "model_resolution", "resolved", "resolved_model"}
+            and node.attr == "tool_context"
+        ):
+            raise GateViolation("authority:resolved-model-tool-context")
 
 
 def _validate_driver_protocol(source: str) -> None:
@@ -242,6 +356,16 @@ def test_agent_loop_dependency_and_composition_cutover_are_closed() -> None:
             "cutover-switch:shadow_loop",
         ),
         (
+            _validate_common_source,
+            "def load_continuation_messages(): pass\n",
+            "legacy:symbol:load_continuation_messages",
+        ),
+        (
+            _validate_common_source,
+            "value = resolved.tool_context\n",
+            "authority:resolved-model-tool-context",
+        ),
+        (
             _validate_driver_protocol,
             "class AgentDriver(Protocol):\n"
             "    def execute(self, invocation): ...\n"
@@ -301,7 +425,59 @@ def test_negative_fixtures_prove_each_gate_rejects(
         validator(source)  # type: ignore[operator]
 
 
+def test_negative_fixture_proves_legacy_symbol_import_alias_is_enforced() -> None:
+    with pytest.raises(GateViolation, match="legacy:symbol:load_continuation_messages"):
+        _validate_common_source(
+            "from old_runtime import load_continuation_messages as source_loader\n"
+        )
+
+
 def test_negative_fixture_proves_bound_response_owner_is_enforced() -> None:
     source = "response = BoundProviderResponse(None, '', '', 0, '')\n"
+    with pytest.raises(GateViolation, match="provenance:constructor-owner"):
+        _validate_bound_response_owner(AI / "agent_loop.py", source)
+
+
+def test_negative_fixture_proves_bound_response_import_alias_is_enforced() -> None:
+    source = "from x import BoundProviderResponse as Response\nresponse = Response()\n"
+    with pytest.raises(GateViolation, match="provenance:constructor-owner"):
+        _validate_bound_response_owner(AI / "agent_loop.py", source)
+
+
+def test_negative_fixture_proves_bound_response_reflection_is_enforced() -> None:
+    source = (
+        "name = 'BoundProviderResponse'\n"
+        "response = getattr(binding, name)()\n"
+    )
+    with pytest.raises(GateViolation, match="provenance:constructor-owner"):
+        _validate_bound_response_owner(AI / "agent_loop.py", source)
+
+
+def test_negative_fixture_proves_computed_reflection_is_enforced() -> None:
+    legacy_source = (
+        "def resume(old):\n"
+        "    return getattr(old, ''.join(['load_continuation_', 'messages']))()\n"
+    )
+    with pytest.raises(GateViolation, match="legacy:symbol:load_continuation_messages"):
+        _validate_common_source(legacy_source)
+
+    response_source = (
+        "def bind(module):\n"
+        "    return getattr(module, 'BoundProvider' + 'Response')()\n"
+    )
+    with pytest.raises(GateViolation, match="provenance:constructor-owner"):
+        _validate_bound_response_owner(AI / "agent_loop.py", response_source)
+
+
+def test_negative_fixture_proves_alias_depth_is_not_an_escape() -> None:
+    source = (
+        "from x import BoundProviderResponse as a6\n"
+        "a1 = a2\n"
+        "a2 = a3\n"
+        "a3 = a4\n"
+        "a4 = a5\n"
+        "a5 = a6\n"
+        "response = a1()\n"
+    )
     with pytest.raises(GateViolation, match="provenance:constructor-owner"):
         _validate_bound_response_owner(AI / "agent_loop.py", source)

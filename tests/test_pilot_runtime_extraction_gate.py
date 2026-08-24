@@ -62,7 +62,12 @@ def _binding_aliases(tree: ast.AST) -> dict[str, str]:
             return f"{parent}.{node.attr}" if parent else node.attr
         return None
 
-    for _ in range(3):
+    seen: set[tuple[tuple[str, str], ...]] = set()
+    while True:
+        before = tuple(sorted(aliases.items()))
+        if before in seen:
+            break
+        seen.add(before)
         changed = False
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
@@ -132,7 +137,12 @@ def _string_bindings(tree: ast.AST) -> dict[str, str]:
     """Resolve literal-string aliases used by dynamic compatibility escapes."""
 
     bindings: dict[str, str] = {}
-    for _ in range(3):
+    seen: set[tuple[tuple[str, str], ...]] = set()
+    while True:
+        before = tuple(sorted(bindings.items()))
+        if before in seen:
+            break
+        seen.add(before)
         changed = False
         for node in ast.walk(tree):
             if not isinstance(node, (ast.Assign, ast.AnnAssign)):
@@ -140,11 +150,8 @@ def _string_bindings(tree: ast.AST) -> dict[str, str]:
             value = node.value
             if value is None:
                 continue
-            if isinstance(value, ast.Constant) and isinstance(value.value, str):
-                resolved = value.value
-            elif isinstance(value, ast.Name) and value.id in bindings:
-                resolved = bindings[value.id]
-            else:
+            resolved = _constant_string(value, bindings)
+            if resolved is None:
                 continue
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             for target in targets:
@@ -156,11 +163,55 @@ def _string_bindings(tree: ast.AST) -> dict[str, str]:
     return bindings
 
 
+def _constant_string(node: ast.AST, bindings: dict[str, str]) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return bindings.get(node.id)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _constant_string(node.left, bindings)
+        right = _constant_string(node.right, bindings)
+        return None if left is None or right is None else left + right
+    if isinstance(node, ast.JoinedStr):
+        parts: list[str] = []
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                parts.append(value.value)
+            elif isinstance(value, ast.FormattedValue):
+                part = _constant_string(value.value, bindings)
+                if part is None:
+                    return None
+                parts.append(part)
+            else:
+                return None
+        return "".join(parts)
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "join"
+        and len(node.args) == 1
+    ):
+        separator = _constant_string(node.func.value, bindings)
+        values = node.args[0]
+        if separator is None or not isinstance(values, (ast.List, ast.Tuple)):
+            return None
+        parts = [_constant_string(value, bindings) for value in values.elts]
+        if any(part is None for part in parts):
+            return None
+        return separator.join(part for part in parts if part is not None)
+    return None
+
+
 def _constant_bindings(tree: ast.AST) -> dict[str, object]:
     """Resolve the small literal subset needed for reachability checks."""
 
     bindings: dict[str, object] = {}
-    for _ in range(3):
+    seen: set[tuple[tuple[str, object], ...]] = set()
+    while True:
+        before = tuple(sorted(bindings.items()))
+        if before in seen:
+            break
+        seen.add(before)
         changed = False
         for node in ast.walk(tree):
             if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.value is None:
@@ -200,11 +251,8 @@ def _dynamic_call_terminal(
     symbol = node.func.args[1] if len(node.func.args) >= 2 else None
     if _call_terminal(node.func, aliases) != "getattr" or symbol is None:
         return None
-    if isinstance(symbol, ast.Constant) and isinstance(symbol.value, str):
-        return symbol.value.rsplit(".", 1)[-1]
-    if isinstance(symbol, ast.Name) and symbol.id in bindings:
-        return bindings[symbol.id].rsplit(".", 1)[-1]
-    return None
+    resolved = _constant_string(symbol, bindings)
+    return resolved.rsplit(".", 1)[-1] if resolved is not None else None
 
 
 def _dynamic_getattr_terminal(
@@ -219,11 +267,8 @@ def _dynamic_getattr_terminal(
     if len(node.args) < 2:
         return None
     symbol = node.args[1]
-    if isinstance(symbol, ast.Constant) and isinstance(symbol.value, str):
-        return symbol.value.rsplit(".", 1)[-1]
-    if isinstance(symbol, ast.Name) and symbol.id in bindings:
-        return bindings[symbol.id].rsplit(".", 1)[-1]
-    return None
+    resolved = _constant_string(symbol, bindings)
+    return resolved.rsplit(".", 1)[-1] if resolved is not None else None
 
 
 def _callable_aliases(
@@ -239,7 +284,12 @@ def _callable_aliases(
         "PreparedStreamGuard",
         "build_guarded_streaming_response",
     }
-    for _ in range(4):
+    seen: set[tuple[tuple[str, str], ...]] = set()
+    while True:
+        before = tuple(sorted(resolved.items()))
+        if before in seen:
+            break
+        seen.add(before)
         changed = False
         for node in ast.walk(tree):
             if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.value is None:
@@ -279,10 +329,9 @@ def _dynamic_attribute_strings(
         ):
             continue
         symbol = node.args[1]
-        if isinstance(symbol, ast.Constant) and isinstance(symbol.value, str):
-            result.add(symbol.value)
-        elif isinstance(symbol, ast.Name) and symbol.id in bindings:
-            result.add(bindings[symbol.id])
+        resolved = _constant_string(symbol, bindings)
+        if resolved is not None:
+            result.add(resolved)
     return result
 
 
@@ -417,6 +466,32 @@ PRIVATE_BOUNDARY_NAMES = frozenset(
         "_PreparedConversation",
         "_PreparedToolCall",
         "_PreparedMessage",
+    }
+)
+TRANSIENT_SECURITY_NAMES = frozenset(
+    {
+        "SegmentExecutionAuthority",
+        "ApprovalExecutionAuthority",
+        "ProviderSurfaceBuildIdentity",
+        "ProviderInvocationIdentity",
+        "NewTurnPrepareCallIdentity",
+        "ReadExecutionCallIdentity",
+        "TypedPendingCallIdentity",
+        "ApprovedWritePrepareCallIdentity",
+        "ApprovedWriteExecuteCallIdentity",
+        "ApplicationScopeConstraint",
+        "AuthorityCallIdentity",
+        "BindingTargetResolution",
+        "PreparedToolCall",
+        "PendingAuthorityClaim",
+        "ExecutionClaim",
+        "ToolExecutionAuthority",
+        "ToolExecutionContext",
+        "SegmentSurfaceGate",
+        "BoundProviderResponse",
+        "TransientToolRuntimeValue",
+        "TrustedContextScope",
+        "TrustedLedgerOmittedTokenProof",
     }
 )
 
@@ -1113,7 +1188,7 @@ def _validate_boundary_names_absent(tree: ast.AST) -> None:
 
 def _validate_no_generic_asdict_boundary(tree: ast.AST) -> None:
     aliases = _binding_aliases(tree)
-    forbidden = PRIVATE_BOUNDARY_NAMES | {
+    forbidden = PRIVATE_BOUNDARY_NAMES | TRANSIENT_SECURITY_NAMES | {
         "MessageOutcome",
         "ConfirmationRequiredOutcome",
         "OperationPendingOutcome",
@@ -1257,6 +1332,95 @@ def _validate_no_generic_asdict_boundary(tree: ast.AST) -> None:
                 )
 
 
+def _validate_no_transient_generic_serializers(tree: ast.AST) -> None:
+    """Reject generic serializers whose parameter is a transient contract.
+
+    This is deliberately function-local.  The older whole-module taint pass is
+    tuned for ``asdict`` and would otherwise confuse ordinary JSON ``dumps``
+    parameters in an unrelated function with an authority value elsewhere in
+    the same module.
+    """
+
+    aliases = _binding_aliases(tree)
+    serializers = {"asdict", "checkpoint", "copy", "deepcopy", "dumps", "replace"}
+    for function in ast.walk(tree):
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        transient_parameters = {
+            parameter.arg
+            for parameter in (
+                *function.args.posonlyargs,
+                *function.args.args,
+                *function.args.kwonlyargs,
+            )
+            if parameter.annotation is not None
+            and bool(_resolved_names(parameter.annotation, aliases) & TRANSIENT_SECURITY_NAMES)
+        }
+        if not transient_parameters:
+            transient_parameters = set()
+        parameter_aliases = set(transient_parameters)
+        while True:
+            changed = False
+            for assignment in ast.walk(function):
+                if not isinstance(assignment, (ast.Assign, ast.AnnAssign)):
+                    continue
+                if assignment.value is None:
+                    continue
+                value = assignment.value
+                direct_constructor = (
+                    _call_terminal(value, aliases)
+                    if isinstance(value, ast.Call)
+                    else None
+                )
+                if not (
+                    direct_constructor in TRANSIENT_SECURITY_NAMES
+                    or (
+                        isinstance(value, ast.Name)
+                        and value.id in parameter_aliases
+                    )
+                ):
+                    continue
+                targets = (
+                    assignment.targets
+                    if isinstance(assignment, ast.Assign)
+                    else [assignment.target]
+                )
+                for target in targets:
+                    if isinstance(target, ast.Name) and target.id not in parameter_aliases:
+                        parameter_aliases.add(target.id)
+                        changed = True
+            if not changed:
+                break
+        for call in ast.walk(function):
+            argument = call.args[0] if isinstance(call, ast.Call) and call.args else None
+            direct_constructor = (
+                _call_terminal(argument, aliases)
+                if isinstance(argument, ast.Call)
+                else None
+            )
+            if (
+                isinstance(call, ast.Call)
+                and _call_terminal(call, aliases) in serializers
+                and argument is not None
+                and (
+                    any(
+                        isinstance(item, ast.Name)
+                        and item.id in parameter_aliases
+                        for item in ast.walk(argument)
+                    )
+                    or any(
+                        isinstance(item, ast.Call)
+                        and _call_terminal(item, aliases) in TRANSIENT_SECURITY_NAMES
+                        for item in ast.walk(argument)
+                    )
+                    or direct_constructor in TRANSIENT_SECURITY_NAMES
+                )
+            ):
+                raise AssertionError(
+                    "transient authority values cannot reach a generic serializer"
+                )
+
+
 def _validate_no_asdict_in_extraction_scope(tree: ast.AST) -> None:
     """Extraction modules must never invoke generic dataclass serialization."""
 
@@ -1277,15 +1441,9 @@ def _validate_no_asdict_in_extraction_scope(tree: ast.AST) -> None:
         ):
             return False
         symbol = value.args[1]
-        return (
-            isinstance(symbol, ast.Constant)
-            and symbol.value == "asdict"
-        ) or (
-            isinstance(symbol, ast.Name)
-            and bindings.get(symbol.id) == "asdict"
-        )
+        return _constant_string(symbol, bindings) == "asdict"
 
-    for _ in range(4):
+    while True:
         changed = False
         for assignment in ast.walk(tree):
             if not isinstance(assignment, (ast.Assign, ast.AnnAssign)):
@@ -1684,6 +1842,38 @@ def test_allowlisted_production_call_sites_do_not_asdict_private_runtime_values(
         _validate_no_generic_asdict_boundary(_tree(path))
 
 
+def test_production_does_not_asdict_transient_authority_or_claim_values() -> None:
+    for path in _production_files():
+        tree = _tree(path)
+        _validate_no_generic_asdict_boundary(tree)
+        _validate_no_transient_generic_serializers(tree)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from dataclasses import asdict\n"
+        "def dump(value: TransientToolRuntimeValue): return asdict(value)\n",
+        "from dataclasses import replace\n"
+        "def dump(value: PendingAuthorityClaim): return replace(value)\n",
+        "from copy import deepcopy\n"
+        "def dump(value: ExecutionClaim): return deepcopy(value)\n",
+        "import pickle\n"
+        "def checkpoint(value: TrustedLedgerOmittedTokenProof): "
+        "return pickle.dumps(value)\n",
+        "import json\n"
+        "def checkpoint():\n"
+        "    claim = PendingAuthorityClaim(...)\n"
+        "    return json.dumps(claim)\n",
+    ],
+)
+def test_transient_security_values_cannot_reach_generic_serializers(
+    source: str,
+) -> None:
+    with pytest.raises(AssertionError):
+        _validate_no_transient_generic_serializers(ast.parse(source))
+
+
 def test_extraction_scope_has_no_generic_asdict_calls() -> None:
     allowlisted_production = (API, TRANSPORT, *tuple(sorted(RUNTIME.glob("*.py"))))
     for path in allowlisted_production:
@@ -1884,6 +2074,40 @@ def test_task11_prepared_gate_rejects_dynamic_prepare_aliases() -> None:
         ),
         lambda tree: _validate_prepared_streams_are_guarded(runtime_tree, tree),
     )
+
+
+def test_computed_reflection_does_not_escape_extraction_gates() -> None:
+    _expect_rejected(
+        "import dataclasses\n"
+        "def dump(value):\n"
+        "    return getattr(dataclasses, ''.join(['as', 'dict']))(value)\n",
+        _validate_no_asdict_in_extraction_scope,
+    )
+    _expect_rejected(
+        "def send_chat(runtime):\n"
+        "    return getattr(runtime, 'append_' + 'message')('x')\n"
+        "def send_chat_stream(runtime): return runtime.run()\n"
+        "def confirm_chat(runtime): return runtime.run()\n"
+        "def confirm_chat_stream(runtime): return runtime.run()\n",
+        _validate_routes_are_runtime_only,
+    )
+    _expect_rejected(
+        "class SyncAgentExecutionHost:\n"
+        "    def __init__(self, value):\n"
+        "        self.store = getattr(value, 'Chat' + 'Repository')\n"
+        "class SseAgentExecutionHost: pass\n",
+        _validate_execution_host_boundary,
+    )
+
+
+def test_transient_container_does_not_escape_generic_serializer_gate() -> None:
+    source = (
+        "import json\n"
+        "def dump(claim: PendingAuthorityClaim):\n"
+        "    return json.dumps({'claim': claim}, default=str)\n"
+    )
+    with pytest.raises(AssertionError):
+        _validate_no_transient_generic_serializers(ast.parse(source))
 
 
 def test_runtime_outcomes_and_events_are_safe_json_shapes() -> None:
@@ -2265,6 +2489,7 @@ def test_canary_private_values_do_not_enter_journal_trace_sse_or_error_log_paylo
                 adapter_kind="typed",
                 proposal_fingerprint="hmac-sha256:" + "c" * 64,
                 confirmation_token_fingerprint="hmac-sha256:" + "d" * 64,
+                authorization_scope_fingerprint="hmac-sha256:" + "e" * 64,
             )
             ledger_session.commit()
             assert ledger_operation.tool_name == "create_application"

@@ -739,9 +739,47 @@ def test_scoped_note_write_preserves_stable_binding_domain_failures(seeded) -> N
     with seeded["session_factory"]() as session:
         notes = _bind(seeded["notes"], session, factory, authority, constraint)
         before_count = session.scalar(select(func.count()).select_from(InterviewNote))
+        statements: list[str] = []
+
+        def capture(_conn, _cursor, statement, _parameters, _context, _executemany):
+            statements.append(statement)
+
+        engine = seeded["session_factory"].kw["bind"]
+        event.listen(engine, "before_cursor_execute", capture)
+        try:
+            with pytest.raises(ScopeAccessDenied):
+                notes.create_note_scoped(
+                    constraint,
+                    NoteCreate(
+                        application_id=seeded["first_id"],
+                        application_event_id=seeded["second_event_id"],
+                        company="A",
+                    ),
+                )
+        finally:
+            event.remove(engine, "before_cursor_execute", capture)
+        assert len(statements) == 1
+        assert "INSERT" in statements[0].upper()
+        assert "RETURNING" in statements[0].upper()
+        assert session.scalar(select(func.count()).select_from(InterviewNote)) == before_count
+        session.rollback()
+
+    event_factory = AuthorityFactory()
+    event_authority, event_constraint = _scope(
+        event_factory, None, context_type="workspace"
+    )
+    with seeded["session_factory"]() as session:
+        notes = _bind(
+            seeded["notes"],
+            session,
+            event_factory,
+            event_authority,
+            event_constraint,
+        )
+        before_count = session.scalar(select(func.count()).select_from(InterviewNote))
         with pytest.raises(NoteBindingError) as invalid_create_event:
             notes.create_note_scoped(
-                constraint,
+                event_constraint,
                 NoteCreate(
                     application_id=seeded["first_id"],
                     application_event_id=seeded["second_event_id"],
@@ -752,10 +790,7 @@ def test_scoped_note_write_preserves_stable_binding_domain_failures(seeded) -> N
         assert str(invalid_create_event.value) == (
             "application_event_id must reference an interview event for the application"
         )
-        assert isinstance(invalid_create_event.value.__cause__, DataError)
-        sentinel_orig = invalid_create_event.value.__cause__.orig
-        assert sentinel_orig.sqlite_errorcode == sqlite3.SQLITE_TOOBIG
-        assert sentinel_orig.sqlite_errorname == "SQLITE_TOOBIG"
+        assert invalid_create_event.value.__cause__ is None
         assert session.scalar(select(func.count()).select_from(InterviewNote)) == before_count
         session.rollback()
 
@@ -982,6 +1017,158 @@ def test_scoped_note_write_does_not_relabel_unrelated_integrity_error(
         current = session.get(InterviewNote, seeded["first_note_id"])
         assert current is not None
         assert current.application_event_id is None
+
+
+def test_scoped_note_create_does_not_relabel_trigger_toobig(seeded) -> None:
+    factory = AuthorityFactory()
+    authority, constraint = _scope(factory, seeded["first_id"])
+    with seeded["session_factory"]() as session:
+        notes = _bind(seeded["notes"], session, factory, authority, constraint)
+        before_count = session.scalar(select(func.count()).select_from(InterviewNote))
+        session.execute(
+            text(
+                """
+                CREATE TRIGGER unrelated_note_insert_toobig
+                BEFORE INSERT ON interview_notes
+                BEGIN
+                    SELECT zeroblob(2147483648);
+                END
+                """
+            )
+        )
+        session.commit()
+
+        with pytest.raises(DataError) as raised:
+            notes.create_note_scoped(
+                constraint,
+                NoteCreate(
+                    application_id=seeded["first_id"],
+                    application_event_id=seeded["first_event_id"],
+                    company="A",
+                ),
+            )
+
+        assert raised.value.orig.sqlite_errorcode == sqlite3.SQLITE_TOOBIG
+        assert raised.value.orig.sqlite_errorname == "SQLITE_TOOBIG"
+        assert session.scalar(select(func.count()).select_from(InterviewNote)) == before_count
+
+
+def test_scoped_note_create_does_not_relabel_business_value_toobig(seeded) -> None:
+    factory = AuthorityFactory()
+    authority, constraint = _scope(factory, seeded["first_id"])
+    with seeded["session_factory"]() as session:
+        notes = _bind(seeded["notes"], session, factory, authority, constraint)
+        before_count = session.scalar(select(func.count()).select_from(InterviewNote))
+        raw_connection = session.connection().connection.driver_connection
+        previous_limit = raw_connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 10_000)
+        try:
+            with pytest.raises(DataError) as raised:
+                notes.create_note_scoped(
+                    constraint,
+                    NoteCreate(
+                        application_id=seeded["first_id"],
+                        application_event_id=seeded["first_event_id"],
+                        company="x" * 20_000,
+                    ),
+                )
+        finally:
+            raw_connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, previous_limit)
+
+        assert raised.value.orig.sqlite_errorcode == sqlite3.SQLITE_TOOBIG
+        assert raised.value.orig.sqlite_errorname == "SQLITE_TOOBIG"
+        assert session.scalar(select(func.count()).select_from(InterviewNote)) == before_count
+
+
+@pytest.mark.parametrize(
+    ("error_code", "error_name"),
+    (
+        (sqlite3.SQLITE_CONSTRAINT_NOTNULL, "SQLITE_CONSTRAINT_UNIQUE"),
+        (sqlite3.SQLITE_CONSTRAINT_UNIQUE, "SQLITE_CONSTRAINT_NOTNULL"),
+    ),
+)
+def test_scoped_note_duplicate_matcher_requires_exact_sqlite_code_and_name(
+    seeded,
+    error_code: int,
+    error_name: str,
+) -> None:
+    factory = AuthorityFactory()
+    authority, constraint = _scope(factory, seeded["first_id"])
+    with seeded["session_factory"]() as session:
+        notes = _bind(seeded["notes"], session, factory, authority, constraint)
+        orig = sqlite3.IntegrityError(
+            "unique constraint failed: interview_notes.application_event_id"
+        )
+        orig.sqlite_errorcode = error_code
+        orig.sqlite_errorname = error_name
+        forged = IntegrityError("INSERT", {}, orig)
+
+        with (
+            patch.object(session, "scalars", side_effect=forged),
+            pytest.raises(IntegrityError) as raised,
+        ):
+            notes.create_note_scoped(
+                constraint,
+                NoteCreate(
+                    application_id=seeded["first_id"],
+                    application_event_id=seeded["first_event_id"],
+                    company="A",
+                ),
+            )
+
+        assert raised.value is forged
+
+
+def test_scoped_note_duplicate_matcher_ignores_sqlite_error_text(seeded) -> None:
+    factory = AuthorityFactory()
+    authority, constraint = _scope(factory, seeded["first_id"])
+    with seeded["session_factory"]() as session:
+        notes = _bind(seeded["notes"], session, factory, authority, constraint)
+        orig = sqlite3.IntegrityError("driver-localized detail")
+        orig.sqlite_errorcode = sqlite3.SQLITE_CONSTRAINT_UNIQUE
+        orig.sqlite_errorname = "SQLITE_CONSTRAINT_UNIQUE"
+        error = IntegrityError("INSERT", {}, orig)
+
+        with (
+            patch.object(session, "scalars", side_effect=error),
+            pytest.raises(NoteBindingError) as raised,
+        ):
+            notes.create_note_scoped(
+                constraint,
+                NoteCreate(
+                    application_id=seeded["first_id"],
+                    application_event_id=seeded["first_event_id"],
+                    company="A",
+                ),
+            )
+
+        assert raised.value.status_code == 409
+        assert str(raised.value) == "Interview event already has a note"
+
+
+def test_scoped_note_duplicate_matcher_requires_sqlite_dbapi_type(seeded) -> None:
+    factory = AuthorityFactory()
+    authority, constraint = _scope(factory, seeded["first_id"])
+    with seeded["session_factory"]() as session:
+        notes = _bind(seeded["notes"], session, factory, authority, constraint)
+        orig = Exception("driver-localized detail")
+        orig.sqlite_errorcode = sqlite3.SQLITE_CONSTRAINT_UNIQUE  # type: ignore[attr-defined]
+        orig.sqlite_errorname = "SQLITE_CONSTRAINT_UNIQUE"  # type: ignore[attr-defined]
+        forged = IntegrityError("INSERT", {}, orig)
+
+        with (
+            patch.object(session, "scalars", side_effect=forged),
+            pytest.raises(IntegrityError) as raised,
+        ):
+            notes.create_note_scoped(
+                constraint,
+                NoteCreate(
+                    application_id=seeded["first_id"],
+                    application_event_id=seeded["first_event_id"],
+                    company="A",
+                ),
+            )
+
+        assert raised.value is forged
 
 
 def test_scoped_write_ports_have_no_unscoped_repository_or_orm_fallback() -> None:

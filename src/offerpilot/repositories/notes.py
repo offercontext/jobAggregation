@@ -11,7 +11,6 @@ from sqlalchemy import (
     case,
     delete,
     exists,
-    func,
     insert,
     literal,
     literal_column,
@@ -19,7 +18,7 @@ from sqlalchemy import (
     select,
     update,
 )
-from sqlalchemy.exc import DataError, IntegrityError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql import Select
 from sqlalchemy.sql.elements import ColumnElement
@@ -44,8 +43,7 @@ if TYPE_CHECKING:
     from offerpilot.repositories.session_binding import AuthorityFactoryProtocol
 
 
-_SQLITE_EVENT_SENTINEL_BLOB_SIZE = 2**31
-_SQLITE_TOOBIG_CODE = 18
+_SQLITE_CONSTRAINT_UNIQUE_CODE = 2067
 
 
 class NoteBindingError(ValueError):
@@ -166,20 +164,6 @@ class NotesRepository:
             raise NoteBindingError(422, "application_event_id requires an application")
 
         values = _note_create_values(data)
-        if data.application_event_id is not None:
-            values["application_event_id"] = case(
-                (
-                    _valid_interview_event(
-                        data.application_event_id,
-                        data.application_id,
-                    ),
-                    data.application_event_id,
-                ),
-                # SQLite's hard value-size ceiling is 2**31 - 1.  The invalid
-                # branch therefore raises the dedicated SQLITE_TOOBIG sentinel
-                # before an application_event_id can be inserted.
-                else_=func.zeroblob(literal(_SQLITE_EVENT_SENTINEL_BLOB_SIZE)),
-            )
         if constraint.mode == "restricted":
             allowed_id = _restricted_scope_id(constraint)
             if data.application_id is not None and data.application_id != allowed_id:
@@ -195,6 +179,31 @@ class NotesRepository:
                 Application.id == allowed_id,
                 Application.deleted_at.is_(None),
             )
+            if data.application_event_id is not None:
+                source = source.where(
+                    _valid_interview_event(
+                        data.application_event_id,
+                        data.application_id,
+                    )
+                )
+            statement = (
+                insert(InterviewNote)
+                .from_select(columns, source)
+                .returning(InterviewNote)
+            )
+        elif data.application_event_id is not None:
+            columns = tuple(values)
+            source = select(
+                *(
+                    value if isinstance(value, ColumnElement) else literal(value)
+                    for value in values.values()
+                )
+            ).where(
+                _valid_interview_event(
+                    data.application_event_id,
+                    data.application_id,
+                )
+            )
             statement = (
                 insert(InterviewNote)
                 .from_select(columns, source)
@@ -209,11 +218,16 @@ class NotesRepository:
         try:
             with binding.session.no_autoflush:
                 rows = list(binding.session.scalars(statement))
-        except DataError as exc:
-            _raise_scoped_note_event_sentinel(exc, event_id=data.application_event_id)
         except IntegrityError as exc:
             _raise_scoped_note_integrity(exc, event_id=data.application_event_id)
         if len(rows) != 1:
+            if constraint.mode == "restricted" or len(rows) > 1:
+                raise ScopeAccessDenied("application scope denied")
+            if data.application_event_id is not None:
+                raise NoteBindingError(
+                    422,
+                    "application_event_id must reference an interview event for the application",
+                )
             raise ScopeAccessDenied("application scope denied")
         return rows[0]
 
@@ -640,34 +654,13 @@ def _raise_scoped_note_integrity(
     *,
     event_id: int | None,
 ) -> NoReturn:
-    detail = str(exc.orig).casefold()
-    error_name = getattr(exc.orig, "sqlite_errorname", None)
-    is_sqlite_integrity = isinstance(exc.orig, sqlite3.IntegrityError)
-    if event_id is not None and (
-        is_sqlite_integrity
-        and error_name == "SQLITE_CONSTRAINT_UNIQUE"
-        and detail
-        == "unique constraint failed: interview_notes.application_event_id"
-    ):
-        raise NoteBindingError(409, "Interview event already has a note") from exc
-    raise exc
-
-
-def _raise_scoped_note_event_sentinel(
-    exc: DataError,
-    *,
-    event_id: int | None,
-) -> NoReturn:
     orig = exc.orig
     if (
         event_id is not None
-        and isinstance(orig, sqlite3.DataError)
-        and getattr(orig, "sqlite_errorcode", None) == _SQLITE_TOOBIG_CODE
-        and getattr(orig, "sqlite_errorname", None) == "SQLITE_TOOBIG"
-        and str(orig).casefold() == "string or blob too big"
+        and isinstance(orig, sqlite3.IntegrityError)
+        and getattr(orig, "sqlite_errorcode", None)
+        == _SQLITE_CONSTRAINT_UNIQUE_CODE
+        and getattr(orig, "sqlite_errorname", None) == "SQLITE_CONSTRAINT_UNIQUE"
     ):
-        raise NoteBindingError(
-            422,
-            "application_event_id must reference an interview event for the application",
-        ) from exc
+        raise NoteBindingError(409, "Interview event already has a note") from exc
     raise exc

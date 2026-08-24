@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Any, Optional
 from builtins import list as BuiltinList
 
 from sqlalchemy import and_, case, exists, select, update
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from offerpilot.application_status import (
@@ -238,30 +237,47 @@ class ApplicationsRepository:
         normalized_reason = closed_reason.strip() if normalized_status == "closed" else ""
 
         now = datetime.now(timezone.utc)
-        values: dict[str, object] = {
-            "status": normalized_status,
-            "closed_reason": (
-                normalized_reason
-                if normalized_status != "closed" or normalized_reason
-                else Application.closed_reason
-            ),
-            "updated_at": now,
-        }
+        transition_allowed = None
+        transition_error = ""
         if normalized_status != "closed":
-            values["company_name"] = case(
-                (Application.status == "closed", None),
-                else_=Application.company_name,
-            )
+            transition_allowed = Application.status != "closed"
+            transition_error = "closed application cannot be reopened"
         elif not normalized_reason:
-            values["company_name"] = case(
-                (Application.closed_reason == "", None),
-                else_=Application.company_name,
+            transition_allowed = and_(
+                Application.status == "closed",
+                Application.closed_reason != "",
             )
+            transition_error = "closed_reason is required when closing an application"
+
+        desired_reason: object
+        if normalized_status != "closed":
+            desired_reason = ""
+        elif normalized_reason:
+            desired_reason = normalized_reason
+        else:
+            desired_reason = Application.closed_reason
+
+        def guarded_value(column: object, value: object) -> object:
+            if transition_allowed is None:
+                return value
+            return case(
+                (transition_allowed, value),
+                else_=column,
+            )
+
+        values: dict[str, object] = {
+            "status": guarded_value(Application.status, normalized_status),
+            "closed_reason": guarded_value(Application.closed_reason, desired_reason),
+            "updated_at": guarded_value(Application.updated_at, now),
+        }
         timestamp_attr = FIRST_STATUS_TIMESTAMP_ATTR[normalized_status]
         timestamp_column = getattr(Application, timestamp_attr)
-        values[timestamp_attr] = case(
-            (timestamp_column.is_(None), now),
-            else_=timestamp_column,
+        desired_timestamp = case(
+            (timestamp_column.is_(None), now), else_=timestamp_column
+        )
+        values[timestamp_attr] = guarded_value(
+            timestamp_column,
+            desired_timestamp,
         )
         statement = (
             update(Application)
@@ -271,25 +287,28 @@ class ApplicationsRepository:
         if constraint.mode == "restricted":
             allowed_id = _restricted_scope_id(constraint)
             statement = statement.where(Application.id == allowed_id)
-        statement = statement.values(**values).returning(Application)
-        try:
-            with binding.session.no_autoflush:
-                rows = list(
-                    binding.session.scalars(
-                        statement.execution_options(populate_existing=True)
-                    )
+        statement = statement.values(**values).returning(
+            Application,
+            (
+                transition_allowed
+                if transition_allowed is not None
+                else Application.id.is_not(None)
+            ).label("transition_allowed"),
+        )
+        with binding.session.no_autoflush:
+            rows = list(
+                binding.session.execute(
+                    statement.execution_options(populate_existing=True)
                 )
-        except IntegrityError as exc:
-            if normalized_status != "closed":
-                raise ValueError("closed application cannot be reopened") from exc
-            raise ValueError(
-                "closed_reason is required when closing an application"
-            ) from exc
+            )
         if len(rows) != 1:
             if constraint.mode == "restricted" or len(rows) > 1:
                 raise ScopeAccessDenied("application scope denied")
             return None
-        return _normalize_model_status(rows[0])
+        app, allowed = rows[0]
+        if not allowed:
+            raise ValueError(transition_error)
+        return _normalize_model_status(app)
 
     def delete(self, app_id: int) -> None:
         with repository_session(self._session_factory, self._session) as session:

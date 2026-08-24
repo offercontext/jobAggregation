@@ -7,7 +7,8 @@ import textwrap
 from unittest.mock import patch
 
 import pytest
-from sqlalchemy import event, func, select
+from sqlalchemy import event, func, select, text
+from sqlalchemy.exc import IntegrityError
 
 from offerpilot.ai.tool_authority import (
     ApplicationScopeConstraint,
@@ -17,7 +18,7 @@ from offerpilot.ai.tool_authority import (
     TrustedContextScope,
 )
 from offerpilot.db import init_database
-from offerpilot.models import ApplicationEvent, InterviewNote, Offer
+from offerpilot.models import Application, ApplicationEvent, InterviewNote, Offer
 from offerpilot.repositories.application_events import (
     ApplicationEventCreate,
     ApplicationEventsRepository,
@@ -422,6 +423,40 @@ def test_scoped_application_status_preserves_closed_and_first_timestamp_predicat
         assert current.closed_reason == "position filled"
 
 
+def test_scoped_application_status_does_not_relabel_unrelated_integrity_error(
+    seeded,
+) -> None:
+    factory = AuthorityFactory()
+    authority, constraint = _scope(factory, seeded["first_id"])
+    with seeded["session_factory"]() as session:
+        applications = _bind(
+            seeded["applications"], session, factory, authority, constraint
+        )
+        session.execute(
+            text(
+                """
+                CREATE TRIGGER unrelated_application_integrity
+                BEFORE UPDATE ON applications
+                BEGIN
+                    SELECT RAISE(ABORT, 'unrelated application integrity failure');
+                END
+                """
+            )
+        )
+        session.commit()
+
+        with pytest.raises(IntegrityError) as raised:
+            applications.update_application_status_scoped(
+                constraint, seeded["first_id"], "interview", ""
+            )
+
+        assert "unrelated application integrity failure" in str(raised.value.orig)
+        session.rollback()
+        current = session.get(Application, seeded["first_id"])
+        assert current is not None
+        assert current.status == "applied"
+
+
 @pytest.mark.parametrize(
     ("repository_key", "method_name", "args_key", "model", "field"),
     (
@@ -737,6 +772,62 @@ def test_scoped_note_write_preserves_stable_binding_domain_failures(seeded) -> N
             )
         assert reparent.value.status_code == 422
         session.rollback()
+
+
+@pytest.mark.parametrize("operation", ("insert", "update"))
+def test_scoped_note_write_does_not_relabel_unrelated_integrity_error(
+    seeded,
+    operation: str,
+) -> None:
+    factory = AuthorityFactory()
+    authority, constraint = _scope(factory, seeded["first_id"])
+    with seeded["session_factory"]() as session:
+        notes = _bind(seeded["notes"], session, factory, authority, constraint)
+        before_count = session.scalar(select(func.count()).select_from(InterviewNote))
+        trigger_detail = (
+            "unique constraint failed: interview_notes.application_event_id"
+            if operation == "insert"
+            else "not null constraint failed: interview_notes.company"
+        )
+        session.execute(
+            text(
+                f"""
+                CREATE TRIGGER unrelated_note_{operation}_integrity
+                BEFORE {operation.upper()} ON interview_notes
+                BEGIN
+                    SELECT RAISE(ABORT, '{trigger_detail}');
+                END
+                """
+            )
+        )
+        session.commit()
+
+        with pytest.raises(IntegrityError) as raised:
+            if operation == "insert":
+                notes.create_note_scoped(
+                    constraint,
+                    NoteCreate(
+                        application_id=seeded["first_id"],
+                        application_event_id=seeded["first_event_id"],
+                        company="A",
+                    ),
+                )
+            else:
+                notes.update_note_scoped(
+                    constraint,
+                    seeded["first_note_id"],
+                    NoteUpdate(
+                        application_event_id=seeded["first_event_id"],
+                        company="A",
+                    ),
+                )
+
+        assert trigger_detail in str(raised.value.orig).casefold()
+        session.rollback()
+        assert session.scalar(select(func.count()).select_from(InterviewNote)) == before_count
+        current = session.get(InterviewNote, seeded["first_note_id"])
+        assert current is not None
+        assert current.application_event_id is None
 
 
 def test_scoped_write_ports_have_no_unscoped_repository_or_orm_fallback() -> None:

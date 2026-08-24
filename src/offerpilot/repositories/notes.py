@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import sqlite3
 from typing import TYPE_CHECKING, Any, NoReturn, Optional, cast
 
 from builtins import list as BuiltinList
@@ -567,15 +568,25 @@ def _raise_scoped_note_integrity(
     application_change: bool = False,
 ) -> NoReturn:
     detail = str(exc.orig).casefold()
+    error_name = getattr(exc.orig, "sqlite_errorname", None)
+    is_sqlite_integrity = isinstance(exc.orig, sqlite3.IntegrityError)
     if event_id is not None and (
-        "unique" in detail or "uq_interview_notes_event_main" in detail
+        is_sqlite_integrity
+        and error_name == "SQLITE_CONSTRAINT_UNIQUE"
+        and detail
+        == "unique constraint failed: interview_notes.application_event_id"
     ):
         raise NoteBindingError(409, "Interview event already has a note") from exc
-    if event_id is not None:
+    company_sentinel_failed = (
+        is_sqlite_integrity
+        and error_name == "SQLITE_CONSTRAINT_NOTNULL"
+        and detail == "not null constraint failed: interview_notes.company"
+    )
+    if event_id is not None and company_sentinel_failed:
         raise NoteBindingError(
             422,
             "application_event_id must reference an interview event for the application",
         ) from exc
-    if application_change:
+    if application_change and company_sentinel_failed:
         raise NoteBindingError(422, "application_id cannot be changed") from exc
     raise exc

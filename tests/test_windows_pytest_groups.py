@@ -117,3 +117,44 @@ def test_pytest_group_aggregate_accepts_windows_backslash_manifest_node_ids(tmp_
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "coverage matches 5 tests" in result.stdout
+
+
+def test_pytest_group_aggregate_treats_parameter_node_ids_as_case_sensitive(
+    tmp_path: Path,
+) -> None:
+    _write_group_results(tmp_path)
+    lower = "tests/test_misc.py::test_misc[1e-7]"
+    upper = "tests/test_misc.py::test_misc[1E-7]"
+    collect_path = tmp_path / "misc.collect.txt"
+    junit_path = tmp_path / "misc.junit.xml"
+    collect_path.write_text(f"{lower}\n{upper}\n", encoding="utf-8")
+    junit_path.write_text(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+        "<testsuites><testsuite name=\"misc\" tests=\"2\" failures=\"0\" "
+        "errors=\"0\" skipped=\"0\">"
+        "<testcase classname=\"tests.test_misc\" name=\"test_misc[1e-7]\"/>"
+        "<testcase classname=\"tests.test_misc\" name=\"test_misc[1E-7]\"/>"
+        "</testsuite></testsuites>",
+        encoding="utf-8",
+    )
+    marker_path = tmp_path / "misc.complete.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker.update(
+        {
+            "collected_count": 2,
+            "test_count": 2,
+            "collect_sha256": hashlib.sha256(collect_path.read_bytes()).hexdigest(),
+            "junit_sha256": hashlib.sha256(junit_path.read_bytes()).hexdigest(),
+        }
+    )
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    manifest_path = tmp_path / "full-manifest.txt"
+    manifest = manifest_path.read_text(encoding="utf-8").replace(
+        "tests/test_misc.py::test_misc", f"{lower}\n{upper}"
+    )
+    manifest_path.write_text(manifest, encoding="utf-8")
+
+    result = _aggregate(tmp_path)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "coverage matches 6 tests" in result.stdout

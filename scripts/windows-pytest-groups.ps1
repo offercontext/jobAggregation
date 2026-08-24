@@ -106,7 +106,7 @@ function Invoke-Group([string]$Name, [string[]]$Files) {
     $collectExit = $LASTEXITCODE
     if ($collectExit -ne 0) { throw "$Name collection failed with exit code $collectExit" }
     $nodes = @(Get-NodeIds $collectOutput)
-    $duplicates = @($nodes | Group-Object | Where-Object Count -gt 1)
+    $duplicates = @($nodes | Group-Object -CaseSensitive | Where-Object Count -gt 1)
     if ($duplicates.Count -gt 0) { throw "$Name collection contains duplicate node ids: $($duplicates.Name -join ', ')" }
     if ($nodes.Count -eq 0) { throw "$Name collection returned no tests" }
 
@@ -142,7 +142,9 @@ function Invoke-Aggregate {
     $manifestPath = Join-Path $ResultDir 'full-manifest.txt'
     if (-not (Test-Path -LiteralPath $manifestPath)) { throw 'full-manifest.txt is missing' }
     $manifest = @(Get-NodeIds (Get-Content -LiteralPath $manifestPath -Encoding utf8))
-    $manifestDuplicates = @($manifest | Group-Object | Where-Object Count -gt 1)
+    $manifestDuplicates = @(
+        $manifest | Group-Object -CaseSensitive | Where-Object Count -gt 1
+    )
     if ($manifestDuplicates.Count -gt 0) { throw 'full manifest contains duplicate node ids' }
     $all = [System.Collections.Generic.List[string]]::new()
     foreach ($name in @('agent', 'domain', 'knowledge', 'proposals', 'misc')) {
@@ -163,7 +165,9 @@ function Invoke-Aggregate {
             throw "$name completion marker does not match persisted results"
         }
         $nodes = @(Get-NodeIds (Get-Content -LiteralPath $collectPath -Encoding utf8))
-        $duplicates = @($nodes | Group-Object | Where-Object Count -gt 1)
+        $duplicates = @(
+            $nodes | Group-Object -CaseSensitive | Where-Object Count -gt 1
+        )
         if ($duplicates.Count -gt 0) { throw "$name aggregate input contains duplicate node ids" }
         if ([int]$marker.collected_count -ne $nodes.Count) { throw "$name collected count mismatches marker" }
         $summary = Get-JunitSummary $junitPath
@@ -173,9 +177,11 @@ function Invoke-Aggregate {
         if ([int]$marker.skipped -ne $summary.skipped) { throw "$name skip count mismatches marker" }
         foreach ($node in $nodes) { $all.Add($node) }
     }
-    $duplicates = @($all | Group-Object | Where-Object Count -gt 1)
+    $duplicates = @($all | Group-Object -CaseSensitive | Where-Object Count -gt 1)
     if ($duplicates.Count -gt 0) { throw "pytest group coverage contains duplicate node ids: $($duplicates.Name -join ', ')" }
-    if ((@($manifest | Sort-Object) -join "`n") -ne (@($all | Sort-Object) -join "`n")) {
+    $sortedManifest = @($manifest | Sort-Object -CaseSensitive) -join "`n"
+    $sortedGroups = @($all | Sort-Object -CaseSensitive) -join "`n"
+    if (-not [string]::Equals($sortedManifest, $sortedGroups, [StringComparison]::Ordinal)) {
         throw 'pytest group coverage differs from full manifest'
     }
     Write-Host "All pytest groups passed; coverage matches $($manifest.Count) tests."

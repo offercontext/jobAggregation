@@ -17,7 +17,7 @@ from offerpilot.ai.tool_runtime.contracts import (
 from offerpilot.ai.types import Message
 
 if TYPE_CHECKING:
-    from offerpilot.ai.agent_loop import AgentLoopInvocation
+    from offerpilot.ai.agent_loop import AgentLoopInvocation, ApprovedContinuationSegment
     from offerpilot.ai.tool_authority import PendingAuthorityClaim
 
 
@@ -316,7 +316,7 @@ class ApprovedWriteContinuation(Protocol):
         record: ToolExecutionRecord[Any, Any],
     ) -> None: ...
 
-    def load_continuation_messages(self) -> tuple[Message, ...]: ...
+    def activate_continuation_segment(self) -> "ApprovedContinuationSegment": ...
 
     def delivery_fence(self) -> bool: ...
 

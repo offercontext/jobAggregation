@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import inspect
 import json
-from copy import copy
 from hashlib import sha256
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from math import isfinite
+from threading import RLock
 from types import SimpleNamespace
 from typing import Any, Protocol, TypeAlias, cast
 from threading import Lock
@@ -34,6 +35,7 @@ from offerpilot.ai.agent_contracts import (
 )
 from offerpilot.ai.agent_loop import (
     AgentLoopInvocation,
+    ApprovedContinuationSegment,
     ApprovedWriteSeed,
     NewTurnSeed,
     SegmentSurfaceGate,
@@ -41,13 +43,20 @@ from offerpilot.ai.agent_loop import (
 from offerpilot.ai.tool_authority import PendingAuthorityClaim
 from offerpilot.ai.tool_authority.contracts import SegmentExecutionAuthority
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
-from offerpilot.ai.tool_runtime.contracts import ToolFailure, ToolSuccess
+from offerpilot.ai.tool_runtime.contracts import (
+    ToolFailure,
+    ToolSuccess,
+    TransientToolRuntimeValue,
+)
 from offerpilot.ai.tool_runtime.legacy import LEGACY_DETERMINISTIC_NAMES
 from offerpilot.ai.tool_runtime.journal import journal_shape_digest
 from offerpilot.ai.tool_specs.catalog import editable_fields_for_tool
 from offerpilot.ai.types import Message, ToolCall
+from offerpilot.ai.pending_replay import PendingReplayArgsDecoderV1, PendingReplayIntegrityError
 from offerpilot.ai.write_operations import (
     LedgerOperationPreheader,
+    OperationCommitted,
+    OperationFailed,
     OperationReplay,
     WriteOperationError,
 )
@@ -68,6 +77,7 @@ from offerpilot.repositories.agent_runs import StartRunCommand, StartSegmentComm
 
 from .contracts import (
     AgentExecutionHost,
+    AssistantDeltaEvent,
     AssistantMessageEvent,
     ConfirmationRequiredOutcome,
     ConfirmationRequest,
@@ -144,6 +154,35 @@ class RouteKind(str, Enum):
     DETERMINISTIC = "deterministic"
 
 
+class _ContinuationActivationRequest(TransientToolRuntimeValue):
+    """Request-free marker for the post-terminal Segment boundary.
+
+    Approval credentials and client-edited fields must never cross the
+    one-shot activation port.  The fresh Segment only needs the canonical
+    Conversation identity; its scope, Source and policy are reloaded from
+    persistence after delivery ownership is established.
+    """
+
+    __slots__ = ("_conversation_id",)
+
+    def __init__(self, conversation_id: int) -> None:
+        if type(conversation_id) is not int or conversation_id <= 0:
+            raise TypeError("continuation activation conversation_id must be positive int")
+        object.__setattr__(self, "_conversation_id", conversation_id)
+
+    @property
+    def conversation_id(self) -> int:
+        return cast(int, object.__getattribute__(self, "_conversation_id"))
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise TypeError("continuation activation marker is immutable")
+
+    def __repr__(self) -> str:
+        return "<_ContinuationActivationRequest transient>"
+
+_RuntimeRequest: TypeAlias = StartTurnRequest | _ContinuationActivationRequest
+
+
 class ConversationGateway(Protocol):
     def create(self, request: StartTurnRequest) -> object: ...
 
@@ -152,10 +191,6 @@ class ConversationGateway(Protocol):
 
 class RouteSelector(Protocol):
     def select(self, request: StartTurnRequest, conversation: object) -> object: ...
-
-
-class ModelResolver(Protocol):
-    def resolve(self, request: StartTurnRequest, conversation: object) -> object: ...
 
 
 class PolicyCatalogResolver(Protocol):
@@ -313,14 +348,11 @@ class JournalFactory(Protocol):
 class ResolvedModel:
     """Frozen invocation view returned by a model resolver.
 
-    The model resolver owns provider/configuration details.  New-turn
-    composition supplies the authority-bound Catalog and Context separately;
-    ``catalog`` remains as a narrow legacy confirmation bridge until that
-    path is migrated, but is never read by the new-turn agent invocation.
+    The resolver owns provider/configuration details.  Each runtime Segment
+    supplies its authority-bound Catalog and Context separately.
     """
 
     model: ChatModel | None
-    catalog: object | None = None
     config: object | None = None
     auto_approve: bool = False
     max_iter: int = DEFAULT_MAX_ITERATIONS
@@ -433,6 +465,22 @@ class _PreparedExecutionCell:
         self.execution_owner: object | None = None
 
 
+class _PreparedConfirmationCell:
+    """Execution-only holder for a deferred approval session.
+
+    The response-header preparation state must not retain a live Conversation
+    or Approval authority.  The transport execution phase fills this cell
+    after it has reloaded the canonical Conversation and called
+    ``approve_modify``.
+    """
+
+    __slots__ = ("session", "conversation")
+
+    def __init__(self) -> None:
+        self.session: ConfirmationSession | None = None
+        self.conversation: object | None = None
+
+
 class _PreparedModelLease:
     """Independent once-only release gate for a prepared provider token."""
 
@@ -480,7 +528,12 @@ class _PreparedStreamState:
     events: tuple[RuntimeEvent, ...] = field(default=(), repr=False, compare=False)
     outcome: RuntimeOutcome | None = field(default=None, repr=False, compare=False)
     confirmation_session: object | None = field(default=None, repr=False, compare=False)
-    confirmation_model: ResolvedModel | None = field(default=None, repr=False, compare=False)
+    confirmation_pending: PendingAction | None = field(default=None, repr=False, compare=False)
+    confirmation_cell: _PreparedConfirmationCell = field(
+        default_factory=_PreparedConfirmationCell,
+        repr=False,
+        compare=False,
+    )
     on_abort: Callable[[], object] | None = field(default=None, repr=False, compare=False)
     on_complete: Callable[[CompletionReason], object] | None = field(
         default=None,
@@ -522,7 +575,6 @@ class RuntimeDependencies:
 
     conversations: ConversationGateway | None = None
     persistence: RuntimePersistence | None = None
-    model_resolver: ModelResolver | None = None
     policy_catalog_resolver: PolicyCatalogResolver | None = None
     segment_context_resolver: SegmentContextResolver | None = None
     surface_gate_resolver: SegmentSurfaceGateResolver | None = None
@@ -635,6 +687,71 @@ class _ConfirmationEventSink:
                 self._deferred.append(event)
             return
         emit_runtime_event(self._sink, event)
+
+
+class _NegotiatedConfirmationEventSink:
+    """Emit confirmation stream metadata from the activated Segment model.
+
+    A live approval cannot resolve its continuation model until the origin
+    write is terminal and owns delivery.  Buffer the small pre-activation
+    event prefix, then publish ``MetaEvent`` first with the fresh model's
+    actual streaming capability.  This keeps transport negotiation truthful
+    without resolving Source/model before the approved executor runs.
+    """
+
+    __slots__ = (
+        "_buffered",
+        "_deferred",
+        "_negotiated",
+        "_origin_tool_call_id",
+        "_sink",
+        "_lock",
+    )
+
+    def __init__(
+        self,
+        sink: RuntimeEventSink,
+        origin_tool_call_id: str,
+        deferred: list[RuntimeEvent],
+    ) -> None:
+        self._sink = sink
+        self._origin_tool_call_id = origin_tool_call_id
+        self._deferred = deferred
+        self._buffered: list[RuntimeEvent] = []
+        self._negotiated = False
+        self._lock = RLock()
+
+    def emit(self, event: RuntimeEvent) -> None:
+        with self._lock:
+            if isinstance(event, ToolResultEvent) and event.tool_call_id == self._origin_tool_call_id:
+                if event not in self._deferred:
+                    self._deferred.append(event)
+                return
+            if not self._negotiated:
+                self._buffered.append(event)
+                return
+            emit_runtime_event(self._sink, event)
+
+    def negotiate(self, model: object | None = None) -> None:
+        with self._lock:
+            if self._negotiated:
+                return
+            supports_delta = callable(getattr(model, "stream_complete", None)) or any(
+                isinstance(event, AssistantDeltaEvent) for event in self._buffered
+            )
+            buffered = tuple(self._buffered)
+            self._buffered.clear()
+            self._negotiated = True
+            emit_runtime_event(
+                self._sink,
+                MetaEvent(supports_delta=supports_delta),
+            )
+            emit_runtime_event(
+                self._sink,
+                StatusEvent(phase="tool_running", label="正在执行确认操作"),
+            )
+            for event in buffered:
+                emit_runtime_event(self._sink, event)
 
 
 def _callable(target: object | None, names: tuple[str, ...]) -> Callable[..., object] | None:
@@ -969,6 +1086,27 @@ def _tool_call(value: object) -> ToolCall:
         str(_attribute(value, "name", "") or ""),
         str(_attribute(value, "args", "") or ""),
     )
+
+
+def _canonical_tool_args(value: object) -> str | None:
+    """Return canonical persisted proposal bytes for history identity checks."""
+
+    if type(value) is not str:
+        return None
+    try:
+        decoded = PendingReplayArgsDecoderV1().decode(value)
+    except PendingReplayIntegrityError:
+        return None
+    try:
+        return json.dumps(
+            decoded,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 def _pending(value: object) -> PendingAction | None:
@@ -2330,7 +2468,7 @@ class PilotRuntime:
                 transport=resolved_transport,
                 replay_preheader=route_preheader,
             )
-        conversation = self._load_confirmation_conversation(request)
+        conversation = self._load_confirmation_conversation(request.conversation_id)
         if conversation is None:
             self._mark_completed_if_active(control)
             return self._failure(
@@ -2468,46 +2606,10 @@ class PilotRuntime:
             and str(_attribute(operation, "tool_name", "") or "") in LEGACY_DETERMINISTIC_NAMES
         )
 
-    @staticmethod
-    def _bind_confirmation_context(
-        raw_context: object | None,
-        session: ConfirmationSession,
-        recorder: object,
-    ) -> object:
-        """Bind the live Ledger executor to the existing tool context.
-
-        ``execute_prepared`` deliberately chooses ``context.operation_executor``
-        before it can ever call a provider executor.  A confirmation resume
-        therefore cannot pass the resolver's context through unchanged: doing
-        so silently bypasses ``WriteOperationCoordinator`` whenever the
-        resolver supplied a context without an executor.  The concrete
-        production context creates a sealed runtime clone that retains the
-        exact authority factory and scope constraint; small adapters used by
-        transport tests must explicitly support the two attributes or fail
-        closed.
-        """
-
-        if isinstance(raw_context, ToolExecutionContext):
-            return raw_context.with_runtime_dependencies(
-                run_recorder=cast(Any, recorder),
-                operation_executor=session.execute_operation,
-            )
-        if raw_context is None:
-            raise TypeError("confirmation tool context is required")
-        try:
-            candidate = copy(raw_context)
-            setattr(candidate, "run_recorder", recorder)
-            setattr(candidate, "operation_executor", session.execute_operation)
-        except (AttributeError, TypeError) as exc:
-            raise TypeError("confirmation tool context cannot be bound") from exc
-        if not callable(getattr(candidate, "operation_executor", None)):
-            raise TypeError("confirmation tool context is missing operation executor")
-        return candidate
-
     def _open_ledger_journal(
         self,
         session: ConfirmationSession,
-        conversation: object,
+        conversation: object | None,
         transport: RuntimeTransportContext,
         control: RuntimeInvocationControl,
         *,
@@ -2527,28 +2629,6 @@ class PilotRuntime:
             raise
         except Exception:
             recorder, started = _NoopRecorder(), False
-        if started and session.state.approved:
-            try:
-                persistence = self._require_dependency("persistence")
-                self._capture_confirmation_journal_context(
-                    recorder,
-                    started,
-                    conversation,
-                    session.state.identity.conversation_id,
-                    persistence,
-                    control,
-                    tool_names=tool_names or (session.state.pending.tool_name,),
-                )
-            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
-                self._abandon(recorder, started)
-                raise
-            except Exception:
-                # Journal is explicitly fail-open.  Product persistence and
-                # Ledger ownership remain authoritative when a diagnostic
-                # snapshot cannot be captured.
-                self._abandon(recorder, started)
-                recorder, started = _NoopRecorder(), False
-
         base_attempt = session.on_confirmation_attempt
         base_result = session.on_confirmation_result
         attempt_id = str(uuid4())
@@ -2606,20 +2686,46 @@ class PilotRuntime:
             if approval_event is not None
             else None
         )
+        resume_recorded = False
+        bound_recording_failed = False
 
         def record_decision(bound_session: object | None) -> None:
+            nonlocal bound_recording_failed, resume_recorded
             with session.state.lock:
                 if session.state.approval_decided_recorded:
                     return
                 session.state.approval_decided_recorded = True
             if not started or approval_event is None:
                 return
-            append_bound = getattr(recorder, "append_prepared_event_bound", None)
-            if bound_session is not None and approval_draft is not None and callable(append_bound):
-                try:
-                    append_bound(bound_session, approval_draft)
-                except Exception:
-                    pass
+            if bound_session is not None:
+                if approval_draft is None:
+                    # A bounded callback must never fall back to an owned
+                    # Journal transaction while the Ledger holds BEGIN
+                    # IMMEDIATE.  Missing draft means the recorder is already
+                    # degraded; latch the local hook and let the Ledger
+                    # transaction continue without a second connection.
+                    resume_recorded = True
+                    return
+                record_bound = getattr(recorder, "record_approval_and_resume_bound", None)
+                if not callable(record_bound):
+                    raise WriteOperationError("operation_not_committed", retryable=True)
+                recorded = record_bound(
+                    bound_session,
+                    approval_draft,
+                    ResumedDisposition(
+                        confirmation_attempt_id=attempt_id,
+                        tool_call_id=session.state.pending.tool_call_id,
+                    ),
+                )
+                if type(recorded) is not bool:
+                    raise WriteOperationError("operation_not_committed", retryable=True)
+                # SafeRunRecorder returns False after a bounded ordinary
+                # Journal failure.  The Ledger transaction must remain
+                # usable (the recorder is degraded and recovery owns the
+                # projection); only a missing/malformed bound port is a
+                # programming-contract failure.
+                bound_recording_failed = not recorded
+                resume_recorded = recorded
                 return
             self._journal_call(
                 recorder,
@@ -2627,23 +2733,48 @@ class PilotRuntime:
                 approval_event,
                 control=control,
             )
+            # Without a caller-owned Ledger session this callback only
+            # records the decision.  Approved execution resumes after the
+            # terminal callback; the bound path above performs both pieces
+            # atomically before the executor.
 
-        resume_recorded = False
-
-        def resume_decision() -> None:
+        def resume_decision(bound_session: object | None = None) -> None:
             nonlocal resume_recorded
             if resume_recorded or not session.state.approval_decided_recorded:
                 return
-            resume_recorded = True
+            command = ResumedDisposition(
+                confirmation_attempt_id=attempt_id,
+                tool_call_id=session.state.pending.tool_call_id,
+            )
+            if bound_session is not None:
+                resume_bound = getattr(recorder, "resume_bound", None)
+                if not callable(resume_bound):
+                    raise WriteOperationError("operation_not_committed", retryable=True)
+                resumed = resume_bound(
+                    bound_session,
+                    command,
+                )
+                if type(resumed) is not bool:
+                    raise WriteOperationError("operation_not_committed", retryable=True)
+                resume_recorded = True
+                return
+            if bound_recording_failed:
+                recover = getattr(recorder, "recover_approval_and_resume", None)
+                if callable(recover) and approval_draft is not None:
+                    recovered = recover(approval_draft, command)
+                    if type(recovered) is not bool:
+                        raise WriteOperationError("operation_not_committed", retryable=True)
+                # The product transaction is already terminal. Recovery is
+                # Journal-only and remains fail-open even if it cannot persist.
+                resume_recorded = True
+                return
             self._journal_call(
                 recorder,
                 "resume",
-                ResumedDisposition(
-                    confirmation_attempt_id=attempt_id,
-                    tool_call_id=session.state.pending.tool_call_id,
-                ),
+                command,
                 control=control,
             )
+            resume_recorded = True
 
         session.state.approval_decided_callback = record_decision
         session.state.approval_resume_callback = resume_decision
@@ -2696,11 +2827,25 @@ class PilotRuntime:
             # The production ``execute_prepared`` atom projects terminal
             # success/failure inside its Ledger transaction.  Re-projecting
             # it from this callback would create duplicate tool.completed or
-            # tool.failed journal rows.  Rejection has no tool terminal at
-            # all, and is represented only by approval.decided.
-            if not approved or (
+            # tool.failed journal rows. If the bounded Journal failed before
+            # tool.started, degraded recovery deliberately omits both sides
+            # rather than create an orphan completion. Rejection has no tool
+            # terminal at all, and is represented only by approval.decided.
+            terminal_persisted = (
                 _attribute(execution_record, "terminal_persisted") is True
-                and _attribute(execution_record, "journal_started_recorded") is True
+            )
+            journal_started_recorded = (
+                _attribute(execution_record, "journal_started_recorded") is True
+            )
+            if not approved or (
+                terminal_persisted
+                and (
+                    journal_started_recorded
+                    or (
+                        _attribute(recorder, "recording_status") == "degraded"
+                        and not journal_started_recorded
+                    )
+                )
             ):
                 return value
             succeeded = isinstance(_attribute(execution_record, "outcome"), ToolSuccess)
@@ -2988,7 +3133,7 @@ class PilotRuntime:
                 message=visible,
                 conversation_id=request.conversation_id,
                 write_status="cancelled",
-                undo=None,
+                undo=self._previous_write_undo(None, request.conversation_id),
                 operation_id=session.state.identity.operation_id,
                 persisted=True,
                 legacy_projection=True,
@@ -3037,7 +3182,7 @@ class PilotRuntime:
             message=visible,
             conversation_id=request.conversation_id,
             write_status="cancelled",
-            undo=None,
+            undo=self._previous_write_undo(None, request.conversation_id),
             operation_id=request.operation_id or session.state.identity.operation_id,
             persisted=True,
             legacy_projection=True,
@@ -3046,57 +3191,210 @@ class PilotRuntime:
         self._mark_completed_if_active(control)
         return outcome
 
-    def _confirmation_source_loader(
+    def _build_confirmation_segment(
         self,
-        conversation: object,
-        request: ConfirmationRequest,
-    ) -> Callable[[], Sequence[Message]]:
-        """Adapt the Runtime source/context atoms for one confirmation load."""
+        session: ConfirmationSession,
+        activation_request: _ContinuationActivationRequest,
+        recorder: object,
+        journal_started: bool,
+        control: RuntimeInvocationControl,
+        cancel_check: Callable[[], bool],
+    ) -> ApprovedContinuationSegment:
+        """Build the sole post-terminal Segment for an approved continuation.
 
-        source_adapter = self._dependencies.source_loader
-        assembler = self._dependencies.context_assembler
+        Every value below comes from a canonical Conversation reload after the
+        origin terminal acquired delivery ownership.  No object captured
+        before approval, approval Authority, or old source loader is reused.
+        """
 
-        def load() -> Sequence[Message]:
-            if source_adapter is None:
-                raise WriteOperationError("operation_unavailable")
-            function = _callable(
-                source_adapter, ("load", "load_sources", "load_chat_source_messages")
-            )
-            if function is None:
-                raise TypeError("source loader does not provide load")
-            source = _invoke(
-                function,
-                {
-                    "conversation": conversation,
-                    "request": request,
-                    "conversation_id": request.conversation_id,
-                    "attachments": (),
-                    "page_context": None,
-                },
-                (),
-            )
-            assembled = source
-            if assembler is not None:
-                assemble = _callable(assembler, ("assemble", "assemble_context", "build_messages"))
-                if assemble is None:
-                    raise TypeError("context assembler does not provide assemble")
-                assembled = _invoke(
-                    assemble,
-                    {
-                        "source": source,
-                        "sources": source,
-                        "conversation": conversation,
-                        "request": request,
-                        "conversation_id": request.conversation_id,
-                    },
-                    (source, conversation, request),
-                )
+        activation_id = activation_request.conversation_id
+
+        def require_activation_identity() -> None:
+            if activation_request.conversation_id != activation_id:
+                raise WriteOperationError("operation_integrity_error")
+
+        if not session.delivery_fence():
+            raise WriteOperationError("operation_delivery_unknown", retryable=True)
+        terminal = session.state.terminal_execution
+        execution_record = session.state.execution_record
+        if not isinstance(terminal, (OperationCommitted, OperationFailed)):
+            raise WriteOperationError("operation_delivery_unknown", retryable=True)
+        if terminal.operation_id != session.state.identity.operation_id:
+            raise WriteOperationError("operation_integrity_error")
+        if (
+            execution_record is None
+            or _attribute(execution_record, "terminal_persisted", False) is not True
+        ):
+            raise WriteOperationError("operation_delivery_unknown", retryable=True)
+        persisted_visible_result = _attribute(execution_record, "persisted_visible_result")
+        terminal_visible_result = _attribute(
+            _attribute(terminal, "payload"), "visible_result"
+        )
+        if (
+            type(persisted_visible_result) is not str
+            or type(terminal_visible_result) is not str
+            or persisted_visible_result != terminal_visible_result
+        ):
+            raise WriteOperationError("operation_integrity_error")
+        conversation = self._load_confirmation_conversation(activation_request.conversation_id)
+        require_activation_identity()
+        if (
+            conversation is None
+            or _conversation_id(conversation) != activation_request.conversation_id
+        ):
+            raise WriteOperationError("operation_unavailable")
+        if _is_archived(conversation):
+            raise WriteOperationError("operation_unavailable")
+        generation = _attribute(conversation, "updated_at")
+        if isinstance(generation, datetime):
+            with session.state.lock:
+                session.state.continuation_generation = generation
+        self._check_cancel(cancel_check, control)
+
+        source = self._load_source(
+            cast(Any, conversation),
+            activation_request,
+            pending_tool_call_id=session.state.pending.tool_call_id,
+        )
+        require_activation_identity()
+        recorder_proxy = _RuntimeRecorderProxy(recorder)
+        segment_value = self._resolve_segment_context(
+            activation_request, conversation, source, recorder_proxy
+        )
+        require_activation_identity()
+        if isinstance(segment_value, RuntimeFailureOutcome) or segment_value is None:
+            raise WriteOperationError("operation_unavailable")
+        segment = segment_value
+        try:
+            assembled = self._assemble_context(source, conversation, activation_request)
+            require_activation_identity()
             values = _attribute(assembled, "messages", _attribute(assembled, "history", assembled))
             if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
                 raise WriteOperationError("operation_unavailable")
-            return tuple(_message(item) for item in values)
-
-        return load
+            messages = tuple(_message(item) for item in values)
+            origin = session.state.origin_tool_message
+            if origin is None:
+                raise WriteOperationError("operation_delivery_unknown", retryable=True)
+            pending = session.state.pending
+            if origin.tool_call_id != pending.tool_call_id:
+                raise WriteOperationError("operation_integrity_error")
+            expected_args = _canonical_tool_args(pending.args)
+            proposal_matches: list[tuple[int, ToolCall, str | None]] = []
+            for index, raw_message in enumerate(values):
+                if str(_attribute(raw_message, "role", "") or "") != "assistant":
+                    continue
+                raw_calls = _attribute(raw_message, "tool_calls", ())
+                if not isinstance(raw_calls, Sequence) or isinstance(raw_calls, (str, bytes)):
+                    continue
+                for raw_call in raw_calls:
+                    call = _tool_call(raw_call)
+                    if call.id == pending.tool_call_id:
+                        proposal_matches.append(
+                            (
+                                index,
+                                call,
+                                _canonical_tool_args(_attribute(raw_call, "args", call.args)),
+                            )
+                        )
+            if (
+                expected_args is None
+                or len(proposal_matches) != 1
+                or proposal_matches[0][1].name != pending.tool_name
+                or proposal_matches[0][2] != expected_args
+            ):
+                raise WriteOperationError("operation_integrity_error")
+            origin_matches = tuple(
+                item
+                for item in messages
+                if item.role == "tool" and item.tool_call_id == origin.tool_call_id
+            )
+            origin_indices = tuple(
+                index
+                for index, item in enumerate(messages)
+                if item.role == "tool" and item.tool_call_id == origin.tool_call_id
+            )
+            if len(origin_matches) == 0:
+                # The normal delivery atom persists origin+continuation only
+                # after the origin terminal.  When this canonical reload races
+                # that atom, make the runtime-owned bundle complete from the
+                # authoritative terminal message exactly once.  The Agent
+                # Loop/Runner never repairs history itself.
+                messages = (*messages, origin)
+            elif len(origin_matches) != 1 or origin_matches[0] != origin:
+                raise WriteOperationError("operation_integrity_error")
+            elif proposal_matches[0][0] >= origin_indices[0]:
+                raise WriteOperationError("operation_integrity_error")
+            policy = self._resolve_policy_catalog(
+                activation_request, conversation, source, segment
+            )
+            require_activation_identity()
+            if isinstance(policy, RuntimeFailureOutcome):
+                raise WriteOperationError(str(policy.code.value))
+            segment = SegmentExecution(
+                authority=segment.authority,
+                context=segment.context,
+                catalog=policy.catalog,
+                close=segment.close,
+                surface_gate=segment.surface_gate,
+                policy=policy,
+            )
+            surface_gate = self._resolve_surface_gate(
+                activation_request, conversation, source, messages, policy, segment
+            )
+            require_activation_identity()
+            if isinstance(surface_gate, RuntimeFailureOutcome):
+                raise WriteOperationError(str(surface_gate.code.value))
+            segment = SegmentExecution(
+                authority=segment.authority,
+                context=segment.context,
+                catalog=segment.catalog,
+                close=segment.close,
+                surface_gate=surface_gate,
+                policy=policy,
+            )
+            resolved = self._resolve_continuation_model(
+                activation_request, conversation, policy
+            )
+            require_activation_identity()
+            if isinstance(resolved, RuntimeFailureOutcome):
+                raise WriteOperationError(str(resolved.code.value))
+            if resolved is None or resolved.model is None:
+                raise WriteOperationError("model_unconfigured")
+            model = resolved.model
+            persistence = self._require_dependency("persistence")
+            try:
+                self._capture_confirmation_journal_context(
+                    recorder,
+                    journal_started,
+                    conversation,
+                    activation_request.conversation_id,
+                    persistence,
+                    control,
+                    tool_names=(session.pending.tool_name,),
+                )
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                raise
+            except Exception:
+                # Journal is diagnostic and fail-open.  The Segment remains
+                # authoritative for Provider execution and delivery.
+                pass
+            bundle = ApprovedContinuationSegment(
+                messages=messages,
+                model=model,
+                catalog=cast(Any, segment.catalog),
+                tool_context=segment.context,
+                surface_gate=cast(Any, segment.surface_gate),
+                max_iterations=resolved.max_iter,
+            )
+            # Publish the close callback only after the complete immutable
+            # bundle has been constructed.  If any constructor/validation
+            # above fails, the outer candidate cleanup owns the sole close.
+            with session.state.lock:
+                session.state.continuation_segment_close = segment.close
+            return bundle
+        except BaseException:
+            self._safe_close_segment_candidate(segment)
+            raise
 
     def _continue_ledger_confirmation(
         self,
@@ -3178,51 +3476,13 @@ class PilotRuntime:
             self._mark_completed_if_active(control)
             return self._confirmation_failure(exc)
 
-        try:
-            conversation = self._load_confirmation_conversation(request)
-        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
-            raise
-        except Exception:
-            self._mark_completed_if_active(control)
-            return self._failure(
-                RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404
-            )
-        if conversation is None or _conversation_id(conversation) != request.conversation_id:
-            self._mark_completed_if_active(control)
-            return self._failure(
-                RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404
-            )
-        if _is_archived(conversation):
-            self._mark_completed_if_active(control)
-            return self._failure(
-                RuntimeFailureCode.CONVERSATION_ARCHIVED, "conversation is archived", 409
-            )
-
-        resolved_model: ResolvedModel | None = None
-        approval_context_resolver = getattr(
-            coordinator.dependencies, "approval_context_resolver", None
-        )
-        if approval_context_resolver is None and self._dependencies.model_resolver is not None:
-            # Compatibility-only injected coordinators do not own production
-            # approval authority composition.  Production always supplies the
-            # resolver and never enters this legacy test seam.
-            model_request = StartTurnRequest(
-                message="继续处理已确认的操作",
-                conversation_id=request.conversation_id,
-            )
-            resolved = self._resolve_model(model_request, conversation)
-            if isinstance(resolved, RuntimeFailureOutcome):
-                self._mark_completed_if_active(control)
-                return resolved
-            resolved_model = resolved
         catalog = self._dependencies.catalog
         try:
             session_or_replay = coordinator.approve_modify(
                 request,
                 pending=preflight_pending,
-                conversation=conversation,
+                conversation=None,
                 catalog=catalog,
-                source_loader=self._confirmation_source_loader(conversation, request),
             )
             if isinstance(session_or_replay, OperationReplay):
                 self._mark_completed_if_active(control)
@@ -3267,17 +3527,27 @@ class PilotRuntime:
         try:
             recorder, journal_started = self._open_ledger_journal(
                 session,
-                conversation,
+                None,
                 transport,
                 control,
                 tool_names=self._journal_tool_names(catalog),
             )
-            raw_context = (
-                session.state.approval_context
-                if session.state.approval_context is not None
-                else None
+            activation_request = _ContinuationActivationRequest(
+                session.state.identity.conversation_id
             )
-            tool_context = self._bind_confirmation_context(raw_context, session, recorder)
+            session.continuation_segment_builder = lambda: self._build_confirmation_segment(
+                session,
+                activation_request,
+                recorder,
+                journal_started,
+                control,
+                cancel_check,
+            )
+            # Approval owns the origin execution and records its terminal
+            # result directly.  Proposal gating is installed only after the
+            # fresh Segment is activated; passing a proxy here would make the
+            # Driver wrap proxy->gate->proxy recursively.
+            tool_context = session.approval_execution_context(recorder)
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
             coordinator.cancel_cleanup(session)
             self._abandon(recorder, journal_started)
@@ -3299,21 +3569,24 @@ class PilotRuntime:
             if event_sink is not None
             else None
         )
-        invocation = AgentLoopInvocation(
-            seed=ApprovedWriteSeed(ConfirmationApprovedWritePort(session)),
-            model=resolved_model.model if resolved_model is not None else None,
-            catalog=cast(Any, catalog),
-            tool_context=cast(Any, tool_context),
-            auto_approve=(resolved_model.auto_approve if resolved_model is not None else False),
-            max_iterations=(
-                resolved_model.max_iter if resolved_model is not None else DEFAULT_MAX_ITERATIONS
-            ),
-            run_recorder=cast(Any, recorder),
-            event_sink=cast(Any, confirmation_event_sink),
-            runtime_signal_sink=signal_sink,
-            cancel_check=self._confirmation_cancel_check(control, cancel_check),
-        )
+        invocation_construction_failed = False
         try:
+            try:
+                invocation = AgentLoopInvocation(
+                    seed=ApprovedWriteSeed(ConfirmationApprovedWritePort(session)),
+                    model=None,
+                    catalog=cast(Any, catalog),
+                    tool_context=cast(Any, tool_context),
+                    auto_approve=False,
+                    max_iterations=DEFAULT_MAX_ITERATIONS,
+                    run_recorder=cast(Any, recorder),
+                    event_sink=cast(Any, confirmation_event_sink),
+                    runtime_signal_sink=signal_sink,
+                    cancel_check=self._confirmation_cancel_check(control, cancel_check),
+                )
+            except Exception:
+                invocation_construction_failed = True
+                raise
             self._check_cancel(cancel_check, control)
             raw_result = (
                 execution_host.run(lambda: self._run_driver(driver, invocation), control)
@@ -3438,6 +3711,10 @@ class PilotRuntime:
                 return replay
             raise
         except Exception as exc:
+            if invocation_construction_failed:
+                coordinator.cancel_cleanup(session)
+                self._abandon(recorder, journal_started)
+                raise
             if _attribute(exc, "code") == RuntimeFailureCode.OPERATION_INTEGRITY_ERROR.value:
                 coordinator.cancel_cleanup(session)
                 self._abandon(recorder, journal_started)
@@ -3476,7 +3753,7 @@ class PilotRuntime:
                     legacy_projection=True,
                 )
             else:
-                outcome = self._provider_confirmation_failure(exc, resolved_model)
+                outcome = self._provider_confirmation_failure(exc)
             self._finalize_confirmation_result(
                 recorder,
                 journal_started,
@@ -4007,6 +4284,18 @@ class PilotRuntime:
                 raise
             except Exception as exc:
                 return self._stream_immediate(self._confirmation_failure(exc), invocation_control)
+            return self._prepare_ledger_confirmation_stream(
+                confirmation_coordinator,
+                request,
+                None,
+                request.conversation_id,
+                transport,
+                invocation_control,
+                replay=None,
+                terminal_checked=True,
+                preflight_pending=preflight_pending,
+                defer_approval=True,
+            )
 
         if (
             isinstance(request, StartTurnRequest)
@@ -4068,7 +4357,7 @@ class PilotRuntime:
         self._phase("conversation")
         try:
             conversation = (
-                self._load_confirmation_conversation(request)
+                self._load_confirmation_conversation(request.conversation_id)
                 if isinstance(request, ConfirmationRequest)
                 else self._load_conversation(request)
             )
@@ -5045,7 +5334,10 @@ class PilotRuntime:
 
         if (
             isinstance(state.request, ConfirmationRequest)
-            and state.confirmation_session is not None
+            and (
+                state.confirmation_session is not None
+                or state.confirmation_pending is not None
+            )
         ):
             try:
                 confirmation_outcome = self._execute_prepared_ledger_confirmation(
@@ -5663,7 +5955,7 @@ class PilotRuntime:
         self,
         coordinator: ConfirmationCoordinator,
         request: ConfirmationRequest,
-        conversation: object,
+        conversation: object | None,
         conversation_id: int,
         transport: RuntimeTransportContext,
         invocation_control: RuntimeInvocationControl,
@@ -5671,6 +5963,7 @@ class PilotRuntime:
         replay: RuntimeOutcome | None = None,
         terminal_checked: bool = False,
         preflight_pending: PendingAction | None = None,
+        defer_approval: bool = False,
     ) -> ImmediateHttpOutcome | PreparedStreamExecution:
         """Freeze Ledger replay/rejection, or lease approved Agent work."""
 
@@ -5789,7 +6082,7 @@ class PilotRuntime:
                         message=visible,
                         conversation_id=request.conversation_id,
                         write_status="cancelled",
-                        undo=None,
+                        undo=self._previous_write_undo(conversation, conversation_id),
                         operation_id=session.state.identity.operation_id,
                         persisted=True,
                         legacy_projection=True,
@@ -5803,6 +6096,11 @@ class PilotRuntime:
                     return self._prepare_deterministic_stream(
                         DeterministicExecution(
                             outcome,
+                            events=self._ledger_direct_events(
+                                outcome,
+                                pending=session.pending,
+                                rejected=True,
+                            ),
                             preparation_kind=PreparationKind.CONFIRMATION,
                         ),
                         request=request,
@@ -5896,125 +6194,70 @@ class PilotRuntime:
                 self._abandon(recorder, journal_started)
                 raise
 
-        resolved_model: ResolvedModel | None = None
-        approval_context_resolver = getattr(
-            coordinator.dependencies, "approval_context_resolver", None
-        )
-        if approval_context_resolver is None and self._dependencies.model_resolver is not None:
-            resolved = self._resolve_model(
-                StartTurnRequest(
-                    message="继续处理已确认的操作",
-                    conversation_id=conversation_id,
-                ),
-                conversation,
-            )
-            if isinstance(resolved, RuntimeFailureOutcome):
-                return self._stream_immediate(resolved, invocation_control)
-            resolved_model = resolved
-        try:
-            session_or_replay = coordinator.approve_modify(
-                request,
-                pending=preflight_pending,
-                conversation=conversation,
-                catalog=self._dependencies.catalog,
-                source_loader=self._confirmation_source_loader(conversation, request),
-            )
-        except ConfirmationReplayError:
-            try:
-                replay = coordinator.replay_outcome(request)
-            except Exception as exc:
-                return self._stream_immediate(self._confirmation_failure(exc), invocation_control)
-            if replay is not None:
-                return self._prepare_deterministic_stream(
-                    DeterministicExecution(replay, preparation_kind=PreparationKind.REPLAY),
-                    request=request,
-                    conversation=conversation,
-                    conversation_id=conversation_id,
-                    transport=transport,
-                    invocation_control=invocation_control,
-                )
-            return self._stream_immediate(
-                self._failure(
-                    RuntimeFailureCode.OPERATION_RESULT_UNKNOWN,
-                    "operation result is unavailable",
-                    503,
-                    retryable=True,
-                ),
-                invocation_control,
-            )
-        except Exception as exc:
-            return self._stream_immediate(self._confirmation_failure(exc), invocation_control)
-        if isinstance(session_or_replay, OperationReplay):
-            try:
-                replay = coordinator.replay_outcome(request)
-            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
-                raise
-            except Exception as exc:
-                return self._stream_immediate(self._confirmation_failure(exc), invocation_control)
-            if replay is None:
+        if defer_approval:
+            if not request.approved or conversation is not None:
                 return self._stream_immediate(
                     self._failure(
-                        RuntimeFailureCode.OPERATION_RESULT_UNKNOWN,
-                        "operation result is unavailable",
+                        RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                        "unsupported runtime route",
                         503,
                         retryable=True,
                     ),
                     invocation_control,
                 )
-            return self._prepare_deterministic_stream(
-                DeterministicExecution(replay, preparation_kind=PreparationKind.REPLAY),
+            cell = _PreparedExecutionCell(run_open=False)
+            confirmation_cell = _PreparedConfirmationCell()
+
+            def deferred_on_abort() -> None:
+                session = confirmation_cell.session
+                if session is not None:
+                    coordinator.cancel_cleanup(session)
+                with cell.lock:
+                    cell.aborted = True
+                    cell.run_open = False
+
+            def deferred_on_complete(_reason: CompletionReason) -> None:
+                with cell.lock:
+                    cell.run_open = False
+
+            state = _PreparedStreamState(
+                owner_token=self._owner_token,
+                preparation_kind=PreparationKind.CONFIRMATION,
+                execution_mode=StreamExecutionMode.AGENT_HOST,
+                control=invocation_control,
                 request=request,
-                conversation=conversation,
+                conversation=None,
                 conversation_id=conversation_id,
+                assembled=(),
+                cell=cell,
                 transport=transport,
-                invocation_control=invocation_control,
+                confirmation_pending=preflight_pending,
+                confirmation_cell=confirmation_cell,
+                on_abort=deferred_on_abort,
+                on_complete=deferred_on_complete,
             )
-        session = session_or_replay
-        cell = _PreparedExecutionCell(run_open=False)
-
-        def on_abort() -> None:
-            coordinator.cancel_cleanup(session)
-            with cell.lock:
-                cell.aborted = True
-                cell.run_open = False
-
-        def on_complete(_reason: CompletionReason) -> None:
-            with cell.lock:
-                cell.run_open = False
-
-        state = _PreparedStreamState(
-            owner_token=self._owner_token,
-            preparation_kind=PreparationKind.CONFIRMATION,
-            execution_mode=StreamExecutionMode.AGENT_HOST,
-            control=invocation_control,
-            request=request,
-            conversation=_prepared_conversation(conversation, conversation_id),
-            conversation_id=conversation_id,
-            # The Agent callback is the only owner of continuation source
-            # loading, after terminal commit and delivery ownership.
-            assembled=(),
-            cell=cell,
-            transport=transport,
-            confirmation_session=session,
-            confirmation_model=resolved_model,
-            on_abort=on_abort,
-            on_complete=on_complete,
-        )
-        transport_run_id = transport.transport_run_id
-        if transport_run_id is None:
-            on_abort()
-            return self._stream_immediate(
-                self._failure(
-                    RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400
-                ),
-                invocation_control,
+            transport_run_id = transport.transport_run_id
+            if transport_run_id is None:
+                deferred_on_abort()
+                return self._stream_immediate(
+                    self._failure(
+                        RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                        "unsupported runtime route",
+                        400,
+                    ),
+                    invocation_control,
+                )
+            return PreparedStreamExecution(
+                invocation_id=transport_run_id,
+                preparation_kind=PreparationKind.CONFIRMATION,
+                execution_mode=StreamExecutionMode.AGENT_HOST,
+                opaque_state=state,
             )
-        return PreparedStreamExecution(
-            invocation_id=transport_run_id,
-            preparation_kind=PreparationKind.CONFIRMATION,
-            execution_mode=StreamExecutionMode.AGENT_HOST,
-            opaque_state=state,
-        )
+
+        # Typed approved continuation is always prepared with the deferred
+        # state above.  There is intentionally no second approval/session
+        # path that can load Conversation or Source during header preparation.
+        raise RuntimeError("typed approval must use deferred continuation preparation")
 
     def _execute_prepared_ledger_confirmation(
         self,
@@ -6024,20 +6267,86 @@ class PilotRuntime:
         execution_host: AgentExecutionHost[object],
         cancel_check: Callable[[], bool],
     ) -> RuntimeOutcome:
-        session = cast(Any, state.confirmation_session)
+        coordinator = cast(ConfirmationCoordinator, self._confirmation_coordinator())
+
+        def finish_pre_agent(outcome: RuntimeOutcome) -> RuntimeOutcome:
+            """Close a deferred approval that never entered the Agent host.
+
+            Response-header preparation intentionally emits no events because
+            the continuation model is still unknown.  If the live claim then
+            loses a race or fails before invocation construction, this body
+            path still owns the complete SSE prefix and Runtime control.  Use
+            the provider-free metadata shape, project replay text before the
+            outer ``CompletedEvent``, and terminalize control exactly as the
+            normal confirmation finalizer does.
+            """
+
+            emit_runtime_event(event_sink, MetaEvent(supports_delta=False))
+            if isinstance(outcome, OperationReplayOutcome):
+                emit_runtime_event(
+                    event_sink,
+                    AssistantMessageEvent(message=outcome.message),
+                )
+            self._mark_completed_if_active(state.control)
+            return outcome
+
+        session = cast(Any, state.confirmation_session or state.confirmation_cell.session)
+        if session is None:
+            request = cast(ConfirmationRequest, state.request)
+            try:
+                session_or_replay = coordinator.approve_modify(
+                    request,
+                    pending=state.confirmation_pending,
+                    conversation=None,
+                    catalog=self._dependencies.catalog,
+                )
+                if isinstance(session_or_replay, OperationReplay):
+                    replay = coordinator.replay_outcome(request)
+                    if replay is None:
+                        return finish_pre_agent(
+                            self._failure(
+                                RuntimeFailureCode.OPERATION_RESULT_UNKNOWN,
+                                "operation result is unavailable",
+                                503,
+                                retryable=True,
+                            )
+                        )
+                    return finish_pre_agent(replay)
+                session = session_or_replay
+                state.confirmation_cell.session = session
+                object.__setattr__(state, "confirmation_session", session)
+            except ConfirmationReplayError:
+                replay = coordinator.replay_outcome(request)
+                if replay is not None:
+                    return finish_pre_agent(replay)
+                return finish_pre_agent(
+                    self._failure(
+                        RuntimeFailureCode.OPERATION_RESULT_UNKNOWN,
+                        "operation result is unavailable",
+                        503,
+                        retryable=True,
+                    )
+                )
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                raise
+            except Exception as exc:
+                return finish_pre_agent(self._confirmation_failure(exc))
+        assert session is not None
         driver = self._dependencies.agent_driver
         if driver is None:
-            coordinator = cast(ConfirmationCoordinator, self._confirmation_coordinator())
             coordinator.cancel_cleanup(session)
-            return self._failure(
-                RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400
+            return finish_pre_agent(
+                self._failure(
+                    RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                    "unsupported runtime route",
+                    400,
+                )
             )
-        self._check_cancel(cancel_check, state.control)
-        model_view = state.confirmation_model
         catalog = self._dependencies.catalog
         recorder: object = _NoopRecorder()
         journal_started = False
         try:
+            self._check_cancel(cancel_check, state.control)
             recorder, journal_started = self._open_ledger_journal(
                 session,
                 state.conversation,
@@ -6045,12 +6354,13 @@ class PilotRuntime:
                 state.control,
                 tool_names=self._journal_tool_names(catalog),
             )
-            raw_context = (
-                session.state.approval_context
-                if session.state.approval_context is not None
-                else None
+            activation_request = _ContinuationActivationRequest(
+                cast(int, state.conversation_id)
             )
-            tool_context = self._bind_confirmation_context(raw_context, session, recorder)
+            # See the synchronous path: the approval origin uses the raw
+            # journal recorder.  The post-terminal Segment owns the gated
+            # proxy used for any chained Pending.
+            tool_context = session.approval_execution_context(recorder)
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
             coordinator = cast(ConfirmationCoordinator, self._confirmation_coordinator())
             coordinator.cancel_cleanup(session)
@@ -6061,52 +6371,66 @@ class PilotRuntime:
             coordinator.cancel_cleanup(session)
             self._abandon(recorder, journal_started)
             bind_outcome = self._confirmation_failure(exc)
-            return bind_outcome
+            return finish_pre_agent(bind_outcome)
         except BaseException:
             coordinator = cast(ConfirmationCoordinator, self._confirmation_coordinator())
             coordinator.cancel_cleanup(session)
             self._abandon(recorder, journal_started)
             raise
-        auto_approve = model_view.auto_approve if model_view is not None else False
-        max_iter = model_view.max_iter if model_view is not None else DEFAULT_MAX_ITERATIONS
+        auto_approve = False
+        max_iter = DEFAULT_MAX_ITERATIONS
         request = cast(ConfirmationRequest, state.request)
         deferred_origin_events: list[RuntimeEvent] = []
         origin_tool_call_id = session.pending.tool_call_id
-
-        emit_runtime_event(
-            event_sink,
-            MetaEvent(
-                supports_delta=callable(
-                    getattr(model_view.model, "stream_complete", None)
-                    if model_view is not None
-                    else None
-                )
-            ),
-        )
-        emit_runtime_event(
-            event_sink,
-            StatusEvent(phase="tool_running", label="正在执行确认操作"),
-        )
+        invocation_construction_failed = False
 
         def invoke_driver(agent_events: RuntimeEventSink) -> object:
-            invocation = AgentLoopInvocation(
-                seed=ApprovedWriteSeed(ConfirmationApprovedWritePort(session)),
-                model=model_view.model if model_view is not None else None,
-                catalog=cast(Any, catalog),
-                tool_context=cast(Any, tool_context),
-                auto_approve=auto_approve,
-                max_iterations=max_iter,
-                run_recorder=cast(Any, recorder),
-                event_sink=cast(
-                    Any,
-                    _ConfirmationEventSink(
-                        agent_events, origin_tool_call_id, deferred_origin_events
-                    ),
-                ),
-                runtime_signal_sink=signal_sink,
-                cancel_check=self._confirmation_cancel_check(state.control, cancel_check),
+            nonlocal invocation_construction_failed
+            confirmation_events = _NegotiatedConfirmationEventSink(
+                agent_events,
+                origin_tool_call_id,
+                deferred_origin_events,
             )
-            return self._run_driver(driver, invocation)
+
+            def build_continuation_segment() -> ApprovedContinuationSegment:
+                segment = self._build_confirmation_segment(
+                    session,
+                    activation_request,
+                    recorder,
+                    journal_started,
+                    state.control,
+                    cancel_check,
+                )
+                confirmation_events.negotiate(segment.model)
+                return segment
+
+            session.continuation_segment_builder = build_continuation_segment
+            try:
+                try:
+                    invocation = AgentLoopInvocation(
+                        seed=ApprovedWriteSeed(ConfirmationApprovedWritePort(session)),
+                        model=None,
+                        catalog=cast(Any, catalog),
+                        tool_context=cast(Any, tool_context),
+                        auto_approve=auto_approve,
+                        max_iterations=max_iter,
+                        run_recorder=cast(Any, recorder),
+                        event_sink=cast(
+                            Any,
+                            confirmation_events,
+                        ),
+                        runtime_signal_sink=signal_sink,
+                        cancel_check=self._confirmation_cancel_check(state.control, cancel_check),
+                    )
+                except Exception:
+                    invocation_construction_failed = True
+                    raise
+                return self._run_driver(driver, invocation)
+            finally:
+                # Direct/failing test Drivers may stop before activating a
+                # post-terminal Segment.  Preserve the closed stream prefix
+                # while deriving ``supports_delta`` from any observed delta.
+                confirmation_events.negotiate()
 
         coordinator = cast(ConfirmationCoordinator, self._confirmation_coordinator())
         try:
@@ -6232,7 +6556,7 @@ class PilotRuntime:
             if isinstance(outcome, MessageOutcome):
                 emit_runtime_event(event_sink, AssistantMessageEvent(message=outcome.message))
             return outcome
-        except (RuntimeCancelled, RuntimeTransportAborted):
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
             coordinator.cancel_cleanup(session)
             self._abandon(recorder, journal_started)
             raise
@@ -6250,6 +6574,10 @@ class PilotRuntime:
                 return replay
             raise
         except Exception as exc:
+            if invocation_construction_failed:
+                coordinator.cancel_cleanup(session)
+                self._abandon(recorder, journal_started)
+                raise
             if _attribute(exc, "code") == RuntimeFailureCode.OPERATION_INTEGRITY_ERROR.value:
                 coordinator.cancel_cleanup(session)
                 self._abandon(recorder, journal_started)
@@ -6373,7 +6701,7 @@ class PilotRuntime:
             (request.conversation_id,),
         )
 
-    def _load_confirmation_conversation(self, request: ConfirmationRequest) -> object | None:
+    def _load_confirmation_conversation(self, conversation_id: int) -> object | None:
         """Load-only conversation path for confirmation preheader checks."""
 
         gateway = self._require_dependency("conversation_gateway")
@@ -6382,8 +6710,8 @@ class PilotRuntime:
             raise TypeError("conversation gateway does not provide load")
         return _invoke(
             function,
-            {"conversation_id": request.conversation_id, "id": request.conversation_id},
-            (request.conversation_id,),
+            {"conversation_id": conversation_id, "id": conversation_id},
+            (conversation_id,),
         )
 
     def _confirmation_messages_exist(self, conversation_id: int) -> bool:
@@ -6484,7 +6812,7 @@ class PilotRuntime:
 
     def _resolve_policy_catalog(
         self,
-        request: StartTurnRequest,
+        request: _RuntimeRequest,
         conversation: object,
         source: object,
         segment: SegmentExecution | None = None,
@@ -6562,7 +6890,7 @@ class PilotRuntime:
 
     def _resolve_segment_context(
         self,
-        request: StartTurnRequest,
+        request: _RuntimeRequest,
         conversation: object,
         source: object,
         recorder: object,
@@ -6635,7 +6963,7 @@ class PilotRuntime:
 
     def _resolve_surface_gate(
         self,
-        request: StartTurnRequest,
+        request: _RuntimeRequest,
         conversation: object,
         source: object,
         assembled: object,
@@ -6711,7 +7039,7 @@ class PilotRuntime:
 
     def _resolve_continuation_model(
         self,
-        request: StartTurnRequest,
+        request: _RuntimeRequest,
         conversation: object,
         policy: ResolvedPolicyCatalog,
     ) -> ResolvedModel | RuntimeFailureOutcome | None:
@@ -6755,64 +7083,6 @@ class PilotRuntime:
             return value
         if _explicitly_unconfigured_model(value):
             return None
-        resolved = _resolved_model(value)
-        if resolved is None:
-            return self._failure(
-                RuntimeFailureCode.AI_PROVIDER_ERROR,
-                "AI 连接失败。请检查 AI 设置或稍后重试。",
-                502,
-                retryable=True,
-            )
-        return resolved
-
-    def _resolve_model(
-        self,
-        request: StartTurnRequest,
-        conversation: object,
-    ) -> ResolvedModel | RuntimeFailureOutcome | None:
-        resolver = self._require_dependency("model_resolver")
-        function = _callable(resolver, ("resolve", "resolve_model", "get_model"))
-        if function is None:
-            raise TypeError("model resolver does not provide resolve")
-        try:
-            value = _invoke(
-                function,
-                {
-                    "request": request,
-                    "conversation": conversation,
-                    "conversation_id": _conversation_id(conversation),
-                },
-                (request, conversation),
-            )
-        except ModelUnconfiguredError:
-            return self._failure(
-                RuntimeFailureCode.MODEL_UNCONFIGURED,
-                "AI is not configured: run `oc config` to set your API key",
-                503,
-                retryable=False,
-            )
-        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
-            raise
-        except Exception:
-            return self._failure(
-                RuntimeFailureCode.AI_PROVIDER_ERROR,
-                "AI 连接失败。请检查 AI 设置或稍后重试。",
-                502,
-                retryable=True,
-            )
-        except BaseException:
-            raise
-        if isinstance(value, RuntimeFailureOutcome):
-            return value
-        if _explicitly_unconfigured_model(value):
-            return None
-        if value is False or (isinstance(value, tuple) and bool(value) and value[0] is False):
-            return self._failure(
-                RuntimeFailureCode.AI_PROVIDER_ERROR,
-                "AI 连接失败。请检查 AI 设置或稍后重试。",
-                502,
-                retryable=True,
-            )
         resolved = _resolved_model(value)
         if resolved is None:
             return self._failure(
@@ -7765,25 +8035,48 @@ class PilotRuntime:
         if callable(settle):
             settle()
 
-    def _load_source(self, conversation: object, request: StartTurnRequest) -> object:
+    def _load_source(
+        self,
+        conversation: object,
+        request: StartTurnRequest | _ContinuationActivationRequest,
+        *,
+        pending_tool_call_id: str | None = None,
+    ) -> object:
         loader = self._require_dependency("source_loader")
         function = _callable(loader, ("load", "load_sources", "load_chat_source_messages"))
         if function is None:
             raise TypeError("source loader does not provide load")
+        if isinstance(request, StartTurnRequest):
+            attachments = request.attachments
+            page_context = request.page_context
+        else:
+            attachments = ()
+            page_context = None
+        trusted_pending_tool_call_id = (
+            str(_attribute(conversation, "pending_tool_call_id", "") or "")
+            if pending_tool_call_id is None
+            else pending_tool_call_id
+        )
+        if type(trusted_pending_tool_call_id) is not str:
+            raise TypeError("pending tool call identity must be text")
         return _invoke(
             function,
             {
                 "conversation": conversation,
                 "request": request,
-                "attachments": request.attachments,
-                "page_context": request.page_context,
+                "attachments": attachments,
+                "page_context": page_context,
+                "pending_tool_call_id": trusted_pending_tool_call_id,
                 "conversation_id": _conversation_id(conversation),
             },
             (conversation, request),
         )
 
     def _assemble_context(
-        self, source: object, conversation: object, request: StartTurnRequest
+        self,
+        source: object,
+        conversation: object,
+        request: StartTurnRequest | _ContinuationActivationRequest,
     ) -> object:
         assembler = self._dependencies.context_assembler
         if assembler is None:
@@ -7794,13 +8087,19 @@ class PilotRuntime:
         function = _callable(assembler, ("assemble", "assemble_context", "build_messages"))
         if function is None:
             raise TypeError("context assembler does not provide assemble")
+        if isinstance(request, StartTurnRequest):
+            attachments = request.attachments
+            page_context = request.page_context
+        else:
+            attachments = ()
+            page_context = None
         values = {
             "source": source,
             "sources": source,
             "conversation": conversation,
             "request": request,
-            "page_context": request.page_context,
-            "attachments": request.attachments,
+            "page_context": page_context,
+            "attachments": attachments,
         }
         return _invoke(function, values, (source, conversation, request))
 
@@ -7834,6 +8133,9 @@ class PilotRuntime:
             auto_approve=resolved.auto_approve,
             max_iterations=resolved.max_iter,
             surface_gate=cast(Any, segment.surface_gate),
+            # The Driver creates the one proposal gate around this raw
+            # recorder and delegates the Segment Context's stable proxy to
+            # that gate.  Keeping this raw avoids proxy->gate recursion.
             run_recorder=cast(Any, recorder),
             event_sink=cast(Any, event_sink),
             runtime_signal_sink=signal_sink,
@@ -8762,9 +9064,6 @@ def _dependency_values(values: Mapping[str, object]) -> dict[str, object]:
         "conversation_store": "conversations",
         "conversation": "conversations",
         "route": "route_selector",
-        "model": "model_resolver",
-        "model_resolver_once": "model_resolver",
-        "model_config_resolver": "model_resolver",
         "source": "source_loader",
         "assembler": "context_assembler",
         "context_builder": "context_assembler",
@@ -8797,7 +9096,6 @@ __all__ = [
     "ContextAssembler",
     "ConversationGateway",
     "JournalFactory",
-    "ModelResolver",
     "NormalizedAgentTurn",
     "PilotRuntime",
     "PilotRuntimeDependencies",

@@ -67,7 +67,6 @@ from .deterministic import (
 )
 from .continuation import (
     ConfirmationCoordinator,
-    ConfirmationContextAssembler,
     ConfirmationDependencies,
     ConfirmationIdentity,
     ConfirmationOperationRepository,
@@ -75,10 +74,8 @@ from .continuation import (
     ConfirmationPersistenceAdapter,
     ConfirmationReplayError,
     ConfirmationSession,
-    ConfirmationSourceAdapter,
     ConfirmationState,
     ConfirmationWriteCoordinator,
-    ContinuationLoader,
     DeliveryBundle,
 )
 from .persistence import (
@@ -98,7 +95,6 @@ from .service import (
     ContextAssembler,
     ConversationGateway,
     JournalFactory,
-    ModelResolver,
     NormalizedAgentTurn,
     PilotRuntime,
     PilotRuntimeDeps,
@@ -128,7 +124,6 @@ __all__ = [
     "DeterministicExecution",
     "DeterministicPilotAdapter",
     "ConfirmationCoordinator",
-    "ConfirmationContextAssembler",
     "ConfirmationDependencies",
     "ConfirmationIdentity",
     "ConfirmationOperationRepository",
@@ -136,10 +131,8 @@ __all__ = [
     "ConfirmationPersistenceAdapter",
     "ConfirmationReplayError",
     "ConfirmationSession",
-    "ConfirmationSourceAdapter",
     "ConfirmationState",
     "ConfirmationWriteCoordinator",
-    "ContinuationLoader",
     "DeliveryBundle",
     "LEGACY_DETERMINISTIC_NAMES",
     "ContextAssembler",
@@ -164,7 +157,6 @@ __all__ = [
     "JsonValue",
     "MISSING_EDITED_ARGS",
     "MessageOutcome",
-    "ModelResolver",
     "ModelUnconfiguredError",
     "MetaEvent",
     "OperationPendingOutcome",

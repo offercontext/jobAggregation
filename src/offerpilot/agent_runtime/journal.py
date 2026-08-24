@@ -33,6 +33,7 @@ from offerpilot.repositories.agent_runs import (
     AgentRunRepository,
     CaptureContextCommand,
     DispositionCommand,
+    JournalConflictError,
     RunStatus,
     StartRunCommand,
     StartSegmentCommand,
@@ -131,6 +132,21 @@ class RunRecorder(Protocol):
 
     def resume(self, command: ResumedDisposition) -> None: ...
 
+    def resume_bound(self, session: Any, command: ResumedDisposition) -> bool: ...
+
+    def record_approval_and_resume_bound(
+        self,
+        session: Any,
+        approval_draft: EventDraft,
+        command: ResumedDisposition,
+    ) -> bool: ...
+
+    def recover_approval_and_resume(
+        self,
+        approval_draft: EventDraft,
+        command: ResumedDisposition,
+    ) -> bool: ...
+
     def suspend(self, command: SuspendedDisposition) -> None: ...
 
     def abandon(self) -> None: ...
@@ -196,6 +212,24 @@ class NullRunRecorder:
     def resume(self, _command: ResumedDisposition) -> None:
         return None
 
+    def resume_bound(self, _session: Any, _command: ResumedDisposition) -> bool:
+        return True
+
+    def record_approval_and_resume_bound(
+        self,
+        _session: Any,
+        _approval_draft: EventDraft,
+        _command: ResumedDisposition,
+    ) -> bool:
+        return True
+
+    def recover_approval_and_resume(
+        self,
+        _approval_draft: EventDraft,
+        _command: ResumedDisposition,
+    ) -> bool:
+        return True
+
     def suspend(self, _command: SuspendedDisposition) -> None:
         return None
 
@@ -253,6 +287,8 @@ class SafeRunRecorder:
         self._resume_state: Literal["not_attempted", "claimed", "completed", "failed"] = (
             "not_attempted"
         )
+        self._resume_bound_transaction: Any | None = None
+        self._degraded_bound_resume_recovered = False
         self._disposition_state: Literal[
             "not_attempted", "claimed", "completed", "failed"
         ] = "not_attempted"
@@ -431,6 +467,252 @@ class SafeRunRecorder:
             False,
             allow_sync=False,
         )
+
+    def resume_bound(self, session: Any, command: ResumedDisposition) -> bool:
+        """Project ``run.resumed`` through the caller-owned Ledger session.
+
+        The approval CAS and the resumed disposition must share one database
+        transaction.  This method therefore never calls ``resume()`` (which
+        owns a fresh Journal transaction) and never routes a disposition draft
+        through ``append_event_bound``. A false return reports degraded
+        recording without changing the caller-owned business transaction.
+
+        Savepoint success is scoped to the current caller transaction.  Once
+        that transaction ends, replay re-enters repository convergence so an
+        outer rollback cannot leave this recorder permanently completed.
+        """
+
+        transaction = session.get_transaction()
+        with self._state_lock:
+            if self._resume_state == "completed":
+                previous = self._resume_bound_transaction
+                if previous is None:
+                    return True
+                if previous.is_active:
+                    return previous is transaction
+            elif self._resume_state != "not_attempted":
+                return False
+            if self._disposition_state != "not_attempted":
+                return self._resume_state == "completed"
+            self._resume_state = "claimed"
+            self._state_condition.notify_all()
+
+        succeeded = False
+
+        def operation(lease: OperationLease) -> bool:
+            if (
+                transaction is None
+                or session.get_transaction() is not transaction
+                or not transaction.is_active
+            ):
+                raise JournalConflictError("bound resume requires caller transaction")
+            event = self._event_preparer(
+                EventInput(
+                    event_type="run.resumed",
+                    facts={
+                        "confirmation_attempt_id": command.confirmation_attempt_id,
+                        "tool_call_id": command.tool_call_id,
+                    },
+                    source_ref_type="tool_call",
+                    source_ref_id=command.tool_call_id,
+                ),
+                lease.work_deadline,
+            )
+            lease.checkpoint()
+            with session.begin_nested():
+                self.repository.converge_disposition_bound(
+                    session,
+                    self.run_id,
+                    DispositionCommand(
+                        target_status="running",
+                        events=(event,),
+                        waiting_tool_call_id=None,
+                        failure_code=None,
+                    ),
+                )
+            return True
+
+        try:
+            succeeded = bool(
+                self._ordinary(
+                    operation,
+                    "journal_resume_failed",
+                    False,
+                    allow_sync=False,
+                    state_check=self._resume_operation_allowed_locked,
+                )
+            )
+            return succeeded
+        finally:
+            with self._state_lock:
+                self._resume_state = "completed" if succeeded else "failed"
+                if succeeded:
+                    self._resume_bound_transaction = transaction
+                self._wait_flag = False
+                self._state_condition.notify_all()
+
+    def record_approval_and_resume_bound(
+        self,
+        session: Any,
+        approval_draft: EventDraft,
+        command: ResumedDisposition,
+    ) -> bool:
+        """Atomically append approval and converge the resumed disposition.
+
+        This is the single bound port used by the approval Ledger callback.
+        The savepoint protects the pair without poisoning the outer Ledger
+        transaction.  Ordinary Journal failures return ``False`` and degrade
+        the recorder while the business operation remains fail-open; malformed
+        port contracts and ``BaseException`` still propagate at the caller.
+        A completed savepoint is replayed through repository convergence after
+        its caller transaction ends, preserving outer-rollback recovery.
+        """
+
+        transaction = session.get_transaction()
+        with self._state_lock:
+            if self._resume_state == "completed":
+                previous = self._resume_bound_transaction
+                if previous is None:
+                    return True
+                if previous.is_active:
+                    return previous is transaction
+            elif self._resume_state != "not_attempted":
+                return False
+            if self._disposition_state != "not_attempted":
+                return self._resume_state == "completed"
+            self._resume_state = "claimed"
+            self._state_condition.notify_all()
+
+        succeeded = False
+
+        def operation(lease: OperationLease) -> bool:
+            if (
+                transaction is None
+                or session.get_transaction() is not transaction
+                or not transaction.is_active
+            ):
+                raise JournalConflictError("bound resume requires caller transaction")
+            event = self._event_preparer(
+                EventInput(
+                    event_type="run.resumed",
+                    facts={
+                        "confirmation_attempt_id": command.confirmation_attempt_id,
+                        "tool_call_id": command.tool_call_id,
+                    },
+                    source_ref_type="tool_call",
+                    source_ref_id=command.tool_call_id,
+                ),
+                lease.work_deadline,
+            )
+            lease.checkpoint()
+            with session.begin_nested():
+                self.repository.append_event_bound(session, self.run_id, approval_draft)
+                self.repository.converge_disposition_bound(
+                    session,
+                    self.run_id,
+                    DispositionCommand(
+                        target_status="running",
+                        events=(event,),
+                        waiting_tool_call_id=None,
+                        failure_code=None,
+                    ),
+                )
+            return True
+
+        try:
+            succeeded = bool(
+                self._ordinary(
+                    operation,
+                    "journal_resume_failed",
+                    False,
+                    allow_sync=False,
+                    state_check=self._resume_operation_allowed_locked,
+                )
+            )
+            return succeeded
+        finally:
+            with self._state_lock:
+                self._resume_state = "completed" if succeeded else "failed"
+                if succeeded:
+                    self._resume_bound_transaction = transaction
+                self._wait_flag = False
+                self._state_condition.notify_all()
+
+    def recover_approval_and_resume(
+        self,
+        approval_draft: EventDraft,
+        command: ResumedDisposition,
+    ) -> bool:
+        """Recover a degraded bound projection after the Ledger commit.
+
+        The normal approval path remains caller-bound. This failure-only port
+        is invoked only after the product transaction has terminalized, so it
+        can safely own one Journal transaction without competing for the
+        Ledger's SQLite write lock.
+        """
+
+        with self._state_lock:
+            if self._resume_state == "completed":
+                return True
+            if (
+                self._resume_state != "failed"
+                or self._disposition_state != "not_attempted"
+            ):
+                return False
+            self._resume_state = "claimed"
+            self._state_condition.notify_all()
+
+        succeeded = False
+
+        def operation(lease: OperationLease) -> bool:
+            event = self._event_preparer(
+                EventInput(
+                    event_type="run.resumed",
+                    facts={
+                        "confirmation_attempt_id": command.confirmation_attempt_id,
+                        "tool_call_id": command.tool_call_id,
+                    },
+                    source_ref_type="tool_call",
+                    source_ref_id=command.tool_call_id,
+                ),
+                lease.work_deadline,
+            )
+            lease.checkpoint()
+            self.repository.recover_degraded_resume(
+                self.run_id,
+                approval_draft,
+                DispositionCommand(
+                    target_status="running",
+                    events=(event,),
+                    waiting_tool_call_id=None,
+                    failure_code=None,
+                ),
+                deadline=lease.work_deadline,
+                safe_clock=lease.safe_clock,
+            )
+            return True
+
+        try:
+            succeeded = bool(
+                self._ordinary(
+                    operation,
+                    "journal_resume_recovery_failed",
+                    False,
+                    allow_sync=False,
+                    allow_degraded=True,
+                    state_check=self._resume_operation_allowed_locked,
+                )
+            )
+            return succeeded
+        finally:
+            with self._state_lock:
+                self._resume_state = "completed" if succeeded else "failed"
+                if succeeded:
+                    self._resume_bound_transaction = None
+                    self._degraded_bound_resume_recovered = True
+                    self._degraded_persisted = True
+                self._wait_flag = False
+                self._state_condition.notify_all()
 
     def resume(self, command: ResumedDisposition) -> None:
         with self._state_lock:
@@ -655,6 +937,7 @@ class SafeRunRecorder:
         default: _T,
         *,
         allow_sync: bool = True,
+        allow_degraded: bool = False,
         state_check: Callable[[], bool] | None = None,
     ) -> _T:
         entry = self.active_budget.safe_monotonic_read()
@@ -674,7 +957,10 @@ class SafeRunRecorder:
                     JOURNAL_OPERATION_HARD_CAP_SECONDS,
                 )
                 with self._state_lock:
-                    pre_allowed = self._ordinary_state_allowed_locked(state_check)
+                    pre_allowed = self._ordinary_state_allowed_locked(
+                        state_check,
+                        allow_degraded=allow_degraded,
+                    )
                 if pre_allowed:
                     acquired = self._acquire_operation(lease)
                     if not acquired:
@@ -687,7 +973,10 @@ class SafeRunRecorder:
                         lease = self._tighten_lease(lease, refreshed)
                         lease.checkpoint()
                         with self._state_lock:
-                            allowed = self._ordinary_state_allowed_locked(state_check)
+                            allowed = self._ordinary_state_allowed_locked(
+                                state_check,
+                                allow_degraded=allow_degraded,
+                            )
                         if allowed:
                             used_before = self.active_budget.used_seconds
                             clock_invalid_before = self.active_budget.clock_invalid_latched
@@ -765,8 +1054,12 @@ class SafeRunRecorder:
     def _ordinary_state_allowed_locked(
         self,
         state_check: Callable[[], bool] | None,
+        *,
+        allow_degraded: bool = False,
     ) -> bool:
-        if self.recording_status != "healthy":
+        if self.recording_status != "healthy" and not (
+            allow_degraded or self._degraded_bound_resume_recovered
+        ):
             return False
         if state_check is not None:
             return state_check()
@@ -1142,6 +1435,8 @@ class SafeRunRecorder:
     def _degrade(self, diagnostic: str) -> bool:
         with self._state_lock:
             first_transition = self.recording_status != "degraded"
+            if self._degraded_bound_resume_recovered:
+                self._degraded_bound_resume_recovered = False
             self.recording_status = "degraded"
             should_emit = diagnostic not in self.diagnostics
             if should_emit:

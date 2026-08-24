@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import inspect
 import tempfile
 import weakref
 from dataclasses import dataclass, replace
 from pathlib import Path
+from threading import RLock
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -13,9 +15,20 @@ import pytest
 
 from offerpilot.chat_transport import PreparedStreamGuard, SseAgentExecutionHost
 from offerpilot.ai.agent_contracts import AgentTurnResult, PendingAction
-from offerpilot.ai.agent_loop import SegmentSurfaceGate, build_segment_surface_gate
+from offerpilot.ai.agent_loop import (
+    ApprovedContinuationSegment,
+    SegmentSurfaceGate,
+    build_segment_surface_gate,
+)
 from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
 from offerpilot.ai.tool_authority.contracts import SegmentExecutionAuthority
+from offerpilot.ai.write_operations import (
+    DeliveryOwnership,
+    OperationCommitted,
+    OperationReplay,
+    TerminalPayload,
+    WriteOperationError,
+)
 from offerpilot.ai.tool_authority.policy import validate_startup_policy
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
@@ -38,12 +51,14 @@ from offerpilot.pilot_runtime.contracts import (
     CancelReason,
     CompletedEvent,
     CompletionReason,
+    ConfirmationRequest,
     ConfirmationRequiredEvent,
     ErrorEvent,
     ImmediateHttpOutcome,
     InvocationState,
     MessageOutcome,
     MetaEvent,
+    OperationReplayOutcome,
     PreparationKind,
     PreparedStreamExecution,
     PilotActionDescriptor,
@@ -55,6 +70,10 @@ from offerpilot.pilot_runtime.contracts import (
 )
 from offerpilot.pilot_runtime.event_sink import InMemoryRuntimeInvocationControl
 from offerpilot.pilot_runtime.persistence import PersistenceResult, PersistenceStatus
+from offerpilot.pilot_runtime.continuation import (
+    ConfirmationApprovedWritePort,
+    ConfirmationSession,
+)
 from offerpilot.pilot_runtime.service import (
     PilotRuntime,
     ResolvedPolicyCatalog,
@@ -272,6 +291,62 @@ class Journal:
     def start_run(self, builder: object) -> Recorder:
         del builder
         return self.recorder
+
+
+class ConfirmationProbe:
+    """Ledger-only probe for the stream response-header boundary.
+
+    The probe intentionally does not implement the future continuation
+    activation port.  It records the legacy ``approve_modify`` arguments so
+    the RED test can pin that approval/session/source material must not cross
+    the response-header boundary.
+    """
+
+    def __init__(self) -> None:
+        operation_id = "operation-stream-task17"
+        self.operation = SimpleNamespace(
+            id=operation_id,
+            conversation_id=7,
+            status="proposed",
+            adapter_kind="typed",
+            tool_call_id="write-1",
+            tool_name="update_application_status",
+        )
+        self.pending = PendingAction(
+            "write-1",
+            "update_application_status",
+            '{"id":1,"status":"offer"}',
+            "确认更新状态",
+            operation_id,
+        )
+        self.approve_calls: list[dict[str, object]] = []
+        self.cleanup_calls = 0
+        self.approval_context = SimpleNamespace(secret="approval-context-canary")
+        self.session = SimpleNamespace(
+            pending=self.pending,
+            state=SimpleNamespace(approval_context=self.approval_context),
+        )
+
+    def operation_preheader(self, request: object, **kwargs: object) -> object:
+        del request, kwargs
+        return SimpleNamespace(operation=self.operation)
+
+    def replay_outcome(self, request: object, **kwargs: object) -> None:
+        del request, kwargs
+        return None
+
+    def preflight_live(self, request: object, **kwargs: object) -> PendingAction:
+        del request, kwargs
+        return self.pending
+
+    def approve_modify(self, request: object, **kwargs: object) -> object:
+        del request
+        self.approve_calls.append(dict(kwargs))
+        return self.session
+
+    def cancel_cleanup(self, session: object) -> None:
+        assert session is self.session
+        self.cleanup_calls += 1
 
 
 def _policy_resolver(catalog: object) -> object:
@@ -1948,3 +2023,324 @@ def test_prepared_state_does_not_retain_resolved_provider_object() -> None:
     state = prepared.opaque_state
     assert getattr(state, "resolved", None) is None
     assert "PROVIDER_CREDENTIAL_CANARY" not in repr(prepared)
+
+
+def test_stream_approval_port_is_a_no_arg_fresh_segment_activation_boundary() -> None:
+    method = getattr(ConfirmationApprovedWritePort, "activate_continuation_segment", None)
+
+    assert callable(method)
+    signature = inspect.signature(method)
+    assert tuple(signature.parameters) == ("self",)
+    assert ApprovedContinuationSegment.__name__ in str(signature.return_annotation)
+
+
+def test_stream_approval_port_rejects_non_segment_activation_results() -> None:
+    class InvalidActivationSession:
+        def activate_continuation_segment(self) -> object:
+            return object()
+
+    port = ConfirmationApprovedWritePort(InvalidActivationSession())  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="ApprovedContinuationSegment"):
+        port.activate_continuation_segment()
+
+
+def test_stream_activation_requires_terminal_and_delivery_ownership() -> None:
+    payload = TerminalPayload(
+        status="committed",
+        result_contract="typed_json_v1",
+        result_json="{}",
+        visible_result="saved",
+        transport_json="{}",
+        undo_json=None,
+        failure_category=None,
+        failure_code=None,
+        digest="sha256:" + "0" * 64,
+    )
+    terminal = OperationCommitted(
+        "operation-stream-task17",
+        payload,
+        DeliveryOwnership("operation-stream-task17", 1, b"owner", "owner-fingerprint"),
+    )
+    segment = _real_segment(Conversation(), object(), MODEL_TOOL_CATALOG)[0]
+    segment = replace(segment, catalog=MODEL_TOOL_CATALOG)
+    messages = (
+        Message(role="user", content="continue"),
+        Message(role="tool", content="saved", tool_call_id="write-1"),
+        Message(role="assistant", content="已保存"),
+    )
+    surface_gate = build_segment_surface_gate(
+        messages,
+        catalog=MODEL_TOOL_CATALOG,
+        context=segment.context,
+        authority=segment.authority,
+        dependency_policy=DEPENDENCY_POLICY_V1,
+        policy=_AUTHORITY_POLICY,
+    )
+    bundle = ApprovedContinuationSegment(
+        messages=messages,
+        model=SimpleNamespace(complete=lambda *_args, **_kwargs: object()),
+        catalog=MODEL_TOOL_CATALOG,
+        tool_context=segment.context,
+        surface_gate=surface_gate,
+    )
+    state = SimpleNamespace(
+        lock=RLock(),
+        continuation_segment_activated=False,
+        cancelled=False,
+        timed_out=False,
+        active=True,
+        terminal_execution=terminal,
+        delivery_ownership=None,
+        approval_context=None,
+        continuation_segment_builder=lambda: bundle,
+    )
+    session = ConfirmationSession(
+        state=state,
+        on_confirmation_attempt=lambda _pending, _prepared: None,
+        on_confirmation_result=lambda *_args: None,
+        execute_operation=lambda *_args: object(),
+        delivery_fence=lambda: state.delivery_ownership is terminal.ownership,
+        continuation_segment_builder=lambda: bundle,
+    )
+
+    try:
+        with pytest.raises(WriteOperationError, match="operation_delivery_unknown"):
+            session.activate_continuation_segment()
+
+        state.delivery_ownership = terminal.ownership
+        activated = session.activate_continuation_segment()
+        assert type(activated) is ApprovedContinuationSegment
+        assert activated.messages == messages
+        tool_messages = [message for message in activated.messages if message.role == "tool"]
+        assert tool_messages == [messages[1]]
+        assert len(tool_messages) == 1
+        assert state.continuation_segment_activated is True
+
+        with pytest.raises(WriteOperationError, match="operation_delivery_unknown"):
+            session.activate_continuation_segment()
+    finally:
+        segment.close()
+
+
+def test_stream_approval_prepare_defers_activation_and_does_not_capture_approval_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preparation must carry only an opaque continuation, never live approval state.
+
+    The approved origin is not executable at the response-header boundary.  A
+    later execute phase must obtain the origin terminal/delivery fence first,
+    then ask the one-shot port for a fresh Segment bundle.  In particular,
+    ``approve_modify`` must not receive the approve-time Conversation or a
+    closure over the raw Runtime Source loader.
+    """
+
+    phases = Phases()
+    source = Source()
+    instance, _persistence, _driver, _host, _journal = runtime(phases, source=source)
+    probe = ConfirmationProbe()
+    object.__setattr__(instance._dependencies, "confirmation_coordinator", probe)
+    conversation_reads: list[object] = []
+
+    def load_conversation(_instance: PilotRuntime, request: object) -> Conversation:
+        conversation_reads.append(request)
+        return Conversation()
+
+    monkeypatch.setattr(PilotRuntime, "_load_confirmation_conversation", load_conversation)
+    request = ConfirmationRequest(
+        conversation_id=7,
+        operation_id=probe.operation.id,
+        approved=True,
+        confirmation_token="stream-token",
+    )
+
+    prepared = instance.prepare_stream(
+        request,
+        transport=transport(),
+        invocation_control=InMemoryRuntimeInvocationControl(),
+    )
+
+    assert isinstance(prepared, PreparedStreamExecution)
+    assert probe.approve_calls == []
+    assert conversation_reads == []
+    assert source.calls == 0
+    state = prepared.opaque_state
+    assert getattr(state, "conversation", None) is None
+    assert getattr(state, "confirmation_session", None) is None
+    assert getattr(state, "confirmation_model", None) is None
+
+
+def test_stream_deferred_approval_claim_failure_emits_meta_and_closes_control() -> None:
+    class BusyConfirmationProbe(ConfirmationProbe):
+        def approve_modify(self, request: object, **kwargs: object) -> object:
+            del request, kwargs
+            raise WriteOperationError("operation_busy", retryable=True)
+
+    phases = Phases()
+    instance, _persistence, _driver, host, _journal = runtime(phases)
+    probe = BusyConfirmationProbe()
+    object.__setattr__(instance._dependencies, "confirmation_coordinator", probe)
+    control = InMemoryRuntimeInvocationControl()
+    prepared = instance.prepare_stream(
+        ConfirmationRequest(
+            conversation_id=7,
+            operation_id=probe.operation.id,
+            approved=True,
+            confirmation_token="stream-token",
+        ),
+        transport=transport(),
+        invocation_control=control,
+    )
+    assert isinstance(prepared, PreparedStreamExecution)
+    guard = PreparedStreamGuard(prepared=prepared)
+    assert guard.begin_execution() is True
+    seen: list[object] = []
+
+    class Sink:
+        def emit(self, event: object) -> None:
+            seen.append(event)
+
+    guard._execute = lambda: instance.execute_prepared_stream(
+        prepared,
+        event_sink=Sink(),
+        signal_sink=None,
+        execution_host=host,
+        cancel_check=lambda: False,
+    )
+    outcome = guard.execute_once()
+
+    assert getattr(outcome, "code", None).value == "operation_busy"
+    assert [type(event) for event in seen] == [MetaEvent, ErrorEvent]
+    assert control.state is InvocationState.COMPLETED
+    assert host.calls == 0
+    assert guard.complete(CompletionReason.NORMAL) is True
+
+
+def test_stream_deferred_approval_pre_agent_failure_cleans_live_session() -> None:
+    phases = Phases()
+    instance, _persistence, _driver, host, _journal = runtime(phases)
+    probe = ConfirmationProbe()
+    object.__setattr__(instance._dependencies, "confirmation_coordinator", probe)
+    object.__setattr__(instance._dependencies, "agent_driver", None)
+    control = InMemoryRuntimeInvocationControl()
+    prepared = instance.prepare_stream(
+        ConfirmationRequest(
+            conversation_id=7,
+            operation_id=probe.operation.id,
+            approved=True,
+            confirmation_token="stream-token",
+        ),
+        transport=transport(),
+        invocation_control=control,
+    )
+    assert isinstance(prepared, PreparedStreamExecution)
+    guard = PreparedStreamGuard(prepared=prepared)
+    assert guard.begin_execution() is True
+    seen: list[object] = []
+
+    class Sink:
+        def emit(self, event: object) -> None:
+            seen.append(event)
+
+    guard._execute = lambda: instance.execute_prepared_stream(
+        prepared,
+        event_sink=Sink(),
+        signal_sink=None,
+        execution_host=host,
+        cancel_check=lambda: False,
+    )
+    outcome = guard.execute_once()
+
+    assert getattr(outcome, "code", None).value == "operation_unavailable"
+    assert [type(event) for event in seen] == [MetaEvent, ErrorEvent]
+    assert probe.cleanup_calls == 1
+    assert control.state is InvocationState.COMPLETED
+    assert host.calls == 0
+    assert guard.complete(CompletionReason.NORMAL) is True
+
+
+def test_stream_deferred_approval_claim_race_replays_full_event_sequence() -> None:
+    class ReplayConfirmationProbe(ConfirmationProbe):
+        def __init__(self) -> None:
+            super().__init__()
+            self.replay_checks = 0
+            self.replay = OperationReplay(
+                self.operation.id,
+                TerminalPayload(
+                    status="committed",
+                    result_contract="typed_json_v1",
+                    result_json="{}",
+                    visible_result="saved",
+                    transport_json="{}",
+                    undo_json=None,
+                    failure_category=None,
+                    failure_code=None,
+                    digest="sha256:" + "0" * 64,
+                ),
+                "delivered",
+                1,
+                None,
+                final_message="already committed",
+            )
+
+        def replay_outcome(self, request: object, **kwargs: object) -> object | None:
+            del request, kwargs
+            self.replay_checks += 1
+            if self.replay_checks == 1:
+                return None
+            return OperationReplayOutcome(
+                operation_id=self.operation.id,
+                conversation_id=7,
+                message="already committed",
+                status="committed",
+                write_status="success",
+            )
+
+        def approve_modify(self, request: object, **kwargs: object) -> OperationReplay:
+            del request, kwargs
+            return self.replay
+
+    phases = Phases()
+    instance, _persistence, _driver, host, _journal = runtime(phases)
+    probe = ReplayConfirmationProbe()
+    object.__setattr__(instance._dependencies, "confirmation_coordinator", probe)
+    control = InMemoryRuntimeInvocationControl()
+    prepared = instance.prepare_stream(
+        ConfirmationRequest(
+            conversation_id=7,
+            operation_id=probe.operation.id,
+            approved=True,
+            confirmation_token="stream-token",
+        ),
+        transport=transport(),
+        invocation_control=control,
+    )
+    assert isinstance(prepared, PreparedStreamExecution)
+    guard = PreparedStreamGuard(prepared=prepared)
+    assert guard.begin_execution() is True
+    seen: list[object] = []
+
+    class Sink:
+        def emit(self, event: object) -> None:
+            seen.append(event)
+
+    guard._execute = lambda: instance.execute_prepared_stream(
+        prepared,
+        event_sink=Sink(),
+        signal_sink=None,
+        execution_host=host,
+        cancel_check=lambda: False,
+    )
+    outcome = guard.execute_once()
+
+    assert isinstance(outcome, OperationReplayOutcome)
+    assert [type(event) for event in seen] == [
+        MetaEvent,
+        AssistantMessageEvent,
+        CompletedEvent,
+    ]
+    assert isinstance(seen[1], AssistantMessageEvent)
+    assert seen[1].message == "already committed"
+    assert control.state is InvocationState.COMPLETED
+    assert host.calls == 0
+    assert guard.complete(CompletionReason.NORMAL) is True

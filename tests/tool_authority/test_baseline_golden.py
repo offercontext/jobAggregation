@@ -21,10 +21,16 @@ from offerpilot.ai.agent_contracts import (
 from offerpilot.ai.agent_loop import (
     AgentLoopInvocation,
     AgentLoopRunner,
+    ApprovedContinuationSegment,
     ApprovedWriteSeed,
     NewTurnSeed,
+    build_segment_surface_gate,
+    _pending_action_revision,
+    _provider_arguments_digest,
     _delivery_error_payload,
 )
+from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
+from offerpilot.ai.tool_authority.policy import validate_startup_policy
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import (
@@ -49,6 +55,7 @@ from offerpilot.ai.write_operations import (
     ledger_fingerprint,
 )
 from offerpilot.agent_runtime.journal import NullRunRecorder
+from offerpilot.context_projector.selector import DEPENDENCY_POLICY_V1
 from offerpilot.chat_transport import (
     encode_sse_event,
     event_sse_name,
@@ -73,8 +80,10 @@ from offerpilot.pilot_runtime.errors import RuntimeFailureCode
 from offerpilot.pilot_runtime.event_sink import InMemoryRuntimeInvocationControl
 from offerpilot.pilot_runtime.persistence import PersistenceResult, PersistenceStatus
 from offerpilot.pilot_runtime.service import PilotRuntime, RuntimeDependencies
+from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 
 from .golden import BASELINE, FIXTURES, canonical_json, load_golden
+from tests.agent_loop.helpers import runtime as agent_loop_runtime
 
 
 MODEL_TOOL_NAMES = (
@@ -429,20 +438,96 @@ class _ClaimProbeError(ValueError):
     pass
 
 
+_PROBE_FACTORY = AuthorityFactory()
+_PROBE_REPOSITORY_CONTEXT = agent_loop_runtime()[1]
+_PROBE_POLICY = validate_startup_policy(MODEL_TOOL_CATALOG.authority_manifest)
+_PROBE_INVOCATIONS: dict[int, object] = {}
+
+
 def _probe_context(
     *, capabilities: frozenset[ToolCapability] = frozenset()
 ) -> ToolExecutionContext:
-    repository = cast(Any, object())
-    return ToolExecutionContext(
+    ordinal = len(_PROBE_INVOCATIONS)
+    authority = _PROBE_FACTORY.create_segment_authority(
+        conversation_id=1,
+        conversation_scope_revision=0,
+        segment_id=f"baseline-probe-segment-{ordinal}",
+        trusted_scope=TrustedContextScope("workspace", None, "general"),
         capabilities=capabilities,
-        current_bindings={},
-        applications=repository,
-        events=repository,
-        notes=repository,
-        offers=repository,
-        resumes=repository,
-        jd_analyses=repository,
+        capability_profile_id=_PROBE_POLICY.capability_profile.profile_id,
+        capability_policy_version=_PROBE_POLICY.capability_policy_version,
+        binding_policy_version=_PROBE_POLICY.binding_policy_version,
+        capability_profile_fingerprint=_PROBE_POLICY.capability_profile_fingerprint,
+        binding_policy_fingerprint=_PROBE_POLICY.binding_policy_fingerprint,
+    )
+    context = ToolExecutionContext(
+        authority=authority,
+        applications=_PROBE_REPOSITORY_CONTEXT.applications,
+        events=_PROBE_REPOSITORY_CONTEXT.events,
+        notes=_PROBE_REPOSITORY_CONTEXT.notes,
+        offers=_PROBE_REPOSITORY_CONTEXT.offers,
+        resumes=_PROBE_REPOSITORY_CONTEXT.resumes,
+        jd_analyses=_PROBE_REPOSITORY_CONTEXT.jd_analyses,
         run_recorder=NullRunRecorder(),
+    )
+    runner_invocation = object()
+    surface = object()
+    binding = object()
+    gateway = object()
+    _PROBE_FACTORY.register_runner_invocation(runner_invocation, authority=authority)
+    _PROBE_FACTORY.register_tool_execution_context(context, authority=authority)
+    build_identity = _PROBE_FACTORY.create_provider_surface_build_identity(
+        authority,
+        runner_invocation=runner_invocation,
+        tool_context=context,
+        model_call_id=f"baseline-probe-model-{ordinal}",
+    )
+    surface_fingerprint = "sha256:" + "e" * 64
+    _PROBE_FACTORY.register_frozen_surface(
+        surface,
+        surface_fingerprint=surface_fingerprint,
+        candidate_count=1,
+        authority=authority,
+        build_identity=build_identity,
+    )
+    _PROBE_FACTORY.register_model_call_surface_binding(
+        binding,
+        surface=surface,
+        surface_fingerprint=surface_fingerprint,
+        authority=authority,
+        build_identity=build_identity,
+    )
+    _PROBE_FACTORY.register_gateway_session(
+        gateway,
+        authority=authority,
+        build_identity=build_identity,
+        surface=surface,
+        surface_fingerprint=surface_fingerprint,
+        model_call_surface_binding=binding,
+    )
+    _PROBE_INVOCATIONS[id(context)] = _PROBE_FACTORY.create_provider_invocation_identity(
+        build_identity,
+        surface=surface,
+        surface_fingerprint=surface_fingerprint,
+        model_call_surface_binding=binding,
+        gateway_session=gateway,
+    )
+    return context
+
+
+def _probe_prepare_identity(context: ToolExecutionContext, call: ToolCall) -> object:
+    invocation = cast(Any, _PROBE_INVOCATIONS[id(context)])
+    attempt_id = _PROBE_FACTORY.issue_provider_attempt(
+        invocation,
+        candidate_ordinal=0,
+    )
+    return _PROBE_FACTORY.create_new_turn_prepare_identity(
+        invocation,
+        attempt_id=attempt_id,
+        candidate_ordinal=0,
+        tool_call_id=call.id,
+        tool_name=call.name,
+        arguments_digest=_provider_arguments_digest(call.args),
     )
 
 
@@ -503,7 +588,12 @@ def _return_preflight_failure(
 
 def _pipeline_projection(spec: ToolSpec[Any, Any], call: ToolCall, context: ToolExecutionContext) -> dict[str, Any]:
     catalog = ToolCatalog([spec], expected_names=(spec.name,))
-    result = prepare_call(catalog, context, call)
+    result = prepare_call(
+        catalog,
+        context,
+        call,
+        call_identity=_probe_prepare_identity(context, call),
+    )
     assert isinstance(result, Rejected)
     failure = result.failure
     assert isinstance(failure, ToolFailure)
@@ -736,7 +826,56 @@ def test_confirmation_routes_use_phase_specific_runtime_mapping_and_transport() 
     ) == metadata["modify_invalid_postheader"]
 
 
-def _prepared_write_probe() -> tuple[ToolSpec[Any, Any], ToolExecutionContext, Any]:
+def _probe_approval_context(
+    pending: PendingAction,
+    *,
+    operation_executor: Any = None,
+) -> tuple[ToolExecutionContext, int, str]:
+    revision = _pending_action_revision(pending.tool_call_id, pending.tool_name, pending.args)
+    digest = _provider_arguments_digest(pending.args)
+    if pending.conversation_id is None:
+        pending.bind_typed_proposal_identity(
+            conversation_id=1,
+            pending_action_revision=revision,
+            pending_confirmation_claim_id=pending.operation_id,
+            arguments_digest=digest,
+        )
+    approval_factory = AuthorityFactory()
+    approval_factory.register_pending(pending)
+    authority = approval_factory.create_approval_authority(
+        operation_id=pending.operation_id,
+        conversation_id=1,
+        conversation_scope_revision=0,
+        trusted_scope=TrustedContextScope("workspace", None, "general"),
+        pending_identity=pending,
+        pending_action_revision=revision,
+        tool_call_id=pending.tool_call_id,
+        tool_name=pending.tool_name,
+        effective_args_digest=digest,
+        capabilities=frozenset(ToolCapability),
+        capability_profile_id=_PROBE_POLICY.capability_profile.profile_id,
+        capability_policy_version=_PROBE_POLICY.capability_policy_version,
+        binding_policy_version=_PROBE_POLICY.binding_policy_version,
+        capability_profile_fingerprint=_PROBE_POLICY.capability_profile_fingerprint,
+        binding_policy_fingerprint=_PROBE_POLICY.binding_policy_fingerprint,
+    )
+    context = ToolExecutionContext(
+        authority=authority,
+        applications=_PROBE_REPOSITORY_CONTEXT.applications,
+        events=_PROBE_REPOSITORY_CONTEXT.events,
+        notes=_PROBE_REPOSITORY_CONTEXT.notes,
+        offers=_PROBE_REPOSITORY_CONTEXT.offers,
+        resumes=_PROBE_REPOSITORY_CONTEXT.resumes,
+        jd_analyses=_PROBE_REPOSITORY_CONTEXT.jd_analyses,
+        run_recorder=NullRunRecorder(),
+        operation_executor=operation_executor,
+    )
+    return context, revision, digest
+
+
+def _prepared_write_probe() -> tuple[
+    ToolSpec[Any, Any], ToolExecutionContext, Any, object, PendingAction
+]:
     spec = replace(
         _probe_spec(
             "authority_execute_probe",
@@ -747,30 +886,6 @@ def _prepared_write_probe() -> tuple[ToolSpec[Any, Any], ToolExecutionContext, A
         confirmation_policy="required",
         write_contract=WriteContract(),
     )
-    context = _probe_context()
-    catalog = ToolCatalog([spec], expected_names=(spec.name,))
-    prepared_result = prepare_call(
-        catalog,
-        context,
-        ToolCall("execute-call", spec.name, "{}"),
-        pending_identity="execute-call:authority_execute_probe",
-        pending_action_revision=1,
-        record_proposal=False,
-    )
-    assert isinstance(prepared_result, ConfirmationRequired)
-    return spec, context, prepared_result.prepared
-
-
-def _raise_claim(_prepared: object) -> None:
-    raise _ClaimProbeError
-
-
-def _mismatched_claim_failure(_prepared: Any) -> ToolFailure:
-    return ToolFailure("conflict", "authorization_mismatch")
-
-
-def _run_stale_promotion(mode: str) -> RuntimeFailureOutcome:
-    spec, context, _prepared = _prepared_write_probe()
     pending = PendingAction(
         "execute-call",
         spec.name,
@@ -778,6 +893,37 @@ def _run_stale_promotion(mode: str) -> RuntimeFailureOutcome:
         "confirm",
         "00000000-0000-0000-0000-000000000003",
     )
+    context, revision, _digest = _probe_approval_context(pending)
+    prepare_identity = context.authority_factory.create_approved_write_prepare_identity(
+        context.authority,
+        approval_context=context,
+        request_identity=pending,
+    )
+    catalog = ToolCatalog([spec], expected_names=(spec.name,))
+    call = ToolCall("execute-call", spec.name, "{}")
+    prepared_result = prepare_call(
+        catalog,
+        context,
+        call,
+        call_identity=prepare_identity,
+        pending_identity=pending,
+        pending_action_revision=revision,
+        record_proposal=False,
+    )
+    assert isinstance(prepared_result, ConfirmationRequired)
+    return spec, context, prepared_result.prepared, prepare_identity, pending
+
+
+def _raise_claim(_prepared: object) -> None:
+    raise _ClaimProbeError
+
+
+def _mismatched_claim_failure(_prepared: Any) -> ToolFailure:
+    return ToolFailure("stale_state", "authorization_mismatch")
+
+
+def _run_stale_promotion(mode: str) -> RuntimeFailureOutcome:
+    spec, context, _prepared, _prepare_identity, pending = _prepared_write_probe()
     continuation = _PromotionContinuation(pending, mode)
 
     def operation_executor(*_args: object) -> ToolExecutionRecord[Any, Any]:
@@ -787,7 +933,10 @@ def _run_stale_promotion(mode: str) -> RuntimeFailureOutcome:
         seed=ApprovedWriteSeed(continuation),
         model=cast(Any, _CountingModel(Assistant(content="must not run"))),
         catalog=ToolCatalog([spec], expected_names=(spec.name,)),
-        tool_context=replace(context, operation_executor=operation_executor),
+        tool_context=context.with_runtime_dependencies(
+            run_recorder=NullRunRecorder(),
+            operation_executor=operation_executor,
+        ),
         auto_approve=False,
         max_iterations=2,
         run_recorder=NullRunRecorder(),
@@ -821,10 +970,11 @@ def test_execute_prepared_failures_promote_to_one_verified_stale_route() -> None
         "confirmation_claim_failed": _raise_claim,
         "authorization_mismatch": _mismatched_claim_failure,
     }.items():
-        spec, context, prepared = _prepared_write_probe()
+        spec, context, prepared, prepare_identity, _pending = _prepared_write_probe()
         record = execute_prepared(
             prepared,
             context,
+            call_identity=prepare_identity,
             confirmation_claimer=claimer,
         )
         assert isinstance(record.outcome, ToolFailure)
@@ -876,9 +1026,73 @@ class _CountingEventSink:
         self.events.append(event)
 
 
+class _ContinuationModel:
+    def __init__(self, inner: object) -> None:
+        self._inner = inner
+
+    def complete(self, messages: list[object], tools: list[object]) -> object:
+        return self._inner.complete(messages, tools)  # type: ignore[attr-defined]
+
+
+class _DelegatingRecorder:
+    """Test equivalent of the Runtime's stable Segment recorder proxy."""
+
+    def __init__(self, delegate: object) -> None:
+        self._delegate = delegate
+
+    def set_delegate(self, delegate: object) -> None:
+        self._delegate = delegate
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._delegate, name)
+
+
+def _approved_segment_for_count_harness(
+    pending: PendingAction,
+    model: object,
+) -> ApprovedContinuationSegment:
+    """Build the strict fresh Segment required by the approved Agent Loop path."""
+
+    segment_catalog, segment_origin = agent_loop_runtime()
+    segment_context = segment_origin.with_runtime_dependencies(
+        run_recorder=_DelegatingRecorder(NullRunRecorder()),
+        operation_executor=None,
+    )
+    messages = (
+        Message(role="user", content="synthetic request"),
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=[ToolCall(pending.tool_call_id, pending.tool_name, pending.args)],
+        ),
+        Message(role="tool", content="saved", tool_call_id=pending.tool_call_id),
+        Message(role="user", content="continue"),
+    )
+    surface_gate = build_segment_surface_gate(
+        messages,
+        catalog=segment_catalog,
+        context=segment_context,
+        authority=segment_context.authority,
+        dependency_policy=DEPENDENCY_POLICY_V1,
+        policy=validate_startup_policy(segment_catalog.authority_manifest),
+    )
+    return ApprovedContinuationSegment(
+        messages=messages,
+        model=_ContinuationModel(model),
+        catalog=segment_catalog,
+        tool_context=segment_context,
+        surface_gate=surface_gate,
+    )
+
+
 class _CountingContinuation:
-    def __init__(self, pending: PendingAction) -> None:
+    def __init__(
+        self,
+        pending: PendingAction,
+        continuation_segment: ApprovedContinuationSegment,
+    ) -> None:
         self._pending = pending
+        self._continuation_segment = continuation_segment
 
     @property
     def pending(self) -> PendingAction:
@@ -899,8 +1113,8 @@ class _CountingContinuation:
     ) -> None:
         return None
 
-    def load_continuation_messages(self) -> tuple[Message, ...]:
-        return (Message(role="user", content="continue"),)
+    def activate_continuation_segment(self) -> ApprovedContinuationSegment:
+        return self._continuation_segment
 
     def delivery_fence(self) -> bool:
         return True
@@ -908,7 +1122,13 @@ class _CountingContinuation:
 
 class _PromotionContinuation(_CountingContinuation):
     def __init__(self, pending: PendingAction, mode: str) -> None:
-        super().__init__(pending)
+        super().__init__(
+            pending,
+            _approved_segment_for_count_harness(
+                pending,
+                _CountingModel(Assistant(content="done")),
+            ),
+        )
         self.mode = mode
 
     def claim(
@@ -922,52 +1142,53 @@ class _PromotionContinuation(_CountingContinuation):
 
 
 def _counted_write_spec(counter: dict[str, int]) -> ToolSpec[Any, Any]:
-    name = "authority_counted_write"
-    parameters: dict[str, Any] = {
-        "type": "object",
-        "properties": {"value": {"type": "string"}},
-    }
-    contract = ProviderToolContract(
-        payload={
-            "type": "function",
-            "function": {"name": name, "description": name, "parameters": parameters},
-        },
-        name=name,
-        description=name,
-        parameters=parameters,
-    )
+    original = MODEL_TOOL_CATALOG.resolve("create_application")
+    assert original is not None
 
     def execute(_args: dict[str, Any], _context: ToolExecutionContext) -> dict[str, bool]:
         counter["tool_spec_executor_calls"] += 1
         return {"ok": True}
 
-    return ToolSpec(
-        contract=contract,
-        kind="write",
-        decoder=lambda values: dict(values),
-        executor=execute,
-        confirmation_policy="required",
-        write_contract=WriteContract(),
-        declared_failure_categories=frozenset({"internal_error"}),
-        success_renderer=str,
+    return replace(original, executor=execute)
+
+
+def _counted_write_catalog(spec: ToolSpec[Any, Any]) -> ToolCatalog:
+    specs = tuple(spec if candidate.name == spec.name else candidate for candidate in MODEL_TOOL_CATALOG.specs)
+    return ToolCatalog(
+        specs,
+        expected_names=MODEL_TOOL_NAMES,
+        authority_manifest=MODEL_TOOL_CATALOG.authority_manifest,
     )
 
 
 def _run_agent_call_count_case(case: str) -> dict[str, object]:
     counter = {"tool_spec_executor_calls": 0, "operation_executor_calls": 0}
     spec = _counted_write_spec(counter)
-    catalog = ToolCatalog([spec], expected_names=(spec.name,))
     sink = _CountingEventSink()
     if case == "new_turn":
         model = _CountingModel(
-            Assistant(tool_calls=[ToolCall("new-call", spec.name, "{}")])
+            Assistant(
+                tool_calls=[
+                    ToolCall(
+                        "new-call",
+                        spec.name,
+                        '{"company_name":"Synthetic Co","position_name":"Engineer"}',
+                    )
+                ]
+            )
         )
+        catalog = _counted_write_catalog(spec)
         seed: NewTurnSeed | ApprovedWriteSeed = NewTurnSeed(
             (Message(role="user", content="synthetic request"),)
         )
-        context = _probe_context()
+        context = _probe_context(capabilities=frozenset(ToolCapability))
     else:
-        pending_args = '{"value":"changed"}' if case == "modify" else "{}"
+        catalog = ToolCatalog([spec], expected_names=(spec.name,))
+        pending_args = (
+            '{"company_name":"Synthetic Co","position_name":"Changed"}'
+            if case == "modify"
+            else '{"company_name":"Synthetic Co","position_name":"Engineer"}'
+        )
         pending = PendingAction(
             f"{case}-call",
             spec.name,
@@ -975,8 +1196,11 @@ def _run_agent_call_count_case(case: str) -> dict[str, object]:
             "confirm",
             f"00000000-0000-0000-0000-00000000000{2 if case == 'modify' else 1}",
         )
-        continuation = _CountingContinuation(pending)
         model = _CountingModel(Assistant(content="done"))
+        continuation = _CountingContinuation(
+            pending,
+            _approved_segment_for_count_harness(pending, model),
+        )
 
         def operation_executor(
             prepared: object,
@@ -997,10 +1221,25 @@ def _run_agent_call_count_case(case: str) -> dict[str, object]:
                 terminal_persisted=True,
                 persisted_visible_result="saved",
                 persisted_transport={"status": "success"},
-            )
+        )
 
         seed = ApprovedWriteSeed(continuation)
-        context = replace(_probe_context(), operation_executor=operation_executor)
+        context, _revision, _digest = _probe_approval_context(
+            pending,
+            operation_executor=operation_executor,
+        )
+    surface_gate = (
+        build_segment_surface_gate(
+            seed.messages,
+            catalog=catalog,
+            context=context,
+            authority=cast(Any, context.authority),
+            dependency_policy=DEPENDENCY_POLICY_V1,
+            policy=validate_startup_policy(catalog.authority_manifest),
+        )
+        if isinstance(seed, NewTurnSeed)
+        else None
+    )
     invocation = AgentLoopInvocation(
         seed=seed,
         model=cast(Any, model),
@@ -1012,6 +1251,7 @@ def _run_agent_call_count_case(case: str) -> dict[str, object]:
         event_sink=sink,
         runtime_signal_sink=None,
         cancel_check=None,
+        surface_gate=surface_gate,
     )
     result = AgentLoopRunner().run(invocation)
     assert isinstance(result, AgentTurnResult)
@@ -1206,7 +1446,7 @@ def _run_ledger_call_count_case(case: str) -> dict[str, object]:
     )
     counts = {"model_calls": 0, "provider_calls": 0}
 
-    def resolve_model(_request: object, _conversation: object) -> object:
+    def resolve_model(_request: object, _conversation: object, _policy: object) -> object:
         counts["provider_calls"] += 1
         raise AssertionError("provider must not run on provider-free Ledger route")
 
@@ -1220,7 +1460,7 @@ def _run_ledger_call_count_case(case: str) -> dict[str, object]:
             conversations=cast(Any, _AuthorityConversations()),
             persistence=cast(Any, persistence),
             confirmation_coordinator=coordinator,
-            model_resolver=cast(Any, resolve_model),
+            continuation_model_resolver=cast(Any, resolve_model),
             agent_driver=cast(Any, Driver()),
         )
     )

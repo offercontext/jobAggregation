@@ -401,7 +401,7 @@ def test_sync_unknown_route_fails_closed_before_model_side_effects(route_value: 
     runtime = PilotRuntime(
         RuntimeDependencies(
             conversations=_Gateway(),
-            model_resolver=provider,
+            continuation_model_resolver=provider,
             route_selector=lambda _request, _conversation: route_value,
         )
     )
@@ -435,7 +435,7 @@ def test_stream_unknown_route_matches_sync_fail_closed_boundary(route_value: str
     runtime = PilotRuntime(
         RuntimeDependencies(
             conversations=_Gateway(),
-            model_resolver=provider,
+            continuation_model_resolver=provider,
             route_selector=lambda _request, _conversation: route_value,
         )
     )
@@ -473,7 +473,7 @@ def test_route_selector_exception_is_typed_and_terminal_in_both_transports() -> 
     runtime = PilotRuntime(
         RuntimeDependencies(
             conversations=_Gateway(),
-            model_resolver=provider,
+            continuation_model_resolver=provider,
             route_selector=broken_selector,
         )
     )
@@ -706,7 +706,7 @@ def test_runtime_clarification_text_and_cancel_use_deterministic_sync_route(
             conversations=_Gateway(),
             persistence=persistence,
             deterministic=adapter,
-            model_resolver=provider,
+            continuation_model_resolver=provider,
             route_selector=lambda _request, _conversation: "model",
         )
     )
@@ -762,7 +762,7 @@ def test_runtime_clarification_text_and_cancel_use_deterministic_stream_route(
             conversations=_Gateway(),
             persistence=persistence,
             deterministic=adapter,
-            model_resolver=provider,
+            continuation_model_resolver=provider,
             route_selector=lambda _request, _conversation: "model",
         )
     )
@@ -1295,7 +1295,7 @@ def test_runtime_pending_guard_precedes_trusted_route_and_does_not_replay() -> N
             conversations=_Gateway(),
             persistence=persistence,
             deterministic=adapter,
-            model_resolver=provider,
+            continuation_model_resolver=provider,
             route_selector=lambda _request, _conversation: "model",
         )
     )

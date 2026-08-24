@@ -1362,6 +1362,8 @@ class WriteOperationCoordinator:
         context: ToolExecutionContext,
         prepare_identity: ApprovedWritePrepareCallIdentity,
         request_fingerprint: str,
+        edited_args_present: bool = False,
+        edited_args: Mapping[str, JSONValue] | None = None,
         undo_seed_builder: UndoSeedBuilder | None = None,
         undo_builder: UndoBuilder | None = None,
         approval_decided_callback: Callable[[object | None], None] | None = None,
@@ -1399,6 +1401,8 @@ class WriteOperationCoordinator:
                     authority,
                     prepare_identity,
                     request_fingerprint,
+                    edited_args_present,
+                    edited_args,
                     factory,
                 )
                 bound_context = context.bind(session)
@@ -1458,10 +1462,7 @@ class WriteOperationCoordinator:
                         self.repository.append_transition(session, operation_id, 2, "approved")
                         self.repository.append_transition(session, operation_id, 3, "claimed")
                         if approval_decided_callback is not None:
-                            try:
-                                approval_decided_callback(session)
-                            except Exception:
-                                pass
+                            approval_decided_callback(session)
                         return self._commit_failure(
                             session,
                             operation,
@@ -1531,10 +1532,7 @@ class WriteOperationCoordinator:
                         factory.revoke(execution_claim)
                     raise WriteOperationError("operation_identity_conflict") from exc
                 if approval_decided_callback is not None:
-                    try:
-                        approval_decided_callback(session)
-                    except Exception:
-                        pass
+                    approval_decided_callback(session)
                 executor_started = False
                 started_recorded = False
 
@@ -2367,6 +2365,8 @@ class WriteOperationCoordinator:
         authority: ApprovalExecutionAuthority,
         prepare_identity: ApprovedWritePrepareCallIdentity,
         request_fingerprint: str,
+        edited_args_present: bool,
+        edited_args: Mapping[str, JSONValue] | None,
         factory: Any,
     ) -> _LockedPendingIdentity:
         if operation.conversation_id is None:
@@ -2394,11 +2394,43 @@ class WriteOperationCoordinator:
             persisted_values = parse_arguments(conversation.pending_args)
             prepared_values = cast(dict[str, JSONValue], dict(prepared.arguments))
             prepared_arguments = canonical_json(cast(JSONValue, prepared_values))
-            persisted_arguments = canonical_json(cast(JSONValue, persisted_values))
+            if type(edited_args_present) is not bool:
+                raise TypeError("edited_args_present must be bool")
+            if edited_args_present:
+                if not isinstance(edited_args, Mapping):
+                    raise TypeError("edited_args must be a mapping when present")
+                patch = dict(edited_args)
+                if any(type(key) is not str for key in patch):
+                    raise TypeError("edited_args keys must be strings")
+                editable_fields = {
+                    descriptor.get("field")
+                    for descriptor in prepared.spec.editable_fields
+                    if type(descriptor.get("field")) is str
+                }
+                if any(key not in editable_fields for key in patch):
+                    raise ValueError("edited_args contains a non-editable field")
+                expected_values = {**persisted_values, **patch}
+            else:
+                if edited_args is not None:
+                    raise TypeError("edited_args must be absent when presence is false")
+                patch = None
+                expected_values = persisted_values
+            expected_arguments = canonical_json(cast(JSONValue, expected_values))
+            # The revision is the Pending identity, not the canonical digest.
+            # Keep the validated mapping's insertion order here so it matches
+            # AgentLoop's `_pending_action_revision` and the persisted
+            # proposal bytes.  Canonical JSON remains the equality/digest
+            # representation below.
+            prepared_identity_arguments = json.dumps(
+                prepared_values,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
             effective = _locked_pending_identity(
                 prepared.tool_call_id,
                 prepared.spec.name,
-                prepared_arguments,
+                prepared_identity_arguments,
             )
             prepared_pending_token = factory.pending_token(prepared.pending_identity)
         except (
@@ -2449,36 +2481,21 @@ class WriteOperationCoordinator:
             )
         ):
             raise WriteOperationError("operation_identity_conflict")
-        no_edit_request = operation_request_fingerprint(
+        expected_request = operation_request_fingerprint(
             self.repository.key,
             operation_id=operation.id,
             tool_call_id=prepared.tool_call_id,
             approved=True,
-            edited_args_present=False,
-            edited_args=None,
-            rejection_feedback_present=False,
-            rejection_feedback="",
-            confirmation_token_fingerprint=operation.confirmation_token_fingerprint or "",
-            proposal_fingerprint=operation.proposal_fingerprint or "",
-        )
-        edited_request = operation_request_fingerprint(
-            self.repository.key,
-            operation_id=operation.id,
-            tool_call_id=prepared.tool_call_id,
-            approved=True,
-            edited_args_present=True,
-            edited_args=prepared_values,
+            edited_args_present=edited_args_present,
+            edited_args=patch,
             rejection_feedback_present=False,
             rejection_feedback="",
             confirmation_token_fingerprint=operation.confirmation_token_fingerprint or "",
             proposal_fingerprint=operation.proposal_fingerprint or "",
         )
         if not (
-            (
-                _constant_time_text_equal(prepared_arguments, persisted_arguments)
-                and _constant_time_text_equal(request_fingerprint, no_edit_request)
-            )
-            or _constant_time_text_equal(request_fingerprint, edited_request)
+            _constant_time_text_equal(prepared_arguments, expected_arguments)
+            and _constant_time_text_equal(request_fingerprint, expected_request)
         ):
             raise WriteOperationError("operation_input_conflict")
         try:

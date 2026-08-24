@@ -213,12 +213,9 @@ def test_production_approve_modify_invokes_minimal_resolver_before_source(
     coordinator = ConfirmationCoordinator(
         ConfirmationDependencies(
             persistence=ChatPersistenceCoordinator(harness.chat),
-            conversations=harness.chat,
             write_operations=harness.repository,
             write_coordinator=harness.coordinator,
             catalog=MODEL_TOOL_CATALOG,
-            source_loader=forbidden_source,
-            applications=ApplicationsRepository(harness.sessions),
             approval_context_resolver=_approval_context_resolver(harness),
         )
     )
@@ -233,7 +230,6 @@ def test_production_approve_modify_invokes_minimal_resolver_before_source(
         pending=harness.pending,
         conversation=conversation,
         catalog=MODEL_TOOL_CATALOG,
-        source_loader=forbidden_source,
     )
 
     try:
@@ -336,7 +332,7 @@ def test_runtime_real_typed_origin_is_provider_and_source_free(tmp_path) -> None
     source_calls = 0
     approval_contexts: list[ToolExecutionContext] = []
 
-    def forbidden_model(_request, _conversation):
+    def forbidden_model(_request, _conversation, _policy):
         nonlocal provider_calls
         provider_calls += 1
         raise AssertionError("origin approval must not resolve a Provider")
@@ -356,12 +352,9 @@ def test_runtime_real_typed_origin_is_provider_and_source_free(tmp_path) -> None
     coordinator = ConfirmationCoordinator(
         ConfirmationDependencies(
             persistence=ChatPersistenceCoordinator(harness.chat),
-            conversations=harness.chat,
             write_operations=harness.repository,
             write_coordinator=harness.coordinator,
             catalog=MODEL_TOOL_CATALOG,
-            source_loader=forbidden_source,
-            applications=harness.applications,
             approval_context_resolver=tracked_approval_context,
         )
     )
@@ -419,8 +412,7 @@ def test_runtime_real_typed_origin_is_provider_and_source_free(tmp_path) -> None
             conversations=Conversations(),
             persistence=ChatPersistenceCoordinator(harness.chat),
             confirmation_coordinator=coordinator,
-            model_resolver=forbidden_model,
-            source_loader=forbidden_source,
+            continuation_model_resolver=forbidden_model,
             agent_driver=OriginDriver(),
             catalog=MODEL_TOOL_CATALOG,
         )
@@ -457,11 +449,9 @@ def test_production_agent_driver_retains_approval_context_seals(tmp_path) -> Non
     coordinator = ConfirmationCoordinator(
         ConfirmationDependencies(
             persistence=ChatPersistenceCoordinator(harness.chat),
-            conversations=harness.chat,
             write_operations=harness.repository,
             write_coordinator=harness.coordinator,
             catalog=MODEL_TOOL_CATALOG,
-            applications=harness.applications,
             approval_context_resolver=_approval_context_resolver(harness),
         )
     )
@@ -496,7 +486,14 @@ def test_production_agent_driver_retains_approval_context_seals(tmp_path) -> Non
     received: list[ToolExecutionContext] = []
 
     class Runner:
-        def run(self, candidate: AgentLoopInvocation) -> AgentTurnResult:
+        def run(
+            self,
+            candidate: AgentLoopInvocation,
+            *,
+            run_recorder: object,
+            event_sink: object,
+        ) -> AgentTurnResult:
+            del run_recorder, event_sink
             received.append(candidate.tool_context)
             return AgentTurnResult([], "", None)
 
@@ -522,11 +519,9 @@ def test_unclaimed_timeout_closes_approval_authority(tmp_path) -> None:
     coordinator = ConfirmationCoordinator(
         ConfirmationDependencies(
             persistence=ChatPersistenceCoordinator(harness.chat),
-            conversations=harness.chat,
             write_operations=harness.repository,
             write_coordinator=harness.coordinator,
             catalog=MODEL_TOOL_CATALOG,
-            applications=harness.applications,
             approval_context_resolver=_approval_context_resolver(harness),
         )
     )
@@ -566,11 +561,9 @@ def test_replay_exit_closes_approval_authority(
     coordinator = ConfirmationCoordinator(
         ConfirmationDependencies(
             persistence=ChatPersistenceCoordinator(harness.chat),
-            conversations=harness.chat,
             write_operations=harness.repository,
             write_coordinator=harness.coordinator,
             catalog=MODEL_TOOL_CATALOG,
-            applications=harness.applications,
             approval_context_resolver=tracked_approval_context,
         )
     )

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import inspect
+from copy import deepcopy
 from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar, Token
 from datetime import datetime, timezone
@@ -36,7 +37,6 @@ from offerpilot.ai.agent_loop import (
     AgentLoopInvocation,
     AgentLoopRunner,
     build_segment_surface_gate,
-    NewTurnSeed,
 )
 from offerpilot.ai.client import ConfiguredAIClient
 from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
@@ -45,6 +45,7 @@ from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_authority.policy import (
     validate_startup_policy,
 )
+from offerpilot.ai.tool_runtime.catalog import ToolCatalog as RuntimeToolCatalog
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 from offerpilot.ai.tool_specs.legacy import build_legacy_deterministic_catalog
 from offerpilot.context_projector.selector import DEPENDENCY_POLICY_V1
@@ -218,6 +219,30 @@ class _PolicyCatalogResolver:
     def __init__(self, catalog: object) -> None:
         self._catalog = catalog
 
+    @staticmethod
+    def _fresh_segment_catalog(catalog: object) -> RuntimeToolCatalog:
+        """Rebuild a detached catalog for each execution Segment.
+
+        The Approval invocation owns the composition-root catalog.  A
+        continuation Segment must receive a distinct catalog identity so an
+        Approval-bound invocation cannot be reused as the post-terminal
+        Segment.  Rebuilding from the startup-validated specs and manifest
+        also keeps the exact provider schema/order and authority fingerprint,
+        while preventing mutable catalog/spec state from crossing the phase
+        boundary.
+        """
+
+        if type(catalog) is not RuntimeToolCatalog:
+            raise ValueError("segment catalog must be a frozen ToolCatalog")
+        specs = tuple(deepcopy(catalog.specs))
+        expected_names = tuple(spec.name for spec in specs)
+        manifest = deepcopy(catalog.authority_manifest)
+        return RuntimeToolCatalog(
+            specs,
+            expected_names=expected_names,
+            authority_manifest=manifest,
+        )
+
     def resolve(
         self,
         request: StartTurnRequest,
@@ -233,7 +258,8 @@ class _PolicyCatalogResolver:
             or segment.catalog is not None
         ):
             raise ValueError("policy resolver requires an unbound Segment authority")
-        manifest = getattr(self._catalog, "authority_manifest", None)
+        segment_catalog = self._fresh_segment_catalog(self._catalog)
+        manifest = segment_catalog.authority_manifest
         if not isinstance(manifest, Mapping):
             raise ValueError("typed catalog manifest is unavailable")
         snapshot = validate_startup_policy(manifest)
@@ -249,7 +275,7 @@ class _PolicyCatalogResolver:
         ):
             raise ValueError("live policy drifted from Segment authority")
         return ResolvedPolicyCatalog(
-            catalog=self._catalog,
+            catalog=segment_catalog,
             policy=snapshot,
             dependency_policy=DEPENDENCY_POLICY_V1,
         )
@@ -724,11 +750,13 @@ class _AgentDriver:
         self._runner = AgentLoopRunner()
 
     def execute(self, invocation: AgentLoopInvocation) -> AgentTurnResult:
-        recorder = (
-            _ProposalJournalGate(invocation.run_recorder)
-            if isinstance(invocation.seed, NewTurnSeed)
-            else invocation.run_recorder
-        )
+        # Every Agent Loop seed gets one proposal gate.  The origin approved
+        # write uses ``record_proposal=False``; only a chained Pending can
+        # queue ``tool.proposed`` and it is released by Runtime after the
+        # authoritative delivery atom succeeds.  The gate wraps the raw
+        # invocation recorder exactly once; Context carries a stable proxy
+        # whose delegate is switched to this gate for the active run.
+        recorder = _ProposalJournalGate(invocation.run_recorder)
         context = invocation.tool_context
         if not isinstance(context, ToolExecutionContext):
             raise TypeError("Agent Loop requires ToolExecutionContext")
@@ -741,15 +769,32 @@ class _AgentDriver:
         runtime_sink = cast(RuntimeEventSink | None, invocation.event_sink)
         agent_sink = _AgentEventAdapter(runtime_sink) if runtime_sink is not None else None
         try:
-            return self._runner.run(
+            result = self._runner.run(
                 invocation,
                 run_recorder=cast(Any, recorder),
                 event_sink=agent_sink,
             )
+            if not isinstance(result, AgentTurnResult):
+                raise TypeError("Agent Loop must return AgentTurnResult")
+            if result.pending is None:
+                # A non-suspending turn owns the queued proposals itself.
+                recorder.release_proposals()
+            else:
+                # A suspending turn is persisted by the delivery atom; its
+                # journal suspension is the sole durable proposal writer.
+                recorder.discard_proposals()
+            return result
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            recorder.discard_proposals()
             raise
         except ChatRunCancelled as exc:
+            recorder.discard_proposals()
             raise RuntimeCancelled() from exc
+        except BaseException:
+            # Provider/Tool/transport failures must never leave deferred
+            # proposal facts available for a later turn.
+            recorder.discard_proposals()
+            raise
 
 
 class _AtomicTimeoutDelivery:
@@ -1096,12 +1141,7 @@ def build_pilot_runtime(
             persistence=cast(Any, persistence),
             write_operations=cast(Any, write_operations),
             write_coordinator=cast(Any, write_coordinator),
-            conversations=gateway,
             catalog=catalog,
-            source_loader=cast(Any, source),
-            context_assembler=cast(Any, assembler),
-            journal=cast(Any, run_recorder_factory),
-            applications=applications,
             approval_context_resolver=resolve_approval_context,
             transactional_delivery=transactional_delivery,
             undo_seed_builder=(

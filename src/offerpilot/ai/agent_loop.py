@@ -4,7 +4,7 @@ import hashlib
 import json
 from copy import deepcopy
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, cast
 from uuid import uuid4
 
@@ -331,6 +331,63 @@ class SegmentSurfaceGate(_ReplacementProtected, TransientToolRuntimeValue):
             raise ProjectionError("preselected_surface_mismatch")
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class ApprovedContinuationSegment(TransientToolRuntimeValue):
+    """Fresh Segment services activated after an approved write is fenced.
+
+    The approval port is deliberately the only producer of this value.  It
+    carries the canonical post-terminal source messages and all Segment-bound
+    Provider inputs together, so the loop cannot accidentally retain the
+    Approval context, catalog, model, or surface gate after the origin write.
+    ``messages`` are the complete source snapshot after the origin ToolMessage
+    has been durably committed; the runner never appends a second local copy.
+    """
+
+    messages: tuple[Message, ...]
+    model: ChatModel
+    catalog: ToolCatalog
+    tool_context: ToolExecutionContext
+    surface_gate: SegmentSurfaceGate
+    # The policy resolver owns the continuation budget.  Carry it with the
+    # fresh Segment so bootstrap cannot silently retain the Approval seed's
+    # default budget.
+    max_iterations: int = DEFAULT_MAX_ITERATIONS
+    _serialization_guard: object = field(
+        default=_TRANSIENT_ASDICT_GUARD,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        if type(self.messages) is not tuple:
+            raise TypeError("ApprovedContinuationSegment messages must be a tuple")
+        if any(not isinstance(message, Message) for message in self.messages):
+            raise TypeError("ApprovedContinuationSegment messages must contain Message values")
+        if self.model is None or not callable(getattr(self.model, "complete", None)):
+            raise TypeError("ApprovedContinuationSegment model is invalid")
+        if type(self.catalog) is not ToolCatalog:
+            raise TypeError("ApprovedContinuationSegment catalog is invalid")
+        if type(self.tool_context) is not ToolExecutionContext:
+            raise TypeError("ApprovedContinuationSegment tool_context is invalid")
+        if type(self.tool_context.authority) is not SegmentExecutionAuthority:
+            raise TypeError("ApprovedContinuationSegment requires Segment authority")
+        if type(self.surface_gate) is not SegmentSurfaceGate:
+            raise TypeError("ApprovedContinuationSegment surface_gate is invalid")
+        if type(self.max_iterations) is not int or self.max_iterations <= 0:
+            raise TypeError("ApprovedContinuationSegment max_iterations is invalid")
+        if (
+            self.surface_gate.authority is not self.tool_context.authority
+            or self.surface_gate.context is not self.tool_context
+            or self.surface_gate.catalog is not self.catalog
+        ):
+            raise ProjectionError("approved continuation Segment bundle mismatch")
+        self.surface_gate._validate_current_surface()
+
+    def __repr__(self) -> str:
+        return "<ApprovedContinuationSegment transient>"
+
+
 def build_segment_surface_gate(
     messages: tuple[Message, ...] | list[Message],
     *,
@@ -418,6 +475,9 @@ class _LoopServices:
         *,
         run_recorder: RunRecorder | None = None,
         event_sink: AgentEventSink | None | object = _NO_OVERRIDE,
+        records: list[ToolExecutionRecord[Any, Any]] | None = None,
+        failures: list[ToolFailure] | None = None,
+        delivery_fence: Callable[[], bool] | None | object = _NO_OVERRIDE,
     ) -> None:
         model = invocation.model
         self.model = (
@@ -439,12 +499,14 @@ class _LoopServices:
         self.surface_gate = invocation.surface_gate
         self.delivery_fence = (
             invocation.seed.continuation.delivery_fence
-            if isinstance(invocation.seed, ApprovedWriteSeed)
+            if delivery_fence is _NO_OVERRIDE and isinstance(invocation.seed, ApprovedWriteSeed)
             else None
+            if delivery_fence is _NO_OVERRIDE
+            else cast(Callable[[], bool] | None, delivery_fence)
         )
         self.runtime_signal_sink = invocation.runtime_signal_sink
-        self.records: list[ToolExecutionRecord[Any, Any]] = []
-        self.failures: list[ToolFailure] = []
+        self.records = [] if records is None else records
+        self.failures = [] if failures is None else failures
         self.runner_invocation = invocation
         self._prepare_identities: dict[int, NewTurnPrepareCallIdentity] = {}
         self._provider_invocations: dict[int, ProviderInvocationIdentity] = {}
@@ -914,7 +976,7 @@ class ApprovedWriteSeed(TransientToolRuntimeValue):
         required_methods = (
             "claim",
             "record_result",
-            "load_continuation_messages",
+            "activate_continuation_segment",
             "delivery_fence",
         )
         if any(
@@ -1037,7 +1099,12 @@ class AgentLoopRunner:
             working_messages = list(invocation.seed.messages)
             added_messages: list[Message] = []
         else:
-            working_messages, added_messages = self._bootstrap_approved(
+            (
+                invocation,
+                services,
+                working_messages,
+                added_messages,
+            ) = self._bootstrap_approved(
                 invocation,
                 invocation.seed.continuation,
                 services,
@@ -1108,7 +1175,7 @@ class AgentLoopRunner:
         services: _LoopServices,
         records: list[ToolExecutionRecord[Any, Any]],
         failures: list[ToolFailure],
-    ) -> tuple[list[Message], list[Message]]:
+    ) -> tuple[AgentLoopInvocation, _LoopServices, list[Message], list[Message]]:
         services.raise_if_cancelled()
         seed = invocation.seed
         if not isinstance(seed, ApprovedWriteSeed):
@@ -1193,10 +1260,52 @@ class AgentLoopRunner:
         # durable delivery before cancellation stops the continuation.
         services.raise_if_cancelled()
         services.require_delivery_fence()
-        loaded = continuation.load_continuation_messages()
-        services.raise_if_cancelled()
-        services.require_delivery_fence()
-        return [*loaded, tool_message], [tool_message]
+        segment = continuation.activate_continuation_segment()
+        if type(segment) is not ApprovedContinuationSegment:
+            raise TypeError("approved continuation port returned an invalid Segment bundle")
+        if (
+            segment.model is invocation.model
+            or segment.catalog is invocation.catalog
+            or segment.tool_context is invocation.tool_context
+        ):
+            raise ProjectionError("approved continuation reused Approval services")
+        fresh_recorder = getattr(segment.tool_context, "run_recorder", None)
+        set_recorder = getattr(fresh_recorder, "set_delegate", None)
+        if not callable(set_recorder):
+            raise ProjectionError("continuation segment recorder proxy is required")
+        # The Driver owns the one proposal gate for this Agent Loop run.  A
+        # fresh Segment must delegate its context recorder to that exact gate;
+        # otherwise chained writes would append directly to the raw journal.
+        set_recorder(services.run_recorder)
+        active_invocation = replace(
+            invocation,
+            seed=NewTurnSeed(segment.messages),
+            model=segment.model,
+            catalog=segment.catalog,
+            tool_context=segment.tool_context,
+            surface_gate=segment.surface_gate,
+            auto_approve=False,
+            max_iterations=segment.max_iterations,
+            run_recorder=services.run_recorder,
+        )
+        active_services = _LoopServices(
+            active_invocation,
+            run_recorder=services.run_recorder,
+            event_sink=services.event_sink,
+            records=records,
+            failures=failures,
+            delivery_fence=services.delivery_fence,
+        )
+        active_services.raise_if_cancelled()
+        active_seed = active_invocation.seed
+        if not isinstance(active_seed, NewTurnSeed):
+            raise TypeError("approved continuation did not activate a Segment seed")
+        return (
+            active_invocation,
+            active_services,
+            list(active_seed.messages),
+            [tool_message],
+        )
 
     def _dispatch(
         self,

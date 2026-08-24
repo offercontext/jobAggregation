@@ -456,7 +456,9 @@ def _primary_execution_harness(
     tmp_path,
     executor,
     *,
+    proposal_args: str = "{}",
     effective_args: str | None = None,
+    edited_args: dict[str, object] | None = None,
     tool_name: str = "create_application",
 ):
     sessions = init_database(tmp_path / "offerpilot.db")
@@ -468,7 +470,7 @@ def _primary_execution_harness(
     pending = PendingAction(
         tool_call_id="write-once",
         tool_name=tool_name,
-        args="{}",
+        args=proposal_args,
         human="create",
         operation_id=operation_id,
     )
@@ -489,7 +491,11 @@ def _primary_execution_harness(
             tool_call_id=pending.tool_call_id,
             tool_name=pending.tool_name,
             adapter_kind="typed",
-            proposal_fingerprint=ledger_fingerprint(key, "write-operation-proposal-v1", {}),
+            proposal_fingerprint=ledger_fingerprint(
+                key,
+                "write-operation-proposal-v1",
+                json.loads(proposal_args),
+            ),
             confirmation_token_fingerprint=ledger_fingerprint(
                 key, "write-operation-confirmation-token-v1", b"synthetic-token"
             ),
@@ -575,6 +581,9 @@ def _primary_execution_harness(
         confirmation_policy="required",
         write_contract=WriteContract(),
         binding_contract=BindingContract("none"),
+        editable_fields=tuple(
+            {"field": key, "type": "long_text"} for key in (edited_args or {})
+        ),
     )
     catalog = ToolCatalog((spec,), expected_names=(spec.name,))
     prepare_identity = factory.create_approved_write_prepare_identity(
@@ -605,14 +614,14 @@ def _primary_execution_harness(
         coordinator=WriteOperationCoordinator(repository),
         request_fingerprint=(
             _approval_request_fingerprint(key, operation_id, pending)
-            if effective_args is None
+            if edited_args is None
             else operation_request_fingerprint(
                 key,
                 operation_id=operation_id,
                 tool_call_id=pending.tool_call_id,
                 approved=True,
                 edited_args_present=True,
-                edited_args=json.loads(decided_args),
+                edited_args=edited_args,
                 rejection_feedback_present=False,
                 rejection_feedback="",
                 confirmation_token_fingerprint=ledger_fingerprint(
@@ -621,10 +630,14 @@ def _primary_execution_harness(
                     b"synthetic-token",
                 ),
                 proposal_fingerprint=ledger_fingerprint(
-                    key, "write-operation-proposal-v1", {}
+                    key,
+                    "write-operation-proposal-v1",
+                    json.loads(proposal_args),
                 ),
             )
         ),
+        edited_args_present=edited_args is not None,
+        edited_args=edited_args,
     )
 
 
@@ -638,7 +651,8 @@ def test_locked_modify_executes_effective_args_against_original_proposal(tmp_pat
     harness = _primary_execution_harness(
         tmp_path,
         executor,
-        effective_args='{"changed":true}',
+        effective_args='{"assessment":"changed"}',
+        edited_args={"assessment": "changed"},
         tool_name="save_offer_assessment",
     )
     try:
@@ -649,10 +663,98 @@ def test_locked_modify_executes_effective_args_against_original_proposal(tmp_pat
             context=harness.context,
             prepare_identity=harness.prepare_identity,
             request_fingerprint=harness.request_fingerprint,
+            edited_args_present=harness.edited_args_present,
+            edited_args=harness.edited_args,
         )
         assert isinstance(execution, OperationCommitted)
         assert record is not None
-        assert seen == [{"changed": True}]
+        assert seen == [{"assessment": "changed"}]
+    finally:
+        harness.factory.close()
+
+
+def test_locked_modify_rejects_patch_prepared_mismatch_before_executor(tmp_path) -> None:
+    calls = 0
+
+    def executor(_args, _context):
+        nonlocal calls
+        calls += 1
+        return {"ok": True}
+
+    harness = _primary_execution_harness(
+        tmp_path,
+        executor,
+        effective_args='{"assessment":"changed"}',
+        edited_args={"assessment": "different"},
+        tool_name="save_offer_assessment",
+    )
+    try:
+        execution, record = harness.coordinator.execute_primary(
+            operation_id=harness.operation_id,
+            conversation_id=harness.conversation.id,
+            prepared=harness.prepared,
+            context=harness.context,
+            prepare_identity=harness.prepare_identity,
+            request_fingerprint=harness.request_fingerprint,
+            edited_args_present=True,
+            edited_args=harness.edited_args,
+        )
+
+        assert isinstance(execution, OperationUnknown)
+        assert execution.code == "operation_input_conflict"
+        assert record is None
+        assert calls == 0
+    finally:
+        harness.factory.close()
+
+
+@pytest.mark.parametrize(
+    ("proposal_args", "effective_args", "edited_args"),
+    [
+        ("{}", "{}", {}),
+        (
+            '{"assessment":"changed"}',
+            '{"assessment":"changed"}',
+            {"assessment": "changed"},
+        ),
+    ],
+)
+def test_locked_modify_preserves_explicit_patch_presence_when_effective_is_unchanged(
+    tmp_path,
+    proposal_args: str,
+    effective_args: str,
+    edited_args: dict[str, object],
+) -> None:
+    calls = 0
+
+    def executor(_args, _context):
+        nonlocal calls
+        calls += 1
+        return {"ok": True}
+
+    harness = _primary_execution_harness(
+        tmp_path,
+        executor,
+        proposal_args=proposal_args,
+        effective_args=effective_args,
+        edited_args=edited_args,
+        tool_name="save_offer_assessment",
+    )
+    try:
+        execution, record = harness.coordinator.execute_primary(
+            operation_id=harness.operation_id,
+            conversation_id=harness.conversation.id,
+            prepared=harness.prepared,
+            context=harness.context,
+            prepare_identity=harness.prepare_identity,
+            request_fingerprint=harness.request_fingerprint,
+            edited_args_present=True,
+            edited_args=edited_args,
+        )
+
+        assert isinstance(execution, OperationCommitted)
+        assert record is not None
+        assert calls == 1
     finally:
         harness.factory.close()
 

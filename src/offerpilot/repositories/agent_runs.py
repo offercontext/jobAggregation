@@ -495,41 +495,7 @@ class AgentRunRepository:
         self._validate_disposition_shape(run_id, command)
         try:
             with self._journal_transaction(deadline=deadline, safe_clock=safe_clock) as session:
-                existing: list[AgentEvent | None] = [
-                    self._existing_event(session, run_id, draft) for draft in command.events
-                ]
-                existing_positions = [
-                    index for index, event in enumerate(existing) if event is not None
-                ]
-                if existing_positions != list(range(len(existing_positions))):
-                    raise JournalConflictError("existing disposition events are not a prefix")
-                self._assert_existing_disposition_order(existing)
-                run = self._required_run(session, run_id)
-                if all(item is not None for item in existing):
-                    self._assert_disposition_projection(run, command)
-                    return tuple(self._detach(session, cast(AgentEvent, item)) for item in existing)
-
-                self._assert_status_transition(run, command.target_status)
-                self._assert_disposition_matches_run(run, command)
-                now = self._utc_now()
-                run.status = command.target_status
-                run.updated_at = now
-                if command.target_status == "waiting_confirmation":
-                    run.waiting_tool_call_id = command.waiting_tool_call_id
-                    run.failure_code = None
-                    run.finished_at = None
-                elif command.target_status == "running":
-                    run.waiting_tool_call_id = None
-                    run.failure_code = None
-                    run.finished_at = None
-                else:
-                    run.waiting_tool_call_id = None
-                    run.failure_code = command.failure_code
-                    run.finished_at = now
-                created: list[AgentEvent] = []
-                for item, draft in zip(existing, command.events, strict=True):
-                    created.append(item or self._insert_event(session, run_id, draft, now))
-                session.flush()
+                created = self._converge_disposition_bound(session, run_id, command)
                 return tuple(self._detach(session, event) for event in created)
         except IntegrityError:
             replayed = self._replay_disposition(
@@ -543,6 +509,115 @@ class AgentRunRepository:
             raise JournalConflictError(
                 "disposition conflicts with persisted journal state"
             ) from None
+
+    def converge_disposition_bound(
+        self,
+        session: Session,
+        run_id: str,
+        command: DispositionCommand,
+    ) -> tuple[AgentEvent, ...]:
+        """Converge a disposition in a caller-owned transaction.
+
+        Confirmation approval and the following ``run.resumed`` projection are
+        part of the write-operation transaction.  Opening an independent
+        Journal transaction here can deadlock SQLite and can leave the Ledger
+        claim committed without its authoritative run projection.  This port
+        intentionally performs the same validation and idempotency checks as
+        :meth:`converge_disposition`, but never commits or opens a connection.
+        """
+
+        if session.get_transaction() is None:
+            raise JournalConflictError("bound disposition requires caller transaction")
+        self._validate_disposition_shape(run_id, command)
+        return self._converge_disposition_bound(session, run_id, command)
+
+    def recover_degraded_resume(
+        self,
+        run_id: str,
+        approval_draft: EventDraft,
+        command: DispositionCommand,
+        *,
+        deadline: float | None = None,
+        safe_clock: SafeClockAdapter | None = None,
+    ) -> tuple[AgentEvent, ...]:
+        """Recover approval/resume after its Ledger transaction has ended.
+
+        This is the failure-only counterpart to the caller-bound savepoint.
+        It owns one short Journal transaction that latches degraded recording,
+        appends the trusted approval decision, and converges ``run.resumed``
+        in sequence. It is safe to replay and never touches product tables.
+        """
+
+        self._validate_deadline_args(deadline, safe_clock)
+        self._validate_event_draft(approval_draft)
+        if approval_draft.event_type != "approval.decided":
+            raise JournalConflictError("degraded recovery requires approval decision")
+        self._validate_disposition_shape(run_id, command)
+        if command.target_status != "running":
+            raise JournalConflictError("degraded recovery requires resumed disposition")
+        with self._journal_transaction(deadline=deadline, safe_clock=safe_clock) as session:
+            run = self._required_run(session, run_id)
+            approval = self._existing_event(session, run_id, approval_draft)
+            if approval is None:
+                approval = self._insert_event(
+                    session,
+                    run_id,
+                    approval_draft,
+                    self._utc_now(),
+                )
+            if run.recording_status != "degraded":
+                run.recording_status = "degraded"
+                run.recording_error_count += 1
+                run.updated_at = self._utc_now()
+                session.flush()
+            resumed = self._converge_disposition_bound(session, run_id, command)
+            return (
+                self._detach(session, approval),
+                *(self._detach(session, event) for event in resumed),
+            )
+
+    def _converge_disposition_bound(
+        self,
+        session: Session,
+        run_id: str,
+        command: DispositionCommand,
+    ) -> tuple[AgentEvent, ...]:
+        existing: list[AgentEvent | None] = [
+            self._existing_event(session, run_id, draft) for draft in command.events
+        ]
+        existing_positions = [
+            index for index, event in enumerate(existing) if event is not None
+        ]
+        if existing_positions != list(range(len(existing_positions))):
+            raise JournalConflictError("existing disposition events are not a prefix")
+        self._assert_existing_disposition_order(existing)
+        run = self._required_run(session, run_id)
+        if all(item is not None for item in existing):
+            self._assert_disposition_projection(run, command)
+            return tuple(cast(AgentEvent, item) for item in existing)
+
+        self._assert_status_transition(run, command.target_status)
+        self._assert_disposition_matches_run(run, command)
+        now = self._utc_now()
+        run.status = command.target_status
+        run.updated_at = now
+        if command.target_status == "waiting_confirmation":
+            run.waiting_tool_call_id = command.waiting_tool_call_id
+            run.failure_code = None
+            run.finished_at = None
+        elif command.target_status == "running":
+            run.waiting_tool_call_id = None
+            run.failure_code = None
+            run.finished_at = None
+        else:
+            run.waiting_tool_call_id = None
+            run.failure_code = command.failure_code
+            run.finished_at = now
+        created: list[AgentEvent] = []
+        for item, draft in zip(existing, command.events, strict=True):
+            created.append(item or self._insert_event(session, run_id, draft, now))
+        session.flush()
+        return tuple(created)
 
     def mark_degraded(
         self,

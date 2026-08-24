@@ -203,8 +203,8 @@ def test_approved_write_seed_caches_and_validates_port_pending_once() -> None:
         def record_result(self, *_args: object) -> None:
             return None
 
-        def load_continuation_messages(self) -> tuple[Message, ...]:
-            return ()
+        def activate_continuation_segment(self) -> object:
+            return object()
 
         def delivery_fence(self) -> bool:
             return True
@@ -239,8 +239,8 @@ def test_approved_write_seed_rejects_incomplete_pending_identity(
         def record_result(self, *_args: object) -> None:
             return None
 
-        def load_continuation_messages(self) -> tuple[Message, ...]:
-            return ()
+        def activate_continuation_segment(self) -> object:
+            return object()
 
         def delivery_fence(self) -> bool:
             return True

@@ -40,7 +40,12 @@ from offerpilot.agent_runtime.journal import (
     TerminalDisposition,
 )
 from offerpilot.models import AgentEvent, ChatMessage, Conversation
-from offerpilot.repositories.agent_runs import AgentRunRepository, StartRunCommand
+from offerpilot.repositories.agent_runs import (
+    AgentRunRepository,
+    DispositionCommand,
+    StartRunCommand,
+    StartSegmentCommand,
+)
 
 KEY = JournalKeyDomain(
     key_id="11111111-1111-4111-8111-111111111111",
@@ -652,6 +657,9 @@ def _recorder(
 
 
 BOUND_RUN_ID = "77777777-7777-4777-8777-777777777777"
+BOUND_CONFIRMATION_SEGMENT_ID = "88888888-8888-4888-8888-888888888888"
+BOUND_CONFIRMATION_ATTEMPT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab"
+BOUND_TOOL_CALL_ID = "call-1"
 
 
 class _BoundRepository(AgentRunRepository):
@@ -659,13 +667,29 @@ class _BoundRepository(AgentRunRepository):
         super().__init__(session_factory)  # type: ignore[arg-type]
         self.clock = clock
         self.bound_calls = 0
+        self.bound_disposition_calls = 0
         self.after_bound: object | None = None
+        self.after_bound_disposition: object | None = None
 
     def append_event_bound(self, session: object, run_id: str, draft: object) -> object:
         self.bound_calls += 1
         result = super().append_event_bound(session, run_id, draft)  # type: ignore[arg-type]
         if self.after_bound is not None:
             self.after_bound()  # type: ignore[operator]
+        return result
+
+    def converge_disposition_bound(
+        self,
+        session: object,
+        run_id: str,
+        command: DispositionCommand,
+    ) -> object:
+        self.bound_disposition_calls += 1
+        result = super().converge_disposition_bound(  # type: ignore[arg-type]
+            session, run_id, command
+        )
+        if self.after_bound_disposition is not None:
+            self.after_bound_disposition()  # type: ignore[operator]
         return result
 
 
@@ -762,6 +786,56 @@ def _load_bound_rows(
             select(ChatMessage).where(ChatMessage.content == "bound-domain-marker")
         )
         return event, marker
+
+
+def _approval_decided_draft(*, decision: str = "approved") -> object:
+    return prepare_event(
+        event_type="approval.decided",
+        execution_segment_id=BOUND_CONFIRMATION_SEGMENT_ID,
+        facts={
+            "confirmation_attempt_id": BOUND_CONFIRMATION_ATTEMPT_ID,
+            "tool_call_id": BOUND_TOOL_CALL_ID,
+            "decision": decision,
+            "original_input_fingerprint": "c" * 64,
+            "decided_input_fingerprint": "c" * 64,
+        },
+        source_ref_type="tool_call",
+        source_ref_id=BOUND_TOOL_CALL_ID,
+        fingerprint_key_id=KEY.key_id,
+    )
+
+
+def _seed_bound_resume_recorder(
+    tmp_path: Path,
+    clock: ManualClock,
+) -> tuple[_BoundRepository, object, SafeRunRecorder, int]:
+    repository, session_factory, initial, _, conversation_id = _seed_bound_recorder(
+        tmp_path, clock
+    )
+    initial.suspend(_suspended_command())
+    repository.start_segment(
+        StartSegmentCommand(
+            run_id=BOUND_RUN_ID,
+            segment_started=prepare_event(
+                event_type="segment.started",
+                execution_segment_id=BOUND_CONFIRMATION_SEGMENT_ID,
+                facts={
+                    "request_kind": "confirmation",
+                    "transport_mode": "sync",
+                    "execution_path": "agent_resume",
+                    "transport_run_id": None,
+                },
+            ),
+        )
+    )
+    recorder = SafeRunRecorder(
+        repository,
+        KEY,
+        BOUND_RUN_ID,
+        BOUND_CONFIRMATION_SEGMENT_ID,
+        clock=clock,
+    )
+    return repository, session_factory, recorder, conversation_id
 
 
 def test_bound_success_commits_journal_event_and_outer_domain_marker(
@@ -952,6 +1026,290 @@ def test_bound_cleanup_failure_never_syncs_degraded_through_caller_session(
     assert sync_calls == 0
     assert recorder.recording_status == "degraded"
     assert recorder.diagnostics == ["journal_cleanup_failed"]
+
+
+def test_combined_bound_resume_uses_caller_session_and_preserves_event_order(
+    tmp_path: Path,
+) -> None:
+    clock = ManualClock()
+    repository, session_factory, recorder, conversation_id = (
+        _seed_bound_resume_recorder(tmp_path, clock)
+    )
+    original_factory = repository.session_factory
+
+    def forbid_second_session() -> object:
+        raise AssertionError("bound Journal path opened a second Session")
+
+    repository.session_factory = forbid_second_session  # type: ignore[assignment]
+    with session_factory() as session:  # type: ignore[operator]
+        with session.begin():
+            assert recorder.record_approval_and_resume_bound(
+                session,
+                _approval_decided_draft(),  # type: ignore[arg-type]
+                _resumed_command(),
+            )
+            assert session.in_transaction()
+            _write_bound_marker(session, conversation_id)
+    repository.session_factory = original_factory
+
+    events = repository.list_events(BOUND_RUN_ID)
+    event_types = [event.event_type for event in events]
+    assert event_types.index("approval.decided") < event_types.index("run.resumed")
+    assert event_types.count("approval.decided") == 1
+    assert event_types.count("run.resumed") == 1
+    assert repository.bound_calls == 1
+    assert repository.bound_disposition_calls == 1
+    assert repository.get_run(BOUND_RUN_ID).status == "running"  # type: ignore[union-attr]
+
+    with session_factory() as session:  # type: ignore[operator]
+        assert session.scalar(
+            select(ChatMessage).where(ChatMessage.content == "bound-domain-marker")
+        ) is not None
+
+
+@pytest.mark.parametrize("combined", (False, True))
+def test_bound_resume_requires_active_caller_transaction(
+    tmp_path: Path,
+    combined: bool,
+) -> None:
+    repository, session_factory, recorder, _ = _seed_bound_resume_recorder(
+        tmp_path, ManualClock()
+    )
+
+    with session_factory() as session:  # type: ignore[operator]
+        if combined:
+            recorded = recorder.record_approval_and_resume_bound(
+                session,
+                _approval_decided_draft(),  # type: ignore[arg-type]
+                _resumed_command(),
+            )
+        else:
+            recorded = recorder.resume_bound(session, _resumed_command())
+        assert recorded is False
+
+    event_types = [event.event_type for event in repository.list_events(BOUND_RUN_ID)]
+    assert "approval.decided" not in event_types
+    assert "run.resumed" not in event_types
+    run = repository.get_run(BOUND_RUN_ID)
+    assert run is not None
+    assert run.status == "waiting_confirmation"
+    assert run.waiting_tool_call_id == BOUND_TOOL_CALL_ID
+    assert recorder.recording_status == "degraded"
+    assert recorder.diagnostics == ["journal_resume_failed"]
+
+
+def test_combined_bound_resume_is_idempotent_on_same_recorder(tmp_path: Path) -> None:
+    repository, session_factory, recorder, _ = _seed_bound_resume_recorder(
+        tmp_path, ManualClock()
+    )
+    draft = _approval_decided_draft()
+
+    with session_factory() as session:  # type: ignore[operator]
+        with session.begin():
+            assert recorder.record_approval_and_resume_bound(
+                session, draft, _resumed_command()  # type: ignore[arg-type]
+            )
+            assert recorder.record_approval_and_resume_bound(
+                session, draft, _resumed_command()  # type: ignore[arg-type]
+            )
+
+    assert repository.bound_calls == 1
+    assert repository.bound_disposition_calls == 1
+    assert [
+        event.event_type for event in repository.list_events(BOUND_RUN_ID)
+    ].count("run.resumed") == 1
+
+
+def test_combined_bound_resume_rolls_back_with_outer_transaction(tmp_path: Path) -> None:
+    repository, session_factory, recorder, conversation_id = (
+        _seed_bound_resume_recorder(tmp_path, ManualClock())
+    )
+
+    with session_factory() as session:  # type: ignore[operator]
+        session.begin()
+        _write_bound_marker(session, conversation_id)
+        session.flush()
+        assert recorder.record_approval_and_resume_bound(
+            session,
+            _approval_decided_draft(),  # type: ignore[arg-type]
+            _resumed_command(),
+        )
+        session.rollback()
+
+    event_types = [event.event_type for event in repository.list_events(BOUND_RUN_ID)]
+    assert "approval.decided" not in event_types
+    assert "run.resumed" not in event_types
+    run = repository.get_run(BOUND_RUN_ID)
+    assert run is not None
+    assert run.status == "waiting_confirmation"
+    assert run.waiting_tool_call_id == BOUND_TOOL_CALL_ID
+    with session_factory() as session:  # type: ignore[operator]
+        assert session.scalar(
+            select(ChatMessage).where(ChatMessage.content == "bound-domain-marker")
+        ) is None
+
+
+def test_combined_bound_resume_replays_on_same_recorder_after_outer_rollback(
+    tmp_path: Path,
+) -> None:
+    repository, session_factory, recorder, conversation_id = _seed_bound_resume_recorder(
+        tmp_path, ManualClock()
+    )
+    draft = _approval_decided_draft()
+
+    with session_factory() as session:  # type: ignore[operator]
+        session.begin()
+        _write_bound_marker(session, conversation_id)
+        session.flush()
+        assert recorder.record_approval_and_resume_bound(
+            session, draft, _resumed_command()  # type: ignore[arg-type]
+        )
+        session.rollback()
+
+    with session_factory() as session:  # type: ignore[operator]
+        with session.begin():
+            assert recorder.record_approval_and_resume_bound(
+                session, draft, _resumed_command()  # type: ignore[arg-type]
+            )
+
+    event_types = [event.event_type for event in repository.list_events(BOUND_RUN_ID)]
+    assert event_types.count("approval.decided") == 1
+    assert event_types.count("run.resumed") == 1
+    assert repository.bound_calls == 2
+    assert repository.bound_disposition_calls == 2
+    assert repository.get_run(BOUND_RUN_ID).status == "running"  # type: ignore[union-attr]
+
+
+def test_resume_bound_replays_on_same_recorder_after_outer_rollback(
+    tmp_path: Path,
+) -> None:
+    repository, session_factory, recorder, conversation_id = _seed_bound_resume_recorder(
+        tmp_path, ManualClock()
+    )
+
+    with session_factory() as session:  # type: ignore[operator]
+        session.begin()
+        _write_bound_marker(session, conversation_id)
+        session.flush()
+        assert recorder.resume_bound(session, _resumed_command())
+        session.rollback()
+
+    with session_factory() as session:  # type: ignore[operator]
+        with session.begin():
+            assert recorder.resume_bound(session, _resumed_command())
+
+    event_types = [event.event_type for event in repository.list_events(BOUND_RUN_ID)]
+    assert event_types.count("run.resumed") == 1
+    assert repository.bound_disposition_calls == 2
+    assert repository.get_run(BOUND_RUN_ID).status == "running"  # type: ignore[union-attr]
+
+
+def test_combined_bound_resume_replay_after_commit_remains_idempotent(
+    tmp_path: Path,
+) -> None:
+    repository, session_factory, recorder, conversation_id = (
+        _seed_bound_resume_recorder(tmp_path, ManualClock())
+    )
+    draft = _approval_decided_draft()
+
+    with session_factory() as session:  # type: ignore[operator]
+        with session.begin():
+            _write_bound_marker(session, conversation_id)
+            session.flush()
+            assert recorder.record_approval_and_resume_bound(
+                session, draft, _resumed_command()  # type: ignore[arg-type]
+            )
+
+    with session_factory() as session:  # type: ignore[operator]
+        with session.begin():
+            assert recorder.record_approval_and_resume_bound(
+                session, draft, _resumed_command()  # type: ignore[arg-type]
+            )
+
+    event_types = [event.event_type for event in repository.list_events(BOUND_RUN_ID)]
+    assert event_types.count("approval.decided") == 1
+    assert event_types.count("run.resumed") == 1
+    assert repository.bound_calls == 2
+    assert repository.bound_disposition_calls == 2
+    assert recorder.recording_status == "healthy"
+
+
+def test_combined_bound_failure_recovers_degraded_resume_after_caller_transaction(
+    tmp_path: Path,
+) -> None:
+    repository, session_factory, recorder, conversation_id = (
+        _seed_bound_resume_recorder(tmp_path, ManualClock())
+    )
+    repository.after_bound = lambda: (_ for _ in ()).throw(
+        RuntimeError("bound-approval-canary")
+    )
+    approval_draft = _approval_decided_draft()
+    command = _resumed_command()
+
+    with session_factory() as session:  # type: ignore[operator]
+        with session.begin():
+            assert (
+                recorder.record_approval_and_resume_bound(
+                    session,
+                    approval_draft,  # type: ignore[arg-type]
+                    command,
+                )
+                is False
+            )
+            assert session.is_active
+            _write_bound_marker(session, conversation_id)
+
+    waiting = repository.get_run(BOUND_RUN_ID)
+    assert waiting is not None and waiting.status == "waiting_confirmation"
+    assert recorder.recover_approval_and_resume(
+        approval_draft,  # type: ignore[arg-type]
+        command,
+    )
+    assert recorder.recover_approval_and_resume(
+        approval_draft,  # type: ignore[arg-type]
+        command,
+    )
+    recorder.append_event(_route_event())
+
+    event_types = [event.event_type for event in repository.list_events(BOUND_RUN_ID)]
+    assert event_types.count("approval.decided") == 1
+    assert event_types.count("run.resumed") == 1
+    assert event_types.count("route.selected") == 1
+    assert event_types.index("approval.decided") < event_types.index("run.resumed")
+    run = repository.get_run(BOUND_RUN_ID)
+    assert run is not None
+    assert run.status == "running"
+    assert run.waiting_tool_call_id is None
+    assert run.recording_status == "degraded"
+    assert run.recording_error_count == 1
+    assert recorder.recording_status == "degraded"
+    assert recorder.diagnostics == ["journal_resume_failed"]
+    with session_factory() as session:  # type: ignore[operator]
+        assert session.scalar(
+            select(ChatMessage).where(ChatMessage.content == "bound-domain-marker")
+        ) is not None
+
+
+def test_resume_bound_ordinary_conflict_is_fail_open_and_degrades_recorder(
+    tmp_path: Path,
+) -> None:
+    repository, session_factory, recorder, conversation_id = (
+        _seed_bound_resume_recorder(tmp_path, ManualClock())
+    )
+    conflicting = ResumedDisposition(
+        confirmation_attempt_id=BOUND_CONFIRMATION_ATTEMPT_ID,
+        tool_call_id="different-call",
+    )
+
+    with session_factory() as session:  # type: ignore[operator]
+        with session.begin():
+            assert recorder.resume_bound(session, conflicting) is False
+            assert session.is_active
+            _write_bound_marker(session, conversation_id)
+
+    assert repository.get_run(BOUND_RUN_ID).status == "waiting_confirmation"  # type: ignore[union-attr]
+    assert recorder.recording_status == "degraded"
+    assert recorder.diagnostics == ["journal_resume_failed"]
 
 
 def test_segment_budget_includes_preprocessing_and_stops_nonterminal_writes() -> None:

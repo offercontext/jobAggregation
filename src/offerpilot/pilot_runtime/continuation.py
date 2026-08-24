@@ -30,6 +30,7 @@ from uuid import UUID
 from sqlalchemy import select
 
 from offerpilot.ai.agent_contracts import PendingAction, _ASDICT_GUARD
+from offerpilot.ai.agent_loop import ApprovedContinuationSegment
 from offerpilot.ai.confirmation import prepare_pending_action
 from offerpilot.ai.tool_authority import (
     ApprovalExecutionAuthority,
@@ -92,9 +93,6 @@ LedgerExecutor = Callable[
     [PreparedToolCall[Any, Any], object, object],
     ToolExecutionRecord[Any, Any],
 ]
-ContinuationLoader = Callable[[], Sequence[Message]]
-
-
 class ConfirmationPendingReader(Protocol):
     """The only persistence read needed before a confirmation claim."""
 
@@ -342,14 +340,6 @@ class ApprovalAuthorityResolver:
             raise WriteOperationError("operation_identity_conflict")
 
 
-class ConfirmationSourceAdapter(Protocol):
-    def load(self, *args: object, **kwargs: object) -> object: ...
-
-
-class ConfirmationContextAssembler(Protocol):
-    def assemble(self, *args: object, **kwargs: object) -> object: ...
-
-
 def _attribute(value: object | None, name: str, default: object = None) -> object:
     if value is None:
         return default
@@ -571,19 +561,13 @@ class ConfirmationDependencies:
     persistence: ConfirmationPersistenceAdapter | None = None
     write_operations: ConfirmationOperationRepository | None = None
     write_coordinator: ConfirmationWriteCoordinator | None = None
-    conversations: object | None = None
     catalog: object | None = None
-    prepare_call: Callable[..., object] | None = field(default=None, repr=False, compare=False)
     undo_seed_builder: Callable[..., Mapping[str, Any]] | None = field(
         default=None, repr=False, compare=False
     )
     undo_builder: Callable[..., Mapping[str, Any] | None] | None = field(
         default=None, repr=False, compare=False
     )
-    source_loader: ConfirmationSourceAdapter | Callable[..., object] | None = None
-    context_assembler: ConfirmationContextAssembler | Callable[..., object] | None = None
-    journal: object | None = None
-    applications: object | None = None
     approval_context_resolver: Callable[..., ToolExecutionContext] | None = field(
         default=None, repr=False, compare=False
     )
@@ -653,6 +637,10 @@ class ConfirmationState:
     delivery_in_progress: bool = field(default=False, repr=False, compare=False)
     delivery_result: PersistenceResult | None = field(default=None, repr=False, compare=False)
     transactional_delivery_persisted: bool = field(default=False, repr=False, compare=False)
+    continuation_segment_activated: bool = field(default=False, repr=False, compare=False)
+    continuation_segment_close: Callable[[], object] | None = field(
+        default=None, repr=False, compare=False
+    )
     active: bool = True
     lock: RLock = field(default_factory=RLock, repr=False, compare=False)
 
@@ -690,8 +678,10 @@ class ConfirmationSession:
     on_confirmation_attempt: ConfirmationAttempt
     on_confirmation_result: ConfirmationResult
     execute_operation: LedgerExecutor
-    continuation_message_loader: ContinuationLoader
     delivery_fence: Callable[[], bool]
+    continuation_segment_builder: Callable[[], object] | None = field(
+        default=None, repr=False, compare=False
+    )
 
     @property
     def pending(self) -> PendingAction:
@@ -707,6 +697,62 @@ class ConfirmationSession:
         if not isinstance(context, ToolExecutionContext):
             raise WriteOperationError("operation_unavailable")
         return context
+
+    def approval_execution_context(self, recorder: object) -> ToolExecutionContext:
+        """Return the origin Approval context with its Ledger executor bound."""
+
+        context = self.approval_context
+        return context.with_runtime_dependencies(
+            run_recorder=cast(Any, recorder),
+            operation_executor=self.execute_operation,
+        )
+
+    def activate_continuation_segment(self) -> ApprovedContinuationSegment:
+        """Close approval and activate one fresh post-terminal Segment."""
+
+        with self.state.lock:
+            if self.state.continuation_segment_activated:
+                raise WriteOperationError("operation_delivery_unknown", retryable=True)
+            if self.state.cancelled or self.state.timed_out or not self.state.active:
+                raise WriteOperationError("confirmation_claim_lost")
+            if _attribute(self.state, "approved", True) is not True:
+                raise WriteOperationError("confirmation_claim_lost")
+            terminal = self.state.terminal_execution
+            if not isinstance(terminal, (OperationCommitted, OperationFailed)):
+                raise WriteOperationError("operation_delivery_unknown", retryable=True)
+            ownership = self.state.delivery_ownership
+            terminal_ownership = _attribute(terminal, "ownership")
+            identity = _attribute(self.state, "identity")
+            expected_operation_id = _attribute(identity, "operation_id", terminal.operation_id)
+            if (
+                type(ownership) is not DeliveryOwnership
+                or type(terminal_ownership) is not DeliveryOwnership
+                or ownership is not terminal_ownership
+                or ownership.operation_id != expected_operation_id
+                or terminal.operation_id != expected_operation_id
+            ):
+                raise WriteOperationError("operation_delivery_unknown", retryable=True)
+            if not self.delivery_fence():
+                raise WriteOperationError("operation_delivery_unknown", retryable=True)
+            builder = self.continuation_segment_builder
+            self.state.continuation_segment_activated = True
+
+        # Approval authority is valid only for the origin transaction.  Close
+        # it before the canonical reload so the fresh Segment cannot retain it.
+        ConfirmationCoordinator._close_approval_context(self.state)
+        if builder is None:
+            raise WriteOperationError("operation_delivery_unknown", retryable=True)
+        value = builder()
+        if type(value) is not ApprovedContinuationSegment:
+            raise WriteOperationError("operation_delivery_unknown", retryable=True)
+        return value
+
+    def close_continuation_segment(self) -> None:
+        with self.state.lock:
+            close = self.state.continuation_segment_close
+            self.state.continuation_segment_close = None
+        if close is not None:
+            close()
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -746,11 +792,14 @@ class ConfirmationApprovedWritePort(TransientToolRuntimeValue):
     ) -> None:
         self.session.on_confirmation_result(pending, True, tool_message, record)
 
-    def load_continuation_messages(self) -> tuple[Message, ...]:
-        return tuple(self.session.continuation_message_loader())
-
     def delivery_fence(self) -> bool:
         return self.session.delivery_fence()
+
+    def activate_continuation_segment(self) -> ApprovedContinuationSegment:
+        value = self.session.activate_continuation_segment()
+        if type(value) is not ApprovedContinuationSegment:
+            raise TypeError("continuation activation must return ApprovedContinuationSegment")
+        return value
 
 
 class ConfirmationReplayError(RuntimeError):
@@ -1306,7 +1355,6 @@ class ConfirmationCoordinator:
         approved: bool,
         conversation: object | None = None,
         undo_seed: Mapping[str, Any] | None = None,
-        source_loader: ContinuationLoader | None = None,
         catalog: object | None = None,
     ) -> ConfirmationSession:
         replay = self.terminal_replay(request)
@@ -1408,7 +1456,11 @@ class ConfirmationCoordinator:
         # violate the preheader rejection boundary and could turn a valid
         # Ledger CAS into a model/conversation failure.
         if approved:
-            generation = self._conversation_generation(conversation, request.conversation_id)
+            # Approval is Ledger/authority-only.  The Conversation generation
+            # used by delivery CAS is established from the canonical reload
+            # after terminal execution and ownership, when the fresh Segment
+            # is activated; never load the pre-approval Conversation here.
+            generation = None
         else:
             candidate_generation = _attribute(conversation, "updated_at")
             generation = candidate_generation if isinstance(candidate_generation, datetime) else None
@@ -1528,58 +1580,11 @@ class ConfirmationCoordinator:
         ) -> ToolExecutionRecord[Any, Any]:
             return self.execute_operation(state, prepared, tool_context, prepare_identity)
 
-        source = source_loader or self._source_loader(
-            conversation, request.conversation_id, request
-        )
-
-        # Source is a post-commit continuation input.  The loader is handed to
-        # the Agent, never eagerly called by the Runtime, and is idempotent at
-        # the boundary so a misbehaving adapter cannot reload mutable history
-        # twice.  The first call is legal only after the primary Ledger row is
-        # terminal and a delivery owner/heartbeat has been acquired.
-        loaded_source: tuple[Message, ...] | None = None
-        load_failure: BaseException | None = None
-        loader_lock = RLock()
-
-        def load_once() -> tuple[Message, ...]:
-            nonlocal loaded_source, load_failure
-            with loader_lock:
-                if loaded_source is not None:
-                    return loaded_source
-                if load_failure is not None:
-                    raise load_failure
-                with state.lock:
-                    terminal = state.terminal_execution
-                    owned = state.delivery_ownership is not None
-                    approved_state = state.approved
-                    cancelled = state.cancelled
-                    timed_out = state.timed_out
-                    active = state.active
-                if (
-                    not approved_state
-                    or cancelled
-                    or timed_out
-                    or not active
-                    or not _terminal(terminal)
-                    or not owned
-                ):
-                    raise WriteOperationError("operation_delivery_unknown", retryable=True)
-                try:
-                    loaded_source = tuple(_message(item) for item in source())
-                except BaseException as exc:
-                    # A single confirmation owns one mutable source snapshot.
-                    # Cache failures too so a driver retry cannot observe a
-                    # second history version or call the source twice.
-                    load_failure = exc
-                    raise
-                return loaded_source
-
         live_session = ConfirmationSession(
             state=state,
             on_confirmation_attempt=attempt,
             on_confirmation_result=result,
             execute_operation=execute,
-            continuation_message_loader=load_once,
             delivery_fence=lambda: self.delivery_fence(state),
         )
         return live_session
@@ -1591,7 +1596,6 @@ class ConfirmationCoordinator:
         pending: PendingAction | None = None,
         conversation: object | None = None,
         undo_seed: Mapping[str, Any] | None = None,
-        source_loader: ContinuationLoader | None = None,
         catalog: object | None = None,
     ) -> ConfirmationSession:
         if not request.approved:
@@ -1602,12 +1606,8 @@ class ConfirmationCoordinator:
             approved=True,
             conversation=conversation,
             undo_seed=undo_seed,
-            source_loader=source_loader,
             catalog=catalog,
         )
-
-    approve = approve_modify
-    modify = approve_modify
 
     def reject(
         self,
@@ -1615,11 +1615,10 @@ class ConfirmationCoordinator:
         *,
         pending: PendingAction | None = None,
         conversation: object | None = None,
-        source_loader: ContinuationLoader | None = None,
     ) -> ConfirmationSession:
         if request.approved:
             raise ValueError("reject requires approved=false")
-        del pending, conversation, source_loader
+        del pending, conversation
         if not request.edited_args.is_missing():
             raise WriteOperationError("operation_input_conflict")
         if not request.confirmation_token and request.rejection_feedback_present:
@@ -1695,6 +1694,11 @@ class ConfirmationCoordinator:
                     state.active = False
                 else:
                     self._set_ownership(state, execution)
+            if not isinstance(execution, OperationReplay):
+                if state.approval_decided_callback is not None:
+                    state.approval_decided_callback(None)
+                if state.approval_resume_callback is not None:
+                    state.approval_resume_callback()
             return None
 
         def result(
@@ -1722,37 +1726,7 @@ class ConfirmationCoordinator:
             execute_operation=lambda *_args: (_ for _ in ()).throw(
                 WriteOperationError("operation_unavailable")
             ),
-            continuation_message_loader=lambda: (),
             delivery_fence=lambda: False,
-        )
-
-    def begin(
-        self,
-        request: ConfirmationRequest,
-        *,
-        pending: PendingAction | None = None,
-        conversation: object | None = None,
-        undo_seed: Mapping[str, Any] | None = None,
-        source_loader: ContinuationLoader | None = None,
-        catalog: object | None = None,
-    ) -> ConfirmationSession | OperationReplay:
-        replay = self.terminal_replay(request)
-        if replay is not None:
-            return replay
-        if request.approved:
-            return self.approve_modify(
-                request,
-                pending=pending,
-                conversation=conversation,
-                undo_seed=undo_seed,
-                source_loader=source_loader,
-                catalog=catalog,
-            )
-        return self.reject(
-            request,
-            pending=pending,
-            conversation=conversation,
-            source_loader=source_loader,
         )
 
     # ---- Ledger execution/result atoms ----------------------------------
@@ -1854,6 +1828,10 @@ class ConfirmationCoordinator:
             "context": tool_context,
             "prepare_identity": prepare_identity,
             "request_fingerprint": state.identity.request_fingerprint,
+            "edited_args_present": not state.edited_args.is_missing(),
+            "edited_args": (
+                None if state.edited_args.is_missing() else state.edited_args.as_mapping
+            ),
             "undo_seed_builder": undo_seed_builder,
             "approval_decided_callback": state.approval_decided_callback,
         }
@@ -1941,8 +1919,6 @@ class ConfirmationCoordinator:
                 # previously exposed undo atom rather than leaving stale
                 # recovery data attached to the conversation.
                 state.undo_update = {}
-            if state.continuation_generation is None:
-                state.continuation_generation = self._conversation_generation(None, state.identity.conversation_id)
             return None
 
     # ---- Ownership, timeout, cancellation, delivery ---------------------
@@ -2040,6 +2016,7 @@ class ConfirmationCoordinator:
                 state.cancelled = True
                 state.active = False
         self._close_approval_context(state)
+        session.close_continuation_segment()
         self.stop_heartbeat(state)
 
     @staticmethod
@@ -2086,6 +2063,13 @@ class ConfirmationCoordinator:
         """Persist exactly one origin+continuation bundle under the owner fence."""
 
         state = session.state
+
+        def close_segment_on_failure() -> None:
+            # A post-terminal Segment is one-shot.  Any delivery CAS/transport
+            # failure must release it before the caller can retry/replay; the
+            # successful atom closes it below.
+            session.close_continuation_segment()
+
         # Final delivery starts only after the approved origin has returned a
         # terminal result.  Revoke its one-shot authority before any durable
         # continuation branch, including every delivery short-circuit.
@@ -2108,6 +2092,7 @@ class ConfirmationCoordinator:
                 or state.cas_lost
                 or state.delivery_in_progress
             ):
+                close_segment_on_failure()
                 return None
             if state.origin_tool_message is None:
                 # A terminal replay has no continuation owner and must not
@@ -2137,15 +2122,18 @@ class ConfirmationCoordinator:
                 state.delivery_in_progress = True
         if ownership_missing:
             self.stop_heartbeat(state)
+            close_segment_on_failure()
             raise WriteOperationError("operation_unavailable")
         if fence_lost:
             self.stop_heartbeat(state)
+            close_segment_on_failure()
             return None
         persistence_object = self.dependencies.persistence
         if persistence_object is None:
             with state.lock:
                 state.delivery_in_progress = False
             self.stop_heartbeat(state)
+            close_segment_on_failure()
             raise WriteOperationError("operation_unavailable")
         values = tuple(delivery.messages)
         chained_pending = pending if pending is not None else delivery.pending
@@ -2178,6 +2166,7 @@ class ConfirmationCoordinator:
                     with state.lock:
                         state.delivery_in_progress = False
                     self.stop_heartbeat(state)
+                    close_segment_on_failure()
                     raise WriteOperationError("operation_unavailable")
                 kwargs = {
                     "conversation_id": state.identity.conversation_id,
@@ -2197,6 +2186,7 @@ class ConfirmationCoordinator:
             with state.lock:
                 state.delivery_in_progress = False
             self.stop_heartbeat(state)
+            close_segment_on_failure()
             raise
         try:
             raw = _invoke(cast(Callable[..., object], persistence), kwargs, ())
@@ -2204,11 +2194,13 @@ class ConfirmationCoordinator:
             with state.lock:
                 state.delivery_in_progress = False
             self.stop_heartbeat(state)
+            close_segment_on_failure()
             raise
         except BaseException:
             with state.lock:
                 state.delivery_in_progress = False
             self.stop_heartbeat(state)
+            close_segment_on_failure()
             raise
         try:
             status = _attribute(raw, "status")
@@ -2217,17 +2209,20 @@ class ConfirmationCoordinator:
             with state.lock:
                 state.delivery_in_progress = False
             self.stop_heartbeat(state)
+            close_segment_on_failure()
             raise
         if status_value == "":
             with state.lock:
                 state.delivery_in_progress = False
             self.stop_heartbeat(state)
+            close_segment_on_failure()
             raise WriteOperationError("operation_delivery_unknown", retryable=True)
         if status_value in {PersistenceStatus.CAS_LOST.value, "cas_lost"}:
             with state.lock:
                 state.cas_lost = True
                 state.delivery_in_progress = False
             self.stop_heartbeat(state)
+            close_segment_on_failure()
             return raw
         if status_value in {
             PersistenceStatus.CLOSED.value,
@@ -2236,6 +2231,7 @@ class ConfirmationCoordinator:
             with state.lock:
                 state.delivery_in_progress = False
             self.stop_heartbeat(state)
+            close_segment_on_failure()
             return raw
         if status_value not in {
             PersistenceStatus.PERSISTED.value,
@@ -2244,6 +2240,7 @@ class ConfirmationCoordinator:
             with state.lock:
                 state.delivery_in_progress = False
             self.stop_heartbeat(state)
+            close_segment_on_failure()
             raise WriteOperationError("operation_delivery_unknown", retryable=True)
         try:
             next_generation = _attribute(raw, "generation")
@@ -2251,6 +2248,7 @@ class ConfirmationCoordinator:
             with state.lock:
                 state.delivery_in_progress = False
             self.stop_heartbeat(state)
+            close_segment_on_failure()
             raise
         with state.lock:
             if isinstance(next_generation, datetime):
@@ -2259,6 +2257,7 @@ class ConfirmationCoordinator:
             state.delivery_in_progress = False
             state.delivery_result = raw if isinstance(raw, PersistenceResult) else None
             state.active = False
+        session.close_continuation_segment()
         self.stop_heartbeat(state)
         return raw
 
@@ -2280,57 +2279,6 @@ class ConfirmationCoordinator:
 
     # ---- detached source/replay helpers ----------------------------------
 
-    def _conversation_generation(self, conversation: object | None, conversation_id: int) -> datetime | None:
-        candidate = conversation
-        if candidate is None:
-            getter = _callable(self.dependencies.conversations, ("load", "get_conversation", "get"))
-            if getter is not None:
-                candidate = _invoke(getter, {"conversation_id": conversation_id, "id": conversation_id}, (conversation_id,))
-        value = _attribute(candidate, "updated_at")
-        return value if isinstance(value, datetime) else None
-
-    def _source_loader(
-        self,
-        conversation: object | None,
-        conversation_id: int,
-        request: ConfirmationRequest | None = None,
-    ) -> ContinuationLoader:
-        loader = _callable(self.dependencies.source_loader, ("load", "load_messages", "messages"))
-        assembler = _callable(self.dependencies.context_assembler, ("assemble", "assemble_context", "build_messages"))
-
-        def load() -> tuple[Message, ...]:
-            if loader is None:
-                raise WriteOperationError("operation_unavailable")
-            source = _invoke(
-                loader,
-                {
-                    "conversation": conversation,
-                    "conversation_id": conversation_id,
-                    "request": request,
-                },
-                (conversation, request or conversation_id),
-            )
-            if assembler is not None:
-                assembled = _invoke(
-                    assembler,
-                    {
-                        "source": source,
-                        "sources": source,
-                        "conversation": conversation,
-                        "conversation_id": conversation_id,
-                        "request": request,
-                    },
-                    (source, conversation),
-                )
-            else:
-                assembled = source
-            values = _attribute(assembled, "messages", assembled)
-            if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
-                raise WriteOperationError("operation_unavailable")
-            return tuple(_message(item) for item in values)
-
-        return load
-
     @staticmethod
     def _rejection_result(feedback: str) -> str:
         if feedback.strip():
@@ -2350,7 +2298,6 @@ __all__ = [
     "ConfirmationAttempt",
     "ConfirmationCoordinator",
     "ConfirmationDependencies",
-    "ConfirmationContextAssembler",
     "ConfirmationIdentity",
     "ConfirmationOperationRepository",
     "ConfirmationPendingReader",
@@ -2358,9 +2305,7 @@ __all__ = [
     "ConfirmationReplayError",
     "ConfirmationResult",
     "ConfirmationSession",
-    "ConfirmationSourceAdapter",
     "ConfirmationState",
     "ConfirmationWriteCoordinator",
-    "ContinuationLoader",
     "DeliveryBundle",
 ]

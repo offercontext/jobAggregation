@@ -62,9 +62,10 @@ from offerpilot.pilot_runtime.contracts import (
     StreamExecutionMode,
 )
 from offerpilot.pilot_runtime import InMemoryRuntimeInvocationControl, RuntimeFailureCode
+from offerpilot.pilot_runtime.persistence import ChatPersistenceCoordinator
 from offerpilot.repositories.applications import ApplicationsRepository
 from offerpilot.repositories.agent_runs import AgentRunRepository, JournalConflictError
-from offerpilot.repositories.chat import ChatRepository
+from offerpilot.repositories.chat import ChatRepository, ConversationScopeMutationSnapshot
 from offerpilot.pilot_runtime.service import PilotRuntime, _has_write_attempt, _write_outcome
 
 
@@ -1835,7 +1836,7 @@ def test_deterministic_pilot_rejection_does_not_write_without_ai(tmp_path):
         "completed",
         predicate=_journal_terminal_predicate(
             required_event_types=("approval.decided", "run.completed"),
-            required_snapshot_kinds=("initial", "confirmation_resume"),
+            required_snapshot_kinds=("initial",),
         ),
     )
     assert len(runs) == 1
@@ -3085,7 +3086,10 @@ def test_journal_complete_secret_canary_scan(tmp_path):
         assert canary not in journal_text
 
     run_by_id = {run.id: run for run in runs}
-    assert any(run.initial_context_ref_fingerprint for run in runs)
+    assert any(
+        run.initial_context_entity_id or run.initial_context_ref_fingerprint
+        for run in runs
+    )
     assert snapshots
     assert all(
         snapshot.fingerprint_key_id == run_by_id[snapshot.run_id].fingerprint_key_id
@@ -4217,7 +4221,13 @@ def test_chat_attachments_resolve_server_records_after_page_context_and_ignore_c
     ).json()
     offer = app_client.post(
         "/api/offers",
-        json={"company_name": "Actual Offer Co", "position_name": "Staff Engineer", "base_monthly": 32000, "notes": "official offer note"},
+        json={
+            "application_id": application["id"],
+            "company_name": "Actual Offer Co",
+            "position_name": "Staff Engineer",
+            "base_monthly": 32000,
+            "notes": "official offer note",
+        },
     ).json()
     resume = app_client.post("/api/resumes/from-sample", json={"sample_id": "backend"}).json()
     model = CapturingScriptedModel([Assistant(content="ok")])
@@ -6346,6 +6356,41 @@ def test_chat_confirm_edited_status_executes_effective_args_and_keeps_immutable_
     assert updated["closed_reason"] == "Paused"
     assert client.get("/api/chat/conversations").json()[0]["pending_action"] is None
 
+    replayed = client.post(
+        endpoint,
+        json={
+            "conversation_id": pending["conversation_id"],
+            "operation_id": response_body["operation_id"],
+            "approved": True,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+            "edited_args": {"status": "closed", "closed_reason": "Paused"},
+        },
+    )
+    assert replayed.status_code == 200
+    replayed_body = (
+        _parse_sse_events(replayed.text)[-1]["data"]["data"]["response"]
+        if endpoint.endswith("/stream")
+        else replayed.json()
+    )
+    assert replayed_body["replayed"] is True
+
+    conflicting = client.post(
+        endpoint,
+        json={
+            "conversation_id": pending["conversation_id"],
+            "operation_id": response_body["operation_id"],
+            "approved": True,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+            "edited_args": {"status": "interview", "closed_reason": ""},
+        },
+    )
+    if endpoint.endswith("/stream"):
+        conflict_event = _parse_sse_events(conflicting.text)[-1]
+        assert conflict_event["event"] == "error"
+        assert conflict_event["data"]["data"]["code"] == "operation_input_conflict"
+    else:
+        assert conflicting.status_code == 409
+
 
 def test_chat_confirm_stream_rejection_is_normal_followup_and_preserves_previous_undo(tmp_path):
     model = ScriptedModel(
@@ -6870,13 +6915,15 @@ def test_chat_confirm_timeout_during_handler_finalizes_durably_later(
         model,
         stable_journal=True,
     )
-    original_update = ApplicationsRepository.update_full
+    original_update = ApplicationsRepository.update_application_status_scoped
 
-    def slow_update(self, app_id, data):
+    def slow_update(self, constraint, app_id, status, closed_reason=""):
         time.sleep(1.0)
-        return original_update(self, app_id, data)
+        return original_update(self, constraint, app_id, status, closed_reason)
 
-    monkeypatch.setattr(ApplicationsRepository, "update_full", slow_update)
+    monkeypatch.setattr(
+        ApplicationsRepository, "update_application_status_scoped", slow_update
+    )
     # Leave enough headroom for prepare/claim work under the full serial gate;
     # the executor itself remains slower than the timeout by construction.
     monkeypatch.setattr(api_module, "CHAT_AGENT_TIMEOUT_SECONDS", 0.75)
@@ -6910,7 +6957,7 @@ def test_chat_confirm_timeout_during_handler_finalizes_durably_later(
         "completed",
         predicate=_journal_terminal_predicate(
             required_event_types=("run.completed",),
-            required_snapshot_kinds=("initial", "model_input", "confirmation_resume"),
+            required_snapshot_kinds=("initial", "model_input"),
         ),
     )
     assert len(runs) == 1
@@ -6928,8 +6975,8 @@ def test_chat_confirm_timeout_during_handler_finalizes_durably_later(
     assert {snapshot.snapshot_kind for snapshot in journal_snapshots} == {
         "initial",
         "model_input",
-        "confirmation_resume",
     }
+    assert len(model.turns) == 1
 
 
 @pytest.mark.parametrize("endpoint", ["/api/chat/confirm", "/api/chat/confirm/stream"])
@@ -6974,14 +7021,16 @@ def test_chat_confirm_slow_handler_atomically_finishes_without_chained_continuat
 
     model = WouldChainModel()
     app_client, client, application, pending = _create_status_confirmation(tmp_path, model)
-    original_update = ApplicationsRepository.update_full
+    original_update = ApplicationsRepository.update_application_status_scoped
 
-    def blocked_update(self, app_id, data):
+    def blocked_update(self, constraint, app_id, status, closed_reason=""):
         handler_started.set()
         assert release_handler.wait(timeout=5)
-        return original_update(self, app_id, data)
+        return original_update(self, constraint, app_id, status, closed_reason)
 
-    monkeypatch.setattr(ApplicationsRepository, "update_full", blocked_update)
+    monkeypatch.setattr(
+        ApplicationsRepository, "update_application_status_scoped", blocked_update
+    )
     # The handler intentionally remains blocked for up to five seconds.  Keep
     # the timeout below that bound, while allowing the worker enough time to
     # enter the handler under the serial release gate before it expires.
@@ -7192,7 +7241,7 @@ def test_chat_confirm_fallback_timeout_before_handler_keeps_retry_claim(
     validation_started = Event()
     release_validation = Event()
     original_prepare = agent_module.prepare_call
-    original_update = ApplicationsRepository.update_full
+    original_update = ApplicationsRepository.update_application_status_scoped
     handler_calls = []
 
     def block_first_prepare(*args, **kwargs):
@@ -7201,12 +7250,14 @@ def test_chat_confirm_fallback_timeout_before_handler_keeps_retry_claim(
             assert release_validation.wait(timeout=5)
         return original_prepare(*args, **kwargs)
 
-    def record_update(self, app_id, data):
-        handler_calls.append((app_id, data.status))
-        return original_update(self, app_id, data)
+    def record_update(self, constraint, app_id, status, closed_reason=""):
+        handler_calls.append((app_id, status))
+        return original_update(self, constraint, app_id, status, closed_reason)
 
     monkeypatch.setattr(agent_module, "prepare_call", block_first_prepare)
-    monkeypatch.setattr(ApplicationsRepository, "update_full", record_update)
+    monkeypatch.setattr(
+        ApplicationsRepository, "update_application_status_scoped", record_update
+    )
     monkeypatch.setattr(api_module, "CHAT_AGENT_TIMEOUT_SECONDS", 0.05)
 
     first = client.post(
@@ -7631,13 +7682,6 @@ def test_chat_confirm_chained_pending_cas_loss_has_no_partial_history(
     )
     client = TestClient(create_app(data_dir=tmp_path, chat_model=model))
     pending = client.post("/api/chat", json={"message": "update two", "conversation_id": 0}).json()
-    newer = PendingAction(
-        "newer-chain",
-        "update_application_status",
-        json.dumps({"id": second["id"], "status": "closed"}),
-        "newer",
-    )
-
     def lose_transition(
         self,
         conversation_id,
@@ -7650,9 +7694,17 @@ def test_chat_confirm_chained_pending_cas_loss_has_no_partial_history(
         delivery_failure_code=None,
         **kwargs,
     ):
-        del delivery_ownership, delivery_failure_code, kwargs
-        self.set_pending_action(conversation_id, newer)
-        self.set_pending_clarification(conversation_id, newer, "newer question")
+        del (
+            self,
+            conversation_id,
+            expected_generation,
+            messages,
+            pending,
+            clarification,
+            delivery_ownership,
+            delivery_failure_code,
+            kwargs,
+        )
         return None
 
     monkeypatch.setattr(
@@ -7673,10 +7725,10 @@ def test_chat_confirm_chained_pending_cas_loss_has_no_partial_history(
     else:
         assert response.status_code == 409
     conversation = client.get("/api/chat/conversations").json()[0]
-    # Lazy adoption restores the still-undelivered Ledger operation instead of
-    # trusting an out-of-band Conversation overwrite.
+    # The strict Typed Pending port leaves the original proposal intact when
+    # continuation delivery loses its CAS. It never adopts an out-of-band card.
     assert conversation["pending_action"]["args"]["status"] == "offer"
-    assert conversation["pending_clarification"]["question"] == "newer question"
+    assert conversation["pending_clarification"] is None
     stored = client.get(f"/api/chat/conversations/{pending['conversation_id']}").json()
     assert all("abandoned-chain" not in str(message.get("tool_calls", "")) for message in stored)
 
@@ -7768,20 +7820,39 @@ def test_chat_confirm_rejects_review_token_after_pending_replacement(
                     )
                 ]
             ),
-            Assistant(content="must not run"),
+            Assistant(
+                tool_calls=[
+                    ToolCall(
+                        id="replacement-write",
+                        name="update_application_status",
+                        args=json.dumps(
+                            {"id": 1, "status": "closed", "closed_reason": "new"}
+                        ),
+                    )
+                ]
+            ),
         ]
     )
     app_client, client, application, pending = _create_status_confirmation(tmp_path, model)
     reviewed_token = pending["pending_action"]["confirmation_token"]
-    replacement = PendingAction(
-        "replacement-write",
-        "update_application_status",
-        json.dumps({"id": application["id"], "status": "closed", "closed_reason": "new"}),
-        "replacement",
+    rejected = client.post(
+        endpoint,
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": False,
+            "confirmation_token": reviewed_token,
+        },
     )
-    ChatRepository(session_factory_for_data_dir(tmp_path)).set_pending_action(
-        pending["conversation_id"], replacement
+    assert rejected.status_code == 200
+    replacement = client.post(
+        "/api/chat",
+        json={
+            "message": "close it instead",
+            "conversation_id": pending["conversation_id"],
+        },
     )
+    assert replacement.status_code == 200
+    assert replacement.json()["type"] == "confirmation_required"
 
     response = client.post(
         endpoint,
@@ -7801,7 +7872,7 @@ def test_chat_confirm_rejects_review_token_after_pending_replacement(
     current = client.get("/api/chat/conversations").json()[0]
     assert current["pending_action"]["args"]["status"] == "closed"
     assert app_client.get(f"/api/applications/{application['id']}").json()["status"] == "interview"
-    assert len(model.turns) == 1
+    assert model.turns == []
 
 
 @pytest.mark.parametrize("endpoint", ["/api/chat/confirm", "/api/chat/confirm/stream"])
@@ -8223,13 +8294,19 @@ def test_chat_conversation_context_label_resolves_application_and_localized_fall
         json={"company_name": "字节跳动", "position_name": "后端工程师", "status": "interview"},
     ).json()
     repo = ChatRepository(session_factory_for_data_dir(tmp_path))
-    application_conversation = repo.create_conversation(
-        "投递对话", context_type="application", context_ref=str(application["id"])
+    application_conversation = repo.create_conversation_with_scope(
+        "投递对话",
+        ConversationScopeMutationSnapshot(
+            context_type="application", context_ref=application["id"]
+        ),
     )
     workspace_conversation = repo.create_conversation("工作区对话")
-    global_conversation = repo.create_conversation("全局对话", context_type="global")
-    mode_conversation = repo.create_conversation(
-        "谈薪对话", mode="nego_coach", context_type="mode"
+    global_conversation = repo.create_conversation_with_scope(
+        "全局对话", ConversationScopeMutationSnapshot(context_type="global")
+    )
+    mode_conversation = repo.create_conversation_with_scope(
+        "谈薪对话",
+        ConversationScopeMutationSnapshot(mode="nego_coach", context_type="mode"),
     )
 
     conversations = {
@@ -8318,15 +8395,29 @@ def test_chat_does_not_return_confirmation_when_conversation_was_archived_during
     client = TestClient(create_app(data_dir=tmp_path, chat_model=model))
     repo = ChatRepository(session_factory_for_data_dir(tmp_path))
     conversation = repo.create_conversation("archive race")
-    original_persist_pending = ChatRepository.persist_pending_action
+    original_persist_pending = ChatPersistenceCoordinator.persist_initial_pending
 
-    def archive_before_pending(self, conversation_id, pending, messages):
-        self.update_conversation_for_archive(
+    def archive_before_pending(
+        self,
+        conversation_id,
+        messages,
+        pending,
+        pending_authority_claim=None,
+    ):
+        repo.update_conversation_for_archive(
             conversation_id, {"archived_at": datetime.now(timezone.utc)}
         )
-        return original_persist_pending(self, conversation_id, pending, messages)
+        return original_persist_pending(
+            self,
+            conversation_id,
+            messages,
+            pending,
+            pending_authority_claim,
+        )
 
-    monkeypatch.setattr(ChatRepository, "persist_pending_action", archive_before_pending)
+    monkeypatch.setattr(
+        ChatPersistenceCoordinator, "persist_initial_pending", archive_before_pending
+    )
 
     response = client.post(
         "/api/chat", json={"message": "创建投递", "conversation_id": conversation.id}

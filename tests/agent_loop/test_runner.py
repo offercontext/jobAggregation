@@ -13,6 +13,7 @@ from offerpilot.ai.agent_contracts import (
     PendingAction,
 )
 from offerpilot.ai.agent_loop import (
+    ApprovedContinuationSegment,
     AgentLoopInvocation,
     AgentLoopRunner,
     ApprovedWriteSeed,
@@ -40,6 +41,19 @@ from offerpilot.context_projector.selector import DEPENDENCY_POLICY_V1
 from .helpers import RecordingEventSink, ScriptedModel, ToolDefinition, runtime
 
 
+class _DelegatingRecorder:
+    """Test equivalent of the Runtime's stable Segment recorder proxy."""
+
+    def __init__(self, delegate: object) -> None:
+        self._delegate = delegate
+
+    def set_delegate(self, delegate: object) -> None:
+        self._delegate = delegate
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._delegate, name)
+
+
 def invocation(
     model: object,
     definitions: tuple[ToolDefinition, ...],
@@ -53,6 +67,7 @@ def invocation(
     catalog_transform: Callable[[ToolCatalog], ToolCatalog] | None = None,
 ) -> AgentLoopInvocation:
     catalog, context = runtime(*definitions)
+    segment_origin = context
     if catalog_transform is not None:
         catalog = catalog_transform(catalog)
     recorder = run_recorder or NullRunRecorder()
@@ -102,6 +117,42 @@ def invocation(
             run_recorder=recorder,
             operation_executor=execute_operation,
         )
+        segment_catalog = ToolCatalog(
+            tuple(catalog.specs),
+            expected_names=tuple(spec.name for spec in catalog.specs),
+        )
+        segment_context = segment_origin.with_runtime_dependencies(
+            run_recorder=_DelegatingRecorder(recorder),
+            operation_executor=None,
+        )
+        segment_messages = (
+            Message(role="user", content="开始"),
+            Message(
+                role="assistant",
+                content="",
+                tool_calls=[ToolCall(pending.tool_call_id, pending.tool_name, pending.args)],
+            ),
+            Message(role="tool", content="已写入", tool_call_id=pending.tool_call_id),
+            Message(role="user", content="继续"),
+        )
+        segment_gate = build_segment_surface_gate(
+            segment_messages,
+            catalog=segment_catalog,
+            context=segment_context,
+            authority=segment_context.authority,
+            dependency_policy=DEPENDENCY_POLICY_V1,
+            policy=validate_startup_policy(segment_catalog.authority_manifest),
+        )
+        segment = ApprovedContinuationSegment(
+            messages=segment_messages,
+            model=_ContinuationModel(model),
+            catalog=segment_catalog,
+            tool_context=segment_context,
+            surface_gate=segment_gate,
+        )
+        configure_segment = getattr(resolved_seed.continuation, "set_continuation_segment", None)
+        if callable(configure_segment):
+            configure_segment(segment)
     else:
         context = context.with_runtime_dependencies(
             run_recorder=recorder,
@@ -183,6 +234,15 @@ class StreamingModel:
     def complete(self, messages: list[object], tools: list[object]) -> Assistant:
         del messages, tools
         raise AssertionError("stream_complete should be preferred")
+
+
+class _ContinuationModel:
+    def __init__(self, inner: object) -> None:
+        self._inner = inner
+
+    def complete(self, messages: list[object], tools: list[object]) -> Assistant:
+        complete = getattr(self._inner, "complete")
+        return complete(messages, tools)
 
 
 def test_new_turn_returns_final_from_one_explicit_model_step() -> None:
@@ -601,6 +661,7 @@ class ApprovedPort:
         self._pending = pending
         self.phases = phases
         self.record: ToolExecutionRecord[Any, Any] | None = None
+        self._segment: ApprovedContinuationSegment | None = None
 
     @property
     def pending(self) -> PendingAction:
@@ -625,15 +686,20 @@ class ApprovedPort:
         self.phases.append("record")
         self.record = record
 
-    def load_continuation_messages(self) -> tuple[Message, ...]:
-        self.phases.append("load")
-        return (Message(role="user", content="继续"),)
+    def set_continuation_segment(self, segment: ApprovedContinuationSegment) -> None:
+        self._segment = segment
+
+    def activate_continuation_segment(self) -> ApprovedContinuationSegment:
+        self.phases.append("activate")
+        if self._segment is None:
+            raise AssertionError("continuation segment was not configured")
+        return self._segment
 
     def delivery_fence(self) -> bool:
         return "claim" in self.phases
 
 
-def test_approval_authority_bootstraps_write_but_cannot_enter_model_loop() -> None:
+def test_approval_authority_switches_to_fresh_segment_model_loop() -> None:
     phases: list[str] = []
     executed: list[str] = []
     pending = PendingAction(
@@ -654,16 +720,157 @@ def test_approval_authority_bootstraps_write_but_cannot_enter_model_loop() -> No
         seed=ApprovedWriteSeed(port),
         event_sink=sink,
     )
-    with pytest.raises(TypeError, match="Provider calls require a Segment authority"):
+    result = AgentLoopRunner().run(base)
+
+    assert executed == ['{"id":1,"status":"applied"}']
+    assert phases == ["pending", "claim", "record", "activate"]
+    assert [type(event) for event in sink.events[:2]] == [AgentToolCall, AgentToolResult]
+    assert result.reply == "写入完成"
+    assert model.calls == 1
+    assert [
+        message.tool_call_id
+        for message in model.inputs[0]
+        if getattr(message, "role", None) == "tool"
+    ] == ["write-1"]
+
+
+def test_approved_activation_failure_does_not_repeat_origin_executor() -> None:
+    phases: list[str] = []
+    executed: list[str] = []
+    pending = PendingAction(
+        "write-1", "update_application_status", '{"id":1,"status":"applied"}', "确认", "operation-1"
+    )
+
+    class FailingPort(ApprovedPort):
+        def activate_continuation_segment(self) -> ApprovedContinuationSegment:
+            self.phases.append("activate")
+            raise RuntimeError("segment activation failed")
+
+    port = FailingPort(pending, phases)
+    model = ScriptedModel(Assistant(content="不应调用"))
+    base = invocation(
+        model,
+        (
+            ToolDefinition(
+                "update_application_status",
+                kind="write",
+                executor=lambda raw: executed.append(raw) or "已写入",
+            ),
+        ),
+        seed=ApprovedWriteSeed(port),
+    )
+
+    with pytest.raises(RuntimeError, match="segment activation failed"):
         AgentLoopRunner().run(base)
 
     assert executed == ['{"id":1,"status":"applied"}']
-    assert phases == ["pending", "claim", "record", "load"]
-    assert [type(event) for event in sink.events[:2]] == [AgentToolCall, AgentToolResult]
+    assert phases == ["pending", "claim", "record", "activate"]
     assert model.calls == 0
 
 
-def test_live_approval_delivery_fence_does_not_authorize_provider() -> None:
+def test_active_segment_rechecks_origin_delivery_fence_after_provider_returns() -> None:
+    phases: list[str] = []
+    executed: list[str] = []
+    pending = PendingAction(
+        "write-1", "update_application_status", '{"id":1,"status":"applied"}', "确认", "operation-1"
+    )
+
+    class RevocablePort(ApprovedPort):
+        allowed = True
+
+        def delivery_fence(self) -> bool:
+            return self.allowed and super().delivery_fence()
+
+    port = RevocablePort(pending, phases)
+
+    class FencedAfterProviderModel(ScriptedModel):
+        def complete(self, messages: list[object], tools: list[object]) -> Assistant:
+            port.allowed = False
+            return super().complete(messages, tools)
+
+    model = FencedAfterProviderModel(Assistant(content="不应提交"))
+    base = invocation(
+        model,
+        (
+            ToolDefinition(
+                "update_application_status",
+                kind="write",
+                executor=lambda raw: executed.append(raw) or "已写入",
+            ),
+        ),
+        seed=ApprovedWriteSeed(port),
+    )
+
+    with pytest.raises(ChatRunCancelled, match="delivery owner fenced"):
+        AgentLoopRunner().run(base)
+
+    assert executed == ['{"id":1,"status":"applied"}']
+    assert model.calls == 1
+
+
+def test_provider_failure_after_approval_does_not_repeat_origin_executor() -> None:
+    phases: list[str] = []
+    executed: list[str] = []
+    pending = PendingAction(
+        "write-1", "update_application_status", '{"id":1,"status":"applied"}', "确认", "operation-1"
+    )
+    port = ApprovedPort(pending, phases)
+
+    class FailingProviderModel(ScriptedModel):
+        def complete(self, messages: list[object], tools: list[object]) -> Assistant:
+            self.calls += 1
+            raise RuntimeError("provider failed")
+
+    model = FailingProviderModel()
+    base = invocation(
+        model,
+        (
+            ToolDefinition(
+                "update_application_status",
+                kind="write",
+                executor=lambda raw: executed.append(raw) or "已写入",
+            ),
+        ),
+        seed=ApprovedWriteSeed(port),
+    )
+
+    with pytest.raises(RuntimeError, match="provider failed"):
+        AgentLoopRunner().run(base)
+
+    assert executed == ['{"id":1,"status":"applied"}']
+    assert model.calls == 1
+
+
+def test_active_segment_provider_input_is_detached_from_source_bundle() -> None:
+    phases: list[str] = []
+    pending = PendingAction(
+        "write-1", "update_application_status", '{"id":1,"status":"applied"}', "确认", "operation-1"
+    )
+    port = ApprovedPort(pending, phases)
+
+    class MutatingSourceModel(ScriptedModel):
+        def complete(self, messages: list[object], tools: list[object]) -> Assistant:
+            assert port._segment is not None
+            port._segment.messages[0].content = "mutated source"  # type: ignore[misc]
+            return super().complete(messages, tools)
+
+    model = MutatingSourceModel(Assistant(content="完成"))
+    base = invocation(
+        model,
+        (ToolDefinition("update_application_status", kind="write"),),
+        seed=ApprovedWriteSeed(port),
+    )
+
+    result = AgentLoopRunner().run(base)
+
+    assert result.reply == "完成"
+    detached_source = next(message for message in model.inputs[0] if message.content == "开始")
+    assert detached_source is not port._segment.messages[0]
+    assert detached_source.content == "开始"
+    assert port._segment.messages[0].content == "mutated source"
+
+
+def test_live_approval_delivery_fence_closes_before_fresh_provider() -> None:
     phases: list[str] = []
     pending = PendingAction(
         "write-1", "update_application_status", '{"id":1,"status":"applied"}', "确认", "operation-1"
@@ -683,10 +890,10 @@ def test_live_approval_delivery_fence_does_not_authorize_provider() -> None:
         seed=ApprovedWriteSeed(port),
     )
 
-    with pytest.raises(TypeError, match="Provider calls require a Segment authority"):
-        AgentLoopRunner().run(base)
+    result = AgentLoopRunner().run(base)
 
-    assert model.calls == 0
+    assert result.reply == "不应调用"
+    assert model.calls == 1
     assert port.allowed is True
 
 

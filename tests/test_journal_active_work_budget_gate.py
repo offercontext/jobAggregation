@@ -25,9 +25,13 @@ JOURNAL_REPOSITORY_API = frozenset(
         "append_event",
         "capture_context",
         "converge_disposition",
+        "recover_degraded_resume",
         "mark_degraded",
         "find_waiting_run",
     }
+)
+BOUND_REPOSITORY_API = frozenset(
+    {"append_event_bound", "converge_disposition_bound"}
 )
 BOUND_FORBIDDEN_NAMES = frozenset(
     {
@@ -364,6 +368,9 @@ EXPECTED_DIRECT_METHODS = MappingProxyType(
                 "capture_surface_context",
                 "prepare_event_draft",
                 "append_prepared_event_bound",
+                "resume_bound",
+                "record_approval_and_resume_bound",
+                "recover_approval_and_resume",
                 "resume",
                 "suspend",
                 "finish",
@@ -417,6 +424,9 @@ EXPECTED_DIRECT_METHODS = MappingProxyType(
                 "append_event_bound",
                 "capture_context",
                 "converge_disposition",
+                "converge_disposition_bound",
+                "recover_degraded_resume",
+                "_converge_disposition_bound",
                 "mark_degraded",
                 "find_waiting_run",
                 "get_run",
@@ -583,7 +593,7 @@ def _validate_journal_repository_calls(tree: ast.AST) -> None:
     _validate_external_method_rebindings(tree)
     parents = _parents(tree)
     calls = _direct_repository_calls(tree)
-    allowed = JOURNAL_REPOSITORY_API | {"append_event_bound"}
+    allowed = JOURNAL_REPOSITORY_API | BOUND_REPOSITORY_API
 
     for node in ast.walk(tree):
         if not _is_self_attribute(node, "repository"):
@@ -647,7 +657,7 @@ def _validate_journal_repository_calls(tree: ast.AST) -> None:
             "Journal repository calls must not forward dynamic positional arguments"
         )
         assert "clock" not in keyword_names, "Journal repository calls must not pass clock"
-        if function.attr == "append_event_bound":
+        if function.attr in BOUND_REPOSITORY_API:
             assert "deadline" not in keyword_names
             assert "safe_clock" not in keyword_names
             continue
@@ -672,28 +682,46 @@ def _validate_journal_repository_calls(tree: ast.AST) -> None:
 
 def _validate_bound_call_ownership(tree: ast.Module) -> None:
     recorder = _top_level_class(tree, "SafeRunRecorder")
-    method = _class_method(recorder, "append_prepared_event_bound")
-    append_calls = [
-        node
-        for node in _direct_repository_calls(tree)
-        if _direct_repository_method(node).attr == "append_event_bound"  # type: ignore[union-attr]
-    ]
-    all_append_calls = [
-        node
-        for node in ast.walk(tree)
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "append_event_bound"
+    expected_owners = {
+        "append_event_bound": {
+            "append_prepared_event_bound",
+            "record_approval_and_resume_bound",
+        },
+        "converge_disposition_bound": {
+            "resume_bound",
+            "record_approval_and_resume_bound",
+        },
+    }
+    for repository_method, owner_names in expected_owners.items():
+        direct_calls = [
+            node
+            for node in _direct_repository_calls(tree)
+            if _direct_repository_method(node).attr == repository_method  # type: ignore[union-attr]
+        ]
+        all_calls = [
+            node
+            for node in ast.walk(tree)
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == repository_method
+            )
+        ]
+        assert len(all_calls) == len(direct_calls), (
+            f"{repository_method} must be called through self.repository"
         )
-    ]
-    assert len(all_append_calls) == len(append_calls), (
-        "append_event_bound must be called through self.repository"
-    )
-    assert len(append_calls) == 1, "append_event_bound must have one Journal call site"
-    assert id(append_calls[0]) in {id(node) for node in ast.walk(method)}, (
-        "append_event_bound must be owned by SafeRunRecorder.append_prepared_event_bound"
-    )
+        owners = {
+            owner_name
+            for owner_name in owner_names
+            if any(
+                id(call) in {id(node) for node in ast.walk(_class_method(recorder, owner_name))}
+                for call in direct_calls
+            )
+        }
+        assert len(direct_calls) == len(owner_names)
+        assert owners == owner_names, (
+            f"{repository_method} must have only its exact bound owners"
+        )
 
 
 def _is_self_name(node: ast.AST) -> bool:
@@ -847,6 +875,54 @@ def _validate_bound_method(method: ast.FunctionDef | ast.AsyncFunctionDef) -> No
             assert "pragma" not in node.value.lower(), "bound path must not issue PRAGMA"
 
 
+def _validate_bound_resume_method(
+    method: ast.FunctionDef | ast.AsyncFunctionDef,
+    *,
+    expected_repository_calls: tuple[str, ...],
+) -> None:
+    parents = _parents(method)
+    _validate_bound_signature(method)
+    assert not any(isinstance(node, ast.AsyncWith) for node in ast.walk(method))
+    nested = [
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.With)
+        and len(node.items) == 1
+        and isinstance(node.items[0].context_expr, ast.Call)
+        and isinstance(node.items[0].context_expr.func, ast.Attribute)
+        and node.items[0].context_expr.func.attr == "begin_nested"
+        and isinstance(node.items[0].context_expr.func.value, ast.Name)
+        and node.items[0].context_expr.func.value.id == "session"
+        and not node.items[0].context_expr.args
+        and not node.items[0].context_expr.keywords
+        and node.items[0].optional_vars is None
+    ]
+    assert len(nested) == 1, "bound resume must own exactly one savepoint"
+    savepoint = nested[0]
+    repository_calls = _direct_repository_calls(method)
+    assert tuple(
+        _direct_repository_method(call).attr  # type: ignore[union-attr]
+        for call in repository_calls
+    ) == expected_repository_calls
+    call_statements: list[ast.Expr] = []
+    for call in repository_calls:
+        assert len(call.args) == 3 and not call.keywords
+        assert isinstance(call.args[0], ast.Name) and call.args[0].id == "session"
+        assert _is_self_attribute(call.args[1], "run_id")
+        statement = parents.get(call)
+        assert isinstance(statement, ast.Expr)
+        assert parents.get(statement) is savepoint
+        call_statements.append(statement)
+    assert [savepoint.body.index(statement) for statement in call_statements] == list(
+        range(len(call_statements))
+    ), "approval append must precede resumed disposition in the savepoint"
+    forbidden = _node_names(method) & BOUND_FORBIDDEN_NAMES
+    assert not forbidden, (
+        f"bound resume owns no Journal transaction machinery: {sorted(forbidden)}"
+    )
+    _validate_journal_repository_calls(method)
+
+
 def _all_argument_names(method: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
     return {
         argument.arg
@@ -928,6 +1004,27 @@ def _validate_repository_module(tree: ast.Module) -> None:
     _validate_bound_repository_implementation(
         _class_method(repository, "append_event_bound")
     )
+    public_bound = _class_method(repository, "converge_disposition_bound")
+    private_bound = _class_method(repository, "_converge_disposition_bound")
+    _validate_bound_signature(public_bound)
+    _validate_bound_signature(private_bound)
+    for method in (public_bound, private_bound):
+        forbidden = _node_names(method) & BOUND_FORBIDDEN_NAMES
+        assert not forbidden, (
+            f"bound disposition owns no transaction machinery: {sorted(forbidden)}"
+        )
+    public_calls = [
+        node
+        for node in ast.walk(public_bound)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and _is_self_name(node.func.value)
+        and node.func.attr == "_converge_disposition_bound"
+    ]
+    assert len(public_calls) == 1
+    assert len(public_calls[0].args) == 3 and not public_calls[0].keywords
+    assert isinstance(public_calls[0].args[0], ast.Name)
+    assert public_calls[0].args[0].id == "session"
 
 
 PUBLIC_BUDGET_API = frozenset(
@@ -1180,6 +1277,17 @@ def test_bound_append_event_is_owned_by_safe_recorder() -> None:
     recorder = _top_level_class(tree, "SafeRunRecorder")
     _validate_bound_call_ownership(tree)
     _validate_bound_method(_class_method(recorder, "append_prepared_event_bound"))
+    _validate_bound_resume_method(
+        _class_method(recorder, "resume_bound"),
+        expected_repository_calls=("converge_disposition_bound",),
+    )
+    _validate_bound_resume_method(
+        _class_method(recorder, "record_approval_and_resume_bound"),
+        expected_repository_calls=(
+            "append_event_bound",
+            "converge_disposition_bound",
+        ),
+    )
 
 
 def test_journal_and_repository_have_no_stale_budget_paths() -> None:

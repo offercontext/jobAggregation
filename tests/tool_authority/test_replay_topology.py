@@ -350,7 +350,6 @@ def test_typed_chained_replay_integrity_and_runtime_side_effect_boundary(
             write_operations=repository,
             write_coordinator=ForbiddenWriteCoordinator(),  # type: ignore[arg-type]
             catalog=ForbiddenCatalog(),
-            prepare_call=forbidden("tool"),
             approval_context_resolver=forbidden("authority"),
         )
     )
@@ -359,7 +358,7 @@ def test_typed_chained_replay_integrity_and_runtime_side_effect_boundary(
             conversations=ForbiddenConversationGateway(),
             confirmation_coordinator=coordinator,
             catalog=ForbiddenCatalog(),  # type: ignore[arg-type]
-            model_resolver=forbidden("provider"),  # type: ignore[arg-type]
+            continuation_model_resolver=forbidden("provider"),  # type: ignore[arg-type]
             agent_driver=forbidden("provider"),  # type: ignore[arg-type]
         )
     )

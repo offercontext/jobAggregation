@@ -1858,6 +1858,7 @@ class DeterministicPilotAdapter:
                     "terminal_assistant_content": message,
                     "claim_id": pending.operation_id,
                     "delivery_ownership": ownership,
+                    "pending_authority_claim": None,
                 },
                 (conversation_id, pending, replacement, origin, {}),
             )
@@ -1876,6 +1877,7 @@ class DeterministicPilotAdapter:
                 "expected_pending": pending,
                 "claim_id": pending.operation_id,
                 "undo": {},
+                "pending_authority_claim": None,
             },
             (conversation_id, ownership, origin, [Message(role="assistant", content=message)]),
         )

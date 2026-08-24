@@ -271,6 +271,42 @@ def _resumed_event(
     )
 
 
+def _seed_waiting_confirmation(
+    tmp_path: Path,
+) -> tuple[AgentRunRepository, object, int, str, DispositionCommand]:
+    repository, conversation_id, _ = _create_run(tmp_path)
+    tool_call_id = "call-bound-resume"
+    repository.converge_disposition(
+        RUN_ID,
+        DispositionCommand(
+            target_status="waiting_confirmation",
+            events=_waiting_events(tool_call_id),
+            waiting_tool_call_id=tool_call_id,
+        ),
+    )
+    confirmation_segment = "99999999-9999-4999-8999-999999999999"
+    repository.start_segment(
+        StartSegmentCommand(
+            run_id=RUN_ID,
+            segment_started=_segment_started(
+                confirmation_segment,
+                request_kind="confirmation",
+            ),
+        )
+    )
+    command = DispositionCommand(
+        target_status="running",
+        events=(
+            _resumed_event(
+                tool_call_id,
+                confirmation_segment,
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab",
+            ),
+        ),
+    )
+    return repository, init_database(tmp_path / "data.db"), conversation_id, tool_call_id, command
+
+
 def test_create_run_atomically_creates_initial_events(tmp_path: Path) -> None:
     conversation_id, message_id = _seed_conversation(tmp_path)
     repository = _repository(tmp_path)
@@ -518,6 +554,119 @@ def test_append_event_bound_keeps_caller_transaction_ownership(tmp_path: Path) -
         assert session.scalar(
             select(ChatMessage).where(ChatMessage.content == "bound-domain-marker")
         ) is not None
+
+
+def test_converge_disposition_bound_requires_active_caller_transaction(
+    tmp_path: Path,
+) -> None:
+    repository, session_factory, _, _, command = _seed_waiting_confirmation(tmp_path)
+
+    with session_factory() as session:  # type: ignore[operator]
+        with pytest.raises(JournalConflictError, match="caller transaction"):
+            repository.converge_disposition_bound(session, RUN_ID, command)
+
+
+def test_converge_disposition_bound_uses_no_second_session_or_commit(
+    tmp_path: Path,
+) -> None:
+    repository, session_factory, conversation_id, _, command = (
+        _seed_waiting_confirmation(tmp_path)
+    )
+
+    def forbid_second_session() -> object:
+        raise AssertionError("bound disposition opened a second Session")
+
+    repository.session_factory = forbid_second_session  # type: ignore[assignment]
+    with session_factory() as session:  # type: ignore[operator]
+        transaction = session.begin()
+        created = repository.converge_disposition_bound(session, RUN_ID, command)
+        session.add(
+            ChatMessage(
+                conversation_id=conversation_id,
+                role="assistant",
+                content="bound-disposition-marker",
+            )
+        )
+        assert session.in_transaction()
+        assert transaction.is_active
+        assert [event.event_type for event in created] == ["run.resumed"]
+        transaction.commit()
+
+    with session_factory() as session:  # type: ignore[operator]
+        run = repository._required_run(session, RUN_ID)
+        assert run.status == "running"
+        assert session.scalar(
+            select(ChatMessage).where(
+                ChatMessage.content == "bound-disposition-marker"
+            )
+        ) is not None
+
+
+def test_converge_disposition_bound_is_idempotent_and_conflicts_on_changed_identity(
+    tmp_path: Path,
+) -> None:
+    repository, session_factory, _, tool_call_id, command = _seed_waiting_confirmation(
+        tmp_path
+    )
+
+    with session_factory() as session:  # type: ignore[operator]
+        with session.begin():
+            first = repository.converge_disposition_bound(session, RUN_ID, command)
+            second = repository.converge_disposition_bound(session, RUN_ID, command)
+            assert [event.id for event in second] == [event.id for event in first]
+
+    changed = DispositionCommand(
+        target_status="running",
+        events=(
+            _resumed_event(
+                tool_call_id,
+                "99999999-9999-4999-8999-999999999999",
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            ),
+        ),
+    )
+    with session_factory() as session:  # type: ignore[operator]
+        with session.begin():
+            with pytest.raises(JournalConflictError):
+                repository.converge_disposition_bound(session, RUN_ID, changed)
+
+    assert [
+        event.event_type for event in repository.list_events(RUN_ID)
+    ].count("run.resumed") == 1
+
+
+def test_converge_disposition_bound_rolls_back_run_event_and_domain_write(
+    tmp_path: Path,
+) -> None:
+    repository, session_factory, conversation_id, tool_call_id, command = (
+        _seed_waiting_confirmation(tmp_path)
+    )
+
+    with session_factory() as session:  # type: ignore[operator]
+        session.begin()
+        repository.converge_disposition_bound(session, RUN_ID, command)
+        session.add(
+            ChatMessage(
+                conversation_id=conversation_id,
+                role="assistant",
+                content="rolled-back-bound-marker",
+            )
+        )
+        session.rollback()
+
+    run = repository.get_run(RUN_ID)
+    assert run is not None
+    assert run.status == "waiting_confirmation"
+    assert run.waiting_tool_call_id == tool_call_id
+    assert "run.resumed" not in [
+        event.event_type for event in repository.list_events(RUN_ID)
+    ]
+    with session_factory() as session:  # type: ignore[operator]
+        assert session.scalar(
+            select(ChatMessage).where(
+                ChatMessage.content == "rolled-back-bound-marker"
+            )
+        ) is None
 
 
 def test_concurrent_identical_event_append_returns_one_persisted_event(tmp_path: Path) -> None:

@@ -51,11 +51,13 @@ from offerpilot.ai.write_operations import (
 )
 from offerpilot.agent_runtime.journal import NullRunRecorder
 from offerpilot.chat_transport import (
+    encode_sse_event,
     event_sse_name,
     event_sse_payload,
     outcome_http_payload,
+    outcome_http_response,
     outcome_http_status,
-    runtime_stream_immediate_response,
+    runtime_stream_response,
 )
 from offerpilot.pilot_runtime.continuation import (
     ConfirmationCoordinator,
@@ -64,6 +66,7 @@ from offerpilot.pilot_runtime.continuation import (
 from offerpilot.pilot_runtime.contracts import (
     ConfirmationRequest,
     ErrorEvent,
+    ImmediateHttpOutcome,
     RuntimeFailureOutcome,
     StartTurnRequest,
 )
@@ -140,9 +143,29 @@ REAL_USER_CANARIES = (
     "真实职位描述",
 )
 WINDOWS_ABSOLUTE_PATH = re.compile(r"[A-Za-z]:[\\/]")
+POSIX_ABSOLUTE_PATH = re.compile(r"(?<![A-Za-z0-9])/(?:[^/\s]+/)+")
+UNC_ABSOLUTE_PATH = re.compile(r"\\\\(?:[^\\/\s]+[\\/]){2,}[^\\/\\s]*")
 TRACEBACK_TEXT = re.compile(r"traceback|stack trace", re.IGNORECASE)
 EXCEPTION_EXPRESSION = re.compile(r"(?:exception|[A-Za-z_][A-Za-z0-9_]*Error)\s*\(")
+EXCEPTION_CLASS_NAME = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception)\b")
 SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
+REVIEWED_CAPABILITY_FINGERPRINT = (
+    "sha256:be49ef8b3335740931fc3dee690948d87fed499921cd9c6f4f8586c786ec7487"
+)
+REVIEWED_BINDING_FINGERPRINT = (
+    "sha256:0cb3e67abade3b5e986414267facd41d49f866050f90a97d50aec32d54320ca7"
+)
+
+
+def _assert_private_string(value: str) -> None:
+    assert not WINDOWS_ABSOLUTE_PATH.search(value)
+    assert not POSIX_ABSOLUTE_PATH.search(value)
+    assert not UNC_ABSOLUTE_PATH.search(value)
+    assert not TRACEBACK_TEXT.search(value)
+    assert not EXCEPTION_EXPRESSION.search(value)
+    assert not EXCEPTION_CLASS_NAME.search(value)
+    for canary in REAL_USER_CANARIES:
+        assert canary not in value
 
 
 def _walk(value: Any) -> None:
@@ -150,17 +173,14 @@ def _walk(value: Any) -> None:
         lowered = {str(key).lower() for key in value}
         assert not FORBIDDEN_KEYS & lowered
         for key, nested in value.items():
-            assert not WINDOWS_ABSOLUTE_PATH.search(str(key))
+            if isinstance(key, str):
+                _assert_private_string(key)
             _walk(nested)
     elif isinstance(value, list):
         for nested in value:
             _walk(nested)
     elif isinstance(value, str):
-        assert not WINDOWS_ABSOLUTE_PATH.search(value)
-        assert not TRACEBACK_TEXT.search(value)
-        assert not EXCEPTION_EXPRESSION.search(value)
-        for canary in REAL_USER_CANARIES:
-            assert canary not in value
+        _assert_private_string(value)
 
 
 def _digest(value: Any) -> str:
@@ -223,33 +243,77 @@ def test_provider_envelopes_and_schema_fingerprints_are_fully_pinned() -> None:
     assert pinned["envelope_fingerprints"] == expected_envelopes
 
 
+class _ImmediateStreamRuntime:
+    def __init__(self, outcome: ImmediateHttpOutcome) -> None:
+        self.outcome = outcome
+
+    def prepare_stream(self, _request: object, **_kwargs: object) -> ImmediateHttpOutcome:
+        return self.outcome
+
+
 def _immediate_transport_projection(
     outcome: RuntimeFailureOutcome,
     request: StartTurnRequest | ConfirmationRequest,
 ) -> dict[str, Any]:
     control = InMemoryRuntimeInvocationControl()
-    immediate = PilotRuntime(RuntimeDependencies())._stream_immediate(outcome, control)
-    response = runtime_stream_immediate_response(
-        immediate,
-        run_id="authority-run",
-        request=request,
+    immediate = PilotRuntime(RuntimeDependencies())._stream_immediate(
+        outcome,
+        cast(Any, control),
     )
-    lines = bytes(response.body).decode("utf-8").splitlines()
-    encoded = next(line.removeprefix("data: ") for line in lines if line.startswith("data: "))
-    envelope = json.loads(encoded)
-    event = ErrorEvent(outcome.code, outcome.message, outcome.retryable, outcome.degraded)
-    typed_event = {"event": event_sse_name(event), "data": event_sse_payload(event)}
-    assert envelope["event"] == typed_event["event"]
-    assert envelope["data"] == typed_event["data"]
+    assert isinstance(immediate, ImmediateHttpOutcome)
+    sync_response = outcome_http_response(immediate)
+    stream_response = runtime_stream_response(
+        _ImmediateStreamRuntime(immediate),
+        request,
+    )
+    stream: dict[str, Any] = {
+        "direct": immediate.response_payload["_runtime_stream_direct"],
+        "http_status": stream_response.status_code,
+        "media_type": str(stream_response.media_type).split(";", 1)[0],
+    }
+    if str(stream_response.media_type).startswith("text/event-stream"):
+        lines = bytes(stream_response.body).decode("utf-8").splitlines()
+        encoded = next(
+            line.removeprefix("data: ")
+            for line in lines
+            if line.startswith("data: ")
+        )
+        envelope = json.loads(encoded)
+        event = ErrorEvent(
+            outcome.code,
+            outcome.message,
+            outcome.retryable,
+            outcome.degraded,
+        )
+        typed_event = {"event": event_sse_name(event), "data": event_sse_payload(event)}
+        assert envelope["event"] == typed_event["event"]
+        assert envelope["data"] == typed_event["data"]
+        stream["sse"] = typed_event
+    else:
+        stream["body"] = json.loads(bytes(stream_response.body).decode("utf-8"))
     return {
         "sync_http": {
-            "status": outcome_http_status(immediate),
-            "body": outcome_http_payload(immediate),
+            "status": sync_response.status_code,
+            "body": json.loads(bytes(sync_response.body).decode("utf-8")),
         },
-        "sse": {
-            "http_status": response.status_code,
-            **typed_event,
-        },
+        "sync_media_type": str(sync_response.media_type).split(";", 1)[0],
+        "stream": stream,
+    }
+
+
+def _postheader_error_projection(outcome: RuntimeFailureOutcome) -> dict[str, Any]:
+    event = ErrorEvent(outcome.code, outcome.message, outcome.retryable, outcome.degraded)
+    encoded = encode_sse_event(event, seq=1, run_id="authority-run")
+    lines = encoded.splitlines()
+    event_name = next(line.removeprefix("event: ") for line in lines if line.startswith("event: "))
+    data = json.loads(next(line.removeprefix("data: ") for line in lines if line.startswith("data: ")))
+    assert event_name == event_sse_name(event)
+    assert data["event"] == event_name
+    assert data["data"] == event_sse_payload(event)
+    return {
+        "http_status": 200,
+        "event": event_name,
+        "data": data["data"],
     }
 
 
@@ -277,7 +341,9 @@ def test_existing_fixture_identities_and_compatibility_facts_are_pinned() -> Non
     pilot = load_golden("pilot_runtime/baseline_golden.json")
     agent = load_golden("agent_loop/baseline_aaecf5d.json")
     compatibility = baseline["compatibility"]
-    preheader_cases = {
+    preheader_cases: dict[
+        str, tuple[RuntimeFailureOutcome, StartTurnRequest | ConfirmationRequest]
+    ] = {
         "source_load_failed": (
             PilotRuntime._failure(
                 RuntimeFailureCode.SOURCE_LOAD_FAILED,
@@ -299,7 +365,7 @@ def test_existing_fixture_identities_and_compatibility_facts_are_pinned() -> Non
             "error_code": body["error_code"],
             "message": body["error"],
             "status": actual["sync_http"]["status"],
-            "sse": actual["sse"],
+            "stream": actual["stream"],
         }
     replay_cases = {
         "operation_delivery_pending": PilotRuntime._failure(
@@ -326,7 +392,7 @@ def test_existing_fixture_identities_and_compatibility_facts_are_pinned() -> Non
             "error_code": body["error_code"],
             "message": body["error"],
             "status": actual["sync_http"]["status"],
-            "sse": actual["sse"],
+            "stream": actual["stream"],
         }
     assert compatibility["tool_failure_messages"] == {
         "validation_error": "工具参数验证失败，请检查后重试。",
@@ -467,27 +533,27 @@ def test_pre_executor_tool_pipeline_is_produced_by_runtime() -> None:
     pipeline = baseline["compatibility"]["pre_executor"]["tool_pipeline"]
     metadata = {
         "schema_missing_required": (
-            "entrypoint.prepare_call_render_agent_delivery_v1",
+            "helper.prepare_call_render_agent_tool_result_projection_v1",
             "scenario.schema_missing_required_get_application_id",
             "origin.schema_missing_required",
         ),
         "decode_exception": (
-            "entrypoint.prepare_call_render_agent_delivery_v1",
+            "helper.prepare_call_render_agent_tool_result_projection_v1",
             "scenario.decoder_exception_after_schema",
             "origin.decoder_exception",
         ),
         "capability_missing": (
-            "entrypoint.prepare_call_render_agent_delivery_v1",
+            "helper.prepare_call_render_agent_tool_result_projection_v1",
             "scenario.missing_applications_read_capability",
             "origin.missing_capability",
         ),
         "binding_exception": (
-            "entrypoint.prepare_call_render_agent_delivery_v1",
+            "helper.prepare_call_render_agent_tool_result_projection_v1",
             "scenario.binding_resolver_exception_after_capability",
             "origin.binding_resolver_exception",
         ),
         "preflight_returned_failure": (
-            "entrypoint.prepare_call_render_agent_delivery_v1",
+            "helper.prepare_call_render_agent_tool_result_projection_v1",
             "scenario.preflight_returned_stale_tool_failure",
             "origin.preflight_returned_tool_failure",
         ),
@@ -566,7 +632,7 @@ def test_pre_executor_tool_pipeline_is_produced_by_runtime() -> None:
         ) == metadata[stage]
 
 
-def _confirmation_route_projection(outcome: Any) -> dict[str, Any]:
+def _postheader_route_projection(outcome: Any) -> dict[str, Any]:
     assert isinstance(outcome, RuntimeFailureOutcome)
     event = ErrorEvent(
         outcome.code,
@@ -586,7 +652,7 @@ def _confirmation_route_projection(outcome: Any) -> dict[str, Any]:
             "status": outcome_http_status(outcome),
             "body": outcome_http_payload(outcome),
         },
-        "sse": {
+        "postheader_stream": {
             "http_status": 200,
             "event": event_sse_name(event),
             "data": event_sse_payload(event),
@@ -594,7 +660,7 @@ def _confirmation_route_projection(outcome: Any) -> dict[str, Any]:
     }
 
 
-def test_confirmation_routes_use_runtime_mapping_and_transport() -> None:
+def test_confirmation_routes_use_phase_specific_runtime_mapping_and_transport() -> None:
     baseline = load_golden("tool_authority/baseline_2427fa6.json")
     confirmation = baseline["compatibility"]["pre_executor"]["confirmation"]
     metadata = {
@@ -603,34 +669,72 @@ def test_confirmation_routes_use_runtime_mapping_and_transport() -> None:
             "scenario.approved_continuation_stale",
             "origin.provider_stale_pending_action",
         ),
-        "modify_invalid": (
+        "modify_invalid_preheader": (
             "entrypoint.confirmation_failure_v1",
-            "scenario.modify_invalid_confirmation",
+            "scenario.modify_invalid_confirmation_preheader",
+            "origin.confirmation_invalid_confirmation",
+        ),
+        "modify_invalid_postheader": (
+            "transport.encode_sse_event_error_v1",
+            "scenario.modify_invalid_confirmation_postheader",
             "origin.confirmation_invalid_confirmation",
         ),
     }
     assert set(confirmation) == set(metadata)
-    cases = {
-        "approve_stale": PilotRuntime._provider_confirmation_failure(
-            StalePendingActionError()
-        ),
-        "modify_invalid": PilotRuntime._confirmation_failure(
-            WriteOperationError("invalid_confirmation")
-        ),
-    }
-    for action, outcome in cases.items():
-        expected = confirmation[action]
-        actual = _confirmation_route_projection(outcome)
-        assert expected["outcome"] == actual["outcome"]
-        assert expected["sync_http"] == actual["sync_http"]
-        assert expected["sse"] == actual["sse"]
-        assert expected["sse"]["http_status"] == 200
-        assert expected["sse"]["event"] == "error"
-        assert (
-            expected["production_entrypoint"],
-            expected["scenario"],
-            expected["failure_origin"],
-        ) == metadata[action]
+    stale = PilotRuntime._provider_confirmation_failure(StalePendingActionError())
+    stale_expected = confirmation["approve_stale"]
+    stale_route = _postheader_route_projection(stale)
+    assert stale_expected["outcome"] == stale_route["outcome"]
+    assert stale_expected["sync_http"] == stale_route["sync_http"]
+    assert stale_expected["postheader_stream"] == stale_route["postheader_stream"]
+    stale_preheader = _immediate_transport_projection(
+        stale,
+        ConfirmationRequest(conversation_id=1, approved=True),
+    )
+    assert stale_expected["preheader_stream"] == stale_preheader["stream"]
+    assert stale_preheader["stream"]["direct"] is False
+    assert stale_preheader["stream"]["http_status"] == 200
+    assert stale_preheader["stream"]["media_type"] == "text/event-stream"
+    assert stale_expected["preheader_stream"]["direct"] is False
+    assert (
+        stale_expected["production_entrypoint"],
+        stale_expected["scenario"],
+        stale_expected["failure_origin"],
+    ) == metadata["approve_stale"]
+
+    invalid = PilotRuntime._confirmation_failure(
+        WriteOperationError("invalid_confirmation")
+    )
+    invalid_preheader_expected = confirmation["modify_invalid_preheader"]
+    invalid_preheader = _immediate_transport_projection(
+        invalid,
+        ConfirmationRequest(conversation_id=1, approved=True),
+    )
+    invalid_route = _postheader_route_projection(invalid)
+    assert invalid_preheader_expected["outcome"] == invalid_route["outcome"]
+    assert invalid_preheader_expected["sync_http"] == invalid_preheader["sync_http"]
+    assert invalid_preheader_expected["sync_media_type"] == invalid_preheader["sync_media_type"]
+    assert invalid_preheader["sync_media_type"] == "application/json"
+    assert invalid_preheader_expected["preheader_stream"] == invalid_preheader["stream"]
+    assert invalid_preheader["stream"]["direct"] is True
+    assert invalid_preheader["stream"]["http_status"] == 422
+    assert invalid_preheader["stream"]["media_type"] == "application/json"
+    assert "sse" not in invalid_preheader["stream"]
+    assert (
+        invalid_preheader_expected["production_entrypoint"],
+        invalid_preheader_expected["scenario"],
+        invalid_preheader_expected["failure_origin"],
+    ) == metadata["modify_invalid_preheader"]
+
+    invalid_postheader_expected = confirmation["modify_invalid_postheader"]
+    invalid_postheader = _postheader_error_projection(invalid)
+    assert invalid_postheader_expected["postheader_stream"] == invalid_postheader
+    assert invalid_postheader["http_status"] == 200
+    assert (
+        invalid_postheader_expected["production_entrypoint"],
+        invalid_postheader_expected["scenario"],
+        invalid_postheader_expected["failure_origin"],
+    ) == metadata["modify_invalid_postheader"]
 
 
 def _prepared_write_probe() -> tuple[ToolSpec[Any, Any], ToolExecutionContext, Any]:
@@ -688,7 +792,7 @@ def _run_stale_promotion(mode: str) -> RuntimeFailureOutcome:
 
     invocation = AgentLoopInvocation(
         seed=ApprovedWriteSeed(continuation),
-        model=_CountingModel(Assistant(content="must not run")),
+        model=cast(Any, _CountingModel(Assistant(content="must not run"))),
         catalog=ToolCatalog([spec], expected_names=(spec.name,)),
         tool_context=replace(context, operation_executor=operation_executor),
         auto_approve=False,
@@ -746,11 +850,11 @@ def test_execute_prepared_failures_promote_to_one_verified_stale_route() -> None
             expected["failure_origin"],
         ) == metadata[mode]
         promoted = _run_stale_promotion(mode)
-        route = _confirmation_route_projection(promoted)
+        route = _postheader_route_projection(promoted)
         assert expected["public_route"] == "route.approve_stale"
         assert route == {
             key: confirmation["approve_stale"][key]
-            for key in ("outcome", "sync_http", "sse")
+            for key in ("outcome", "sync_http", "postheader_stream")
         }
 
 
@@ -760,7 +864,12 @@ class _CountingModel:
         self.model_calls = 0
         self.provider_calls = 0
 
-    def complete(self, _messages: list[Message], _tools: list[object]) -> Assistant:
+    def complete(
+        self,
+        _messages: list[Message],
+        _tools: list[Any],
+        _response_format: dict[str, Any] | None = None,
+    ) -> Assistant:
         self.model_calls += 1
         self.provider_calls += 1
         return self.responses.pop(0)
@@ -843,7 +952,7 @@ def _counted_write_spec(counter: dict[str, int]) -> ToolSpec[Any, Any]:
     )
 
     def execute(_args: dict[str, Any], _context: ToolExecutionContext) -> dict[str, bool]:
-        counter["executor_calls"] += 1
+        counter["tool_spec_executor_calls"] += 1
         return {"ok": True}
 
     return ToolSpec(
@@ -859,7 +968,7 @@ def _counted_write_spec(counter: dict[str, int]) -> ToolSpec[Any, Any]:
 
 
 def _run_agent_call_count_case(case: str) -> dict[str, object]:
-    counter = {"executor_calls": 0}
+    counter = {"tool_spec_executor_calls": 0, "operation_executor_calls": 0}
     spec = _counted_write_spec(counter)
     catalog = ToolCatalog([spec], expected_names=(spec.name,))
     sink = _CountingEventSink()
@@ -888,9 +997,9 @@ def _run_agent_call_count_case(case: str) -> dict[str, object]:
             _context: object,
             authorization: ExecutionAuthorization,
         ) -> ToolExecutionRecord[Any, Any]:
-            counter["executor_calls"] += 1
+            counter["operation_executor_calls"] += 1
             return ToolExecutionRecord(
-                prepared=prepared,
+                prepared=cast(Any, prepared),
                 outcome=ToolSuccess({"ok": True}),
                 execution_started=True,
                 operation_id=authorization.operation_id,
@@ -903,7 +1012,7 @@ def _run_agent_call_count_case(case: str) -> dict[str, object]:
         context = replace(_probe_context(), operation_executor=operation_executor)
     invocation = AgentLoopInvocation(
         seed=seed,
-        model=model,
+        model=cast(Any, model),
         catalog=catalog,
         tool_context=context,
         auto_approve=False,
@@ -919,7 +1028,8 @@ def _run_agent_call_count_case(case: str) -> dict[str, object]:
         "model_calls": model.model_calls,
         "provider_calls": model.provider_calls,
         "tool_calls": sum(isinstance(event, AgentToolCall) for event in sink.events),
-        "executor_calls": counter["executor_calls"],
+        "tool_spec_executor_calls": counter["tool_spec_executor_calls"],
+        "operation_executor_calls": counter["operation_executor_calls"],
         "provider_free": model.provider_calls == 0,
     }
 
@@ -952,7 +1062,7 @@ class _AuthorityOperations:
         token = "t" * 64
         self.token = token
         self.operation.confirmation_token_fingerprint = ledger_fingerprint(
-            self.key,
+            cast(Any, self.key),
             "write-operation-confirmation-token-v1",
             token.encode("ascii"),
         )
@@ -1099,8 +1209,8 @@ def _run_ledger_call_count_case(case: str) -> dict[str, object]:
     coordinator = ConfirmationCoordinator(
         ConfirmationDependencies(
             persistence=persistence,
-            write_operations=operations,
-            write_coordinator=write,
+            write_operations=cast(Any, operations),
+            write_coordinator=cast(Any, write),
         )
     )
     counts = {"model_calls": 0, "provider_calls": 0}
@@ -1116,11 +1226,11 @@ def _run_ledger_call_count_case(case: str) -> dict[str, object]:
 
     runtime = PilotRuntime(
         RuntimeDependencies(
-            conversations=_AuthorityConversations(),
-            persistence=persistence,
+            conversations=cast(Any, _AuthorityConversations()),
+            persistence=cast(Any, persistence),
             confirmation_coordinator=coordinator,
-            model_resolver=resolve_model,
-            agent_driver=Driver(),
+            model_resolver=cast(Any, resolve_model),
+            agent_driver=cast(Any, Driver()),
         )
     )
     outcome = runtime.continue_confirmation(
@@ -1130,7 +1240,7 @@ def _run_ledger_call_count_case(case: str) -> dict[str, object]:
             operation_id=operations.operation_id,
             confirmation_token=operations.token,
         ),
-        invocation_control=InMemoryRuntimeInvocationControl(),
+        invocation_control=cast(Any, InMemoryRuntimeInvocationControl()),
     )
     assert outcome is not None
     if case == "reject":
@@ -1147,13 +1257,19 @@ def _run_ledger_call_count_case(case: str) -> dict[str, object]:
         "model_calls": counts["model_calls"],
         "provider_calls": counts["provider_calls"],
         "tool_calls": 0,
-        "executor_calls": write.execute_calls,
+        "tool_spec_executor_calls": 0,
+        "operation_executor_calls": write.execute_calls,
         "provider_free": counts["provider_calls"] == 0,
     }
 
 
 def test_call_count_and_provider_free_baselines_are_produced_by_real_harnesses() -> None:
     baseline = load_golden("tool_authority/baseline_2427fa6.json")
+    assert baseline["call_count_harness"] == {
+        "level": "agent_loop_and_ledger_route_harness",
+        "required_gates": ["task17_pilot_runtime_approve_modify_endpoint"],
+        "wire_level_endpoint_claim": False,
+    }
     actual = {
         case: _run_agent_call_count_case(case)
         for case in ("new_turn", "approve", "modify")
@@ -1239,6 +1355,7 @@ def test_policy_fingerprints_are_independent_fixed_reviewed_digests() -> None:
         "fingerprint": profile["fingerprint"],
     }
     assert SHA256.fullmatch(profile["fingerprint"])
+    assert profile["fingerprint"] == REVIEWED_CAPABILITY_FINGERPRINT
     profile_input = {
         "schema": profile["schema"],
         "profile_id": profile["profile_id"],
@@ -1259,6 +1376,7 @@ def test_policy_fingerprints_are_independent_fixed_reviewed_digests() -> None:
     assert binding["collection_scope_rule_version"] == "application-collection-scope-v1"
     assert binding["public_denial_rule_version"] == "scope-denial-v1"
     assert SHA256.fullmatch(binding["fingerprint"])
+    assert binding["fingerprint"] == REVIEWED_BINDING_FINGERPRINT
     semantic_tools = []
     for item in authority["tools"]:
         semantic_tools.append(

@@ -1498,3 +1498,36 @@ def test_register_tool_spec_validation_is_atomic_for_noncanonical_payload(extra:
             object_id == id(spec) and owner is factory
             for object_id, (_, owner) in authority_composition._ACTIVE_OBJECTS.items()
         )
+
+
+def test_duplicate_claim_lifecycle_does_not_revoke_existing_owner() -> None:
+    with execution_scope() as factory:
+        authority = _segment(factory)
+        prepared = _prepared(factory, authority, kind="write")
+        pending = SimpleNamespace(
+            operation_id="op-duplicate-lifecycle",
+            conversation_id=11,
+            tool_call_id=prepared.tool_call_id,
+            tool_name=prepared.spec.name,
+            pending_action_revision=1,
+            pending_confirmation_claim_id="duplicate-lifecycle-claim",
+            arguments_digest=SHA,
+        )
+        factory.register_pending(pending)
+        claim = factory.issue_pending_claim(
+            authority,
+            prepared=prepared,
+            pending=pending,
+            operation_id="op-duplicate-lifecycle",
+            tool_call_id=prepared.tool_call_id,
+            tool_name=prepared.spec.name,
+            arguments_digest=SHA,
+            pending_confirmation_claim_id="duplicate-lifecycle-claim",
+        )
+        with factory.claim_lifecycle(claim):
+            with pytest.raises(AuthorityPhaseError):
+                with factory.claim_lifecycle(claim):
+                    raise AssertionError("duplicate lifecycle must not enter")
+            assert factory.claim_state(claim) == "in_flight"
+            assert factory.is_active(claim)
+        assert factory.claim_state(claim) is None

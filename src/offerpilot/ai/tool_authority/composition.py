@@ -2680,6 +2680,39 @@ class AuthorityFactory:
                 return
         pending_record.owners.discard(id(lifecycle.authority))
 
+    def _revoke_lifecycle_after_entry_failure(
+        self,
+        value: ExecutionClaim | PendingAuthorityClaim | TrustedLedgerOmittedTokenProof,
+        *,
+        owns_in_flight: bool,
+    ) -> None:
+        """Clean only a lifecycle record owned by this context entry.
+
+        A failed source validation leaves an active record in ``issued`` and
+        must be cleaned.  A duplicate entry observes ``in_flight`` owned by a
+        different lifecycle and must leave it untouched.
+        """
+
+        with self._lock:
+            table: dict[int, _Lifecycle]
+            if isinstance(value, TrustedLedgerOmittedTokenProof):
+                table = self._proofs
+            else:
+                table = self._claims
+            lifecycle = table.get(id(value))
+            if lifecycle is None or lifecycle.value is not value:
+                return
+            if not owns_in_flight and lifecycle.state != "issued":
+                return
+            if owns_in_flight and lifecycle.state not in {"issued", "in_flight"}:
+                return
+            try:
+                self.revoke(value)
+            except AuthorityPhaseError:
+                # Preserve the original entry/body/consume error if another
+                # owner finalized the record before cleanup acquired the lock.
+                pass
+
     def mark_in_flight(self, value: ExecutionClaim | PendingAuthorityClaim | TrustedLedgerOmittedTokenProof) -> None:
         with self._lock:
             if isinstance(value, TrustedLedgerOmittedTokenProof):
@@ -2773,23 +2806,20 @@ class AuthorityFactory:
     def claim_lifecycle(
         self, value: ExecutionClaim | PendingAuthorityClaim | TrustedLedgerOmittedTokenProof
     ) -> Iterator[ExecutionClaim | PendingAuthorityClaim | TrustedLedgerOmittedTokenProof]:
+        owns_in_flight = False
         completed = False
         try:
             self.mark_in_flight(value)
+            owns_in_flight = True
             yield value
             self.consume(value)
             completed = True
         finally:
             if not completed:
-                try:
-                    # Identity-only revoke is deliberate: entry/source
-                    # validation may have failed, but the owned record still
-                    # must not leak claims, tokens, or Pending ownership.
-                    self.revoke(value)
-                except AuthorityPhaseError:
-                    # Preserve the original entry/body/consume failure for
-                    # fabricated or already-finalized values.
-                    pass
+                self._revoke_lifecycle_after_entry_failure(
+                    value,
+                    owns_in_flight=owns_in_flight,
+                )
 
     # Helpers for tests and future pipeline ports.  They never expose token
     # values as text and deliberately return only bounded counts/booleans.

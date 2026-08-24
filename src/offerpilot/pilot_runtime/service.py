@@ -2067,20 +2067,109 @@ class PilotRuntime:
         attempt_id = str(uuid4())
         late_journal_closed = False
 
-        def attempt(action: PendingAction, prepared: object | None) -> object:
-            # Decision/resume is recorded before the CAS atom.  If the CAS is
-            # lost the segment is later abandoned, while the Ledger remains
-            # authoritative and no provider is reached.
-            self._record_journal_approval(
+        original_fingerprint = self._journal_call(
+            recorder,
+            "fingerprint_pending_identity",
+            {
+                "tool_call_id": session.state.pending.tool_call_id,
+                "tool_name": session.state.pending.tool_name,
+                "args": session.state.pending.args,
+            },
+            control=control,
+        )
+        decided_fingerprint = self._journal_call(
+            recorder,
+            "fingerprint_pending_identity",
+            {
+                "tool_call_id": session.state.effective_pending.tool_call_id,
+                "tool_name": session.state.effective_pending.tool_name,
+                "args": session.state.effective_pending.args,
+            },
+            control=control,
+        )
+        approval_event = (
+            EventInput(
+                event_type="approval.decided",
+                facts={
+                    "confirmation_attempt_id": attempt_id,
+                    "decision": (
+                        "rejected"
+                        if not session.state.approved
+                        else "edited"
+                        if not session.state.edited_args.is_missing()
+                        else "approved"
+                    ),
+                    "tool_call_id": session.state.pending.tool_call_id,
+                    "original_input_fingerprint": original_fingerprint,
+                    "decided_input_fingerprint": decided_fingerprint,
+                },
+                source_ref_type="tool_call",
+                source_ref_id=session.state.pending.tool_call_id,
+            )
+            if isinstance(original_fingerprint, str)
+            and isinstance(decided_fingerprint, str)
+            else None
+        )
+        approval_draft = (
+            self._journal_call(
                 recorder,
-                started,
-                attempt_id,
-                session.state.pending,
-                action,
-                prepared is not None,
-                edited=not session.state.edited_args.is_missing(),
+                "prepare_event_draft",
+                approval_event,
                 control=control,
             )
+            if approval_event is not None
+            else None
+        )
+
+        def record_decision(bound_session: object | None) -> None:
+            with session.state.lock:
+                if session.state.approval_decided_recorded:
+                    return
+                session.state.approval_decided_recorded = True
+            if not started or approval_event is None:
+                return
+            append_bound = getattr(recorder, "append_prepared_event_bound", None)
+            if (
+                bound_session is not None
+                and approval_draft is not None
+                and callable(append_bound)
+            ):
+                try:
+                    append_bound(bound_session, approval_draft)
+                except Exception:
+                    pass
+                return
+            self._journal_call(
+                recorder,
+                "append_event",
+                approval_event,
+                control=control,
+            )
+
+        resume_recorded = False
+
+        def resume_decision() -> None:
+            nonlocal resume_recorded
+            if resume_recorded or not session.state.approval_decided_recorded:
+                return
+            resume_recorded = True
+            self._journal_call(
+                recorder,
+                "resume",
+                ResumedDisposition(
+                    confirmation_attempt_id=attempt_id,
+                    tool_call_id=session.state.pending.tool_call_id,
+                ),
+                control=control,
+            )
+
+        session.state.approval_decided_callback = record_decision
+        session.state.approval_resume_callback = resume_decision
+
+        def attempt(action: PendingAction, prepared: object | None) -> object:
+            # The Ledger atom invokes ``record_decision`` only after its
+            # Pending claim/CAS wins.  Scope/Binding/pre-executor failures and
+            # losers therefore leave no synthetic approval decision event.
             return base_attempt(action, cast(Any, prepared))
 
         def result(

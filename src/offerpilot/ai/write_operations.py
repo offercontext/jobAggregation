@@ -26,8 +26,13 @@ from offerpilot.ai.tool_authority import (
     ApprovedWritePrepareCallIdentity,
     AuthorityFactory,
     AuthorityPhaseError,
+    AuthorityUse,
     TrustedLedgerOmittedTokenProof,
+    require_authority_phase,
+    require_authority_spec,
 )
+from offerpilot.ai.tool_authority.fingerprint import authorization_scope_fingerprint
+from offerpilot.ai.tool_runtime.context import audit_bindings, pre_resolver_scope_policy
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import (
     JSONValue,
@@ -46,7 +51,13 @@ from offerpilot.ai.tool_runtime.validation import (
     canonical_json,
     parse_arguments,
 )
-from offerpilot.models import ChatMessage, Conversation, WriteOperation, WriteOperationTransition
+from offerpilot.models import (
+    Application,
+    ChatMessage,
+    Conversation,
+    WriteOperation,
+    WriteOperationTransition,
+)
 from offerpilot.context_projector.loader import WORK_DEADLINE_SECONDS, database_coordinator
 
 
@@ -1071,6 +1082,7 @@ class WriteOperationCoordinator:
         request_fingerprint: str,
         undo_seed_builder: UndoSeedBuilder | None = None,
         undo_builder: UndoBuilder | None = None,
+        approval_decided_callback: Callable[[object | None], None] | None = None,
     ) -> tuple[OperationExecution, ToolExecutionRecord[Any, Any] | None]:
         owner = self.repository.prepare_owner(operation_id)
         try:
@@ -1097,15 +1109,36 @@ class WriteOperationCoordinator:
                 if conversation is None:
                     raise WriteOperationError("operation_identity_conflict")
                 locked_pending = self._verify_primary(
+                    session,
                     operation,
                     conversation,
                     conversation_id,
                     prepared,
                     authority,
                     prepare_identity,
+                    request_fingerprint,
                     factory,
                 )
                 bound_context = context.bind(session)
+                try:
+                    scope_failure = pre_resolver_scope_policy(
+                        prepared.spec, bound_context
+                    )
+                    if scope_failure is not None:
+                        raise WriteOperationError("scope_access_denied")
+                    _binding, binding_allowed = audit_bindings(
+                        prepared.spec,
+                        prepared.typed_args,
+                        bound_context,
+                    )
+                except WriteOperationError:
+                    raise
+                except Exception as exc:
+                    raise WriteOperationError(
+                        "operation_not_committed", retryable=True
+                    ) from exc
+                if not binding_allowed:
+                    raise WriteOperationError("scope_access_denied")
                 if prepared.spec.mutable_validator is not None:
                     failure = prepared.spec.mutable_validator(prepared.typed_args, bound_context)
                     try:
@@ -1126,6 +1159,7 @@ class WriteOperationCoordinator:
                             .where(Conversation.pending_tool_call_id == prepared.tool_call_id)
                             .where(Conversation.pending_tool_name == prepared.spec.name)
                             .where(Conversation.pending_args == locked_pending.raw_args)
+                            .where(Conversation.pending_confirmation_claim_id == "")
                             .values(
                                 pending_confirmation_claim_id=operation_id,
                                 pending_confirmation_claimed_at=datetime.now(timezone.utc),
@@ -1141,6 +1175,11 @@ class WriteOperationCoordinator:
                         )
                         self.repository.append_transition(session, operation_id, 2, "approved")
                         self.repository.append_transition(session, operation_id, 3, "claimed")
+                        if approval_decided_callback is not None:
+                            try:
+                                approval_decided_callback(session)
+                            except Exception:
+                                pass
                         return self._commit_failure(
                             session,
                             operation,
@@ -1176,6 +1215,7 @@ class WriteOperationCoordinator:
                     .where(Conversation.pending_tool_call_id == prepared.tool_call_id)
                     .where(Conversation.pending_tool_name == prepared.spec.name)
                     .where(Conversation.pending_args == locked_pending.raw_args)
+                    .where(Conversation.pending_confirmation_claim_id == "")
                     .values(
                         pending_confirmation_claim_id=operation_id,
                         pending_confirmation_claimed_at=datetime.now(timezone.utc),
@@ -1208,6 +1248,11 @@ class WriteOperationCoordinator:
                     if execution_claim is not None and factory.claim_state(execution_claim) is not None:
                         factory.revoke(execution_claim)
                     raise WriteOperationError("operation_identity_conflict") from exc
+                if approval_decided_callback is not None:
+                    try:
+                        approval_decided_callback(session)
+                    except Exception:
+                        pass
                 executor_started = False
                 started_recorded = False
 
@@ -1987,37 +2032,62 @@ class WriteOperationCoordinator:
 
     def _verify_primary(
         self,
+        session: Session,
         operation: WriteOperation,
         conversation: Conversation,
         conversation_id: int,
         prepared: PreparedToolCall[Any, Any],
         authority: ApprovalExecutionAuthority,
         prepare_identity: ApprovedWritePrepareCallIdentity,
+        request_fingerprint: str,
         factory: Any,
     ) -> _LockedPendingIdentity:
+        if operation.conversation_id is None:
+            raise WriteOperationError("operation_unavailable")
+        if operation.conversation_id != conversation_id or conversation.id != conversation_id:
+            raise WriteOperationError("operation_identity_conflict")
         if operation.authorization_scope_fingerprint is None:
             raise WriteOperationError("authorization_scope_unbound")
-        locked = _locked_pending_identity(
+        locked_proposal = _locked_pending_identity(
             conversation.pending_tool_call_id,
             conversation.pending_tool_name,
             conversation.pending_args,
         )
         try:
+            require_authority_phase(
+                authority,
+                AuthorityUse.APPROVED_WRITE_PREPARE,
+                prepare_identity,
+            )
+            require_authority_spec(
+                authority,
+                AuthorityUse.APPROVED_WRITE_PREPARE,
+                prepared.spec,
+            )
             persisted_values = parse_arguments(conversation.pending_args)
-            prepared_arguments = canonical_json(cast(JSONValue, dict(prepared.arguments)))
+            prepared_values = cast(dict[str, JSONValue], dict(prepared.arguments))
+            prepared_arguments = canonical_json(cast(JSONValue, prepared_values))
             persisted_arguments = canonical_json(cast(JSONValue, persisted_values))
+            effective = _locked_pending_identity(
+                prepared.tool_call_id,
+                prepared.spec.name,
+                prepared_arguments,
+            )
             prepared_pending_token = factory.pending_token(prepared.pending_identity)
-        except (ArgumentValidationError, AuthorityPhaseError) as exc:
+        except (
+            ArgumentValidationError,
+            AuthorityPhaseError,
+            TypeError,
+            ValueError,
+        ) as exc:
             raise WriteOperationError("operation_identity_conflict") from exc
         if (
             operation.operation_role != "primary"
             or operation.adapter_kind != "typed"
             or operation.status != "proposed"
             or operation.fingerprint_key_id != self.repository.key.key_id
-            or operation.conversation_id != conversation_id
             or operation.tool_call_id != prepared.tool_call_id
             or operation.tool_name != prepared.spec.name
-            or conversation.id != conversation_id
             or conversation.pending_operation_id != operation.id
             or conversation.pending_tool_call_id != prepared.tool_call_id
             or conversation.pending_tool_name != prepared.spec.name
@@ -2028,21 +2098,20 @@ class WriteOperationCoordinator:
             or prepare_identity.operation_id != operation.id
             or prepare_identity.tool_call_id != prepared.tool_call_id
             or prepare_identity.tool_name != prepared.spec.name
-            or prepared.pending_action_revision != locked.pending_action_revision
-            or authority.pending_action_revision != locked.pending_action_revision
-            or prepare_identity.pending_action_revision != locked.pending_action_revision
+            or prepared.pending_action_revision != effective.pending_action_revision
+            or authority.pending_action_revision != effective.pending_action_revision
+            or prepare_identity.pending_action_revision != effective.pending_action_revision
             or prepared_pending_token is not authority.pending_identity
             or prepare_identity.pending_identity is not authority.pending_identity
             or not _constant_time_text_equal(
-                prepared.arguments_digest, locked.arguments_digest
+                prepared.arguments_digest, effective.arguments_digest
             )
             or not _constant_time_text_equal(
-                authority.effective_args_digest, locked.arguments_digest
+                authority.effective_args_digest, effective.arguments_digest
             )
             or not _constant_time_text_equal(
-                prepare_identity.effective_args_digest, locked.arguments_digest
+                prepare_identity.effective_args_digest, effective.arguments_digest
             )
-            or not _constant_time_text_equal(prepared_arguments, persisted_arguments)
             or not _constant_time_text_equal(
                 operation.proposal_fingerprint,
                 ledger_fingerprint(
@@ -2053,7 +2122,87 @@ class WriteOperationCoordinator:
             )
         ):
             raise WriteOperationError("operation_identity_conflict")
-        return locked
+        no_edit_request = operation_request_fingerprint(
+            self.repository.key,
+            operation_id=operation.id,
+            tool_call_id=prepared.tool_call_id,
+            approved=True,
+            edited_args_present=False,
+            edited_args=None,
+            rejection_feedback_present=False,
+            rejection_feedback="",
+            confirmation_token_fingerprint=operation.confirmation_token_fingerprint or "",
+            proposal_fingerprint=operation.proposal_fingerprint or "",
+        )
+        edited_request = operation_request_fingerprint(
+            self.repository.key,
+            operation_id=operation.id,
+            tool_call_id=prepared.tool_call_id,
+            approved=True,
+            edited_args_present=True,
+            edited_args=prepared_values,
+            rejection_feedback_present=False,
+            rejection_feedback="",
+            confirmation_token_fingerprint=operation.confirmation_token_fingerprint or "",
+            proposal_fingerprint=operation.proposal_fingerprint or "",
+        )
+        if not (
+            (
+                _constant_time_text_equal(prepared_arguments, persisted_arguments)
+                and _constant_time_text_equal(request_fingerprint, no_edit_request)
+            )
+            or _constant_time_text_equal(request_fingerprint, edited_request)
+        ):
+            raise WriteOperationError("operation_input_conflict")
+        try:
+            scope = authority.trusted_scope
+            context_ref: int | None = None
+            if conversation.context_type == "application":
+                context_ref = int(conversation.context_ref)
+            if (
+                authority.conversation_scope_revision != conversation.scope_revision
+                or scope.context_type != conversation.context_type
+                or scope.context_ref != context_ref
+                or scope.mode != conversation.mode
+            ):
+                raise WriteOperationError("authorization_scope_changed")
+            locked_scope_fingerprint = authorization_scope_fingerprint(
+                self.repository.key,
+                conversation_id=conversation.id,
+                conversation_scope_revision=conversation.scope_revision,
+                context_type=conversation.context_type,
+                context_ref=context_ref,
+                mode=conversation.mode,
+                capability_profile_id=authority.capability_profile_id,
+                capability_policy_version=authority.capability_policy_version,
+                binding_policy_version=authority.binding_policy_version,
+                capability_profile_fingerprint=authority.capability_profile_fingerprint,
+                binding_policy_fingerprint=authority.binding_policy_fingerprint,
+            )
+        except WriteOperationError:
+            raise
+        except Exception as exc:
+            raise WriteOperationError(
+                "operation_not_committed", retryable=True
+            ) from exc
+        if not _constant_time_text_equal(
+            operation.authorization_scope_fingerprint,
+            locked_scope_fingerprint,
+        ):
+            raise WriteOperationError("authorization_scope_changed")
+        if context_ref is not None:
+            active_parent = session.scalar(
+                select(Application.id)
+                .where(Application.id == context_ref)
+                .where(Application.deleted_at.is_(None))
+            )
+            if active_parent != context_ref:
+                raise WriteOperationError("authorization_scope_unavailable")
+        return _LockedPendingIdentity(
+            locked_proposal.raw_args,
+            effective.arguments_digest,
+            effective.pending_action_revision,
+        )
 
     def _commit_failure(
         self,

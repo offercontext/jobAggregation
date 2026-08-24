@@ -14,6 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from offerpilot.agent_runtime.journal import NullRunRecorder
 from offerpilot.ai.agent_contracts import PendingAction
 from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
+from offerpilot.ai.tool_authority.fingerprint import authorization_scope_fingerprint
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import (
@@ -36,6 +37,7 @@ from offerpilot.ai.write_operations import (
     TYPED_WRITE_OPERATION_NAMES,
     DeliveryHeartbeat,
     DeliveryOwnership,
+    OperationCommitted,
     OperationFailed,
     OperationReplay,
     OperationUnknown,
@@ -45,6 +47,7 @@ from offerpilot.ai.write_operations import (
     compensation_operation_id,
     ledger_fingerprint,
     load_or_create_ledger_key,
+    operation_request_fingerprint,
 )
 from offerpilot.db import init_database
 from offerpilot.repositories.application_events import ApplicationEventsRepository
@@ -55,6 +58,25 @@ from offerpilot.repositories.notes import NotesRepository
 from offerpilot.repositories.offers import OffersRepository
 from offerpilot.repositories.resumes import ResumesRepository
 from offerpilot.models import Conversation, WriteOperation, WriteOperationTransition
+
+
+def _approval_request_fingerprint(key, operation_id: str, pending: PendingAction) -> str:
+    return operation_request_fingerprint(
+        key,
+        operation_id=operation_id,
+        tool_call_id=pending.tool_call_id,
+        approved=True,
+        edited_args_present=False,
+        edited_args=None,
+        rejection_feedback_present=False,
+        rejection_feedback="",
+        confirmation_token_fingerprint=ledger_fingerprint(
+            key, "write-operation-confirmation-token-v1", b"synthetic-token"
+        ),
+        proposal_fingerprint=ledger_fingerprint(
+            key, "write-operation-proposal-v1", {}
+        ),
+    )
 
 
 def test_write_operation_manifests_are_exact() -> None:
@@ -279,7 +301,19 @@ def test_mapped_domain_failure_rolls_back_executor_savepoint(tmp_path) -> None:
             confirmation_token_fingerprint=ledger_fingerprint(
                 key, "write-operation-confirmation-token-v1", b"synthetic-token"
             ),
-            authorization_scope_fingerprint="hmac-sha256:" + "b" * 64,
+            authorization_scope_fingerprint=authorization_scope_fingerprint(
+                key,
+                conversation_id=conversation.id,
+                conversation_scope_revision=0,
+                context_type="workspace",
+                context_ref=None,
+                mode="general",
+                capability_profile_id="agent_typed_v1",
+                capability_policy_version="capability-policy-v1",
+                binding_policy_version="binding-policy-v1",
+                capability_profile_fingerprint="sha256:" + "0" * 64,
+                binding_policy_fingerprint="sha256:" + "0" * 64,
+            ),
         )
         setup_session.commit()
 
@@ -378,7 +412,9 @@ def test_mapped_domain_failure_rolls_back_executor_savepoint(tmp_path) -> None:
         prepared=prepared,
         context=context,
         prepare_identity=prepare_identity,
-        request_fingerprint="hmac-sha256:" + "a" * 64,
+        request_fingerprint=_approval_request_fingerprint(
+            key, operation_id, pending
+        ),
     )
 
     assert isinstance(execution, OperationFailed)
@@ -416,7 +452,13 @@ def _pending_revision(tool_call_id: str, tool_name: str, raw_args: str) -> int:
     return int.from_bytes(hashlib.sha256(canonical).digest()[:8], "big") & ((1 << 63) - 1)
 
 
-def _primary_execution_harness(tmp_path, executor):
+def _primary_execution_harness(
+    tmp_path,
+    executor,
+    *,
+    effective_args: str | None = None,
+    tool_name: str = "create_application",
+):
     sessions = init_database(tmp_path / "offerpilot.db")
     key = load_or_create_ledger_key(tmp_path, sessions)
     repository = WriteOperationRepository(sessions, key)
@@ -425,12 +467,13 @@ def _primary_execution_harness(tmp_path, executor):
     operation_id = str(uuid4())
     pending = PendingAction(
         tool_call_id="write-once",
-        tool_name="create_application",
+        tool_name=tool_name,
         args="{}",
         human="create",
         operation_id=operation_id,
     )
-    revision = _pending_revision(pending.tool_call_id, pending.tool_name, pending.args)
+    decided_args = pending.args if effective_args is None else effective_args
+    revision = _pending_revision(pending.tool_call_id, pending.tool_name, decided_args)
     with sessions() as setup_session:
         setup_conversation = setup_session.get(Conversation, conversation.id)
         assert setup_conversation is not None
@@ -450,7 +493,19 @@ def _primary_execution_harness(tmp_path, executor):
             confirmation_token_fingerprint=ledger_fingerprint(
                 key, "write-operation-confirmation-token-v1", b"synthetic-token"
             ),
-            authorization_scope_fingerprint="hmac-sha256:" + "b" * 64,
+            authorization_scope_fingerprint=authorization_scope_fingerprint(
+                key,
+                conversation_id=conversation.id,
+                conversation_scope_revision=0,
+                context_type="workspace",
+                context_ref=None,
+                mode="general",
+                capability_profile_id="agent_typed_v1",
+                capability_policy_version="capability-policy-v1",
+                binding_policy_version="binding-policy-v1",
+                capability_profile_fingerprint="sha256:" + "0" * 64,
+                binding_policy_fingerprint="sha256:" + "0" * 64,
+            ),
         )
         setup_session.commit()
 
@@ -460,7 +515,13 @@ def _primary_execution_harness(tmp_path, executor):
     offers = OffersRepository(sessions)
     resumes = ResumesRepository(sessions)
     factory = AuthorityFactory()
-    arguments_digest = "sha256:" + hashlib.sha256(b"{}").hexdigest()
+    arguments_digest = "sha256:" + hashlib.sha256(
+        json.dumps(
+            json.loads(decided_args),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
     pending_identity = SimpleNamespace(
         conversation_id=conversation.id,
         operation_id=operation_id,
@@ -524,7 +585,7 @@ def _primary_execution_harness(tmp_path, executor):
     prepared_result = prepare_call(
         catalog,
         context,
-        ToolCall(pending.tool_call_id, pending.tool_name, pending.args),
+        ToolCall(pending.tool_call_id, pending.tool_name, decided_args),
         call_identity=prepare_identity,
         pending_identity=pending_identity,
         pending_action_revision=revision,
@@ -542,8 +603,58 @@ def _primary_execution_harness(tmp_path, executor):
         prepared=prepared_result.prepared,
         prepare_identity=prepare_identity,
         coordinator=WriteOperationCoordinator(repository),
-        request_fingerprint="hmac-sha256:" + "a" * 64,
+        request_fingerprint=(
+            _approval_request_fingerprint(key, operation_id, pending)
+            if effective_args is None
+            else operation_request_fingerprint(
+                key,
+                operation_id=operation_id,
+                tool_call_id=pending.tool_call_id,
+                approved=True,
+                edited_args_present=True,
+                edited_args=json.loads(decided_args),
+                rejection_feedback_present=False,
+                rejection_feedback="",
+                confirmation_token_fingerprint=ledger_fingerprint(
+                    key,
+                    "write-operation-confirmation-token-v1",
+                    b"synthetic-token",
+                ),
+                proposal_fingerprint=ledger_fingerprint(
+                    key, "write-operation-proposal-v1", {}
+                ),
+            )
+        ),
     )
+
+
+def test_locked_modify_executes_effective_args_against_original_proposal(tmp_path) -> None:
+    seen: list[dict[str, object]] = []
+
+    def executor(args, _context):
+        seen.append(dict(args))
+        return {"ok": True}
+
+    harness = _primary_execution_harness(
+        tmp_path,
+        executor,
+        effective_args='{"changed":true}',
+        tool_name="save_offer_assessment",
+    )
+    try:
+        execution, record = harness.coordinator.execute_primary(
+            operation_id=harness.operation_id,
+            conversation_id=harness.conversation.id,
+            prepared=harness.prepared,
+            context=harness.context,
+            prepare_identity=harness.prepare_identity,
+            request_fingerprint=harness.request_fingerprint,
+        )
+        assert isinstance(execution, OperationCommitted)
+        assert record is not None
+        assert seen == [{"changed": True}]
+    finally:
+        harness.factory.close()
 
 
 @pytest.mark.parametrize("failure_site", ("renderer", "transport", "undo"))

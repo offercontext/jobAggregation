@@ -27,9 +27,16 @@ from threading import RLock
 from typing import Any, Protocol, cast
 from uuid import UUID
 
+from sqlalchemy import select
+
 from offerpilot.ai.agent_contracts import PendingAction, _ASDICT_GUARD
 from offerpilot.ai.confirmation import prepare_pending_action
-from offerpilot.ai.tool_authority import PendingAuthorityClaim
+from offerpilot.ai.tool_authority import (
+    ApprovalExecutionAuthority,
+    AuthorityFactory,
+    PendingAuthorityClaim,
+    TrustedContextScope,
+)
 from offerpilot.ai.tool_runtime.contracts import (
     JSONValue,
     PreparedToolCall,
@@ -53,6 +60,7 @@ from offerpilot.ai.write_operations import (
     ledger_fingerprint,
     operation_request_fingerprint,
 )
+from offerpilot.models import Application, Conversation, WriteOperation
 
 from .contracts import (
     ConfirmationRequiredOutcome,
@@ -119,6 +127,165 @@ class ConfirmationWriteCoordinator(Protocol):
     def reject_primary(self, **kwargs: object) -> OperationExecution: ...
 
     def execute_primary(self, **kwargs: object) -> tuple[OperationExecution, ToolExecutionRecord[Any, Any] | None]: ...
+
+
+_STALE_APPROVAL_CODES = frozenset(
+    {
+        "authorization_scope_changed",
+        "authorization_scope_unbound",
+        "authorization_scope_unavailable",
+        "scope_access_denied",
+    }
+)
+
+
+def _public_confirmation_error_code(code: str) -> str:
+    return "stale_pending_action" if code in _STALE_APPROVAL_CODES else code
+
+
+class ApprovalAuthorityResolver:
+    """Minimal, provider-free resolver for one proposed approval attempt.
+
+    The resolver deliberately projects only Ledger identity, the owning
+    Conversation scope/revision, and active Application visibility.  Pending
+    arguments are supplied only as an already-computed digest/revision and are
+    never loaded or decoded here.
+    """
+
+    __slots__ = (
+        "repository",
+        "factory",
+        "capabilities",
+        "capability_profile_id",
+        "capability_policy_version",
+        "binding_policy_version",
+        "capability_profile_fingerprint",
+        "binding_policy_fingerprint",
+    )
+
+    def __init__(
+        self,
+        repository: object,
+        factory: AuthorityFactory,
+        *,
+        capabilities: frozenset[object] = frozenset(),
+        capability_profile_id: str = "agent_typed_v1",
+        capability_policy_version: str = "capability-policy-v1",
+        binding_policy_version: str = "binding-policy-v1",
+        capability_profile_fingerprint: str = "sha256:" + "0" * 64,
+        binding_policy_fingerprint: str = "sha256:" + "0" * 64,
+    ) -> None:
+        self.repository = repository
+        self.factory = factory
+        self.capabilities = capabilities
+        self.capability_profile_id = capability_profile_id
+        self.capability_policy_version = capability_policy_version
+        self.binding_policy_version = binding_policy_version
+        self.capability_profile_fingerprint = capability_profile_fingerprint
+        self.binding_policy_fingerprint = binding_policy_fingerprint
+
+    def resolve(
+        self,
+        *,
+        operation: object,
+        pending: object,
+        conversation_id: int,
+        pending_action_revision: int,
+        effective_args_digest: str,
+    ) -> ApprovalExecutionAuthority:
+        session_factory = _attribute(self.repository, "session_factory")
+        if not callable(session_factory):
+            raise WriteOperationError("operation_unavailable")
+        operation_id = str(_attribute(operation, "id", "") or "")
+        with session_factory() as session:
+            ledger_row = session.execute(
+                select(
+                    WriteOperation.id,
+                    WriteOperation.conversation_id,
+                    WriteOperation.status,
+                    WriteOperation.adapter_kind,
+                    WriteOperation.tool_call_id,
+                    WriteOperation.tool_name,
+                    WriteOperation.proposal_fingerprint,
+                    WriteOperation.confirmation_token_fingerprint,
+                    WriteOperation.authorization_scope_fingerprint,
+                ).where(WriteOperation.id == operation_id)
+            ).one_or_none()
+            if ledger_row is None:
+                raise WriteOperationError("operation_result_unknown", retryable=True)
+            if ledger_row.conversation_id is None:
+                raise WriteOperationError("operation_unavailable")
+            if ledger_row.status != "proposed":
+                raise WriteOperationError("operation_identity_conflict")
+            if ledger_row.authorization_scope_fingerprint is None:
+                raise WriteOperationError("authorization_scope_unbound")
+            scope_row = session.execute(
+                select(
+                    Conversation.id,
+                    Conversation.context_type,
+                    Conversation.context_ref,
+                    Conversation.mode,
+                    Conversation.scope_revision,
+                    Conversation.pending_operation_id,
+                    Conversation.pending_tool_call_id,
+                    Conversation.pending_tool_name,
+                    Conversation.pending_confirmation_claim_id,
+                ).where(Conversation.id == conversation_id)
+            ).one_or_none()
+            if scope_row is None:
+                raise WriteOperationError("operation_unavailable")
+            if (
+                ledger_row.conversation_id != conversation_id
+                or scope_row.pending_operation_id != operation_id
+                or scope_row.pending_tool_call_id != ledger_row.tool_call_id
+                or scope_row.pending_tool_name != ledger_row.tool_name
+                or scope_row.pending_confirmation_claim_id != ""
+            ):
+                raise WriteOperationError("operation_identity_conflict")
+            context_ref: int | None = None
+            if scope_row.context_type == "application":
+                try:
+                    context_ref = int(scope_row.context_ref)
+                except (TypeError, ValueError) as exc:
+                    raise WriteOperationError("authorization_scope_unavailable") from exc
+                active = session.scalar(
+                    select(Application.id)
+                    .where(Application.id == context_ref)
+                    .where(Application.deleted_at.is_(None))
+                )
+                if active != context_ref:
+                    raise WriteOperationError("authorization_scope_unavailable")
+        self.factory.register_pending(
+            pending,
+            conversation_id=conversation_id,
+            operation_id=operation_id,
+            tool_call_id=str(ledger_row.tool_call_id),
+            tool_name=str(ledger_row.tool_name),
+            pending_action_revision=pending_action_revision,
+            effective_args_digest=effective_args_digest,
+            arguments_digest=effective_args_digest,
+        )
+        return self.factory.create_approval_authority(
+            operation_id=operation_id,
+            conversation_id=conversation_id,
+            conversation_scope_revision=int(scope_row.scope_revision),
+            trusted_scope=TrustedContextScope(
+                cast(Any, scope_row.context_type),
+                context_ref,
+                str(scope_row.mode),
+            ),
+            pending_identity=pending,
+            pending_action_revision=pending_action_revision,
+            tool_call_id=str(ledger_row.tool_call_id),
+            tool_name=str(ledger_row.tool_name),
+            effective_args_digest=effective_args_digest,
+            capability_profile_id=self.capability_profile_id,
+            capabilities=self.capabilities,
+            capability_policy_version=self.capability_policy_version,
+            binding_policy_version=self.binding_policy_version,
+            capability_profile_fingerprint=self.capability_profile_fingerprint,
+            binding_policy_fingerprint=self.binding_policy_fingerprint,
+        )
 
 
 class ConfirmationSourceAdapter(Protocol):
@@ -399,6 +566,13 @@ class ConfirmationState:
     undo_seed: Mapping[str, Any] = field(default_factory=dict, repr=False)
     claim_id: str | None = field(default=None, repr=False)
     confirmation_attempted: bool = False
+    approval_decided_callback: Callable[[object | None], None] | None = field(
+        default=None, repr=False, compare=False
+    )
+    approval_resume_callback: Callable[[], None] | None = field(
+        default=None, repr=False, compare=False
+    )
+    approval_decided_recorded: bool = field(default=False, repr=False, compare=False)
     terminal_execution: OperationExecution | None = field(default=None, repr=False)
     origin_tool_message: Message | None = field(default=None, repr=False)
     execution_record: ToolExecutionRecord[Any, Any] | None = field(default=None, repr=False)
@@ -1155,6 +1329,10 @@ class ConfirmationCoordinator:
                         # the missing owner as an infrastructure failure.
                         state.replayed = True
                         return None
+                    if state.approval_decided_callback is not None:
+                        state.approval_decided_callback(None)
+                    if state.approval_resume_callback is not None:
+                        state.approval_resume_callback()
                     self._set_ownership(state, execution)
                     return None
                 return None
@@ -1456,7 +1634,10 @@ class ConfirmationCoordinator:
         ):
             raise WriteOperationError("operation_result_unknown", retryable=True)
         if isinstance(execution, OperationUnknown):
-            raise WriteOperationError(execution.code, retryable=execution.retryable)
+            raise WriteOperationError(
+                _public_confirmation_error_code(execution.code),
+                retryable=execution.retryable,
+            )
         return cast(OperationExecution, execution)
 
     def execute_operation(
@@ -1528,6 +1709,7 @@ class ConfirmationCoordinator:
             "prepare_identity": prepare_identity,
             "request_fingerprint": state.identity.request_fingerprint,
             "undo_seed_builder": undo_seed_builder,
+            "approval_decided_callback": state.approval_decided_callback,
         }
         if undo_builder is not None:
             values["undo_builder"] = undo_builder
@@ -1554,13 +1736,18 @@ class ConfirmationCoordinator:
         if _terminal(execution):
             state.terminal_execution = execution
             self._set_ownership(state, execution)
+            if state.approval_resume_callback is not None:
+                state.approval_resume_callback()
         if record is not None:
             return record
         if isinstance(execution, OperationReplay):
             state.replayed = True
             raise ConfirmationReplayError(execution)
         if isinstance(execution, OperationUnknown):
-            raise WriteOperationError(execution.code, retryable=execution.retryable)
+            raise WriteOperationError(
+                _public_confirmation_error_code(execution.code),
+                retryable=execution.retryable,
+            )
         raise WriteOperationError("operation_result_unknown", retryable=True)
 
     def record_result(

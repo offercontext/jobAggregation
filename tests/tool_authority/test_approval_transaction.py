@@ -1,0 +1,503 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+from threading import Event
+from types import SimpleNamespace
+from uuid import uuid4
+
+import pytest
+from sqlalchemy import delete, update
+
+import test_write_operations as support
+
+from offerpilot.agent_runtime.journal import NullRunRecorder
+from offerpilot.ai.agent_contracts import PendingAction
+from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
+from offerpilot.ai.tool_authority.fingerprint import authorization_scope_fingerprint
+from offerpilot.ai.tool_runtime.catalog import ToolCatalog
+from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
+from offerpilot.ai.tool_runtime.contracts import ConfirmationRequired
+from offerpilot.ai.tool_runtime.pipeline import Rejected, prepare_call
+from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.ai.types import ToolCall
+from offerpilot.ai.write_operations import (
+    OperationUnknown,
+    WriteOperationCoordinator,
+    WriteOperationRepository,
+    ledger_fingerprint,
+    load_or_create_ledger_key,
+    operation_request_fingerprint,
+)
+from offerpilot.db import init_database
+from offerpilot.models import Conversation, InterviewNote, WriteOperation
+from offerpilot.repositories.application_events import ApplicationEventsRepository
+from offerpilot.repositories.applications import ApplicationCreate, ApplicationsRepository
+from offerpilot.repositories.chat import ChatRepository
+from offerpilot.repositories.jd import JDAnalysesRepository
+from offerpilot.repositories.notes import NoteCreate, NotesRepository
+from offerpilot.repositories.offers import OffersRepository
+from offerpilot.repositories.resumes import ResumesRepository
+
+
+def _scoped_approval_harness(
+    tmp_path,
+    *,
+    tool_name: str,
+    proposal: dict[str, object],
+    effective: dict[str, object] | None = None,
+):
+    sessions = init_database(tmp_path / f"{tool_name}.db")
+    key = load_or_create_ledger_key(tmp_path, sessions)
+    repository = WriteOperationRepository(sessions, key)
+    applications = ApplicationsRepository(sessions)
+    first = applications.create(ApplicationCreate("A", "Backend"))
+    second = applications.create(ApplicationCreate("B", "Frontend"))
+    notes = NotesRepository(sessions)
+    bound_note = notes.create(NoteCreate(application_id=first.id, company="A"))
+    conversation = ChatRepository(sessions, repository).create_conversation("approval")
+    operation_id = str(uuid4())
+    raw_proposal = json.dumps(proposal, sort_keys=True, separators=(",", ":"))
+    decided = proposal if effective is None else effective
+    raw_effective = json.dumps(decided, sort_keys=True, separators=(",", ":"))
+    pending = PendingAction(
+        "scoped-call", tool_name, raw_proposal, tool_name, operation_id
+    )
+    revision = support._pending_revision(pending.tool_call_id, tool_name, raw_effective)
+    digest = "sha256:" + hashlib.sha256(raw_effective.encode()).hexdigest()
+    token_fingerprint = ledger_fingerprint(
+        key, "write-operation-confirmation-token-v1", b"scoped-token"
+    )
+    proposal_fingerprint = ledger_fingerprint(
+        key, "write-operation-proposal-v1", proposal
+    )
+    with sessions() as session:
+        owner = session.get(Conversation, conversation.id)
+        assert owner is not None
+        owner.context_type = "application"
+        owner.context_ref = str(first.id)
+        owner.scope_revision = 1
+        owner.pending_operation_id = operation_id
+        owner.pending_tool_call_id = pending.tool_call_id
+        owner.pending_tool_name = tool_name
+        owner.pending_args = raw_proposal
+        owner.pending_human = tool_name
+        repository.create_primary(
+            session,
+            operation_id=operation_id,
+            conversation_id=conversation.id,
+            tool_call_id=pending.tool_call_id,
+            tool_name=tool_name,
+            adapter_kind="typed",
+            proposal_fingerprint=proposal_fingerprint,
+            confirmation_token_fingerprint=token_fingerprint,
+            authorization_scope_fingerprint=authorization_scope_fingerprint(
+                key,
+                conversation_id=conversation.id,
+                conversation_scope_revision=1,
+                context_type="application",
+                context_ref=first.id,
+                mode="general",
+                capability_profile_id="agent_typed_v1",
+                capability_policy_version="capability-policy-v1",
+                binding_policy_version="binding-policy-v1",
+                capability_profile_fingerprint="sha256:" + "0" * 64,
+                binding_policy_fingerprint="sha256:" + "0" * 64,
+            ),
+        )
+        session.commit()
+    factory = AuthorityFactory()
+    pending_identity = SimpleNamespace(
+        conversation_id=conversation.id,
+        operation_id=operation_id,
+        tool_call_id=pending.tool_call_id,
+        tool_name=tool_name,
+        pending_action_revision=revision,
+        arguments_digest=digest,
+        effective_args_digest=digest,
+    )
+    factory.register_pending(pending_identity)
+    authority = factory.create_approval_authority(
+        operation_id=operation_id,
+        conversation_id=conversation.id,
+        conversation_scope_revision=1,
+        trusted_scope=TrustedContextScope("application", first.id, "general"),
+        pending_identity=pending_identity,
+        pending_action_revision=revision,
+        tool_call_id=pending.tool_call_id,
+        tool_name=tool_name,
+        effective_args_digest=digest,
+        capabilities=frozenset(ToolCapability),
+    )
+    context = ToolExecutionContext(
+        authority=authority,
+        applications=applications,
+        events=ApplicationEventsRepository(sessions),
+        notes=notes,
+        offers=OffersRepository(sessions),
+        resumes=ResumesRepository(sessions),
+        jd_analyses=JDAnalysesRepository(sessions),
+        run_recorder=NullRunRecorder(),
+    )
+    original_spec = MODEL_TOOL_CATALOG.resolve(tool_name)
+    assert original_spec is not None
+    executor_calls: list[object] = []
+
+    def executor(args, _context):
+        executor_calls.append(dict(args))
+        return {"ok": True}
+
+    spec = replace(original_spec, executor=executor)
+    catalog = ToolCatalog((spec,), expected_names=(tool_name,))
+    prepare_identity = factory.create_approved_write_prepare_identity(
+        authority,
+        approval_context=context,
+        request_identity=object(),
+    )
+    prepared_result = prepare_call(
+        catalog,
+        context,
+        ToolCall(pending.tool_call_id, tool_name, raw_effective),
+        call_identity=prepare_identity,
+        pending_identity=pending_identity,
+        pending_action_revision=revision,
+        record_proposal=False,
+    )
+    request_fingerprint = operation_request_fingerprint(
+        key,
+        operation_id=operation_id,
+        tool_call_id=pending.tool_call_id,
+        approved=True,
+        edited_args_present=effective is not None,
+        edited_args=effective,
+        rejection_feedback_present=False,
+        rejection_feedback="",
+        confirmation_token_fingerprint=token_fingerprint,
+        proposal_fingerprint=proposal_fingerprint,
+    )
+    return SimpleNamespace(
+        sessions=sessions,
+        repository=repository,
+        coordinator=WriteOperationCoordinator(repository),
+        factory=factory,
+        conversation=conversation,
+        operation_id=operation_id,
+        first_id=first.id,
+        second_id=second.id,
+        note_id=bound_note.id,
+        context=context,
+        prepare_identity=prepare_identity,
+        prepared_result=prepared_result,
+        request_fingerprint=request_fingerprint,
+        executor_calls=executor_calls,
+    )
+
+
+def _execute_scoped(harness):
+    assert isinstance(harness.prepared_result, ConfirmationRequired)
+    return harness.coordinator.execute_primary(
+        operation_id=harness.operation_id,
+        conversation_id=harness.conversation.id,
+        prepared=harness.prepared_result.prepared,
+        context=harness.context,
+        prepare_identity=harness.prepare_identity,
+        request_fingerprint=harness.request_fingerprint,
+    )
+
+
+def test_locked_scope_revision_change_rolls_back_before_executor(tmp_path) -> None:
+    calls = 0
+    decisions: list[str] = []
+
+    def executor(_args, _context):
+        nonlocal calls
+        calls += 1
+        return {"ok": True}
+
+    harness = support._primary_execution_harness(tmp_path, executor)
+    with harness.sessions() as session:
+        conversation = session.get(Conversation, harness.conversation.id)
+        assert conversation is not None
+        conversation.context_type = "global"
+        conversation.scope_revision = 1
+        session.commit()
+    try:
+        execution, record = harness.coordinator.execute_primary(
+            operation_id=harness.operation_id,
+            conversation_id=harness.conversation.id,
+            prepared=harness.prepared,
+            context=harness.context,
+            prepare_identity=harness.prepare_identity,
+            request_fingerprint=harness.request_fingerprint,
+            approval_decided_callback=lambda _session: decisions.append("approval.decided"),
+        )
+        assert isinstance(execution, OperationUnknown)
+        assert execution.code == "authorization_scope_changed"
+        assert record is None
+        assert calls == 0
+        assert decisions == []
+        with harness.sessions() as session:
+            operation = session.get(WriteOperation, harness.operation_id)
+            conversation = session.get(Conversation, harness.conversation.id)
+            assert operation is not None and operation.status == "proposed"
+            assert conversation is not None
+            assert conversation.pending_operation_id == harness.operation_id
+            assert conversation.pending_confirmation_claim_id == ""
+    finally:
+        harness.factory.close()
+
+
+def test_locked_scope_aba_is_rejected_by_revision(tmp_path) -> None:
+    calls = 0
+
+    def executor(_args, _context):
+        nonlocal calls
+        calls += 1
+        return {"ok": True}
+
+    harness = support._primary_execution_harness(tmp_path, executor)
+    with harness.sessions() as session:
+        conversation = session.get(Conversation, harness.conversation.id)
+        assert conversation is not None
+        conversation.context_type = "global"
+        conversation.scope_revision = 1
+        session.commit()
+    with harness.sessions() as session:
+        conversation = session.get(Conversation, harness.conversation.id)
+        assert conversation is not None
+        conversation.context_type = "workspace"
+        conversation.scope_revision = 2
+        session.commit()
+    try:
+        execution, record = harness.coordinator.execute_primary(
+            operation_id=harness.operation_id,
+            conversation_id=harness.conversation.id,
+            prepared=harness.prepared,
+            context=harness.context,
+            prepare_identity=harness.prepare_identity,
+            request_fingerprint=harness.request_fingerprint,
+        )
+        assert isinstance(execution, OperationUnknown)
+        assert execution.code == "authorization_scope_changed"
+        assert record is None
+        assert calls == 0
+    finally:
+        harness.factory.close()
+
+
+def test_locked_claim_cas_does_not_overwrite_another_attempt(tmp_path) -> None:
+    calls = 0
+    decisions: list[str] = []
+
+    def executor(_args, _context):
+        nonlocal calls
+        calls += 1
+        return {"ok": True}
+
+    harness = support._primary_execution_harness(tmp_path, executor)
+    with harness.sessions() as session:
+        conversation = session.get(Conversation, harness.conversation.id)
+        assert conversation is not None
+        conversation.pending_confirmation_claim_id = "another-attempt"
+        session.commit()
+    try:
+        execution, record = harness.coordinator.execute_primary(
+            operation_id=harness.operation_id,
+            conversation_id=harness.conversation.id,
+            prepared=harness.prepared,
+            context=harness.context,
+            prepare_identity=harness.prepare_identity,
+            request_fingerprint=harness.request_fingerprint,
+            approval_decided_callback=lambda _session: decisions.append("approval.decided"),
+        )
+        assert isinstance(execution, OperationUnknown)
+        assert execution.code == "operation_identity_conflict"
+        assert record is None
+        assert calls == 0
+        assert decisions == []
+    finally:
+        harness.factory.close()
+
+
+@pytest.mark.parametrize("mutation", ("reparent", "delete"))
+def test_second_connection_target_change_is_denied_before_claim_and_executor(
+    tmp_path, mutation: str
+) -> None:
+    harness = _scoped_approval_harness(
+        tmp_path,
+        tool_name="update_note",
+        proposal={"id": 1, "company": "updated"},
+    )
+    assert harness.note_id == 1
+    with harness.sessions() as session:
+        if mutation == "reparent":
+            session.execute(
+                update(InterviewNote)
+                .where(InterviewNote.id == harness.note_id)
+                .values(application_id=harness.second_id)
+            )
+        else:
+            session.execute(
+                delete(InterviewNote).where(InterviewNote.id == harness.note_id)
+            )
+        session.commit()
+    try:
+        execution, record = _execute_scoped(harness)
+        assert isinstance(execution, OperationUnknown)
+        assert execution.code == "scope_access_denied"
+        assert record is None
+        assert harness.executor_calls == []
+        with harness.sessions() as session:
+            operation = session.get(WriteOperation, harness.operation_id)
+            conversation = session.get(Conversation, harness.conversation.id)
+            assert operation is not None and operation.status == "proposed"
+            assert conversation is not None
+            assert conversation.pending_confirmation_claim_id == ""
+    finally:
+        harness.factory.close()
+
+
+def test_second_connection_parent_delete_denies_standalone_add_note(tmp_path) -> None:
+    harness = _scoped_approval_harness(
+        tmp_path,
+        tool_name="add_note",
+        proposal={"company": "Standalone"},
+    )
+    ApplicationsRepository(harness.sessions).delete(harness.first_id)
+    try:
+        execution, record = _execute_scoped(harness)
+        assert isinstance(execution, OperationUnknown)
+        assert execution.code == "authorization_scope_unavailable"
+        assert record is None
+        assert harness.executor_calls == []
+    finally:
+        harness.factory.close()
+
+
+def test_modify_to_cross_application_is_rejected_during_prepare(tmp_path) -> None:
+    harness = _scoped_approval_harness(
+        tmp_path,
+        tool_name="update_application_status",
+        proposal={"id": 1, "status": "interview"},
+        effective={"id": 2, "status": "interview"},
+    )
+    try:
+        assert isinstance(harness.prepared_result, Rejected)
+        assert harness.prepared_result.failure.code == "scope_access_denied"
+        assert harness.executor_calls == []
+        with harness.sessions() as session:
+            operation = session.get(WriteOperation, harness.operation_id)
+            conversation = session.get(Conversation, harness.conversation.id)
+            assert operation is not None and operation.status == "proposed"
+            assert conversation is not None
+            assert conversation.pending_confirmation_claim_id == ""
+    finally:
+        harness.factory.close()
+
+
+def test_approve_reject_race_has_one_terminal_winner_and_one_executor(tmp_path) -> None:
+    entered = Event()
+    release = Event()
+    calls = 0
+
+    def executor(_args, _context):
+        nonlocal calls
+        calls += 1
+        entered.set()
+        assert release.wait(10)
+        return {"ok": True}
+
+    harness = support._primary_execution_harness(
+        tmp_path,
+        executor,
+        tool_name="save_offer_assessment",
+    )
+    reject_fingerprint = operation_request_fingerprint(
+        harness.repository.key,
+        operation_id=harness.operation_id,
+        tool_call_id=harness.pending.tool_call_id,
+        approved=False,
+        edited_args_present=False,
+        edited_args=None,
+        rejection_feedback_present=False,
+        rejection_feedback="",
+        confirmation_token_fingerprint=ledger_fingerprint(
+            harness.repository.key,
+            "write-operation-confirmation-token-v1",
+            b"synthetic-token",
+        ),
+        proposal_fingerprint=ledger_fingerprint(
+            harness.repository.key,
+            "write-operation-proposal-v1",
+            {},
+        ),
+    )
+
+    def approve():
+        return harness.coordinator.execute_primary(
+            operation_id=harness.operation_id,
+            conversation_id=harness.conversation.id,
+            prepared=harness.prepared,
+            context=harness.context,
+            prepare_identity=harness.prepare_identity,
+            request_fingerprint=harness.request_fingerprint,
+        )
+
+    def reject():
+        return harness.coordinator.reject_primary(
+            operation_id=harness.operation_id,
+            conversation_id=harness.conversation.id,
+            tool_call_id=harness.pending.tool_call_id,
+            tool_name=harness.pending.tool_name,
+            request_fingerprint=reject_fingerprint,
+            visible_result="rejected",
+            confirmation_token="synthetic-token",
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            approval_future = pool.submit(approve)
+            assert entered.wait(10)
+            rejection_future = pool.submit(reject)
+            release.set()
+            approval, approval_record = approval_future.result(timeout=10)
+            rejection = rejection_future.result(timeout=10)
+        assert approval_record is not None
+        assert isinstance(rejection, OperationUnknown)
+        assert rejection.code == "operation_input_conflict"
+        assert rejection.operation_id == approval.operation_id
+        assert calls == 1
+    finally:
+        release.set()
+        harness.factory.close()
+
+
+def test_decision_callback_is_after_claim_and_before_executor(tmp_path) -> None:
+    events: list[str] = []
+
+    def executor(_args, _context):
+        events.append("executor")
+        return {"ok": True}
+
+    harness = support._primary_execution_harness(
+        tmp_path,
+        executor,
+        tool_name="save_offer_assessment",
+    )
+    try:
+        execution, record = harness.coordinator.execute_primary(
+            operation_id=harness.operation_id,
+            conversation_id=harness.conversation.id,
+            prepared=harness.prepared,
+            context=harness.context,
+            prepare_identity=harness.prepare_identity,
+            request_fingerprint=harness.request_fingerprint,
+            approval_decided_callback=lambda _session: events.append("approval.decided"),
+        )
+        assert record is not None
+        assert execution.operation_id == harness.operation_id
+        assert events == ["approval.decided", "executor"]
+    finally:
+        harness.factory.close()

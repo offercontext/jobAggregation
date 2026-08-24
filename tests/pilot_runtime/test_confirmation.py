@@ -25,6 +25,7 @@ from offerpilot.ai.write_operations import (
     LedgerPendingPointer,
     OperationCommitted,
     OperationReplay,
+    OperationUnknown,
     TerminalPayload,
     ledger_fingerprint,
     WriteOperationCoordinator,
@@ -573,6 +574,130 @@ def test_approve_claims_executes_once_and_delivers_once() -> None:
 
     assert write.execute_calls == 1
     assert len(deliveries) == 1
+
+
+@pytest.mark.parametrize(
+    "internal_code",
+    (
+        "authorization_scope_changed",
+        "authorization_scope_unbound",
+        "authorization_scope_unavailable",
+        "scope_access_denied",
+    ),
+)
+def test_locked_approval_denial_projects_only_stale_pending_action(
+    internal_code: str,
+) -> None:
+    operations = _Operations(status="proposed")
+    pending = PendingAction(
+        "call-1", "create_application", "{}", "create", operations.operation_id
+    )
+
+    class DeniedWriteCoordinator(_WriteCoordinator):
+        def execute_primary(self, **kwargs: object) -> object:
+            self.execute_calls += 1
+            return OperationUnknown(
+                str(kwargs["operation_id"]), internal_code, False
+            ), None
+
+    write = DeniedWriteCoordinator()
+    coordinator = ConfirmationCoordinator(_deps(_Persistence(pending), operations, write))
+    session = coordinator.approve_modify(
+        ConfirmationRequest(
+            conversation_id=7,
+            approved=True,
+            operation_id=operations.operation_id,
+            confirmation_token=operations.token,
+        ),
+        pending=pending,
+    )
+    prepared = SimpleNamespace(
+        pending_identity="call-1:create_application",
+        pending_action_revision=1,
+        tool_call_id="call-1",
+        spec=SimpleNamespace(name="create_application"),
+        arguments_digest="digest",
+    )
+    assert session.on_confirmation_attempt(pending, cast(Any, prepared)) is None
+
+    with pytest.raises(WriteOperationError) as raised:
+        session.execute_operation(prepared, object(), object())  # type: ignore[arg-type]
+
+    assert raised.value.code == "stale_pending_action"
+    assert internal_code not in str(raised.value)
+    assert write.execute_calls == 1
+
+
+def test_journal_approval_decision_waits_for_ledger_claim_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    operations = _Operations(status="proposed")
+    pending = PendingAction(
+        "call-1", "create_application", "{}", "create", operations.operation_id
+    )
+    persistence = _Persistence(pending)
+    coordinator = ConfirmationCoordinator(
+        _deps(persistence, operations, _WriteCoordinator())
+    )
+    session = coordinator.approve_modify(
+        ConfirmationRequest(
+            conversation_id=7,
+            approved=True,
+            operation_id=operations.operation_id,
+            confirmation_token=operations.token,
+        ),
+        pending=pending,
+    )
+    prepared = SimpleNamespace(
+        pending_identity="call-1:create_application",
+        pending_action_revision=1,
+        tool_call_id="call-1",
+        spec=SimpleNamespace(name="create_application"),
+        arguments_digest="digest",
+    )
+    decisions: list[str] = []
+
+    class Recorder:
+        recording_status = "healthy"
+
+        def fingerprint_pending_identity(self, _payload: object) -> str:
+            return "f" * 64
+
+        def prepare_event_draft(self, event: object) -> object:
+            return event
+
+        def append_event(self, event: object) -> None:
+            decisions.append(str(getattr(event, "event_type", "")))
+
+        def resume(self, _command: object) -> None:
+            decisions.append("run.resumed")
+
+    recorder = Recorder()
+    runtime = PilotRuntime(RuntimeDependencies(persistence=persistence))  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        PilotRuntime,
+        "_resume_journal_confirmation",
+        lambda self, *_args, **_kwargs: (recorder, True),
+    )
+    monkeypatch.setattr(
+        PilotRuntime,
+        "_capture_confirmation_journal_context",
+        lambda self, *_args, **_kwargs: None,
+    )
+    runtime._open_ledger_journal(
+        session,
+        SimpleNamespace(),
+        RuntimeTransportContext(mode="sync"),
+        InMemoryRuntimeInvocationControl(),
+    )
+    assert session.on_confirmation_attempt(pending, cast(Any, prepared)) is None
+    assert decisions == []
+    assert session.state.approval_decided_callback is not None
+
+    session.state.approval_decided_callback(None)
+    session.state.approval_decided_callback(None)
+
+    assert decisions == ["approval.decided"]
 
 
 def test_timeout_after_terminal_converges_fallback_and_ignores_late_bundle() -> None:

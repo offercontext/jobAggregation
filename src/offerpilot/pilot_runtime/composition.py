@@ -174,12 +174,18 @@ class _ConversationGateway:
         self._title_from_message = title_from_message or _title_from_message
 
     def create(self, request: StartTurnRequest) -> object:
-        create = getattr(self._chat, "create_conversation")
-        return create(
-            self._title_from_message(request.message),
-            mode=request.mode,
+        from offerpilot.repositories.chat import ConversationScopeMutationSnapshot
+
+        create = getattr(self._chat, "create_conversation_with_scope")
+        mutation = ConversationScopeMutationSnapshot(
             context_type=request.context_type,
             context_ref=request.context_ref,
+            mode=request.mode,
+        )
+        return create(
+            self._title_from_message(request.message),
+            mutation,
+            title_source="fallback",
         )
 
     def load(self, conversation_id: int) -> object | None:

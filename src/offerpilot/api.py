@@ -4459,6 +4459,9 @@ def create_app(
         typed_request = _normalize_runtime_start_request(payload)
         if isinstance(typed_request, JSONResponse):
             return typed_request
+        scope_error = _preflight_new_conversation_scope(typed_request, applications)
+        if scope_error is not None:
+            return scope_error
         runtime = http_request.app.state.pilot_runtime
         created_new = typed_request.conversation_id in (None, 0)
         title_latch: RuntimeSignalLatch | None = None
@@ -4483,6 +4486,10 @@ def create_app(
             if set_title_conversation_id is not None:
                 set_title_conversation_id(getattr(outcome, "conversation_id", None))
             return _runtime_http_response(outcome)
+        except ConversationScopeUnavailable:
+            return error_response(503, "conversation scope is unavailable", code="scope_unavailable")
+        except (ConversationScopeError, TypeError, ValueError) as exc:
+            return error_response(422, str(exc))
         except RuntimeAgentTimedOut:
             return error_response(504, CHAT_TIMEOUT_MESSAGE, code="chat_agent_timeout")
         except (RuntimeCancelled, RuntimeTransportAborted) as exc:
@@ -4500,6 +4507,9 @@ def create_app(
         typed_request = _normalize_runtime_start_request(payload)
         if isinstance(typed_request, JSONResponse):
             return typed_request
+        scope_error = _preflight_new_conversation_scope(typed_request, applications)
+        if scope_error is not None:
+            return scope_error
         runtime = http_request.app.state.pilot_runtime
         created_new = typed_request.conversation_id in (None, 0)
         title_latch: RuntimeSignalLatch | None = None
@@ -4524,6 +4534,14 @@ def create_app(
                 background=_runtime_stream_background(background_tasks, title_latch),
                 timeout_seconds=CHAT_AGENT_TIMEOUT_SECONDS,
             )
+        except ConversationScopeUnavailable:
+            if title_latch is not None:
+                title_latch.finalize()
+            return error_response(503, "conversation scope is unavailable", code="scope_unavailable")
+        except (ConversationScopeError, TypeError, ValueError) as exc:
+            if title_latch is not None:
+                title_latch.finalize()
+            return error_response(422, str(exc))
         except (RuntimeAgentTimedOut, RuntimeCancelled, RuntimeTransportAborted) as exc:
             if title_latch is not None:
                 title_latch.finalize()
@@ -7454,6 +7472,31 @@ def _confirmation_conversation_id(payload: dict[str, Any]) -> int | JSONResponse
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         return error_response(400, "conversation_id must be a positive integer")
     return value
+
+
+def _preflight_new_conversation_scope(
+    request: StartTurnRequest,
+    applications: ApplicationsRepository,
+) -> JSONResponse | None:
+    """Reject an unavailable new Application scope before runtime side effects.
+
+    The repository gateway repeats this check inside its ``BEGIN IMMEDIATE``
+    create transaction. This inexpensive read only keeps sync and stream
+    routes from entering source/model preparation when the parent is already
+    missing or deleted.
+    """
+
+    if request.conversation_id not in (None, 0):
+        return None
+    if request.context_type != "application":
+        return None
+    try:
+        application_id = int(request.context_ref)
+    except (TypeError, ValueError):
+        return error_response(422, "application context_ref is invalid")
+    if applications.get(application_id) is None:
+        return error_response(503, "conversation scope is unavailable", code="scope_unavailable")
+    return None
 
 
 def _normalize_runtime_start_request(

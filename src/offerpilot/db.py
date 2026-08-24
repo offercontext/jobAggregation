@@ -66,6 +66,7 @@ def init_database(db_path: Path) -> SessionFactory:
     Base.metadata.create_all(engine)
     _ensure_context_projector_manifest_v2_schema(engine)
     _ensure_write_operation_ledger_schema(engine)
+    _ensure_scoped_tool_authority_schema(engine)
     _ensure_column(
         engine,
         "conversations",
@@ -1631,6 +1632,257 @@ def _ensure_write_operation_ledger_schema(engine) -> None:  # type: ignore[no-un
         engine,
         "0026_write_operation_ledger",
         "Add durable Agent write operation ledger and fenced delivery identity",
+    )
+
+
+def _ensure_scoped_tool_authority_schema(engine) -> None:  # type: ignore[no-untyped-def]
+    """Install the additive Conversation scope and authorization guards (0028)."""
+
+    _ensure_column(
+        engine,
+        "write_operations",
+        "authorization_scope_fingerprint",
+        "TEXT",
+    )
+    with engine.begin() as conn:
+        # Only the two historical empty representations are canonicalized.  An
+        # unknown or malformed legacy mode remains observable for the Source /
+        # Authority fail-closed boundary.
+        conn.execute(
+            text(
+                "UPDATE conversations SET mode = 'general' "
+                "WHERE mode IS NULL OR mode = ''"
+            )
+        )
+
+    # Add the monotonic revision only after legacy mode values have been
+    # canonicalized.  On a pre-0028 database SQLite fills every existing row
+    # with the declared zero default; a partially applied/reopened database
+    # keeps its already persisted revision unchanged.
+    _ensure_column(
+        engine,
+        "conversations",
+        "scope_revision",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+
+    with engine.begin() as conn:
+        conversation_triggers = (
+            "trg_conversations_scope_insert",
+            "trg_conversations_scope_update",
+            "trg_conversations_scope_revision_unchanged",
+            "trg_conversations_mode_insert",
+            "trg_conversations_mode_update",
+        )
+        for trigger_name in conversation_triggers:
+            conn.execute(text(f"DROP TRIGGER IF EXISTS {trigger_name}"))
+
+        conn.execute(
+            text(
+                """
+                CREATE TRIGGER trg_conversations_scope_insert
+                BEFORE INSERT ON conversations
+                BEGIN
+                    SELECT CASE WHEN
+                        typeof(NEW.scope_revision) <> 'integer'
+                        OR NEW.scope_revision <> 0
+                    THEN RAISE(ABORT, 'conversation scope revision must start at zero') END;
+                    SELECT CASE WHEN
+                        typeof(NEW.scope_revision) <> 'integer'
+                        OR NEW.scope_revision < 0
+                        OR NEW.scope_revision > 9223372036854775807
+                    THEN RAISE(ABORT, 'conversation scope revision is out of range') END;
+                END
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TRIGGER trg_conversations_scope_update
+                BEFORE UPDATE ON conversations
+                WHEN NEW.context_type IS NOT OLD.context_type
+                  OR NEW.context_ref IS NOT OLD.context_ref
+                  OR NEW.mode IS NOT OLD.mode
+                BEGIN
+                    SELECT CASE WHEN OLD.scope_revision = 9223372036854775807
+                        THEN RAISE(ABORT, 'conversation scope revision overflow') END;
+                    SELECT CASE WHEN
+                        typeof(NEW.scope_revision) <> 'integer'
+                        OR NEW.scope_revision < 0
+                        OR NEW.scope_revision > 9223372036854775807
+                        OR NEW.scope_revision <> OLD.scope_revision + 1
+                    THEN RAISE(ABORT, 'conversation scope revision must increment') END;
+                END
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TRIGGER trg_conversations_scope_revision_unchanged
+                BEFORE UPDATE ON conversations
+                WHEN NEW.context_type IS OLD.context_type
+                  AND NEW.context_ref IS OLD.context_ref
+                  AND NEW.mode IS OLD.mode
+                  AND NEW.scope_revision IS NOT OLD.scope_revision
+                BEGIN
+                    SELECT RAISE(ABORT, 'conversation scope revision changed without scope mutation');
+                END
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TRIGGER trg_conversations_mode_insert
+                BEFORE INSERT ON conversations
+                WHEN typeof(NEW.mode) <> 'text'
+                  OR NEW.mode IS NULL
+                  OR length(CAST(NEW.mode AS BLOB)) = 0
+                  OR length(NEW.mode) > 64
+                  OR length(CAST(NEW.mode AS BLOB)) > 256
+                  OR NEW.mode <> trim(NEW.mode)
+                  OR unicode(substr(NEW.mode, 1, 1)) IN
+                     (160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198,
+                      8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288)
+                  OR unicode(substr(NEW.mode, -1, 1)) IN
+                     (160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198,
+                      8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288)
+                  OR instr(NEW.mode, char(0)) > 0
+                  OR NEW.mode GLOB ('*[' || char(1) || '-' || char(31) || char(127) || '-' || char(159) || ']*')
+                BEGIN
+                    SELECT RAISE(ABORT, 'invalid conversation mode');
+                END
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TRIGGER trg_conversations_mode_update
+                BEFORE UPDATE OF mode ON conversations
+                WHEN typeof(NEW.mode) <> 'text'
+                  OR NEW.mode IS NULL
+                  OR length(CAST(NEW.mode AS BLOB)) = 0
+                  OR length(NEW.mode) > 64
+                  OR length(CAST(NEW.mode AS BLOB)) > 256
+                  OR NEW.mode <> trim(NEW.mode)
+                  OR unicode(substr(NEW.mode, 1, 1)) IN
+                     (160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198,
+                      8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288)
+                  OR unicode(substr(NEW.mode, -1, 1)) IN
+                     (160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198,
+                      8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288)
+                  OR instr(NEW.mode, char(0)) > 0
+                  OR NEW.mode GLOB ('*[' || char(1) || '-' || char(31) || char(127) || '-' || char(159) || ']*')
+                BEGIN
+                    SELECT RAISE(ABORT, 'invalid conversation mode');
+                END
+                """
+            )
+        )
+
+        operation_triggers = (
+            "trg_write_operation_scope_insert",
+            "trg_write_operation_scope_fingerprint_immutable",
+            "trg_write_operation_scope_identity_immutable",
+            "trg_write_operation_scope_conversation_immutable",
+            "trg_write_operation_scope_status",
+        )
+        for trigger_name in operation_triggers:
+            conn.execute(text(f"DROP TRIGGER IF EXISTS {trigger_name}"))
+
+        conn.execute(
+            text(
+                """
+                CREATE TRIGGER trg_write_operation_scope_insert
+                BEFORE INSERT ON write_operations
+                WHEN (
+                    NEW.operation_role = 'primary'
+                    AND NEW.adapter_kind = 'typed'
+                    AND NEW.status = 'proposed'
+                    AND NEW.authorization_scope_fingerprint IS NULL
+                  ) OR (
+                    NEW.authorization_scope_fingerprint IS NOT NULL
+                    AND (
+                      length(NEW.authorization_scope_fingerprint) <> 76
+                      OR substr(NEW.authorization_scope_fingerprint,1,12) <> 'hmac-sha256:'
+                      OR substr(NEW.authorization_scope_fingerprint,13) GLOB '*[^0-9a-f]*'
+                    )
+                  )
+                BEGIN
+                    SELECT RAISE(ABORT, 'invalid authorization scope fingerprint');
+                END
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TRIGGER trg_write_operation_scope_fingerprint_immutable
+                BEFORE UPDATE OF authorization_scope_fingerprint ON write_operations
+                WHEN NEW.authorization_scope_fingerprint IS NOT OLD.authorization_scope_fingerprint
+                BEGIN
+                    SELECT RAISE(ABORT, 'authorization scope fingerprint is immutable');
+                END
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TRIGGER trg_write_operation_scope_identity_immutable
+                BEFORE UPDATE ON write_operations
+                WHEN NEW.operation_role IS NOT OLD.operation_role
+                  OR NEW.adapter_kind IS NOT OLD.adapter_kind
+                  OR NEW.tool_name IS NOT OLD.tool_name
+                  OR NEW.tool_call_id IS NOT OLD.tool_call_id
+                  OR NEW.fingerprint_key_id IS NOT OLD.fingerprint_key_id
+                  OR NEW.proposal_fingerprint IS NOT OLD.proposal_fingerprint
+                  OR NEW.confirmation_token_fingerprint IS NOT OLD.confirmation_token_fingerprint
+                  OR NEW.parent_operation_id IS NOT OLD.parent_operation_id
+                BEGIN
+                    SELECT RAISE(ABORT, 'write operation authority identity is immutable');
+                END
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TRIGGER trg_write_operation_scope_conversation_immutable
+                BEFORE UPDATE OF conversation_id ON write_operations
+                WHEN (OLD.conversation_id IS NULL AND NEW.conversation_id IS NOT NULL)
+                  OR (OLD.conversation_id IS NOT NULL AND NEW.conversation_id IS NOT NULL
+                      AND NEW.conversation_id <> OLD.conversation_id)
+                BEGIN
+                    SELECT RAISE(ABORT, 'write operation conversation binding is immutable');
+                END
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TRIGGER trg_write_operation_scope_status
+                BEFORE UPDATE OF status ON write_operations
+                WHEN OLD.operation_role = 'primary'
+                  AND OLD.adapter_kind = 'typed'
+                  AND OLD.status = 'proposed'
+                  AND OLD.authorization_scope_fingerprint IS NULL
+                  AND NEW.status NOT IN ('proposed','rejected')
+                BEGIN
+                    SELECT RAISE(ABORT, 'unbound typed operation cannot become terminal');
+                END
+                """
+            )
+        )
+
+    _record_migration(
+        engine,
+        "0028_scoped_tool_authority",
+        "Add Conversation scope revision and Write Operation authorization fingerprint",
     )
 
 

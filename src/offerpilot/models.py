@@ -1463,6 +1463,13 @@ class Wakeup(Base):
 
 class Conversation(Base):
     __tablename__ = "conversations"
+    __table_args__ = (
+        CheckConstraint(
+            "typeof(scope_revision) = 'integer' "
+            "AND scope_revision BETWEEN 0 AND 9223372036854775807",
+            name="ck_conversations_scope_revision",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     title: Mapped[str] = mapped_column(
@@ -1476,6 +1483,9 @@ class Conversation(Base):
         String, default="workspace", server_default="workspace"
     )
     context_ref: Mapped[str] = mapped_column(String, default="", server_default="")
+    scope_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
     pinned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     pending_tool_call_id: Mapped[str] = mapped_column(String, default="", server_default="")
@@ -1711,6 +1721,18 @@ class WriteOperation(Base):
             name="ck_write_operations_hmac_fingerprints",
         ),
         CheckConstraint(
+            "authorization_scope_fingerprint IS NULL OR "
+            "(length(authorization_scope_fingerprint) = 76 "
+            "AND substr(authorization_scope_fingerprint,1,12) = 'hmac-sha256:' "
+            "AND substr(authorization_scope_fingerprint,13) NOT GLOB '*[^0-9a-f]*')",
+            name="ck_write_operations_authorization_scope_fingerprint",
+        ),
+        CheckConstraint(
+            "NOT (operation_role = 'primary' AND adapter_kind = 'typed' "
+            "AND status = 'proposed' AND authorization_scope_fingerprint IS NULL)",
+            name="ck_write_operations_typed_primary_scope_bound",
+        ),
+        CheckConstraint(
             "(parent_terminal_payload_sha256 IS NULL OR (length(parent_terminal_payload_sha256) = 71 "
             "AND substr(parent_terminal_payload_sha256,1,7) = 'sha256:' "
             "AND substr(parent_terminal_payload_sha256,8) NOT GLOB '*[^0-9a-f]*')) "
@@ -1835,6 +1857,9 @@ class WriteOperation(Base):
     proposal_fingerprint: Mapped[str | None] = mapped_column(String, nullable=True)
     input_fingerprint: Mapped[str | None] = mapped_column(String, nullable=True)
     confirmation_token_fingerprint: Mapped[str | None] = mapped_column(String, nullable=True)
+    authorization_scope_fingerprint: Mapped[str | None] = mapped_column(
+        String, nullable=True
+    )
     operation_request_fingerprint: Mapped[str | None] = mapped_column(String, nullable=True)
     result_contract: Mapped[str | None] = mapped_column(String, nullable=True)
     result_json: Mapped[str | None] = mapped_column(Text, nullable=True)

@@ -9,7 +9,7 @@ import pytest
 
 from offerpilot.agent_runtime.journal import NullRunRecorder
 from offerpilot.ai.agent_contracts import AgentTurnResult, PendingAction
-from offerpilot.ai.agent_loop import ApprovedWriteSeed
+from offerpilot.ai.agent_loop import AgentLoopInvocation, ApprovedWriteSeed
 from offerpilot.ai.tool_authority import (
     ApprovalExecutionAuthority,
     AuthorityFactory,
@@ -32,9 +32,11 @@ from offerpilot.ai.write_operations import (
 )
 from offerpilot.pilot_runtime.continuation import (
     ApprovalAuthorityResolver,
+    ConfirmationApprovedWritePort,
     ConfirmationCoordinator,
     ConfirmationDependencies,
 )
+from offerpilot.pilot_runtime.composition import _AgentDriver
 from offerpilot.pilot_runtime.contracts import ConfirmationRequest
 from offerpilot.pilot_runtime.event_sink import InMemoryRuntimeInvocationControl
 from offerpilot.pilot_runtime.persistence import ChatPersistenceCoordinator
@@ -439,3 +441,68 @@ def test_runtime_real_typed_origin_is_provider_and_source_free(tmp_path) -> None
     updated = NotesRepository(harness.sessions).get(harness.note_id)
     assert updated is not None
     assert updated.questions == "approved"
+
+
+def test_production_agent_driver_retains_approval_context_seals(tmp_path) -> None:
+    harness = _approval_harness(tmp_path)
+    conversation = harness.chat.get_conversation(harness.conversation.id)
+    assert conversation is not None
+    coordinator = ConfirmationCoordinator(
+        ConfirmationDependencies(
+            persistence=ChatPersistenceCoordinator(harness.chat),
+            conversations=harness.chat,
+            write_operations=harness.repository,
+            write_coordinator=harness.coordinator,
+            catalog=MODEL_TOOL_CATALOG,
+            applications=harness.applications,
+            approval_context_resolver=_approval_context_resolver(harness),
+        )
+    )
+    session = coordinator.approve_modify(
+        ConfirmationRequest(
+            conversation_id=conversation.id,
+            operation_id=harness.operation_id,
+            approved=True,
+            confirmation_token="scoped-token",
+        ),
+        pending=harness.pending,
+        conversation=conversation,
+        catalog=MODEL_TOOL_CATALOG,
+    )
+    origin = session.approval_context
+    context = origin.with_runtime_dependencies(
+        run_recorder=NullRunRecorder(),
+        operation_executor=session.execute_operation,
+    )
+    invocation = AgentLoopInvocation(
+        seed=ApprovedWriteSeed(ConfirmationApprovedWritePort(session)),
+        model=None,
+        catalog=MODEL_TOOL_CATALOG,
+        tool_context=context,
+        auto_approve=False,
+        max_iterations=1,
+        run_recorder=NullRunRecorder(),
+        event_sink=None,
+        runtime_signal_sink=None,
+        cancel_check=None,
+    )
+    received: list[ToolExecutionContext] = []
+
+    class Runner:
+        def run(self, candidate: AgentLoopInvocation) -> AgentTurnResult:
+            received.append(candidate.tool_context)
+            return AgentTurnResult([], "", None)
+
+    driver = _AgentDriver()
+    driver._runner = Runner()  # type: ignore[assignment]
+    try:
+        result = driver.execute(invocation)
+        assert result.reply == ""
+        assert len(received) == 1
+        rebound = received[0]
+        assert rebound.authority is origin.authority
+        assert rebound.authority_factory is origin.authority_factory
+        assert rebound.scope_constraint is origin.scope_constraint
+        assert rebound.operation_executor is session.execute_operation
+    finally:
+        origin.authority_factory.close()

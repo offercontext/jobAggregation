@@ -481,7 +481,10 @@ class _AgentDriver:
         context = invocation.tool_context
         if not isinstance(context, ToolExecutionContext):
             raise TypeError("Agent Loop requires ToolExecutionContext")
-        bound_context = replace(context, run_recorder=cast(Any, recorder))
+        bound_context = context.with_runtime_dependencies(
+            run_recorder=cast(Any, recorder),
+            operation_executor=context.operation_executor,
+        )
         runtime_sink = cast(RuntimeEventSink | None, invocation.event_sink)
         agent_sink = _AgentEventAdapter(runtime_sink) if runtime_sink is not None else None
         try:

@@ -15,6 +15,7 @@ import pytest
 from offerpilot.ai.agent_contracts import AgentTurnResult, PendingAction
 from offerpilot.ai.agent_loop import ApprovedWriteSeed
 from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
+from offerpilot.ai.tool_runtime.legacy import LEGACY_DETERMINISTIC_NAMES
 from offerpilot.ai.tool_runtime.pipeline import prepare_call
 from offerpilot.ai.tool_runtime.contracts import ToolFailure, ToolSuccess
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
@@ -1328,14 +1329,73 @@ def test_reject_preheader_does_not_touch_conversation_or_model() -> None:
         ConfirmationRequest(
             conversation_id=7,
             approved=False,
-            operation_id=operations.operation_id,
-            confirmation_token=operations.token,
         ),
         invocation_control=InMemoryRuntimeInvocationControl(),
     )
 
     assert getattr(outcome, "write_status", None) == "cancelled"
     assert calls == {"conversation": 0, "model": 0}
+    assert persistence.pending_reads == 0
+    assert operations.preheader_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("adapter_kind", "tool_name", "approved", "expected"),
+    [
+        *(("legacy_deterministic", name, True, True) for name in LEGACY_DETERMINISTIC_NAMES),
+        ("legacy_deterministic", "create_application", True, False),
+        ("typed", next(iter(LEGACY_DETERMINISTIC_NAMES)), True, False),
+        ("legacy_deterministic", next(iter(LEGACY_DETERMINISTIC_NAMES)), False, False),
+    ],
+)
+def test_deterministic_confirmation_requires_exact_closed_adapter_identity(
+    adapter_kind: str,
+    tool_name: str,
+    approved: bool,
+    expected: bool,
+) -> None:
+    operations = _Operations(status="proposed")
+    operations.operation.adapter_kind = adapter_kind
+    operations.operation.tool_name = tool_name
+    persistence = _Persistence(None)
+    coordinator = ConfirmationCoordinator(_deps(persistence, operations))
+    runtime = PilotRuntime(
+        RuntimeDependencies(
+            persistence=persistence,  # type: ignore[arg-type]
+            confirmation_coordinator=coordinator,
+        )
+    )
+
+    result = runtime._is_deterministic_confirmation(
+        ConfirmationRequest(
+            conversation_id=7,
+            approved=approved,
+            operation_id=operations.operation_id,
+        )
+    )
+
+    assert result is expected
+    assert persistence.pending_reads == 0
+
+
+def test_omitted_id_legacy_classifier_uses_only_bounded_ledger_preheader() -> None:
+    operations = _Operations(status="proposed")
+    operations.operation.adapter_kind = "legacy_deterministic"
+    operations.operation.tool_name = next(iter(LEGACY_DETERMINISTIC_NAMES))
+    persistence = _Persistence(None)
+    coordinator = ConfirmationCoordinator(_deps(persistence, operations))
+    runtime = PilotRuntime(
+        RuntimeDependencies(
+            persistence=persistence,  # type: ignore[arg-type]
+            confirmation_coordinator=coordinator,
+        )
+    )
+
+    assert runtime._is_deterministic_confirmation(
+        ConfirmationRequest(conversation_id=7, approved=True)
+    )
+    assert operations.preheader_calls == 1
+    assert persistence.pending_reads == 0
 
 
 def test_reject_session_does_not_load_conversation_for_generation() -> None:
@@ -1873,8 +1933,6 @@ def test_rejection_stream_uses_complete_typed_events_without_user_message_saved(
         ConfirmationRequest(
             conversation_id=7,
             approved=False,
-            operation_id=operations.operation_id,
-            confirmation_token=operations.token,
         ),
         transport=RuntimeTransportContext(
             mode="stream",
@@ -1896,6 +1954,8 @@ def test_rejection_stream_uses_complete_typed_events_without_user_message_saved(
     assert cast(Any, state.events[2]).confirm_mode == "rejected"
     assert cast(Any, state.events[3]).status == "error"
     assert not any(type(event).__name__ == "UserMessageSavedEvent" for event in state.events)
+    assert persistence.pending_reads == 0
+    assert operations.preheader_calls == 1
 
 
 def test_approved_stream_orders_meta_status_tool_result_assistant_completed() -> None:

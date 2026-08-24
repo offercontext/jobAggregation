@@ -1953,33 +1953,49 @@ class PilotRuntime:
     def _is_deterministic_confirmation(self, request: ConfirmationRequest) -> bool:
         """Select the closed deterministic adapter from the persisted operation kind."""
 
-        if not isinstance(request, ConfirmationRequest):
+        if not isinstance(request, ConfirmationRequest) or not request.approved:
             return False
-        operation_id = request.operation_id
-        if not isinstance(operation_id, str) or not operation_id:
-            pending_getter = _callable(
-                self._dependencies.persistence,
-                ("get_pending_action", "pending_action"),
-            )
-            if pending_getter is None:
-                return False
-            pending = _invoke(
-                pending_getter,
-                {"conversation_id": request.conversation_id, "id": request.conversation_id},
-                (request.conversation_id,),
-            )
-            operation_id = str(_attribute(pending, "operation_id", "") or "")
         coordinator = self._confirmation_coordinator()
-        write_operations = _attribute(_attribute(coordinator, "dependencies"), "write_operations")
-        getter = _callable(write_operations, ("get", "get_operation"))
-        if getter is None or not operation_id:
-            return False
-        operation = _invoke(
-            getter,
-            {"operation_id": operation_id, "id": operation_id},
-            (operation_id,),
+        write_operations = _attribute(
+            _attribute(coordinator, "dependencies"), "write_operations"
         )
-        return str(_attribute(operation, "adapter_kind", "") or "") == "legacy_deterministic"
+        operation_id = request.operation_id
+        operation: object | None = None
+        if not isinstance(operation_id, str) or not operation_id:
+            preheader = _callable(
+                write_operations,
+                ("operation_preheader",),
+            )
+            if preheader is None:
+                return False
+            try:
+                bounded = _invoke(
+                    preheader,
+                    {
+                        "conversation_id": request.conversation_id,
+                        "operation_id": None,
+                    },
+                    (request.conversation_id, None),
+                )
+            except WriteOperationError:
+                # The coordinator owns the public stale/unavailable mapping.
+                return False
+            operation = _attribute(bounded, "operation")
+        else:
+            getter = _callable(write_operations, ("get", "get_operation"))
+            if getter is None:
+                return False
+            operation = _invoke(
+                getter,
+                {"operation_id": operation_id, "id": operation_id},
+                (operation_id,),
+            )
+        return (
+            str(_attribute(operation, "adapter_kind", "") or "")
+            == "legacy_deterministic"
+            and str(_attribute(operation, "tool_name", "") or "")
+            in LEGACY_DETERMINISTIC_NAMES
+        )
 
     @staticmethod
     def _bind_confirmation_context(

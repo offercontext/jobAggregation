@@ -165,6 +165,7 @@ from offerpilot.repositories.chat import (
     ConversationScopeError,
     ConversationScopeMutationSnapshot,
     ConversationScopeUnavailable,
+    ConversationScopeVisibilityFailure,
 )
 from offerpilot.repositories.application_events import (
     ApplicationEventCreate,
@@ -4486,7 +4487,7 @@ def create_app(
             if set_title_conversation_id is not None:
                 set_title_conversation_id(getattr(outcome, "conversation_id", None))
             return _runtime_http_response(outcome)
-        except ConversationScopeUnavailable:
+        except (ConversationScopeUnavailable, ConversationScopeVisibilityFailure):
             return _source_load_failed_response()
         except (ConversationScopeError, TypeError, ValueError) as exc:
             return error_response(422, str(exc))
@@ -4534,7 +4535,7 @@ def create_app(
                 background=_runtime_stream_background(background_tasks, title_latch),
                 timeout_seconds=CHAT_AGENT_TIMEOUT_SECONDS,
             )
-        except ConversationScopeUnavailable:
+        except (ConversationScopeUnavailable, ConversationScopeVisibilityFailure):
             if title_latch is not None:
                 title_latch.finalize()
             return _source_load_failed_response()
@@ -4741,6 +4742,8 @@ def create_app(
             )
         except ConversationScopeUnavailable:
             return error_response(404, "conversation not found")
+        except ConversationScopeVisibilityFailure:
+            return _source_load_failed_response()
         except (ConversationScopeError, TypeError, ValueError) as exc:
             return error_response(422, str(exc))
         if conversation is None:
@@ -8137,12 +8140,13 @@ def _canonical_source_scope(conversation: Any) -> _CanonicalSourceScope:
         raise ProjectionError("source_load_failed")
     if type(scope_revision) is not int or not 0 <= scope_revision <= 9_223_372_036_854_775_807:
         raise ProjectionError("source_load_failed")
-    if context_ref is not None and type(context_ref) is not str:
-        raise ProjectionError("source_load_failed")
     try:
         canonical = ConversationScopeMutationSnapshot(
             context_type=context_type,
-            context_ref=context_ref,
+            # Historical non-Application refs never establish authority. Keep
+            # the stored value only for the same-snapshot equality check below
+            # and canonicalize the effective ref to the approved empty value.
+            context_ref=context_ref if context_type == "application" else "",
             mode=mode,
         )
     except (ConversationScopeError, TypeError, ValueError) as exc:

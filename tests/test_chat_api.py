@@ -32,7 +32,12 @@ from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 from offerpilot.agent_runtime.journal import NullRunRecorderFactory, RunRecorderFactory
 from offerpilot.agent_runtime.keyring import load_or_create_journal_key
 from offerpilot.agent_runtime.trace import reconstruct_agent_run
-from offerpilot.api import _stored_messages_to_ai, _title_from_message, create_app
+from offerpilot.api import (
+    _canonical_source_scope,
+    _stored_messages_to_ai,
+    _title_from_message,
+    create_app,
+)
 from offerpilot.config import Config, save_config
 from offerpilot.db import journal_session_factory_for_data_dir, session_factory_for_data_dir
 from offerpilot.models import (
@@ -8874,3 +8879,22 @@ def test_chat_fails_closed_for_invalid_persisted_scope_or_mode(tmp_path, column,
     assert response.status_code == 503
     assert response.json()["error_code"] == "source_load_failed"
     assert model.calls == []
+
+
+@pytest.mark.parametrize("context_type", ["workspace", "global", "mode"])
+def test_chat_ignores_legacy_non_application_ref_when_loading_source(
+    context_type: str,
+) -> None:
+    legacy_ref = "legacy\x00private-ref"
+    scope = _canonical_source_scope(
+        SimpleNamespace(
+            id=7,
+            context_type=context_type,
+            context_ref=legacy_ref,
+            mode="general",
+            scope_revision=3,
+        )
+    )
+
+    assert scope.persisted_context_ref == legacy_ref
+    assert scope.application_id is None

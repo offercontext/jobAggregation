@@ -38,6 +38,10 @@ class ConversationScopeUnavailable(ConversationScopeError):
     """The requested Application scope does not resolve to an active row."""
 
 
+class ConversationScopeVisibilityFailure(ConversationScopeError):
+    """The active-Application visibility query failed internally."""
+
+
 @dataclass(frozen=True, slots=True)
 class ConversationScopeMutationSnapshot:
     """Canonical, validated scope values used by the atomic repository ports.
@@ -1097,7 +1101,9 @@ def _require_active_application(
             application_id,
         )
     except AuthorityApplicationVisibilityError as exc:
-        raise ConversationScopeUnavailable("application context is unavailable") from exc
+        raise ConversationScopeVisibilityFailure(
+            "application context visibility could not be checked"
+        ) from exc
     if visible is None:
         raise ConversationScopeUnavailable("application context is unavailable")
 

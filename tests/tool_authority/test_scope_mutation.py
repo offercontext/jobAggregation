@@ -16,6 +16,11 @@ from offerpilot.repositories.chat import (
     ChatRepository,
     ConversationScopeError,
     ConversationScopeMutationSnapshot,
+    ConversationScopeVisibilityFailure,
+)
+from offerpilot.ai.tool_authority.visibility import (
+    AuthorityApplicationVisibilityError,
+    AuthorityApplicationVisibilityQuery,
 )
 
 
@@ -23,6 +28,59 @@ from offerpilot.repositories.chat import (
 def repo(tmp_path: Path) -> ChatRepository:
     sessions = init_database(tmp_path / "offerpilot.db")
     return ChatRepository(sessions)
+
+
+def test_patch_visibility_internal_error_is_retryable_and_not_not_found(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = TestClient(create_app(data_dir=tmp_path))
+    application = client.post(
+        "/api/applications",
+        json={"company_name": "Scope", "position_name": "Role"},
+    ).json()
+    repository = ChatRepository(init_database(tmp_path / "data.db"))
+    conversation = repository.create_conversation_with_scope(
+        "scoped",
+        ConversationScopeMutationSnapshot(
+            context_type="application",
+            context_ref=application["id"],
+            mode="general",
+        ),
+    )
+
+    def fail_visibility(*_args: object, **_kwargs: object) -> object:
+        raise AuthorityApplicationVisibilityError("secret database detail")
+
+    monkeypatch.setattr(
+        AuthorityApplicationVisibilityQuery,
+        "execute_on_session",
+        fail_visibility,
+    )
+    with pytest.raises(ConversationScopeVisibilityFailure):
+        repository.patch_conversation_with_scope(
+            conversation.id,
+            {"title": "must roll back"},
+            ConversationScopeMutationSnapshot(
+                context_type="application",
+                context_ref=application["id"],
+                mode="focused",
+            ),
+            expected_scope_revision=0,
+        )
+
+    response = client.patch(
+        f"/api/chat/conversations/{conversation.id}",
+        json={"mode": "focused", "title": "must roll back"},
+    )
+    assert response.status_code == 503
+    assert response.json() == {
+        "error": "上下文暂时无法加载，请稍后重试。",
+        "error_code": "source_load_failed",
+    }
+    assert "secret" not in response.text
+    stored = repository.get_conversation(conversation.id)
+    assert stored is not None
+    assert (stored.title, stored.mode, stored.scope_revision) == ("scoped", "general", 0)
 
 
 def test_generic_conversation_writes_reject_scope_keys(repo: ChatRepository) -> None:

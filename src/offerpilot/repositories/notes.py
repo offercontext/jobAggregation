@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, cast
+from typing import TYPE_CHECKING, Any, NoReturn, Optional, cast
 
 from builtins import list as BuiltinList
 
-from sqlalchemy import and_, delete, exists, or_, select
+from sqlalchemy import and_, case, delete, exists, insert, literal, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql import Select
+from sqlalchemy.sql.elements import ColumnElement
 
 from offerpilot.models import Application, ApplicationEvent, InterviewNote
 from offerpilot.repositories.applications import _restricted_scope_id
@@ -135,6 +136,64 @@ class NotesRepository:
             session.refresh(note)
             return note
 
+    def create_note_scoped(
+        self,
+        constraint: ApplicationScopeConstraint,
+        data: NoteCreate,
+    ) -> InterviewNote:
+        binding = self._require_scoped(constraint)
+        require_scoped_optional_id(data.application_id, "application_id")
+        require_scoped_optional_id(data.application_event_id, "application_event_id")
+        if data.application_event_id is not None and data.application_id is None:
+            raise NoteBindingError(422, "application_event_id requires an application")
+
+        values = _note_create_values(data)
+        if data.application_event_id is not None:
+            values["company"] = case(
+                (
+                    _valid_interview_event(
+                        data.application_event_id,
+                        data.application_id,
+                    ),
+                    data.company,
+                ),
+                else_=None,
+            )
+        if constraint.mode == "restricted":
+            allowed_id = _restricted_scope_id(constraint)
+            if data.application_id is not None and data.application_id != allowed_id:
+                raise ScopeAccessDenied("application scope denied")
+            columns = tuple(values)
+            source = select(
+                *(
+                    value if isinstance(value, ColumnElement) else literal(value)
+                    for value in values.values()
+                )
+            ).select_from(Application)
+            source = source.where(
+                Application.id == allowed_id,
+                Application.deleted_at.is_(None),
+            )
+            statement = (
+                insert(InterviewNote)
+                .from_select(columns, source)
+                .returning(InterviewNote)
+            )
+        else:
+            statement = (
+                insert(InterviewNote)
+                .values(**values)
+                .returning(InterviewNote)
+            )
+        try:
+            with binding.session.no_autoflush:
+                rows = list(binding.session.scalars(statement))
+        except IntegrityError as exc:
+            _raise_scoped_note_integrity(exc, event_id=data.application_event_id)
+        if len(rows) != 1:
+            raise ScopeAccessDenied("application scope denied")
+        return rows[0]
+
     def list(self, application_id: int = 0) -> list[InterviewNote]:
         statement = (
             select(InterviewNote)
@@ -259,12 +318,120 @@ class NotesRepository:
             session.refresh(note)
             return note
 
+    def update_note_scoped(
+        self,
+        constraint: ApplicationScopeConstraint,
+        note_id: int,
+        data: NoteUpdate,
+    ) -> Optional[InterviewNote]:
+        binding = self._require_scoped(constraint)
+        note_id = require_scoped_positive_int64(note_id, "note id")
+        if data.application_id is not UNSET:
+            require_scoped_optional_id(data.application_id, "application_id")
+        if data.application_event_id is not UNSET:
+            require_scoped_optional_id(data.application_event_id, "application_event_id")
+
+        visible_parent = exists(
+            select(Application.id).where(
+                Application.id == InterviewNote.application_id,
+                Application.deleted_at.is_(None),
+            )
+        )
+        statement = update(InterviewNote).where(InterviewNote.id == note_id)
+        if constraint.mode == "restricted":
+            allowed_id = _restricted_scope_id(constraint)
+            if data.application_id is not UNSET and data.application_id != allowed_id:
+                raise ScopeAccessDenied("application scope denied")
+            statement = statement.where(
+                InterviewNote.application_id == allowed_id,
+                visible_parent,
+            )
+        else:
+            statement = statement.where(
+                or_(InterviewNote.application_id.is_(None), visible_parent)
+            )
+
+        values = _note_update_values(data)
+        domain_predicates: list[ColumnElement[bool]] = []
+        application_change = data.application_id is not UNSET
+        if application_change:
+            if data.application_id is None:
+                domain_predicates.append(InterviewNote.application_id.is_(None))
+            else:
+                domain_predicates.append(
+                    InterviewNote.application_id == data.application_id
+                )
+        event_id: int | None = None
+        if data.application_event_id is not UNSET:
+            event_id = cast(int | None, data.application_event_id)
+            if event_id is not None:
+                domain_predicates.append(
+                    _valid_interview_event(event_id, InterviewNote.application_id)
+                )
+        if domain_predicates:
+            values["company"] = case(
+                (and_(*domain_predicates), values["company"]),
+                else_=None,
+            )
+        statement = (
+            statement.values(**values)
+            .returning(InterviewNote)
+            .execution_options(populate_existing=True)
+        )
+        try:
+            with binding.session.no_autoflush:
+                rows = list(binding.session.scalars(statement))
+        except IntegrityError as exc:
+            _raise_scoped_note_integrity(
+                exc,
+                event_id=event_id,
+                application_change=application_change,
+            )
+        if len(rows) != 1:
+            if constraint.mode == "restricted" or len(rows) > 1:
+                raise ScopeAccessDenied("application scope denied")
+            return None
+        return rows[0]
+
     def delete(self, note_id: int) -> None:
         with repository_session(self._session_factory, self._session) as session:
             note = cast(Optional[InterviewNote], session.scalar(self._visible_note_statement(note_id)))
             if note is not None:
                 session.delete(note)
                 finish_repository_write(session, self._session)
+
+    def delete_note_scoped(
+        self,
+        constraint: ApplicationScopeConstraint,
+        note_id: int,
+    ) -> bool:
+        binding = self._require_scoped(constraint)
+        note_id = require_scoped_positive_int64(note_id, "note id")
+        visible_parent = exists(
+            select(Application.id).where(
+                Application.id == InterviewNote.application_id,
+                Application.deleted_at.is_(None),
+            )
+        )
+        statement = delete(InterviewNote).where(InterviewNote.id == note_id)
+        if constraint.mode == "restricted":
+            allowed_id = _restricted_scope_id(constraint)
+            statement = statement.where(
+                InterviewNote.application_id == allowed_id,
+                visible_parent,
+            )
+        else:
+            statement = statement.where(
+                or_(InterviewNote.application_id.is_(None), visible_parent)
+            )
+        returning_statement = statement.returning(InterviewNote.id)
+        with binding.session.no_autoflush:
+            rows = list(binding.session.scalars(returning_statement))
+        if len(rows) != 1:
+            if constraint.mode == "restricted" or len(rows) > 1:
+                raise ScopeAccessDenied("application scope denied")
+            return False
+        return True
 
     def delete_if_matches(self, note_id: int, expected: dict[str, object]) -> bool:
         statement = (
@@ -342,3 +509,73 @@ class NotesRepository:
         existing = session.scalar(existing_statement)
         if existing is not None:
             raise NoteBindingError(409, "Interview event already has a note")
+
+
+def _note_create_values(data: NoteCreate) -> dict[str, object]:
+    return {
+        "application_id": data.application_id,
+        "application_event_id": data.application_event_id,
+        "company": data.company,
+        "position": data.position,
+        "round": data.round,
+        "date": data.date,
+        "questions": data.questions,
+        "self_reflection": data.self_reflection,
+        "difficulty_points": data.difficulty_points,
+        "mood": data.mood,
+    }
+
+
+def _note_update_values(data: NoteUpdate) -> dict[str, object]:
+    values: dict[str, object] = {
+        "company": data.company,
+        "position": data.position,
+        "round": data.round,
+        "date": data.date,
+        "questions": data.questions,
+        "self_reflection": data.self_reflection,
+        "difficulty_points": data.difficulty_points,
+        "mood": data.mood,
+    }
+    if data.application_id is not UNSET:
+        values["application_id"] = data.application_id
+    if data.application_event_id is not UNSET:
+        values["application_event_id"] = data.application_event_id
+    return values
+
+
+def _valid_interview_event(
+    event_id: int,
+    application_id: Any,
+) -> ColumnElement[bool]:
+    return exists(
+        select(ApplicationEvent.id)
+        .join(Application, Application.id == ApplicationEvent.application_id)
+        .where(
+            ApplicationEvent.id == event_id,
+            ApplicationEvent.event_type == "interview",
+            ApplicationEvent.application_id == application_id,
+            Application.deleted_at.is_(None),
+        )
+    )
+
+
+def _raise_scoped_note_integrity(
+    exc: IntegrityError,
+    *,
+    event_id: int | None,
+    application_change: bool = False,
+) -> NoReturn:
+    detail = str(exc.orig).casefold()
+    if event_id is not None and (
+        "unique" in detail or "uq_interview_notes_event_main" in detail
+    ):
+        raise NoteBindingError(409, "Interview event already has a note") from exc
+    if event_id is not None:
+        raise NoteBindingError(
+            422,
+            "application_event_id must reference an interview event for the application",
+        ) from exc
+    if application_change:
+        raise NoteBindingError(422, "application_id cannot be changed") from exc
+    raise exc

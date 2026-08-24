@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from builtins import list as BuiltinList
 
-from sqlalchemy import and_, delete, select
+from sqlalchemy import and_, delete, exists, insert, literal, select, update
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql import Select
 
@@ -113,6 +113,45 @@ class ApplicationEventsRepository:
             finish_repository_write(session, self._session)
             session.refresh(event)
             return event
+
+    def create_application_event_scoped(
+        self,
+        constraint: ApplicationScopeConstraint,
+        data: ApplicationEventCreate,
+    ) -> ApplicationEvent:
+        binding = self._require_scoped(constraint)
+        application_id = require_scoped_positive_int64(
+            data.application_id, "application_id"
+        )
+        values = _event_values(data)
+        if constraint.mode == "unrestricted":
+            statement = (
+                insert(ApplicationEvent)
+                .values(**_event_values(data, tags_key="_tags"))
+                .returning(ApplicationEvent)
+            )
+        else:
+            allowed_id = _restricted_scope_id(constraint)
+            if application_id != allowed_id:
+                raise ScopeAccessDenied("application scope denied")
+            columns = tuple(values)
+            source = select(
+                *(literal(values[column]) for column in columns)
+            ).select_from(Application)
+            source = source.where(
+                Application.id == allowed_id,
+                Application.deleted_at.is_(None),
+            )
+            statement = (
+                insert(ApplicationEvent)
+                .from_select(columns, source)
+                .returning(ApplicationEvent)
+            )
+        with binding.session.no_autoflush:
+            rows = list(binding.session.scalars(statement))
+        if len(rows) != 1:
+            raise ScopeAccessDenied("application scope denied")
+        return rows[0]
 
     def list(
         self,
@@ -263,6 +302,46 @@ class ApplicationEventsRepository:
             session.refresh(event)
             return event
 
+    def update_application_event_scoped(
+        self,
+        constraint: ApplicationScopeConstraint,
+        event_id: int,
+        data: ApplicationEventCreate,
+    ) -> Optional[ApplicationEvent]:
+        binding = self._require_scoped(constraint)
+        event_id = require_scoped_positive_int64(event_id, "application event id")
+        application_id = require_scoped_positive_int64(
+            data.application_id, "application_id"
+        )
+        active_parent = exists(
+            select(Application.id).where(
+                Application.id == ApplicationEvent.application_id,
+                Application.deleted_at.is_(None),
+            )
+        )
+        statement = (
+            update(ApplicationEvent)
+            .where(ApplicationEvent.id == event_id)
+            .where(active_parent)
+        )
+        if constraint.mode == "restricted":
+            allowed_id = _restricted_scope_id(constraint)
+            if application_id != allowed_id:
+                raise ScopeAccessDenied("application scope denied")
+            statement = statement.where(ApplicationEvent.application_id == allowed_id)
+        statement = (
+            statement.values(**_event_values(data, tags_key="_tags"))
+            .returning(ApplicationEvent)
+            .execution_options(populate_existing=True)
+        )
+        with binding.session.no_autoflush:
+            rows = list(binding.session.scalars(statement))
+        if len(rows) != 1:
+            if constraint.mode == "restricted" or len(rows) > 1:
+                raise ScopeAccessDenied("application scope denied")
+            return None
+        return rows[0]
+
     def delete(self, event_id: int) -> bool:
         with repository_session(self._session_factory, self._session) as session:
             event = _get_visible_event(session, event_id)
@@ -271,6 +350,36 @@ class ApplicationEventsRepository:
             session.delete(event)
             finish_repository_write(session, self._session)
             return True
+
+    def delete_application_event_scoped(
+        self,
+        constraint: ApplicationScopeConstraint,
+        event_id: int,
+    ) -> bool:
+        binding = self._require_scoped(constraint)
+        event_id = require_scoped_positive_int64(event_id, "application event id")
+        active_parent = exists(
+            select(Application.id).where(
+                Application.id == ApplicationEvent.application_id,
+                Application.deleted_at.is_(None),
+            )
+        )
+        statement = (
+            delete(ApplicationEvent)
+            .where(ApplicationEvent.id == event_id)
+            .where(active_parent)
+        )
+        if constraint.mode == "restricted":
+            allowed_id = _restricted_scope_id(constraint)
+            statement = statement.where(ApplicationEvent.application_id == allowed_id)
+        returning_statement = statement.returning(ApplicationEvent.id)
+        with binding.session.no_autoflush:
+            rows = list(binding.session.scalars(returning_statement))
+        if len(rows) != 1:
+            if constraint.mode == "restricted" or len(rows) > 1:
+                raise ScopeAccessDenied("application scope denied")
+            return False
+        return True
 
     def delete_if_matches(self, event_id: int, expected: dict[str, object]) -> bool:
         scheduled_at = _expected_datetime(expected.get("scheduled_at"))
@@ -310,6 +419,26 @@ def _get_visible_event(session: Session, event_id: int) -> Optional[ApplicationE
         .where(Application.deleted_at.is_(None))
     )
     return event
+
+
+def _event_values(
+    data: ApplicationEventCreate,
+    *,
+    tags_key: str = "tags",
+) -> dict[str, object]:
+    return {
+        "application_id": data.application_id,
+        "event_type": data.event_type,
+        "subtype": data.subtype,
+        tags_key: json.dumps(data.tags or [], ensure_ascii=False),
+        "round": data.round,
+        "scheduled_at": data.scheduled_at,
+        "duration_minutes": data.duration_minutes,
+        "location": data.location,
+        "notes": data.notes,
+        "remind_at": data.remind_at,
+        "status": data.status or "todo",
+    }
 
 
 def _event_filters(

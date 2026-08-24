@@ -6,7 +6,8 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from builtins import list as BuiltinList
 
-from sqlalchemy import and_, exists, select, update
+from sqlalchemy import and_, case, exists, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from offerpilot.application_status import (
@@ -221,6 +222,74 @@ class ApplicationsRepository:
             finish_repository_write(session, self._session)
             session.refresh(app)
             return app
+
+    def update_application_status_scoped(
+        self,
+        constraint: ApplicationScopeConstraint,
+        app_id: int,
+        status: str,
+        closed_reason: str = "",
+    ) -> Optional[Application]:
+        """Update status through the final authority-constrained statement."""
+
+        binding = self._require_scoped(constraint)
+        app_id = require_scoped_positive_int64(app_id, "application id")
+        normalized_status = normalize_application_status(status)
+        normalized_reason = closed_reason.strip() if normalized_status == "closed" else ""
+
+        now = datetime.now(timezone.utc)
+        values: dict[str, object] = {
+            "status": normalized_status,
+            "closed_reason": (
+                normalized_reason
+                if normalized_status != "closed" or normalized_reason
+                else Application.closed_reason
+            ),
+            "updated_at": now,
+        }
+        if normalized_status != "closed":
+            values["company_name"] = case(
+                (Application.status == "closed", None),
+                else_=Application.company_name,
+            )
+        elif not normalized_reason:
+            values["company_name"] = case(
+                (Application.closed_reason == "", None),
+                else_=Application.company_name,
+            )
+        timestamp_attr = FIRST_STATUS_TIMESTAMP_ATTR[normalized_status]
+        timestamp_column = getattr(Application, timestamp_attr)
+        values[timestamp_attr] = case(
+            (timestamp_column.is_(None), now),
+            else_=timestamp_column,
+        )
+        statement = (
+            update(Application)
+            .where(Application.id == app_id)
+            .where(Application.deleted_at.is_(None))
+        )
+        if constraint.mode == "restricted":
+            allowed_id = _restricted_scope_id(constraint)
+            statement = statement.where(Application.id == allowed_id)
+        statement = statement.values(**values).returning(Application)
+        try:
+            with binding.session.no_autoflush:
+                rows = list(
+                    binding.session.scalars(
+                        statement.execution_options(populate_existing=True)
+                    )
+                )
+        except IntegrityError as exc:
+            if normalized_status != "closed":
+                raise ValueError("closed application cannot be reopened") from exc
+            raise ValueError(
+                "closed_reason is required when closing an application"
+            ) from exc
+        if len(rows) != 1:
+            if constraint.mode == "restricted" or len(rows) > 1:
+                raise ScopeAccessDenied("application scope denied")
+            return None
+        return _normalize_model_status(rows[0])
 
     def delete(self, app_id: int) -> None:
         with repository_session(self._session_factory, self._session) as session:

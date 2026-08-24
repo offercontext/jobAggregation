@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Optional
 
 from builtins import list as BuiltinList
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, exists, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from offerpilot.models import Application, Offer
@@ -197,9 +197,97 @@ class OffersRepository:
             session.refresh(offer)
             return offer
 
+    def update_offer_scoped(
+        self,
+        constraint: ApplicationScopeConstraint,
+        offer_id: int,
+        data: OfferCreate,
+    ) -> Optional[Offer]:
+        binding = self._require_scoped(constraint)
+        offer_id = require_scoped_positive_int64(offer_id, "offer id")
+        if data.application_id is not None:
+            require_scoped_positive_int64(data.application_id, "application_id")
+        statement = update(Offer).where(Offer.id == offer_id)
+        if constraint.mode == "restricted":
+            allowed_id = _restricted_scope_id(constraint)
+            if data.application_id != allowed_id:
+                raise ScopeAccessDenied("application scope denied")
+            active_parent = exists(
+                select(Application.id).where(
+                    Application.id == Offer.application_id,
+                    Application.deleted_at.is_(None),
+                )
+            )
+            statement = statement.where(
+                Offer.application_id == allowed_id,
+                active_parent,
+            )
+        statement = (
+            statement.values(**_offer_values(data))
+            .returning(Offer)
+            .execution_options(populate_existing=True)
+        )
+        with binding.session.no_autoflush:
+            rows = list(binding.session.scalars(statement))
+        if len(rows) != 1:
+            if constraint.mode == "restricted" or len(rows) > 1:
+                raise ScopeAccessDenied("application scope denied")
+            return None
+        return rows[0]
+
+    def save_offer_assessment_scoped(
+        self,
+        constraint: ApplicationScopeConstraint,
+        offer_id: int,
+        assessment: str,
+    ) -> Optional[Offer]:
+        binding = self._require_scoped(constraint)
+        offer_id = require_scoped_positive_int64(offer_id, "offer id")
+        statement = update(Offer).where(Offer.id == offer_id)
+        if constraint.mode == "restricted":
+            allowed_id = _restricted_scope_id(constraint)
+            active_parent = exists(
+                select(Application.id).where(
+                    Application.id == Offer.application_id,
+                    Application.deleted_at.is_(None),
+                )
+            )
+            statement = statement.where(
+                Offer.application_id == allowed_id,
+                active_parent,
+            )
+        statement = (
+            statement.values(assessment=assessment)
+            .returning(Offer)
+            .execution_options(populate_existing=True)
+        )
+        with binding.session.no_autoflush:
+            rows = list(binding.session.scalars(statement))
+        if len(rows) != 1:
+            if constraint.mode == "restricted" or len(rows) > 1:
+                raise ScopeAccessDenied("application scope denied")
+            return None
+        return rows[0]
+
     def delete(self, offer_id: int) -> None:
         with repository_session(self._session_factory, self._session) as session:
             offer = session.get(Offer, offer_id)
             if offer is not None:
                 session.delete(offer)
                 finish_repository_write(session, self._session)
+
+
+def _offer_values(data: OfferCreate) -> dict[str, object]:
+    return {
+        "company_name": data.company_name,
+        "position_name": data.position_name,
+        "status": data.status or "pending",
+        "base_monthly": data.base_monthly,
+        "months_per_year": data.months_per_year or 12,
+        "signing_bonus": data.signing_bonus,
+        "equity": data.equity,
+        "perks": data.perks,
+        "deadline": data.deadline,
+        "notes": data.notes,
+        "assessment": data.assessment,
+    }

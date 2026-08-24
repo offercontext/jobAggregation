@@ -5,7 +5,31 @@ import hashlib
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+
+from offerpilot.ai.agent_contracts import AgentToolResult, StalePendingActionError
+from offerpilot.ai.agent_loop import _delivery_error_payload
+from offerpilot.ai.tool_runtime.catalog import ToolCatalog
+from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
+from offerpilot.ai.tool_runtime.contracts import (
+    BindingTarget,
+    ProviderToolContract,
+    ToolFailure,
+    ToolSpec,
+)
+from offerpilot.ai.tool_runtime.pipeline import Rejected, prepare_call
+from offerpilot.ai.tool_runtime.rendering import render_compatibility
+from offerpilot.ai.types import ToolCall
+from offerpilot.ai.write_operations import WriteOperationError
+from offerpilot.agent_runtime.journal import NullRunRecorder
+from offerpilot.chat_transport import (
+    event_sse_name,
+    event_sse_payload,
+    outcome_http_payload,
+    outcome_http_status,
+)
+from offerpilot.pilot_runtime.contracts import ErrorEvent, RuntimeFailureOutcome
+from offerpilot.pilot_runtime.service import PilotRuntime
 
 from .golden import BASELINE, FIXTURES, canonical_json, load_golden
 
@@ -221,93 +245,241 @@ def test_existing_fixture_identities_and_compatibility_facts_are_pinned() -> Non
     }
 
 
-def test_pre_executor_sync_and_sse_bodies_are_exact() -> None:
-    baseline = load_golden("baseline_2427fa6.json")
-    pre_executor = baseline["compatibility"]["pre_executor"]
+class _DecodeProbeError(ValueError):
+    pass
 
-    def tool_body(summary: str) -> dict[str, object]:
-        return {
-            "tool_call_id": "synthetic-call",
-            "tool_name": "synthetic_tool",
-            "status": "error",
-            "summary": summary,
-            "evidence": [],
-            "affected_resources": [],
-            "changed_entities": [],
-        }
 
-    pipeline = {
-        "schema": (
-            "validation_error",
-            "schema_validation_failed",
-            "错误：工具参数验证失败，请检查后重试。",
-        ),
-        "decode": (
-            "internal_error",
-            "argument_decode_failed",
-            "错误：工具执行失败，请稍后重试。",
-        ),
-        "capability": (
-            "permission_denied",
-            "missing_capability",
-            "错误：permission denied",
-        ),
-        "binding": (
-            "internal_error",
-            "binding_resolution_failed",
-            "错误：工具执行失败，请稍后重试。",
-        ),
-        "preflight": (
-            "stale_state",
-            "preflight_failed",
-            "错误：当前状态已变化，请刷新后重试。",
-        ),
-    }
-    for stage, (category, code, message) in pipeline.items():
-        body = tool_body(message)
-        assert pre_executor["tool_pipeline"][stage] == {
-            "failure": {"category": category, "code": code, "message": message},
-            "sync": {"status": 200, "body": body},
-            "sse": {"event": "tool_result", "data": body},
-        }
+class _BindingProbeError(ValueError):
+    pass
 
-    confirmation = {
-        "approve_claim": (
-            "conflict",
-            "confirmation_claim_failed",
-            "错误：操作冲突，请刷新后重试。",
-            "待确认操作已过期或正在处理中，请刷新对话后重试。",
-        ),
-        "approve_authorization": (
-            "stale_state",
-            "authorization_mismatch",
-            "错误：当前状态已变化，请刷新后重试。",
-            "待确认操作已过期或正在处理中，请刷新对话后重试。",
-        ),
-        "modify_validation": (
-            "validation_error",
-            "invalid_confirmation",
-            "对话结果暂时无法保存。",
-            "对话结果暂时无法保存。",
-        ),
-    }
-    for action, (category, code, message, route_message) in confirmation.items():
-        route_code = "invalid_confirmation" if action == "modify_validation" else "stale_pending_action"
-        route_status = 422 if action == "modify_validation" else 409
-        body = {"error": route_message, "error_code": route_code}
-        assert pre_executor["confirmation"][action] == {
-            "failure": {"category": category, "code": code, "message": message},
-            "sync": {"status": route_status, "body": body},
-            "sse": {
-                "event": "error",
-                "data": {
-                    "code": route_code,
-                    "message": route_message,
-                    "retryable": True,
-                    "degraded": False,
-                },
+
+def _probe_context(
+    *, capabilities: frozenset[ToolCapability] = frozenset()
+) -> ToolExecutionContext:
+    repository = cast(Any, object())
+    return ToolExecutionContext(
+        capabilities=capabilities,
+        current_bindings={},
+        applications=repository,
+        events=repository,
+        notes=repository,
+        offers=repository,
+        resumes=repository,
+        jd_analyses=repository,
+        run_recorder=NullRunRecorder(),
+    )
+
+
+def _probe_spec(
+    name: str,
+    *,
+    parameters: dict[str, Any],
+    decoder: Any,
+    required_capabilities: frozenset[ToolCapability] = frozenset(),
+    binding_resolvers: tuple[Any, ...] = (),
+    preflight: Any = None,
+) -> ToolSpec[Any, Any]:
+    contract = ProviderToolContract(
+        payload={
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": name,
+                "parameters": parameters,
             },
+        },
+        name=name,
+        description=name,
+        parameters=parameters,
+    )
+    return ToolSpec(
+        contract=contract,
+        kind="read",
+        decoder=decoder,
+        executor=lambda args, _context: args,
+        required_capabilities=required_capabilities,
+        binding_resolvers=binding_resolvers,
+        preflight=preflight,
+        declared_failure_categories=frozenset(
+            {"validation_error", "permission_denied", "stale_state", "internal_error"}
+        ),
+        success_renderer=str,
+    )
+
+
+def _identity_decoder(values: dict[str, Any]) -> dict[str, Any]:
+    return dict(values)
+
+
+def _raise_decode(_values: dict[str, Any]) -> dict[str, Any]:
+    raise _DecodeProbeError
+
+
+def _raise_binding(_args: dict[str, Any], _context: ToolExecutionContext) -> BindingTarget:
+    raise _BindingProbeError
+
+
+def _return_preflight_failure(
+    _args: dict[str, Any], _context: ToolExecutionContext
+) -> ToolFailure:
+    return ToolFailure("stale_state", "preflight_failed")
+
+
+def _pipeline_projection(spec: ToolSpec[Any, Any], call: ToolCall, context: ToolExecutionContext) -> dict[str, Any]:
+    catalog = ToolCatalog([spec], expected_names=(spec.name,))
+    result = prepare_call(catalog, context, call)
+    assert isinstance(result, Rejected)
+    failure = result.failure
+    assert isinstance(failure, ToolFailure)
+    rendered = render_compatibility(spec, failure)
+    event = AgentToolResult(
+        tool_call_id=call.id,
+        operation_id="",
+        payload=_delivery_error_payload(call.id, spec.name, rendered),
+    )
+    return {
+        "failure": {
+            "category": failure.category,
+            "code": failure.code,
+            "compatibility_detail": failure.compatibility_detail,
+        },
+        "rendered_message": rendered,
+        "agent_tool_result": {
+            "event": "tool_result",
+            "payload": json.loads(canonical_json(dict(event.payload))),
+        },
+    }
+
+
+def test_pre_executor_tool_pipeline_is_produced_by_runtime() -> None:
+    baseline = load_golden("baseline_2427fa6.json")
+    pipeline = baseline["compatibility"]["pre_executor"]["tool_pipeline"]
+    simple_parameters = {"type": "object", "additionalProperties": False}
+    schema_parameters = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"id": {"type": "integer"}},
+        "required": ["id"],
+    }
+    cases = {
+        "schema_missing_required": (
+            _probe_spec(
+                "get_application",
+                parameters=schema_parameters,
+                decoder=_identity_decoder,
+            ),
+            _probe_context(),
+            ToolCall("schema-call", "get_application", "{}"),
+        ),
+        "decode_exception": (
+            _probe_spec(
+                "authority_decode_probe",
+                parameters=simple_parameters,
+                decoder=_raise_decode,
+            ),
+            _probe_context(),
+            ToolCall("decode-call", "authority_decode_probe", "{}"),
+        ),
+        "capability_missing": (
+            _probe_spec(
+                "authority_capability_probe",
+                parameters=simple_parameters,
+                decoder=_identity_decoder,
+                required_capabilities=frozenset({ToolCapability.APPLICATIONS_READ}),
+            ),
+            _probe_context(),
+            ToolCall("capability-call", "authority_capability_probe", "{}"),
+        ),
+        "binding_exception": (
+            _probe_spec(
+                "authority_binding_probe",
+                parameters=simple_parameters,
+                decoder=_identity_decoder,
+                binding_resolvers=(_raise_binding,),
+            ),
+            _probe_context(),
+            ToolCall("binding-call", "authority_binding_probe", "{}"),
+        ),
+        "preflight_returned_failure": (
+            _probe_spec(
+                "authority_preflight_probe",
+                parameters=simple_parameters,
+                decoder=_identity_decoder,
+                preflight=_return_preflight_failure,
+            ),
+            _probe_context(),
+            ToolCall("preflight-call", "authority_preflight_probe", "{}"),
+        ),
+    }
+    for stage, (spec, context, call) in cases.items():
+        expected = pipeline[stage]
+        assert "sync_http" not in expected
+        assert "sync" not in expected
+        assert "sse" not in expected
+        actual = _pipeline_projection(spec, call, context)
+        assert expected["failure"] == actual["failure"]
+        assert expected["rendered_message"] == actual["rendered_message"]
+        assert expected["agent_tool_result"] == actual["agent_tool_result"]
+        assert isinstance(expected["production_entrypoint"], str)
+        assert isinstance(expected["scenario"], str)
+        assert expected["failure_origin"] in {
+            "schema_missing_required",
+            "decoder_exception",
+            "missing_capability",
+            "binding_resolver_exception",
+            "preflight_returned_tool_failure",
         }
+
+
+def _confirmation_route_projection(outcome: Any) -> dict[str, Any]:
+    assert isinstance(outcome, RuntimeFailureOutcome)
+    event = ErrorEvent(
+        outcome.code,
+        outcome.message,
+        outcome.retryable,
+        outcome.degraded,
+    )
+    return {
+        "outcome": {
+            "code": outcome.code.value,
+            "message": outcome.message,
+            "status_code": outcome.status_code,
+            "retryable": outcome.retryable,
+            "degraded": outcome.degraded,
+        },
+        "sync_http": {
+            "status": outcome_http_status(outcome),
+            "body": outcome_http_payload(outcome),
+        },
+        "sse": {
+            "http_status": 200,
+            "event": event_sse_name(event),
+            "data": event_sse_payload(event),
+        },
+    }
+
+
+def test_confirmation_routes_use_runtime_mapping_and_transport() -> None:
+    baseline = load_golden("baseline_2427fa6.json")
+    confirmation = baseline["compatibility"]["pre_executor"]["confirmation"]
+    cases = {
+        "approve_stale": PilotRuntime._provider_confirmation_failure(
+            StalePendingActionError()
+        ),
+        "modify_invalid": PilotRuntime._confirmation_failure(
+            WriteOperationError("invalid_confirmation")
+        ),
+    }
+    for action, outcome in cases.items():
+        expected = confirmation[action]
+        actual = _confirmation_route_projection(outcome)
+        assert expected["outcome"] == actual["outcome"]
+        assert expected["sync_http"] == actual["sync_http"]
+        assert expected["sse"] == actual["sse"]
+        assert expected["sse"]["http_status"] == 200
+        assert expected["sse"]["event"] == "error"
+        assert isinstance(expected["production_entrypoint"], str)
+        assert isinstance(expected["scenario"], str)
 
 
 def test_call_count_and_provider_free_baselines_are_explicit() -> None:

@@ -965,6 +965,16 @@ class ConfirmationCoordinator:
             ),
         )
 
+    def operation_preheader(self, request: ConfirmationRequest) -> LedgerOperationPreheader:
+        """Load the bounded Ledger route identity exactly once for Runtime dispatch."""
+
+        if not isinstance(request, ConfirmationRequest):
+            raise TypeError("request must be a ConfirmationRequest")
+        preheader = self._preheader(request)
+        if type(preheader) is not LedgerOperationPreheader:
+            raise WriteOperationError("operation_unavailable")
+        return preheader
+
     def _rejection_fingerprint(
         self,
         request: ConfirmationRequest,
@@ -1000,9 +1010,7 @@ class ConfirmationCoordinator:
             rejection_feedback_present=request.rejection_feedback_present,
             rejection_feedback=request.rejection_feedback,
             confirmation_token_fingerprint=stored,
-            proposal_fingerprint=str(
-                _attribute(operation, "proposal_fingerprint", "") or ""
-            ),
+            proposal_fingerprint=str(_attribute(operation, "proposal_fingerprint", "") or ""),
         )
 
     def _fingerprint(
@@ -1070,12 +1078,16 @@ class ConfirmationCoordinator:
         getter = _callable(self.dependencies.persistence, ("get_pending_action",))
         if getter is None:
             raise WriteOperationError("operation_unavailable")
-        pending = _pending(_invoke(getter, {"conversation_id": conversation_id}, (conversation_id,)))
+        pending = _pending(
+            _invoke(getter, {"conversation_id": conversation_id}, (conversation_id,))
+        )
         if pending is None:
             raise WriteOperationError("stale_pending_action")
         return pending
 
-    def _validate_live_identity(self, conversation_id: int, pending: PendingAction, operation: object) -> None:
+    def _validate_live_identity(
+        self, conversation_id: int, pending: PendingAction, operation: object
+    ) -> None:
         if _attribute(operation, "conversation_id") != conversation_id:
             raise WriteOperationError("operation_identity_conflict")
         for field_name in ("tool_call_id", "tool_name"):
@@ -1083,7 +1095,10 @@ class ConfirmationCoordinator:
                 getattr(pending, field_name)
             ):
                 raise WriteOperationError("operation_identity_conflict")
-        if not pending.operation_id or str(_attribute(operation, "id", "") or "") != pending.operation_id:
+        if (
+            not pending.operation_id
+            or str(_attribute(operation, "id", "") or "") != pending.operation_id
+        ):
             raise WriteOperationError("operation_identity_conflict")
 
     def terminal_replay(
@@ -1152,7 +1167,11 @@ class ConfirmationCoordinator:
         replay_function = _callable(repository, ("replay",))
         if replay_function is None:
             raise WriteOperationError("operation_unavailable")
-        replay = _invoke(replay_function, {"operation": operation, "request_fingerprint": fingerprint}, (operation, fingerprint))
+        replay = _invoke(
+            replay_function,
+            {"operation": operation, "request_fingerprint": fingerprint},
+            (operation, fingerprint),
+        )
         if not isinstance(replay, OperationReplay):
             raise WriteOperationError("operation_result_unknown", retryable=True)
         if replay.delivery_status != "pending":
@@ -1160,13 +1179,19 @@ class ConfirmationCoordinator:
         converge = _callable(repository, ("converge_expired_delivery",))
         if converge is None:
             raise WriteOperationError("operation_delivery_unknown")
-        converged = _invoke(converge, {"operation_id": operation_id, "id": operation_id}, (operation_id,))
+        converged = _invoke(
+            converge, {"operation_id": operation_id, "id": operation_id}, (operation_id,)
+        )
         if isinstance(converged, OperationUnknown):
             raise WriteOperationError(converged.code, retryable=converged.retryable)
         fresh = self._operation(operation_id)
         if fresh is None:
             raise WriteOperationError("operation_result_unknown", retryable=True)
-        replayed = _invoke(replay_function, {"operation": fresh, "request_fingerprint": fingerprint}, (fresh, fingerprint))
+        replayed = _invoke(
+            replay_function,
+            {"operation": fresh, "request_fingerprint": fingerprint},
+            (fresh, fingerprint),
+        )
         if not isinstance(replayed, OperationReplay):
             raise WriteOperationError("operation_result_unknown", retryable=True)
         return replayed
@@ -1175,22 +1200,44 @@ class ConfirmationCoordinator:
     replay_terminal = terminal_replay
 
     def replay_outcome(
-        self, request: ConfirmationRequest
+        self,
+        request: ConfirmationRequest,
+        *,
+        preheader: LedgerOperationPreheader | None = None,
     ) -> OperationReplayOutcome | ConfirmationRequiredOutcome | None:
-        replay = self.terminal_replay(request)
+        operation: object | None = None
+        if preheader is not None:
+            if type(preheader) is not LedgerOperationPreheader:
+                raise TypeError("preheader must be an exact LedgerOperationPreheader")
+            operation = preheader.operation
+            if _attribute(operation, "conversation_id") != request.conversation_id:
+                raise WriteOperationError("operation_identity_conflict")
+            if request.operation_id:
+                try:
+                    requested_id = str(UUID(request.operation_id))
+                    operation_id = str(UUID(str(_attribute(operation, "id", "") or "")))
+                except (TypeError, ValueError) as exc:
+                    raise WriteOperationError("operation_identity_conflict") from exc
+                if requested_id != operation_id:
+                    raise WriteOperationError("operation_identity_conflict")
+        replay = self.terminal_replay(request, operation=operation)
         if replay is None:
             return None
-        operation: object | None = None
+        metadata_operation = operation
         try:
             transport = json.loads(replay.payload.transport_json or "{}")
         except (TypeError, ValueError, json.JSONDecodeError):
             transport = None
-        if not isinstance(transport, Mapping) or not transport.get("tool_call_id") or not transport.get("tool_name"):
-            operation = self._operation(replay.operation_id)
+        if (
+            not isinstance(transport, Mapping)
+            or not transport.get("tool_call_id")
+            or not transport.get("tool_name")
+        ):
+            metadata_operation = self._operation(replay.operation_id)
         return _runtime_replay(
             replay,
             request.conversation_id,
-            operation=operation,
+            operation=metadata_operation,
         )
 
     def preflight_live(

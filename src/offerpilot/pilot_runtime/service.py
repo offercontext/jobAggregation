@@ -46,7 +46,11 @@ from offerpilot.ai.tool_runtime.legacy import LEGACY_DETERMINISTIC_NAMES
 from offerpilot.ai.tool_runtime.journal import journal_shape_digest
 from offerpilot.ai.tool_specs.catalog import editable_fields_for_tool
 from offerpilot.ai.types import Message, ToolCall
-from offerpilot.ai.write_operations import OperationReplay, WriteOperationError
+from offerpilot.ai.write_operations import (
+    LedgerOperationPreheader,
+    OperationReplay,
+    WriteOperationError,
+)
 from offerpilot.agent_runtime.events import (
     ContextManifestInput,
     normalize_context_identity,
@@ -105,7 +109,11 @@ from .errors import (
     RuntimeFailureCode,
     RuntimeTransportAborted,
 )
-from .deterministic import DeterministicExecution, DeterministicPilotAdapter
+from .deterministic import (
+    DeterministicExecution,
+    DeterministicPilotAdapter,
+    _DeterministicConfirmationPreflight,
+)
 from .event_sink import emit_runtime_event, require_runtime_active
 from .continuation import (
     ConfirmationApprovedWritePort,
@@ -2216,8 +2224,101 @@ class PilotRuntime:
             return self._failure(
                 RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400
             )
+        self._phase("validate")
+        try:
+            self._validate(request)
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except (PendingActionValidationError, ValueError):
+            self._mark_completed_if_active(control)
+            return self._confirmation_failure(WriteOperationError("invalid_confirmation"))
+        except Exception as exc:
+            self._mark_completed_if_active(control)
+            return self._confirmation_failure(exc)
+        effective_cancel_check = cancel_check or (lambda: False)
+        self._check_cancel(effective_cancel_check, control)
+
         continuation = self._confirmation_coordinator()
-        if continuation is not None and not self._is_deterministic_confirmation(request):
+        route_preheader: LedgerOperationPreheader | None = None
+        legacy_deterministic = False
+        legacy_preflight: _DeterministicConfirmationPreflight | None = None
+        deterministic = self._dependencies.deterministic
+        if continuation is not None and request.approved:
+            try:
+                route_preheader = continuation.operation_preheader(request)
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                raise
+            except Exception as exc:
+                self._mark_completed_if_active(control)
+                return self._confirmation_failure(exc)
+            route_operation = route_preheader.operation
+            adapter_kind = str(_attribute(route_operation, "adapter_kind", "") or "")
+            route_tool_name = str(_attribute(route_operation, "tool_name", "") or "")
+            if (
+                adapter_kind == "legacy_deterministic"
+                and route_tool_name not in LEGACY_DETERMINISTIC_NAMES
+            ):
+                self._mark_completed_if_active(control)
+                return DeterministicPilotAdapter._write_error(
+                    WriteOperationError("operation_identity_conflict")
+                )
+            legacy_deterministic = self._is_deterministic_confirmation(
+                request,
+                operation=route_operation,
+            )
+            if legacy_deterministic:
+                if type(deterministic) is not DeterministicPilotAdapter:
+                    self._mark_completed_if_active(control)
+                    return self._failure(
+                        RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                        "unsupported runtime route",
+                        400,
+                    )
+                deterministic_operations = _attribute(
+                    _attribute(deterministic, "dependencies"), "write_operations"
+                )
+                coordinator_operations = _attribute(
+                    _attribute(continuation, "dependencies"), "write_operations"
+                )
+                if deterministic_operations is not coordinator_operations:
+                    self._mark_completed_if_active(control)
+                    return self._failure(
+                        RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                        "写入账本暂不可用。",
+                        503,
+                        retryable=True,
+                    )
+                try:
+                    candidate = deterministic.preflight_confirmation(
+                        request,
+                        preheader=route_preheader,
+                        transport=resolved_transport,
+                    )
+                except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                    raise
+                except Exception as exc:
+                    self._mark_completed_if_active(control)
+                    return self._confirmation_failure(exc)
+                if type(candidate) is not _DeterministicConfirmationPreflight:
+                    self._mark_completed_if_active(control)
+                    return self._failure(
+                        RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                        "unsupported runtime route",
+                        400,
+                    )
+                legacy_preflight = candidate
+                if candidate.preheader is not route_preheader or not candidate.matched:
+                    self._mark_completed_if_active(control)
+                    return self._failure(
+                        RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                        "写入账本暂不可用。",
+                        503,
+                        retryable=True,
+                    )
+                if candidate.execution is not None:
+                    self._mark_completed_if_active(control)
+                    return candidate.execution.outcome
+        if continuation is not None and not legacy_deterministic:
             return self._continue_ledger_confirmation(
                 continuation,
                 request,
@@ -2225,12 +2326,10 @@ class PilotRuntime:
                 event_sink=event_sink,
                 signal_sink=signal_sink,
                 execution_host=execution_host,
-                cancel_check=cancel_check or (lambda: False),
+                cancel_check=effective_cancel_check,
                 transport=resolved_transport,
+                replay_preheader=route_preheader,
             )
-        self._phase("validate")
-        self._validate(request)
-        self._check_cancel(lambda: False, control)
         conversation = self._load_confirmation_conversation(request)
         if conversation is None:
             self._mark_completed_if_active(control)
@@ -2261,12 +2360,15 @@ class PilotRuntime:
             except ValueError as exc:
                 self._mark_completed_if_active(control)
                 return self._failure(RuntimeFailureCode.INVALID_CONFIRMATION, str(exc), 422)
-        terminal_probe = _callable(adapter, ("is_terminal_replay",))
-        terminal_replay = (
-            bool(_invoke(terminal_probe, {"request": request}, (request,)))
-            if terminal_probe is not None
-            else False
-        )
+        if legacy_preflight is not None:
+            terminal_replay = legacy_preflight.execution is not None
+        else:
+            terminal_probe = _callable(adapter, ("is_terminal_replay",))
+            terminal_replay = (
+                bool(_invoke(terminal_probe, {"request": request}, (request,)))
+                if terminal_probe is not None
+                else False
+            )
         if (
             not terminal_replay
             and request.approved
@@ -2288,12 +2390,17 @@ class PilotRuntime:
             )
         )
         try:
-            execution = adapter.confirm(
-                request,
-                conversation,
-                transport=resolved_transport,
-                on_confirmation_attempt=on_attempt,
-                on_tool_result=on_result,
+            execution = _invoke(
+                adapter.confirm,
+                {
+                    "request": request,
+                    "conversation": conversation,
+                    "transport": resolved_transport,
+                    "on_confirmation_attempt": on_attempt,
+                    "on_tool_result": on_result,
+                    "preflight": legacy_preflight,
+                },
+                (request, conversation),
             )
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
             recorder = journal_holder.get("recorder")
@@ -2344,44 +2451,18 @@ class PilotRuntime:
     def _confirmation_coordinator(self) -> ConfirmationCoordinator | None:
         return self._dependencies.confirmation_coordinator or self._dependencies.continuation
 
-    def _is_deterministic_confirmation(self, request: ConfirmationRequest) -> bool:
+    def _is_deterministic_confirmation(
+        self,
+        request: ConfirmationRequest,
+        *,
+        operation: object | None = None,
+    ) -> bool:
         """Select the closed deterministic adapter from the persisted operation kind."""
 
         if not isinstance(request, ConfirmationRequest) or not request.approved:
             return False
-        coordinator = self._confirmation_coordinator()
-        write_operations = _attribute(_attribute(coordinator, "dependencies"), "write_operations")
-        operation_id = request.operation_id
-        operation: object | None = None
-        if not isinstance(operation_id, str) or not operation_id:
-            preheader = _callable(
-                write_operations,
-                ("operation_preheader",),
-            )
-            if preheader is None:
-                return False
-            try:
-                bounded = _invoke(
-                    preheader,
-                    {
-                        "conversation_id": request.conversation_id,
-                        "operation_id": None,
-                    },
-                    (request.conversation_id, None),
-                )
-            except WriteOperationError:
-                # The coordinator owns the public stale/unavailable mapping.
-                return False
-            operation = _attribute(bounded, "operation")
-        else:
-            getter = _callable(write_operations, ("get", "get_operation"))
-            if getter is None:
-                return False
-            operation = _invoke(
-                getter,
-                {"operation_id": operation_id, "id": operation_id},
-                (operation_id,),
-            )
+        if operation is None:
+            return False
         return (
             str(_attribute(operation, "adapter_kind", "") or "") == "legacy_deterministic"
             and str(_attribute(operation, "tool_name", "") or "") in LEGACY_DETERMINISTIC_NAMES
@@ -3028,6 +3109,7 @@ class PilotRuntime:
         execution_host: AgentExecutionHost[object] | None,
         cancel_check: Callable[[], bool],
         transport: RuntimeTransportContext,
+        replay_preheader: LedgerOperationPreheader | None,
     ) -> RuntimeOutcome:
         """Run a Ledger-backed confirmation without opening the old route state.
 
@@ -3036,19 +3118,6 @@ class PilotRuntime:
         Pending enters the Agent Driver's typed ``execute`` entry; all result
         persistence remains a coordinator atom.
         """
-
-        self._phase("validate")
-        try:
-            self._validate(request)
-        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
-            raise
-        except (PendingActionValidationError, ValueError):
-            self._mark_completed_if_active(control)
-            return self._confirmation_failure(WriteOperationError("invalid_confirmation"))
-        except Exception as exc:
-            self._mark_completed_if_active(control)
-            return self._confirmation_failure(exc)
-        self._check_cancel(cancel_check, control)
 
         # Rejection is the direct worker path.  It must not load a Conversation
         # or resolve a model before the Pending/Ledger CAS has converged.
@@ -3070,7 +3139,7 @@ class PilotRuntime:
                 raise
 
         try:
-            replay = coordinator.replay_outcome(request)
+            replay = coordinator.replay_outcome(request, preheader=replay_preheader)
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
             raise
         except Exception as exc:
@@ -3760,10 +3829,110 @@ class PilotRuntime:
         confirmation_coordinator = self._confirmation_coordinator()
         stream_replay: RuntimeOutcome | None = None
         preflight_pending: PendingAction | None = None
+        route_preheader: LedgerOperationPreheader | None = None
+        legacy_deterministic = False
+        legacy_preflight: _DeterministicConfirmationPreflight | None = None
+        deterministic = self._dependencies.deterministic
+        if (
+            isinstance(request, ConfirmationRequest)
+            and request.approved
+            and confirmation_coordinator is not None
+        ):
+            try:
+                route_preheader = confirmation_coordinator.operation_preheader(request)
+            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                raise
+            except Exception as exc:
+                return self._stream_immediate(self._confirmation_failure(exc), invocation_control)
+            route_operation = route_preheader.operation
+            adapter_kind = str(_attribute(route_operation, "adapter_kind", "") or "")
+            route_tool_name = str(_attribute(route_operation, "tool_name", "") or "")
+            if (
+                adapter_kind == "legacy_deterministic"
+                and route_tool_name not in LEGACY_DETERMINISTIC_NAMES
+            ):
+                return self._stream_immediate(
+                    DeterministicPilotAdapter._write_error(
+                        WriteOperationError("operation_identity_conflict")
+                    ),
+                    invocation_control,
+                )
+            legacy_deterministic = self._is_deterministic_confirmation(
+                request,
+                operation=route_operation,
+            )
+            if legacy_deterministic:
+                if type(deterministic) is not DeterministicPilotAdapter:
+                    return self._stream_immediate(
+                        self._failure(
+                            RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                            "unsupported runtime route",
+                            400,
+                        ),
+                        invocation_control,
+                    )
+                deterministic_operations = _attribute(
+                    _attribute(deterministic, "dependencies"), "write_operations"
+                )
+                coordinator_operations = _attribute(
+                    _attribute(confirmation_coordinator, "dependencies"),
+                    "write_operations",
+                )
+                if deterministic_operations is not coordinator_operations:
+                    return self._stream_immediate(
+                        self._failure(
+                            RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                            "写入账本暂不可用。",
+                            503,
+                            retryable=True,
+                        ),
+                        invocation_control,
+                    )
+                try:
+                    candidate = deterministic.preflight_confirmation(
+                        request,
+                        preheader=route_preheader,
+                        transport=transport,
+                    )
+                except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                    raise
+                except Exception as exc:
+                    return self._stream_immediate(
+                        self._confirmation_failure(exc), invocation_control
+                    )
+                if type(candidate) is not _DeterministicConfirmationPreflight:
+                    return self._stream_immediate(
+                        self._failure(
+                            RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                            "unsupported runtime route",
+                            400,
+                        ),
+                        invocation_control,
+                    )
+                legacy_preflight = candidate
+                if candidate.preheader is not route_preheader or not candidate.matched:
+                    return self._stream_immediate(
+                        self._failure(
+                            RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                            "写入账本暂不可用。",
+                            503,
+                            retryable=True,
+                        ),
+                        invocation_control,
+                    )
+                if candidate.execution is not None:
+                    return self._prepare_deterministic_stream(
+                        candidate.execution,
+                        request=request,
+                        conversation=None,
+                        conversation_id=request.conversation_id,
+                        transport=transport,
+                        invocation_control=invocation_control,
+                    )
         if (
             isinstance(request, ConfirmationRequest)
             and confirmation_coordinator is not None
-            and not self._is_deterministic_confirmation(request)
+            and not legacy_deterministic
         ):
             if not request.approved:
                 # The reject coordinator owns terminal replay as part of the
@@ -3779,7 +3948,10 @@ class PilotRuntime:
                     terminal_checked=True,
                 )
             try:
-                stream_replay = confirmation_coordinator.replay_outcome(request)
+                stream_replay = confirmation_coordinator.replay_outcome(
+                    request,
+                    preheader=route_preheader,
+                )
             except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
                 raise
             except Exception as exc:
@@ -3935,7 +4107,7 @@ class PilotRuntime:
         if (
             isinstance(request, ConfirmationRequest)
             and continuation is not None
-            and not self._is_deterministic_confirmation(request)
+            and not legacy_deterministic
         ):
             return self._prepare_ledger_confirmation_stream(
                 continuation,
@@ -3967,11 +4139,8 @@ class PilotRuntime:
                         self._failure(RuntimeFailureCode.INVALID_CONFIRMATION, str(exc), 422),
                         invocation_control,
                     )
-            terminal_probe = _callable(adapter, ("is_terminal_replay",))
-            terminal_replay = (
-                bool(_invoke(terminal_probe, {"request": request}, (request,)))
-                if terminal_probe is not None
-                else False
+            terminal_replay = bool(
+                legacy_preflight is not None and legacy_preflight.execution is not None
             )
             if (
                 not terminal_replay
@@ -3996,12 +4165,17 @@ class PilotRuntime:
                 )
             )
             try:
-                execution = adapter.confirm(
-                    request,
-                    conversation,
-                    transport=transport,
-                    on_confirmation_attempt=on_attempt,
-                    on_tool_result=on_result,
+                execution = _invoke(
+                    adapter.confirm,
+                    {
+                        "request": request,
+                        "conversation": conversation,
+                        "transport": transport,
+                        "on_confirmation_attempt": on_attempt,
+                        "on_tool_result": on_result,
+                        "preflight": legacy_preflight,
+                    },
+                    (request, conversation),
                 )
             except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
                 recorder = journal_holder.get("recorder")

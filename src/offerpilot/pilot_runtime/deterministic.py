@@ -46,6 +46,7 @@ from offerpilot.ai.tool_runtime.legacy import (
 from offerpilot.ai.tool_specs.legacy import build_legacy_deterministic_catalog
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.ai.write_operations import (
+    LedgerOperationPreheader,
     OperationCommitted,
     OperationFailed,
     OperationReplay,
@@ -200,6 +201,32 @@ class DeterministicExecution:
             type(self.input_message_id) is not int or self.input_message_id <= 0
         ):
             raise ValueError("input_message_id must be a positive integer or None")
+
+
+@dataclass(frozen=True, slots=True)
+class _DeterministicConfirmationPreflight:
+    """One bounded Ledger decision for Legacy confirmation routing and replay."""
+
+    preheader: LedgerOperationPreheader | None = field(repr=False, compare=False)
+    matched: bool
+    execution: DeterministicExecution | None = None
+    route_identity: tuple[int, str, str, str] | None = field(
+        default=None, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        if type(self.matched) is not bool:
+            raise TypeError("matched must be a bool")
+        if self.preheader is not None and type(self.preheader) is not LedgerOperationPreheader:
+            raise TypeError("preheader must be an exact LedgerOperationPreheader")
+        if self.matched and self.preheader is None:
+            raise ValueError("matched preflight requires a preheader")
+        if self.matched and self.route_identity is None:
+            raise ValueError("matched preflight requires a route identity")
+
+    @property
+    def operation(self) -> object | None:
+        return self.preheader.operation if self.preheader is not None else None
 
 
 def _attribute(value: object, name: str, default: object = None) -> object:
@@ -583,9 +610,84 @@ class DeterministicPilotAdapter:
         operation = _callable(operations, ("get",))
         if operation is None:
             return False
-        value = _invoke(operation, {"operation_id": operation_id, "id": operation_id}, (operation_id,))
+        value = _invoke(
+            operation, {"operation_id": operation_id, "id": operation_id}, (operation_id,)
+        )
         status = _attribute(value, "status", None)
         return value is not None and status is not None and str(status) != "proposed"
+
+    def preflight_confirmation(
+        self,
+        request: ConfirmationRequest,
+        *,
+        preheader: LedgerOperationPreheader | None = None,
+        transport: RuntimeTransportContext | None = None,
+    ) -> _DeterministicConfirmationPreflight:
+        """Classify and replay one approved Legacy operation without Conversation state."""
+
+        if not isinstance(request, ConfirmationRequest):
+            raise TypeError("request must be a ConfirmationRequest")
+        if not request.approved:
+            return _DeterministicConfirmationPreflight(None, False)
+        if type(preheader) is not LedgerOperationPreheader:
+            raise TypeError("preheader must be an exact LedgerOperationPreheader")
+        operation = _attribute(preheader, "operation", None)
+        adapter_kind = str(_attribute(operation, "adapter_kind", "") or "")
+        if adapter_kind != "legacy_deterministic":
+            return _DeterministicConfirmationPreflight(preheader, False)
+        tool_name = str(_attribute(operation, "tool_name", "") or "")
+        route_identity = (
+            request.conversation_id,
+            str(_attribute(operation, "id", "") or ""),
+            str(_attribute(operation, "tool_call_id", "") or ""),
+            tool_name,
+        )
+        if tool_name not in LEGACY_DETERMINISTIC_NAMES:
+            return _DeterministicConfirmationPreflight(
+                preheader,
+                True,
+                DeterministicExecution(
+                    self._write_error(WriteOperationError("operation_identity_conflict")),
+                    preparation_kind=PreparationKind.REPLAY,
+                ),
+                route_identity,
+            )
+        pointer = _attribute(preheader, "pending_pointer", None)
+        proposed = str(_attribute(operation, "status", "") or "") == "proposed"
+        proposed_identity_matches = bool(
+            not proposed
+            or (
+                pointer is not None
+                and _attribute(pointer, "conversation_id", None) == request.conversation_id
+                and str(_attribute(pointer, "operation_id", "") or "")
+                == str(_attribute(operation, "id", "") or "")
+                and str(_attribute(pointer, "tool_call_id", "") or "")
+                == str(_attribute(operation, "tool_call_id", "") or "")
+                and str(_attribute(pointer, "tool_name", "") or "") == tool_name
+            )
+        )
+        if not proposed_identity_matches:
+            return _DeterministicConfirmationPreflight(
+                preheader,
+                True,
+                DeterministicExecution(
+                    self._write_error(WriteOperationError("operation_integrity_error")),
+                    preparation_kind=PreparationKind.REPLAY,
+                ),
+                route_identity,
+            )
+        execution = self._terminal_replay(
+            request,
+            request.conversation_id,
+            transport=transport,
+            operation=operation,
+        )
+        return _DeterministicConfirmationPreflight(
+            preheader,
+            True,
+            execution,
+            route_identity,
+        )
 
     def start_turn(
         self,
@@ -775,6 +877,7 @@ class DeterministicPilotAdapter:
         transport: RuntimeTransportContext | None = None,
         on_confirmation_attempt: Callable[[PendingAction, bool], object] | None = None,
         on_tool_result: Callable[[PendingAction, str, bool], object] | None = None,
+        preflight: _DeterministicConfirmationPreflight | None = None,
     ) -> DeterministicExecution:
         conversation_id = self._conversation_id(conversation)
         if not request.approved and not request.edited_args.is_missing():
@@ -795,36 +898,76 @@ class DeterministicPilotAdapter:
                 ),
                 preparation_kind=PreparationKind.DETERMINISTIC_CONFIRMATION,
             )
-        terminal = self._terminal_replay(
-            request,
-            conversation_id,
-            transport=transport,
-        )
+        if preflight is not None:
+            if type(preflight) is not _DeterministicConfirmationPreflight:
+                raise TypeError("preflight must be an exact deterministic confirmation preflight")
+            if not preflight.matched:
+                raise ValueError("preflight does not authorize the Legacy route")
+            terminal = preflight.execution
+            if terminal is None:
+                terminal = self._fresh_terminal_replay(
+                    request,
+                    conversation_id,
+                    preflight=preflight,
+                    transport=transport,
+                )
+        else:
+            terminal = self._terminal_replay(
+                request,
+                conversation_id,
+                transport=transport,
+            )
         if terminal is not None:
             return terminal
         pending = self._pending_for(conversation)
         if pending is None or pending.tool_name not in LEGACY_DETERMINISTIC_NAMES:
             return DeterministicExecution(
-                _error(RuntimeFailureCode.STALE_PENDING_ACTION, "待确认操作已过期，请刷新后重试。", 409),
+                _error(
+                    RuntimeFailureCode.STALE_PENDING_ACTION, "待确认操作已过期，请刷新后重试。", 409
+                ),
                 preparation_kind=PreparationKind.DETERMINISTIC_CONFIRMATION,
             )
+        if preflight is not None:
+            pending_route_identity = (
+                conversation_id,
+                pending.operation_id,
+                pending.tool_call_id,
+                pending.tool_name,
+            )
+            if pending_route_identity != preflight.route_identity:
+                return DeterministicExecution(
+                    self._write_error(WriteOperationError("operation_identity_conflict")),
+                    preparation_kind=PreparationKind.DETERMINISTIC_CONFIRMATION,
+                )
         if request.operation_id is not None and request.operation_id != pending.operation_id:
             return DeterministicExecution(
-                _error(RuntimeFailureCode.OPERATION_IDENTITY_CONFLICT, "operation identity conflict", 409),
+                _error(
+                    RuntimeFailureCode.OPERATION_IDENTITY_CONFLICT,
+                    "operation identity conflict",
+                    409,
+                ),
                 preparation_kind=PreparationKind.DETERMINISTIC_CONFIRMATION,
             )
         expected_token = _confirmation_token(pending)
         token = request.confirmation_token or expected_token
         if not compare_digest(token, expected_token):
             return DeterministicExecution(
-                _error(RuntimeFailureCode.STALE_PENDING_ACTION, "待确认操作已被更新，请刷新后重试。", 409),
+                _error(
+                    RuntimeFailureCode.STALE_PENDING_ACTION,
+                    "待确认操作已被更新，请刷新后重试。",
+                    409,
+                ),
                 preparation_kind=PreparationKind.DETERMINISTIC_CONFIRMATION,
             )
         if not request.confirmation_token and (
             not request.edited_args.is_missing() or request.rejection_feedback
         ):
             return DeterministicExecution(
-                _error(RuntimeFailureCode.INVALID_CONFIRMATION, "confirmation_token is required when changing confirmation details", 422),
+                _error(
+                    RuntimeFailureCode.INVALID_CONFIRMATION,
+                    "confirmation_token is required when changing confirmation details",
+                    422,
+                ),
                 preparation_kind=PreparationKind.DETERMINISTIC_CONFIRMATION,
             )
 
@@ -950,10 +1093,17 @@ class DeterministicPilotAdapter:
             return self._replay_execution(conversation_id, rejection, fingerprint, transport=transport)
         if not isinstance(rejection, (OperationCommitted, OperationFailed)):
             return DeterministicExecution(
-                _error(RuntimeFailureCode.OPERATION_RESULT_UNKNOWN, "写入结果暂时无法确认，请保留确认卡后重试。", 503, retryable=True),
+                _error(
+                    RuntimeFailureCode.OPERATION_RESULT_UNKNOWN,
+                    "写入结果暂时无法确认，请保留确认卡后重试。",
+                    503,
+                    retryable=True,
+                ),
                 preparation_kind=PreparationKind.DETERMINISTIC_CONFIRMATION,
             )
-        origin = Message(role="tool", content=_CANCELLED_TOOL_RESULT, tool_call_id=pending.tool_call_id)
+        origin = Message(
+            role="tool", content=_CANCELLED_TOOL_RESULT, tool_call_id=pending.tool_call_id
+        )
         response = self._deliver_terminal(
             conversation_id,
             pending,
@@ -968,31 +1118,93 @@ class DeterministicPilotAdapter:
     execute_confirmation = confirm
     continue_confirmation = confirm
 
+    def _fresh_terminal_replay(
+        self,
+        request: ConfirmationRequest,
+        conversation_id: int,
+        *,
+        preflight: _DeterministicConfirmationPreflight,
+        transport: RuntimeTransportContext | None,
+    ) -> DeterministicExecution | None:
+        """Close the proposed-to-terminal race with one authoritative fresh read."""
+
+        operations = self.dependencies.write_operations
+        getter = _callable(operations, ("get",))
+        route_identity = preflight.route_identity
+        operation_id = request.operation_id or (route_identity[1] if route_identity else "")
+        if getter is None or not isinstance(operation_id, str) or not operation_id:
+            return DeterministicExecution(
+                self._write_error(WriteOperationError("operation_unavailable", retryable=True)),
+                preparation_kind=PreparationKind.REPLAY,
+            )
+        operation = _invoke(
+            getter,
+            {"operation_id": operation_id, "id": operation_id},
+            (operation_id,),
+        )
+        if operation is None or route_identity is None:
+            return DeterministicExecution(
+                self._write_error(WriteOperationError("operation_unavailable", retryable=True)),
+                preparation_kind=PreparationKind.REPLAY,
+            )
+        current_identity = (
+            _attribute(operation, "conversation_id", None),
+            str(_attribute(operation, "id", "") or ""),
+            str(_attribute(operation, "tool_call_id", "") or ""),
+            str(_attribute(operation, "tool_name", "") or ""),
+        )
+        if (
+            current_identity != route_identity
+            or str(_attribute(operation, "adapter_kind", "") or "") != "legacy_deterministic"
+            or current_identity[3] not in LEGACY_DETERMINISTIC_NAMES
+        ):
+            return DeterministicExecution(
+                self._write_error(WriteOperationError("operation_identity_conflict")),
+                preparation_kind=PreparationKind.REPLAY,
+            )
+        return self._terminal_replay(
+            request,
+            conversation_id,
+            transport=transport,
+            operation=operation,
+        )
+
     def _terminal_replay(
         self,
         request: ConfirmationRequest,
         conversation_id: int,
         *,
         transport: RuntimeTransportContext | None,
+        operation: object | None = None,
     ) -> DeterministicExecution | None:
         operations = self.dependencies.write_operations
-        operation_id = request.operation_id
+        operation_id = request.operation_id or (
+            str(_attribute(operation, "id", "") or "") if operation is not None else ""
+        )
         if operations is None or not isinstance(operation_id, str) or not operation_id:
             return None
-        getter = _callable(operations, ("get",))
-        if getter is None:
-            return None
-        operation = _invoke(
-            getter,
-            {"operation_id": operation_id, "id": operation_id},
-            (operation_id,),
-        )
+        if operation is None:
+            getter = _callable(operations, ("get",))
+            if getter is None:
+                return None
+            operation = _invoke(
+                getter,
+                {"operation_id": operation_id, "id": operation_id},
+                (operation_id,),
+            )
         status = _attribute(operation, "status", None)
         if operation is None or status is None or str(status) == "proposed":
             return None
-        if _attribute(operation, "conversation_id", None) != conversation_id or not request.confirmation_token:
+        if (
+            _attribute(operation, "conversation_id", None) != conversation_id
+            or not request.confirmation_token
+        ):
             return DeterministicExecution(
-                _error(RuntimeFailureCode.OPERATION_IDENTITY_CONFLICT, "operation identity conflict", 409),
+                _error(
+                    RuntimeFailureCode.OPERATION_IDENTITY_CONFLICT,
+                    "operation identity conflict",
+                    409,
+                ),
                 preparation_kind=PreparationKind.REPLAY,
             )
         synthetic = PendingAction(
@@ -1012,7 +1224,12 @@ class DeterministicPilotAdapter:
             replay = cast(Any, operations).replay(operation, request_fingerprint)
             if not isinstance(replay, OperationReplay):
                 return DeterministicExecution(
-                    _error(RuntimeFailureCode.OPERATION_RESULT_UNKNOWN, "写入结果暂时无法确认，请保留确认卡后重试。", 503, retryable=True),
+                    _error(
+                        RuntimeFailureCode.OPERATION_RESULT_UNKNOWN,
+                        "写入结果暂时无法确认，请保留确认卡后重试。",
+                        503,
+                        retryable=True,
+                    ),
                     preparation_kind=PreparationKind.REPLAY,
                 )
             return self._replay_execution(

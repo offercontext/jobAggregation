@@ -1385,10 +1385,12 @@ def test_deterministic_confirmation_requires_exact_closed_adapter_identity(
             conversation_id=7,
             approved=approved,
             operation_id=operations.operation_id,
-        )
+        ),
+        operation=operations.operation,
     )
 
     assert result is expected
+    assert operations.preheader_calls == 0
     assert persistence.pending_reads == 0
 
 
@@ -1405,10 +1407,30 @@ def test_omitted_id_legacy_classifier_uses_only_bounded_ledger_preheader() -> No
         )
     )
 
-    assert runtime._is_deterministic_confirmation(
+    request = ConfirmationRequest(conversation_id=7, approved=True)
+    preheader = coordinator.operation_preheader(request)
+
+    assert runtime._is_deterministic_confirmation(request, operation=preheader.operation)
+    assert operations.preheader_calls == 1
+    assert persistence.pending_reads == 0
+
+
+def test_deterministic_classifier_never_bootstraps_without_an_operation() -> None:
+    operations = _Operations(status="proposed")
+    operations.operation.adapter_kind = "legacy_deterministic"
+    operations.operation.tool_name = next(iter(LEGACY_DETERMINISTIC_NAMES))
+    persistence = _Persistence(None)
+    runtime = PilotRuntime(
+        RuntimeDependencies(
+            persistence=persistence,  # type: ignore[arg-type]
+            confirmation_coordinator=ConfirmationCoordinator(_deps(persistence, operations)),
+        )
+    )
+
+    assert not runtime._is_deterministic_confirmation(
         ConfirmationRequest(conversation_id=7, approved=True)
     )
-    assert operations.preheader_calls == 1
+    assert operations.preheader_calls == 0
     assert persistence.pending_reads == 0
 
 

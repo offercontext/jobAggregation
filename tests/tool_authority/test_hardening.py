@@ -31,7 +31,9 @@ from offerpilot.ai.tool_runtime.contracts import (
     BindingResolverSpec,
     PreparedToolCall,
     ProviderToolContract,
+    ToolExceptionMapping,
     ToolSpec,
+    WriteContract,
 )
 
 
@@ -919,6 +921,38 @@ def test_registered_tool_spec_snapshot_rejects_binding_authority_mutation(
             )
         assert calls["evil"] == 0
         assert not factory._prepared
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("preflight", lambda _args, _context: None),
+        ("mutable_validator", lambda _args, _context: None),
+        ("success_renderer", lambda _result: "forged"),
+        ("result_metadata", lambda _result: None),
+        ("confirmation_description", lambda _args: "forged"),
+        ("schema_failure_renderer", lambda _arguments, _detail: "forged"),
+        ("editable_fields", ({"field": "forged", "type": "text"},)),
+        ("declared_failure_categories", frozenset({"conflict"})),
+        (
+            "exception_map",
+            (ToolExceptionMapping(ValueError, "conflict", "forged_conflict"),),
+        ),
+        ("write_contract", WriteContract()),
+    ),
+)
+def test_prepared_call_rejects_in_flight_tool_spec_semantic_mutation(
+    field: str,
+    replacement: object,
+) -> None:
+    with execution_scope() as factory:
+        authority = _segment(factory)
+        prepared = _prepared(factory, authority, kind="write")
+
+        object.__setattr__(prepared.spec, field, replacement)
+
+        with pytest.raises(AuthorityPhaseError):
+            factory.require_prepared_call(prepared, authority)
 
 
 def test_closed_factory_rejects_every_public_registration_without_pollution() -> None:

@@ -100,6 +100,34 @@ def _resolver_integrity_snapshot(resolver: object) -> tuple[object, ...]:
     return ("callable", resolver)
 
 
+def _write_contract_integrity_snapshot(contract: WriteContract | None) -> tuple[object, ...]:
+    if contract is None:
+        return (None,)
+    return (
+        contract,
+        contract.adapter_kind,
+        contract.result_contract,
+        contract.undo_policy,
+        contract.result_bytes,
+        contract.visible_bytes,
+        contract.transport_bytes,
+        contract.undo_bytes,
+    )
+
+
+def _exception_map_integrity_snapshot(spec: ToolSpec[Any, Any]) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        (
+            mapping,
+            mapping.exception_type,
+            mapping.category,
+            mapping.code,
+            mapping.compatibility_detail,
+        )
+        for mapping in spec.exception_map
+    )
+
+
 def _spec_integrity_snapshot(spec: ToolSpec[Any, Any]) -> tuple[object, ...]:
     if not isinstance(spec.binding_contract, BindingContract):
         raise ValueError("tool binding contract metadata is required")
@@ -115,6 +143,18 @@ def _spec_integrity_snapshot(spec: ToolSpec[Any, Any]) -> tuple[object, ...]:
         spec.binding_contract,
         (spec.binding_contract.kind, spec.binding_contract.entity_kind),
         tuple(_resolver_integrity_snapshot(resolver) for resolver in spec.binding_resolvers),
+        spec.decoder,
+        spec.executor,
+        spec.preflight,
+        spec.mutable_validator,
+        spec.success_renderer,
+        spec.result_metadata,
+        spec.confirmation_description,
+        spec.schema_failure_renderer,
+        copy.deepcopy(spec.editable_fields),
+        spec.declared_failure_categories,
+        _exception_map_integrity_snapshot(spec),
+        _write_contract_integrity_snapshot(spec.write_contract),
     )
 
 
@@ -131,6 +171,40 @@ def _resolver_integrity_matches(
             if current_item[2] is not expected_item[2] or current_item[3:] != expected_item[3:]:
                 return False
     return True
+
+
+def _identity_tuple_matches(current: tuple[object, ...], expected: tuple[object, ...]) -> bool:
+    return len(current) == len(expected) and all(
+        current_item is expected_item
+        for current_item, expected_item in zip(current, expected)
+    )
+
+
+def _exception_map_integrity_matches(
+    current: tuple[tuple[object, ...], ...],
+    expected: tuple[tuple[object, ...], ...],
+) -> bool:
+    if len(current) != len(expected):
+        return False
+    for current_item, expected_item in zip(current, expected):
+        if current_item[0] is not expected_item[0]:
+            return False
+        if current_item[1] is not expected_item[1] or current_item[2:4] != expected_item[2:4]:
+            return False
+        if current_item[4] is not expected_item[4]:
+            return False
+    return True
+
+
+def _write_contract_integrity_matches(
+    current: tuple[object, ...],
+    expected: tuple[object, ...],
+) -> bool:
+    if len(current) != len(expected):
+        return False
+    if current[0] is not expected[0]:
+        return False
+    return current[1:] == expected[1:]
 
 
 class ToolCatalog:
@@ -183,6 +257,23 @@ class ToolCatalog:
             if not _resolver_integrity_matches(
                 cast(tuple[tuple[object, ...], ...], current[10]),
                 cast(tuple[tuple[object, ...], ...], expected[10]),
+            ):
+                raise ValueError("tool catalog integrity drift")
+            if not _identity_tuple_matches(
+                current[11:19],
+                expected[11:19],
+            ):
+                raise ValueError("tool catalog integrity drift")
+            if current[19:21] != expected[19:21]:
+                raise ValueError("tool catalog integrity drift")
+            if not _exception_map_integrity_matches(
+                cast(tuple[tuple[object, ...], ...], current[21]),
+                cast(tuple[tuple[object, ...], ...], expected[21]),
+            ):
+                raise ValueError("tool catalog integrity drift")
+            if not _write_contract_integrity_matches(
+                cast(tuple[object, ...], current[22]),
+                cast(tuple[object, ...], expected[22]),
             ):
                 raise ValueError("tool catalog integrity drift")
 

@@ -74,6 +74,7 @@ def _seed_completed_origin(
     child_human: str | None = None,
     outcome: str = "chained_pending",
     complete_delivery: bool = True,
+    delivery_should_fail: bool = False,
 ):
     sessions = init_database(tmp_path / "offerpilot.db")
     key = load_or_create_ledger_key(tmp_path, sessions)
@@ -212,12 +213,25 @@ def _seed_completed_origin(
                 ]
             )
             session.flush()
-            assert repository.complete_delivery(
-                session,
-                owner,
-                outcome=outcome,  # type: ignore[arg-type]
-                next_operation_id=child.id if outcome == "chained_pending" else None,
-            )
+            if delivery_should_fail:
+                with pytest.raises(WriteOperationError, match="operation_delivery_unknown"):
+                    repository.complete_delivery(
+                        session,
+                        owner,
+                        outcome=outcome,  # type: ignore[arg-type]
+                        next_operation_id=(
+                            child.id if outcome == "chained_pending" else None
+                        ),
+                    )
+                assert origin.delivery_status == "pending"
+                assert origin.delivery_next_operation_id is None
+            else:
+                assert repository.complete_delivery(
+                    session,
+                    owner,
+                    outcome=outcome,  # type: ignore[arg-type]
+                    next_operation_id=(child.id if outcome == "chained_pending" else None),
+                )
         else:
             conversation_row.pending_operation_id = origin.id
             conversation_row.pending_tool_call_id = origin.tool_call_id or ""
@@ -243,6 +257,28 @@ def test_typed_chained_replay_returns_one_verified_operation_owned_pending(tmp_p
     assert replay.chained_pending.adapter_kind == "typed"
     assert replay.chained_pending.operation_id == child_id
     assert replay.chained_pending.decoded_args == {"id": 1, "content": "next"}
+
+
+def test_mixed_adapter_child_is_rejected_before_delivery_commit(tmp_path) -> None:
+    sessions, _repository, origin_id, child_id, conversation_id = _seed_completed_origin(
+        tmp_path,
+        origin_adapter="typed",
+        origin_name="update_note",
+        child_adapter="legacy_deterministic",
+        child_name="save_application_jd_version",
+        child_args='{"application_id":1,"jd_text":"next"}',
+        delivery_should_fail=True,
+    )
+
+    with sessions() as session:
+        origin = session.get(WriteOperation, origin_id)
+        conversation = session.get(Conversation, conversation_id)
+        assert origin is not None
+        assert conversation is not None
+        assert origin.delivery_status == "pending"
+        assert origin.delivery_outcome is None
+        assert origin.delivery_next_operation_id is None
+        assert conversation.pending_operation_id == child_id
 
 
 @pytest.mark.parametrize(
@@ -614,18 +650,21 @@ def test_expired_delivery_recovery_never_selects_pending_columns(tmp_path) -> No
     "child_name",
     ("create_application_submission_snapshot", "record_application_outcome"),
 )
-def test_only_jd_save_legacy_child_is_replay_reachable(tmp_path, child_name: str) -> None:
-    _sessions, repository, origin_id, _child_id, _conversation_id = _seed_completed_origin(
+def test_only_jd_save_legacy_child_is_delivery_reachable(tmp_path, child_name: str) -> None:
+    sessions, _repository, origin_id, _child_id, _conversation_id = _seed_completed_origin(
         tmp_path,
         origin_adapter="legacy_deterministic",
         origin_name=child_name,
         child_adapter="legacy_deterministic",
         child_name=child_name,
         child_args='{"application_id":1}',
+        delivery_should_fail=True,
     )
-    with pytest.raises(WriteOperationError) as caught:
-        _replay(repository, origin_id)
-    assert caught.value.code == "operation_delivery_unknown"
+    with sessions() as session:
+        origin = session.get(WriteOperation, origin_id)
+        assert origin is not None
+        assert origin.delivery_status == "pending"
+        assert origin.delivery_next_operation_id is None
 
 
 def test_new_typed_proposal_uses_strict_replay_codec() -> None:

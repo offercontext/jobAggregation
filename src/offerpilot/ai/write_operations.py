@@ -516,6 +516,24 @@ def _chained_manifest(operation: WriteOperation | None) -> JSONValue:
     }
 
 
+def _chained_adapter_kind(
+    operation: WriteOperation,
+    child: WriteOperation,
+) -> Literal["typed", "legacy_deterministic"] | None:
+    """Return the only adapter topology that delivery replay can verify."""
+
+    if operation.adapter_kind == "typed" and child.adapter_kind == "typed":
+        return "typed"
+    if (
+        operation.adapter_kind == "legacy_deterministic"
+        and child.adapter_kind == "legacy_deterministic"
+        and operation.tool_name == "save_application_jd_version"
+        and child.tool_name == "save_application_jd_version"
+    ):
+        return "legacy_deterministic"
+    return None
+
+
 def _pending_confirmation_token(
     tool_call_id: str,
     tool_name: str,
@@ -859,16 +877,8 @@ class WriteOperationRepository:
                 or child.conversation_id != operation.conversation_id
             ):
                 raise WriteOperationError("operation_delivery_unknown", retryable=True)
-            if operation.adapter_kind == "typed" and child.adapter_kind == "typed":
-                adapter_kind = "typed"
-            elif (
-                operation.adapter_kind == "legacy_deterministic"
-                and child.adapter_kind == "legacy_deterministic"
-                and operation.tool_name == "save_application_jd_version"
-                and child.tool_name == "save_application_jd_version"
-            ):
-                adapter_kind = "legacy_deterministic"
-            else:
+            adapter_kind = _chained_adapter_kind(operation, child)
+            if adapter_kind is None:
                 raise WriteOperationError("operation_delivery_unknown", retryable=True)
         elif operation.delivery_next_operation_id is not None:
             raise WriteOperationError("operation_delivery_unknown", retryable=True)
@@ -1061,6 +1071,7 @@ class WriteOperationRepository:
                 or pending_identity.pending_operation_id != child.id
                 or pending_identity.pending_tool_call_id != child.tool_call_id
                 or pending_identity.pending_tool_name != child.tool_name
+                or _chained_adapter_kind(operation, child) is None
             ):
                 raise WriteOperationError("operation_delivery_unknown")
         else:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -168,6 +169,91 @@ def test_model_catalog_fails_closed_after_provider_or_authority_metadata_mutatio
             MODEL_TOOL_CATALOG.resolve("get_application")
     finally:
         object.__setattr__(spec, "binding_contract", original_binding)
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "decoder",
+        "executor",
+        "preflight",
+        "mutable_validator",
+        "success_renderer",
+        "result_metadata",
+        "confirmation_description",
+        "schema_failure_renderer",
+    ),
+)
+def test_model_catalog_fails_closed_after_execution_callable_mutation(field: str) -> None:
+    spec = MODEL_TOOL_CATALOG.resolve("get_application")
+    assert spec is not None
+    original = getattr(spec, field)
+    try:
+        object.__setattr__(spec, field, lambda *_args, **_kwargs: {"forged": True})
+        with pytest.raises(ValueError, match="catalog integrity drift"):
+            MODEL_TOOL_CATALOG.resolve("get_application")
+        with pytest.raises(ValueError, match="catalog integrity drift"):
+            MODEL_TOOL_CATALOG.specs
+    finally:
+        object.__setattr__(spec, field, original)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("editable_fields", ({"field": "forged", "type": "text"},)),
+        ("declared_failure_categories", frozenset()),
+    ),
+)
+def test_model_catalog_fails_closed_after_execution_metadata_mutation(
+    field: str,
+    replacement: object,
+) -> None:
+    spec = MODEL_TOOL_CATALOG.resolve("get_application")
+    assert spec is not None
+    original = getattr(spec, field)
+    try:
+        object.__setattr__(spec, field, replacement)
+        with pytest.raises(ValueError, match="catalog integrity drift"):
+            MODEL_TOOL_CATALOG.resolve("get_application")
+    finally:
+        object.__setattr__(spec, field, original)
+
+
+def test_model_catalog_fails_closed_after_exception_map_or_write_contract_mutation() -> None:
+    read_spec = MODEL_TOOL_CATALOG.resolve("get_application")
+    write_spec = MODEL_TOOL_CATALOG.resolve("update_application_status")
+    assert read_spec is not None
+    assert write_spec is not None
+    original_exception_map = read_spec.exception_map
+    original_write_contract = write_spec.write_contract
+    assert original_exception_map
+    assert original_write_contract is not None
+    try:
+        forged_mapping = replace(
+            original_exception_map[0],
+            compatibility_detail=lambda _error: "forged private detail",
+        )
+        object.__setattr__(
+            read_spec,
+            "exception_map",
+            (forged_mapping, *original_exception_map[1:]),
+        )
+        with pytest.raises(ValueError, match="catalog integrity drift"):
+            MODEL_TOOL_CATALOG.resolve("get_application")
+    finally:
+        object.__setattr__(read_spec, "exception_map", original_exception_map)
+
+    try:
+        object.__setattr__(
+            write_spec,
+            "write_contract",
+            replace(original_write_contract, visible_bytes=original_write_contract.visible_bytes - 1),
+        )
+        with pytest.raises(ValueError, match="catalog integrity drift"):
+            MODEL_TOOL_CATALOG.resolve("update_application_status")
+    finally:
+        object.__setattr__(write_spec, "write_contract", original_write_contract)
 
 
 def test_provider_contract_projection_is_detached_from_catalog_storage() -> None:

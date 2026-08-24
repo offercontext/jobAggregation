@@ -8,6 +8,7 @@ There is no durable or process-wide completed-history store.
 
 from __future__ import annotations
 
+import copy
 from contextlib import contextmanager
 from dataclasses import fields as dataclass_fields
 import hashlib
@@ -1422,6 +1423,46 @@ class AuthorityFactory:
             spec.binding_contract,
             (spec.binding_contract.kind, spec.binding_contract.entity_kind),
             tuple(resolver_snapshots),
+            AuthorityFactory._tool_spec_execution_snapshot(spec),
+        )
+
+    @staticmethod
+    def _tool_spec_execution_snapshot(spec: ToolSpec[Any, Any]) -> tuple[object, ...]:
+        exception_map = tuple(
+            (
+                mapping,
+                mapping.exception_type,
+                mapping.category,
+                mapping.code,
+                mapping.compatibility_detail,
+            )
+            for mapping in spec.exception_map
+        )
+        write_contract = (
+            (None,)
+            if spec.write_contract is None
+            else (
+                spec.write_contract,
+                spec.write_contract.adapter_kind,
+                spec.write_contract.result_contract,
+                spec.write_contract.undo_policy,
+                spec.write_contract.result_bytes,
+                spec.write_contract.visible_bytes,
+                spec.write_contract.transport_bytes,
+                spec.write_contract.undo_bytes,
+            )
+        )
+        return (
+            spec.preflight,
+            spec.mutable_validator,
+            spec.success_renderer,
+            spec.result_metadata,
+            spec.confirmation_description,
+            spec.schema_failure_renderer,
+            copy.deepcopy(spec.editable_fields),
+            spec.declared_failure_categories,
+            exception_map,
+            write_contract,
         )
 
     @staticmethod
@@ -1438,6 +1479,40 @@ class AuthorityFactory:
                 if current_item[2] is not expected_item[2] or current_item[3:] != expected_item[3:]:
                     return False
         return True
+
+    @staticmethod
+    def _tool_spec_execution_snapshots_match(
+        current: tuple[object, ...],
+        expected: tuple[object, ...],
+    ) -> bool:
+        if len(current) != 10 or len(expected) != 10:
+            return False
+        if any(current[index] is not expected[index] for index in range(6)):
+            return False
+        if current[6:8] != expected[6:8]:
+            return False
+        current_exception_map = cast(tuple[tuple[object, ...], ...], current[8])
+        expected_exception_map = cast(tuple[tuple[object, ...], ...], expected[8])
+        if len(current_exception_map) != len(expected_exception_map):
+            return False
+        for current_item, expected_item in zip(
+            current_exception_map, expected_exception_map
+        ):
+            if current_item[0] is not expected_item[0]:
+                return False
+            if (
+                current_item[1] is not expected_item[1]
+                or current_item[2:4] != expected_item[2:4]
+                or current_item[4] is not expected_item[4]
+            ):
+                return False
+        current_write = cast(tuple[object, ...], current[9])
+        expected_write = cast(tuple[object, ...], expected[9])
+        return (
+            len(current_write) == len(expected_write)
+            and current_write[0] is expected_write[0]
+            and current_write[1:] == expected_write[1:]
+        )
 
     def _validate_registered_tool_spec(self, spec: ToolSpec[Any, Any]) -> None:
         snapshot = self._tool_spec_fields.get(id(spec))
@@ -1459,6 +1534,11 @@ class AuthorityFactory:
             cast(tuple[tuple[object, ...], ...], snapshot[9]),
         ):
             raise AuthorityPhaseError("ToolSpec binding resolver identity changed")
+        if not self._tool_spec_execution_snapshots_match(
+            cast(tuple[object, ...], current[10]),
+            cast(tuple[object, ...], snapshot[10]),
+        ):
+            raise AuthorityPhaseError("ToolSpec execution semantic identity changed")
 
     def issue_prepared_construction_identity(
         self, authority: ToolExecutionAuthority, **_: object

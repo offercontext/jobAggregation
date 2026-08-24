@@ -1336,8 +1336,10 @@ class AuthorityFactory:
         """Issue a one-shot ticket for one exact repository binding attempt."""
 
         with self._lock:
+            if type(self) is not AuthorityFactory:
+                raise AuthorityPhaseError("repository binding requires the exact AuthorityFactory")
             self._ensure_open()
-            self.require_scope_constraint(constraint, authority)
+            AuthorityFactory.require_scope_constraint(self, constraint, authority)
             ticket = _RepositoryBindingTicket(
                 self,
                 repository=repository,
@@ -1354,6 +1356,8 @@ class AuthorityFactory:
         """Drop an unused binding ticket after construction failure."""
 
         with self._lock:
+            if type(self) is not AuthorityFactory:
+                raise AuthorityPhaseError("repository binding requires the exact AuthorityFactory")
             self._ensure_open()
             found = self._repository_binding_tickets.get(id(ticket))
             if found is None or found is not ticket:
@@ -1375,8 +1379,10 @@ class AuthorityFactory:
         """Register an exact Session-bound repository binding once."""
 
         with self._lock:
+            if type(self) is not AuthorityFactory:
+                raise AuthorityPhaseError("repository binding requires the exact AuthorityFactory")
             self._ensure_open()
-            self.require_scope_constraint(constraint, authority)
+            AuthorityFactory.require_scope_constraint(self, constraint, authority)
             ticket_record = self._repository_binding_tickets.get(id(ticket))
             if (
                 ticket_record is None
@@ -1443,6 +1449,8 @@ class AuthorityFactory:
         """Require exact binding/repository/session/constraint provenance."""
 
         with self._lock:
+            if type(self) is not AuthorityFactory:
+                raise AuthorityPhaseError("repository binding requires the exact AuthorityFactory")
             self._ensure_open()
             registration = self._repository_bindings.get(id(binding))
             if registration is None or registration.value is not binding:
@@ -1458,8 +1466,8 @@ class AuthorityFactory:
             ):
                 raise AuthorityPhaseError("repository binding caller provenance mismatch")
             self._authority_record(expected_authority)
-            self.require_scope_constraint(
-                expected_constraint, cast(ToolExecutionAuthority, expected_authority)
+            AuthorityFactory.require_scope_constraint(
+                self, expected_constraint, cast(ToolExecutionAuthority, expected_authority)
             )
             from offerpilot.repositories.session_binding import ScopedRepositoryBinding
 
@@ -3221,7 +3229,10 @@ def require_repository_binding(
         found = _ACTIVE_REPOSITORY_BINDINGS.get(id(binding))
     if found is None or found[0] is not binding:
         raise AuthorityPhaseError("repository binding is not active")
-    found[1].require_repository_binding(
+    if type(found[1]) is not AuthorityFactory:
+        raise AuthorityPhaseError("repository binding owner is not the exact AuthorityFactory")
+    AuthorityFactory.require_repository_binding(
+        found[1],
         binding,
         repository=repository,
         session=session,

@@ -317,6 +317,70 @@ def test_registered_binding_rejects_cross_repository_and_attribute_injection(see
         event.remove(engine, "before_cursor_execute", capture)
 
 
+def test_evil_factory_cannot_register_or_use_a_binding(seeded) -> None:
+    trusted_factory = AuthorityFactory()
+    _, authority, _ = _constraint(trusted_factory)
+    engine = seeded["session_factory"].kw["bind"]
+    statements: list[str] = []
+
+    def capture(_conn, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement)
+
+    class EvilFactory(AuthorityFactory):
+        def require_scope_constraint(self, constraint, authority):
+            del constraint, authority
+
+        def require_repository_binding(
+            self, binding, *, repository, session, constraint
+        ) -> None:
+            del binding, repository, session, constraint
+
+    forged = ApplicationScopeConstraint(
+        entity_kind="application",
+        mode="restricted",
+        allowed_identities=frozenset({seeded["second"].id}),
+        authority_instance_token=authority.authority_instance_token,
+    )
+    evil_factory = EvilFactory()
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        with seeded["session_factory"]() as session:
+            target = seeded["applications"].bind(session)
+            binding = ScopedRepositoryBinding(
+                session,
+                forged,
+                evil_factory,
+                authority,
+                _seal=_SCOPED_BINDING_SEAL,
+                _ticket=object(),
+            )
+            with pytest.raises(AuthorityPhaseError):
+                evil_factory.issue_repository_binding_ticket(
+                    repository=target,
+                    session=session,
+                    constraint=forged,
+                    authority=authority,
+                )
+            with pytest.raises(AuthorityPhaseError):
+                evil_factory.register_repository_binding(
+                    binding,
+                    ticket=object(),
+                    repository=target,
+                    session=session,
+                    constraint=forged,
+                    authority=authority,
+                )
+            with pytest.raises(AuthorityPhaseError):
+                evil_factory.revoke_repository_binding_ticket(object())
+            with pytest.raises(AuthorityPhaseError):
+                binding.require(forged, repository=target)
+            assert statements == []
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+        evil_factory.close()
+        trusted_factory.close()
+
+
 @pytest.mark.parametrize("cleanup", ("revoke", "close"))
 def test_binding_registry_cleanup_fails_closed_without_sql(seeded, cleanup: str) -> None:
     factory = AuthorityFactory()

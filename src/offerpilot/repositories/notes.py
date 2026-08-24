@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import sqlite3
-from typing import TYPE_CHECKING, Any, NoReturn, Optional, cast
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 from builtins import list as BuiltinList
 
@@ -41,9 +40,6 @@ from offerpilot.repositories.session_binding import (
 if TYPE_CHECKING:
     from offerpilot.ai.tool_authority.contracts import ApplicationScopeConstraint, ToolExecutionAuthority
     from offerpilot.repositories.session_binding import AuthorityFactoryProtocol
-
-
-_SQLITE_CONSTRAINT_UNIQUE_CODE = 2067
 
 
 class NoteBindingError(ValueError):
@@ -184,7 +180,8 @@ class NotesRepository:
                     _valid_interview_event(
                         data.application_event_id,
                         data.application_id,
-                    )
+                    ),
+                    _note_event_available(data.application_event_id),
                 )
             statement = (
                 insert(InterviewNote)
@@ -202,7 +199,8 @@ class NotesRepository:
                 _valid_interview_event(
                     data.application_event_id,
                     data.application_id,
-                )
+                ),
+                _note_event_available(data.application_event_id),
             )
             statement = (
                 insert(InterviewNote)
@@ -215,11 +213,8 @@ class NotesRepository:
                 .values(**values)
                 .returning(InterviewNote)
             )
-        try:
-            with binding.session.no_autoflush:
-                rows = list(binding.session.scalars(statement))
-        except IntegrityError as exc:
-            _raise_scoped_note_integrity(exc, event_id=data.application_event_id)
+        with binding.session.no_autoflush:
+            rows = list(binding.session.scalars(statement))
         if len(rows) != 1:
             if constraint.mode == "restricted" or len(rows) > 1:
                 raise ScopeAccessDenied("application scope denied")
@@ -402,6 +397,7 @@ class NotesRepository:
         event_id: int | None = None
         event_allowed: ColumnElement[bool]
         returned_event_allowed: ColumnElement[bool]
+        duplicate_allowed: ColumnElement[bool]
         if data.application_event_id is not UNSET:
             event_id = cast(int | None, data.application_event_id)
             if event_id is not None:
@@ -409,13 +405,19 @@ class NotesRepository:
                     event_id, InterviewNote.application_id
                 )
                 returned_event_allowed = _valid_interview_event_returning(event_id)
+                duplicate_allowed = _note_event_available(
+                    event_id,
+                    excluding_note_id=note_id,
+                )
             else:
                 event_allowed = literal(True)
                 returned_event_allowed = literal(True)
+                duplicate_allowed = literal(True)
         else:
             event_allowed = literal(True)
             returned_event_allowed = literal(True)
-        domain_allowed = and_(application_allowed, event_allowed)
+            duplicate_allowed = literal(True)
+        domain_allowed = and_(application_allowed, event_allowed, duplicate_allowed)
         guarded_values = {
             key: case(
                 (domain_allowed, value),
@@ -429,22 +431,17 @@ class NotesRepository:
                 InterviewNote,
                 application_allowed.label("application_allowed"),
                 returned_event_allowed.label("event_allowed"),
+                duplicate_allowed.label("duplicate_allowed"),
             )
             .execution_options(populate_existing=True, synchronize_session=False)
         )
-        try:
-            with binding.session.no_autoflush:
-                rows = list(binding.session.execute(statement))
-        except IntegrityError as exc:
-            _raise_scoped_note_integrity(
-                exc,
-                event_id=event_id,
-            )
+        with binding.session.no_autoflush:
+            rows = list(binding.session.execute(statement))
         if len(rows) != 1:
             if constraint.mode == "restricted" or len(rows) > 1:
                 raise ScopeAccessDenied("application scope denied")
             return None
-        note, application_is_allowed, event_is_allowed = rows[0]
+        note, application_is_allowed, event_is_allowed, duplicate_is_allowed = rows[0]
         if not application_is_allowed:
             raise NoteBindingError(422, "application_id cannot be changed")
         if not event_is_allowed:
@@ -452,6 +449,8 @@ class NotesRepository:
                 422,
                 "application_event_id must reference an interview event for the application",
             )
+        if not duplicate_is_allowed:
+            raise NoteBindingError(409, "Interview event already has a note")
         return cast(InterviewNote, note)
 
     def delete(self, note_id: int) -> None:
@@ -649,18 +648,15 @@ def _valid_interview_event_returning(event_id: int) -> ColumnElement[bool]:
     )
 
 
-def _raise_scoped_note_integrity(
-    exc: IntegrityError,
+def _note_event_available(
+    event_id: int,
     *,
-    event_id: int | None,
-) -> NoReturn:
-    orig = exc.orig
-    if (
-        event_id is not None
-        and isinstance(orig, sqlite3.IntegrityError)
-        and getattr(orig, "sqlite_errorcode", None)
-        == _SQLITE_CONSTRAINT_UNIQUE_CODE
-        and getattr(orig, "sqlite_errorname", None) == "SQLITE_CONSTRAINT_UNIQUE"
-    ):
-        raise NoteBindingError(409, "Interview event already has a note") from exc
-    raise exc
+    excluding_note_id: int | None = None,
+) -> ColumnElement[bool]:
+    note_table = InterviewNote.__table__.alias("note_event_owner")
+    statement = select(note_table.c.id).where(
+        note_table.c.application_event_id == event_id
+    )
+    if excluding_note_id is not None:
+        statement = statement.where(note_table.c.id != excluding_note_id)
+    return ~exists(statement)

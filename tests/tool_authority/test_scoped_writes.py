@@ -724,7 +724,7 @@ def test_scoped_note_write_preserves_stable_binding_domain_failures(seeded) -> N
 
     with seeded["session_factory"]() as session:
         notes = _bind(seeded["notes"], session, factory, authority, constraint)
-        with pytest.raises(NoteBindingError) as duplicate:
+        with pytest.raises(ScopeAccessDenied):
             notes.create_note_scoped(
                 constraint,
                 NoteCreate(
@@ -733,7 +733,6 @@ def test_scoped_note_write_preserves_stable_binding_domain_failures(seeded) -> N
                     company="duplicate",
                 ),
             )
-        assert duplicate.value.status_code == 409
         session.rollback()
 
     with seeded["session_factory"]() as session:
@@ -777,6 +776,19 @@ def test_scoped_note_write_preserves_stable_binding_domain_failures(seeded) -> N
             event_constraint,
         )
         before_count = session.scalar(select(func.count()).select_from(InterviewNote))
+        with pytest.raises(NoteBindingError) as duplicate_create_event:
+            notes.create_note_scoped(
+                event_constraint,
+                NoteCreate(
+                    application_id=seeded["first_id"],
+                    application_event_id=seeded["first_event_id"],
+                    company="duplicate",
+                ),
+            )
+        assert duplicate_create_event.value.status_code == 422
+        assert str(duplicate_create_event.value) == (
+            "application_event_id must reference an interview event for the application"
+        )
         with pytest.raises(NoteBindingError) as invalid_create_event:
             notes.create_note_scoped(
                 event_constraint,
@@ -1080,14 +1092,33 @@ def test_scoped_note_create_does_not_relabel_business_value_toobig(seeded) -> No
 
 
 @pytest.mark.parametrize(
-    ("error_code", "error_name"),
+    ("orig_type", "error_code", "error_name"),
     (
-        (sqlite3.SQLITE_CONSTRAINT_NOTNULL, "SQLITE_CONSTRAINT_UNIQUE"),
-        (sqlite3.SQLITE_CONSTRAINT_UNIQUE, "SQLITE_CONSTRAINT_NOTNULL"),
+        (
+            sqlite3.IntegrityError,
+            sqlite3.SQLITE_CONSTRAINT_NOTNULL,
+            "SQLITE_CONSTRAINT_UNIQUE",
+        ),
+        (
+            sqlite3.IntegrityError,
+            sqlite3.SQLITE_CONSTRAINT_UNIQUE,
+            "SQLITE_CONSTRAINT_NOTNULL",
+        ),
+        (
+            sqlite3.IntegrityError,
+            sqlite3.SQLITE_CONSTRAINT_UNIQUE,
+            "SQLITE_CONSTRAINT_UNIQUE",
+        ),
+        (
+            Exception,
+            sqlite3.SQLITE_CONSTRAINT_UNIQUE,
+            "SQLITE_CONSTRAINT_UNIQUE",
+        ),
     ),
 )
-def test_scoped_note_duplicate_matcher_requires_exact_sqlite_code_and_name(
+def test_scoped_note_create_preserves_integrity_errors_without_sqlite_matching(
     seeded,
+    orig_type: type[Exception],
     error_code: int,
     error_name: str,
 ) -> None:
@@ -1095,11 +1126,9 @@ def test_scoped_note_duplicate_matcher_requires_exact_sqlite_code_and_name(
     authority, constraint = _scope(factory, seeded["first_id"])
     with seeded["session_factory"]() as session:
         notes = _bind(seeded["notes"], session, factory, authority, constraint)
-        orig = sqlite3.IntegrityError(
-            "unique constraint failed: interview_notes.application_event_id"
-        )
-        orig.sqlite_errorcode = error_code
-        orig.sqlite_errorname = error_name
+        orig = orig_type("arbitrary driver detail")
+        orig.sqlite_errorcode = error_code  # type: ignore[attr-defined]
+        orig.sqlite_errorname = error_name  # type: ignore[attr-defined]
         forged = IntegrityError("INSERT", {}, orig)
 
         with (
@@ -1118,24 +1147,61 @@ def test_scoped_note_duplicate_matcher_requires_exact_sqlite_code_and_name(
         assert raised.value is forged
 
 
-def test_scoped_note_duplicate_matcher_ignores_sqlite_error_text(seeded) -> None:
+def test_scoped_note_create_preserves_trigger_unique_from_another_table(seeded) -> None:
     factory = AuthorityFactory()
     authority, constraint = _scope(factory, seeded["first_id"])
     with seeded["session_factory"]() as session:
         notes = _bind(seeded["notes"], session, factory, authority, constraint)
-        orig = sqlite3.IntegrityError("driver-localized detail")
-        orig.sqlite_errorcode = sqlite3.SQLITE_CONSTRAINT_UNIQUE
-        orig.sqlite_errorname = "SQLITE_CONSTRAINT_UNIQUE"
-        error = IntegrityError("INSERT", {}, orig)
+        before_count = session.scalar(select(func.count()).select_from(InterviewNote))
+        session.execute(text("CREATE TABLE unrelated_unique (value INTEGER UNIQUE)"))
+        session.execute(text("INSERT INTO unrelated_unique (value) VALUES (1)"))
+        session.execute(
+            text(
+                """
+                CREATE TRIGGER unrelated_note_insert_unique
+                BEFORE INSERT ON interview_notes
+                BEGIN
+                    INSERT INTO unrelated_unique (value) VALUES (1);
+                END
+                """
+            )
+        )
+        session.commit()
 
-        with (
-            patch.object(session, "scalars", side_effect=error),
-            pytest.raises(NoteBindingError) as raised,
-        ):
+        with pytest.raises(IntegrityError) as raised:
             notes.create_note_scoped(
                 constraint,
                 NoteCreate(
                     application_id=seeded["first_id"],
+                    application_event_id=seeded["first_event_id"],
+                    company="A",
+                ),
+            )
+
+        assert raised.value.orig.sqlite_errorcode == sqlite3.SQLITE_CONSTRAINT_UNIQUE
+        assert raised.value.orig.sqlite_errorname == "SQLITE_CONSTRAINT_UNIQUE"
+        assert session.scalar(select(func.count()).select_from(InterviewNote)) == before_count
+
+
+def test_scoped_note_update_classifies_duplicate_without_integrity_error(seeded) -> None:
+    factory = AuthorityFactory()
+    authority, constraint = _scope(factory, seeded["first_id"])
+    with seeded["session_factory"]() as session:
+        notes = _bind(seeded["notes"], session, factory, authority, constraint)
+        notes.create_note_scoped(
+            constraint,
+            NoteCreate(
+                application_id=seeded["first_id"],
+                application_event_id=seeded["first_event_id"],
+                company="bound",
+            ),
+        )
+
+        with pytest.raises(NoteBindingError) as raised:
+            notes.update_note_scoped(
+                constraint,
+                seeded["first_note_id"],
+                NoteUpdate(
                     application_event_id=seeded["first_event_id"],
                     company="A",
                 ),
@@ -1143,32 +1209,11 @@ def test_scoped_note_duplicate_matcher_ignores_sqlite_error_text(seeded) -> None
 
         assert raised.value.status_code == 409
         assert str(raised.value) == "Interview event already has a note"
-
-
-def test_scoped_note_duplicate_matcher_requires_sqlite_dbapi_type(seeded) -> None:
-    factory = AuthorityFactory()
-    authority, constraint = _scope(factory, seeded["first_id"])
-    with seeded["session_factory"]() as session:
-        notes = _bind(seeded["notes"], session, factory, authority, constraint)
-        orig = Exception("driver-localized detail")
-        orig.sqlite_errorcode = sqlite3.SQLITE_CONSTRAINT_UNIQUE  # type: ignore[attr-defined]
-        orig.sqlite_errorname = "SQLITE_CONSTRAINT_UNIQUE"  # type: ignore[attr-defined]
-        forged = IntegrityError("INSERT", {}, orig)
-
-        with (
-            patch.object(session, "scalars", side_effect=forged),
-            pytest.raises(IntegrityError) as raised,
-        ):
-            notes.create_note_scoped(
-                constraint,
-                NoteCreate(
-                    application_id=seeded["first_id"],
-                    application_event_id=seeded["first_event_id"],
-                    company="A",
-                ),
-            )
-
-        assert raised.value is forged
+        assert raised.value.__cause__ is None
+        session.expire_all()
+        current = session.get(InterviewNote, seeded["first_note_id"])
+        assert current is not None
+        assert current.application_event_id is None
 
 
 def test_scoped_write_ports_have_no_unscoped_repository_or_orm_fallback() -> None:

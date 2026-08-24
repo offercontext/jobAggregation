@@ -1361,6 +1361,8 @@ class DeterministicPilotAdapter:
     @staticmethod
     def _write_error(exc: WriteOperationError) -> RuntimeFailureOutcome:
         code_map: dict[str, RuntimeFailureCode] = {
+            "operation_delivery_unknown": RuntimeFailureCode.OPERATION_DELIVERY_UNKNOWN,
+            "operation_integrity_error": RuntimeFailureCode.OPERATION_INTEGRITY_ERROR,
             "operation_delivery_pending": RuntimeFailureCode.OPERATION_DELIVERY_PENDING,
             "operation_result_unknown": RuntimeFailureCode.OPERATION_RESULT_UNKNOWN,
             "operation_input_conflict": RuntimeFailureCode.OPERATION_INPUT_CONFLICT,
@@ -1368,8 +1370,38 @@ class DeterministicPilotAdapter:
             "operation_unavailable": RuntimeFailureCode.OPERATION_UNAVAILABLE,
         }
         code = code_map.get(exc.code, RuntimeFailureCode.OPERATION_FAILED)
-        status = 409 if code in {RuntimeFailureCode.OPERATION_DELIVERY_PENDING, RuntimeFailureCode.OPERATION_INPUT_CONFLICT, RuntimeFailureCode.OPERATION_IDENTITY_CONFLICT} else 503
-        return _error(code, "无法确认写入结果，请保留原请求后重试。", status, retryable=exc.retryable)
+        if code in {
+            RuntimeFailureCode.OPERATION_DELIVERY_PENDING,
+            RuntimeFailureCode.OPERATION_INPUT_CONFLICT,
+            RuntimeFailureCode.OPERATION_IDENTITY_CONFLICT,
+            RuntimeFailureCode.OPERATION_INTEGRITY_ERROR,
+        }:
+            status = 409
+        else:
+            status = 503
+        message = (
+            "对话结果暂时无法保存。"
+            if code
+            in {
+                RuntimeFailureCode.OPERATION_DELIVERY_UNKNOWN,
+                RuntimeFailureCode.OPERATION_INTEGRITY_ERROR,
+            }
+            else "无法确认写入结果，请保留原请求后重试。"
+        )
+        return _error(
+            code,
+            message,
+            status,
+            retryable=(
+                True
+                if code
+                in {
+                    RuntimeFailureCode.OPERATION_DELIVERY_UNKNOWN,
+                    RuntimeFailureCode.OPERATION_INTEGRITY_ERROR,
+                }
+                else exc.retryable
+            ),
+        )
 
     @staticmethod
     def _write_unknown(execution: OperationUnknown) -> RuntimeFailureOutcome:
@@ -1670,22 +1702,45 @@ class DeterministicPilotAdapter:
                     )
                 replay = repository.replay(refreshed, request_fingerprint)
             if replay.delivery_outcome == "chained_pending":
-                pending = _pending(
-                    self.dependencies.persistence.get_pending_action(conversation_id)
+                verified = replay.chained_pending
+                if (
+                    verified is None
+                    or verified.adapter_kind != "legacy_deterministic"
+                    or verified.tool_name != "save_application_jd_version"
+                    or verified.conversation_id != conversation_id
+                ):
+                    raise WriteOperationError(
+                        "operation_delivery_unknown", retryable=True
+                    )
+                pending = PendingAction(
+                    verified.tool_call_id,
+                    verified.tool_name,
+                    verified.raw_args,
+                    verified.human,
+                    verified.operation_id,
                 )
-                if pending is not None:
-                    confirmation = self._confirmation_required(
-                        pending,
-                        conversation_id,
-                        operation_id=replay.operation_id,
-                        replayed=True,
-                    )
-                    return DeterministicExecution(
-                        confirmation.outcome,
-                        events=confirmation.events,
-                        preparation_kind=PreparationKind.REPLAY,
-                        pending_replay=True,
-                    )
+                token = _confirmation_token(pending)
+                expected_token = ledger_fingerprint(
+                    cast(Any, operations).key,
+                    "write-operation-confirmation-token-v1",
+                    token.encode("ascii"),
+                )
+                if not compare_digest(
+                    expected_token, verified.confirmation_token_fingerprint
+                ):
+                    raise WriteOperationError("operation_integrity_error")
+                confirmation = self._confirmation_required(
+                    pending,
+                    conversation_id,
+                    operation_id=replay.operation_id,
+                    replayed=True,
+                )
+                return DeterministicExecution(
+                    confirmation.outcome,
+                    events=confirmation.events,
+                    preparation_kind=PreparationKind.REPLAY,
+                    pending_replay=True,
+                )
             status = replay.payload.status
             if status == "committed":
                 message, write_status = replay.final_message or "操作已完成。", "success"

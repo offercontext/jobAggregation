@@ -28,6 +28,7 @@ from offerpilot.ai.write_operations import (
     OperationReplay,
     OperationUnknown,
     TerminalPayload,
+    VerifiedPendingReplay,
     ledger_fingerprint,
     WriteOperationCoordinator,
     WriteOperationError,
@@ -117,6 +118,7 @@ class _Operations:
         self.converge_calls = 0
         self.heartbeat_calls = 0
         self.preheader_calls = 0
+        self.chained_pending: VerifiedPendingReplay | None = None
 
     def get(self, _operation_id: str) -> object:
         return self.operation
@@ -158,6 +160,7 @@ class _Operations:
             None,
             self.delivery_outcome,
             "saved",
+            chained_pending=self.chained_pending,
         )
 
     def converge_expired_delivery(self, _operation_id: str) -> OperationReplay:
@@ -467,6 +470,17 @@ def test_chained_terminal_replay_loads_child_pending_only_after_ledger_replay() 
         "child",
         str(uuid4()),
     )
+    operations.chained_pending = VerifiedPendingReplay(
+        adapter_kind="typed",
+        conversation_id=7,
+        operation_id=child.operation_id,
+        tool_call_id=child.tool_call_id,
+        tool_name=child.tool_name,
+        raw_args=child.args,
+        human=child.human,
+        confirmation_token_fingerprint="hmac-sha256:" + "0" * 64,
+        decoded_args=json.loads(child.args),
+    )
     persistence = _Persistence(child)
     coordinator = ConfirmationCoordinator(_deps(persistence, operations))
     request = ConfirmationRequest(
@@ -483,7 +497,7 @@ def test_chained_terminal_replay_loads_child_pending_only_after_ledger_replay() 
     assert outcome.pending_action is not None
     assert outcome.pending_action.tool_name == child.tool_name
     assert operations.replay_calls == 1
-    assert persistence.pending_reads == 1
+    assert persistence.pending_reads == 0
 
 
 def test_reject_uses_ledger_cas_without_decoding_or_catalog() -> None:

@@ -14,6 +14,13 @@ from offerpilot.ai.tool_runtime.contracts import (
     ToolSpec,
     WriteContract,
 )
+from offerpilot.ai.write_operations import (
+    OperationReplay,
+    TerminalPayload,
+    VerifiedPendingReplay,
+)
+from offerpilot.pilot_runtime.continuation import _runtime_replay
+from offerpilot.pilot_runtime.contracts import ConfirmationRequiredOutcome
 
 
 _EDITABLE_FIELDS = (
@@ -165,3 +172,42 @@ def test_pending_identity_can_be_carried_without_eager_argument_decode(raw_args:
 
     assert action.args is raw_args
     assert action.operation_id == "operation-1"
+
+
+def test_chained_replay_projects_only_repository_verified_typed_arguments() -> None:
+    child = VerifiedPendingReplay(
+        adapter_kind="typed",
+        conversation_id=7,
+        operation_id="child-operation",
+        tool_call_id="child-call",
+        tool_name="update_application_status",
+        raw_args='{"id":7,"status":"offer"}',
+        human="change status",
+        confirmation_token_fingerprint="hmac-sha256:" + "0" * 64,
+        decoded_args={"id": 7, "status": "offer"},
+    )
+    replay = OperationReplay(
+        operation_id="origin-operation",
+        payload=TerminalPayload(
+            status="committed",
+            result_contract="typed_json_v1",
+            result_json="{}",
+            visible_result="done",
+            transport_json="{}",
+            undo_json=None,
+            failure_category=None,
+            failure_code=None,
+            digest="sha256:" + "0" * 64,
+        ),
+        delivery_status="completed",
+        delivery_generation=1,
+        delivery_lease_expires_at=None,
+        delivery_outcome="chained_pending",
+        chained_pending=child,
+    )
+
+    outcome = _runtime_replay(replay, 7)
+
+    assert isinstance(outcome, ConfirmationRequiredOutcome)
+    assert outcome.pending_action.operation_id == "child-operation"
+    assert dict(outcome.pending_action.args) == {"id": 7, "status": "offer"}

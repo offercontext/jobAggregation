@@ -29,6 +29,7 @@ from offerpilot.ai.tool_runtime.contracts import (
     ToolSuccess,
 )
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.ai.write_operations import WriteOperationError
 from offerpilot.agent_runtime.journal import NullRunRecorderFactory, RunRecorderFactory
 from offerpilot.agent_runtime.keyring import load_or_create_journal_key
 from offerpilot.agent_runtime.trace import reconstruct_agent_run
@@ -60,11 +61,11 @@ from offerpilot.pilot_runtime.contracts import (
     PreparationKind,
     StreamExecutionMode,
 )
-from offerpilot.pilot_runtime import InMemoryRuntimeInvocationControl
+from offerpilot.pilot_runtime import InMemoryRuntimeInvocationControl, RuntimeFailureCode
 from offerpilot.repositories.applications import ApplicationsRepository
 from offerpilot.repositories.agent_runs import AgentRunRepository, JournalConflictError
 from offerpilot.repositories.chat import ChatRepository
-from offerpilot.pilot_runtime.service import _has_write_attempt, _write_outcome
+from offerpilot.pilot_runtime.service import PilotRuntime, _has_write_attempt, _write_outcome
 
 
 def _force_replace_claimed_pending_for_cas_test(
@@ -8745,6 +8746,32 @@ def test_chat_confirm_returns_args_for_chained_pending_write(tmp_path):
         "id": second["id"],
         "status": "interview",
     }
+
+
+@pytest.mark.parametrize(
+    ("code", "expected", "status"),
+    (
+        (
+            "operation_delivery_unknown",
+            RuntimeFailureCode.OPERATION_DELIVERY_UNKNOWN,
+            503,
+        ),
+        (
+            "operation_integrity_error",
+            RuntimeFailureCode.OPERATION_INTEGRITY_ERROR,
+            409,
+        ),
+    ),
+)
+def test_replay_topology_errors_keep_existing_public_contract(
+    code: str, expected: RuntimeFailureCode, status: int
+) -> None:
+    outcome = PilotRuntime._confirmation_failure(WriteOperationError(code))
+
+    assert outcome.code is expected
+    assert outcome.status_code == status
+    assert outcome.message == "对话结果暂时无法保存。"
+    assert outcome.retryable is True
 
 
 @pytest.mark.parametrize("context_ref", ["not-an-id", "999999"])

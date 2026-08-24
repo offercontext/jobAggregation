@@ -761,19 +761,33 @@ class ConfirmationReplayError(RuntimeError):
         self.replay = replay
 
 
-def _replayed_pending_payload(pending: PendingAction) -> PendingActionPayload:
-    try:
-        decoded = json.loads(pending.args or "{}")
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise WriteOperationError("operation_integrity_error") from exc
-    if not isinstance(decoded, Mapping):
-        raise WriteOperationError("operation_integrity_error")
+def _replayed_pending_payload(replay: OperationReplay) -> PendingActionPayload:
+    pending = replay.chained_pending
+    if (
+        pending is None
+        or pending.adapter_kind != "typed"
+        or pending.decoded_args is None
+    ):
+        raise WriteOperationError("operation_delivery_unknown", retryable=True)
+    canonical_args = json.dumps(
+        pending.decoded_args,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    identity = json.dumps(
+        [pending.tool_call_id, pending.tool_name, canonical_args],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    token = hashlib.sha256(identity.encode("utf-8")).hexdigest()
     return PendingActionPayload(
         tool_name=pending.tool_name,
         operation_id=pending.operation_id,
         human=pending.human,
-        args=freeze_json_mapping(cast(Mapping[str, object], decoded)),
-        confirmation_token=_confirmation_token(pending),
+        args=freeze_json_mapping(cast(Mapping[str, object], pending.decoded_args)),
+        confirmation_token=token,
     )
 
 
@@ -781,7 +795,6 @@ def _runtime_replay(
     replay: OperationReplay,
     conversation_id: int,
     *,
-    pending: PendingAction | None = None,
     operation: object | None = None,
 ) -> OperationReplayOutcome | ConfirmationRequiredOutcome:
     payload = replay.payload
@@ -790,9 +803,7 @@ def _runtime_replay(
     if replay.delivery_status not in {"pending", "completed", "failed"}:
         raise WriteOperationError("operation_integrity_error")
     if replay.delivery_outcome == "chained_pending":
-        if pending is None:
-            raise WriteOperationError("operation_delivery_unknown")
-        pending_payload = _replayed_pending_payload(pending)
+        pending_payload = _replayed_pending_payload(replay)
         return ConfirmationRequiredOutcome(
             confirmation_token=pending_payload.confirmation_token,
             conversation_id=conversation_id,
@@ -812,13 +823,11 @@ def _runtime_replay(
     tool_call_id = str(
         transport.get("tool_call_id")
         or _attribute(operation, "tool_call_id", "")
-        or _attribute(pending, "tool_call_id", "")
         or ""
     )
     tool_name = str(
         transport.get("tool_name")
         or _attribute(operation, "tool_name", "")
-        or _attribute(pending, "tool_name", "")
         or ""
     )
     if not tool_call_id or not tool_name:
@@ -1178,18 +1187,9 @@ class ConfirmationCoordinator:
             transport = None
         if not isinstance(transport, Mapping) or not transport.get("tool_call_id") or not transport.get("tool_name"):
             operation = self._operation(replay.operation_id)
-        pending: PendingAction | None = None
-        if replay.delivery_outcome == "chained_pending":
-            try:
-                pending = self._pending_for(request.conversation_id, None)
-            except WriteOperationError as exc:
-                if exc.code == "stale_pending_action":
-                    raise WriteOperationError("operation_delivery_unknown") from exc
-                raise
         return _runtime_replay(
             replay,
             request.conversation_id,
-            pending=pending,
             operation=operation,
         )
 
@@ -1972,6 +1972,7 @@ class ConfirmationCoordinator:
             if not attempted:
                 with state.lock:
                     state.active = False
+                self._close_approval_context(state)
             return None
         result = self.final_delivery(
             session,

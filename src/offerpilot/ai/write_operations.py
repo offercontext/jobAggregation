@@ -8,7 +8,7 @@ import os
 import secrets
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -34,6 +34,10 @@ from offerpilot.ai.tool_authority.fingerprint import authorization_scope_fingerp
 from offerpilot.ai.tool_authority.visibility import (
     AuthorityApplicationVisibilityError,
     AuthorityApplicationVisibilityQuery,
+)
+from offerpilot.ai.pending_replay import (
+    PendingReplayArgsDecoderV1,
+    PendingReplayIntegrityError,
 )
 from offerpilot.ai.tool_runtime.context import audit_bindings, pre_resolver_scope_policy
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
@@ -215,6 +219,21 @@ class TerminalPayload:
     digest: str
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class VerifiedPendingReplay(_Transient):
+    """One operation-owned Pending snapshot verified after delivery topology."""
+
+    adapter_kind: Literal["typed", "legacy_deterministic"]
+    conversation_id: int
+    operation_id: str
+    tool_call_id: str
+    tool_name: str
+    raw_args: str = field(repr=False)
+    human: str
+    confirmation_token_fingerprint: str = field(repr=False)
+    decoded_args: dict[str, JSONValue] | None = field(default=None, repr=False)
+
+
 @dataclass(frozen=True)
 class OperationCommitted(_Transient):
     operation_id: str
@@ -241,6 +260,7 @@ class OperationReplay(_Transient):
     delivery_outcome: str | None = None
     final_message: str | None = None
     replayed: bool = True
+    chained_pending: VerifiedPendingReplay | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -496,6 +516,19 @@ def _chained_manifest(operation: WriteOperation | None) -> JSONValue:
     }
 
 
+def _pending_confirmation_token(
+    tool_call_id: str,
+    tool_name: str,
+    canonical_arguments: Mapping[str, JSONValue],
+) -> str:
+    identity = json.dumps(
+        [tool_call_id, tool_name, canonical_json(dict(canonical_arguments))],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
 def _valid_delivery_messages(
     operation: WriteOperation,
     messages: Sequence[ChatMessage],
@@ -655,12 +688,22 @@ class WriteOperationRepository:
             raise WriteOperationError("operation_input_conflict")
         payload = payload_from_operation(operation)
         final_message = None
+        chained_pending = None
         if operation.delivery_status in {"completed", "failed"}:
-            with self.session_factory() as session:
-                current = session.get(WriteOperation, operation.id)
-                if current is None:
-                    raise WriteOperationError("operation_delivery_unknown")
-                final_message = self._verify_delivery(session, current)
+            try:
+                with self.session_factory() as session:
+                    current = session.get(WriteOperation, operation.id)
+                    if current is None:
+                        raise WriteOperationError(
+                            "operation_delivery_unknown", retryable=True
+                        )
+                    final_message, chained_pending = self._verify_delivery(session, current)
+            except WriteOperationError:
+                raise
+            except Exception as exc:
+                raise WriteOperationError(
+                    "operation_delivery_unknown", retryable=True
+                ) from exc
         return OperationReplay(
             operation.id,
             payload,
@@ -669,10 +712,12 @@ class WriteOperationRepository:
             operation.delivery_lease_expires_at,
             operation.delivery_outcome,
             final_message,
+            chained_pending=chained_pending,
         )
 
-    @staticmethod
-    def _verify_delivery(session: Session, operation: WriteOperation) -> str:
+    def _verify_delivery(
+        self, session: Session, operation: WriteOperation
+    ) -> tuple[str, VerifiedPendingReplay | None]:
         messages = list(
             session.scalars(
                 select(ChatMessage)
@@ -683,7 +728,7 @@ class WriteOperationRepository:
         if len(messages) != operation.delivery_message_count or not _valid_delivery_messages(
             operation, messages
         ):
-            raise WriteOperationError("operation_delivery_unknown")
+            raise WriteOperationError("operation_delivery_unknown", retryable=True)
         manifest_messages: list[JSONValue] = [
             {
                 "role": item.role,
@@ -701,23 +746,29 @@ class WriteOperationRepository:
             if operation.delivery_next_operation_id
             else None
         )
+        adapter_kind: Literal["typed", "legacy_deterministic"] | None = None
         if operation.delivery_outcome == "chained_pending":
-            conversation = session.get(Conversation, operation.conversation_id)
             if (
                 child is None
-                or conversation is None
+                or operation.operation_role != "primary"
                 or child.operation_role != "primary"
+                or child.status != "proposed"
                 or child.conversation_id != operation.conversation_id
-                or (
-                    child.status == "proposed"
-                    and (
-                        conversation.pending_operation_id != child.id
-                        or conversation.pending_tool_call_id != child.tool_call_id
-                        or conversation.pending_tool_name != child.tool_name
-                    )
-                )
             ):
-                raise WriteOperationError("operation_delivery_unknown")
+                raise WriteOperationError("operation_delivery_unknown", retryable=True)
+            if operation.adapter_kind == "typed" and child.adapter_kind == "typed":
+                adapter_kind = "typed"
+            elif (
+                operation.adapter_kind == "legacy_deterministic"
+                and child.adapter_kind == "legacy_deterministic"
+                and operation.tool_name == "save_application_jd_version"
+                and child.tool_name == "save_application_jd_version"
+            ):
+                adapter_kind = "legacy_deterministic"
+            else:
+                raise WriteOperationError("operation_delivery_unknown", retryable=True)
+        elif operation.delivery_next_operation_id is not None:
+            raise WriteOperationError("operation_delivery_unknown", retryable=True)
         manifest: dict[str, JSONValue] = {
             "operation_id": operation.id,
             "status": operation.status,
@@ -735,13 +786,73 @@ class WriteOperationRepository:
         }
         digest = "sha256:" + hashlib.sha256(canonical_json(manifest).encode("utf-8")).hexdigest()
         if not hmac.compare_digest(digest, operation.delivery_manifest_sha256 or ""):
-            raise WriteOperationError("operation_delivery_unknown")
+            raise WriteOperationError("operation_delivery_unknown", retryable=True)
         final = next(
             (item.content for item in reversed(messages) if item.role == "assistant"), None
         )
         if final is None:
-            raise WriteOperationError("operation_delivery_unknown")
-        return final
+            raise WriteOperationError("operation_delivery_unknown", retryable=True)
+        if adapter_kind is None:
+            return final, None
+
+        assert child is not None
+        pending_row = session.execute(
+            select(
+                Conversation.id,
+                Conversation.pending_operation_id,
+                Conversation.pending_tool_call_id,
+                Conversation.pending_tool_name,
+                Conversation.pending_args,
+                Conversation.pending_human,
+            )
+            .where(Conversation.id == operation.conversation_id)
+            .where(Conversation.pending_operation_id == child.id)
+        ).one_or_none()
+        if (
+            pending_row is None
+            or pending_row.pending_operation_id != child.id
+            or pending_row.pending_tool_call_id != child.tool_call_id
+            or pending_row.pending_tool_name != child.tool_name
+        ):
+            raise WriteOperationError("operation_delivery_unknown", retryable=True)
+
+        decoded_args: dict[str, JSONValue] | None = None
+        if adapter_kind == "typed":
+            try:
+                decoded_args = PendingReplayArgsDecoderV1().decode(pending_row.pending_args)
+            except PendingReplayIntegrityError as exc:
+                raise WriteOperationError("operation_integrity_error") from exc
+            expected_proposal = ledger_fingerprint(
+                self.key, "write-operation-proposal-v1", decoded_args
+            )
+            if not hmac.compare_digest(
+                expected_proposal, child.proposal_fingerprint or ""
+            ):
+                raise WriteOperationError("operation_integrity_error")
+            token = _pending_confirmation_token(
+                child.tool_call_id or "", child.tool_name, decoded_args
+            )
+            expected_token = ledger_fingerprint(
+                self.key,
+                "write-operation-confirmation-token-v1",
+                token.encode("ascii"),
+            )
+            if not hmac.compare_digest(
+                expected_token, child.confirmation_token_fingerprint or ""
+            ):
+                raise WriteOperationError("operation_integrity_error")
+
+        return final, VerifiedPendingReplay(
+            adapter_kind=adapter_kind,
+            conversation_id=int(pending_row.id),
+            operation_id=child.id,
+            tool_call_id=child.tool_call_id or "",
+            tool_name=child.tool_name,
+            raw_args=pending_row.pending_args,
+            human=pending_row.pending_human or child.tool_name,
+            confirmation_token_fingerprint=child.confirmation_token_fingerprint or "",
+            decoded_args=decoded_args,
+        )
 
     def prepare_owner(self, operation_id: str, generation: int = 1) -> DeliveryOwnership:
         raw = secrets.token_bytes(32)

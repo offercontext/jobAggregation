@@ -12,6 +12,7 @@ from offerpilot.ai.write_operations import (
     OperationFailed,
     OperationReplay,
     TerminalPayload,
+    VerifiedPendingReplay,
     ledger_fingerprint,
 )
 from offerpilot.pilot_runtime import (
@@ -835,6 +836,7 @@ def test_chained_pending_replay_keeps_only_baseline_replay_metadata() -> None:
                     b"terminal-token",
                 ),
             )
+            self.chained_pending: VerifiedPendingReplay | None = None
 
         def replay(self, _operation: object, _fingerprint: str) -> OperationReplay:
             return OperationReplay(
@@ -855,6 +857,7 @@ def test_chained_pending_replay_keeps_only_baseline_replay_metadata() -> None:
                 None,
                 "chained_pending",
                 "",
+                chained_pending=self.chained_pending,
             )
 
     persistence = _Persistence()
@@ -870,6 +873,22 @@ def test_chained_pending_replay_keeps_only_baseline_replay_metadata() -> None:
         legacy_catalog_factory=_catalog_factory([0]),
     )
     adapter.start_turn(StartTurnRequest(message="保存 JD：岗位"), _Conversation())
+    child = persistence.pending
+    assert child is not None
+    operations.chained_pending = VerifiedPendingReplay(
+        adapter_kind="legacy_deterministic",
+        conversation_id=7,
+        operation_id=child.operation_id,
+        tool_call_id=child.tool_call_id,
+        tool_name=child.tool_name,
+        raw_args=child.args,
+        human=child.human,
+        confirmation_token_fingerprint=ledger_fingerprint(
+            operations.key,
+            "write-operation-confirmation-token-v1",
+            _confirmation_token(child).encode("ascii"),
+        ),
+    )
     execution = adapter.confirm(
         ConfirmationRequest(
             conversation_id=7,

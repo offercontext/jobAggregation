@@ -14,6 +14,10 @@ from sqlalchemy import delete, or_, select, text, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from offerpilot.ai.agent_contracts import PendingAction
+from offerpilot.ai.pending_replay import (
+    PendingReplayArgsDecoderV1,
+    PendingReplayIntegrityError,
+)
 from offerpilot.ai.tool_authority import (
     AuthorityFactory,
     AuthorityPhaseError,
@@ -1574,20 +1578,8 @@ def _pending_confirmation_token(pending: PendingAction) -> str:
 
 def _canonical_pending_arguments(raw: str) -> Mapping[str, Any]:
     try:
-        value = json.loads(raw)
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise AuthorityPhaseError("Typed Pending arguments are not canonical JSON") from exc
-    if not isinstance(value, Mapping) or any(type(key) is not str for key in value):
-        raise AuthorityPhaseError("Typed Pending arguments must be a JSON object")
-    try:
-        json.dumps(
-            value,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
-    except (TypeError, ValueError) as exc:
+        value = PendingReplayArgsDecoderV1().decode(raw)
+    except PendingReplayIntegrityError as exc:
         raise AuthorityPhaseError("Typed Pending arguments are not canonical JSON") from exc
     return cast(Mapping[str, Any], value)
 

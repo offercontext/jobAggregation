@@ -3,12 +3,13 @@ from __future__ import annotations
 import ast
 from datetime import datetime, timezone
 import inspect
+import sqlite3
 import textwrap
 from unittest.mock import patch
 
 import pytest
 from sqlalchemy import event, func, select, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DataError, IntegrityError
 
 from offerpilot.ai.tool_authority import (
     ApplicationScopeConstraint,
@@ -737,6 +738,29 @@ def test_scoped_note_write_preserves_stable_binding_domain_failures(seeded) -> N
 
     with seeded["session_factory"]() as session:
         notes = _bind(seeded["notes"], session, factory, authority, constraint)
+        before_count = session.scalar(select(func.count()).select_from(InterviewNote))
+        with pytest.raises(NoteBindingError) as invalid_create_event:
+            notes.create_note_scoped(
+                constraint,
+                NoteCreate(
+                    application_id=seeded["first_id"],
+                    application_event_id=seeded["second_event_id"],
+                    company="A",
+                ),
+            )
+        assert invalid_create_event.value.status_code == 422
+        assert str(invalid_create_event.value) == (
+            "application_event_id must reference an interview event for the application"
+        )
+        assert isinstance(invalid_create_event.value.__cause__, DataError)
+        sentinel_orig = invalid_create_event.value.__cause__.orig
+        assert sentinel_orig.sqlite_errorcode == sqlite3.SQLITE_TOOBIG
+        assert sentinel_orig.sqlite_errorname == "SQLITE_TOOBIG"
+        assert session.scalar(select(func.count()).select_from(InterviewNote)) == before_count
+        session.rollback()
+
+    with seeded["session_factory"]() as session:
+        notes = _bind(seeded["notes"], session, factory, authority, constraint)
         with pytest.raises(NoteBindingError) as invalid_event:
             notes.update_note_scoped(
                 constraint,
@@ -771,6 +795,136 @@ def test_scoped_note_write_preserves_stable_binding_domain_failures(seeded) -> N
                 ),
             )
         assert reparent.value.status_code == 422
+        assert str(reparent.value) == "application_id cannot be changed"
+        session.rollback()
+
+
+@pytest.mark.parametrize("operation", ("insert", "update"))
+def test_scoped_note_write_rejects_non_string_company_before_sql(
+    seeded,
+    operation: str,
+) -> None:
+    factory = AuthorityFactory()
+    authority, constraint = _scope(factory, seeded["first_id"])
+    with seeded["session_factory"]() as session:
+        notes = _bind(seeded["notes"], session, factory, authority, constraint)
+        with (
+            patch.object(
+                session,
+                "execute",
+                side_effect=AssertionError("SQL executed before company validation"),
+            ) as execute,
+            patch.object(
+                session,
+                "scalars",
+                side_effect=AssertionError("SQL executed before company validation"),
+            ) as scalars,
+        ):
+            with pytest.raises(ValueError, match="company must be a string"):
+                if operation == "insert":
+                    notes.create_note_scoped(
+                        constraint,
+                        NoteCreate(
+                            application_id=seeded["first_id"],
+                            application_event_id=seeded["first_event_id"],
+                            company=None,  # type: ignore[arg-type]
+                        ),
+                    )
+                else:
+                    notes.update_note_scoped(
+                        constraint,
+                        seeded["first_note_id"],
+                        NoteUpdate(
+                            application_event_id=seeded["first_event_id"],
+                            company=None,  # type: ignore[arg-type]
+                        ),
+                    )
+            execute.assert_not_called()
+            scalars.assert_not_called()
+
+
+def test_scoped_note_write_allows_empty_company(seeded) -> None:
+    factory = AuthorityFactory()
+    authority, constraint = _scope(factory, seeded["first_id"])
+    with seeded["session_factory"]() as session:
+        notes = _bind(seeded["notes"], session, factory, authority, constraint)
+        created = notes.create_note_scoped(
+            constraint,
+            NoteCreate(application_id=seeded["first_id"], company=""),
+        )
+        updated = notes.update_note_scoped(
+            constraint,
+            seeded["first_note_id"],
+            NoteUpdate(company=""),
+        )
+        assert created.company == ""
+        assert updated is not None
+        assert updated.company == ""
+
+
+@pytest.mark.parametrize("operation", ("insert", "update"))
+def test_scoped_note_write_preserves_real_unrelated_not_null_error(
+    seeded,
+    operation: str,
+) -> None:
+    factory = AuthorityFactory()
+    authority, constraint = _scope(factory, seeded["first_id"])
+    with seeded["session_factory"]() as session:
+        notes = _bind(seeded["notes"], session, factory, authority, constraint)
+        with pytest.raises(IntegrityError) as raised:
+            if operation == "insert":
+                notes.create_note_scoped(
+                    constraint,
+                    NoteCreate(
+                        application_id=seeded["first_id"],
+                        application_event_id=seeded["first_event_id"],
+                        company="A",
+                        position=None,  # type: ignore[arg-type]
+                    ),
+                )
+            else:
+                notes.update_note_scoped(
+                    constraint,
+                    seeded["first_note_id"],
+                    NoteUpdate(
+                        application_event_id=seeded["first_event_id"],
+                        company="A",
+                        position=None,  # type: ignore[arg-type]
+                    ),
+                )
+
+        assert raised.value.orig.sqlite_errorname == "SQLITE_CONSTRAINT_NOTNULL"
+        assert str(raised.value.orig).casefold() == (
+            "not null constraint failed: interview_notes.position"
+        )
+        session.rollback()
+
+
+def test_scoped_note_update_prioritizes_immutable_application_over_valid_event(
+    seeded,
+) -> None:
+    factory = AuthorityFactory()
+    authority, constraint = _scope(factory, None, context_type="workspace")
+    with seeded["session_factory"]() as session:
+        notes = _bind(seeded["notes"], session, factory, authority, constraint)
+        with pytest.raises(NoteBindingError) as raised:
+            notes.update_note_scoped(
+                constraint,
+                seeded["first_note_id"],
+                NoteUpdate(
+                    application_id=seeded["second_id"],
+                    application_event_id=seeded["first_event_id"],
+                    company="A",
+                ),
+            )
+
+        assert raised.value.status_code == 422
+        assert str(raised.value) == "application_id cannot be changed"
+        session.expire_all()
+        current = session.get(InterviewNote, seeded["first_note_id"])
+        assert current is not None
+        assert current.application_id == seeded["first_id"]
+        assert current.application_event_id is None
         session.rollback()
 
 

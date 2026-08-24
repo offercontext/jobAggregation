@@ -6,8 +6,20 @@ from typing import TYPE_CHECKING, Any, NoReturn, Optional, cast
 
 from builtins import list as BuiltinList
 
-from sqlalchemy import and_, case, delete, exists, insert, literal, or_, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import (
+    and_,
+    case,
+    delete,
+    exists,
+    func,
+    insert,
+    literal,
+    literal_column,
+    or_,
+    select,
+    update,
+)
+from sqlalchemy.exc import DataError, IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql import Select
 from sqlalchemy.sql.elements import ColumnElement
@@ -30,6 +42,10 @@ from offerpilot.repositories.session_binding import (
 if TYPE_CHECKING:
     from offerpilot.ai.tool_authority.contracts import ApplicationScopeConstraint, ToolExecutionAuthority
     from offerpilot.repositories.session_binding import AuthorityFactoryProtocol
+
+
+_SQLITE_EVENT_SENTINEL_BLOB_SIZE = 2**31
+_SQLITE_TOOBIG_CODE = 18
 
 
 class NoteBindingError(ValueError):
@@ -143,6 +159,7 @@ class NotesRepository:
         data: NoteCreate,
     ) -> InterviewNote:
         binding = self._require_scoped(constraint)
+        _require_note_company(data.company)
         require_scoped_optional_id(data.application_id, "application_id")
         require_scoped_optional_id(data.application_event_id, "application_event_id")
         if data.application_event_id is not None and data.application_id is None:
@@ -150,15 +167,18 @@ class NotesRepository:
 
         values = _note_create_values(data)
         if data.application_event_id is not None:
-            values["company"] = case(
+            values["application_event_id"] = case(
                 (
                     _valid_interview_event(
                         data.application_event_id,
                         data.application_id,
                     ),
-                    data.company,
+                    data.application_event_id,
                 ),
-                else_=None,
+                # SQLite's hard value-size ceiling is 2**31 - 1.  The invalid
+                # branch therefore raises the dedicated SQLITE_TOOBIG sentinel
+                # before an application_event_id can be inserted.
+                else_=func.zeroblob(literal(_SQLITE_EVENT_SENTINEL_BLOB_SIZE)),
             )
         if constraint.mode == "restricted":
             allowed_id = _restricted_scope_id(constraint)
@@ -189,6 +209,8 @@ class NotesRepository:
         try:
             with binding.session.no_autoflush:
                 rows = list(binding.session.scalars(statement))
+        except DataError as exc:
+            _raise_scoped_note_event_sentinel(exc, event_id=data.application_event_id)
         except IntegrityError as exc:
             _raise_scoped_note_integrity(exc, event_id=data.application_event_id)
         if len(rows) != 1:
@@ -327,6 +349,7 @@ class NotesRepository:
     ) -> Optional[InterviewNote]:
         binding = self._require_scoped(constraint)
         note_id = require_scoped_positive_int64(note_id, "note id")
+        _require_note_company(data.company)
         if data.application_id is not UNSET:
             require_scoped_optional_id(data.application_id, "application_id")
         if data.application_event_id is not UNSET:
@@ -353,46 +376,69 @@ class NotesRepository:
             )
 
         values = _note_update_values(data)
-        domain_predicates: list[ColumnElement[bool]] = []
         application_change = data.application_id is not UNSET
+        application_allowed: ColumnElement[bool]
         if application_change:
             if data.application_id is None:
-                domain_predicates.append(InterviewNote.application_id.is_(None))
+                application_allowed = InterviewNote.application_id.is_(None)
             else:
-                domain_predicates.append(
-                    InterviewNote.application_id == data.application_id
-                )
+                application_allowed = InterviewNote.application_id == data.application_id
+        else:
+            application_allowed = literal(True)
         event_id: int | None = None
+        event_allowed: ColumnElement[bool]
+        returned_event_allowed: ColumnElement[bool]
         if data.application_event_id is not UNSET:
             event_id = cast(int | None, data.application_event_id)
             if event_id is not None:
-                domain_predicates.append(
-                    _valid_interview_event(event_id, InterviewNote.application_id)
+                event_allowed = _valid_interview_event(
+                    event_id, InterviewNote.application_id
                 )
-        if domain_predicates:
-            values["company"] = case(
-                (and_(*domain_predicates), values["company"]),
-                else_=None,
+                returned_event_allowed = _valid_interview_event_returning(event_id)
+            else:
+                event_allowed = literal(True)
+                returned_event_allowed = literal(True)
+        else:
+            event_allowed = literal(True)
+            returned_event_allowed = literal(True)
+        domain_allowed = and_(application_allowed, event_allowed)
+        guarded_values = {
+            key: case(
+                (domain_allowed, value),
+                else_=getattr(InterviewNote, key),
             )
+            for key, value in values.items()
+        }
         statement = (
-            statement.values(**values)
-            .returning(InterviewNote)
-            .execution_options(populate_existing=True)
+            statement.values(**guarded_values)
+            .returning(
+                InterviewNote,
+                application_allowed.label("application_allowed"),
+                returned_event_allowed.label("event_allowed"),
+            )
+            .execution_options(populate_existing=True, synchronize_session=False)
         )
         try:
             with binding.session.no_autoflush:
-                rows = list(binding.session.scalars(statement))
+                rows = list(binding.session.execute(statement))
         except IntegrityError as exc:
             _raise_scoped_note_integrity(
                 exc,
                 event_id=event_id,
-                application_change=application_change,
             )
         if len(rows) != 1:
             if constraint.mode == "restricted" or len(rows) > 1:
                 raise ScopeAccessDenied("application scope denied")
             return None
-        return rows[0]
+        note, application_is_allowed, event_is_allowed = rows[0]
+        if not application_is_allowed:
+            raise NoteBindingError(422, "application_id cannot be changed")
+        if not event_is_allowed:
+            raise NoteBindingError(
+                422,
+                "application_event_id must reference an interview event for the application",
+            )
+        return cast(InterviewNote, note)
 
     def delete(self, note_id: int) -> None:
         with repository_session(self._session_factory, self._session) as session:
@@ -527,6 +573,12 @@ def _note_create_values(data: NoteCreate) -> dict[str, object]:
     }
 
 
+def _require_note_company(company: object) -> str:
+    if type(company) is not str:
+        raise ValueError("company must be a string")
+    return company
+
+
 def _note_update_values(data: NoteUpdate) -> dict[str, object]:
     values: dict[str, object] = {
         "company": data.company,
@@ -561,11 +613,32 @@ def _valid_interview_event(
     )
 
 
+def _valid_interview_event_returning(event_id: int) -> ColumnElement[bool]:
+    event_table = ApplicationEvent.__table__.alias("note_guard_event")
+    application_table = Application.__table__.alias("note_guard_application")
+    return exists(
+        select(literal_column("note_guard_event.id"))
+        .select_from(
+            event_table.join(
+                application_table,
+                literal_column("note_guard_application.id")
+                == literal_column("note_guard_event.application_id"),
+            )
+        )
+        .where(
+            literal_column("note_guard_event.id") == event_id,
+            literal_column("note_guard_event.event_type") == "interview",
+            literal_column("note_guard_event.application_id")
+            == literal_column("interview_notes.application_id"),
+            literal_column("note_guard_application.deleted_at").is_(None),
+        )
+    )
+
+
 def _raise_scoped_note_integrity(
     exc: IntegrityError,
     *,
     event_id: int | None,
-    application_change: bool = False,
 ) -> NoReturn:
     detail = str(exc.orig).casefold()
     error_name = getattr(exc.orig, "sqlite_errorname", None)
@@ -577,16 +650,24 @@ def _raise_scoped_note_integrity(
         == "unique constraint failed: interview_notes.application_event_id"
     ):
         raise NoteBindingError(409, "Interview event already has a note") from exc
-    company_sentinel_failed = (
-        is_sqlite_integrity
-        and error_name == "SQLITE_CONSTRAINT_NOTNULL"
-        and detail == "not null constraint failed: interview_notes.company"
-    )
-    if event_id is not None and company_sentinel_failed:
+    raise exc
+
+
+def _raise_scoped_note_event_sentinel(
+    exc: DataError,
+    *,
+    event_id: int | None,
+) -> NoReturn:
+    orig = exc.orig
+    if (
+        event_id is not None
+        and isinstance(orig, sqlite3.DataError)
+        and getattr(orig, "sqlite_errorcode", None) == _SQLITE_TOOBIG_CODE
+        and getattr(orig, "sqlite_errorname", None) == "SQLITE_TOOBIG"
+        and str(orig).casefold() == "string or blob too big"
+    ):
         raise NoteBindingError(
             422,
             "application_event_id must reference an interview event for the application",
         ) from exc
-    if application_change and company_sentinel_failed:
-        raise NoteBindingError(422, "application_id cannot be changed") from exc
     raise exc

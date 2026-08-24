@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 
@@ -17,7 +17,13 @@ from offerpilot.ai.agent_loop import (
     AgentLoopRunner,
     ApprovedWriteSeed,
     NewTurnSeed,
+    build_segment_surface_gate,
+    _pending_action_revision,
+    _provider_arguments_digest,
 )
+from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
+from offerpilot.ai.tool_authority.policy import validate_startup_policy
+from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import (
     PreparedToolCall,
     ToolExecutionRecord,
@@ -29,6 +35,7 @@ from offerpilot.ai.types import Assistant, Message, ToolCall
 from offerpilot.agent_runtime.journal import NullRunRecorder
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 from offerpilot.context_projector.contracts import ProjectionError
+from offerpilot.context_projector.selector import DEPENDENCY_POLICY_V1
 
 from .helpers import RecordingEventSink, ScriptedModel, ToolDefinition, runtime
 
@@ -43,14 +50,77 @@ def invocation(
     max_iterations: int = 8,
     auto_approve: bool = False,
     cancel_check: object | None = None,
+    catalog_transform: Callable[[ToolCatalog], ToolCatalog] | None = None,
 ) -> AgentLoopInvocation:
     catalog, context = runtime(*definitions)
+    if catalog_transform is not None:
+        catalog = catalog_transform(catalog)
     recorder = run_recorder or NullRunRecorder()
-    context = replace(context, run_recorder=recorder)
-    if isinstance(seed, ApprovedWriteSeed):
-        context = replace(context, operation_executor=execute_operation)
+    resolved_seed = seed or NewTurnSeed((Message(role="user", content="开始"),))
+    if isinstance(resolved_seed, ApprovedWriteSeed):
+        policy = validate_startup_policy(catalog.authority_manifest)
+        pending = resolved_seed.pending
+        revision = _pending_action_revision(
+            pending.tool_call_id,
+            pending.tool_name,
+            pending.args,
+        )
+        digest = _provider_arguments_digest(pending.args)
+        pending.bind_typed_proposal_identity(
+            conversation_id=1,
+            pending_action_revision=revision,
+            pending_confirmation_claim_id="agent-loop-test-claim",
+            arguments_digest=digest,
+        )
+        approval_factory = AuthorityFactory()
+        approval_factory.register_pending(pending)
+        authority = approval_factory.create_approval_authority(
+            operation_id=pending.operation_id,
+            conversation_id=1,
+            conversation_scope_revision=0,
+            trusted_scope=TrustedContextScope("workspace", None, "general"),
+            pending_identity=pending,
+            pending_action_revision=revision,
+            tool_call_id=pending.tool_call_id,
+            tool_name=pending.tool_name,
+            effective_args_digest=digest,
+            capabilities=frozenset(ToolCapability),
+            capability_profile_id=policy.capability_profile.profile_id,
+            capability_policy_version=policy.capability_policy_version,
+            binding_policy_version=policy.binding_policy_version,
+            capability_profile_fingerprint=policy.capability_profile_fingerprint,
+            binding_policy_fingerprint=policy.binding_policy_fingerprint,
+        )
+        context = ToolExecutionContext(
+            authority=authority,
+            applications=context.applications,
+            events=context.events,
+            jd_analyses=context.jd_analyses,
+            notes=context.notes,
+            offers=context.offers,
+            resumes=context.resumes,
+            run_recorder=recorder,
+            operation_executor=execute_operation,
+        )
+    else:
+        context = context.with_runtime_dependencies(
+            run_recorder=recorder,
+            operation_executor=None,
+        )
+    surface_gate = (
+        build_segment_surface_gate(
+            resolved_seed.messages,
+            catalog=catalog,
+            context=context,
+            authority=context.authority,
+            dependency_policy=DEPENDENCY_POLICY_V1,
+            policy=validate_startup_policy(catalog.authority_manifest),
+        )
+        if isinstance(resolved_seed, NewTurnSeed)
+        else None
+    )
     return AgentLoopInvocation(
-        seed=seed or NewTurnSeed((Message(role="user", content="开始"),)),
+        seed=resolved_seed,
         model=model,
         catalog=catalog,
         tool_context=context,
@@ -60,6 +130,7 @@ def invocation(
         event_sink=event_sink,
         runtime_signal_sink=None,
         cancel_check=cancel_check,
+        surface_gate=surface_gate,
     )
 
 
@@ -121,9 +192,7 @@ def test_new_turn_returns_final_from_one_explicit_model_step() -> None:
 
     assert result.reply == "完成"
     assert result.pending is None
-    assert [(message.role, message.content) for message in result.added] == [
-        ("assistant", "完成")
-    ]
+    assert [(message.role, message.content) for message in result.added] == [("assistant", "完成")]
     assert model.calls == 1
 
 
@@ -132,18 +201,24 @@ def test_read_batch_runs_all_calls_in_provider_order() -> None:
     model = ScriptedModel(
         Assistant(
             tool_calls=[
-                ToolCall("read-1", "first", "{}"),
-                ToolCall("read-2", "second", "{}"),
+                ToolCall("read-1", "list_applications", "{}"),
+                ToolCall("read-2", "list_notes", "{}"),
             ]
         ),
         Assistant(content="完成"),
     )
     definitions = (
-        ToolDefinition("first", executor=lambda _args: executed.append("first") or "一"),
-        ToolDefinition("second", executor=lambda _args: executed.append("second") or "二"),
+        ToolDefinition(
+            "list_applications", executor=lambda _args: executed.append("first") or "一"
+        ),
+        ToolDefinition("list_notes", executor=lambda _args: executed.append("second") or "二"),
     )
 
-    result = AgentLoopRunner().run(invocation(model, definitions))
+    base = invocation(model, definitions)
+    authority = base.tool_context.authority
+    assert base.surface_gate is not None
+    assert base.surface_gate.authority is authority
+    result = AgentLoopRunner().run(base)
 
     assert executed == ["first", "second"]
     assert [message.tool_call_id for message in result.added if message.role == "tool"] == [
@@ -151,12 +226,17 @@ def test_read_batch_runs_all_calls_in_provider_order() -> None:
         "read-2",
     ]
     assert result.reply == "完成"
+    assert model.calls == 2
+    assert base.tool_context.authority is authority
+    assert base.surface_gate.authority is authority
 
 
 def test_write_tool_pauses_before_execution() -> None:
     calls: list[str] = []
     model = ScriptedModel(
-        Assistant(tool_calls=[ToolCall("w1", "update_application_status", '{"id":1}')])
+        Assistant(
+            tool_calls=[ToolCall("w1", "update_application_status", '{"id":1,"status":"applied"}')]
+        )
     )
     result = AgentLoopRunner().run(
         invocation(
@@ -182,15 +262,10 @@ def test_pending_return_rechecks_active_after_confirmation_summary() -> None:
     cancelled = False
     descriptions = 0
     model = ScriptedModel(
-        Assistant(tool_calls=[ToolCall("w1", "write", "{}")])
+        Assistant(
+            tool_calls=[ToolCall("w1", "update_application_status", '{"id":1,"status":"applied"}')]
+        )
     )
-    base = invocation(
-        model,
-        (ToolDefinition("write", kind="write"),),
-        cancel_check=lambda: cancelled,
-    )
-    spec = base.catalog.resolve("write")
-    assert spec is not None
 
     def describe(_args: object) -> str:
         nonlocal cancelled, descriptions
@@ -199,13 +274,24 @@ def test_pending_return_rechecks_active_after_confirmation_summary() -> None:
             cancelled = True
         return "write"
 
-    catalog = ToolCatalog(
-        (replace(spec, confirmation_description=describe),),
-        expected_names=("write",),
+    def with_description(catalog: ToolCatalog) -> ToolCatalog:
+        specs = tuple(
+            replace(item, confirmation_description=describe)
+            if item.name == "update_application_status"
+            else item
+            for item in catalog.specs
+        )
+        return ToolCatalog(specs, expected_names=tuple(item.name for item in specs))
+
+    base = invocation(
+        model,
+        (ToolDefinition("update_application_status", kind="write"),),
+        cancel_check=lambda: cancelled,
+        catalog_transform=with_description,
     )
 
     with pytest.raises(ChatRunCancelled):
-        AgentLoopRunner().run(replace(base, catalog=catalog))
+        AgentLoopRunner().run(base)
 
     assert descriptions == 2
     assert model.calls == 1
@@ -215,19 +301,31 @@ def test_pending_return_rechecks_active_after_confirmation_summary() -> None:
     ("calls", "expected_ids"),
     [
         (
-            [ToolCall("read-1", "read", "{}"), ToolCall("read-2", "read", "{}")],
+            [
+                ToolCall("read-1", "list_applications", "{}"),
+                ToolCall("read-2", "list_applications", "{}"),
+            ],
             ["read-1", "read-2"],
         ),
         (
-            [ToolCall("write-1", "write", "{}"), ToolCall("read-1", "read", "{}")],
+            [
+                ToolCall("write-1", "update_application_status", '{"id":1,"status":"applied"}'),
+                ToolCall("read-1", "list_applications", "{}"),
+            ],
             ["write-1"],
         ),
         (
-            [ToolCall("read-1", "read", "{}"), ToolCall("write-1", "write", "{}")],
+            [
+                ToolCall("read-1", "list_applications", "{}"),
+                ToolCall("write-1", "update_application_status", '{"id":1,"status":"applied"}'),
+            ],
             ["read-1"],
         ),
         (
-            [ToolCall("write-1", "write", "{}"), ToolCall("write-2", "write", "{}")],
+            [
+                ToolCall("write-1", "update_application_status", '{"id":1,"status":"applied"}'),
+                ToolCall("write-2", "update_application_status", '{"id":2,"status":"applied"}'),
+            ],
             ["write-1"],
         ),
     ],
@@ -237,8 +335,8 @@ def test_multi_tool_call_selection_matches_baseline_matrix(
 ) -> None:
     model = ScriptedModel(Assistant(tool_calls=calls), Assistant(content="完成"))
     definitions = (
-        ToolDefinition("read"),
-        ToolDefinition("write", kind="write"),
+        ToolDefinition("list_applications"),
+        ToolDefinition("update_application_status", kind="write"),
     )
 
     result = AgentLoopRunner().run(invocation(model, definitions))
@@ -293,8 +391,8 @@ def test_failed_first_read_does_not_block_second_read_in_same_turn() -> None:
     model = ScriptedModel(
         Assistant(
             tool_calls=[
-                ToolCall("first", "first_read", "{}"),
-                ToolCall("second", "second_read", "{}"),
+                ToolCall("first", "list_applications", "{}"),
+                ToolCall("second", "list_notes", "{}"),
             ]
         ),
         Assistant(content="done"),
@@ -303,10 +401,8 @@ def test_failed_first_read_does_not_block_second_read_in_same_turn() -> None:
         invocation(
             model,
             (
-                ToolDefinition("first_read", executor=fail),
-                ToolDefinition(
-                    "second_read", executor=lambda raw: executed.append("second") or raw
-                ),
+                ToolDefinition("list_applications", executor=fail),
+                ToolDefinition("list_notes", executor=lambda raw: executed.append("second") or raw),
             ),
         )
     )
@@ -322,9 +418,7 @@ def test_failed_first_read_does_not_block_second_read_in_same_turn() -> None:
 
 def test_always_confirm_write_pauses_even_when_auto_approve_is_enabled() -> None:
     calls: list[str] = []
-    model = ScriptedModel(
-        Assistant(tool_calls=[ToolCall("d1", "delete_note", '{"id":1}')])
-    )
+    model = ScriptedModel(Assistant(tool_calls=[ToolCall("d1", "delete_note", '{"id":1}')]))
     result = AgentLoopRunner().run(
         invocation(
             model,
@@ -347,12 +441,24 @@ def test_always_confirm_write_pauses_even_when_auto_approve_is_enabled() -> None
 
 def test_write_never_auto_approves_and_suspends_without_executor() -> None:
     executed: list[str] = []
-    model = ScriptedModel(Assistant(tool_calls=[ToolCall("write-1", "write", "{}")]))
+    model = ScriptedModel(
+        Assistant(
+            tool_calls=[
+                ToolCall("write-1", "update_application_status", '{"id":1,"status":"applied"}')
+            ]
+        )
+    )
 
     result = AgentLoopRunner().run(
         invocation(
             model,
-            (ToolDefinition("write", kind="write", executor=lambda raw: executed.append(raw) or raw),),
+            (
+                ToolDefinition(
+                    "update_application_status",
+                    kind="write",
+                    executor=lambda raw: executed.append(raw) or raw,
+                ),
+            ),
             auto_approve=True,
         )
     )
@@ -367,7 +473,7 @@ def test_write_never_auto_approves_and_suspends_without_executor() -> None:
 
 def test_invalid_non_object_write_args_emit_safe_summary_and_continue() -> None:
     model = ScriptedModel(
-        Assistant(tool_calls=[ToolCall("write-1", "write", "[]")]),
+        Assistant(tool_calls=[ToolCall("write-1", "update_application_status", "[]")]),
         Assistant(content="参数无效"),
     )
     sink = RecordingEventSink()
@@ -375,7 +481,7 @@ def test_invalid_non_object_write_args_emit_safe_summary_and_continue() -> None:
     result = AgentLoopRunner().run(
         invocation(
             model,
-            (ToolDefinition("write", kind="write", executor=lambda raw: raw),),
+            (ToolDefinition("update_application_status", kind="write", executor=lambda raw: raw),),
             event_sink=sink,
         )
     )
@@ -387,9 +493,7 @@ def test_invalid_non_object_write_args_emit_safe_summary_and_continue() -> None:
 
 def test_event_sink_emits_assistant_delta_from_streaming_model() -> None:
     sink = RecordingEventSink()
-    result = AgentLoopRunner().run(
-        invocation(StreamingModel(), (), event_sink=sink)
-    )
+    result = AgentLoopRunner().run(invocation(StreamingModel(), (), event_sink=sink))
 
     assert result.reply == "流式回复"
     assert result.pending is None
@@ -398,6 +502,29 @@ def test_event_sink_emits_assistant_delta_from_streaming_model() -> None:
         "流式",
         "回复",
     ]
+
+
+def test_runner_event_sink_override_receives_read_tool_events() -> None:
+    invocation_sink = RecordingEventSink()
+    runner_sink = RecordingEventSink()
+    model = ScriptedModel(
+        Assistant(tool_calls=[ToolCall("r1", "list_applications", "{}")]),
+        Assistant(content="done"),
+    )
+
+    result = AgentLoopRunner().run(
+        invocation(
+            model,
+            (ToolDefinition("list_applications", executor=lambda _raw: "[]"),),
+            event_sink=invocation_sink,
+        ),
+        event_sink=runner_sink,
+    )
+
+    assert result.reply == "done"
+    assert any(isinstance(event, AgentToolCall) for event in runner_sink.events)
+    assert any(isinstance(event, AgentToolResult) for event in runner_sink.events)
+    assert invocation_sink.events == []
 
 
 def test_cancellation_after_provider_response_drops_buffered_deltas() -> None:
@@ -457,7 +584,9 @@ def test_journal_records_read_tool_loop_and_increments_model_step() -> None:
         "model.requested",
         "model.completed",
     ]
-    model_events = [event for event in recorder.events if getattr(event, "event_type", "").startswith("model.")]
+    model_events = [
+        event for event in recorder.events if getattr(event, "event_type", "").startswith("model.")
+    ]
     assert [getattr(event, "model_step", None) for event in model_events] == [1, 1, 2, 2]
     assert getattr(model_events[0], "model_call_id", None) == getattr(
         model_events[1], "model_call_id", None
@@ -504,32 +633,41 @@ class ApprovedPort:
         return "claim" in self.phases
 
 
-def test_approved_write_bootstraps_then_enters_same_model_loop() -> None:
+def test_approval_authority_bootstraps_write_but_cannot_enter_model_loop() -> None:
     phases: list[str] = []
     executed: list[str] = []
-    pending = PendingAction("write-1", "write", "{}", "确认", "operation-1")
+    pending = PendingAction(
+        "write-1", "update_application_status", '{"id":1,"status":"applied"}', "确认", "operation-1"
+    )
     port = ApprovedPort(pending, phases)
     sink = RecordingEventSink()
     model = ScriptedModel(Assistant(content="写入完成"))
     base = invocation(
         model,
-        (ToolDefinition("write", kind="write", executor=lambda raw: executed.append(raw) or "已写入"),),
+        (
+            ToolDefinition(
+                "update_application_status",
+                kind="write",
+                executor=lambda raw: executed.append(raw) or "已写入",
+            ),
+        ),
         seed=ApprovedWriteSeed(port),
         event_sink=sink,
     )
-    result = AgentLoopRunner().run(base)
+    with pytest.raises(TypeError, match="Provider calls require a Segment authority"):
+        AgentLoopRunner().run(base)
 
-    assert executed == ["{}"]
+    assert executed == ['{"id":1,"status":"applied"}']
     assert phases == ["pending", "claim", "record", "load"]
-    assert result.reply == "写入完成"
-    assert [message.role for message in result.added] == ["tool", "assistant"]
-    assert len(result.records) == 1
     assert [type(event) for event in sink.events[:2]] == [AgentToolCall, AgentToolResult]
+    assert model.calls == 0
 
 
-def test_final_return_rechecks_delivery_fence_after_last_cancel_checkpoint() -> None:
+def test_live_approval_delivery_fence_does_not_authorize_provider() -> None:
     phases: list[str] = []
-    pending = PendingAction("write-1", "write", "{}", "确认", "operation-1")
+    pending = PendingAction(
+        "write-1", "update_application_status", '{"id":1,"status":"applied"}', "确认", "operation-1"
+    )
 
     class RevokedAtReturnPort(ApprovedPort):
         allowed = True
@@ -538,37 +676,47 @@ def test_final_return_rechecks_delivery_fence_after_last_cancel_checkpoint() -> 
             return self.allowed and super().delivery_fence()
 
     port = RevokedAtReturnPort(pending, phases)
-    recorder = RecordingJournal()
-    post_completion_checks = 0
-
-    def cancel_check() -> bool:
-        nonlocal post_completion_checks
-        if any(getattr(event, "event_type", "") == "model.completed" for event in recorder.events):
-            post_completion_checks += 1
-            if post_completion_checks == 2:
-                port.allowed = False
-        return False
-
+    model = ScriptedModel(Assistant(content="不应调用"))
     base = invocation(
-        ScriptedModel(Assistant(content="完成")),
-        (ToolDefinition("write", kind="write"),),
+        model,
+        (ToolDefinition("update_application_status", kind="write"),),
         seed=ApprovedWriteSeed(port),
-        run_recorder=recorder,
-        cancel_check=cancel_check,
     )
 
-    with pytest.raises(ChatRunCancelled):
+    with pytest.raises(TypeError, match="Provider calls require a Segment authority"):
         AgentLoopRunner().run(base)
 
-    assert post_completion_checks == 2
-    assert port.allowed is False
+    assert model.calls == 0
+    assert port.allowed is True
+
+
+def test_approval_authority_cannot_be_reused_as_a_new_turn_segment() -> None:
+    phases: list[str] = []
+    pending = PendingAction(
+        "write-1",
+        "update_application_status",
+        '{"id":1,"status":"applied"}',
+        "确认",
+        "operation-1",
+    )
+    base = invocation(
+        ScriptedModel(Assistant(content="不应调用")),
+        (ToolDefinition("update_application_status", kind="write"),),
+        seed=ApprovedWriteSeed(ApprovedPort(pending, phases)),
+    )
+
+    with pytest.raises(TypeError, match="NewTurnSeed requires Segment authority"):
+        replace(base, seed=NewTurnSeed((Message(role="user", content="continue"),)))
 
 
 def test_approved_claim_failure_stops_before_executor_and_provider() -> None:
     phases: list[str] = []
     executed: list[str] = []
-    pending = PendingAction("write-1", "write", "{}", "确认", "operation-1")
+    pending = PendingAction(
+        "write-1", "update_application_status", '{"id":1,"status":"applied"}', "确认", "operation-1"
+    )
     port = ApprovedPort(pending, phases)
+
     def lost_claim(_pending: PendingAction, _prepared: PreparedToolCall[Any, Any]) -> ToolFailure:
         phases.append("claim")
         return ToolFailure("stale_state", "confirmation_claim_lost")
@@ -577,10 +725,19 @@ def test_approved_claim_failure_stops_before_executor_and_provider() -> None:
     model = ScriptedModel(Assistant(content="不应调用"))
     base = invocation(
         model,
-        (ToolDefinition("write", kind="write", executor=lambda raw: executed.append(raw) or raw),),
+        (
+            ToolDefinition(
+                "update_application_status",
+                kind="write",
+                executor=lambda raw: executed.append(raw) or raw,
+            ),
+        ),
         seed=ApprovedWriteSeed(port),
     )
-    context = replace(base.tool_context, operation_executor=lambda *_args: pytest.fail("executor"))
+    context = base.tool_context.with_runtime_dependencies(
+        run_recorder=base.run_recorder,
+        operation_executor=lambda *_args: pytest.fail("executor"),
+    )
 
     with pytest.raises(Exception, match="confirmation claim"):
         AgentLoopRunner().run(replace(base, tool_context=context))
@@ -601,13 +758,17 @@ def test_cancellation_before_read_executor_is_fail_closed() -> None:
             return value
 
     model = CancellingModel(
-        Assistant(tool_calls=[ToolCall("r1", "read", "{}")] ),
+        Assistant(tool_calls=[ToolCall("r1", "list_applications", "{}")]),
     )
     with pytest.raises(ChatRunCancelled):
         AgentLoopRunner().run(
             invocation(
                 model,
-                (ToolDefinition("read", executor=lambda raw: executed.append(raw) or raw),),
+                (
+                    ToolDefinition(
+                        "list_applications", executor=lambda raw: executed.append(raw) or raw
+                    ),
+                ),
                 cancel_check=lambda: cancelled,
             )
         )
@@ -626,14 +787,14 @@ def test_cancellation_after_read_executor_does_not_repeat_executor() -> None:
         return raw
 
     model = ScriptedModel(
-        Assistant(tool_calls=[ToolCall("r1", "read", "{}")] ),
+        Assistant(tool_calls=[ToolCall("r1", "list_applications", "{}")]),
         Assistant(content="never reached"),
     )
     with pytest.raises(ChatRunCancelled):
         AgentLoopRunner().run(
             invocation(
                 model,
-                (ToolDefinition("read", executor=execute),),
+                (ToolDefinition("list_applications", executor=execute),),
                 cancel_check=lambda: cancelled,
             )
         )
@@ -645,7 +806,9 @@ def test_cancellation_after_read_executor_does_not_repeat_executor() -> None:
 def test_delivery_fence_after_approved_executor_aborts_without_repeat() -> None:
     phases: list[str] = []
     executed: list[str] = []
-    pending = PendingAction("write-1", "write", "{}", "确认", "operation-1")
+    pending = PendingAction(
+        "write-1", "update_application_status", '{"id":1,"status":"applied"}', "确认", "operation-1"
+    )
 
     class RevokedPort(ApprovedPort):
         allowed = True
@@ -657,7 +820,13 @@ def test_delivery_fence_after_approved_executor_aborts_without_repeat() -> None:
     model = ScriptedModel(Assistant(content="never reached"))
     base = invocation(
         model,
-        (ToolDefinition("write", kind="write", executor=lambda raw: executed.append(raw) or raw),),
+        (
+            ToolDefinition(
+                "update_application_status",
+                kind="write",
+                executor=lambda raw: executed.append(raw) or raw,
+            ),
+        ),
         seed=ApprovedWriteSeed(port),
     )
 
@@ -671,10 +840,16 @@ def test_delivery_fence_after_approved_executor_aborts_without_repeat() -> None:
 
     with pytest.raises(ChatRunCancelled):
         AgentLoopRunner().run(
-            replace(base, tool_context=replace(base.tool_context, operation_executor=execute_and_revoke))
+            replace(
+                base,
+                tool_context=base.tool_context.with_runtime_dependencies(
+                    run_recorder=base.run_recorder,
+                    operation_executor=execute_and_revoke,
+                ),
+            )
         )
 
-    assert executed == ["{}"]
+    assert executed == ['{"id":1,"status":"applied"}']
     assert model.calls == 0
 
 
@@ -693,8 +868,9 @@ def test_mixed_known_and_unknown_surface_tool_calls_fail_closed_before_events_or
                 ]
             )
 
+    seed = NewTurnSeed((Message(role="user", content="offer"),))
     invocation_value = AgentLoopInvocation(
-        seed=NewTurnSeed((Message(role="user", content="offer"),)),
+        seed=seed,
         model=MixedModel(),
         catalog=MODEL_TOOL_CATALOG,
         tool_context=context,
@@ -704,6 +880,14 @@ def test_mixed_known_and_unknown_surface_tool_calls_fail_closed_before_events_or
         event_sink=events,
         runtime_signal_sink=None,
         cancel_check=None,
+        surface_gate=build_segment_surface_gate(
+            seed.messages,
+            catalog=MODEL_TOOL_CATALOG,
+            context=context,
+            authority=context.authority,
+            dependency_policy=DEPENDENCY_POLICY_V1,
+            policy=validate_startup_policy(MODEL_TOOL_CATALOG.authority_manifest),
+        ),
     )
 
     from offerpilot.context_projector.contracts import ProjectionError
@@ -719,7 +903,7 @@ def test_partial_catalog_model_also_fails_closed_at_surface_before_dispatch() ->
     model = ScriptedModel(
         Assistant(
             tool_calls=[
-                ToolCall("known", "known_read", "{}"),
+                ToolCall("known", "list_offers", "{}"),
                 ToolCall("unknown", "not_exposed", "{}"),
             ]
         )
@@ -732,7 +916,7 @@ def test_partial_catalog_model_also_fails_closed_at_surface_before_dispatch() ->
                 model,
                 (
                     ToolDefinition(
-                        "known_read",
+                        "list_offers",
                         executor=lambda raw: executed.append(raw) or raw,
                     ),
                 ),
@@ -760,7 +944,7 @@ def test_streaming_unknown_surface_tool_drops_buffered_delta_before_binding() ->
             on_delta("不得向外暴露")
             return Assistant(
                 tool_calls=[
-                    ToolCall("known", "known_read", "{}"),
+                    ToolCall("known", "list_offers", "{}"),
                     ToolCall("unknown", "not_exposed", "{}"),
                 ]
             )
@@ -771,7 +955,7 @@ def test_streaming_unknown_surface_tool_drops_buffered_delta_before_binding() ->
                 StreamingMixedModel(),
                 (
                     ToolDefinition(
-                        "known_read",
+                        "list_offers",
                         executor=lambda raw: executed.append(raw) or raw,
                     ),
                 ),

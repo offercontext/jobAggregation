@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pickle
 import json
-from dataclasses import asdict, fields
+from dataclasses import asdict, fields, replace
 
 import pytest
 
@@ -22,11 +22,14 @@ from offerpilot.ai.agent_loop import (
     AgentLoopRunner,
     ApprovedWriteSeed,
     NewTurnSeed,
+    build_segment_surface_gate,
 )
 from offerpilot.ai.types import Assistant
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.agent_runtime.journal import NullRunRecorder
-from offerpilot.context_projector.binding import BoundProviderResponse
+from offerpilot.context_projector.binding import BoundProviderResponse, ModelCallSurfaceBinding
+from offerpilot.context_projector.selector import DEPENDENCY_POLICY_V1
+from offerpilot.ai.tool_authority.policy import validate_startup_policy
 from offerpilot.pilot_runtime.composition import _AgentDriver
 from offerpilot.pilot_runtime.errors import RuntimeCancelled
 
@@ -259,8 +262,9 @@ def test_injected_two_argument_model_remains_supported_behind_gateway() -> None:
 
 def test_composition_driver_maps_typed_chat_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
     catalog, context = runtime()
+    seed = NewTurnSeed((Message(role="user", content="hello"),))
     invocation = AgentLoopInvocation(
-        seed=NewTurnSeed((Message(role="user", content="hello"),)),
+        seed=seed,
         model=ScriptedModel(Assistant(content="unused")),
         catalog=catalog,
         tool_context=context,
@@ -270,9 +274,21 @@ def test_composition_driver_maps_typed_chat_cancellation(monkeypatch: pytest.Mon
         event_sink=None,
         runtime_signal_sink=None,
         cancel_check=None,
+        surface_gate=build_segment_surface_gate(
+            seed.messages,
+            catalog=catalog,
+            context=context,
+            authority=context.authority,
+            dependency_policy=DEPENDENCY_POLICY_V1,
+            policy=validate_startup_policy(catalog.authority_manifest),
+        ),
     )
 
-    def cancel(_runner: AgentLoopRunner, _invocation: AgentLoopInvocation) -> AgentTurnResult:
+    def cancel(
+        _runner: AgentLoopRunner,
+        _invocation: AgentLoopInvocation,
+        **_kwargs: object,
+    ) -> AgentTurnResult:
         raise ChatRunCancelled("cancelled")
 
     monkeypatch.setattr(AgentLoopRunner, "run", cancel)
@@ -282,14 +298,90 @@ def test_composition_driver_maps_typed_chat_cancellation(monkeypatch: pytest.Mon
     assert isinstance(raised.value.__cause__, ChatRunCancelled)
 
 
+def test_new_turn_invocation_requires_the_exact_segment_surface_gate() -> None:
+    catalog, context = runtime()
+    seed = NewTurnSeed((Message(role="user", content="hello"),))
+    gate = build_segment_surface_gate(
+        seed.messages,
+        catalog=catalog,
+        context=context,
+        authority=context.authority,
+        dependency_policy=DEPENDENCY_POLICY_V1,
+        policy=validate_startup_policy(catalog.authority_manifest),
+    )
+    invocation = AgentLoopInvocation(
+        seed=seed,
+        model=ScriptedModel(Assistant(content="unused")),
+        catalog=catalog,
+        tool_context=context,
+        auto_approve=False,
+        max_iterations=1,
+        run_recorder=NullRunRecorder(),
+        event_sink=None,
+        runtime_signal_sink=None,
+        cancel_check=None,
+        surface_gate=gate,
+    )
+
+    assert invocation.surface_gate is gate
+    assert gate.authority is context.authority
+    assert gate.context is context
+    with pytest.raises(TypeError, match="SegmentSurfaceGate"):
+        replace(invocation, surface_gate=None)
+
+
 def test_bound_provider_attempt_identity_is_transient_and_private() -> None:
     attempt_canary = "provider-attempt-private-canary"
+    _, context = runtime()
+    factory = context.authority_factory
+    runner, surface, gateway = object(), object(), object()
+    factory.register_runner_invocation(runner, authority=context.authority)
+    factory.register_tool_execution_context(context, authority=context.authority)
+    build_identity = factory.create_provider_surface_build_identity(
+        context.authority,
+        runner_invocation=runner,
+        tool_context=context,
+        model_call_id="model-call",
+    )
+    fingerprint = "sha256:" + "f" * 64
+    binding = ModelCallSurfaceBinding("model-call", fingerprint, frozenset(), 1)
+    factory.register_frozen_surface(
+        surface,
+        surface_fingerprint=fingerprint,
+        candidate_count=1,
+        authority=context.authority,
+        build_identity=build_identity,
+    )
+    factory.register_model_call_surface_binding(
+        binding,
+        surface=surface,
+        surface_fingerprint=fingerprint,
+        authority=context.authority,
+        build_identity=build_identity,
+    )
+    factory.register_gateway_session(
+        gateway,
+        authority=context.authority,
+        build_identity=build_identity,
+        surface=surface,
+        surface_fingerprint=fingerprint,
+        model_call_surface_binding=binding,
+    )
+    invocation_identity = factory.create_provider_invocation_identity(
+        build_identity,
+        surface=surface,
+        surface_fingerprint=fingerprint,
+        model_call_surface_binding=binding,
+        gateway_session=gateway,
+    )
     response = BoundProviderResponse(
         "model-call",
         0,
         attempt_canary,
-        "f" * 64,
+        fingerprint,
         Assistant(content="ok"),
+        invocation_identity,
+        binding,
     )
 
     assert attempt_canary not in repr(response)

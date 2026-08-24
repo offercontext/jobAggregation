@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import json
 import inspect
-from dataclasses import replace
 from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar, Token
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 from typing import Any, cast
+from uuid import uuid4
 
 from sqlalchemy import event as sqlalchemy_event, select
 
@@ -32,15 +32,22 @@ from offerpilot.ai.agent_contracts import (
     PendingAction,
 )
 from offerpilot.ai.agent_loop import (
+    SegmentSurfaceGate,
     AgentLoopInvocation,
     AgentLoopRunner,
+    build_segment_surface_gate,
     NewTurnSeed,
 )
 from offerpilot.ai.client import ConfiguredAIClient
-from offerpilot.ai.tool_authority import AuthorityFactory
-from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
+from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
+from offerpilot.ai.tool_authority.contracts import SegmentExecutionAuthority
+from offerpilot.ai.tool_runtime.context import ToolExecutionContext
+from offerpilot.ai.tool_authority.policy import (
+    validate_startup_policy,
+)
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 from offerpilot.ai.tool_specs.legacy import build_legacy_deterministic_catalog
+from offerpilot.context_projector.selector import DEPENDENCY_POLICY_V1
 from offerpilot.ai.write_operations import (
     WriteOperationCoordinator,
     WriteOperationError,
@@ -87,7 +94,9 @@ from offerpilot.pilot_runtime.service import (
     PilotRuntime,
     ResolvedModel,
     RuntimeDependencies,
+    ResolvedPolicyCatalog,
     SourceLoader,
+    SegmentExecution,
 )
 
 
@@ -127,7 +136,9 @@ def _provider_error_message(error: Exception, config: Config) -> str:
     return f"AI 连接失败：{detail}。请检查 AI 设置或稍后重试。"
 
 
-def _invoke(function: Callable[..., object], values: Mapping[str, object], positional: tuple[object, ...]) -> object:
+def _invoke(
+    function: Callable[..., object], values: Mapping[str, object], positional: tuple[object, ...]
+) -> object:
     """Bind one injected composition seam without retrying its body."""
 
     try:
@@ -199,31 +210,69 @@ class _ConversationGateway:
         return cast(object | None, getter(conversation_id))
 
 
-class _ModelResolver:
-    __slots__ = (
-        "_injected",
-        "_data_dir",
-        "_catalog",
-        "_tool_context",
-    )
+class _PolicyCatalogResolver:
+    """Pure startup/policy boundary; it never constructs a Provider."""
 
-    def __init__(
+    __slots__ = ("_catalog",)
+
+    def __init__(self, catalog: object) -> None:
+        self._catalog = catalog
+
+    def resolve(
         self,
-        injected: ChatModel | None,
-        data_dir: Path,
-        catalog: object,
-        tool_context: Callable[[object, object], object],
-    ) -> None:
+        request: StartTurnRequest,
+        conversation: object,
+        source: object,
+        segment: object | None = None,
+    ) -> ResolvedPolicyCatalog:
+        del request, conversation, source
+        if (
+            type(segment) is not SegmentExecution
+            or type(segment.authority) is not SegmentExecutionAuthority
+            or type(segment.context) is not ToolExecutionContext
+            or segment.catalog is not None
+        ):
+            raise ValueError("policy resolver requires an unbound Segment authority")
+        manifest = getattr(self._catalog, "authority_manifest", None)
+        if not isinstance(manifest, Mapping):
+            raise ValueError("typed catalog manifest is unavailable")
+        snapshot = validate_startup_policy(manifest)
+        profile = snapshot.capability_profile
+        authority = segment.authority
+        if (
+            authority.capability_profile_id != profile.profile_id
+            or authority.capabilities != frozenset(profile.capabilities)
+            or authority.capability_policy_version != snapshot.capability_policy_version
+            or authority.binding_policy_version != snapshot.binding_policy_version
+            or authority.capability_profile_fingerprint != snapshot.capability_profile_fingerprint
+            or authority.binding_policy_fingerprint != snapshot.binding_policy_fingerprint
+        ):
+            raise ValueError("live policy drifted from Segment authority")
+        return ResolvedPolicyCatalog(
+            catalog=self._catalog,
+            policy=snapshot,
+            dependency_policy=DEPENDENCY_POLICY_V1,
+        )
+
+
+class _ContinuationModelResolver:
+    """The only production resolver allowed to construct ``ConfiguredAIClient``."""
+
+    __slots__ = ("_injected", "_data_dir")
+
+    def __init__(self, injected: ChatModel | None, data_dir: Path) -> None:
         self._injected = injected
         self._data_dir = data_dir
-        self._catalog = catalog
-        self._tool_context = tool_context
 
-    def resolve(self, request: StartTurnRequest, conversation: object) -> ResolvedModel:
-        del request
-        config: Config
+    def resolve(
+        self,
+        request: StartTurnRequest,
+        conversation: object,
+        policy: object | None = None,
+    ) -> ResolvedModel:
+        del request, conversation
+        config: Config = load_config(self._data_dir)
         if self._injected is None:
-            config = load_config(self._data_dir)
             try:
                 model: object = ConfiguredAIClient(
                     config,
@@ -235,17 +284,209 @@ class _ModelResolver:
                 raise ModelUnconfiguredError(str(exc)) from exc
         else:
             model = self._injected
-            config = load_config(self._data_dir)
+
         def provider_error(error: Exception, current_config: Config = config) -> str:
             return _provider_error_message(error, current_config)
 
         return ResolvedModel(
             model=cast(ChatModel, model),
-            catalog=self._catalog,
             config=config,
-            tool_context=self._tool_context(conversation, NullRunRecorder()),
             auto_approve=config.chat_auto_approve_writes is True,
             provider_error_message=provider_error,
+        )
+
+
+class _SegmentContextResolver:
+    """Bind one Source scope/revision to one execution-scoped authority/context."""
+
+    __slots__ = (
+        "_applications",
+        "_events",
+        "_notes",
+        "_offers",
+        "_resumes",
+        "_jd_analyses",
+        "_policy_snapshot",
+    )
+
+    def __init__(
+        self,
+        *,
+        applications: object,
+        events: object,
+        notes: object,
+        offers: object,
+        resumes: object,
+        jd_analyses: object,
+        policy_snapshot: object,
+    ) -> None:
+        self._applications = applications
+        self._events = events
+        self._notes = notes
+        self._offers = offers
+        self._resumes = resumes
+        self._jd_analyses = jd_analyses
+        self._policy_snapshot = policy_snapshot
+
+    @staticmethod
+    def _scope(conversation: object, source: object) -> tuple[int, str, int | None, str, int]:
+        values = {
+            name: _attribute(source, name, None)
+            for name in ("conversation_id", "context_type", "context_ref", "mode", "scope_revision")
+        }
+        conversation_id = values["conversation_id"]
+        context_type = values["context_type"]
+        context_ref_value = values["context_ref"]
+        mode = values["mode"]
+        revision = values["scope_revision"]
+        if type(conversation_id) is not int or conversation_id <= 0:
+            raise ValueError("invalid canonical conversation identity")
+        if type(context_type) is not str or context_type not in {
+            "workspace",
+            "global",
+            "application",
+            "mode",
+        }:
+            raise ValueError("invalid canonical context type")
+        if type(mode) is not str or not mode:
+            raise ValueError("invalid canonical context mode")
+        if type(revision) is not int or revision < 0:
+            raise ValueError("invalid canonical scope revision")
+        conversation_identity = _attribute(conversation, "id")
+        if conversation_identity != conversation_id:
+            raise ValueError("source conversation identity changed")
+        conversation_scope = (
+            _attribute(conversation, "context_type"),
+            _attribute(conversation, "context_ref"),
+            _attribute(conversation, "mode"),
+            _attribute(conversation, "scope_revision"),
+        )
+        if any(value is None for value in conversation_scope):
+            raise ValueError("conversation scope is not canonical")
+        source_ref = "" if context_ref_value is None else str(context_ref_value)
+        conversation_ref = "" if conversation_scope[1] is None else str(conversation_scope[1])
+        if (context_type, source_ref, mode, revision) != (
+            conversation_scope[0],
+            conversation_ref,
+            conversation_scope[2],
+            conversation_scope[3],
+        ):
+            raise ValueError("source scope changed before authority resolution")
+        if context_type == "application":
+            try:
+                context_ref = int(str(context_ref_value or ""))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("invalid application scope identity") from exc
+            if context_ref <= 0:
+                raise ValueError("invalid application scope identity")
+        else:
+            context_ref = None
+        return conversation_id, context_type, context_ref, mode, revision
+
+    def resolve(
+        self,
+        request: StartTurnRequest,
+        conversation: object,
+        source: object,
+        recorder: object,
+    ) -> SegmentExecution:
+        del request
+        snapshot = self._policy_snapshot
+        profile = _attribute(snapshot, "capability_profile")
+        capabilities = _attribute(profile, "capabilities", ())
+        if not isinstance(capabilities, tuple):
+            raise ValueError("capability profile is not immutable")
+        conversation_id, context_type, context_ref, mode, revision = self._scope(
+            conversation, source
+        )
+        factory = AuthorityFactory()
+        try:
+            trusted_scope = TrustedContextScope(cast(Any, context_type), context_ref, mode)
+            authority = factory.create_segment_authority(
+                conversation_id=conversation_id,
+                conversation_scope_revision=revision,
+                segment_id=uuid4().hex,
+                trusted_scope=trusted_scope,
+                capability_profile_id=str(_attribute(profile, "profile_id", "agent_typed_v1")),
+                capabilities=frozenset(capabilities),
+                capability_policy_version=str(
+                    _attribute(snapshot, "capability_policy_version", "capability-policy-v1")
+                ),
+                binding_policy_version=str(
+                    _attribute(snapshot, "binding_policy_version", "binding-policy-v1")
+                ),
+                capability_profile_fingerprint=str(
+                    _attribute(snapshot, "capability_profile_fingerprint", "")
+                ),
+                binding_policy_fingerprint=str(
+                    _attribute(snapshot, "binding_policy_fingerprint", "")
+                ),
+            )
+            context = ToolExecutionContext(
+                authority=authority,
+                applications=cast(Any, self._applications),
+                events=cast(Any, self._events),
+                notes=cast(Any, self._notes),
+                offers=cast(Any, self._offers),
+                resumes=cast(Any, self._resumes),
+                jd_analyses=cast(Any, self._jd_analyses),
+                run_recorder=cast(Any, recorder),
+            )
+            return SegmentExecution(
+                authority=authority,
+                context=context,
+                catalog=None,
+                close=factory.close,
+            )
+        except BaseException:
+            factory.close()
+            raise
+
+
+class _SegmentSurfaceGateResolver:
+    """Freeze Catalog/Profile/Selector/Authority visibility before Provider."""
+
+    def resolve(
+        self,
+        request: StartTurnRequest,
+        conversation: object,
+        source: object,
+        assembled: object,
+        policy: object,
+        segment: object,
+    ) -> SegmentSurfaceGate:
+        del request, conversation, source
+        if not isinstance(segment, SegmentExecution):
+            raise TypeError("Segment surface gate requires SegmentExecution")
+        if segment.catalog is not _attribute(policy, "catalog"):
+            raise ValueError("Segment catalog drifted from policy catalog")
+        if type(segment.context) is not ToolExecutionContext:
+            raise TypeError("Segment surface gate requires exact ToolExecutionContext")
+        if not isinstance(assembled, Sequence) or isinstance(assembled, (str, bytes)):
+            raise TypeError("Segment surface gate requires assembled messages")
+        messages = tuple(
+            value
+            if isinstance(value, Message)
+            else Message(
+                role=str(_attribute(value, "role", "assistant") or "assistant"),
+                content=str(_attribute(value, "content", value) or ""),
+                surface_contributor=str(_attribute(value, "surface_contributor", "") or ""),
+                surface_signal=str(_attribute(value, "surface_signal", "") or ""),
+                surface_revision=str(_attribute(value, "surface_revision", "") or ""),
+                surface_page_kind=str(_attribute(value, "surface_page_kind", "") or ""),
+                surface_attachment_kinds=str(
+                    _attribute(value, "surface_attachment_kinds", "") or ""
+                ),
+            )
+            for value in assembled
+        )
+        return build_segment_surface_gate(
+            messages,
+            catalog=cast(Any, segment.catalog),
+            context=segment.context,
+            authority=cast(Any, segment.authority),
+            dependency_policy=cast(Any, _attribute(policy, "dependency_policy")),
+            policy=cast(Any, _attribute(policy, "policy")),
         )
 
 
@@ -292,9 +533,7 @@ class _ContextAdapter(ContextAssembler):
         persistence: ChatPersistenceCoordinator,
         *,
         system_message: Callable[[], object],
-        clarification_message: Callable[
-            [tuple[PendingAction, str] | None, str], object | None
-        ],
+        clarification_message: Callable[[tuple[PendingAction, str] | None, str], object | None],
         page_messages: Callable[[Mapping[str, object] | None], Sequence[object]],
     ) -> None:
         self._persistence = persistence
@@ -357,6 +596,18 @@ class _ContextAdapter(ContextAssembler):
             values.extend(self._page_messages(page_context))
             values.extend(attachment_messages)
         values.extend(history)
+        if isinstance(request, StartTurnRequest):
+            # The current request is a mandatory, request-local surface
+            # contributor.  It must be the final user message so the
+            # provider-free Segment gate and the later projector cannot
+            # accidentally select a historical user turn.
+            values.append(
+                Message(
+                    role="user",
+                    content=request.message,
+                    surface_contributor="current_request",
+                )
+            )
         return tuple(values)
 
 
@@ -481,20 +732,19 @@ class _AgentDriver:
         context = invocation.tool_context
         if not isinstance(context, ToolExecutionContext):
             raise TypeError("Agent Loop requires ToolExecutionContext")
-        bound_context = context.with_runtime_dependencies(
-            run_recorder=cast(Any, recorder),
-            operation_executor=context.operation_executor,
-        )
+        # The Context is the exact authority-bound carrier created by the
+        # Source/Segment composition phase.  Only its recorder proxy may swap
+        # the runtime journal delegate; never clone the Context here.
+        set_recorder = getattr(context.run_recorder, "set_delegate", None)
+        if callable(set_recorder):
+            set_recorder(recorder)
         runtime_sink = cast(RuntimeEventSink | None, invocation.event_sink)
         agent_sink = _AgentEventAdapter(runtime_sink) if runtime_sink is not None else None
         try:
             return self._runner.run(
-                replace(
-                    invocation,
-                    tool_context=bound_context,
-                    run_recorder=cast(Any, recorder),
-                    event_sink=agent_sink,
-                )
+                invocation,
+                run_recorder=cast(Any, recorder),
+                event_sink=agent_sink,
             )
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
             raise
@@ -544,9 +794,7 @@ class _AtomicTimeoutDelivery:
             return owner
 
         setattr(repository, "prepare_owner", capture_owner)
-        sqlalchemy_event.listen(
-            repository.session_factory, "before_commit", self._before_commit
-        )
+        sqlalchemy_event.listen(repository.session_factory, "before_commit", self._before_commit)
 
     def register(self, state: object) -> object:
         handle = object()
@@ -649,8 +897,7 @@ class _AtomicTimeoutDelivery:
                 resolved = getattr(bound_chat, "resolve_pending_confirmation")(
                     cast(
                         int,
-                        _attribute(_attribute(state, "identity"), "conversation_id", 0)
-                        or 0,
+                        _attribute(_attribute(state, "identity"), "conversation_id", 0) or 0,
                     ),
                     cast(Any, pending),
                     Message(
@@ -743,11 +990,8 @@ def build_pilot_runtime(
     write_coordinator: WriteOperationCoordinator | None,
     source_loader: Callable[..., object],
     system_message: Callable[[], object],
-    clarification_message: Callable[
-        [tuple[PendingAction, str] | None, str], object | None
-    ],
+    clarification_message: Callable[[tuple[PendingAction, str] | None, str], object | None],
     page_context_messages: Callable[[Mapping[str, object] | None], Sequence[object]],
-    model_tool_context: Callable[[object, object], object],
     missing_target_question: Callable[..., str | None] | None = None,
     pending_action_details: Callable[[PendingAction], Mapping[str, object]] | None = None,
     undo_seed_for_pending: Callable[[PendingAction, object], Mapping[str, object]] | None = None,
@@ -762,7 +1006,6 @@ def build_pilot_runtime(
 ) -> PilotRuntime:
     """Build one frozen production Runtime graph from app-owned dependencies."""
 
-    del context_source_loader
     persistence = ChatPersistenceCoordinator(cast(Any, chat))
     gateway = _ConversationGateway(chat, title_from_message)
     source = _SourceAdapter(source_loader)
@@ -773,7 +1016,21 @@ def build_pilot_runtime(
         page_messages=page_context_messages,
     )
     driver = _AgentDriver()
-    resolver = _ModelResolver(chat_model, data_dir, catalog, model_tool_context)
+    policy_resolver = _PolicyCatalogResolver(catalog)
+    continuation_model_resolver = _ContinuationModelResolver(chat_model, data_dir)
+    surface_gate_resolver = _SegmentSurfaceGateResolver()
+    policy_snapshot = validate_startup_policy(
+        cast(Mapping[str, object], getattr(catalog, "authority_manifest"))
+    )
+    segment_resolver = _SegmentContextResolver(
+        applications=applications,
+        events=events,
+        notes=notes,
+        offers=offers,
+        resumes=resumes,
+        jd_analyses=jd_analyses,
+        policy_snapshot=policy_snapshot,
+    )
     deterministic = DeterministicPilotAdapter(
         DeterministicDependencies(
             persistence=cast(Any, persistence),
@@ -807,7 +1064,12 @@ def build_pilot_runtime(
             authority = ApprovalAuthorityResolver(
                 write_operations,
                 factory,
-                capabilities=frozenset(ToolCapability),
+                capabilities=frozenset(policy_snapshot.capability_profile.capabilities),
+                capability_profile_id=policy_snapshot.capability_profile.profile_id,
+                capability_policy_version=policy_snapshot.capability_policy_version,
+                binding_policy_version=policy_snapshot.binding_policy_version,
+                capability_profile_fingerprint=policy_snapshot.capability_profile_fingerprint,
+                binding_policy_fingerprint=policy_snapshot.binding_policy_fingerprint,
             ).resolve(
                 operation=operation,
                 pending=pending,
@@ -878,7 +1140,10 @@ def build_pilot_runtime(
     dependencies = RuntimeDependencies(
         conversations=gateway,
         persistence=persistence,
-        model_resolver=resolver,
+        policy_catalog_resolver=policy_resolver,
+        segment_context_resolver=segment_resolver,
+        surface_gate_resolver=surface_gate_resolver,
+        continuation_model_resolver=continuation_model_resolver,
         source_loader=source,
         context_assembler=assembler,
         agent_driver=cast(Any, driver),

@@ -32,8 +32,14 @@ from offerpilot.ai.agent_contracts import (
     PendingActionValidationError,
     StalePendingActionError,
 )
-from offerpilot.ai.agent_loop import AgentLoopInvocation, ApprovedWriteSeed, NewTurnSeed
+from offerpilot.ai.agent_loop import (
+    AgentLoopInvocation,
+    ApprovedWriteSeed,
+    NewTurnSeed,
+    SegmentSurfaceGate,
+)
 from offerpilot.ai.tool_authority import PendingAuthorityClaim
+from offerpilot.ai.tool_authority.contracts import SegmentExecutionAuthority
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import ToolFailure, ToolSuccess
 from offerpilot.ai.tool_runtime.legacy import LEGACY_DETERMINISTIC_NAMES
@@ -144,6 +150,55 @@ class ModelResolver(Protocol):
     def resolve(self, request: StartTurnRequest, conversation: object) -> object: ...
 
 
+class PolicyCatalogResolver(Protocol):
+    """Resolve the closed Catalog/Policy before any Provider is constructed."""
+
+    def resolve(
+        self,
+        request: StartTurnRequest,
+        conversation: object,
+        source: object,
+        segment: object | None = None,
+    ) -> object: ...
+
+
+class SegmentContextResolver(Protocol):
+    """Construct one authority-bound Context from one trusted Source snapshot."""
+
+    def resolve(
+        self,
+        request: StartTurnRequest,
+        conversation: object,
+        source: object,
+        recorder: object,
+    ) -> object: ...
+
+
+class SegmentSurfaceGateResolver(Protocol):
+    """Build provider-free selector/authority visibility for one Segment."""
+
+    def resolve(
+        self,
+        request: StartTurnRequest,
+        conversation: object,
+        source: object,
+        assembled: object,
+        policy: object,
+        segment: object,
+    ) -> object: ...
+
+
+class ContinuationModelResolver(Protocol):
+    """Construct a Provider only after Source, Authority and Policy are ready."""
+
+    def resolve(
+        self,
+        request: StartTurnRequest,
+        conversation: object,
+        policy: object,
+    ) -> object: ...
+
+
 class SourceLoader(Protocol):
     def load(self, conversation: object, request: StartTurnRequest) -> object: ...
 
@@ -250,15 +305,15 @@ class JournalFactory(Protocol):
 class ResolvedModel:
     """Frozen invocation view returned by a model resolver.
 
-    ``catalog`` and ``tool_context`` intentionally remain opaque.  The Agent
-    adapter passes them through without inspecting Graph state or provider
-    internals.
+    The model resolver owns provider/configuration details.  New-turn
+    composition supplies the authority-bound Catalog and Context separately;
+    ``catalog`` remains as a narrow legacy confirmation bridge until that
+    path is migrated, but is never read by the new-turn agent invocation.
     """
 
     model: ChatModel | None
     catalog: object | None = None
     config: object | None = None
-    tool_context: object | None = None
     auto_approve: bool = False
     max_iter: int = DEFAULT_MAX_ITERATIONS
     provider_error_message: Callable[[Exception], str] | None = field(
@@ -278,6 +333,34 @@ class NormalizedAgentTurn:
     pending_authority_claim: PendingAuthorityClaim | None = field(
         default=None, repr=False, compare=False
     )
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedPolicyCatalog:
+    """Provider-free policy/catalog result for one canonical Source snapshot."""
+
+    catalog: object
+    policy: object
+    dependency_policy: object | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SegmentExecution:
+    """One Segment authority and its exact Context identity.
+
+    The close callback revokes the execution-scoped factory.  Runtime keeps
+    this object alive across all model calls and closes it exactly once after
+    sync/stream completion or abort.
+    """
+
+    authority: object
+    context: ToolExecutionContext
+    catalog: object | None
+    close: Callable[[], object]
+    surface_gate: SegmentSurfaceGate | object | None = field(
+        default=None, repr=False, compare=False
+    )
+    policy: ResolvedPolicyCatalog | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -373,6 +456,10 @@ class _PreparedStreamState:
     conversation: _PreparedConversation | None = field(repr=False, compare=False)
     conversation_id: int | None = field(default=None, compare=False)
     model_token: object | None = field(default=None, repr=False, compare=False)
+    segment_token: object | None = field(default=None, repr=False, compare=False)
+    surface_gate: SegmentSurfaceGate | object | None = field(
+        default=None, repr=False, compare=False
+    )
     assembled: tuple[object, ...] = field(default=(), repr=False, compare=False)
     recorder: object = field(default_factory=lambda: _NoopRecorder(), repr=False, compare=False)
     journal_started: bool = field(default=False, compare=False)
@@ -428,6 +515,10 @@ class RuntimeDependencies:
     conversations: ConversationGateway | None = None
     persistence: RuntimePersistence | None = None
     model_resolver: ModelResolver | None = None
+    policy_catalog_resolver: PolicyCatalogResolver | None = None
+    segment_context_resolver: SegmentContextResolver | None = None
+    surface_gate_resolver: SegmentSurfaceGateResolver | None = None
+    continuation_model_resolver: ContinuationModelResolver | None = None
     source_loader: SourceLoader | None = None
     context_assembler: ContextAssembler | None = None
     agent_driver: AgentDriver | None = None
@@ -446,9 +537,7 @@ class RuntimeDependencies:
     confirmation_coordinator: ConfirmationCoordinator | None = field(
         default=None, repr=False, compare=False
     )
-    continuation: ConfirmationCoordinator | None = field(
-        default=None, repr=False, compare=False
-    )
+    continuation: ConfirmationCoordinator | None = field(default=None, repr=False, compare=False)
 
 
 RuntimeDependenciesLike: TypeAlias = RuntimeDependencies | Mapping[str, object]
@@ -470,6 +559,21 @@ class _NoopRecorder:
 
     def suspend(self, *_args: object, **_kwargs: object) -> None:
         return None
+
+
+class _RuntimeRecorderProxy:
+    """Stable recorder identity for a Context built before journal start."""
+
+    __slots__ = ("_delegate",)
+
+    def __init__(self, delegate: object | None = None) -> None:
+        self._delegate = delegate or _NoopRecorder()
+
+    def set_delegate(self, delegate: object) -> None:
+        self._delegate = delegate
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._delegate, name)
 
 
 class _NoopEventSink:
@@ -518,14 +622,12 @@ class _ConfirmationEventSink:
         self._deferred = deferred
 
     def emit(self, event: RuntimeEvent) -> None:
-        if (
-            isinstance(event, ToolResultEvent)
-            and event.tool_call_id == self._origin_tool_call_id
-        ):
+        if isinstance(event, ToolResultEvent) and event.tool_call_id == self._origin_tool_call_id:
             if event not in self._deferred:
                 self._deferred.append(event)
             return
         emit_runtime_event(self._sink, event)
+
 
 def _callable(target: object | None, names: tuple[str, ...]) -> Callable[..., object] | None:
     if target is None:
@@ -614,10 +716,14 @@ def _invoke(
                 if parameter.name in values:
                     args.append(values[parameter.name])
                 continue
-            if parameter.kind in {
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                inspect.Parameter.KEYWORD_ONLY,
-            } and parameter.name in values:
+            if (
+                parameter.kind
+                in {
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                }
+                and parameter.name in values
+            ):
                 kwargs[parameter.name] = values[parameter.name]
         if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters):
             keyword_values = dict(values)
@@ -708,13 +814,19 @@ def _message(value: object) -> Message:
         role = str(value.get("role") or "assistant")
         content = str(value.get("content") or "")
         raw_calls = value.get("tool_calls") or []
-        tool_calls = [_tool_call(item) for item in raw_calls] if isinstance(raw_calls, Sequence) and not isinstance(raw_calls, (str, bytes)) else []
+        tool_calls = (
+            [_tool_call(item) for item in raw_calls]
+            if isinstance(raw_calls, Sequence) and not isinstance(raw_calls, (str, bytes))
+            else []
+        )
         return Message(
             role=role,
             content=content,
             tool_calls=tool_calls,
             tool_call_id=str(value.get("tool_call_id") or ""),
-            provider_blocks=dict(value.get("provider_blocks") or {}) if isinstance(value.get("provider_blocks"), Mapping) else {},
+            provider_blocks=dict(value.get("provider_blocks") or {})
+            if isinstance(value.get("provider_blocks"), Mapping)
+            else {},
             surface_contributor=str(value.get("surface_contributor") or ""),
             surface_signal=str(value.get("surface_signal") or ""),
             surface_revision=str(value.get("surface_revision") or ""),
@@ -1032,14 +1144,18 @@ def _prepend_write_success(
         company = str(payload.get("company_name") or "").strip()
         position = str(payload.get("position_name") or "").strip()
         meta = " · ".join(value for value in (company, position) if value)
-        summary = f"✅ 创建成功：投递记录 #{record_id} 已保存（{meta}）。" if record_id and meta else ""
+        summary = (
+            f"✅ 创建成功：投递记录 #{record_id} 已保存（{meta}）。" if record_id and meta else ""
+        )
     elif pending.tool_name == "add_note":
         record_id = payload.get("note_id") or payload.get("id")
         company = str(payload.get("company") or "").strip()
         position = str(payload.get("position") or "").strip()
         round_name = str(payload.get("round") or "").strip()
         meta = " · ".join(value for value in (company, position, round_name) if value)
-        summary = f"✅ 保存成功：复盘记录 #{record_id} 已保存（{meta}）。" if record_id and meta else ""
+        summary = (
+            f"✅ 保存成功：复盘记录 #{record_id} 已保存（{meta}）。" if record_id and meta else ""
+        )
     else:
         record_id = payload.get("application_event_id") or payload.get("id")
         summary = f"✅ 创建成功：日程 #{record_id} 已保存。" if record_id else ""
@@ -1117,7 +1233,9 @@ def _valid_pending_action(
     return bool(_confirmation_token(pending))
 
 
-def _has_write_attempt(added: Sequence[object], records: Sequence[object], catalog: object | None) -> bool:
+def _has_write_attempt(
+    added: Sequence[object], records: Sequence[object], catalog: object | None
+) -> bool:
     write_names = _catalog_write_names(catalog)
     for item in added:
         message = _message(item)
@@ -1209,17 +1327,19 @@ def _explicitly_unconfigured_model(value: object) -> bool:
     return model is None
 
 
-def _resolved_model_parts(model: object, config: object | None, *, source: object | None = None) -> ResolvedModel:
+def _resolved_model_parts(
+    model: object, config: object | None, *, source: object | None = None
+) -> ResolvedModel:
     origin = source if source is not None else config
-    catalog = _attribute(origin, "catalog", _attribute(origin, "tool_catalog"))
-    tool_context = _attribute(origin, "tool_context")
-    auto_approve = _attribute(config, "chat_auto_approve_writes", _attribute(config, "auto_approve", False))
-    max_iter = _attribute(config, "max_iter", _attribute(config, "max_iterations", DEFAULT_MAX_ITERATIONS))
+    auto_approve = _attribute(
+        config, "chat_auto_approve_writes", _attribute(config, "auto_approve", False)
+    )
+    max_iter = _attribute(
+        config, "max_iter", _attribute(config, "max_iterations", DEFAULT_MAX_ITERATIONS)
+    )
     return ResolvedModel(
         model=cast(ChatModel, model),
-        catalog=catalog,
         config=config,
-        tool_context=tool_context,
         auto_approve=auto_approve is True,
         max_iter=max_iter if type(max_iter) is int and max_iter > 0 else DEFAULT_MAX_ITERATIONS,
         provider_error_message=(
@@ -1264,7 +1384,12 @@ def _write_status(result: NormalizedAgentTurn) -> WriteStatus:
 class PilotRuntime:
     """The synchronous model-only Start Turn state machine."""
 
-    __slots__ = ("_dependencies", "_owner_token", "_prepared_models")
+    __slots__ = (
+        "_dependencies",
+        "_owner_token",
+        "_prepared_models",
+        "_prepared_segments",
+    )
 
     def __init__(
         self,
@@ -1273,13 +1398,17 @@ class PilotRuntime:
     ) -> None:
         self._owner_token = object()
         self._prepared_models: dict[object, ResolvedModel] = {}
+        self._prepared_segments: dict[object, SegmentExecution] = {}
         if dependencies is None:
             values = dict(kwargs)
             self._dependencies = RuntimeDependencies(**cast(Any, _dependency_values(values)))
             return
         if kwargs:
             if isinstance(dependencies, RuntimeDependencies):
-                values = {field: getattr(dependencies, field) for field in RuntimeDependencies.__dataclass_fields__}
+                values = {
+                    field: getattr(dependencies, field)
+                    for field in RuntimeDependencies.__dataclass_fields__
+                }
             else:
                 if isinstance(dependencies, Mapping):
                     values = dict(dependencies)
@@ -1293,9 +1422,7 @@ class PilotRuntime:
             if isinstance(dependencies, Mapping):
                 values = dict(dependencies)
             else:
-                values = {
-                    **_dependency_object_values(dependencies)
-                }
+                values = {**_dependency_object_values(dependencies)}
             self._dependencies = RuntimeDependencies(**cast(Any, _dependency_values(values)))
 
     def start_turn(
@@ -1315,12 +1442,20 @@ class PilotRuntime:
             raise TypeError("request must be a StartTurnRequest")
         resolved_transport = transport or RuntimeTransportContext(mode="sync")
         if resolved_transport.mode != "sync":
-            return self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400)
+            return self._failure(
+                RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400
+            )
         if execution_host is None or invocation_control is None:
             raise TypeError("execution_host and invocation_control are required")
         cancel = cancel_check or (lambda: False)
+        segment_lease: _PreparedModelLease | None = None
+
+        def close_segment_once() -> None:
+            if segment_lease is not None:
+                segment_lease.release_once()
 
         def complete_early(outcome: RuntimeOutcome) -> RuntimeOutcome:
+            close_segment_once()
             self._mark_completed(invocation_control)
             return outcome
 
@@ -1346,7 +1481,9 @@ class PilotRuntime:
                     return complete_early(self._failure(code, text, 422))
                 except LookupError:
                     return complete_early(
-                        self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "application not found", 404)
+                        self._failure(
+                            RuntimeFailureCode.APPLICATION_NOT_FOUND, "application not found", 404
+                        )
                     )
                 except Exception:
                     return complete_early(
@@ -1362,16 +1499,22 @@ class PilotRuntime:
         conversation = self._load_conversation(request)
         if conversation is None:
             return complete_early(
-                self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404)
+                self._failure(
+                    RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404
+                )
             )
         conversation_id = _conversation_id(conversation)
         if conversation_id is None:
             return complete_early(
-                self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404)
+                self._failure(
+                    RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404
+                )
             )
         if _is_archived(conversation):
             return complete_early(
-                self._failure(RuntimeFailureCode.CONVERSATION_ARCHIVED, "conversation is archived", 409)
+                self._failure(
+                    RuntimeFailureCode.CONVERSATION_ARCHIVED, "conversation is archived", 409
+                )
             )
 
         route_validation = self._validate_route_action(request)
@@ -1412,7 +1555,9 @@ class PilotRuntime:
                 # Keep the pre-Task-8 closed boundary when a composition root
                 # has not installed the trusted deterministic bridge.
                 return complete_early(
-                    self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400)
+                    self._failure(
+                        RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400
+                    )
                 )
             validate_action = _callable(adapter, ("validate_action",))
             if validate_action is not None:
@@ -1438,22 +1583,193 @@ class PilotRuntime:
             except ValueError as exc:
                 text = str(exc)
                 if "context is required" in text or "context is invalid" in text:
-                    deterministic_outcome = self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, text, 422)
+                    deterministic_outcome = self._failure(
+                        RuntimeFailureCode.OPERATION_UNAVAILABLE, text, 422
+                    )
                 else:
-                    deterministic_outcome = self._failure(RuntimeFailureCode.INVALID_CONFIRMATION, text, 422)
+                    deterministic_outcome = self._failure(
+                        RuntimeFailureCode.INVALID_CONFIRMATION, text, 422
+                    )
                 return complete_early(deterministic_outcome)
             except LookupError:
                 return complete_early(
-                    self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "application not found", 404)
+                    self._failure(
+                        RuntimeFailureCode.APPLICATION_NOT_FOUND, "application not found", 404
+                    )
                 )
             except Exception:
                 return complete_early(
-                    self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话结果暂时无法保存。", 503, retryable=True)
+                    self._failure(
+                        RuntimeFailureCode.OPERATION_FAILED,
+                        "对话结果暂时无法保存。",
+                        503,
+                        retryable=True,
+                    )
                 )
             raise AssertionError("unreachable deterministic dispatch")
 
-        self._phase("model_resolve")
-        resolved = self._resolve_model(request, conversation)
+        self._phase("source_load")
+        try:
+            source = self._load_source(conversation, request)
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception:
+            return complete_early(
+                self._failure(
+                    RuntimeFailureCode.SOURCE_LOAD_FAILED,
+                    "上下文暂时无法加载，请稍后重试。",
+                    503,
+                    retryable=True,
+                )
+            )
+        except BaseException:
+            raise
+
+        recorder_proxy = _RuntimeRecorderProxy()
+        self._phase("segment_resolve")
+        try:
+            segment_value = self._resolve_segment_context(
+                request,
+                conversation,
+                source,
+                recorder_proxy,
+            )
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception:
+            return complete_early(
+                self._failure(
+                    RuntimeFailureCode.SOURCE_LOAD_FAILED,
+                    "上下文暂时无法加载，请稍后重试。",
+                    503,
+                    retryable=True,
+                )
+            )
+        except BaseException:
+            raise
+        if isinstance(segment_value, RuntimeFailureOutcome):
+            return complete_early(segment_value)
+        if segment_value is None:
+            return complete_early(
+                self._failure(
+                    RuntimeFailureCode.SOURCE_LOAD_FAILED,
+                    "上下文暂时无法加载，请稍后重试。",
+                    503,
+                    retryable=True,
+                )
+            )
+        segment = segment_value
+        segment_lease = _PreparedModelLease(segment.close)
+
+        def phase_with_segment(name: str) -> None:
+            try:
+                self._phase(name)
+            except BaseException:
+                close_segment_once()
+                raise
+
+        phase_with_segment("context_assemble")
+        try:
+            assembled = self._assemble_context(source, conversation, request)
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            close_segment_once()
+            raise
+        except Exception:
+            return complete_early(
+                self._failure(
+                    RuntimeFailureCode.SOURCE_LOAD_FAILED,
+                    "上下文暂时无法加载，请稍后重试。",
+                    503,
+                    retryable=True,
+                )
+            )
+        except BaseException:
+            close_segment_once()
+            raise
+
+        phase_with_segment("policy_resolve")
+        try:
+            policy = self._resolve_policy_catalog(request, conversation, source, segment)
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            close_segment_once()
+            raise
+        except Exception:
+            return complete_early(
+                self._failure(
+                    RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                    "工具权限暂时不可用，请稍后重试。",
+                    503,
+                    retryable=True,
+                )
+            )
+        except BaseException:
+            close_segment_once()
+            raise
+        if isinstance(policy, RuntimeFailureOutcome):
+            return complete_early(policy)
+        segment = SegmentExecution(
+            authority=segment.authority,
+            context=segment.context,
+            catalog=policy.catalog,
+            close=segment.close,
+            surface_gate=segment.surface_gate,
+            policy=policy,
+        )
+
+        phase_with_segment("surface_resolve")
+        try:
+            surface_gate = self._resolve_surface_gate(
+                request,
+                conversation,
+                source,
+                assembled,
+                policy,
+                segment,
+            )
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            close_segment_once()
+            raise
+        except Exception:
+            return complete_early(
+                self._failure(
+                    RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                    "工具权限暂时不可用，请稍后重试。",
+                    503,
+                    retryable=True,
+                )
+            )
+        except BaseException:
+            close_segment_once()
+            raise
+        if isinstance(surface_gate, RuntimeFailureOutcome):
+            return complete_early(surface_gate)
+        segment = SegmentExecution(
+            authority=segment.authority,
+            context=segment.context,
+            catalog=segment.catalog,
+            close=segment.close,
+            surface_gate=surface_gate,
+            policy=policy,
+        )
+
+        phase_with_segment("model_resolve")
+        try:
+            resolved = self._resolve_continuation_model(request, conversation, policy)
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            close_segment_once()
+            raise
+        except Exception:
+            return complete_early(
+                self._failure(
+                    RuntimeFailureCode.AI_PROVIDER_ERROR,
+                    "AI 连接失败。请检查 AI 设置或稍后重试。",
+                    502,
+                    retryable=True,
+                )
+            )
+        except BaseException:
+            close_segment_once()
+            raise
         if isinstance(resolved, RuntimeFailureOutcome):
             return complete_early(resolved)
         if resolved is None:
@@ -1466,12 +1782,20 @@ class PilotRuntime:
                 )
             )
 
-        persistence = self._require_dependency("persistence")
-        persistence_failure = self._validate_persistence_surface(persistence)
+        try:
+            persistence = self._require_dependency("persistence")
+            persistence_failure = self._validate_persistence_surface(persistence)
+        except BaseException:
+            close_segment_once()
+            raise
         if persistence_failure is not None:
             return complete_early(persistence_failure)
-        self._phase("user_persist")
-        self._check_cancel(cancel, invocation_control)
+        phase_with_segment("user_persist")
+        try:
+            self._check_cancel(cancel, invocation_control)
+        except BaseException:
+            close_segment_once()
+            raise
         try:
             user_result = self._persist_user(
                 persistence,
@@ -1480,6 +1804,7 @@ class PilotRuntime:
                 control=invocation_control,
             )
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            close_segment_once()
             raise
         except Exception:
             return complete_early(
@@ -1491,16 +1816,29 @@ class PilotRuntime:
                 )
             )
         except BaseException:
+            close_segment_once()
             raise
-        if not _result_persisted(user_result):
+        try:
+            user_persisted = _result_persisted(user_result)
+            user_failure_status = _failure_status(user_result) if not user_persisted else ""
+        except BaseException:
+            close_segment_once()
+            raise
+        if not user_persisted:
             code = (
                 RuntimeFailureCode.CONVERSATION_ARCHIVED
-                if _failure_status(user_result) == "closed"
+                if user_failure_status == "closed"
                 else RuntimeFailureCode.APPLICATION_NOT_FOUND
-                if _failure_status(user_result) == "not_found"
+                if user_failure_status == "not_found"
                 else RuntimeFailureCode.OPERATION_FAILED
             )
-            status = 409 if code is RuntimeFailureCode.CONVERSATION_ARCHIVED else 404 if code is RuntimeFailureCode.APPLICATION_NOT_FOUND else 503
+            status = (
+                409
+                if code is RuntimeFailureCode.CONVERSATION_ARCHIVED
+                else 404
+                if code is RuntimeFailureCode.APPLICATION_NOT_FOUND
+                else 503
+            )
             return complete_early(
                 self._failure(
                     code,
@@ -1510,7 +1848,11 @@ class PilotRuntime:
                 )
             )
 
-        input_message_id = _attribute(user_result, "message_id")
+        try:
+            input_message_id = _attribute(user_result, "message_id")
+        except BaseException:
+            close_segment_once()
+            raise
         if type(input_message_id) is not int or input_message_id <= 0:
             try:
                 persisted_ids = self._snapshot_message_ids(persistence, conversation_id)
@@ -1523,17 +1865,41 @@ class PilotRuntime:
                         retryable=True,
                     )
                 )
+            except BaseException:
+                close_segment_once()
+                raise
             input_message_id = persisted_ids[-1] if persisted_ids else None
 
-        self._phase("run_start")
-        self._check_cancel(cancel, invocation_control)
-        recorder, journal_started = self._start_journal(
-            conversation,
-            conversation_id,
-            input_message_id,
-            request,
-            resolved_transport,
-        )
+        phase_with_segment("run_start")
+        try:
+            self._check_cancel(cancel, invocation_control)
+        except BaseException:
+            close_segment_once()
+            raise
+        try:
+            recorder, journal_started = self._start_journal(
+                conversation,
+                conversation_id,
+                input_message_id,
+                request,
+                resolved_transport,
+            )
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            close_segment_once()
+            raise
+        except Exception:
+            close_segment_once()
+            return complete_early(
+                self._failure(
+                    RuntimeFailureCode.OPERATION_FAILED,
+                    "对话结果暂时无法保存。",
+                    503,
+                    retryable=True,
+                )
+            )
+        except BaseException:
+            close_segment_once()
+            raise
 
         abandoned = False
         completion_marked = False
@@ -1541,16 +1907,20 @@ class PilotRuntime:
         def abandon_once() -> None:
             nonlocal abandoned
             if abandoned:
+                close_segment_once()
                 return
             abandoned = True
             self._abandon(recorder, journal_started)
+            close_segment_once()
 
         def complete_once() -> None:
             nonlocal completion_marked
             if completion_marked:
+                close_segment_once()
                 return
             self._mark_completed(invocation_control)
             completion_marked = True
+            close_segment_once()
 
         def finish_or_raise(
             status: str,
@@ -1572,6 +1942,13 @@ class PilotRuntime:
             except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
                 abandon_once()
                 raise
+            except BaseException:
+                abandon_once()
+                raise
+            finally:
+                # Timeout/failure delivery may legally run after the control
+                # leaves ACTIVE, but the Segment lease still ends here.
+                close_segment_once()
 
         try:
             # These are the first two baseline Journal facts after run creation.
@@ -1585,39 +1962,6 @@ class PilotRuntime:
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
             abandon_once()
             raise
-
-        try:
-            self._phase("source_load")
-            source = self._load_source(conversation, request)
-        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
-            abandon_once()
-            raise
-        except Exception:
-            finish_or_raise("failed", RuntimeFailureCode.SOURCE_LOAD_FAILED.value)
-            return self._failure(
-                RuntimeFailureCode.SOURCE_LOAD_FAILED,
-                "上下文暂时无法加载，请稍后重试。",
-                503,
-                retryable=True,
-            )
-        except BaseException:
-            abandon_once()
-            raise
-
-        try:
-            self._phase("context_assemble")
-            assembled = self._assemble_context(source, conversation, request)
-        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
-            abandon_once()
-            raise
-        except Exception:
-            finish_or_raise("failed", RuntimeFailureCode.SOURCE_LOAD_FAILED.value)
-            return self._failure(
-                RuntimeFailureCode.SOURCE_LOAD_FAILED,
-                "上下文暂时无法加载，请稍后重试。",
-                503,
-                retryable=True,
-            )
         except BaseException:
             abandon_once()
             raise
@@ -1629,7 +1973,7 @@ class PilotRuntime:
                 conversation,
                 conversation_id,
                 input_message_id,
-                resolved.catalog,
+                segment.catalog,
                 persistence,
                 invocation_control,
             )
@@ -1649,26 +1993,41 @@ class PilotRuntime:
             abandon_once()
             raise
 
-        driver = cast(AgentDriver, self._require_dependency("agent_driver"))
-        safe_event_sink: RuntimeEventSink = _SafeEventSink(event_sink) if event_sink is not None else _NoopEventSink()
-        safe_signal_sink: RuntimeSignalSink[str] | None = _SafeSignalSink(signal_sink) if signal_sink is not None else None
+        try:
+            driver = cast(AgentDriver, self._require_dependency("agent_driver"))
+        except BaseException:
+            abandon_once()
+            raise
+        safe_event_sink: RuntimeEventSink = (
+            _SafeEventSink(event_sink) if event_sink is not None else _NoopEventSink()
+        )
+        safe_signal_sink: RuntimeSignalSink[str] | None = (
+            _SafeSignalSink(signal_sink) if signal_sink is not None else None
+        )
+
         def checked_cancel() -> bool:
             self._check_cancel(cancel, invocation_control)
             return False
 
-        invocation = self._agent_invocation(
-            resolved,
-            assembled,
-            conversation,
-            request,
-            recorder,
-            safe_event_sink,
-            safe_signal_sink,
-            checked_cancel,
-        )
+        try:
+            invocation = self._agent_invocation(
+                resolved,
+                segment,
+                assembled,
+                conversation,
+                request,
+                recorder,
+                safe_event_sink,
+                safe_signal_sink,
+                checked_cancel,
+            )
+        except BaseException:
+            abandon_once()
+            raise
 
         try:
             self._phase("agent_host")
+
             def thunk() -> object:
                 return self._run_driver(driver, invocation)
 
@@ -1738,7 +2097,7 @@ class PilotRuntime:
             raise
 
         try:
-            self._phase("result_normalize")
+            phase_with_segment("result_normalize")
             self._check_cancel(cancel, invocation_control)
             normalized = _normalize_agent_result(raw_result)
             self._check_cancel(cancel, invocation_control)
@@ -1754,7 +2113,7 @@ class PilotRuntime:
             raise
 
         try:
-            self._phase("message_persist")
+            phase_with_segment("message_persist")
             self._check_cancel(cancel, invocation_control)
             persisted_turn = self._persist_result(
                 persistence,
@@ -1762,7 +2121,7 @@ class PilotRuntime:
                 request,
                 normalized,
                 conversation,
-                catalog=resolved.catalog,
+                catalog=segment.catalog,
                 ensure_active=lambda: self._check_cancel(cancel, invocation_control),
                 control=invocation_control,
             )
@@ -1772,12 +2131,18 @@ class PilotRuntime:
             raise
         except Exception:
             finish_or_raise("failed", "unknown")
-            return self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话结果暂时无法保存。", 503, retryable=True)
+            return self._failure(
+                RuntimeFailureCode.OPERATION_FAILED, "对话结果暂时无法保存。", 503, retryable=True
+            )
         except BaseException:
             abandon_once()
             raise
 
-        outcome = persisted_turn.outcome
+        try:
+            outcome = persisted_turn.outcome
+        except BaseException:
+            abandon_once()
+            raise
         try:
             self._record_journal_persisted(
                 recorder,
@@ -1802,7 +2167,7 @@ class PilotRuntime:
                     journal_started,
                     normalized.pending,
                     invocation_control,
-                    catalog=resolved.catalog,
+                    catalog=segment.catalog,
                 )
             except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
                 abandon_once()
@@ -1810,6 +2175,9 @@ class PilotRuntime:
             try:
                 complete_once()
             except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                abandon_once()
+                raise
+            except BaseException:
                 abandon_once()
                 raise
         else:
@@ -1845,7 +2213,9 @@ class PilotRuntime:
             raise TypeError("invocation_control is required")
         resolved_transport = transport or RuntimeTransportContext(mode="sync")
         if resolved_transport.mode != "sync":
-            return self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400)
+            return self._failure(
+                RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400
+            )
         continuation = self._confirmation_coordinator()
         if continuation is not None and not self._is_deterministic_confirmation(request):
             return self._continue_ledger_confirmation(
@@ -1864,18 +2234,26 @@ class PilotRuntime:
         conversation = self._load_confirmation_conversation(request)
         if conversation is None:
             self._mark_completed_if_active(control)
-            return self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404)
+            return self._failure(
+                RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404
+            )
         conversation_id = _conversation_id(conversation)
         if conversation_id is None:
             self._mark_completed_if_active(control)
-            return self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404)
+            return self._failure(
+                RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404
+            )
         if _is_archived(conversation):
             self._mark_completed_if_active(control)
-            return self._failure(RuntimeFailureCode.CONVERSATION_ARCHIVED, "conversation is archived", 409)
+            return self._failure(
+                RuntimeFailureCode.CONVERSATION_ARCHIVED, "conversation is archived", 409
+            )
         adapter = self._dependencies.deterministic
         if adapter is None:
             self._mark_completed_if_active(control)
-            return self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400)
+            return self._failure(
+                RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400
+            )
         validate_action = _callable(adapter, ("validate_action",))
         if validate_action is not None:
             try:
@@ -1889,17 +2267,25 @@ class PilotRuntime:
             if terminal_probe is not None
             else False
         )
-        if not terminal_replay and request.approved and not self._confirmation_messages_exist(conversation_id):
+        if (
+            not terminal_replay
+            and request.approved
+            and not self._confirmation_messages_exist(conversation_id)
+        ):
             self._mark_completed_if_active(control)
-            return self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404)
+            return self._failure(
+                RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404
+            )
         original_pending = None if terminal_replay else adapter.pending_action(conversation)
-        original, journal_holder, on_attempt, on_result = self._deterministic_confirmation_callbacks(
-            adapter,
-            conversation,
-            resolved_transport,
-            control,
-            original=original_pending,
-            edited=not request.edited_args.is_missing(),
+        original, journal_holder, on_attempt, on_result = (
+            self._deterministic_confirmation_callbacks(
+                adapter,
+                conversation,
+                resolved_transport,
+                control,
+                original=original_pending,
+                edited=not request.edited_args.is_missing(),
+            )
         )
         try:
             execution = adapter.confirm(
@@ -1917,15 +2303,23 @@ class PilotRuntime:
         except Exception:
             recorder = journal_holder.get("recorder")
             if recorder is not None:
-                self._finish(recorder, journal_holder.get("started") is True, "failed", "unknown", control)
+                self._finish(
+                    recorder, journal_holder.get("started") is True, "failed", "unknown", control
+                )
             self._mark_completed_if_active(control)
-            return self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话结果暂时无法保存。", 503, retryable=True)
+            return self._failure(
+                RuntimeFailureCode.OPERATION_FAILED, "对话结果暂时无法保存。", 503, retryable=True
+            )
         except BaseException:
             recorder = journal_holder.get("recorder")
             if recorder is not None:
                 self._abandon(recorder, journal_holder.get("started") is True)
             raise
-        outcome = execution.outcome if isinstance(execution, DeterministicExecution) else cast(RuntimeOutcome, execution)
+        outcome = (
+            execution.outcome
+            if isinstance(execution, DeterministicExecution)
+            else cast(RuntimeOutcome, execution)
+        )
         try:
             self._finish_deterministic_confirmation_journal(
                 journal_holder,
@@ -1956,9 +2350,7 @@ class PilotRuntime:
         if not isinstance(request, ConfirmationRequest) or not request.approved:
             return False
         coordinator = self._confirmation_coordinator()
-        write_operations = _attribute(
-            _attribute(coordinator, "dependencies"), "write_operations"
-        )
+        write_operations = _attribute(_attribute(coordinator, "dependencies"), "write_operations")
         operation_id = request.operation_id
         operation: object | None = None
         if not isinstance(operation_id, str) or not operation_id:
@@ -1991,10 +2383,8 @@ class PilotRuntime:
                 (operation_id,),
             )
         return (
-            str(_attribute(operation, "adapter_kind", "") or "")
-            == "legacy_deterministic"
-            and str(_attribute(operation, "tool_name", "") or "")
-            in LEGACY_DETERMINISTIC_NAMES
+            str(_attribute(operation, "adapter_kind", "") or "") == "legacy_deterministic"
+            and str(_attribute(operation, "tool_name", "") or "") in LEGACY_DETERMINISTIC_NAMES
         )
 
     @staticmethod
@@ -2122,8 +2512,7 @@ class PilotRuntime:
                 source_ref_type="tool_call",
                 source_ref_id=session.state.pending.tool_call_id,
             )
-            if isinstance(original_fingerprint, str)
-            and isinstance(decided_fingerprint, str)
+            if isinstance(original_fingerprint, str) and isinstance(decided_fingerprint, str)
             else None
         )
         approval_draft = (
@@ -2145,11 +2534,7 @@ class PilotRuntime:
             if not started or approval_event is None:
                 return
             append_bound = getattr(recorder, "append_prepared_event_bound", None)
-            if (
-                bound_session is not None
-                and approval_draft is not None
-                and callable(append_bound)
-            ):
+            if bound_session is not None and approval_draft is not None and callable(append_bound):
                 try:
                     append_bound(bound_session, approval_draft)
                 except Exception:
@@ -2216,8 +2601,7 @@ class PilotRuntime:
                 if not succeeded:
                     late_outcome = _attribute(execution_record, "outcome")
                     late_failure_code = str(
-                        _attribute(late_outcome, "code", "operation_failed")
-                        or "operation_failed"
+                        _attribute(late_outcome, "code", "operation_failed") or "operation_failed"
                     )
                 self._finish(
                     recorder,
@@ -2233,12 +2617,9 @@ class PilotRuntime:
             # it from this callback would create duplicate tool.completed or
             # tool.failed journal rows.  Rejection has no tool terminal at
             # all, and is represented only by approval.decided.
-            if (
-                not approved
-                or (
-                    _attribute(execution_record, "terminal_persisted") is True
-                    and _attribute(execution_record, "journal_started_recorded") is True
-                )
+            if not approved or (
+                _attribute(execution_record, "terminal_persisted") is True
+                and _attribute(execution_record, "journal_started_recorded") is True
             ):
                 return value
             succeeded = isinstance(_attribute(execution_record, "outcome"), ToolSuccess)
@@ -2545,9 +2926,7 @@ class PilotRuntime:
                 session,
                 DeliveryBundle((Message(role="assistant", content=visible),)),
             )
-            self._record_ledger_delivery_journal(
-                recorder, journal_started, session, control
-            )
+            self._record_ledger_delivery_journal(recorder, journal_started, session, control)
         except BaseException:
             coordinator.cancel_cleanup(session)
             self._abandon(recorder, journal_started)
@@ -2599,7 +2978,9 @@ class PilotRuntime:
         def load() -> Sequence[Message]:
             if source_adapter is None:
                 raise WriteOperationError("operation_unavailable")
-            function = _callable(source_adapter, ("load", "load_sources", "load_chat_source_messages"))
+            function = _callable(
+                source_adapter, ("load", "load_sources", "load_chat_source_messages")
+            )
             if function is None:
                 raise TypeError("source loader does not provide load")
             source = _invoke(
@@ -2663,9 +3044,7 @@ class PilotRuntime:
             raise
         except (PendingActionValidationError, ValueError):
             self._mark_completed_if_active(control)
-            return self._confirmation_failure(
-                WriteOperationError("invalid_confirmation")
-            )
+            return self._confirmation_failure(WriteOperationError("invalid_confirmation"))
         except Exception as exc:
             self._mark_completed_if_active(control)
             return self._confirmation_failure(exc)
@@ -2736,13 +3115,19 @@ class PilotRuntime:
             raise
         except Exception:
             self._mark_completed_if_active(control)
-            return self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404)
+            return self._failure(
+                RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404
+            )
         if conversation is None or _conversation_id(conversation) != request.conversation_id:
             self._mark_completed_if_active(control)
-            return self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404)
+            return self._failure(
+                RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404
+            )
         if _is_archived(conversation):
             self._mark_completed_if_active(control)
-            return self._failure(RuntimeFailureCode.CONVERSATION_ARCHIVED, "conversation is archived", 409)
+            return self._failure(
+                RuntimeFailureCode.CONVERSATION_ARCHIVED, "conversation is archived", 409
+            )
 
         resolved_model: ResolvedModel | None = None
         approval_context_resolver = getattr(
@@ -2761,11 +3146,7 @@ class PilotRuntime:
                 self._mark_completed_if_active(control)
                 return resolved
             resolved_model = resolved
-        catalog = (
-            resolved_model.catalog
-            if resolved_model is not None
-            else self._dependencies.catalog
-        )
+        catalog = self._dependencies.catalog
         try:
             session_or_replay = coordinator.approve_modify(
                 request,
@@ -2809,7 +3190,9 @@ class PilotRuntime:
         if driver is None:
             coordinator.cancel_cleanup(session)
             self._mark_completed_if_active(control)
-            return self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400)
+            return self._failure(
+                RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400
+            )
         recorder: object = _NoopRecorder()
         journal_started = False
         try:
@@ -2823,13 +3206,9 @@ class PilotRuntime:
             raw_context = (
                 session.state.approval_context
                 if session.state.approval_context is not None
-                else resolved_model.tool_context
-                if resolved_model is not None
                 else None
             )
-            tool_context = self._bind_confirmation_context(
-                raw_context, session, recorder
-            )
+            tool_context = self._bind_confirmation_context(raw_context, session, recorder)
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
             coordinator.cancel_cleanup(session)
             self._abandon(recorder, journal_started)
@@ -2856,13 +3235,9 @@ class PilotRuntime:
             model=resolved_model.model if resolved_model is not None else None,
             catalog=cast(Any, catalog),
             tool_context=cast(Any, tool_context),
-            auto_approve=(
-                resolved_model.auto_approve if resolved_model is not None else False
-            ),
+            auto_approve=(resolved_model.auto_approve if resolved_model is not None else False),
             max_iterations=(
-                resolved_model.max_iter
-                if resolved_model is not None
-                else DEFAULT_MAX_ITERATIONS
+                resolved_model.max_iter if resolved_model is not None else DEFAULT_MAX_ITERATIONS
             ),
             run_recorder=cast(Any, recorder),
             event_sink=cast(Any, confirmation_event_sink),
@@ -2872,9 +3247,7 @@ class PilotRuntime:
         try:
             self._check_cancel(cancel_check, control)
             raw_result = (
-                execution_host.run(
-                    lambda: self._run_driver(driver, invocation), control
-                )
+                execution_host.run(lambda: self._run_driver(driver, invocation), control)
                 if execution_host is not None
                 else self._run_driver(driver, invocation)
             )
@@ -3073,7 +3446,9 @@ class PilotRuntime:
             # not allowed to make an unowned write appear durable.
             coordinator.cancel_cleanup(typed_session)
             self._mark_completed_if_active(control)
-            return self._failure(RuntimeFailureCode.OPERATION_FAILED, "写入结果暂时无法保存。", 503, retryable=True)
+            return self._failure(
+                RuntimeFailureCode.OPERATION_FAILED, "写入结果暂时无法保存。", 503, retryable=True
+            )
         added = [_message(item) for item in normalized.added]
         continuation: list[Message] = []
         origin_removed = False
@@ -3145,11 +3520,11 @@ class PilotRuntime:
         write_error = (
             str(compatibility_detail)
             if isinstance(compatibility_detail, str) and compatibility_detail
-            else str(payload) if payload else None
+            else str(payload)
+            if payload
+            else None
         )
-        write_status: WriteStatus = (
-            "success" if state.succeeded else "failed"
-        )
+        write_status: WriteStatus = "success" if state.succeeded else "failed"
         if not state.approved:
             write_status = "cancelled"
         visible_reply = _user_facing_assistant_content(
@@ -3379,9 +3754,7 @@ class PilotRuntime:
                 invocation_control,
             )
         except Exception as exc:
-            return self._stream_immediate(
-                self._confirmation_failure(exc), invocation_control
-            )
+            return self._stream_immediate(self._confirmation_failure(exc), invocation_control)
         self._check_cancel(lambda: False, invocation_control)
 
         confirmation_coordinator = self._confirmation_coordinator()
@@ -3410,9 +3783,7 @@ class PilotRuntime:
             except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
                 raise
             except Exception as exc:
-                return self._stream_immediate(
-                    self._confirmation_failure(exc), invocation_control
-                )
+                return self._stream_immediate(self._confirmation_failure(exc), invocation_control)
             if stream_replay is not None:
                 # Ledger replay is transport-independent and must not load a
                 # Conversation or source before the response header.
@@ -3463,9 +3834,7 @@ class PilotRuntime:
             except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
                 raise
             except Exception as exc:
-                return self._stream_immediate(
-                    self._confirmation_failure(exc), invocation_control
-                )
+                return self._stream_immediate(self._confirmation_failure(exc), invocation_control)
 
         if (
             isinstance(request, StartTurnRequest)
@@ -3485,10 +3854,14 @@ class PilotRuntime:
                         if "context" in text
                         else RuntimeFailureCode.INVALID_CONFIRMATION
                     )
-                    return self._stream_immediate(self._failure(code, text, 422), invocation_control)
+                    return self._stream_immediate(
+                        self._failure(code, text, 422), invocation_control
+                    )
                 except LookupError:
                     return self._stream_immediate(
-                        self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "application not found", 404),
+                        self._failure(
+                            RuntimeFailureCode.APPLICATION_NOT_FOUND, "application not found", 404
+                        ),
                         invocation_control,
                     )
                 except Exception:
@@ -3580,7 +3953,9 @@ class PilotRuntime:
         if isinstance(request, ConfirmationRequest):
             if adapter is None:
                 return self._stream_immediate(
-                    self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400),
+                    self._failure(
+                        RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400
+                    ),
                     invocation_control,
                 )
             validate_action = _callable(adapter, ("validate_action",))
@@ -3598,19 +3973,27 @@ class PilotRuntime:
                 if terminal_probe is not None
                 else False
             )
-            if not terminal_replay and request.approved and not self._confirmation_messages_exist(conversation_id):
+            if (
+                not terminal_replay
+                and request.approved
+                and not self._confirmation_messages_exist(conversation_id)
+            ):
                 return self._stream_immediate(
-                    self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404),
+                    self._failure(
+                        RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404
+                    ),
                     invocation_control,
                 )
             original_pending = None if terminal_replay else adapter.pending_action(conversation)
-            original, journal_holder, on_attempt, on_result = self._deterministic_confirmation_callbacks(
-                adapter,
-                conversation,
-                transport,
-                invocation_control,
-                original=original_pending,
-                edited=not request.edited_args.is_missing(),
+            original, journal_holder, on_attempt, on_result = (
+                self._deterministic_confirmation_callbacks(
+                    adapter,
+                    conversation,
+                    transport,
+                    invocation_control,
+                    original=original_pending,
+                    edited=not request.edited_args.is_missing(),
+                )
             )
             try:
                 execution = adapter.confirm(
@@ -3636,7 +4019,12 @@ class PilotRuntime:
                         invocation_control,
                     )
                 return self._stream_immediate(
-                    self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话结果暂时无法保存。", 503, retryable=True),
+                    self._failure(
+                        RuntimeFailureCode.OPERATION_FAILED,
+                        "对话结果暂时无法保存。",
+                        503,
+                        retryable=True,
+                    ),
                     invocation_control,
                 )
             except BaseException:
@@ -3646,7 +4034,12 @@ class PilotRuntime:
                 raise
             if not isinstance(execution, DeterministicExecution):
                 return self._stream_immediate(
-                    self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话结果暂时无法保存。", 503, retryable=True),
+                    self._failure(
+                        RuntimeFailureCode.OPERATION_FAILED,
+                        "对话结果暂时无法保存。",
+                        503,
+                        retryable=True,
+                    ),
                     invocation_control,
                 )
             try:
@@ -3714,7 +4107,11 @@ class PilotRuntime:
                 )
             except BaseException:
                 raise
-            if route is RouteKind.MODEL and pending_guard is not None and pending_guard is not False:
+            if (
+                route is RouteKind.MODEL
+                and pending_guard is not None
+                and pending_guard is not False
+            ):
                 return self._stream_immediate(
                     self._failure(
                         RuntimeFailureCode.PENDING_CONFIRMATION_REQUIRED,
@@ -3726,7 +4123,9 @@ class PilotRuntime:
         if route is not RouteKind.MODEL:
             if adapter is None:
                 return self._stream_immediate(
-                    self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400),
+                    self._failure(
+                        RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400
+                    ),
                     invocation_control,
                 )
             validate_action = _callable(adapter, ("validate_action",))
@@ -3763,23 +4162,36 @@ class PilotRuntime:
                 raise
             except ValueError as exc:
                 text = str(exc)
-                code = RuntimeFailureCode.OPERATION_UNAVAILABLE if "context" in text else RuntimeFailureCode.INVALID_CONFIRMATION
+                code = (
+                    RuntimeFailureCode.OPERATION_UNAVAILABLE
+                    if "context" in text
+                    else RuntimeFailureCode.INVALID_CONFIRMATION
+                )
                 status_code = 422
                 if "journal_started" in locals():
                     self._finish(recorder, journal_started, "failed", "unknown", invocation_control)
-                return self._stream_immediate(self._failure(code, text, status_code), invocation_control)
+                return self._stream_immediate(
+                    self._failure(code, text, status_code), invocation_control
+                )
             except LookupError:
                 if "journal_started" in locals():
                     self._finish(recorder, journal_started, "failed", "unknown", invocation_control)
                 return self._stream_immediate(
-                    self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "application not found", 404),
+                    self._failure(
+                        RuntimeFailureCode.APPLICATION_NOT_FOUND, "application not found", 404
+                    ),
                     invocation_control,
                 )
             except Exception:
                 if "journal_started" in locals():
                     self._finish(recorder, journal_started, "failed", "unknown", invocation_control)
                 return self._stream_immediate(
-                    self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话结果暂时无法保存。", 503, retryable=True),
+                    self._failure(
+                        RuntimeFailureCode.OPERATION_FAILED,
+                        "对话结果暂时无法保存。",
+                        503,
+                        retryable=True,
+                    ),
                     invocation_control,
                 )
             except BaseException:
@@ -3840,84 +4252,8 @@ class PilotRuntime:
                 journal_started=journal_started,
             )
 
-        self._phase("model_resolve")
-        resolved = self._resolve_model(request, conversation)
-        if isinstance(resolved, RuntimeFailureOutcome):
-            return self._stream_immediate(resolved, invocation_control)
-        if resolved is None:
-            return self._stream_immediate(
-                self._failure(
-                    RuntimeFailureCode.MODEL_UNCONFIGURED,
-                    "AI 设置尚未完成，请检查模型配置。",
-                    503,
-                ),
-                invocation_control,
-            )
-
-        persistence = self._require_dependency("persistence")
-        persistence_failure = self._validate_persistence_surface(persistence)
-        if persistence_failure is not None:
-            return self._stream_immediate(persistence_failure, invocation_control)
-
-        self._phase("user_persist")
-        self._check_cancel(lambda: False, invocation_control)
+        self._phase("source_load")
         try:
-            user_result = self._persist_user(
-                persistence,
-                conversation_id,
-                request.message,
-                control=invocation_control,
-            )
-        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
-            raise
-        except Exception:
-            return self._stream_immediate(
-                self._failure(
-                    RuntimeFailureCode.OPERATION_FAILED,
-                    "对话当前不可写入。",
-                    503,
-                    retryable=True,
-                ),
-                invocation_control,
-            )
-        if not _result_persisted(user_result):
-            status = _failure_status(user_result)
-            code = (
-                RuntimeFailureCode.CONVERSATION_ARCHIVED
-                if status == "closed"
-                else RuntimeFailureCode.APPLICATION_NOT_FOUND
-                if status == "not_found"
-                else RuntimeFailureCode.OPERATION_FAILED
-            )
-            status_code = 409 if code is RuntimeFailureCode.CONVERSATION_ARCHIVED else 404 if code is RuntimeFailureCode.APPLICATION_NOT_FOUND else 503
-            return self._stream_immediate(
-                self._failure(
-                    code,
-                    "对话当前不可写入。",
-                    status_code,
-                    retryable=code is RuntimeFailureCode.OPERATION_FAILED,
-                ),
-                invocation_control,
-            )
-
-        input_message_id = _attribute(user_result, "message_id")
-        if type(input_message_id) is not int or input_message_id <= 0:
-            try:
-                persisted_ids = self._snapshot_message_ids(persistence, conversation_id)
-            except _PersistenceReadbackError:
-                return self._stream_immediate(
-                    self._failure(
-                        RuntimeFailureCode.OPERATION_FAILED,
-                        "对话结果暂时无法保存。",
-                        503,
-                        retryable=True,
-                    ),
-                    invocation_control,
-                )
-            input_message_id = persisted_ids[-1] if persisted_ids else None
-
-        try:
-            self._phase("source_load")
             source = self._load_source(conversation, request)
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
             raise
@@ -3931,10 +4267,15 @@ class PilotRuntime:
                 ),
                 invocation_control,
             )
+        except BaseException:
+            raise
 
+        recorder_proxy = _RuntimeRecorderProxy()
+        self._phase("segment_resolve")
         try:
-            self._phase("context_assemble")
-            assembled = self._assemble_context(source, conversation, request)
+            segment_value = self._resolve_segment_context(
+                request, conversation, source, recorder_proxy
+            )
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
             raise
         except Exception:
@@ -3947,17 +4288,313 @@ class PilotRuntime:
                 ),
                 invocation_control,
             )
+        except BaseException:
+            raise
+        if isinstance(segment_value, RuntimeFailureOutcome):
+            return self._stream_immediate(segment_value, invocation_control)
+        if segment_value is None:
+            return self._stream_immediate(
+                self._failure(
+                    RuntimeFailureCode.SOURCE_LOAD_FAILED,
+                    "上下文暂时无法加载，请稍后重试。",
+                    503,
+                    retryable=True,
+                ),
+                invocation_control,
+            )
+        segment = segment_value
+        segment_token = object()
+        self._prepared_segments[segment_token] = segment
+        segment_lease = _PreparedModelLease(segment.close)
 
-        self._phase("transport_identity")
-        self._check_cancel(lambda: False, invocation_control)
-        self._phase("run_start")
-        recorder, journal_started = self._start_journal(
-            conversation,
-            conversation_id,
-            input_message_id,
-            request,
-            transport,
+        def release_segment_now() -> None:
+            try:
+                segment_lease.release_once()
+            finally:
+                self._prepared_segments.pop(segment_token, None)
+
+        def phase_with_segment(name: str) -> None:
+            try:
+                self._phase(name)
+            except BaseException:
+                release_segment_now()
+                raise
+
+        phase_with_segment("context_assemble")
+        try:
+            assembled = self._assemble_context(source, conversation, request)
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            release_segment_now()
+            raise
+        except Exception:
+            release_segment_now()
+            return self._stream_immediate(
+                self._failure(
+                    RuntimeFailureCode.SOURCE_LOAD_FAILED,
+                    "上下文暂时无法加载，请稍后重试。",
+                    503,
+                    retryable=True,
+                ),
+                invocation_control,
+            )
+        except BaseException:
+            release_segment_now()
+            raise
+
+        phase_with_segment("policy_resolve")
+        try:
+            policy = self._resolve_policy_catalog(request, conversation, source, segment)
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            release_segment_now()
+            raise
+        except Exception:
+            release_segment_now()
+            return self._stream_immediate(
+                self._failure(
+                    RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                    "工具权限暂时不可用，请稍后重试。",
+                    503,
+                    retryable=True,
+                ),
+                invocation_control,
+            )
+        except BaseException:
+            release_segment_now()
+            raise
+        if isinstance(policy, RuntimeFailureOutcome):
+            release_segment_now()
+            return self._stream_immediate(policy, invocation_control)
+        segment = SegmentExecution(
+            authority=segment.authority,
+            context=segment.context,
+            catalog=policy.catalog,
+            close=segment.close,
+            surface_gate=segment.surface_gate,
+            policy=policy,
         )
+
+        phase_with_segment("surface_resolve")
+        try:
+            surface_gate = self._resolve_surface_gate(
+                request,
+                conversation,
+                source,
+                assembled,
+                policy,
+                segment,
+            )
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            release_segment_now()
+            raise
+        except Exception:
+            release_segment_now()
+            return self._stream_immediate(
+                self._failure(
+                    RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                    "工具权限暂时不可用，请稍后重试。",
+                    503,
+                    retryable=True,
+                ),
+                invocation_control,
+            )
+        except BaseException:
+            release_segment_now()
+            raise
+        if isinstance(surface_gate, RuntimeFailureOutcome):
+            release_segment_now()
+            return self._stream_immediate(surface_gate, invocation_control)
+        segment = SegmentExecution(
+            authority=segment.authority,
+            context=segment.context,
+            catalog=segment.catalog,
+            close=segment.close,
+            surface_gate=surface_gate,
+            policy=policy,
+        )
+        self._prepared_segments[segment_token] = segment
+
+        phase_with_segment("model_resolve")
+        try:
+            resolved = self._resolve_continuation_model(request, conversation, policy)
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            release_segment_now()
+            raise
+        except Exception:
+            release_segment_now()
+            return self._stream_immediate(
+                self._failure(
+                    RuntimeFailureCode.AI_PROVIDER_ERROR,
+                    "AI 连接失败。请检查 AI 设置或稍后重试。",
+                    502,
+                    retryable=True,
+                ),
+                invocation_control,
+            )
+        except BaseException:
+            release_segment_now()
+            raise
+        if isinstance(resolved, RuntimeFailureOutcome):
+            release_segment_now()
+            return self._stream_immediate(resolved, invocation_control)
+        if resolved is None:
+            release_segment_now()
+            return self._stream_immediate(
+                self._failure(
+                    RuntimeFailureCode.MODEL_UNCONFIGURED,
+                    "AI 设置尚未完成，请检查模型配置。",
+                    503,
+                ),
+                invocation_control,
+            )
+
+        model_token = object()
+        self._prepared_models[model_token] = resolved
+        model_lease = _PreparedModelLease(lambda: self._prepared_models.pop(model_token, None))
+
+        def release_segment() -> None:
+            release_segment_now()
+
+        def release_model() -> None:
+            model_lease.release_once()
+
+        def release_prepared() -> None:
+            try:
+                release_model()
+            finally:
+                release_segment()
+
+        def phase_with_prepared(name: str) -> None:
+            try:
+                self._phase(name)
+            except BaseException:
+                release_prepared()
+                raise
+
+        def stream_failure(outcome: RuntimeFailureOutcome) -> ImmediateHttpOutcome:
+            release_prepared()
+            return self._stream_immediate(outcome, invocation_control)
+
+        try:
+            persistence = self._require_dependency("persistence")
+            persistence_failure = self._validate_persistence_surface(persistence)
+        except BaseException:
+            release_prepared()
+            raise
+        if persistence_failure is not None:
+            return stream_failure(persistence_failure)
+
+        phase_with_prepared("user_persist")
+        try:
+            self._check_cancel(lambda: False, invocation_control)
+        except BaseException:
+            release_prepared()
+            raise
+        try:
+            user_result = self._persist_user(
+                persistence,
+                conversation_id,
+                request.message,
+                control=invocation_control,
+            )
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            release_prepared()
+            raise
+        except Exception:
+            return stream_failure(
+                self._failure(
+                    RuntimeFailureCode.OPERATION_FAILED,
+                    "对话当前不可写入。",
+                    503,
+                    retryable=True,
+                ),
+            )
+        except BaseException:
+            release_prepared()
+            raise
+        try:
+            user_persisted = _result_persisted(user_result)
+            status = _failure_status(user_result) if not user_persisted else ""
+        except BaseException:
+            release_prepared()
+            raise
+        if not user_persisted:
+            code = (
+                RuntimeFailureCode.CONVERSATION_ARCHIVED
+                if status == "closed"
+                else RuntimeFailureCode.APPLICATION_NOT_FOUND
+                if status == "not_found"
+                else RuntimeFailureCode.OPERATION_FAILED
+            )
+            status_code = (
+                409
+                if code is RuntimeFailureCode.CONVERSATION_ARCHIVED
+                else 404
+                if code is RuntimeFailureCode.APPLICATION_NOT_FOUND
+                else 503
+            )
+            return stream_failure(
+                self._failure(
+                    code,
+                    "对话当前不可写入。",
+                    status_code,
+                    retryable=code is RuntimeFailureCode.OPERATION_FAILED,
+                ),
+            )
+
+        try:
+            input_message_id = _attribute(user_result, "message_id")
+        except BaseException:
+            release_prepared()
+            raise
+        if type(input_message_id) is not int or input_message_id <= 0:
+            try:
+                persisted_ids = self._snapshot_message_ids(persistence, conversation_id)
+            except _PersistenceReadbackError:
+                return stream_failure(
+                    self._failure(
+                        RuntimeFailureCode.OPERATION_FAILED,
+                        "对话结果暂时无法保存。",
+                        503,
+                        retryable=True,
+                    ),
+                )
+            except BaseException:
+                release_prepared()
+                raise
+            input_message_id = persisted_ids[-1] if persisted_ids else None
+
+        phase_with_prepared("transport_identity")
+        try:
+            self._check_cancel(lambda: False, invocation_control)
+        except BaseException:
+            release_prepared()
+            raise
+        phase_with_prepared("run_start")
+        try:
+            recorder, journal_started = self._start_journal(
+                conversation,
+                conversation_id,
+                input_message_id,
+                request,
+                transport,
+            )
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            release_prepared()
+            raise
+        except Exception:
+            release_prepared()
+            return self._stream_immediate(
+                self._failure(
+                    RuntimeFailureCode.OPERATION_FAILED,
+                    "对话结果暂时无法保存。",
+                    503,
+                    retryable=True,
+                ),
+                invocation_control,
+            )
+        except BaseException:
+            release_prepared()
+            raise
 
         try:
             self._record_journal_route(
@@ -3974,15 +4611,17 @@ class PilotRuntime:
                 conversation,
                 conversation_id,
                 input_message_id,
-                resolved.catalog,
+                segment.catalog,
                 persistence,
                 invocation_control,
             )
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
             self._abandon(recorder, journal_started)
+            release_prepared()
             raise
         except Exception:
             self._abandon(recorder, journal_started)
+            release_prepared()
             return self._stream_immediate(
                 self._failure(
                     RuntimeFailureCode.OPERATION_FAILED,
@@ -3992,19 +4631,15 @@ class PilotRuntime:
                 ),
                 invocation_control,
             )
+        except BaseException:
+            self._abandon(recorder, journal_started)
+            release_prepared()
+            raise
 
         cell = _PreparedExecutionCell(run_open=journal_started)
-        model_token = object()
-        self._prepared_models[model_token] = resolved
-        model_lease = _PreparedModelLease(
-            lambda: self._prepared_models.pop(model_token, None)
-        )
-
-        def release_model() -> None:
-            model_lease.release_once()
 
         def on_abort() -> None:
-            release_model()
+            release_prepared()
             with cell.lock:
                 if cell.aborted or cell.completed:
                     return
@@ -4017,7 +4652,7 @@ class PilotRuntime:
                 invocation_control.mark_completed()
 
         def on_complete(_reason: CompletionReason) -> None:
-            release_model()
+            release_prepared()
             with cell.lock:
                 if cell.aborted or cell.completed:
                     return
@@ -4027,7 +4662,7 @@ class PilotRuntime:
         try:
             frozen_assembled = _freeze_stream_value(assembled)
         except (TypeError, ValueError):
-            release_model()
+            release_prepared()
             self._abandon(recorder, journal_started)
             return self._stream_immediate(
                 self._failure(
@@ -4038,34 +4673,60 @@ class PilotRuntime:
                 ),
                 invocation_control,
             )
+        except BaseException:
+            release_prepared()
+            self._abandon(recorder, journal_started)
+            raise
         assembled_values = (
             cast(tuple[object, ...], frozen_assembled)
             if isinstance(frozen_assembled, tuple)
             else (frozen_assembled,)
         )
-        state = _PreparedStreamState(
-            owner_token=self._owner_token,
-            preparation_kind=PreparationKind.MODEL,
-            execution_mode=StreamExecutionMode.AGENT_HOST,
-            control=invocation_control,
-            request=request,
-            conversation=_prepared_conversation(conversation, conversation_id),
-            conversation_id=conversation_id,
-            model_token=model_token,
-            assembled=assembled_values,
-            recorder=recorder,
-            journal_started=journal_started,
-            transport=transport,
-            cell=cell,
-            on_abort=on_abort,
-            on_complete=on_complete,
-        )
-        transport_run_id = transport.transport_run_id
-        if transport_run_id is None:  # pragma: no cover - RuntimeTransportContext validates this
-            release_model()
+        try:
+            detached_conversation = _prepared_conversation(conversation, conversation_id)
+            state = _PreparedStreamState(
+                owner_token=self._owner_token,
+                preparation_kind=PreparationKind.MODEL,
+                execution_mode=StreamExecutionMode.AGENT_HOST,
+                control=invocation_control,
+                request=request,
+                conversation=detached_conversation,
+                conversation_id=conversation_id,
+                model_token=model_token,
+                segment_token=segment_token,
+                surface_gate=surface_gate,
+                assembled=assembled_values,
+                recorder=recorder,
+                journal_started=journal_started,
+                transport=transport,
+                cell=cell,
+                on_abort=on_abort,
+                on_complete=on_complete,
+            )
+        except (TypeError, ValueError):
+            release_prepared()
             self._abandon(recorder, journal_started)
             return self._stream_immediate(
-                self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400),
+                self._failure(
+                    RuntimeFailureCode.OPERATION_FAILED,
+                    "对话结果暂时无法保存。",
+                    503,
+                    retryable=True,
+                ),
+                invocation_control,
+            )
+        except BaseException:
+            release_prepared()
+            self._abandon(recorder, journal_started)
+            raise
+        transport_run_id = transport.transport_run_id
+        if transport_run_id is None:  # pragma: no cover - RuntimeTransportContext validates this
+            release_prepared()
+            self._abandon(recorder, journal_started)
+            return self._stream_immediate(
+                self._failure(
+                    RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400
+                ),
                 invocation_control,
             )
         try:
@@ -4076,10 +4737,15 @@ class PilotRuntime:
                 opaque_state=state,
             )
         except BaseException:
-            release_model()
+            release_prepared()
             self._abandon(recorder, journal_started)
             raise
-        self._phase("prepared")
+        try:
+            self._phase("prepared")
+        except BaseException:
+            release_prepared()
+            self._abandon(recorder, journal_started)
+            raise
         return prepared
 
     def execute_prepared_stream(
@@ -4240,7 +4906,9 @@ class PilotRuntime:
                         ),
                     )
                 else:
-                    emit_runtime_event(safe_event_sink, CompletedEvent(response=confirmation_outcome))
+                    emit_runtime_event(
+                        safe_event_sink, CompletedEvent(response=confirmation_outcome)
+                    )
                 return finish(confirmation_outcome, CompletionReason.NORMAL)
             except RuntimeCancelled:
                 abort(CompletionReason.CANCELLED)
@@ -4286,11 +4954,19 @@ class PilotRuntime:
                 raise
 
         resolved_model = (
-            self._prepared_models.get(state.model_token)
-            if state.model_token is not None
+            self._prepared_models.get(state.model_token) if state.model_token is not None else None
+        )
+        segment = (
+            self._prepared_segments.get(state.segment_token)
+            if state.segment_token is not None
             else None
         )
-        if resolved_model is None or state.conversation is None or state.conversation_id is None:
+        if (
+            resolved_model is None
+            or segment is None
+            or state.conversation is None
+            or state.conversation_id is None
+        ):
             abort(CompletionReason.TRANSPORT_ABORTED)
             raise RuntimeTransportAborted()
 
@@ -4298,9 +4974,7 @@ class PilotRuntime:
             emit_runtime_event(
                 safe_event_sink,
                 MetaEvent(
-                    supports_delta=callable(
-                        getattr(resolved_model.model, "stream_complete", None)
-                    )
+                    supports_delta=callable(getattr(resolved_model.model, "stream_complete", None))
                 ),
             )
             emit_runtime_event(safe_event_sink, UserMessageSavedEvent())
@@ -4320,6 +4994,7 @@ class PilotRuntime:
             def build_invocation(agent_events: RuntimeEventSink) -> AgentLoopInvocation:
                 invocation = self._agent_invocation(
                     resolved_model,
+                    segment,
                     tuple(_materialize_stream_value(item) for item in state.assembled),
                     state.conversation,
                     cast(StartTurnRequest, state.request),
@@ -4438,7 +5113,10 @@ class PilotRuntime:
                 503,
                 retryable=True,
             )
-            emit_runtime_event(safe_event_sink, ErrorEvent(outcome.code, outcome.message, outcome.retryable, outcome.degraded))
+            emit_runtime_event(
+                safe_event_sink,
+                ErrorEvent(outcome.code, outcome.message, outcome.retryable, outcome.degraded),
+            )
             emit_runtime_event(safe_event_sink, CompletedEvent(response=outcome))
             return finish(outcome, CompletionReason.CANCELLED)
         except RuntimeCancelled:
@@ -4462,7 +5140,10 @@ class PilotRuntime:
             )
             close_terminal_owner()
             self._mark_completed_if_active(state.control)
-            emit_runtime_event(safe_event_sink, ErrorEvent(outcome.code, outcome.message, outcome.retryable, outcome.degraded))
+            emit_runtime_event(
+                safe_event_sink,
+                ErrorEvent(outcome.code, outcome.message, outcome.retryable, outcome.degraded),
+            )
             return finish(outcome, CompletionReason.NORMAL)
         except BaseException:
             abort(CompletionReason.TRANSPORT_ABORTED)
@@ -4481,7 +5162,7 @@ class PilotRuntime:
                 cast(StartTurnRequest, state.request),
                 normalized,
                 state.conversation,
-                catalog=resolved_model.catalog,
+                catalog=segment.catalog,
                 ensure_active=lambda: self._check_cancel(cancel_check, state.control),
                 control=state.control,
             )
@@ -4500,7 +5181,7 @@ class PilotRuntime:
                     state.journal_started,
                     normalized.pending,
                     state.control,
-                    catalog=resolved_model.catalog,
+                    catalog=segment.catalog,
                 )
                 close_terminal_owner()
                 self._mark_completed_if_active(state.control)
@@ -4510,12 +5191,13 @@ class PilotRuntime:
 
                     payload = PendingActionPayload(
                         tool_name=normalized.pending.tool_name,
-                        operation_id=normalized.pending.operation_id or normalized.pending.tool_call_id,
+                        operation_id=normalized.pending.operation_id
+                        or normalized.pending.tool_call_id,
                         human=normalized.pending.human,
                         args=args,
                         confirmation_token=token,
                         editable_fields=self._pending_editable_fields(
-                            normalized.pending, resolved_model.catalog
+                            normalized.pending, segment.catalog
                         ),
                         details=self._pending_action_details(normalized.pending),
                     )
@@ -4532,7 +5214,9 @@ class PilotRuntime:
                         ),
                     )
             elif isinstance(outcome, RuntimeFailureOutcome):
-                self._finish(state.recorder, state.journal_started, "failed", "unknown", state.control)
+                self._finish(
+                    state.recorder, state.journal_started, "failed", "unknown", state.control
+                )
                 close_terminal_owner()
                 self._mark_completed_if_active(state.control)
                 emit_runtime_event(
@@ -4546,11 +5230,15 @@ class PilotRuntime:
                     ),
                 )
             else:
-                self._finish(state.recorder, state.journal_started, "completed", None, state.control)
+                self._finish(
+                    state.recorder, state.journal_started, "completed", None, state.control
+                )
                 close_terminal_owner()
                 self._mark_completed_if_active(state.control)
                 if isinstance(outcome, (MessageOutcome, OperationReplayOutcome)):
-                    emit_runtime_event(safe_event_sink, AssistantMessageEvent(message=outcome.message))
+                    emit_runtime_event(
+                        safe_event_sink, AssistantMessageEvent(message=outcome.message)
+                    )
             emit_runtime_event(safe_event_sink, CompletedEvent(response=outcome))
             return finish(outcome, CompletionReason.NORMAL)
         except RuntimeCancelled:
@@ -4570,13 +5258,18 @@ class PilotRuntime:
                 retryable=True,
             )
             try:
-                self._finish(state.recorder, state.journal_started, "failed", "unknown", state.control)
+                self._finish(
+                    state.recorder, state.journal_started, "failed", "unknown", state.control
+                )
                 close_terminal_owner()
                 self._mark_completed_if_active(state.control)
             except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
                 abort(CompletionReason.TRANSPORT_ABORTED)
                 raise
-            emit_runtime_event(safe_event_sink, ErrorEvent(outcome.code, outcome.message, outcome.retryable, outcome.degraded))
+            emit_runtime_event(
+                safe_event_sink,
+                ErrorEvent(outcome.code, outcome.message, outcome.retryable, outcome.degraded),
+            )
             emit_runtime_event(safe_event_sink, CompletedEvent(response=outcome))
             return finish(outcome, CompletionReason.NORMAL)
         except BaseException:
@@ -4651,8 +5344,10 @@ class PilotRuntime:
         )
         confirmation_mode = "rejected" if rejected else "approved"
         message = str(_attribute(outcome, "message", "") or "")
-        summary = replay.summary if replay is not None else (
-            "用户已拒绝，操作未执行。" if rejected else message
+        summary = (
+            replay.summary
+            if replay is not None
+            else ("用户已拒绝，操作未执行。" if rejected else message)
         )
         visible_result = replay.visible_result if replay is not None else message
         evidence = replay.evidence if replay is not None else ()
@@ -4746,7 +5441,9 @@ class PilotRuntime:
         transport_run_id = transport.transport_run_id
         if transport_run_id is None:  # pragma: no cover - transport validates this
             return self._stream_immediate(
-                self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400),
+                self._failure(
+                    RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400
+                ),
                 invocation_control,
             )
         cell = _PreparedExecutionCell(run_open=False)
@@ -5045,16 +5742,14 @@ class PilotRuntime:
                 request,
                 pending=preflight_pending,
                 conversation=conversation,
-                catalog=(resolved_model.catalog if resolved_model is not None else self._dependencies.catalog),
+                catalog=self._dependencies.catalog,
                 source_loader=self._confirmation_source_loader(conversation, request),
             )
         except ConfirmationReplayError:
             try:
                 replay = coordinator.replay_outcome(request)
             except Exception as exc:
-                return self._stream_immediate(
-                    self._confirmation_failure(exc), invocation_control
-                )
+                return self._stream_immediate(self._confirmation_failure(exc), invocation_control)
             if replay is not None:
                 return self._prepare_deterministic_stream(
                     DeterministicExecution(replay, preparation_kind=PreparationKind.REPLAY),
@@ -5065,7 +5760,12 @@ class PilotRuntime:
                     invocation_control=invocation_control,
                 )
             return self._stream_immediate(
-                self._failure(RuntimeFailureCode.OPERATION_RESULT_UNKNOWN, "operation result is unavailable", 503, retryable=True),
+                self._failure(
+                    RuntimeFailureCode.OPERATION_RESULT_UNKNOWN,
+                    "operation result is unavailable",
+                    503,
+                    retryable=True,
+                ),
                 invocation_control,
             )
         except Exception as exc:
@@ -5076,12 +5776,15 @@ class PilotRuntime:
             except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
                 raise
             except Exception as exc:
-                return self._stream_immediate(
-                    self._confirmation_failure(exc), invocation_control
-                )
+                return self._stream_immediate(self._confirmation_failure(exc), invocation_control)
             if replay is None:
                 return self._stream_immediate(
-                    self._failure(RuntimeFailureCode.OPERATION_RESULT_UNKNOWN, "operation result is unavailable", 503, retryable=True),
+                    self._failure(
+                        RuntimeFailureCode.OPERATION_RESULT_UNKNOWN,
+                        "operation result is unavailable",
+                        503,
+                        retryable=True,
+                    ),
                     invocation_control,
                 )
             return self._prepare_deterministic_stream(
@@ -5127,7 +5830,9 @@ class PilotRuntime:
         if transport_run_id is None:
             on_abort()
             return self._stream_immediate(
-                self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400),
+                self._failure(
+                    RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400
+                ),
                 invocation_control,
             )
         return PreparedStreamExecution(
@@ -5150,14 +5855,12 @@ class PilotRuntime:
         if driver is None:
             coordinator = cast(ConfirmationCoordinator, self._confirmation_coordinator())
             coordinator.cancel_cleanup(session)
-            return self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400)
+            return self._failure(
+                RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400
+            )
         self._check_cancel(cancel_check, state.control)
         model_view = state.confirmation_model
-        catalog = (
-            model_view.catalog
-            if model_view is not None
-            else self._dependencies.catalog
-        )
+        catalog = self._dependencies.catalog
         recorder: object = _NoopRecorder()
         journal_started = False
         try:
@@ -5171,13 +5874,9 @@ class PilotRuntime:
             raw_context = (
                 session.state.approval_context
                 if session.state.approval_context is not None
-                else model_view.tool_context
-                if model_view is not None
                 else None
             )
-            tool_context = self._bind_confirmation_context(
-                raw_context, session, recorder
-            )
+            tool_context = self._bind_confirmation_context(raw_context, session, recorder)
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
             coordinator = cast(ConfirmationCoordinator, self._confirmation_coordinator())
             coordinator.cancel_cleanup(session)
@@ -5214,6 +5913,7 @@ class PilotRuntime:
             event_sink,
             StatusEvent(phase="tool_running", label="正在执行确认操作"),
         )
+
         def invoke_driver(agent_events: RuntimeEventSink) -> object:
             invocation = AgentLoopInvocation(
                 seed=ApprovedWriteSeed(ConfirmationApprovedWritePort(session)),
@@ -5230,9 +5930,7 @@ class PilotRuntime:
                     ),
                 ),
                 runtime_signal_sink=signal_sink,
-                cancel_check=self._confirmation_cancel_check(
-                    state.control, cancel_check
-                ),
+                cancel_check=self._confirmation_cancel_check(state.control, cancel_check),
             )
             return self._run_driver(driver, invocation)
 
@@ -5266,9 +5964,7 @@ class PilotRuntime:
                 else:
                     raw_result = streamed
             else:
-                raw_result = execution_host.run(
-                    lambda: invoke_driver(event_sink), state.control
-                )
+                raw_result = execution_host.run(lambda: invoke_driver(event_sink), state.control)
             normalized = _normalize_agent_result(raw_result)
             outcome: RuntimeOutcome = self._finish_ledger_confirmation(
                 coordinator,
@@ -5443,7 +6139,6 @@ class PilotRuntime:
             if not control.mark_completed():
                 require_runtime_active(control)
 
-
     # ---- state-machine stages -------------------------------------------------
 
     def _require_dependency(self, name: str) -> object:
@@ -5498,7 +6193,11 @@ class PilotRuntime:
         function = _callable(gateway, ("load", "get", "get_conversation", "create_or_load"))
         if function is None:
             raise TypeError("conversation gateway does not provide load")
-        return _invoke(function, {"conversation_id": request.conversation_id, "id": request.conversation_id}, (request.conversation_id,))
+        return _invoke(
+            function,
+            {"conversation_id": request.conversation_id, "id": request.conversation_id},
+            (request.conversation_id,),
+        )
 
     def _load_confirmation_conversation(self, request: ConfirmationRequest) -> object | None:
         """Load-only conversation path for confirmation preheader checks."""
@@ -5594,9 +6293,13 @@ class PilotRuntime:
             )
         return None
 
-    def _pending_guard(self, conversation_id: int, conversation: object, request: StartTurnRequest) -> object | None:
+    def _pending_guard(
+        self, conversation_id: int, conversation: object, request: StartTurnRequest
+    ) -> object | None:
         target = self._dependencies.pending_guard or self._dependencies.persistence
-        function = _callable(target, ("get_pending_action", "pending_guard", "get_live_pending", "check"))
+        function = _callable(
+            target, ("get_pending_action", "pending_guard", "get_live_pending", "check")
+        )
         if function is None:
             return None
         return _invoke(
@@ -5604,6 +6307,289 @@ class PilotRuntime:
             {"conversation_id": conversation_id, "conversation": conversation, "request": request},
             (conversation_id,),
         )
+
+    def _resolve_policy_catalog(
+        self,
+        request: StartTurnRequest,
+        conversation: object,
+        source: object,
+        segment: SegmentExecution | None = None,
+    ) -> ResolvedPolicyCatalog | RuntimeFailureOutcome:
+        resolver = self._require_dependency("policy_catalog_resolver")
+        function = _callable(resolver, ("resolve", "resolve_policy", "resolve_catalog"))
+        if function is None:
+            raise TypeError("policy/catalog resolver does not provide resolve")
+        try:
+            value = _invoke(
+                function,
+                {
+                    "request": request,
+                    "conversation": conversation,
+                    "source": source,
+                    "segment": segment,
+                },
+                (request, conversation, source, segment),
+            )
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception:
+            return self._failure(
+                RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                "工具权限暂时不可用，请稍后重试。",
+                503,
+                retryable=True,
+            )
+        except BaseException:
+            raise
+        if isinstance(value, RuntimeFailureOutcome):
+            return value
+        if (
+            type(value) is not ResolvedPolicyCatalog
+            or type(segment) is not SegmentExecution
+            or type(segment.authority) is not SegmentExecutionAuthority
+            or type(segment.context) is not ToolExecutionContext
+            or segment.context.authority is not segment.authority
+            or segment.catalog is not None
+            or segment.policy is not None
+            or segment.surface_gate is not None
+            or value.catalog is None
+            or value.policy is None
+            or value.dependency_policy is None
+        ):
+            return self._failure(
+                RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                "工具权限暂时不可用，请稍后重试。",
+                503,
+                retryable=True,
+            )
+        profile = _attribute(value.policy, "capability_profile")
+        capabilities = _attribute(profile, "capabilities")
+        authority = segment.authority
+        if (
+            type(capabilities) is not tuple
+            or authority.capability_profile_id != _attribute(profile, "profile_id")
+            or authority.capabilities != frozenset(capabilities)
+            or authority.capability_policy_version
+            != _attribute(value.policy, "capability_policy_version")
+            or authority.binding_policy_version
+            != _attribute(value.policy, "binding_policy_version")
+            or authority.capability_profile_fingerprint
+            != _attribute(value.policy, "capability_profile_fingerprint")
+            or authority.binding_policy_fingerprint
+            != _attribute(value.policy, "binding_policy_fingerprint")
+        ):
+            return self._failure(
+                RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                "工具权限暂时不可用，请稍后重试。",
+                503,
+                retryable=True,
+            )
+        return value
+
+    def _resolve_segment_context(
+        self,
+        request: StartTurnRequest,
+        conversation: object,
+        source: object,
+        recorder: object,
+    ) -> SegmentExecution | RuntimeFailureOutcome:
+        resolver = self._require_dependency("segment_context_resolver")
+        function = _callable(resolver, ("resolve", "resolve_segment", "resolve_context"))
+        if function is None:
+            raise TypeError("segment context resolver does not provide resolve")
+        try:
+            value = _invoke(
+                function,
+                {
+                    "request": request,
+                    "conversation": conversation,
+                    "source": source,
+                    "recorder": recorder,
+                },
+                (request, conversation, source, recorder),
+            )
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception:
+            return self._failure(
+                RuntimeFailureCode.SOURCE_LOAD_FAILED,
+                "上下文暂时无法加载，请稍后重试。",
+                503,
+                retryable=True,
+            )
+        except BaseException:
+            raise
+        if isinstance(value, RuntimeFailureOutcome):
+            return value
+        valid = False
+        if type(value) is SegmentExecution:
+            try:
+                valid = (
+                    type(value.authority) is SegmentExecutionAuthority
+                    and type(value.context) is ToolExecutionContext
+                    and value.context.authority is value.authority
+                    and value.catalog is None
+                    and value.policy is None
+                    and value.surface_gate is None
+                    and callable(value.close)
+                )
+            except BaseException:
+                self._safe_close_segment_candidate(value)
+                raise
+        if not valid:
+            self._safe_close_segment_candidate(value)
+            return self._failure(
+                RuntimeFailureCode.SOURCE_LOAD_FAILED,
+                "上下文暂时无法加载，请稍后重试。",
+                503,
+                retryable=True,
+            )
+        return cast(SegmentExecution, value)
+
+    @staticmethod
+    def _safe_close_segment_candidate(value: object) -> None:
+        try:
+            close = getattr(value, "close", None)
+        except BaseException:
+            return
+        if not callable(close):
+            return
+        try:
+            close()
+        except BaseException:
+            return
+
+    def _resolve_surface_gate(
+        self,
+        request: StartTurnRequest,
+        conversation: object,
+        source: object,
+        assembled: object,
+        policy: ResolvedPolicyCatalog,
+        segment: SegmentExecution,
+    ) -> SegmentSurfaceGate | object | RuntimeFailureOutcome:
+        resolver = self._require_dependency("surface_gate_resolver")
+        function = _callable(resolver, ("resolve", "resolve_surface_gate", "resolve_gate"))
+        if function is None:
+            raise TypeError("segment surface gate resolver does not provide resolve")
+        try:
+            value = _invoke(
+                function,
+                {
+                    "request": request,
+                    "conversation": conversation,
+                    "source": source,
+                    "assembled": assembled,
+                    "policy": policy,
+                    "segment": segment,
+                },
+                (request, conversation, source, assembled, policy, segment),
+            )
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception:
+            return self._failure(
+                RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                "工具权限暂时不可用，请稍后重试。",
+                503,
+                retryable=True,
+            )
+        except BaseException:
+            raise
+        if isinstance(value, RuntimeFailureOutcome):
+            return value
+        if (
+            type(value) is not SegmentSurfaceGate
+            or value.authority is not segment.authority
+            or value.context is not segment.context
+            or value.catalog is not segment.catalog
+            or segment.policy is not policy
+        ):
+            return self._failure(
+                RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                "工具权限暂时不可用，请稍后重试。",
+                503,
+                retryable=True,
+            )
+        try:
+            segment.context.authority_factory.require_segment_surface_gate(
+                value,
+                authority=segment.authority,
+                context=segment.context,
+                catalog=segment.catalog,
+                policy=value.policy,
+                dependency_policy=value.dependency_policy,
+                selection=value.selection,
+                authority_surface=value.authority_surface,
+            )
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception:
+            return self._failure(
+                RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                "工具权限暂时不可用，请稍后重试。",
+                503,
+                retryable=True,
+            )
+        except BaseException:
+            raise
+        return value
+
+    def _resolve_continuation_model(
+        self,
+        request: StartTurnRequest,
+        conversation: object,
+        policy: ResolvedPolicyCatalog,
+    ) -> ResolvedModel | RuntimeFailureOutcome | None:
+        resolver = self._require_dependency("continuation_model_resolver")
+        function = _callable(
+            resolver,
+            ("resolve", "resolve_model", "resolve_continuation_model"),
+        )
+        if function is None:
+            raise TypeError("continuation model resolver does not provide resolve")
+        try:
+            value = _invoke(
+                function,
+                {
+                    "request": request,
+                    "conversation": conversation,
+                    "policy": policy,
+                    "catalog": policy.catalog,
+                },
+                (request, conversation, policy),
+            )
+        except ModelUnconfiguredError:
+            return self._failure(
+                RuntimeFailureCode.MODEL_UNCONFIGURED,
+                "AI is not configured: run `oc config` to set your API key",
+                503,
+                retryable=False,
+            )
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception:
+            return self._failure(
+                RuntimeFailureCode.AI_PROVIDER_ERROR,
+                "AI 连接失败。请检查 AI 设置或稍后重试。",
+                502,
+                retryable=True,
+            )
+        except BaseException:
+            raise
+        if isinstance(value, RuntimeFailureOutcome):
+            return value
+        if _explicitly_unconfigured_model(value):
+            return None
+        resolved = _resolved_model(value)
+        if resolved is None:
+            return self._failure(
+                RuntimeFailureCode.AI_PROVIDER_ERROR,
+                "AI 连接失败。请检查 AI 设置或稍后重试。",
+                502,
+                retryable=True,
+            )
+        return resolved
 
     def _resolve_model(
         self,
@@ -5646,9 +6632,7 @@ class PilotRuntime:
             return value
         if _explicitly_unconfigured_model(value):
             return None
-        if value is False or (
-            isinstance(value, tuple) and bool(value) and value[0] is False
-        ):
+        if value is False or (isinstance(value, tuple) and bool(value) and value[0] is False):
             return self._failure(
                 RuntimeFailureCode.AI_PROVIDER_ERROR,
                 "AI 连接失败。请检查 AI 设置或稍后重试。",
@@ -5676,11 +6660,7 @@ class PilotRuntime:
         if not callable(fence):
             raise TypeError("invocation control does not provide run_if_active")
         result = fence(action, allow_timeout=allow_timeout)
-        if (
-            not isinstance(result, tuple)
-            or len(result) != 2
-            or type(result[0]) is not bool
-        ):
+        if not isinstance(result, tuple) or len(result) != 2 or type(result[0]) is not bool:
             raise TypeError("run_if_active must return (bool, value)")
         if not result[0]:
             if allow_timeout:
@@ -5771,6 +6751,7 @@ class PilotRuntime:
             ("__call__", "is_visible", "application_visible"),
         )
         if application_visible is None:
+
             def application_visible(_application_id: int) -> bool:
                 return False
 
@@ -5803,7 +6784,8 @@ class PilotRuntime:
                 facts={
                     "request_kind": request_kind,
                     "transport_mode": transport.mode,
-                    "execution_path": execution_path or ("model_turn" if route_kind == "model" else "deterministic_action"),
+                    "execution_path": execution_path
+                    or ("model_turn" if route_kind == "model" else "deterministic_action"),
                     "transport_run_id": (
                         str(transport.transport_run_id)
                         if transport.transport_run_id is not None
@@ -5829,6 +6811,7 @@ class PilotRuntime:
                 run_started=run_started,
                 segment_started=segment_started,
             )
+
         try:
             # RunRecorderFactory.start_run accepts exactly one StartRunCommand
             # or StartRunBuilder.  Passing the builder preserves its budget and
@@ -6046,9 +7029,16 @@ class PilotRuntime:
                 # snapshot cannot be read, close this resumed segment rather
                 # than changing the already-committed product outcome.
                 current = None
-        if isinstance(outcome, RuntimeFailureOutcome) and outcome.code is RuntimeFailureCode.STALE_PENDING_ACTION:
+        if (
+            isinstance(outcome, RuntimeFailureOutcome)
+            and outcome.code is RuntimeFailureCode.STALE_PENDING_ACTION
+        ):
             self._abandon(recorder, True)
-        elif original is not None and current is not None and current.tool_call_id != original.tool_call_id:
+        elif (
+            original is not None
+            and current is not None
+            and current.tool_call_id != original.tool_call_id
+        ):
             self._suspend(recorder, True, current, control, catalog=None, trusted_legacy=True)
         elif isinstance(outcome, RuntimeFailureOutcome):
             self._finish(recorder, True, "failed", "unknown", control)
@@ -6071,7 +7061,9 @@ class PilotRuntime:
         message_ids = self._snapshot_message_ids(persistence, conversation_id)
         logical_input = {
             "conversation_id": conversation_id,
-            "context_type": str(_attribute(conversation, "context_type", "workspace") or "workspace"),
+            "context_type": str(
+                _attribute(conversation, "context_type", "workspace") or "workspace"
+            ),
             "context_ref": str(_attribute(conversation, "context_ref", "") or ""),
             "message_count": len(message_ids),
             "tool_names": list(tool_names),
@@ -6108,13 +7100,21 @@ class PilotRuntime:
         original_fingerprint = self._journal_call(
             recorder,
             "fingerprint_pending_identity",
-            {"tool_call_id": original.tool_call_id, "tool_name": original.tool_name, "args": original.args},
+            {
+                "tool_call_id": original.tool_call_id,
+                "tool_name": original.tool_name,
+                "args": original.args,
+            },
             control=control,
         )
         decided_fingerprint = self._journal_call(
             recorder,
             "fingerprint_pending_identity",
-            {"tool_call_id": effective.tool_call_id, "tool_name": effective.tool_name, "args": effective.args},
+            {
+                "tool_call_id": effective.tool_call_id,
+                "tool_name": effective.tool_name,
+                "args": effective.args,
+            },
             control=control,
         )
         if not isinstance(original_fingerprint, str) or not isinstance(decided_fingerprint, str):
@@ -6220,10 +7220,14 @@ class PilotRuntime:
         if conversation_id is None:
             raise LookupError("conversation not found")
         pending_before = adapter.pending_action(conversation)
-        replay = pending_before is not None and pending_before.tool_name in LEGACY_DETERMINISTIC_NAMES
+        replay = (
+            pending_before is not None and pending_before.tool_name in LEGACY_DETERMINISTIC_NAMES
+        )
         if replay:
             assert pending_before is not None
-            recorder, started = self._resume_journal_replay(conversation_id, pending_before, transport)
+            recorder, started = self._resume_journal_replay(
+                conversation_id, pending_before, transport
+            )
         else:
             recorder, started = self._start_journal(
                 conversation,
@@ -6270,13 +7274,17 @@ class PilotRuntime:
             raise
         except LookupError:
             self._finish(recorder, started, "failed", "unknown", control)
-            return self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "application not found", 404)
+            return self._failure(
+                RuntimeFailureCode.APPLICATION_NOT_FOUND, "application not found", 404
+            )
         except ValueError as exc:
             self._finish(recorder, started, "failed", "unknown", control)
             return self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, str(exc), 422)
         except Exception:
             self._finish(recorder, started, "failed", "unknown", control)
-            return self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话结果暂时无法保存。", 503, retryable=True)
+            return self._failure(
+                RuntimeFailureCode.OPERATION_FAILED, "对话结果暂时无法保存。", 503, retryable=True
+            )
         except BaseException:
             self._abandon(recorder, started)
             raise
@@ -6292,7 +7300,9 @@ class PilotRuntime:
         elif isinstance(execution.outcome, ConfirmationRequiredOutcome):
             try:
                 pending = adapter.pending_action(conversation)
-                self._suspend(recorder, started, pending, control, catalog=None, trusted_legacy=True)
+                self._suspend(
+                    recorder, started, pending, control, catalog=None, trusted_legacy=True
+                )
             except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
                 self._abandon(recorder, started)
                 raise
@@ -6488,11 +7498,17 @@ class PilotRuntime:
         if not started:
             return
         message_ids = self._snapshot_message_ids(persistence, conversation_id)
-        if type(input_message_id) is int and input_message_id > 0 and input_message_id not in message_ids:
+        if (
+            type(input_message_id) is int
+            and input_message_id > 0
+            and input_message_id not in message_ids
+        ):
             message_ids = (*message_ids, input_message_id)
         logical_input = {
             "conversation_id": conversation_id,
-            "context_type": str(_attribute(conversation, "context_type", "workspace") or "workspace"),
+            "context_type": str(
+                _attribute(conversation, "context_type", "workspace") or "workspace"
+            ),
             "context_ref": str(_attribute(conversation, "context_ref", "") or ""),
             "mode": str(_attribute(conversation, "mode", "general") or "general"),
             "message_count": len(message_ids),
@@ -6557,8 +7573,8 @@ class PilotRuntime:
                         "message_id": message_id,
                         "message_kind": message_kind or "assistant",
                     },
-                source_ref_type="message",
-                source_ref_id=message_id,
+                    source_ref_type="message",
+                    source_ref_id=message_id,
                 ),
                 control=control,
                 allow_timeout=allow_timeout,
@@ -6592,7 +7608,9 @@ class PilotRuntime:
             (conversation, request),
         )
 
-    def _assemble_context(self, source: object, conversation: object, request: StartTurnRequest) -> object:
+    def _assemble_context(
+        self, source: object, conversation: object, request: StartTurnRequest
+    ) -> object:
         assembler = self._dependencies.context_assembler
         if assembler is None:
             if isinstance(source, Sequence) and not isinstance(source, (str, bytes)):
@@ -6615,6 +7633,7 @@ class PilotRuntime:
     def _agent_invocation(
         self,
         resolved: ResolvedModel,
+        segment: SegmentExecution,
         assembled: object,
         conversation: object,
         request: StartTurnRequest,
@@ -6636,10 +7655,11 @@ class PilotRuntime:
         return AgentLoopInvocation(
             seed=NewTurnSeed(messages),
             model=resolved.model,
-            catalog=cast(Any, resolved.catalog),
-            tool_context=cast(Any, resolved.tool_context),
+            catalog=cast(Any, segment.catalog),
+            tool_context=cast(Any, segment.context),
             auto_approve=resolved.auto_approve,
             max_iterations=resolved.max_iter,
+            surface_gate=cast(Any, segment.surface_gate),
             run_recorder=cast(Any, recorder),
             event_sink=cast(Any, event_sink),
             runtime_signal_sink=signal_sink,
@@ -6680,7 +7700,9 @@ class PilotRuntime:
             ):
                 return None
             return result
-        function = _callable(persistence, ("persist_assistant_message", "persist_initial_assistant_message"))
+        function = _callable(
+            persistence, ("persist_assistant_message", "persist_initial_assistant_message")
+        )
         if function is None:
             return None
         result = self._commit_fence(
@@ -6727,7 +7749,12 @@ class PilotRuntime:
         pending = result.pending
         if pending is not None and not _valid_pending_action(pending, catalog):
             return _PersistedTurn(
-                self._failure(RuntimeFailureCode.OPERATION_FAILED, "待确认操作暂时无法保存。", 503, retryable=True)
+                self._failure(
+                    RuntimeFailureCode.OPERATION_FAILED,
+                    "待确认操作暂时无法保存。",
+                    503,
+                    retryable=True,
+                )
             )
         effective_messages, forced_reply = _with_write_error_followup(
             result.added,
@@ -6806,7 +7833,12 @@ class PilotRuntime:
             )
             if not self._verify_pending_snapshot(persistence, conversation_id, pending):
                 return _PersistedTurn(
-                    self._failure(RuntimeFailureCode.OPERATION_FAILED, "待确认操作暂时无法保存。", 503, retryable=True),
+                    self._failure(
+                        RuntimeFailureCode.OPERATION_FAILED,
+                        "待确认操作暂时无法保存。",
+                        503,
+                        retryable=True,
+                    ),
                     message_ids,
                 )
             args, token = _safe_pending_payload(pending)
@@ -6833,7 +7865,9 @@ class PilotRuntime:
 
         if not messages and reply:
             messages = [Message(role="assistant", content=reply)]
-        function = _callable(persistence, ("persist_initial_messages", "persist_messages", "persist_ai_messages"))
+        function = _callable(
+            persistence, ("persist_initial_messages", "persist_messages", "persist_ai_messages")
+        )
         if function is None:
             raise TypeError("persistence does not provide message persistence")
         before_ids = self._snapshot_message_ids(persistence, conversation_id)
@@ -6867,13 +7901,23 @@ class PilotRuntime:
             if forced_pending is not None:
                 if not _valid_pending_action(forced_pending, catalog):
                     return _PersistedTurn(
-                        self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话澄清暂时无法保存。", 503, retryable=True),
+                        self._failure(
+                            RuntimeFailureCode.OPERATION_FAILED,
+                            "对话澄清暂时无法保存。",
+                            503,
+                            retryable=True,
+                        ),
                         message_ids,
                     )
                 setter = _callable(persistence, ("set_pending_clarification",))
                 if setter is None:
                     return _PersistedTurn(
-                        self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话澄清暂时无法保存。", 503, retryable=True),
+                        self._failure(
+                            RuntimeFailureCode.OPERATION_FAILED,
+                            "对话澄清暂时无法保存。",
+                            503,
+                            retryable=True,
+                        ),
                         message_ids,
                     )
                 commit_setter = setter
@@ -6903,7 +7947,12 @@ class PilotRuntime:
                     expected_question=forced_reply,
                 ):
                     return _PersistedTurn(
-                        self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话澄清暂时无法保存。", 503, retryable=True),
+                        self._failure(
+                            RuntimeFailureCode.OPERATION_FAILED,
+                            "对话澄清暂时无法保存。",
+                            503,
+                            retryable=True,
+                        ),
                         message_ids,
                     )
         elif clarification is not None and _looks_like_followup_question(reply):
@@ -6913,13 +7962,23 @@ class PilotRuntime:
                 require_operation_id=False,
             ):
                 return _PersistedTurn(
-                    self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话澄清暂时无法保存。", 503, retryable=True),
+                    self._failure(
+                        RuntimeFailureCode.OPERATION_FAILED,
+                        "对话澄清暂时无法保存。",
+                        503,
+                        retryable=True,
+                    ),
                     message_ids,
                 )
             setter = _callable(persistence, ("set_pending_clarification",))
             if setter is None:
                 return _PersistedTurn(
-                    self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话澄清暂时无法保存。", 503, retryable=True),
+                    self._failure(
+                        RuntimeFailureCode.OPERATION_FAILED,
+                        "对话澄清暂时无法保存。",
+                        503,
+                        retryable=True,
+                    ),
                     message_ids,
                 )
             ensure_active()
@@ -6948,14 +8007,24 @@ class PilotRuntime:
                 expected_question=reply,
             ):
                 return _PersistedTurn(
-                    self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话澄清暂时无法保存。", 503, retryable=True),
+                    self._failure(
+                        RuntimeFailureCode.OPERATION_FAILED,
+                        "对话澄清暂时无法保存。",
+                        503,
+                        retryable=True,
+                    ),
                     message_ids,
                 )
         else:
             clear = _callable(persistence, ("clear_pending_clarification",))
             if clarification is not None and clear is None:
                 return _PersistedTurn(
-                    self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话澄清暂时无法清理。", 503, retryable=True),
+                    self._failure(
+                        RuntimeFailureCode.OPERATION_FAILED,
+                        "对话澄清暂时无法清理。",
+                        503,
+                        retryable=True,
+                    ),
                     message_ids,
                 )
             if clear is not None:
@@ -6979,7 +8048,12 @@ class PilotRuntime:
                     clarification=True,
                 ):
                     return _PersistedTurn(
-                        self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话澄清暂时无法清理。", 503, retryable=True),
+                        self._failure(
+                            RuntimeFailureCode.OPERATION_FAILED,
+                            "对话澄清暂时无法清理。",
+                            503,
+                            retryable=True,
+                        ),
                         message_ids,
                     )
         return _PersistedTurn(
@@ -7083,7 +8157,9 @@ class PilotRuntime:
     ) -> tuple[PendingAction, str] | None:
         getter = _callable(persistence, ("get_pending_clarification",))
         if getter is None:
-            raise _PersistenceReadbackError("persistence clarification readback capability is missing")
+            raise _PersistenceReadbackError(
+                "persistence clarification readback capability is missing"
+            )
         try:
             value = _invoke(getter, {"conversation_id": conversation_id}, (conversation_id,))
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
@@ -7105,15 +8181,26 @@ class PilotRuntime:
         if status == "closed":
             return self._failure(RuntimeFailureCode.CONVERSATION_ARCHIVED, archived_message, 409)
         if status == "not_found":
-            return self._failure(RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404)
-        return self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话结果暂时无法保存。", 503, retryable=True)
+            return self._failure(
+                RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404
+            )
+        return self._failure(
+            RuntimeFailureCode.OPERATION_FAILED, "对话结果暂时无法保存。", 503, retryable=True
+        )
 
     def _missing_question(self, pending: PendingAction, conversation_id: int) -> str | None:
-        function = _callable(self._dependencies.missing_target_question, ("missing_target_question", "question", "resolve"))
+        function = _callable(
+            self._dependencies.missing_target_question,
+            ("missing_target_question", "question", "resolve"),
+        )
         if function is None:
             value = _attribute(pending, "missing_question")
             return value if isinstance(value, str) and value else None
-        value = _invoke(function, {"pending": pending, "conversation_id": conversation_id}, (pending, conversation_id))
+        value = _invoke(
+            function,
+            {"pending": pending, "conversation_id": conversation_id},
+            (pending, conversation_id),
+        )
         return value if isinstance(value, str) and value else None
 
     def _persist_clarification(
@@ -7130,7 +8217,12 @@ class PilotRuntime:
     ) -> _PersistedTurn:
         if not _valid_pending_action(pending, catalog):
             return _PersistedTurn(
-                self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话澄清暂时无法保存。", 503, retryable=True)
+                self._failure(
+                    RuntimeFailureCode.OPERATION_FAILED,
+                    "对话澄清暂时无法保存。",
+                    503,
+                    retryable=True,
+                )
             )
         atomic = _callable(persistence, ("persist_clarification", "persist_pending_clarification"))
         if atomic is not None:
@@ -7167,7 +8259,12 @@ class PilotRuntime:
                 expected_question=question,
             ):
                 return _PersistedTurn(
-                    self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话澄清暂时无法保存。", 503, retryable=True),
+                    self._failure(
+                        RuntimeFailureCode.OPERATION_FAILED,
+                        "对话澄清暂时无法保存。",
+                        503,
+                        retryable=True,
+                    ),
                     message_ids,
                 )
         else:
@@ -7184,25 +8281,39 @@ class PilotRuntime:
                     (conversation_id, messages),
                 ),
             )
-            message_ids = self._result_message_ids(persistence, conversation_id, persisted, before_ids)
+            message_ids = self._result_message_ids(
+                persistence, conversation_id, persisted, before_ids
+            )
             if not _result_persisted(persisted):
-                return _PersistedTurn(self._persistence_failure(persisted, "对话已归档，无法保存回复。"), message_ids)
+                return _PersistedTurn(
+                    self._persistence_failure(persisted, "对话已归档，无法保存回复。"), message_ids
+                )
             clear = _callable(persistence, ("clear_pending_action",))
             if clear is not None:
                 ensure_active()
                 clear_result = self._commit_fence(
                     control,
-                    lambda: _invoke(clear, {"conversation_id": conversation_id}, (conversation_id,)),
+                    lambda: _invoke(
+                        clear, {"conversation_id": conversation_id}, (conversation_id,)
+                    ),
                 )
                 if not _result_persisted(clear_result):
-                    return _PersistedTurn(self._persistence_failure(clear_result, "对话已归档，无法保存回复。"), message_ids)
+                    return _PersistedTurn(
+                        self._persistence_failure(clear_result, "对话已归档，无法保存回复。"),
+                        message_ids,
+                    )
                 if not self._verify_pending_cleared(
                     persistence,
                     conversation_id,
                     clarification=False,
                 ):
                     return _PersistedTurn(
-                        self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话结果暂时无法保存。", 503, retryable=True),
+                        self._failure(
+                            RuntimeFailureCode.OPERATION_FAILED,
+                            "对话结果暂时无法保存。",
+                            503,
+                            retryable=True,
+                        ),
                         message_ids,
                     )
             setter = _callable(persistence, ("set_pending_clarification",))
@@ -7214,7 +8325,11 @@ class PilotRuntime:
                     control,
                     lambda: _invoke(
                         setter,
-                        {"conversation_id": conversation_id, "pending": pending, "question": question},
+                        {
+                            "conversation_id": conversation_id,
+                            "pending": pending,
+                            "question": question,
+                        },
                         (conversation_id, pending, question),
                     ),
                 )
@@ -7222,12 +8337,22 @@ class PilotRuntime:
                 raise
             except Exception:
                 return _PersistedTurn(
-                    self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话结果暂时无法保存。", 503, retryable=True),
+                    self._failure(
+                        RuntimeFailureCode.OPERATION_FAILED,
+                        "对话结果暂时无法保存。",
+                        503,
+                        retryable=True,
+                    ),
                     message_ids,
                 )
             if set_result is None:
                 return _PersistedTurn(
-                    self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话结果暂时无法保存。", 503, retryable=True),
+                    self._failure(
+                        RuntimeFailureCode.OPERATION_FAILED,
+                        "对话结果暂时无法保存。",
+                        503,
+                        retryable=True,
+                    ),
                     message_ids,
                 )
             if not _result_persisted(set_result):
@@ -7243,13 +8368,25 @@ class PilotRuntime:
                 expected_question=question,
             ):
                 return _PersistedTurn(
-                    self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话澄清暂时无法保存。", 503, retryable=True),
+                    self._failure(
+                        RuntimeFailureCode.OPERATION_FAILED,
+                        "对话澄清暂时无法保存。",
+                        503,
+                        retryable=True,
+                    ),
                     message_ids,
                 )
-            assistant = _callable(persistence, ("persist_assistant_message", "persist_initial_assistant_message"))
+            assistant = _callable(
+                persistence, ("persist_assistant_message", "persist_initial_assistant_message")
+            )
             if assistant is None:
                 return _PersistedTurn(
-                    self._failure(RuntimeFailureCode.OPERATION_FAILED, "对话结果暂时无法保存。", 503, retryable=True),
+                    self._failure(
+                        RuntimeFailureCode.OPERATION_FAILED,
+                        "对话结果暂时无法保存。",
+                        503,
+                        retryable=True,
+                    ),
                     message_ids,
                 )
             ensure_active()
@@ -7261,11 +8398,17 @@ class PilotRuntime:
                     (conversation_id, question),
                 ),
             )
-            assistant_ids = self._result_message_ids(persistence, conversation_id, persisted, before_ids)
+            assistant_ids = self._result_message_ids(
+                persistence, conversation_id, persisted, before_ids
+            )
             message_ids = tuple(dict.fromkeys((*message_ids, *assistant_ids)))
         if not _result_persisted(persisted):
-            return _PersistedTurn(self._persistence_failure(persisted, "对话已归档，无法保存回复。"), message_ids)
-        return _PersistedTurn(MessageOutcome(message=question, conversation_id=conversation_id), message_ids)
+            return _PersistedTurn(
+                self._persistence_failure(persisted, "对话已归档，无法保存回复。"), message_ids
+            )
+        return _PersistedTurn(
+            MessageOutcome(message=question, conversation_id=conversation_id), message_ids
+        )
 
     # ---- cleanup and control -------------------------------------------------
 

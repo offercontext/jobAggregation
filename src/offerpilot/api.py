@@ -56,7 +56,6 @@ from offerpilot.reliability.trace import (
     record_mock_interview_trace,
 )
 from offerpilot.ai.client import ConfiguredAIClient
-from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import (
     ToolExecutionRecord,
     ToolSuccess,
@@ -78,7 +77,6 @@ from offerpilot.ai.write_operations import (
 )
 from offerpilot.agent_runtime.journal import (
     NullRunRecorderFactory,
-    RunRecorder,
     RunRecorderFactory,
 )
 from offerpilot.agent_runtime.keyring import JOURNAL_KEY_FILENAME, load_or_create_journal_key
@@ -313,39 +311,6 @@ from offerpilot.chat_transport import (
 )
 
 _MOCK_INTERVIEW_TRACE_RUN_ID = uuid4().hex
-
-
-def _model_tool_context(
-    conversation: Any,
-    applications: Any,
-    events: Any,
-    notes: Any,
-    offers: Any,
-    resumes: Any,
-    jd_analyses: Any,
-    run_recorder: RunRecorder,
-    operation_executor: Any = None,
-) -> ToolExecutionContext:
-    current_bindings: dict[str, int | str] = {}
-    if str(conversation.context_type or "") == "application":
-        try:
-            application_id = int(str(conversation.context_ref or ""))
-        except ValueError:
-            application_id = 0
-        if application_id > 0:
-            current_bindings["application"] = application_id
-    return ToolExecutionContext(
-        applications=applications,
-        capabilities=frozenset(ToolCapability),
-        current_bindings=current_bindings,
-        events=events,
-        jd_analyses=jd_analyses,
-        notes=notes,
-        offers=offers,
-        resumes=resumes,
-        run_recorder=run_recorder,
-        operation_executor=operation_executor,
-    )
 
 
 CHAT_AGENT_TIMEOUT_SECONDS = 120.0
@@ -1360,9 +1325,7 @@ def create_app(
         normalized_attachments: list[dict[str, str]] = []
         for attachment in attachments:
             if isinstance(attachment, AttachmentReference):
-                normalized_attachments.append(
-                    {"kind": attachment.kind, "id": attachment.ref}
-                )
+                normalized_attachments.append({"kind": attachment.kind, "id": attachment.ref})
             elif isinstance(attachment, Mapping):
                 kind = attachment.get("kind")
                 ref = attachment.get("id", attachment.get("ref"))
@@ -1373,18 +1336,6 @@ def create_app(
             conversation,
             normalized_attachments or None,
             pending_tool_call_id=pending_tool_call_id,
-        )
-
-    def _runtime_tool_context(conversation: object, run_recorder: object) -> object:
-        return _model_tool_context(
-            cast(Any, conversation),
-            applications,
-            events,
-            notes,
-            offers,
-            resumes,
-            jd_analyses,
-            cast(RunRecorder, run_recorder),
         )
 
     app.state.pilot_runtime = build_pilot_runtime(
@@ -1409,7 +1360,6 @@ def create_app(
         page_context_messages=lambda page: _chat_page_context_messages(
             dict(page) if page is not None else None
         ),
-        model_tool_context=_runtime_tool_context,
         missing_target_question=lambda pending, _conversation_id: _pending_action_missing_question(
             cast(PendingAction, pending),
             applications,
@@ -4571,6 +4521,7 @@ def create_app(
             return _runtime_http_response(outcome)
         except (RuntimeAgentTimedOut, RuntimeCancelled, RuntimeTransportAborted) as exc:
             return _runtime_error_response(exc)
+
     @app.post("/api/chat/undo-last-write")
     def undo_last_write(payload: dict[str, Any] = Body(...)) -> JSONResponse:
         conversation_id = _confirmation_conversation_id(payload)
@@ -7529,9 +7480,7 @@ def _normalize_runtime_start_request(
     try:
         page_context = _normalize_chat_page_context(payload.get("page_context"))
         raw_attachments = (
-            _normalize_chat_attachments(payload["attachments"])
-            if "attachments" in payload
-            else []
+            _normalize_chat_attachments(payload["attachments"]) if "attachments" in payload else []
         )
     except ValueError as exc:
         return error_response(422, str(exc))
@@ -7674,6 +7623,7 @@ def _runtime_title_latch(
         )
 
     latch = RuntimeSignalLatch(register=register)
+
     def set_conversation_id(value: int | None) -> None:
         if type(value) is int and value > 0:
             holder["conversation_id"] = value
@@ -8109,6 +8059,14 @@ class _FrozenChatSourceMessages:
     history: tuple[Message, ...]
     context_message: Message | None
     attachment_messages: tuple[Message, ...]
+    # The source loader and the authority resolver consume one canonical scope
+    # snapshot.  Keep the validated identity beside the frozen messages so the
+    # resolver cannot silently re-read a different Conversation row.
+    conversation_id: int = 0
+    context_type: str = ""
+    context_ref: str | None = None
+    mode: str = ""
+    scope_revision: int = -1
 
 
 @dataclass(frozen=True, slots=True)
@@ -8196,10 +8154,14 @@ def _load_chat_source_messages(
             scope.scope_revision,
         ):
             raise RuntimeError("conversation scope changed during source load")
-        if scope.application_id is not None and visibility.execute_on_source_connection(
-            connection,
-            scope.application_id,
-        ) is None:
+        if (
+            scope.application_id is not None
+            and visibility.execute_on_source_connection(
+                connection,
+                scope.application_id,
+            )
+            is None
+        ):
             raise RuntimeError("application context is unavailable")
         history_rows = fetch_rows(
             connection.execute(
@@ -8287,7 +8249,16 @@ def _load_chat_source_messages(
         )
         context_message = _snapshot_context_message(context_row)
         attachment_messages = tuple(_snapshot_attachment_messages(attachment_rows))
-        return _FrozenChatSourceMessages(history, context_message, attachment_messages)
+        return _FrozenChatSourceMessages(
+            history,
+            context_message,
+            attachment_messages,
+            conversation_id=scope.conversation_id,
+            context_type=scope.context_type,
+            context_ref=scope.persisted_context_ref,
+            mode=scope.mode,
+            scope_revision=scope.scope_revision,
+        )
 
     return cast(_FrozenChatSourceMessages, loader.load(read, freeze))
 

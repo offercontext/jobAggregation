@@ -35,7 +35,7 @@ from offerpilot.context_projector.history import (
     rank_history,
     validate_message_integrity,
 )
-from offerpilot.context_projector.selector import ToolSelectionSignals, select_tools
+from offerpilot.context_projector.selector import ToolSelection, ToolSelectionSignals, select_tools
 from offerpilot.context_projector.authority_surface import (
     AuthoritySurfaceView,
     intersect_authority_surface,
@@ -56,6 +56,10 @@ class ProjectionRequest:
     dependency_policy: DependencyPolicyV1 = DEPENDENCY_POLICY_V1
     sources: tuple[FrozenSource, ...] = ()
     provider_surface_build_identity: object | None = None
+    # A Segment owns the provider-free selector/authority intersection.  When
+    # present, the projector only performs budget/message projection over this
+    # sealed selection; it must not re-run selector or authority intersection.
+    preselected_tools: ToolSelection | None = None
 
 
 class ModelSurfaceProjector:
@@ -69,19 +73,36 @@ class ModelSurfaceProjector:
         if any(len(source.chunks) > 32 for source in request.sources):
             raise ProjectionError("source_chunk_limit_exceeded")
         contributors = self._validate_contributors(request.contributors)
-        if request.provider_catalog.provider_contracts() != request.provider_tools:
-            raise ProjectionError("provider_catalog_mismatch")
-        selection = select_tools(
-            request.provider_tools,
-            request.tool_signals,
-            dependency_policy=request.dependency_policy,
-        )
-        selection = intersect_authority_surface(
-            request.provider_catalog,
-            selection,
-            request.authority_surface,
-            dependency_policy=request.dependency_policy,
-        )
+        if request.preselected_tools is None:
+            if request.provider_catalog.provider_contracts() != request.provider_tools:
+                raise ProjectionError("provider_catalog_mismatch")
+            selection = select_tools(
+                request.provider_tools,
+                request.tool_signals,
+                dependency_policy=request.dependency_policy,
+            )
+            selection = intersect_authority_surface(
+                request.provider_catalog,
+                selection,
+                request.authority_surface,
+                dependency_policy=request.dependency_policy,
+            )
+        else:
+            selection = request.preselected_tools
+            if tuple(selection.tools) != tuple(
+                contract
+                for contract in request.provider_catalog.provider_contracts()
+                if contract.name in selection.names
+            ):
+                raise ProjectionError("preselected_surface_mismatch")
+            if tuple(contract.name for contract in selection.tools) != selection.names:
+                raise ProjectionError("preselected_surface_mismatch")
+            if not selection.tools:
+                raise ProjectionError("empty_authority_surface")
+            request.dependency_policy.validate_closed(
+                selection.names,
+                tuple(contract.name for contract in request.provider_catalog.provider_contracts()),
+            )
         tool_bytes = canonical_json([dict(tool.payload) for tool in selection.tools])
         if len(tool_bytes) > PROVIDER_TOOLS_BYTE_CAP:
             raise ProjectionError("provider_tools_byte_cap_exceeded")

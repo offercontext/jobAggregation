@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import tempfile
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -12,12 +13,25 @@ import pytest
 
 from offerpilot.chat_transport import PreparedStreamGuard, SseAgentExecutionHost
 from offerpilot.ai.agent_contracts import AgentTurnResult, PendingAction
+from offerpilot.ai.agent_loop import SegmentSurfaceGate, build_segment_surface_gate
+from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
+from offerpilot.ai.tool_authority.contracts import SegmentExecutionAuthority
+from offerpilot.ai.tool_authority.policy import validate_startup_policy
+from offerpilot.ai.tool_runtime.context import ToolExecutionContext
+from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.context_projector.selector import DEPENDENCY_POLICY_V1
 from offerpilot.agent_runtime.journal import NullRunRecorder, RunRecorderFactory
 from offerpilot.agent_runtime.keyring import JournalKeyDomain
 from offerpilot.db import init_database
 from offerpilot.pilot_runtime.persistence import ChatPersistenceCoordinator
 from offerpilot.repositories.agent_runs import AgentRunRepository
 from offerpilot.repositories.chat import ChatRepository
+from offerpilot.repositories.application_events import ApplicationEventsRepository
+from offerpilot.repositories.applications import ApplicationsRepository
+from offerpilot.repositories.jd import JDAnalysesRepository
+from offerpilot.repositories.notes import NotesRepository
+from offerpilot.repositories.offers import OffersRepository
+from offerpilot.repositories.resumes import ResumesRepository
 from offerpilot.pilot_runtime.errors import RuntimeCancelled, RuntimeTransportAborted
 from offerpilot.pilot_runtime.contracts import (
     AssistantMessageEvent,
@@ -43,14 +57,22 @@ from offerpilot.pilot_runtime.event_sink import InMemoryRuntimeInvocationControl
 from offerpilot.pilot_runtime.persistence import PersistenceResult, PersistenceStatus
 from offerpilot.pilot_runtime.service import (
     PilotRuntime,
+    ResolvedPolicyCatalog,
     ResolvedModel,
     RuntimeDependencies,
+    SegmentExecution,
     _PreparedExecutionCell,
     _PreparedStreamState,
     _freeze_stream_value,
     _materialize_stream_value,
 )
 from offerpilot.ai.types import Message, ToolCall
+
+
+_AUTHORITY_SESSIONS = init_database(
+    Path(tempfile.mkdtemp(prefix="offerpilot-stream-authority-")) / "authority.db"
+)
+_AUTHORITY_POLICY = validate_startup_policy(MODEL_TOOL_CATALOG.authority_manifest)
 
 
 class Phases:
@@ -128,24 +150,34 @@ class Persistence:
         self.assistant_count += len(ids)
         return PersistenceResult(PersistenceStatus.PERSISTED, message_ids=ids)
 
-    def persist_initial_pending(self, conversation_id: int, messages: object, pending: object) -> PersistenceResult:
+    def persist_initial_pending(
+        self, conversation_id: int, messages: object, pending: object
+    ) -> PersistenceResult:
         self.pending = pending
         return self.persist_initial_messages(conversation_id, messages)
 
-    def persist_initial_assistant_message(self, conversation_id: int, content: str, **kwargs: object) -> PersistenceResult:
+    def persist_initial_assistant_message(
+        self, conversation_id: int, content: str, **kwargs: object
+    ) -> PersistenceResult:
         del conversation_id, content, kwargs
         self.assistant_count += 1
         return PersistenceResult(PersistenceStatus.PERSISTED, message_id=self._persist("assistant"))
 
-    def persist_assistant_message(self, conversation_id: int, content: str, **kwargs: object) -> PersistenceResult:
+    def persist_assistant_message(
+        self, conversation_id: int, content: str, **kwargs: object
+    ) -> PersistenceResult:
         return self.persist_initial_assistant_message(conversation_id, content, **kwargs)
 
-    def persist_clarification(self, conversation_id: int, messages: object, pending: object, question: str) -> PersistenceResult:
+    def persist_clarification(
+        self, conversation_id: int, messages: object, pending: object, question: str
+    ) -> PersistenceResult:
         del question
         self.pending = pending
         return self.persist_initial_messages(conversation_id, messages)
 
-    def set_pending_clarification(self, conversation_id: int, pending: object, question: str) -> PersistenceResult:
+    def set_pending_clarification(
+        self, conversation_id: int, pending: object, question: str
+    ) -> PersistenceResult:
         del conversation_id, question
         self.pending = pending
         return PersistenceResult(PersistenceStatus.PERSISTED)
@@ -242,30 +274,155 @@ class Journal:
         return self.recorder
 
 
+def _policy_resolver(catalog: object) -> object:
+    def resolve(request: object, conversation: object, source: object) -> object:
+        del request, conversation, source
+        return ResolvedPolicyCatalog(
+            catalog=catalog,
+            policy=_AUTHORITY_POLICY,
+            dependency_policy=DEPENDENCY_POLICY_V1,
+        )
+
+    return resolve
+
+
+def _real_segment(
+    conversation: object,
+    recorder: object,
+    catalog: object,
+    close_counter: list[int] | None = None,
+) -> tuple[SegmentExecution, SegmentSurfaceGate | None]:
+    conversation_id = getattr(conversation, "id")
+    context_type = str(getattr(conversation, "context_type", "workspace"))
+    context_ref = getattr(conversation, "context_ref", None)
+    if context_type != "application":
+        context_ref = None
+    mode = str(getattr(conversation, "mode", "general"))
+    revision = int(getattr(conversation, "scope_revision", 0))
+    factory = AuthorityFactory()
+    authority = factory.create_segment_authority(
+        conversation_id=conversation_id,
+        conversation_scope_revision=revision,
+        segment_id=f"stream-test-{conversation_id}-{id(recorder)}",
+        trusted_scope=TrustedContextScope(context_type, context_ref, mode),
+        capability_profile_id=_AUTHORITY_POLICY.capability_profile.profile_id,
+        capabilities=frozenset(_AUTHORITY_POLICY.capability_profile.capabilities),
+        capability_policy_version=_AUTHORITY_POLICY.capability_policy_version,
+        binding_policy_version=_AUTHORITY_POLICY.binding_policy_version,
+        capability_profile_fingerprint=_AUTHORITY_POLICY.capability_profile_fingerprint,
+        binding_policy_fingerprint=_AUTHORITY_POLICY.binding_policy_fingerprint,
+    )
+    context = ToolExecutionContext(
+        authority=authority,
+        applications=ApplicationsRepository(_AUTHORITY_SESSIONS),
+        events=ApplicationEventsRepository(_AUTHORITY_SESSIONS),
+        notes=NotesRepository(_AUTHORITY_SESSIONS),
+        offers=OffersRepository(_AUTHORITY_SESSIONS),
+        resumes=ResumesRepository(_AUTHORITY_SESSIONS),
+        jd_analyses=JDAnalysesRepository(_AUTHORITY_SESSIONS),
+        run_recorder=recorder,  # type: ignore[arg-type]
+    )
+
+    def close() -> None:
+        if close_counter is not None:
+            close_counter.append(1)
+        factory.close()
+
+    return (
+        SegmentExecution(
+            authority=authority,
+            context=context,
+            catalog=None,
+            close=close,
+            surface_gate=None,
+        ),
+        None,
+    )
+
+
+def _segment_resolver(
+    request: object,
+    conversation: object,
+    source: object,
+    recorder: object,
+) -> SegmentExecution:
+    del request, source
+    return _real_segment(conversation, recorder, MODEL_TOOL_CATALOG)[0]
+
+
+def _surface_resolver(
+    request: object,
+    conversation: object,
+    source: object,
+    assembled: object,
+    policy: object,
+    segment: object,
+) -> object:
+    del request, conversation, source
+    messages = tuple(
+        value if isinstance(value, Message) else Message(role="user", content=str(value))
+        for value in assembled
+    )
+    return build_segment_surface_gate(
+        messages,
+        catalog=getattr(policy, "catalog"),
+        context=getattr(segment, "context"),
+        authority=getattr(segment, "authority"),
+        dependency_policy=getattr(policy, "dependency_policy"),
+        policy=getattr(policy, "policy"),
+    )
+
+
 def runtime(
     phases: Phases,
     *,
+    persistence: Persistence | None = None,
     source: Source | None = None,
     route: str = "model",
     conversation: Conversation | None = None,
     model: object = "model",
     catalog: object | None = None,
     assembled: object | None = None,
+    surface_resolver: object | None = None,
+    policy_resolver: object | None = None,
+    segment_resolver: object | None = None,
+    close_counter: list[int] | None = None,
 ) -> tuple[PilotRuntime, Persistence, Driver, Host, Journal]:
-    persistence = Persistence()
+    resolved_persistence = persistence or Persistence()
     driver = Driver()
     host = Host()
     journal = Journal()
 
+    # Segment visibility is issued only against the reviewed typed catalog;
+    # pending/readback tests use typed tool names for their assertions.
+    resolved_catalog = MODEL_TOOL_CATALOG
+
+    def resolve_segment(
+        request: object,
+        conversation: object,
+        source_value: object,
+        recorder: object,
+    ) -> SegmentExecution:
+        del request, source_value
+        return _real_segment(
+            conversation,
+            recorder,
+            resolved_catalog,
+            close_counter,
+        )[0]
+
     def resolve(request: object, conversation: object) -> object:
         del request, conversation
-        return None if model is None else ResolvedModel(model=model, catalog=catalog)
+        return None if model is None else ResolvedModel(model=model)
 
     instance = PilotRuntime(
         RuntimeDependencies(
             conversations=Conversations(conversation),
-            persistence=persistence,
-            model_resolver=resolve,
+            persistence=resolved_persistence,
+            policy_catalog_resolver=policy_resolver or _policy_resolver(resolved_catalog),
+            segment_context_resolver=segment_resolver or resolve_segment,
+            surface_gate_resolver=surface_resolver or _surface_resolver,
+            continuation_model_resolver=resolve,
             source_loader=source or Source(),
             context_assembler=Assembler(assembled),
             agent_driver=driver,
@@ -274,48 +431,414 @@ def runtime(
             phase_sink=phases,
         )
     )
-    return instance, persistence, driver, host, journal
+    return instance, resolved_persistence, driver, host, journal
 
 
 def transport() -> RuntimeTransportContext:
-    return RuntimeTransportContext(mode="stream", transport_run_id=uuid4(), stream_version="pilot-sse-v1")
+    return RuntimeTransportContext(
+        mode="stream", transport_run_id=uuid4(), stream_version="pilot-sse-v1"
+    )
 
 
 def test_stream_model_preparation_order_and_source_failure_boundary() -> None:
     phases = Phases()
-    instance, persistence, driver, host, journal = runtime(phases, source=Source(error=RuntimeError("no")))
+    instance, persistence, driver, host, journal = runtime(
+        phases, source=Source(error=RuntimeError("no"))
+    )
     control = InMemoryRuntimeInvocationControl()
 
-    prepared = instance.prepare_stream(StartTurnRequest(message="hi"), transport=transport(), invocation_control=control)
+    prepared = instance.prepare_stream(
+        StartTurnRequest(message="hi"), transport=transport(), invocation_control=control
+    )
 
     assert isinstance(prepared, ImmediateHttpOutcome)
     assert prepared.status_code == 503
     assert prepared.payload["error_code"] == "source_load_failed"
     assert phases.items == [
-        "validate", "conversation", "route:model", "pending_guard", "model_resolve",
-        "user_persist", "source_load",
+        "validate",
+        "conversation",
+        "route:model",
+        "pending_guard",
+        "source_load",
     ]
-    assert persistence.user_count == 1
+    assert persistence.user_count == 0
     assert driver.calls == 0
     assert host.calls == 0
     assert journal.recorder.finished == []
     assert control.state is InvocationState.COMPLETED
 
 
+def test_stream_segment_failure_stops_before_policy_catalog_and_side_effects() -> None:
+    phases = Phases()
+    policy_calls: list[object] = []
+
+    def failing_segment(
+        request: object,
+        conversation: object,
+        source: object,
+        recorder: object,
+    ) -> object:
+        del request, conversation, source, recorder
+        raise RuntimeError("segment unavailable")
+
+    def policy_spy(*args: object, **kwargs: object) -> object:
+        policy_calls.append((args, kwargs))
+        return ResolvedPolicyCatalog(
+            catalog=MODEL_TOOL_CATALOG,
+            policy=_AUTHORITY_POLICY,
+            dependency_policy=DEPENDENCY_POLICY_V1,
+        )
+
+    instance, persistence, driver, host, journal = runtime(
+        phases,
+        segment_resolver=failing_segment,
+        policy_resolver=policy_spy,
+    )
+    prepared = instance.prepare_stream(
+        StartTurnRequest(message="hi"),
+        transport=transport(),
+        invocation_control=InMemoryRuntimeInvocationControl(),
+    )
+
+    assert isinstance(prepared, ImmediateHttpOutcome)
+    assert prepared.payload["error_code"] == "source_load_failed"
+    assert policy_calls == []
+    assert "context_assemble" not in phases.items
+    assert "policy_resolve" not in phases.items
+    assert "surface_resolve" not in phases.items
+    assert "model_resolve" not in phases.items
+    assert persistence.user_count == 0
+    assert driver.calls == 0
+    assert host.calls == 0
+    assert journal.recorder.finished == []
+    assert journal.recorder.abandoned == 0
+
+
+def test_stream_live_policy_drift_closes_segment_before_provider_or_user() -> None:
+    phases = Phases()
+    close_count: list[int] = []
+    drifted = replace(
+        _AUTHORITY_POLICY,
+        binding_policy_fingerprint="sha256:" + "1" * 64,
+    )
+
+    def drift_policy(
+        request: object,
+        conversation: object,
+        source: object,
+        segment: object,
+    ) -> object:
+        del request, conversation, source
+        assert type(segment) is SegmentExecution
+        assert type(segment.authority) is SegmentExecutionAuthority
+        assert type(segment.context) is ToolExecutionContext
+        assert segment.context.authority is segment.authority
+        assert segment.catalog is None
+        assert segment.policy is None
+        assert segment.surface_gate is None
+        return ResolvedPolicyCatalog(
+            catalog=MODEL_TOOL_CATALOG,
+            policy=drifted,
+            dependency_policy=DEPENDENCY_POLICY_V1,
+        )
+
+    instance, persistence, driver, host, journal = runtime(
+        phases,
+        policy_resolver=drift_policy,
+        close_counter=close_count,
+    )
+    prepared = instance.prepare_stream(
+        StartTurnRequest(message="hi"),
+        transport=transport(),
+        invocation_control=InMemoryRuntimeInvocationControl(),
+    )
+
+    assert isinstance(prepared, ImmediateHttpOutcome)
+    assert prepared.payload["error_code"] == "operation_unavailable"
+    assert close_count == [1]
+    assert "surface_resolve" not in phases.items
+    assert "model_resolve" not in phases.items
+    assert persistence.user_count == 0
+    assert driver.calls == 0
+    assert host.calls == 0
+    assert journal.recorder.finished == []
+    assert journal.recorder.abandoned == 0
+    assert instance._prepared_models == {}  # type: ignore[attr-defined]
+    assert instance._prepared_segments == {}  # type: ignore[attr-defined]
+
+
+def test_stream_policy_spy_sees_exact_unbound_segment_after_segment_phase() -> None:
+    phases = Phases()
+    seen: list[tuple[list[str], object]] = []
+
+    def policy_spy(
+        request: object,
+        conversation: object,
+        source: object,
+        segment: object,
+    ) -> object:
+        del request, conversation, source
+        snapshot = list(phases.items)
+        phases.append("policy_manifest_read")
+        seen.append((snapshot, segment))
+        assert type(segment) is SegmentExecution
+        assert type(segment.authority) is SegmentExecutionAuthority
+        assert type(segment.context) is ToolExecutionContext
+        assert segment.context.authority is segment.authority
+        assert segment.catalog is None
+        assert segment.policy is None
+        assert segment.surface_gate is None
+        return ResolvedPolicyCatalog(
+            catalog=MODEL_TOOL_CATALOG,
+            policy=_AUTHORITY_POLICY,
+            dependency_policy=DEPENDENCY_POLICY_V1,
+        )
+
+    def malformed_gate(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        return object()
+
+    instance, persistence, driver, host, journal = runtime(
+        phases,
+        policy_resolver=policy_spy,
+        surface_resolver=malformed_gate,
+    )
+    prepared = instance.prepare_stream(
+        StartTurnRequest(message="hi"),
+        transport=transport(),
+        invocation_control=InMemoryRuntimeInvocationControl(),
+    )
+
+    assert isinstance(prepared, ImmediateHttpOutcome)
+    assert prepared.payload["error_code"] == "operation_unavailable"
+    assert len(seen) == 1
+    snapshot, _segment = seen[0]
+    assert snapshot.index("segment_resolve") < snapshot.index("policy_resolve")
+    assert phases.items.index("policy_manifest_read") > phases.items.index("segment_resolve")
+    assert persistence.user_count == 0
+    assert driver.calls == 0
+    assert host.calls == 0
+    assert journal.recorder.finished == []
+
+
+def test_stream_malformed_surface_gate_closes_before_model_or_user() -> None:
+    phases = Phases()
+    close_count: list[int] = []
+
+    def malformed_gate(*_args: object, **_kwargs: object) -> object:
+        return object()
+
+    instance, persistence, driver, host, journal = runtime(
+        phases,
+        surface_resolver=malformed_gate,
+        close_counter=close_count,
+    )
+    prepared = instance.prepare_stream(
+        StartTurnRequest(message="hi"),
+        transport=transport(),
+        invocation_control=InMemoryRuntimeInvocationControl(),
+    )
+
+    assert isinstance(prepared, ImmediateHttpOutcome)
+    assert prepared.payload["error_code"] == "operation_unavailable"
+    assert close_count == [1]
+    assert "model_resolve" not in phases.items
+    assert persistence.user_count == 0
+    assert driver.calls == 0
+    assert host.calls == 0
+    assert journal.recorder.finished == []
+
+
+@pytest.mark.parametrize(
+    ("field_name", "error"),
+    [
+        ("status", ValueError("status getter")),
+        ("status", KeyboardInterrupt()),
+        ("message_id", ValueError("message id getter")),
+        ("message_id", KeyboardInterrupt()),
+    ],
+)
+def test_stream_user_result_getter_releases_segment_on_any_exception(
+    field_name: str,
+    error: BaseException,
+) -> None:
+    close_count: list[int] = []
+
+    class ExplodingResult:
+        @property
+        def status(self) -> object:
+            if field_name == "status":
+                raise error
+            return PersistenceStatus.PERSISTED
+
+        @property
+        def message_id(self) -> object:
+            if field_name == "message_id":
+                raise error
+            return 1
+
+    class PersistenceWithExplodingResult(Persistence):
+        def persist_initial_user_message(self, conversation_id: int, content: str) -> object:
+            del conversation_id, content
+            return ExplodingResult()
+
+    phases = Phases()
+    persistence = PersistenceWithExplodingResult()
+    instance, _unused, _driver, _host, _journal = runtime(
+        phases,
+        persistence=persistence,
+        close_counter=close_count,
+    )
+
+    with pytest.raises(type(error)):
+        instance.prepare_stream(
+            StartTurnRequest(message="hi"),
+            transport=transport(),
+            invocation_control=InMemoryRuntimeInvocationControl(),
+        )
+    assert close_count == [1]
+    assert instance._prepared_models == {}  # type: ignore[attr-defined]
+    assert instance._prepared_segments == {}  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("error", [ValueError("persistence surface"), KeyboardInterrupt()])
+def test_stream_persistence_surface_getter_releases_segment_on_any_exception(
+    error: BaseException,
+) -> None:
+    close_count: list[int] = []
+
+    class PersistenceWithExplodingSurface(Persistence):
+        def __getattribute__(self, name: str) -> object:
+            if name == "persist_initial_assistant_message":
+                raise error
+            return super().__getattribute__(name)
+
+    persistence = PersistenceWithExplodingSurface()
+    phases = Phases()
+    instance, _unused, _driver, _host, _journal = runtime(
+        phases,
+        persistence=persistence,
+        close_counter=close_count,
+    )
+
+    if isinstance(error, KeyboardInterrupt):
+        with pytest.raises(KeyboardInterrupt):
+            instance.prepare_stream(
+                StartTurnRequest(message="hi"),
+                transport=transport(),
+                invocation_control=InMemoryRuntimeInvocationControl(),
+            )
+    else:
+        result = instance.prepare_stream(
+            StartTurnRequest(message="hi"),
+            transport=transport(),
+            invocation_control=InMemoryRuntimeInvocationControl(),
+        )
+        assert isinstance(result, ImmediateHttpOutcome)
+        assert result.payload["error_code"] == "operation_failed"
+    assert close_count == [1]
+    assert instance._prepared_models == {}  # type: ignore[attr-defined]
+    assert instance._prepared_segments == {}  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("error", [RuntimeError("freeze"), KeyboardInterrupt()])
+def test_stream_assembled_freeze_releases_segment_on_any_exception(
+    error: BaseException,
+) -> None:
+    class ExplodingList(list[object]):
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            if "context_capture" in phases.items:
+                raise error
+            return super().__iter__()
+
+    close_count: list[int] = []
+    phases = Phases()
+    instance, _persistence, _driver, _host, journal = runtime(
+        phases,
+        assembled=ExplodingList([Message(role="user", content="hi")]),
+        close_counter=close_count,
+    )
+
+    with pytest.raises(type(error)):
+        instance.prepare_stream(
+            StartTurnRequest(message="hi"),
+            transport=transport(),
+            invocation_control=InMemoryRuntimeInvocationControl(),
+        )
+    assert close_count == [1]
+    assert instance._prepared_models == {}  # type: ignore[attr-defined]
+    assert instance._prepared_segments == {}  # type: ignore[attr-defined]
+    assert journal.recorder.abandoned == 1
+
+
+@pytest.mark.parametrize("error", [RuntimeError("conversation getter"), KeyboardInterrupt()])
+def test_stream_prepared_conversation_getter_releases_segment_on_any_exception(
+    error: BaseException,
+) -> None:
+    class ExplodingConversation:
+        id = 7
+        context_type = "workspace"
+        context_ref = ""
+        archived_at = None
+
+        def __init__(self) -> None:
+            self._mode_reads = 0
+
+        @property
+        def mode(self) -> str:
+            self._mode_reads += 1
+            if self._mode_reads >= 3 and "context_capture" in phases.items:
+                raise error
+            return "general"
+
+    close_count: list[int] = []
+    phases = Phases()
+    instance, _persistence, _driver, _host, journal = runtime(
+        phases,
+        conversation=ExplodingConversation(),  # type: ignore[arg-type]
+        close_counter=close_count,
+    )
+
+    with pytest.raises(type(error)):
+        instance.prepare_stream(
+            StartTurnRequest(message="hi"),
+            transport=transport(),
+            invocation_control=InMemoryRuntimeInvocationControl(),
+        )
+    assert close_count == [1]
+    assert instance._prepared_models == {}  # type: ignore[attr-defined]
+    assert instance._prepared_segments == {}  # type: ignore[attr-defined]
+    assert journal.recorder.abandoned == 1
+
+
 def test_stream_model_prepare_and_agent_host_execution_emits_baseline_prefix() -> None:
     phases = Phases()
     instance, persistence, driver, host, journal = runtime(phases)
     control = InMemoryRuntimeInvocationControl()
-    prepared = instance.prepare_stream(StartTurnRequest(message="hi"), transport=transport(), invocation_control=control)
+    prepared = instance.prepare_stream(
+        StartTurnRequest(message="hi"), transport=transport(), invocation_control=control
+    )
 
     assert isinstance(prepared, PreparedStreamExecution)
     assert len(instance._prepared_models) == 1  # type: ignore[attr-defined]
     assert prepared.preparation_kind is PreparationKind.MODEL
     assert prepared.execution_mode is StreamExecutionMode.AGENT_HOST
     assert phases.items == [
-        "validate", "conversation", "route:model", "pending_guard", "model_resolve",
-        "user_persist", "source_load", "context_assemble", "transport_identity",
-        "run_start", "context_capture", "prepared",
+        "validate",
+        "conversation",
+        "route:model",
+        "pending_guard",
+        "source_load",
+        "segment_resolve",
+        "context_assemble",
+        "policy_resolve",
+        "surface_resolve",
+        "model_resolve",
+        "user_persist",
+        "transport_identity",
+        "run_start",
+        "context_capture",
+        "prepared",
     ]
     seen: list[object] = []
 
@@ -345,6 +868,7 @@ def test_stream_model_prepare_and_agent_host_execution_emits_baseline_prefix() -
     assert control.state is InvocationState.COMPLETED
     assert journal.recorder.finished
     assert len(instance._prepared_models) == 0  # type: ignore[attr-defined]
+    assert len(instance._prepared_segments) == 0  # type: ignore[attr-defined]
     assert "agent_host" in phases.items
 
 
@@ -353,7 +877,9 @@ def test_prepare_rejects_deterministic_route_before_user_or_run() -> None:
     instance, persistence, driver, host, journal = runtime(phases, route="deterministic")
     control = InMemoryRuntimeInvocationControl()
 
-    result = instance.prepare_stream(StartTurnRequest(message="hi"), transport=transport(), invocation_control=control)
+    result = instance.prepare_stream(
+        StartTurnRequest(message="hi"), transport=transport(), invocation_control=control
+    )
 
     assert isinstance(result, ImmediateHttpOutcome)
     assert result.status_code == 400
@@ -374,7 +900,6 @@ def test_deterministic_pilot_action_is_rejected_before_conversation_side_effects
         RuntimeDependencies(
             conversations=conversations,
             persistence=persistence,
-            model_resolver=lambda request, conversation: ResolvedModel(model="model"),
             source_loader=Source(),
             context_assembler=Assembler(),
             agent_driver=driver,
@@ -454,7 +979,11 @@ def test_direct_prepared_execution_has_no_agent_host_and_is_single_use(
     assert guard.execute_once() == outcome
     assert host.calls == 0
     assert driver.calls == 0
-    assert seen == [MetaEvent(), AssistantMessageEvent(message="already committed"), CompletedEvent(response=outcome)]
+    assert seen == [
+        MetaEvent(),
+        AssistantMessageEvent(message="already committed"),
+        CompletedEvent(response=outcome),
+    ]
     assert guard.complete(CompletionReason.NORMAL) is True
     assert guard.execute_once() is None
     assert host.calls == 0
@@ -606,7 +1135,9 @@ def test_model_abort_keeps_user_and_abandons_open_run_without_new_facts() -> Non
     phases = Phases()
     instance, persistence, _driver, _host, journal = runtime(phases)
     control = InMemoryRuntimeInvocationControl()
-    prepared = instance.prepare_stream(StartTurnRequest(message="hi"), transport=transport(), invocation_control=control)
+    prepared = instance.prepare_stream(
+        StartTurnRequest(message="hi"), transport=transport(), invocation_control=control
+    )
     assert isinstance(prepared, PreparedStreamExecution)
     guard = PreparedStreamGuard(prepared=prepared)
 
@@ -625,7 +1156,9 @@ def test_model_prepared_stream_adapts_sse_host_queue_once() -> None:
     phases = Phases()
     instance, _persistence, driver, _unused_host, _journal = runtime(phases)
     control = InMemoryRuntimeInvocationControl()
-    prepared = instance.prepare_stream(StartTurnRequest(message="hi"), transport=transport(), invocation_control=control)
+    prepared = instance.prepare_stream(
+        StartTurnRequest(message="hi"), transport=transport(), invocation_control=control
+    )
     assert isinstance(prepared, PreparedStreamExecution)
     guard = PreparedStreamGuard(prepared=prepared)
     assert guard.begin_execution() is True
@@ -687,7 +1220,12 @@ def test_real_stream_run_recorder_keeps_transport_uuid_and_terminal_events(
         RuntimeDependencies(
             conversations=Gateway(),
             persistence=persistence,
-            model_resolver=lambda request, current: ResolvedModel(model="model"),
+            policy_catalog_resolver=_policy_resolver(MODEL_TOOL_CATALOG),
+            segment_context_resolver=_segment_resolver,
+            surface_gate_resolver=_surface_resolver,
+            continuation_model_resolver=lambda request, current, policy: ResolvedModel(
+                model="model"
+            ),
             source_loader=Source(),
             context_assembler=Assembler(),
             agent_driver=Driver(),
@@ -740,7 +1278,12 @@ def test_null_journal_recorder_does_not_mark_prepared_run_open() -> None:
         RuntimeDependencies(
             conversations=Conversations(),
             persistence=Persistence(),
-            model_resolver=lambda request, conversation: ResolvedModel(model="model"),
+            policy_catalog_resolver=_policy_resolver(MODEL_TOOL_CATALOG),
+            segment_context_resolver=_segment_resolver,
+            surface_gate_resolver=_surface_resolver,
+            continuation_model_resolver=lambda request, conversation, policy: ResolvedModel(
+                model="model"
+            ),
             source_loader=Source(),
             context_assembler=Assembler(),
             agent_driver=Driver(),
@@ -852,7 +1395,10 @@ def test_terminal_abort_releases_provider_token_and_canary_exactly_once() -> Non
         RuntimeDependencies(
             conversations=Conversations(),
             persistence=Persistence(),
-            model_resolver=resolver,
+            policy_catalog_resolver=_policy_resolver(MODEL_TOOL_CATALOG),
+            segment_context_resolver=_segment_resolver,
+            surface_gate_resolver=_surface_resolver,
+            continuation_model_resolver=resolver,
             source_loader=Source(),
             context_assembler=Assembler(),
             agent_driver=Driver(),
@@ -1254,20 +1800,10 @@ def test_materialize_stream_value_rejects_unknown_detached_values() -> None:
 
 
 def test_stream_pending_emits_waiting_status_before_confirmation() -> None:
-    class Catalog:
-        def resolve(self, name: str) -> object:
-            return SimpleNamespace(name=name, kind="write")
-
-        def write_names(self) -> set[str]:
-            return {"update_application_status"}
-
-        def provider_contracts(self) -> list[object]:
-            return [SimpleNamespace(name="update_application_status")]
-
     phases = Phases()
     instance, _persistence, driver, host, _journal = runtime(
         phases,
-        catalog=Catalog(),
+        catalog=MODEL_TOOL_CATALOG,
     )
     driver.result = AgentTurnResult(
         [],

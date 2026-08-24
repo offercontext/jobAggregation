@@ -2,19 +2,18 @@ from __future__ import annotations
 
 import json
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Literal, Mapping
+from typing import Any, Callable, Literal
 
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
+from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
+from offerpilot.ai.tool_authority.policy import validate_startup_policy
 from offerpilot.ai.tool_runtime.contracts import (
-    ProviderToolContract,
-    ToolExceptionMapping,
     ToolFailure,
-    ToolSpec,
-    WriteContract,
 )
+from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 from offerpilot.ai.types import Assistant
 from offerpilot.agent_runtime.journal import NullRunRecorder
 from offerpilot.db import init_database
@@ -39,24 +38,15 @@ class ToolDefinition:
 
 
 def runtime(*definitions: ToolDefinition) -> tuple[ToolCatalog, ToolExecutionContext]:
-    specs: list[ToolSpec[Any, Any]] = []
-    names: list[str] = []
+    specs = list(MODEL_TOOL_CATALOG.specs)
+    positions = {spec.name: index for index, spec in enumerate(specs)}
     for definition in definitions:
-        names.append(definition.name)
-        schema: Mapping[str, Any] = {"type": "object", "properties": {}}
-        contract = ProviderToolContract(
-            payload={
-                "type": "function",
-                "function": {
-                    "name": definition.name,
-                    "description": definition.name,
-                    "parameters": schema,
-                },
-            },
-            name=definition.name,
-            description=definition.name,
-            parameters=schema,
-        )
+        position = positions.get(definition.name)
+        if position is None:
+            raise ValueError(f"test tool must use a model catalog name: {definition.name}")
+        original = specs[position]
+        if definition.kind != original.kind:
+            raise ValueError(f"test tool kind differs from model catalog: {definition.name}")
         raw_executor = definition.executor
         raw_validator = definition.validator
 
@@ -79,30 +69,33 @@ def runtime(*definitions: ToolDefinition) -> tuple[ToolCatalog, ToolExecutionCon
             detail = raw_validator(json.dumps(args, ensure_ascii=False, separators=(",", ":")))
             return ToolFailure("validation_error", "test_validation", detail) if detail else None
 
-        is_write = definition.kind == "write"
-        specs.append(
-            ToolSpec(
-                contract=contract,
-                kind=definition.kind,
-                decoder=lambda values: dict(values),
-                executor=executor,
-                confirmation_policy="required" if is_write else "none",
-                preflight=preflight if raw_validator is not None else None,
-                mutable_validator=preflight if raw_validator is not None else None,
-                declared_failure_categories=frozenset({"validation_error", "internal_error"}),
-                exception_map=(
-                    ToolExceptionMapping(Exception, "internal_error", "test_handler_error", str),
-                ),
-                success_renderer=str,
-                confirmation_description=lambda _args, name=definition.name: name,
-                write_contract=WriteContract() if is_write else None,
-            )
+        specs[position] = replace(
+            original,
+            decoder=lambda values: dict(values),
+            executor=executor,
+            preflight=preflight if raw_validator is not None else None,
+            mutable_validator=preflight if raw_validator is not None else None,
+            success_renderer=str,
+            confirmation_description=lambda _args, name=definition.name: name,
         )
-    catalog = ToolCatalog(specs, expected_names=names)
-    context = ToolExecutionContext(
-        applications=ApplicationsRepository(_SESSIONS),
+    catalog = ToolCatalog(specs, expected_names=tuple(spec.name for spec in specs))
+    policy = validate_startup_policy(catalog.authority_manifest)
+    authority_factory = AuthorityFactory()
+    authority = authority_factory.create_segment_authority(
+        conversation_id=1,
+        conversation_scope_revision=0,
+        segment_id="agent-loop-test-segment",
+        trusted_scope=TrustedContextScope("workspace", None, "general"),
         capabilities=frozenset(ToolCapability),
-        current_bindings={},
+        capability_profile_id=policy.capability_profile.profile_id,
+        capability_policy_version=policy.capability_policy_version,
+        binding_policy_version=policy.binding_policy_version,
+        capability_profile_fingerprint=policy.capability_profile_fingerprint,
+        binding_policy_fingerprint=policy.binding_policy_fingerprint,
+    )
+    context = ToolExecutionContext(
+        authority=authority,
+        applications=ApplicationsRepository(_SESSIONS),
         events=ApplicationEventsRepository(_SESSIONS),
         jd_analyses=JDAnalysesRepository(_SESSIONS),
         notes=NotesRepository(_SESSIONS),

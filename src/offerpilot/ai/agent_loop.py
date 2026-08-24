@@ -33,6 +33,7 @@ from offerpilot.ai.tool_authority import (
     ProviderInvocationIdentity,
     SegmentExecutionAuthority,
 )
+from offerpilot.ai.tool_authority.contracts import _ReplacementProtected
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import (
@@ -72,11 +73,21 @@ from offerpilot.context_projector.gateway import (
     SingleCandidateAgentTransport,
 )
 from offerpilot.context_projector.projector import ModelSurfaceProjector, ProjectionRequest
-from offerpilot.context_projector.selector import ToolSelectionSignals
-from offerpilot.context_projector.authority_surface import AuthoritySurfaceView
+from offerpilot.context_projector.selector import (
+    DependencyPolicyV1,
+    ToolSelection,
+    ToolSelectionSignals,
+    require_dependency_policy_v1,
+    select_tools,
+)
+from offerpilot.context_projector.authority_surface import (
+    AuthoritySurfaceView,
+    intersect_authority_surface,
+)
 
 
 DEFAULT_MAX_ITERATIONS = 20
+_NO_OVERRIDE = object()
 
 
 class _InjectedSurfaceAdapter:
@@ -90,11 +101,12 @@ class _InjectedSurfaceAdapter:
             model="injected-agent-model",
             enabled=True,
         )
-        chain = FrozenProviderExecutionChain.freeze([profile])
-        self._gateway = AgentProviderGatewaySession(
-            chain,
-            SingleCandidateAgentTransport(self._complete, self._stream),
-        )
+        self._chain = FrozenProviderExecutionChain.freeze([profile])
+        self._transport = SingleCandidateAgentTransport(self._complete, self._stream)
+        self._gateway = AgentProviderGatewaySession(self._chain, self._transport)
+
+    def new_agent_provider_session(self) -> AgentProviderGatewaySession:
+        return AgentProviderGatewaySession(self._chain, self._transport)
 
     @property
     def agent_provider_budgets(self) -> tuple[ProviderBudget, ...]:
@@ -187,8 +199,226 @@ class _InjectedSurfaceAdapter:
         return cast(Assistant, self._inner.complete(messages, tools))
 
 
+class _PerCallSurfaceModel:
+    """Bind one exact gateway session to one model-call surface."""
+
+    def __init__(self, inner: ChatModel, gateway: AgentProviderGatewaySession) -> None:
+        self._inner = inner
+        self._gateway = gateway
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    @property
+    def agent_provider_budgets(self) -> tuple[ProviderBudget, ...]:
+        return tuple(self._gateway.budgets)
+
+    @property
+    def agent_provider_manifest_identities(self) -> tuple[str, ...]:
+        return tuple(self._gateway.manifest_identities)
+
+    def bind_agent_provider_surface(self, **kwargs: object) -> ProviderInvocationIdentity:
+        return self._gateway.bind_provider_surface(**cast(Any, kwargs))
+
+    def preflight_agent_surface(self, surface: FrozenModelSurface, **kwargs: object) -> None:
+        self._gateway.preflight(surface, **cast(Any, kwargs))
+
+    def complete_agent_surface(self, surface: FrozenModelSurface, **kwargs: object) -> object:
+        return self._gateway.complete(surface, **cast(Any, kwargs))
+
+    def stream_agent_surface(
+        self,
+        surface: FrozenModelSurface,
+        on_delta: Callable[[str], None],
+        **kwargs: object,
+    ) -> object:
+        return self._gateway.stream_deferred(surface, on_delta, **cast(Any, kwargs))
+
+    def consume_agent_provider_attempt(self, attempt_id: str) -> bool:
+        return self._gateway.consume_attempt(attempt_id)
+
+
+def _surface_selection_matches(left: ToolSelection, right: ToolSelection) -> bool:
+    if (
+        left.names != right.names
+        or left.envelope_fingerprint != right.envelope_fingerprint
+        or left.fallback_all != right.fallback_all
+        or left.domains != right.domains
+        or len(left.tools) != len(right.tools)
+    ):
+        return False
+    return all(
+        left_tool.name == right_tool.name
+        and left_tool.description == right_tool.description
+        and left_tool.payload == right_tool.payload
+        and left_tool.parameters == right_tool.parameters
+        for left_tool, right_tool in zip(left.tools, right.tools)
+    )
+
+
+@dataclass(frozen=True, slots=True, repr=False, eq=False)
+class SegmentSurfaceGate(_ReplacementProtected, TransientToolRuntimeValue):
+    """Provider-free selector/authority intersection for one Segment.
+
+    The gate is sealed before a continuation model is resolved.  The Agent
+    Loop may still project messages and budgets for each model call, but it
+    consumes this exact selection rather than re-running selector or
+    capability/scope intersection inside the loop.
+    """
+
+    authority: SegmentExecutionAuthority = field(repr=False)
+    context: ToolExecutionContext = field(repr=False)
+    catalog: ToolCatalog = field(repr=False)
+    authority_surface: AuthoritySurfaceView = field(repr=False)
+    selection: ToolSelection = field(repr=False)
+    dependency_policy: DependencyPolicyV1 = field(repr=False)
+    policy: object = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        self._validate_current_surface()
+        self._seal_replacement()
+
+    def _validate_current_surface(self) -> None:
+        if type(self.authority) is not SegmentExecutionAuthority:
+            raise ProjectionError("segment_authority_required")
+        if type(self.context) is not ToolExecutionContext:
+            raise ProjectionError("tool_context_required")
+        if self.context.authority is not self.authority:
+            raise ProjectionError("segment_context_mismatch")
+        if type(self.catalog) is not ToolCatalog:
+            raise ProjectionError("typed_catalog_required")
+        expected_view = AuthoritySurfaceView.from_authority(self.authority)
+        if self.authority_surface != expected_view:
+            raise ProjectionError("authority_surface_mismatch")
+        require_dependency_policy_v1(self.dependency_policy)
+        profile = getattr(self.policy, "capability_profile", None)
+        if profile is None:
+            raise ProjectionError("capability_profile_required")
+        if (
+            getattr(profile, "profile_id", None) != self.authority.capability_profile_id
+            or getattr(self.policy, "capability_policy_version", None)
+            != self.authority.capability_policy_version
+            or getattr(self.policy, "binding_policy_version", None)
+            != self.authority.binding_policy_version
+            or getattr(self.policy, "capability_profile_fingerprint", None)
+            != self.authority.capability_profile_fingerprint
+            or getattr(self.policy, "binding_policy_fingerprint", None)
+            != self.authority.binding_policy_fingerprint
+        ):
+            raise ProjectionError("capability_profile_drift")
+        if (
+            not self.selection.tools
+            or tuple(contract.name for contract in self.selection.tools) != self.selection.names
+        ):
+            raise ProjectionError("invalid_tool_surface")
+        contracts = self.catalog.provider_contracts()
+        if any(contract not in contracts for contract in self.selection.tools):
+            raise ProjectionError("preselected_surface_mismatch")
+        self.dependency_policy.validate_closed(
+            self.selection.names,
+            tuple(contract.name for contract in contracts),
+        )
+        try:
+            projected = intersect_authority_surface(
+                self.catalog,
+                self.selection,
+                self.authority_surface,
+                dependency_policy=self.dependency_policy,
+            )
+        except ProjectionError:
+            raise
+        if not _surface_selection_matches(projected, self.selection):
+            raise ProjectionError("preselected_surface_mismatch")
+
+
+def build_segment_surface_gate(
+    messages: tuple[Message, ...] | list[Message],
+    *,
+    catalog: ToolCatalog,
+    context: ToolExecutionContext,
+    authority: SegmentExecutionAuthority,
+    dependency_policy: DependencyPolicyV1,
+    policy: object,
+) -> SegmentSurfaceGate:
+    """Build the provider-free selection gate for one trusted Segment."""
+
+    if type(catalog) is not ToolCatalog:
+        raise ProjectionError("typed_catalog_required")
+    if type(context) is not ToolExecutionContext:
+        raise ProjectionError("tool_context_required")
+    if context.authority is not authority:
+        raise ProjectionError("segment_context_mismatch")
+    values = tuple(messages)
+    user_indexes = [index for index, message in enumerate(values) if message.role == "user"]
+    if not user_indexes:
+        raise ProjectionError("current_request_required")
+    current = values[user_indexes[-1]]
+    page_kinds = tuple(
+        dict.fromkeys(message.surface_page_kind for message in values if message.surface_page_kind)
+    )
+    if len(page_kinds) > 1:
+        raise ProjectionError("multiple_page_kinds")
+    attachment_kinds = tuple(
+        dict.fromkeys(
+            kind
+            for message in values
+            for kind in message.surface_attachment_kinds.split(",")
+            if kind
+        )
+    )
+    trusted_domains = tuple(
+        dict.fromkeys(
+            signal for message in values for signal in message.surface_signal.split(",") if signal
+        )
+    )
+    signals = ToolSelectionSignals(
+        current_request=current.content,
+        page_kind=page_kinds[0] if page_kinds else "workspace",
+        attachment_kinds=attachment_kinds,
+        trusted_domains=trusted_domains,
+    )
+    provider_tools = tuple(catalog.provider_contracts())
+    dependency_policy = require_dependency_policy_v1(dependency_policy)
+    selection = select_tools(provider_tools, signals, dependency_policy=dependency_policy)
+    authority_surface = AuthoritySurfaceView.from_authority(authority)
+    selection = intersect_authority_surface(
+        catalog,
+        selection,
+        authority_surface,
+        dependency_policy=dependency_policy,
+    )
+    factory = context.authority_factory
+    factory.register_tool_execution_context(context, authority=authority)
+    gate = SegmentSurfaceGate(
+        authority=authority,
+        context=context,
+        catalog=catalog,
+        authority_surface=authority_surface,
+        selection=selection,
+        dependency_policy=dependency_policy,
+        policy=policy,
+    )
+    factory.register_segment_surface_gate(
+        gate,
+        authority=authority,
+        context=context,
+        catalog=catalog,
+        policy=policy,
+        dependency_policy=dependency_policy,
+        selection=selection,
+        authority_surface=authority_surface,
+    )
+    return gate
+
+
 class _LoopServices:
-    def __init__(self, invocation: AgentLoopInvocation) -> None:
+    def __init__(
+        self,
+        invocation: AgentLoopInvocation,
+        *,
+        run_recorder: RunRecorder | None = None,
+        event_sink: AgentEventSink | None | object = _NO_OVERRIDE,
+    ) -> None:
         model = invocation.model
         self.model = (
             _InjectedSurfaceAdapter(model)
@@ -199,9 +429,14 @@ class _LoopServices:
         )
         self.catalog = invocation.catalog
         self.context = invocation.tool_context
-        self.event_sink = invocation.event_sink
+        self.event_sink = (
+            invocation.event_sink
+            if event_sink is _NO_OVERRIDE
+            else cast(AgentEventSink | None, event_sink)
+        )
         self.cancel_check = invocation.cancel_check
-        self.run_recorder = invocation.run_recorder
+        self.run_recorder = invocation.run_recorder if run_recorder is None else run_recorder
+        self.surface_gate = invocation.surface_gate
         self.delivery_fence = (
             invocation.seed.continuation.delivery_fence
             if isinstance(invocation.seed, ApprovedWriteSeed)
@@ -218,6 +453,33 @@ class _LoopServices:
             factory = self.context.authority_factory
             factory.register_runner_invocation(invocation, authority=self.context.authority)
             factory.register_tool_execution_context(self.context, authority=self.context.authority)
+            if isinstance(invocation.seed, NewTurnSeed):
+                self._require_surface_gate()
+
+    def _require_surface_gate(self) -> SegmentSurfaceGate:
+        if type(self.surface_gate) is not SegmentSurfaceGate:
+            raise ProjectionError("segment_surface_gate_required")
+        gate = self.surface_gate
+        if type(self.context.authority) is not SegmentExecutionAuthority:
+            raise ProjectionError("segment_authority_required")
+        authority = self.context.authority
+        try:
+            gate._validate_current_surface()
+            self.context.authority_factory.require_segment_surface_gate(
+                gate,
+                authority=authority,
+                context=self.context,
+                catalog=self.catalog,
+                policy=gate.policy,
+                dependency_policy=gate.dependency_policy,
+                selection=gate.selection,
+                authority_surface=gate.authority_surface,
+            )
+        except ProjectionError:
+            raise
+        except Exception as exc:
+            raise ProjectionError("segment_surface_gate_mismatch") from exc
+        return gate
 
     def complete_model(
         self,
@@ -228,12 +490,24 @@ class _LoopServices:
     ) -> Assistant:
         if self.model is None:
             raise RuntimeError("provider-free confirmation cannot call a model")
-        model_call_id = str(uuid4())
-        complete_surface = getattr(self.model, "complete_agent_surface", None)
-        stream_surface = getattr(self.model, "stream_agent_surface", None)
+        if isinstance(self.runner_invocation.seed, NewTurnSeed):
+            self._require_surface_gate()
+        model: object = self.model
+        complete_surface = getattr(model, "complete_agent_surface", None)
+        stream_surface = getattr(model, "stream_agent_surface", None)
         surface_aware = callable(complete_surface) or callable(stream_surface)
         if not surface_aware:
             raise TypeError("Agent Provider surface adapter is required")
+        new_session = getattr(model, "new_agent_provider_session", None)
+        if not callable(new_session):
+            raise ProjectionError("provider_gateway_session_factory_required")
+        gateway = new_session()
+        if type(gateway) is not AgentProviderGatewaySession:
+            raise ProjectionError("provider_gateway_session_required")
+        model = _PerCallSurfaceModel(cast(ChatModel, model), gateway)
+        model_call_id = str(uuid4())
+        complete_surface = getattr(model, "complete_agent_surface", None)
+        stream_surface = getattr(model, "stream_agent_surface", None)
         if type(self.context.authority) is not SegmentExecutionAuthority:
             raise TypeError("Provider calls require a Segment authority")
         factory = self.context.authority_factory
@@ -248,6 +522,7 @@ class _LoopServices:
             tools,
             model_call_id=model_call_id,
             build_identity=build_identity,
+            model=model,
         )
         messages = surface.thaw_messages()
         tools = list(surface.tools)
@@ -257,6 +532,7 @@ class _LoopServices:
             model_step=model_step,
             model_call_id=model_call_id,
             surface=surface,
+            model=model,
         )
         is_stream = callable(stream_surface)
         buffered_deltas: list[str] = []
@@ -266,7 +542,7 @@ class _LoopServices:
                 buffered_deltas.append(delta)
 
         binding = ModelCallSurfaceBinding.from_surface(surface)
-        bind_surface = getattr(self.model, "bind_agent_provider_surface", None)
+        bind_surface = getattr(model, "bind_agent_provider_surface", None)
         if not callable(bind_surface):
             raise TypeError("Agent Provider surface binder is missing")
         invocation_identity = bind_surface(
@@ -275,7 +551,7 @@ class _LoopServices:
             surface=surface,
             model_call_surface_binding=binding,
         )
-        preflight = getattr(self.model, "preflight_agent_surface", None)
+        preflight = getattr(model, "preflight_agent_surface", None)
         if not callable(preflight):
             raise TypeError("Agent Provider preflight is missing")
         preflight(
@@ -284,7 +560,7 @@ class _LoopServices:
             stream=is_stream,
         )
         if snapshot_id is not None:
-            provider_kind, model_id, supports_json_schema = _journal_model_metadata(self.model)
+            provider_kind, model_id, supports_json_schema = _journal_model_metadata(model)
             model_id_fingerprint = self.fingerprint_model_id(model_id)
             self.append_journal_event(
                 EventInput(
@@ -324,11 +600,7 @@ class _LoopServices:
                     invocation_identity=invocation_identity,
                     before_attempt=self.require_active,
                 )
-            attempt_validator = getattr(
-                self.model,
-                "consume_agent_provider_attempt",
-                None,
-            )
+            attempt_validator = getattr(model, "consume_agent_provider_attempt", None)
             if not callable(attempt_validator):
                 raise TypeError("Agent Provider Gateway attempt validator is missing")
             assistant = binding.validate_response(
@@ -392,7 +664,13 @@ class _LoopServices:
         *,
         model_call_id: str,
         build_identity: object,
+        model: object | None = None,
     ) -> FrozenModelSurface:
+        gate = (
+            self._require_surface_gate()
+            if isinstance(self.runner_invocation.seed, NewTurnSeed)
+            else None
+        )
         system = tuple(
             FrozenMessage.freeze(message)
             for message in messages
@@ -451,7 +729,8 @@ class _LoopServices:
             }:
                 status = "disabled"
             contributors.append(ContributorResult(name, status, contributor_messages))
-        budgets = getattr(self.model, "agent_provider_budgets", (ProviderBudget(),))
+        surface_model = self.model if model is None else model
+        budgets = getattr(surface_model, "agent_provider_budgets", (ProviderBudget(),))
         trusted_domains = tuple(
             dict.fromkeys(
                 signal
@@ -499,6 +778,11 @@ class _LoopServices:
                     chunks=chunk_structured_source(content),
                 )
             )
+        if gate is None:
+            raise ProjectionError("segment_surface_gate_required")
+        preselected_tools = gate.selection
+        dependency_policy = gate.dependency_policy
+        authority = cast(SegmentExecutionAuthority, self.context.authority)
         request = ProjectionRequest(
             model_call_id=model_call_id,
             contributors=tuple(contributors),
@@ -511,12 +795,12 @@ class _LoopServices:
                 trusted_domains=trusted_domains,
             ),
             provider_budgets=tuple(budgets),
-            authority_surface=AuthoritySurfaceView.from_authority(
-                cast(SegmentExecutionAuthority, self.context.authority)
-            ),
+            authority_surface=AuthoritySurfaceView.from_authority(authority),
             provider_catalog=self.catalog,
+            dependency_policy=dependency_policy,
             sources=tuple(sources),
             provider_surface_build_identity=build_identity,
+            preselected_tools=preselected_tools,
         )
         return ModelSurfaceProjector().project(request)
 
@@ -536,12 +820,16 @@ class _LoopServices:
         model_step: int,
         model_call_id: str,
         surface: FrozenModelSurface | None,
+        model: object | None = None,
     ) -> str | None:
         try:
             capture_surface = getattr(self.run_recorder, "capture_surface_context", None)
             if surface is not None and callable(capture_surface):
+                capture_model = self.model if model is None else model
                 identities = tuple(
-                    getattr(self.model, "agent_provider_manifest_identities", ("agent-provider",))
+                    getattr(
+                        capture_model, "agent_provider_manifest_identities", ("agent-provider",)
+                    )
                 )
                 captured = capture_surface(
                     _journal_model_input(messages, tools),
@@ -663,6 +951,7 @@ class AgentLoopInvocation(TransientToolRuntimeValue):
     event_sink: AgentEventSink | None
     runtime_signal_sink: AgentRuntimeSignalSink | None
     cancel_check: CancelCheck | None
+    surface_gate: SegmentSurfaceGate | None = field(default=None, repr=False, compare=False)
     _serialization_guard: object = field(
         default=_TRANSIENT_ASDICT_GUARD, init=False, repr=False, compare=False
     )
@@ -670,6 +959,35 @@ class AgentLoopInvocation(TransientToolRuntimeValue):
     def __post_init__(self) -> None:
         if not isinstance(self.seed, (NewTurnSeed, ApprovedWriteSeed)):
             raise TypeError("AgentLoopInvocation seed is invalid")
+        if type(self.tool_context) is not ToolExecutionContext:
+            raise TypeError("AgentLoopInvocation tool_context is invalid")
+        authority_type = type(self.tool_context.authority)
+        expected_authority = (
+            SegmentExecutionAuthority
+            if isinstance(self.seed, NewTurnSeed)
+            else ApprovalExecutionAuthority
+        )
+        if authority_type is not expected_authority:
+            raise TypeError(
+                "NewTurnSeed requires Segment authority"
+                if isinstance(self.seed, NewTurnSeed)
+                else "ApprovedWriteSeed requires Approval authority"
+            )
+        if isinstance(self.seed, NewTurnSeed) and type(self.surface_gate) is not SegmentSurfaceGate:
+            raise TypeError("NewTurnSeed requires an exact SegmentSurfaceGate")
+        if isinstance(self.seed, NewTurnSeed):
+            gate = cast(SegmentSurfaceGate, self.surface_gate)
+            authority = cast(SegmentExecutionAuthority, self.tool_context.authority)
+            self.tool_context.authority_factory.require_segment_surface_gate(
+                gate,
+                authority=authority,
+                context=self.tool_context,
+                catalog=self.catalog,
+                policy=gate.policy,
+                dependency_policy=gate.dependency_policy,
+                selection=gate.selection,
+                authority_surface=gate.authority_surface,
+            )
         if type(self.auto_approve) is not bool:
             raise TypeError("AgentLoopInvocation auto_approve must be bool")
         if type(self.max_iterations) is not int or self.max_iterations < 0:
@@ -684,7 +1002,13 @@ class AgentLoopInvocation(TransientToolRuntimeValue):
 
 
 class AgentLoopRunner:
-    def run(self, invocation: AgentLoopInvocation) -> AgentTurnResult:
+    def run(
+        self,
+        invocation: AgentLoopInvocation,
+        *,
+        run_recorder: RunRecorder | None = None,
+        event_sink: AgentEventSink | None | object = _NO_OVERRIDE,
+    ) -> AgentTurnResult:
         if not isinstance(invocation.catalog, ToolCatalog):
             raise TypeError("AgentLoopInvocation catalog is invalid")
         if not isinstance(invocation.tool_context, ToolExecutionContext):
@@ -693,7 +1017,14 @@ class AgentLoopRunner:
             isinstance(message, Message) for message in invocation.seed.messages
         ):
             raise TypeError("NewTurnSeed messages must contain Message values")
-        return self._run(invocation, _LoopServices(invocation))
+        return self._run(
+            invocation,
+            _LoopServices(
+                invocation,
+                run_recorder=run_recorder,
+                event_sink=event_sink,
+            ),
+        )
 
     def _run(
         self,
@@ -749,7 +1080,7 @@ class AgentLoopRunner:
                     tuple(failures),
                 )
             for call in selected:
-                self._emit_tool_call(invocation, call)
+                self._emit_tool_call(invocation, call, services.event_sink)
             pending = self._dispatch(
                 invocation,
                 selected,
@@ -813,7 +1144,7 @@ class AgentLoopRunner:
                     prepared_result.failure.compatibility_detail or prepared_result.failure.code
                 )
             raise PendingActionValidationError("pending tool no longer requires confirmation")
-        self._emit_pending_tool_call(invocation, pending, "approved")
+        self._emit_pending_tool_call(invocation, pending, "approved", services.event_sink)
 
         def claim(prepared: Any) -> Any:
             services.raise_if_cancelled()
@@ -846,7 +1177,14 @@ class AgentLoopRunner:
             result = record.persisted_visible_result
         else:
             result = render_compatibility(spec, record.outcome)
-        self._emit_tool_result(invocation, pending.tool_call_id, pending.tool_name, result, record)
+        self._emit_tool_result(
+            invocation,
+            pending.tool_call_id,
+            pending.tool_name,
+            result,
+            record,
+            services.event_sink,
+        )
         tool_message = Message(role="tool", content=result, tool_call_id=pending.tool_call_id)
         continuation.record_result(pending, tool_message, record)
         # A rejected/stale claim must retain its domain error even when the
@@ -889,6 +1227,7 @@ class AgentLoopRunner:
                     None,
                     working_messages,
                     added_messages,
+                    services.event_sink,
                 )
                 continue
             pending_draft: PendingAction | None = None
@@ -924,6 +1263,7 @@ class AgentLoopRunner:
                     None,
                     working_messages,
                     added_messages,
+                    services.event_sink,
                 )
                 continue
             if spec.kind == "write":
@@ -976,6 +1316,7 @@ class AgentLoopRunner:
                     None,
                     working_messages,
                     added_messages,
+                    services.event_sink,
                 )
                 continue
             if isinstance(prepared, ReadyToExecute):
@@ -1014,6 +1355,7 @@ class AgentLoopRunner:
                 record,
                 working_messages,
                 added_messages,
+                services.event_sink,
             )
         return None
 
@@ -1025,17 +1367,23 @@ class AgentLoopRunner:
         record: ToolExecutionRecord[Any, Any] | None,
         working_messages: list[Message],
         added_messages: list[Message],
+        event_sink: AgentEventSink | None,
     ) -> None:
-        self._emit_tool_result(invocation, call.id, call.name, result, record)
+        self._emit_tool_result(invocation, call.id, call.name, result, record, event_sink)
         message = Message(role="tool", content=result, tool_call_id=call.id)
         working_messages.append(message)
         added_messages.append(message)
 
-    def _emit_tool_call(self, invocation: AgentLoopInvocation, call: ToolCall) -> None:
+    def _emit_tool_call(
+        self,
+        invocation: AgentLoopInvocation,
+        call: ToolCall,
+        event_sink: AgentEventSink | None,
+    ) -> None:
         spec = invocation.catalog.resolve(call.name)
         is_write = spec is not None and spec.kind == "write"
         self._emit(
-            invocation,
+            event_sink,
             AgentToolCall(
                 tool_call_id=call.id,
                 tool_name=call.name,
@@ -1052,10 +1400,11 @@ class AgentLoopRunner:
         invocation: AgentLoopInvocation,
         pending: PendingAction,
         confirm_mode: str,
+        event_sink: AgentEventSink | None,
     ) -> None:
         spec = invocation.catalog.resolve(pending.tool_name)
         self._emit(
-            invocation,
+            event_sink,
             AgentToolCall(
                 tool_call_id=pending.tool_call_id,
                 tool_name=pending.tool_name,
@@ -1074,6 +1423,7 @@ class AgentLoopRunner:
         tool_name: str,
         result: str,
         record: ToolExecutionRecord[Any, Any] | None,
+        event_sink: AgentEventSink | None,
     ) -> None:
         payload: dict[str, Any]
         if record is not None and record.terminal_persisted:
@@ -1092,7 +1442,7 @@ class AgentLoopRunner:
             payload.setdefault("operation_id", record.operation_id)
         payload.setdefault("summary", _summarize_tool_result(result))
         self._emit(
-            invocation,
+            event_sink,
             AgentToolResult(
                 tool_call_id=tool_call_id,
                 operation_id=str(payload.get("operation_id") or ""),
@@ -1101,9 +1451,9 @@ class AgentLoopRunner:
         )
 
     @staticmethod
-    def _emit(invocation: AgentLoopInvocation, event: AgentLoopEvent) -> None:
-        if invocation.event_sink is not None:
-            invocation.event_sink.emit(event)
+    def _emit(event_sink: AgentEventSink | None, event: AgentLoopEvent) -> None:
+        if event_sink is not None:
+            event_sink.emit(event)
 
 
 def _parse_json_object(raw: str, error_message: str) -> dict[str, Any]:

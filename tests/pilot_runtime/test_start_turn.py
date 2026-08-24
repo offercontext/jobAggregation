@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+import tempfile
 from threading import Event, Thread
 from types import SimpleNamespace
 
@@ -28,13 +29,24 @@ from offerpilot.pilot_runtime.event_sink import InMemoryRuntimeInvocationControl
 from offerpilot.chat_transport import SyncAgentExecutionHost
 from offerpilot.pilot_runtime.service import (
     PilotRuntime,
+    ResolvedPolicyCatalog,
     ResolvedModel,
+    SegmentExecution,
     RuntimeDependencies,
     _result_persisted,
 )
 from offerpilot.pilot_runtime.service import _normalize_agent_result
+from offerpilot.pilot_runtime.composition import _ContextAdapter
+from offerpilot.context_projector.contracts import ProjectionError
+from offerpilot.ai.agent_loop import _LoopServices
 from offerpilot.ai.agent_contracts import AgentTurnResult, PendingAction
-from offerpilot.ai.agent_loop import NewTurnSeed
+from offerpilot.ai.agent_loop import NewTurnSeed, SegmentSurfaceGate, build_segment_surface_gate
+from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
+from offerpilot.ai.tool_authority.contracts import SegmentExecutionAuthority
+from offerpilot.ai.tool_authority.policy import validate_startup_policy
+from offerpilot.ai.tool_runtime.context import ToolExecutionContext
+from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.context_projector.selector import DEPENDENCY_POLICY_V1
 from offerpilot.ai.tool_runtime.contracts import ToolFailure
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.api import _confirmation_token as baseline_confirmation_token
@@ -51,6 +63,18 @@ from offerpilot.pilot_runtime.persistence import (
 from offerpilot.repositories.agent_runs import AgentRunRepository
 from offerpilot.repositories.chat import ChatRepository
 from offerpilot.repositories.agent_runs import StartRunCommand
+from offerpilot.repositories.application_events import ApplicationEventsRepository
+from offerpilot.repositories.applications import ApplicationsRepository
+from offerpilot.repositories.jd import JDAnalysesRepository
+from offerpilot.repositories.notes import NotesRepository
+from offerpilot.repositories.offers import OffersRepository
+from offerpilot.repositories.resumes import ResumesRepository
+
+
+_AUTHORITY_SESSIONS = init_database(
+    Path(tempfile.mkdtemp(prefix="offerpilot-pilot-authority-")) / "authority.db"
+)
+_AUTHORITY_POLICY = validate_startup_policy(MODEL_TOOL_CATALOG.authority_manifest)
 
 
 class _Phases:
@@ -104,6 +128,60 @@ class _Catalog:
         return tuple(SimpleNamespace(name=name) for name in sorted(self._write_names))
 
 
+def _real_segment(
+    conversation: object,
+    recorder: object,
+    catalog: object,
+    close_counter: list[int] | None = None,
+) -> tuple[SegmentExecution, SegmentSurfaceGate | None]:
+    conversation_id = getattr(conversation, "id")
+    context_type = str(getattr(conversation, "context_type", "workspace"))
+    context_ref = getattr(conversation, "context_ref", None)
+    if context_type != "application":
+        context_ref = None
+    mode = str(getattr(conversation, "mode", "general"))
+    revision = int(getattr(conversation, "scope_revision", 0))
+    factory = AuthorityFactory()
+    authority = factory.create_segment_authority(
+        conversation_id=conversation_id,
+        conversation_scope_revision=revision,
+        segment_id=f"pilot-test-{conversation_id}-{id(recorder)}",
+        trusted_scope=TrustedContextScope(context_type, context_ref, mode),
+        capability_profile_id=_AUTHORITY_POLICY.capability_profile.profile_id,
+        capabilities=frozenset(_AUTHORITY_POLICY.capability_profile.capabilities),
+        capability_policy_version=_AUTHORITY_POLICY.capability_policy_version,
+        binding_policy_version=_AUTHORITY_POLICY.binding_policy_version,
+        capability_profile_fingerprint=_AUTHORITY_POLICY.capability_profile_fingerprint,
+        binding_policy_fingerprint=_AUTHORITY_POLICY.binding_policy_fingerprint,
+    )
+    context = ToolExecutionContext(
+        authority=authority,
+        applications=ApplicationsRepository(_AUTHORITY_SESSIONS),
+        events=ApplicationEventsRepository(_AUTHORITY_SESSIONS),
+        notes=NotesRepository(_AUTHORITY_SESSIONS),
+        offers=OffersRepository(_AUTHORITY_SESSIONS),
+        resumes=ResumesRepository(_AUTHORITY_SESSIONS),
+        jd_analyses=JDAnalysesRepository(_AUTHORITY_SESSIONS),
+        run_recorder=recorder,  # type: ignore[arg-type]
+    )
+
+    def close() -> None:
+        if close_counter is not None:
+            close_counter.append(1)
+        factory.close()
+
+    return (
+        SegmentExecution(
+            authority=authority,
+            context=context,
+            catalog=None,
+            close=close,
+            surface_gate=None,
+        ),
+        None,
+    )
+
+
 class _Persistence:
     def __init__(self, phases: _Phases, *, pending: object | None = None) -> None:
         self.phases = phases
@@ -138,42 +216,48 @@ class _Persistence:
         del conversation_id, content
         self.user_count += 1
         message_id = self._append_message("user")
-        return PersistenceResult(PersistenceStatus.PERSISTED, message_count=1, message_id=message_id)
+        return PersistenceResult(
+            PersistenceStatus.PERSISTED, message_count=1, message_id=message_id
+        )
 
     def persist_initial_messages(self, conversation_id: int, messages: object) -> object:
         del conversation_id
         self.message_count += 1
         values = tuple(messages) if isinstance(messages, (tuple, list)) else ()
         message_ids = tuple(
-            self._append_message(str(getattr(message, "role", "assistant")))
-            for message in values
+            self._append_message(str(getattr(message, "role", "assistant"))) for message in values
         )
         if not message_ids:
             message_ids = (self._append_message("assistant"),)
         return PersistenceResult(PersistenceStatus.PERSISTED, message_ids=message_ids)
 
-    def persist_initial_pending(self, conversation_id: int, messages: object, pending: object) -> object:
+    def persist_initial_pending(
+        self, conversation_id: int, messages: object, pending: object
+    ) -> object:
         del conversation_id
         self.pending = pending
         self.pending_count += 1
         values = tuple(messages) if isinstance(messages, (tuple, list)) else ()
         message_ids = tuple(
-            self._append_message(str(getattr(message, "role", "assistant")))
-            for message in values
+            self._append_message(str(getattr(message, "role", "assistant"))) for message in values
         )
         return PersistenceResult(
             PersistenceStatus.PERSISTED,
             message_ids=message_ids,
         )
 
-    def persist_initial_assistant_message(self, conversation_id: int, content: str, **kwargs: object) -> object:
+    def persist_initial_assistant_message(
+        self, conversation_id: int, content: str, **kwargs: object
+    ) -> object:
         del conversation_id, content, kwargs
         return PersistenceResult(
             PersistenceStatus.PERSISTED,
             message_id=self._append_message("assistant"),
         )
 
-    def persist_assistant_message(self, conversation_id: int, content: str, **kwargs: object) -> object:
+    def persist_assistant_message(
+        self, conversation_id: int, content: str, **kwargs: object
+    ) -> object:
         return self.persist_initial_assistant_message(conversation_id, content, **kwargs)
 
     def persist_clarification(
@@ -187,15 +271,16 @@ class _Persistence:
         self.clarification_count += 1
         values = tuple(messages) if isinstance(messages, (tuple, list)) else ()
         message_ids = tuple(
-            self._append_message(str(getattr(message, "role", "assistant")))
-            for message in values
+            self._append_message(str(getattr(message, "role", "assistant"))) for message in values
         )
         self.pending = None
         self.clarification = SimpleNamespace(pending=pending, question=question)
         message_ids += (self._append_message("assistant"),)
         return PersistenceResult(PersistenceStatus.PERSISTED, message_ids=message_ids)
 
-    def set_pending_clarification(self, conversation_id: int, pending: object, question: str) -> object:
+    def set_pending_clarification(
+        self, conversation_id: int, pending: object, question: str
+    ) -> object:
         del conversation_id
         self.clarification = SimpleNamespace(pending=pending, question=question)
         self.clarification_count += 1
@@ -272,7 +357,9 @@ class _Assembler:
 
 
 class _Driver:
-    def __init__(self, phases: _Phases, result: object | None = None, error: BaseException | None = None) -> None:
+    def __init__(
+        self, phases: _Phases, result: object | None = None, error: BaseException | None = None
+    ) -> None:
         self.phases = phases
         self.result = result or AgentTurnResult([], "hello", None)
         self.error = error
@@ -315,6 +402,50 @@ def test_agent_driver_result_boundary_rejects_structural_namespace() -> None:
         _normalize_agent_result({"added": [], "reply": "done", "pending": None})
 
 
+def test_production_context_assembler_appends_current_request_as_last_user() -> None:
+    class Persistence:
+        def get_pending_clarification(self, conversation_id: int) -> None:
+            del conversation_id
+            return None
+
+    adapter = _ContextAdapter(
+        Persistence(),  # type: ignore[arg-type]
+        system_message=lambda: Message(role="system", content="policy"),
+        clarification_message=lambda _pending, _message: None,
+        page_messages=lambda _page: (),
+    )
+    assembled = adapter.assemble(
+        SimpleNamespace(history=(Message(role="user", content="old"),)),
+        _Conversation(),
+        StartTurnRequest(message="new request"),
+    )
+    assert isinstance(assembled[-1], Message)
+    assert assembled[-1].role == "user"
+    assert assembled[-1].content == "new request"
+    assert assembled[-1].surface_contributor == "current_request"
+
+
+def test_surface_aware_model_without_exact_session_factory_fails_closed() -> None:
+    class SurfaceModel:
+        def complete_agent_surface(self, *_args: object, **_kwargs: object) -> object:
+            return object()
+
+    invocation = SimpleNamespace(
+        model=SurfaceModel(),
+        catalog=SimpleNamespace(),
+        tool_context=SimpleNamespace(authority=object()),
+        seed=SimpleNamespace(),
+        event_sink=None,
+        cancel_check=None,
+        run_recorder=_Recorder(_Phases()),
+        runtime_signal_sink=None,
+        surface_gate=None,
+    )
+    services = _LoopServices(invocation)
+    with pytest.raises(ProjectionError, match="factory_required"):
+        services.complete_model([], [], model_step=1)
+
+
 def _runtime(
     phases: _Phases,
     *,
@@ -330,22 +461,76 @@ def _runtime(
     catalog: object | None = None,
     dependency_catalog: object | None = None,
     model_resolver: object | None = None,
+    surface_resolver: object | None = None,
+    policy_resolver: object | None = None,
+    segment_resolver: object | None = None,
+    close_counter: list[int] | None = None,
 ) -> tuple[PilotRuntime, _Persistence, _Journal]:
     resolved_persistence = persistence or _Persistence(phases)
     resolved_journal = journal or _Journal(phases)
-    resolved_catalog = catalog or _Catalog()
+    # Segment visibility is issued only against the reviewed typed catalog;
+    # pending/readback tests use unknown names when they need a rejection.
+    resolved_catalog = MODEL_TOOL_CATALOG
 
     def resolve_model(request: object, conversation: object) -> object:
         del request, conversation
         if model is None:
             return None
-        return ResolvedModel(model=model, catalog=resolved_catalog)
+        return ResolvedModel(model=model)
+
+    def resolve_policy(request: object, conversation: object, source_value: object) -> object:
+        del request, conversation, source_value
+        return ResolvedPolicyCatalog(
+            catalog=resolved_catalog,
+            policy=_AUTHORITY_POLICY,
+            dependency_policy=DEPENDENCY_POLICY_V1,
+        )
+
+    def resolve_segment(
+        request: object,
+        conversation: object,
+        source_value: object,
+        recorder: object,
+    ) -> object:
+        del request, source_value
+        segment, _gate = _real_segment(
+            conversation,
+            recorder,
+            resolved_catalog,
+            close_counter,
+        )
+        return segment
+
+    def resolve_surface(
+        request: object,
+        conversation: object,
+        source_value: object,
+        assembled: object,
+        policy: object,
+        segment: object,
+    ) -> object:
+        del request, conversation, source_value
+        messages = tuple(
+            value if isinstance(value, Message) else Message(role="user", content=str(value))
+            for value in assembled
+        )
+        return build_segment_surface_gate(
+            messages,
+            catalog=getattr(policy, "catalog"),
+            context=getattr(segment, "context"),
+            authority=getattr(segment, "authority"),
+            dependency_policy=getattr(policy, "dependency_policy"),
+            policy=getattr(policy, "policy"),
+        )
 
     runtime = PilotRuntime(
         RuntimeDependencies(
             conversations=_ConversationStore(phases, conversation),
             route_selector=lambda request, conversation: route,
-            model_resolver=model_resolver or resolve_model,
+            policy_catalog_resolver=policy_resolver or resolve_policy,
+            segment_context_resolver=segment_resolver or resolve_segment,
+            surface_gate_resolver=surface_resolver or resolve_surface,
+            continuation_model_resolver=model_resolver or resolve_model,
             persistence=resolved_persistence,
             journal=resolved_journal,
             source_loader=source or _Source(phases),
@@ -391,18 +576,236 @@ def test_start_turn_sync_sequence_is_frozen() -> None:
         "conversation",
         "route:model",
         "pending_guard",
+        "source_load",
+        "segment_resolve",
+        "context_assemble",
+        "policy_resolve",
+        "surface_resolve",
         "model_resolve",
         "user_persist",
         "run_start",
-        "source_load",
-        "context_assemble",
         "agent_host",
         "result_normalize",
         "message_persist",
         "run_finish",
     ]
-    assert persistence.user_count == 1
-    assert persistence.message_count == 1
+
+
+def test_sync_segment_failure_stops_before_policy_catalog_and_side_effects() -> None:
+    phases = _Phases()
+    policy_calls: list[object] = []
+
+    def failing_segment(
+        request: object,
+        conversation: object,
+        source: object,
+        recorder: object,
+    ) -> object:
+        del request, conversation, source, recorder
+        raise RuntimeError("segment unavailable")
+
+    def policy_spy(*args: object, **kwargs: object) -> object:
+        policy_calls.append((args, kwargs))
+        return ResolvedPolicyCatalog(
+            catalog=MODEL_TOOL_CATALOG,
+            policy=_AUTHORITY_POLICY,
+            dependency_policy=DEPENDENCY_POLICY_V1,
+        )
+
+    runtime, persistence, journal = _runtime(
+        phases,
+        segment_resolver=failing_segment,
+        policy_resolver=policy_spy,
+    )
+    driver = runtime._dependencies.agent_driver
+    result = _start(runtime, _Host(phases))
+
+    assert isinstance(result, RuntimeFailureOutcome)
+    assert result.code is RuntimeFailureCode.SOURCE_LOAD_FAILED
+    assert policy_calls == []
+    assert "context_assemble" not in phases.items
+    assert "policy_resolve" not in phases.items
+    assert "surface_resolve" not in phases.items
+    assert "model_resolve" not in phases.items
+    assert persistence.user_count == 0
+    assert getattr(driver, "provider_calls", 0) == 0
+    assert journal.recorder.dispositions == []
+
+
+def test_sync_live_policy_drift_closes_segment_before_provider_or_user() -> None:
+    phases = _Phases()
+    close_count: list[int] = []
+    drifted = replace(
+        _AUTHORITY_POLICY,
+        binding_policy_fingerprint="sha256:" + "1" * 64,
+    )
+
+    def drift_policy(
+        request: object,
+        conversation: object,
+        source: object,
+        segment: object,
+    ) -> object:
+        del request, conversation, source
+        assert type(segment) is SegmentExecution
+        assert type(segment.authority) is SegmentExecutionAuthority
+        assert type(segment.context) is ToolExecutionContext
+        assert segment.context.authority is segment.authority
+        assert segment.catalog is None
+        assert segment.policy is None
+        assert segment.surface_gate is None
+        return ResolvedPolicyCatalog(
+            catalog=MODEL_TOOL_CATALOG,
+            policy=drifted,
+            dependency_policy=DEPENDENCY_POLICY_V1,
+        )
+
+    runtime, persistence, journal = _runtime(
+        phases,
+        policy_resolver=drift_policy,
+        close_counter=close_count,
+    )
+    result = _start(runtime, _Host(phases))
+
+    assert isinstance(result, RuntimeFailureOutcome)
+    assert result.code is RuntimeFailureCode.OPERATION_UNAVAILABLE
+    assert close_count == [1]
+    assert "surface_resolve" not in phases.items
+    assert "model_resolve" not in phases.items
+    assert persistence.user_count == 0
+    assert journal.recorder.dispositions == []
+
+
+def test_sync_policy_spy_sees_exact_unbound_segment_after_segment_phase() -> None:
+    phases = _Phases()
+    seen: list[tuple[list[str], object]] = []
+
+    def policy_spy(
+        request: object,
+        conversation: object,
+        source: object,
+        segment: object,
+    ) -> object:
+        del request, conversation, source
+        seen.append((list(phases.items), segment))
+        assert type(segment) is SegmentExecution
+        assert type(segment.authority) is SegmentExecutionAuthority
+        assert type(segment.context) is ToolExecutionContext
+        assert segment.context.authority is segment.authority
+        assert segment.catalog is None
+        assert segment.policy is None
+        assert segment.surface_gate is None
+        return ResolvedPolicyCatalog(
+            catalog=MODEL_TOOL_CATALOG,
+            policy=_AUTHORITY_POLICY,
+            dependency_policy=DEPENDENCY_POLICY_V1,
+        )
+
+    runtime, _persistence, _journal = _runtime(phases, policy_resolver=policy_spy)
+    result = _start(runtime, _Host(phases))
+
+    assert isinstance(result, MessageOutcome)
+    assert len(seen) == 1
+    snapshot, _segment = seen[0]
+    assert snapshot.index("segment_resolve") < snapshot.index("policy_resolve")
+
+
+def test_sync_malformed_surface_gate_closes_before_model_or_user() -> None:
+    phases = _Phases()
+    close_count: list[int] = []
+
+    def malformed_gate(*_args: object, **_kwargs: object) -> object:
+        return object()
+
+    runtime, persistence, journal = _runtime(
+        phases,
+        surface_resolver=malformed_gate,
+        close_counter=close_count,
+    )
+    result = _start(runtime, _Host(phases))
+
+    assert isinstance(result, RuntimeFailureOutcome)
+    assert result.code is RuntimeFailureCode.OPERATION_UNAVAILABLE
+    assert close_count == [1]
+    assert "model_resolve" not in phases.items
+    assert persistence.user_count == 0
+
+
+@pytest.mark.parametrize(
+    ("field_name", "error"),
+    [
+        ("status", ValueError("status getter")),
+        ("status", KeyboardInterrupt()),
+        ("message_id", ValueError("message id getter")),
+        ("message_id", KeyboardInterrupt()),
+    ],
+)
+def test_sync_user_result_getter_closes_segment_on_any_exception(
+    field_name: str,
+    error: BaseException,
+) -> None:
+    phases = _Phases()
+    close_count: list[int] = []
+
+    class ExplodingResult:
+        @property
+        def status(self) -> object:
+            if field_name == "status":
+                raise error
+            return PersistenceStatus.PERSISTED
+
+        @property
+        def message_id(self) -> object:
+            if field_name == "message_id":
+                raise error
+            return 1
+
+    class PersistenceWithExplodingResult(_Persistence):
+        def persist_initial_user_message(self, conversation_id: int, content: str) -> object:
+            del conversation_id, content
+            return ExplodingResult()
+
+    persistence = PersistenceWithExplodingResult(phases)
+    runtime, _, journal = _runtime(
+        phases,
+        persistence=persistence,
+        close_counter=close_count,
+    )
+
+    with pytest.raises(type(error)):
+        _start(runtime, _Host(phases))
+    assert close_count == [1]
+
+
+@pytest.mark.parametrize("error", [ValueError("persistence surface"), KeyboardInterrupt()])
+def test_sync_persistence_surface_getter_closes_segment_on_any_exception(
+    error: BaseException,
+) -> None:
+    phases = _Phases()
+    close_count: list[int] = []
+
+    class PersistenceWithExplodingSurface(_Persistence):
+        def __getattribute__(self, name: str) -> object:
+            if name == "persist_initial_assistant_message":
+                raise error
+            return super().__getattribute__(name)
+
+    persistence = PersistenceWithExplodingSurface(phases)
+    runtime, _, journal = _runtime(
+        phases,
+        persistence=persistence,
+        close_counter=close_count,
+    )
+
+    if isinstance(error, KeyboardInterrupt):
+        with pytest.raises(KeyboardInterrupt):
+            _start(runtime, _Host(phases))
+    else:
+        result = _start(runtime, _Host(phases))
+        assert isinstance(result, RuntimeFailureOutcome)
+        assert result.code is RuntimeFailureCode.OPERATION_FAILED
+    assert close_count == [1]
+    assert journal.recorder.events == []
 
 
 def test_sync_host_leaves_control_active_until_runtime_terminal_commit() -> None:
@@ -519,8 +922,7 @@ def test_journal_factory_receives_exact_start_run_builder_and_baseline_events() 
     assert journal.command is not None
     assert journal.command.input_message_id == 11
     assert any(
-        getattr(event, "event_type", None) == "route.selected"
-        for event in journal.recorder.events
+        getattr(event, "event_type", None) == "route.selected" for event in journal.recorder.events
     )
     assert journal.recorder.contexts
     assert any(
@@ -567,11 +969,44 @@ def test_real_run_recorder_factory_accepts_runtime_builder_and_records_terminal_
             assert conversation_id == conversation.id
             return conversation
 
+    def resolve_surface(
+        request: object,
+        current_conversation: object,
+        source: object,
+        assembled: object,
+        policy: object,
+        segment: object,
+    ) -> object:
+        del request, current_conversation, source
+        messages = tuple(
+            value if isinstance(value, Message) else Message(role="user", content=str(value))
+            for value in assembled
+        )
+        return build_segment_surface_gate(
+            messages,
+            catalog=getattr(policy, "catalog"),
+            context=getattr(segment, "context"),
+            authority=getattr(segment, "authority"),
+            dependency_policy=getattr(policy, "dependency_policy"),
+            policy=getattr(policy, "policy"),
+        )
+
     runtime = PilotRuntime(
         RuntimeDependencies(
             conversations=Gateway(),
             persistence=coordinator,
-            model_resolver=lambda request, conversation: "model",
+            policy_catalog_resolver=lambda request, conversation, source: ResolvedPolicyCatalog(
+                catalog=MODEL_TOOL_CATALOG,
+                policy=_AUTHORITY_POLICY,
+                dependency_policy=DEPENDENCY_POLICY_V1,
+            ),
+            segment_context_resolver=lambda request, conversation, source, recorder: _real_segment(
+                conversation, recorder, MODEL_TOOL_CATALOG
+            )[0],
+            surface_gate_resolver=resolve_surface,
+            continuation_model_resolver=lambda request, conversation, policy: ResolvedModel(
+                model="model"
+            ),
             source_loader=_Source(phases),
             context_assembler=_Assembler(phases),
             agent_driver=_Driver(phases),
@@ -643,7 +1078,9 @@ def test_missing_conversation_has_no_model_or_persistence_side_effect() -> None:
 
 def test_live_pending_stops_before_model_resolution() -> None:
     phases = _Phases()
-    pending = SimpleNamespace(tool_call_id="call-1", tool_name="write", args="{}", human="write", operation_id="op-1")
+    pending = SimpleNamespace(
+        tool_call_id="call-1", tool_name="write", args="{}", human="write", operation_id="op-1"
+    )
     runtime, persistence, _ = _runtime(phases, persistence=_Persistence(phases, pending=pending))
 
     result = _start(runtime, _Host(phases))
@@ -654,7 +1091,7 @@ def test_live_pending_stops_before_model_resolution() -> None:
     assert "agent_host" not in phases.items
 
 
-def test_source_failure_persists_user_and_finishes_failed_journal() -> None:
+def test_source_failure_stops_before_user_and_journal() -> None:
     phases = _Phases()
     control = InMemoryRuntimeInvocationControl()
     runtime, persistence, journal = _runtime(
@@ -666,9 +1103,9 @@ def test_source_failure_persists_user_and_finishes_failed_journal() -> None:
 
     assert isinstance(result, RuntimeFailureOutcome)
     assert result.code is RuntimeFailureCode.SOURCE_LOAD_FAILED
-    assert persistence.user_count == 1
+    assert persistence.user_count == 0
     assert persistence.message_count == 0
-    assert journal.recorder.dispositions == [("failed", "source_load_failed")]
+    assert journal.recorder.dispositions == []
     assert control.state is InvocationState.COMPLETED
 
 
@@ -706,7 +1143,12 @@ def test_initial_user_persist_failure_is_safe_before_journal_or_agent(
     assert driver.provider_calls == 0
     assert journal.recorder.dispositions == []
     assert "run_start" not in phases.items
-    assert "source_load" not in phases.items
+    assert "source_load" in phases.items
+    assert "context_assemble" in phases.items
+    assert "policy_resolve" in phases.items
+    assert "segment_resolve" in phases.items
+    assert "model_resolve" in phases.items
+    assert "run_start" not in phases.items
     assert "agent_host" not in phases.items
 
 
@@ -729,7 +1171,7 @@ def test_phase_sink_failure_is_fail_open_before_authoritative_finish() -> None:
 
     assert isinstance(result, RuntimeFailureOutcome)
     assert result.code is RuntimeFailureCode.SOURCE_LOAD_FAILED
-    assert journal.recorder.dispositions == [("failed", "source_load_failed")]
+    assert journal.recorder.dispositions == []
 
 
 def test_phase_sink_failure_does_not_block_authoritative_abandon() -> None:
@@ -873,6 +1315,7 @@ def test_model_unconfigured_returns_before_user_persist() -> None:
 
 def test_model_unconfigured_is_only_mapped_from_closed_signal() -> None:
     phases = _Phases()
+
     def resolve_model(request: object, conversation: object) -> object:
         del request, conversation
         raise ModelUnconfiguredError()
@@ -888,6 +1331,7 @@ def test_model_unconfigured_is_only_mapped_from_closed_signal() -> None:
 
 def test_model_resolver_exception_is_provider_failure_not_unconfigured() -> None:
     phases = _Phases()
+
     def resolve_model(request: object, conversation: object) -> object:
         del request, conversation
         raise ValueError("AI is not configured")
@@ -910,7 +1354,7 @@ def test_resolved_model_with_none_model_is_unconfigured_before_user_persist() ->
 
     def resolve_model(request: object, conversation: object) -> object:
         del request, conversation
-        return ResolvedModel(model=None, catalog=_Catalog())
+        return ResolvedModel(model=None)
 
     runtime, _, _journal = _runtime(
         phases,
@@ -949,9 +1393,9 @@ def test_forced_clarification_requires_exact_pending_readback() -> None:
             return SimpleNamespace(
                 pending=SimpleNamespace(
                     tool_call_id="other-call",
-                    tool_name="write",
+                    tool_name="update_application_status",
                     args="{}",
-                    human="write",
+                    human="update_application_status",
                     operation_id="",
                 ),
                 question="other question",
@@ -963,7 +1407,7 @@ def test_forced_clarification_requires_exact_pending_readback() -> None:
             Message(
                 role="assistant",
                 content="",
-                tool_calls=[ToolCall("call-1", "write", "{}")],
+                tool_calls=[ToolCall("call-1", "update_application_status", "{}")],
             )
         ],
         reply="",
@@ -1023,9 +1467,7 @@ def test_commit_fence_cancel_wins_without_running_callback() -> None:
     writes: list[str] = []
 
     assert control.request_cancel(CancelReason.EXPLICIT_CANCEL)
-    committed, value = control.run_if_active(
-        lambda: (writes.append("persisted"), "value")[1]
-    )
+    committed, value = control.run_if_active(lambda: (writes.append("persisted"), "value")[1])
 
     assert committed is False
     assert value is None
@@ -1050,9 +1492,7 @@ def test_commit_fence_persist_wins_then_cancel_waits_for_commit() -> None:
     assert entered.wait(timeout=5)
     cancel_result: list[bool] = []
     canceller = Thread(
-        target=lambda: cancel_result.append(
-            control.request_cancel(CancelReason.EXPLICIT_CANCEL)
-        )
+        target=lambda: cancel_result.append(control.request_cancel(CancelReason.EXPLICIT_CANCEL))
     )
     canceller.start()
     release.set()
@@ -1068,7 +1508,9 @@ def test_commit_fence_persist_wins_then_cancel_waits_for_commit() -> None:
 
 def test_provider_failure_is_safe_and_finishes_provider_error() -> None:
     phases = _Phases()
-    runtime, persistence, journal = _runtime(phases, driver=_Driver(phases, error=ValueError("secret")))
+    runtime, persistence, journal = _runtime(
+        phases, driver=_Driver(phases, error=ValueError("secret"))
+    )
 
     result = _start(runtime, _Host(phases))
 
@@ -1099,7 +1541,9 @@ def test_same_named_ordinary_exception_is_not_runtime_cancellation() -> None:
 
 def test_pending_result_is_atomically_persisted_and_suspended() -> None:
     phases = _Phases()
-    pending = PendingAction("call-1", "write", '{"id": 1}', "write", "op-1")
+    pending = PendingAction(
+        "call-1", "update_application_status", '{"id": 1}', "update_application_status", "op-1"
+    )
     persistence = _Persistence(phases)
     runtime, _, journal = _runtime(
         phases,
@@ -1152,7 +1596,7 @@ def test_pending_uses_resolved_catalog_not_global_dependency_catalog() -> None:
     runtime, _, journal = _runtime(
         phases,
         persistence=persistence,
-        catalog=_Catalog(write_names=()),
+        catalog=MODEL_TOOL_CATALOG,
         dependency_catalog=_Catalog(write_names=("write",)),
         driver=_Driver(phases, result=AgentTurnResult([], "", pending)),
     )
@@ -1167,7 +1611,9 @@ def test_pending_uses_resolved_catalog_not_global_dependency_catalog() -> None:
 
 def test_pending_readback_identity_mismatch_is_safe_after_persistence() -> None:
     phases = _Phases()
-    pending = PendingAction("call-1", "write", "{}", "write", "op-1")
+    pending = PendingAction(
+        "call-1", "update_application_status", "{}", "update_application_status", "op-1"
+    )
 
     class MismatchPersistence(_Persistence):
         def __init__(self, phases: _Phases) -> None:
@@ -1181,9 +1627,9 @@ def test_pending_readback_identity_mismatch_is_safe_after_persistence() -> None:
                 return None
             return SimpleNamespace(
                 tool_call_id="other-call",
-                tool_name="write",
+                tool_name="update_application_status",
                 args="{}",
-                human="write",
+                human="update_application_status",
                 operation_id="other-op",
             )
 
@@ -1215,7 +1661,9 @@ def test_persistence_failure_finishes_failed_not_completed(
     expected_code: RuntimeFailureCode,
 ) -> None:
     phases = _Phases()
-    action = PendingAction("call-1", "write", '{"id":1}', "write", "op-1")
+    action = PendingAction(
+        "call-1", "update_application_status", '{"id":1}', "update_application_status", "op-1"
+    )
 
     class FailingPersistence(_Persistence):
         def persist_initial_pending(
@@ -1233,9 +1681,7 @@ def test_persistence_failure_finishes_failed_not_completed(
 
     persistence = FailingPersistence(phases)
     result_value = (
-        AgentTurnResult([], "", action)
-        if pending
-        else AgentTurnResult([], "final", None)
+        AgentTurnResult([], "", action) if pending else AgentTurnResult([], "final", None)
     )
     runtime, _, journal = _runtime(
         phases,
@@ -1253,7 +1699,9 @@ def test_persistence_failure_finishes_failed_not_completed(
 
 def test_missing_target_uses_clarification_without_pending_outcome() -> None:
     phases = _Phases()
-    pending = PendingAction("call-1", "write", "{}", "write", "op-1")
+    pending = PendingAction(
+        "call-1", "update_application_status", "{}", "update_application_status", "op-1"
+    )
     persistence = _Persistence(phases)
     runtime, _, journal = _runtime(
         phases,
@@ -1275,7 +1723,9 @@ def test_non_atomic_clarification_set_failure_stops_before_assistant_and_complet
     failure_mode: str,
 ) -> None:
     phases = _Phases()
-    pending = PendingAction("call-1", "write", "{}", "write", "op-1")
+    pending = PendingAction(
+        "call-1", "update_application_status", "{}", "update_application_status", "op-1"
+    )
 
     class FallbackPersistence(_Persistence):
         def __init__(self, phases: _Phases) -> None:
@@ -1514,8 +1964,12 @@ def test_event_sink_transport_failure_is_not_provider_failure() -> None:
     assert persistence.message_count == 0
 
 
-@pytest.mark.parametrize("control_error", [RuntimeCancelled(), RuntimeTransportAborted(), KeyboardInterrupt()])
-def test_control_and_base_exceptions_are_rethrown_after_journal_cleanup(control_error: BaseException) -> None:
+@pytest.mark.parametrize(
+    "control_error", [RuntimeCancelled(), RuntimeTransportAborted(), KeyboardInterrupt()]
+)
+def test_control_and_base_exceptions_are_rethrown_after_journal_cleanup(
+    control_error: BaseException,
+) -> None:
     phases = _Phases()
     runtime, _persistence, journal = _runtime(phases)
 

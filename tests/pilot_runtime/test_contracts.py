@@ -50,6 +50,7 @@ from offerpilot.pilot_runtime.contracts import (
     UserMessageSavedEvent,
 )
 from offerpilot.pilot_runtime.errors import RuntimeCancelled, RuntimeTransportAborted
+from offerpilot.pilot_runtime.service import ResolvedModel
 
 
 def test_freeze_json_mapping_has_stable_contract_exports() -> None:
@@ -59,6 +60,10 @@ def test_freeze_json_mapping_has_stable_contract_exports() -> None:
     assert "freeze_json_mapping" in contracts.__all__
     assert "freeze_json_mapping" in pilot_runtime.__all__
     assert pilot_runtime.freeze_json_mapping is freeze_json_mapping
+
+
+def test_resolved_model_is_provider_only_and_has_no_tool_context() -> None:
+    assert "tool_context" not in {field.name for field in fields(ResolvedModel)}
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
@@ -419,9 +424,7 @@ def test_confirmation_payload_preserves_complete_pending_action_shape() -> None:
         editable_fields=(_json_object({"field": "status", "label": "状态"}),),
         details=_json_object(
             {
-                "target": _json_object(
-                    {"id": "application-draft-1", "kind": "application"}
-                ),
+                "target": _json_object({"id": "application-draft-1", "kind": "application"}),
                 "proposed_changes": (
                     _json_object({"field": "status", "before": "", "after": "applied"}),
                 ),
@@ -559,7 +562,10 @@ def test_prepared_execution_kind_and_mode_matrix(
 
 
 def test_failure_codes_are_closed_and_errors_are_not_serializable() -> None:
-    assert RuntimeFailureOutcome(code=RuntimeFailureCode.SOURCE_LOAD_FAILED).code is RuntimeFailureCode.SOURCE_LOAD_FAILED
+    assert (
+        RuntimeFailureOutcome(code=RuntimeFailureCode.SOURCE_LOAD_FAILED).code
+        is RuntimeFailureCode.SOURCE_LOAD_FAILED
+    )
     with pytest.raises((TypeError, ValueError)):
         RuntimeFailureOutcome(code="made_up_failure")  # type: ignore[arg-type]
     with pytest.raises((TypeError, ValueError)):
@@ -657,9 +663,12 @@ def test_sensitive_and_opaque_values_are_not_exposed_by_repr() -> None:
 def test_stream_version_and_transport_mode_are_closed_and_consistent() -> None:
     assert RuntimeTransportContext(mode="sync").stream_version is None
     run_id = uuid4()
-    assert RuntimeTransportContext(
-        mode="stream", transport_run_id=run_id, stream_version="pilot-sse-v1"
-    ).stream_version == "pilot-sse-v1"
+    assert (
+        RuntimeTransportContext(
+            mode="stream", transport_run_id=run_id, stream_version="pilot-sse-v1"
+        ).stream_version
+        == "pilot-sse-v1"
+    )
     with pytest.raises(TypeError):
         RuntimeTransportContext(mode=object())  # type: ignore[arg-type]
     with pytest.raises(ValueError):
@@ -868,7 +877,5 @@ def test_chat_route_failure_codes_match_the_closed_baseline_set() -> None:
     }
     for source_path, source_codes in source_expectations.items():
         source_text = source_path.read_text(encoding="utf-8")
-        assert source_codes <= {
-            code for code in expected if code in source_text
-        }, source_path
+        assert source_codes <= {code for code in expected if code in source_text}, source_path
     assert enum_values == expected

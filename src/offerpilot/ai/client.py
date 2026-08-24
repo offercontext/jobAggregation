@@ -55,8 +55,20 @@ class ConfiguredAIClient:
             chain = FrozenProviderExecutionChain.freeze(self._providers)
         except ProjectionError as exc:
             raise ValueError(f"AI provider configuration is invalid: {exc.code}") from exc
+        self._provider_chain = chain
         self._agent_gateway = AgentProviderGatewaySession(
             chain,
+            SingleCandidateAgentTransport(
+                self._complete_with_frozen_candidate,
+                self._stream_with_frozen_candidate,
+            ),
+        )
+
+    def new_agent_provider_session(self) -> AgentProviderGatewaySession:
+        """Return a fresh gateway for one exact model-call surface."""
+
+        return AgentProviderGatewaySession(
+            self._provider_chain,
             SingleCandidateAgentTransport(
                 self._complete_with_frozen_candidate,
                 self._stream_with_frozen_candidate,

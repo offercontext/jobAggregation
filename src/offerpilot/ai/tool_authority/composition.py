@@ -1124,6 +1124,7 @@ class AuthorityFactory:
                 prepared.binding,
                 prepared._replacement_guard,
                 _dataclass_snapshot(prepared.binding),
+                prepared.typed_args,
                 _canonical_arguments_digest(prepared.typed_args),
             )
             self._objects[id(prepared)] = prepared
@@ -1664,10 +1665,12 @@ class AuthorityFactory:
         current_arguments_digest = _canonical_arguments_digest(original.arguments)
         if not constant_time_equal(current_arguments_digest, cast(str, fields[2])):
             raise AuthorityPhaseError("Prepared arguments changed")
+        if original.typed_args is not fields[8]:
+            raise AuthorityPhaseError("Prepared typed arguments object identity changed")
         current_typed_args_digest = _canonical_arguments_digest(original.typed_args)
         if not constant_time_equal(
             current_typed_args_digest,
-            cast(str, fields[8]),
+            cast(str, fields[9]),
         ):
             raise AuthorityPhaseError("Prepared typed arguments changed")
         if original.authority_instance_token is not _authority_token(found[2]):

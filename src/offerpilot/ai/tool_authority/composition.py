@@ -66,6 +66,7 @@ from .contracts import (
 _ACTIVE_AUTHORITIES: dict[int, tuple[ToolExecutionAuthority, "AuthorityFactory"]] = {}
 _ACTIVE_AUTHORITIES_LOCK = RLock()
 _ACTIVE_OBJECTS: dict[int, tuple[object, "AuthorityFactory"]] = {}
+_ACTIVE_REPOSITORY_BINDINGS: dict[int, tuple[object, "AuthorityFactory"]] = {}
 
 
 def _authority_token(authority: ToolExecutionAuthority) -> AuthorityInstanceToken:
@@ -215,6 +216,28 @@ class _RegisteredIdentity:
         self.semantic = dict(semantic or {})
 
 
+class _RepositoryBindingTicket:
+    """One-shot composition-root ticket for a Session-bound repository port."""
+
+    __slots__ = ("factory", "repository", "session", "constraint", "authority", "used")
+
+    def __init__(
+        self,
+        factory: "AuthorityFactory",
+        *,
+        repository: object,
+        session: object,
+        constraint: object,
+        authority: ToolExecutionAuthority,
+    ) -> None:
+        self.factory = factory
+        self.repository = repository
+        self.session = session
+        self.constraint = constraint
+        self.authority = authority
+        self.used = False
+
+
 class _AuthorityRecord:
     __slots__ = ("authority", "token", "kind", "fields", "trusted_scope_fields")
 
@@ -257,6 +280,9 @@ class AuthorityFactory:
         self._surfaces: dict[int, _RegisteredIdentity] = {}
         self._bindings: dict[int, _RegisteredIdentity] = {}
         self._gateway_sessions: dict[int, _RegisteredIdentity] = {}
+        self._repository_binding_tickets: dict[int, _RepositoryBindingTicket] = {}
+        self._repository_bindings: dict[int, _RegisteredIdentity] = {}
+        self._repository_binding_fields: dict[int, tuple[object, ...]] = {}
         self._attempts: dict[str, _RegisteredIdentity] = {}
         self._operations: dict[int, _RegisteredIdentity] = {}
         self._transactions: dict[int, _RegisteredIdentity] = {}
@@ -327,6 +353,7 @@ class AuthorityFactory:
             + len(self._surfaces)
             + len(self._bindings)
             + len(self._gateway_sessions)
+            + len(self._repository_bindings)
             + len(self._attempts)
             + len(self._operations)
             + len(self._transactions)
@@ -349,6 +376,9 @@ class AuthorityFactory:
                 for object_id, (_, owner) in tuple(_ACTIVE_OBJECTS.items()):
                     if owner is self:
                         del _ACTIVE_OBJECTS[object_id]
+                for binding_id, (_, owner) in tuple(_ACTIVE_REPOSITORY_BINDINGS.items()):
+                    if owner is self:
+                        del _ACTIVE_REPOSITORY_BINDINGS[binding_id]
             self._authorities.clear()
             self._pending.clear()
             self._prepared.clear()
@@ -369,6 +399,9 @@ class AuthorityFactory:
             self._surfaces.clear()
             self._bindings.clear()
             self._gateway_sessions.clear()
+            self._repository_binding_tickets.clear()
+            self._repository_bindings.clear()
+            self._repository_binding_fields.clear()
             self._attempts.clear()
             self._operations.clear()
             self._transactions.clear()
@@ -600,6 +633,21 @@ class AuthorityFactory:
                     if registration.authority is authority:
                         del table[identity_id]
                         self._objects.pop(identity_id, None)
+            for binding_id, registration in tuple(self._repository_bindings.items()):
+                if registration.authority is authority:
+                    del self._repository_bindings[binding_id]
+                    self._repository_binding_fields.pop(binding_id, None)
+                    self._objects.pop(binding_id, None)
+                    self._drop_object(registration.value)
+                    with _ACTIVE_AUTHORITIES_LOCK:
+                        found_binding = _ACTIVE_REPOSITORY_BINDINGS.get(binding_id)
+                        if found_binding is not None and found_binding[0] is registration.value:
+                            del _ACTIVE_REPOSITORY_BINDINGS[binding_id]
+            for ticket_id, ticket in tuple(self._repository_binding_tickets.items()):
+                if ticket.authority is authority:
+                    del self._repository_binding_tickets[ticket_id]
+                    self._objects.pop(ticket_id, None)
+                    self._drop_object(ticket)
             for spec_id, (spec, owner, _) in tuple(self._tool_specs.items()):
                 if owner is authority:
                     del self._tool_specs[spec_id]
@@ -1276,6 +1324,185 @@ class AuthorityFactory:
             _validate_snapshot(constraint, found[2], "scope constraint")
             if constraint.authority_instance_token is not _authority_token(authority):
                 raise AuthorityPhaseError("scope constraint token mismatch")
+
+    def issue_repository_binding_ticket(
+        self,
+        *,
+        repository: object,
+        session: object,
+        constraint: ApplicationScopeConstraint,
+        authority: ToolExecutionAuthority,
+    ) -> object:
+        """Issue a one-shot ticket for one exact repository binding attempt."""
+
+        with self._lock:
+            self._ensure_open()
+            self.require_scope_constraint(constraint, authority)
+            ticket = _RepositoryBindingTicket(
+                self,
+                repository=repository,
+                session=session,
+                constraint=constraint,
+                authority=authority,
+            )
+            self._claim_object(ticket)
+            self._repository_binding_tickets[id(ticket)] = ticket
+            self._objects[id(ticket)] = ticket
+            return ticket
+
+    def revoke_repository_binding_ticket(self, ticket: object) -> None:
+        """Drop an unused binding ticket after construction failure."""
+
+        with self._lock:
+            self._ensure_open()
+            found = self._repository_binding_tickets.get(id(ticket))
+            if found is None or found is not ticket:
+                raise AuthorityPhaseError("repository binding ticket is not active")
+            del self._repository_binding_tickets[id(ticket)]
+            self._objects.pop(id(ticket), None)
+            self._drop_object(ticket)
+
+    def register_repository_binding(
+        self,
+        binding: object,
+        *,
+        ticket: object,
+        repository: object,
+        session: object,
+        constraint: ApplicationScopeConstraint,
+        authority: ToolExecutionAuthority,
+    ) -> object:
+        """Register an exact Session-bound repository binding once."""
+
+        with self._lock:
+            self._ensure_open()
+            self.require_scope_constraint(constraint, authority)
+            ticket_record = self._repository_binding_tickets.get(id(ticket))
+            if (
+                ticket_record is None
+                or ticket_record is not ticket
+                or ticket_record.used
+                or ticket_record.factory is not self
+                or ticket_record.repository is not repository
+                or ticket_record.session is not session
+                or ticket_record.constraint is not constraint
+                or ticket_record.authority is not authority
+            ):
+                raise AuthorityPhaseError("repository binding ticket mismatch")
+            from offerpilot.repositories.session_binding import ScopedRepositoryBinding
+
+            if type(binding) is not ScopedRepositoryBinding:
+                raise AuthorityPhaseError("repository binding has an invalid concrete type")
+            try:
+                binding._assert_sealed()
+            except AttributeError as exc:
+                raise AuthorityPhaseError("repository binding seal is missing") from exc
+            if (
+                binding.session is not session
+                or binding.constraint is not constraint
+                or binding.authority is not authority
+                or binding.authority_factory is not self
+                or binding._ticket is not ticket
+            ):
+                raise AuthorityPhaseError("repository binding provenance mismatch")
+            binding_id = id(binding)
+            if binding_id in self._repository_bindings:
+                raise AuthorityPhaseError("repository binding is already registered")
+            self._claim_object(binding)
+            self._repository_bindings[binding_id] = _RegisteredIdentity(
+                binding,
+                authority=authority,
+                parent=repository,
+                provenance=(session, constraint, self, ticket),
+            )
+            self._repository_binding_fields[binding_id] = (
+                repository,
+                session,
+                constraint,
+                authority,
+                self,
+                ticket,
+            )
+            self._objects[binding_id] = binding
+            ticket_record.used = True
+            del self._repository_binding_tickets[id(ticket)]
+            self._objects.pop(id(ticket), None)
+            self._drop_object(ticket)
+            with _ACTIVE_AUTHORITIES_LOCK:
+                _ACTIVE_REPOSITORY_BINDINGS[binding_id] = (binding, self)
+            return binding
+
+    def require_repository_binding(
+        self,
+        binding: object,
+        *,
+        repository: object,
+        session: object,
+        constraint: object,
+    ) -> None:
+        """Require exact binding/repository/session/constraint provenance."""
+
+        with self._lock:
+            self._ensure_open()
+            registration = self._repository_bindings.get(id(binding))
+            if registration is None or registration.value is not binding:
+                raise AuthorityPhaseError("repository binding is not active in this factory")
+            expected = self._repository_binding_fields.get(id(binding))
+            if expected is None:
+                raise AuthorityPhaseError("repository binding snapshot is missing")
+            expected_repository, expected_session, expected_constraint, expected_authority, expected_factory, expected_ticket = expected
+            if (
+                repository is not expected_repository
+                or session is not expected_session
+                or constraint is not expected_constraint
+            ):
+                raise AuthorityPhaseError("repository binding caller provenance mismatch")
+            self._authority_record(expected_authority)
+            self.require_scope_constraint(
+                expected_constraint, cast(ToolExecutionAuthority, expected_authority)
+            )
+            from offerpilot.repositories.session_binding import ScopedRepositoryBinding
+
+            if type(binding) is not ScopedRepositoryBinding:
+                raise AuthorityPhaseError("repository binding has an invalid concrete type")
+            try:
+                binding._assert_sealed()
+            except AttributeError as exc:
+                raise AuthorityPhaseError("repository binding seal is missing") from exc
+            if not self._repository_binding_snapshot_matches(binding, expected):
+                raise AuthorityPhaseError("repository binding snapshot changed")
+
+    @staticmethod
+    def _repository_binding_snapshot_matches(
+        binding: object,
+        expected: tuple[object, ...],
+    ) -> bool:
+        expected_repository, expected_session, expected_constraint, expected_authority, expected_factory, expected_ticket = expected
+        try:
+            from offerpilot.repositories.session_binding import ScopedRepositoryBinding
+
+            if type(binding) is not ScopedRepositoryBinding:
+                return False
+            binding._assert_sealed()
+            actual = (
+                expected_repository,
+                binding.session,
+                binding.constraint,
+                binding.authority,
+                binding.authority_factory,
+                binding._ticket,
+            )
+        except (AttributeError, AuthorityPhaseError):
+            return False
+        return (
+            actual[0] is expected_repository
+            and actual[1] is expected_session
+            and actual[2] is expected_constraint
+            and actual[3] is expected_authority
+            and actual[4] is expected_factory
+            and actual[5] is expected_ticket
+        )
+
 
     def create_binding_target_resolution(
         self,
@@ -2930,6 +3157,12 @@ class AuthorityFactory:
                 for lifecycle in self._proofs.values()
             ):
                 return True
+            repository_binding = self._repository_bindings.get(id(value))
+            if repository_binding is not None and repository_binding.value is value:
+                snapshot = self._repository_binding_fields.get(id(value))
+                return snapshot is not None and self._repository_binding_snapshot_matches(
+                    value, snapshot
+                )
             call = self._calls.get(id(value))
             if call is not None and call[0] is value:
                 try:
@@ -2973,6 +3206,27 @@ def _active_factory(authority: ToolExecutionAuthority) -> AuthorityFactory:
         if found is None or found[0] is not authority:
             raise AuthorityPhaseError("authority is not active")
         return found[1]
+
+
+def require_repository_binding(
+    binding: object,
+    *,
+    repository: object,
+    session: object,
+    constraint: object,
+) -> None:
+    """Validate a repository binding through its owning live factory."""
+
+    with _ACTIVE_AUTHORITIES_LOCK:
+        found = _ACTIVE_REPOSITORY_BINDINGS.get(id(binding))
+    if found is None or found[0] is not binding:
+        raise AuthorityPhaseError("repository binding is not active")
+    found[1].require_repository_binding(
+        binding,
+        repository=repository,
+        session=session,
+        constraint=constraint,
+    )
 
 
 _PHASE_IDENTITIES: Mapping[str, type[AuthorityCallIdentity]] = {

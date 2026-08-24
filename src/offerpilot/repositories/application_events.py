@@ -73,15 +73,15 @@ class ApplicationEventsRepository:
         authority_factory: AuthorityFactoryProtocol,
         authority: ToolExecutionAuthority,
     ) -> "ApplicationEventsRepository":
+        repository = ApplicationEventsRepository(self._session_factory, session)
         binding = bind_scoped_repository(
             session,
             constraint,
             authority_factory=authority_factory,
             authority=authority,
+            repository=repository,
         )
-        return attach_scoped_repository(
-            ApplicationEventsRepository(self._session_factory, session), binding
-        )
+        return attach_scoped_repository(repository, binding)
 
     def _require_scoped(self, constraint: object) -> ScopedRepositoryBinding:
         binding = self._scope_binding
@@ -89,7 +89,9 @@ class ApplicationEventsRepository:
             raise scoped_authority_phase_error(
                 "scoped repository requires a caller-owned bound Session"
             )
-        binding.require(constraint)
+        if type(binding) is not ScopedRepositoryBinding:
+            raise scoped_authority_phase_error("scoped repository binding has an invalid type")
+        binding.require(constraint, repository=self)
         return binding
 
     def create(self, data: ApplicationEventCreate) -> ApplicationEvent:

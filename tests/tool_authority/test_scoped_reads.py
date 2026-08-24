@@ -26,7 +26,11 @@ from offerpilot.repositories.applications import ApplicationCreate, Applications
 from offerpilot.repositories.jd import JDAnalysesRepository, JDAnalysisCreate
 from offerpilot.repositories.notes import NoteCreate, NotesRepository
 from offerpilot.repositories.offers import OfferCreate, OffersRepository
-from offerpilot.repositories.session_binding import ScopeAccessDenied, ScopedRepositoryBinding
+from offerpilot.repositories.session_binding import (
+    ScopeAccessDenied,
+    ScopedRepositoryBinding,
+    _SCOPED_BINDING_SEAL,
+)
 
 
 _DIGEST = "sha256:" + "a" * 64
@@ -260,6 +264,83 @@ def test_scoped_binding_cannot_be_forged_or_subclass_factory_bypassed(seeded) ->
     finally:
         event.remove(engine, "before_cursor_execute", capture)
     assert statements == []
+
+
+def test_registered_binding_rejects_cross_repository_and_attribute_injection(seeded) -> None:
+    factory = AuthorityFactory()
+    _, authority, constraint = _constraint(factory)
+    engine = seeded["session_factory"].kw["bind"]
+    statements: list[str] = []
+
+    def capture(_conn, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement)
+
+    class EvilFactory(AuthorityFactory):
+        def require_scope_constraint(self, constraint, authority):
+            del constraint, authority
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        with seeded["session_factory"]() as session:
+            bound = _bind_scoped(seeded["applications"], session, factory, authority, constraint)
+            binding = bound._scope_binding
+            assert binding is not None
+
+            with pytest.raises(AuthorityPhaseError):
+                ScopedRepositoryBinding(
+                    session,
+                    constraint,
+                    factory,
+                    authority,
+                    _seal=_SCOPED_BINDING_SEAL,
+                )
+
+            foreign_repository = seeded["applications"].bind(session)
+            object.__setattr__(foreign_repository, "_scope_binding", binding)
+            with pytest.raises(AuthorityPhaseError):
+                foreign_repository.list_applications_scoped(constraint)
+            assert statements == []
+
+            forged = ApplicationScopeConstraint(
+                entity_kind="application",
+                mode="restricted",
+                allowed_identities=frozenset({seeded["second"].id}),
+                authority_instance_token=authority.authority_instance_token,
+            )
+            object.__setattr__(binding, "constraint", forged)
+            object.__setattr__(binding, "authority_factory", EvilFactory())
+            object.__setattr__(bound, "_scope_binding", binding)
+            with pytest.raises(AuthorityPhaseError):
+                bound.list_applications_scoped(forged)
+            assert statements == []
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+
+
+@pytest.mark.parametrize("cleanup", ("revoke", "close"))
+def test_binding_registry_cleanup_fails_closed_without_sql(seeded, cleanup: str) -> None:
+    factory = AuthorityFactory()
+    _, authority, constraint = _constraint(factory)
+    engine = seeded["session_factory"].kw["bind"]
+    statements: list[str] = []
+
+    def capture(_conn, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        with seeded["session_factory"]() as session:
+            bound = _bind_scoped(seeded["applications"], session, factory, authority, constraint)
+            assert factory.active_count > 0
+            if cleanup == "revoke":
+                factory.revoke_authority(authority)
+            else:
+                factory.close()
+            with pytest.raises(AuthorityPhaseError):
+                bound.list_applications_scoped(constraint)
+            assert statements == []
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
 
 
 def test_scoped_point_and_application_filter_ids_are_exact_positive_int64(seeded) -> None:

@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from offerpilot.ai.tool_runtime.contracts import ProviderToolContract
+from offerpilot.ai.tool_runtime.catalog import ToolCatalog
+from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 from offerpilot.context_projector.budget import (
     BUDGET_POLICY_VERSION,
     CANONICAL_MESSAGES_BYTE_CAP,
@@ -34,6 +36,11 @@ from offerpilot.context_projector.history import (
     validate_message_integrity,
 )
 from offerpilot.context_projector.selector import ToolSelectionSignals, select_tools
+from offerpilot.context_projector.authority_surface import (
+    AuthoritySurfaceView,
+    intersect_authority_surface,
+)
+from offerpilot.context_projector.selector import DEPENDENCY_POLICY_V1, DependencyPolicyV1
 
 
 @dataclass(frozen=True)
@@ -44,7 +51,11 @@ class ProjectionRequest:
     provider_tools: tuple[ProviderToolContract, ...]
     tool_signals: ToolSelectionSignals
     provider_budgets: tuple[ProviderBudget, ...]
+    authority_surface: AuthoritySurfaceView
+    provider_catalog: ToolCatalog = MODEL_TOOL_CATALOG
+    dependency_policy: DependencyPolicyV1 = DEPENDENCY_POLICY_V1
     sources: tuple[FrozenSource, ...] = ()
+    provider_surface_build_identity: object | None = None
 
 
 class ModelSurfaceProjector:
@@ -58,7 +69,19 @@ class ModelSurfaceProjector:
         if any(len(source.chunks) > 32 for source in request.sources):
             raise ProjectionError("source_chunk_limit_exceeded")
         contributors = self._validate_contributors(request.contributors)
-        selection = select_tools(request.provider_tools, request.tool_signals)
+        if request.provider_catalog.provider_contracts() != request.provider_tools:
+            raise ProjectionError("typed_catalog_drift")
+        selection = select_tools(
+            request.provider_tools,
+            request.tool_signals,
+            dependency_policy=request.dependency_policy,
+        )
+        selection = intersect_authority_surface(
+            request.provider_catalog,
+            selection,
+            request.authority_surface,
+            dependency_policy=request.dependency_policy,
+        )
         tool_bytes = canonical_json([dict(tool.payload) for tool in selection.tools])
         if len(tool_bytes) > PROVIDER_TOOLS_BYTE_CAP:
             raise ProjectionError("provider_tools_byte_cap_exceeded")
@@ -149,7 +172,7 @@ class ModelSurfaceProjector:
                 "tools": [dict(tool.payload) for tool in selection.tools],
             }
         )
-        fingerprint = sha256_hex(canonical_surface)
+        fingerprint = "sha256:" + sha256_hex(canonical_surface)
         audit = RuntimeSurfaceAudit(
             budget_policy_version=BUDGET_POLICY_VERSION,
             contributor_statuses=tuple(
@@ -190,6 +213,7 @@ class ModelSurfaceProjector:
             runtime_surface_fingerprint=fingerprint,
             provider_candidate_count=len(request.provider_budgets),
             audit=audit,
+            provider_surface_build_identity=request.provider_surface_build_identity,
         )
 
     @staticmethod

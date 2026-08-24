@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from collections.abc import Callable
 
 from offerpilot.ai.tool_runtime.contracts import TransientToolRuntimeValue
+from offerpilot.ai.tool_authority.contracts import ProviderInvocationIdentity
 from offerpilot.ai.types import Assistant
 from offerpilot.context_projector.contracts import FrozenModelSurface, ProjectionError
 
@@ -45,6 +46,17 @@ class ModelCallSurfaceBinding:
         *,
         attempt_validator: Callable[[str], bool],
     ) -> Assistant:
+        if response.model_call_surface_binding is not self:
+            raise ProjectionError("provider_response_binding_mismatch")
+        invocation = response.provider_invocation_identity
+        if type(invocation) is not ProviderInvocationIdentity:
+            raise ProjectionError("provider_response_invocation_mismatch")
+        if (
+            invocation.model_call_surface_binding is not self
+            or invocation.model_call_id != self.model_call_id
+            or invocation.surface_fingerprint != self.runtime_surface_fingerprint
+        ):
+            raise ProjectionError("provider_response_invocation_mismatch")
         if response.model_call_id != self.model_call_id:
             raise ProjectionError("provider_response_model_call_mismatch")
         if response.runtime_surface_fingerprint != self.runtime_surface_fingerprint:
@@ -74,6 +86,8 @@ class BoundProviderResponse(TransientToolRuntimeValue):
     provider_attempt_id: str
     runtime_surface_fingerprint: str
     response: Assistant = field(repr=False)
+    provider_invocation_identity: ProviderInvocationIdentity = field(repr=False)
+    model_call_surface_binding: ModelCallSurfaceBinding = field(repr=False)
     _serialization_guard: object = field(
         default=_BOUND_RESPONSE_SERIALIZATION_GUARD,
         init=False,
@@ -90,8 +104,11 @@ class BoundProviderResponse(TransientToolRuntimeValue):
             or type(self.provider_attempt_id) is not str
             or not self.provider_attempt_id
             or type(self.runtime_surface_fingerprint) is not str
-            or len(self.runtime_surface_fingerprint) != 64
+            or not self.runtime_surface_fingerprint.startswith("sha256:")
+            or len(self.runtime_surface_fingerprint) != 71
             or not isinstance(self.response, Assistant)
+            or type(self.provider_invocation_identity) is not ProviderInvocationIdentity
+            or type(self.model_call_surface_binding) is not ModelCallSurfaceBinding
         ):
             raise ProjectionError("invalid_bound_provider_response")
 

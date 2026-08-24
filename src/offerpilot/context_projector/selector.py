@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from types import MappingProxyType
+from typing import Iterable, Mapping
 
 from offerpilot.ai.tool_runtime.contracts import ProviderToolContract
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_NAMES
+from offerpilot.ai.tool_authority.policy import DEPENDENCY_POLICY_VERSION
 from offerpilot.context_projector.contracts import ProjectionError, canonical_json, sha256_hex
 
 SELECTOR_VERSION = "tool-surface-selector-v1"
@@ -57,6 +59,97 @@ _DEPENDENCIES: dict[str, frozenset[str]] = {
     "get_jd_analysis": frozenset({"list_jd_analyses"}),
 }
 
+
+@dataclass(frozen=True, slots=True)
+class DependencyPolicyV1:
+    """Closed, versioned dependency graph shared by selection and authority filtering."""
+
+    version: str
+    catalog_names: tuple[str, ...]
+    dependencies: Mapping[str, tuple[str, ...] | frozenset[str]]
+
+    def __post_init__(self) -> None:
+        normalized = {name: tuple(sorted(values)) for name, values in self.dependencies.items()}
+        object.__setattr__(self, "dependencies", MappingProxyType(normalized))
+
+    @property
+    def coverage(self) -> int:
+        return len(self.catalog_names)
+
+    def canonical_manifest(self) -> dict[str, object]:
+        return {
+            "dependency_policy_version": self.version,
+            "catalog_names": list(self.catalog_names),
+            "dependencies": {
+                name: list(self.dependencies[name]) for name in sorted(self.dependencies)
+            },
+        }
+
+    @property
+    def canonical_fingerprint(self) -> str:
+        return "sha256:" + sha256_hex(canonical_json(self.canonical_manifest()))
+
+    def validate_closed(
+        self,
+        selected_names: Iterable[str],
+        catalog_names: Iterable[str],
+    ) -> None:
+        if self.version != DEPENDENCY_POLICY_VERSION:
+            raise ProjectionError("unsupported_dependency_policy_version")
+        catalog = tuple(catalog_names)
+        if (
+            catalog != self.catalog_names
+            or self.catalog_names != MODEL_TOOL_NAMES
+            or len(set(catalog)) != 25
+        ):
+            raise ProjectionError("dependency_catalog_mismatch")
+        dependency_names = set(self.dependencies)
+        catalog_set = set(catalog)
+        if dependency_names != catalog_set:
+            raise ProjectionError("dependency_node_coverage_mismatch")
+        if any(
+            dependency not in catalog_set
+            for dependencies in self.dependencies.values()
+            for dependency in dependencies
+        ):
+            raise ProjectionError("unknown_tool_dependency")
+        self._validate_acyclic()
+        selected = tuple(selected_names)
+        if len(set(selected)) != len(selected) or any(name not in catalog_set for name in selected):
+            raise ProjectionError("unknown_selected_tool")
+        selected_set = set(selected)
+        if any(
+            dependency not in selected_set
+            for name in selected
+            for dependency in self.dependencies[name]
+        ):
+            raise ProjectionError("tool_dependency_not_closed")
+
+    def _validate_acyclic(self) -> None:
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(name: str) -> None:
+            if name in visiting:
+                raise ProjectionError("tool_dependency_cycle")
+            if name in visited:
+                return
+            visiting.add(name)
+            for dependency in self.dependencies[name]:
+                visit(dependency)
+            visiting.remove(name)
+            visited.add(name)
+
+        for name in self.catalog_names:
+            visit(name)
+
+
+DEPENDENCY_POLICY_V1 = DependencyPolicyV1(
+    version=DEPENDENCY_POLICY_VERSION,
+    catalog_names=MODEL_TOOL_NAMES,
+    dependencies={name: _DEPENDENCIES.get(name, frozenset()) for name in MODEL_TOOL_NAMES},
+)
+
 _LEXICAL_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "applications",
@@ -104,11 +197,13 @@ class ToolSelection:
     domains: tuple[str, ...]
 
 
-def _dependency_closure(names: set[str]) -> set[str]:
+def _dependency_closure(
+    names: set[str], dependency_policy: DependencyPolicyV1 = DEPENDENCY_POLICY_V1
+) -> set[str]:
     pending = list(names)
     while pending:
         name = pending.pop()
-        for dependency in _DEPENDENCIES.get(name, ()):
+        for dependency in dependency_policy.dependencies.get(name, ()):
             if dependency not in MODEL_TOOL_NAMES:
                 raise ProjectionError("tool_dependency_missing")
             if dependency not in names:
@@ -120,6 +215,8 @@ def _dependency_closure(names: set[str]) -> set[str]:
 def select_tools(
     catalog: Iterable[ProviderToolContract],
     signals: ToolSelectionSignals,
+    *,
+    dependency_policy: DependencyPolicyV1 = DEPENDENCY_POLICY_V1,
 ) -> ToolSelection:
     if signals.version != SELECTOR_VERSION:
         raise ProjectionError("unsupported_selector_version")
@@ -151,11 +248,12 @@ def select_tools(
         selected_names = set()
         for domain in domains:
             selected_names.update(_DOMAIN_TOOLS[domain])
-        _dependency_closure(selected_names)
+        _dependency_closure(selected_names, dependency_policy)
     selected = tuple(contract for contract in contracts if contract.name in selected_names)
     ordered_names = tuple(contract.name for contract in selected)
     if not selected or not set(ordered_names).issubset(MODEL_TOOL_NAMES):
         raise ProjectionError("invalid_tool_surface")
+    dependency_policy.validate_closed(ordered_names, names)
     envelopes = [dict(contract.payload) for contract in selected]
     return ToolSelection(
         tools=selected,

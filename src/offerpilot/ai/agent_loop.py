@@ -26,7 +26,12 @@ from offerpilot.ai.agent_contracts import (
     JsonValue,
     StalePendingActionError,
 )
-from offerpilot.ai.tool_authority import ApprovalExecutionAuthority
+from offerpilot.ai.tool_authority import (
+    ApprovalExecutionAuthority,
+    NewTurnPrepareCallIdentity,
+    ProviderInvocationIdentity,
+    SegmentExecutionAuthority,
+)
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import (
@@ -57,7 +62,6 @@ from offerpilot.context_projector.contracts import (
     FrozenModelSurface,
     FrozenSource,
     ProjectionError,
-    RuntimeSurfaceAudit,
     canonical_json,
     sha256_hex,
 )
@@ -68,6 +72,7 @@ from offerpilot.context_projector.gateway import (
 )
 from offerpilot.context_projector.projector import ModelSurfaceProjector, ProjectionRequest
 from offerpilot.context_projector.selector import ToolSelectionSignals
+from offerpilot.context_projector.authority_surface import AuthoritySurfaceView
 
 
 DEFAULT_MAX_ITERATIONS = 20
@@ -98,27 +103,59 @@ class _InjectedSurfaceAdapter:
     def agent_provider_manifest_identities(self) -> tuple[str, ...]:
         return self._gateway.manifest_identities
 
-    def preflight_agent_surface(self, surface: FrozenModelSurface, *, stream: bool) -> None:
-        self._gateway.preflight(surface, stream=stream)
+    def bind_agent_provider_surface(
+        self,
+        *,
+        authority: SegmentExecutionAuthority,
+        build_identity: object,
+        surface: FrozenModelSurface,
+        model_call_surface_binding: ModelCallSurfaceBinding,
+    ) -> ProviderInvocationIdentity:
+        return self._gateway.bind_provider_surface(
+            authority=authority,
+            build_identity=cast(Any, build_identity),
+            surface=surface,
+            model_call_surface_binding=model_call_surface_binding,
+        )
+
+    def preflight_agent_surface(
+        self,
+        surface: FrozenModelSurface,
+        *,
+        invocation_identity: ProviderInvocationIdentity,
+        stream: bool,
+    ) -> None:
+        self._gateway.preflight(
+            surface,
+            invocation_identity=invocation_identity,
+            stream=stream,
+        )
 
     def complete_agent_surface(
         self,
         surface: FrozenModelSurface,
         *,
+        invocation_identity: ProviderInvocationIdentity,
         before_attempt: Callable[[], None] | None = None,
     ) -> object:
-        return self._gateway.complete(surface, before_attempt=before_attempt)
+        return self._gateway.complete(
+            surface,
+            invocation_identity=invocation_identity,
+            before_attempt=before_attempt,
+        )
 
     def stream_agent_surface(
         self,
         surface: FrozenModelSurface,
         on_delta: Any,
         *,
+        invocation_identity: ProviderInvocationIdentity,
         before_attempt: Callable[[], None] | None = None,
     ) -> object:
         return self._gateway.stream_deferred(
             surface,
             on_delta,
+            invocation_identity=invocation_identity,
             before_attempt=before_attempt,
         )
 
@@ -172,6 +209,13 @@ class _LoopServices:
         self.runtime_signal_sink = invocation.runtime_signal_sink
         self.records: list[ToolExecutionRecord[Any, Any]] = []
         self.failures: list[ToolFailure] = []
+        self.runner_invocation = invocation
+        self._prepare_identities: dict[int, NewTurnPrepareCallIdentity] = {}
+        self._provider_invocations: dict[int, ProviderInvocationIdentity] = {}
+        if type(self.context.authority) is SegmentExecutionAuthority:
+            factory = self.context.authority_factory
+            factory.register_runner_invocation(invocation, authority=self.context.authority)
+            factory.register_tool_execution_context(self.context, authority=self.context.authority)
 
     def complete_model(
         self,
@@ -186,14 +230,25 @@ class _LoopServices:
         complete_surface = getattr(self.model, "complete_agent_surface", None)
         stream_surface = getattr(self.model, "stream_agent_surface", None)
         surface_aware = callable(complete_surface) or callable(stream_surface)
-        surface = (
-            self.project_model_surface(messages, tools, model_call_id=model_call_id)
-            if surface_aware
-            else None
+        if not surface_aware:
+            raise TypeError("Agent Provider surface adapter is required")
+        if type(self.context.authority) is not SegmentExecutionAuthority:
+            raise TypeError("Provider calls require a Segment authority")
+        factory = self.context.authority_factory
+        build_identity = factory.create_provider_surface_build_identity(
+            self.context.authority,
+            runner_invocation=self.runner_invocation,
+            tool_context=self.context,
+            model_call_id=model_call_id,
         )
-        if surface is not None:
-            messages = surface.thaw_messages()
-            tools = list(surface.tools)
+        surface = self.project_model_surface(
+            messages,
+            tools,
+            model_call_id=model_call_id,
+            build_identity=build_identity,
+        )
+        messages = surface.thaw_messages()
+        tools = list(surface.tools)
         snapshot_id = self.capture_model_input(
             messages,
             tools,
@@ -201,18 +256,31 @@ class _LoopServices:
             model_call_id=model_call_id,
             surface=surface,
         )
-        stream_complete = getattr(self.model, "stream_complete", None)
-        is_stream = callable(stream_surface) if surface is not None else callable(stream_complete)
+        is_stream = callable(stream_surface)
         buffered_deltas: list[str] = []
 
         def buffer_delta(delta: str) -> None:
             if delta:
                 buffered_deltas.append(delta)
 
-        if surface is not None:
-            preflight = getattr(self.model, "preflight_agent_surface", None)
-            if callable(preflight):
-                preflight(surface, stream=is_stream)
+        binding = ModelCallSurfaceBinding.from_surface(surface)
+        bind_surface = getattr(self.model, "bind_agent_provider_surface", None)
+        if not callable(bind_surface):
+            raise TypeError("Agent Provider surface binder is missing")
+        invocation_identity = bind_surface(
+            authority=self.context.authority,
+            build_identity=build_identity,
+            surface=surface,
+            model_call_surface_binding=binding,
+        )
+        preflight = getattr(self.model, "preflight_agent_surface", None)
+        if not callable(preflight):
+            raise TypeError("Agent Provider preflight is missing")
+        preflight(
+            surface,
+            invocation_identity=invocation_identity,
+            stream=is_stream,
+        )
         if snapshot_id is not None:
             provider_kind, model_id, supports_json_schema = _journal_model_metadata(self.model)
             model_id_fingerprint = self.fingerprint_model_id(model_id)
@@ -237,41 +305,47 @@ class _LoopServices:
             )
         try:
             self.require_active()
-            if surface is not None:
-                if is_stream:
-                    if not callable(stream_surface):
-                        raise TypeError("surface streaming model is missing")
-                    bound = stream_surface(
-                        surface,
-                        buffer_delta,
-                        before_attempt=self.require_active,
-                    )
-                else:
-                    if not callable(complete_surface):
-                        raise TypeError("surface completion model is missing")
-                    bound = complete_surface(
-                        surface,
-                        before_attempt=self.require_active,
-                    )
-                attempt_validator = getattr(
-                    self.model,
-                    "consume_agent_provider_attempt",
-                    None,
-                )
-                if not callable(attempt_validator):
-                    raise TypeError("Agent Provider Gateway attempt validator is missing")
-                assistant = ModelCallSurfaceBinding.from_surface(surface).validate_response(
-                    bound,
-                    attempt_validator=attempt_validator,
-                )
-            elif is_stream:
-                assistant = cast(Any, self.model).stream_complete(
-                    messages,
-                    tools,
+            if is_stream:
+                if not callable(stream_surface):
+                    raise TypeError("surface streaming model is missing")
+                bound = stream_surface(
+                    surface,
                     buffer_delta,
+                    invocation_identity=invocation_identity,
+                    before_attempt=self.require_active,
                 )
             else:
-                assistant = cast(Any, self.model).complete(messages, tools)
+                if not callable(complete_surface):
+                    raise TypeError("surface completion model is missing")
+                bound = complete_surface(
+                    surface,
+                    invocation_identity=invocation_identity,
+                    before_attempt=self.require_active,
+                )
+            attempt_validator = getattr(
+                self.model,
+                "consume_agent_provider_attempt",
+                None,
+            )
+            if not callable(attempt_validator):
+                raise TypeError("Agent Provider Gateway attempt validator is missing")
+            assistant = binding.validate_response(
+                bound,
+                attempt_validator=attempt_validator,
+            )
+            if bound.provider_invocation_identity is not invocation_identity:
+                raise ProjectionError("provider_response_invocation_mismatch")
+            for call in assistant.tool_calls:
+                prepare_identity = factory.create_new_turn_prepare_identity(
+                    invocation_identity,
+                    attempt_id=bound.provider_attempt_id,
+                    candidate_ordinal=bound.candidate_ordinal,
+                    tool_call_id=call.id,
+                    tool_name=call.name,
+                    arguments_digest=_provider_arguments_digest(call.args),
+                )
+                self._prepare_identities[id(call)] = prepare_identity
+                self._provider_invocations[id(call)] = invocation_identity
             self.require_active()
             for delta in buffered_deltas:
                 self.emit_assistant_delta(delta)
@@ -315,6 +389,7 @@ class _LoopServices:
         tools: list[ProviderToolContract],
         *,
         model_call_id: str,
+        build_identity: object,
     ) -> FrozenModelSurface:
         system = tuple(
             FrozenMessage.freeze(message)
@@ -434,59 +509,14 @@ class _LoopServices:
                 trusted_domains=trusted_domains,
             ),
             provider_budgets=tuple(budgets),
+            authority_surface=AuthoritySurfaceView.from_authority(
+                cast(SegmentExecutionAuthority, self.context.authority)
+            ),
+            provider_catalog=self.catalog,
             sources=tuple(sources),
+            provider_surface_build_identity=build_identity,
         )
-        try:
-            return ModelSurfaceProjector().project(request)
-        except ProjectionError as exc:
-            # The production typed catalog keeps the selector's canonical
-            # dependency contract.  Test-injected models may intentionally
-            # use a smaller valid catalog; they still receive a Frozen
-            # Surface/Gateway binding so an unexposed response is rejected
-            # before Agent events or Dispatcher execution.
-            if str(exc) != "typed_catalog_drift":
-                raise
-            return self._project_injected_surface(messages, tools, model_call_id, budgets)
-
-    @staticmethod
-    def _project_injected_surface(
-        messages: list[Message],
-        tools: list[ProviderToolContract],
-        model_call_id: str,
-        budgets: object,
-    ) -> FrozenModelSurface:
-        frozen_messages = tuple(FrozenMessage.freeze(message) for message in messages)
-        tool_values = [dict(tool.payload) for tool in tools]
-        message_values = [message.canonical_value() for message in frozen_messages]
-        canonical_surface = canonical_json(
-            {"messages": message_values, "tools": tool_values}
-        )
-        message_bytes = canonical_json(message_values)
-        tool_bytes = canonical_json(tool_values)
-        audit = RuntimeSurfaceAudit(
-            budget_policy_version="injected-surface-v1",
-            contributor_statuses=tuple((name, "not_applicable") for name in CONTRIBUTOR_ORDER),
-            selected_history_group_ids=(),
-            selected_tool_names=tuple(tool.name for tool in tools),
-            source_fingerprints=(),
-            estimated_input_units=len(canonical_surface),
-            canonical_message_bytes=len(message_bytes),
-            canonical_tool_bytes=len(tool_bytes),
-            truncated=False,
-            signals=("injected_catalog",),
-        )
-        try:
-            candidate_count = len(tuple(cast(Any, budgets)))
-        except TypeError:
-            candidate_count = 0
-        return FrozenModelSurface(
-            model_call_id=model_call_id,
-            messages=frozen_messages,
-            tools=tuple(tools),
-            runtime_surface_fingerprint=sha256_hex(canonical_surface),
-            provider_candidate_count=max(candidate_count, 1),
-            audit=audit,
-        )
+        return ModelSurfaceProjector().project(request)
 
     def require_delivery_fence(self) -> None:
         if self.delivery_fence is not None and not self.delivery_fence():
@@ -562,7 +592,9 @@ class _LoopServices:
 @dataclass(frozen=True, slots=True, repr=False)
 class NewTurnSeed(TransientToolRuntimeValue):
     messages: tuple[Message, ...]
-    _serialization_guard: object = field(default=_TRANSIENT_ASDICT_GUARD, init=False, repr=False, compare=False)
+    _serialization_guard: object = field(
+        default=_TRANSIENT_ASDICT_GUARD, init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if type(self.messages) is not tuple:
@@ -582,12 +614,19 @@ class NewTurnSeed(TransientToolRuntimeValue):
 class ApprovedWriteSeed(TransientToolRuntimeValue):
     continuation: ApprovedWriteContinuation
     _pending_snapshot: PendingAction = field(init=False, repr=False, compare=False)
-    _serialization_guard: object = field(default=_TRANSIENT_ASDICT_GUARD, init=False, repr=False, compare=False)
+    _serialization_guard: object = field(
+        default=_TRANSIENT_ASDICT_GUARD, init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if self.continuation is None:
             raise TypeError("ApprovedWriteSeed continuation is required")
-        required_methods = ("claim", "record_result", "load_continuation_messages", "delivery_fence")
+        required_methods = (
+            "claim",
+            "record_result",
+            "load_continuation_messages",
+            "delivery_fence",
+        )
         if any(
             not callable(getattr(self.continuation, name, None)) for name in required_methods
         ) or not hasattr(type(self.continuation), "pending"):
@@ -622,7 +661,9 @@ class AgentLoopInvocation(TransientToolRuntimeValue):
     event_sink: AgentEventSink | None
     runtime_signal_sink: AgentRuntimeSignalSink | None
     cancel_check: CancelCheck | None
-    _serialization_guard: object = field(default=_TRANSIENT_ASDICT_GUARD, init=False, repr=False, compare=False)
+    _serialization_guard: object = field(
+        default=_TRANSIENT_ASDICT_GUARD, init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.seed, (NewTurnSeed, ApprovedWriteSeed)):
@@ -851,6 +892,7 @@ class AgentLoopRunner:
                 invocation.catalog,
                 invocation.tool_context,
                 call,
+                call_identity=services._prepare_identities.get(id(call)),
                 pending_identity=(f"{call.id}:{call.name}" if spec.kind == "write" else None),
                 pending_action_revision=(
                     _pending_action_revision(call.id, call.name, call.args)
@@ -893,7 +935,23 @@ class AgentLoopRunner:
             if isinstance(prepared, ReadyToExecute):
                 services.raise_if_cancelled()
                 services.require_delivery_fence()
-                record = execute_prepared(prepared.prepared, invocation.tool_context)
+                provider_invocation = services._provider_invocations.get(id(call))
+                if provider_invocation is None:
+                    raise TypeError("read execution Provider provenance is missing")
+                read_identity = (
+                    invocation.tool_context.authority_factory.create_read_execution_identity(
+                        provider_invocation,
+                        prepared=prepared.prepared,
+                        tool_call_id=call.id,
+                        tool_name=call.name,
+                        arguments_digest=prepared.prepared.arguments_digest,
+                    )
+                )
+                record = execute_prepared(
+                    prepared.prepared,
+                    invocation.tool_context,
+                    call_identity=read_identity,
+                )
                 services.raise_if_cancelled()
                 services.require_delivery_fence()
                 records.append(record)
@@ -1076,6 +1134,16 @@ def _journal_model_input(
             for tool in tools
         ],
     }
+
+
+def _provider_arguments_digest(raw: str) -> str:
+    """Freeze response arguments without allowing malformed JSON to skip Pipeline validation."""
+
+    try:
+        value: object = parse_arguments(raw)
+    except ArgumentValidationError:
+        value = {"invalid_raw_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest()}
+    return "sha256:" + hashlib.sha256(canonical_json(value)).hexdigest()
 
 
 def _journal_model_metadata(model: object) -> tuple[str, str, bool]:

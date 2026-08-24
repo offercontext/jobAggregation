@@ -14,8 +14,13 @@ from litellm import completion
 
 from offerpilot.ai.types import Assistant, Message, ToolCall
 from offerpilot.ai.tool_runtime.contracts import ProviderToolContract
+from offerpilot.ai.tool_authority.contracts import (
+    ProviderInvocationIdentity,
+    ProviderSurfaceBuildIdentity,
+    SegmentExecutionAuthority,
+)
 from offerpilot.config import AIProviderProfile, Config
-from offerpilot.context_projector.binding import BoundProviderResponse
+from offerpilot.context_projector.binding import BoundProviderResponse, ModelCallSurfaceBinding
 from offerpilot.context_projector.budget import (
     ADAPTER_REQUEST_BODY_BYTE_CAP,
     DEFAULT_OUTPUT_RESERVE,
@@ -70,27 +75,59 @@ class ConfiguredAIClient:
     def agent_provider_manifest_identities(self) -> tuple[str, ...]:
         return self._agent_gateway.manifest_identities
 
-    def preflight_agent_surface(self, surface: FrozenModelSurface, *, stream: bool) -> None:
-        self._agent_gateway.preflight(surface, stream=stream)
+    def bind_agent_provider_surface(
+        self,
+        *,
+        authority: SegmentExecutionAuthority,
+        build_identity: ProviderSurfaceBuildIdentity,
+        surface: FrozenModelSurface,
+        model_call_surface_binding: ModelCallSurfaceBinding,
+    ) -> ProviderInvocationIdentity:
+        return self._agent_gateway.bind_provider_surface(
+            authority=authority,
+            build_identity=build_identity,
+            surface=surface,
+            model_call_surface_binding=model_call_surface_binding,
+        )
+
+    def preflight_agent_surface(
+        self,
+        surface: FrozenModelSurface,
+        *,
+        invocation_identity: ProviderInvocationIdentity,
+        stream: bool,
+    ) -> None:
+        self._agent_gateway.preflight(
+            surface,
+            invocation_identity=invocation_identity,
+            stream=stream,
+        )
 
     def complete_agent_surface(
         self,
         surface: FrozenModelSurface,
         *,
+        invocation_identity: ProviderInvocationIdentity,
         before_attempt: Callable[[], None] | None = None,
     ) -> BoundProviderResponse:
-        return self._agent_gateway.complete(surface, before_attempt=before_attempt)
+        return self._agent_gateway.complete(
+            surface,
+            invocation_identity=invocation_identity,
+            before_attempt=before_attempt,
+        )
 
     def stream_agent_surface(
         self,
         surface: FrozenModelSurface,
         on_delta: Callable[[str], None],
         *,
+        invocation_identity: ProviderInvocationIdentity,
         before_attempt: Callable[[], None] | None = None,
     ) -> BoundProviderResponse:
         return self._agent_gateway.stream_deferred(
             surface,
             on_delta,
+            invocation_identity=invocation_identity,
             before_attempt=before_attempt,
         )
 
@@ -141,10 +178,10 @@ class ConfiguredAIClient:
             correlation_id = uuid.uuid4().hex[:16]
             started = time.perf_counter()
             try:
-                assistant = self._complete_with_provider(
-                    provider, messages, tools, response_format
+                assistant = self._complete_with_provider(provider, messages, tools, response_format)
+                provider_blocks = (
+                    assistant.provider_blocks if isinstance(assistant.provider_blocks, dict) else {}
                 )
-                provider_blocks = assistant.provider_blocks if isinstance(assistant.provider_blocks, dict) else {}
                 _try_audit_provider_result(
                     provider,
                     status="success",
@@ -242,9 +279,7 @@ class ConfiguredAIClient:
             "messages": [_openai_message(message) for message in messages],
             "api_key": provider.api_key,
         }
-        api_base = (
-            provider.base_url.rstrip("/") if force_api_base else _litellm_api_base(provider)
-        )
+        api_base = provider.base_url.rstrip("/") if force_api_base else _litellm_api_base(provider)
         if api_base:
             payload["api_base"] = api_base
         if tools:
@@ -293,9 +328,7 @@ class ConfiguredAIClient:
             "api_key": provider.api_key,
             "stream": True,
         }
-        api_base = (
-            provider.base_url.rstrip("/") if force_api_base else _litellm_api_base(provider)
-        )
+        api_base = provider.base_url.rstrip("/") if force_api_base else _litellm_api_base(provider)
         if api_base:
             payload["api_base"] = api_base
         if tools:
@@ -317,9 +350,9 @@ class ConfiguredAIClient:
                 on_delta(text)
             reasoning_content = _get(delta, "reasoning_content")
             if reasoning_content:
-                provider_blocks["reasoning_content"] = str(provider_blocks.get("reasoning_content") or "") + str(
-                    reasoning_content
-                )
+                provider_blocks["reasoning_content"] = str(
+                    provider_blocks.get("reasoning_content") or ""
+                ) + str(reasoning_content)
             for raw_call in _get(delta, "tool_calls") or []:
                 index = int(_get(raw_call, "index") or 0)
                 current = tool_calls.setdefault(index, {"id": "", "name": "", "args": ""})
@@ -387,7 +420,12 @@ def _audit_provider_endpoint(base_url: str) -> None:
     with open(path, "a", encoding="utf-8") as audit:
         audit.write(
             json.dumps(
-                {"kind": "provider_egress", "scheme": parsed.scheme, "host": parsed.hostname, "port": port},
+                {
+                    "kind": "provider_egress",
+                    "scheme": parsed.scheme,
+                    "host": parsed.hostname,
+                    "port": port,
+                },
                 ensure_ascii=True,
             )
             + "\n"
@@ -530,9 +568,7 @@ def _adapter_preflight_payload(provider: AIProviderProfile, payload: dict[str, A
     input_units = _json_bytes(payload.get("messages", [])) + _json_bytes(payload.get("tools", []))
     context_window = 32_768 if provider.context_window == 0 else provider.context_window
     output_reserve = (
-        DEFAULT_OUTPUT_RESERVE
-        if provider.max_output_tokens == 0
-        else provider.max_output_tokens
+        DEFAULT_OUTPUT_RESERVE if provider.max_output_tokens == 0 else provider.max_output_tokens
     )
     budget = ProviderBudget(
         context_window=context_window,
@@ -644,13 +680,9 @@ def _openai_message(message: Message) -> dict[str, Any]:
     if message.role == "user":
         images = message.provider_blocks.get("images") or []
         if images:
-            content_parts: list[dict[str, Any]] = [
-                {"type": "text", "text": message.content}
-            ]
+            content_parts: list[dict[str, Any]] = [{"type": "text", "text": message.content}]
             for url in images:
-                content_parts.append(
-                    {"type": "image_url", "image_url": {"url": url}}
-                )
+                content_parts.append({"type": "image_url", "image_url": {"url": url}})
             out["content"] = content_parts
         else:
             out["content"] = message.content

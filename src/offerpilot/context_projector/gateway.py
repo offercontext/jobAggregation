@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 import re
-import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 from threading import Lock
 from urllib.parse import urlsplit, urlunsplit
 
 from offerpilot.ai.control import AgentLoopControlError
 from offerpilot.ai.tool_runtime.contracts import ProviderToolContract
+from offerpilot.ai.tool_authority.composition import require_authority_phase
+from offerpilot.ai.tool_authority.contracts import (
+    AuthorityUse,
+    ProviderInvocationIdentity,
+    ProviderSurfaceBuildIdentity,
+    SegmentExecutionAuthority,
+)
 from offerpilot.ai.types import Assistant, Message
 from offerpilot.config import AIProviderProfile
-from offerpilot.context_projector.binding import BoundProviderResponse
+from offerpilot.context_projector.binding import BoundProviderResponse, ModelCallSurfaceBinding
 from offerpilot.context_projector.budget import (
     ADAPTER_REQUEST_BODY_BYTE_CAP,
     DEFAULT_OUTPUT_RESERVE,
@@ -206,11 +212,95 @@ class AgentProviderGatewaySession:
         self._attempts: set[str] = set()
         self._attempt_lock = Lock()
 
-    def _begin_attempt(self) -> str:
-        attempt_id = uuid.uuid4().hex
+    def _begin_authorized_attempt(
+        self,
+        invocation_identity: ProviderInvocationIdentity,
+        candidate_ordinal: int,
+    ) -> str:
+        context = invocation_identity.tool_context
+        factory = getattr(context, "authority_factory", None)
+        if factory is None:
+            raise ProjectionError("provider_invocation_context_invalid")
+        attempt_id = factory.issue_provider_attempt(
+            invocation_identity,
+            candidate_ordinal=candidate_ordinal,
+        )
+        if type(attempt_id) is not str or not attempt_id:
+            raise ProjectionError("provider_attempt_identity_invalid")
         with self._attempt_lock:
             self._attempts.add(attempt_id)
         return attempt_id
+
+    def bind_provider_surface(
+        self,
+        *,
+        authority: SegmentExecutionAuthority,
+        build_identity: ProviderSurfaceBuildIdentity,
+        surface: FrozenModelSurface,
+        model_call_surface_binding: ModelCallSurfaceBinding,
+    ) -> ProviderInvocationIdentity:
+        if type(authority) is not SegmentExecutionAuthority:
+            raise ProjectionError("segment_authority_required")
+        require_authority_phase(authority, AuthorityUse.PROVIDER_SURFACE_BUILD, build_identity)
+        if surface.provider_surface_build_identity is not build_identity:
+            raise ProjectionError("provider_surface_build_identity_mismatch")
+        context = build_identity.tool_context
+        factory = getattr(context, "authority_factory", None)
+        if factory is None or getattr(context, "authority", None) is not authority:
+            raise ProjectionError("provider_invocation_context_invalid")
+        factory.register_frozen_surface(
+            surface,
+            surface_fingerprint=surface.runtime_surface_fingerprint,
+            candidate_count=surface.provider_candidate_count,
+            authority=authority,
+            build_identity=build_identity,
+        )
+        factory.register_model_call_surface_binding(
+            model_call_surface_binding,
+            surface=surface,
+            surface_fingerprint=surface.runtime_surface_fingerprint,
+            authority=authority,
+            build_identity=build_identity,
+        )
+        factory.register_gateway_session(
+            self,
+            authority,
+            build_identity=build_identity,
+            surface=surface,
+            surface_fingerprint=surface.runtime_surface_fingerprint,
+            model_call_surface_binding=model_call_surface_binding,
+        )
+        invocation = factory.create_provider_invocation_identity(
+            build_identity,
+            surface=surface,
+            surface_fingerprint=surface.runtime_surface_fingerprint,
+            model_call_surface_binding=model_call_surface_binding,
+            gateway_session=self,
+        )
+        if type(invocation) is not ProviderInvocationIdentity:
+            raise ProjectionError("provider_invocation_identity_required")
+        return invocation
+
+    def _validate_invocation(
+        self,
+        surface: FrozenModelSurface,
+        invocation_identity: ProviderInvocationIdentity,
+    ) -> None:
+        if type(invocation_identity) is not ProviderInvocationIdentity:
+            raise ProjectionError("provider_invocation_identity_required")
+        context = invocation_identity.tool_context
+        authority = getattr(context, "authority", None)
+        if type(authority) is not SegmentExecutionAuthority:
+            raise ProjectionError("segment_authority_required")
+        require_authority_phase(authority, AuthorityUse.PROVIDER_INVOKE, invocation_identity)
+        if (
+            invocation_identity.surface is not surface
+            or invocation_identity.gateway_session is not self
+            or invocation_identity.model_call_id != surface.model_call_id
+            or invocation_identity.surface_fingerprint != surface.runtime_surface_fingerprint
+            or type(invocation_identity.model_call_surface_binding) is not ModelCallSurfaceBinding
+        ):
+            raise ProjectionError("provider_invocation_identity_mismatch")
 
     def _discard_attempt(self, attempt_id: str) -> None:
         with self._attempt_lock:
@@ -239,10 +329,12 @@ class AgentProviderGatewaySession:
     def preflight(
         self,
         surface: FrozenModelSurface,
-        response_format: dict[str, Any] | None = None,
         *,
+        invocation_identity: ProviderInvocationIdentity,
+        response_format: dict[str, Any] | None = None,
         stream: bool = False,
     ) -> None:
+        self._validate_invocation(surface, invocation_identity)
         # The projector used the minimum budget of this exact frozen chain, so
         # one deterministic preflight is sufficient before model.requested.
         SingleCandidateAgentTransport._preflight(
@@ -254,13 +346,15 @@ class AgentProviderGatewaySession:
         surface: FrozenModelSurface,
         response_format: dict[str, Any] | None = None,
         *,
+        invocation_identity: ProviderInvocationIdentity,
         before_attempt: Callable[[], None] | None = None,
     ) -> BoundProviderResponse:
+        self._validate_invocation(surface, invocation_identity)
         last_error: Exception | None = None
         for ordinal, candidate in enumerate(self._chain.candidates):
             if before_attempt is not None:
                 before_attempt()
-            attempt_id = self._begin_attempt()
+            attempt_id = self._begin_authorized_attempt(invocation_identity, ordinal)
             try:
                 response = self._transport.complete_one(candidate, surface, response_format)
                 return BoundProviderResponse(
@@ -269,6 +363,11 @@ class AgentProviderGatewaySession:
                     attempt_id,
                     surface.runtime_surface_fingerprint,
                     response,
+                    invocation_identity,
+                    cast(
+                        ModelCallSurfaceBinding,
+                        invocation_identity.model_call_surface_binding,
+                    ),
                 )
             except AgentLoopControlError:
                 self._discard_attempt(attempt_id)
@@ -287,13 +386,15 @@ class AgentProviderGatewaySession:
         surface: FrozenModelSurface,
         on_delta: Callable[[str], None],
         *,
+        invocation_identity: ProviderInvocationIdentity,
         before_attempt: Callable[[], None] | None = None,
     ) -> BoundProviderResponse:
+        self._validate_invocation(surface, invocation_identity)
         last_error: Exception | None = None
         for ordinal, candidate in enumerate(self._chain.candidates):
             if before_attempt is not None:
                 before_attempt()
-            attempt_id = self._begin_attempt()
+            attempt_id = self._begin_authorized_attempt(invocation_identity, ordinal)
             visible = False
 
             def emit(value: str) -> None:
@@ -310,6 +411,11 @@ class AgentProviderGatewaySession:
                     attempt_id,
                     surface.runtime_surface_fingerprint,
                     response,
+                    invocation_identity,
+                    cast(
+                        ModelCallSurfaceBinding,
+                        invocation_identity.model_call_surface_binding,
+                    ),
                 )
             except AgentLoopControlError:
                 self._discard_attempt(attempt_id)
@@ -330,6 +436,7 @@ class AgentProviderGatewaySession:
         surface: FrozenModelSurface,
         on_delta: Callable[[str], None],
         *,
+        invocation_identity: ProviderInvocationIdentity,
         before_attempt: Callable[[], None] | None = None,
     ) -> BoundProviderResponse:
         """Stream with provider-attempt-local delta buffers.
@@ -343,11 +450,12 @@ class AgentProviderGatewaySession:
         provider attempt.  ``stream`` intentionally retains its historical
         visible-delta/no-fallback semantics for ordinary callers.
         """
+        self._validate_invocation(surface, invocation_identity)
         last_error: Exception | None = None
         for ordinal, candidate in enumerate(self._chain.candidates):
             if before_attempt is not None:
                 before_attempt()
-            attempt_id = self._begin_attempt()
+            attempt_id = self._begin_authorized_attempt(invocation_identity, ordinal)
             deferred: list[str] = []
 
             def defer(value: str) -> None:
@@ -362,6 +470,11 @@ class AgentProviderGatewaySession:
                     attempt_id,
                     surface.runtime_surface_fingerprint,
                     response,
+                    invocation_identity,
+                    cast(
+                        ModelCallSurfaceBinding,
+                        invocation_identity.model_call_surface_binding,
+                    ),
                 )
             except AgentLoopControlError:
                 self._discard_attempt(attempt_id)

@@ -251,6 +251,7 @@ class FrozenModelSurface:
     runtime_surface_fingerprint: str
     provider_candidate_count: int
     audit: RuntimeSurfaceAudit = field(repr=False)
+    provider_surface_build_identity: object | None = field(default=None, repr=False, compare=False)
 
     def thaw_messages(self) -> list[Message]:
         return [message.thaw() for message in self.messages]

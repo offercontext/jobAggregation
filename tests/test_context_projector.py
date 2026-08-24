@@ -6,7 +6,7 @@ import hmac
 import json
 import sqlite3
 import time
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,11 +24,19 @@ from offerpilot.agent_runtime.budget import JournalBudgetExhausted
 from offerpilot.agent_runtime.journal import RunRecorderFactory
 from offerpilot.agent_runtime.keyring import load_or_create_journal_key
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG, MODEL_TOOL_NAMES
+from offerpilot.ai.tool_authority.policy import (
+    AGENT_TYPED_V1_PROFILE,
+    CAPABILITY_POLICY_VERSION,
+    DEPENDENCY_POLICY_VERSION,
+)
+from offerpilot.ai.tool_authority.composition import AuthorityFactory
+from offerpilot.ai.tool_authority.contracts import TrustedContextScope
 from offerpilot.ai.types import Assistant, Message, ToolCall
 from offerpilot.context_projector.binding import (
     BoundProviderResponse,
     ModelCallSurfaceBinding,
 )
+from offerpilot.context_projector.authority_surface import AuthoritySurfaceView
 from offerpilot.context_projector.chunking import chunk_structured_source
 from offerpilot.context_projector.budget import (
     OPTIONAL_HISTORY_MESSAGE_BYTE_CAP,
@@ -39,6 +47,7 @@ from offerpilot.context_projector.contracts import (
     CONTRIBUTOR_ORDER,
     ContributorResult,
     FrozenMessage,
+    FrozenModelSurface,
     FrozenSource,
     ProjectionError,
     RuntimeSourceAudit,
@@ -74,6 +83,63 @@ from offerpilot.db import init_database, journal_session_factory_for_data_dir
 from offerpilot.models import AgentContextSnapshot, AgentEvent, AgentRun, Conversation
 from offerpilot.repositories.agent_runs import AgentRunRepository
 from offerpilot.api import create_app
+
+
+def _authority_surface(*, application: bool = False) -> AuthoritySurfaceView:
+    return AuthoritySurfaceView(
+        capability_profile_id="agent_typed_v1",
+        capability_policy_version=CAPABILITY_POLICY_VERSION,
+        dependency_policy_version=DEPENDENCY_POLICY_VERSION,
+        capabilities=frozenset(AGENT_TYPED_V1_PROFILE.capabilities),
+        context_type="application" if application else "workspace",
+    )
+
+
+_GATEWAY_AUTHORITY_FACTORIES: list[AuthorityFactory] = []
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _close_gateway_authority_factories() -> object:
+    yield
+    for factory in reversed(_GATEWAY_AUTHORITY_FACTORIES):
+        factory.close()
+    _GATEWAY_AUTHORITY_FACTORIES.clear()
+
+
+def _authorize_gateway_surface(
+    surface: FrozenModelSurface,
+    gateway: AgentProviderGatewaySession,
+) -> tuple[FrozenModelSurface, object, ModelCallSurfaceBinding]:
+    factory = AuthorityFactory()
+    _GATEWAY_AUTHORITY_FACTORIES.append(factory)
+    authority = factory.create_segment_authority(
+        conversation_id=1,
+        conversation_scope_revision=0,
+        segment_id=f"segment-{len(_GATEWAY_AUTHORITY_FACTORIES)}",
+        trusted_scope=TrustedContextScope(
+            context_type="workspace", context_ref=None, mode="general"
+        ),
+        capabilities=frozenset(AGENT_TYPED_V1_PROFILE.capabilities),
+    )
+    runner = object()
+    context = SimpleNamespace(authority=authority, authority_factory=factory)
+    factory.register_runner_invocation(runner, authority=authority)
+    factory.register_tool_execution_context(context, authority=authority)
+    build = factory.create_provider_surface_build_identity(
+        authority,
+        runner_invocation=runner,
+        tool_context=context,
+        model_call_id=surface.model_call_id,
+    )
+    authorized = replace(surface, provider_surface_build_identity=build)
+    binding = ModelCallSurfaceBinding.from_surface(authorized)
+    invocation = gateway.bind_provider_surface(
+        authority=authority,
+        build_identity=build,
+        surface=authorized,
+        model_call_surface_binding=binding,
+    )
+    return authorized, invocation, binding
 
 
 class FailingGuard:
@@ -188,11 +254,16 @@ def frozen(role: str, content: str = "", *, message_id: int = 0) -> FrozenMessag
 def contributors(request: str = "比较 offer") -> tuple[ContributorResult, ...]:
     values = []
     for name in CONTRIBUTOR_ORDER:
-        status = "disabled" if name in {
-            "confirmed_memory",
-            "knowledge_context",
-            "older_conversation_summary",
-        } else "not_applicable"
+        status = (
+            "disabled"
+            if name
+            in {
+                "confirmed_memory",
+                "knowledge_context",
+                "older_conversation_summary",
+            }
+            else "not_applicable"
+        )
         messages = ()
         if name == "static_policy":
             status, messages = "ready", (frozen("system", "policy"),)
@@ -210,8 +281,12 @@ def test_canonical_contract_rejects_runtime_objects_and_non_finite_numbers() -> 
 
 
 def test_frozen_source_has_distinct_revision_and_full_content_fingerprint() -> None:
-    source = FrozenSource.present(kind="application", revision_identity="revision:7", content={"x": 1})
-    changed = FrozenSource.present(kind="application", revision_identity="revision:7", content={"x": 2})
+    source = FrozenSource.present(
+        kind="application", revision_identity="revision:7", content={"x": 1}
+    )
+    changed = FrozenSource.present(
+        kind="application", revision_identity="revision:7", content={"x": 2}
+    )
     assert source.revision_identity == changed.revision_identity
     assert source.content_revision_fingerprint != changed.content_revision_fingerprint
     with pytest.raises(FrozenInstanceError):
@@ -313,9 +388,7 @@ def test_history_marks_complete_canonical_message_over_one_mib_as_oversized(
                 ),
                 source_message_id=2,
             ),
-            FrozenMessage.freeze(
-                Message("tool", "[]", tool_call_id="large"), source_message_id=3
-            ),
+            FrozenMessage.freeze(Message("tool", "[]", tool_call_id="large"), source_message_id=3),
         )
     else:
         messages = (
@@ -336,9 +409,7 @@ def test_budget_rounding_remainder_enters_shared_pool() -> None:
 
 
 def test_structured_chunker_records_paths_sizes_and_truncation() -> None:
-    chunks = chunk_structured_source(
-        {"resume": {"summary": "求" * 100}}, byte_cap=64, max_chunks=2
-    )
+    chunks = chunk_structured_source({"resume": {"summary": "求" * 100}}, byte_cap=64, max_chunks=2)
     assert len(chunks) == 2
     assert chunks[0].path == "$.resume.summary"
     assert chunks[0].original_bytes == 300
@@ -354,6 +425,7 @@ def test_projection_is_repeatable_and_preserves_current_request() -> None:
         provider_tools=MODEL_TOOL_CATALOG.provider_contracts(),
         tool_signals=ToolSelectionSignals(page_kind="offers", current_request="比较 offer"),
         provider_budgets=(ProviderBudget(),),
+        authority_surface=_authority_surface(),
     )
     first = ModelSurfaceProjector().project(request)
     second = ModelSurfaceProjector().project(request)
@@ -370,6 +442,7 @@ def test_projection_mandatory_overflow_fails_before_provider() -> None:
         provider_tools=MODEL_TOOL_CATALOG.provider_contracts(),
         tool_signals=ToolSelectionSignals(current_request="offer"),
         provider_budgets=(ProviderBudget(context_window=10_000),),
+        authority_surface=_authority_surface(),
     )
     with pytest.raises(ProjectionError, match="mandatory_surface_over_budget"):
         ModelSurfaceProjector().project(request)
@@ -384,18 +457,34 @@ def test_bound_response_rejects_unexposed_tool_without_executor() -> None:
             MODEL_TOOL_CATALOG.provider_contracts(),
             ToolSelectionSignals(page_kind="offers", current_request="offer"),
             (ProviderBudget(),),
+            _authority_surface(),
         )
     )
-    binding = ModelCallSurfaceBinding.from_surface(surface)
+    chain = FrozenProviderExecutionChain.freeze(
+        [AIProviderProfile(id="bound", api_key="x", base_url="https://bound.test/v1")]
+    )
+    gateway = AgentProviderGatewaySession(
+        chain,
+        SingleCandidateAgentTransport(
+            lambda *_args: Assistant(),
+            lambda *_args: Assistant(),
+        ),
+    )
+    surface, invocation, binding = _authorize_gateway_surface(surface, gateway)
+    attempt = invocation.tool_context.authority_factory.issue_provider_attempt(
+        invocation, candidate_ordinal=0
+    )
     response = BoundProviderResponse(
         "call-1",
         0,
-        "attempt",
+        attempt,
         surface.runtime_surface_fingerprint,
         Assistant(tool_calls=[ToolCall("x", "delete_note", "{}")]),
+        invocation,
+        binding,
     )
     with pytest.raises(ProjectionError, match="unknown_tool"):
-        binding.validate_response(response, attempt_validator=lambda value: value == "attempt")
+        binding.validate_response(response, attempt_validator=lambda value: value == attempt)
 
 
 @pytest.mark.parametrize(
@@ -412,7 +501,7 @@ def test_bound_provider_response_rejects_malformed_provenance_types(
     values: tuple[object, object, object, object, object],
 ) -> None:
     with pytest.raises(ProjectionError, match="invalid_bound_provider_response"):
-        BoundProviderResponse(*values)  # type: ignore[arg-type]
+        BoundProviderResponse(*values, object(), object())  # type: ignore[arg-type]
 
 
 def test_gateway_reuses_surface_and_stops_stream_fallback_after_delta() -> None:
@@ -429,6 +518,7 @@ def test_gateway_reuses_surface_and_stops_stream_fallback_after_delta() -> None:
             MODEL_TOOL_CATALOG.provider_contracts(),
             ToolSelectionSignals(page_kind="offers", current_request="offer"),
             tuple(candidate.budget() for candidate in chain.candidates),
+            _authority_surface(),
         )
     )
     calls: list[str] = []
@@ -443,8 +533,9 @@ def test_gateway_reuses_surface_and_stops_stream_fallback_after_delta() -> None:
         raise RuntimeError("lost")
 
     gateway = AgentProviderGatewaySession(chain, SingleCandidateAgentTransport(complete, stream))
+    surface, invocation, _binding = _authorize_gateway_surface(surface, gateway)
     with pytest.raises(RuntimeError, match="lost"):
-        gateway.stream(surface, lambda _value: None)
+        gateway.stream(surface, lambda _value: None, invocation_identity=invocation)
     assert calls == ["a"]
 
 
@@ -463,6 +554,7 @@ def test_gateway_deferred_stream_discards_failed_candidate_deltas_before_fallbac
             MODEL_TOOL_CATALOG.provider_contracts(),
             ToolSelectionSignals(page_kind="offers", current_request="offer"),
             tuple(candidate.budget() for candidate in chain.candidates),
+            _authority_surface(),
         )
     )
     calls: list[str] = []
@@ -481,9 +573,10 @@ def test_gateway_deferred_stream_discards_failed_candidate_deltas_before_fallbac
         return Assistant(content="winner")
 
     gateway = AgentProviderGatewaySession(chain, SingleCandidateAgentTransport(complete, stream))
+    surface, invocation, _binding = _authorize_gateway_surface(surface, gateway)
     deltas: list[str] = []
 
-    response = gateway.stream_deferred(surface, deltas.append)
+    response = gateway.stream_deferred(surface, deltas.append, invocation_identity=invocation)
 
     assert response.response.content == "winner"
     assert calls == ["a", "b"]
@@ -505,6 +598,7 @@ def test_gateway_deferred_stream_callback_failure_does_not_retry_completed_provi
             MODEL_TOOL_CATALOG.provider_contracts(),
             ToolSelectionSignals(page_kind="offers", current_request="offer"),
             tuple(candidate.budget() for candidate in chain.candidates),
+            _authority_surface(),
         )
     )
     calls: list[str] = []
@@ -519,12 +613,13 @@ def test_gateway_deferred_stream_callback_failure_does_not_retry_completed_provi
         return Assistant(content="ok")
 
     gateway = AgentProviderGatewaySession(chain, SingleCandidateAgentTransport(complete, stream))
+    surface, invocation, _binding = _authorize_gateway_surface(surface, gateway)
 
     def failing_sink(_value: str) -> None:
         raise RuntimeError("sink-failed")
 
     with pytest.raises(RuntimeError, match="sink-failed"):
-        gateway.stream_deferred(surface, failing_sink)
+        gateway.stream_deferred(surface, failing_sink, invocation_identity=invocation)
 
     assert calls == ["a"]
 
@@ -545,6 +640,7 @@ def test_gateway_checks_active_before_each_fallback_attempt(mode: str) -> None:
             MODEL_TOOL_CATALOG.provider_contracts(),
             ToolSelectionSignals(page_kind="offers", current_request="offer"),
             tuple(candidate.budget() for candidate in chain.candidates),
+            _authority_surface(),
         )
     )
     calls: list[str] = []
@@ -569,13 +665,28 @@ def test_gateway_checks_active_before_each_fallback_attempt(mode: str) -> None:
         raise RuntimeError("provider-lost")
 
     gateway = AgentProviderGatewaySession(chain, SingleCandidateAgentTransport(complete, stream))
+    surface, invocation, _binding = _authorize_gateway_surface(surface, gateway)
     with pytest.raises(RuntimeCancelled):
         if mode == "complete":
-            gateway.complete(surface, before_attempt=require_active)
+            gateway.complete(
+                surface,
+                invocation_identity=invocation,
+                before_attempt=require_active,
+            )
         elif mode == "stream":
-            gateway.stream(surface, lambda _value: None, before_attempt=require_active)
+            gateway.stream(
+                surface,
+                lambda _value: None,
+                invocation_identity=invocation,
+                before_attempt=require_active,
+            )
         else:
-            gateway.stream_deferred(surface, lambda _value: None, before_attempt=require_active)
+            gateway.stream_deferred(
+                surface,
+                lambda _value: None,
+                invocation_identity=invocation,
+                before_attempt=require_active,
+            )
 
     assert calls == ["a"]
     assert checks == [0, 1]
@@ -605,6 +716,7 @@ def test_gateway_discards_attempt_on_raw_base_exception(
             MODEL_TOOL_CATALOG.provider_contracts(),
             ToolSelectionSignals(page_kind="offers", current_request="offer"),
             tuple(candidate.budget() for candidate in chain.candidates),
+            _authority_surface(),
         )
     )
     calls: list[str] = []
@@ -619,13 +731,14 @@ def test_gateway_discards_attempt_on_raw_base_exception(
         raise error
 
     gateway = AgentProviderGatewaySession(chain, SingleCandidateAgentTransport(complete, stream))
+    surface, invocation, _binding = _authorize_gateway_surface(surface, gateway)
     with pytest.raises(type(error)) as raised:
         if mode == "complete":
-            gateway.complete(surface)
+            gateway.complete(surface, invocation_identity=invocation)
         elif mode == "stream":
-            gateway.stream(surface, lambda _value: None)
+            gateway.stream(surface, lambda _value: None, invocation_identity=invocation)
         else:
-            gateway.stream_deferred(surface, lambda _value: None)
+            gateway.stream_deferred(surface, lambda _value: None, invocation_identity=invocation)
 
     assert raised.value is error
     assert calls == ["a"]
@@ -655,6 +768,7 @@ def test_gateway_discards_attempt_on_raw_sink_base_exception(
             MODEL_TOOL_CATALOG.provider_contracts(),
             ToolSelectionSignals(page_kind="offers", current_request="offer"),
             tuple(candidate.budget() for candidate in chain.candidates),
+            _authority_surface(),
         )
     )
     calls: list[str] = []
@@ -670,15 +784,16 @@ def test_gateway_discards_attempt_on_raw_sink_base_exception(
         return Assistant(content="ok")
 
     gateway = AgentProviderGatewaySession(chain, SingleCandidateAgentTransport(complete, stream))
+    surface, invocation, _binding = _authorize_gateway_surface(surface, gateway)
 
     def failing_sink(_value: str) -> None:
         raise error
 
     with pytest.raises(type(error)) as raised:
         if mode == "stream":
-            gateway.stream(surface, failing_sink)
+            gateway.stream(surface, failing_sink, invocation_identity=invocation)
         else:
-            gateway.stream_deferred(surface, failing_sink)
+            gateway.stream_deferred(surface, failing_sink, invocation_identity=invocation)
 
     assert raised.value is error
     assert calls == ["a"]
@@ -708,6 +823,7 @@ def test_gateway_never_falls_back_after_runtime_control_error(
             MODEL_TOOL_CATALOG.provider_contracts(),
             ToolSelectionSignals(page_kind="offers", current_request="offer"),
             tuple(candidate.budget() for candidate in chain.candidates),
+            _authority_surface(),
         )
     )
     calls: list[str] = []
@@ -724,12 +840,13 @@ def test_gateway_never_falls_back_after_runtime_control_error(
         chain,
         SingleCandidateAgentTransport(complete, stream),
     )
+    surface, invocation, _binding = _authorize_gateway_surface(surface, gateway)
 
     with pytest.raises(type(control_error)) as raised:
         if mode == "complete":
-            gateway.complete(surface)
+            gateway.complete(surface, invocation_identity=invocation)
         else:
-            gateway.stream(surface, lambda _value: None)
+            gateway.stream(surface, lambda _value: None, invocation_identity=invocation)
 
     assert raised.value is control_error
     assert calls == ["a"]
@@ -746,6 +863,7 @@ def test_gateway_attempt_identity_is_session_owned_and_single_use() -> None:
             MODEL_TOOL_CATALOG.provider_contracts(),
             ToolSelectionSignals(page_kind="offers", current_request="offer"),
             tuple(candidate.budget() for candidate in chain.candidates),
+            _authority_surface(),
         )
     )
 
@@ -763,16 +881,19 @@ def test_gateway_attempt_identity_is_session_owned_and_single_use() -> None:
         chain,
         SingleCandidateAgentTransport(complete, stream),
     )
-    response = owner.complete(surface)
-    binding = ModelCallSurfaceBinding.from_surface(surface)
+    surface, invocation, binding = _authorize_gateway_surface(surface, owner)
+    response = owner.complete(surface, invocation_identity=invocation)
 
     with pytest.raises(ProjectionError, match="provider_response_attempt_mismatch"):
         binding.validate_response(response, attempt_validator=stranger.consume_attempt)
 
-    assert binding.validate_response(
-        response,
-        attempt_validator=owner.consume_attempt,
-    ).content == "ok"
+    assert (
+        binding.validate_response(
+            response,
+            attempt_validator=owner.consume_attempt,
+        ).content
+        == "ok"
+    )
     with pytest.raises(ProjectionError, match="provider_response_attempt_mismatch"):
         binding.validate_response(response, attempt_validator=owner.consume_attempt)
 
@@ -791,8 +912,12 @@ def test_loader_uses_one_snapshot_and_fetchmany(tmp_path: Path) -> None:
     database = tmp_path / "context.db"
     with sqlite3.connect(database) as connection:
         connection.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)")
-        connection.executemany("INSERT INTO items(value) VALUES (?)", [(str(i),) for i in range(70)])
-    loader: ContextSourceLoader[tuple[tuple[object, ...], ...], tuple[str, ...]] = ContextSourceLoader(database)
+        connection.executemany(
+            "INSERT INTO items(value) VALUES (?)", [(str(i),) for i in range(70)]
+        )
+    loader: ContextSourceLoader[tuple[tuple[object, ...], ...], tuple[str, ...]] = (
+        ContextSourceLoader(database)
+    )
 
     def read(connection: sqlite3.Connection) -> tuple[tuple[object, ...], ...]:
         return fetch_rows(connection.execute("SELECT value FROM items ORDER BY id"))
@@ -816,7 +941,10 @@ def test_loader_propagates_base_exception(tmp_path: Path) -> None:
 def test_manifest_v2_is_canonical_private_and_validated_by_shared_entrypoint() -> None:
     audit = RuntimeSurfaceAudit(
         "model-surface-budget-v1",
-        tuple((name, "disabled" if name.endswith("summary") else "ready") for name in CONTRIBUTOR_ORDER),  # type: ignore[arg-type]
+        tuple(
+            (name, "disabled" if name.endswith("summary") else "ready")
+            for name in CONTRIBUTOR_ORDER
+        ),  # type: ignore[arg-type]
         ("group-1",),
         MODEL_TOOL_NAMES,
         ("a" * 64,),
@@ -1097,9 +1225,10 @@ def test_manifest_v2_sha_updates_fixed_byte_chunks(monkeypatch: pytest.MonkeyPat
     )
 
     assert len(prepared.manifest_json.encode("utf-8")) > 4096
-    assert prepared.manifest_digest == hashlib.sha256(
-        prepared.manifest_json.encode("utf-8")
-    ).hexdigest()
+    assert (
+        prepared.manifest_digest
+        == hashlib.sha256(prepared.manifest_json.encode("utf-8")).hexdigest()
+    )
     assert chunks
     assert max(len(chunk) for chunk in chunks) <= 4096
     assert any(len(chunk) == 4096 for chunk in chunks)

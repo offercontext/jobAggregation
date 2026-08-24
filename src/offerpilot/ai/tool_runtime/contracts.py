@@ -33,6 +33,22 @@ FailureCategory: TypeAlias = Literal[
     "internal_error",
 ]
 BindingStatus: TypeAlias = Literal["matched", "mismatched", "unbound", "unavailable"]
+BindingContractKind: TypeAlias = Literal[
+    "none",
+    "enforce_if_bound",
+    "scoped_collection",
+    "optional_target",
+    "non_application_only",
+]
+BindingEntityKind: TypeAlias = Literal["application", "resume"]
+BindingResolverId: TypeAlias = Literal[
+    "application_identity_arg",
+    "application_event_parent",
+    "note_application_parent",
+    "offer_application_parent",
+    "resume_identity_arg",
+    "jd_analysis_application_parent",
+]
 
 ArgsT = TypeVar("ArgsT")
 ResultT = TypeVar("ResultT")
@@ -128,6 +144,83 @@ class BindingTarget:
             raise ValueError("binding target availability is inconsistent")
 
 
+@dataclass(frozen=True, slots=True)
+class BindingContract:
+    """Closed V1 binding strategy declared by one Typed Tool.
+
+    The entity kind is explicit rather than inferred from resolver callables or
+    tool names.  ``none`` and ``non_application_only`` intentionally carry no
+    entity kind because they cannot declare target resolvers.
+    """
+
+    kind: BindingContractKind = "none"
+    entity_kind: BindingEntityKind | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in {
+            "none",
+            "enforce_if_bound",
+            "scoped_collection",
+            "optional_target",
+            "non_application_only",
+        }:
+            raise ValueError("unknown binding contract kind")
+        if self.kind in {"none", "non_application_only"}:
+            if self.entity_kind is not None:
+                raise ValueError("unbound binding contract cannot declare an entity kind")
+        elif self.entity_kind not in {"application", "resume"}:
+            raise ValueError("bound binding contract requires an entity kind")
+
+
+@dataclass(frozen=True, slots=True)
+class BindingResolverSpec(Generic[ArgsT]):
+    """Stable resolver metadata plus its request-scoped implementation.
+
+    The metadata is the authority identity.  The callable is deliberately
+    excluded from equality/repr/fingerprint; it is only the execution hook.
+    """
+
+    resolver_id: BindingResolverId
+    entity_kind: BindingEntityKind
+    arg_path: str
+    presence: Literal["required", "optional"]
+    identity_type: Literal["positive_int64"]
+    resolve: Callable[[ArgsT, "ToolExecutionContext"], Any] = field(
+        repr=False,
+        compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        if self.resolver_id not in {
+            "application_identity_arg",
+            "application_event_parent",
+            "note_application_parent",
+            "offer_application_parent",
+            "resume_identity_arg",
+            "jd_analysis_application_parent",
+        }:
+            raise ValueError("unknown binding resolver id")
+        if self.entity_kind not in {"application", "resume"}:
+            raise ValueError("unknown binding resolver entity kind")
+        if (
+            type(self.arg_path) is not str
+            or not self.arg_path
+            or not self.arg_path.isidentifier()
+        ):
+            raise ValueError("binding resolver arg_path must be a single typed-args field")
+        if self.presence not in {"required", "optional"}:
+            raise ValueError("unknown binding resolver presence")
+        if self.identity_type != "positive_int64":
+            raise ValueError("unknown binding resolver identity type")
+        if not callable(self.resolve):
+            raise TypeError("binding resolver implementation must be callable")
+
+    def __call__(self, args: ArgsT, context: "ToolExecutionContext") -> Any:
+        """Keep the existing Pipeline call site source-compatible."""
+
+        return self.resolve(args, context)
+
+
 @dataclass(frozen=True)
 class ToolFailure(TransientToolRuntimeValue):
     category: FailureCategory
@@ -165,7 +258,7 @@ class ToolExceptionMapping:
 ToolDecoder: TypeAlias = Callable[[Mapping[str, JSONValue]], ArgsT]
 ToolCheck: TypeAlias = Callable[[ArgsT, "ToolExecutionContext"], ToolFailure | None]
 ToolExecutor: TypeAlias = Callable[[ArgsT, "ToolExecutionContext"], ResultT]
-BindingResolver: TypeAlias = Callable[[ArgsT, "ToolExecutionContext"], BindingTarget]
+BindingResolver: TypeAlias = Callable[[ArgsT, "ToolExecutionContext"], Any] | BindingResolverSpec[ArgsT]
 SuccessRenderer: TypeAlias = Callable[[ResultT], str]
 ResultMetadataProjector: TypeAlias = Callable[[ResultT], ToolResultMetadata]
 ConfirmationDescription: TypeAlias = Callable[[ArgsT], str]
@@ -224,6 +317,7 @@ class ToolSpec(Generic[ArgsT, ResultT]):
     decoder: ToolDecoder[ArgsT] = field(repr=False, compare=False)
     executor: ToolExecutor[ArgsT, ResultT] = field(repr=False, compare=False)
     required_capabilities: frozenset[str] = field(default_factory=frozenset)
+    binding_contract: BindingContract = field(default_factory=BindingContract)
     binding_resolvers: tuple[BindingResolver[ArgsT], ...] = field(default_factory=tuple)
     confirmation_policy: ConfirmationPolicy = "none"
     editable_fields: tuple[Mapping[str, JSONValue], ...] = field(default_factory=tuple)

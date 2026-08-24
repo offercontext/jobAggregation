@@ -5,7 +5,13 @@ from collections.abc import Mapping
 from typing import Any, TypedDict, cast
 
 from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
-from offerpilot.ai.tool_runtime.contracts import BindingTarget, JSONValue, ToolFailure, ToolSpec
+from offerpilot.ai.tool_runtime.contracts import (
+    BindingContract,
+    BindingResolverSpec,
+    JSONValue,
+    ToolFailure,
+    ToolSpec,
+)
 from offerpilot.ai.tool_specs.common import (
     INPUT_EXCEPTION_MAP,
     NOT_FOUND_EXCEPTION_MAP,
@@ -17,6 +23,8 @@ from offerpilot.ai.tool_specs.common import (
     note_json,
     optional_integer,
     provider_contract,
+    resolve_identity_argument,
+    resolve_parent_application,
 )
 from offerpilot.repositories.notes import NoteCreate, NoteUpdate
 
@@ -39,17 +47,41 @@ def _decode(values: Mapping[str, JSONValue]) -> NoteArgs:
     return cast(NoteArgs, decode_mapping(values))
 
 
-def _application_binding(args: NoteArgs, context: ToolExecutionContext) -> BindingTarget:
-    del context
-    identity = args.get("application_id")
-    return BindingTarget("application", identity, identity is not None)
+def _application_binding(args: NoteArgs, context: ToolExecutionContext) -> object:
+    return resolve_identity_argument(
+        args,
+        context,
+        entity_kind="application",
+        arg_path="application_id",
+        presence="optional",
+    )
 
 
-def _note_binding(args: NoteArgs, context: ToolExecutionContext) -> BindingTarget:
-    note_id = args.get("id")
-    note = context.notes.get(note_id) if note_id is not None else None
-    identity = note.application_id if note is not None else None
-    return BindingTarget("application", identity, identity is not None)
+def _note_binding(args: NoteArgs, context: ToolExecutionContext) -> object:
+    return resolve_parent_application(
+        args,
+        context,
+        arg_path="id",
+        entity_kind="application",
+    )
+
+
+_APPLICATION_OPTIONAL_RESOLVER = BindingResolverSpec(
+    resolver_id="application_identity_arg",
+    entity_kind="application",
+    arg_path="application_id",
+    presence="optional",
+    identity_type="positive_int64",
+    resolve=_application_binding,
+)
+_NOTE_PARENT_RESOLVER = BindingResolverSpec(
+    resolver_id="note_application_parent",
+    entity_kind="application",
+    arg_path="id",
+    presence="required",
+    identity_type="positive_int64",
+    resolve=_note_binding,
+)
 
 
 def _list(args: NoteArgs, context: ToolExecutionContext) -> list[dict[str, Any]]:
@@ -147,8 +179,8 @@ def note_specs() -> tuple[ToolSpec[Any, Any], ...]:
     read = frozenset({ToolCapability.NOTES_READ})
     write = frozenset({ToolCapability.NOTES_WRITE})
     return (
-        ToolSpec(contract=provider_contract("list_notes", "List interview review notes. Optionally filter by application id.", {"type": "object", "properties": {"application_id": {"type": "integer"}}}), kind="read", decoder=_decode, executor=_list, required_capabilities=read, binding_resolvers=(_application_binding,), success_renderer=compact_json),
-        ToolSpec(contract=provider_contract("add_note", "Add an interview review note. If application_id is present, company and position can be omitted.", _schema([])), kind="write", decoder=_decode, executor=_add, required_capabilities=write, binding_resolvers=(_application_binding,), confirmation_policy="required", preflight=_validate_add, mutable_validator=_validate_add, declared_failure_categories=frozenset({"validation_error", "not_found"}), exception_map=INPUT_EXCEPTION_MAP + NOT_FOUND_EXCEPTION_MAP, success_renderer=compact_json),
-        ToolSpec(contract=provider_contract("update_note", "Update an existing interview review note. Missing fields keep existing values.", _schema(["id"])), kind="write", decoder=_decode, executor=_update, required_capabilities=write, binding_resolvers=(_note_binding,), confirmation_policy="required", declared_failure_categories=frozenset({"not_found"}), exception_map=NOT_FOUND_EXCEPTION_MAP, success_renderer=compact_json),
-        ToolSpec(contract=provider_contract("delete_note", "Delete an interview review note by id.", {"type": "object", "properties": {"id": {"type": "integer", "description": "Note id."}}, "required": ["id"]}), kind="write", decoder=_decode, executor=_delete, required_capabilities=write, binding_resolvers=(_note_binding,), confirmation_policy="required", success_renderer=compact_json),
+        ToolSpec(contract=provider_contract("list_notes", "List interview review notes. Optionally filter by application id.", {"type": "object", "properties": {"application_id": {"type": "integer"}}}), kind="read", decoder=_decode, executor=_list, required_capabilities=read, binding_contract=BindingContract("scoped_collection", "application"), binding_resolvers=(_APPLICATION_OPTIONAL_RESOLVER,), success_renderer=compact_json),
+        ToolSpec(contract=provider_contract("add_note", "Add an interview review note. If application_id is present, company and position can be omitted.", _schema([])), kind="write", decoder=_decode, executor=_add, required_capabilities=write, binding_contract=BindingContract("optional_target", "application"), binding_resolvers=(_APPLICATION_OPTIONAL_RESOLVER,), confirmation_policy="required", preflight=_validate_add, mutable_validator=_validate_add, declared_failure_categories=frozenset({"validation_error", "not_found"}), exception_map=INPUT_EXCEPTION_MAP + NOT_FOUND_EXCEPTION_MAP, success_renderer=compact_json),
+        ToolSpec(contract=provider_contract("update_note", "Update an existing interview review note. Missing fields keep existing values.", _schema(["id"])), kind="write", decoder=_decode, executor=_update, required_capabilities=write, binding_contract=BindingContract("enforce_if_bound", "application"), binding_resolvers=(_NOTE_PARENT_RESOLVER, _APPLICATION_OPTIONAL_RESOLVER), confirmation_policy="required", declared_failure_categories=frozenset({"not_found"}), exception_map=NOT_FOUND_EXCEPTION_MAP, success_renderer=compact_json),
+        ToolSpec(contract=provider_contract("delete_note", "Delete an interview review note by id.", {"type": "object", "properties": {"id": {"type": "integer", "description": "Note id."}}, "required": ["id"]}), kind="write", decoder=_decode, executor=_delete, required_capabilities=write, binding_contract=BindingContract("enforce_if_bound", "application"), binding_resolvers=(_NOTE_PARENT_RESOLVER,), confirmation_policy="required", success_renderer=compact_json),
     )

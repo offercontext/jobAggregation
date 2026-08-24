@@ -6,7 +6,7 @@ from copy import deepcopy
 from typing import Any, cast
 
 from offerpilot.application_status import APPLICATION_STATUS_IDS
-from offerpilot.ai.tool_runtime.catalog import ToolCatalog
+from offerpilot.ai.tool_runtime.catalog import ToolCatalog, authority_manifest_for_specs
 from offerpilot.ai.tool_runtime.contracts import JSONValue, ToolSpec, UndoPolicy, WriteContract
 from offerpilot.ai.tool_specs.application_events import application_event_specs
 from offerpilot.ai.tool_specs.applications import application_specs
@@ -164,7 +164,12 @@ def build_model_tool_catalog() -> ToolCatalog:
         *jd_analysis_specs(),
     )
     specs = tuple(_with_runtime_metadata(spec) for spec in raw_specs)
-    return ToolCatalog(specs, expected_names=MODEL_TOOL_NAMES)
+    authority_manifest = authority_manifest_for_specs(specs, strict=True)
+    return ToolCatalog(
+        specs,
+        expected_names=MODEL_TOOL_NAMES,
+        authority_manifest=authority_manifest,
+    )
 
 
 MODEL_TOOL_CATALOG = build_model_tool_catalog()

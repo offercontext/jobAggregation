@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from datetime import datetime, timezone
-from typing import Any, cast
+from typing import Any, Literal, cast
 
+from offerpilot.ai.tool_authority.contracts import require_positive_int64
 from offerpilot.ai.tool_runtime.contracts import (
+    BindingTarget,
     JSONValue,
     ProviderToolContract,
     ToolExceptionMapping,
@@ -32,6 +34,125 @@ class ToolRecordNotFound(Exception):
 
 class ToolStateConflict(Exception):
     """A declared mutable-state conflict."""
+
+
+BindingResolutionState = Literal["resolved", "omitted", "detached", "unavailable"]
+
+
+def _authority_binding_resolution(
+    context: object,
+    *,
+    entity_kind: Literal["application", "resume"],
+    state: BindingResolutionState,
+    identity: int | None,
+) -> object:
+    """Return an authority-bound resolution when the context exposes the port.
+
+    Task4 deliberately does not open a repository session or read an ORM row.
+    Task7/Task9 provide the authority-aware context port.  The legacy fallback
+    keeps old unit-level Pipeline fixtures callable until that cut-over and
+    never exposes a parent body.
+    """
+
+    if state == "resolved":
+        require_positive_int64(identity, "binding identity")
+    elif identity is not None:
+        raise ValueError("only resolved binding targets may carry identity")
+
+    for method_name in ("binding_target_resolution", "create_binding_target_resolution"):
+        method = getattr(context, method_name, None)
+        if callable(method):
+            return method(entity_kind=entity_kind, state=state, identity=identity)
+    factory = getattr(context, "authority_factory", None)
+    authority = getattr(context, "authority", None)
+    method = getattr(factory, "create_binding_target_resolution", None)
+    if callable(method) and authority is not None:
+        return method(
+            authority,
+            entity_kind=entity_kind,
+            state=state,
+            identity=identity,
+        )
+    return BindingTarget(
+        entity_kind=entity_kind,
+        identity=identity if state == "resolved" else None,
+        available=state == "resolved",
+    )
+
+
+def resolve_identity_argument(
+    args: Mapping[str, object],
+    context: object,
+    *,
+    entity_kind: Literal["application", "resume"],
+    arg_path: str,
+    presence: Literal["required", "optional"],
+) -> object:
+    """Resolve a primitive typed-args identity without coercion."""
+
+    if arg_path not in args:
+        state: BindingResolutionState = "omitted" if presence == "optional" else "unavailable"
+        return _authority_binding_resolution(
+            context, entity_kind=entity_kind, state=state, identity=None
+        )
+    raw = args[arg_path]
+    if type(raw) is not int or not 1 <= raw <= 2**63 - 1:
+        return _authority_binding_resolution(
+            context, entity_kind=entity_kind, state="unavailable", identity=None
+        )
+    return _authority_binding_resolution(
+        context, entity_kind=entity_kind, state="resolved", identity=raw
+    )
+
+
+def resolve_parent_application(
+    args: Mapping[str, object],
+    context: object,
+    *,
+    arg_path: str,
+    entity_kind: Literal["application"],
+) -> object:
+    """Resolve only a primitive parent identity through an explicit context port.
+
+    The port returns ``(state, parent_id)`` or an object/mapping with the same
+    fields.  A missing port is unavailable; no fallback to Repository.get()
+    is allowed because that would read and retain entity bodies in a resolver.
+    """
+
+    identity = args.get(arg_path)
+    if type(identity) is not int or not 1 <= identity <= 2**63 - 1:
+        return _authority_binding_resolution(
+            context, entity_kind=entity_kind, state="unavailable", identity=None
+        )
+    port = getattr(context, "binding_resolver_port", None)
+    resolver = getattr(port, "resolve_parent_identity", None)
+    if not callable(resolver):
+        resolver = getattr(context, "resolve_parent_identity", None)
+    if not callable(resolver):
+        return _authority_binding_resolution(
+            context, entity_kind=entity_kind, state="unavailable", identity=None
+        )
+    result = resolver(entity_kind, identity)
+    if isinstance(result, Mapping):
+        state = result.get("state")
+        parent_id = result.get("identity")
+    elif isinstance(result, tuple) and len(result) == 2:
+        state, parent_id = result
+    else:
+        state = getattr(result, "state", None)
+        parent_id = getattr(result, "identity", None)
+    if state not in {"resolved", "detached", "unavailable"}:
+        state = "unavailable"
+        parent_id = None
+    if state == "resolved" and (type(parent_id) is not int or not 1 <= parent_id <= 2**63 - 1):
+        state = "unavailable"
+        parent_id = None
+    return _authority_binding_resolution(
+        context,
+        entity_kind=entity_kind,
+        state=cast(BindingResolutionState, state),
+        identity=cast(int | None, parent_id),
+    )
 
 
 INPUT_EXCEPTION_MAP = (

@@ -1,6 +1,8 @@
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.contracts import (
     BindingAudit,
+    BindingContract,
+    BindingResolverSpec,
     BindingTarget,
     ConfirmationRequired,
     ExecutionAuthorization,
@@ -35,6 +37,8 @@ from offerpilot.ai.tool_runtime.transport import project_transport_event
 __all__ = [
     "ArgumentValidationError",
     "BindingAudit",
+    "BindingContract",
+    "BindingResolverSpec",
     "BindingTarget",
     "ConfirmationRequired",
     "ExecutionAuthorization",

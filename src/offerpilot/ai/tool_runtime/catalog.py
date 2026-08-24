@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+import copy
 from dataclasses import replace
 from typing import Any
 
 from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
 
 from offerpilot.ai.tool_runtime.contracts import (
+    BindingContract,
+    BindingResolverSpec,
     FailureCategory,
     ProviderToolContract,
     REQUIRED_UNDO_TOOL_NAMES,
@@ -16,6 +19,7 @@ from offerpilot.ai.tool_runtime.contracts import (
     WriteContract,
 )
 from offerpilot.ai.tool_runtime.validation import compile_tool_schema
+from offerpilot.ai.tool_authority.policy import EXPECTED_CAPABILITY_SET, validate_startup_policy
 
 
 _FAILURE_CATEGORIES: frozenset[str] = frozenset(
@@ -32,24 +36,86 @@ _FAILURE_CATEGORIES: frozenset[str] = frozenset(
 )
 
 
+def authority_manifest_for_specs(
+    specs: Sequence[ToolSpec[Any, Any]],
+    *,
+    strict: bool = True,
+) -> dict[str, object]:
+    """Project ToolSpec authority metadata into the canonical manifest shape.
+
+    This is a structural projection, not a second matrix: the runtime specs
+    remain the source of values and the policy module supplies the pinned
+    fingerprint.  In strict mode a bare legacy resolver is rejected instead
+    of being inferred from a function name or signature.
+    """
+
+    tools: list[dict[str, object]] = []
+    for ordinal, spec in enumerate(specs, start=1):
+        if not isinstance(spec.binding_contract, BindingContract):
+            raise ValueError("tool binding contract metadata is required")
+        resolvers: list[dict[str, object]] = []
+        for resolver in spec.binding_resolvers:
+            if not isinstance(resolver, BindingResolverSpec):
+                if strict:
+                    raise ValueError("binding resolver metadata is required")
+                continue
+            resolvers.append(
+                {
+                    "resolver_id": resolver.resolver_id,
+                    "entity_kind": resolver.entity_kind,
+                    "arg_path": resolver.arg_path,
+                    "presence": resolver.presence,
+                    "identity_type": resolver.identity_type,
+                }
+            )
+        tools.append(
+            {
+                "ordinal": ordinal,
+                "name": spec.name,
+                "kind": spec.kind,
+                "confirmation_policy": spec.confirmation_policy,
+                "required_capabilities": [str(capability) for capability in spec.required_capabilities],
+                "binding": {
+                    "kind": spec.binding_contract.kind,
+                    "entity_kind": spec.binding_contract.entity_kind,
+                },
+                "resolvers": resolvers,
+            }
+        )
+    return {"schema_version": 1, "tools": tools}
+
+
 class ToolCatalog:
     def __init__(
         self,
         specs: Sequence[ToolSpec[Any, Any]],
         *,
         expected_names: Sequence[str],
+        authority_manifest: Mapping[str, object] | None = None,
     ) -> None:
         ordered = tuple(self._with_write_contract(spec) for spec in specs)
+        expected = tuple(expected_names)
         names = tuple(spec.name for spec in ordered)
-        if names != tuple(expected_names) or len(set(names)) != len(names):
+        if names != expected or len(set(names)) != len(names):
             raise ValueError("tool catalog names/order mismatch")
+        strict_authority = authority_manifest is not None or len(expected) == 25
         for spec in ordered:
-            self._validate_spec(spec)
+            self._validate_spec(spec, strict_authority=strict_authority)
+        projected_manifest: dict[str, object] | None = None
+        if strict_authority:
+            projected_manifest = authority_manifest_for_specs(ordered, strict=True)
+            if authority_manifest is not None and projected_manifest != dict(authority_manifest):
+                raise ValueError("authority manifest drift")
+            try:
+                validate_startup_policy(projected_manifest)
+            except ValueError as exc:
+                raise ValueError("authority policy drift") from exc
         self._ordered = ordered
         self._specs = {spec.name: spec for spec in ordered}
         self._validators = {
             spec.name: compile_tool_schema(spec.contract.parameters) for spec in ordered
         }
+        self._authority_manifest = projected_manifest
 
     @staticmethod
     def _with_write_contract(spec: ToolSpec[Any, Any]) -> ToolSpec[Any, Any]:
@@ -63,7 +129,7 @@ class ToolCatalog:
         return spec
 
     @staticmethod
-    def _validate_spec(spec: ToolSpec[Any, Any]) -> None:
+    def _validate_spec(spec: ToolSpec[Any, Any], *, strict_authority: bool = False) -> None:
         if spec.kind == "read" and spec.confirmation_policy != "none":
             raise ValueError("read tool cannot require confirmation")
         if spec.kind == "read" and spec.write_contract is not None:
@@ -78,6 +144,48 @@ class ToolCatalog:
             category: FailureCategory = mapping.category
             if category not in spec.declared_failure_categories:
                 raise ValueError("exception mapping category is not declared")
+        if not isinstance(spec.binding_contract, BindingContract):
+            raise ValueError("tool binding contract metadata is required")
+        if not strict_authority:
+            return
+        capabilities = {str(capability) for capability in spec.required_capabilities}
+        if not capabilities or not capabilities.issubset(EXPECTED_CAPABILITY_SET):
+            raise ValueError("unknown capability")
+        resolvers = spec.binding_resolvers
+        if any(not isinstance(resolver, BindingResolverSpec) for resolver in resolvers):
+            raise ValueError("binding resolver metadata is required")
+        resolver_specs = tuple(
+            resolver for resolver in resolvers if isinstance(resolver, BindingResolverSpec)
+        )
+        contract = spec.binding_contract
+        if contract.kind in {"none", "non_application_only"}:
+            if contract.entity_kind is not None or resolver_specs:
+                raise ValueError("unbound binding contract cannot declare resolvers")
+        else:
+            if contract.entity_kind is None:
+                raise ValueError("bound binding contract requires an entity kind")
+            if contract.kind == "scoped_collection" and len(resolver_specs) > 1:
+                raise ValueError("scoped collection accepts at most one resolver")
+            if contract.kind == "optional_target" and len(resolver_specs) > 1:
+                raise ValueError("optional target accepts at most one resolver")
+            for resolver in resolver_specs:
+                if resolver.entity_kind != contract.entity_kind:
+                    raise ValueError("mixed binding resolver entity kinds")
+            if contract.kind == "scoped_collection" and resolver_specs:
+                if resolver_specs[0].presence != "optional":
+                    raise ValueError("scoped collection resolver must be optional")
+        for resolver in resolver_specs:
+            if resolver.resolver_id not in {
+                "application_identity_arg",
+                "application_event_parent",
+                "note_application_parent",
+                "offer_application_parent",
+                "resume_identity_arg",
+                "jd_analysis_application_parent",
+            }:
+                raise ValueError("unknown binding resolver id")
+            if resolver.identity_type != "positive_int64":
+                raise ValueError("unknown binding resolver identity type")
 
     def resolve(self, name: str) -> ToolSpec[Any, Any] | None:
         return self._specs.get(name)
@@ -90,3 +198,13 @@ class ToolCatalog:
 
     def write_names(self) -> frozenset[str]:
         return frozenset(spec.name for spec in self._ordered if spec.kind == "write")
+
+    @property
+    def specs(self) -> tuple[ToolSpec[Any, Any], ...]:
+        return self._ordered
+
+    @property
+    def authority_manifest(self) -> dict[str, object]:
+        if self._authority_manifest is None:
+            return authority_manifest_for_specs(self._ordered, strict=False)
+        return copy.deepcopy(self._authority_manifest)

@@ -5,7 +5,13 @@ from typing import Any, TypedDict, cast
 
 from offerpilot.application_status import APPLICATION_STATUS_IDS, normalize_application_status
 from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
-from offerpilot.ai.tool_runtime.contracts import BindingTarget, JSONValue, ToolFailure, ToolSpec
+from offerpilot.ai.tool_runtime.contracts import (
+    BindingContract,
+    BindingResolverSpec,
+    JSONValue,
+    ToolFailure,
+    ToolSpec,
+)
 from offerpilot.ai.tool_specs.common import (
     CONFLICT_EXCEPTION_MAP,
     INPUT_EXCEPTION_MAP,
@@ -17,6 +23,7 @@ from offerpilot.ai.tool_specs.common import (
     decode_mapping,
     integer,
     provider_contract,
+    resolve_identity_argument,
     spaced_json,
 )
 from offerpilot.repositories.applications import ApplicationCreate
@@ -44,10 +51,24 @@ def _status_schema_failure(arguments: Mapping[str, JSONValue], code: str) -> str
     return None
 
 
-def _app_binding(args: ApplicationArgs, context: ToolExecutionContext) -> BindingTarget:
-    del context
-    identity = args.get("id")
-    return BindingTarget("application", identity, identity is not None)
+def _app_binding(args: ApplicationArgs, context: ToolExecutionContext) -> object:
+    return resolve_identity_argument(
+        args,
+        context,
+        entity_kind="application",
+        arg_path="id",
+        presence="required",
+    )
+
+
+_APPLICATION_IDENTITY_RESOLVER = BindingResolverSpec(
+    resolver_id="application_identity_arg",
+    entity_kind="application",
+    arg_path="id",
+    presence="required",
+    identity_type="positive_int64",
+    resolve=_app_binding,
+)
 
 
 def _list(args: ApplicationArgs, context: ToolExecutionContext) -> list[dict[str, Any]]:
@@ -139,6 +160,7 @@ def application_specs() -> tuple[ToolSpec[Any, Any], ...]:
             ),
             kind="read", decoder=_decode, executor=_list,
             required_capabilities=frozenset({ToolCapability.APPLICATIONS_READ}),
+            binding_contract=BindingContract("scoped_collection", "application"),
             success_renderer=spaced_json,
         ),
         ToolSpec(
@@ -149,7 +171,8 @@ def application_specs() -> tuple[ToolSpec[Any, Any], ...]:
             ),
             kind="read", decoder=_decode, executor=_get,
             required_capabilities=frozenset({ToolCapability.APPLICATIONS_READ}),
-            binding_resolvers=(_app_binding,), declared_failure_categories=frozenset({"not_found"}),
+            binding_contract=BindingContract("enforce_if_bound", "application"),
+            binding_resolvers=(_APPLICATION_IDENTITY_RESOLVER,), declared_failure_categories=frozenset({"not_found"}),
             exception_map=NOT_FOUND_EXCEPTION_MAP, success_renderer=spaced_json,
         ),
         ToolSpec(
@@ -160,6 +183,7 @@ def application_specs() -> tuple[ToolSpec[Any, Any], ...]:
             ),
             kind="write", decoder=_decode, executor=_create,
             required_capabilities=frozenset({ToolCapability.APPLICATIONS_WRITE}), confirmation_policy="required",
+            binding_contract=BindingContract("non_application_only"),
             preflight=_validate_create, mutable_validator=_validate_create,
             declared_failure_categories=frozenset({"validation_error", "conflict"}), exception_map=INPUT_EXCEPTION_MAP,
             success_renderer=spaced_json,
@@ -172,7 +196,8 @@ def application_specs() -> tuple[ToolSpec[Any, Any], ...]:
                 {"type": "object", "properties": {"id": {"type": "integer", "description": "Application id returned by list_applications."}, "status": {"type": "string", "enum": statuses}, "closed_reason": {"type": "string", "description": "Required when status is closed."}}, "required": ["id", "status"]},
             ),
             kind="write", decoder=_decode, executor=_update,
-            required_capabilities=frozenset({ToolCapability.APPLICATIONS_WRITE}), binding_resolvers=(_app_binding,),
+            required_capabilities=frozenset({ToolCapability.APPLICATIONS_WRITE}),
+            binding_contract=BindingContract("enforce_if_bound", "application"), binding_resolvers=(_APPLICATION_IDENTITY_RESOLVER,),
             confirmation_policy="required", declared_failure_categories=frozenset({"validation_error", "not_found", "conflict"}),
             exception_map=INPUT_EXCEPTION_MAP + NOT_FOUND_EXCEPTION_MAP + CONFLICT_EXCEPTION_MAP, success_renderer=spaced_json,
             schema_failure_renderer=_status_schema_failure,

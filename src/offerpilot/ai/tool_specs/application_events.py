@@ -5,7 +5,12 @@ from datetime import datetime
 from typing import Any, TypedDict, cast
 
 from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
-from offerpilot.ai.tool_runtime.contracts import BindingTarget, JSONValue, ToolSpec
+from offerpilot.ai.tool_runtime.contracts import (
+    BindingContract,
+    BindingResolverSpec,
+    JSONValue,
+    ToolSpec,
+)
 from offerpilot.ai.tool_specs.common import (
     INPUT_EXCEPTION_MAP,
     NOT_FOUND_EXCEPTION_MAP,
@@ -18,6 +23,8 @@ from offerpilot.ai.tool_specs.common import (
     integer,
     optional_integer,
     provider_contract,
+    resolve_identity_argument,
+    resolve_parent_application,
 )
 from offerpilot.repositories.application_events import ApplicationEventCreate
 
@@ -45,22 +52,59 @@ def _decode(values: Mapping[str, JSONValue]) -> EventArgs:
     return cast(EventArgs, decode_mapping(values))
 
 
-def _application_binding(args: EventArgs, context: ToolExecutionContext) -> BindingTarget:
-    del context
-    identity = args.get("application_id")
-    return BindingTarget("application", identity, identity is not None)
-
-
-def _event_binding(args: EventArgs, context: ToolExecutionContext) -> BindingTarget:
-    event_id = args.get("id")
-    if event_id is None:
-        return BindingTarget("application", None, False)
-    event = context.events.get(event_id)
-    return BindingTarget(
-        "application",
-        event.application_id if event is not None else None,
-        event is not None,
+def _application_optional_binding(args: EventArgs, context: ToolExecutionContext) -> object:
+    return resolve_identity_argument(
+        args,
+        context,
+        entity_kind="application",
+        arg_path="application_id",
+        presence="optional",
     )
+
+
+def _application_required_binding(args: EventArgs, context: ToolExecutionContext) -> object:
+    return resolve_identity_argument(
+        args,
+        context,
+        entity_kind="application",
+        arg_path="application_id",
+        presence="required",
+    )
+
+
+def _event_binding(args: EventArgs, context: ToolExecutionContext) -> object:
+    return resolve_parent_application(
+        args,
+        context,
+        arg_path="id",
+        entity_kind="application",
+    )
+
+
+_APPLICATION_OPTIONAL_RESOLVER = BindingResolverSpec(
+    resolver_id="application_identity_arg",
+    entity_kind="application",
+    arg_path="application_id",
+    presence="optional",
+    identity_type="positive_int64",
+    resolve=_application_optional_binding,
+)
+_APPLICATION_REQUIRED_RESOLVER = BindingResolverSpec(
+    resolver_id="application_identity_arg",
+    entity_kind="application",
+    arg_path="application_id",
+    presence="required",
+    identity_type="positive_int64",
+    resolve=_application_required_binding,
+)
+_APPLICATION_EVENT_PARENT_RESOLVER = BindingResolverSpec(
+    resolver_id="application_event_parent",
+    entity_kind="application",
+    arg_path="id",
+    presence="required",
+    identity_type="positive_int64",
+    resolve=_event_binding,
+)
 
 
 def _list(args: EventArgs, context: ToolExecutionContext) -> list[dict[str, Any]]:
@@ -171,32 +215,37 @@ def application_event_specs() -> tuple[ToolSpec[Any, Any], ...]:
                 {"type": "object", "properties": {"month": {"type": "string", "description": "Optional YYYY-MM month filter."}, "application_id": {"type": "integer"}, "event_type": {"type": "string", "enum": list(EVENT_TYPES)}}},
             ),
             kind="read", decoder=_decode, executor=_list, required_capabilities=read,
-            binding_resolvers=(_application_binding,), success_renderer=compact_json,
+            binding_contract=BindingContract("scoped_collection", "application"),
+            binding_resolvers=(_APPLICATION_OPTIONAL_RESOLVER,), success_renderer=compact_json,
         ),
         ToolSpec(
             contract=provider_contract("get_application_event", "Get one application event by id.", id_schema),
             kind="read", decoder=_decode, executor=_get, required_capabilities=read,
-            binding_resolvers=(_event_binding,), declared_failure_categories=frozenset({"not_found"}),
+            binding_contract=BindingContract("enforce_if_bound", "application"),
+            binding_resolvers=(_APPLICATION_EVENT_PARENT_RESOLVER,), declared_failure_categories=frozenset({"not_found"}),
             exception_map=NOT_FOUND_EXCEPTION_MAP, success_renderer=compact_json,
         ),
         ToolSpec(
             contract=provider_contract("create_application_event", "Create an application event. Use written_test.subtype=assessment for assessments.", _event_schema(["application_id", "event_type", "scheduled_at", "duration_minutes"])),
             kind="write", decoder=_decode, executor=_create, required_capabilities=write,
-            binding_resolvers=(_application_binding,), confirmation_policy="required",
+            binding_contract=BindingContract("enforce_if_bound", "application"),
+            binding_resolvers=(_APPLICATION_REQUIRED_RESOLVER,), confirmation_policy="required",
             declared_failure_categories=frozenset({"validation_error", "not_found"}), exception_map=INPUT_EXCEPTION_MAP + NOT_FOUND_EXCEPTION_MAP,
             success_renderer=compact_json,
         ),
         ToolSpec(
             contract=provider_contract("update_application_event", "Update an existing application event.", _event_schema(["id", "application_id", "event_type", "scheduled_at", "duration_minutes"])),
             kind="write", decoder=_decode, executor=_update, required_capabilities=write,
-            binding_resolvers=(_event_binding, _application_binding), confirmation_policy="required",
+            binding_contract=BindingContract("enforce_if_bound", "application"),
+            binding_resolvers=(_APPLICATION_EVENT_PARENT_RESOLVER, _APPLICATION_REQUIRED_RESOLVER), confirmation_policy="required",
             declared_failure_categories=frozenset({"validation_error", "not_found"}), exception_map=INPUT_EXCEPTION_MAP + NOT_FOUND_EXCEPTION_MAP,
             success_renderer=compact_json,
         ),
         ToolSpec(
             contract=provider_contract("delete_application_event", "Delete an application event by id.", id_schema),
             kind="write", decoder=_decode, executor=_delete, required_capabilities=write,
-            binding_resolvers=(_event_binding,), confirmation_policy="required",
+            binding_contract=BindingContract("enforce_if_bound", "application"),
+            binding_resolvers=(_APPLICATION_EVENT_PARENT_RESOLVER,), confirmation_policy="required",
             declared_failure_categories=frozenset({"not_found"}), exception_map=NOT_FOUND_EXCEPTION_MAP,
             success_renderer=compact_json,
         ),

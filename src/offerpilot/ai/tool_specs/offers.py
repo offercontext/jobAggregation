@@ -4,7 +4,12 @@ from collections.abc import Mapping
 from typing import Any, TypedDict, cast
 
 from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
-from offerpilot.ai.tool_runtime.contracts import BindingTarget, JSONValue, ToolSpec
+from offerpilot.ai.tool_runtime.contracts import (
+    BindingContract,
+    BindingResolverSpec,
+    JSONValue,
+    ToolSpec,
+)
 from offerpilot.ai.tool_specs.common import (
     INPUT_EXCEPTION_MAP,
     NOT_FOUND_EXCEPTION_MAP,
@@ -15,6 +20,7 @@ from offerpilot.ai.tool_specs.common import (
     integer,
     offer_json,
     provider_contract,
+    resolve_parent_application,
 )
 from offerpilot.repositories.offers import OfferCreate
 
@@ -42,11 +48,23 @@ def _decode(values: Mapping[str, JSONValue]) -> OfferArgs:
     return cast(OfferArgs, decode_mapping(values))
 
 
-def _offer_binding(args: OfferArgs, context: ToolExecutionContext) -> BindingTarget:
-    offer_id = args.get("id")
-    offer = context.offers.get(offer_id) if offer_id is not None else None
-    identity = offer.application_id if offer is not None else None
-    return BindingTarget("application", identity, identity is not None)
+def _offer_binding(args: OfferArgs, context: ToolExecutionContext) -> object:
+    return resolve_parent_application(
+        args,
+        context,
+        arg_path="id",
+        entity_kind="application",
+    )
+
+
+_OFFER_PARENT_RESOLVER = BindingResolverSpec(
+    resolver_id="offer_application_parent",
+    entity_kind="application",
+    arg_path="id",
+    presence="required",
+    identity_type="positive_int64",
+    resolve=_offer_binding,
+)
 
 
 def _list(args: OfferArgs, context: ToolExecutionContext) -> list[dict[str, Any]]:
@@ -136,9 +154,9 @@ def offer_specs() -> tuple[ToolSpec[Any, Any], ...]:
     write = frozenset({ToolCapability.OFFERS_WRITE})
     id_schema: dict[str, JSONValue] = {"type": "object", "properties": {"id": {"type": "integer", "description": "Offer id."}}, "required": ["id"]}
     return (
-        ToolSpec(contract=provider_contract("list_offers", "List offers. The returned id is an offer id, not an application id; use application_id only when it is present.", {"type": "object", "properties": {"status": {"type": "string", "enum": list(OFFER_STATUSES)}}}), kind="read", decoder=_decode, executor=_list, required_capabilities=read, success_renderer=compact_json),
-        ToolSpec(contract=provider_contract("get_offer", "Get one offer by offer id. Offer id is not an application id.", id_schema), kind="read", decoder=_decode, executor=_get, required_capabilities=read, binding_resolvers=(_offer_binding,), declared_failure_categories=frozenset({"not_found"}), exception_map=NOT_FOUND_EXCEPTION_MAP, success_renderer=compact_json),
-        ToolSpec(contract=provider_contract("compare_offers", "Compare offers by offer ids. Missing ids are skipped.", {"type": "object", "properties": {"ids": {"type": "array", "items": {"type": "integer"}}}, "required": ["ids"]}), kind="read", decoder=_decode, executor=_compare, required_capabilities=read, declared_failure_categories=frozenset({"validation_error"}), exception_map=INPUT_EXCEPTION_MAP, success_renderer=compact_json),
-        ToolSpec(contract=provider_contract("update_offer", "Update an offer. Missing fields keep existing values.", _offer_schema(["id"])), kind="write", decoder=_decode, executor=_update, required_capabilities=write, binding_resolvers=(_offer_binding,), confirmation_policy="required", declared_failure_categories=frozenset({"validation_error", "not_found"}), exception_map=INPUT_EXCEPTION_MAP + NOT_FOUND_EXCEPTION_MAP, success_renderer=compact_json),
-        ToolSpec(contract=provider_contract("save_offer_assessment", "Save or replace the assessment text for an offer.", {"type": "object", "properties": {"id": {"type": "integer"}, "assessment": {"type": "string"}}, "required": ["id", "assessment"]}), kind="write", decoder=_decode, executor=_assessment, required_capabilities=write, binding_resolvers=(_offer_binding,), confirmation_policy="required", declared_failure_categories=frozenset({"validation_error", "not_found"}), exception_map=INPUT_EXCEPTION_MAP + NOT_FOUND_EXCEPTION_MAP, success_renderer=compact_json),
+        ToolSpec(contract=provider_contract("list_offers", "List offers. The returned id is an offer id, not an application id; use application_id only when it is present.", {"type": "object", "properties": {"status": {"type": "string", "enum": list(OFFER_STATUSES)}}}), kind="read", decoder=_decode, executor=_list, required_capabilities=read, binding_contract=BindingContract("scoped_collection", "application"), success_renderer=compact_json),
+        ToolSpec(contract=provider_contract("get_offer", "Get one offer by offer id. Offer id is not an application id.", id_schema), kind="read", decoder=_decode, executor=_get, required_capabilities=read, binding_contract=BindingContract("enforce_if_bound", "application"), binding_resolvers=(_OFFER_PARENT_RESOLVER,), declared_failure_categories=frozenset({"not_found"}), exception_map=NOT_FOUND_EXCEPTION_MAP, success_renderer=compact_json),
+        ToolSpec(contract=provider_contract("compare_offers", "Compare offers by offer ids. Missing ids are skipped.", {"type": "object", "properties": {"ids": {"type": "array", "items": {"type": "integer"}}}, "required": ["ids"]}), kind="read", decoder=_decode, executor=_compare, required_capabilities=read, binding_contract=BindingContract("non_application_only"), declared_failure_categories=frozenset({"validation_error"}), exception_map=INPUT_EXCEPTION_MAP, success_renderer=compact_json),
+        ToolSpec(contract=provider_contract("update_offer", "Update an offer. Missing fields keep existing values.", _offer_schema(["id"])), kind="write", decoder=_decode, executor=_update, required_capabilities=write, binding_contract=BindingContract("enforce_if_bound", "application"), binding_resolvers=(_OFFER_PARENT_RESOLVER,), confirmation_policy="required", declared_failure_categories=frozenset({"validation_error", "not_found"}), exception_map=INPUT_EXCEPTION_MAP + NOT_FOUND_EXCEPTION_MAP, success_renderer=compact_json),
+        ToolSpec(contract=provider_contract("save_offer_assessment", "Save or replace the assessment text for an offer.", {"type": "object", "properties": {"id": {"type": "integer"}, "assessment": {"type": "string"}}, "required": ["id", "assessment"]}), kind="write", decoder=_decode, executor=_assessment, required_capabilities=write, binding_contract=BindingContract("enforce_if_bound", "application"), binding_resolvers=(_OFFER_PARENT_RESOLVER,), confirmation_policy="required", declared_failure_categories=frozenset({"validation_error", "not_found"}), exception_map=INPUT_EXCEPTION_MAP + NOT_FOUND_EXCEPTION_MAP, success_renderer=compact_json),
     )

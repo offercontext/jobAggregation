@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import pickle
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -12,6 +13,8 @@ from offerpilot.ai import client as ai_client
 from offerpilot.ai.client import ConfiguredAIClient
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.contracts import (
+    BindingContract,
+    BindingResolverSpec,
     BindingAudit,
     ExecutionAuthorization,
     PreparedToolCall,
@@ -201,3 +204,30 @@ def test_complete_tool_classification_is_exactly_twenty_five_typed_plus_three_le
     assert len(LEGACY_DETERMINISTIC_NAMES) == 3
     assert typed.isdisjoint(LEGACY_DETERMINISTIC_NAMES)
     assert len(typed | LEGACY_DETERMINISTIC_NAMES) == 28
+
+
+def test_catalog_rejects_unknown_capability_and_resolver_metadata() -> None:
+    spec = _spec("read_one")
+    with pytest.raises(ValueError, match="unknown capability"):
+        ToolCatalog(
+            [replace(spec, required_capabilities=frozenset({"future.read"}))],
+            expected_names=("read_one",),
+            authority_manifest={
+                "schema_version": 1,
+                "tools": [],
+            },
+        )
+
+
+def test_binding_contract_and_resolver_descriptor_have_closed_fields() -> None:
+    contract = BindingContract(kind="enforce_if_bound", entity_kind="application")
+    resolver = BindingResolverSpec(
+        resolver_id="application_identity_arg",
+        entity_kind="application",
+        arg_path="id",
+        presence="required",
+        identity_type="positive_int64",
+        resolve=lambda args, context: None,
+    )
+    assert contract.entity_kind == "application"
+    assert resolver.arg_path == "id"

@@ -4,7 +4,12 @@ from collections.abc import Mapping
 from typing import Any, TypedDict, cast
 
 from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
-from offerpilot.ai.tool_runtime.contracts import BindingTarget, JSONValue, ToolSpec
+from offerpilot.ai.tool_runtime.contracts import (
+    BindingContract,
+    BindingResolverSpec,
+    JSONValue,
+    ToolSpec,
+)
 from offerpilot.ai.tool_specs.common import (
     NOT_FOUND_EXCEPTION_MAP,
     ToolRecordNotFound,
@@ -14,6 +19,8 @@ from offerpilot.ai.tool_specs.common import (
     jd_analysis_json,
     optional_integer,
     provider_contract,
+    resolve_identity_argument,
+    resolve_parent_application,
 )
 
 
@@ -26,17 +33,41 @@ def _decode(values: Mapping[str, JSONValue]) -> JDArgs:
     return cast(JDArgs, decode_mapping(values))
 
 
-def _application_binding(args: JDArgs, context: ToolExecutionContext) -> BindingTarget:
-    del context
-    identity = args.get("application_id")
-    return BindingTarget("application", identity, identity is not None)
+def _application_binding(args: JDArgs, context: ToolExecutionContext) -> object:
+    return resolve_identity_argument(
+        args,
+        context,
+        entity_kind="application",
+        arg_path="application_id",
+        presence="optional",
+    )
 
 
-def _analysis_binding(args: JDArgs, context: ToolExecutionContext) -> BindingTarget:
-    analysis_id = args.get("id")
-    analysis = context.jd_analyses.get(analysis_id) if analysis_id is not None else None
-    identity = analysis.application_id if analysis is not None else None
-    return BindingTarget("application", identity, identity is not None)
+def _analysis_binding(args: JDArgs, context: ToolExecutionContext) -> object:
+    return resolve_parent_application(
+        args,
+        context,
+        arg_path="id",
+        entity_kind="application",
+    )
+
+
+_APPLICATION_OPTIONAL_RESOLVER = BindingResolverSpec(
+    resolver_id="application_identity_arg",
+    entity_kind="application",
+    arg_path="application_id",
+    presence="optional",
+    identity_type="positive_int64",
+    resolve=_application_binding,
+)
+_JD_ANALYSIS_PARENT_RESOLVER = BindingResolverSpec(
+    resolver_id="jd_analysis_application_parent",
+    entity_kind="application",
+    arg_path="id",
+    presence="required",
+    identity_type="positive_int64",
+    resolve=_analysis_binding,
+)
 
 
 def _list(args: JDArgs, context: ToolExecutionContext) -> list[dict[str, Any]]:
@@ -53,6 +84,6 @@ def _get(args: JDArgs, context: ToolExecutionContext) -> dict[str, Any]:
 def jd_analysis_specs() -> tuple[ToolSpec[Any, Any], ...]:
     read = frozenset({ToolCapability.JD_ANALYSES_READ})
     return (
-        ToolSpec(contract=provider_contract("list_jd_analyses", "List saved JD analyses. Optionally filter by application id.", {"type": "object", "properties": {"application_id": {"type": "integer"}}}), kind="read", decoder=_decode, executor=_list, required_capabilities=read, binding_resolvers=(_application_binding,), success_renderer=compact_json),
-        ToolSpec(contract=provider_contract("get_jd_analysis", "Get one saved JD analysis by id.", {"type": "object", "properties": {"id": {"type": "integer", "description": "JD analysis id."}}, "required": ["id"]}), kind="read", decoder=_decode, executor=_get, required_capabilities=read, binding_resolvers=(_analysis_binding,), declared_failure_categories=frozenset({"not_found"}), exception_map=NOT_FOUND_EXCEPTION_MAP, success_renderer=compact_json),
+        ToolSpec(contract=provider_contract("list_jd_analyses", "List saved JD analyses. Optionally filter by application id.", {"type": "object", "properties": {"application_id": {"type": "integer"}}}), kind="read", decoder=_decode, executor=_list, required_capabilities=read, binding_contract=BindingContract("scoped_collection", "application"), binding_resolvers=(_APPLICATION_OPTIONAL_RESOLVER,), success_renderer=compact_json),
+        ToolSpec(contract=provider_contract("get_jd_analysis", "Get one saved JD analysis by id.", {"type": "object", "properties": {"id": {"type": "integer", "description": "JD analysis id."}}, "required": ["id"]}), kind="read", decoder=_decode, executor=_get, required_capabilities=read, binding_contract=BindingContract("enforce_if_bound", "application"), binding_resolvers=(_JD_ANALYSIS_PARENT_RESOLVER,), declared_failure_categories=frozenset({"not_found"}), exception_map=NOT_FOUND_EXCEPTION_MAP, success_renderer=compact_json),
     )

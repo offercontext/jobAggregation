@@ -3,22 +3,28 @@ from __future__ import annotations
 import json
 import pickle
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from threading import Event, Lock, RLock
+from time import monotonic
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Callable, cast
 from uuid import uuid4
-from dataclasses import replace
 
 import pytest
 
 from offerpilot.ai.agent_contracts import AgentTurnResult, PendingAction
 from offerpilot.ai.agent_loop import ApprovedWriteSeed
+from offerpilot.ai.tool_authority.fingerprint import authorization_scope_fingerprint
+from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
-from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
+from offerpilot.ai.tool_authority import (
+    ApprovalExecutionAuthority,
+    AuthorityFactory,
+    TrustedContextScope,
+)
 from offerpilot.ai.tool_runtime.legacy import LEGACY_DETERMINISTIC_NAMES
-from offerpilot.ai.tool_runtime.pipeline import prepare_call
-from offerpilot.ai.tool_runtime.contracts import ToolFailure, ToolSuccess
+from offerpilot.ai.tool_runtime.pipeline import execute_prepared, prepare_call
+from offerpilot.ai.tool_runtime.contracts import ConfirmationRequired, ToolFailure, ToolSuccess
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.ai.write_operations import (
@@ -35,6 +41,7 @@ from offerpilot.ai.write_operations import (
     WriteOperationError,
     WriteOperationRepository,
     load_or_create_ledger_key,
+    pending_action_identity,
 )
 from offerpilot.agent_runtime.journal import NullRunRecorder, NullRunRecorderFactory
 from offerpilot.chat_transport import SseAgentExecutionHost, outcome_http_payload
@@ -63,6 +70,7 @@ from offerpilot.pilot_runtime.contracts import (
     ToolResultEvent,
 )
 from offerpilot.pilot_runtime.continuation import (
+    ApprovalAuthorityResolver,
     ConfirmationApprovedWritePort,
     ConfirmationCoordinator,
     ConfirmationDependencies,
@@ -1730,9 +1738,145 @@ def test_reject_session_does_not_load_conversation_for_generation() -> None:
     assert session.state.continuation_generation is None
 
 
-@pytest.mark.skip(
-    reason="legacy raw ToolExecutionContext harness; exact-authority coverage lives in tool_authority tests"
-)
+def _real_sqlite_approval_context_resolver(
+    sessions: Any,
+    operations: WriteOperationRepository,
+    factories: list[AuthorityFactory],
+) -> Callable[..., ToolExecutionContext]:
+    def resolve(**kwargs: object) -> ToolExecutionContext:
+        factory = AuthorityFactory()
+        factories.append(factory)
+        try:
+            authority = ApprovalAuthorityResolver(
+                operations,
+                factory,
+                capabilities=frozenset(ToolCapability),
+            ).resolve(**cast(Any, kwargs))
+            return ToolExecutionContext(
+                authority=authority,
+                applications=ApplicationsRepository(sessions),
+                events=ApplicationEventsRepository(sessions),
+                notes=NotesRepository(sessions),
+                offers=OffersRepository(sessions),
+                resumes=ResumesRepository(sessions),
+                jd_analyses=JDAnalysesRepository(sessions),
+                run_recorder=NullRunRecorder(),
+            )
+        except BaseException:
+            factory.close()
+            raise
+
+    return resolve
+
+
+def _persist_real_sqlite_typed_pending(
+    sessions: Any,
+    operations: WriteOperationRepository,
+    key: Any,
+    *,
+    tool_call_id: str,
+    raw_args: str,
+) -> tuple[Conversation, PendingAction]:
+    chat = ChatRepository(sessions, operations)
+    conversation = chat.create_conversation("workspace")
+    pending = PendingAction(
+        tool_call_id,
+        "save_offer_assessment",
+        raw_args,
+        "save assessment",
+        str(uuid4()),
+    )
+    with sessions() as setup_session:
+        owner = setup_session.get(Conversation, conversation.id)
+        assert owner is not None
+        owner.pending_operation_id = pending.operation_id
+        owner.pending_tool_call_id = pending.tool_call_id
+        owner.pending_tool_name = pending.tool_name
+        owner.pending_args = pending.args
+        owner.pending_human = pending.human
+        operations.create_primary(
+            setup_session,
+            operation_id=pending.operation_id,
+            conversation_id=conversation.id,
+            tool_call_id=pending.tool_call_id,
+            tool_name=pending.tool_name,
+            adapter_kind="typed",
+            proposal_fingerprint=ledger_fingerprint(
+                key, "write-operation-proposal-v1", json.loads(pending.args)
+            ),
+            confirmation_token_fingerprint=ledger_fingerprint(
+                key,
+                "write-operation-confirmation-token-v1",
+                _confirmation_token(pending).encode("ascii"),
+            ),
+            authorization_scope_fingerprint=authorization_scope_fingerprint(
+                key,
+                conversation_id=conversation.id,
+                conversation_scope_revision=0,
+                context_type="workspace",
+                context_ref=None,
+                mode="general",
+                capability_profile_id="agent_typed_v1",
+                capability_policy_version="capability-policy-v1",
+                binding_policy_version="binding-policy-v1",
+                capability_profile_fingerprint="sha256:" + "0" * 64,
+                binding_policy_fingerprint="sha256:" + "0" * 64,
+            ),
+        )
+        setup_session.commit()
+    return conversation, pending
+
+
+def _real_sqlite_approval_catalog(executor: object) -> ToolCatalog:
+    base_spec = MODEL_TOOL_CATALOG.resolve("save_offer_assessment")
+    assert base_spec is not None
+    spec = replace(base_spec, binding_resolvers=(), executor=cast(Any, executor))
+    return ToolCatalog((spec,), expected_names=(spec.name,))
+
+
+def _prepare_real_sqlite_approval(
+    session: object,
+    catalog: ToolCatalog,
+    request: ConfirmationRequest,
+) -> tuple[PendingAction, ToolExecutionContext, object, object]:
+    pending = cast(Any, session).pending
+    assert isinstance(pending, PendingAction)
+    digest, revision = pending_action_identity(
+        pending.tool_call_id,
+        pending.tool_name,
+        pending.args,
+    )
+    assert pending.arguments_digest == digest
+    assert pending.effective_args_digest == digest
+    assert pending.pending_action_revision == revision
+    context = cast(Any, session).approval_execution_context(NullRunRecorder())
+    assert isinstance(context, ToolExecutionContext)
+    assert isinstance(context.authority, ApprovalExecutionAuthority)
+    factory = context.authority_factory
+    prepare_identity = factory.create_approved_write_prepare_identity(
+        context.authority,
+        approval_context=context,
+        request_identity=request,
+    )
+    result = prepare_call(
+        catalog,
+        context,
+        ToolCall(pending.tool_call_id, pending.tool_name, pending.args),
+        call_identity=prepare_identity,
+        pending_identity=pending,
+        pending_action_revision=revision,
+        record_proposal=False,
+    )
+    assert isinstance(result, ConfirmationRequired)
+    return pending, context, result.prepared, prepare_identity
+
+
+def _close_real_sqlite_factories(factories: list[AuthorityFactory]) -> None:
+    for factory in factories:
+        factory.close()
+        assert factory.active_count == 0
+
+
 def test_real_sqlite_coordinator_executes_prepared_call_once_and_persists_delivery(
     tmp_path: Any,
 ) -> None:
@@ -1743,123 +1887,82 @@ def test_real_sqlite_coordinator_executes_prepared_call_once_and_persists_delive
     operations = WriteOperationRepository(sessions, key)
     chat = ChatRepository(sessions, operations)
     persistence = ChatPersistenceCoordinator(chat)
-    conversation = chat.create_conversation("workspace")
-    operation_id = str(uuid4())
-    pending = PendingAction(
-        "real-call",
-        "save_offer_assessment",
-        '{"id":1,"assessment":"ok"}',
-        "save assessment",
-        operation_id,
+    conversation, pending = _persist_real_sqlite_typed_pending(
+        sessions,
+        operations,
+        key,
+        tool_call_id="real-call",
+        raw_args='{"id":1,"assessment":"ok"}',
     )
-    with sessions() as setup_session:
-        owner = setup_session.get(Conversation, conversation.id)
-        assert owner is not None
-        owner.pending_operation_id = operation_id
-        owner.pending_tool_call_id = pending.tool_call_id
-        owner.pending_tool_name = pending.tool_name
-        owner.pending_args = pending.args
-        owner.pending_human = pending.human
-        operations.create_primary(
-            setup_session,
-            operation_id=operation_id,
-            conversation_id=conversation.id,
-            tool_call_id=pending.tool_call_id,
-            tool_name=pending.tool_name,
-            adapter_kind="typed",
-            proposal_fingerprint=ledger_fingerprint(
-                key, "write-operation-proposal-v1", json.loads(pending.args)
-            ),
-            confirmation_token_fingerprint=ledger_fingerprint(
-                key,
-                "write-operation-confirmation-token-v1",
-                _confirmation_token(pending).encode("ascii"),
-            ),
-            authorization_scope_fingerprint="hmac-sha256:" + "a" * 64,
-        )
-        setup_session.commit()
     calls: list[str] = []
-    base_spec = MODEL_TOOL_CATALOG.resolve("save_offer_assessment")
-    assert base_spec is not None
 
     def execute(_args: object, _context: object) -> dict[str, object]:
         calls.append("executor")
         return {"ok": True}
 
-    spec = replace(base_spec, binding_resolvers=(), executor=execute)
-
-    class Catalog:
-        def resolve(self, name: str) -> object | None:
-            return spec if name == spec.name else None
-
-        def validator_for(self, _name: str) -> object:
-            return MODEL_TOOL_CATALOG.validator_for(spec.name)
-
-        def provider_contracts(self) -> tuple[object, ...]:
-            return (spec.contract,)
-
-    context = ToolExecutionContext(
-        capabilities=frozenset(ToolCapability),
-        current_bindings={},
-        applications=ApplicationsRepository(sessions),
-        events=ApplicationEventsRepository(sessions),
-        notes=NotesRepository(sessions),
-        offers=OffersRepository(sessions),
-        resumes=ResumesRepository(sessions),
-        jd_analyses=JDAnalysesRepository(sessions),
-        run_recorder=NullRunRecorder(),
-    )
-    prepared_result = prepare_call(
-        Catalog(),
-        context,
-        ToolCall("real-call", spec.name, pending.args),
-        pending_identity="real-call:save_offer_assessment",
-        pending_action_revision=1,
-        record_proposal=False,
-    )
-    prepared = getattr(prepared_result, "prepared", None)
-    assert prepared is not None
-
+    catalog = _real_sqlite_approval_catalog(execute)
+    factories: list[AuthorityFactory] = []
     coordinator = ConfirmationCoordinator(
         ConfirmationDependencies(
-            persistence=persistence,
-            write_operations=operations,
-            write_coordinator=WriteOperationCoordinator(operations),
-            catalog=Catalog(),
+            persistence=cast(Any, persistence),
+            write_operations=cast(Any, operations),
+            write_coordinator=cast(Any, WriteOperationCoordinator(operations)),
+            catalog=catalog,
+            approval_context_resolver=_real_sqlite_approval_context_resolver(
+                sessions, operations, factories
+            ),
         )
     )
     request = ConfirmationRequest(
         conversation_id=conversation.id,
         approved=True,
-        operation_id=operation_id,
+        operation_id=pending.operation_id,
         confirmation_token=_confirmation_token(pending),
     )
-    session = coordinator.approve_modify(request, pending=pending, catalog=Catalog())
-    authorization = session.on_confirmation_attempt(pending, prepared)
-    assert not isinstance(authorization, ToolFailure)
-    record = session.execute_operation(prepared, context, cast(Any, authorization))
-    session.on_confirmation_result(
-        pending,
-        True,
-        Message(role="tool", content="saved", tool_call_id=pending.tool_call_id),
-        record,
-    )
-    delivered = coordinator.final_delivery(
-        session,
-        DeliveryBundle((Message(role="assistant", content="done"),)),
-    )
+    session = None
+    try:
+        session = coordinator.approve_modify(request, catalog=catalog)
+        live_pending, context, prepared, prepare_identity = _prepare_real_sqlite_approval(
+            session, catalog, request
+        )
+        record = execute_prepared(
+            cast(Any, prepared),
+            context,
+            call_identity=cast(Any, prepare_identity),
+            confirmation_claimer=lambda value: session.on_confirmation_attempt(
+                live_pending, value
+            ),
+        )
+        assert record.terminal_persisted
+        visible_result = record.persisted_visible_result
+        assert isinstance(visible_result, str)
+        session.on_confirmation_result(
+            live_pending,
+            True,
+            Message(
+                role="tool",
+                content=visible_result,
+                tool_call_id=live_pending.tool_call_id,
+            ),
+            record,
+        )
+        delivered = coordinator.final_delivery(
+            session,
+            DeliveryBundle((Message(role="assistant", content="done"),)),
+        )
 
-    assert calls == ["executor"]
-    assert getattr(delivered, "status", None) == PersistenceStatus.PERSISTED
-    operation = operations.get(operation_id)
-    assert operation is not None
-    assert operation.status == "committed"
-    assert operation.delivery_status == "completed"
+        assert calls == ["executor"]
+        assert getattr(delivered, "status", None) == PersistenceStatus.PERSISTED
+        operation = operations.get(pending.operation_id)
+        assert operation is not None
+        assert operation.status == "committed"
+        assert operation.delivery_status == "completed"
+    finally:
+        if session is not None:
+            coordinator.cancel_cleanup(session)
+        _close_real_sqlite_factories(factories)
 
 
-@pytest.mark.skip(
-    reason="legacy raw ToolExecutionContext harness; exact-authority race coverage lives in tool_authority tests"
-)
 def test_real_sqlite_two_connections_have_one_claim_and_one_executor(
     tmp_path: Any,
 ) -> None:
@@ -1870,47 +1973,18 @@ def test_real_sqlite_two_connections_have_one_claim_and_one_executor(
     operations = WriteOperationRepository(sessions, key)
     chat = ChatRepository(sessions, operations)
     persistence = ChatPersistenceCoordinator(chat)
-    conversation = chat.create_conversation("workspace")
-    operation_id = str(uuid4())
-    pending = PendingAction(
-        "race-call",
-        "save_offer_assessment",
-        '{"id":1,"assessment":"race"}',
-        "save assessment",
-        operation_id,
+    conversation, pending = _persist_real_sqlite_typed_pending(
+        sessions,
+        operations,
+        key,
+        tool_call_id="race-call",
+        raw_args='{"id":1,"assessment":"race"}',
     )
-    with sessions() as setup_session:
-        owner = setup_session.get(Conversation, conversation.id)
-        assert owner is not None
-        owner.pending_operation_id = operation_id
-        owner.pending_tool_call_id = pending.tool_call_id
-        owner.pending_tool_name = pending.tool_name
-        owner.pending_args = pending.args
-        owner.pending_human = pending.human
-        operations.create_primary(
-            setup_session,
-            operation_id=operation_id,
-            conversation_id=conversation.id,
-            tool_call_id=pending.tool_call_id,
-            tool_name=pending.tool_name,
-            adapter_kind="typed",
-            proposal_fingerprint=ledger_fingerprint(
-                key, "write-operation-proposal-v1", json.loads(pending.args)
-            ),
-            confirmation_token_fingerprint=ledger_fingerprint(
-                key,
-                "write-operation-confirmation-token-v1",
-                _confirmation_token(pending).encode("ascii"),
-            ),
-            authorization_scope_fingerprint="hmac-sha256:" + "a" * 64,
-        )
-        setup_session.commit()
-    base_spec = MODEL_TOOL_CATALOG.resolve("save_offer_assessment")
-    assert base_spec is not None
     calls = 0
     calls_lock = Lock()
     first_executor_entered = Event()
     release_first_executor = Event()
+    second_worker_ready_for_claim = Event()
 
     def execute(_args: object, _context: object) -> dict[str, object]:
         nonlocal calls
@@ -1922,104 +1996,111 @@ def test_real_sqlite_two_connections_have_one_claim_and_one_executor(
             assert release_first_executor.wait(10)
         return {"ok": True}
 
-    spec = replace(base_spec, binding_resolvers=(), executor=execute)
-
-    class Catalog:
-        def resolve(self, name: str) -> object | None:
-            return spec if name == spec.name else None
-
-        def validator_for(self, _name: str) -> object:
-            return MODEL_TOOL_CATALOG.validator_for(spec.name)
-
-        def provider_contracts(self) -> tuple[object, ...]:
-            return (spec.contract,)
-
-    catalog = Catalog()
-
-    def context() -> ToolExecutionContext:
-        return ToolExecutionContext(
-            capabilities=frozenset(ToolCapability),
-            current_bindings={},
-            applications=ApplicationsRepository(sessions),
-            events=ApplicationEventsRepository(sessions),
-            notes=NotesRepository(sessions),
-            offers=OffersRepository(sessions),
-            resumes=ResumesRepository(sessions),
-            jd_analyses=JDAnalysesRepository(sessions),
-            run_recorder=NullRunRecorder(),
-        )
-
-    prepared_result = prepare_call(
-        catalog,
-        context(),
-        ToolCall("race-call", spec.name, pending.args),
-        pending_identity="race-call:save_offer_assessment",
-        pending_action_revision=1,
-        record_proposal=False,
-    )
-    prepared = getattr(prepared_result, "prepared", None)
-    assert prepared is not None
+    catalog = _real_sqlite_approval_catalog(execute)
+    factories: list[AuthorityFactory] = []
     request = ConfirmationRequest(
         conversation_id=conversation.id,
         approved=True,
-        operation_id=operation_id,
+        operation_id=pending.operation_id,
         confirmation_token=_confirmation_token(pending),
     )
 
-    def worker() -> str:
+    def worker(worker_ordinal: int) -> str:
+        assert worker_ordinal in {1, 2}
         coordinator = ConfirmationCoordinator(
             ConfirmationDependencies(
-                persistence=persistence,
-                write_operations=operations,
-                write_coordinator=WriteOperationCoordinator(operations),
+                persistence=cast(Any, persistence),
+                write_operations=cast(Any, operations),
+                write_coordinator=cast(Any, WriteOperationCoordinator(operations)),
                 catalog=catalog,
+                approval_context_resolver=_real_sqlite_approval_context_resolver(
+                    sessions, operations, factories
+                ),
             )
         )
+        session = None
         try:
-            session = coordinator.approve_modify(request, pending=pending, catalog=catalog)
-        except ConfirmationReplayError:
-            return "replay"
-        except WriteOperationError as exc:
-            # The second connection may observe the first owner's live
-            # delivery lease.  The production route maps this exact Ledger
-            # state to HTTP 409; it must not claim or execute a second write.
-            if exc.code == "operation_delivery_pending":
-                return "in_progress"
-            raise
-        authorization = session.on_confirmation_attempt(pending, prepared)
-        assert not isinstance(authorization, ToolFailure)
-        try:
-            record = session.execute_operation(prepared, context(), cast(Any, authorization))
-        except ConfirmationReplayError:
-            return "replay"
-        session.on_confirmation_result(
-            pending,
-            True,
-            Message(role="tool", content="saved", tool_call_id=pending.tool_call_id),
-            record,
-        )
-        delivered = coordinator.final_delivery(
-            session,
-            DeliveryBundle((Message(role="assistant", content="done"),)),
-        )
-        assert getattr(delivered, "status", None) is PersistenceStatus.PERSISTED
-        return "committed"
+            try:
+                session = coordinator.approve_modify(request, catalog=catalog)
+            except ConfirmationReplayError:
+                return "replay"
+            except WriteOperationError as exc:
+                # The second connection may observe the first owner's live
+                # delivery lease.  The production route maps this exact Ledger
+                # state to HTTP 409; it must not claim or execute a second write.
+                if exc.code == "operation_delivery_pending":
+                    return "in_progress"
+                raise
+            live_pending, context, prepared, prepare_identity = (
+                _prepare_real_sqlite_approval(session, catalog, request)
+            )
+            if worker_ordinal == 2:
+                second_worker_ready_for_claim.set()
+                assert release_first_executor.wait(10)
+            try:
+                record = execute_prepared(
+                    cast(Any, prepared),
+                    context,
+                    call_identity=cast(Any, prepare_identity),
+                    confirmation_claimer=lambda value: session.on_confirmation_attempt(
+                        live_pending, value
+                    ),
+                )
+            except ConfirmationReplayError:
+                return "replay"
+            visible_result = record.persisted_visible_result
+            assert isinstance(visible_result, str)
+            session.on_confirmation_result(
+                live_pending,
+                True,
+                Message(
+                    role="tool",
+                    content=visible_result,
+                    tool_call_id=live_pending.tool_call_id,
+                ),
+                record,
+            )
+            delivered = coordinator.final_delivery(
+                session,
+                DeliveryBundle((Message(role="assistant", content="done"),)),
+            )
+            assert getattr(delivered, "status", None) is PersistenceStatus.PERSISTED
+            return "committed"
+        finally:
+            if session is not None:
+                coordinator.cancel_cleanup(session)
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        first = pool.submit(worker)
-        assert first_executor_entered.wait(10)
-        second = pool.submit(worker)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(worker, 1)
+            assert first_executor_entered.wait(10)
+            second = pool.submit(worker, 2)
+            deadline = monotonic() + 10
+            while not second_worker_ready_for_claim.wait(0.05):
+                if second.done():
+                    release_first_executor.set()
+                    early_result = second.result(timeout=1)
+                    pytest.fail(
+                        "second worker exited before the execute/claim boundary: "
+                        f"{early_result}"
+                    )
+                if monotonic() >= deadline:
+                    release_first_executor.set()
+                    pytest.fail("second worker did not reach the execute/claim boundary")
+            release_first_executor.set()
+            results = {first.result(timeout=15), second.result(timeout=15)}
+
+        assert results <= {"committed", "replay", "in_progress"}
+        assert "committed" in results
+        assert len(results) == 2
+        assert calls == 1
+        operation = operations.get(pending.operation_id)
+        assert operation is not None
+        assert operation.status == "committed"
+        assert operation.delivery_status == "completed"
+    finally:
         release_first_executor.set()
-        results = {first.result(timeout=15), second.result(timeout=15)}
-
-    assert results <= {"committed", "replay", "in_progress"}
-    assert "committed" in results
-    assert len(results) == 2
-    assert calls == 1
-    operation = operations.get(operation_id)
-    assert operation is not None
-    assert operation.status == "committed"
-    assert operation.delivery_status == "completed"
+        _close_real_sqlite_factories(factories)
 
 
 def test_delivery_race_has_one_active_owner_call() -> None:

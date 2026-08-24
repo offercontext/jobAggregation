@@ -11,7 +11,11 @@ from offerpilot.ai.tool_authority.policy import (
 )
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.context_projector.contracts import ProjectionError, canonical_json, sha256_hex
-from offerpilot.context_projector.selector import DependencyPolicyV1, ToolSelection
+from offerpilot.context_projector.selector import (
+    DependencyPolicyV1,
+    ToolSelection,
+    require_dependency_policy_v1,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +52,7 @@ def intersect_authority_surface(
 
     if type(catalog) is not ToolCatalog:
         raise ProjectionError("typed_catalog_required")
+    dependency_policy = require_dependency_policy_v1(dependency_policy)
     catalog_contracts = catalog.provider_contracts()
     catalog_names = tuple(contract.name for contract in catalog_contracts)
     if catalog_names != dependency_policy.catalog_names:
@@ -66,7 +71,7 @@ def intersect_authority_surface(
             continue
         spec = catalog.resolve(name)
         if spec is None:
-            raise ProjectionError("typed_catalog_drift")
+            raise ProjectionError("provider_catalog_resolution_failed")
         required = frozenset(str(capability) for capability in spec.required_capabilities)
         if not required.issubset(capability_values):
             continue

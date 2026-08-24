@@ -15,6 +15,7 @@ from offerpilot.ai.tool_authority.contracts import (
     ProviderInvocationIdentity,
     ProviderSurfaceBuildIdentity,
     SegmentExecutionAuthority,
+    constant_time_equal,
 )
 from offerpilot.ai.types import Assistant, Message
 from offerpilot.config import AIProviderProfile
@@ -159,7 +160,20 @@ class SingleCandidateAgentTransport:
         candidate: FrozenProviderCandidate,
         surface: FrozenModelSurface,
         response_format: dict[str, Any] | None = None,
+        *,
+        invocation_identity: ProviderInvocationIdentity,
+        provider_attempt_id: str,
+        candidate_ordinal: int,
+        gateway_session: AgentProviderGatewaySession,
     ) -> Assistant:
+        self._authorize_provider_io(
+            candidate,
+            surface,
+            invocation_identity=invocation_identity,
+            provider_attempt_id=provider_attempt_id,
+            candidate_ordinal=candidate_ordinal,
+            gateway_session=gateway_session,
+        )
         self._preflight(candidate, surface, response_format, stream=False)
         return self._complete(
             candidate, surface.thaw_messages(), list(surface.tools), response_format
@@ -170,9 +184,42 @@ class SingleCandidateAgentTransport:
         candidate: FrozenProviderCandidate,
         surface: FrozenModelSurface,
         on_delta: Callable[[str], None],
+        *,
+        invocation_identity: ProviderInvocationIdentity,
+        provider_attempt_id: str,
+        candidate_ordinal: int,
+        gateway_session: AgentProviderGatewaySession,
     ) -> Assistant:
+        self._authorize_provider_io(
+            candidate,
+            surface,
+            invocation_identity=invocation_identity,
+            provider_attempt_id=provider_attempt_id,
+            candidate_ordinal=candidate_ordinal,
+            gateway_session=gateway_session,
+        )
         self._preflight(candidate, surface, None, stream=True)
         return self._stream(candidate, surface.thaw_messages(), list(surface.tools), on_delta)
+
+    @staticmethod
+    def _authorize_provider_io(
+        candidate: FrozenProviderCandidate,
+        surface: FrozenModelSurface,
+        *,
+        invocation_identity: ProviderInvocationIdentity,
+        provider_attempt_id: str,
+        candidate_ordinal: int,
+        gateway_session: AgentProviderGatewaySession,
+    ) -> None:
+        if type(gateway_session) is not AgentProviderGatewaySession:
+            raise ProjectionError("provider_gateway_session_required")
+        gateway_session._authorize_network_attempt(
+            candidate,
+            surface,
+            invocation_identity=invocation_identity,
+            provider_attempt_id=provider_attempt_id,
+            candidate_ordinal=candidate_ordinal,
+        )
 
     @staticmethod
     def _preflight(
@@ -210,6 +257,7 @@ class AgentProviderGatewaySession:
         self._chain = chain
         self._transport = transport
         self._attempts: set[str] = set()
+        self._network_started_attempts: set[str] = set()
         self._attempt_lock = Lock()
 
     def _begin_authorized_attempt(
@@ -244,6 +292,22 @@ class AgentProviderGatewaySession:
         require_authority_phase(authority, AuthorityUse.PROVIDER_SURFACE_BUILD, build_identity)
         if surface.provider_surface_build_identity is not build_identity:
             raise ProjectionError("provider_surface_build_identity_mismatch")
+        expected_binding = ModelCallSurfaceBinding.from_surface(surface)
+        if (
+            type(model_call_surface_binding) is not ModelCallSurfaceBinding
+            or build_identity.model_call_id != surface.model_call_id
+            or surface.provider_candidate_count != len(self._chain.candidates)
+            or model_call_surface_binding.model_call_id != expected_binding.model_call_id
+            or not constant_time_equal(
+                model_call_surface_binding.runtime_surface_fingerprint,
+                expected_binding.runtime_surface_fingerprint,
+            )
+            or model_call_surface_binding.exposed_tool_names
+            != expected_binding.exposed_tool_names
+            or model_call_surface_binding.provider_candidate_count
+            != expected_binding.provider_candidate_count
+        ):
+            raise ProjectionError("provider_surface_binding_mismatch")
         context = build_identity.tool_context
         factory = getattr(context, "authority_factory", None)
         if factory is None or getattr(context, "authority", None) is not authority:
@@ -305,14 +369,56 @@ class AgentProviderGatewaySession:
     def _discard_attempt(self, attempt_id: str) -> None:
         with self._attempt_lock:
             self._attempts.discard(attempt_id)
+            self._network_started_attempts.discard(attempt_id)
+
+    def _authorize_network_attempt(
+        self,
+        candidate: FrozenProviderCandidate,
+        surface: FrozenModelSurface,
+        *,
+        invocation_identity: ProviderInvocationIdentity,
+        provider_attempt_id: str,
+        candidate_ordinal: int,
+    ) -> None:
+        self._validate_invocation(surface, invocation_identity)
+        if (
+            type(candidate_ordinal) is not int
+            or candidate_ordinal < 0
+            or candidate_ordinal >= len(self._chain.candidates)
+            or self._chain.candidates[candidate_ordinal] is not candidate
+            or type(provider_attempt_id) is not str
+            or not provider_attempt_id
+        ):
+            raise ProjectionError("provider_network_attempt_mismatch")
+        context = invocation_identity.tool_context
+        factory = getattr(context, "authority_factory", None)
+        if factory is None:
+            raise ProjectionError("provider_invocation_context_invalid")
+        factory.validate_provider_attempt(
+            invocation_identity,
+            attempt_id=provider_attempt_id,
+            candidate_ordinal=candidate_ordinal,
+            gateway_session=self,
+        )
+        with self._attempt_lock:
+            if (
+                provider_attempt_id not in self._attempts
+                or provider_attempt_id in self._network_started_attempts
+            ):
+                raise ProjectionError("provider_network_attempt_mismatch")
+            self._network_started_attempts.add(provider_attempt_id)
 
     def consume_attempt(self, attempt_id: str) -> bool:
         if not attempt_id:
             return False
         with self._attempt_lock:
-            if attempt_id not in self._attempts:
+            if (
+                attempt_id not in self._attempts
+                or attempt_id not in self._network_started_attempts
+            ):
                 return False
             self._attempts.remove(attempt_id)
+            self._network_started_attempts.remove(attempt_id)
             return True
 
     @property
@@ -356,7 +462,15 @@ class AgentProviderGatewaySession:
                 before_attempt()
             attempt_id = self._begin_authorized_attempt(invocation_identity, ordinal)
             try:
-                response = self._transport.complete_one(candidate, surface, response_format)
+                response = self._transport.complete_one(
+                    candidate,
+                    surface,
+                    response_format,
+                    invocation_identity=invocation_identity,
+                    provider_attempt_id=attempt_id,
+                    candidate_ordinal=ordinal,
+                    gateway_session=self,
+                )
                 return BoundProviderResponse(
                     surface.model_call_id,
                     ordinal,
@@ -404,7 +518,15 @@ class AgentProviderGatewaySession:
                     on_delta(value)
 
             try:
-                response = self._transport.stream_one(candidate, surface, emit)
+                response = self._transport.stream_one(
+                    candidate,
+                    surface,
+                    emit,
+                    invocation_identity=invocation_identity,
+                    provider_attempt_id=attempt_id,
+                    candidate_ordinal=ordinal,
+                    gateway_session=self,
+                )
                 return BoundProviderResponse(
                     surface.model_call_id,
                     ordinal,
@@ -463,7 +585,15 @@ class AgentProviderGatewaySession:
                     deferred.append(value)
 
             try:
-                response = self._transport.stream_one(candidate, surface, defer)
+                response = self._transport.stream_one(
+                    candidate,
+                    surface,
+                    defer,
+                    invocation_identity=invocation_identity,
+                    provider_attempt_id=attempt_id,
+                    candidate_ordinal=ordinal,
+                    gateway_session=self,
+                )
                 bound = BoundProviderResponse(
                     surface.model_call_id,
                     ordinal,

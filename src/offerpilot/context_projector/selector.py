@@ -149,6 +149,19 @@ DEPENDENCY_POLICY_V1 = DependencyPolicyV1(
     catalog_names=MODEL_TOOL_NAMES,
     dependencies={name: _DEPENDENCIES.get(name, frozenset()) for name in MODEL_TOOL_NAMES},
 )
+DEPENDENCY_POLICY_V1_FINGERPRINT = (
+    "sha256:28298385eb8cd540587934141d61ed737a99a6532fff4f303ee0890ec843e3b3"
+)
+
+
+def require_dependency_policy_v1(policy: DependencyPolicyV1) -> DependencyPolicyV1:
+    """Reject copied or drifted dependency metadata at runtime boundaries."""
+
+    if policy is not DEPENDENCY_POLICY_V1:
+        raise ProjectionError("dependency_policy_instance_mismatch")
+    if policy.canonical_fingerprint != DEPENDENCY_POLICY_V1_FINGERPRINT:
+        raise ProjectionError("dependency_policy_fingerprint_mismatch")
+    return policy
 
 _LEXICAL_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
@@ -218,12 +231,13 @@ def select_tools(
     *,
     dependency_policy: DependencyPolicyV1 = DEPENDENCY_POLICY_V1,
 ) -> ToolSelection:
+    dependency_policy = require_dependency_policy_v1(dependency_policy)
     if signals.version != SELECTOR_VERSION:
         raise ProjectionError("unsupported_selector_version")
     contracts = tuple(catalog)
     names = tuple(contract.name for contract in contracts)
     if names != MODEL_TOOL_NAMES or len(set(names)) != len(names):
-        raise ProjectionError("typed_catalog_drift")
+        raise ProjectionError("provider_catalog_mismatch")
     if signals.page_kind not in _PAGE_DOMAINS:
         raise ProjectionError("unknown_page_kind")
     if any(kind not in _ATTACHMENT_DOMAINS for kind in signals.attachment_kinds):

@@ -190,6 +190,21 @@ def test_gateway_requires_exact_invocation_surface_binding_and_session_before_ne
         )
         surface = _surface(build)
         binding = ModelCallSurfaceBinding.from_surface(surface)
+        invalid_bindings = (
+            replace(binding, model_call_id="other-model-call"),
+            replace(binding, runtime_surface_fingerprint="sha256:" + "b" * 64),
+            replace(binding, exposed_tool_names=frozenset()),
+            replace(binding, provider_candidate_count=2),
+        )
+        for invalid_binding in invalid_bindings:
+            with pytest.raises(ProjectionError, match="provider_surface_binding_mismatch"):
+                gateway.bind_provider_surface(
+                    authority=authority,
+                    build_identity=build,
+                    surface=surface,
+                    model_call_surface_binding=invalid_binding,
+                )
+        assert calls == []
         invocation = gateway.bind_provider_surface(
             authority=authority,
             build_identity=build,
@@ -244,6 +259,90 @@ def test_gateway_missing_or_alternate_invocation_calls_provider_zero() -> None:
     with pytest.raises(TypeError):
         gateway.complete(_surface(object()))
     assert calls == []
+
+
+def test_single_candidate_adapter_requires_exact_registered_attempt_before_callback() -> None:
+    calls: list[object] = []
+    chain = FrozenProviderExecutionChain.freeze(
+        [AIProviderProfile(id="one", api_key="secret", base_url="https://one.test/v1")]
+    )
+    transport = SingleCandidateAgentTransport(
+        lambda candidate, *_args: calls.append(candidate) or Assistant(content="ok"),
+        lambda *_args: Assistant(content="ok"),
+    )
+    gateway = AgentProviderGatewaySession(chain, transport)
+    with execution_scope() as factory:
+        authority = factory.create_segment_authority(
+            conversation_id=1,
+            conversation_scope_revision=0,
+            segment_id="segment",
+            trusted_scope=TrustedContextScope(
+                context_type="workspace", context_ref=None, mode="general"
+            ),
+            capabilities=frozenset(AGENT_TYPED_V1_PROFILE.capabilities),
+        )
+        runner = object()
+        context = SimpleNamespace(authority=authority, authority_factory=factory)
+        factory.register_runner_invocation(runner, authority=authority)
+        factory.register_tool_execution_context(context, authority=authority)
+        build = factory.create_provider_surface_build_identity(
+            authority,
+            runner_invocation=runner,
+            tool_context=context,
+            model_call_id="model-call",
+        )
+        surface = _surface(build)
+        binding = ModelCallSurfaceBinding.from_surface(surface)
+        invocation = gateway.bind_provider_surface(
+            authority=authority,
+            build_identity=build,
+            surface=surface,
+            model_call_surface_binding=binding,
+        )
+        attempt_id = gateway._begin_authorized_attempt(invocation, 0)
+
+        with pytest.raises(TypeError):
+            transport.complete_one(chain.candidates[0], surface)
+        with pytest.raises(ProjectionError):
+            transport.complete_one(
+                chain.candidates[0],
+                surface,
+                invocation_identity=invocation,
+                provider_attempt_id="",
+                candidate_ordinal=0,
+                gateway_session=gateway,
+            )
+        with pytest.raises(ProjectionError):
+            transport.complete_one(
+                chain.candidates[0],
+                surface,
+                invocation_identity=invocation,
+                provider_attempt_id=attempt_id,
+                candidate_ordinal=1,
+                gateway_session=gateway,
+            )
+        assert calls == []
+
+        response = transport.complete_one(
+            chain.candidates[0],
+            surface,
+            invocation_identity=invocation,
+            provider_attempt_id=attempt_id,
+            candidate_ordinal=0,
+            gateway_session=gateway,
+        )
+        assert response.content == "ok"
+        assert len(calls) == 1
+        with pytest.raises(ProjectionError):
+            transport.complete_one(
+                chain.candidates[0],
+                surface,
+                invocation_identity=invocation,
+                provider_attempt_id=attempt_id,
+                candidate_ordinal=0,
+                gateway_session=gateway,
+            )
+        assert len(calls) == 1
 
 
 def test_configured_client_requires_identity_before_provider_adapter(

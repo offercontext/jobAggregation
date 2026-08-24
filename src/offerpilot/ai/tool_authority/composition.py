@@ -2132,6 +2132,48 @@ class AuthorityFactory:
 
     issue_gateway_attempt = issue_provider_attempt
 
+    def validate_provider_attempt(
+        self,
+        invocation_identity: ProviderInvocationIdentity,
+        *,
+        attempt_id: str,
+        candidate_ordinal: int,
+        gateway_session: object,
+    ) -> None:
+        """Validate the exact session-issued attempt immediately before Provider I/O."""
+
+        with self._lock:
+            authority = self._call_authority(invocation_identity, AuthorityUse.PROVIDER_INVOKE)
+            _require_text(attempt_id, "attempt_id")
+            require_nonnegative_int64(candidate_ordinal, "candidate_ordinal")
+            if invocation_identity.gateway_session is not gateway_session:
+                raise AuthorityPhaseError("attempt Gateway Session mismatch")
+            surface = self._registered_authority_identity(
+                self._surfaces,
+                invocation_identity.surface,
+                authority,
+                "surface",
+            )
+            if surface.candidate_count is None or candidate_ordinal >= surface.candidate_count:
+                raise AuthorityPhaseError("candidate ordinal is outside frozen surface")
+            attempt = self._attempts.get(attempt_id)
+            if attempt is None or attempt.value != attempt_id:
+                raise AuthorityPhaseError("attempt was not issued by this factory")
+            if (
+                attempt.authority is not authority
+                or attempt.parent is not invocation_identity
+                or attempt.candidate_ordinal != candidate_ordinal
+                or attempt.semantic.get("gateway_session") is not gateway_session
+                or attempt.fingerprint is None
+                or not constant_time_equal(
+                    attempt.fingerprint,
+                    invocation_identity.surface_fingerprint,
+                )
+            ):
+                raise AuthorityPhaseError("attempt does not match Provider invocation")
+
+    validate_gateway_attempt = validate_provider_attempt
+
     def create_provider_surface_build_identity(
         self,
         authority: SegmentExecutionAuthority,

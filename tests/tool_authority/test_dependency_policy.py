@@ -10,6 +10,7 @@ from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_NAMES
 from offerpilot.context_projector.contracts import ProjectionError
 from offerpilot.context_projector.selector import (
     DEPENDENCY_POLICY_V1,
+    DEPENDENCY_POLICY_V1_FINGERPRINT,
     DependencyPolicyV1,
     select_tools,
     ToolSelectionSignals,
@@ -43,6 +44,33 @@ def test_dependency_policy_v1_matches_read_only_canonical_golden() -> None:
         "dependencies": expected["dependencies"],
     }
     assert DEPENDENCY_POLICY_V1.canonical_fingerprint == expected["canonical_sha256"]
+    assert DEPENDENCY_POLICY_V1_FINGERPRINT == expected["canonical_sha256"]
+
+
+def test_runtime_rejects_semantically_weakened_dependency_policy_clone() -> None:
+    weakened = DependencyPolicyV1(
+        version=DEPENDENCY_POLICY_VERSION,
+        catalog_names=MODEL_TOOL_NAMES,
+        dependencies={name: () for name in MODEL_TOOL_NAMES},
+    )
+    weakened.validate_closed(MODEL_TOOL_NAMES, MODEL_TOOL_NAMES)
+
+    with pytest.raises(ProjectionError, match="dependency_policy_instance_mismatch"):
+        select_tools(
+            MODEL_TOOL_CATALOG.provider_contracts(),
+            ToolSelectionSignals(page_kind="offers"),
+            dependency_policy=weakened,
+        )
+
+
+def test_production_source_has_no_catalog_drift_or_injected_surface_fallback() -> None:
+    source_root = Path(__file__).parents[2] / "src"
+    production = "\n".join(
+        path.read_text(encoding="utf-8") for path in source_root.rglob("*.py")
+    )
+    assert "typed_catalog_drift" not in production
+    assert "_project_injected_surface" not in production
+    assert "injected-surface-v1" not in production
 
 
 def test_dependency_policy_rejects_unknown_missing_cycle_and_version_drift() -> None:

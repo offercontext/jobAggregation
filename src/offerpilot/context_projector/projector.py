@@ -70,7 +70,7 @@ class ModelSurfaceProjector:
             raise ProjectionError("source_chunk_limit_exceeded")
         contributors = self._validate_contributors(request.contributors)
         if request.provider_catalog.provider_contracts() != request.provider_tools:
-            raise ProjectionError("typed_catalog_drift")
+            raise ProjectionError("provider_catalog_mismatch")
         selection = select_tools(
             request.provider_tools,
             request.tool_signals,

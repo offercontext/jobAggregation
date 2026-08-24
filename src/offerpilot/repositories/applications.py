@@ -4,7 +4,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from sqlalchemy import exists, select, update
+from builtins import list as BuiltinList
+
+from sqlalchemy import and_, exists, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from offerpilot.application_status import (
@@ -13,7 +15,19 @@ from offerpilot.application_status import (
     normalize_application_status,
 )
 from offerpilot.models import APPLICATION_FOREIGN_KEY_MODELS, Application
-from offerpilot.repositories.session_binding import finish_repository_write, repository_session
+from offerpilot.ai.tool_authority import (
+    ApplicationScopeConstraint,
+    AuthorityFactory,
+    AuthorityPhaseError,
+    ToolExecutionAuthority,
+)
+from offerpilot.repositories.session_binding import (
+    ScopedRepositoryBinding,
+    ScopeAccessDenied,
+    bind_scoped_repository,
+    finish_repository_write,
+    repository_session,
+)
 
 
 @dataclass
@@ -29,12 +43,41 @@ class ApplicationCreate:
 
 
 class ApplicationsRepository:
-    def __init__(self, session_factory: sessionmaker[Session], session: Session | None = None):
+    def __init__(
+        self,
+        session_factory: sessionmaker[Session],
+        session: Session | None = None,
+        scope_binding: ScopedRepositoryBinding | None = None,
+    ):
         self._session_factory = session_factory
         self._session = session
+        self._scope_binding = scope_binding
 
     def bind(self, session: Session) -> "ApplicationsRepository":
         return ApplicationsRepository(self._session_factory, session)
+
+    def bind_scoped(
+        self,
+        session: Session,
+        constraint: ApplicationScopeConstraint,
+        *,
+        authority_factory: AuthorityFactory,
+        authority: ToolExecutionAuthority,
+    ) -> "ApplicationsRepository":
+        binding = bind_scoped_repository(
+            session,
+            constraint,
+            authority_factory=authority_factory,
+            authority=authority,
+        )
+        return ApplicationsRepository(self._session_factory, session, binding)
+
+    def _require_scoped(self, constraint: object) -> ScopedRepositoryBinding:
+        binding = self._scope_binding
+        if binding is None or self._session is None:
+            raise AuthorityPhaseError("scoped repository requires a caller-owned bound Session")
+        binding.require(constraint)
+        return binding
 
     def create(self, data: ApplicationCreate) -> Application:
         now = datetime.now(timezone.utc)
@@ -75,6 +118,71 @@ class ApplicationsRepository:
             if app is None or app.deleted_at is not None:
                 return None
             return _normalize_model_status(app)
+
+    def list_applications_scoped(
+        self,
+        constraint: ApplicationScopeConstraint,
+        status: str = "",
+    ) -> BuiltinList[Application]:
+        binding = self._require_scoped(constraint)
+        session = binding.session
+        if constraint.mode == "unrestricted":
+            with session.no_autoflush:
+                statement = select(Application).where(Application.deleted_at.is_(None))
+                if status:
+                    statement = statement.where(Application.status == normalize_application_status(status))
+                statement = statement.order_by(Application.applied_at.desc())
+                return [_normalize_model_status(item) for item in session.scalars(statement)]
+
+        allowed_id = _restricted_scope_id(constraint)
+        scope_parent = (
+            select(Application.id.label("_scope_application_id"))
+            .where(Application.id == allowed_id, Application.deleted_at.is_(None))
+            .cte("scoped_application")
+        )
+        join_condition = Application.id == scope_parent.c._scope_application_id
+        if status:
+            join_condition = and_(
+                join_condition,
+                Application.status == normalize_application_status(status),
+            )
+        statement = (
+            select(Application, scope_parent.c._scope_application_id)
+            .select_from(scope_parent.outerjoin(Application, join_condition))
+            .order_by(Application.applied_at.desc())
+        )
+        with session.no_autoflush:
+            rows = session.execute(statement).all()
+        if not rows or rows[0][1] is None:
+            raise ScopeAccessDenied("application scope is unavailable")
+        return [_normalize_model_status(row[0]) for row in rows if row[0] is not None]
+
+    def get_application_scoped(
+        self,
+        constraint: ApplicationScopeConstraint,
+        app_id: int,
+    ) -> Optional[Application]:
+        binding = self._require_scoped(constraint)
+        session = binding.session
+        if constraint.mode == "unrestricted":
+            with session.no_autoflush:
+                app = session.scalar(
+                    select(Application)
+                    .where(Application.id == app_id)
+                    .where(Application.deleted_at.is_(None))
+                )
+        else:
+            allowed_id = _restricted_scope_id(constraint)
+            with session.no_autoflush:
+                app = session.scalar(
+                    select(Application)
+                    .where(Application.id == app_id)
+                    .where(Application.id == allowed_id)
+                    .where(Application.deleted_at.is_(None))
+                )
+        if app is None and constraint.mode == "restricted":
+            raise ScopeAccessDenied("application scope denied")
+        return _normalize_model_status(app) if app is not None else None
 
     def update_full(self, app_id: int, data: ApplicationCreate) -> Optional[Application]:
         with repository_session(self._session_factory, self._session) as session:
@@ -183,3 +291,12 @@ def _normalize_model_status(app: Application) -> Application:
         if value is not None and value.tzinfo is None:
             setattr(app, attr, value.replace(tzinfo=timezone.utc))
     return app
+
+
+def _restricted_scope_id(constraint: ApplicationScopeConstraint) -> int:
+    if constraint.mode != "restricted" or len(constraint.allowed_identities) != 1:
+        raise AuthorityPhaseError("restricted Application scope must contain one identity")
+    identity = next(iter(constraint.allowed_identities))
+    if type(identity) is not int or identity <= 0:
+        raise AuthorityPhaseError("restricted Application scope identity is invalid")
+    return identity

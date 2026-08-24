@@ -3,13 +3,29 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
-from sqlalchemy import delete, select
+from builtins import list as BuiltinList
+
+from sqlalchemy import and_, delete, select
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.sql import Select
 
 from offerpilot.models import Application, ApplicationEvent
-from offerpilot.repositories.session_binding import finish_repository_write, repository_session
+from offerpilot.ai.tool_authority import (
+    ApplicationScopeConstraint,
+    AuthorityFactory,
+    AuthorityPhaseError,
+    ToolExecutionAuthority,
+)
+from offerpilot.repositories.applications import _restricted_scope_id
+from offerpilot.repositories.session_binding import (
+    ScopedRepositoryBinding,
+    ScopeAccessDenied,
+    bind_scoped_repository,
+    finish_repository_write,
+    repository_session,
+)
 
 
 @dataclass
@@ -35,12 +51,41 @@ class ApplicationEventWithApplication:
 
 
 class ApplicationEventsRepository:
-    def __init__(self, session_factory: sessionmaker[Session], session: Session | None = None):
+    def __init__(
+        self,
+        session_factory: sessionmaker[Session],
+        session: Session | None = None,
+        scope_binding: ScopedRepositoryBinding | None = None,
+    ):
         self._session_factory = session_factory
         self._session = session
+        self._scope_binding = scope_binding
 
     def bind(self, session: Session) -> "ApplicationEventsRepository":
         return ApplicationEventsRepository(self._session_factory, session)
+
+    def bind_scoped(
+        self,
+        session: Session,
+        constraint: ApplicationScopeConstraint,
+        *,
+        authority_factory: AuthorityFactory,
+        authority: ToolExecutionAuthority,
+    ) -> "ApplicationEventsRepository":
+        binding = bind_scoped_repository(
+            session,
+            constraint,
+            authority_factory=authority_factory,
+            authority=authority,
+        )
+        return ApplicationEventsRepository(self._session_factory, session, binding)
+
+    def _require_scoped(self, constraint: object) -> ScopedRepositoryBinding:
+        binding = self._scope_binding
+        if binding is None or self._session is None:
+            raise AuthorityPhaseError("scoped repository requires a caller-owned bound Session")
+        binding.require(constraint)
+        return binding
 
     def create(self, data: ApplicationEventCreate) -> ApplicationEvent:
         event = ApplicationEvent(
@@ -97,6 +142,97 @@ class ApplicationEventsRepository:
     def get(self, event_id: int) -> Optional[ApplicationEvent]:
         with repository_session(self._session_factory, self._session) as session:
             return _get_visible_event(session, event_id)
+
+    def list_application_events_scoped(
+        self,
+        constraint: ApplicationScopeConstraint,
+        month: str = "",
+        application_id: int = 0,
+        event_type: str = "",
+    ) -> BuiltinList[ApplicationEventWithApplication]:
+        binding = self._require_scoped(constraint)
+        session = binding.session
+        if constraint.mode == "unrestricted":
+            statement = (
+                select(ApplicationEvent, Application.company_name, Application.position_name)
+                .join(Application, Application.id == ApplicationEvent.application_id)
+                .where(Application.deleted_at.is_(None))
+                .order_by(ApplicationEvent.scheduled_at.asc(), ApplicationEvent.id.asc())
+            )
+            statement = _event_filters(statement, month, application_id, event_type)
+            with session.no_autoflush:
+                rows = session.execute(statement).all()
+            return [
+                ApplicationEventWithApplication(event=row[0], company_name=row[1], position_name=row[2])
+                for row in rows
+            ]
+
+        allowed_id = _restricted_scope_id(constraint)
+        scope_parent = (
+            select(
+                Application.id.label("_scope_application_id"),
+                Application.company_name.label("_scope_company_name"),
+                Application.position_name.label("_scope_position_name"),
+            )
+            .where(Application.id == allowed_id, Application.deleted_at.is_(None))
+            .cte("scoped_application")
+        )
+        join_condition = ApplicationEvent.application_id == scope_parent.c._scope_application_id
+        if application_id > 0:
+            join_condition = and_(join_condition, ApplicationEvent.application_id == application_id)
+        if month:
+            bounds = _month_bounds(month)
+            if bounds is not None:
+                start, end = bounds
+                join_condition = and_(
+                    join_condition,
+                    ApplicationEvent.scheduled_at >= start,
+                    ApplicationEvent.scheduled_at < end,
+                )
+        if event_type:
+            join_condition = and_(join_condition, ApplicationEvent.event_type == event_type)
+        statement = (
+            select(
+                ApplicationEvent,
+                scope_parent.c._scope_company_name,
+                scope_parent.c._scope_position_name,
+                scope_parent.c._scope_application_id,
+            )
+            .select_from(scope_parent.outerjoin(ApplicationEvent, join_condition))
+            .order_by(ApplicationEvent.scheduled_at.asc(), ApplicationEvent.id.asc())
+        )
+        with session.no_autoflush:
+            rows = session.execute(statement).all()
+        if not rows or rows[0][3] is None:
+            raise ScopeAccessDenied("application scope is unavailable")
+        return [
+            ApplicationEventWithApplication(event=row[0], company_name=row[1], position_name=row[2])
+            for row in rows
+            if row[0] is not None
+        ]
+
+    def get_application_event_scoped(
+        self,
+        constraint: ApplicationScopeConstraint,
+        event_id: int,
+    ) -> Optional[ApplicationEvent]:
+        binding = self._require_scoped(constraint)
+        session = binding.session
+        if constraint.mode == "unrestricted":
+            return _get_visible_event(session, event_id)
+        allowed_id = _restricted_scope_id(constraint)
+        with session.no_autoflush:
+            event = session.scalar(
+                select(ApplicationEvent)
+                .join(Application, Application.id == ApplicationEvent.application_id)
+                .where(ApplicationEvent.id == event_id)
+                .where(ApplicationEvent.application_id == allowed_id)
+                .where(Application.id == allowed_id)
+                .where(Application.deleted_at.is_(None))
+            )
+        if event is None:
+            raise ScopeAccessDenied("application scope denied")
+        return event
 
     def update(self, event_id: int, data: ApplicationEventCreate) -> Optional[ApplicationEvent]:
         with repository_session(self._session_factory, self._session) as session:
@@ -165,6 +301,25 @@ def _get_visible_event(session: Session, event_id: int) -> Optional[ApplicationE
         .where(Application.deleted_at.is_(None))
     )
     return event
+
+
+def _event_filters(
+    statement: Select[Any],
+    month: str,
+    application_id: int,
+    event_type: str,
+) -> Select[Any]:
+    if month:
+        bounds = _month_bounds(month)
+        if bounds is not None:
+            start, end = bounds
+            statement = statement.where(ApplicationEvent.scheduled_at >= start)
+            statement = statement.where(ApplicationEvent.scheduled_at < end)
+    if application_id > 0:
+        statement = statement.where(ApplicationEvent.application_id == application_id)
+    if event_type:
+        statement = statement.where(ApplicationEvent.event_type == event_type)
+    return statement
 
 
 def duration_minutes(duration: str | int) -> int:

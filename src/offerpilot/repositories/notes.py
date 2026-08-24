@@ -3,13 +3,25 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, cast
 
-from sqlalchemy import delete, exists, or_, select
+from builtins import list as BuiltinList
+
+from sqlalchemy import and_, delete, exists, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql import Select
 
+from offerpilot.ai.tool_authority import (
+    ApplicationScopeConstraint,
+    AuthorityFactory,
+    AuthorityPhaseError,
+    ToolExecutionAuthority,
+)
 from offerpilot.models import Application, ApplicationEvent, InterviewNote
+from offerpilot.repositories.applications import _restricted_scope_id
 from offerpilot.repositories.session_binding import (
+    ScopedRepositoryBinding,
+    ScopeAccessDenied,
+    bind_scoped_repository,
     finish_repository_write,
     repository_session,
     rollback_repository_write,
@@ -58,12 +70,41 @@ class NoteUpdate:
 
 
 class NotesRepository:
-    def __init__(self, session_factory: sessionmaker[Session], session: Session | None = None):
+    def __init__(
+        self,
+        session_factory: sessionmaker[Session],
+        session: Session | None = None,
+        scope_binding: ScopedRepositoryBinding | None = None,
+    ):
         self._session_factory = session_factory
         self._session = session
+        self._scope_binding = scope_binding
 
     def bind(self, session: Session) -> "NotesRepository":
         return NotesRepository(self._session_factory, session)
+
+    def bind_scoped(
+        self,
+        session: Session,
+        constraint: ApplicationScopeConstraint,
+        *,
+        authority_factory: AuthorityFactory,
+        authority: ToolExecutionAuthority,
+    ) -> "NotesRepository":
+        binding = bind_scoped_repository(
+            session,
+            constraint,
+            authority_factory=authority_factory,
+            authority=authority,
+        )
+        return NotesRepository(self._session_factory, session, binding)
+
+    def _require_scoped(self, constraint: object) -> ScopedRepositoryBinding:
+        binding = self._scope_binding
+        if binding is None or self._session is None:
+            raise AuthorityPhaseError("scoped repository requires a caller-owned bound Session")
+        binding.require(constraint)
+        return binding
 
     def create(self, data: NoteCreate) -> InterviewNote:
         note = InterviewNote(
@@ -111,6 +152,74 @@ class NotesRepository:
     def get(self, note_id: int) -> Optional[InterviewNote]:
         with repository_session(self._session_factory, self._session) as session:
             return cast(Optional[InterviewNote], session.scalar(self._visible_note_statement(note_id)))
+
+    def list_notes_scoped(
+        self,
+        constraint: ApplicationScopeConstraint,
+        application_id: int = 0,
+    ) -> BuiltinList[InterviewNote]:
+        binding = self._require_scoped(constraint)
+        session = binding.session
+        if constraint.mode == "unrestricted":
+            statement = (
+                select(InterviewNote)
+                .outerjoin(Application, Application.id == InterviewNote.application_id)
+                .where(
+                    or_(
+                        InterviewNote.application_id.is_(None),
+                        Application.deleted_at.is_(None),
+                    )
+                )
+            )
+            if application_id > 0:
+                statement = statement.where(InterviewNote.application_id == application_id)
+            statement = statement.order_by(InterviewNote.created_at.desc(), InterviewNote.id.desc())
+            with session.no_autoflush:
+                return list(session.scalars(statement))
+
+        allowed_id = _restricted_scope_id(constraint)
+        scope_parent = (
+            select(Application.id.label("_scope_application_id"))
+            .where(Application.id == allowed_id, Application.deleted_at.is_(None))
+            .cte("scoped_application")
+        )
+        join_condition = InterviewNote.application_id == scope_parent.c._scope_application_id
+        if application_id > 0:
+            join_condition = and_(join_condition, InterviewNote.application_id == application_id)
+        statement = (
+            select(InterviewNote, scope_parent.c._scope_application_id)
+            .select_from(scope_parent.outerjoin(InterviewNote, join_condition))
+            .order_by(InterviewNote.created_at.desc(), InterviewNote.id.desc())
+        )
+        with session.no_autoflush:
+            rows = session.execute(statement).all()
+        if not rows or rows[0][1] is None:
+            raise ScopeAccessDenied("application scope is unavailable")
+        return [row[0] for row in rows if row[0] is not None]
+
+    def get_note_scoped(
+        self,
+        constraint: ApplicationScopeConstraint,
+        note_id: int,
+    ) -> Optional[InterviewNote]:
+        binding = self._require_scoped(constraint)
+        session = binding.session
+        if constraint.mode == "unrestricted":
+            with session.no_autoflush:
+                return cast(Optional[InterviewNote], session.scalar(self._visible_note_statement(note_id)))
+        allowed_id = _restricted_scope_id(constraint)
+        with session.no_autoflush:
+            note = session.scalar(
+                select(InterviewNote)
+                .join(Application, Application.id == InterviewNote.application_id)
+                .where(InterviewNote.id == note_id)
+                .where(InterviewNote.application_id == allowed_id)
+                .where(Application.id == allowed_id)
+                .where(Application.deleted_at.is_(None))
+            )
+        if note is None:
+            raise ScopeAccessDenied("application scope denied")
+        return note
 
     def update(self, note_id: int, data: NoteUpdate) -> Optional[InterviewNote]:
         with repository_session(self._session_factory, self._session) as session:

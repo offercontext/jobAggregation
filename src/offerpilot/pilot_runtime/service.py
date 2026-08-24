@@ -33,6 +33,7 @@ from offerpilot.ai.agent_contracts import (
     StalePendingActionError,
 )
 from offerpilot.ai.agent_loop import AgentLoopInvocation, ApprovedWriteSeed, NewTurnSeed
+from offerpilot.ai.tool_authority import PendingAuthorityClaim
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import ToolFailure, ToolSuccess
 from offerpilot.ai.tool_runtime.legacy import LEGACY_DETERMINISTIC_NAMES
@@ -214,6 +215,7 @@ class RuntimePersistence(Protocol):
         conversation_id: int,
         messages: Sequence[Message],
         pending: PendingAction,
+        pending_authority_claim: PendingAuthorityClaim | None = None,
     ) -> PersistenceResult: ...
 
     def persist_clarification(
@@ -273,6 +275,9 @@ class NormalizedAgentTurn:
     pending: PendingAction | None
     records: tuple[object, ...] = ()
     failures: tuple[object, ...] = ()
+    pending_authority_claim: PendingAuthorityClaim | None = field(
+        default=None, repr=False, compare=False
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1157,6 +1162,7 @@ def _normalize_agent_result(value: object) -> NormalizedAgentTurn:
         value.pending,
         tuple(value.records),
         tuple(value.failures),
+        value.pending_authority_claim,
     )
 
 
@@ -2945,7 +2951,11 @@ class PilotRuntime:
         pending = normalized.pending
         delivery = coordinator.final_delivery(
             typed_session,
-            DeliveryBundle(tuple(continuation), pending=pending),
+            DeliveryBundle(
+                tuple(continuation),
+                pending=pending,
+                pending_authority_claim=normalized.pending_authority_claim,
+            ),
         )
         delivery_status = _failure_status(delivery)
         if delivery is None or delivery_status in {"cas_lost", "closed", "not_found"}:
@@ -6566,7 +6576,12 @@ class PilotRuntime:
                 control,
                 lambda: _invoke(
                     commit_function,
-                    {"conversation_id": conversation_id, "messages": messages, "pending": pending},
+                    {
+                        "conversation_id": conversation_id,
+                        "messages": messages,
+                        "pending": pending,
+                        "pending_authority_claim": result.pending_authority_claim,
+                    },
                     (conversation_id, messages, pending),
                 ),
             )

@@ -1726,6 +1726,8 @@ class WriteOperationCoordinator:
         prepare_identity: ApprovedWritePrepareCallIdentity,
         factory: Any,
     ) -> _LockedPendingIdentity:
+        if operation.authorization_scope_fingerprint is None:
+            raise WriteOperationError("authorization_scope_unbound")
         locked = _locked_pending_identity(
             conversation.pending_tool_call_id,
             conversation.pending_tool_name,

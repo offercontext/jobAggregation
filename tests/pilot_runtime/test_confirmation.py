@@ -233,6 +233,75 @@ def test_terminal_replay_is_ledger_first_and_never_reads_pending() -> None:
     assert persistence.pending_reads == 0
 
 
+def test_unbound_typed_proposal_fails_before_token_or_catalog_on_approval() -> None:
+    operations = _Operations(status="proposed")
+    operations.operation.adapter_kind = "typed"
+    operations.operation.authorization_scope_fingerprint = None
+    pending = PendingAction(
+        "call-1", "create_application", "{}", "create", operations.operation_id
+    )
+    persistence = _Persistence(pending)
+    coordinator = ConfirmationCoordinator(_deps(persistence, operations))
+
+    class ForbiddenCatalog:
+        def get(self, *_args: object, **_kwargs: object) -> object:
+            raise AssertionError("catalog must not be reached for an unbound Typed proposal")
+
+    request = ConfirmationRequest(
+        conversation_id=7,
+        approved=True,
+        operation_id=operations.operation_id,
+        confirmation_token=operations.token,
+    )
+
+    with pytest.raises(WriteOperationError) as raised:
+        coordinator.preflight_live(request, catalog=ForbiddenCatalog())
+
+    assert raised.value.code == "authorization_scope_unbound"
+
+
+def test_operation_without_conversation_is_unavailable_for_every_decision() -> None:
+    operations = _Operations(status="proposed")
+    operations.operation.conversation_id = None
+    pending = PendingAction(
+        "call-1", "create_application", "{}", "create", operations.operation_id
+    )
+    coordinator = ConfirmationCoordinator(_deps(_Persistence(pending), operations))
+
+    for approved in (True, False):
+        request = ConfirmationRequest(
+            conversation_id=7,
+            approved=approved,
+            operation_id=operations.operation_id,
+            confirmation_token=operations.token,
+        )
+        with pytest.raises(WriteOperationError) as raised:
+            coordinator.terminal_replay(request)
+        assert raised.value.code == "operation_unavailable"
+
+
+def test_unbound_typed_proposal_can_still_be_rejected_without_catalog() -> None:
+    operations = _Operations(status="proposed")
+    operations.operation.adapter_kind = "typed"
+    operations.operation.authorization_scope_fingerprint = None
+    pending = PendingAction(
+        "call-1", "create_application", "{}", "create", operations.operation_id
+    )
+    coordinator = ConfirmationCoordinator(_deps(_Persistence(pending), operations))
+
+    session = coordinator.reject(
+        ConfirmationRequest(
+            conversation_id=7,
+            approved=False,
+            operation_id=operations.operation_id,
+            confirmation_token=operations.token,
+        ),
+        pending=pending,
+    )
+
+    assert session.state.identity.operation_id == operations.operation_id
+
+
 def test_terminal_replay_rejects_wrong_token_without_pending_or_runtime_calls() -> None:
     operations = _Operations(status="committed")
     persistence = _Persistence(None)

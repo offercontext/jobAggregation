@@ -18,6 +18,7 @@ from offerpilot.ai.types import Message
 
 if TYPE_CHECKING:
     from offerpilot.ai.agent_loop import AgentLoopInvocation
+    from offerpilot.ai.tool_authority import PendingAuthorityClaim
 
 
 # Keep the established import surface while the dependency-free control
@@ -125,6 +126,17 @@ class PendingAction(TransientToolRuntimeValue):
     args: str
     human: str
     operation_id: str = ""
+    conversation_id: int | None = field(default=None, init=False, repr=False, compare=False)
+    pending_action_revision: int | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    pending_confirmation_claim_id: str | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    arguments_digest: str | None = field(default=None, init=False, repr=False, compare=False)
+    effective_args_digest: str | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
     _serialization_guard: _TransientAsdictGuard = field(
         default=_ASDICT_GUARD,
         init=False,
@@ -146,6 +158,30 @@ class PendingAction(TransientToolRuntimeValue):
     def __repr__(self) -> str:
         return "<PendingAction transient>"
 
+    def bind_typed_proposal_identity(
+        self,
+        *,
+        conversation_id: int,
+        pending_action_revision: int,
+        pending_confirmation_claim_id: str,
+        arguments_digest: str,
+    ) -> None:
+        """Seal factory-readable transient identity on the original Pending."""
+
+        if self.conversation_id is not None:
+            raise TypeError("PendingAction proposal identity is already bound")
+        if type(conversation_id) is not int or conversation_id <= 0:
+            raise TypeError("conversation_id must be a positive integer")
+        if type(pending_action_revision) is not int or pending_action_revision <= 0:
+            raise TypeError("pending_action_revision must be a positive integer")
+        _require_text(pending_confirmation_claim_id, "pending_confirmation_claim_id")
+        _require_text(arguments_digest, "arguments_digest")
+        self.conversation_id = conversation_id
+        self.pending_action_revision = pending_action_revision
+        self.pending_confirmation_claim_id = pending_confirmation_claim_id
+        self.arguments_digest = arguments_digest
+        self.effective_args_digest = arguments_digest
+
 
 @dataclass(frozen=True, repr=False)
 class AgentTurnResult(TransientToolRuntimeValue):
@@ -154,6 +190,9 @@ class AgentTurnResult(TransientToolRuntimeValue):
     pending: PendingAction | None
     records: tuple[ToolExecutionRecord[Any, Any], ...] = ()
     failures: tuple[ToolFailure, ...] = ()
+    pending_authority_claim: PendingAuthorityClaim | None = field(
+        default=None, repr=False, compare=False
+    )
     _serialization_guard: _TransientAsdictGuard = field(
         default=_ASDICT_GUARD,
         init=False,
@@ -171,6 +210,13 @@ class AgentTurnResult(TransientToolRuntimeValue):
             raise TypeError("AgentTurnResult pending must be PendingAction or None")
         if type(self.records) is not tuple or type(self.failures) is not tuple:
             raise TypeError("AgentTurnResult records/failures must be tuples")
+        if self.pending_authority_claim is not None:
+            from offerpilot.ai.tool_authority import PendingAuthorityClaim
+
+            if type(self.pending_authority_claim) is not PendingAuthorityClaim:
+                raise TypeError("pending_authority_claim must be an exact PendingAuthorityClaim")
+            if self.pending is None:
+                raise TypeError("pending_authority_claim requires a PendingAction")
 
     def __repr__(self) -> str:
         return "<AgentTurnResult transient>"

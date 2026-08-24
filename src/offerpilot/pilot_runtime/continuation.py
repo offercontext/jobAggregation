@@ -29,6 +29,7 @@ from uuid import UUID
 
 from offerpilot.ai.agent_contracts import PendingAction, _ASDICT_GUARD
 from offerpilot.ai.confirmation import prepare_pending_action
+from offerpilot.ai.tool_authority import PendingAuthorityClaim
 from offerpilot.ai.tool_runtime.contracts import (
     JSONValue,
     PreparedToolCall,
@@ -423,6 +424,9 @@ class DeliveryBundle:
     messages: tuple[Message, ...]
     pending: PendingAction | None = None
     clarification: tuple[PendingAction, str] | None = None
+    pending_authority_claim: PendingAuthorityClaim | None = field(
+        default=None, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if type(self.messages) is not tuple:
@@ -431,6 +435,11 @@ class DeliveryBundle:
             raise TypeError("messages must contain Message values")
         if self.pending is not None and self.clarification is not None:
             raise ValueError("pending and clarification cannot both be delivered")
+        if self.pending_authority_claim is not None:
+            if type(self.pending_authority_claim) is not PendingAuthorityClaim:
+                raise TypeError("pending_authority_claim must be an exact PendingAuthorityClaim")
+            if self.pending is None:
+                raise ValueError("pending_authority_claim requires a chained Pending")
 
 
 @dataclass(slots=True, repr=False)
@@ -774,6 +783,8 @@ class ConfirmationCoordinator:
         operation = operation if operation is not None else self._operation(operation_id)
         if operation is None:
             raise WriteOperationError("operation_result_unknown", retryable=True)
+        if _attribute(operation, "conversation_id") is None:
+            raise WriteOperationError("operation_unavailable")
         status = _status(operation)
         if status not in {"proposed", "committed", "rejected", "failed"}:
             raise WriteOperationError("operation_integrity_error")
@@ -882,12 +893,19 @@ class ConfirmationCoordinator:
             if request.operation_id and request.operation_id != live.operation_id:
                 raise WriteOperationError("operation_identity_conflict")
             raise WriteOperationError("operation_result_unknown", retryable=True)
+        if _attribute(operation, "conversation_id") is None:
+            raise WriteOperationError("operation_unavailable")
         self._validate_live_identity(request.conversation_id, live, operation)
         if _status(operation) != "proposed":
             changed = self.terminal_replay(request, operation=operation)
             if changed is not None:
                 raise ConfirmationReplayError(changed)
             raise WriteOperationError("operation_result_unknown", retryable=True)
+        if (
+            _attribute(operation, "adapter_kind") == "typed"
+            and _attribute(operation, "authorization_scope_fingerprint") is None
+        ):
+            raise WriteOperationError("authorization_scope_unbound")
         token = self._token(live, request)
         if request.confirmation_token and not compare_digest(token, request.confirmation_token):
             raise WriteOperationError("operation_input_conflict")
@@ -934,6 +952,12 @@ class ConfirmationCoordinator:
             # The row changed after the first Ledger-first read.  Re-run the
             # terminal branch with a fresh row; never inspect stale Pending.
             raise ConfirmationReplayError(cast(OperationReplay, self.terminal_replay(request, operation=operation)))
+        if (
+            approved
+            and _attribute(operation, "adapter_kind") == "typed"
+            and _attribute(operation, "authorization_scope_fingerprint") is None
+        ):
+            raise WriteOperationError("authorization_scope_unbound")
         token = self._token(live, request)
         if request.confirmation_token and not compare_digest(token, request.confirmation_token):
             raise WriteOperationError("operation_input_conflict")
@@ -1526,6 +1550,7 @@ class ConfirmationCoordinator:
         pending: PendingAction | None = None,
         clarification: tuple[PendingAction, str] | None = None,
         failure_code: str | None = None,
+        pending_authority_claim: PendingAuthorityClaim | None = None,
     ) -> PersistenceResult | object | None:
         """Persist exactly one origin+continuation bundle under the owner fence."""
 
@@ -1533,7 +1558,12 @@ class ConfirmationCoordinator:
         if isinstance(bundle, DeliveryBundle):
             delivery = bundle
         else:
-            delivery = DeliveryBundle(tuple(_message(item) for item in bundle), pending, clarification)
+            delivery = DeliveryBundle(
+                tuple(_message(item) for item in bundle),
+                pending,
+                clarification,
+                pending_authority_claim,
+            )
         fence_lost = False
         ownership_missing = False
         with state.lock:
@@ -1584,6 +1614,11 @@ class ConfirmationCoordinator:
             raise WriteOperationError("operation_unavailable")
         values = tuple(delivery.messages)
         chained_pending = pending if pending is not None else delivery.pending
+        chained_pending_claim = (
+            pending_authority_claim
+            if pending is not None
+            else delivery.pending_authority_claim
+        )
         clarification_value = clarification if clarification is not None else delivery.clarification
         try:
             persistence = _attribute(persistence_object, "persist_confirmation_delivery")
@@ -1600,6 +1635,7 @@ class ConfirmationCoordinator:
                     "claim_id": claim_id,
                     "undo": undo,
                     "delivery_failure_code": failure_code,
+                    "pending_authority_claim": chained_pending_claim,
                 }
             else:
                 persistence = _attribute(persistence_object, "persist_confirmation_continuation")
@@ -1620,6 +1656,7 @@ class ConfirmationCoordinator:
                     "claim_id": claim_id,
                     "origin_message": state.origin_tool_message,
                     "undo": undo,
+                    "pending_authority_claim": chained_pending_claim,
                 }
         except BaseException:
             with state.lock:

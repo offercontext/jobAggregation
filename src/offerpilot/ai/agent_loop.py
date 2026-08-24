@@ -29,6 +29,7 @@ from offerpilot.ai.agent_contracts import (
 from offerpilot.ai.tool_authority import (
     ApprovalExecutionAuthority,
     NewTurnPrepareCallIdentity,
+    PendingAuthorityClaim,
     ProviderInvocationIdentity,
     SegmentExecutionAuthority,
 )
@@ -212,6 +213,7 @@ class _LoopServices:
         self.runner_invocation = invocation
         self._prepare_identities: dict[int, NewTurnPrepareCallIdentity] = {}
         self._provider_invocations: dict[int, ProviderInvocationIdentity] = {}
+        self._pending_claims: dict[int, PendingAuthorityClaim] = {}
         if type(self.context.authority) is SegmentExecutionAuthority:
             factory = self.context.authority_factory
             factory.register_runner_invocation(invocation, authority=self.context.authority)
@@ -765,6 +767,7 @@ class AgentLoopRunner:
                     pending,
                     tuple(records),
                     tuple(failures),
+                    pending_authority_claim=services._pending_claims.get(id(pending)),
                 )
 
     def _bootstrap_approved(
@@ -888,17 +891,27 @@ class AgentLoopRunner:
                     added_messages,
                 )
                 continue
+            pending_draft: PendingAction | None = None
+            pending_revision: int | None = None
+            if spec.kind == "write":
+                pending_revision = max(
+                    1,
+                    _pending_action_revision(call.id, call.name, call.args),
+                )
+                pending_draft = PendingAction(
+                    tool_call_id=call.id,
+                    tool_name=call.name,
+                    args=call.args,
+                    human=_spec_confirmation_description(spec, call.args, call.name),
+                    operation_id=str(uuid4()),
+                )
             prepared = prepare_call(
                 invocation.catalog,
                 invocation.tool_context,
                 call,
                 call_identity=services._prepare_identities.get(id(call)),
-                pending_identity=(f"{call.id}:{call.name}" if spec.kind == "write" else None),
-                pending_action_revision=(
-                    _pending_action_revision(call.id, call.name, call.args)
-                    if spec.kind == "write"
-                    else None
-                ),
+                pending_identity=pending_draft,
+                pending_action_revision=pending_revision,
             )
             services.raise_if_cancelled()
             if isinstance(prepared, Rejected):
@@ -915,13 +928,46 @@ class AgentLoopRunner:
                 continue
             if spec.kind == "write":
                 if isinstance(prepared, ConfirmationRequired):
-                    return PendingAction(
+                    if type(invocation.tool_context.authority) is not SegmentExecutionAuthority:
+                        raise TypeError("Typed Pending requires Segment authority")
+                    if pending_draft is None or pending_revision is None:
+                        raise TypeError("Typed Pending draft identity is missing")
+                    pending = pending_draft
+                    operation_id = pending.operation_id
+                    revision = pending_revision
+                    pending.bind_typed_proposal_identity(
+                        conversation_id=invocation.tool_context.authority.conversation_id,
+                        pending_action_revision=revision,
+                        pending_confirmation_claim_id=operation_id,
+                        arguments_digest=prepared.prepared.arguments_digest,
+                    )
+                    factory = invocation.tool_context.authority_factory
+                    factory.register_pending(pending)
+                    factory.create_typed_pending_identity(
+                        authority=invocation.tool_context.authority,
+                        runner_invocation=services.runner_invocation,
+                        tool_context=invocation.tool_context,
+                        prepared=prepared.prepared,
+                        pending=pending,
+                        operation_id=operation_id,
+                        pending_action_revision=revision,
                         tool_call_id=call.id,
                         tool_name=call.name,
-                        args=call.args,
-                        human=_spec_confirmation_description(spec, call.args, call.name),
-                        operation_id=str(uuid4()),
+                        arguments_digest=prepared.prepared.arguments_digest,
                     )
+                    pending_claim = factory.issue_pending_claim(
+                        invocation.tool_context.authority,
+                        prepared=prepared.prepared,
+                        pending=pending,
+                        operation_id=operation_id,
+                        tool_call_id=call.id,
+                        tool_name=call.name,
+                        arguments_digest=prepared.prepared.arguments_digest,
+                        pending_action_revision=revision,
+                        pending_confirmation_claim_id=operation_id,
+                    )
+                    services._pending_claims[id(pending)] = pending_claim
+                    return pending
                 result = "错误：确认操作状态不一致"
                 self._append_tool_result(
                     invocation,

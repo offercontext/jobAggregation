@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from threading import Barrier
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import update
@@ -8,7 +9,7 @@ from sqlalchemy import update
 from offerpilot.ai.agent_contracts import PendingAction
 from offerpilot.ai.types import Message
 from offerpilot.db import init_database
-from offerpilot.models import Conversation
+from offerpilot.models import Conversation, WriteOperation
 from offerpilot.repositories.chat import ChatRepository
 
 
@@ -79,6 +80,29 @@ def test_pending_action_cannot_be_added_after_archive(tmp_path):
     assert archived.status == "updated"
     assert created is False
     assert repo.get_pending_action(conversation.id) is None
+
+
+def test_reading_old_typed_pending_never_lazy_backfills_ledger(tmp_path):
+    session_factory = init_database(tmp_path / "data.db")
+    repo = ChatRepository(session_factory)
+    conversation = repo.create_conversation("old-unbound-typed")
+    operation_id = str(uuid4())
+    with session_factory() as session:
+        stored = session.get(Conversation, conversation.id)
+        assert stored is not None
+        stored.pending_tool_call_id = "old-call"
+        stored.pending_operation_id = operation_id
+        stored.pending_tool_name = "update_application_status"
+        stored.pending_args = '{"id":1,"status":"offer"}'
+        stored.pending_human = "update"
+        session.commit()
+
+    pending = repo.get_pending_action(conversation.id)
+
+    assert pending is not None
+    assert pending.operation_id == operation_id
+    with session_factory() as session:
+        assert session.get(WriteOperation, operation_id) is None
 
 
 def test_pending_action_and_proposal_messages_are_atomic_when_archived(tmp_path):

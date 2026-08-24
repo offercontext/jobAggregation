@@ -5,12 +5,13 @@ from datetime import datetime, timezone
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, get_type_hints
+from typing import Any, cast, get_type_hints
 from uuid import uuid4
 
 import pytest
 
 from offerpilot.ai.agent_contracts import PendingAction
+from offerpilot.ai.tool_authority import PendingAuthorityClaim
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.ai.write_operations import (
     DeliveryOwnership,
@@ -57,9 +58,9 @@ def make_delivery_fixtures(
     conversation = chat.create_conversation("delivery")
     pending = PendingAction(
         "call-1",
-        "update_application_status",
-        '{"id": 1}',
-        "更新状态",
+        "save_application_jd_version",
+        '{"application_id":1,"jd_text":"origin"}',
+        "保存岗位资料",
         str(uuid4()),
     )
     assert chat.persist_pending_action(conversation.id, pending, [])
@@ -98,6 +99,44 @@ def _message_projection(message: object) -> dict[str, str]:
     return {
         field: str(getattr(message, field))
         for field in ("role", "content", "tool_calls", "tool_call_id", "provider_blocks")
+    }
+
+
+def test_initial_pending_forwards_exact_transient_authority_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coordinator, conversation_id = make_persistence_coordinator(tmp_path)
+    pending = PendingAction("call", "update_application_status", "{}", "update")
+    claim = cast(PendingAuthorityClaim, object())
+    captured: dict[str, object] = {}
+
+    def persist(
+        actual_conversation_id: int,
+        actual_pending: PendingAction,
+        _messages: object,
+        *,
+        pending_authority_claim: PendingAuthorityClaim | None = None,
+    ) -> bool:
+        captured.update(
+            conversation_id=actual_conversation_id,
+            pending=actual_pending,
+            claim=pending_authority_claim,
+        )
+        return True
+
+    monkeypatch.setattr(coordinator._chat, "persist_pending_action", persist)
+    result = coordinator.persist_initial_pending(
+        conversation_id,
+        [],
+        pending,
+        pending_authority_claim=claim,
+    )
+
+    assert result.persisted
+    assert captured == {
+        "conversation_id": conversation_id,
+        "pending": pending,
+        "claim": claim,
     }
 
 
@@ -479,9 +518,9 @@ def test_confirmation_delivery_atomically_chains_a_new_pending_with_ledger(
     )
     replacement = PendingAction(
         "call-2",
-        "update_application_status",
-        '{"id": 2}',
-        "更新第二条状态",
+        "save_application_jd_version",
+        '{"application_id":2,"jd_text":"next"}',
+        "保存第二份岗位资料",
         str(uuid4()),
     )
     generation = conversation_generation(chat, conversation_id)
@@ -751,9 +790,9 @@ def test_duplicate_chained_delivery_without_pending_has_no_inferred_outcome(
     )
     replacement = PendingAction(
         "call-2",
-        "update_application_status",
-        '{"id": 2}',
-        "更新第二条状态",
+        "save_application_jd_version",
+        '{"application_id":2,"jd_text":"next"}',
+        "保存第二份岗位资料",
         str(uuid4()),
     )
     origin = Message(role="tool", content="结果", tool_call_id=pending.tool_call_id)

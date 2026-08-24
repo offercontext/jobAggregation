@@ -16,6 +16,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, cast
 
 from offerpilot.ai.agent_contracts import PendingAction
+from offerpilot.ai.tool_authority import PendingAuthorityClaim
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.ai.write_operations import DeliveryOwnership
 from offerpilot.repositories.chat import ChatRepository
@@ -667,6 +668,7 @@ class ChatPersistenceCoordinator:
         conversation_id: int,
         messages: Sequence[MessageInput],
         pending: PendingAction,
+        pending_authority_claim: PendingAuthorityClaim | None = None,
     ) -> PersistenceResult:
         """Atomically persist a Runtime-authorized initial Pending proposal.
 
@@ -684,6 +686,7 @@ class ChatPersistenceCoordinator:
             conversation_id,
             pending,
             [_message_values(message) for message in messages],
+            pending_authority_claim=pending_authority_claim,
         )
         if persisted:
             message_ids = _new_message_ids(before, self.list_messages(conversation_id))
@@ -826,6 +829,7 @@ class ChatPersistenceCoordinator:
         claim_id: str | None = None,
         undo: dict[str, Any] | None = None,
         delivery_failure_code: str | None = None,
+        pending_authority_claim: PendingAuthorityClaim | None = None,
     ) -> PersistenceResult:
         """Atomically deliver an origin tool result and continuation.
 
@@ -907,6 +911,7 @@ class ChatPersistenceCoordinator:
                 claim_id=claim_id,
                 origin_message=origin,
                 undo=undo,
+                pending_authority_claim=pending_authority_claim,
             )
         elif ownership is None and expected is not None:
             # The non-Ledger compatibility atom writes one terminal assistant
@@ -926,6 +931,7 @@ class ChatPersistenceCoordinator:
                     undo,
                     terminal_assistant_content=terminal,
                     claim_id=claim_id,
+                    pending_authority_claim=pending_authority_claim,
                 )
             else:
                 origin_persisted = True
@@ -952,6 +958,7 @@ class ChatPersistenceCoordinator:
                 expected_pending=None,
                 origin_message=None,
                 undo=undo,
+                pending_authority_claim=pending_authority_claim,
             )
 
         if persisted_generation is None:
@@ -1012,6 +1019,7 @@ class ChatPersistenceCoordinator:
         claim_id: str | None = None,
         undo: dict[str, Any] | None = None,
         clarification: tuple[PendingAction, str] | None = None,
+        pending_authority_claim: PendingAuthorityClaim | None = None,
     ) -> PersistenceResult:
         """Typed replay delivery facade; replay never executes a provider/tool."""
 
@@ -1029,6 +1037,7 @@ class ChatPersistenceCoordinator:
             claim_id=claim_id,
             undo=undo,
             delivery_failure_code=failure_code,
+            pending_authority_claim=pending_authority_claim,
         )
 
     def persist_confirmation_continuation(
@@ -1045,6 +1054,7 @@ class ChatPersistenceCoordinator:
         claim_id: str | None = None,
         origin_message: MessageInput | None = None,
         undo: dict[str, Any] | None = None,
+        pending_authority_claim: PendingAuthorityClaim | None = None,
     ) -> PersistenceResult:
         """Compatibility-shaped continuation facade for Runtime callers."""
 
@@ -1062,6 +1072,7 @@ class ChatPersistenceCoordinator:
             claim_id=claim_id,
             undo=undo,
             delivery_failure_code=delivery_failure_code,
+            pending_authority_claim=pending_authority_claim,
         )
 
     @staticmethod

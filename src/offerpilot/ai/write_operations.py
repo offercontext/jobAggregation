@@ -24,7 +24,9 @@ from sqlalchemy.orm import Session, sessionmaker
 from offerpilot.ai.tool_authority import (
     ApprovalExecutionAuthority,
     ApprovedWritePrepareCallIdentity,
+    AuthorityFactory,
     AuthorityPhaseError,
+    TrustedLedgerOmittedTokenProof,
 )
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import (
@@ -162,6 +164,29 @@ class DeliveryHeartbeat(_Transient):
                     return
         except Exception:
             self._stop.set()
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class LedgerPendingPointer:
+    """Bounded Conversation projection used before a confirmation decision.
+
+    Deliberately absent are Pending arguments, human text, generation fields,
+    and every lazy ORM relationship.  This is an identity/CAS carrier only.
+    """
+
+    conversation_id: int
+    operation_id: str
+    tool_call_id: str
+    tool_name: str
+    pending_confirmation_claim_id: str
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class LedgerOperationPreheader:
+    """One Ledger row plus its exact, bounded owning-Conversation pointer."""
+
+    operation: WriteOperation
+    pending_pointer: LedgerPendingPointer
 
 
 @dataclass(frozen=True)
@@ -495,6 +520,62 @@ class WriteOperationRepository:
     def get(self, operation_id: str) -> WriteOperation | None:
         with self.session_factory() as session:
             return session.get(WriteOperation, operation_id)
+
+    def operation_preheader(
+        self,
+        *,
+        conversation_id: int,
+        operation_id: str | None,
+    ) -> LedgerOperationPreheader:
+        """Load the confirmation identity without selecting Pending content.
+
+        An explicit operation id is always the first database read.  When the
+        id is omitted, the only bootstrap read is the five-column Conversation
+        pointer projection; the Ledger is never scanned or guessed.
+        """
+
+        with self.session_factory() as session:
+            operation: WriteOperation | None = None
+            if operation_id is not None:
+                operation = session.get(WriteOperation, operation_id)
+                if operation is None:
+                    raise WriteOperationError("operation_result_unknown", retryable=True)
+                if operation.conversation_id is None:
+                    raise WriteOperationError("operation_unavailable")
+                if operation.conversation_id != conversation_id:
+                    raise WriteOperationError("operation_identity_conflict")
+
+            pointer_row = session.execute(
+                select(
+                    Conversation.id,
+                    Conversation.pending_operation_id,
+                    Conversation.pending_tool_call_id,
+                    Conversation.pending_tool_name,
+                    Conversation.pending_confirmation_claim_id,
+                ).where(Conversation.id == conversation_id)
+            ).one_or_none()
+            if pointer_row is None:
+                raise WriteOperationError("operation_unavailable")
+            pointer = LedgerPendingPointer(
+                conversation_id=int(pointer_row.id),
+                operation_id=str(pointer_row.pending_operation_id or ""),
+                tool_call_id=str(pointer_row.pending_tool_call_id or ""),
+                tool_name=str(pointer_row.pending_tool_name or ""),
+                pending_confirmation_claim_id=str(
+                    pointer_row.pending_confirmation_claim_id or ""
+                ),
+            )
+            if operation is None:
+                if not pointer.operation_id:
+                    raise WriteOperationError("stale_pending_action")
+                operation = session.get(WriteOperation, pointer.operation_id)
+                if operation is None:
+                    raise WriteOperationError("operation_result_unknown", retryable=True)
+                if operation.conversation_id is None:
+                    raise WriteOperationError("operation_unavailable")
+                if operation.conversation_id != conversation_id:
+                    raise WriteOperationError("operation_identity_conflict")
+            return LedgerOperationPreheader(operation, pointer)
 
     def create_primary(
         self,
@@ -1319,11 +1400,15 @@ class WriteOperationCoordinator:
         tool_name: str,
         request_fingerprint: str,
         visible_result: str,
+        confirmation_token: str | None = None,
     ) -> OperationExecution:
         owner = self.repository.prepare_owner(operation_id)
         try:
             with self.repository.session_factory() as session:
                 session.execute(text("BEGIN IMMEDIATE"))
+                outer_transaction = session.get_transaction()
+                if outer_transaction is None:
+                    raise WriteOperationError("operation_not_committed", retryable=True)
                 operation = session.get(WriteOperation, operation_id)
                 if operation is None:
                     raise WriteOperationError("operation_result_unknown", retryable=True)
@@ -1331,25 +1416,58 @@ class WriteOperationCoordinator:
                     replay = self.repository.replay(operation, request_fingerprint)
                     session.rollback()
                     return replay
+                if operation.conversation_id is None:
+                    raise WriteOperationError("operation_unavailable")
                 if (
                     operation.conversation_id != conversation_id
                     or operation.tool_call_id != tool_call_id
                     or operation.tool_name != tool_name
                 ):
                     raise WriteOperationError("operation_identity_conflict")
-                claimed = session.execute(
-                    update(Conversation)
-                    .where(Conversation.id == conversation_id)
-                    .where(Conversation.pending_operation_id == operation_id)
-                    .where(Conversation.pending_tool_call_id == tool_call_id)
-                    .where(Conversation.pending_tool_name == tool_name)
-                    .values(
-                        pending_confirmation_claim_id=operation_id,
-                        pending_confirmation_claimed_at=datetime.now(timezone.utc),
-                    )
+                pointer_row = session.execute(
+                    select(
+                        Conversation.id,
+                        Conversation.pending_operation_id,
+                        Conversation.pending_tool_call_id,
+                        Conversation.pending_tool_name,
+                        Conversation.pending_confirmation_claim_id,
+                    ).where(Conversation.id == conversation_id)
+                ).one_or_none()
+                if pointer_row is None:
+                    raise WriteOperationError("operation_unavailable")
+                pointer = LedgerPendingPointer(
+                    conversation_id=int(pointer_row.id),
+                    operation_id=str(pointer_row.pending_operation_id or ""),
+                    tool_call_id=str(pointer_row.pending_tool_call_id or ""),
+                    tool_name=str(pointer_row.pending_tool_name or ""),
+                    pending_confirmation_claim_id=str(
+                        pointer_row.pending_confirmation_claim_id or ""
+                    ),
                 )
-                if getattr(claimed, "rowcount", 0) != 1:
+                if (
+                    pointer.operation_id != operation_id
+                    or pointer.tool_call_id != tool_call_id
+                    or pointer.tool_name != tool_name
+                    or pointer.pending_confirmation_claim_id != ""
+                ):
                     raise WriteOperationError("operation_identity_conflict")
+
+                if confirmation_token is not None:
+                    try:
+                        token_bytes = confirmation_token.encode("ascii")
+                    except UnicodeEncodeError as exc:
+                        raise WriteOperationError("invalid_confirmation") from exc
+                    supplied_fingerprint = ledger_fingerprint(
+                        self.repository.key,
+                        "write-operation-confirmation-token-v1",
+                        token_bytes,
+                    )
+                    if not hmac.compare_digest(
+                        supplied_fingerprint,
+                        operation.confirmation_token_fingerprint or "",
+                    ):
+                        raise WriteOperationError("operation_input_conflict")
+
                 payload = build_terminal_payload(
                     status="rejected",
                     result_contract="rejection_json_v1",
@@ -1364,10 +1482,134 @@ class WriteOperationCoordinator:
                     failure_category=None,
                     failure_code=None,
                 )
-                operation.operation_request_fingerprint = request_fingerprint
-                operation.rejected_at = datetime.now(timezone.utc)
-                self._set_terminal(operation, payload, owner)
-                self.repository.append_transition(session, operation_id, 2, "rejected")
+
+                proof: TrustedLedgerOmittedTokenProof | None = None
+                factory: AuthorityFactory | None = None
+                if confirmation_token is None:
+                    factory = AuthorityFactory()
+                    factory.register_operation(operation)
+                    pointer_revision = int.from_bytes(
+                        hashlib.sha256(
+                            canonical_json(
+                                {
+                                    "conversation_id": pointer.conversation_id,
+                                    "operation_id": pointer.operation_id,
+                                    "tool_call_id": pointer.tool_call_id,
+                                    "tool_name": pointer.tool_name,
+                                    "pending_confirmation_claim_id": (
+                                        pointer.pending_confirmation_claim_id
+                                    ),
+                                }
+                            ).encode("utf-8")
+                        ).digest()[:8],
+                        "big",
+                    ) & ((1 << 63) - 1)
+                    factory.register_pending(
+                        pointer,
+                        conversation_id=pointer.conversation_id,
+                        operation_id=pointer.operation_id,
+                        tool_call_id=pointer.tool_call_id,
+                        tool_name=pointer.tool_name,
+                        pending_action_revision=pointer_revision,
+                        pending_confirmation_claim_id=(
+                            pointer.pending_confirmation_claim_id
+                        ),
+                        arguments_digest="sha256:"
+                        + hashlib.sha256(
+                            canonical_json(
+                                {
+                                    "operation_id": pointer.operation_id,
+                                    "tool_call_id": pointer.tool_call_id,
+                                    "tool_name": pointer.tool_name,
+                                }
+                            ).encode("utf-8")
+                        ).hexdigest(),
+                        effective_args_digest="sha256:"
+                        + hashlib.sha256(
+                            canonical_json(
+                                {
+                                    "operation_id": pointer.operation_id,
+                                    "tool_call_id": pointer.tool_call_id,
+                                    "tool_name": pointer.tool_name,
+                                }
+                            ).encode("utf-8")
+                        ).hexdigest(),
+                    )
+                    factory.register_transaction(outer_transaction)
+                    proof = factory.issue_omitted_token_proof(
+                        operation,
+                        pending_pointer=pointer,
+                        transaction=outer_transaction,
+                    )
+
+                def reject_cas() -> None:
+                    cleared = session.execute(
+                        update(Conversation)
+                        .where(Conversation.id == conversation_id)
+                        .where(Conversation.pending_operation_id == operation_id)
+                        .where(Conversation.pending_tool_call_id == tool_call_id)
+                        .where(Conversation.pending_tool_name == tool_name)
+                        .where(Conversation.pending_confirmation_claim_id == "")
+                        .values(
+                            pending_operation_id="",
+                            pending_tool_call_id="",
+                            pending_tool_name="",
+                            pending_confirmation_claim_id="",
+                            pending_confirmation_claimed_at=None,
+                            pending_args="",
+                            pending_human="",
+                            updated_at=datetime.now(timezone.utc),
+                        )
+                    )
+                    if getattr(cleared, "rowcount", 0) != 1:
+                        raise WriteOperationError("operation_identity_conflict")
+                    operation.operation_request_fingerprint = request_fingerprint
+                    self._set_terminal(operation, payload, owner)
+                    self.repository.append_transition(session, operation_id, 2, "rejected")
+                    session.add_all(
+                        (
+                            ChatMessage(
+                                conversation_id=conversation_id,
+                                role="tool",
+                                content=canonical_json(
+                                    {
+                                        "status": "cancelled",
+                                        "message": "用户取消了该操作，未执行。",
+                                    }
+                                ),
+                                tool_call_id=tool_call_id,
+                                operation_id=operation_id,
+                                delivery_kind="origin_tool_result",
+                                delivery_ordinal=0,
+                            ),
+                            ChatMessage(
+                                conversation_id=conversation_id,
+                                role="assistant",
+                                content=visible_result,
+                                operation_id=operation_id,
+                                delivery_kind="continuation_message",
+                                delivery_ordinal=1,
+                            ),
+                        )
+                    )
+                    session.flush()
+                    if not self.repository.complete_delivery(
+                        session,
+                        owner,
+                        outcome="final_response",
+                    ):
+                        raise WriteOperationError("operation_delivery_unknown")
+
+                try:
+                    if proof is None:
+                        reject_cas()
+                    else:
+                        assert factory is not None
+                        with factory.claim_lifecycle(proof):
+                            reject_cas()
+                finally:
+                    if factory is not None:
+                        factory.close()
                 try:
                     session.commit()
                 except OperationalError:
@@ -1377,7 +1619,7 @@ class WriteOperationCoordinator:
                         absent_code="operation_result_unknown",
                         proposed_code="operation_not_committed",
                     )
-                return OperationFailed(operation_id, payload, owner)
+                return OperationFailed(operation_id, payload, None)
         except WriteOperationError as exc:
             return OperationUnknown(operation_id, exc.code, exc.retryable)
         except OperationalError:

@@ -2338,7 +2338,17 @@ class PilotRuntime:
     ) -> RuntimeOutcome:
         """Complete rejection from Pending/Ledger atoms only."""
 
-        session = coordinator.reject(request)
+        try:
+            session = coordinator.reject(request)
+        except ConfirmationReplayError:
+            replay = coordinator.replay_outcome(request)
+            self._mark_completed_if_active(control)
+            return replay or self._failure(
+                RuntimeFailureCode.OPERATION_RESULT_UNKNOWN,
+                "operation result is unavailable",
+                503,
+                retryable=True,
+            )
         recorder: object = _NoopRecorder()
         journal_started = False
         try:
@@ -2406,6 +2416,19 @@ class PilotRuntime:
             )
             or "已取消这次操作。"
         )
+        if session.state.delivered:
+            outcome = MessageOutcome(
+                message=visible,
+                conversation_id=request.conversation_id,
+                write_status="cancelled",
+                undo=None,
+                operation_id=session.state.identity.operation_id,
+                persisted=True,
+                legacy_projection=True,
+            )
+            self._close_ledger_journal(recorder, journal_started, outcome, control)
+            self._mark_completed_if_active(control)
+            return outcome
         origin = Message(
             role="tool",
             content=_CANCELLED_TOOL_RESULT,
@@ -2449,10 +2472,7 @@ class PilotRuntime:
             message=visible,
             conversation_id=request.conversation_id,
             write_status="cancelled",
-            undo=self._previous_write_undo(
-                None,
-                request.conversation_id,
-            ),
+            undo=None,
             operation_id=request.operation_id or session.state.identity.operation_id,
             persisted=True,
             legacy_projection=True,
@@ -2546,17 +2566,6 @@ class PilotRuntime:
             return self._confirmation_failure(exc)
         self._check_cancel(cancel_check, control)
 
-        try:
-            replay = coordinator.replay_outcome(request)
-        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
-            raise
-        except Exception as exc:
-            self._mark_completed_if_active(control)
-            return self._confirmation_failure(exc)
-        if replay is not None:
-            self._mark_completed_if_active(control)
-            return replay
-
         # Rejection is the direct worker path.  It must not load a Conversation
         # or resolve a model before the Pending/Ledger CAS has converged.
         if not request.approved:
@@ -2575,6 +2584,17 @@ class PilotRuntime:
                 return self._confirmation_failure(exc)
             except BaseException:
                 raise
+
+        try:
+            replay = coordinator.replay_outcome(request)
+        except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            raise
+        except Exception as exc:
+            self._mark_completed_if_active(control)
+            return self._confirmation_failure(exc)
+        if replay is not None:
+            self._mark_completed_if_active(control)
+            return replay
 
         # Validate the live Pending/Ledger identity before touching a
         # Conversation or resolving a model.  The session constructor repeats
@@ -3252,6 +3272,19 @@ class PilotRuntime:
             and confirmation_coordinator is not None
             and not self._is_deterministic_confirmation(request)
         ):
+            if not request.approved:
+                # The reject coordinator owns terminal replay as part of the
+                # same bounded preheader; do not perform a second bootstrap.
+                return self._prepare_ledger_confirmation_stream(
+                    confirmation_coordinator,
+                    request,
+                    None,
+                    request.conversation_id,
+                    transport,
+                    invocation_control,
+                    replay=None,
+                    terminal_checked=True,
+                )
             try:
                 stream_replay = confirmation_coordinator.replay_outcome(request)
             except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
@@ -3273,19 +3306,6 @@ class PilotRuntime:
                     conversation_id=request.conversation_id,
                     transport=transport,
                     invocation_control=invocation_control,
-                )
-            if not request.approved:
-                # Rejection is already a complete direct Ledger worker path;
-                # do not load Conversation/model state just to prepare SSE.
-                return self._prepare_ledger_confirmation_stream(
-                    confirmation_coordinator,
-                    request,
-                    None,
-                    request.conversation_id,
-                    transport,
-                    invocation_control,
-                    replay=None,
-                    terminal_checked=True,
                 )
             try:
                 preflight_pending = confirmation_coordinator.preflight_live(
@@ -4688,7 +4708,31 @@ class PilotRuntime:
             recorder: object = _NoopRecorder()
             journal_started = False
             try:
-                session = coordinator.reject(request, conversation=conversation)
+                try:
+                    session = coordinator.reject(request, conversation=conversation)
+                except ConfirmationReplayError:
+                    replayed = coordinator.replay_outcome(request)
+                    if replayed is not None:
+                        return self._prepare_deterministic_stream(
+                            DeterministicExecution(
+                                replayed,
+                                preparation_kind=PreparationKind.REPLAY,
+                            ),
+                            request=request,
+                            conversation=conversation,
+                            conversation_id=conversation_id,
+                            transport=transport,
+                            invocation_control=invocation_control,
+                        )
+                    return self._stream_immediate(
+                        self._failure(
+                            RuntimeFailureCode.OPERATION_RESULT_UNKNOWN,
+                            "operation result is unavailable",
+                            503,
+                            retryable=True,
+                        ),
+                        invocation_control,
+                    )
                 recorder, journal_started = self._open_ledger_journal(
                     session,
                     conversation
@@ -4749,6 +4793,33 @@ class PilotRuntime:
                     )
                     or "已取消这次操作。"
                 )
+                if session.state.delivered:
+                    outcome = MessageOutcome(
+                        message=visible,
+                        conversation_id=request.conversation_id,
+                        write_status="cancelled",
+                        undo=None,
+                        operation_id=session.state.identity.operation_id,
+                        persisted=True,
+                        legacy_projection=True,
+                    )
+                    self._close_ledger_journal(
+                        recorder,
+                        journal_started,
+                        outcome,
+                        invocation_control,
+                    )
+                    return self._prepare_deterministic_stream(
+                        DeterministicExecution(
+                            outcome,
+                            preparation_kind=PreparationKind.CONFIRMATION,
+                        ),
+                        request=request,
+                        conversation=conversation,
+                        conversation_id=conversation_id,
+                        transport=transport,
+                        invocation_control=invocation_control,
+                    )
                 origin = Message(
                     role="tool",
                     content=_CANCELLED_TOOL_RESULT,

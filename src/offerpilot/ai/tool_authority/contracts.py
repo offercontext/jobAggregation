@@ -777,9 +777,10 @@ class TrustedLedgerOmittedTokenProof(_ReplacementProtected, TransientToolRuntime
             (self.pending_operation_id, "pending_operation_id"),
             (self.pending_tool_call_id, "pending_tool_call_id"),
             (self.pending_tool_name, "pending_tool_name"),
-            (self.pending_confirmation_claim_id, "pending_confirmation_claim_id"),
         ):
             _require_text(value, name)
+        if type(self.pending_confirmation_claim_id) is not str:
+            raise TypeError("pending_confirmation_claim_id must be an exact string")
         _require_hmac_digest(self.proposal_fingerprint, "proposal_fingerprint")
         _require_hmac_digest(
             self.confirmation_token_fingerprint,

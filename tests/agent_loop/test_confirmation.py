@@ -148,3 +148,20 @@ def test_prepare_pending_action_rejects_non_object_original_args(raw_args: str) 
             editable_catalog(),
             {},
         )
+
+
+@pytest.mark.parametrize(
+    "raw_args",
+    (pytest.param('{"malformed":', id="malformed"), pytest.param("x" * 65_537, id="oversized")),
+)
+def test_pending_identity_can_be_carried_without_eager_argument_decode(raw_args: str) -> None:
+    action = PendingAction(
+        "w1",
+        "update_application_status",
+        raw_args,
+        "private",
+        "operation-1",
+    )
+
+    assert action.args is raw_args
+    assert action.operation_id == "operation-1"

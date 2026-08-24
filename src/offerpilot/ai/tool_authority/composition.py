@@ -856,6 +856,11 @@ class AuthorityFactory:
                 require_positive_int64(value, name)
             elif name in {"arguments_digest", "effective_args_digest"}:
                 _require_digest(value, name)
+            elif name == "pending_confirmation_claim_id":
+                if type(value) is not str:
+                    raise AuthorityPhaseError(
+                        "Pending pending_confirmation_claim_id must be an exact string"
+                    )
             elif type(value) is not str or not value:
                 raise AuthorityPhaseError(f"Pending {name} must be non-empty text")
             current = record.semantic.get(name)
@@ -920,7 +925,11 @@ class AuthorityFactory:
         for name, expected in record.semantic.items():
             current = current_values.get(name)
             if current is None:
-                if type(record.value) is object:
+                if type(record.value) is object or name in {
+                    "pending_action_revision",
+                    "arguments_digest",
+                    "effective_args_digest",
+                }:
                     # A plain object has no mutable semantic surface; explicit
                     # registration kwargs are its complete bounded identity.
                     continue
@@ -936,7 +945,13 @@ class AuthorityFactory:
                 ):
                     raise AuthorityPhaseError("Pending digest identity changed")
             else:
-                _require_text(current, name)
+                if name == "pending_confirmation_claim_id":
+                    if type(current) is not str:
+                        raise AuthorityPhaseError(
+                            "Pending claim identity is invalid"
+                        )
+                else:
+                    _require_text(current, name)
                 if current != expected:
                     raise AuthorityPhaseError("Pending semantic identity changed")
 
@@ -2071,7 +2086,6 @@ class AuthorityFactory:
                 "tool_name",
                 "proposal_fingerprint",
                 "confirmation_token_fingerprint",
-                "pending_confirmation_claim_id",
             )
             semantic: dict[str, object] = {}
             operation_id = getattr(value, "operation_id", None)
@@ -2883,6 +2897,13 @@ class AuthorityFactory:
             operation_record = self._registered_identity(self._operations, operation)
             pending_record = self._pending_record_for_object(pending_pointer)
             transaction_record = self._registered_identity(self._transactions, transaction)
+            if isinstance(transaction, SessionTransaction):
+                proof_session = transaction.session
+                if proof_session is None:
+                    raise AuthorityPhaseError(
+                        "omitted-token proof transaction is no longer active"
+                    )
+                self._require_current_outer_transaction(proof_session, transaction)
             semantic = operation_record.semantic
             current_operation_id = getattr(operation, "operation_id", None)
             if current_operation_id is None:
@@ -2896,7 +2917,6 @@ class AuthorityFactory:
                 "tool_name",
                 "proposal_fingerprint",
                 "confirmation_token_fingerprint",
-                "pending_confirmation_claim_id",
                 "conversation_id",
             ):
                 current_value = getattr(operation, name, None)
@@ -2918,7 +2938,6 @@ class AuthorityFactory:
             tool_name = semantic.get("tool_name")
             proposal_fingerprint = semantic.get("proposal_fingerprint")
             confirmation_token_fingerprint = semantic.get("confirmation_token_fingerprint")
-            pending_confirmation_claim_id = semantic.get("pending_confirmation_claim_id")
             if not all(
                 type(value) is str and bool(value)
                 for value in (
@@ -2926,7 +2945,6 @@ class AuthorityFactory:
                     adapter_kind,
                     tool_call_id,
                     tool_name,
-                    pending_confirmation_claim_id,
                 )
             ):
                 raise AuthorityPhaseError("Operation semantic identity is incomplete")
@@ -2941,8 +2959,17 @@ class AuthorityFactory:
                 "confirmation_token_fingerprint",
             )
             pending_semantic = pending_record.semantic
+            pending_confirmation_claim_id = pending_semantic.get(
+                "pending_confirmation_claim_id"
+            )
+            if type(pending_confirmation_claim_id) is not str:
+                raise AuthorityPhaseError("Pending claim identity is incomplete")
             for name, expected in pending_semantic.items():
-                if name in {"arguments_digest", "effective_args_digest"}:
+                if name in {
+                    "pending_action_revision",
+                    "arguments_digest",
+                    "effective_args_digest",
+                }:
                     continue
                 if getattr(pending_pointer, name, None) != expected:
                     raise AuthorityPhaseError("Pending pointer semantic identity changed")
@@ -2950,7 +2977,6 @@ class AuthorityFactory:
                 ("operation_id", operation_id),
                 ("tool_call_id", tool_call_id),
                 ("tool_name", tool_name),
-                ("pending_confirmation_claim_id", pending_confirmation_claim_id),
             ):
                 if pending_semantic.get(name) != expected:
                     raise AuthorityPhaseError("Pending pointer does not match Operation")
@@ -3126,6 +3152,15 @@ class AuthorityFactory:
             self._transactions,
             lifecycle.transaction,
         )
+        if isinstance(lifecycle.transaction, SessionTransaction):
+            proof_session = lifecycle.transaction.session
+            if proof_session is None:
+                raise AuthorityPhaseError(
+                    "omitted-token proof transaction is no longer active"
+                )
+            self._require_current_outer_transaction(
+                proof_session, lifecycle.transaction
+            )
         authority = lifecycle.authority
         if operation_record.authority is not authority:
             raise AuthorityPhaseError("proof operation provenance changed")
@@ -3145,8 +3180,6 @@ class AuthorityFactory:
             or proof.adapter_kind != semantic.get("adapter_kind")
             or proof.tool_call_id != semantic.get("tool_call_id")
             or proof.tool_name != semantic.get("tool_name")
-            or proof.pending_confirmation_claim_id
-            != semantic.get("pending_confirmation_claim_id")
         ):
             raise AuthorityPhaseError("proof operation source identity changed")
         for name, proof_value in (
@@ -3264,7 +3297,15 @@ class AuthorityFactory:
     def consume(self, value: ExecutionClaim | PendingAuthorityClaim | TrustedLedgerOmittedTokenProof) -> None:
         with self._lock:
             if isinstance(value, TrustedLedgerOmittedTokenProof):
-                lifecycle = self._proof_lifecycle(value)
+                # The successful reject CAS intentionally changes the exact
+                # Operation and Pending pointer sources.  They were checked
+                # when entering in_flight; consumption must still authenticate
+                # the sealed proof object, but must not reject its own atom.
+                lifecycle = self._proof_lifecycle(value, validate_sources=False)
+                snapshot = self._proof_fields.get(id(value))
+                if snapshot is None:
+                    raise AuthorityPhaseError("proof snapshot is missing")
+                _validate_snapshot(value, snapshot, "proof")
                 table = self._proofs
             else:
                 lifecycle = self._claim_lifecycle(value)

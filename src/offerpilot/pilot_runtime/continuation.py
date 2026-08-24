@@ -42,6 +42,8 @@ from offerpilot.ai.types import Message, ToolCall
 from offerpilot.ai.write_operations import (
     DeliveryHeartbeat,
     DeliveryOwnership,
+    LedgerOperationPreheader,
+    LedgerPendingPointer,
     OperationCommitted,
     OperationExecution,
     OperationFailed,
@@ -99,6 +101,10 @@ class ConfirmationOperationRepository(Protocol):
     key: object
 
     def get(self, operation_id: str) -> object | None: ...
+
+    def operation_preheader(
+        self, *, conversation_id: int, operation_id: str | None
+    ) -> LedgerOperationPreheader: ...
 
     def replay(self, operation: object, request_fingerprint: str) -> OperationReplay: ...
 
@@ -666,6 +672,89 @@ class ConfirmationCoordinator:
             raise WriteOperationError("operation_unavailable")
         return _invoke(getter, {"operation_id": operation_id, "id": operation_id}, (operation_id,))
 
+    def _preheader(self, request: ConfirmationRequest) -> LedgerOperationPreheader:
+        repository = self.dependencies.write_operations
+        loader = _callable(repository, ("operation_preheader", "load_operation_preheader"))
+        if loader is not None:
+            value = _invoke(
+                loader,
+                {
+                    "conversation_id": request.conversation_id,
+                    "operation_id": request.operation_id,
+                },
+                (),
+            )
+            if not isinstance(value, LedgerOperationPreheader):
+                operation = _attribute(value, "operation")
+                pointer = _attribute(value, "pending_pointer")
+                if operation is None or not isinstance(pointer, LedgerPendingPointer):
+                    raise WriteOperationError("operation_unavailable")
+                value = LedgerOperationPreheader(cast(Any, operation), pointer)
+            return value
+        # Compatibility for narrow test doubles with an explicit Ledger id.
+        # Production repositories always expose the bounded projection above;
+        # an omitted id never falls back to reading a full Pending object.
+        if not request.operation_id:
+            raise WriteOperationError("operation_unavailable")
+        operation = self._operation(request.operation_id)
+        if operation is None:
+            raise WriteOperationError("operation_result_unknown", retryable=True)
+        operation_conversation_id = _attribute(operation, "conversation_id")
+        if operation_conversation_id is None:
+            raise WriteOperationError("operation_unavailable")
+        if operation_conversation_id != request.conversation_id:
+            raise WriteOperationError("operation_identity_conflict")
+        return LedgerOperationPreheader(
+            cast(Any, operation),
+            LedgerPendingPointer(
+                conversation_id=request.conversation_id,
+                operation_id=str(_attribute(operation, "id", "") or ""),
+                tool_call_id=str(_attribute(operation, "tool_call_id", "") or ""),
+                tool_name=str(_attribute(operation, "tool_name", "") or ""),
+                pending_confirmation_claim_id="",
+            ),
+        )
+
+    def _rejection_fingerprint(
+        self,
+        request: ConfirmationRequest,
+        preheader: LedgerOperationPreheader,
+    ) -> str:
+        operation = preheader.operation
+        repository = self.dependencies.write_operations
+        key = _attribute(repository, "key")
+        if key is None:
+            raise WriteOperationError("operation_unavailable")
+        stored = str(_attribute(operation, "confirmation_token_fingerprint", "") or "")
+        if request.confirmation_token:
+            try:
+                token_bytes = request.confirmation_token.encode("ascii")
+            except UnicodeEncodeError as exc:
+                raise WriteOperationError("invalid_confirmation") from exc
+            supplied = ledger_fingerprint(
+                cast(Any, key),
+                "write-operation-confirmation-token-v1",
+                token_bytes,
+            )
+            if not compare_digest(supplied, stored):
+                raise WriteOperationError("operation_input_conflict")
+        elif request.rejection_feedback_present:
+            raise WriteOperationError("invalid_confirmation")
+        return operation_request_fingerprint(
+            cast(Any, key),
+            operation_id=str(_attribute(operation, "id", "") or ""),
+            tool_call_id=str(_attribute(operation, "tool_call_id", "") or ""),
+            approved=False,
+            edited_args_present=False,
+            edited_args=None,
+            rejection_feedback_present=request.rejection_feedback_present,
+            rejection_feedback=request.rejection_feedback,
+            confirmation_token_fingerprint=stored,
+            proposal_fingerprint=str(
+                _attribute(operation, "proposal_fingerprint", "") or ""
+            ),
+        )
+
     def _fingerprint(
         self,
         pending: PendingAction,
@@ -762,9 +851,12 @@ class ConfirmationCoordinator:
         if request.approved and request.rejection_feedback_present:
             raise WriteOperationError("operation_input_conflict")
         operation_id = request.operation_id
-        if operation is None and not operation_id:
-            return None
-        if not operation_id and operation is not None:
+        if operation is None:
+            preheader = self._preheader(request)
+            operation = preheader.operation
+            if not operation_id:
+                operation_id = str(_attribute(operation, "id", "") or "")
+        elif not operation_id:
             operation_id = str(_attribute(operation, "id", "") or "")
         if not operation_id:
             raise WriteOperationError("operation_result_unknown", retryable=True)
@@ -780,9 +872,7 @@ class ConfirmationCoordinator:
         # spelling from the transport, then use the canonical value for the
         # repository lookup and every downstream fingerprint.
         operation_id = normalized_operation_id
-        operation = operation if operation is not None else self._operation(operation_id)
-        if operation is None:
-            raise WriteOperationError("operation_result_unknown", retryable=True)
+        assert operation is not None
         if _attribute(operation, "conversation_id") is None:
             raise WriteOperationError("operation_unavailable")
         status = _status(operation)
@@ -1207,12 +1297,109 @@ class ConfirmationCoordinator:
     ) -> ConfirmationSession:
         if request.approved:
             raise ValueError("reject requires approved=false")
-        return self._new_session(
-            request,
-            pending=pending,
+        del pending, conversation, source_loader
+        if not request.edited_args.is_missing():
+            raise WriteOperationError("operation_input_conflict")
+        if not request.confirmation_token and request.rejection_feedback_present:
+            raise WriteOperationError("invalid_confirmation")
+        preheader = self._preheader(request)
+        operation = preheader.operation
+        if _status(operation) != "proposed":
+            replay = self.terminal_replay(request, operation=operation)
+            if replay is not None:
+                raise ConfirmationReplayError(replay)
+            raise WriteOperationError("operation_result_unknown", retryable=True)
+        pointer = preheader.pending_pointer
+        operation_id = str(_attribute(operation, "id", "") or "")
+        if (
+            _attribute(operation, "conversation_id") != request.conversation_id
+            or pointer.conversation_id != request.conversation_id
+            or pointer.operation_id != operation_id
+            or pointer.tool_call_id != str(_attribute(operation, "tool_call_id", "") or "")
+            or pointer.tool_name != str(_attribute(operation, "tool_name", "") or "")
+            or pointer.pending_confirmation_claim_id != ""
+        ):
+            raise WriteOperationError("operation_identity_conflict")
+        fingerprint = self._rejection_fingerprint(request, preheader)
+        rejected_pending = PendingAction(
+            pointer.tool_call_id,
+            pointer.tool_name,
+            "",
+            pointer.tool_name,
+            pointer.operation_id,
+        )
+        state = ConfirmationState(
+            identity=ConfirmationIdentity(
+                conversation_id=request.conversation_id,
+                operation_id=operation_id,
+                tool_call_id=pointer.tool_call_id,
+                tool_name=pointer.tool_name,
+                request_fingerprint=fingerprint,
+                confirmation_token=request.confirmation_token or "",
+                proposal_fingerprint=str(
+                    _attribute(operation, "proposal_fingerprint", "") or ""
+                ),
+            ),
+            pending=rejected_pending,
+            effective_pending=rejected_pending,
             approved=False,
-            conversation=conversation,
-            source_loader=source_loader,
+            edited_args=request.edited_args,
+            rejection_feedback=request.rejection_feedback,
+        )
+
+        def attempt(
+            action: PendingAction,
+            prepared: PreparedToolCall[Any, Any] | None,
+        ) -> ToolFailure | None:
+            del action
+            if prepared is not None:
+                return ToolFailure("conflict", "confirmation_claim_failed")
+            with state.lock:
+                if not state.active or state.cancelled or state.timed_out:
+                    return ToolFailure("stale_state", "confirmation_claim_lost")
+                state.confirmation_attempted = True
+                state.claim_id = operation_id
+            execution = self._reject(state, self._rejection_result(state.rejection_feedback))
+            with state.lock:
+                state.terminal_execution = execution
+                if isinstance(execution, OperationReplay):
+                    state.replayed = True
+                elif _attribute(execution, "ownership") is None:
+                    # Parameter-free rejection atom already persisted the
+                    # deterministic origin/assistant pair and closed delivery.
+                    state.delivered = True
+                    state.active = False
+                else:
+                    self._set_ownership(state, execution)
+            return None
+
+        def result(
+            action: PendingAction,
+            approved_result: bool,
+            tool_message: Message,
+            execution_record: ToolExecutionRecord[Any, Any] | None,
+        ) -> object:
+            with state.lock:
+                atomically_delivered = state.delivered
+            if atomically_delivered:
+                return None
+            return self.record_result(
+                state,
+                action,
+                approved_result,
+                tool_message,
+                execution_record,
+            )
+
+        return ConfirmationSession(
+            state=state,
+            on_confirmation_attempt=attempt,
+            on_confirmation_result=result,
+            execute_operation=lambda *_args: (_ for _ in ()).throw(
+                WriteOperationError("operation_unavailable")
+            ),
+            continuation_message_loader=lambda: (),
+            delivery_fence=lambda: False,
         )
 
     def begin(
@@ -1259,6 +1446,7 @@ class ConfirmationCoordinator:
                 "tool_name": state.identity.tool_name,
                 "request_fingerprint": state.identity.request_fingerprint,
                 "visible_result": visible_result,
+                "confirmation_token": state.identity.confirmation_token or None,
             },
             (),
         )

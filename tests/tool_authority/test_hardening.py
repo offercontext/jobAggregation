@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 import copy
 import hashlib
 import json
@@ -11,7 +12,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, SessionTransaction
 
 import offerpilot.ai.tool_authority.composition as authority_composition
 from offerpilot.ai.tool_authority import (
@@ -38,6 +39,12 @@ SHA = "sha256:" + hashlib.sha256(b"{}").hexdigest()
 SHA_B = "sha256:" + "b" * 64
 HMAC = "hmac-sha256:" + "c" * 64
 HMAC_B = "hmac-sha256:" + "d" * 64
+
+
+@pytest.fixture
+def active_transaction() -> Iterator[SessionTransaction]:
+    with Session() as session, session.begin() as transaction:
+        yield transaction
 
 
 def _args_digest(arguments: object) -> str:
@@ -472,7 +479,9 @@ def test_execution_claim_requires_registered_transaction_and_approval_pending_ob
             assert isinstance(claim, ExecutionClaim)
 
 
-def test_omitted_proof_requires_registered_operation_pending_transaction_and_claim_id() -> None:
+def test_omitted_proof_requires_registered_operation_pending_transaction_and_claim_id(
+    active_transaction: SessionTransaction,
+) -> None:
     with execution_scope() as factory:
         operation = SimpleNamespace(
             id="op-1",
@@ -494,7 +503,7 @@ def test_omitted_proof_requires_registered_operation_pending_transaction_and_cla
             arguments_digest=SHA,
             pending_confirmation_claim_id="pending-claim-1",
         )
-        transaction = object()
+        transaction = active_transaction
         with pytest.raises(AuthorityPhaseError):
             factory.issue_omitted_token_proof(
                 operation=operation,
@@ -1038,7 +1047,9 @@ def test_pending_snapshot_is_checked_before_approval_typed_and_execution_side_ef
             assert factory._transactions[id(transaction)].authority is None
 
 
-def test_omitted_proof_requires_strict_hmac_fingerprints() -> None:
+def test_omitted_proof_requires_strict_hmac_fingerprints(
+    active_transaction: SessionTransaction,
+) -> None:
     with execution_scope() as factory:
         operation = SimpleNamespace(
             id="op-hmac",
@@ -1063,7 +1074,7 @@ def test_omitted_proof_requires_strict_hmac_fingerprints() -> None:
             pending_confirmation_claim_id="pending-hmac",
             arguments_digest=SHA,
         )
-        transaction = object()
+        transaction = active_transaction
         factory.register_operation(operation)
         factory.register_pending(pending)
         factory.register_transaction(transaction)
@@ -1263,7 +1274,10 @@ def test_execution_claim_lifecycle_revalidates_pending_and_prepared_sources() ->
 
 
 @pytest.mark.parametrize("source", ["operation", "pending", "transaction"])
-def test_omitted_proof_lifecycle_revalidates_registered_sources(source: str) -> None:
+def test_omitted_proof_lifecycle_revalidates_registered_sources(
+    source: str,
+    active_transaction: SessionTransaction,
+) -> None:
     with execution_scope() as factory:
         operation = SimpleNamespace(
             id="op-proof-source",
@@ -1285,7 +1299,7 @@ def test_omitted_proof_lifecycle_revalidates_registered_sources(source: str) -> 
             pending_confirmation_claim_id="proof-source-claim",
             arguments_digest=SHA,
         )
-        transaction = object()
+        transaction = active_transaction
         factory.register_operation(operation)
         factory.register_pending(pending)
         factory.register_transaction(transaction)
@@ -1305,7 +1319,10 @@ def test_omitted_proof_lifecycle_revalidates_registered_sources(source: str) -> 
 
 
 @pytest.mark.parametrize("case", ["operation_unowned", "pending_unowned", "conflict"])
-def test_omitted_proof_sources_must_have_one_consistent_authority(case: str) -> None:
+def test_omitted_proof_sources_must_have_one_consistent_authority(
+    case: str,
+    active_transaction: SessionTransaction,
+) -> None:
     with execution_scope() as factory:
         pending = SimpleNamespace(
             operation_id="op-proof-ownership",
@@ -1342,7 +1359,7 @@ def test_omitted_proof_sources_must_have_one_consistent_authority(case: str) -> 
             confirmation_token_fingerprint=HMAC_B,
             pending_confirmation_claim_id="proof-ownership-claim",
         )
-        transaction = object()
+        transaction = active_transaction
         if case == "operation_unowned":
             factory.register_operation(operation)
             factory.register_transaction(transaction, authority=authority_a)
@@ -1364,7 +1381,9 @@ def test_omitted_proof_sources_must_have_one_consistent_authority(case: str) -> 
             )
 
 
-def test_omitted_proof_all_unowned_sources_are_a_valid_boundary() -> None:
+def test_omitted_proof_all_unowned_sources_are_a_valid_boundary(
+    active_transaction: SessionTransaction,
+) -> None:
     with execution_scope() as factory:
         operation = SimpleNamespace(
             id="op-proof-unowned",
@@ -1386,7 +1405,7 @@ def test_omitted_proof_all_unowned_sources_are_a_valid_boundary() -> None:
             pending_confirmation_claim_id="proof-unowned-claim",
             arguments_digest=SHA,
         )
-        transaction = object()
+        transaction = active_transaction
         factory.register_operation(operation)
         factory.register_pending(pending)
         factory.register_transaction(transaction)

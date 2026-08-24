@@ -2897,13 +2897,16 @@ class AuthorityFactory:
             operation_record = self._registered_identity(self._operations, operation)
             pending_record = self._pending_record_for_object(pending_pointer)
             transaction_record = self._registered_identity(self._transactions, transaction)
-            if isinstance(transaction, SessionTransaction):
-                proof_session = transaction.session
-                if proof_session is None:
-                    raise AuthorityPhaseError(
-                        "omitted-token proof transaction is no longer active"
-                    )
-                self._require_current_outer_transaction(proof_session, transaction)
+            if not isinstance(transaction, SessionTransaction):
+                raise AuthorityPhaseError(
+                    "omitted-token proof requires a SQLAlchemy Session transaction"
+                )
+            proof_session = transaction.session
+            if proof_session is None:
+                raise AuthorityPhaseError(
+                    "omitted-token proof transaction is no longer active"
+                )
+            self._require_current_outer_transaction(proof_session, transaction)
             semantic = operation_record.semantic
             current_operation_id = getattr(operation, "operation_id", None)
             if current_operation_id is None:
@@ -3152,15 +3155,18 @@ class AuthorityFactory:
             self._transactions,
             lifecycle.transaction,
         )
-        if isinstance(lifecycle.transaction, SessionTransaction):
-            proof_session = lifecycle.transaction.session
-            if proof_session is None:
-                raise AuthorityPhaseError(
-                    "omitted-token proof transaction is no longer active"
-                )
-            self._require_current_outer_transaction(
-                proof_session, lifecycle.transaction
+        if not isinstance(lifecycle.transaction, SessionTransaction):
+            raise AuthorityPhaseError(
+                "omitted-token proof requires a SQLAlchemy Session transaction"
             )
+        proof_session = lifecycle.transaction.session
+        if proof_session is None:
+            raise AuthorityPhaseError(
+                "omitted-token proof transaction is no longer active"
+            )
+        self._require_current_outer_transaction(
+            proof_session, lifecycle.transaction
+        )
         authority = lifecycle.authority
         if operation_record.authority is not authority:
             raise AuthorityPhaseError("proof operation provenance changed")

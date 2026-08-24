@@ -27,7 +27,6 @@ from offerpilot.ai.tool_authority import (
     AuthorityFactory,
     AuthorityPhaseError,
     AuthorityUse,
-    TrustedLedgerOmittedTokenProof,
     require_authority_phase,
     require_authority_spec,
 )
@@ -197,7 +196,7 @@ class LedgerOperationPreheader:
     """One Ledger row plus its exact, bounded owning-Conversation pointer."""
 
     operation: WriteOperation
-    pending_pointer: LedgerPendingPointer
+    pending_pointer: LedgerPendingPointer | None
 
 
 @dataclass(frozen=True)
@@ -555,6 +554,8 @@ class WriteOperationRepository:
                     raise WriteOperationError("operation_unavailable")
                 if operation.conversation_id != conversation_id:
                     raise WriteOperationError("operation_identity_conflict")
+                if operation.status in _TERMINAL_STATUSES:
+                    return LedgerOperationPreheader(operation, None)
 
             pointer_row = session.execute(
                 select(
@@ -1528,64 +1529,62 @@ class WriteOperationCoordinator:
                     failure_code=None,
                 )
 
-                proof: TrustedLedgerOmittedTokenProof | None = None
-                factory: AuthorityFactory | None = None
-                if confirmation_token is None:
-                    factory = AuthorityFactory()
-                    factory.register_operation(operation)
-                    pointer_revision = int.from_bytes(
-                        hashlib.sha256(
-                            canonical_json(
-                                {
-                                    "conversation_id": pointer.conversation_id,
-                                    "operation_id": pointer.operation_id,
-                                    "tool_call_id": pointer.tool_call_id,
-                                    "tool_name": pointer.tool_name,
-                                    "pending_confirmation_claim_id": (
-                                        pointer.pending_confirmation_claim_id
-                                    ),
-                                }
-                            ).encode("utf-8")
-                        ).digest()[:8],
-                        "big",
-                    ) & ((1 << 63) - 1)
-                    factory.register_pending(
-                        pointer,
-                        conversation_id=pointer.conversation_id,
-                        operation_id=pointer.operation_id,
-                        tool_call_id=pointer.tool_call_id,
-                        tool_name=pointer.tool_name,
-                        pending_action_revision=pointer_revision,
-                        pending_confirmation_claim_id=(
-                            pointer.pending_confirmation_claim_id
-                        ),
-                        arguments_digest="sha256:"
-                        + hashlib.sha256(
-                            canonical_json(
-                                {
-                                    "operation_id": pointer.operation_id,
-                                    "tool_call_id": pointer.tool_call_id,
-                                    "tool_name": pointer.tool_name,
-                                }
-                            ).encode("utf-8")
-                        ).hexdigest(),
-                        effective_args_digest="sha256:"
-                        + hashlib.sha256(
-                            canonical_json(
-                                {
-                                    "operation_id": pointer.operation_id,
-                                    "tool_call_id": pointer.tool_call_id,
-                                    "tool_name": pointer.tool_name,
-                                }
-                            ).encode("utf-8")
-                        ).hexdigest(),
-                    )
-                    factory.register_transaction(outer_transaction)
-                    proof = factory.issue_omitted_token_proof(
-                        operation,
-                        pending_pointer=pointer,
-                        transaction=outer_transaction,
-                    )
+                factory = AuthorityFactory()
+                factory.register_operation(operation)
+                pointer_revision = int.from_bytes(
+                    hashlib.sha256(
+                        canonical_json(
+                            {
+                                "conversation_id": pointer.conversation_id,
+                                "operation_id": pointer.operation_id,
+                                "tool_call_id": pointer.tool_call_id,
+                                "tool_name": pointer.tool_name,
+                                "pending_confirmation_claim_id": (
+                                    pointer.pending_confirmation_claim_id
+                                ),
+                            }
+                        ).encode("utf-8")
+                    ).digest()[:8],
+                    "big",
+                ) & ((1 << 63) - 1)
+                pointer_digest = "sha256:" + hashlib.sha256(
+                    canonical_json(
+                        {
+                            "operation_id": pointer.operation_id,
+                            "tool_call_id": pointer.tool_call_id,
+                            "tool_name": pointer.tool_name,
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+                factory.register_pending(
+                    pointer,
+                    conversation_id=pointer.conversation_id,
+                    operation_id=pointer.operation_id,
+                    tool_call_id=pointer.tool_call_id,
+                    tool_name=pointer.tool_name,
+                    pending_action_revision=pointer_revision,
+                    pending_confirmation_claim_id=(
+                        pointer.pending_confirmation_claim_id
+                    ),
+                    arguments_digest=pointer_digest,
+                    effective_args_digest=pointer_digest,
+                )
+                factory.register_transaction(outer_transaction)
+                proof = factory.issue_omitted_token_proof(
+                    operation,
+                    pending_pointer=pointer,
+                    transaction=outer_transaction,
+                )
+
+                expected_adapter_kind = operation.adapter_kind
+                expected_proposal_fingerprint = operation.proposal_fingerprint
+                expected_confirmation_token_fingerprint = (
+                    operation.confirmation_token_fingerprint
+                )
+                expected_authorization_scope_fingerprint = (
+                    operation.authorization_scope_fingerprint
+                )
+                expected_fingerprint_key_id = operation.fingerprint_key_id
 
                 def reject_cas() -> None:
                     cleared = session.execute(
@@ -1608,8 +1607,61 @@ class WriteOperationCoordinator:
                     )
                     if getattr(cleared, "rowcount", 0) != 1:
                         raise WriteOperationError("operation_identity_conflict")
-                    operation.operation_request_fingerprint = request_fingerprint
-                    self._set_terminal(operation, payload, owner)
+                    now = datetime.now(timezone.utc)
+                    terminalized = session.execute(
+                        update(WriteOperation)
+                        .where(WriteOperation.id == operation_id)
+                        .where(WriteOperation.operation_role == "primary")
+                        .where(WriteOperation.status == "proposed")
+                        .where(WriteOperation.conversation_id == conversation_id)
+                        .where(WriteOperation.adapter_kind == expected_adapter_kind)
+                        .where(WriteOperation.tool_call_id == tool_call_id)
+                        .where(WriteOperation.tool_name == tool_name)
+                        .where(
+                            WriteOperation.proposal_fingerprint
+                            == expected_proposal_fingerprint
+                        )
+                        .where(
+                            WriteOperation.confirmation_token_fingerprint
+                            == expected_confirmation_token_fingerprint
+                        )
+                        .where(
+                            WriteOperation.authorization_scope_fingerprint
+                            == expected_authorization_scope_fingerprint
+                        )
+                        .where(
+                            WriteOperation.fingerprint_key_id
+                            == expected_fingerprint_key_id
+                        )
+                        .where(WriteOperation.operation_request_fingerprint.is_(None))
+                        .values(
+                            status=payload.status,
+                            operation_request_fingerprint=request_fingerprint,
+                            result_contract=payload.result_contract,
+                            result_json=payload.result_json,
+                            visible_result=payload.visible_result,
+                            transport_json=payload.transport_json,
+                            undo_json=payload.undo_json,
+                            terminal_payload_sha256=payload.digest,
+                            failure_category=payload.failure_category,
+                            failure_code=payload.failure_code,
+                            rejected_at=now,
+                            delivery_status="pending",
+                            delivery_generation=owner.generation,
+                            delivery_owner_token_fingerprint=owner.fingerprint,
+                            delivery_lease_expires_at=cast(
+                                Any,
+                                func.unixepoch("now")
+                                + DELIVERY_OWNER_LEASE_SECONDS,
+                            ),
+                            updated_at=now,
+                        )
+                        .execution_options(synchronize_session=False)
+                    )
+                    if getattr(terminalized, "rowcount", 0) != 1:
+                        raise WriteOperationError("operation_identity_conflict")
+                    session.expire(operation)
+                    session.refresh(operation)
                     self.repository.append_transition(session, operation_id, 2, "rejected")
                     session.add_all(
                         (
@@ -1646,17 +1698,9 @@ class WriteOperationCoordinator:
                         raise WriteOperationError("operation_delivery_unknown")
 
                 try:
-                    if proof is None:
+                    with factory.claim_lifecycle(proof):
                         reject_cas()
-                    else:
-                        assert factory is not None
-                        with factory.claim_lifecycle(proof):
-                            reject_cas()
-                finally:
-                    if factory is not None:
-                        factory.close()
-                try:
-                    session.commit()
+                        session.commit()
                 except OperationalError:
                     return self._reconcile_commit_unknown(
                         operation_id,
@@ -1664,6 +1708,8 @@ class WriteOperationCoordinator:
                         absent_code="operation_result_unknown",
                         proposed_code="operation_not_committed",
                     )
+                finally:
+                    factory.close()
                 return OperationFailed(operation_id, payload, None)
         except WriteOperationError as exc:
             return OperationUnknown(operation_id, exc.code, exc.retryable)

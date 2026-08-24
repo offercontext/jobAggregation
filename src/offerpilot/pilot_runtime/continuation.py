@@ -1488,6 +1488,8 @@ class ConfirmationCoordinator:
                 raise ConfirmationReplayError(replay)
             raise WriteOperationError("operation_result_unknown", retryable=True)
         pointer = preheader.pending_pointer
+        if pointer is None:
+            raise WriteOperationError("operation_identity_conflict")
         operation_id = str(_attribute(operation, "id", "") or "")
         if (
             _attribute(operation, "conversation_id") != request.conversation_id

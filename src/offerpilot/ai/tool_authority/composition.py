@@ -2646,6 +2646,20 @@ class AuthorityFactory:
         digest: str,
         revision: int,
     ) -> tuple[object, ...]:
+        if kind == "pending":
+            # Pending/Prepared are exact sources used to authenticate one
+            # issued claim, but their Python addresses do not define the
+            # stable semantic proposal identity.  A retry can reconstruct either
+            # object; the same operation/tool/digest/revision must therefore
+            # remain one-shot across this factory's live Segment authorities.
+            return (
+                kind,
+                operation_id,
+                tool_call_id,
+                tool_name,
+                digest,
+                revision,
+            )
         return (
             kind,
             id(authority),
@@ -2667,7 +2681,12 @@ class AuthorityFactory:
         for key, active_id in tuple(self._claim_keys.items()):
             if active_id == claim_id:
                 if finalize_pending and key[0] == "pending":
-                    authority_id = cast(int, key[1])
+                    lifecycle = self._claims.get(claim_id)
+                    if lifecycle is None or lifecycle.authority is None:
+                        raise AuthorityPhaseError(
+                            "Pending claim authority is unavailable during finalization"
+                        )
+                    authority_id = id(lifecycle.authority)
                     self._finalized_pending_claim_keys.setdefault(
                         authority_id, set()
                     ).add(key)
@@ -2748,12 +2767,20 @@ class AuthorityFactory:
                 arguments_digest,
                 pending_action_revision,
             )
-            finalized_keys = self._finalized_pending_claim_keys.get(id(authority), set())
-            if key in self._claim_keys or key in finalized_keys:
+            was_finalized = any(
+                key in finalized
+                for finalized in self._finalized_pending_claim_keys.values()
+            )
+            # Once a fully validated Pending source is presented by one
+            # authority it remains owned by that authority even when an active
+            # or finalized semantic proposal rejects reissuance.  This keeps a
+            # clone from becoming an unowned registry leak or a cross-authority
+            # retry source before authority cleanup.
+            self._claim_pending_owner(pending_record, authority)
+            if key in self._claim_keys or was_finalized:
                 raise AuthorityPhaseError(
                     "an equivalent Pending claim is already active or finalized"
                 )
-            self._claim_pending_owner(pending_record, authority)
             claim_token = cast(
                 PendingClaimInstanceToken,
                 _new_opaque_handle(PendingClaimInstanceToken),

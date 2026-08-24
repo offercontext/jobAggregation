@@ -18,6 +18,8 @@ from uuid import uuid4
 
 from offerpilot.ai.tool_runtime.contracts import (
     BindingAudit,
+    BindingContract,
+    BindingResolverSpec,
     PreparedToolCall,
     ProviderToolContract,
     ToolSpec,
@@ -1060,7 +1062,11 @@ class AuthorityFactory:
         with self._lock:
             self._ensure_open()
             self._authority_record(authority)
-            if type(spec) is not ToolSpec or type(spec.contract) is not ProviderToolContract:
+            if (
+                type(spec) is not ToolSpec
+                or type(spec.contract) is not ProviderToolContract
+                or type(spec.binding_contract) is not BindingContract
+            ):
                 raise AuthorityPhaseError("ToolSpec must use the exact validated contract type")
             if not callable(spec.decoder) or not callable(spec.executor):
                 raise AuthorityPhaseError("ToolSpec decoder/executor must be callable")
@@ -1098,6 +1104,28 @@ class AuthorityFactory:
 
     @staticmethod
     def _tool_spec_snapshot(spec: ToolSpec[Any, Any]) -> tuple[object, ...]:
+        if type(spec.binding_contract) is not BindingContract:
+            raise AuthorityPhaseError("ToolSpec binding contract type changed")
+
+        resolver_snapshots: list[tuple[object, ...]] = []
+        for resolver in spec.binding_resolvers:
+            if isinstance(resolver, BindingResolverSpec):
+                resolver_snapshots.append(
+                    (
+                        "descriptor",
+                        resolver,
+                        resolver.resolve,
+                        resolver.resolver_id,
+                        resolver.entity_kind,
+                        resolver.arg_path,
+                        resolver.presence,
+                        resolver.identity_type,
+                    )
+                )
+            else:
+                # Legacy/custom specs may still carry a bare callable.  Its
+                # object identity is the only safe snapshot available.
+                resolver_snapshots.append(("callable", resolver))
         return (
             spec.contract,
             _canonical_contract_fingerprint(spec.contract.payload),
@@ -1106,8 +1134,25 @@ class AuthorityFactory:
             spec.kind,
             spec.confirmation_policy,
             spec.required_capabilities,
-            spec.binding_resolvers,
+            spec.binding_contract,
+            (spec.binding_contract.kind, spec.binding_contract.entity_kind),
+            tuple(resolver_snapshots),
         )
+
+    @staticmethod
+    def _resolver_snapshots_match(
+        current: tuple[tuple[object, ...], ...],
+        expected: tuple[tuple[object, ...], ...],
+    ) -> bool:
+        if len(current) != len(expected):
+            return False
+        for current_item, expected_item in zip(current, expected):
+            if current_item[0] != expected_item[0] or current_item[1] is not expected_item[1]:
+                return False
+            if current_item[0] == "descriptor":
+                if current_item[2] is not expected_item[2] or current_item[3:] != expected_item[3:]:
+                    return False
+        return True
 
     def _validate_registered_tool_spec(self, spec: ToolSpec[Any, Any]) -> None:
         snapshot = self._tool_spec_fields.get(id(spec))
@@ -1120,8 +1165,15 @@ class AuthorityFactory:
             raise AuthorityPhaseError("ToolSpec contract identity changed")
         if current[2] is not snapshot[2] or current[3] is not snapshot[3]:
             raise AuthorityPhaseError("ToolSpec executor identity changed")
-        if current[4:] != snapshot[4:]:
+        if current[4:7] != snapshot[4:7]:
             raise AuthorityPhaseError("ToolSpec semantic identity changed")
+        if current[7] is not snapshot[7] or current[8] != snapshot[8]:
+            raise AuthorityPhaseError("ToolSpec binding contract identity changed")
+        if not self._resolver_snapshots_match(
+            cast(tuple[tuple[object, ...], ...], current[9]),
+            cast(tuple[tuple[object, ...], ...], snapshot[9]),
+        ):
+            raise AuthorityPhaseError("ToolSpec binding resolver identity changed")
 
     def issue_prepared_construction_identity(
         self, authority: ToolExecutionAuthority, **_: object
@@ -2995,6 +3047,13 @@ def require_authority_spec(
 
     factory = _active_factory(authority)
     factory._authority_record(authority)
+    if type(spec) is ToolSpec:
+        registration = factory._tool_specs.get(id(spec))
+        if registration is None or registration[0] is not spec:
+            raise AuthorityPhaseError("ToolSpec is not registered for this authority")
+        if registration[1] is not authority:
+            raise AuthorityPhaseError("ToolSpec provenance does not match authority")
+        factory._validate_registered_tool_spec(spec)
     phase = _use_value(use)
     kind = getattr(spec, "kind", None)
     confirmation_policy = getattr(spec, "confirmation_policy", None)

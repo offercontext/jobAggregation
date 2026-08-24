@@ -10,6 +10,7 @@ import pytest
 
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.contracts import (
+    BindingContract,
     BindingResolverSpec,
 )
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG, MODEL_TOOL_NAMES
@@ -144,6 +145,49 @@ def test_non_typed_legacy_names_cannot_enter_the_typed_catalog() -> None:
         name not in {contract.name for contract in MODEL_TOOL_CATALOG.provider_contracts()}
         for name in LEGACY_DETERMINISTIC_NAMES
     )
+
+
+def test_model_catalog_fails_closed_after_provider_or_authority_metadata_mutation() -> None:
+    spec = MODEL_TOOL_CATALOG.resolve("get_application")
+    assert spec is not None
+    original_payload = copy.deepcopy(spec.contract.payload)
+    original_binding = spec.binding_contract
+    try:
+        spec.contract.payload["function"]["description"] = "evil provider description"  # type: ignore[index]
+        with pytest.raises(ValueError, match="catalog integrity drift"):
+            MODEL_TOOL_CATALOG.provider_contracts()
+        with pytest.raises(ValueError, match="catalog integrity drift"):
+            MODEL_TOOL_CATALOG.authority_manifest
+    finally:
+        spec.contract.payload.clear()
+        spec.contract.payload.update(original_payload)
+
+    try:
+        object.__setattr__(spec, "binding_contract", BindingContract("none"))
+        with pytest.raises(ValueError, match="catalog integrity drift"):
+            MODEL_TOOL_CATALOG.resolve("get_application")
+    finally:
+        object.__setattr__(spec, "binding_contract", original_binding)
+
+
+def test_provider_contract_projection_is_detached_from_catalog_storage() -> None:
+    contracts = MODEL_TOOL_CATALOG.provider_contracts()
+    original = copy.deepcopy(contracts[0].payload)
+    try:
+        contracts[0].payload["function"]["description"] = "evil detached description"  # type: ignore[index]
+        assert MODEL_TOOL_CATALOG.provider_contracts()[0].payload["function"]["description"] != (
+            "evil detached description"
+        )
+    finally:
+        contracts[0].payload.clear()
+        contracts[0].payload.update(original)
+
+
+def test_schema_validator_projection_is_detached_from_catalog_storage() -> None:
+    validator = MODEL_TOOL_CATALOG.validator_for("list_applications")
+    original = copy.deepcopy(validator.schema)
+    validator.schema["description"] = "evil schema description"
+    assert MODEL_TOOL_CATALOG.validator_for("list_applications").schema == original
 
 
 class _ResolutionContext:

@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 import copy
 from dataclasses import replace
-from typing import Any
+from typing import Any, cast
 
 from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
 
@@ -85,6 +85,54 @@ def authority_manifest_for_specs(
     return {"schema_version": 1, "tools": tools}
 
 
+def _resolver_integrity_snapshot(resolver: object) -> tuple[object, ...]:
+    if isinstance(resolver, BindingResolverSpec):
+        return (
+            "descriptor",
+            resolver,
+            resolver.resolve,
+            resolver.resolver_id,
+            resolver.entity_kind,
+            resolver.arg_path,
+            resolver.presence,
+            resolver.identity_type,
+        )
+    return ("callable", resolver)
+
+
+def _spec_integrity_snapshot(spec: ToolSpec[Any, Any]) -> tuple[object, ...]:
+    if not isinstance(spec.binding_contract, BindingContract):
+        raise ValueError("tool binding contract metadata is required")
+    return (
+        spec.contract,
+        copy.deepcopy(spec.contract.payload),
+        spec.contract.name,
+        spec.contract.description,
+        copy.deepcopy(spec.contract.parameters),
+        spec.kind,
+        spec.confirmation_policy,
+        spec.required_capabilities,
+        spec.binding_contract,
+        (spec.binding_contract.kind, spec.binding_contract.entity_kind),
+        tuple(_resolver_integrity_snapshot(resolver) for resolver in spec.binding_resolvers),
+    )
+
+
+def _resolver_integrity_matches(
+    current: tuple[tuple[object, ...], ...],
+    expected: tuple[tuple[object, ...], ...],
+) -> bool:
+    if len(current) != len(expected):
+        return False
+    for current_item, expected_item in zip(current, expected):
+        if current_item[0] != expected_item[0] or current_item[1] is not expected_item[1]:
+            return False
+        if current_item[0] == "descriptor":
+            if current_item[2] is not expected_item[2] or current_item[3:] != expected_item[3:]:
+                return False
+    return True
+
+
 class ToolCatalog:
     def __init__(
         self,
@@ -112,10 +160,31 @@ class ToolCatalog:
                 raise ValueError("authority policy drift") from exc
         self._ordered = ordered
         self._specs = {spec.name: spec for spec in ordered}
-        self._validators = {
-            spec.name: compile_tool_schema(spec.contract.parameters) for spec in ordered
+        self._integrity_snapshots = {
+            id(spec): _spec_integrity_snapshot(spec) for spec in ordered
         }
+        self._validator_schemas = {
+            spec.name: copy.deepcopy(spec.contract.parameters) for spec in ordered
+        }
+        for schema in self._validator_schemas.values():
+            compile_tool_schema(copy.deepcopy(schema))
         self._authority_manifest = projected_manifest
+
+    def _ensure_integrity(self) -> None:
+        for spec in self._ordered:
+            expected = self._integrity_snapshots.get(id(spec))
+            if expected is None:
+                raise ValueError("tool catalog integrity drift")
+            current = _spec_integrity_snapshot(spec)
+            if current[0] is not expected[0] or current[1:8] != expected[1:8]:
+                raise ValueError("tool catalog integrity drift")
+            if current[8] is not expected[8] or current[9] != expected[9]:
+                raise ValueError("tool catalog integrity drift")
+            if not _resolver_integrity_matches(
+                cast(tuple[tuple[object, ...], ...], current[10]),
+                cast(tuple[tuple[object, ...], ...], expected[10]),
+            ):
+                raise ValueError("tool catalog integrity drift")
 
     @staticmethod
     def _with_write_contract(spec: ToolSpec[Any, Any]) -> ToolSpec[Any, Any]:
@@ -188,23 +257,29 @@ class ToolCatalog:
                 raise ValueError("unknown binding resolver identity type")
 
     def resolve(self, name: str) -> ToolSpec[Any, Any] | None:
+        self._ensure_integrity()
         return self._specs.get(name)
 
     def validator_for(self, name: str) -> Draft202012Validator:
-        return self._validators[name]
+        self._ensure_integrity()
+        return compile_tool_schema(copy.deepcopy(self._validator_schemas[name]))
 
     def provider_contracts(self) -> tuple[ProviderToolContract, ...]:
-        return tuple(spec.contract for spec in self._ordered)
+        self._ensure_integrity()
+        return tuple(copy.deepcopy(spec.contract) for spec in self._ordered)
 
     def write_names(self) -> frozenset[str]:
+        self._ensure_integrity()
         return frozenset(spec.name for spec in self._ordered if spec.kind == "write")
 
     @property
     def specs(self) -> tuple[ToolSpec[Any, Any], ...]:
+        self._ensure_integrity()
         return self._ordered
 
     @property
     def authority_manifest(self) -> dict[str, object]:
+        self._ensure_integrity()
         if self._authority_manifest is None:
             return authority_manifest_for_specs(self._ordered, strict=False)
         return copy.deepcopy(self._authority_manifest)

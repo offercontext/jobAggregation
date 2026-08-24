@@ -25,6 +25,8 @@ from offerpilot.ai.tool_authority import (
 )
 from offerpilot.ai.tool_runtime.contracts import (
     BindingAudit,
+    BindingContract,
+    BindingResolverSpec,
     PreparedToolCall,
     ProviderToolContract,
     ToolSpec,
@@ -799,6 +801,111 @@ def test_prepare_port_requires_registered_prepare_call_spec_and_exact_args_diges
                 contract_fingerprint=SHA_B,
                 binding=BindingAudit(status="unbound", target_count=0),
             )
+
+
+@pytest.mark.parametrize("mutation", ["binding_contract", "resolver_descriptor", "resolver_callable"])
+def test_registered_tool_spec_snapshot_rejects_binding_authority_mutation(
+    mutation: str,
+) -> None:
+    with execution_scope() as factory:
+        authority = _segment(factory)
+        invocation, *_ = _registered_invocation(factory, authority)
+        attempt = factory.issue_provider_attempt(invocation, candidate_ordinal=0)
+        prepare_identity = factory.create_new_turn_prepare_identity(
+            invocation,
+            attempt_id=attempt,
+            candidate_ordinal=0,
+            tool_call_id="call-binding-integrity",
+            tool_name="get_application",
+            arguments_digest=SHA,
+        )
+        calls = {"evil": 0}
+
+        def evil_resolver(args: object, context: object) -> object:
+            del args, context
+            calls["evil"] += 1
+            return object()
+
+        resolver = BindingResolverSpec(
+            resolver_id="application_identity_arg",
+            entity_kind="application",
+            arg_path="id",
+            presence="required",
+            identity_type="positive_int64",
+            resolve=lambda args, context: None,
+        )
+        spec = ToolSpec(
+            contract=ProviderToolContract(
+                payload={
+                    "type": "function",
+                    "function": {
+                        "name": "get_application",
+                        "description": "",
+                        "parameters": {},
+                    },
+                },
+                name="get_application",
+                description="",
+                parameters={},
+            ),
+            kind="read",
+            decoder=lambda value: value,
+            executor=lambda args, context: args,
+            binding_contract=BindingContract("enforce_if_bound", "application"),
+            binding_resolvers=(resolver,),
+        )
+        factory.register_tool_spec(
+            spec,
+            authority=authority,
+            prepare_identity=prepare_identity,
+        )
+
+        if mutation == "binding_contract":
+            object.__setattr__(
+                spec,
+                "binding_contract",
+                BindingContract("enforce_if_bound", "application"),
+            )
+        elif mutation == "resolver_descriptor":
+            object.__setattr__(
+                spec,
+                "binding_resolvers",
+                (
+                    BindingResolverSpec(
+                        resolver_id="application_identity_arg",
+                        entity_kind="application",
+                        arg_path="id",
+                        presence="required",
+                        identity_type="positive_int64",
+                        resolve=evil_resolver,
+                    ),
+                ),
+            )
+        else:
+            object.__setattr__(resolver, "resolve", evil_resolver)
+
+        contract_fingerprint = "sha256:" + hashlib.sha256(
+            json.dumps(
+                dict(spec.contract.payload),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        with pytest.raises(AuthorityPhaseError):
+            factory.prepare_tool_call(
+                authority,
+                prepare_identity=prepare_identity,
+                tool_call_id="call-binding-integrity",
+                spec=spec,
+                arguments={},
+                typed_args={},
+                arguments_digest=SHA,
+                contract_fingerprint=contract_fingerprint,
+                binding=BindingAudit(status="unbound", target_count=0),
+            )
+        assert calls["evil"] == 0
+        assert not factory._prepared
 
 
 def test_closed_factory_rejects_every_public_registration_without_pollution() -> None:

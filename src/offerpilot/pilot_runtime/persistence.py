@@ -19,7 +19,7 @@ from offerpilot.ai.agent_contracts import PendingAction
 from offerpilot.ai.tool_authority import PendingAuthorityClaim
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.ai.write_operations import DeliveryOwnership
-from offerpilot.repositories.chat import ChatRepository
+from offerpilot.repositories.chat import ChatRepository, _pending_claim_lifecycle
 
 from .contracts import ImmutablePayload, freeze_json_mapping
 
@@ -678,28 +678,29 @@ class ChatPersistenceCoordinator:
         the existing repository atom and never fabricates cross-layer checks.
         """
 
-        status = self._writable_status(conversation_id)
-        if status is not None:
-            return PersistenceResult(status, operation_id=pending.operation_id or None)
-        before = self.list_messages(conversation_id)
-        persisted = self._chat.persist_pending_action(
-            conversation_id,
-            pending,
-            [_message_values(message) for message in messages],
-            pending_authority_claim=pending_authority_claim,
-        )
-        if persisted:
-            message_ids = _new_message_ids(before, self.list_messages(conversation_id))
+        with _pending_claim_lifecycle(pending_authority_claim):
+            status = self._writable_status(conversation_id)
+            if status is not None:
+                return PersistenceResult(status, operation_id=pending.operation_id or None)
+            before = self.list_messages(conversation_id)
+            persisted = self._chat.persist_pending_action(
+                conversation_id,
+                pending,
+                [_message_values(message) for message in messages],
+                pending_authority_claim=pending_authority_claim,
+            )
+            if persisted:
+                message_ids = _new_message_ids(before, self.list_messages(conversation_id))
+                return PersistenceResult(
+                    PersistenceStatus.PERSISTED,
+                    message_count=len(messages),
+                    message_ids=message_ids,
+                    operation_id=pending.operation_id or None,
+                )
             return PersistenceResult(
-                PersistenceStatus.PERSISTED,
-                message_count=len(messages),
-                message_ids=message_ids,
+                self._failure_status(conversation_id, operation_id=pending.operation_id or None),
                 operation_id=pending.operation_id or None,
             )
-        return PersistenceResult(
-            self._failure_status(conversation_id, operation_id=pending.operation_id or None),
-            operation_id=pending.operation_id or None,
-        )
 
     def clear_pending_action(self, conversation_id: int) -> PersistenceResult:
         """Clear a live Pending card through the existing repository atom."""
@@ -814,6 +815,44 @@ class ChatPersistenceCoordinator:
         )
 
     def persist_confirmation_delivery(
+        self,
+        conversation_id: int,
+        ownership: DeliveryOwnership | None,
+        origin_tool_message: MessageInput,
+        continuation: Sequence[MessageInput] | None = None,
+        chained_pending: PendingAction | None = None,
+        *,
+        messages: Sequence[MessageInput] | None = None,
+        pending: PendingAction | None = None,
+        clarification: tuple[PendingAction, str] | None = None,
+        expected_generation: datetime | None = None,
+        expected_pending: PendingAction | None = None,
+        claim_id: str | None = None,
+        undo: dict[str, Any] | None = None,
+        delivery_failure_code: str | None = None,
+        pending_authority_claim: PendingAuthorityClaim | None = None,
+    ) -> PersistenceResult:
+        """Own a chained Pending claim across every delivery short-circuit."""
+
+        with _pending_claim_lifecycle(pending_authority_claim):
+            return self._persist_confirmation_delivery(
+                conversation_id,
+                ownership,
+                origin_tool_message,
+                continuation,
+                chained_pending,
+                messages=messages,
+                pending=pending,
+                clarification=clarification,
+                expected_generation=expected_generation,
+                expected_pending=expected_pending,
+                claim_id=claim_id,
+                undo=undo,
+                delivery_failure_code=delivery_failure_code,
+                pending_authority_claim=pending_authority_claim,
+            )
+
+    def _persist_confirmation_delivery(
         self,
         conversation_id: int,
         ownership: DeliveryOwnership | None,

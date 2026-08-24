@@ -4,6 +4,7 @@ import json
 import hmac
 import re
 from contextlib import contextmanager
+from contextvars import ContextVar
 from hashlib import sha256
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -56,6 +57,84 @@ class ConversationScopeVisibilityFailure(ConversationScopeError):
 
 class _PendingClaimCASLost(RuntimeError):
     """Internal control flow which revokes a one-shot Pending claim."""
+
+
+@dataclass(slots=True)
+class _PendingClaimLease:
+    """One nested call-chain's ownership of a one-shot Pending claim."""
+
+    claim: PendingAuthorityClaim
+    factory: AuthorityFactory
+    transaction_owner: object | None = None
+    session: Session | None = None
+    committed: bool = False
+
+    def bind_transaction(self, owner: object, session: Session) -> None:
+        if self.committed:
+            raise AuthorityPhaseError("Typed Pending claim is already committed")
+        if self.transaction_owner is not None or self.session is not None:
+            raise AuthorityPhaseError("Typed Pending claim already owns a transaction")
+        self.transaction_owner = owner
+        self.session = session
+
+    def require_transaction(self, owner: object, session: Session) -> None:
+        if self.transaction_owner is not owner or self.session is not session:
+            raise AuthorityPhaseError(
+                "Typed Pending persistence requires its exact active transaction"
+            )
+
+    def commit_transaction(self, owner: object, session: Session) -> None:
+        self.require_transaction(owner, session)
+        self.factory.consume(self.claim)
+        self.committed = True
+
+    def release_transaction(self, owner: object, session: Session) -> None:
+        self.require_transaction(owner, session)
+        self.transaction_owner = None
+        self.session = None
+
+
+_ACTIVE_PENDING_CLAIM_LEASE: ContextVar[_PendingClaimLease | None] = ContextVar(
+    "offerpilot_active_pending_claim_lease",
+    default=None,
+)
+
+
+@contextmanager
+def _pending_claim_lifecycle(
+    claim: PendingAuthorityClaim | None,
+) -> Any:
+    """Own one claim across nested coordinator/repository calls.
+
+    The outermost entry marks the claim in flight.  Only the exact repository
+    transaction can mark the lease committed; every other normal return and
+    every exception (including cancellation) revokes it.
+    """
+
+    if claim is None:
+        yield None
+        return
+    if type(claim) is not PendingAuthorityClaim:
+        raise AuthorityPhaseError("Typed Pending claim has an invalid type")
+    active = _ACTIVE_PENDING_CLAIM_LEASE.get()
+    if active is not None and active.claim is claim:
+        yield active
+        return
+
+    factory = _pending_claim_factory(claim)
+    try:
+        factory.mark_in_flight(claim)
+    except BaseException:
+        factory._revoke_lifecycle_after_entry_failure(claim, owns_in_flight=False)
+        raise
+    lease = _PendingClaimLease(claim, factory)
+    token = _ACTIVE_PENDING_CLAIM_LEASE.set(lease)
+    try:
+        yield lease
+    finally:
+        _ACTIVE_PENDING_CLAIM_LEASE.reset(token)
+        if not lease.committed:
+            factory._revoke_lifecycle_after_entry_failure(claim, owns_in_flight=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,21 +195,26 @@ class ChatRepository:
     ) -> Any:
         """Own a Pending claim from before lock acquisition through commit."""
 
-        if self._session is not None:
-            raise AuthorityPhaseError(
-                "Typed Pending persistence requires the transaction-owning repository"
-            )
-        factory = _pending_claim_factory(claim)
-        with factory.claim_lifecycle(claim):
+        with _pending_claim_lifecycle(claim) as lease:
+            if lease is None:  # pragma: no cover - exact claim required by the signature
+                raise AuthorityPhaseError("Typed Pending claim lifecycle is unavailable")
+            if self._session is not None:
+                raise AuthorityPhaseError(
+                    "Typed Pending persistence requires the transaction-owning repository"
+                )
             with self._operation_session() as (session, owned):
                 if not owned:  # pragma: no cover - guarded above
                     raise AuthorityPhaseError("Typed Pending transaction ownership was lost")
+                lease.bind_transaction(self, session)
                 try:
                     yield session
                     session.commit()
+                    lease.commit_transaction(self, session)
                 except BaseException:
                     session.rollback()
                     raise
+                finally:
+                    lease.release_transaction(self, session)
 
     @contextmanager
     def _pending_route_transaction(
@@ -138,17 +222,15 @@ class ChatRepository:
         pending: PendingAction,
         claim: PendingAuthorityClaim | None,
     ) -> Any:
-        adapter_kind = self._pending_adapter_kind(pending, claim)
-        if adapter_kind == "typed":
-            typed_claim = cast(PendingAuthorityClaim, claim)
-            try:
+        with _pending_claim_lifecycle(claim):
+            adapter_kind = self._pending_adapter_kind(pending, claim)
+            if adapter_kind == "typed":
+                typed_claim = cast(PendingAuthorityClaim, claim)
                 with self._typed_pending_transaction(typed_claim) as session:
                     yield session, False, adapter_kind, typed_claim
-            except _PendingClaimCASLost:
                 return
-            return
-        with self._operation_session() as (session, owned):
-            yield session, owned, adapter_kind, None
+            with self._operation_session() as (session, owned):
+                yield session, owned, adapter_kind, None
 
     @contextmanager
     def _optional_pending_route_transaction(
@@ -157,13 +239,17 @@ class ChatRepository:
         claim: PendingAuthorityClaim | None,
     ) -> Any:
         if pending is not None:
-            with self._pending_route_transaction(pending, claim) as route:
-                yield route
+            try:
+                with self._pending_route_transaction(pending, claim) as route:
+                    yield route
+            except _PendingClaimCASLost:
+                return
             return
-        if claim is not None:
-            raise AuthorityPhaseError("Pending claim requires a chained Pending")
-        with self._operation_session() as (session, owned):
-            yield session, owned, "none", None
+        with _pending_claim_lifecycle(claim):
+            if claim is not None:
+                raise AuthorityPhaseError("Pending claim requires a chained Pending")
+            with self._operation_session() as (session, owned):
+                yield session, owned, "none", None
 
     def create_conversation(
         self,
@@ -430,57 +516,53 @@ class ChatRepository:
         *,
         pending_authority_claim: PendingAuthorityClaim | None = None,
     ) -> bool:
-        if pending.operation_id and self._write_operations is None:
-            return False
-        adapter_kind = self._pending_adapter_kind(pending, pending_authority_claim)
-        if adapter_kind == "typed":
-            claim = cast(PendingAuthorityClaim, pending_authority_claim)
-            try:
-                with self._typed_pending_transaction(claim) as session:
-                    self._validate_typed_pending(session, conversation_id, pending, claim)
-                    result = session.execute(
-                        update(Conversation)
-                        .where(Conversation.id == conversation_id)
-                        .where(Conversation.archived_at.is_(None))
-                        .where(Conversation.pending_confirmation_claim_id == "")
-                        .values(
-                            pending_tool_call_id=pending.tool_call_id,
-                            pending_operation_id=pending.operation_id,
-                            pending_confirmation_claim_id="",
-                            pending_confirmation_claimed_at=None,
-                            pending_tool_name=pending.tool_name,
-                            pending_args=pending.args,
-                            pending_human=pending.human,
-                            updated_at=datetime.now(timezone.utc),
-                        )
+        try:
+            with self._pending_route_transaction(
+                pending, pending_authority_claim
+            ) as (session, owned, adapter_kind, typed_claim):
+                if typed_claim is not None:
+                    self._validate_typed_pending(
+                        session, conversation_id, pending, typed_claim
                     )
-                    if getattr(result, "rowcount", 0) != 1:
-                        raise _PendingClaimCASLost
-                    self.persist_typed_pending(session, conversation_id, pending, claim)
-                return True
-            except _PendingClaimCASLost:
-                return False
-        with self._session_factory() as session:
-            if adapter_kind == "legacy":
-                self.persist_legacy_pending(session, conversation_id, pending)
-            result = session.execute(
-                update(Conversation)
-                .where(Conversation.id == conversation_id)
-                .where(Conversation.archived_at.is_(None))
-                .where(Conversation.pending_confirmation_claim_id == "")
-                .values(
-                    pending_tool_call_id=pending.tool_call_id,
-                    pending_operation_id=pending.operation_id,
-                    pending_confirmation_claim_id="",
-                    pending_confirmation_claimed_at=None,
-                    pending_tool_name=pending.tool_name,
-                    pending_args=pending.args,
-                    pending_human=pending.human,
-                    updated_at=datetime.now(timezone.utc),
+                result = session.execute(
+                    update(Conversation)
+                    .where(Conversation.id == conversation_id)
+                    .where(Conversation.archived_at.is_(None))
+                    .where(Conversation.pending_confirmation_claim_id == "")
+                    .where(Conversation.pending_tool_call_id == "")
+                    .where(Conversation.pending_operation_id == "")
+                    .where(Conversation.pending_tool_name == "")
+                    .values(
+                        pending_tool_call_id=pending.tool_call_id,
+                        pending_operation_id=pending.operation_id,
+                        pending_confirmation_claim_id="",
+                        pending_confirmation_claimed_at=None,
+                        pending_tool_name=pending.tool_name,
+                        pending_args=pending.args,
+                        pending_human=pending.human,
+                        updated_at=datetime.now(timezone.utc),
+                    )
                 )
-            )
-            session.commit()
-            return getattr(result, "rowcount", 0) == 1
+                if getattr(result, "rowcount", 0) != 1:
+                    if typed_claim is not None:
+                        raise _PendingClaimCASLost
+                    if owned:
+                        session.rollback()
+                    return False
+                if adapter_kind == "typed":
+                    self.persist_typed_pending(
+                        session,
+                        conversation_id,
+                        pending,
+                        cast(PendingAuthorityClaim, typed_claim),
+                    )
+                elif adapter_kind == "legacy":
+                    self.persist_legacy_pending(session, conversation_id, pending)
+                if owned:
+                    session.commit()
+                return True
+        except _PendingClaimCASLost:
+            return False
 
     def persist_pending_action(
         self,
@@ -491,80 +573,59 @@ class ChatRepository:
         pending_authority_claim: PendingAuthorityClaim | None = None,
     ) -> bool:
         """Atomically persist a write proposal and make it the pending action."""
-        if pending.operation_id and self._write_operations is None:
-            return False
-        adapter_kind = self._pending_adapter_kind(pending, pending_authority_claim)
-        if adapter_kind == "typed":
-            claim = cast(PendingAuthorityClaim, pending_authority_claim)
-            try:
-                with self._typed_pending_transaction(claim) as session:
-                    self._validate_typed_pending(session, conversation_id, pending, claim)
-                    result = session.execute(
-                        update(Conversation)
-                        .where(Conversation.id == conversation_id)
-                        .where(Conversation.archived_at.is_(None))
-                        .where(Conversation.pending_confirmation_claim_id == "")
-                        .where(Conversation.pending_tool_call_id == "")
-                        .where(Conversation.pending_operation_id == "")
-                        .where(Conversation.pending_tool_name == "")
-                        .values(
-                            pending_tool_call_id=pending.tool_call_id,
-                            pending_operation_id=pending.operation_id,
-                            pending_confirmation_claim_id="",
-                            pending_confirmation_claimed_at=None,
-                            pending_tool_name=pending.tool_name,
-                            pending_args=pending.args,
-                            pending_human=pending.human,
-                            clarification_tool_call_id="",
-                            clarification_tool_name="",
-                            clarification_args="",
-                            clarification_human="",
-                            clarification_question="",
-                            updated_at=datetime.now(timezone.utc),
-                        )
+        try:
+            with self._pending_route_transaction(
+                pending, pending_authority_claim
+            ) as (session, owned, adapter_kind, typed_claim):
+                if typed_claim is not None:
+                    self._validate_typed_pending(
+                        session, conversation_id, pending, typed_claim
                     )
-                    if getattr(result, "rowcount", 0) != 1:
-                        raise _PendingClaimCASLost
-                    self.persist_typed_pending(session, conversation_id, pending, claim)
-                    self._add_pending_messages(session, conversation_id, messages)
-                return True
-            except _PendingClaimCASLost:
-                return False
-        with self._operation_session() as (session, owned):
-            result = session.execute(
-                update(Conversation)
-                .where(Conversation.id == conversation_id)
-                .where(Conversation.archived_at.is_(None))
-                .where(Conversation.pending_confirmation_claim_id == "")
-                .where(Conversation.pending_tool_call_id == "")
-                .where(Conversation.pending_operation_id == "")
-                .where(Conversation.pending_tool_name == "")
-                .values(
-                    pending_tool_call_id=pending.tool_call_id,
-                    pending_operation_id=pending.operation_id,
-                    pending_confirmation_claim_id="",
-                    pending_confirmation_claimed_at=None,
-                    pending_tool_name=pending.tool_name,
-                    pending_args=pending.args,
-                    pending_human=pending.human,
-                    clarification_tool_call_id="",
-                    clarification_tool_name="",
-                    clarification_args="",
-                    clarification_human="",
-                    clarification_question="",
-                    updated_at=datetime.now(timezone.utc),
+                result = session.execute(
+                    update(Conversation)
+                    .where(Conversation.id == conversation_id)
+                    .where(Conversation.archived_at.is_(None))
+                    .where(Conversation.pending_confirmation_claim_id == "")
+                    .where(Conversation.pending_tool_call_id == "")
+                    .where(Conversation.pending_operation_id == "")
+                    .where(Conversation.pending_tool_name == "")
+                    .values(
+                        pending_tool_call_id=pending.tool_call_id,
+                        pending_operation_id=pending.operation_id,
+                        pending_confirmation_claim_id="",
+                        pending_confirmation_claimed_at=None,
+                        pending_tool_name=pending.tool_name,
+                        pending_args=pending.args,
+                        pending_human=pending.human,
+                        clarification_tool_call_id="",
+                        clarification_tool_name="",
+                        clarification_args="",
+                        clarification_human="",
+                        clarification_question="",
+                        updated_at=datetime.now(timezone.utc),
+                    )
                 )
-            )
-            if getattr(result, "rowcount", 0) != 1:
+                if getattr(result, "rowcount", 0) != 1:
+                    if typed_claim is not None:
+                        raise _PendingClaimCASLost
+                    if owned:
+                        session.rollback()
+                    return False
+                if adapter_kind == "typed":
+                    self.persist_typed_pending(
+                        session,
+                        conversation_id,
+                        pending,
+                        cast(PendingAuthorityClaim, typed_claim),
+                    )
+                elif adapter_kind == "legacy":
+                    self.persist_legacy_pending(session, conversation_id, pending)
+                self._add_pending_messages(session, conversation_id, messages)
                 if owned:
-                    session.rollback()
-                return False
-            if adapter_kind == "legacy":
-                self.persist_legacy_pending(session, conversation_id, pending)
-            self._add_pending_messages(session, conversation_id, messages)
-            if owned:
-                session.commit()
-            return True
+                    session.commit()
+                return True
+        except _PendingClaimCASLost:
+            return False
 
     def clear_pending_action(self, conversation_id: int) -> None:
         with self._session_factory() as session:
@@ -864,7 +925,8 @@ class ChatRepository:
         pending_authority_claim: PendingAuthorityClaim | None = None,
     ) -> datetime | None:
         if expected_generation is None:
-            return None
+            with _pending_claim_lifecycle(pending_authority_claim):
+                return None
         values: dict[str, Any] = {}
         if expected_pending is not None:
             values.update(
@@ -1163,16 +1225,18 @@ class ChatRepository:
         pending: PendingAction,
         claim: PendingAuthorityClaim | None,
     ) -> Literal["typed", "legacy", "none"]:
-        if not pending.operation_id:
-            if claim is not None:
-                raise AuthorityPhaseError("Pending claim requires an operation identity")
-            return "none"
         if pending.tool_name in TYPED_WRITE_OPERATION_NAMES:
+            if not pending.operation_id:
+                raise AuthorityPhaseError("Typed Pending requires an operation identity")
             if type(claim) is not PendingAuthorityClaim:
                 raise AuthorityPhaseError("Typed Pending requires its exact authority claim")
             if self._write_operations is None:
                 raise AuthorityPhaseError("Typed Pending operation repository is unavailable")
             return "typed"
+        if not pending.operation_id:
+            if claim is not None:
+                raise AuthorityPhaseError("Pending claim requires an operation identity")
+            return "none"
         if pending.tool_name in LEGACY_WRITE_OPERATION_NAMES:
             if claim is not None:
                 raise AuthorityPhaseError("Legacy Pending cannot consume a Typed claim")
@@ -1206,37 +1270,41 @@ class ChatRepository:
     ) -> None:
         """Persist the Typed Operation side of an already locked Pending atom."""
 
-        scope_fingerprint, arguments = self._validate_typed_pending(
-            session,
-            conversation_id,
-            pending,
-            pending_authority_claim,
-        )
-        if self._write_operations is None:
-            raise AuthorityPhaseError("Typed Pending operation repository is unavailable")
-        if session.get(WriteOperation, pending.operation_id) is not None:
-            raise AuthorityPhaseError("Typed Pending operation identity already exists")
-        proposal = ledger_fingerprint(
-            self._write_operations.key,
-            "write-operation-proposal-v1",
-            cast(JSONValue, dict(arguments)),
-        )
-        token_fingerprint = ledger_fingerprint(
-            self._write_operations.key,
-            "write-operation-confirmation-token-v1",
-            _pending_confirmation_token(pending).encode("ascii"),
-        )
-        self._write_operations.create_primary(
-            session,
-            operation_id=pending.operation_id,
-            conversation_id=conversation_id,
-            tool_call_id=pending.tool_call_id,
-            tool_name=pending.tool_name,
-            adapter_kind="typed",
-            proposal_fingerprint=proposal,
-            confirmation_token_fingerprint=token_fingerprint,
-            authorization_scope_fingerprint=scope_fingerprint,
-        )
+        with _pending_claim_lifecycle(pending_authority_claim) as lease:
+            if lease is None:  # pragma: no cover - exact claim required by the signature
+                raise AuthorityPhaseError("Typed Pending claim lifecycle is unavailable")
+            lease.require_transaction(self, session)
+            scope_fingerprint, arguments = self._validate_typed_pending(
+                session,
+                conversation_id,
+                pending,
+                pending_authority_claim,
+            )
+            if self._write_operations is None:
+                raise AuthorityPhaseError("Typed Pending operation repository is unavailable")
+            if session.get(WriteOperation, pending.operation_id) is not None:
+                raise AuthorityPhaseError("Typed Pending operation identity already exists")
+            proposal = ledger_fingerprint(
+                self._write_operations.key,
+                "write-operation-proposal-v1",
+                cast(JSONValue, dict(arguments)),
+            )
+            token_fingerprint = ledger_fingerprint(
+                self._write_operations.key,
+                "write-operation-confirmation-token-v1",
+                _pending_confirmation_token(pending).encode("ascii"),
+            )
+            self._write_operations.create_primary(
+                session,
+                operation_id=pending.operation_id,
+                conversation_id=conversation_id,
+                tool_call_id=pending.tool_call_id,
+                tool_name=pending.tool_name,
+                adapter_kind="typed",
+                proposal_fingerprint=proposal,
+                confirmation_token_fingerprint=token_fingerprint,
+                authorization_scope_fingerprint=scope_fingerprint,
+            )
 
     def _validate_typed_pending(
         self,
@@ -1249,8 +1317,8 @@ class ChatRepository:
             raise AuthorityPhaseError("Typed Pending claim has an invalid type")
         factory = _pending_claim_factory(claim)
         lifecycle = factory._claim_lifecycle(claim)
-        if lifecycle.state not in {"issued", "in_flight"}:
-            raise AuthorityPhaseError("Typed Pending claim is not active")
+        if lifecycle.state != "in_flight":
+            raise AuthorityPhaseError("Typed Pending claim is not in flight")
         if lifecycle.pending is not pending:
             raise AuthorityPhaseError("Typed Pending object identity does not match claim")
         if type(lifecycle.authority) is not SegmentExecutionAuthority:

@@ -17,7 +17,7 @@ def test_archive_update_distinguishes_missing_pending_and_success(tmp_path):
     repo = ChatRepository(init_database(tmp_path / "data.db"))
     pending_conversation = repo.create_conversation("pending")
     active_conversation = repo.create_conversation("active")
-    pending = PendingAction("write-1", "update_application_status", '{"id":1}', "update")
+    pending = PendingAction("write-1", "display_pending_notice", '{"id":1}', "update")
     assert repo.set_pending_action(pending_conversation.id, pending) is True
 
     missing = repo.update_conversation_for_archive(999_999, {"archived_at": datetime.now(timezone.utc)})
@@ -40,7 +40,7 @@ def test_archive_update_distinguishes_missing_pending_and_success(tmp_path):
 def test_archive_and_pending_creation_are_mutually_exclusive_under_race(tmp_path):
     repo = ChatRepository(init_database(tmp_path / "data.db"))
     conversation = repo.create_conversation("race")
-    pending = PendingAction("write-1", "update_application_status", '{"id":1}', "update")
+    pending = PendingAction("write-1", "display_pending_notice", '{"id":1}', "update")
     barrier = Barrier(2)
 
     def archive():
@@ -74,7 +74,7 @@ def test_pending_action_cannot_be_added_after_archive(tmp_path):
 
     created = repo.set_pending_action(
         conversation.id,
-        PendingAction("write-1", "update_application_status", '{"id":1}', "update"),
+        PendingAction("write-1", "display_pending_notice", '{"id":1}', "update"),
     )
 
     assert archived.status == "updated"
@@ -111,7 +111,7 @@ def test_pending_action_and_proposal_messages_are_atomic_when_archived(tmp_path)
     archived = repo.update_conversation_for_archive(
         conversation.id, {"archived_at": datetime.now(timezone.utc)}
     )
-    pending = PendingAction("write-1", "update_application_status", '{"id":1}', "update")
+    pending = PendingAction("write-1", "display_pending_notice", '{"id":1}', "update")
 
     persisted = repo.persist_pending_action(
         conversation.id,
@@ -136,7 +136,7 @@ def test_pending_action_and_proposal_messages_are_atomic_when_archived(tmp_path)
 def test_resolve_pending_confirmation_atomically_persists_result_and_clears_state(tmp_path):
     repo = ChatRepository(init_database(tmp_path / "data.db"))
     conversation = repo.create_conversation("confirm")
-    pending = PendingAction("write-1", "update_application_status", '{"id":1}', "update")
+    pending = PendingAction("write-1", "display_pending_notice", '{"id":1}', "update")
     repo.set_pending_action(conversation.id, pending)
     repo.set_pending_clarification(conversation.id, pending, "clarify")
     repo.set_last_write_undo(conversation.id, {"kind": "previous"})
@@ -168,7 +168,7 @@ def test_resolve_pending_confirmation_atomically_persists_result_and_clears_stat
 def test_pending_confirmation_claim_is_durable_private_and_single_winner(tmp_path):
     repo = ChatRepository(init_database(tmp_path / "data.db"))
     conversation = repo.create_conversation("confirm")
-    pending = PendingAction("write-1", "update_application_status", '{"id":1}', "update")
+    pending = PendingAction("write-1", "display_pending_notice", '{"id":1}', "update")
     repo.set_pending_action(conversation.id, pending)
 
     assert repo.claim_pending_confirmation(conversation.id, pending, "claim-one") is True
@@ -202,7 +202,7 @@ def test_pending_confirmation_claim_never_rewrites_provider_tool_call_id(tmp_pat
     provider_id = "\x1eofferpilot-confirmation-claim:provider:owned"
     pending = PendingAction(
         provider_id,
-        "update_application_status",
+        "display_pending_notice",
         '{"id":1}',
         "update",
     )
@@ -219,8 +219,8 @@ def test_pending_confirmation_claim_never_rewrites_provider_tool_call_id(tmp_pat
 def test_generic_pending_mutations_cannot_clear_or_replace_active_claim(tmp_path):
     repo = ChatRepository(init_database(tmp_path / "data.db"))
     conversation = repo.create_conversation("confirm")
-    pending = PendingAction("write-1", "update_application_status", '{"id":1}', "update")
-    replacement = PendingAction("write-2", "update_application_status", '{"id":2}', "new")
+    pending = PendingAction("write-1", "display_pending_notice", '{"id":1}', "update")
+    replacement = PendingAction("write-2", "display_pending_notice", '{"id":2}', "new")
     repo.set_pending_action(conversation.id, pending)
     assert repo.claim_pending_confirmation(conversation.id, pending, "claim-one") is True
 
@@ -246,7 +246,7 @@ def test_pending_confirmation_claim_has_one_winner_across_repository_instances(t
     first = ChatRepository(session_factory)
     second = ChatRepository(session_factory)
     conversation = first.create_conversation("confirm")
-    pending = PendingAction("write-1", "update_application_status", '{"id":1}', "update")
+    pending = PendingAction("write-1", "display_pending_notice", '{"id":1}', "update")
     first.set_pending_action(conversation.id, pending)
     barrier = Barrier(2)
 
@@ -268,7 +268,7 @@ def test_stale_pending_confirmation_claim_can_be_recovered_after_process_loss(tm
     session_factory = init_database(tmp_path / "data.db")
     repo = ChatRepository(session_factory)
     conversation = repo.create_conversation("confirm")
-    pending = PendingAction("write-1", "update_application_status", '{"id":1}', "update")
+    pending = PendingAction("write-1", "display_pending_notice", '{"id":1}', "update")
     repo.set_pending_action(conversation.id, pending)
     assert repo.claim_pending_confirmation(conversation.id, pending, "abandoned") is True
 
@@ -309,7 +309,7 @@ def test_stale_pending_confirmation_claim_can_be_recovered_after_process_loss(tm
 def test_empty_pending_confirmation_claim_id_is_rejected_without_clearing_pending(tmp_path):
     repo = ChatRepository(init_database(tmp_path / "data.db"))
     conversation = repo.create_conversation("confirm")
-    pending = PendingAction("write-1", "update_application_status", '{"id":1}', "update")
+    pending = PendingAction("write-1", "display_pending_notice", '{"id":1}', "update")
     repo.set_pending_action(conversation.id, pending)
 
     with pytest.raises(ValueError, match="non-empty"):
@@ -328,8 +328,8 @@ def test_empty_pending_confirmation_claim_id_is_rejected_without_clearing_pendin
 def test_resolve_pending_confirmation_cas_does_not_clear_newer_pending(tmp_path):
     repo = ChatRepository(init_database(tmp_path / "data.db"))
     conversation = repo.create_conversation("confirm")
-    expected = PendingAction("write-1", "update_application_status", '{"id":1}', "first")
-    newer = PendingAction("write-2", "update_application_status", '{"id":2}', "second")
+    expected = PendingAction("write-1", "display_pending_notice", '{"id":1}', "first")
+    newer = PendingAction("write-2", "display_pending_notice", '{"id":2}', "second")
     repo.set_pending_action(conversation.id, newer)
 
     resolved = repo.resolve_pending_confirmation(
@@ -396,7 +396,7 @@ def test_replace_pending_confirmation_cas_does_not_overwrite_newer_card(tmp_path
 def test_resolve_pending_confirmation_preserves_existing_undo(tmp_path):
     repo = ChatRepository(init_database(tmp_path / "data.db"))
     conversation = repo.create_conversation("confirm")
-    pending = PendingAction("write-1", "update_application_status", '{"id":1}', "update")
+    pending = PendingAction("write-1", "display_pending_notice", '{"id":1}', "update")
     previous = {"kind": "create_application", "application_id": 9}
     repo.set_pending_action(conversation.id, pending)
     repo.set_last_write_undo(conversation.id, previous)
@@ -415,7 +415,7 @@ def test_resolve_pending_confirmation_preserves_existing_undo(tmp_path):
 def test_resolve_pending_confirmation_clears_existing_undo(tmp_path):
     repo = ChatRepository(init_database(tmp_path / "data.db"))
     conversation = repo.create_conversation("confirm")
-    pending = PendingAction("write-1", "update_application_status", '{"id":1}', "update")
+    pending = PendingAction("write-1", "display_pending_notice", '{"id":1}', "update")
     repo.set_pending_action(conversation.id, pending)
     repo.set_last_write_undo(conversation.id, {"kind": "old"})
 
@@ -448,7 +448,7 @@ def test_clear_last_write_undo_if_matches_preserves_newer_undo(tmp_path):
 def test_confirmation_continuation_survives_generated_title_update(tmp_path):
     repo = ChatRepository(init_database(tmp_path / "data.db"))
     conversation = repo.create_conversation("confirm")
-    pending = PendingAction("write-1", "update_application_status", '{"id":1}', "first")
+    pending = PendingAction("write-1", "display_pending_notice", '{"id":1}', "first")
     repo.set_pending_action(conversation.id, pending)
     generation = repo.resolve_pending_confirmation(
         conversation.id,
@@ -483,7 +483,7 @@ def test_confirmation_continuation_survives_generated_title_update(tmp_path):
 def test_confirmation_continuation_rejects_stale_conversation_generation(tmp_path):
     repo = ChatRepository(init_database(tmp_path / "data.db"))
     conversation = repo.create_conversation("confirm")
-    pending = PendingAction("write-1", "update_application_status", '{"id":1}', "first")
+    pending = PendingAction("write-1", "display_pending_notice", '{"id":1}', "first")
     repo.set_pending_action(conversation.id, pending)
     generation = repo.resolve_pending_confirmation(
         conversation.id,
@@ -492,7 +492,7 @@ def test_confirmation_continuation_rejects_stale_conversation_generation(tmp_pat
         {"kind": "undo"},
     )
     repo.append_message(conversation.id, "user", content="newer activity")
-    stale_pending = PendingAction("write-2", "update_application_status", '{"id":2}', "old")
+    stale_pending = PendingAction("write-2", "display_pending_notice", '{"id":2}', "old")
 
     persisted = repo.persist_confirmation_continuation(
         conversation.id,
@@ -520,8 +520,8 @@ def test_confirmation_continuation_rejects_stale_conversation_generation(tmp_pat
 def test_confirmation_continuation_generation_is_consumed_once(tmp_path):
     repo = ChatRepository(init_database(tmp_path / "data.db"))
     conversation = repo.create_conversation("confirm")
-    pending = PendingAction("write-1", "update_application_status", '{"id":1}', "first")
-    chained = PendingAction("write-2", "update_application_status", '{"id":2}', "second")
+    pending = PendingAction("write-1", "display_pending_notice", '{"id":1}', "first")
+    chained = PendingAction("write-2", "display_pending_notice", '{"id":2}', "second")
     repo.set_pending_action(conversation.id, pending)
     generation = repo.resolve_pending_confirmation(
         conversation.id,
@@ -564,8 +564,8 @@ def test_confirmation_continuation_generation_is_consumed_once(tmp_path):
 def test_confirmation_continuation_cannot_create_pending_after_archive(tmp_path):
     repo = ChatRepository(init_database(tmp_path / "data.db"))
     conversation = repo.create_conversation("confirm")
-    pending = PendingAction("write-1", "update_application_status", '{"id":1}', "first")
-    chained = PendingAction("write-2", "update_application_status", '{"id":2}', "second")
+    pending = PendingAction("write-1", "display_pending_notice", '{"id":1}', "first")
+    chained = PendingAction("write-2", "display_pending_notice", '{"id":2}', "second")
     repo.set_pending_action(conversation.id, pending)
     generation = repo.resolve_pending_confirmation(
         conversation.id,

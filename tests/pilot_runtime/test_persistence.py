@@ -11,11 +11,11 @@ from uuid import uuid4
 import pytest
 
 from offerpilot.ai.agent_contracts import PendingAction
-from offerpilot.ai.tool_authority import PendingAuthorityClaim
+from offerpilot.ai.tool_authority import AuthorityPhaseError, PendingAuthorityClaim
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.ai.write_operations import (
     DeliveryOwnership,
-    OperationFailed,
+    OperationCommitted,
     WriteOperationCoordinator,
     WriteOperationRepository,
     ledger_fingerprint,
@@ -33,6 +33,10 @@ from offerpilot.pilot_runtime.persistence import (
     PersistenceStatus,
     _persistable_ai_messages,
 )
+from tests.tool_authority.test_pending_claim import _harness
+
+
+_NON_LEDGER_PENDING_TOOL = "display_pending_notice"
 
 
 def make_persistence_coordinator(tmp_path: Path) -> tuple[ChatPersistenceCoordinator, int]:
@@ -69,15 +73,20 @@ def make_delivery_fixtures(
         "write-operation-request-v1",
         {"conversation_id": conversation.id, "operation_id": pending.operation_id},
     )
-    terminal = WriteOperationCoordinator(operations).reject_primary(
+    terminal = WriteOperationCoordinator(operations).execute_legacy(
         operation_id=pending.operation_id,
         conversation_id=conversation.id,
         tool_call_id=pending.tool_call_id,
         tool_name=pending.tool_name,
+        input_fingerprint=ledger_fingerprint(
+            key,
+            "write-operation-input-v1",
+            {"operation_id": pending.operation_id},
+        ),
         request_fingerprint=request_fingerprint,
-        visible_result="已拒绝",
+        executor=lambda _session: "已提交",
     )
-    assert isinstance(terminal, OperationFailed)
+    assert isinstance(terminal, OperationCommitted)
     assert terminal.ownership is not None
     return (
         ChatPersistenceCoordinator(chat),
@@ -105,10 +114,10 @@ def _message_projection(message: object) -> dict[str, str]:
 def test_initial_pending_forwards_exact_transient_authority_claim(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    coordinator, conversation_id = make_persistence_coordinator(tmp_path)
-    pending = PendingAction("call", "update_application_status", "{}", "update")
-    claim = cast(PendingAuthorityClaim, object())
+    harness = _harness(tmp_path)
+    coordinator = ChatPersistenceCoordinator(harness.chat)
     captured: dict[str, object] = {}
+    original = harness.chat.persist_pending_action
 
     def persist(
         actual_conversation_id: int,
@@ -122,22 +131,38 @@ def test_initial_pending_forwards_exact_transient_authority_claim(
             pending=actual_pending,
             claim=pending_authority_claim,
         )
-        return True
+        return original(
+            actual_conversation_id,
+            actual_pending,
+            [],
+            pending_authority_claim=pending_authority_claim,
+        )
 
-    monkeypatch.setattr(coordinator._chat, "persist_pending_action", persist)
-    result = coordinator.persist_initial_pending(
-        conversation_id,
-        [],
-        pending,
-        pending_authority_claim=claim,
-    )
+    monkeypatch.setattr(harness.chat, "persist_pending_action", persist)
+    try:
+        result = coordinator.persist_initial_pending(
+            harness.conversation_id,
+            [],
+            harness.pending,
+            pending_authority_claim=harness.claim,
+        )
 
-    assert result.persisted
-    assert captured == {
-        "conversation_id": conversation_id,
-        "pending": pending,
-        "claim": claim,
-    }
+        assert result.persisted
+        assert captured == {
+            "conversation_id": harness.conversation_id,
+            "pending": harness.pending,
+            "claim": harness.claim,
+        }
+        forged = cast(PendingAuthorityClaim, object())
+        with pytest.raises(AuthorityPhaseError):
+            coordinator.persist_initial_pending(
+                harness.conversation_id,
+                [],
+                harness.pending,
+                pending_authority_claim=forged,
+            )
+    finally:
+        harness.close()
 
 
 def _raw_agent_messages() -> list[Message]:
@@ -188,7 +213,7 @@ def test_initial_pending_matches_baseline_message_sanitization(tmp_path: Path) -
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
     messages = _raw_agent_messages()
     pending = PendingAction(
-        "call-malicious-1", "update_application_status", '{"id": 7}', "更新状态"
+        "call-malicious-1", _NON_LEDGER_PENDING_TOOL, '{"id": 7}', "更新状态"
     )
     expected = _persistable_ai_messages(messages)
 
@@ -217,8 +242,8 @@ def test_clarification_replaces_stale_clarification_and_reports_assistant_id(
     tmp_path: Path,
 ) -> None:
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
-    stale = PendingAction("old-call", "add_note", '{"company":"旧"}', "旧复盘")
-    fresh = PendingAction("new-call", "add_note", '{"company":"新"}', "新复盘")
+    stale = PendingAction("old-call", _NON_LEDGER_PENDING_TOOL, '{"company":"旧"}', "旧复盘")
+    fresh = PendingAction("new-call", _NON_LEDGER_PENDING_TOOL, '{"company":"新"}', "新复盘")
     assert coordinator.set_pending_clarification(conversation_id, stale, "旧问题").persisted
 
     result = coordinator.persist_clarification(
@@ -342,7 +367,7 @@ def test_mapping_tool_args_preserve_nested_json_and_do_not_alias_input(
 
 def test_initial_pending_persists_atomic_tool_chain_and_pending(tmp_path: Path) -> None:
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
-    pending = PendingAction("call-1", "update_application_status", '{"id": 1}', "更新状态")
+    pending = PendingAction("call-1", _NON_LEDGER_PENDING_TOOL, '{"id": 1}', "更新状态")
     messages = [
         {
             "role": "assistant",
@@ -367,8 +392,8 @@ def test_initial_pending_persists_atomic_tool_chain_and_pending(tmp_path: Path) 
 
 def test_confirmation_delivery_atomically_replaces_chained_pending(tmp_path: Path) -> None:
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
-    current = PendingAction("old-call", "update_application_status", '{"id": 1}', "旧卡")
-    replacement = PendingAction("new-call", "update_application_status", '{"id": 2}', "新卡")
+    current = PendingAction("old-call", _NON_LEDGER_PENDING_TOOL, '{"id": 1}', "旧卡")
+    replacement = PendingAction("new-call", _NON_LEDGER_PENDING_TOOL, '{"id": 2}', "新卡")
     assert coordinator._chat.set_pending_action(conversation_id, current)
     generation = conversation_generation(coordinator._chat, conversation_id)
     ownership = DeliveryOwnership("missing-operation", 1, b"raw", "fingerprint")
@@ -393,8 +418,8 @@ def test_confirmation_delivery_rejects_conflicting_pending_and_clarification_inp
     tmp_path: Path,
 ) -> None:
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
-    current = PendingAction("old-call", "update_application_status", '{"id": 1}', "旧卡")
-    replacement = PendingAction("new-call", "update_application_status", '{"id": 2}', "新卡")
+    current = PendingAction("old-call", _NON_LEDGER_PENDING_TOOL, '{"id": 1}', "旧卡")
+    replacement = PendingAction("new-call", _NON_LEDGER_PENDING_TOOL, '{"id": 2}', "新卡")
     clarification = (replacement, "请补充信息")
     origin = Message(role="tool", content="结果", tool_call_id=current.tool_call_id)
     continuation = [Message(role="assistant", content="继续")]
@@ -416,8 +441,8 @@ def test_confirmation_delivery_rejects_both_pending_parameter_names_without_writ
     tmp_path: Path,
 ) -> None:
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
-    current = PendingAction("old-call", "update_application_status", '{"id": 1}', "旧卡")
-    replacement = PendingAction("new-call", "update_application_status", '{"id": 2}', "新卡")
+    current = PendingAction("old-call", _NON_LEDGER_PENDING_TOOL, '{"id": 1}', "旧卡")
+    replacement = PendingAction("new-call", _NON_LEDGER_PENDING_TOOL, '{"id": 2}', "新卡")
 
     with pytest.raises(ValueError, match="pending"):
         coordinator.persist_confirmation_delivery(
@@ -436,8 +461,10 @@ def test_legacy_confirmation_rejects_unsupported_clarification_without_writes(
     tmp_path: Path,
 ) -> None:
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
-    current = PendingAction("old-call", "update_application_status", '{"id": 1}', "旧卡")
-    clarification = PendingAction("clarify-call", "update_application_status", '{"id": 2}', "补充")
+    current = PendingAction("old-call", _NON_LEDGER_PENDING_TOOL, '{"id": 1}', "旧卡")
+    clarification = PendingAction(
+        "clarify-call", _NON_LEDGER_PENDING_TOOL, '{"id": 2}', "补充"
+    )
     assert coordinator._chat.set_pending_action(conversation_id, current)
 
     with pytest.raises(ValueError, match="clarification"):
@@ -456,7 +483,7 @@ def test_legacy_confirmation_rejects_unsupported_clarification_without_writes(
 
 def test_legacy_origin_mapping_keeps_delivery_when_metadata_is_opaque(tmp_path: Path) -> None:
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
-    pending = PendingAction("call-1", "update_application_status", '{"id": 1}', "更新状态")
+    pending = PendingAction("call-1", _NON_LEDGER_PENDING_TOOL, '{"id": 1}', "更新状态")
     assert coordinator._chat.set_pending_action(conversation_id, pending)
 
     result = coordinator.persist_confirmation_delivery(
@@ -553,7 +580,7 @@ def test_confirmation_clarification_is_persisted_atomically_with_delivery(
     )
     clarification = PendingAction(
         "call-2",
-        "update_application_status",
+        _NON_LEDGER_PENDING_TOOL,
         '{"id": 2}',
         "更新第二条状态",
     )
@@ -586,7 +613,7 @@ def test_confirmation_delivery_cas_loss_has_no_partial_messages(tmp_path: Path) 
     )
     newer = PendingAction(
         "new-call",
-        "update_application_status",
+        _NON_LEDGER_PENDING_TOOL,
         '{"id": 3}',
         "更新第三条状态",
         pending.operation_id,
@@ -631,7 +658,7 @@ def test_confirmation_delivery_rollback_leaves_no_partial_messages(tmp_path: Pat
 
 def test_clarification_set_and_clear_are_typed(tmp_path: Path) -> None:
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
-    pending = PendingAction("call-1", "update_application_status", '{"id": 1}', "更新状态")
+    pending = PendingAction("call-1", _NON_LEDGER_PENDING_TOOL, '{"id": 1}', "更新状态")
 
     set_result = coordinator.set_pending_clarification(conversation_id, pending, "缺什么？")
     assert set_result.status is PersistenceStatus.PERSISTED
@@ -648,7 +675,7 @@ def test_clarification_set_ignores_ledger_operation_id_not_stored_by_chat_atom(
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
     pending = PendingAction(
         "call-1",
-        "update_application_status",
+        _NON_LEDGER_PENDING_TOOL,
         '{"id": 1}',
         "更新状态",
         str(uuid4()),
@@ -668,7 +695,7 @@ def test_archived_initial_pending_is_closed_without_messages(tmp_path: Path) -> 
     coordinator._chat.update_conversation_for_archive(
         conversation_id, {"archived_at": datetime.now(timezone.utc)}
     )
-    pending = PendingAction("call-1", "update_application_status", '{"id": 1}', "更新状态")
+    pending = PendingAction("call-1", _NON_LEDGER_PENDING_TOOL, '{"id": 1}', "更新状态")
 
     result = coordinator.persist_initial_pending(conversation_id, [], pending)
 
@@ -707,8 +734,8 @@ def test_archived_confirmation_delivery_is_closed_without_calling_atom(
 
 def test_pending_cas_loss_is_typed_and_non_mutating(tmp_path: Path) -> None:
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
-    first = PendingAction("call-1", "update_application_status", '{"id": 1}', "第一张")
-    second = PendingAction("call-2", "update_application_status", '{"id": 2}', "第二张")
+    first = PendingAction("call-1", _NON_LEDGER_PENDING_TOOL, '{"id": 1}', "第一张")
+    second = PendingAction("call-2", _NON_LEDGER_PENDING_TOOL, '{"id": 2}', "第二张")
     assert coordinator._chat.set_pending_action(conversation_id, first)
 
     result = coordinator.persist_initial_pending(conversation_id, [], second)
@@ -722,7 +749,7 @@ def test_confirmation_fallback_and_replay_have_typed_delivery_outcomes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
-    pending = PendingAction("call-1", "update_application_status", '{"id": 1}', "更新状态")
+    pending = PendingAction("call-1", _NON_LEDGER_PENDING_TOOL, '{"id": 1}', "更新状态")
     assert coordinator._chat.set_pending_action(conversation_id, pending)
     owner = DeliveryOwnership("operation-1", 1, b"raw", "fingerprint")
     generation = conversation_generation(coordinator._chat, conversation_id)
@@ -1053,7 +1080,7 @@ def test_public_message_reads_are_frozen_detached_snapshots(tmp_path: Path) -> N
 def test_public_pending_reads_are_frozen_snapshots(tmp_path: Path) -> None:
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
     pending = PendingAction(
-        "call-1", "update_application_status", '{"id": 7}', "更新状态"
+        "call-1", _NON_LEDGER_PENDING_TOOL, '{"id": 7}', "更新状态"
     )
     assert coordinator._chat.set_pending_action(conversation_id, pending) is True
     assert coordinator._chat.set_pending_clarification(
@@ -1083,7 +1110,7 @@ def test_public_pending_reads_are_frozen_snapshots(tmp_path: Path) -> None:
     backing_clarification = coordinator._chat.get_pending_clarification(conversation_id)
     assert backing_clarification is not None
     backing_clarification[0].args = "mutated backing args"
-    assert pending_view.tool_name == "update_application_status"
+    assert pending_view.tool_name == _NON_LEDGER_PENDING_TOOL
     assert clarification_view.pending.args == '{"id": 7}'
 
 
@@ -1115,7 +1142,7 @@ def test_message_helpers_preserve_identity_fields(tmp_path: Path, method: str) -
     if method == "persist_initial_user_message":
         result = coordinator.persist_initial_user_message(conversation_id, "用户消息")
     else:
-        pending = PendingAction("call-1", "update_application_status", '{"id": 1}', "更新状态")
+        pending = PendingAction("call-1", _NON_LEDGER_PENDING_TOOL, '{"id": 1}', "更新状态")
         coordinator._chat.set_pending_clarification(conversation_id, pending, "缺什么？")
         result = coordinator.persist_timeout_assistant(conversation_id, "超时，请重试。")
     assert result.persisted is True

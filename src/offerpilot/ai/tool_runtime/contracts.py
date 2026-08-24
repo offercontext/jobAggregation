@@ -6,7 +6,17 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Generic, Literal, NoReturn, SupportsIndex, TypeAlias, TypeVar
 
 if TYPE_CHECKING:
+    from offerpilot.ai.tool_authority.contracts import AuthorityInstanceToken
     from offerpilot.ai.tool_runtime.context import ToolExecutionContext
+
+
+if TYPE_CHECKING:
+    AuthorityInstanceTokenLike: TypeAlias = AuthorityInstanceToken
+else:
+    # Resolve annotations safely while the leaf authority module imports this
+    # runtime module.  Static type checkers still see the opaque handle type;
+    # runtime callers cannot use this alias to construct a token.
+    AuthorityInstanceTokenLike: TypeAlias = Any
 
 
 JSONValue: TypeAlias = None | bool | int | float | str | list["JSONValue"] | dict[str, "JSONValue"]
@@ -72,6 +82,7 @@ class _TransientAsdictGuard:
 
 
 _TRANSIENT_ASDICT_GUARD = _TransientAsdictGuard()
+_PREPARED_REPLACEMENT_SENTINEL = object()
 
 
 @dataclass(frozen=True)
@@ -245,7 +256,7 @@ class ToolSpec(Generic[ArgsT, ResultT]):
         return self.contract.name
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class PreparedToolCall(TransientToolRuntimeValue, Generic[ArgsT, ResultT]):
     tool_call_id: str
     spec: ToolSpec[ArgsT, ResultT] = field(repr=False)
@@ -261,13 +272,33 @@ class PreparedToolCall(TransientToolRuntimeValue, Generic[ArgsT, ResultT]):
     # provider/ledger/payload representation.  It remains optional until the
     # authority-bound pipeline cutover, while already making prepared calls
     # produced by that pipeline non-serializable and identity-bound.
-    authority_instance_token: object | None = field(default=None, repr=False, compare=False)
+    authority_instance_token: AuthorityInstanceTokenLike | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    _replacement_guard: object = field(
+        default=_PREPARED_REPLACEMENT_SENTINEL,
+        init=True,
+        repr=False,
+        compare=False,
+        kw_only=True,
+    )
     _serialization_guard: object = field(
         default=_TRANSIENT_ASDICT_GUARD,
         init=False,
         repr=False,
         compare=False,
     )
+
+    def __post_init__(self) -> None:
+        if self._replacement_guard is not _PREPARED_REPLACEMENT_SENTINEL:
+            # Legacy Tool Pipeline still enriches an unbound Prepared value
+            # once with its journal draft.  Authority-bound values are sealed
+            # and cannot enter that compatibility path.
+            if self.authority_instance_token is not None:
+                raise TypeError("transient tool runtime value cannot be replaced")
+        object.__setattr__(self, "_replacement_guard", object())
 
 
 @dataclass(frozen=True)

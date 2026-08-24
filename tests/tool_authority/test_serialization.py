@@ -52,9 +52,9 @@ def _prepared(factory: AuthorityFactory) -> PreparedToolCall[Any, Any]:
         arguments_digest="sha256:" + "a" * 64,
         contract_fingerprint="sha256:" + "b" * 64,
         binding=BindingAudit(status="unbound", target_count=0),
-        authority_instance_token=authority.authority_instance_token,
     )
-    factory.register_prepared(prepared, authority)
+    seal = factory.issue_prepared_construction_identity(authority)
+    factory.bind_new_prepared(prepared, authority, seal)
     return prepared
 
 
@@ -141,6 +141,8 @@ def test_prepared_tool_call_carries_opaque_authority_handle_and_is_transient() -
     with execution_scope() as factory:
         prepared = _prepared(factory)
         assert prepared.authority_instance_token is not None
+        assert "0x" not in repr(prepared)
+        assert "sha256:" not in repr(prepared)
         with pytest.raises(TypeError):
             copy.deepcopy(prepared)
         with pytest.raises(TypeError):

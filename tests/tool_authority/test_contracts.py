@@ -52,42 +52,61 @@ def _segment(factory: AuthorityFactory) -> SegmentExecutionAuthority:
     )
 
 
-def _prepared(authority: SegmentExecutionAuthority) -> PreparedToolCall[Any, Any]:
+def _prepared(
+    factory: AuthorityFactory,
+    authority: ToolExecutionAuthority,
+    *,
+    tool_call_id: str = "call-1",
+    tool_name: str = "get_application",
+    kind: str = "read",
+) -> PreparedToolCall[Any, Any]:
     spec = ToolSpec(
         contract=ProviderToolContract(
             payload={
                 "type": "function",
-                "function": {"name": "get_application", "description": "", "parameters": {}},
+                "function": {"name": tool_name, "description": "", "parameters": {}},
             },
-            name="get_application",
+            name=tool_name,
             description="",
             parameters={},
         ),
-        kind="read",
+        kind=kind,  # type: ignore[arg-type]
         decoder=lambda value: value,
         executor=lambda args, context: args,
     )
-    return PreparedToolCall(
-        tool_call_id="call-1",
+    prepared = PreparedToolCall(
+        tool_call_id=tool_call_id,
         spec=spec,
         arguments={},
         typed_args={},
         arguments_digest="sha256:" + "a" * 64,
         contract_fingerprint="sha256:" + "b" * 64,
         binding=BindingAudit(status="unbound", target_count=0),
-        authority_instance_token=authority.authority_instance_token,
     )
+    seal = factory.issue_prepared_construction_identity(authority)
+    factory.bind_new_prepared(prepared, authority, seal)
+    return prepared
 
 
 def test_authority_types_are_separate_and_segment_is_tool_execution_authority() -> None:
     with execution_scope() as factory:
         segment = _segment(factory)
+        pending_object = object()
+        factory.register_pending(
+            pending_object,
+            conversation_id=11,
+            operation_id="op-1",
+            tool_call_id="call-1",
+            tool_name="update_application_status",
+            pending_action_revision=1,
+            effective_args_digest="sha256:" + "a" * 64,
+        )
         approval = factory.create_approval_authority(
             operation_id="op-1",
             conversation_id=11,
             conversation_scope_revision=0,
             trusted_scope=_scope(),
-            pending_identity=factory.register_pending(object()),
+            pending_identity=pending_object,
             pending_action_revision=1,
             tool_call_id="call-1",
             tool_name="update_application_status",
@@ -126,12 +145,22 @@ def test_positive_int64_is_strict_for_contract_identities() -> None:
 def test_phase_matrix_rejects_wrong_authority_and_wrong_identity_before_lookup() -> None:
     with execution_scope() as factory:
         segment = _segment(factory)
+        pending_object = object()
+        factory.register_pending(
+            pending_object,
+            conversation_id=11,
+            operation_id="op-1",
+            tool_call_id="call-1",
+            tool_name="update_application_status",
+            pending_action_revision=1,
+            effective_args_digest="sha256:" + "a" * 64,
+        )
         approval = factory.create_approval_authority(
             operation_id="op-1",
             conversation_id=11,
             conversation_scope_revision=0,
             trusted_scope=_scope(),
-            pending_identity=factory.register_pending(object()),
+            pending_identity=pending_object,
             pending_action_revision=1,
             tool_call_id="call-1",
             tool_name="update_application_status",
@@ -143,6 +172,20 @@ def test_phase_matrix_rejects_wrong_authority_and_wrong_identity_before_lookup()
         surface = object()
         binding = object()
         gateway = object()
+        factory.register_runner_invocation(runner, authority=segment)
+        factory.register_tool_execution_context(context, authority=segment)
+        factory.register_frozen_surface(
+            surface,
+            surface_fingerprint="sha256:" + "c" * 64,
+            authority=segment,
+        )
+        factory.register_model_call_surface_binding(
+            binding,
+            surface=surface,
+            surface_fingerprint="sha256:" + "c" * 64,
+            authority=segment,
+        )
+        factory.register_gateway_session(gateway, authority=segment)
         build = factory.create_provider_surface_build_identity(
             segment,
             runner_invocation=runner,
@@ -156,9 +199,7 @@ def test_phase_matrix_rejects_wrong_authority_and_wrong_identity_before_lookup()
             model_call_surface_binding=binding,
             gateway_session=gateway,
         )
-        pending = factory.register_pending(object())
-        prepared = _prepared(segment)
-        factory.register_prepared(prepared, segment)
+        prepared = _prepared(factory, segment)
         read = factory.create_read_execution_identity(
             invocation,
             prepared=prepared,
@@ -178,24 +219,32 @@ def test_phase_matrix_rejects_wrong_authority_and_wrong_identity_before_lookup()
         with pytest.raises(AuthorityPhaseError):
             require_authority_phase(segment, "provider_invoke", build)
 
-        same_fields = replace(read)
-        with pytest.raises(AuthorityPhaseError):
-            require_authority_phase(segment, "read_execute", same_fields)
+        with pytest.raises(TypeError):
+            replace(read)
 
         with pytest.raises(AuthorityPhaseError):
             require_authority_phase(segment, "typed_pending_claim", read)
-        del pending
 
 
 def test_spec_gate_is_fail_closed_for_approval_and_segment_write() -> None:
     with execution_scope() as factory:
         segment = _segment(factory)
+        pending_object = object()
+        factory.register_pending(
+            pending_object,
+            conversation_id=11,
+            operation_id="op-1",
+            tool_call_id="call-1",
+            tool_name="update_application_status",
+            pending_action_revision=1,
+            effective_args_digest="sha256:" + "a" * 64,
+        )
         approval = factory.create_approval_authority(
             operation_id="op-1",
             conversation_id=11,
             conversation_scope_revision=0,
             trusted_scope=_scope(),
-            pending_identity=factory.register_pending(object()),
+            pending_identity=pending_object,
             pending_action_revision=1,
             tool_call_id="call-1",
             tool_name="update_application_status",
@@ -248,17 +297,25 @@ def test_constraint_and_resolution_invariants_are_closed() -> None:
 def test_claims_are_one_shot_and_scope_exit_revokes_active_values() -> None:
     with execution_scope() as factory:
         authority = _segment(factory)
-        prepared = _prepared(authority)
-        factory.register_prepared(prepared, authority)
+        prepared = _prepared(factory, authority)
         pending_object = object()
-        pending = factory.register_pending(pending_object)
+        pending = factory.register_pending(
+            pending_object,
+            conversation_id=11,
+            operation_id="op-1",
+            tool_call_id="call-1",
+            tool_name="get_application",
+            pending_action_revision=1,
+            pending_confirmation_claim_id="pending-claim-1",
+            arguments_digest="sha256:" + "a" * 64,
+        )
         claim = factory.issue_pending_claim(
             authority,
             prepared=prepared,
             pending=pending_object,
             operation_id="op-1",
             tool_call_id="call-1",
-            tool_name="create_application_event",
+            tool_name="get_application",
             arguments_digest=prepared.arguments_digest,
         )
         assert isinstance(claim, PendingAuthorityClaim)
@@ -277,21 +334,35 @@ def test_claims_are_one_shot_and_scope_exit_revokes_active_values() -> None:
 def test_approval_execution_claim_binds_prepared_and_authority_identity() -> None:
     with execution_scope() as factory:
         pending_object = object()
-        pending = factory.register_pending(pending_object)
+        factory.register_pending(
+            pending_object,
+            conversation_id=11,
+            operation_id="op-1",
+            tool_call_id="call-1",
+            tool_name="update_application_status",
+            pending_action_revision=1,
+            effective_args_digest="sha256:" + "a" * 64,
+        )
         approval = factory.create_approval_authority(
             operation_id="op-1",
             conversation_id=11,
             conversation_scope_revision=0,
             trusted_scope=_scope(),
-            pending_identity=pending,
+            pending_identity=pending_object,
             pending_action_revision=1,
             tool_call_id="call-1",
             tool_name="update_application_status",
             effective_args_digest="sha256:" + "a" * 64,
             capabilities=frozenset({"applications.write"}),
         )
-        prepared = _prepared(approval)
-        factory.register_prepared(prepared, approval)
+        prepared = _prepared(
+            factory,
+            approval,
+            tool_name="update_application_status",
+            kind="write",
+        )
+        transaction = object()
+        factory.register_transaction(transaction)
         claim = factory.issue_execution_claim(
             approval,
             prepared=prepared,
@@ -300,6 +371,7 @@ def test_approval_execution_claim_binds_prepared_and_authority_identity() -> Non
             tool_call_id="call-1",
             tool_name="update_application_status",
             effective_args_digest=approval.effective_args_digest,
+            transaction=transaction,
         )
         assert isinstance(claim, ExecutionClaim)
         assert claim.prepared_instance_token is factory.prepared_token(prepared)

@@ -20,6 +20,7 @@ MAX_INT64: Final = 2**63 - 1
 
 
 _OPAQUE_SEAL = object()
+_REPLACEMENT_SENTINEL = object()
 
 
 class AuthorityContractError(TypeError):
@@ -84,6 +85,10 @@ class PreparedInstanceToken(_OpaqueHandle):
     """Identity token for one live PreparedToolCall object."""
 
 
+class PreparedConstructionIdentity(_OpaqueHandle):
+    """One-shot seal issued by the factory for a new PreparedToolCall."""
+
+
 class ExecutionClaimInstanceToken(_OpaqueHandle):
     """Identity token for one one-shot execution claim."""
 
@@ -131,6 +136,89 @@ def _require_text(value: object, field_name: str) -> str:
     return value
 
 
+_CAPABILITY_NAMES = frozenset(
+    {
+        "applications.read",
+        "applications.write",
+        "application_events.read",
+        "application_events.write",
+        "notes.read",
+        "notes.write",
+        "offers.read",
+        "offers.write",
+        "resumes.read",
+        "resumes.write",
+        "jd_analyses.read",
+    }
+)
+
+
+def _require_capabilities(value: object) -> frozenset[object]:
+    if type(value) is not frozenset:
+        raise TypeError("capabilities must be a frozenset")
+    for capability in value:
+        # The leaf module cannot import ``tool_runtime.context`` (that module
+        # owns the repository-bearing execution context).  Accept its one
+        # closed enum by its stable module/class identity, or a canonical text
+        # value used by the composition-root tests.  Arbitrary objects with a
+        # convenient ``value`` attribute are deliberately not capabilities.
+        if type(capability) is str:
+            normalized = capability
+        else:
+            capability_type = type(capability)
+            if (
+                capability_type.__module__ != "offerpilot.ai.tool_runtime.context"
+                or capability_type.__name__ != "ToolCapability"
+                or not isinstance(capability, str)
+            ):
+                raise ValueError("capability is not in the closed V1 capability set")
+            normalized = str(capability)
+        if normalized not in _CAPABILITY_NAMES:
+            raise ValueError("capability is not in the closed V1 capability set")
+    return value
+
+
+def _require_digest(value: object, field_name: str, *, allow_hmac: bool = False) -> str:
+    if type(value) is not str:
+        raise TypeError(f"{field_name} must be text")
+    prefixes = ("sha256:", "hmac-sha256:") if allow_hmac else ("sha256:",)
+    prefix = next((candidate for candidate in prefixes if value.startswith(candidate)), None)
+    if prefix is None or len(value) != len(prefix) + 64:
+        raise ValueError(f"{field_name} must be a canonical digest")
+    if any(character not in "0123456789abcdef" for character in value[len(prefix) :]):
+        raise ValueError(f"{field_name} must use lowercase hexadecimal")
+    return value
+
+
+class _TrustedScopeAsdictGuard:
+    __slots__ = ()
+
+    def __deepcopy__(self, memo: dict[int, object]) -> NoReturn:
+        del memo
+        raise TypeError("transient tool runtime value cannot be serialized")
+
+
+_TRUSTED_SCOPE_ASDICT_GUARD = _TrustedScopeAsdictGuard()
+
+
+@dataclass(frozen=True, slots=True, repr=False, eq=False)
+class _ReplacementProtected:
+    """Private constructor marker that makes ``dataclasses.replace`` fail."""
+
+    _replacement_guard: object = field(
+        default=_REPLACEMENT_SENTINEL,
+        init=True,
+        repr=False,
+        compare=False,
+        kw_only=True,
+    )
+
+    def _seal_replacement(self) -> None:
+        if self._replacement_guard is not _REPLACEMENT_SENTINEL:
+            raise TypeError("transient tool runtime value cannot be replaced")
+        object.__setattr__(self, "_replacement_guard", object())
+
+
 def constant_time_equal(left: str, right: str) -> bool:
     """Compare fixed-length textual digests without exposing timing by length."""
 
@@ -164,22 +252,34 @@ class AuthorityDiagnosticReason(str, Enum):
         return self.value
 
 
-@dataclass(frozen=True, slots=True, repr=False)
-class TrustedContextScope(TransientToolRuntimeValue):
+@dataclass(frozen=True, slots=True, repr=False, eq=False)
+class TrustedContextScope(_ReplacementProtected, TransientToolRuntimeValue):
     """Canonical, already validated Conversation scope used by an Authority."""
 
     context_type: Literal["workspace", "global", "application", "mode"]
     context_ref: int | None = field(repr=False)
     mode: str = field(repr=False)
+    _serialization_guard: object = field(
+        default=_TRUSTED_SCOPE_ASDICT_GUARD,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
-        if self.context_type not in {"workspace", "global", "application", "mode"}:
+        if type(self.context_type) is not str or self.context_type not in {
+            "workspace",
+            "global",
+            "application",
+            "mode",
+        }:
             raise ValueError("unknown trusted context type")
         if self.context_type == "application":
             require_positive_int64(self.context_ref, "context_ref")
         elif self.context_ref is not None:
             raise ValueError("non-application scope cannot have a context_ref")
         _require_text(self.mode, "mode")
+        self._seal_replacement()
 
 
 class ToolExecutionAuthority(TransientToolRuntimeValue):
@@ -188,8 +288,8 @@ class ToolExecutionAuthority(TransientToolRuntimeValue):
     __slots__ = ()
 
 
-@dataclass(frozen=True, slots=True, repr=False)
-class SegmentExecutionAuthority(ToolExecutionAuthority):
+@dataclass(frozen=True, slots=True, repr=False, eq=False)
+class SegmentExecutionAuthority(_ReplacementProtected, ToolExecutionAuthority):
     conversation_id: int
     conversation_scope_revision: int
     segment_id: str
@@ -199,31 +299,31 @@ class SegmentExecutionAuthority(ToolExecutionAuthority):
     capabilities: frozenset[object] = field(default_factory=frozenset, repr=False)
     capability_policy_version: str = "capability-policy-v1"
     binding_policy_version: str = "binding-policy-v1"
-    capability_profile_fingerprint: str = ""
-    binding_policy_fingerprint: str = ""
+    capability_profile_fingerprint: str = "sha256:" + "0" * 64
+    binding_policy_fingerprint: str = "sha256:" + "0" * 64
 
     def __post_init__(self) -> None:
         require_positive_int64(self.conversation_id, "conversation_id")
         require_nonnegative_int64(self.conversation_scope_revision, "conversation_scope_revision")
         _require_text(self.segment_id, "segment_id")
+        if type(self.trusted_scope) is not TrustedContextScope:
+            raise TypeError("trusted_scope must be the exact TrustedContextScope type")
         _require_text(self.capability_profile_id, "capability_profile_id")
         _require_text(self.capability_policy_version, "capability_policy_version")
         _require_text(self.binding_policy_version, "binding_policy_version")
-        if type(self.capabilities) is not frozenset:
-            raise TypeError("capabilities must be a frozenset")
-        if type(self.capability_profile_fingerprint) is not str:
-            raise TypeError("capability_profile_fingerprint must be text")
-        if type(self.binding_policy_fingerprint) is not str:
-            raise TypeError("binding_policy_fingerprint must be text")
+        _require_capabilities(self.capabilities)
+        _require_digest(self.capability_profile_fingerprint, "capability_profile_fingerprint")
+        _require_digest(self.binding_policy_fingerprint, "binding_policy_fingerprint")
         _require_token(
             self.authority_instance_token,
             AuthorityInstanceToken,
             "authority_instance_token",
         )
+        self._seal_replacement()
 
 
-@dataclass(frozen=True, slots=True, repr=False)
-class ApprovalExecutionAuthority(ToolExecutionAuthority):
+@dataclass(frozen=True, slots=True, repr=False, eq=False)
+class ApprovalExecutionAuthority(_ReplacementProtected, ToolExecutionAuthority):
     operation_id: str
     conversation_id: int
     conversation_scope_revision: int
@@ -238,8 +338,8 @@ class ApprovalExecutionAuthority(ToolExecutionAuthority):
     capabilities: frozenset[object] = field(default_factory=frozenset, repr=False)
     capability_policy_version: str = "capability-policy-v1"
     binding_policy_version: str = "binding-policy-v1"
-    capability_profile_fingerprint: str = ""
-    binding_policy_fingerprint: str = ""
+    capability_profile_fingerprint: str = "sha256:" + "0" * 64
+    binding_policy_fingerprint: str = "sha256:" + "0" * 64
 
     def __post_init__(self) -> None:
         _require_text(self.operation_id, "operation_id")
@@ -247,19 +347,23 @@ class ApprovalExecutionAuthority(ToolExecutionAuthority):
         require_nonnegative_int64(self.conversation_scope_revision, "conversation_scope_revision")
         _require_text(self.tool_call_id, "tool_call_id")
         _require_text(self.tool_name, "tool_name")
-        _require_text(self.effective_args_digest, "effective_args_digest")
+        _require_digest(self.effective_args_digest, "effective_args_digest")
         require_positive_int64(self.pending_action_revision, "pending_action_revision")
+        if type(self.trusted_scope) is not TrustedContextScope:
+            raise TypeError("trusted_scope must be the exact TrustedContextScope type")
         _require_text(self.capability_profile_id, "capability_profile_id")
         _require_text(self.capability_policy_version, "capability_policy_version")
         _require_text(self.binding_policy_version, "binding_policy_version")
-        if type(self.capabilities) is not frozenset:
-            raise TypeError("capabilities must be a frozenset")
+        _require_capabilities(self.capabilities)
+        _require_digest(self.capability_profile_fingerprint, "capability_profile_fingerprint")
+        _require_digest(self.binding_policy_fingerprint, "binding_policy_fingerprint")
         _require_token(self.pending_identity, PendingInstanceToken, "pending_identity")
         _require_token(
             self.approval_authority_instance_token,
             AuthorityInstanceToken,
             "approval_authority_instance_token",
         )
+        self._seal_replacement()
 
     @property
     def authority_instance_token(self) -> AuthorityInstanceToken:
@@ -276,8 +380,8 @@ class AuthorityCallIdentity(TransientToolRuntimeValue):
 AuthorityCallIdentityValue = AuthorityCallIdentity
 
 
-@dataclass(frozen=True, slots=True, repr=False)
-class ProviderSurfaceBuildIdentity(AuthorityCallIdentity):
+@dataclass(frozen=True, slots=True, repr=False, eq=False)
+class ProviderSurfaceBuildIdentity(_ReplacementProtected, AuthorityCallIdentity):
     authority_instance_token: AuthorityInstanceToken = field(repr=False, compare=False)
     runner_invocation: object = field(repr=False, compare=False)
     segment_id: str
@@ -288,6 +392,7 @@ class ProviderSurfaceBuildIdentity(AuthorityCallIdentity):
         _require_token(self.authority_instance_token, AuthorityInstanceToken, "authority_instance_token")
         _require_text(self.segment_id, "segment_id")
         _require_text(self.model_call_id, "model_call_id")
+        self._seal_replacement()
 
     @property
     def runner_invocation_identity(self) -> object:
@@ -298,8 +403,8 @@ class ProviderSurfaceBuildIdentity(AuthorityCallIdentity):
         return self.tool_context
 
 
-@dataclass(frozen=True, slots=True, repr=False)
-class ProviderInvocationIdentity(AuthorityCallIdentity):
+@dataclass(frozen=True, slots=True, repr=False, eq=False)
+class ProviderInvocationIdentity(_ReplacementProtected, AuthorityCallIdentity):
     authority_instance_token: AuthorityInstanceToken = field(repr=False, compare=False)
     runner_invocation: object = field(repr=False, compare=False)
     segment_id: str
@@ -314,7 +419,8 @@ class ProviderInvocationIdentity(AuthorityCallIdentity):
         _require_token(self.authority_instance_token, AuthorityInstanceToken, "authority_instance_token")
         _require_text(self.segment_id, "segment_id")
         _require_text(self.model_call_id, "model_call_id")
-        _require_text(self.surface_fingerprint, "surface_fingerprint")
+        _require_digest(self.surface_fingerprint, "surface_fingerprint")
+        self._seal_replacement()
 
     @property
     def runner_invocation_identity(self) -> object:
@@ -329,8 +435,8 @@ class ProviderInvocationIdentity(AuthorityCallIdentity):
         return self.model_call_surface_binding
 
 
-@dataclass(frozen=True, slots=True, repr=False)
-class NewTurnPrepareCallIdentity(AuthorityCallIdentity):
+@dataclass(frozen=True, slots=True, repr=False, eq=False)
+class NewTurnPrepareCallIdentity(_ReplacementProtected, AuthorityCallIdentity):
     authority_instance_token: AuthorityInstanceToken = field(repr=False, compare=False)
     runner_invocation: object = field(repr=False, compare=False)
     segment_id: str
@@ -357,13 +463,16 @@ class NewTurnPrepareCallIdentity(AuthorityCallIdentity):
             (self.tool_name, "tool_name"),
             (self.arguments_digest, "arguments_digest"),
         ):
-            _require_text(value, name)
-        if type(self.candidate_ordinal) is not int or self.candidate_ordinal < 0:
-            raise ValueError("candidate_ordinal must be a non-negative int")
+            if name == "surface_fingerprint" or name == "arguments_digest":
+                _require_digest(value, name)
+            else:
+                _require_text(value, name)
+        require_nonnegative_int64(self.candidate_ordinal, "candidate_ordinal")
+        self._seal_replacement()
 
 
-@dataclass(frozen=True, slots=True, repr=False)
-class ReadExecutionCallIdentity(AuthorityCallIdentity):
+@dataclass(frozen=True, slots=True, repr=False, eq=False)
+class ReadExecutionCallIdentity(_ReplacementProtected, AuthorityCallIdentity):
     authority_instance_token: AuthorityInstanceToken = field(repr=False, compare=False)
     runner_invocation: object = field(repr=False, compare=False)
     segment_id: str
@@ -389,11 +498,15 @@ class ReadExecutionCallIdentity(AuthorityCallIdentity):
             (self.tool_name, "tool_name"),
             (self.arguments_digest, "arguments_digest"),
         ):
-            _require_text(value, name)
+            if name == "surface_fingerprint" or name == "arguments_digest":
+                _require_digest(value, name)
+            else:
+                _require_text(value, name)
+        self._seal_replacement()
 
 
-@dataclass(frozen=True, slots=True, repr=False)
-class TypedPendingCallIdentity(AuthorityCallIdentity):
+@dataclass(frozen=True, slots=True, repr=False, eq=False)
+class TypedPendingCallIdentity(_ReplacementProtected, AuthorityCallIdentity):
     authority_instance_token: AuthorityInstanceToken = field(repr=False, compare=False)
     runner_invocation: object = field(repr=False, compare=False)
     segment_id: str
@@ -419,11 +532,15 @@ class TypedPendingCallIdentity(AuthorityCallIdentity):
             (self.tool_name, "tool_name"),
             (self.arguments_digest, "arguments_digest"),
         ):
-            _require_text(value, name)
+            if name == "arguments_digest":
+                _require_digest(value, name)
+            else:
+                _require_text(value, name)
+        self._seal_replacement()
 
 
-@dataclass(frozen=True, slots=True, repr=False)
-class ApprovedWritePrepareCallIdentity(AuthorityCallIdentity):
+@dataclass(frozen=True, slots=True, repr=False, eq=False)
+class ApprovedWritePrepareCallIdentity(_ReplacementProtected, AuthorityCallIdentity):
     approval_authority_instance_token: AuthorityInstanceToken = field(repr=False, compare=False)
     approval_context: object = field(repr=False, compare=False)
     request_identity: object = field(repr=False, compare=False)
@@ -452,11 +569,15 @@ class ApprovedWritePrepareCallIdentity(AuthorityCallIdentity):
             (self.tool_name, "tool_name"),
             (self.effective_args_digest, "effective_args_digest"),
         ):
-            _require_text(value, name)
+            if name == "effective_args_digest":
+                _require_digest(value, name)
+            else:
+                _require_text(value, name)
+        self._seal_replacement()
 
 
-@dataclass(frozen=True, slots=True, repr=False)
-class ApprovedWriteExecuteCallIdentity(AuthorityCallIdentity):
+@dataclass(frozen=True, slots=True, repr=False, eq=False)
+class ApprovedWriteExecuteCallIdentity(_ReplacementProtected, AuthorityCallIdentity):
     approval_authority_instance_token: AuthorityInstanceToken = field(repr=False, compare=False)
     approval_context: object = field(repr=False, compare=False)
     request_identity: object = field(repr=False, compare=False)
@@ -495,11 +616,15 @@ class ApprovedWriteExecuteCallIdentity(AuthorityCallIdentity):
             (self.tool_name, "tool_name"),
             (self.effective_args_digest, "effective_args_digest"),
         ):
-            _require_text(value, name)
+            if name == "effective_args_digest":
+                _require_digest(value, name)
+            else:
+                _require_text(value, name)
+        self._seal_replacement()
 
 
-@dataclass(frozen=True, slots=True, repr=False)
-class PendingAuthorityClaim(TransientToolRuntimeValue):
+@dataclass(frozen=True, slots=True, repr=False, eq=False)
+class PendingAuthorityClaim(_ReplacementProtected, TransientToolRuntimeValue):
     conversation_id: int
     segment_id: str
     authority_instance_token: AuthorityInstanceToken = field(repr=False, compare=False)
@@ -516,6 +641,7 @@ class PendingAuthorityClaim(TransientToolRuntimeValue):
     tool_call_id: str
     tool_name: str
     arguments_digest: str
+    pending_confirmation_claim_id: str
     prepared_instance_token: PreparedInstanceToken = field(repr=False, compare=False)
     pending_claim_instance_token: PendingInstanceToken = field(repr=False, compare=False)
 
@@ -531,10 +657,20 @@ class PendingAuthorityClaim(TransientToolRuntimeValue):
             (self.tool_call_id, "tool_call_id"),
             (self.tool_name, "tool_name"),
             (self.arguments_digest, "arguments_digest"),
+            (self.pending_confirmation_claim_id, "pending_confirmation_claim_id"),
         ):
-            _require_text(value, name)
-        if type(self.capabilities) is not frozenset:
-            raise TypeError("capabilities must be a frozenset")
+            if name == "arguments_digest":
+                _require_digest(value, name)
+            else:
+                _require_text(value, name)
+        _require_capabilities(self.capabilities)
+        if type(self.trusted_scope) is not TrustedContextScope:
+            raise TypeError("trusted_scope must be the exact TrustedContextScope type")
+        _require_digest(
+            self.capability_profile_fingerprint,
+            "capability_profile_fingerprint",
+        )
+        _require_digest(self.binding_policy_fingerprint, "binding_policy_fingerprint")
         _require_token(self.authority_instance_token, AuthorityInstanceToken, "authority_instance_token")
         _require_token(self.pending_identity, PendingInstanceToken, "pending_identity")
         _require_token(self.prepared_instance_token, PreparedInstanceToken, "prepared_instance_token")
@@ -543,10 +679,11 @@ class PendingAuthorityClaim(TransientToolRuntimeValue):
             PendingInstanceToken,
             "pending_claim_instance_token",
         )
+        self._seal_replacement()
 
 
-@dataclass(frozen=True, slots=True, repr=False)
-class ExecutionClaim(TransientToolRuntimeValue):
+@dataclass(frozen=True, slots=True, repr=False, eq=False)
+class ExecutionClaim(_ReplacementProtected, TransientToolRuntimeValue):
     operation_id: str
     conversation_id: int
     pending_identity: PendingInstanceToken = field(repr=False, compare=False)
@@ -554,6 +691,7 @@ class ExecutionClaim(TransientToolRuntimeValue):
     tool_call_id: str
     tool_name: str
     effective_args_digest: str
+    transaction: object = field(repr=False, compare=False)
     approval_authority_instance_token: AuthorityInstanceToken = field(repr=False, compare=False)
     prepared_instance_token: PreparedInstanceToken = field(repr=False, compare=False)
     execution_claim_instance_token: ExecutionClaimInstanceToken = field(repr=False, compare=False)
@@ -564,7 +702,11 @@ class ExecutionClaim(TransientToolRuntimeValue):
         require_positive_int64(self.pending_action_revision, "pending_action_revision")
         _require_text(self.tool_call_id, "tool_call_id")
         _require_text(self.tool_name, "tool_name")
-        _require_text(self.effective_args_digest, "effective_args_digest")
+        _require_digest(self.effective_args_digest, "effective_args_digest")
+        if self.transaction is None or isinstance(
+            self.transaction, (str, bytes, int, float, bool, tuple, frozenset)
+        ):
+            raise TypeError("transaction must be a registered opaque object")
         _require_token(self.pending_identity, PendingInstanceToken, "pending_identity")
         _require_token(
             self.approval_authority_instance_token,
@@ -577,14 +719,15 @@ class ExecutionClaim(TransientToolRuntimeValue):
             ExecutionClaimInstanceToken,
             "execution_claim_instance_token",
         )
+        self._seal_replacement()
 
     @property
     def authority_instance_token(self) -> AuthorityInstanceToken:
         return self.approval_authority_instance_token
 
 
-@dataclass(frozen=True, slots=True, repr=False)
-class TrustedLedgerOmittedTokenProof(TransientToolRuntimeValue):
+@dataclass(frozen=True, slots=True, repr=False, eq=False)
+class TrustedLedgerOmittedTokenProof(_ReplacementProtected, TransientToolRuntimeValue):
     operation_id: str
     conversation_id: int
     status: Literal["proposed"]
@@ -596,12 +739,15 @@ class TrustedLedgerOmittedTokenProof(TransientToolRuntimeValue):
     pending_operation_id: str
     pending_tool_call_id: str
     pending_tool_name: str
+    pending_confirmation_claim_id: str
     omitted_token_proof_instance_token: OmittedTokenProofInstanceToken = field(
         repr=False, compare=False
     )
 
     def __post_init__(self) -> None:
         require_positive_int64(self.conversation_id, "conversation_id")
+        if self.status != "proposed" or type(self.status) is not str:
+            raise ValueError("omitted-token proof status must be exactly proposed")
         for value, name in (
             (self.operation_id, "operation_id"),
             (self.adapter_kind, "adapter_kind"),
@@ -612,29 +758,39 @@ class TrustedLedgerOmittedTokenProof(TransientToolRuntimeValue):
             (self.pending_operation_id, "pending_operation_id"),
             (self.pending_tool_call_id, "pending_tool_call_id"),
             (self.pending_tool_name, "pending_tool_name"),
+            (self.pending_confirmation_claim_id, "pending_confirmation_claim_id"),
         ):
             _require_text(value, name)
+        _require_digest(self.proposal_fingerprint, "proposal_fingerprint", allow_hmac=True)
+        _require_digest(
+            self.confirmation_token_fingerprint,
+            "confirmation_token_fingerprint",
+            allow_hmac=True,
+        )
         _require_token(
             self.omitted_token_proof_instance_token,
             OmittedTokenProofInstanceToken,
             "omitted_token_proof_instance_token",
         )
+        self._seal_replacement()
 
     @property
     def proof_instance_token(self) -> OmittedTokenProofInstanceToken:
         return self.omitted_token_proof_instance_token
 
 
-@dataclass(frozen=True, slots=True, repr=False)
-class ApplicationScopeConstraint(TransientToolRuntimeValue):
+@dataclass(frozen=True, slots=True, repr=False, eq=False)
+class ApplicationScopeConstraint(_ReplacementProtected, TransientToolRuntimeValue):
     entity_kind: Literal["application"]
     mode: Literal["unrestricted", "restricted"]
     allowed_identities: frozenset[int] = field(repr=False)
     authority_instance_token: AuthorityInstanceToken = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        if self.entity_kind != "application":
+        if type(self.entity_kind) is not str or self.entity_kind != "application":
             raise ValueError("application scope constraint has a fixed entity kind")
+        if type(self.mode) is not str:
+            raise TypeError("application scope constraint mode must be text")
         if self.mode == "unrestricted":
             if self.allowed_identities != frozenset():
                 raise ValueError("unrestricted constraint must have no identities")
@@ -648,24 +804,32 @@ class ApplicationScopeConstraint(TransientToolRuntimeValue):
         if type(self.allowed_identities) is not frozenset:
             raise TypeError("allowed_identities must be a frozenset")
         _require_token(self.authority_instance_token, AuthorityInstanceToken, "authority_instance_token")
+        self._seal_replacement()
 
 
-@dataclass(frozen=True, slots=True, repr=False)
-class BindingTargetResolution(TransientToolRuntimeValue):
-    entity_kind: str
+@dataclass(frozen=True, slots=True, repr=False, eq=False)
+class BindingTargetResolution(_ReplacementProtected, TransientToolRuntimeValue):
+    entity_kind: Literal["application", "resume"]
     state: Literal["resolved", "omitted", "detached", "unavailable"]
     identity: int | None
     authority_instance_token: AuthorityInstanceToken = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        _require_text(self.entity_kind, "entity_kind")
-        if self.state not in {"resolved", "omitted", "detached", "unavailable"}:
+        if type(self.entity_kind) is not str or self.entity_kind not in {"application", "resume"}:
+            raise ValueError("binding entity_kind is closed to application/resume")
+        if type(self.state) is not str or self.state not in {
+            "resolved",
+            "omitted",
+            "detached",
+            "unavailable",
+        }:
             raise ValueError("unknown binding target state")
         if self.state == "resolved":
             require_positive_int64(self.identity, "identity")
         elif self.identity is not None:
             raise ValueError("only resolved targets may carry an identity")
         _require_token(self.authority_instance_token, AuthorityInstanceToken, "authority_instance_token")
+        self._seal_replacement()
 
 
 __all__ = [
@@ -677,6 +841,8 @@ __all__ = [
     "AuthorityInstanceToken",
     "AuthorityPhaseError",
     "AuthorityUse",
+    "ApprovedWriteExecuteCallIdentity",
+    "ApprovedWritePrepareCallIdentity",
     "ApprovalExecutionAuthority",
     "ApplicationScopeConstraint",
     "BindingTargetResolution",
@@ -687,6 +853,7 @@ __all__ = [
     "PendingAuthorityClaim",
     "PendingInstanceToken",
     "PreparedInstanceToken",
+    "PreparedConstructionIdentity",
     "ProviderInvocationIdentity",
     "ProviderSurfaceBuildIdentity",
     "ReadExecutionCallIdentity",

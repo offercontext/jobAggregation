@@ -280,6 +280,9 @@ class AuthorityFactory:
         self._claims: dict[int, _Lifecycle] = {}
         self._claim_fields: dict[int, dict[str, object]] = {}
         self._claim_keys: dict[tuple[object, ...], int] = {}
+        self._finalized_pending_claim_keys: dict[
+            int, set[tuple[object, ...]]
+        ] = {}
         self._proofs: dict[int, _Lifecycle] = {}
         self._proof_fields: dict[int, dict[str, object]] = {}
         self._proof_keys: dict[tuple[int, int, int], int] = {}
@@ -409,6 +412,7 @@ class AuthorityFactory:
             self._claims.clear()
             self._claim_fields.clear()
             self._claim_keys.clear()
+            self._finalized_pending_claim_keys.clear()
             self._proofs.clear()
             self._proof_fields.clear()
             self._proof_keys.clear()
@@ -690,6 +694,7 @@ class AuthorityFactory:
                         self._objects.pop(id(pending_record.token), None)
             self._objects.pop(id(authority), None)
             self._objects.pop(id(record.token), None)
+            self._finalized_pending_claim_keys.pop(id(authority), None)
             self._prune_global_objects()
             del self._authorities[id(authority)]
             with _ACTIVE_AUTHORITIES_LOCK:
@@ -2653,9 +2658,19 @@ class AuthorityFactory:
             revision,
         )
 
-    def _drop_claim_key(self, claim_id: int) -> None:
+    def _drop_claim_key(
+        self,
+        claim_id: int,
+        *,
+        finalize_pending: bool = False,
+    ) -> None:
         for key, active_id in tuple(self._claim_keys.items()):
             if active_id == claim_id:
+                if finalize_pending and key[0] == "pending":
+                    authority_id = cast(int, key[1])
+                    self._finalized_pending_claim_keys.setdefault(
+                        authority_id, set()
+                    ).add(key)
                 del self._claim_keys[key]
 
     def _drop_proof_key(self, proof_id: int) -> None:
@@ -2733,8 +2748,11 @@ class AuthorityFactory:
                 arguments_digest,
                 pending_action_revision,
             )
-            if key in self._claim_keys:
-                raise AuthorityPhaseError("an equivalent Pending claim is already active")
+            finalized_keys = self._finalized_pending_claim_keys.get(id(authority), set())
+            if key in self._claim_keys or key in finalized_keys:
+                raise AuthorityPhaseError(
+                    "an equivalent Pending claim is already active or finalized"
+                )
             self._claim_pending_owner(pending_record, authority)
             claim_token = cast(
                 PendingClaimInstanceToken,
@@ -3320,7 +3338,10 @@ class AuthorityFactory:
                 raise AuthorityPhaseError("one-shot value must be in flight before consume")
             token: object | None = None
             if table is self._claims:
-                self._drop_claim_key(id(value))
+                self._drop_claim_key(
+                    id(value),
+                    finalize_pending=isinstance(value, PendingAuthorityClaim),
+                )
                 token = getattr(value, "pending_claim_instance_token", None)
                 if token is None:
                     token = getattr(value, "execution_claim_instance_token", None)
@@ -3350,7 +3371,10 @@ class AuthorityFactory:
                 raise AuthorityPhaseError("one-shot value is already finalized")
             token: object | None = None
             if table is self._claims:
-                self._drop_claim_key(id(value))
+                self._drop_claim_key(
+                    id(value),
+                    finalize_pending=isinstance(value, PendingAuthorityClaim),
+                )
                 token = getattr(value, "pending_claim_instance_token", None)
                 if token is None:
                     token = getattr(value, "execution_claim_instance_token", None)

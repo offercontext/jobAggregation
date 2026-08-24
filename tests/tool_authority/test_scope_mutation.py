@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,7 @@ from offerpilot.db import init_database
 from offerpilot.models import Application
 from offerpilot.repositories.chat import (
     ChatRepository,
+    ConversationScopeError,
     ConversationScopeMutationSnapshot,
 )
 
@@ -29,6 +31,51 @@ def test_generic_conversation_writes_reject_scope_keys(repo: ChatRepository) -> 
     conversation = repo.create_conversation("ok")
     with pytest.raises(ValueError, match="scope"):
         repo.update_conversation(conversation.id, {"context_type": "global"})
+    with pytest.raises(ValueError, match="scope"):
+        repo.update_conversation_for_archive(
+            conversation.id,
+            {"context_type": "application", "context_ref": "999999", "scope_revision": 1},
+        )
+    stored = repo.get_conversation(conversation.id)
+    assert stored is not None
+    assert (stored.context_type, stored.context_ref, stored.scope_revision) == (
+        "workspace",
+        "",
+        0,
+    )
+
+
+@pytest.mark.parametrize("context_type", ["workspace", "global", "mode"])
+def test_non_application_ref_is_validated_then_discarded(
+    repo: ChatRepository,
+    context_type: str,
+) -> None:
+    conversation = repo.create_conversation_with_scope(
+        "discard ref",
+        ConversationScopeMutationSnapshot(
+            context_type=context_type,
+            context_ref="legacy-ref",
+            mode="general",
+        ),
+    )
+    assert conversation.context_ref == ""
+
+
+@pytest.mark.parametrize(
+    "context_ref",
+    [1, True, "bad\x00ref", "x" * 257, "\ud800"],
+)
+def test_non_application_ref_rejects_invalid_shape_before_write(
+    repo: ChatRepository,
+    context_ref: object,
+) -> None:
+    with pytest.raises(ConversationScopeError, match="context_ref"):
+        ConversationScopeMutationSnapshot(
+            context_type="workspace",
+            context_ref=context_ref,
+            mode="general",
+        )
+    assert repo.list_conversations(include_archived=True) == []
 
 
 def test_create_scope_canonicalizes_application_int_and_starts_revision_zero(
@@ -111,7 +158,10 @@ def test_new_invisible_application_scope_has_no_conversation_or_runtime_side_eff
         },
     )
     assert response.status_code == 503
-    assert response.json()["error_code"] == "scope_unavailable"
+    assert response.json() == {
+        "error": "上下文暂时无法加载，请稍后重试。",
+        "error_code": "source_load_failed",
+    }
     assert ChatRepository(init_database(tmp_path / "data.db")).list_conversations(
         include_archived=True
     ) == []
@@ -181,6 +231,61 @@ def test_patch_context_ref_without_type_is_rejected_without_revision_change(tmp_
     assert stored is not None
     assert stored.title == "patch"
     assert stored.scope_revision == 0
+
+
+@pytest.mark.parametrize("deleted", [False, True])
+def test_patch_unavailable_application_uses_safe_not_found_and_rolls_back(
+    tmp_path: Path,
+    deleted: bool,
+) -> None:
+    repo = ChatRepository(init_database(tmp_path / "data.db"))
+    conversation = repo.create_conversation("before")
+    with repo._session_factory() as session:
+        application = Application(company_name="Hidden", position_name="Role")
+        if deleted:
+            application.deleted_at = datetime.now(timezone.utc)
+        session.add(application)
+        session.commit()
+        application_id = application.id
+    if not deleted:
+        application_id += 100_000
+    client = TestClient(create_app(data_dir=tmp_path))
+
+    response = client.patch(
+        f"/api/chat/conversations/{conversation.id}",
+        json={
+            "title": "must not commit",
+            "context_type": "application",
+            "context_ref": application_id,
+        },
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"error": "conversation not found"}
+    stored = repo.get_conversation(conversation.id)
+    assert stored is not None
+    assert (stored.title, stored.context_type, stored.context_ref, stored.scope_revision) == (
+        "before",
+        "workspace",
+        "",
+        0,
+    )
+
+
+def test_patch_title_retains_baseline_string_coercion(tmp_path: Path) -> None:
+    repo = ChatRepository(init_database(tmp_path / "data.db"))
+    conversation = repo.create_conversation("before")
+    client = TestClient(create_app(data_dir=tmp_path))
+
+    response = client.patch(
+        f"/api/chat/conversations/{conversation.id}",
+        json={"title": 123},
+    )
+
+    assert response.status_code == 200
+    stored = repo.get_conversation(conversation.id)
+    assert stored is not None
+    assert stored.title == "123"
 
 
 def test_pending_read_does_not_lazy_create_operation(tmp_path: Path) -> None:

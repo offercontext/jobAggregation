@@ -19,7 +19,7 @@ from offerpilot.ai.write_operations import (
     ledger_fingerprint,
 )
 from offerpilot.ai.types import Message
-from offerpilot.models import Application, ChatMessage, Conversation, WriteOperation
+from offerpilot.models import ChatMessage, Conversation, WriteOperation
 
 
 _CONFIRMATION_CLAIM_LEASE = timedelta(minutes=15)
@@ -272,6 +272,8 @@ class ChatRepository:
     def update_conversation_for_archive(
         self, conversation_id: int, values: dict[str, Any]
     ) -> ConversationArchiveUpdate:
+        if _SCOPE_KEYS.intersection(values):
+            raise ValueError("scope fields require patch_conversation_with_scope")
         now = datetime.now(timezone.utc)
         with self._session_factory() as session:
             result = session.execute(
@@ -1031,7 +1033,17 @@ def _canonical_context_ref(context_type: str, value: object) -> str:
     if context_type != "application":
         if value is None or value == "":
             return ""
-        raise ConversationScopeError("context_ref must be empty for this context_type")
+        if type(value) is not str:
+            raise ConversationScopeError("context_ref must be a string")
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ConversationScopeError("context_ref must not contain surrogate characters") from exc
+        if len(encoded) > 256:
+            raise ConversationScopeError("context_ref must be at most 256 bytes")
+        if any(ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F for char in value):
+            raise ConversationScopeError("context_ref must not contain control characters")
+        return ""
     if value is None or value == "":
         raise ConversationScopeError("application context_ref is required")
     if type(value) is int:
@@ -1074,11 +1086,19 @@ def _require_active_application(
     if mutation.context_type != "application":
         return
     application_id = int(cast(str, mutation.context_ref))
-    statement = select(Application.id).where(
-        Application.id == application_id,
-        Application.deleted_at.is_(None),
+    from offerpilot.ai.tool_authority.visibility import (
+        AuthorityApplicationVisibilityError,
+        AuthorityApplicationVisibilityQuery,
     )
-    if session.scalar(statement) is None:
+
+    try:
+        visible = AuthorityApplicationVisibilityQuery().execute_on_session(
+            session,
+            application_id,
+        )
+    except AuthorityApplicationVisibilityError as exc:
+        raise ConversationScopeUnavailable("application context is unavailable") from exc
+    if visible is None:
         raise ConversationScopeUnavailable("application context is unavailable")
 
 

@@ -14,7 +14,7 @@ from zipfile import ZipFile
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, select, text, update
 from sqlalchemy.exc import OperationalError
 
 import offerpilot.agent_runtime.journal as journal_module
@@ -1338,7 +1338,7 @@ def test_arbitrary_context_strings_never_enter_journal_storage(tmp_path):
         },
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 422
     runs, events, snapshots = _journal_rows(tmp_path)
     journal_text = "\n".join(
         [
@@ -3034,7 +3034,7 @@ def test_journal_complete_secret_canary_scan(tmp_path):
         json={
             "message": "prepare private write",
             "conversation_id": 0,
-            "context_type": "custom-private-type",
+            "context_type": "workspace",
             "context_ref": "arbitrary-context-ref-canary-71f29",
         },
     )
@@ -8748,15 +8748,127 @@ def test_chat_fails_closed_before_model_for_invalid_application_scope(
 ):
     model = CapturingScriptedModel([Assistant(content="不应调用模型")])
     client = TestClient(create_app(data_dir=tmp_path, chat_model=model))
-    conversation = ChatRepository(session_factory_for_data_dir(tmp_path)).create_conversation(
-        "失效投递上下文",
-        context_type="application",
-        context_ref=context_ref,
-    )
+    repository = ChatRepository(session_factory_for_data_dir(tmp_path))
+    conversation = repository.create_conversation("失效投递上下文")
+    with repository._session_factory() as session:
+        session.execute(
+            text(
+                "UPDATE conversations SET context_type = 'application', "
+                "context_ref = :context_ref, scope_revision = scope_revision + 1 "
+                "WHERE id = :conversation_id"
+            ),
+            {"context_ref": context_ref, "conversation_id": conversation.id},
+        )
+        session.commit()
 
     response = client.post(
         "/api/chat",
         json={"message": "总结当前投递", "conversation_id": conversation.id},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error_code"] == "source_load_failed"
+    assert model.calls == []
+
+
+def test_chat_fails_closed_when_persisted_application_scope_is_soft_deleted(tmp_path):
+    bootstrap = TestClient(create_app(data_dir=tmp_path))
+    application = bootstrap.post(
+        "/api/applications",
+        json={"company_name": "Scope Canary", "position_name": "Role"},
+    ).json()
+    model = CapturingScriptedModel([Assistant(content="first"), Assistant(content="must not run")])
+    client = TestClient(create_app(data_dir=tmp_path, chat_model=model))
+    first = client.post(
+        "/api/chat",
+        json={
+            "message": "start",
+            "conversation_id": 0,
+            "context_type": "application",
+            "context_ref": application["id"],
+        },
+    )
+    assert first.status_code == 200
+
+    applications = ApplicationsRepository(session_factory_for_data_dir(tmp_path))
+    applications.delete(application["id"])
+    assert applications.get(application["id"]) is None
+    response = client.post(
+        "/api/chat",
+        json={"message": "continue", "conversation_id": first.json()["conversation_id"]},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error_code"] == "source_load_failed"
+    assert len(model.calls) == 1
+
+
+def test_chat_application_attachment_hides_soft_deleted_record_body(tmp_path):
+    bootstrap = TestClient(create_app(data_dir=tmp_path))
+    application = bootstrap.post(
+        "/api/applications",
+        json={
+            "company_name": "deleted-attachment-body-canary",
+            "position_name": "Role",
+            "notes": "deleted-attachment-notes-canary",
+        },
+    ).json()
+    applications = ApplicationsRepository(session_factory_for_data_dir(tmp_path))
+    applications.delete(application["id"])
+    assert applications.get(application["id"]) is None
+    model = CapturingScriptedModel([Assistant(content="done")])
+    client = TestClient(create_app(data_dir=tmp_path, chat_model=model))
+
+    response = client.post(
+        "/api/chat",
+        json={
+            "message": "read attachment",
+            "conversation_id": 0,
+            "attachments": [{"kind": "application", "id": str(application["id"])}],
+        },
+    )
+
+    assert response.status_code == 200
+    surface = "\n".join(message.content for message in model.calls[0])
+    assert "not found or is no longer available" in surface
+    assert "deleted-attachment-body-canary" not in surface
+    assert "deleted-attachment-notes-canary" not in surface
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("context_type", "custom-private-type"),
+        ("mode", " bad-mode"),
+    ],
+)
+def test_chat_fails_closed_for_invalid_persisted_scope_or_mode(tmp_path, column, value):
+    repository = ChatRepository(session_factory_for_data_dir(tmp_path))
+    conversation = repository.create_conversation("legacy invalid scope")
+    with repository._session_factory() as session:
+        if column == "mode":
+            session.execute(text("DROP TRIGGER trg_conversations_mode_update"))
+        statement = {
+            "context_type": (
+                "UPDATE conversations SET context_type = :value, "
+                "scope_revision = scope_revision + 1 WHERE id = :conversation_id"
+            ),
+            "mode": (
+                "UPDATE conversations SET mode = :value, "
+                "scope_revision = scope_revision + 1 WHERE id = :conversation_id"
+            ),
+        }[column]
+        session.execute(
+            text(statement),
+            {"value": value, "conversation_id": conversation.id},
+        )
+        session.commit()
+    model = CapturingScriptedModel([Assistant(content="must not run")])
+    client = TestClient(create_app(data_dir=tmp_path, chat_model=model))
+
+    response = client.post(
+        "/api/chat",
+        json={"message": "continue", "conversation_id": conversation.id},
     )
 
     assert response.status_code == 503

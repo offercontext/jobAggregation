@@ -4459,7 +4459,7 @@ def create_app(
         typed_request = _normalize_runtime_start_request(payload)
         if isinstance(typed_request, JSONResponse):
             return typed_request
-        scope_error = _preflight_new_conversation_scope(typed_request, applications)
+        scope_error = _preflight_new_conversation_scope(typed_request, session_factory)
         if scope_error is not None:
             return scope_error
         runtime = http_request.app.state.pilot_runtime
@@ -4487,7 +4487,7 @@ def create_app(
                 set_title_conversation_id(getattr(outcome, "conversation_id", None))
             return _runtime_http_response(outcome)
         except ConversationScopeUnavailable:
-            return error_response(503, "conversation scope is unavailable", code="scope_unavailable")
+            return _source_load_failed_response()
         except (ConversationScopeError, TypeError, ValueError) as exc:
             return error_response(422, str(exc))
         except RuntimeAgentTimedOut:
@@ -4507,7 +4507,7 @@ def create_app(
         typed_request = _normalize_runtime_start_request(payload)
         if isinstance(typed_request, JSONResponse):
             return typed_request
-        scope_error = _preflight_new_conversation_scope(typed_request, applications)
+        scope_error = _preflight_new_conversation_scope(typed_request, session_factory)
         if scope_error is not None:
             return scope_error
         runtime = http_request.app.state.pilot_runtime
@@ -4537,7 +4537,7 @@ def create_app(
         except ConversationScopeUnavailable:
             if title_latch is not None:
                 title_latch.finalize()
-            return error_response(503, "conversation scope is unavailable", code="scope_unavailable")
+            return _source_load_failed_response()
         except (ConversationScopeError, TypeError, ValueError) as exc:
             if title_latch is not None:
                 title_latch.finalize()
@@ -4692,10 +4692,7 @@ def create_app(
         values: dict[str, Any] = {}
         now = datetime.now(timezone.utc)
         if "title" in payload:
-            raw_title = payload.get("title")
-            if not isinstance(raw_title, str):
-                return error_response(422, "title must be a string")
-            title = raw_title.strip()
+            title = str(payload.get("title") or "").strip()
             if not title:
                 return error_response(400, "title is required")
             values["title"] = title[:80]
@@ -4743,7 +4740,7 @@ def create_app(
                 expected_scope_revision=existing.scope_revision,
             )
         except ConversationScopeUnavailable:
-            return error_response(503, "conversation scope is unavailable", code="scope_unavailable")
+            return error_response(404, "conversation not found")
         except (ConversationScopeError, TypeError, ValueError) as exc:
             return error_response(422, str(exc))
         if conversation is None:
@@ -7476,7 +7473,7 @@ def _confirmation_conversation_id(payload: dict[str, Any]) -> int | JSONResponse
 
 def _preflight_new_conversation_scope(
     request: StartTurnRequest,
-    applications: ApplicationsRepository,
+    sessions: Callable[[], Session],
 ) -> JSONResponse | None:
     """Reject an unavailable new Application scope before runtime side effects.
 
@@ -7494,9 +7491,33 @@ def _preflight_new_conversation_scope(
         application_id = int(request.context_ref)
     except (TypeError, ValueError):
         return error_response(422, "application context_ref is invalid")
-    if applications.get(application_id) is None:
-        return error_response(503, "conversation scope is unavailable", code="scope_unavailable")
+    from offerpilot.ai.tool_authority.visibility import (
+        AuthorityApplicationVisibilityError,
+        AuthorityApplicationVisibilityQuery,
+    )
+
+    try:
+        with sessions() as session:
+            visible = AuthorityApplicationVisibilityQuery().execute_on_session(
+                session,
+                application_id,
+            )
+    except AuthorityApplicationVisibilityError:
+        return _source_load_failed_response()
+    if visible is None:
+        return _source_load_failed_response()
     return None
+
+
+def _source_load_failed_response() -> JSONResponse:
+    return _runtime_http_response(
+        RuntimeFailureOutcome(
+            RuntimeFailureCode.SOURCE_LOAD_FAILED,
+            "上下文暂时无法加载，请稍后重试。",
+            503,
+            retryable=True,
+        )
+    )
 
 
 def _normalize_runtime_start_request(
@@ -8087,6 +8108,58 @@ class _FrozenChatSourceMessages:
     attachment_messages: tuple[Message, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _CanonicalSourceScope:
+    conversation_id: int
+    context_type: str
+    persisted_context_ref: str | None
+    mode: str
+    scope_revision: int
+    application_id: int | None
+
+
+def _canonical_source_scope(conversation: Any) -> _CanonicalSourceScope:
+    conversation_id = getattr(conversation, "id", None)
+    context_type = getattr(conversation, "context_type", None)
+    context_ref = getattr(conversation, "context_ref", None)
+    mode = getattr(conversation, "mode", None)
+    scope_revision = getattr(conversation, "scope_revision", None)
+    if type(conversation_id) is not int or conversation_id <= 0:
+        raise ProjectionError("source_load_failed")
+    if type(context_type) is not str or context_type not in {
+        "workspace",
+        "global",
+        "application",
+        "mode",
+    }:
+        raise ProjectionError("source_load_failed")
+    if type(mode) is not str or not mode:
+        raise ProjectionError("source_load_failed")
+    if type(scope_revision) is not int or not 0 <= scope_revision <= 9_223_372_036_854_775_807:
+        raise ProjectionError("source_load_failed")
+    if context_ref is not None and type(context_ref) is not str:
+        raise ProjectionError("source_load_failed")
+    try:
+        canonical = ConversationScopeMutationSnapshot(
+            context_type=context_type,
+            context_ref=context_ref,
+            mode=mode,
+        )
+    except (ConversationScopeError, TypeError, ValueError) as exc:
+        raise ProjectionError("source_load_failed") from exc
+    application_id = (
+        int(cast(str, canonical.context_ref)) if context_type == "application" else None
+    )
+    return _CanonicalSourceScope(
+        conversation_id,
+        context_type,
+        context_ref,
+        mode,
+        scope_revision,
+        application_id,
+    )
+
+
 def _load_chat_source_messages(
     loader: ContextSourceLoader[Any, Any],
     conversation: Any,
@@ -8094,14 +8167,10 @@ def _load_chat_source_messages(
     *,
     pending_tool_call_id: str = "",
 ) -> _FrozenChatSourceMessages:
-    application_id = None
-    if conversation.context_type == "application":
-        raw_context_ref = str(conversation.context_ref or "")
-        if not raw_context_ref.isdecimal():
-            raise ProjectionError("source_load_failed")
-        application_id = int(raw_context_ref)
-        if application_id <= 0:
-            raise ProjectionError("source_load_failed")
+    scope = _canonical_source_scope(conversation)
+    from offerpilot.ai.tool_authority.visibility import AuthorityApplicationVisibilityQuery
+
+    visibility = AuthorityApplicationVisibilityQuery()
 
     def one(connection: sqlite3.Connection, query: str, params: tuple[Any, ...]) -> Any:
         rows = fetch_rows(connection.execute(query, params), max_rows=2)
@@ -8112,27 +8181,34 @@ def _load_chat_source_messages(
     def read(connection: sqlite3.Connection) -> tuple[Any, Any, Any]:
         conversation_row = one(
             connection,
-            "SELECT context_type, context_ref, mode FROM conversations WHERE id = ?",
-            (int(conversation.id),),
+            "SELECT context_type, context_ref, mode, scope_revision "
+            "FROM conversations WHERE id = ?",
+            (scope.conversation_id,),
         )
-        if conversation_row is None or tuple(str(item or "") for item in conversation_row) != (
-            str(conversation.context_type or ""),
-            str(conversation.context_ref or ""),
-            str(conversation.mode or ""),
+        if conversation_row is None or tuple(conversation_row) != (
+            scope.context_type,
+            scope.persisted_context_ref,
+            scope.mode,
+            scope.scope_revision,
         ):
             raise RuntimeError("conversation scope changed during source load")
+        if scope.application_id is not None and visibility.execute_on_source_connection(
+            connection,
+            scope.application_id,
+        ) is None:
+            raise RuntimeError("application context is unavailable")
         history_rows = fetch_rows(
             connection.execute(
                 """
                 SELECT id, role, content, tool_calls, tool_call_id, provider_blocks
                 FROM chat_messages WHERE conversation_id = ? ORDER BY id ASC
                 """,
-                (int(conversation.id),),
+                (scope.conversation_id,),
             ),
             max_rows=4096,
         )
         context_row = None
-        if application_id is not None:
+        if scope.application_id is not None:
             context_row = one(
                 connection,
                 """
@@ -8150,9 +8226,9 @@ def _load_chat_source_messages(
                     WHERE d2.application_id = a.id AND d2.jd_version_id = j.id
                     ORDER BY d2.id ASC LIMIT 1
                 )
-                WHERE a.id = ?
+                WHERE a.id = ? AND a.deleted_at IS NULL
                 """,
-                (application_id,),
+                (scope.application_id,),
             )
             if context_row is None:
                 raise RuntimeError("application context does not exist")
@@ -8164,16 +8240,18 @@ def _load_chat_source_messages(
                 row = one(
                     connection,
                     """SELECT id, company_name, position_name, status, source, notes, updated_at
-                       FROM applications WHERE id = ?""",
+                       FROM applications WHERE id = ? AND deleted_at IS NULL""",
                     (record_id,),
                 )
             elif kind == "offer":
                 row = one(
                     connection,
-                    """SELECT id, application_id, company_name, position_name, status,
-                              base_monthly, months_per_year, signing_bonus, equity, perks,
-                              deadline, notes, assessment, updated_at
-                       FROM offers WHERE id = ?""",
+                    """SELECT o.id, o.application_id, o.company_name, o.position_name, o.status,
+                              o.base_monthly, o.months_per_year, o.signing_bonus, o.equity, o.perks,
+                              o.deadline, o.notes, o.assessment, o.updated_at
+                       FROM offers o
+                       JOIN applications a ON a.id = o.application_id
+                       WHERE o.id = ? AND a.deleted_at IS NULL""",
                     (record_id,),
                 )
             else:

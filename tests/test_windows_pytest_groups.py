@@ -74,6 +74,7 @@ def _aggregate(result_dir: Path) -> subprocess.CompletedProcess[str]:
         cwd=ROOT,
         capture_output=True,
         text=True,
+        encoding="utf-8",
     )
 
 
@@ -119,21 +120,27 @@ def test_pytest_group_aggregate_accepts_windows_backslash_manifest_node_ids(tmp_
     assert "coverage matches 5 tests" in result.stdout
 
 
-def test_pytest_group_aggregate_treats_parameter_node_ids_as_case_sensitive(
+@pytest.mark.parametrize(
+    ("first_suffix", "second_suffix"),
+    (("1e-7", "1E-7"), ("é", "e\N{COMBINING ACUTE ACCENT}")),
+)
+def test_pytest_group_aggregate_treats_parameter_node_ids_as_ordinal(
     tmp_path: Path,
+    first_suffix: str,
+    second_suffix: str,
 ) -> None:
     _write_group_results(tmp_path)
-    lower = "tests/test_misc.py::test_misc[1e-7]"
-    upper = "tests/test_misc.py::test_misc[1E-7]"
+    first = f"tests/test_misc.py::test_misc[{first_suffix}]"
+    second = f"tests/test_misc.py::test_misc[{second_suffix}]"
     collect_path = tmp_path / "misc.collect.txt"
     junit_path = tmp_path / "misc.junit.xml"
-    collect_path.write_text(f"{lower}\n{upper}\n", encoding="utf-8")
+    collect_path.write_text(f"{first}\n{second}\n", encoding="utf-8")
     junit_path.write_text(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
         "<testsuites><testsuite name=\"misc\" tests=\"2\" failures=\"0\" "
         "errors=\"0\" skipped=\"0\">"
-        "<testcase classname=\"tests.test_misc\" name=\"test_misc[1e-7]\"/>"
-        "<testcase classname=\"tests.test_misc\" name=\"test_misc[1E-7]\"/>"
+        f"<testcase classname=\"tests.test_misc\" name=\"test_misc[{first_suffix}]\"/>"
+        f"<testcase classname=\"tests.test_misc\" name=\"test_misc[{second_suffix}]\"/>"
         "</testsuite></testsuites>",
         encoding="utf-8",
     )
@@ -150,7 +157,7 @@ def test_pytest_group_aggregate_treats_parameter_node_ids_as_case_sensitive(
     marker_path.write_text(json.dumps(marker), encoding="utf-8")
     manifest_path = tmp_path / "full-manifest.txt"
     manifest = manifest_path.read_text(encoding="utf-8").replace(
-        "tests/test_misc.py::test_misc", f"{lower}\n{upper}"
+        "tests/test_misc.py::test_misc", f"{first}\n{second}"
     )
     manifest_path.write_text(manifest, encoding="utf-8")
 
@@ -158,3 +165,64 @@ def test_pytest_group_aggregate_treats_parameter_node_ids_as_case_sensitive(
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "coverage matches 6 tests" in result.stdout
+
+
+def test_pytest_group_aggregate_rejects_case_mismatched_allowlisted_skip(
+    tmp_path: Path,
+) -> None:
+    _write_group_results(tmp_path)
+    original = "tests/test_knowledge.py::test_knowledge"
+    mismatched = (
+        "tests/test_knowledge_ingest_integrity.py::"
+        "TEST_failed_commit_cleanup_does_not_follow_symlink"
+    )
+    collect_path = tmp_path / "knowledge.collect.txt"
+    junit_path = tmp_path / "knowledge.junit.xml"
+    collect_path.write_text(mismatched + "\n", encoding="utf-8")
+    junit_path.write_text(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+        "<testsuites><testsuite name=\"knowledge\" tests=\"1\" failures=\"0\" "
+        "errors=\"0\" skipped=\"1\">"
+        "<testcase classname=\"tests.test_knowledge_ingest_integrity\" "
+        "name=\"TEST_failed_commit_cleanup_does_not_follow_symlink\">"
+        "<skipped message=\"当前环境没有创建符号链接的权限\"/>"
+        "</testcase></testsuite></testsuites>",
+        encoding="utf-8",
+    )
+    marker_path = tmp_path / "knowledge.complete.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker.update(
+        {
+            "skipped": 1,
+            "collect_sha256": hashlib.sha256(collect_path.read_bytes()).hexdigest(),
+            "junit_sha256": hashlib.sha256(junit_path.read_bytes()).hexdigest(),
+        }
+    )
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    manifest_path = tmp_path / "full-manifest.txt"
+    manifest_path.write_text(
+        manifest_path.read_text(encoding="utf-8").replace(original, mismatched),
+        encoding="utf-8",
+    )
+
+    result = _aggregate(tmp_path)
+
+    assert result.returncode != 0
+    assert "unexpected skip" in (result.stdout + result.stderr).lower()
+
+
+def test_pytest_group_aggregate_rejects_case_only_union_mismatch(tmp_path: Path) -> None:
+    _write_group_results(tmp_path)
+    manifest_path = tmp_path / "full-manifest.txt"
+    manifest_path.write_text(
+        manifest_path.read_text(encoding="utf-8").replace(
+            "tests/test_misc.py::test_misc",
+            "tests/test_misc.py::TEST_misc",
+        ),
+        encoding="utf-8",
+    )
+
+    result = _aggregate(tmp_path)
+
+    assert result.returncode != 0
+    assert "coverage differs" in (result.stdout + result.stderr).lower()

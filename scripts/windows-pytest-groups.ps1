@@ -19,6 +19,21 @@ function Get-NodeIds([object[]]$Output) {
     } | Where-Object { $_ })
 }
 
+function Get-OrdinalDuplicates([string[]]$Values) {
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $duplicates = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($value in $Values) {
+        if (-not $seen.Add($value)) { [void]$duplicates.Add($value) }
+    }
+    @($duplicates)
+}
+
+function Test-OrdinalSetEqual([string[]]$Left, [string[]]$Right) {
+    $values = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($value in $Left) { [void]$values.Add($value) }
+    $values.SetEquals($Right)
+}
+
 function Get-TestFiles {
     @(
         Get-ChildItem -Path (Join-Path $repoRoot 'tests') -Recurse -File -Filter 'test_*.py' |
@@ -47,12 +62,26 @@ function Get-AllowedSkips {
     $reason = [Text.Encoding]::UTF8.GetString(
         [Convert]::FromBase64String('5b2T5YmN546v5aKD5rKh5pyJ5Yib5bu656ym5Y+36ZO+5o6l55qE5p2D6ZmQ')
     )
-    @{
-        'tests\test_knowledge_ingest_integrity.py::test_failed_commit_cleanup_does_not_follow_symlink' = $reason
-        'tests\test_knowledge_reset.py::test_cli_rejects_knowledge_root_symlink_with_external_sentinels' = $reason
-        'tests\test_knowledge_reset.py::test_cli_rejects_legacy_reset_root_symlink_with_external_sentinels' = $reason
-        'tests\test_knowledge_reset.py::test_cli_does_not_follow_nested_escape_symlink' = $reason
-    }
+    $allowed = [System.Collections.Generic.Dictionary[string,string]]::new(
+        [StringComparer]::Ordinal
+    )
+    $allowed.Add(
+        'tests\test_knowledge_ingest_integrity.py::test_failed_commit_cleanup_does_not_follow_symlink',
+        $reason
+    )
+    $allowed.Add(
+        'tests\test_knowledge_reset.py::test_cli_rejects_knowledge_root_symlink_with_external_sentinels',
+        $reason
+    )
+    $allowed.Add(
+        'tests\test_knowledge_reset.py::test_cli_rejects_legacy_reset_root_symlink_with_external_sentinels',
+        $reason
+    )
+    $allowed.Add(
+        'tests\test_knowledge_reset.py::test_cli_does_not_follow_nested_escape_symlink',
+        $reason
+    )
+    return ,$allowed
 }
 
 function Get-SkipsFromJunit([string]$Path) {
@@ -66,6 +95,22 @@ function Get-SkipsFromJunit([string]$Path) {
         [pscustomobject]@{
             NodeId = "tests\$relative.py::$([string]$testcase.name)"
             Reason = [string]$testcase.skipped.message
+        }
+    }
+}
+
+function Assert-AllowedSkips([string]$Path, [string]$Name) {
+    $allowed = Get-AllowedSkips
+    foreach ($skip in @(Get-SkipsFromJunit $Path)) {
+        if (
+            -not $allowed.ContainsKey($skip.NodeId) -or
+            -not [string]::Equals(
+                $allowed[$skip.NodeId],
+                $skip.Reason,
+                [StringComparison]::Ordinal
+            )
+        ) {
+            throw "$Name has an unexpected skip: $($skip.NodeId) [$($skip.Reason)]"
         }
     }
 }
@@ -106,19 +151,14 @@ function Invoke-Group([string]$Name, [string[]]$Files) {
     $collectExit = $LASTEXITCODE
     if ($collectExit -ne 0) { throw "$Name collection failed with exit code $collectExit" }
     $nodes = @(Get-NodeIds $collectOutput)
-    $duplicates = @($nodes | Group-Object -CaseSensitive | Where-Object Count -gt 1)
-    if ($duplicates.Count -gt 0) { throw "$Name collection contains duplicate node ids: $($duplicates.Name -join ', ')" }
+    $duplicates = @(Get-OrdinalDuplicates $nodes)
+    if ($duplicates.Count -gt 0) { throw "$Name collection contains duplicate node ids: $($duplicates -join ', ')" }
     if ($nodes.Count -eq 0) { throw "$Name collection returned no tests" }
 
     $null = & uv run pytest -q -rs --disable-warnings "--junitxml=$junitPath" @Files 2>&1 | Tee-Object -FilePath $runPath
     $runExit = $LASTEXITCODE
     if (-not (Test-Path -LiteralPath $junitPath)) { throw "$Name did not produce JUnit" }
-    $allowed = Get-AllowedSkips
-    foreach ($skip in @(Get-SkipsFromJunit $junitPath)) {
-        if (-not $allowed.ContainsKey($skip.NodeId) -or $allowed[$skip.NodeId] -ne $skip.Reason) {
-            throw "$Name has an unexpected skip: $($skip.NodeId) [$($skip.Reason)]"
-        }
-    }
+    Assert-AllowedSkips $junitPath $Name
     $summary = Get-JunitSummary $junitPath
     if ($runExit -ne 0) { throw "$Name pytest failed with exit code $runExit" }
     $marker = [ordered]@{
@@ -142,9 +182,7 @@ function Invoke-Aggregate {
     $manifestPath = Join-Path $ResultDir 'full-manifest.txt'
     if (-not (Test-Path -LiteralPath $manifestPath)) { throw 'full-manifest.txt is missing' }
     $manifest = @(Get-NodeIds (Get-Content -LiteralPath $manifestPath -Encoding utf8))
-    $manifestDuplicates = @(
-        $manifest | Group-Object -CaseSensitive | Where-Object Count -gt 1
-    )
+    $manifestDuplicates = @(Get-OrdinalDuplicates $manifest)
     if ($manifestDuplicates.Count -gt 0) { throw 'full manifest contains duplicate node ids' }
     $all = [System.Collections.Generic.List[string]]::new()
     foreach ($name in @('agent', 'domain', 'knowledge', 'proposals', 'misc')) {
@@ -165,23 +203,20 @@ function Invoke-Aggregate {
             throw "$name completion marker does not match persisted results"
         }
         $nodes = @(Get-NodeIds (Get-Content -LiteralPath $collectPath -Encoding utf8))
-        $duplicates = @(
-            $nodes | Group-Object -CaseSensitive | Where-Object Count -gt 1
-        )
+        $duplicates = @(Get-OrdinalDuplicates $nodes)
         if ($duplicates.Count -gt 0) { throw "$name aggregate input contains duplicate node ids" }
         if ([int]$marker.collected_count -ne $nodes.Count) { throw "$name collected count mismatches marker" }
         $summary = Get-JunitSummary $junitPath
+        Assert-AllowedSkips $junitPath $name
         if ([int]$marker.test_count -ne $summary.tests) { throw "$name test count mismatches marker" }
         if ([int]$marker.failures -ne $summary.failures) { throw "$name failure count mismatches marker" }
         if ([int]$marker.errors -ne $summary.errors) { throw "$name error count mismatches marker" }
         if ([int]$marker.skipped -ne $summary.skipped) { throw "$name skip count mismatches marker" }
         foreach ($node in $nodes) { $all.Add($node) }
     }
-    $duplicates = @($all | Group-Object -CaseSensitive | Where-Object Count -gt 1)
-    if ($duplicates.Count -gt 0) { throw "pytest group coverage contains duplicate node ids: $($duplicates.Name -join ', ')" }
-    $sortedManifest = @($manifest | Sort-Object -CaseSensitive) -join "`n"
-    $sortedGroups = @($all | Sort-Object -CaseSensitive) -join "`n"
-    if (-not [string]::Equals($sortedManifest, $sortedGroups, [StringComparison]::Ordinal)) {
+    $duplicates = @(Get-OrdinalDuplicates @($all))
+    if ($duplicates.Count -gt 0) { throw "pytest group coverage contains duplicate node ids: $($duplicates -join ', ')" }
+    if (-not (Test-OrdinalSetEqual $manifest @($all))) {
         throw 'pytest group coverage differs from full manifest'
     }
     Write-Host "All pytest groups passed; coverage matches $($manifest.Count) tests."

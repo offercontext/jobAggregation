@@ -30,7 +30,6 @@ from uuid import UUID
 from offerpilot.ai.agent_contracts import PendingAction, _ASDICT_GUARD
 from offerpilot.ai.confirmation import prepare_pending_action
 from offerpilot.ai.tool_runtime.contracts import (
-    ExecutionAuthorization,
     JSONValue,
     PreparedToolCall,
     ToolExecutionRecord,
@@ -66,14 +65,14 @@ from .persistence import PersistenceResult, PersistenceStatus
 
 ConfirmationAttempt = Callable[
     [PendingAction, PreparedToolCall[Any, Any] | None],
-    ExecutionAuthorization | ToolFailure | None,
+    ToolFailure | None,
 ]
 ConfirmationResult = Callable[
     [PendingAction, bool, Message, ToolExecutionRecord[Any, Any] | None],
     object,
 ]
 LedgerExecutor = Callable[
-    [PreparedToolCall[Any, Any], object, ExecutionAuthorization],
+    [PreparedToolCall[Any, Any], object, object],
     ToolExecutionRecord[Any, Any],
 ]
 ContinuationLoader = Callable[[], Sequence[Message]]
@@ -477,9 +476,9 @@ class ConfirmationApprovedWritePort(TransientToolRuntimeValue):
         self,
         pending: PendingAction,
         prepared: PreparedToolCall[Any, Any],
-    ) -> ExecutionAuthorization | ToolFailure:
+    ) -> ToolFailure | None:
         claimed = self.session.on_confirmation_attempt(pending, prepared)
-        if not isinstance(claimed, (ExecutionAuthorization, ToolFailure)):
+        if claimed is not None and not isinstance(claimed, ToolFailure):
             raise WriteOperationError("confirmation_claim_lost")
         return claimed
 
@@ -998,7 +997,7 @@ class ConfirmationCoordinator:
         def attempt(
             action: PendingAction,
             prepared: PreparedToolCall[Any, Any] | None,
-        ) -> ExecutionAuthorization | ToolFailure | None:
+        ) -> ToolFailure | None:
             with state.lock:
                 if not state.active or state.cancelled or state.timed_out:
                     return ToolFailure("stale_state", "confirmation_claim_lost")
@@ -1044,14 +1043,7 @@ class ConfirmationCoordinator:
                         return None
                     self._set_ownership(state, execution)
                     return None
-                return ExecutionAuthorization(
-                    pending_identity=cast(str, _attribute(prepared, "pending_identity")),
-                    pending_action_revision=cast(int, _attribute(prepared, "pending_action_revision")),
-                    tool_call_id=str(_attribute(prepared, "tool_call_id", action.tool_call_id) or action.tool_call_id),
-                    tool_name=str(_attribute(_attribute(prepared, "spec"), "name", action.tool_name) or action.tool_name),
-                    arguments_digest=str(_attribute(prepared, "arguments_digest", "") or ""),
-                    operation_id=state.identity.operation_id,
-                )
+                return None
 
         def result(
             action: PendingAction,
@@ -1096,9 +1088,9 @@ class ConfirmationCoordinator:
         def execute(
             prepared: PreparedToolCall[Any, Any],
             tool_context: object,
-            authorization: ExecutionAuthorization,
+            prepare_identity: object,
         ) -> ToolExecutionRecord[Any, Any]:
-            return self.execute_operation(state, prepared, tool_context, authorization)
+            return self.execute_operation(state, prepared, tool_context, prepare_identity)
 
         source = source_loader or self._source_loader(
             conversation, request.conversation_id, request
@@ -1260,7 +1252,7 @@ class ConfirmationCoordinator:
         state: ConfirmationState,
         prepared: PreparedToolCall[Any, Any],
         tool_context: object,
-        authorization: ExecutionAuthorization,
+        prepare_identity: object,
     ) -> ToolExecutionRecord[Any, Any]:
         with state.lock:
             if state.cancelled or state.timed_out or not state.active:
@@ -1321,7 +1313,7 @@ class ConfirmationCoordinator:
             "conversation_id": state.identity.conversation_id,
             "prepared": prepared,
             "context": tool_context,
-            "authorization": authorization,
+            "prepare_identity": prepare_identity,
             "request_fingerprint": state.identity.request_fingerprint,
             "undo_seed_builder": undo_seed_builder,
         }

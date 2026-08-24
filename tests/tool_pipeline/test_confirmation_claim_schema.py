@@ -10,6 +10,9 @@ def test_confirmation_claim_column_and_migration_are_durable(tmp_path) -> None:
     engine = session_factory.kw["bind"]
 
     columns = {column["name"] for column in inspect(engine).get_columns("conversations")}
+    operation_columns = {
+        column["name"] for column in inspect(engine).get_columns("write_operations")
+    }
     with engine.connect() as connection:
         migration_count = connection.execute(
             text(
@@ -20,6 +23,7 @@ def test_confirmation_claim_column_and_migration_are_durable(tmp_path) -> None:
 
     assert {"pending_confirmation_claim_id", "pending_confirmation_claimed_at"} <= columns
     assert migration_count == 1
+    assert not {"execution_claim", "execution_claim_token"} & operation_columns
 
 
 def test_confirmation_claim_migration_upgrades_0024_database_idempotently(tmp_path) -> None:

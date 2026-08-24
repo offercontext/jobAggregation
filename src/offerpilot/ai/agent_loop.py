@@ -26,6 +26,7 @@ from offerpilot.ai.agent_contracts import (
     JsonValue,
     StalePendingActionError,
 )
+from offerpilot.ai.tool_authority import ApprovalExecutionAuthority
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import (
@@ -741,11 +742,19 @@ class AgentLoopRunner:
         spec = invocation.catalog.resolve(pending.tool_name)
         if spec is None or spec.kind != "write":
             raise PendingActionValidationError("approved pending tool is not a write tool")
+        prepare_identity = (
+            invocation.tool_context.authority_factory.create_approved_write_prepare_identity(
+                cast(ApprovalExecutionAuthority, invocation.tool_context.authority),
+                approval_context=invocation.tool_context,
+                request_identity=seed,
+            )
+        )
         prepared_result = prepare_call(
             invocation.catalog,
             invocation.tool_context,
             ToolCall(pending.tool_call_id, pending.tool_name, pending.args),
-            pending_identity=f"{pending.tool_call_id}:{pending.tool_name}",
+            call_identity=prepare_identity,
+            pending_identity=pending,
             pending_action_revision=_pending_action_revision(
                 pending.tool_call_id,
                 pending.tool_name,
@@ -770,6 +779,7 @@ class AgentLoopRunner:
         record = execute_prepared(
             prepared_result.prepared,
             invocation.tool_context,
+            call_identity=prepare_identity,
             confirmation_claimer=claim,
         )
         records.append(record)

@@ -21,17 +21,21 @@ from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
+from offerpilot.ai.tool_authority import (
+    ApprovalExecutionAuthority,
+    ApprovedWritePrepareCallIdentity,
+    AuthorityPhaseError,
+)
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import (
-    ExecutionAuthorization,
     JSONValue,
     PreparedToolCall,
     ToolExecutionRecord,
     ToolFailure,
-    ToolSuccess,
     TRANSACTIONAL_TYPED_WRITE_NAMES,
     UndoPolicy,
 )
+from offerpilot.ai.tool_runtime.pipeline import execute_prepared
 from offerpilot.ai.tool_runtime.rendering import render_compatibility
 from offerpilot.ai.tool_runtime.journal import project_tool_started_bound
 from offerpilot.ai.tool_runtime.transport import project_transport_event
@@ -499,6 +503,7 @@ class WriteOperationRepository:
         adapter_kind: Literal["typed", "legacy_deterministic"],
         proposal_fingerprint: str,
         confirmation_token_fingerprint: str,
+        authorization_scope_fingerprint: str | None = None,
         agent_run_id: str | None = None,
     ) -> WriteOperation:
         if tool_name not in (*TYPED_WRITE_OPERATION_NAMES, *LEGACY_WRITE_OPERATION_NAMES):
@@ -515,6 +520,7 @@ class WriteOperationRepository:
             fingerprint_key_id=self.key.key_id,
             proposal_fingerprint=proposal_fingerprint,
             confirmation_token_fingerprint=confirmation_token_fingerprint,
+            authorization_scope_fingerprint=authorization_scope_fingerprint,
             delivery_status="pending",
             delivery_generation=0,
         )
@@ -890,6 +896,12 @@ LegacyExecutor = Callable[[Session], str]
 CompensationExecutor = Callable[[Session, Mapping[str, Any]], str]
 
 
+class _ClaimedWriteFailure(Exception):
+    def __init__(self, record: ToolExecutionRecord[Any, Any]) -> None:
+        super().__init__("claimed write failed")
+        self.record = record
+
+
 def compensation_request_fingerprint(
     key: LedgerKeyDomain,
     *,
@@ -922,7 +934,7 @@ class WriteOperationCoordinator:
         conversation_id: int,
         prepared: PreparedToolCall[Any, Any],
         context: ToolExecutionContext,
-        authorization: ExecutionAuthorization,
+        prepare_identity: ApprovedWritePrepareCallIdentity,
         request_fingerprint: str,
         undo_seed_builder: UndoSeedBuilder | None = None,
         undo_builder: UndoBuilder | None = None,
@@ -939,7 +951,7 @@ class WriteOperationCoordinator:
                     replay = self.repository.replay(operation, request_fingerprint)
                     session.rollback()
                     return replay, None
-                self._verify_primary(operation, conversation_id, prepared, authorization)
+                self._verify_primary(operation, conversation_id, prepared)
                 bound_context = context.bind(session)
                 if prepared.spec.mutable_validator is not None:
                     failure = prepared.spec.mutable_validator(prepared.typed_args, bound_context)
@@ -983,6 +995,35 @@ class WriteOperationCoordinator:
                     raise WriteOperationError("operation_identity_conflict")
                 self.repository.append_transition(session, operation_id, 2, "approved")
                 self.repository.append_transition(session, operation_id, 3, "claimed")
+                authority = context.authority
+                if type(authority) is not ApprovalExecutionAuthority:
+                    raise WriteOperationError("operation_identity_conflict")
+                if type(prepare_identity) is not ApprovedWritePrepareCallIdentity:
+                    raise WriteOperationError("operation_identity_conflict")
+                factory = context.authority_factory
+                execution_claim = None
+                try:
+                    factory.register_transaction(session, authority=authority)
+                    execution_claim = factory.issue_execution_claim(
+                        authority,
+                        prepared=prepared,
+                        pending=prepared.pending_identity,
+                        operation_id=operation_id,
+                        tool_call_id=prepared.tool_call_id,
+                        tool_name=prepared.spec.name,
+                        effective_args_digest=prepared.arguments_digest,
+                        pending_action_revision=prepared.pending_action_revision,
+                        transaction=session,
+                    )
+                    execute_identity = factory.create_approved_write_execute_identity(
+                        prepare_identity,
+                        prepared=prepared,
+                        execution_claim=execution_claim,
+                    )
+                except AuthorityPhaseError as exc:
+                    if execution_claim is not None and factory.claim_state(execution_claim) is not None:
+                        factory.revoke(execution_claim)
+                    raise WriteOperationError("operation_identity_conflict") from exc
                 try:
                     with session.begin_nested():
                         started_recorded = project_tool_started_bound(
@@ -993,9 +1034,34 @@ class WriteOperationCoordinator:
                             if undo_seed_builder is not None
                             else {}
                         )
-                        result = prepared.spec.executor(prepared.typed_args, bound_context)
+                        dispatched = execute_prepared(
+                            prepared,
+                            bound_context,
+                            call_identity=execute_identity,
+                            execution_claim=execution_claim,
+                            locked_effective_args_digest=prepared.arguments_digest,
+                        )
+                        if isinstance(dispatched.outcome, ToolFailure):
+                            if dispatched.outcome.category == "internal_error":
+                                raise WriteOperationError(
+                                    "operation_not_committed", retryable=True
+                                )
+                            raise _ClaimedWriteFailure(
+                                ToolExecutionRecord(
+                                    prepared,
+                                    dispatched.outcome,
+                                    True,
+                                    operation_id,
+                                    False,
+                                    False,
+                                    None,
+                                    None,
+                                    started_recorded,
+                                )
+                            )
+                        result = dispatched.outcome.result
                         record = ToolExecutionRecord(
-                            prepared, ToolSuccess(result), True, operation_id, False
+                            prepared, dispatched.outcome, True, operation_id, False
                         )
                         undo = (
                             undo_builder(prepared, record, undo_seed)
@@ -1047,6 +1113,17 @@ class WriteOperationCoordinator:
                             cast(dict[str, JSONValue], json.loads(payload.transport_json)),
                             started_recorded,
                         )
+                except _ClaimedWriteFailure as exc:
+                    failure = cast(ToolFailure, exc.record.outcome)
+                    return self._commit_failure(
+                        session,
+                        operation,
+                        prepared,
+                        failure,
+                        request_fingerprint,
+                        owner,
+                        record=exc.record,
+                    )
                 except WriteOperationError:
                     raise
                 except Exception as exc:
@@ -1076,6 +1153,9 @@ class WriteOperationCoordinator:
                         record=record,
                     )
                     return committed_failure
+                finally:
+                    if factory.claim_state(execution_claim) is not None:
+                        factory.revoke(execution_claim)
                 try:
                     session.commit()
                 except OperationalError:
@@ -1542,16 +1622,11 @@ class WriteOperationCoordinator:
         operation: WriteOperation,
         conversation_id: int,
         prepared: PreparedToolCall[Any, Any],
-        authorization: ExecutionAuthorization,
     ) -> None:
         if (
             operation.conversation_id != conversation_id
             or operation.tool_call_id != prepared.tool_call_id
             or operation.tool_name != prepared.spec.name
-            or authorization.operation_id != operation.id
-            or authorization.tool_call_id != prepared.tool_call_id
-            or authorization.tool_name != prepared.spec.name
-            or authorization.arguments_digest != prepared.arguments_digest
         ):
             raise WriteOperationError("operation_identity_conflict")
 

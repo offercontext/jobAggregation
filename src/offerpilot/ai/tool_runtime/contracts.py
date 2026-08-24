@@ -418,16 +418,6 @@ PreparedCallResult: TypeAlias = (
 
 
 @dataclass(frozen=True)
-class ExecutionAuthorization(TransientToolRuntimeValue):
-    pending_identity: object = field(repr=False, compare=False)
-    pending_action_revision: int
-    tool_call_id: str
-    tool_name: str
-    arguments_digest: str
-    operation_id: str = ""
-
-
-@dataclass(frozen=True)
 class ToolExecutionRecord(TransientToolRuntimeValue, Generic[ArgsT, ResultT]):
     prepared: PreparedToolCall[ArgsT, ResultT] = field(repr=False)
     outcome: ToolSuccess[ResultT] | ToolFailure = field(repr=False)

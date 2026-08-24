@@ -9,7 +9,6 @@ from types import MappingProxyType
 from typing import Any, Literal, Protocol, TYPE_CHECKING, TypeAlias, cast
 
 from offerpilot.ai.tool_runtime.contracts import (
-    ExecutionAuthorization,
     PreparedToolCall,
     ToolExecutionRecord,
     ToolFailure,
@@ -262,7 +261,7 @@ class ApprovedWriteContinuation(Protocol):
         self,
         pending: PendingAction,
         prepared: PreparedToolCall[Any, Any],
-    ) -> ExecutionAuthorization | ToolFailure: ...
+    ) -> ToolFailure | None: ...
 
     def record_result(
         self,

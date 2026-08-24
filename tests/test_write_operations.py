@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import asdict
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -9,11 +10,12 @@ from sqlalchemy.exc import IntegrityError
 
 from offerpilot.agent_runtime.journal import NullRunRecorder
 from offerpilot.ai.agent_contracts import PendingAction
+from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
+from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import (
-    BindingAudit,
-    ExecutionAuthorization,
-    PreparedToolCall,
+    BindingContract,
+    ConfirmationRequired,
     ProviderToolContract,
     REQUIRED_UNDO_TOOL_NAMES,
     TRANSACTIONAL_TYPED_WRITE_NAMES,
@@ -21,6 +23,8 @@ from offerpilot.ai.tool_runtime.contracts import (
     ToolSpec,
     WriteContract,
 )
+from offerpilot.ai.tool_runtime.pipeline import prepare_call
+from offerpilot.ai.types import ToolCall
 from offerpilot.ai.write_operations import (
     COMPENSATION_OPERATION_NAMES,
     LEDGER_KEY_FILENAME,
@@ -35,6 +39,7 @@ from offerpilot.ai.write_operations import (
     WriteOperationError,
     WriteOperationRepository,
     compensation_operation_id,
+    ledger_fingerprint,
     load_or_create_ledger_key,
 )
 from offerpilot.db import init_database
@@ -84,10 +89,10 @@ def test_ledger_key_is_independent_and_missing_key_fails_closed(tmp_path) -> Non
     key = load_or_create_ledger_key(tmp_path, sessions)
     repository = WriteOperationRepository(sessions, key)
     chat = ChatRepository(sessions, repository)
-    conversation = chat.create_conversation("workspace", "", "general")
+    conversation = chat.create_conversation("workspace")
     pending = PendingAction(
         tool_call_id="write-1",
-        tool_name="update_application_status",
+        tool_name="save_application_jd_version",
         args='{"id":1,"status":"offer"}',
         human="update",
         operation_id=str(uuid4()),
@@ -169,10 +174,10 @@ def test_bound_chat_operation_uses_caller_transaction(tmp_path) -> None:
     key = load_or_create_ledger_key(tmp_path, sessions)
     repository = WriteOperationRepository(sessions, key)
     chat = ChatRepository(sessions, repository)
-    conversation = chat.create_conversation("workspace", "", "general")
+    conversation = chat.create_conversation("workspace")
     pending = PendingAction(
         tool_call_id="bound-write",
-        tool_name="update_application_status",
+        tool_name="save_application_jd_version",
         args='{"id":1,"status":"offer"}',
         human="update",
         operation_id=str(uuid4()),
@@ -193,13 +198,13 @@ def test_transition_trigger_rejects_out_of_order_state(tmp_path) -> None:
     key = load_or_create_ledger_key(tmp_path, sessions)
     repository = WriteOperationRepository(sessions, key)
     chat = ChatRepository(sessions, repository)
-    conversation = chat.create_conversation("workspace", "", "general")
+    conversation = chat.create_conversation("workspace")
     operation_id = str(uuid4())
     assert chat.persist_pending_action(
         conversation.id,
         PendingAction(
             tool_call_id="transition-write",
-            tool_name="update_application_status",
+                tool_name="save_application_jd_version",
             args='{"id":1,"status":"offer"}',
             human="update",
             operation_id=operation_id,
@@ -221,14 +226,14 @@ def test_primary_operation_rejects_empty_tool_call_id(tmp_path) -> None:
     key = load_or_create_ledger_key(tmp_path, sessions)
     repository = WriteOperationRepository(sessions, key)
     chat = ChatRepository(sessions, repository)
-    conversation = chat.create_conversation("workspace", "", "general")
+    conversation = chat.create_conversation("workspace")
 
     with pytest.raises(IntegrityError):
         chat.persist_pending_action(
             conversation.id,
             PendingAction(
                 tool_call_id="",
-                tool_name="update_application_status",
+                tool_name="save_application_jd_version",
                 args='{"id":1,"status":"offer"}',
                 human="update",
                 operation_id=str(uuid4()),
@@ -242,7 +247,7 @@ def test_mapped_domain_failure_rolls_back_executor_savepoint(tmp_path) -> None:
     key = load_or_create_ledger_key(tmp_path, sessions)
     repository = WriteOperationRepository(sessions, key)
     chat = ChatRepository(sessions, repository)
-    conversation = chat.create_conversation("workspace", "", "general")
+    conversation = chat.create_conversation("workspace")
     operation_id = str(uuid4())
     pending = PendingAction(
         tool_call_id="write-savepoint",
@@ -251,16 +256,57 @@ def test_mapped_domain_failure_rolls_back_executor_savepoint(tmp_path) -> None:
         human="create",
         operation_id=operation_id,
     )
-    assert chat.persist_pending_action(conversation.id, pending, [])
+    with sessions() as setup_session:
+        setup_conversation = setup_session.get(Conversation, conversation.id)
+        assert setup_conversation is not None
+        setup_conversation.pending_operation_id = operation_id
+        setup_conversation.pending_tool_call_id = pending.tool_call_id
+        setup_conversation.pending_tool_name = pending.tool_name
+        repository.create_primary(
+            setup_session,
+            operation_id=operation_id,
+            conversation_id=conversation.id,
+            tool_call_id=pending.tool_call_id,
+            tool_name=pending.tool_name,
+            adapter_kind="typed",
+            proposal_fingerprint=ledger_fingerprint(key, "write-operation-proposal-v1", {}),
+            confirmation_token_fingerprint=ledger_fingerprint(
+                key, "write-operation-confirmation-token-v1", b"synthetic-token"
+            ),
+            authorization_scope_fingerprint="hmac-sha256:" + "b" * 64,
+        )
+        setup_session.commit()
 
     applications = ApplicationsRepository(sessions)
     events = ApplicationEventsRepository(sessions)
     notes = NotesRepository(sessions)
     offers = OffersRepository(sessions)
     resumes = ResumesRepository(sessions)
-    context = ToolExecutionContext(
+    factory = AuthorityFactory()
+    arguments_digest = "sha256:" + __import__("hashlib").sha256(b"{}").hexdigest()
+    pending_identity = SimpleNamespace(
+        conversation_id=conversation.id,
+        operation_id=operation_id,
+        tool_call_id=pending.tool_call_id,
+        tool_name=pending.tool_name,
+        pending_action_revision=1,
+        effective_args_digest=arguments_digest,
+    )
+    factory.register_pending(pending_identity)
+    authority = factory.create_approval_authority(
+        operation_id=operation_id,
+        conversation_id=conversation.id,
+        conversation_scope_revision=0,
+        trusted_scope=TrustedContextScope("workspace", None, "general"),
+        pending_identity=pending_identity,
+        pending_action_revision=1,
+        tool_call_id=pending.tool_call_id,
+        tool_name=pending.tool_name,
+        effective_args_digest=arguments_digest,
         capabilities=frozenset({ToolCapability.APPLICATIONS_WRITE}),
-        current_bindings={},
+    )
+    context = ToolExecutionContext(
+        authority=authority,
         applications=applications,
         events=events,
         notes=notes,
@@ -274,7 +320,7 @@ def test_mapped_domain_failure_rolls_back_executor_savepoint(tmp_path) -> None:
         payload={
             "type": "function",
             "function": {
-                "name": "create_application",
+                    "name": "create_application",
                 "description": "create",
                 "parameters": parameters,
             },
@@ -295,32 +341,34 @@ def test_mapped_domain_failure_rolls_back_executor_savepoint(tmp_path) -> None:
         executor=mutate_then_fail,
         confirmation_policy="required",
         exception_map=(ToolExceptionMapping(ValueError, "conflict", "domain_conflict"),),
+        declared_failure_categories=frozenset({"conflict"}),
         write_contract=WriteContract(),
+        binding_contract=BindingContract("none"),
     )
-    prepared = PreparedToolCall(
-        tool_call_id=pending.tool_call_id,
-        spec=spec,
-        arguments={},
-        typed_args={},
-        arguments_digest="sha256:args",
-        contract_fingerprint="sha256:contract",
-        binding=BindingAudit("unbound", 0),
+    catalog = ToolCatalog((spec,), expected_names=(spec.name,))
+    prepare_identity = factory.create_approved_write_prepare_identity(
+        authority,
+        approval_context=context,
+        request_identity=object(),
     )
-    authorization = ExecutionAuthorization(
-        pending_identity=object(),
+    prepared_result = prepare_call(
+        catalog,
+        context,
+        ToolCall(pending.tool_call_id, pending.tool_name, pending.args),
+        call_identity=prepare_identity,
+        pending_identity=pending_identity,
         pending_action_revision=1,
-        tool_call_id=pending.tool_call_id,
-        tool_name=pending.tool_name,
-        arguments_digest=prepared.arguments_digest,
-        operation_id=operation_id,
+        record_proposal=False,
     )
+    assert isinstance(prepared_result, ConfirmationRequired)
+    prepared = prepared_result.prepared
 
     execution, record = WriteOperationCoordinator(repository).execute_primary(
         operation_id=operation_id,
         conversation_id=conversation.id,
         prepared=prepared,
         context=context,
-        authorization=authorization,
+        prepare_identity=prepare_identity,
         request_fingerprint="hmac-sha256:" + "a" * 64,
     )
 
@@ -339,3 +387,4 @@ def test_mapped_domain_failure_rolls_back_executor_savepoint(tmp_path) -> None:
     assert isinstance(takeover, OperationUnknown)
     assert takeover.code == "operation_delivery_unknown"
     assert takeover.retryable is False
+    factory.close()

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import hashlib
+import json
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +12,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from offerpilot.agent_runtime.journal import NullRunRecorder
+from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import (
@@ -49,9 +52,34 @@ MODEL_BY_TABLE = {
 class Harness:
     context: ToolExecutionContext
     session_factory: sessionmaker[Session]
+    authority_factory: AuthorityFactory
+    invocation_identity: object
 
     def close(self) -> None:
+        self.authority_factory.close()
         self.session_factory.kw["bind"].dispose()
+
+    def prepare_identity(self, call: ToolCall) -> object:
+        attempt = self.authority_factory.issue_provider_attempt(
+            cast(Any, self.invocation_identity), candidate_ordinal=0
+        )
+        return self.authority_factory.create_new_turn_prepare_identity(
+            cast(Any, self.invocation_identity),
+            attempt_id=attempt,
+            candidate_ordinal=0,
+            tool_call_id=call.id,
+            tool_name=call.name,
+            arguments_digest=_arguments_digest(call.args),
+        )
+
+    def read_identity(self, prepared: Any) -> object:
+        return self.authority_factory.create_read_execution_identity(
+            cast(Any, self.invocation_identity),
+            prepared=prepared,
+            tool_call_id=prepared.tool_call_id,
+            tool_name=prepared.spec.name,
+            arguments_digest=prepared.arguments_digest,
+        )
 
 
 def normalize_visible(value: str) -> str:
@@ -152,11 +180,17 @@ def build_harness(path: Path, tool_name: str, case: str) -> Harness:
         if deleted_resume:
             resumes.delete(resume.id)
 
-    capabilities = frozenset(ToolCapability)
+    authority_factory = AuthorityFactory()
+    authority = authority_factory.create_segment_authority(
+        conversation_id=1,
+        conversation_scope_revision=0,
+        segment_id="domain-harness",
+        trusted_scope=TrustedContextScope("workspace", None, "general"),
+        capabilities=frozenset(ToolCapability),
+    )
     context = ToolExecutionContext(
+        authority=authority,
         applications=applications,
-        capabilities=capabilities,
-        current_bindings={},
         events=events,
         jd_analyses=jd_analyses,
         notes=notes,
@@ -164,7 +198,51 @@ def build_harness(path: Path, tool_name: str, case: str) -> Harness:
         resumes=resumes,
         run_recorder=cast(Any, NullRunRecorder()),
     )
-    return Harness(context=context, session_factory=session_factory)
+    runner, surface, binding, gateway = object(), object(), object(), object()
+    authority_factory.register_runner_invocation(runner, authority=authority)
+    authority_factory.register_tool_execution_context(context, authority=authority)
+    build_identity = authority_factory.create_provider_surface_build_identity(
+        authority,
+        runner_invocation=runner,
+        tool_context=context,
+        model_call_id="domain-model-call",
+    )
+    surface_fingerprint = "sha256:" + "e" * 64
+    authority_factory.register_frozen_surface(
+        surface,
+        surface_fingerprint=surface_fingerprint,
+        candidate_count=64,
+        authority=authority,
+        build_identity=build_identity,
+    )
+    authority_factory.register_model_call_surface_binding(
+        binding,
+        surface=surface,
+        surface_fingerprint=surface_fingerprint,
+        authority=authority,
+        build_identity=build_identity,
+    )
+    authority_factory.register_gateway_session(
+        gateway,
+        authority=authority,
+        build_identity=build_identity,
+        surface=surface,
+        surface_fingerprint=surface_fingerprint,
+        model_call_surface_binding=binding,
+    )
+    invocation_identity = authority_factory.create_provider_invocation_identity(
+        build_identity,
+        surface=surface,
+        surface_fingerprint=surface_fingerprint,
+        model_call_surface_binding=binding,
+        gateway_session=gateway,
+    )
+    return Harness(
+        context=context,
+        session_factory=session_factory,
+        authority_factory=authority_factory,
+        invocation_identity=invocation_identity,
+    )
 
 
 def execute_case(
@@ -192,14 +270,16 @@ def execute_case(
             expected_names=tuple(spec.name for spec in instrumented),
         )
         spec = cast(ToolSpec[Any, Any], catalog.resolve(case["tool_name"]))
+        tool_call = ToolCall(
+            id="golden-call",
+            name=case["tool_name"],
+            args=_canonical_arguments(case["arguments"]),
+        )
         prepared = prepare_call(
             catalog,
             harness.context,
-            ToolCall(
-                id="golden-call",
-                name=case["tool_name"],
-                args=_canonical_arguments(case["arguments"]),
-            ),
+            tool_call,
+            call_identity=harness.prepare_identity(tool_call),
             pending_action_revision=1,
             pending_identity="golden-pending",
             stage_sink=stages.append,
@@ -222,6 +302,11 @@ def execute_case(
             record = execute_prepared(
                 prepared.prepared,
                 harness.context,
+                call_identity=(
+                    harness.read_identity(prepared.prepared)
+                    if isinstance(prepared, ReadyToExecute)
+                    else None
+                ),
                 confirmation_claimer=claim if isinstance(prepared, ConfirmationRequired) else None,
             )
             visible = render_compatibility(spec, record.outcome)
@@ -244,8 +329,6 @@ def execute_case(
 
 
 def _canonical_arguments(arguments: dict[str, Any]) -> str:
-    import json
-
     return json.dumps(
         arguments,
         ensure_ascii=False,
@@ -253,3 +336,18 @@ def _canonical_arguments(arguments: dict[str, Any]) -> str:
         separators=(",", ":"),
         allow_nan=False,
     )
+
+
+def _arguments_digest(raw: str) -> str:
+    try:
+        value = json.loads(raw)
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except Exception:
+        encoded = raw.encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()

@@ -85,7 +85,13 @@ _NOTE_PARENT_RESOLVER = BindingResolverSpec(
 
 
 def _list(args: NoteArgs, context: ToolExecutionContext) -> list[dict[str, Any]]:
-    return [note_json(note) for note in context.notes.list(application_id=optional_integer(args, "application_id"))]
+    return [
+        note_json(note)
+        for note in context.notes.list_notes_scoped(
+            context.scope_constraint,
+            application_id=args.get("application_id"),
+        )
+    ]
 
 
 def _validate_add(args: NoteArgs, context: ToolExecutionContext) -> ToolFailure | None:
@@ -111,14 +117,17 @@ def _add(args: NoteArgs, context: ToolExecutionContext) -> dict[str, Any]:
     company = str(args.get("company") or "")
     position = str(args.get("position") or "")
     if application_id is not None:
-        app = context.applications.get(application_id)
+        app = context.applications.get_application_scoped(
+            context.scope_constraint, application_id
+        )
         if app is None:
             raise ToolRecordNotFound("application not found")
         company = company or app.company_name
         position = position or app.position_name
     if not company:
         raise ToolInputError("add_note requires company")
-    note = context.notes.create(
+    note = context.notes.create_note_scoped(
+        context.scope_constraint,
         NoteCreate(
             application_id=application_id,
             company=company,
@@ -141,10 +150,11 @@ def _existing(args: NoteArgs, key: str, current: str) -> str:
 
 def _update(args: NoteArgs, context: ToolExecutionContext) -> dict[str, Any]:
     note_id = integer(args, "id", "update_note")
-    existing = context.notes.get(note_id)
+    existing = context.notes.get_note_scoped(context.scope_constraint, note_id)
     if existing is None:
         raise ToolRecordNotFound("note not found")
-    updated = context.notes.update(
+    updated = context.notes.update_note_scoped(
+        context.scope_constraint,
         note_id,
         NoteUpdate(
             application_id=existing.application_id,
@@ -166,9 +176,11 @@ def _update(args: NoteArgs, context: ToolExecutionContext) -> dict[str, Any]:
 
 def _delete(args: NoteArgs, context: ToolExecutionContext) -> dict[str, bool]:
     note_id = integer(args, "id", "delete_note")
-    deleted = context.notes.get(note_id) is not None
-    context.notes.delete(note_id)
-    return {"deleted": deleted}
+    return {
+        "deleted": context.notes.delete_note_scoped(
+            context.scope_constraint, note_id
+        )
+    }
 
 
 def _schema(required: list[JSONValue]) -> dict[str, JSONValue]:

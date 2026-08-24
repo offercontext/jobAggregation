@@ -72,11 +72,20 @@ _APPLICATION_IDENTITY_RESOLVER = BindingResolverSpec(
 
 
 def _list(args: ApplicationArgs, context: ToolExecutionContext) -> list[dict[str, Any]]:
-    return [application_json(app) for app in context.applications.list(status=str(args.get("status") or ""))]
+    return [
+        application_json(app)
+        for app in context.applications.list_applications_scoped(
+            context.scope_constraint,
+            status=str(args.get("status") or ""),
+        )
+    ]
 
 
 def _get(args: ApplicationArgs, context: ToolExecutionContext) -> dict[str, Any]:
-    app = context.applications.get(integer(args, "id", "get_application"))
+    app = context.applications.get_application_scoped(
+        context.scope_constraint,
+        integer(args, "id", "get_application"),
+    )
     if app is None:
         raise ToolRecordNotFound("application not found")
     return application_json(app)
@@ -123,22 +132,12 @@ def _create(args: ApplicationArgs, context: ToolExecutionContext) -> dict[str, A
 
 
 def _update(args: ApplicationArgs, context: ToolExecutionContext) -> dict[str, Any]:
-    app = context.applications.get(integer(args, "id", "update_application_status"))
-    if app is None:
-        raise ToolRecordNotFound("application not found")
     try:
-        updated = context.applications.update_full(
-            app.id,
-            ApplicationCreate(
-                company_name=app.company_name,
-                position_name=app.position_name,
-                job_url=app.job_url,
-                status=normalize_application_status(str(args["status"])),
-                source=app.source,
-                notes=app.notes,
-                applied_at=app.applied_at,
-                closed_reason=str(args.get("closed_reason") or ""),
-            ),
+        updated = context.applications.update_application_status_scoped(
+            context.scope_constraint,
+            integer(args, "id", "update_application_status"),
+            normalize_application_status(str(args["status"])),
+            str(args.get("closed_reason") or ""),
         )
     except ValueError as exc:
         message = str(exc)

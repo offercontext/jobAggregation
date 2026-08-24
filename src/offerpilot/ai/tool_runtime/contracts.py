@@ -6,17 +6,19 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Generic, Literal, NoReturn, SupportsIndex, TypeAlias, TypeVar
 
 if TYPE_CHECKING:
-    from offerpilot.ai.tool_authority.contracts import AuthorityInstanceToken
+    from offerpilot.ai.tool_authority.contracts import AuthorityInstanceToken, PreparedInstanceToken
     from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 
 
 if TYPE_CHECKING:
     AuthorityInstanceTokenLike: TypeAlias = AuthorityInstanceToken
+    PreparedInstanceTokenLike: TypeAlias = PreparedInstanceToken
 else:
     # Resolve annotations safely while the leaf authority module imports this
     # runtime module.  Static type checkers still see the opaque handle type;
     # runtime callers cannot use this alias to construct a token.
     AuthorityInstanceTokenLike: TypeAlias = Any
+    PreparedInstanceTokenLike: TypeAlias = Any
 
 
 JSONValue: TypeAlias = None | bool | int | float | str | list["JSONValue"] | dict[str, "JSONValue"]
@@ -362,11 +364,16 @@ class PreparedToolCall(TransientToolRuntimeValue, Generic[ArgsT, ResultT]):
     pending_identity: object | None = field(default=None, repr=False, compare=False)
     pending_action_revision: int | None = None
     journal_started_draft: object | None = field(default=None, repr=False, compare=False)
-    # The authority token is intentionally opaque and excluded from every
-    # provider/ledger/payload representation.  It remains optional until the
-    # authority-bound pipeline cutover, while already making prepared calls
-    # produced by that pipeline non-serializable and identity-bound.
+    # The two opaque registry tokens are attached only by the controlled
+    # factory-backed prepare port.  Optional construction defaults allow that
+    # factory to allocate the Prepared object before its identity token exists;
+    # the Pipeline never returns a Prepared value until both are exact.
     authority_instance_token: AuthorityInstanceTokenLike | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    prepared_instance_token: PreparedInstanceTokenLike | None = field(
         default=None,
         repr=False,
         compare=False,

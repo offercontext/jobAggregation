@@ -68,11 +68,20 @@ _OFFER_PARENT_RESOLVER = BindingResolverSpec(
 
 
 def _list(args: OfferArgs, context: ToolExecutionContext) -> list[dict[str, Any]]:
-    return [offer_json(offer) for offer in context.offers.list(status=str(args.get("status") or ""))]
+    return [
+        offer_json(offer)
+        for offer in context.offers.list_offers_scoped(
+            context.scope_constraint,
+            status=str(args.get("status") or ""),
+        )
+    ]
 
 
 def _get(args: OfferArgs, context: ToolExecutionContext) -> dict[str, Any]:
-    offer = context.offers.get(integer(args, "id", "get_offer"))
+    offer = context.offers.get_offer_scoped(
+        context.scope_constraint,
+        integer(args, "id", "get_offer"),
+    )
     if offer is None:
         raise ToolRecordNotFound("offer not found")
     return offer_json(offer)
@@ -123,10 +132,14 @@ def _create_data(args: OfferArgs, existing: Any) -> OfferCreate:
 
 def _update(args: OfferArgs, context: ToolExecutionContext) -> dict[str, Any]:
     offer_id = integer(args, "id", "update_offer")
-    existing = context.offers.get(offer_id)
+    existing = context.offers.get_offer_scoped(context.scope_constraint, offer_id)
     if existing is None:
         raise ToolRecordNotFound("offer not found")
-    updated = context.offers.update(offer_id, _create_data(args, existing))
+    updated = context.offers.update_offer_scoped(
+        context.scope_constraint,
+        offer_id,
+        _create_data(args, existing),
+    )
     if updated is None:
         raise ToolRecordNotFound("offer not found")
     return offer_json(updated)
@@ -134,12 +147,11 @@ def _update(args: OfferArgs, context: ToolExecutionContext) -> dict[str, Any]:
 
 def _assessment(args: OfferArgs, context: ToolExecutionContext) -> dict[str, Any]:
     offer_id = integer(args, "id", "save_offer_assessment")
-    existing = context.offers.get(offer_id)
-    if existing is None:
-        raise ToolRecordNotFound("offer not found")
-    copied = dict(args)
-    copied["assessment"] = str(args.get("assessment") or "")
-    updated = context.offers.update(offer_id, _create_data(cast(OfferArgs, copied), existing))
+    updated = context.offers.save_offer_assessment_scoped(
+        context.scope_constraint,
+        offer_id,
+        str(args.get("assessment") or ""),
+    )
     if updated is None:
         raise ToolRecordNotFound("offer not found")
     return offer_json(updated)

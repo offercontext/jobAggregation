@@ -17,7 +17,6 @@ from offerpilot.ai.tool_specs.common import (
     decode_mapping,
     integer,
     jd_analysis_json,
-    optional_integer,
     provider_contract,
     resolve_identity_argument,
     resolve_parent_application,
@@ -71,11 +70,20 @@ _JD_ANALYSIS_PARENT_RESOLVER = BindingResolverSpec(
 
 
 def _list(args: JDArgs, context: ToolExecutionContext) -> list[dict[str, Any]]:
-    return [jd_analysis_json(row) for row in context.jd_analyses.list(application_id=optional_integer(args, "application_id"))]
+    return [
+        jd_analysis_json(row)
+        for row in context.jd_analyses.list_jd_analyses_scoped(
+            context.scope_constraint,
+            application_id=args.get("application_id"),
+        )
+    ]
 
 
 def _get(args: JDArgs, context: ToolExecutionContext) -> dict[str, Any]:
-    analysis = context.jd_analyses.get(integer(args, "id", "get_jd_analysis"))
+    analysis = context.jd_analyses.get_jd_analysis_scoped(
+        context.scope_constraint,
+        integer(args, "id", "get_jd_analysis"),
+    )
     if analysis is None:
         raise ToolRecordNotFound("jd analysis not found")
     return jd_analysis_json(analysis)

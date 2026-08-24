@@ -1,162 +1,133 @@
 from __future__ import annotations
 
+import inspect
 import pickle
 from typing import Any, cast
 
 import pytest
+from sqlalchemy.orm import Session
 
-from offerpilot.ai.tool_runtime.context import (
-    UNAVAILABLE,
-    ToolCapability,
-    ToolExecutionContext,
-    aggregate_binding,
-    evaluate_context,
-)
-from offerpilot.ai.tool_runtime.contracts import (
-    BindingAudit,
-    BindingTarget,
-    ProviderToolContract,
-    ToolFailure,
-    ToolSpec,
-)
+from offerpilot.agent_runtime.journal import NullRunRecorder
+from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
+from offerpilot.ai.tool_runtime.context import ToolExecutionContext
+from offerpilot.db import init_database
+from offerpilot.repositories.application_events import ApplicationEventsRepository
+from offerpilot.repositories.applications import ApplicationsRepository
+from offerpilot.repositories.jd import JDAnalysesRepository
+from offerpilot.repositories.notes import NotesRepository
+from offerpilot.repositories.offers import OffersRepository
+from offerpilot.repositories.resumes import ResumesRepository
 
 
-class RepositorySpy:
-    def __init__(self) -> None:
-        self.calls = 0
-
-    def get(self, record_id: int) -> object:
-        self.calls += 1
-        return {"id": record_id}
-
-
-class BindingResolverSpy:
-    def __init__(self, identity: int | str | object) -> None:
-        self.calls = 0
-        self.identity = identity
-
-    def __call__(self, args: dict[str, Any], context: ToolExecutionContext) -> BindingTarget:
-        self.calls += 1
-        context.applications.get(int(args["application_id"]))
-        if self.identity is UNAVAILABLE:
-            return BindingTarget(entity_kind="application", identity=None, available=False)
-        return BindingTarget(
-            entity_kind="application",
-            identity=cast(int | str, self.identity),
-            available=True,
-        )
-
-
-def _spec(resolver: BindingResolverSpy) -> ToolSpec[dict[str, Any], dict[str, Any]]:
-    parameters = {
-        "properties": {"application_id": {"type": "integer"}},
-        "required": ["application_id"],
-        "type": "object",
-    }
-    return ToolSpec(
-        binding_resolvers=(resolver,),
-        contract=ProviderToolContract(
-            payload={
-                "type": "function",
-                "function": {
-                    "description": "read one application",
-                    "name": "read_application",
-                    "parameters": parameters,
-                },
-            },
-            name="read_application",
-            description="read one application",
-            parameters=parameters,
-        ),
-        decoder=lambda values: dict(values),
-        executor=lambda args, context: args,
-        kind="read",
-        required_capabilities=frozenset({ToolCapability.APPLICATIONS_READ}),
-    )
-
-
-def _context(
-    repository: RepositorySpy,
+def _authority_context(
+    tmp_path: Any,
     *,
-    capabilities: frozenset[ToolCapability],
-    current_bindings: dict[str, int | str] | None = None,
-) -> ToolExecutionContext:
-    return ToolExecutionContext(
-        applications=cast(Any, repository),
-        capabilities=capabilities,
-        current_bindings=current_bindings or {},
-        events=cast(Any, object()),
-        jd_analyses=cast(Any, object()),
-        notes=cast(Any, object()),
-        offers=cast(Any, object()),
-        resumes=cast(Any, object()),
-        run_recorder=cast(Any, object()),
+    context_type: str = "application",
+) -> tuple[AuthorityFactory, ToolExecutionContext, Any]:
+    session_factory = init_database(tmp_path / "context.db")
+    factory = AuthorityFactory()
+    scope = TrustedContextScope(
+        cast(Any, context_type),
+        7 if context_type == "application" else None,
+        "general",
     )
-
-
-def test_missing_capability_short_circuits_before_binding_and_repository() -> None:
-    repository = RepositorySpy()
-    resolver = BindingResolverSpy(7)
-    context = _context(repository, capabilities=frozenset())
-
-    outcome = evaluate_context(_spec(resolver), {"application_id": 7}, context)
-
-    assert outcome == ToolFailure(
-        category="permission_denied",
-        code="missing_capability",
-        compatibility_detail="permission denied",
+    authority = factory.create_segment_authority(
+        conversation_id=1,
+        conversation_scope_revision=0,
+        segment_id="segment-context",
+        trusted_scope=scope,
+        capabilities=frozenset({"applications.read"}),
     )
-    assert resolver.calls == 0
-    assert repository.calls == 0
-
-
-@pytest.mark.parametrize(
-    ("current", "targets", "expected"),
-    (
-        (None, [], "unbound"),
-        (7, [], "unavailable"),
-        (7, [7, 7], "matched"),
-        (7, [7, 9], "mismatched"),
-        (7, [7, UNAVAILABLE], "unavailable"),
-        (7, [9, UNAVAILABLE], "mismatched"),
-    ),
-)
-def test_binding_aggregation_has_fixed_precedence(
-    current: int | None,
-    targets: list[int | object],
-    expected: str,
-) -> None:
-    assert aggregate_binding(current, targets) == expected
-
-
-def test_binding_is_audit_only_and_contains_no_entity_id() -> None:
-    repository = RepositorySpy()
-    resolver = BindingResolverSpy(9)
-    context = _context(
-        repository,
-        capabilities=frozenset({ToolCapability.APPLICATIONS_READ}),
-        current_bindings={"application": 7},
+    context = ToolExecutionContext(
+        authority=authority,
+        applications=ApplicationsRepository(session_factory),
+        events=ApplicationEventsRepository(session_factory),
+        notes=NotesRepository(session_factory),
+        offers=OffersRepository(session_factory),
+        resumes=ResumesRepository(session_factory),
+        jd_analyses=JDAnalysesRepository(session_factory),
+        run_recorder=cast(Any, NullRunRecorder()),
     )
-    arguments = {"application_id": 9, "extra": "preserved"}
-
-    audit = evaluate_context(_spec(resolver), arguments, context)
-
-    assert audit == BindingAudit(
-        status="mismatched",
-        target_count=1,
-        entity_kinds=("application",),
-    )
-    assert arguments == {"application_id": 9, "extra": "preserved"}
-    assert "7" not in repr(audit)
-    assert "9" not in repr(audit)
-    assert resolver.calls == 1
-    assert repository.calls == 1
+    return factory, context, session_factory
 
 
-def test_tool_execution_context_is_transient_and_hides_dependencies() -> None:
-    repository = RepositorySpy()
-    context = _context(repository, capabilities=frozenset())
+def test_context_requires_authority_and_removes_raw_authorization_inputs(tmp_path: Any) -> None:
+    factory, context, session_factory = _authority_context(tmp_path)
+    try:
+        parameters = inspect.signature(ToolExecutionContext).parameters
+        assert "authority" in parameters
+        assert "capabilities" not in parameters
+        assert "current_bindings" not in parameters
+        assert not hasattr(context, "capabilities")
+        assert not hasattr(context, "current_bindings")
+        assert context.authority.capabilities == frozenset({"applications.read"})
+    finally:
+        factory.close()
+        session_factory.kw["bind"].dispose()
 
-    with pytest.raises(TypeError, match="transient tool runtime value"):
-        pickle.dumps(context)
-    assert "RepositorySpy" not in repr(context)
+
+def test_context_bind_uses_one_session_and_exact_registered_constraint(tmp_path: Any) -> None:
+    factory, context, session_factory = _authority_context(tmp_path)
+    try:
+        with session_factory() as session:
+            bound = context.bind(session)
+
+            assert bound.authority is context.authority
+            assert bound.scope_constraint is context.scope_constraint
+            assert bound.bound_session is session
+            assert bound.applications._session is session
+            assert bound.events._session is session
+            assert bound.notes._session is session
+            assert bound.offers._session is session
+            assert bound.resumes._session is session
+            assert bound.jd_analyses._session is session
+            for repository in (
+                bound.applications,
+                bound.events,
+                bound.notes,
+                bound.offers,
+                bound.jd_analyses,
+            ):
+                binding = repository._scope_binding
+                assert binding is not None
+                assert binding.session is session
+                assert binding.constraint is context.scope_constraint
+                assert binding.authority is context.authority
+                assert binding.authority_factory is factory
+    finally:
+        factory.close()
+        session_factory.kw["bind"].dispose()
+
+
+def test_context_rejects_session_binding_after_authority_revocation(tmp_path: Any) -> None:
+    factory, context, session_factory = _authority_context(tmp_path)
+    factory.revoke_authority(context.authority)
+    try:
+        with session_factory() as session:
+            with pytest.raises(Exception, match="authority|constraint|active"):
+                context.bind(session)
+    finally:
+        factory.close()
+        session_factory.kw["bind"].dispose()
+
+
+def test_tool_execution_context_is_transient_and_hides_dependencies(tmp_path: Any) -> None:
+    factory, context, session_factory = _authority_context(tmp_path, context_type="workspace")
+    try:
+        with pytest.raises(TypeError, match="transient tool runtime value"):
+            pickle.dumps(context)
+        assert "ApplicationsRepository" not in repr(context)
+        assert "authority_instance_token" not in repr(context)
+    finally:
+        factory.close()
+        session_factory.kw["bind"].dispose()
+
+
+def test_bind_requires_a_caller_owned_sqlalchemy_session(tmp_path: Any) -> None:
+    factory, context, session_factory = _authority_context(tmp_path)
+    try:
+        with pytest.raises(Exception):
+            context.bind(cast(Session, object()))
+    finally:
+        factory.close()
+        session_factory.kw["bind"].dispose()

@@ -1,27 +1,55 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar, cast
 
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.orm import Session, sessionmaker
 
 from offerpilot.agent_runtime.journal import RunRecorder
+from offerpilot.ai.tool_authority.composition import AuthorityFactory, _active_factory
+from offerpilot.ai.tool_authority.contracts import (
+    ApplicationScopeConstraint,
+    BindingTargetResolution,
+    ToolExecutionAuthority,
+)
+from offerpilot.ai.tool_authority.policy import decide_binding
 from offerpilot.ai.tool_runtime.contracts import (
     BindingAudit,
-    BindingStatus,
-    BindingTarget,
+    BindingResolverSpec,
     ToolFailure,
     ToolSpec,
     TransientToolRuntimeValue,
 )
+from offerpilot.models import ApplicationEvent, InterviewNote, JDAnalysis, Offer
 from offerpilot.repositories.application_events import ApplicationEventsRepository
 from offerpilot.repositories.applications import ApplicationsRepository
 from offerpilot.repositories.jd import JDAnalysesRepository
 from offerpilot.repositories.notes import NotesRepository
 from offerpilot.repositories.offers import OffersRepository
 from offerpilot.repositories.resumes import ResumesRepository
+
+
+class _UnavailableBindingTarget:
+    __slots__ = ()
+
+
+# Kept only as an import-compatible pure aggregation sentinel.  Authority-bound
+# execution never uses it or accepts it from a resolver.
+UNAVAILABLE = _UnavailableBindingTarget()
+
+
+def aggregate_binding(current: object | None, targets: list[object] | tuple[object, ...]) -> str:
+    if current is None:
+        return "unbound"
+    if not targets:
+        return "unavailable"
+    if any(target is not UNAVAILABLE and target != current for target in targets):
+        return "mismatched"
+    if any(target is UNAVAILABLE for target in targets):
+        return "unavailable"
+    return "matched"
 
 
 class ToolCapability(str, Enum):
@@ -41,21 +69,17 @@ class ToolCapability(str, Enum):
         return self.value
 
 
-class _UnavailableBindingTarget:
-    __slots__ = ()
-
-    def __repr__(self) -> str:
-        return "UNAVAILABLE"
-
-
-UNAVAILABLE = _UnavailableBindingTarget()
-BindingIdentity = int | str | _UnavailableBindingTarget
-
-
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False, repr=False)
 class ToolExecutionContext(TransientToolRuntimeValue):
-    capabilities: frozenset[ToolCapability]
-    current_bindings: Mapping[str, int | str] = field(repr=False)
+    """Exact-authority execution dependencies for one live Typed segment.
+
+    Authorization is deliberately not accepted as raw constructor data.  The
+    active factory supplies the one scope constraint, and every bound clone
+    retains that exact object while swapping all repositories onto one
+    caller-owned Session.
+    """
+
+    authority: ToolExecutionAuthority = field(repr=False)
     applications: ApplicationsRepository = field(repr=False)
     events: ApplicationEventsRepository = field(repr=False)
     notes: NotesRepository = field(repr=False)
@@ -63,39 +87,337 @@ class ToolExecutionContext(TransientToolRuntimeValue):
     resumes: ResumesRepository = field(repr=False)
     jd_analyses: JDAnalysesRepository = field(repr=False)
     run_recorder: RunRecorder = field(repr=False, compare=False)
+    _authority_factory: AuthorityFactory = field(repr=False, compare=False)
+    _scope_constraint: ApplicationScopeConstraint = field(repr=False, compare=False)
+    _session_factory: sessionmaker[Session] = field(repr=False, compare=False)
     operation_executor: Any = field(default=None, repr=False, compare=False)
+    _bound_session: Session | None = field(default=None, repr=False, compare=False)
 
-    def bind(self, session: Session) -> "ToolExecutionContext":
-        return ToolExecutionContext(
-            capabilities=self.capabilities,
-            current_bindings=self.current_bindings,
-            applications=self.applications.bind(session),
-            events=self.events.bind(session),
-            notes=self.notes.bind(session),
-            offers=self.offers.bind(session),
-            resumes=self.resumes.bind(session),
-            jd_analyses=self.jd_analyses,
-            run_recorder=self.run_recorder,
-            operation_executor=self.operation_executor,
+    def __init__(
+        self,
+        *,
+        authority: ToolExecutionAuthority,
+        applications: ApplicationsRepository,
+        events: ApplicationEventsRepository,
+        notes: NotesRepository,
+        offers: OffersRepository,
+        resumes: ResumesRepository,
+        jd_analyses: JDAnalysesRepository,
+        run_recorder: RunRecorder,
+        operation_executor: Any = None,
+    ) -> None:
+        factory = _active_factory(authority)
+        constraint = factory.create_application_scope_constraint(authority)
+        repository_factory = self._require_common_session_factory(
+            applications, events, notes, offers, resumes, jd_analyses
+        )
+        self._assign(
+            authority=authority,
+            applications=applications,
+            events=events,
+            notes=notes,
+            offers=offers,
+            resumes=resumes,
+            jd_analyses=jd_analyses,
+            run_recorder=run_recorder,
+            operation_executor=operation_executor,
+            authority_factory=factory,
+            scope_constraint=constraint,
+            bound_session=None,
+            repository_factory=repository_factory,
         )
 
+    @staticmethod
+    def _require_common_session_factory(
+        applications: ApplicationsRepository,
+        events: ApplicationEventsRepository,
+        notes: NotesRepository,
+        offers: OffersRepository,
+        resumes: ResumesRepository,
+        jd_analyses: JDAnalysesRepository,
+    ) -> sessionmaker[Session]:
+        factories = tuple(
+            getattr(repository, "_session_factory", None)
+            for repository in (applications, events, notes, offers, resumes, jd_analyses)
+        )
+        first = factories[0]
+        if first is None or any(item is not first for item in factories[1:]):
+            raise TypeError("ToolExecutionContext repositories must share one Session factory")
+        return cast(sessionmaker[Session], first)
 
-def aggregate_binding(
-    current: int | str | None,
-    targets: Sequence[BindingIdentity | object],
-) -> BindingStatus:
-    if current is None:
-        return "unbound"
-    if not targets:
-        return "unavailable"
-    if any(target is not UNAVAILABLE and target != current for target in targets):
-        return "mismatched"
-    if any(target is UNAVAILABLE for target in targets):
-        return "unavailable"
-    return "matched"
+    def _assign(
+        self,
+        *,
+        authority: ToolExecutionAuthority,
+        applications: ApplicationsRepository,
+        events: ApplicationEventsRepository,
+        notes: NotesRepository,
+        offers: OffersRepository,
+        resumes: ResumesRepository,
+        jd_analyses: JDAnalysesRepository,
+        run_recorder: RunRecorder,
+        operation_executor: Any,
+        authority_factory: AuthorityFactory,
+        scope_constraint: ApplicationScopeConstraint,
+        bound_session: Session | None,
+        repository_factory: sessionmaker[Session],
+    ) -> None:
+        object.__setattr__(self, "authority", authority)
+        object.__setattr__(self, "applications", applications)
+        object.__setattr__(self, "events", events)
+        object.__setattr__(self, "notes", notes)
+        object.__setattr__(self, "offers", offers)
+        object.__setattr__(self, "resumes", resumes)
+        object.__setattr__(self, "jd_analyses", jd_analyses)
+        object.__setattr__(self, "run_recorder", run_recorder)
+        object.__setattr__(self, "operation_executor", operation_executor)
+        object.__setattr__(self, "_authority_factory", authority_factory)
+        object.__setattr__(self, "_scope_constraint", scope_constraint)
+        object.__setattr__(self, "_bound_session", bound_session)
+        object.__setattr__(self, "_session_factory", repository_factory)
+
+    @property
+    def authority_factory(self) -> AuthorityFactory:
+        return self._authority_factory
+
+    @property
+    def scope_constraint(self) -> ApplicationScopeConstraint:
+        self._authority_factory.require_scope_constraint(
+            self._scope_constraint, self.authority
+        )
+        return self._scope_constraint
+
+    @property
+    def bound_session(self) -> Session | None:
+        return self._bound_session
+
+    @property
+    def session_factory(self) -> sessionmaker[Session]:
+        return self._session_factory
+
+    def bind(self, session: Session) -> "ToolExecutionContext":
+        if not isinstance(session, Session):
+            raise TypeError("ToolExecutionContext.bind requires a caller-owned Session")
+        factory = self._authority_factory
+        constraint = self.scope_constraint
+        bound = object.__new__(ToolExecutionContext)
+        bound._assign(
+            authority=self.authority,
+            applications=self.applications.bind_scoped(
+                session,
+                constraint,
+                authority_factory=factory,
+                authority=self.authority,
+            ),
+            events=self.events.bind_scoped(
+                session,
+                constraint,
+                authority_factory=factory,
+                authority=self.authority,
+            ),
+            notes=self.notes.bind_scoped(
+                session,
+                constraint,
+                authority_factory=factory,
+                authority=self.authority,
+            ),
+            offers=self.offers.bind_scoped(
+                session,
+                constraint,
+                authority_factory=factory,
+                authority=self.authority,
+            ),
+            resumes=self.resumes.bind(session),
+            jd_analyses=self.jd_analyses.bind_scoped(
+                session,
+                constraint,
+                authority_factory=factory,
+                authority=self.authority,
+            ),
+            run_recorder=self.run_recorder,
+            operation_executor=self.operation_executor,
+            authority_factory=factory,
+            scope_constraint=constraint,
+            bound_session=session,
+            repository_factory=self._session_factory,
+        )
+        return bound
+
+    def binding_target_resolution(
+        self,
+        *,
+        entity_kind: Literal["application", "resume"],
+        state: Literal["resolved", "omitted", "detached", "unavailable"],
+        identity: int | None,
+    ) -> BindingTargetResolution:
+        return self._authority_factory.create_binding_target_resolution(
+            self.authority,
+            entity_kind=entity_kind,
+            state=state,
+            identity=identity,
+        )
+
+    create_binding_target_resolution = binding_target_resolution
+
+    def resolver_context(self, resolver_id: str) -> "_BindingResolverContext":
+        return _BindingResolverContext(self, resolver_id)
+
+    def _resolve_parent_identity(self, resolver_id: str, identity: int) -> tuple[str, int | None]:
+        model: type[Any]
+        if resolver_id == "application_event_parent":
+            model = ApplicationEvent
+        elif resolver_id == "note_application_parent":
+            model = InterviewNote
+        elif resolver_id == "offer_application_parent":
+            model = Offer
+        elif resolver_id == "jd_analysis_application_parent":
+            model = JDAnalysis
+        else:
+            return ("unavailable", None)
+        statement = select(model.application_id).where(model.id == identity)
+        if self._bound_session is not None:
+            row = self._bound_session.execute(statement).one_or_none()
+        else:
+            with self._session_factory() as session:
+                row = session.execute(statement).one_or_none()
+        if row is None:
+            return ("unavailable", None)
+        parent = row[0]
+        if parent is None:
+            return ("detached", None)
+        if type(parent) is not int or not 1 <= parent <= 2**63 - 1:
+            return ("unavailable", None)
+        return ("resolved", parent)
+
+
+class _BindingResolverContext:
+    __slots__ = ("_context", "_resolver_id")
+
+    def __init__(self, context: ToolExecutionContext, resolver_id: str) -> None:
+        self._context = context
+        self._resolver_id = resolver_id
+
+    @property
+    def applications(self) -> ApplicationsRepository:
+        return self._context.applications
+
+    @property
+    def events(self) -> ApplicationEventsRepository:
+        return self._context.events
+
+    @property
+    def notes(self) -> NotesRepository:
+        return self._context.notes
+
+    @property
+    def offers(self) -> OffersRepository:
+        return self._context.offers
+
+    @property
+    def resumes(self) -> ResumesRepository:
+        return self._context.resumes
+
+    @property
+    def jd_analyses(self) -> JDAnalysesRepository:
+        return self._context.jd_analyses
+
+    @property
+    def authority(self) -> ToolExecutionAuthority:
+        return self._context.authority
+
+    @property
+    def authority_factory(self) -> AuthorityFactory:
+        return self._context.authority_factory
+
+    def binding_target_resolution(self, **values: Any) -> BindingTargetResolution:
+        return self._context.binding_target_resolution(**values)
+
+    create_binding_target_resolution = binding_target_resolution
+
+    def resolve_parent_identity(self, entity_kind: str, identity: int) -> tuple[str, int | None]:
+        if entity_kind != "application":
+            return ("unavailable", None)
+        return self._context._resolve_parent_identity(self._resolver_id, identity)
 
 
 ArgsT = TypeVar("ArgsT")
+
+
+def require_capabilities(
+    spec: ToolSpec[Any, Any],
+    context: ToolExecutionContext,
+) -> ToolFailure | None:
+    if spec.required_capabilities.issubset(cast(Any, context.authority).capabilities):
+        return None
+    return ToolFailure(
+        category="permission_denied",
+        code="missing_capability",
+        compatibility_detail="permission denied",
+    )
+
+
+def pre_resolver_scope_policy(
+    spec: ToolSpec[Any, Any], context: ToolExecutionContext
+) -> ToolFailure | None:
+    if (
+        spec.binding_contract.kind == "non_application_only"
+        and cast(Any, context.authority).trusted_scope.context_type == "application"
+    ):
+        return scope_access_denied()
+    return None
+
+
+def audit_bindings(
+    spec: ToolSpec[ArgsT, Any],
+    typed_args: ArgsT,
+    context: ToolExecutionContext,
+) -> tuple[BindingAudit, bool]:
+    resolutions: list[dict[str, object]] = []
+    entity_kinds: set[str] = set()
+    for resolver in spec.binding_resolvers:
+        if type(resolver) is not BindingResolverSpec:
+            raise TypeError("authority-bound binding resolver requires stable metadata")
+        resolver_context = context.resolver_context(resolver.resolver_id)
+        resolution = resolver(typed_args, cast(Any, resolver_context))
+        if type(resolution) is not BindingTargetResolution:
+            raise TypeError("binding resolver returned an unsealed resolution")
+        context.authority_factory.require_binding_target_resolution(
+            resolution, context.authority
+        )
+        entity_kinds.add(resolution.entity_kind)
+        resolutions.append(
+            {
+                "entity_kind": resolution.entity_kind,
+                "state": resolution.state,
+                "identity": resolution.identity,
+                "presence": resolver.presence,
+            }
+        )
+
+    contract = spec.binding_contract
+    scope = cast(Any, context.authority).trusted_scope
+    scope_bound = contract.entity_kind == "application" and scope.context_type == "application"
+    bound_identities = (
+        (cast(int, scope.context_ref),)
+        if scope_bound
+        else ()
+    )
+    decision = decide_binding(
+        contract.kind,
+        scope_bound=scope_bound,
+        bound_identities=bound_identities,
+        resolutions=resolutions,
+    )
+    if contract.entity_kind is not None:
+        entity_kinds.add(contract.entity_kind)
+    return (
+        BindingAudit(
+            status=decision.status,
+            target_count=len(resolutions),
+            entity_kinds=tuple(sorted(entity_kinds)),
+        ),
+        decision.allowed,
+    )
 
 
 def evaluate_context(
@@ -106,62 +428,29 @@ def evaluate_context(
     permission = require_capabilities(spec, context)
     if permission is not None:
         return permission
-    return audit_bindings(spec, typed_args, context)
+    scope_failure = pre_resolver_scope_policy(spec, context)
+    if scope_failure is not None:
+        return scope_failure
+    audit, allowed = audit_bindings(spec, typed_args, context)
+    return audit if allowed else scope_access_denied()
 
 
-def require_capabilities(
-    spec: ToolSpec[Any, Any],
-    context: ToolExecutionContext,
-) -> ToolFailure | None:
-    if spec.required_capabilities.issubset(context.capabilities):
-        return None
+def scope_access_denied() -> ToolFailure:
     return ToolFailure(
         category="permission_denied",
-        code="missing_capability",
+        code="scope_access_denied",
         compatibility_detail="permission denied",
     )
 
 
-def audit_bindings(
-    spec: ToolSpec[ArgsT, Any],
-    typed_args: ArgsT,
-    context: ToolExecutionContext,
-) -> BindingAudit:
-    targets = tuple(resolver(typed_args, context) for resolver in spec.binding_resolvers)
-    if not targets:
-        status: BindingStatus = "unbound" if not context.current_bindings else "unavailable"
-        return BindingAudit(status=status, target_count=0)
-
-    statuses = _binding_statuses(targets, context.current_bindings)
-    status = _aggregate_statuses(statuses)
-    return BindingAudit(
-        status=status,
-        target_count=len(targets),
-        entity_kinds=tuple(sorted({target.entity_kind for target in targets})),
-    )
-
-
-def _binding_statuses(
-    targets: tuple[BindingTarget, ...],
-    current_bindings: Mapping[str, int | str],
-) -> tuple[BindingStatus, ...]:
-    grouped: dict[str, list[BindingIdentity]] = {}
-    for target in targets:
-        if target.available:
-            if target.identity is None:
-                raise ValueError("available binding target is missing identity")
-            identity: BindingIdentity = target.identity
-        else:
-            identity = UNAVAILABLE
-        grouped.setdefault(target.entity_kind, []).append(identity)
-    return tuple(
-        aggregate_binding(current_bindings.get(entity_kind), identities)
-        for entity_kind, identities in grouped.items()
-    )
-
-
-def _aggregate_statuses(statuses: Sequence[BindingStatus]) -> BindingStatus:
-    for status in ("mismatched", "unavailable", "unbound", "matched"):
-        if status in statuses:
-            return status
-    return "unavailable"
+__all__ = [
+    "UNAVAILABLE",
+    "ToolCapability",
+    "ToolExecutionContext",
+    "aggregate_binding",
+    "audit_bindings",
+    "evaluate_context",
+    "pre_resolver_scope_policy",
+    "require_capabilities",
+    "scope_access_denied",
+]

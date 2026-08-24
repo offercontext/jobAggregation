@@ -2,15 +2,29 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any, TypeAlias, cast
 
 from offerpilot.ai.control import AgentLoopControlError
+from offerpilot.ai.tool_authority import (
+    ApprovalExecutionAuthority,
+    ApprovedWritePrepareCallIdentity,
+    AuthorityCallIdentity,
+    AuthorityPhaseError,
+    AuthorityUse,
+    NewTurnPrepareCallIdentity,
+    ReadExecutionCallIdentity,
+    SegmentExecutionAuthority,
+    require_authority_phase,
+    require_authority_spec,
+)
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.context import (
     ToolExecutionContext,
     audit_bindings,
+    pre_resolver_scope_policy,
     require_capabilities,
+    scope_access_denied,
 )
 from offerpilot.ai.tool_runtime.contracts import (
     ConfirmationRequired,
@@ -40,6 +54,7 @@ from offerpilot.ai.tool_runtime.validation import (
     validate_arguments,
 )
 from offerpilot.ai.types import ToolCall
+from offerpilot.repositories.session_binding import ScopeAccessDenied
 
 
 @dataclass(frozen=True)
@@ -59,11 +74,20 @@ def prepare_call(
     context: ToolExecutionContext,
     call: ToolCall,
     *,
+    call_identity: AuthorityCallIdentity | None = None,
     pending_identity: object | None = None,
     pending_action_revision: int | None = None,
     stage_sink: StageSink | None = None,
     record_proposal: bool = True,
 ) -> PrepareResult:
+    use = _prepare_use(context, call_identity)
+    _stage(stage_sink, "authority.prelookup")
+    if call_identity is None:
+        raise AuthorityPhaseError("prepare_call requires a registered call identity")
+    require_authority_phase(context.authority, use, call_identity)
+    _require_context_identity(context, call_identity)
+
+    _stage(stage_sink, "catalog.lookup")
     spec = catalog.resolve(call.name)
     if spec is None:
         return Rejected(
@@ -74,8 +98,20 @@ def prepare_call(
             )
         )
 
+    _stage(stage_sink, "authority.postlookup")
+    factory = context.authority_factory
+    factory.register_tool_spec(
+        spec,
+        authority=context.authority,
+        prepare_identity=cast(
+            NewTurnPrepareCallIdentity | ApprovedWritePrepareCallIdentity,
+            call_identity,
+        ),
+    )
+    require_authority_spec(context.authority, use, spec)
     if record_proposal:
         project_tool_proposed(context.run_recorder, spec, call)
+
     _stage(stage_sink, "parse")
     try:
         parsed = parse_arguments(call.args)
@@ -104,13 +140,21 @@ def prepare_call(
     if permission is not None:
         return Rejected(permission)
 
-    _stage(stage_sink, "binding")
+    _stage(stage_sink, "scope_policy")
+    scope_failure = pre_resolver_scope_policy(spec, context)
+    if scope_failure is not None:
+        return Rejected(scope_failure)
+
+    _stage(stage_sink, "binding.resolve")
     try:
-        binding = audit_bindings(spec, typed_args, context)
+        binding, binding_allowed = audit_bindings(spec, typed_args, context)
     except AgentLoopControlError:
         raise
     except Exception:
         return Rejected(ToolFailure("internal_error", "binding_resolution_failed"))
+    _stage(stage_sink, "binding.policy")
+    if not binding_allowed:
+        return Rejected(scope_access_denied())
 
     _stage(stage_sink, "preflight")
     if spec.preflight is not None:
@@ -124,22 +168,39 @@ def prepare_call(
             return Rejected(preflight_failure)
 
     arguments = cast(dict[str, JSONValue], lossless_typed_copy(validated))
-    prepared = PreparedToolCall(
-        arguments=arguments,
-        arguments_digest=_arguments_digest(arguments),
-        binding=binding,
-        contract_fingerprint=_contract_fingerprint(spec.contract.payload),
-        pending_action_revision=pending_action_revision,
-        pending_identity=pending_identity,
-        spec=spec,
+    prepared = factory.prepare_tool_call(
+        context.authority,
+        prepare_identity=cast(
+            NewTurnPrepareCallIdentity | ApprovedWritePrepareCallIdentity,
+            call_identity,
+        ),
         tool_call_id=call.id,
+        spec=spec,
+        arguments=arguments,
         typed_args=typed_args,
+        arguments_digest=_arguments_digest(arguments),
+        contract_fingerprint=_contract_fingerprint(spec.contract.payload),
+        binding=binding,
+    )
+    object.__setattr__(
+        prepared,
+        "prepared_instance_token",
+        factory.prepared_token(prepared),
     )
     if spec.kind == "write":
-        prepared = replace(
+        # The draft is transport compatibility data, not authorization.  It is
+        # attached to the exact factory-created Prepared object and never used
+        # to reconstruct authority or constraint state.
+        object.__setattr__(
             prepared,
-            journal_started_draft=prepare_tool_started_draft(context.run_recorder, prepared),
+            "journal_started_draft",
+            prepare_tool_started_draft(context.run_recorder, prepared),
         )
+        object.__setattr__(prepared, "pending_identity", pending_identity)
+        object.__setattr__(
+            prepared, "pending_action_revision", pending_action_revision
+        )
+    _stage(stage_sink, "prepared")
     if spec.confirmation_policy == "required":
         return ConfirmationRequired(prepared)
     return ReadyToExecute(prepared)
@@ -149,8 +210,33 @@ def execute_prepared(
     prepared: PreparedToolCall[Any, Any],
     context: ToolExecutionContext,
     *,
+    call_identity: AuthorityCallIdentity | None = None,
     confirmation_claimer: ConfirmationClaimer | None = None,
     stage_sink: StageSink | None = None,
+) -> ToolExecutionRecord[Any, Any]:
+    if prepared.spec.kind == "read":
+        return _execute_read(
+            prepared,
+            context,
+            call_identity=call_identity,
+            stage_sink=stage_sink,
+        )
+    # Task 10 replaces this isolated compatibility branch with a sealed
+    # one-shot ExecutionClaim.  Task 9 neither creates nor imitates that claim.
+    return _execute_compatibility_write(
+        prepared,
+        context,
+        confirmation_claimer=confirmation_claimer,
+        stage_sink=stage_sink,
+    )
+
+
+def _execute_compatibility_write(
+    prepared: PreparedToolCall[Any, Any],
+    context: ToolExecutionContext,
+    *,
+    confirmation_claimer: ConfirmationClaimer | None,
+    stage_sink: StageSink | None,
 ) -> ToolExecutionRecord[Any, Any]:
     spec = prepared.spec
     _stage(stage_sink, "mutable")
@@ -163,52 +249,51 @@ def execute_prepared(
             return _failed_record(prepared, _map_exception(spec, exc))
         if mutable_failure is not None:
             return _failed_record(prepared, mutable_failure)
-
-    if spec.kind == "write":
-        _stage(stage_sink, "claim")
-        if confirmation_claimer is None:
-            return _failed_record(
-                prepared,
-                ToolFailure("conflict", "confirmation_claim_required"),
-            )
-        try:
-            authorization = confirmation_claimer(prepared)
-        except AgentLoopControlError:
-            raise
-        except Exception:
-            return _failed_record(prepared, ToolFailure("conflict", "confirmation_claim_failed"))
-        if isinstance(authorization, ToolFailure):
-            return _failed_record(prepared, authorization)
-        _stage(stage_sink, "authorization")
-        _stage(stage_sink, "authorization_match")
-        if not _authorization_matches(prepared, authorization):
-            return _failed_record(
-                prepared,
-                ToolFailure("stale_state", "authorization_mismatch"),
-            )
-        if context.operation_executor is not None:
-            record = cast(
-                ToolExecutionRecord[Any, Any],
-                context.operation_executor(prepared, context, authorization),
-            )
-            if record.replayed or not record.execution_started:
-                return record
-            started_recorded = record.journal_started_recorded
-            if record.persisted_visible_result is None:
-                raise RuntimeError("persisted operation result is missing")
-            project_tool_terminal(
-                context.run_recorder,
-                record,
-                started_recorded=started_recorded,
-                visible_result=record.persisted_visible_result,
-            )
+    _stage(stage_sink, "claim")
+    if confirmation_claimer is None:
+        return _failed_record(
+            prepared, ToolFailure("conflict", "confirmation_claim_required")
+        )
+    try:
+        authorization = confirmation_claimer(prepared)
+    except AgentLoopControlError:
+        raise
+    except Exception:
+        return _failed_record(
+            prepared, ToolFailure("conflict", "confirmation_claim_failed")
+        )
+    if isinstance(authorization, ToolFailure):
+        return _failed_record(prepared, authorization)
+    _stage(stage_sink, "authorization")
+    _stage(stage_sink, "authorization_match")
+    if not _authorization_matches(prepared, authorization):
+        return _failed_record(
+            prepared, ToolFailure("stale_state", "authorization_mismatch")
+        )
+    if context.operation_executor is not None:
+        record = cast(
+            ToolExecutionRecord[Any, Any],
+            context.operation_executor(prepared, context, authorization),
+        )
+        if record.replayed or not record.execution_started:
             return record
-
+        if record.persisted_visible_result is None:
+            raise RuntimeError("persisted operation result is missing")
+        project_tool_terminal(
+            context.run_recorder,
+            record,
+            started_recorded=record.journal_started_recorded,
+            visible_result=record.persisted_visible_result,
+        )
+        return record
     started_recorded = project_tool_started(context.run_recorder, prepared)
     _stage(stage_sink, "tool.started")
     _stage(stage_sink, "executor")
     try:
-        result = spec.executor(prepared.typed_args, context)
+        with context.session_factory() as session:
+            bound_context = context.bind(session)
+            result = spec.executor(prepared.typed_args, bound_context)
+            session.commit()
     except AgentLoopControlError:
         raise
     except Exception as exc:
@@ -225,7 +310,6 @@ def execute_prepared(
             visible_result=render_compatibility(spec, record.outcome),
         )
         return record
-
     record = ToolExecutionRecord(
         execution_started=True,
         outcome=ToolSuccess(result),
@@ -239,6 +323,125 @@ def execute_prepared(
         visible_result=render_compatibility(spec, record.outcome),
     )
     return record
+
+
+def _execute_read(
+    prepared: PreparedToolCall[Any, Any],
+    context: ToolExecutionContext,
+    *,
+    call_identity: AuthorityCallIdentity | None,
+    stage_sink: StageSink | None,
+) -> ToolExecutionRecord[Any, Any]:
+    _stage(stage_sink, "authority.prelookup")
+    if call_identity is None or type(call_identity) is not ReadExecutionCallIdentity:
+        raise AuthorityPhaseError("read execution requires a registered read call identity")
+    require_authority_phase(context.authority, AuthorityUse.READ_EXECUTE, call_identity)
+    _require_context_identity(context, call_identity)
+    if call_identity.prepared is not prepared:
+        raise AuthorityPhaseError("read identity belongs to another PreparedToolCall")
+    if prepared.prepared_instance_token is not call_identity.prepared_instance_token:
+        raise AuthorityPhaseError("PreparedToolCall registry token mismatch")
+
+    spec = prepared.spec
+    _stage(stage_sink, "authority.postlookup")
+    require_authority_spec(context.authority, AuthorityUse.READ_EXECUTE, spec)
+
+    with context.session_factory() as session:
+        bound_context = context.bind(session)
+        _stage(stage_sink, "capability")
+        permission = require_capabilities(spec, bound_context)
+        if permission is not None:
+            session.rollback()
+            return _failed_record(prepared, permission)
+
+        _stage(stage_sink, "binding.resolve")
+        try:
+            binding, binding_allowed = audit_bindings(
+                spec, prepared.typed_args, bound_context
+            )
+        except AgentLoopControlError:
+            session.rollback()
+            raise
+        except Exception:
+            session.rollback()
+            return _failed_record(
+                prepared, ToolFailure("internal_error", "binding_resolution_failed")
+            )
+        _stage(stage_sink, "binding.policy")
+        del binding
+        if not binding_allowed:
+            session.rollback()
+            return _failed_record(prepared, scope_access_denied())
+
+        # End the resolver snapshot before the externally visible start event.
+        # The same Session object is retained, but the final scoped statement
+        # begins a fresh SQLite snapshot and is the authorization/data
+        # linearization point.
+        session.rollback()
+        _stage(stage_sink, "binding.rollback")
+
+        started_recorded = project_tool_started(context.run_recorder, prepared)
+        _stage(stage_sink, "tool.started")
+        _stage(stage_sink, "executor")
+        try:
+            result = spec.executor(prepared.typed_args, bound_context)
+        except AgentLoopControlError:
+            raise
+        except Exception as exc:
+            record = ToolExecutionRecord(
+                execution_started=True,
+                outcome=_map_exception(spec, exc),
+                prepared=prepared,
+            )
+            _stage(stage_sink, "tool.failed")
+            project_tool_terminal(
+                context.run_recorder,
+                record,
+                started_recorded=started_recorded,
+                visible_result=render_compatibility(spec, record.outcome),
+            )
+            return record
+
+        record = ToolExecutionRecord(
+            execution_started=True,
+            outcome=ToolSuccess(result),
+            prepared=prepared,
+        )
+        _stage(stage_sink, "tool.completed")
+        project_tool_terminal(
+            context.run_recorder,
+            record,
+            started_recorded=started_recorded,
+            visible_result=render_compatibility(spec, record.outcome),
+        )
+        return record
+
+
+def _prepare_use(
+    context: ToolExecutionContext,
+    call_identity: AuthorityCallIdentity | None,
+) -> AuthorityUse:
+    authority = context.authority
+    if isinstance(authority, SegmentExecutionAuthority):
+        if call_identity is not None and type(call_identity) is not NewTurnPrepareCallIdentity:
+            raise AuthorityPhaseError("Segment prepare requires NewTurnPrepareCallIdentity")
+        return AuthorityUse.NEW_TURN_PREPARE
+    if isinstance(authority, ApprovalExecutionAuthority):
+        if call_identity is not None and type(call_identity) is not ApprovedWritePrepareCallIdentity:
+            raise AuthorityPhaseError("approval prepare requires ApprovedWritePrepareCallIdentity")
+        return AuthorityUse.APPROVED_WRITE_PREPARE
+    raise AuthorityPhaseError("unknown ToolExecutionAuthority")
+
+
+def _require_context_identity(
+    context: ToolExecutionContext, call_identity: AuthorityCallIdentity
+) -> None:
+    identity_context = getattr(call_identity, "tool_context", None)
+    if identity_context is not None and identity_context is not context:
+        raise AuthorityPhaseError("call identity belongs to another ToolExecutionContext")
+    approval_context = getattr(call_identity, "approval_context", None)
+    if approval_context is not None and approval_context is not context:
+        raise AuthorityPhaseError("approval identity belongs to another ToolExecutionContext")
 
 
 def _validation_failure(code: str) -> ToolFailure:
@@ -299,6 +502,8 @@ def _authorization_matches(
 
 
 def _map_exception(spec: ToolSpec[Any, Any], error: Exception) -> ToolFailure:
+    if isinstance(error, ScopeAccessDenied):
+        return scope_access_denied()
     for mapping in spec.exception_map:
         if isinstance(error, mapping.exception_type):
             return _mapped_failure(mapping, error)

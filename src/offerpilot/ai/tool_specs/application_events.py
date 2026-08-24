@@ -108,16 +108,20 @@ _APPLICATION_EVENT_PARENT_RESOLVER = BindingResolverSpec(
 
 
 def _list(args: EventArgs, context: ToolExecutionContext) -> list[dict[str, Any]]:
-    rows = context.events.list(
+    rows = context.events.list_application_events_scoped(
+        context.scope_constraint,
         month=str(args.get("month") or ""),
-        application_id=optional_integer(args, "application_id"),
+        application_id=args.get("application_id"),
         event_type=str(args.get("event_type") or ""),
     )
     return [event_with_application_json(item) for item in rows]
 
 
 def _get(args: EventArgs, context: ToolExecutionContext) -> dict[str, Any]:
-    event = context.events.get(integer(args, "id", "get_application_event"))
+    event = context.events.get_application_event_scoped(
+        context.scope_constraint,
+        integer(args, "id", "get_application_event"),
+    )
     if event is None:
         raise ToolRecordNotFound("application event not found")
     return event_json(event)
@@ -125,7 +129,9 @@ def _get(args: EventArgs, context: ToolExecutionContext) -> dict[str, Any]:
 
 def _event_create(args: EventArgs, context: ToolExecutionContext, tool_name: str) -> ApplicationEventCreate:
     application_id = integer(args, "application_id", tool_name)
-    if context.applications.get(application_id) is None:
+    if context.applications.get_application_scoped(
+        context.scope_constraint, application_id
+    ) is None:
         raise ToolRecordNotFound("application not found")
     event_type = str(args.get("event_type") or "")
     if event_type not in EVENT_TYPES:
@@ -165,21 +171,33 @@ def _event_create(args: EventArgs, context: ToolExecutionContext, tool_name: str
 
 
 def _create(args: EventArgs, context: ToolExecutionContext) -> dict[str, Any]:
-    return event_json(context.events.create(_event_create(args, context, "create_application_event")))
+    return event_json(
+        context.events.create_application_event_scoped(
+            context.scope_constraint,
+            _event_create(args, context, "create_application_event"),
+        )
+    )
 
 
 def _update(args: EventArgs, context: ToolExecutionContext) -> dict[str, Any]:
     event_id = integer(args, "id", "update_application_event")
-    if context.events.get(event_id) is None:
-        raise ToolRecordNotFound("application event not found")
-    event = context.events.update(event_id, _event_create(args, context, "update_application_event"))
+    event = context.events.update_application_event_scoped(
+        context.scope_constraint,
+        event_id,
+        _event_create(args, context, "update_application_event"),
+    )
     if event is None:
         raise ToolRecordNotFound("application event not found")
     return event_json(event)
 
 
 def _delete(args: EventArgs, context: ToolExecutionContext) -> dict[str, bool]:
-    return {"deleted": context.events.delete(integer(args, "id", "delete_application_event"))}
+    return {
+        "deleted": context.events.delete_application_event_scoped(
+            context.scope_constraint,
+            integer(args, "id", "delete_application_event"),
+        )
+    }
 
 
 def _event_schema(required: list[JSONValue]) -> dict[str, JSONValue]:

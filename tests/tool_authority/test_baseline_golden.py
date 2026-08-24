@@ -30,7 +30,6 @@ from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionCont
 from offerpilot.ai.tool_runtime.contracts import (
     BindingTarget,
     ConfirmationRequired,
-    ExecutionAuthorization,
     ProviderToolContract,
     ToolExecutionRecord,
     ToolFailure,
@@ -762,18 +761,12 @@ def _prepared_write_probe() -> tuple[ToolSpec[Any, Any], ToolExecutionContext, A
     return spec, context, prepared_result.prepared
 
 
-def _raise_claim(_prepared: object) -> ExecutionAuthorization:
+def _raise_claim(_prepared: object) -> None:
     raise _ClaimProbeError
 
 
-def _mismatched_authorization(prepared: Any) -> ExecutionAuthorization:
-    return ExecutionAuthorization(
-        pending_identity="mismatched-authority-identity",
-        pending_action_revision=prepared.pending_action_revision or 1,
-        tool_call_id=prepared.tool_call_id,
-        tool_name=prepared.spec.name,
-        arguments_digest=prepared.arguments_digest,
-    )
+def _mismatched_claim_failure(_prepared: Any) -> ToolFailure:
+    return ToolFailure("conflict", "authorization_mismatch")
 
 
 def _run_stale_promotion(mode: str) -> RuntimeFailureOutcome:
@@ -826,7 +819,7 @@ def test_execute_prepared_failures_promote_to_one_verified_stale_route() -> None
     assert set(expected_cases) == set(metadata)
     for mode, claimer in {
         "confirmation_claim_failed": _raise_claim,
-        "authorization_mismatch": _mismatched_authorization,
+        "authorization_mismatch": _mismatched_claim_failure,
     }.items():
         spec, context, prepared = _prepared_write_probe()
         record = execute_prepared(
@@ -895,15 +888,8 @@ class _CountingContinuation:
         self,
         pending: PendingAction,
         prepared: object,
-    ) -> ExecutionAuthorization:
-        return ExecutionAuthorization(
-            pending_identity=getattr(prepared, "pending_identity"),
-            pending_action_revision=getattr(prepared, "pending_action_revision"),
-            tool_call_id=pending.tool_call_id,
-            tool_name=pending.tool_name,
-            arguments_digest=getattr(prepared, "arguments_digest"),
-            operation_id=pending.operation_id,
-        )
+    ) -> ToolFailure | None:
+        return None
 
     def record_result(
         self,
@@ -929,10 +915,10 @@ class _PromotionContinuation(_CountingContinuation):
         self,
         pending: PendingAction,
         prepared: object,
-    ) -> ExecutionAuthorization:
+    ) -> ToolFailure | None:
         if self.mode == "confirmation_claim_failed":
             return _raise_claim(prepared)
-        return _mismatched_authorization(prepared)
+        return _mismatched_claim_failure(prepared)
 
 
 def _counted_write_spec(counter: dict[str, int]) -> ToolSpec[Any, Any]:
@@ -994,15 +980,20 @@ def _run_agent_call_count_case(case: str) -> dict[str, object]:
 
         def operation_executor(
             prepared: object,
-            _context: object,
-            authorization: ExecutionAuthorization,
+            execution_context: object,
+            _prepare_identity: object,
         ) -> ToolExecutionRecord[Any, Any]:
             counter["operation_executor_calls"] += 1
+            operation_id = getattr(
+                getattr(execution_context, "authority", None),
+                "operation_id",
+                "",
+            )
             return ToolExecutionRecord(
                 prepared=cast(Any, prepared),
                 outcome=ToolSuccess({"ok": True}),
                 execution_started=True,
-                operation_id=authorization.operation_id,
+                operation_id=operation_id,
                 terminal_persisted=True,
                 persisted_visible_result="saved",
                 persisted_transport={"status": "success"},

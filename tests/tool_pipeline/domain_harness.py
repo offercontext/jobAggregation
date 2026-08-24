@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 from sqlalchemy import func, select
@@ -17,9 +18,11 @@ from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import (
     ConfirmationRequired,
-    ExecutionAuthorization,
     ReadyToExecute,
+    ToolExecutionRecord,
+    ToolFailure,
     ToolSpec,
+    ToolSuccess,
 )
 from offerpilot.ai.tool_runtime.pipeline import Rejected, execute_prepared, prepare_call
 from offerpilot.ai.tool_runtime.rendering import render_compatibility
@@ -289,26 +292,119 @@ def execute_case(
             compatibility_handler_calls = 0 if stages[-1:] == ["preflight"] else 1
         else:
             assert isinstance(prepared, (ReadyToExecute, ConfirmationRequired))
-
-            def claim(call: Any) -> ExecutionAuthorization:
-                return ExecutionAuthorization(
-                    arguments_digest=call.arguments_digest,
+            if isinstance(prepared, ReadyToExecute):
+                record = execute_prepared(
+                    prepared.prepared,
+                    harness.context,
+                    call_identity=harness.read_identity(prepared.prepared),
+                )
+            else:
+                approval_factory = AuthorityFactory()
+                pending = SimpleNamespace(
+                    operation_id="golden-operation",
+                    conversation_id=1,
+                    tool_call_id=tool_call.id,
+                    tool_name=tool_call.name,
                     pending_action_revision=1,
-                    pending_identity="golden-pending",
-                    tool_call_id="golden-call",
-                    tool_name=spec.name,
+                    effective_args_digest=prepared.prepared.arguments_digest,
+                )
+                approval_factory.register_pending(pending)
+                authority = approval_factory.create_approval_authority(
+                    operation_id=pending.operation_id,
+                    conversation_id=pending.conversation_id,
+                    conversation_scope_revision=0,
+                    trusted_scope=TrustedContextScope("workspace", None, "general"),
+                    pending_identity=pending,
+                    pending_action_revision=pending.pending_action_revision,
+                    tool_call_id=pending.tool_call_id,
+                    tool_name=pending.tool_name,
+                    effective_args_digest=pending.effective_args_digest,
+                    capabilities=frozenset(ToolCapability),
                 )
 
-            record = execute_prepared(
-                prepared.prepared,
-                harness.context,
-                call_identity=(
-                    harness.read_identity(prepared.prepared)
-                    if isinstance(prepared, ReadyToExecute)
-                    else None
-                ),
-                confirmation_claimer=claim if isinstance(prepared, ConfirmationRequired) else None,
-            )
+                def execute_operation(
+                    approved: Any,
+                    approved_context: ToolExecutionContext,
+                    _prepare_identity: object,
+                ) -> ToolExecutionRecord[Any, Any]:
+                    with harness.session_factory() as session:
+                        bound_context = approved_context.bind(session)
+                        try:
+                            outcome: ToolSuccess[Any] | ToolFailure = ToolSuccess(
+                                approved.spec.executor(approved.typed_args, bound_context)
+                            )
+                        except Exception as exc:
+                            mapping = next(
+                                (
+                                    item
+                                    for item in approved.spec.exception_map
+                                    if isinstance(exc, item.exception_type)
+                                ),
+                                None,
+                            )
+                            outcome = (
+                                ToolFailure("internal_error", "executor_exception")
+                                if mapping is None
+                                else ToolFailure(
+                                    mapping.category,
+                                    mapping.code,
+                                    (
+                                        mapping.compatibility_detail(exc)
+                                        if mapping.compatibility_detail is not None
+                                        else ""
+                                    ),
+                                )
+                            )
+                        session.commit()
+                    visible_result = render_compatibility(approved.spec, outcome)
+                    return ToolExecutionRecord(
+                        prepared=approved,
+                        outcome=outcome,
+                        execution_started=True,
+                        operation_id=pending.operation_id,
+                        terminal_persisted=True,
+                        persisted_visible_result=visible_result,
+                        persisted_transport={"status": "success"},
+                    )
+
+                approval_context = ToolExecutionContext(
+                    authority=authority,
+                    applications=harness.context.applications,
+                    events=harness.context.events,
+                    notes=harness.context.notes,
+                    offers=harness.context.offers,
+                    resumes=harness.context.resumes,
+                    jd_analyses=harness.context.jd_analyses,
+                    run_recorder=cast(Any, NullRunRecorder()),
+                    operation_executor=execute_operation,
+                )
+                approval_factory.register_tool_execution_context(
+                    approval_context, authority=authority
+                )
+                prepare_identity = approval_factory.create_approved_write_prepare_identity(
+                    authority,
+                    approval_context=approval_context,
+                    request_identity=object(),
+                )
+                approved = prepare_call(
+                    catalog,
+                    approval_context,
+                    tool_call,
+                    call_identity=prepare_identity,
+                    pending_identity=pending,
+                    pending_action_revision=1,
+                    record_proposal=False,
+                )
+                assert isinstance(approved, ConfirmationRequired)
+                try:
+                    record = execute_prepared(
+                        approved.prepared,
+                        approval_context,
+                        call_identity=prepare_identity,
+                        confirmation_claimer=lambda _call: None,
+                    )
+                finally:
+                    approval_factory.close()
             visible = render_compatibility(spec, record.outcome)
             compatibility_handler_calls = executor_calls
         projection: dict[str, Any] = {}

@@ -16,7 +16,6 @@ from offerpilot.ai.agent_contracts import PendingAction
 from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import (
     BindingAudit,
-    ExecutionAuthorization,
     PreparedToolCall,
     REQUIRED_UNDO_TOOL_NAMES,
     ToolExceptionMapping,
@@ -115,15 +114,8 @@ def _prepared(tool_name: str, tool_call_id: str, calls: list[str]):
     )
 
 
-def _authorization(prepared, operation_id: str):
-    return ExecutionAuthorization(
-        pending_identity=object(),
-        pending_action_revision=1,
-        tool_call_id=prepared.tool_call_id,
-        tool_name=prepared.spec.name,
-        arguments_digest=prepared.arguments_digest,
-        operation_id=operation_id,
-    )
+def _prepare_identity(_prepared, _operation_id: str):
+    return object()
 
 
 def _execute_typed_parent(tmp_path, tool_name: str):
@@ -143,7 +135,7 @@ def _execute_typed_parent(tmp_path, tool_name: str):
         conversation_id=conversation.id,
         prepared=prepared,
         context=context,
-        authorization=_authorization(prepared, operation_id),
+        prepare_identity=_prepare_identity(prepared, operation_id),
         request_fingerprint=request_fingerprint,
         undo_builder=undo_builder,
     )
@@ -190,7 +182,7 @@ def test_all_typed_ledger_adapters_execute_once_and_replay_without_runtime_calls
         conversation_id=conversation.id,
         prepared=prepared,
         context=context,
-        authorization=_authorization(prepared, operation_id),
+        prepare_identity=_prepare_identity(prepared, operation_id),
         request_fingerprint=request_fingerprint,
     )
 
@@ -351,7 +343,7 @@ def test_two_connections_choose_one_primary_executor_winner(tmp_path) -> None:
             return original_executor(args, bound_context)
 
     prepared = replace(prepared, spec=replace(prepared.spec, executor=synchronized_executor))
-    authorization = _authorization(prepared, operation_id)
+    prepare_identity = _prepare_identity(prepared, operation_id)
 
     def approve():
         return coordinator.execute_primary(
@@ -359,7 +351,7 @@ def test_two_connections_choose_one_primary_executor_winner(tmp_path) -> None:
             conversation_id=conversation.id,
             prepared=prepared,
             context=context,
-            authorization=authorization,
+            prepare_identity=prepare_identity,
             request_fingerprint="hmac-sha256:" + "6" * 64,
         )[0]
 
@@ -378,7 +370,7 @@ def test_primary_commit_unknown_reconciles_without_second_executor_call(
     conversation, operation_id, tool_call_id = _propose(chat, "delete_note")
     calls: list[str] = []
     prepared = _prepared("delete_note", tool_call_id, calls)
-    authorization = _authorization(prepared, operation_id)
+    prepare_identity = _prepare_identity(prepared, operation_id)
     real_commit = Session.commit
     injected = False
 
@@ -399,7 +391,7 @@ def test_primary_commit_unknown_reconciles_without_second_executor_call(
         conversation_id=conversation.id,
         prepared=prepared,
         context=context,
-        authorization=authorization,
+        prepare_identity=prepare_identity,
         request_fingerprint="hmac-sha256:" + "7" * 64,
     )
     reconciled, _ = coordinator.execute_primary(**arguments)
@@ -452,7 +444,7 @@ def test_deterministic_failure_commit_unknown_replays_failed_terminal(
         conversation_id=conversation.id,
         prepared=prepared,
         context=context,
-        authorization=_authorization(prepared, operation_id),
+        prepare_identity=_prepare_identity(prepared, operation_id),
         request_fingerprint="hmac-sha256:" + "9" * 64,
     )
     reconciled, reconciled_record = coordinator.execute_primary(**arguments)

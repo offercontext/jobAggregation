@@ -19,7 +19,6 @@ from offerpilot.ai.agent_loop import (
     NewTurnSeed,
 )
 from offerpilot.ai.tool_runtime.contracts import (
-    ExecutionAuthorization,
     PreparedToolCall,
     ToolExecutionRecord,
     ToolFailure,
@@ -67,14 +66,15 @@ def invocation(
 def execute_operation(
     prepared: PreparedToolCall[Any, Any],
     context: object,
-    authorization: ExecutionAuthorization,
+    _prepare_identity: object,
 ) -> ToolExecutionRecord[Any, Any]:
     value = prepared.spec.executor(prepared.typed_args, context)
+    operation_id = getattr(getattr(context, "authority", None), "operation_id", "operation-1")
     return ToolExecutionRecord(
         prepared=prepared,
         outcome=ToolSuccess(value),
         execution_started=True,
-        operation_id=authorization.operation_id,
+        operation_id=operation_id,
         terminal_persisted=True,
         persisted_visible_result=str(value),
         persisted_transport={"status": "success", "result": str(value)},
@@ -482,16 +482,9 @@ class ApprovedPort:
         self,
         pending: PendingAction,
         prepared: PreparedToolCall[Any, Any],
-    ) -> ExecutionAuthorization | ToolFailure:
+    ) -> ToolFailure | None:
         self.phases.append("claim")
-        return ExecutionAuthorization(
-            pending_identity=prepared.pending_identity,
-            pending_action_revision=prepared.pending_action_revision or 0,
-            tool_call_id=pending.tool_call_id,
-            tool_name=pending.tool_name,
-            arguments_digest=prepared.arguments_digest,
-            operation_id=pending.operation_id,
-        )
+        return None
 
     def record_result(
         self,
@@ -671,10 +664,10 @@ def test_delivery_fence_after_approved_executor_aborts_without_repeat() -> None:
     def execute_and_revoke(
         prepared: PreparedToolCall[Any, Any],
         context: object,
-        authorization: ExecutionAuthorization,
+        prepare_identity: object,
     ) -> ToolExecutionRecord[Any, Any]:
         port.allowed = False
-        return execute_operation(prepared, context, authorization)
+        return execute_operation(prepared, context, prepare_identity)
 
     with pytest.raises(ChatRunCancelled):
         AgentLoopRunner().run(

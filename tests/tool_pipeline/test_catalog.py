@@ -16,7 +16,6 @@ from offerpilot.ai.tool_runtime.contracts import (
     BindingContract,
     BindingResolverSpec,
     BindingAudit,
-    ExecutionAuthorization,
     PreparedToolCall,
     ProviderToolContract,
     ToolExecutionRecord,
@@ -137,28 +136,20 @@ def test_transient_runtime_values_reject_pickle_and_hide_sensitive_fields() -> N
         tool_call_id="call-1",
         typed_args={"private": "sensitive-argument-value"},
     )
-    authorization = ExecutionAuthorization(
-        arguments_digest=prepared.arguments_digest,
-        pending_action_revision=3,
-        pending_identity="private pending identity",
-        tool_call_id="call-1",
-        tool_name="read_one",
-    )
     record = ToolExecutionRecord(
         execution_started=False,
         outcome=failure,
         prepared=prepared,
     )
 
-    for value in (failure, prepared, authorization, record):
+    for value in (failure, prepared, record):
         with pytest.raises(TypeError, match="transient tool runtime value"):
             pickle.dumps(value)
         with pytest.raises(TypeError, match="transient tool runtime value"):
             value.__getstate__()
 
-    rendered = repr((failure, prepared, authorization, record))
+    rendered = repr((failure, prepared, record))
     assert "private exception text" not in rendered
-    assert "private pending identity" not in rendered
     assert "sensitive-argument-value" not in rendered
 
 

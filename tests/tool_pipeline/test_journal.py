@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+from types import SimpleNamespace
 from typing import Any, cast
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
+import pytest
 
 from golden import load_golden
 
@@ -355,9 +357,66 @@ def test_pre_execution_stale_claim_sequence_matches_first_phase_golden() -> None
     _append_approval_requested(recorder)
     _append_approval_decided(recorder, "approved")
 
+    approval_factory = AuthorityFactory()
+    pending = SimpleNamespace(
+        operation_id="operation-1",
+        conversation_id=1,
+        tool_call_id="write-1",
+        tool_name=spec.name,
+        pending_action_revision=1,
+        effective_args_digest=prepared.prepared.arguments_digest,
+    )
+    approval_factory.register_pending(pending)
+    approval_authority = approval_factory.create_approval_authority(
+        operation_id=pending.operation_id,
+        conversation_id=pending.conversation_id,
+        conversation_scope_revision=0,
+        trusted_scope=TrustedContextScope("workspace", None, "general"),
+        pending_identity=pending,
+        pending_action_revision=pending.pending_action_revision,
+        tool_call_id=pending.tool_call_id,
+        tool_name=pending.tool_name,
+        effective_args_digest=pending.effective_args_digest,
+        capabilities=frozenset({ToolCapability.APPLICATIONS_WRITE}),
+    )
+    approval_context = ToolExecutionContext(
+        authority=approval_authority,
+        applications=context.applications,
+        events=context.events,
+        jd_analyses=context.jd_analyses,
+        notes=context.notes,
+        offers=context.offers,
+        resumes=context.resumes,
+        run_recorder=cast(Any, recorder),
+        operation_executor=lambda *_args: pytest.fail("stale claim reached operation executor"),
+    )
+    approval_factory.register_tool_execution_context(
+        approval_context, authority=approval_authority
+    )
+    prepare_identity = approval_factory.create_approved_write_prepare_identity(
+        approval_authority,
+        approval_context=approval_context,
+        request_identity=object(),
+    )
+    approved = prepare_call(
+        catalog,
+        approval_context,
+        ToolCall(
+            id="write-1",
+            name=spec.name,
+            args='{"id":1,"status":"offer"}',
+        ),
+        call_identity=prepare_identity,
+        pending_identity=pending,
+        pending_action_revision=1,
+        record_proposal=False,
+    )
+    assert isinstance(approved, ConfirmationRequired)
+
     record = execute_prepared(
-        prepared.prepared,
-        context,
+        approved.prepared,
+        approval_context,
+        call_identity=prepare_identity,
         confirmation_claimer=lambda call: ToolFailure(
             "stale_state",
             "confirmation_claim_lost",
@@ -366,6 +425,7 @@ def test_pre_execution_stale_claim_sequence_matches_first_phase_golden() -> None
 
     assert record.execution_started is False
     _assert_golden_case("pre_execution_stale_claim", recorder.events)
+    approval_factory.close()
     factory.close()
 
 

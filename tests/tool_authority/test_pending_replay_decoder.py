@@ -94,6 +94,14 @@ def test_decoder_rejects_non_finite_numbers(constant: str) -> None:
         "1e-400",  # Underflows and cannot round-trip through canonical JSON.
         "9007199254740993.0",  # Loses precision as a canonical JSON float.
         "-0",  # Aliases canonical integer zero.
+        "1e0",
+        "1.00",
+        "1e+0",
+        "0.10",
+        "1e-7",
+        "1E-7",
+        "10e-8",
+        "0e999",
     ],
 )
 def test_decoder_rejects_numeric_range_and_canonical_mismatch(number: str) -> None:
@@ -102,7 +110,7 @@ def test_decoder_rejects_numeric_range_and_canonical_mismatch(number: str) -> No
 
 def test_decoder_accepts_exact_canonical_json_numbers() -> None:
     assert PendingReplayArgsDecoderV1().decode(
-        '{"integer":9007199254740993,"decimal":0.1,"exponent":1e-7}'
+        '{"integer":9007199254740993,"decimal":0.1,"exponent":1e-07}'
     ) == {
         "integer": 9_007_199_254_740_993,
         "decimal": 0.1,

@@ -909,22 +909,34 @@ class WriteOperationRepository:
             for item in messages
         ]
         child = session.get(WriteOperation, next_operation_id) if next_operation_id else None
-        conversation = session.get(Conversation, operation.conversation_id)
-        if conversation is None:
-            raise WriteOperationError("operation_delivery_unknown")
         if outcome == "chained_pending":
+            pending_identity = session.execute(
+                select(
+                    Conversation.id,
+                    Conversation.pending_operation_id,
+                    Conversation.pending_tool_call_id,
+                    Conversation.pending_tool_name,
+                ).where(Conversation.id == operation.conversation_id)
+            ).one_or_none()
             if (
                 child is None
                 or child.operation_role != "primary"
                 or child.status != "proposed"
                 or child.conversation_id != operation.conversation_id
-                or conversation.pending_operation_id != child.id
-                or conversation.pending_tool_call_id != child.tool_call_id
-                or conversation.pending_tool_name != child.tool_name
+                or pending_identity is None
+                or pending_identity.pending_operation_id != child.id
+                or pending_identity.pending_tool_call_id != child.tool_call_id
+                or pending_identity.pending_tool_name != child.tool_name
             ):
                 raise WriteOperationError("operation_delivery_unknown")
-        elif next_operation_id is not None or conversation.pending_operation_id == operation.id:
-            raise WriteOperationError("operation_delivery_unknown")
+        else:
+            conversation_id = session.scalar(
+                select(Conversation.id)
+                .where(Conversation.id == operation.conversation_id)
+                .where(Conversation.pending_operation_id != operation.id)
+            )
+            if conversation_id is None or next_operation_id is not None:
+                raise WriteOperationError("operation_delivery_unknown")
         manifest: dict[str, JSONValue] = {
             "operation_id": operation.id,
             "status": operation.status,
@@ -1062,21 +1074,31 @@ class WriteOperationRepository:
                 operation.delivery_generation = takeover.generation
                 operation.delivery_owner_token_fingerprint = takeover.fingerprint
                 operation.delivery_lease_expires_at = now_epoch + DELIVERY_OWNER_LEASE_SECONDS
-                conversation = session.get(Conversation, operation.conversation_id)
-                if conversation is not None and conversation.pending_operation_id == operation.id:
-                    conversation.pending_operation_id = ""
-                    conversation.pending_tool_call_id = ""
-                    conversation.pending_tool_name = ""
-                    conversation.pending_args = ""
-                    conversation.pending_human = ""
-                    conversation.pending_confirmation_claim_id = ""
-                    conversation.pending_confirmation_claimed_at = None
-                    if operation.status == "committed" and operation.undo_json:
-                        conversation.last_write_undo_json = operation.undo_json
-                        conversation.last_write_operation_id = operation.id
-                    elif operation.status != "rejected":
-                        conversation.last_write_undo_json = ""
-                        conversation.last_write_operation_id = ""
+                conversation_update = (
+                    update(Conversation)
+                    .where(Conversation.id == operation.conversation_id)
+                    .where(Conversation.pending_operation_id == operation.id)
+                    .values(
+                        pending_operation_id="",
+                        pending_tool_call_id="",
+                        pending_tool_name="",
+                        pending_args="",
+                        pending_human="",
+                        pending_confirmation_claim_id="",
+                        pending_confirmation_claimed_at=None,
+                    )
+                )
+                if operation.status == "committed" and operation.undo_json:
+                    conversation_update = conversation_update.values(
+                        last_write_undo_json=operation.undo_json,
+                        last_write_operation_id=operation.id,
+                    )
+                elif operation.status != "rejected":
+                    conversation_update = conversation_update.values(
+                        last_write_undo_json="",
+                        last_write_operation_id="",
+                    )
+                session.execute(conversation_update)
                 session.flush()
                 if not self.complete_delivery(
                     session,

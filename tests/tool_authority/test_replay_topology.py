@@ -5,9 +5,12 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import event
 
+import offerpilot.ai.write_operations as write_operations
 from offerpilot.ai.agent_contracts import PendingAction
 from offerpilot.ai.write_operations import (
+    OperationReplay,
     WriteOperationError,
     WriteOperationRepository,
     build_terminal_payload,
@@ -32,6 +35,7 @@ def _seed_completed_origin(
     child_name: str = "update_note",
     child_args: str = '{"id":1,"content":"next"}',
     outcome: str = "chained_pending",
+    complete_delivery: bool = True,
 ):
     sessions = init_database(tmp_path / "offerpilot.db")
     key = load_or_create_ledger_key(tmp_path, sessions)
@@ -126,35 +130,42 @@ def _seed_completed_origin(
         origin.committed_at = now
         origin.delivery_generation = owner.generation
         origin.delivery_owner_token_fingerprint = owner.fingerprint
-        origin.delivery_lease_expires_at = 4_102_444_800
-        session.add_all(
-            [
-                ChatMessage(
-                    conversation_id=conversation.id,
-                    role="tool",
-                    content="saved",
-                    tool_call_id="origin-call",
-                    operation_id=origin.id,
-                    delivery_kind="origin_tool_result",
-                    delivery_ordinal=0,
-                ),
-                ChatMessage(
-                    conversation_id=conversation.id,
-                    role="assistant",
-                    content="done",
-                    operation_id=origin.id,
-                    delivery_kind="continuation_message",
-                    delivery_ordinal=1,
-                ),
-            ]
-        )
-        session.flush()
-        assert repository.complete_delivery(
-            session,
-            owner,
-            outcome=outcome,  # type: ignore[arg-type]
-            next_operation_id=child.id if outcome == "chained_pending" else None,
-        )
+        origin.delivery_lease_expires_at = 4_102_444_800 if complete_delivery else 0
+        if complete_delivery:
+            session.add_all(
+                [
+                    ChatMessage(
+                        conversation_id=conversation.id,
+                        role="tool",
+                        content="saved",
+                        tool_call_id="origin-call",
+                        operation_id=origin.id,
+                        delivery_kind="origin_tool_result",
+                        delivery_ordinal=0,
+                    ),
+                    ChatMessage(
+                        conversation_id=conversation.id,
+                        role="assistant",
+                        content="done",
+                        operation_id=origin.id,
+                        delivery_kind="continuation_message",
+                        delivery_ordinal=1,
+                    ),
+                ]
+            )
+            session.flush()
+            assert repository.complete_delivery(
+                session,
+                owner,
+                outcome=outcome,  # type: ignore[arg-type]
+                next_operation_id=child.id if outcome == "chained_pending" else None,
+            )
+        else:
+            conversation_row.pending_operation_id = origin.id
+            conversation_row.pending_tool_call_id = origin.tool_call_id or ""
+            conversation_row.pending_tool_name = origin.tool_name
+            conversation_row.pending_args = '{"private":"must-not-be-selected"}'
+            conversation_row.pending_human = "private pending"
         session.commit()
     return sessions, repository, origin_id, child_id, conversation.id
 
@@ -187,10 +198,14 @@ def test_manifest_failure_wins_before_malformed_pending_decode(
         assert conversation is not None
         conversation.pending_args = "{"
         session.commit()
-    monkeypatch.setattr(
-        "offerpilot.ai.write_operations._valid_delivery_messages",
-        lambda *_args: False,
-    )
+    chained_manifest = write_operations._chained_manifest
+
+    def tampered_manifest(operation: WriteOperation | None):
+        manifest = chained_manifest(operation)
+        assert manifest is not None
+        return {**manifest, "tool_name": "tampered-after-delivery"}
+
+    monkeypatch.setattr(write_operations, "_chained_manifest", tampered_manifest)
     with pytest.raises(WriteOperationError) as caught:
         _replay(repository, origin_id)
     assert caught.value.code == "operation_delivery_unknown"
@@ -248,11 +263,85 @@ def test_terminal_child_is_not_a_valid_chained_pending(tmp_path) -> None:
 
 
 def test_final_terminal_replay_has_no_pending_projection(tmp_path) -> None:
-    _sessions, repository, origin_id, _child_id, _conversation_id = _seed_completed_origin(
+    sessions, repository, origin_id, child_id, conversation_id = _seed_completed_origin(
         tmp_path, outcome="final_response"
     )
-    replay = _replay(repository, origin_id)
+    with sessions() as session:
+        conversation = session.get(Conversation, conversation_id)
+        child = session.get(WriteOperation, child_id)
+        assert conversation is not None
+        assert child is not None
+        conversation.pending_operation_id = child.id
+        conversation.pending_tool_call_id = child.tool_call_id or ""
+        conversation.pending_tool_name = child.tool_name
+        conversation.pending_args = '{"private":"must-not-be-selected"}'
+        conversation.pending_human = "private pending"
+        session.commit()
+        bind = session.get_bind()
+    statements: list[str] = []
+
+    def capture_statement(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        statements.append(statement)
+
+    event.listen(bind, "before_cursor_execute", capture_statement)
+    try:
+        replay = _replay(repository, origin_id)
+    finally:
+        event.remove(bind, "before_cursor_execute", capture_statement)
+
     assert replay.chained_pending is None
+    selected_projections = tuple(
+        statement.lower().split("from", maxsplit=1)[0]
+        for statement in statements
+        if statement.lstrip().upper().startswith("SELECT")
+    )
+    assert not any("conversations.pending_" in value for value in selected_projections)
+
+
+def test_expired_delivery_recovery_never_selects_pending_columns(tmp_path) -> None:
+    sessions, repository, origin_id, _child_id, conversation_id = _seed_completed_origin(
+        tmp_path,
+        outcome="final_response",
+        complete_delivery=False,
+    )
+    with sessions() as session:
+        bind = session.get_bind()
+    statements: list[str] = []
+
+    def capture_statement(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        statements.append(statement)
+
+    event.listen(bind, "before_cursor_execute", capture_statement)
+    try:
+        replay = repository.converge_expired_delivery(origin_id)
+    finally:
+        event.remove(bind, "before_cursor_execute", capture_statement)
+
+    assert isinstance(replay, OperationReplay)
+    selected_projections = tuple(
+        statement.lower().split("from", maxsplit=1)[0]
+        for statement in statements
+        if statement.lstrip().upper().startswith("SELECT")
+    )
+    assert not any("conversations.pending_" in value for value in selected_projections)
+    with sessions() as session:
+        conversation = session.get(Conversation, conversation_id)
+        assert conversation is not None
+        assert conversation.pending_operation_id == ""
 
 
 @pytest.mark.parametrize(

@@ -66,12 +66,15 @@ def _parse_float(raw: str) -> float:
         _integrity_error()
     try:
         source = Decimal(raw)
-        canonical = Decimal(json.dumps(value, allow_nan=False))
+        canonical_raw = json.dumps(value, allow_nan=False)
+        canonical = Decimal(canonical_raw)
     except (InvalidOperation, TypeError, ValueError, OverflowError) as exc:
         raise PendingReplayIntegrityError from exc
     # Do not accept underflow or precision loss that would cause a different
-    # number to be covered by the canonical Ledger fingerprint.
-    if source != canonical:
+    # number to be covered by the canonical Ledger fingerprint.  Exact spelling
+    # also matters: persisted Typed proposals use this same canonical encoder,
+    # so aliases such as ``1e0`` and ``1.00`` are integrity failures.
+    if source != canonical or raw != canonical_raw:
         _integrity_error()
     return value
 

@@ -2,6 +2,7 @@ from sqlalchemy import inspect, text
 
 from offerpilot.ai.agent_contracts import PendingAction
 from offerpilot.db import init_database
+from offerpilot.models import Conversation
 from offerpilot.repositories.chat import ChatRepository
 
 
@@ -32,7 +33,16 @@ def test_confirmation_claim_migration_upgrades_0024_database_idempotently(tmp_pa
     repo = ChatRepository(original_factory)
     conversation = repo.create_conversation("existing")
     pending = PendingAction("write-1", "update_application_status", '{"id":1}', "update")
-    assert repo.set_pending_action(conversation.id, pending) is True
+    with original_factory() as session:
+        historical = session.get(Conversation, conversation.id)
+        assert historical is not None
+        historical.pending_tool_call_id = pending.tool_call_id
+        historical.pending_operation_id = pending.operation_id
+        historical.pending_tool_name = pending.tool_name
+        historical.pending_args = pending.args
+        historical.pending_human = pending.human
+        session.commit()
+
     original_engine = original_factory.kw["bind"]
     with original_engine.begin() as connection:
         connection.execute(

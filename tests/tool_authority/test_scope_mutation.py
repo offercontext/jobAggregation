@@ -9,9 +9,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from offerpilot.api import create_app
-from offerpilot.ai.agent_contracts import PendingAction
 from offerpilot.db import init_database
-from offerpilot.models import Application
+from offerpilot.models import Application, Conversation
 from offerpilot.repositories.chat import (
     ChatRepository,
     ConversationScopeError,
@@ -347,12 +346,18 @@ def test_patch_title_retains_baseline_string_coercion(tmp_path: Path) -> None:
 
 
 def test_pending_read_does_not_lazy_create_operation(tmp_path: Path) -> None:
-    repo = ChatRepository(init_database(tmp_path / "data.db"))
+    session_factory = init_database(tmp_path / "data.db")
+    repo = ChatRepository(session_factory)
     conversation = repo.create_conversation("read")
-    assert repo.set_pending_action(
-        conversation.id,
-        PendingAction("call", "update_application_status", '{"id":1}', "update"),
-    )
+    with session_factory() as session:
+        historical = session.get(Conversation, conversation.id)
+        assert historical is not None
+        historical.pending_tool_call_id = "call"
+        historical.pending_tool_name = "update_application_status"
+        historical.pending_args = '{"id":1}'
+        historical.pending_human = "update"
+        session.commit()
+
     assert repo.get_pending_action(conversation.id) is not None
     assert repo.get_conversation(conversation.id) is not None
     assert repo.list_conversations(include_archived=True)

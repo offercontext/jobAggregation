@@ -10,7 +10,7 @@ describe('application stage workspace model', () => {
     ['interview', true, '面试结束', '完成面试复盘'],
     ['offer', false, '已获 Offer', '查看 Offer 与截止时间'],
     ['closed', false, '已结束', '记录结果与经验'],
-  ] as const)('maps %s to one primary action', (status, hasCompletedInterview, label, primaryActionLabel) => {
+  ] as const)('maps %s with completed interview=%s to one primary action', (status, hasCompletedInterview, label, primaryActionLabel) => {
     expect(getApplicationWorkspaceStage(status, { hasCompletedInterview })).toMatchObject({ label, primaryActionLabel });
   });
 

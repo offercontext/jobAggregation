@@ -404,6 +404,24 @@ class AuthorityFactory:
             )
             return record
 
+    def _authority_record_identity_only(self, authority: object) -> _AuthorityRecord:
+        """Return an active authority by exact object identity for cleanup.
+
+        Normal ports use ``_authority_record`` and therefore reject semantic
+        mutations.  Revocation must still be able to remove the object graph
+        after such a mutation, so cleanup intentionally performs only the
+        closed concrete-type and registry-identity checks.
+        """
+
+        with self._lock:
+            self._ensure_open()
+            if type(authority) not in {SegmentExecutionAuthority, ApprovalExecutionAuthority}:
+                raise AuthorityPhaseError("authority object has an invalid concrete type")
+            record = self._authorities.get(id(authority))
+            if record is None or record.authority is not authority:
+                raise AuthorityPhaseError("authority object is not active in this execution scope")
+            return record
+
     def _segment_record(self, authority: object) -> _AuthorityRecord:
         record = self._authority_record(authority)
         if not isinstance(record.authority, SegmentExecutionAuthority):
@@ -513,7 +531,7 @@ class AuthorityFactory:
 
     def revoke_authority(self, authority: ToolExecutionAuthority) -> None:
         with self._lock:
-            record = self._authority_record(authority)
+            record = self._authority_record_identity_only(authority)
             for claim_id, lifecycle in tuple(self._claims.items()):
                 if lifecycle.authority is authority:
                     self._drop_claim_key(claim_id)
@@ -542,11 +560,14 @@ class AuthorityFactory:
                         self._drop_object(proof_token)
                     self._objects.pop(proof_id, None)
                     self._drop_object(lifecycle.value)
-            for prepared_id, (_, _, owner) in tuple(self._prepared.items()):
+            for prepared_id, (prepared, prepared_token, owner) in tuple(self._prepared.items()):
                 if owner is authority:
                     del self._prepared[prepared_id]
                     self._prepared_fields.pop(prepared_id, None)
                     self._objects.pop(prepared_id, None)
+                    self._objects.pop(id(prepared_token), None)
+                    self._drop_object(prepared)
+                    self._drop_object(prepared_token)
             for construction_id, lifecycle in tuple(self._prepared_construction.items()):
                 if lifecycle.authority is authority:
                     del self._prepared_construction[construction_id]
@@ -1062,6 +1083,7 @@ class AuthorityFactory:
             identity_tool_name = getattr(prepare_identity, "tool_name")
             if spec.name != identity_tool_name:
                 raise AuthorityPhaseError("ToolSpec name does not match prepare identity")
+            spec_snapshot = self._tool_spec_snapshot(spec)
             existing = self._tool_specs.get(id(spec))
             if existing is not None:
                 if existing[0] is not spec or existing[1] is not authority or existing[2] is not prepare_identity:
@@ -1070,7 +1092,7 @@ class AuthorityFactory:
                 return spec
             self._claim_object(spec)
             self._tool_specs[id(spec)] = (spec, authority, prepare_identity)
-            self._tool_spec_fields[id(spec)] = self._tool_spec_snapshot(spec)
+            self._tool_spec_fields[id(spec)] = spec_snapshot
             self._objects[id(spec)] = spec
             return spec
 
@@ -2751,21 +2773,23 @@ class AuthorityFactory:
     def claim_lifecycle(
         self, value: ExecutionClaim | PendingAuthorityClaim | TrustedLedgerOmittedTokenProof
     ) -> Iterator[ExecutionClaim | PendingAuthorityClaim | TrustedLedgerOmittedTokenProof]:
-        self.mark_in_flight(value)
+        completed = False
         try:
+            self.mark_in_flight(value)
             yield value
-        except BaseException:
-            self.revoke(value)
-            raise
-        else:
-            try:
-                self.consume(value)
-            except BaseException:
-                # A source can become stale while the body is running.  Keep
-                # consume fail-closed, but always revoke the owned record so
-                # the scope cannot retain a poisoned one-shot value.
-                self.revoke(value)
-                raise
+            self.consume(value)
+            completed = True
+        finally:
+            if not completed:
+                try:
+                    # Identity-only revoke is deliberate: entry/source
+                    # validation may have failed, but the owned record still
+                    # must not leak claims, tokens, or Pending ownership.
+                    self.revoke(value)
+                except AuthorityPhaseError:
+                    # Preserve the original entry/body/consume failure for
+                    # fabricated or already-finalized values.
+                    pass
 
     # Helpers for tests and future pipeline ports.  They never expose token
     # values as text and deliberately return only bounded counts/booleans.

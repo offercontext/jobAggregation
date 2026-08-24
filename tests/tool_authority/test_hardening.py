@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import pickle
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
@@ -11,6 +12,7 @@ from typing import Any
 
 import pytest
 
+import offerpilot.ai.tool_authority.composition as authority_composition
 from offerpilot.ai.tool_authority import (
     AuthorityFactory,
     AuthorityPhaseError,
@@ -1378,3 +1380,121 @@ def test_pending_registration_rejects_foreign_opaque_role_tokens() -> None:
             with pytest.raises(AuthorityPhaseError):
                 second.register_pending(token)
             assert second.active_count == before
+
+
+def test_claim_lifecycle_cleans_entry_failure_after_source_mutation() -> None:
+    with execution_scope() as factory:
+        authority = _segment(factory)
+        prepared = _prepared(factory, authority, kind="write")
+        pending = SimpleNamespace(
+            operation_id="op-entry-mutation",
+            conversation_id=11,
+            tool_call_id=prepared.tool_call_id,
+            tool_name=prepared.spec.name,
+            pending_action_revision=1,
+            pending_confirmation_claim_id="entry-mutation-claim",
+            arguments_digest=SHA,
+        )
+        factory.register_pending(pending)
+        claim = factory.issue_pending_claim(
+            authority,
+            prepared=prepared,
+            pending=pending,
+            operation_id="op-entry-mutation",
+            tool_call_id=prepared.tool_call_id,
+            tool_name=prepared.spec.name,
+            arguments_digest=SHA,
+            pending_confirmation_claim_id="entry-mutation-claim",
+        )
+        pending.tool_name = "mutated-before-enter"
+        with pytest.raises(AuthorityPhaseError):
+            with factory.claim_lifecycle(claim):
+                raise AssertionError("the body must not be entered")
+        assert not factory._claims
+        assert not factory._claim_fields
+        assert not factory._pending[id(pending)].owners
+        claim_object_ids = {id(claim), id(claim.pending_claim_instance_token)}
+        assert not any(
+            object_id in claim_object_ids and owner is factory
+            for object_id, (_, owner) in authority_composition._ACTIVE_OBJECTS.items()
+        )
+
+
+def test_revoke_authority_uses_exact_identity_after_authority_mutation() -> None:
+    with execution_scope() as factory:
+        authority = _segment(factory)
+        prepared = _prepared(factory, authority, kind="write")
+        pending = SimpleNamespace(
+            operation_id="op-authority-revoke",
+            conversation_id=11,
+            tool_call_id=prepared.tool_call_id,
+            tool_name=prepared.spec.name,
+            pending_action_revision=1,
+            pending_confirmation_claim_id="authority-revoke-claim",
+            arguments_digest=SHA,
+        )
+        factory.register_pending(pending)
+        claim = factory.issue_pending_claim(
+            authority,
+            prepared=prepared,
+            pending=pending,
+            operation_id="op-authority-revoke",
+            tool_call_id=prepared.tool_call_id,
+            tool_name=prepared.spec.name,
+            arguments_digest=SHA,
+            pending_confirmation_claim_id="authority-revoke-claim",
+        )
+        object.__setattr__(authority, "segment_id", "mutated-authority")
+        factory.revoke_authority(authority)
+        assert not factory._claims
+        assert not factory._claim_fields
+        assert factory.active_count == 0
+        assert not factory.is_active(authority)
+        assert not factory.is_active(claim)
+        assert not any(owner is factory for _, owner in authority_composition._ACTIVE_OBJECTS.values())
+
+
+@pytest.mark.parametrize("extra", [math.nan, object()])
+def test_register_tool_spec_validation_is_atomic_for_noncanonical_payload(extra: object) -> None:
+    with execution_scope() as factory:
+        authority = _segment(factory)
+        invocation, *_ = _registered_invocation(factory, authority)
+        attempt = factory.issue_provider_attempt(invocation, candidate_ordinal=0)
+        prepare_identity = factory.create_new_turn_prepare_identity(
+            invocation,
+            attempt_id=attempt,
+            candidate_ordinal=0,
+            tool_call_id="call-invalid-spec",
+            tool_name="invalid_spec",
+            arguments_digest=SHA,
+        )
+        spec = ToolSpec(
+            contract=ProviderToolContract(
+                payload={
+                    "type": "function",
+                    "function": {"name": "invalid_spec", "description": "", "parameters": {}},
+                    "extra": extra,
+                },
+                name="invalid_spec",
+                description="",
+                parameters={},
+            ),
+            kind="read",
+            decoder=lambda value: value,
+            executor=lambda args, context: args,
+        )
+        before = factory.active_count
+        with pytest.raises((AuthorityPhaseError, ValueError, TypeError)):
+            factory.register_tool_spec(
+                spec,
+                authority=authority,
+                prepare_identity=prepare_identity,
+            )
+        assert factory.active_count == before
+        assert id(spec) not in factory._tool_specs
+        assert id(spec) not in factory._tool_spec_fields
+        assert id(spec) not in factory._objects
+        assert not any(
+            object_id == id(spec) and owner is factory
+            for object_id, (_, owner) in authority_composition._ACTIVE_OBJECTS.items()
+        )

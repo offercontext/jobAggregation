@@ -33,6 +33,12 @@ class TransientToolRuntimeValue:
 
     __slots__ = ()
 
+    def __repr__(self) -> str:
+        # Transient values may contain opaque identities and trusted scope
+        # primitives.  A stable type-only representation prevents accidental
+        # object-address/field leakage in diagnostics.
+        return f"<{type(self).__name__}>"
+
     @staticmethod
     def _serialization_error() -> TypeError:
         return TypeError("transient tool runtime value cannot be serialized")
@@ -44,8 +50,28 @@ class TransientToolRuntimeValue:
     def __getstate__(self) -> NoReturn:
         raise self._serialization_error()
 
+    def __copy__(self) -> NoReturn:
+        raise self._serialization_error()
+
+    def __deepcopy__(self, memo: dict[int, object]) -> NoReturn:
+        del memo
+        raise self._serialization_error()
+
     def to_json(self) -> NoReturn:
         raise self._serialization_error()
+
+
+class _TransientAsdictGuard:
+    """Private field sentinel closing dataclasses.asdict for transient DTOs."""
+
+    __slots__ = ()
+
+    def __deepcopy__(self, memo: dict[int, object]) -> NoReturn:
+        del memo
+        raise TypeError("transient tool runtime value cannot be serialized")
+
+
+_TRANSIENT_ASDICT_GUARD = _TransientAsdictGuard()
 
 
 @dataclass(frozen=True)
@@ -231,6 +257,17 @@ class PreparedToolCall(TransientToolRuntimeValue, Generic[ArgsT, ResultT]):
     pending_identity: object | None = field(default=None, repr=False, compare=False)
     pending_action_revision: int | None = None
     journal_started_draft: object | None = field(default=None, repr=False, compare=False)
+    # The authority token is intentionally opaque and excluded from every
+    # provider/ledger/payload representation.  It remains optional until the
+    # authority-bound pipeline cutover, while already making prepared calls
+    # produced by that pipeline non-serializable and identity-bound.
+    authority_instance_token: object | None = field(default=None, repr=False, compare=False)
+    _serialization_guard: object = field(
+        default=_TRANSIENT_ASDICT_GUARD,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass(frozen=True)

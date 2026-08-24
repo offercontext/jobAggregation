@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import replace
 from typing import Any
 
@@ -11,6 +13,7 @@ from offerpilot.ai.tool_authority import (
     ApplicationScopeConstraint,
     AuthorityFactory,
     AuthorityPhaseError,
+    ApprovalExecutionAuthority,
     BindingTargetResolution,
     ExecutionClaim,
     NewTurnPrepareCallIdentity,
@@ -36,6 +39,7 @@ from offerpilot.ai.tool_runtime.contracts import (
 
 
 MAX_INT64 = 2**63 - 1
+ARG_DIGEST = "sha256:" + hashlib.sha256(b"{}").hexdigest()
 
 
 def _scope() -> TrustedContextScope:
@@ -73,19 +77,90 @@ def _prepared(
         kind=kind,  # type: ignore[arg-type]
         decoder=lambda value: value,
         executor=lambda args, context: args,
+        confirmation_policy="required" if kind == "write" else "none",
     )
-    prepared = PreparedToolCall(
+    if isinstance(authority, ApprovalExecutionAuthority):
+        prepare_identity = factory.create_approved_write_prepare_identity(
+            authority,
+            approval_context=object(),
+            request_identity=object(),
+        )
+    else:
+        runner = object()
+        context = object()
+        surface = object()
+        binding = object()
+        gateway = object()
+        factory.register_runner_invocation(runner, authority=authority)
+        factory.register_tool_execution_context(context, authority=authority)
+        build = factory.create_provider_surface_build_identity(
+            authority,
+            runner_invocation=runner,
+            tool_context=context,
+            model_call_id="model-prepare",
+        )
+        factory.register_frozen_surface(
+            surface,
+            surface_fingerprint="sha256:" + "c" * 64,
+            authority=authority,
+            build_identity=build,
+        )
+        factory.register_model_call_surface_binding(
+            binding,
+            surface=surface,
+            surface_fingerprint="sha256:" + "c" * 64,
+            authority=authority,
+            build_identity=build,
+        )
+        factory.register_gateway_session(
+            gateway,
+            authority=authority,
+            build_identity=build,
+            surface=surface,
+            surface_fingerprint="sha256:" + "c" * 64,
+            model_call_surface_binding=binding,
+        )
+        invocation = factory.create_provider_invocation_identity(
+            build,
+            surface=surface,
+            surface_fingerprint="sha256:" + "c" * 64,
+            model_call_surface_binding=binding,
+            gateway_session=gateway,
+        )
+        attempt = factory.issue_provider_attempt(invocation, candidate_ordinal=0)
+        prepare_identity = factory.create_new_turn_prepare_identity(
+            invocation,
+            attempt_id=attempt,
+            candidate_ordinal=0,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            arguments_digest=ARG_DIGEST,
+        )
+    factory.register_tool_spec(
+        spec,
+        authority=authority,
+        prepare_identity=prepare_identity,
+    )
+    contract_fingerprint = "sha256:" + hashlib.sha256(
+        json.dumps(
+            dict(spec.contract.payload),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return factory.prepare_tool_call(
+        authority,
+        prepare_identity=prepare_identity,
         tool_call_id=tool_call_id,
         spec=spec,
         arguments={},
         typed_args={},
-        arguments_digest="sha256:" + "a" * 64,
-        contract_fingerprint="sha256:" + "b" * 64,
+        arguments_digest=ARG_DIGEST,
+        contract_fingerprint=contract_fingerprint,
         binding=BindingAudit(status="unbound", target_count=0),
     )
-    seal = factory.issue_prepared_construction_identity(authority)
-    factory.bind_new_prepared(prepared, authority, seal)
-    return prepared
 
 
 def test_authority_types_are_separate_and_segment_is_tool_execution_authority() -> None:
@@ -99,7 +174,7 @@ def test_authority_types_are_separate_and_segment_is_tool_execution_authority() 
             tool_call_id="call-1",
             tool_name="update_application_status",
             pending_action_revision=1,
-            effective_args_digest="sha256:" + "a" * 64,
+            effective_args_digest=ARG_DIGEST,
         )
         approval = factory.create_approval_authority(
             operation_id="op-1",
@@ -110,7 +185,7 @@ def test_authority_types_are_separate_and_segment_is_tool_execution_authority() 
             pending_action_revision=1,
             tool_call_id="call-1",
             tool_name="update_application_status",
-            effective_args_digest="sha256:" + "a" * 64,
+            effective_args_digest=ARG_DIGEST,
             capabilities=frozenset({"applications.write"}),
         )
 
@@ -118,6 +193,12 @@ def test_authority_types_are_separate_and_segment_is_tool_execution_authority() 
         assert isinstance(approval, ToolExecutionAuthority)
         assert type(segment) is not type(approval)
         assert isinstance(segment, SegmentExecutionAuthority)
+
+
+def test_contracts_star_import_does_not_expose_private_opaque_minting() -> None:
+    namespace: dict[str, object] = {}
+    exec("from offerpilot.ai.tool_authority.contracts import *", namespace)
+    assert "_new_opaque_handle" not in namespace
 
 
 def test_positive_int64_is_strict_for_contract_identities() -> None:
@@ -153,7 +234,7 @@ def test_phase_matrix_rejects_wrong_authority_and_wrong_identity_before_lookup()
             tool_call_id="call-1",
             tool_name="update_application_status",
             pending_action_revision=1,
-            effective_args_digest="sha256:" + "a" * 64,
+            effective_args_digest=ARG_DIGEST,
         )
         approval = factory.create_approval_authority(
             operation_id="op-1",
@@ -164,7 +245,7 @@ def test_phase_matrix_rejects_wrong_authority_and_wrong_identity_before_lookup()
             pending_action_revision=1,
             tool_call_id="call-1",
             tool_name="update_application_status",
-            effective_args_digest="sha256:" + "a" * 64,
+            effective_args_digest=ARG_DIGEST,
             capabilities=frozenset({"applications.write"}),
         )
         context = object()
@@ -174,23 +255,32 @@ def test_phase_matrix_rejects_wrong_authority_and_wrong_identity_before_lookup()
         gateway = object()
         factory.register_runner_invocation(runner, authority=segment)
         factory.register_tool_execution_context(context, authority=segment)
+        build = factory.create_provider_surface_build_identity(
+            segment,
+            runner_invocation=runner,
+            tool_context=context,
+            model_call_id="model-1",
+        )
         factory.register_frozen_surface(
             surface,
             surface_fingerprint="sha256:" + "c" * 64,
             authority=segment,
+            build_identity=build,
         )
         factory.register_model_call_surface_binding(
             binding,
             surface=surface,
             surface_fingerprint="sha256:" + "c" * 64,
             authority=segment,
+            build_identity=build,
         )
-        factory.register_gateway_session(gateway, authority=segment)
-        build = factory.create_provider_surface_build_identity(
-            segment,
-            runner_invocation=runner,
-            tool_context=context,
-            model_call_id="model-1",
+        factory.register_gateway_session(
+            gateway,
+            authority=segment,
+            build_identity=build,
+            surface=surface,
+            surface_fingerprint="sha256:" + "c" * 64,
+            model_call_surface_binding=binding,
         )
         invocation = factory.create_provider_invocation_identity(
             build,
@@ -237,7 +327,7 @@ def test_spec_gate_is_fail_closed_for_approval_and_segment_write() -> None:
             tool_call_id="call-1",
             tool_name="update_application_status",
             pending_action_revision=1,
-            effective_args_digest="sha256:" + "a" * 64,
+            effective_args_digest=ARG_DIGEST,
         )
         approval = factory.create_approval_authority(
             operation_id="op-1",
@@ -248,7 +338,7 @@ def test_spec_gate_is_fail_closed_for_approval_and_segment_write() -> None:
             pending_action_revision=1,
             tool_call_id="call-1",
             tool_name="update_application_status",
-            effective_args_digest="sha256:" + "a" * 64,
+            effective_args_digest=ARG_DIGEST,
             capabilities=frozenset({"applications.write"}),
         )
         read_spec = type("Spec", (), {"kind": "read", "confirmation_policy": "none"})()
@@ -297,7 +387,7 @@ def test_constraint_and_resolution_invariants_are_closed() -> None:
 def test_claims_are_one_shot_and_scope_exit_revokes_active_values() -> None:
     with execution_scope() as factory:
         authority = _segment(factory)
-        prepared = _prepared(factory, authority)
+        prepared = _prepared(factory, authority, kind="write")
         pending_object = object()
         pending = factory.register_pending(
             pending_object,
@@ -307,7 +397,7 @@ def test_claims_are_one_shot_and_scope_exit_revokes_active_values() -> None:
             tool_name="get_application",
             pending_action_revision=1,
             pending_confirmation_claim_id="pending-claim-1",
-            arguments_digest="sha256:" + "a" * 64,
+            arguments_digest=ARG_DIGEST,
         )
         claim = factory.issue_pending_claim(
             authority,
@@ -341,7 +431,7 @@ def test_approval_execution_claim_binds_prepared_and_authority_identity() -> Non
             tool_call_id="call-1",
             tool_name="update_application_status",
             pending_action_revision=1,
-            effective_args_digest="sha256:" + "a" * 64,
+            effective_args_digest=ARG_DIGEST,
         )
         approval = factory.create_approval_authority(
             operation_id="op-1",
@@ -352,7 +442,7 @@ def test_approval_execution_claim_binds_prepared_and_authority_identity() -> Non
             pending_action_revision=1,
             tool_call_id="call-1",
             tool_name="update_application_status",
-            effective_args_digest="sha256:" + "a" * 64,
+            effective_args_digest=ARG_DIGEST,
             capabilities=frozenset({"applications.write"}),
         )
         prepared = _prepared(

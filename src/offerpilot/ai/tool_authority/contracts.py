@@ -81,6 +81,10 @@ class PendingInstanceToken(_OpaqueHandle):
     """Identity token for one live Pending pointer/proposal."""
 
 
+class PendingClaimInstanceToken(_OpaqueHandle):
+    """Identity token for one live PendingAuthorityClaim."""
+
+
 class PreparedInstanceToken(_OpaqueHandle):
     """Identity token for one live PreparedToolCall object."""
 
@@ -188,6 +192,16 @@ def _require_digest(value: object, field_name: str, *, allow_hmac: bool = False)
     if any(character not in "0123456789abcdef" for character in value[len(prefix) :]):
         raise ValueError(f"{field_name} must use lowercase hexadecimal")
     return value
+
+
+def _require_hmac_digest(value: object, field_name: str) -> str:
+    """Require the operation-ledger HMAC form, never the public SHA form."""
+
+    if type(value) is not str:
+        raise TypeError(f"{field_name} must be text")
+    if not value.startswith("hmac-sha256:"):
+        raise ValueError(f"{field_name} must be a canonical hmac digest")
+    return _require_digest(value, field_name, allow_hmac=True)
 
 
 class _TrustedScopeAsdictGuard:
@@ -643,7 +657,7 @@ class PendingAuthorityClaim(_ReplacementProtected, TransientToolRuntimeValue):
     arguments_digest: str
     pending_confirmation_claim_id: str
     prepared_instance_token: PreparedInstanceToken = field(repr=False, compare=False)
-    pending_claim_instance_token: PendingInstanceToken = field(repr=False, compare=False)
+    pending_claim_instance_token: PendingClaimInstanceToken = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
         require_positive_int64(self.conversation_id, "conversation_id")
@@ -676,7 +690,7 @@ class PendingAuthorityClaim(_ReplacementProtected, TransientToolRuntimeValue):
         _require_token(self.prepared_instance_token, PreparedInstanceToken, "prepared_instance_token")
         _require_token(
             self.pending_claim_instance_token,
-            PendingInstanceToken,
+            PendingClaimInstanceToken,
             "pending_claim_instance_token",
         )
         self._seal_replacement()
@@ -761,11 +775,10 @@ class TrustedLedgerOmittedTokenProof(_ReplacementProtected, TransientToolRuntime
             (self.pending_confirmation_claim_id, "pending_confirmation_claim_id"),
         ):
             _require_text(value, name)
-        _require_digest(self.proposal_fingerprint, "proposal_fingerprint", allow_hmac=True)
-        _require_digest(
+        _require_hmac_digest(self.proposal_fingerprint, "proposal_fingerprint")
+        _require_hmac_digest(
             self.confirmation_token_fingerprint,
             "confirmation_token_fingerprint",
-            allow_hmac=True,
         )
         _require_token(
             self.omitted_token_proof_instance_token,
@@ -851,6 +864,7 @@ __all__ = [
     "NewTurnPrepareCallIdentity",
     "OmittedTokenProofInstanceToken",
     "PendingAuthorityClaim",
+    "PendingClaimInstanceToken",
     "PendingInstanceToken",
     "PreparedInstanceToken",
     "PreparedConstructionIdentity",
@@ -862,7 +876,6 @@ __all__ = [
     "TrustedContextScope",
     "TrustedLedgerOmittedTokenProof",
     "TypedPendingCallIdentity",
-    "_new_opaque_handle",
     "constant_time_equal",
     "require_nonnegative_int64",
     "require_positive_int64",

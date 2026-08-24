@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import pickle
 from dataclasses import asdict, replace
 from typing import Any
@@ -44,18 +46,82 @@ def _prepared(factory: AuthorityFactory) -> PreparedToolCall[Any, Any]:
         decoder=lambda value: value,
         executor=lambda args, context: args,
     )
-    prepared = PreparedToolCall(
+    runner = object()
+    context = object()
+    surface = object()
+    binding = object()
+    gateway = object()
+    fingerprint = "sha256:" + "c" * 64
+    factory.register_runner_invocation(runner, authority=authority)
+    factory.register_tool_execution_context(context, authority=authority)
+    build = factory.create_provider_surface_build_identity(
+        authority,
+        runner_invocation=runner,
+        tool_context=context,
+        model_call_id="model-serialization",
+    )
+    factory.register_frozen_surface(
+        surface,
+        surface_fingerprint=fingerprint,
+        authority=authority,
+        build_identity=build,
+    )
+    factory.register_model_call_surface_binding(
+        binding,
+        surface=surface,
+        surface_fingerprint=fingerprint,
+        authority=authority,
+        build_identity=build,
+    )
+    factory.register_gateway_session(
+        gateway,
+        authority=authority,
+        build_identity=build,
+        surface=surface,
+        surface_fingerprint=fingerprint,
+        model_call_surface_binding=binding,
+    )
+    invocation = factory.create_provider_invocation_identity(
+        build,
+        surface=surface,
+        surface_fingerprint=fingerprint,
+        model_call_surface_binding=binding,
+        gateway_session=gateway,
+    )
+    attempt = factory.issue_provider_attempt(invocation, candidate_ordinal=0)
+    prepare_identity = factory.create_new_turn_prepare_identity(
+        invocation,
+        attempt_id=attempt,
+        candidate_ordinal=0,
+        tool_call_id="call-serialization",
+        tool_name=spec.name,
+        arguments_digest="sha256:" + hashlib.sha256(b"{}").hexdigest(),
+    )
+    factory.register_tool_spec(
+        spec,
+        authority=authority,
+        prepare_identity=prepare_identity,
+    )
+    contract_fingerprint = "sha256:" + hashlib.sha256(
+        json.dumps(
+            dict(spec.contract.payload),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return factory.prepare_tool_call(
+        authority,
+        prepare_identity=prepare_identity,
         tool_call_id="call-serialization",
         spec=spec,
         arguments={},
         typed_args={},
-        arguments_digest="sha256:" + "a" * 64,
-        contract_fingerprint="sha256:" + "b" * 64,
+        arguments_digest="sha256:" + hashlib.sha256(b"{}").hexdigest(),
+        contract_fingerprint=contract_fingerprint,
         binding=BindingAudit(status="unbound", target_count=0),
     )
-    seal = factory.issue_prepared_construction_identity(authority)
-    factory.bind_new_prepared(prepared, authority, seal)
-    return prepared
 
 
 @pytest.mark.parametrize("operation", [copy.copy, copy.deepcopy, pickle.dumps])

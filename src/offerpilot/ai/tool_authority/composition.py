@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import fields as dataclass_fields
+import hashlib
+import json
 from threading import RLock
 from typing import Any, Iterator, Literal, Mapping, cast
 from uuid import uuid4
@@ -17,6 +19,7 @@ from uuid import uuid4
 from offerpilot.ai.tool_runtime.contracts import (
     BindingAudit,
     PreparedToolCall,
+    ProviderToolContract,
     ToolSpec,
 )
 
@@ -35,6 +38,7 @@ from .contracts import (
     NewTurnPrepareCallIdentity,
     OmittedTokenProofInstanceToken,
     PendingAuthorityClaim,
+    PendingClaimInstanceToken,
     PendingInstanceToken,
     PreparedConstructionIdentity,
     PreparedInstanceToken,
@@ -47,7 +51,9 @@ from .contracts import (
     TrustedLedgerOmittedTokenProof,
     TypedPendingCallIdentity,
     _new_opaque_handle,
+    _OpaqueHandle,
     _require_digest,
+    _require_hmac_digest,
     _require_text,
     constant_time_equal,
     require_nonnegative_int64,
@@ -81,6 +87,40 @@ def _dataclass_snapshot(value: object) -> dict[str, object]:
     }
 
 
+def _canonical_arguments_digest(arguments: object) -> str:
+    if not isinstance(arguments, Mapping):
+        raise AuthorityPhaseError("Prepared arguments must be a mapping")
+    if any(type(key) is not str for key in arguments):
+        raise AuthorityPhaseError("Prepared argument keys must be strings")
+    try:
+        payload = json.dumps(
+            arguments,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise AuthorityPhaseError("Prepared arguments are not canonical JSON") from exc
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def _canonical_contract_fingerprint(payload: object) -> str:
+    if not isinstance(payload, Mapping):
+        raise AuthorityPhaseError("ToolSpec contract payload must be a mapping")
+    try:
+        encoded = json.dumps(
+            dict(payload),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise AuthorityPhaseError("ToolSpec contract payload is not canonical JSON") from exc
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
 def _validate_snapshot(value: object, snapshot: Mapping[str, object], label: str) -> None:
     for name, expected in snapshot.items():
         current = getattr(value, name, None)
@@ -100,7 +140,15 @@ def _validate_snapshot(value: object, snapshot: Mapping[str, object], label: str
 
 
 class _Lifecycle:
-    __slots__ = ("value", "state", "authority", "prepared", "pending", "transaction")
+    __slots__ = (
+        "value",
+        "state",
+        "authority",
+        "prepared",
+        "pending",
+        "transaction",
+        "operation",
+    )
 
     def __init__(
         self,
@@ -110,6 +158,7 @@ class _Lifecycle:
         prepared: object | None = None,
         pending: object | None = None,
         transaction: object | None = None,
+        operation: object | None = None,
     ) -> None:
         self.value = value
         self.state: Literal["issued", "in_flight"] = "issued"
@@ -117,6 +166,7 @@ class _Lifecycle:
         self.prepared = prepared
         self.pending = pending
         self.transaction = transaction
+        self.operation = operation
 
 
 class _PendingRecord:
@@ -137,6 +187,7 @@ class _RegisteredIdentity:
         "candidate_count",
         "candidate_ordinal",
         "parent",
+        "provenance",
         "semantic",
     )
 
@@ -149,6 +200,7 @@ class _RegisteredIdentity:
         candidate_count: int | None = None,
         candidate_ordinal: int | None = None,
         parent: object | None = None,
+        provenance: tuple[object, ...] = (),
         semantic: Mapping[str, object] | None = None,
     ) -> None:
         self.value = value
@@ -157,6 +209,7 @@ class _RegisteredIdentity:
         self.candidate_count = candidate_count
         self.candidate_ordinal = candidate_ordinal
         self.parent = parent
+        self.provenance = provenance
         self.semantic = dict(semantic or {})
 
 
@@ -205,6 +258,11 @@ class AuthorityFactory:
         self._attempts: dict[str, _RegisteredIdentity] = {}
         self._operations: dict[int, _RegisteredIdentity] = {}
         self._transactions: dict[int, _RegisteredIdentity] = {}
+        self._tool_specs: dict[
+            int,
+            tuple[ToolSpec[Any, Any], ToolExecutionAuthority, AuthorityCallIdentity],
+        ] = {}
+        self._tool_spec_fields: dict[int, tuple[object, ...]] = {}
         self._objects: dict[int, object] = {}
         self._attempt_sequence = 0
 
@@ -270,6 +328,7 @@ class AuthorityFactory:
             + len(self._attempts)
             + len(self._operations)
             + len(self._transactions)
+            + len(self._tool_specs)
         )
 
     @property
@@ -311,6 +370,8 @@ class AuthorityFactory:
             self._attempts.clear()
             self._operations.clear()
             self._transactions.clear()
+            self._tool_specs.clear()
+            self._tool_spec_fields.clear()
             self._objects.clear()
 
     def _register_authority(
@@ -444,7 +505,7 @@ class AuthorityFactory:
                 binding_policy_fingerprint=binding_policy_fingerprint,
                 approval_authority_instance_token=token,
             )
-            pending_record.owners.add(id(authority))
+            self._claim_pending_owner(pending_record, authority)
             return cast(ApprovalExecutionAuthority, self._register_authority(authority, token))
 
     approval_authority = create_approval_authority
@@ -458,13 +519,29 @@ class AuthorityFactory:
                     self._drop_claim_key(claim_id)
                     del self._claims[claim_id]
                     self._claim_fields.pop(claim_id, None)
+                    claim_token = getattr(lifecycle.value, "pending_claim_instance_token", None)
+                    if claim_token is None:
+                        claim_token = getattr(
+                            lifecycle.value, "execution_claim_instance_token", None
+                        )
+                    if claim_token is not None:
+                        self._objects.pop(id(claim_token), None)
+                        self._drop_object(claim_token)
                     self._objects.pop(claim_id, None)
+                    self._drop_object(lifecycle.value)
             for proof_id, lifecycle in tuple(self._proofs.items()):
                 if lifecycle.authority is authority:
                     self._drop_proof_key(proof_id)
                     del self._proofs[proof_id]
                     self._proof_fields.pop(proof_id, None)
+                    proof_token = getattr(
+                        lifecycle.value, "omitted_token_proof_instance_token", None
+                    )
+                    if proof_token is not None:
+                        self._objects.pop(id(proof_token), None)
+                        self._drop_object(proof_token)
                     self._objects.pop(proof_id, None)
+                    self._drop_object(lifecycle.value)
             for prepared_id, (_, _, owner) in tuple(self._prepared.items()):
                 if owner is authority:
                     del self._prepared[prepared_id]
@@ -500,6 +577,12 @@ class AuthorityFactory:
                     if registration.authority is authority:
                         del table[identity_id]
                         self._objects.pop(identity_id, None)
+            for spec_id, (spec, owner, _) in tuple(self._tool_specs.items()):
+                if owner is authority:
+                    del self._tool_specs[spec_id]
+                    self._tool_spec_fields.pop(spec_id, None)
+                    self._objects.pop(spec_id, None)
+                    self._drop_object(spec)
             for attempt_id, registration in tuple(self._attempts.items()):
                 if registration.authority is authority:
                     del self._attempts[attempt_id]
@@ -534,6 +617,8 @@ class AuthorityFactory:
     ) -> PendingInstanceToken:
         with self._lock:
             self._ensure_open()
+            if isinstance(pending, _OpaqueHandle) and type(pending) is not PendingInstanceToken:
+                raise AuthorityPhaseError("Pending registration requires the exact Pending role")
             if pending is None or isinstance(
                 pending, (str, bytes, int, float, bool, tuple, frozenset)
             ):
@@ -691,6 +776,7 @@ class AuthorityFactory:
             record.semantic[name] = value
 
     def _require_pending_semantic(self, record: _PendingRecord, **expected: object) -> None:
+        self._validate_pending_snapshot(record)
         core = (
             expected.get("conversation_id"),
             expected.get("operation_id"),
@@ -733,6 +819,33 @@ class AuthorityFactory:
             allow_partial=True,
         )
 
+    def _validate_pending_snapshot(self, record: _PendingRecord) -> None:
+        """Fail closed when a caller mutates a registered Pending in place."""
+
+        current_values = self._pending_semantic_from_object(record.value)
+        for name, expected in record.semantic.items():
+            current = current_values.get(name)
+            if current is None:
+                if type(record.value) is object:
+                    # A plain object has no mutable semantic surface; explicit
+                    # registration kwargs are its complete bounded identity.
+                    continue
+                raise AuthorityPhaseError("Pending semantic identity was removed")
+            if name in {"conversation_id", "pending_action_revision"}:
+                require_positive_int64(current, name)
+                if current != expected:
+                    raise AuthorityPhaseError("Pending semantic identity changed")
+            elif name in {"arguments_digest", "effective_args_digest"}:
+                current_digest = _require_digest(current, name)
+                if not isinstance(expected, str) or not constant_time_equal(
+                    current_digest, expected
+                ):
+                    raise AuthorityPhaseError("Pending digest identity changed")
+            else:
+                _require_text(current, name)
+                if current != expected:
+                    raise AuthorityPhaseError("Pending semantic identity changed")
+
     @staticmethod
     def _pending_semantic_from_object(pending: object) -> dict[str, object | None]:
         """Read only bounded Pending identity fields at registration time."""
@@ -750,25 +863,40 @@ class AuthorityFactory:
         values: dict[str, object | None] = {}
         for name in names:
             values[name] = getattr(pending, name, None)
+        if values["arguments_digest"] is None:
+            values["arguments_digest"] = values["effective_args_digest"]
+        if values["effective_args_digest"] is None:
+            values["effective_args_digest"] = values["arguments_digest"]
         return values
 
     def _mark_pending_owner(self, pending: object, authority: ToolExecutionAuthority) -> None:
         record = self._pending.get(id(pending))
         if record is None or record.value is not pending:
             raise AuthorityPhaseError("Pending object is not registered")
-        record.owners.add(id(authority))
+        self._claim_pending_owner(record, authority)
+
+    @staticmethod
+    def _claim_pending_owner(
+        record: _PendingRecord, authority: ToolExecutionAuthority
+    ) -> None:
+        owner_id = id(authority)
+        if record.owners and any(existing != owner_id for existing in record.owners):
+            raise AuthorityPhaseError("Pending is already owned by another authority")
+        record.owners.add(owner_id)
 
     def _pending_token(self, pending: object) -> PendingInstanceToken:
         with self._lock:
             if type(pending) is PendingInstanceToken:
                 for record in self._pending.values():
                     if record.token is pending:
+                        self._validate_pending_snapshot(record)
                         return pending
                 raise AuthorityPhaseError("pending identity is not active")
             pending_id = id(pending)
             found = self._pending.get(pending_id)
             if found is None or found.value is not pending:
                 raise AuthorityPhaseError("pending object is not registered")
+            self._validate_pending_snapshot(found)
             return found.token
 
     def _pending_record_for_object(self, pending: object) -> _PendingRecord:
@@ -778,6 +906,7 @@ class AuthorityFactory:
         found = self._pending.get(pending_id)
         if found is None or found.value is not pending:
             raise AuthorityPhaseError("pending object is not registered")
+        self._validate_pending_snapshot(found)
         return found
 
     def _pending_record_for_token(self, token: PendingInstanceToken) -> _PendingRecord:
@@ -785,6 +914,7 @@ class AuthorityFactory:
             raise AuthorityPhaseError("pending identity token has an invalid type")
         for record in self._pending.values():
             if record.token is token:
+                self._validate_pending_snapshot(record)
                 return record
         raise AuthorityPhaseError("pending identity is not active")
 
@@ -805,45 +935,79 @@ class AuthorityFactory:
                 self._prepared_record(prepared)
                 return existing[1]
             raise AuthorityPhaseError(
-                "PreparedToolCall must be created through bind_new_prepared with a construction seal"
+                "PreparedToolCall must be created through the controlled prepare port"
             )
 
-    def issue_prepared_construction_identity(
-        self, authority: ToolExecutionAuthority
-    ) -> PreparedConstructionIdentity:
-        with self._lock:
-            self._authority_record(authority)
-            token = cast(
-                PreparedConstructionIdentity,
-                _new_opaque_handle(PreparedConstructionIdentity),
-            )
-            self._claim_object(token)
-            self._prepared_construction[id(token)] = _Lifecycle(token, authority=authority)
-            self._objects[id(token)] = token
-            return token
-
-    prepared_construction_identity = issue_prepared_construction_identity
-
-    def bind_new_prepared(
+    def prepare_tool_call(
         self,
-        prepared: PreparedToolCall[Any, Any],
         authority: ToolExecutionAuthority,
-        construction_identity: PreparedConstructionIdentity,
-    ) -> PreparedInstanceToken:
+        *,
+        prepare_identity: NewTurnPrepareCallIdentity | ApprovedWritePrepareCallIdentity,
+        tool_call_id: str,
+        spec: ToolSpec[Any, Any],
+        arguments: Any,
+        typed_args: Any,
+        arguments_digest: str,
+        contract_fingerprint: str,
+        binding: BindingAudit,
+    ) -> PreparedToolCall[Any, Any]:
+        """Construct and bind PreparedToolCall at the controlled prepare port."""
+
         with self._lock:
             self._ensure_open()
             self._authority_record(authority)
-            lifecycle = self._prepared_construction.get(id(construction_identity))
-            if lifecycle is None or lifecycle.value is not construction_identity:
-                raise AuthorityPhaseError("Prepared construction seal is not active")
-            if lifecycle.authority is not authority or lifecycle.state != "issued":
-                raise AuthorityPhaseError("Prepared construction seal authority mismatch")
+            if type(prepare_identity) is NewTurnPrepareCallIdentity:
+                identity_authority = self._call_authority(
+                    prepare_identity,
+                    AuthorityUse.NEW_TURN_PREPARE,
+                )
+            elif type(prepare_identity) is ApprovedWritePrepareCallIdentity:
+                identity_authority = self._call_authority(
+                    prepare_identity,
+                    AuthorityUse.APPROVED_WRITE_PREPARE,
+                )
+            else:
+                raise AuthorityPhaseError("PreparedToolCall requires a registered prepare identity")
+            if identity_authority is not authority:
+                raise AuthorityPhaseError("prepare identity belongs to another authority")
+            spec_registration = self._tool_specs.get(id(spec))
+            if spec_registration is None or spec_registration[0] is not spec:
+                raise AuthorityPhaseError("ToolSpec is not registered for this prepare identity")
+            if spec_registration[1] is not authority or spec_registration[2] is not prepare_identity:
+                raise AuthorityPhaseError("ToolSpec provenance does not match prepare identity")
+            self._validate_registered_tool_spec(spec)
+            identity_tool_call_id = getattr(prepare_identity, "tool_call_id")
+            identity_tool_name = getattr(prepare_identity, "tool_name")
+            identity_digest = getattr(
+                prepare_identity,
+                "arguments_digest",
+                getattr(prepare_identity, "effective_args_digest", None),
+            )
+            if tool_call_id != identity_tool_call_id or spec.name != identity_tool_name:
+                raise AuthorityPhaseError("PreparedToolCall identity does not match prepare call")
+            expected_digest = _canonical_arguments_digest(arguments)
+            _require_digest(arguments_digest, "arguments_digest")
+            if not constant_time_equal(arguments_digest, expected_digest):
+                raise AuthorityPhaseError("Prepared arguments digest is not canonical")
+            if not isinstance(identity_digest, str) or not constant_time_equal(
+                arguments_digest, identity_digest
+            ):
+                raise AuthorityPhaseError("Prepared digest does not match prepare call")
+            expected_contract_fingerprint = _canonical_contract_fingerprint(spec.contract.payload)
+            _require_digest(contract_fingerprint, "contract_fingerprint")
+            if not constant_time_equal(contract_fingerprint, expected_contract_fingerprint):
+                raise AuthorityPhaseError("Prepared contract fingerprint is not canonical")
+            prepared = PreparedToolCall(
+                tool_call_id=tool_call_id,
+                spec=spec,
+                arguments=arguments,
+                typed_args=typed_args,
+                arguments_digest=arguments_digest,
+                contract_fingerprint=contract_fingerprint,
+                binding=binding,
+            )
             if not self._prepared_shape_is_controlled(prepared):
                 raise AuthorityPhaseError("PreparedToolCall has an untrusted shape")
-            if prepared.authority_instance_token is not None:
-                raise AuthorityPhaseError("PreparedToolCall must be unbound at construction")
-            if id(prepared) in self._prepared:
-                raise AuthorityPhaseError("PreparedToolCall was already bound")
             self._claim_object(prepared)
             object.__setattr__(prepared, "authority_instance_token", _authority_token(authority))
             token = cast(PreparedInstanceToken, _new_opaque_handle(PreparedInstanceToken))
@@ -857,12 +1021,110 @@ class AuthorityFactory:
                 prepared.spec,
                 prepared.binding,
                 prepared._replacement_guard,
+                _dataclass_snapshot(prepared.binding),
             )
             self._objects[id(prepared)] = prepared
-            del self._prepared_construction[id(construction_identity)]
-            self._objects.pop(id(construction_identity), None)
-            self._drop_object(construction_identity)
-            return token
+            self._objects[id(token)] = token
+            return prepared
+
+    def register_tool_spec(
+        self,
+        spec: ToolSpec[Any, Any],
+        *,
+        authority: ToolExecutionAuthority,
+        prepare_identity: NewTurnPrepareCallIdentity | ApprovedWritePrepareCallIdentity,
+    ) -> ToolSpec[Any, Any]:
+        """Register one exact, composition-root-validated ToolSpec for prepare."""
+
+        with self._lock:
+            self._ensure_open()
+            self._authority_record(authority)
+            if type(spec) is not ToolSpec or type(spec.contract) is not ProviderToolContract:
+                raise AuthorityPhaseError("ToolSpec must use the exact validated contract type")
+            if not callable(spec.decoder) or not callable(spec.executor):
+                raise AuthorityPhaseError("ToolSpec decoder/executor must be callable")
+            if type(prepare_identity) is NewTurnPrepareCallIdentity:
+                identity_authority = self._call_authority(
+                    prepare_identity,
+                    AuthorityUse.NEW_TURN_PREPARE,
+                )
+            elif type(prepare_identity) is ApprovedWritePrepareCallIdentity:
+                identity_authority = self._call_authority(
+                    prepare_identity,
+                    AuthorityUse.APPROVED_WRITE_PREPARE,
+                )
+                if spec.kind != "write" or spec.confirmation_policy != "required":
+                    raise AuthorityPhaseError("Approved prepare requires a confirmed write spec")
+            else:
+                raise AuthorityPhaseError("ToolSpec requires a registered prepare identity")
+            if identity_authority is not authority:
+                raise AuthorityPhaseError("prepare identity belongs to another authority")
+            identity_tool_name = getattr(prepare_identity, "tool_name")
+            if spec.name != identity_tool_name:
+                raise AuthorityPhaseError("ToolSpec name does not match prepare identity")
+            existing = self._tool_specs.get(id(spec))
+            if existing is not None:
+                if existing[0] is not spec or existing[1] is not authority or existing[2] is not prepare_identity:
+                    raise AuthorityPhaseError("ToolSpec provenance changed")
+                self._validate_registered_tool_spec(spec)
+                return spec
+            self._claim_object(spec)
+            self._tool_specs[id(spec)] = (spec, authority, prepare_identity)
+            self._tool_spec_fields[id(spec)] = self._tool_spec_snapshot(spec)
+            self._objects[id(spec)] = spec
+            return spec
+
+    @staticmethod
+    def _tool_spec_snapshot(spec: ToolSpec[Any, Any]) -> tuple[object, ...]:
+        return (
+            spec.contract,
+            _canonical_contract_fingerprint(spec.contract.payload),
+            spec.decoder,
+            spec.executor,
+            spec.kind,
+            spec.confirmation_policy,
+            spec.required_capabilities,
+            spec.binding_resolvers,
+        )
+
+    def _validate_registered_tool_spec(self, spec: ToolSpec[Any, Any]) -> None:
+        snapshot = self._tool_spec_fields.get(id(spec))
+        if snapshot is None:
+            raise AuthorityPhaseError("ToolSpec registration snapshot is missing")
+        current = self._tool_spec_snapshot(spec)
+        if current[0] is not snapshot[0] or not constant_time_equal(
+            cast(str, current[1]), cast(str, snapshot[1])
+        ):
+            raise AuthorityPhaseError("ToolSpec contract identity changed")
+        if current[2] is not snapshot[2] or current[3] is not snapshot[3]:
+            raise AuthorityPhaseError("ToolSpec executor identity changed")
+        if current[4:] != snapshot[4:]:
+            raise AuthorityPhaseError("ToolSpec semantic identity changed")
+
+    def issue_prepared_construction_identity(
+        self, authority: ToolExecutionAuthority, **_: object
+    ) -> PreparedConstructionIdentity:
+        with self._lock:
+            self._ensure_open()
+            del authority
+            raise AuthorityPhaseError(
+                "Prepared construction seals are private to the controlled prepare port"
+            )
+
+    prepared_construction_identity = issue_prepared_construction_identity
+
+    def bind_new_prepared(
+        self,
+        prepared: PreparedToolCall[Any, Any],
+        authority: ToolExecutionAuthority,
+        construction_identity: PreparedConstructionIdentity,
+    ) -> PreparedInstanceToken:
+        with self._lock:
+            self._ensure_open()
+            del prepared, authority, construction_identity
+            raise AuthorityPhaseError(
+                "PreparedToolCall must be constructed by prepare_tool_call"
+            )
 
     bind_prepared = bind_new_prepared
 
@@ -1029,6 +1291,11 @@ class AuthorityFactory:
             or original._replacement_guard is not fields[6]
         ):
             raise AuthorityPhaseError("PreparedToolCall object identity changed")
+        self._validate_registered_tool_spec(original.spec)
+        _validate_snapshot(original.binding, cast(Mapping[str, object], fields[7]), "Prepared binding")
+        current_arguments_digest = _canonical_arguments_digest(original.arguments)
+        if not constant_time_equal(current_arguments_digest, cast(str, fields[2])):
+            raise AuthorityPhaseError("Prepared arguments changed")
         if original.authority_instance_token is not _authority_token(found[2]):
             raise AuthorityPhaseError("PreparedToolCall authority identity changed")
         return (original, found[1], found[2])
@@ -1050,6 +1317,27 @@ class AuthorityFactory:
         _require_digest(arguments_digest, "arguments_digest")
         if not constant_time_equal(arguments_digest, prepared.arguments_digest):
             raise AuthorityPhaseError("arguments digest does not match PreparedToolCall")
+
+    @staticmethod
+    def _require_prepared_phase(
+        prepared: PreparedToolCall[Any, Any],
+        *,
+        kind: Literal["read", "write"],
+        confirmation_policy: Literal["none", "required"],
+    ) -> None:
+        """Enforce the phase/spec pairing at every factory port.
+
+        The public ``require_authority_spec`` gate is useful for callers, but
+        execution ports must not rely on callers invoking it first.  Checking
+        the exact registered Prepared spec here keeps wrong-phase requests
+        fail-closed before pending/claim/identity state can be mutated.
+        """
+
+        if (
+            prepared.spec.kind != kind
+            or prepared.spec.confirmation_policy != confirmation_policy
+        ):
+            raise AuthorityPhaseError("PreparedToolCall spec is not valid for this phase")
 
     def _register_call(
         self, call: AuthorityCallIdentity, authority: ToolExecutionAuthority, use: AuthorityUse
@@ -1074,9 +1362,13 @@ class AuthorityFactory:
         candidate_count: int | None = None,
         candidate_ordinal: int | None = None,
         parent: object | None = None,
+        provenance: tuple[object, ...] = (),
         semantic: Mapping[str, object] | None = None,
     ) -> object:
-        if value is None or isinstance(value, (str, bytes, int, float, bool, tuple, frozenset)):
+        self._ensure_open()
+        if value is None or isinstance(
+            value, (str, bytes, int, float, bool, tuple, frozenset, _OpaqueHandle)
+        ):
             raise AuthorityPhaseError("opaque runtime identity must be a caller-owned object")
         if authority is not None:
             self._authority_record(authority)
@@ -1093,6 +1385,11 @@ class AuthorityFactory:
                 raise AuthorityPhaseError("identity fingerprint changed")
             if parent is not None and existing.parent is not parent:
                 raise AuthorityPhaseError("identity parent changed")
+            if len(existing.provenance) != len(provenance) or any(
+                current is not expected
+                for current, expected in zip(existing.provenance, provenance)
+            ):
+                raise AuthorityPhaseError("identity provenance changed")
             if semantic is not None and existing.semantic != dict(semantic):
                 raise AuthorityPhaseError("identity semantic fields changed")
             if existing.authority is None:
@@ -1106,6 +1403,7 @@ class AuthorityFactory:
             candidate_count=candidate_count,
             candidate_ordinal=candidate_ordinal,
             parent=parent,
+            provenance=provenance,
             semantic=semantic,
         )
         self._objects[id(value)] = value
@@ -1149,10 +1447,61 @@ class AuthorityFactory:
             raise AuthorityPhaseError(f"{field_name} was not registered for this authority")
         return found
 
+    def _provider_build_for_registration(
+        self,
+        build_identity: object,
+        authority: ToolExecutionAuthority,
+    ) -> ProviderSurfaceBuildIdentity:
+        if type(build_identity) is not ProviderSurfaceBuildIdentity:
+            raise AuthorityPhaseError("provider registration requires the exact build identity")
+        build_authority = self._call_authority(
+            build_identity,
+            AuthorityUse.PROVIDER_SURFACE_BUILD,
+        )
+        if build_authority is not authority:
+            raise AuthorityPhaseError("provider build belongs to another authority")
+        return build_identity
+
+    @staticmethod
+    def _same_provenance(
+        actual: tuple[object, ...], expected: tuple[object, ...]
+    ) -> bool:
+        return len(actual) == len(expected) and all(
+            current is expected_value
+            for current, expected_value in zip(actual, expected)
+        )
+
+    def _reject_alternate_provenance(
+        self,
+        table: dict[int, _RegisteredIdentity],
+        build_identity: ProviderSurfaceBuildIdentity,
+        value: object,
+        label: str,
+    ) -> None:
+        for registration in table.values():
+            if self._same_provenance(registration.provenance, (build_identity,)) and (
+                registration.value is not value
+            ):
+                raise AuthorityPhaseError(f"alternate {label} for this model call is forbidden")
+
+    def _reject_alternate_build_provenance(
+        self,
+        table: dict[int, _RegisteredIdentity],
+        build_identity: ProviderSurfaceBuildIdentity,
+        value: object,
+        label: str,
+    ) -> None:
+        for registration in table.values():
+            if registration.provenance and registration.provenance[0] is build_identity and (
+                registration.value is not value
+            ):
+                raise AuthorityPhaseError(f"alternate {label} for this model call is forbidden")
+
     def register_runner_invocation(
         self, value: object, authority: ToolExecutionAuthority | None = None
     ) -> object:
         with self._lock:
+            self._ensure_open()
             return self._register_identity(self._runner_invocations, value, authority=authority)
 
     register_runner_identity = register_runner_invocation
@@ -1161,6 +1510,7 @@ class AuthorityFactory:
         self, value: object, authority: ToolExecutionAuthority | None = None
     ) -> object:
         with self._lock:
+            self._ensure_open()
             return self._register_identity(self._tool_contexts, value, authority=authority)
 
     register_tool_context = register_tool_execution_context
@@ -1172,9 +1522,17 @@ class AuthorityFactory:
         *,
         surface_fingerprint: str,
         candidate_count: int = 1,
-        authority: ToolExecutionAuthority | None = None,
+        authority: ToolExecutionAuthority,
+        build_identity: ProviderSurfaceBuildIdentity | None = None,
     ) -> object:
         with self._lock:
+            self._ensure_open()
+            if type(authority) not in {SegmentExecutionAuthority, ApprovalExecutionAuthority}:
+                raise AuthorityPhaseError("surface registration requires an authority")
+            if build_identity is None:
+                raise AuthorityPhaseError("surface registration requires a build identity")
+            build = self._provider_build_for_registration(build_identity, authority)
+            self._reject_alternate_provenance(self._surfaces, build, value, "surface")
             _require_digest(surface_fingerprint, "surface_fingerprint")
             require_positive_int64(candidate_count, "candidate_count")
             return self._register_identity(
@@ -1183,6 +1541,7 @@ class AuthorityFactory:
                 authority=authority,
                 fingerprint=surface_fingerprint,
                 candidate_count=candidate_count,
+                provenance=(build,),
             )
 
     register_surface = register_frozen_surface
@@ -1194,31 +1553,104 @@ class AuthorityFactory:
         *,
         surface: object,
         surface_fingerprint: str,
-        authority: ToolExecutionAuthority | None = None,
+        authority: ToolExecutionAuthority,
+        build_identity: ProviderSurfaceBuildIdentity | None = None,
     ) -> object:
         with self._lock:
+            self._ensure_open()
+            if type(authority) not in {SegmentExecutionAuthority, ApprovalExecutionAuthority}:
+                raise AuthorityPhaseError("binding registration requires an authority")
+            if build_identity is None:
+                raise AuthorityPhaseError("binding registration requires a build identity")
+            build = self._provider_build_for_registration(build_identity, authority)
             _require_digest(surface_fingerprint, "surface_fingerprint")
             surface_registration = self._surfaces.get(id(surface))
             if surface_registration is None or surface_registration.value is not surface:
                 raise AuthorityPhaseError("Frozen surface must be registered first")
-            if surface_registration.fingerprint != surface_fingerprint:
+            if surface_registration.authority is not authority:
+                raise AuthorityPhaseError("surface belongs to another authority")
+            if not self._same_provenance(surface_registration.provenance, (build,)):
+                raise AuthorityPhaseError("surface belongs to another model call")
+            if surface_registration.fingerprint is None or not constant_time_equal(
+                surface_registration.fingerprint,
+                surface_fingerprint,
+            ):
                 raise AuthorityPhaseError("binding surface fingerprint mismatch")
+            self._reject_alternate_provenance(self._bindings, build, value, "surface binding")
             return self._register_identity(
                 self._bindings,
                 value,
                 authority=authority,
                 fingerprint=surface_fingerprint,
                 parent=surface,
+                provenance=(build,),
             )
 
     register_surface_binding = register_model_call_surface_binding
     register_binding = register_model_call_surface_binding
 
     def register_gateway_session(
-        self, value: object, authority: ToolExecutionAuthority | None = None
+        self,
+        value: object,
+        authority: ToolExecutionAuthority,
+        *,
+        build_identity: ProviderSurfaceBuildIdentity | None = None,
+        surface: object | None = None,
+        surface_fingerprint: str | None = None,
+        model_call_surface_binding: object | None = None,
     ) -> object:
         with self._lock:
-            return self._register_identity(self._gateway_sessions, value, authority=authority)
+            self._ensure_open()
+            if type(authority) not in {SegmentExecutionAuthority, ApprovalExecutionAuthority}:
+                raise AuthorityPhaseError("gateway registration requires an authority")
+            if build_identity is None:
+                raise AuthorityPhaseError("gateway registration requires a build identity")
+            build = self._provider_build_for_registration(build_identity, authority)
+            if surface is None or surface_fingerprint is None or model_call_surface_binding is None:
+                raise AuthorityPhaseError(
+                    "gateway registration requires exact surface and binding provenance"
+                )
+            _require_digest(surface_fingerprint, "surface_fingerprint")
+            surface_record = self._registered_authority_identity(
+                self._surfaces,
+                surface,
+                authority,
+                "surface",
+            )
+            if not self._same_provenance(surface_record.provenance, (build,)):
+                raise AuthorityPhaseError("gateway surface provenance does not match build")
+            if surface_record.fingerprint is None or not constant_time_equal(
+                surface_record.fingerprint,
+                surface_fingerprint,
+            ):
+                raise AuthorityPhaseError("gateway surface fingerprint mismatch")
+            binding_record = self._registered_authority_identity(
+                self._bindings,
+                model_call_surface_binding,
+                authority,
+                "model call surface binding",
+            )
+            if (
+                binding_record.parent is not surface
+                or not self._same_provenance(binding_record.provenance, (build,))
+                or binding_record.fingerprint is None
+                or not constant_time_equal(binding_record.fingerprint, surface_fingerprint)
+            ):
+                raise AuthorityPhaseError("gateway binding provenance does not match surface")
+            self._reject_alternate_build_provenance(
+                self._gateway_sessions,
+                build,
+                value,
+                "gateway session",
+            )
+            return self._register_identity(
+                self._gateway_sessions,
+                value,
+                authority=authority,
+                fingerprint=surface_fingerprint,
+                parent=surface,
+                provenance=(build, model_call_surface_binding),
+            )
 
     register_gateway = register_gateway_session
     register_session = register_gateway_session
@@ -1256,7 +1688,7 @@ class AuthorityFactory:
                     if type(field_value) is not str or field_value != "proposed":
                         raise AuthorityPhaseError("Operation must be proposed")
                 elif name in {"proposal_fingerprint", "confirmation_token_fingerprint"}:
-                    _require_digest(field_value, name, allow_hmac=True)
+                    _require_hmac_digest(field_value, name)
                 else:
                     _require_text(field_value, name)
                 semantic[name] = field_value
@@ -1364,6 +1796,8 @@ class AuthorityFactory:
             surface_record = self._registered_authority_identity(
                 self._surfaces, surface, authority, "surface"
             )
+            if not self._same_provenance(surface_record.provenance, (build_identity,)):
+                raise AuthorityPhaseError("surface provenance does not match build identity")
             if surface_record.fingerprint is None or not constant_time_equal(
                 surface_record.fingerprint, surface_fingerprint
             ):
@@ -1374,13 +1808,25 @@ class AuthorityFactory:
                 authority,
                 "model call surface binding",
             )
-            if binding_record.parent is not surface or binding_record.fingerprint is None or not constant_time_equal(
-                binding_record.fingerprint, surface_fingerprint
+            if (
+                binding_record.parent is not surface
+                or not self._same_provenance(binding_record.provenance, (build_identity,))
+                or binding_record.fingerprint is None
+                or not constant_time_equal(binding_record.fingerprint, surface_fingerprint)
             ):
                 raise AuthorityPhaseError("surface binding does not match frozen surface")
-            self._registered_authority_identity(
+            gateway_record = self._registered_authority_identity(
                 self._gateway_sessions, gateway_session, authority, "gateway session"
             )
+            if (
+                gateway_record.parent is not surface
+                or len(gateway_record.provenance) != 2
+                or gateway_record.provenance[0] is not build_identity
+                or gateway_record.provenance[1] is not model_call_surface_binding
+                or gateway_record.fingerprint is None
+                or not constant_time_equal(gateway_record.fingerprint, surface_fingerprint)
+            ):
+                raise AuthorityPhaseError("gateway provenance does not match build identity")
             call = ProviderInvocationIdentity(
                 authority_instance_token=authority.authority_instance_token,
                 runner_invocation=build_identity.runner_invocation,
@@ -1462,6 +1908,11 @@ class AuthorityFactory:
         with self._lock:
             authority = self._call_authority(invocation_identity, AuthorityUse.PROVIDER_INVOKE)
             prepared_record = self._prepared_record(prepared)
+            self._require_prepared_phase(
+                prepared,
+                kind="read",
+                confirmation_policy="none",
+            )
             self._require_prepared_call_fields(
                 prepared,
                 tool_call_id=tool_call_id,
@@ -1515,6 +1966,11 @@ class AuthorityFactory:
                 self._tool_contexts, tool_context, authority, "tool context"
             )
             prepared_record = self._prepared_record(prepared)
+            self._require_prepared_phase(
+                prepared,
+                kind="write",
+                confirmation_policy="required",
+            )
             self._require_prepared_call_fields(
                 prepared,
                 tool_call_id=tool_call_id,
@@ -1533,6 +1989,7 @@ class AuthorityFactory:
                 pending_action_revision=pending_action_revision,
                 arguments_digest=arguments_digest,
             )
+            self._claim_pending_owner(pending_record, authority)
             pending_token = pending_record.token
             call = TypedPendingCallIdentity(
                 authority_instance_token=authority.authority_instance_token,
@@ -1597,6 +2054,11 @@ class AuthorityFactory:
             prepared_record = self._prepared_record(prepared)
             if prepared_record[2] is not authority:
                 raise AuthorityPhaseError("PreparedToolCall belongs to another authority")
+            self._require_prepared_phase(
+                prepared,
+                kind="write",
+                confirmation_policy="required",
+            )
             claim_lifecycle = self._claim_lifecycle(execution_claim)
             claim_value = cast(ExecutionClaim, claim_lifecycle.value)
             if (
@@ -1715,6 +2177,11 @@ class AuthorityFactory:
         with self._lock:
             self._segment_record(authority)
             prepared_record = self._prepared_record(prepared)
+            self._require_prepared_phase(
+                prepared,
+                kind="write",
+                confirmation_policy="required",
+            )
             self._require_prepared_call_fields(
                 prepared,
                 tool_call_id=tool_call_id,
@@ -1766,8 +2233,11 @@ class AuthorityFactory:
             )
             if key in self._claim_keys:
                 raise AuthorityPhaseError("an equivalent Pending claim is already active")
-            pending_record.owners.add(id(authority))
-            claim_token = cast(PendingInstanceToken, _new_opaque_handle(PendingInstanceToken))
+            self._claim_pending_owner(pending_record, authority)
+            claim_token = cast(
+                PendingClaimInstanceToken,
+                _new_opaque_handle(PendingClaimInstanceToken),
+            )
             claim = PendingAuthorityClaim(
                 conversation_id=authority.conversation_id,
                 segment_id=authority.segment_id,
@@ -1795,10 +2265,12 @@ class AuthorityFactory:
                 prepared=prepared,
                 pending=pending,
             )
+            self._claim_object(claim_token)
             self._claim_object(claim)
             self._claim_fields[id(claim)] = _dataclass_snapshot(claim)
             self._claim_keys[key] = id(claim)
             self._objects[id(claim)] = claim
+            self._objects[id(claim_token)] = claim_token
             return claim
 
     pending_authority_claim = issue_pending_claim
@@ -1826,6 +2298,11 @@ class AuthorityFactory:
             prepared_record = self._prepared_record(prepared)
             if prepared_record[2] is not authority:
                 raise AuthorityPhaseError("PreparedToolCall belongs to another authority")
+            self._require_prepared_phase(
+                prepared,
+                kind="write",
+                confirmation_policy="required",
+            )
             self._require_prepared_call_fields(
                 prepared,
                 tool_call_id=tool_call_id,
@@ -1866,9 +2343,9 @@ class AuthorityFactory:
             )
             if key in self._claim_keys:
                 raise AuthorityPhaseError("an equivalent ExecutionClaim is already active")
+            self._claim_pending_owner(pending_record, authority)
             if transaction_record.authority is None:
                 transaction_record.authority = authority
-            pending_record.owners.add(id(authority))
             claim_token = cast(ExecutionClaimInstanceToken, _new_opaque_handle(ExecutionClaimInstanceToken))
             claim = ExecutionClaim(
                 operation_id=operation_id,
@@ -1890,10 +2367,12 @@ class AuthorityFactory:
                 pending=pending,
                 transaction=transaction,
             )
+            self._claim_object(claim_token)
             self._claim_object(claim)
             self._claim_fields[id(claim)] = _dataclass_snapshot(claim)
             self._claim_keys[key] = id(claim)
             self._objects[id(claim)] = claim
+            self._objects[id(claim_token)] = claim_token
             return claim
 
     execution_claim = issue_execution_claim
@@ -1962,11 +2441,10 @@ class AuthorityFactory:
                 confirmation_token_fingerprint, str
             ):
                 raise AuthorityPhaseError("Operation fingerprints are incomplete")
-            _require_digest(proposal_fingerprint, "proposal_fingerprint", allow_hmac=True)
-            _require_digest(
+            _require_hmac_digest(proposal_fingerprint, "proposal_fingerprint")
+            _require_hmac_digest(
                 confirmation_token_fingerprint,
                 "confirmation_token_fingerprint",
-                allow_hmac=True,
             )
             pending_semantic = pending_record.semantic
             for name, expected in pending_semantic.items():
@@ -1984,25 +2462,32 @@ class AuthorityFactory:
                     raise AuthorityPhaseError("Pending pointer does not match Operation")
             if pending_semantic.get("conversation_id") != conversation_id:
                 raise AuthorityPhaseError("Pending conversation identity does not match Operation")
-            # Bind the transaction to the same authority owner when one was
-            # already established; an unrelated transaction object cannot be
-            # substituted by equal fields.
-            proof_authority = operation_record.authority
-            if proof_authority is None and len(pending_record.owners) == 1:
-                candidate_authority_id = next(iter(pending_record.owners))
-                candidate_record = self._authorities.get(candidate_authority_id)
-                if candidate_record is not None:
-                    proof_authority = candidate_record.authority
-            if proof_authority is None:
-                proof_authority = transaction_record.authority
-            if (
-                transaction_record.authority is not None
-                and proof_authority is not None
-                and transaction_record.authority is not proof_authority
-            ):
-                raise AuthorityPhaseError("proof transaction belongs to another authority")
-            if transaction_record.authority is None:
-                transaction_record.authority = proof_authority
+            # Determine proof ownership from all three registered sources
+            # before creating any one-shot value.  A partially bound tuple is
+            # rejected; the only ownerless boundary is all three sources
+            # being explicitly unowned.
+            if len(pending_record.owners) > 1:
+                raise AuthorityPhaseError("proof Pending has conflicting owners")
+            pending_authority: ToolExecutionAuthority | None = None
+            if pending_record.owners:
+                pending_authority_id = next(iter(pending_record.owners))
+                pending_authority_record = self._authorities.get(pending_authority_id)
+                if pending_authority_record is None:
+                    raise AuthorityPhaseError("proof Pending owner is not active")
+                pending_authority = pending_authority_record.authority
+            source_authorities = (
+                operation_record.authority,
+                pending_authority,
+                transaction_record.authority,
+            )
+            if any(source is None for source in source_authorities):
+                if not all(source is None for source in source_authorities):
+                    raise AuthorityPhaseError("proof sources are not bound to one authority")
+                proof_authority = None
+            else:
+                proof_authority = cast(ToolExecutionAuthority, source_authorities[0])
+                if any(source is not proof_authority for source in source_authorities[1:]):
+                    raise AuthorityPhaseError("proof sources belong to different authorities")
             proof_key = (id(operation), id(pending_pointer), id(transaction))
             if proof_key in self._proof_keys:
                 raise AuthorityPhaseError("an equivalent omitted-token proof is already active")
@@ -2032,38 +2517,146 @@ class AuthorityFactory:
                 authority=proof_authority,
                 pending=pending_pointer,
                 transaction=transaction,
+                operation=operation,
             )
+            self._claim_object(proof_token)
             self._claim_object(proof)
             self._proof_fields[id(proof)] = _dataclass_snapshot(proof)
             self._proof_keys[proof_key] = id(proof)
             self._objects[id(proof)] = proof
+            self._objects[id(proof_token)] = proof_token
             return proof
 
     omitted_token_proof = issue_omitted_token_proof
 
-    def _claim_lifecycle(self, claim: object) -> _Lifecycle:
+    def _validate_claim_sources(self, lifecycle: _Lifecycle) -> None:
+        """Revalidate every exact source retained by a live claim."""
+
+        authority = lifecycle.authority
+        if authority is None:
+            raise AuthorityPhaseError("claim authority provenance is missing")
+        self._authority_record(authority)
+        if lifecycle.prepared is None:
+            raise AuthorityPhaseError("claim Prepared provenance is missing")
+        prepared_record = self._prepared_record(lifecycle.prepared)
+        if prepared_record[2] is not authority:
+            raise AuthorityPhaseError("claim Prepared provenance changed")
+        if lifecycle.pending is None:
+            raise AuthorityPhaseError("claim Pending provenance is missing")
+        pending_record = self._pending_record_for_object(lifecycle.pending)
+        if id(authority) not in pending_record.owners:
+            raise AuthorityPhaseError("claim Pending ownership changed")
+        claim_pending_token = getattr(lifecycle.value, "pending_identity", None)
+        if claim_pending_token is not pending_record.token:
+            raise AuthorityPhaseError("claim Pending identity changed")
+        if lifecycle.transaction is not None:
+            transaction_record = self._registered_identity(
+                self._transactions,
+                lifecycle.transaction,
+            )
+            if transaction_record.authority is not authority:
+                raise AuthorityPhaseError("claim transaction provenance changed")
+
+    def _validate_proof_sources(self, lifecycle: _Lifecycle) -> None:
+        """Revalidate the registered Operation/Pending/transaction proof inputs."""
+
+        if lifecycle.operation is None or lifecycle.pending is None or lifecycle.transaction is None:
+            raise AuthorityPhaseError("omitted-token proof provenance is incomplete")
+        operation_record = self._registered_identity(self._operations, lifecycle.operation)
+        pending_record = self._pending_record_for_object(lifecycle.pending)
+        transaction_record = self._registered_identity(
+            self._transactions,
+            lifecycle.transaction,
+        )
+        authority = lifecycle.authority
+        if operation_record.authority is not authority:
+            raise AuthorityPhaseError("proof operation provenance changed")
+        if transaction_record.authority is not authority:
+            raise AuthorityPhaseError("proof transaction provenance changed")
+        if authority is None:
+            if pending_record.owners:
+                raise AuthorityPhaseError("proof Pending ownership changed")
+        elif pending_record.owners != {id(authority)}:
+            raise AuthorityPhaseError("proof Pending ownership changed")
+        proof = cast(TrustedLedgerOmittedTokenProof, lifecycle.value)
+        semantic = operation_record.semantic
+        if (
+            proof.operation_id != semantic.get("operation_id")
+            or proof.conversation_id != semantic.get("conversation_id")
+            or proof.status != semantic.get("status")
+            or proof.adapter_kind != semantic.get("adapter_kind")
+            or proof.tool_call_id != semantic.get("tool_call_id")
+            or proof.tool_name != semantic.get("tool_name")
+            or proof.pending_confirmation_claim_id
+            != semantic.get("pending_confirmation_claim_id")
+        ):
+            raise AuthorityPhaseError("proof operation source identity changed")
+        for name, proof_value in (
+            ("proposal_fingerprint", proof.proposal_fingerprint),
+            ("confirmation_token_fingerprint", proof.confirmation_token_fingerprint),
+        ):
+            expected = semantic.get(name)
+            if not isinstance(expected, str) or not constant_time_equal(proof_value, expected):
+                raise AuthorityPhaseError("proof operation fingerprint changed")
+        pending_semantic = pending_record.semantic
+        if (
+            proof.pending_operation_id != pending_semantic.get("operation_id")
+            or proof.pending_tool_call_id != pending_semantic.get("tool_call_id")
+            or proof.pending_tool_name != pending_semantic.get("tool_name")
+            or proof.pending_confirmation_claim_id
+            != pending_semantic.get("pending_confirmation_claim_id")
+            or pending_semantic.get("conversation_id") != semantic.get("conversation_id")
+        ):
+            raise AuthorityPhaseError("proof Pending source identity changed")
+
+    def _claim_lifecycle(
+        self, claim: object, *, validate_sources: bool = True
+    ) -> _Lifecycle:
         with self._lock:
             self._ensure_open()
             lifecycle = self._claims.get(id(claim))
             if lifecycle is None or lifecycle.value is not claim:
                 raise AuthorityPhaseError("claim is not active in this scope")
-            snapshot = self._claim_fields.get(id(claim))
-            if snapshot is None:
-                raise AuthorityPhaseError("claim snapshot is missing")
-            _validate_snapshot(claim, snapshot, "claim")
+            if validate_sources:
+                snapshot = self._claim_fields.get(id(claim))
+                if snapshot is None:
+                    raise AuthorityPhaseError("claim snapshot is missing")
+                _validate_snapshot(claim, snapshot, "claim")
+                self._validate_claim_sources(lifecycle)
             return lifecycle
 
-    def _proof_lifecycle(self, proof: object) -> _Lifecycle:
+    def _proof_lifecycle(
+        self, proof: object, *, validate_sources: bool = True
+    ) -> _Lifecycle:
         with self._lock:
             self._ensure_open()
             lifecycle = self._proofs.get(id(proof))
             if lifecycle is None or lifecycle.value is not proof:
                 raise AuthorityPhaseError("proof is not active in this scope")
-            snapshot = self._proof_fields.get(id(proof))
-            if snapshot is None:
-                raise AuthorityPhaseError("proof snapshot is missing")
-            _validate_snapshot(proof, snapshot, "proof")
+            if validate_sources:
+                snapshot = self._proof_fields.get(id(proof))
+                if snapshot is None:
+                    raise AuthorityPhaseError("proof snapshot is missing")
+                _validate_snapshot(proof, snapshot, "proof")
+                self._validate_proof_sources(lifecycle)
             return lifecycle
+
+    def _release_claim_pending_owner(self, lifecycle: _Lifecycle) -> None:
+        """Release a claim's Pending owner once no sibling claim uses it."""
+
+        if lifecycle.pending is None or lifecycle.authority is None:
+            return
+        pending_record = self._pending.get(id(lifecycle.pending))
+        if pending_record is None or pending_record.value is not lifecycle.pending:
+            return
+        for other in self._claims.values():
+            if (
+                other is not lifecycle
+                and other.pending is lifecycle.pending
+                and other.authority is lifecycle.authority
+            ):
+                return
+        pending_record.owners.discard(id(lifecycle.authority))
 
     def mark_in_flight(self, value: ExecutionClaim | PendingAuthorityClaim | TrustedLedgerOmittedTokenProof) -> None:
         with self._lock:
@@ -2087,33 +2680,54 @@ class AuthorityFactory:
                 table = self._claims
             if lifecycle.state != "in_flight":
                 raise AuthorityPhaseError("one-shot value must be in flight before consume")
+            token: object | None = None
             if table is self._claims:
                 self._drop_claim_key(id(value))
+                token = getattr(value, "pending_claim_instance_token", None)
+                if token is None:
+                    token = getattr(value, "execution_claim_instance_token", None)
+                self._claim_fields.pop(id(value), None)
             else:
                 self._drop_proof_key(id(value))
+                token = getattr(value, "omitted_token_proof_instance_token", None)
+                self._proof_fields.pop(id(value), None)
             table.pop(id(value), None)
             self._objects.pop(id(value), None)
             self._drop_object(value)
+            if token is not None:
+                self._objects.pop(id(token), None)
+                self._drop_object(token)
 
     consume_claim = consume
 
     def revoke(self, value: ExecutionClaim | PendingAuthorityClaim | TrustedLedgerOmittedTokenProof) -> None:
         with self._lock:
             if isinstance(value, TrustedLedgerOmittedTokenProof):
-                lifecycle = self._proof_lifecycle(value)
+                lifecycle = self._proof_lifecycle(value, validate_sources=False)
                 table = self._proofs
             else:
-                lifecycle = self._claim_lifecycle(value)
+                lifecycle = self._claim_lifecycle(value, validate_sources=False)
                 table = self._claims
             if lifecycle.state not in {"issued", "in_flight"}:
                 raise AuthorityPhaseError("one-shot value is already finalized")
+            token: object | None = None
             if table is self._claims:
                 self._drop_claim_key(id(value))
+                token = getattr(value, "pending_claim_instance_token", None)
+                if token is None:
+                    token = getattr(value, "execution_claim_instance_token", None)
+                self._claim_fields.pop(id(value), None)
+                self._release_claim_pending_owner(lifecycle)
             else:
                 self._drop_proof_key(id(value))
+                token = getattr(value, "omitted_token_proof_instance_token", None)
+                self._proof_fields.pop(id(value), None)
             table.pop(id(value), None)
             self._objects.pop(id(value), None)
             self._drop_object(value)
+            if token is not None:
+                self._objects.pop(id(token), None)
+                self._drop_object(token)
 
     revoke_claim = revoke
 
@@ -2144,7 +2758,14 @@ class AuthorityFactory:
             self.revoke(value)
             raise
         else:
-            self.consume(value)
+            try:
+                self.consume(value)
+            except BaseException:
+                # A source can become stale while the body is running.  Keep
+                # consume fail-closed, but always revoke the owned record so
+                # the scope cannot retain a poisoned one-shot value.
+                self.revoke(value)
+                raise
 
     # Helpers for tests and future pipeline ports.  They never expose token
     # values as text and deliberately return only bounded counts/booleans.
@@ -2222,6 +2843,13 @@ class AuthorityFactory:
                 found = table.get(id(value))
                 if found is not None and found.value is value:
                     return True
+            spec_registration = self._tool_specs.get(id(value))
+            if spec_registration is not None and spec_registration[0] is value:
+                try:
+                    self._validate_registered_tool_spec(value)
+                except AuthorityPhaseError:
+                    return False
+                return True
             return type(value) is str and any(
                 found.value == value for found in self._attempts.values()
             )

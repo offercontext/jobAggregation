@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from offerpilot.agent_runtime.journal import NullRunRecorder
@@ -654,5 +655,54 @@ def test_locked_pending_args_change_rejects_before_executor(tmp_path) -> None:
         with harness.sessions() as session:
             operation = session.get(WriteOperation, harness.operation_id)
             assert operation is not None and operation.status == "proposed"
+    finally:
+        harness.factory.close()
+
+
+@pytest.mark.parametrize("end_transaction", ("commit", "rollback", "close"))
+def test_undo_seed_cannot_end_claim_transaction_before_executor(
+    tmp_path, end_transaction: str
+) -> None:
+    calls = 0
+
+    def executor(_args, _context):
+        nonlocal calls
+        calls += 1
+        return {"ok": True}
+
+    def end_outer_transaction(_prepared, context):
+        getattr(context.bound_session, end_transaction)()
+        return {}
+
+    harness = _primary_execution_harness(tmp_path, executor)
+    try:
+        execution, record = harness.coordinator.execute_primary(
+            operation_id=harness.operation_id,
+            conversation_id=harness.conversation.id,
+            prepared=harness.prepared,
+            context=harness.context,
+            prepare_identity=harness.prepare_identity,
+            request_fingerprint=harness.request_fingerprint,
+            undo_seed_builder=end_outer_transaction,
+        )
+        assert isinstance(execution, OperationUnknown)
+        assert execution.code == "operation_not_committed"
+        assert record is None
+        assert calls == 0
+        with harness.sessions() as session:
+            operation = session.get(WriteOperation, harness.operation_id)
+            conversation = session.get(Conversation, harness.conversation.id)
+            transitions = session.scalars(
+                select(WriteOperationTransition)
+                .where(WriteOperationTransition.operation_id == harness.operation_id)
+                .order_by(WriteOperationTransition.seq)
+            ).all()
+            assert operation is not None and operation.status == "proposed"
+            assert conversation is not None
+            assert conversation.pending_confirmation_claim_id == ""
+            assert conversation.pending_confirmation_claimed_at is None
+            assert [(item.seq, item.state) for item in transitions] == [
+                (1, "proposed")
+            ]
     finally:
         harness.factory.close()

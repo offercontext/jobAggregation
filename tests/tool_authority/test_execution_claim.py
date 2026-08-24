@@ -141,7 +141,13 @@ def _issue(
     prepare_identity: object,
     transaction: object,
 ):
-    factory.register_transaction(transaction, authority=authority)
+    if not transaction.in_transaction():
+        transaction.begin()
+    outer_transaction = transaction.get_transaction()
+    assert outer_transaction is not None
+    factory.register_execution_transaction(
+        transaction, outer_transaction, authority=authority
+    )
     claim = factory.issue_execution_claim(
         authority,
         prepared=prepared,  # type: ignore[arg-type]
@@ -150,7 +156,8 @@ def _issue(
         tool_call_id="call-1",
         tool_name="sealed_write",
         effective_args_digest=ARGUMENTS_DIGEST,
-        transaction=transaction,
+        session=transaction,
+        transaction=outer_transaction,
     )
     execute_identity = factory.create_approved_write_execute_identity(
         prepare_identity,  # type: ignore[arg-type]
@@ -158,6 +165,16 @@ def _issue(
         execution_claim=claim,
     )
     return claim, execute_identity
+
+
+def _execute_claim(prepared, context, session, claim, execute_identity):
+    return execute_prepared(
+        prepared,
+        context.bind(session),
+        call_identity=execute_identity,
+        execution_claim=claim,
+        locked_effective_args_digest=ARGUMENTS_DIGEST,
+    )
 
 
 def test_write_without_operation_executor_fails_closed(tmp_path) -> None:
@@ -346,6 +363,129 @@ def test_execute_identity_rejects_different_same_authority_context(tmp_path) -> 
                     execution_claim=claim,
                     locked_effective_args_digest=ARGUMENTS_DIGEST,
                 )
+        assert calls == 0
+    finally:
+        factory.close()
+
+
+@pytest.mark.parametrize("end_transaction", ("commit", "rollback", "close"))
+def test_ended_outer_transaction_revokes_claim_before_executor(
+    tmp_path, end_transaction: str
+) -> None:
+    calls = 0
+
+    def executor(_args, _context):
+        nonlocal calls
+        calls += 1
+        return {"ok": True}
+
+    factory, authority, context, pending, prepared, prepare_identity, sessions = _setup(
+        tmp_path, executor
+    )
+    try:
+        with sessions() as session:
+            claim, execute_identity = _issue(
+                factory, authority, pending, prepared, prepare_identity, session
+            )
+            getattr(session, end_transaction)()
+            with pytest.raises(AuthorityPhaseError):
+                _execute_claim(prepared, context, session, claim, execute_identity)
+            assert factory.claim_state(claim) is None
+        assert calls == 0
+    finally:
+        factory.close()
+
+
+def test_execution_claim_requires_current_active_outer_transaction(tmp_path) -> None:
+    calls = 0
+
+    def executor(_args, _context):
+        nonlocal calls
+        calls += 1
+
+    factory, authority, _context, pending, prepared, _prepare_identity, sessions = _setup(
+        tmp_path, executor
+    )
+    try:
+        with sessions() as session:
+            inactive_outer = session.begin()
+            session.rollback()
+            factory.register_transaction(inactive_outer, authority=authority)
+            with pytest.raises(AuthorityPhaseError):
+                factory.issue_execution_claim(
+                    authority,
+                    prepared=prepared,
+                    pending=pending,
+                    operation_id="operation-1",
+                    tool_call_id="call-1",
+                    tool_name="sealed_write",
+                    effective_args_digest=ARGUMENTS_DIGEST,
+                    session=session,
+                    transaction=inactive_outer,
+                )
+        assert calls == 0
+    finally:
+        factory.close()
+
+
+def test_nested_savepoint_uses_outer_transaction_identity(tmp_path) -> None:
+    calls = 0
+
+    def executor(_args, context):
+        nonlocal calls
+        calls += 1
+        assert context.bound_session.get_transaction() is outer_transaction
+        assert context.bound_session.get_nested_transaction() is nested_transaction
+        return {"ok": True}
+
+    factory, authority, context, pending, prepared, prepare_identity, sessions = _setup(
+        tmp_path, executor
+    )
+    try:
+        with sessions() as session:
+            session.begin()
+            outer_transaction = session.get_transaction()
+            assert outer_transaction is not None
+            claim, execute_identity = _issue(
+                factory, authority, pending, prepared, prepare_identity, session
+            )
+            with session.begin_nested() as nested_transaction:
+                record = _execute_claim(
+                    prepared, context, session, claim, execute_identity
+                )
+            assert record.execution_started
+            assert calls == 1
+    finally:
+        factory.close()
+
+
+def test_nested_transaction_cannot_replace_outer_claim_identity(tmp_path) -> None:
+    calls = 0
+
+    def executor(_args, _context):
+        nonlocal calls
+        calls += 1
+
+    factory, authority, _context, pending, prepared, _prepare_identity, sessions = _setup(
+        tmp_path, executor
+    )
+    try:
+        with sessions() as session:
+            session.begin()
+            with session.begin_nested() as nested_transaction:
+                factory.register_transaction(nested_transaction, authority=authority)
+                with pytest.raises(AuthorityPhaseError):
+                    factory.issue_execution_claim(
+                        authority,
+                        prepared=prepared,
+                        pending=pending,
+                        operation_id="operation-1",
+                        tool_call_id="call-1",
+                        tool_name="sealed_write",
+                        effective_args_digest=ARGUMENTS_DIGEST,
+                        session=session,
+                        transaction=nested_transaction,
+                    )
         assert calls == 0
     finally:
         factory.close()

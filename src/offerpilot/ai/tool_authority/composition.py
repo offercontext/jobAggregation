@@ -16,6 +16,8 @@ from threading import RLock
 from typing import Any, Iterator, Literal, Mapping, cast
 from uuid import uuid4
 
+from sqlalchemy.orm import Session, SessionTransaction
+
 from offerpilot.ai.tool_runtime.contracts import (
     BindingAudit,
     BindingContract,
@@ -149,6 +151,7 @@ class _Lifecycle:
         "authority",
         "prepared",
         "pending",
+        "session",
         "transaction",
         "operation",
     )
@@ -160,6 +163,7 @@ class _Lifecycle:
         authority: ToolExecutionAuthority | None = None,
         prepared: object | None = None,
         pending: object | None = None,
+        session: object | None = None,
         transaction: object | None = None,
         operation: object | None = None,
     ) -> None:
@@ -168,6 +172,7 @@ class _Lifecycle:
         self.authority = authority
         self.prepared = prepared
         self.pending = pending
+        self.session = session
         self.transaction = transaction
         self.operation = operation
 
@@ -2099,6 +2104,22 @@ class AuthorityFactory:
             self._ensure_open()
             return self._register_identity(self._transactions, value, authority=authority)
 
+    def register_execution_transaction(
+        self,
+        session: object,
+        transaction: object,
+        *,
+        authority: ApprovalExecutionAuthority,
+    ) -> object:
+        """Register the exact active outer transaction used by a write claim."""
+
+        with self._lock:
+            self._approval_record(authority)
+            self._require_current_outer_transaction(session, transaction)
+            return self._register_identity(
+                self._transactions, transaction, authority=authority
+            )
+
     register_operation_identity = register_operation
     register_transaction_identity = register_transaction
 
@@ -2750,12 +2771,16 @@ class AuthorityFactory:
         tool_name: str,
         effective_args_digest: str,
         pending_action_revision: int | None = None,
+        session: object | None = None,
         transaction: object | None = None,
     ) -> ExecutionClaim:
         with self._lock:
             self._approval_record(authority)
-            if transaction is None:
-                raise AuthorityPhaseError("ExecutionClaim requires a registered transaction")
+            if session is None or transaction is None:
+                raise AuthorityPhaseError(
+                    "ExecutionClaim requires an active Session transaction"
+                )
+            self._require_current_outer_transaction(session, transaction)
             transaction_record = self._registered_identity(self._transactions, transaction)
             if transaction_record.authority is not None and transaction_record.authority is not authority:
                 raise AuthorityPhaseError("transaction belongs to another authority")
@@ -2819,6 +2844,7 @@ class AuthorityFactory:
                 tool_call_id=tool_call_id,
                 tool_name=tool_name,
                 effective_args_digest=effective_args_digest,
+                session=session,
                 transaction=transaction,
                 approval_authority_instance_token=authority.authority_instance_token,
                 prepared_instance_token=prepared_record[1],
@@ -2829,6 +2855,7 @@ class AuthorityFactory:
                 authority=authority,
                 prepared=prepared,
                 pending=pending,
+                session=session,
                 transaction=transaction,
             )
             self._claim_object(claim_token)
@@ -3020,6 +3047,70 @@ class AuthorityFactory:
             )
             if transaction_record.authority is not authority:
                 raise AuthorityPhaseError("claim transaction provenance changed")
+        claim = lifecycle.value
+        if isinstance(claim, ExecutionClaim):
+            if (
+                lifecycle.session is None
+                or lifecycle.transaction is None
+                or claim.session is not lifecycle.session
+                or claim.transaction is not lifecycle.transaction
+            ):
+                raise AuthorityPhaseError(
+                    "claim Session transaction provenance changed"
+                )
+            self._require_current_outer_transaction(
+                lifecycle.session, lifecycle.transaction
+            )
+
+    @staticmethod
+    def _require_current_outer_transaction(session: object, transaction: object) -> None:
+        """Require one exact active outer transaction on one exact Session."""
+
+        if not isinstance(session, Session) or not isinstance(
+            transaction, SessionTransaction
+        ):
+            raise AuthorityPhaseError(
+                "ExecutionClaim requires a SQLAlchemy Session transaction"
+            )
+        get_transaction = getattr(session, "get_transaction", None)
+        in_transaction = getattr(session, "in_transaction", None)
+        if not callable(get_transaction) or not callable(in_transaction):
+            raise AuthorityPhaseError("ExecutionClaim Session carrier is invalid")
+        try:
+            current = get_transaction()
+            active = getattr(transaction, "is_active", False)
+            session_active = in_transaction()
+        except Exception as exc:
+            raise AuthorityPhaseError(
+                "ExecutionClaim transaction state is unavailable"
+            ) from exc
+        if (
+            current is not transaction
+            or transaction.session is not session
+            or transaction.parent is not None
+            or active is not True
+            or session_active is not True
+        ):
+            raise AuthorityPhaseError(
+                "ExecutionClaim outer transaction is no longer active"
+            )
+
+    def require_execution_claim_transaction(
+        self, claim: ExecutionClaim, session: object
+    ) -> None:
+        """Revalidate exact Session/outer-transaction identity at dispatch."""
+
+        with self._lock:
+            lifecycle = self._claim_lifecycle(claim)
+            if lifecycle.session is not session:
+                raise AuthorityPhaseError(
+                    "ExecutionClaim belongs to another Session"
+                )
+            if lifecycle.transaction is None:
+                raise AuthorityPhaseError(
+                    "ExecutionClaim transaction provenance is missing"
+                )
+            self._require_current_outer_transaction(session, lifecycle.transaction)
 
     def _validate_proof_sources(self, lifecycle: _Lifecycle) -> None:
         """Revalidate the registered Operation/Pending/transaction proof inputs."""

@@ -995,6 +995,9 @@ class WriteOperationCoordinator:
         try:
             with self.repository.session_factory() as session:
                 session.execute(text("BEGIN IMMEDIATE"))
+                outer_transaction = session.get_transaction()
+                if outer_transaction is None:
+                    raise WriteOperationError("operation_not_committed", retryable=True)
                 operation = session.get(WriteOperation, operation_id)
                 if operation is None:
                     session.rollback()
@@ -1024,6 +1027,16 @@ class WriteOperationCoordinator:
                 bound_context = context.bind(session)
                 if prepared.spec.mutable_validator is not None:
                     failure = prepared.spec.mutable_validator(prepared.typed_args, bound_context)
+                    try:
+                        factory.register_execution_transaction(
+                            session,
+                            outer_transaction,
+                            authority=authority,
+                        )
+                    except AuthorityPhaseError as exc:
+                        raise WriteOperationError(
+                            "operation_not_committed", retryable=True
+                        ) from exc
                     if failure is not None:
                         claimed = session.execute(
                             update(Conversation)
@@ -1056,6 +1069,25 @@ class WriteOperationCoordinator:
                             owner,
                             arguments_digest=locked_pending.arguments_digest,
                         )
+                try:
+                    undo_seed = (
+                        undo_seed_builder(prepared, bound_context)
+                        if undo_seed_builder is not None
+                        else {}
+                    )
+                    factory.register_execution_transaction(
+                        session,
+                        outer_transaction,
+                        authority=authority,
+                    )
+                except AuthorityPhaseError as exc:
+                    raise WriteOperationError(
+                        "operation_not_committed", retryable=True
+                    ) from exc
+                except Exception as exc:
+                    raise WriteOperationError(
+                        "operation_not_committed", retryable=True
+                    ) from exc
                 claimed = session.execute(
                     update(Conversation)
                     .where(Conversation.id == conversation_id)
@@ -1074,7 +1106,6 @@ class WriteOperationCoordinator:
                 self.repository.append_transition(session, operation_id, 3, "claimed")
                 execution_claim = None
                 try:
-                    factory.register_transaction(session, authority=authority)
                     execution_claim = factory.issue_execution_claim(
                         authority,
                         prepared=prepared,
@@ -1084,7 +1115,8 @@ class WriteOperationCoordinator:
                         tool_name=prepared.spec.name,
                         effective_args_digest=locked_pending.arguments_digest,
                         pending_action_revision=locked_pending.pending_action_revision,
-                        transaction=session,
+                        session=session,
+                        transaction=outer_transaction,
                     )
                     execute_identity = factory.create_approved_write_execute_identity(
                         prepare_identity,
@@ -1107,11 +1139,6 @@ class WriteOperationCoordinator:
                     with session.begin_nested():
                         started_recorded = project_tool_started_bound(
                             bound_context.run_recorder, session, prepared
-                        )
-                        undo_seed = (
-                            undo_seed_builder(prepared, bound_context)
-                            if undo_seed_builder is not None
-                            else {}
                         )
                         dispatched = execute_prepared(
                             prepared,

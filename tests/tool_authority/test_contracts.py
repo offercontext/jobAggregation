@@ -6,6 +6,7 @@ from dataclasses import replace
 from typing import Any
 
 import pytest
+from sqlalchemy.orm import Session
 
 from offerpilot.ai.tool_authority import (
     ApprovedWriteExecuteCallIdentity,
@@ -453,24 +454,26 @@ def test_approval_execution_claim_binds_prepared_and_authority_identity() -> Non
             tool_name="update_application_status",
             kind="write",
         )
-        transaction = object()
-        factory.register_transaction(transaction)
-        claim = factory.issue_execution_claim(
-            approval,
-            prepared=prepared,
-            pending=pending_object,
-            operation_id="op-1",
-            tool_call_id="call-1",
-            tool_name="update_application_status",
-            effective_args_digest=approval.effective_args_digest,
-            transaction=transaction,
-        )
-        assert isinstance(claim, ExecutionClaim)
-        assert claim.prepared_instance_token is factory.prepared_token(prepared)
-        factory.mark_in_flight(claim)
-        factory.consume(claim)
-        with pytest.raises(AuthorityPhaseError):
+        with Session() as session:
+            transaction = session.begin()
+            factory.register_transaction(transaction)
+            claim = factory.issue_execution_claim(
+                approval,
+                prepared=prepared,
+                pending=pending_object,
+                operation_id="op-1",
+                tool_call_id="call-1",
+                tool_name="update_application_status",
+                effective_args_digest=approval.effective_args_digest,
+                session=session,
+                transaction=transaction,
+            )
+            assert isinstance(claim, ExecutionClaim)
+            assert claim.prepared_instance_token is factory.prepared_token(prepared)
+            factory.mark_in_flight(claim)
             factory.consume(claim)
+            with pytest.raises(AuthorityPhaseError):
+                factory.consume(claim)
 
 
 def test_call_identity_variants_are_closed_types() -> None:

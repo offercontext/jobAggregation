@@ -332,8 +332,11 @@ def _execute_claimed_write(
             raise AuthorityPhaseError("execute identity belongs to another PreparedToolCall")
         if call_identity.execution_claim is not execution_claim:
             raise AuthorityPhaseError("execute identity belongs to another ExecutionClaim")
-        if context.bound_session is not execution_claim.transaction:
-            raise AuthorityPhaseError("ExecutionClaim belongs to another transaction")
+        if context.bound_session is not execution_claim.session:
+            raise AuthorityPhaseError("ExecutionClaim belongs to another Session")
+        factory.require_execution_claim_transaction(
+            execution_claim, context.bound_session
+        )
         typed_args_digest = _typed_args_digest(prepared.typed_args)
         digests = (
             prepared.arguments_digest,

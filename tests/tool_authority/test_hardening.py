@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from sqlalchemy.orm import Session
 
 import offerpilot.ai.tool_authority.composition as authority_composition
 from offerpilot.ai.tool_authority import (
@@ -442,8 +443,22 @@ def test_execution_claim_requires_registered_transaction_and_approval_pending_ob
             tool_name="update_application_status",
             kind="write",
         )
-        with pytest.raises(AuthorityPhaseError):
-            factory.issue_execution_claim(
+        with Session() as session:
+            transaction = session.begin()
+            with pytest.raises(AuthorityPhaseError):
+                factory.issue_execution_claim(
+                    approval,
+                    prepared=prepared,
+                    pending=pending,
+                    operation_id="op-1",
+                    tool_call_id="update_application_status",
+                    tool_name="update_application_status",
+                    effective_args_digest=SHA,
+                    session=session,
+                    transaction=transaction,
+                )
+            factory.register_transaction(transaction)
+            claim = factory.issue_execution_claim(
                 approval,
                 prepared=prepared,
                 pending=pending,
@@ -451,21 +466,10 @@ def test_execution_claim_requires_registered_transaction_and_approval_pending_ob
                 tool_call_id="update_application_status",
                 tool_name="update_application_status",
                 effective_args_digest=SHA,
-                transaction=object(),
+                session=session,
+                transaction=transaction,
             )
-        transaction = object()
-        factory.register_transaction(transaction)
-        claim = factory.issue_execution_claim(
-            approval,
-            prepared=prepared,
-            pending=pending,
-            operation_id="op-1",
-            tool_call_id="update_application_status",
-            tool_name="update_application_status",
-            effective_args_digest=SHA,
-            transaction=transaction,
-        )
-        assert isinstance(claim, ExecutionClaim)
+            assert isinstance(claim, ExecutionClaim)
 
 
 def test_omitted_proof_requires_registered_operation_pending_transaction_and_claim_id() -> None:
@@ -1015,21 +1019,23 @@ def test_pending_snapshot_is_checked_before_approval_typed_and_execution_side_ef
             tool_name="update_application_status",
             kind="write",
         )
-        transaction = object()
-        factory.register_transaction(transaction)
-        pending.effective_args_digest = SHA_B
-        with pytest.raises(AuthorityPhaseError):
-            factory.issue_execution_claim(
-                approval,
-                prepared=prepared,
-                pending=pending,
-                operation_id="op-execution-mutation",
-                tool_call_id="update_application_status",
-                tool_name="update_application_status",
-                effective_args_digest=SHA,
-                transaction=transaction,
-            )
-        assert factory._transactions[id(transaction)].authority is None
+        with Session() as session:
+            transaction = session.begin()
+            factory.register_transaction(transaction)
+            pending.effective_args_digest = SHA_B
+            with pytest.raises(AuthorityPhaseError):
+                factory.issue_execution_claim(
+                    approval,
+                    prepared=prepared,
+                    pending=pending,
+                    operation_id="op-execution-mutation",
+                    tool_call_id="update_application_status",
+                    tool_name="update_application_status",
+                    effective_args_digest=SHA,
+                    session=session,
+                    transaction=transaction,
+                )
+            assert factory._transactions[id(transaction)].authority is None
 
 
 def test_omitted_proof_requires_strict_hmac_fingerprints() -> None:
@@ -1237,21 +1243,23 @@ def test_execution_claim_lifecycle_revalidates_pending_and_prepared_sources() ->
             tool_name="update_application_status",
             kind="write",
         )
-        transaction = object()
-        factory.register_transaction(transaction)
-        claim = factory.issue_execution_claim(
-            authority,
-            prepared=prepared,
-            pending=pending,
-            operation_id="op-execution-source",
-            tool_call_id="update_application_status",
-            tool_name="update_application_status",
-            effective_args_digest=SHA,
-            transaction=transaction,
-        )
-        pending.effective_args_digest = SHA_B
-        with pytest.raises(AuthorityPhaseError):
-            factory.mark_in_flight(claim)
+        with Session() as session:
+            transaction = session.begin()
+            factory.register_transaction(transaction)
+            claim = factory.issue_execution_claim(
+                authority,
+                prepared=prepared,
+                pending=pending,
+                operation_id="op-execution-source",
+                tool_call_id="update_application_status",
+                tool_name="update_application_status",
+                effective_args_digest=SHA,
+                session=session,
+                transaction=transaction,
+            )
+            pending.effective_args_digest = SHA_B
+            with pytest.raises(AuthorityPhaseError):
+                factory.mark_in_flight(claim)
 
 
 @pytest.mark.parametrize("source", ["operation", "pending", "transaction"])

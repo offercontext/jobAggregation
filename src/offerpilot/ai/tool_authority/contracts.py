@@ -705,6 +705,7 @@ class ExecutionClaim(_ReplacementProtected, TransientToolRuntimeValue):
     tool_call_id: str
     tool_name: str
     effective_args_digest: str
+    session: object = field(repr=False, compare=False)
     transaction: object = field(repr=False, compare=False)
     approval_authority_instance_token: AuthorityInstanceToken = field(repr=False, compare=False)
     prepared_instance_token: PreparedInstanceToken = field(repr=False, compare=False)
@@ -717,10 +718,14 @@ class ExecutionClaim(_ReplacementProtected, TransientToolRuntimeValue):
         _require_text(self.tool_call_id, "tool_call_id")
         _require_text(self.tool_name, "tool_name")
         _require_digest(self.effective_args_digest, "effective_args_digest")
-        if self.transaction is None or isinstance(
-            self.transaction, (str, bytes, int, float, bool, tuple, frozenset)
+        for value, name in (
+            (self.session, "session"),
+            (self.transaction, "transaction"),
         ):
-            raise TypeError("transaction must be a registered opaque object")
+            if value is None or isinstance(
+                value, (str, bytes, int, float, bool, tuple, frozenset)
+            ):
+                raise TypeError(f"{name} must be a registered opaque object")
         _require_token(self.pending_identity, PendingInstanceToken, "pending_identity")
         _require_token(
             self.approval_authority_instance_token,

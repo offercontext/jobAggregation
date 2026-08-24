@@ -1511,6 +1511,23 @@ class AuthorityFactory:
             and actual[5] is expected_ticket
         )
 
+    def _repository_binding_sources_match(self, expected: tuple[object, ...]) -> bool:
+        """Return whether a binding's registered authority and constraint remain valid."""
+
+        if type(self) is not AuthorityFactory:
+            return False
+        _, _, expected_constraint, expected_authority, _, _ = expected
+        try:
+            self._authority_record(expected_authority)
+            AuthorityFactory.require_scope_constraint(
+                self,
+                expected_constraint,
+                cast(ToolExecutionAuthority, expected_authority),
+            )
+        except AuthorityPhaseError:
+            return False
+        return True
+
 
     def create_binding_target_resolution(
         self,
@@ -3168,8 +3185,10 @@ class AuthorityFactory:
             repository_binding = self._repository_bindings.get(id(value))
             if repository_binding is not None and repository_binding.value is value:
                 snapshot = self._repository_binding_fields.get(id(value))
-                return snapshot is not None and self._repository_binding_snapshot_matches(
-                    value, snapshot
+                return (
+                    snapshot is not None
+                    and self._repository_binding_sources_match(snapshot)
+                    and self._repository_binding_snapshot_matches(value, snapshot)
                 )
             call = self._calls.get(id(value))
             if call is not None and call[0] is value:

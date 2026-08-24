@@ -381,6 +381,29 @@ def test_evil_factory_cannot_register_or_use_a_binding(seeded) -> None:
         trusted_factory.close()
 
 
+@pytest.mark.parametrize("mutation", ("constraint", "authority"))
+def test_binding_is_active_revalidates_registered_sources(seeded, mutation: str) -> None:
+    factory = AuthorityFactory()
+    _, authority, constraint = _constraint(factory)
+
+    with seeded["session_factory"]() as session:
+        bound = _bind_scoped(seeded["applications"], session, factory, authority, constraint)
+        binding = bound._scope_binding
+        assert binding is not None
+        assert factory.is_active(binding)
+
+        if mutation == "constraint":
+            object.__setattr__(constraint, "allowed_identities", frozenset({seeded["second"].id}))
+        else:
+            object.__setattr__(
+                authority,
+                "conversation_scope_revision",
+                authority.conversation_scope_revision + 1,
+            )
+
+        assert factory.is_active(binding) is False
+
+
 @pytest.mark.parametrize("cleanup", ("revoke", "close"))
 def test_binding_registry_cleanup_fails_closed_without_sql(seeded, cleanup: str) -> None:
     factory = AuthorityFactory()
@@ -396,10 +419,14 @@ def test_binding_registry_cleanup_fails_closed_without_sql(seeded, cleanup: str)
         with seeded["session_factory"]() as session:
             bound = _bind_scoped(seeded["applications"], session, factory, authority, constraint)
             assert factory.active_count > 0
+            binding = bound._scope_binding
+            assert binding is not None
+            assert factory.is_active(binding)
             if cleanup == "revoke":
                 factory.revoke_authority(authority)
             else:
                 factory.close()
+            assert factory.is_active(binding) is False
             with pytest.raises(AuthorityPhaseError):
                 bound.list_applications_scoped(constraint)
             assert statements == []

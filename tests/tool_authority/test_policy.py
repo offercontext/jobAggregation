@@ -168,6 +168,22 @@ def test_binding_policy_input_uses_one_ordered_manifest_projection() -> None:
     assert binding_policy_fingerprint(manifest) == _reviewed_policy()["binding_policy"]["fingerprint"]
 
 
+@pytest.mark.parametrize("schema_version", [True, 1.0, "1"])
+def test_manifest_schema_version_requires_exact_integer(schema_version: object) -> None:
+    manifest = _manifest()
+    manifest["schema_version"] = schema_version
+    with pytest.raises(AuthorityPolicyError):
+        validate_startup_policy(manifest, expected_policy=_reviewed_policy())
+
+
+@pytest.mark.parametrize("ordinal", [True, 1.0, "1"])
+def test_manifest_ordinal_requires_exact_integer(ordinal: object) -> None:
+    manifest = _manifest()
+    manifest["tools"][0]["ordinal"] = ordinal
+    with pytest.raises(AuthorityPolicyError):
+        validate_startup_policy(manifest, expected_policy=_reviewed_policy())
+
+
 @pytest.mark.parametrize(
     ("path", "replacement"),
     [

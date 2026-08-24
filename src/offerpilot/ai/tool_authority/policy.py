@@ -326,7 +326,7 @@ def _exact_keys(value: Mapping[str, object], expected: frozenset[str], field_nam
 
 def _validate_manifest(manifest: Mapping[str, object]) -> Sequence[Mapping[str, object]]:
     _exact_keys(manifest, frozenset({"schema_version", "tools"}), "manifest")
-    if manifest.get("schema_version") != 1:
+    if type(manifest.get("schema_version")) is not int or manifest.get("schema_version") != 1:
         raise AuthorityPolicyError("unknown authority manifest schema version")
     tools_value = manifest.get("tools")
     if type(tools_value) is not list or len(tools_value) != 25:
@@ -338,7 +338,7 @@ def _validate_manifest(manifest: Mapping[str, object]) -> Sequence[Mapping[str, 
     for index, raw_tool in enumerate(cast(list[object], tools_value), start=1):
         tool = _mapping(raw_tool, f"tools[{index - 1}]")
         _exact_keys(tool, _MANIFEST_KEYS, f"tools[{index - 1}]")
-        if tool.get("ordinal") != index:
+        if type(tool.get("ordinal")) is not int or tool.get("ordinal") != index:
             raise AuthorityPolicyError("authority manifest ordinals are not contiguous")
         name = _require_nonempty_text(tool.get("name"), "tool name")
         if name in names:

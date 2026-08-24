@@ -160,7 +160,12 @@ from offerpilot.repositories.adaptive_interview_practice import (
     AdaptivePracticeRepository,
     AdaptivePracticeValidationError,
 )
-from offerpilot.repositories.chat import ChatRepository
+from offerpilot.repositories.chat import (
+    ChatRepository,
+    ConversationScopeError,
+    ConversationScopeMutationSnapshot,
+    ConversationScopeUnavailable,
+)
 from offerpilot.repositories.application_events import (
     ApplicationEventCreate,
     ApplicationEventsRepository,
@@ -4669,17 +4674,14 @@ def create_app(
         values: dict[str, Any] = {}
         now = datetime.now(timezone.utc)
         if "title" in payload:
-            title = str(payload.get("title") or "").strip()
+            raw_title = payload.get("title")
+            if not isinstance(raw_title, str):
+                return error_response(422, "title must be a string")
+            title = raw_title.strip()
             if not title:
                 return error_response(400, "title is required")
             values["title"] = title[:80]
             values["title_source"] = "manual"
-        if "context_type" in payload:
-            values["context_type"] = (
-                str(payload.get("context_type") or "workspace").strip() or "workspace"
-            )
-        if "context_ref" in payload:
-            values["context_ref"] = str(payload.get("context_ref") or "").strip()
         if "pinned" in payload:
             if not isinstance(payload.get("pinned"), bool):
                 return error_response(422, "pinned must be boolean")
@@ -4688,15 +4690,51 @@ def create_app(
             if not isinstance(payload.get("archived"), bool):
                 return error_response(422, "archived must be boolean")
             values["archived_at"] = now if payload["archived"] else None
-        if payload.get("archived") is True:
-            archive_update = chat.update_conversation_for_archive(conversation_id, values)
-            if archive_update.status == "not_found":
+
+        scope_keys = {"context_type", "context_ref", "mode"}
+        has_scope_fields = bool(scope_keys.intersection(payload))
+        mutation: ConversationScopeMutationSnapshot | None = None
+        if has_scope_fields:
+            if "context_ref" in payload and "context_type" not in payload:
+                return error_response(422, "context_ref requires context_type")
+            raw_context_type = (
+                payload["context_type"] if "context_type" in payload else existing.context_type
+            )
+            raw_context_ref = (
+                payload["context_ref"]
+                if "context_ref" in payload
+                else ("" if "context_type" in payload else existing.context_ref)
+            )
+            raw_mode = payload["mode"] if "mode" in payload else existing.mode
+            try:
+                mutation = ConversationScopeMutationSnapshot(
+                    context_type=raw_context_type,
+                    context_ref=raw_context_ref,
+                    mode=raw_mode,
+                )
+            except (ConversationScopeError, TypeError, ValueError) as exc:
+                return error_response(422, str(exc))
+
+        if payload.get("archived") is True and existing.pending_tool_name:
+            return error_response(409, "该对话有待确认操作，完成或取消后才能归档")
+        try:
+            conversation = chat.patch_conversation_with_scope(
+                conversation_id,
+                values,
+                mutation,
+                expected_scope_revision=existing.scope_revision,
+            )
+        except ConversationScopeUnavailable:
+            return error_response(503, "conversation scope is unavailable", code="scope_unavailable")
+        except (ConversationScopeError, TypeError, ValueError) as exc:
+            return error_response(422, str(exc))
+        if conversation is None:
+            latest = chat.get_conversation(conversation_id)
+            if latest is None:
                 return error_response(404, "conversation not found")
-            if archive_update.status == "pending":
+            if payload.get("archived") is True and latest.pending_tool_name:
                 return error_response(409, "该对话有待确认操作，完成或取消后才能归档")
-            conversation = archive_update.conversation
-        else:
-            conversation = chat.update_conversation(conversation_id, values)
+            return error_response(409, "conversation changed; please retry", code="scope_conflict")
         assert conversation is not None
         return JSONResponse(_conversation_json(conversation, applications, application_jd_versions))
 
@@ -7456,9 +7494,45 @@ def _normalize_runtime_start_request(
             if "pilot_action" in payload
             else None
         )
-        context_type = str(payload.get("context_type") or "workspace").strip() or "workspace"
-        context_ref = str(payload.get("context_ref") or "").strip()
-        mode = str(payload.get("mode") or "general").strip() or "general"
+        raw_context_type = payload.get("context_type")
+        if raw_context_type is None or raw_context_type == "":
+            context_type = "workspace"
+        elif type(raw_context_type) is str:
+            context_type = raw_context_type
+        else:
+            raise ValueError("context_type must be a string")
+
+        raw_context_ref = payload.get("context_ref")
+        if raw_context_ref is None or raw_context_ref == "":
+            context_ref = ""
+        elif type(raw_context_ref) is str:
+            context_ref = raw_context_ref
+        elif type(raw_context_ref) is int:
+            context_ref = str(raw_context_ref)
+        else:
+            raise ValueError("context_ref must be a string or integer")
+
+        raw_mode = payload.get("mode")
+        if raw_mode is None or raw_mode == "":
+            mode = "general"
+        elif type(raw_mode) is str:
+            mode = raw_mode
+        else:
+            raise ValueError("mode must be a string")
+
+        # A new turn is the only request phase allowed to establish scope.
+        # Validate its complete canonical snapshot here, before runtime/model
+        # work. Existing-turn scope fields are shape-validated above and are
+        # intentionally left untouched for the persisted Conversation to own.
+        if raw_conversation_id == 0:
+            scope = ConversationScopeMutationSnapshot(
+                context_type=context_type,
+                context_ref=context_ref,
+                mode=mode,
+            )
+            context_type = cast(str, scope.context_type)
+            context_ref = cast(str, scope.context_ref)
+            mode = cast(str, scope.mode)
         immutable_page = freeze_json_mapping(page_context) if page_context is not None else None
         attachments = tuple(
             AttachmentReference(item["kind"], item["id"]) for item in raw_attachments

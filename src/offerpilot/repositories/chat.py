@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import json
+import re
 from contextlib import contextmanager
 from hashlib import sha256
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Literal, cast
+from typing import Any, Literal, Mapping, cast
 
 from sqlalchemy import delete, or_, select, text, update
 from sqlalchemy.orm import Session, sessionmaker
-from uuid import uuid4
 
 from offerpilot.ai.agent_contracts import PendingAction
 from offerpilot.ai.write_operations import (
@@ -19,10 +19,45 @@ from offerpilot.ai.write_operations import (
     ledger_fingerprint,
 )
 from offerpilot.ai.types import Message
-from offerpilot.models import ChatMessage, Conversation, WriteOperation
+from offerpilot.models import Application, ChatMessage, Conversation, WriteOperation
 
 
 _CONFIRMATION_CLAIM_LEASE = timedelta(minutes=15)
+_MAX_SCOPE_REVISION = 9223372036854775807
+_SCOPE_CONTEXT_TYPES = frozenset({"workspace", "global", "mode", "application"})
+_ASCII_POSITIVE_INTEGER = re.compile(r"[1-9][0-9]*\Z")
+_SCOPE_KEYS = frozenset({"mode", "context_type", "context_ref", "scope_revision"})
+_SCOPE_ARGUMENT_MISSING = object()
+
+
+class ConversationScopeError(ValueError):
+    """Invalid or unavailable scope input which must fail before persistence."""
+
+
+class ConversationScopeUnavailable(ConversationScopeError):
+    """The requested Application scope does not resolve to an active row."""
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationScopeMutationSnapshot:
+    """Canonical, validated scope values used by the atomic repository ports.
+
+    The constructor intentionally accepts the JSON-level Application id forms
+    (exact Python ``int`` or canonical decimal ``str``), but stores only the
+    canonical string representation.  It never strips or case-folds user input.
+    """
+
+    context_type: str | None = "workspace"
+    context_ref: object = ""
+    mode: str | None = "general"
+
+    def __post_init__(self) -> None:
+        context_type = _canonical_context_type(self.context_type)
+        context_ref = _canonical_context_ref(context_type, self.context_ref)
+        mode = _canonical_scope_mode(self.mode)
+        object.__setattr__(self, "context_type", context_type)
+        object.__setattr__(self, "context_ref", context_ref)
+        object.__setattr__(self, "mode", mode)
 
 
 @dataclass(frozen=True)
@@ -57,17 +92,24 @@ class ChatRepository:
     def create_conversation(
         self,
         title: str,
-        mode: str = "general",
-        context_type: str = "workspace",
-        context_ref: str = "",
+        mode: object = _SCOPE_ARGUMENT_MISSING,
+        context_type: object = _SCOPE_ARGUMENT_MISSING,
+        context_ref: object = _SCOPE_ARGUMENT_MISSING,
         title_source: str = "fallback",
     ) -> Conversation:
+        if (
+            mode is not _SCOPE_ARGUMENT_MISSING
+            or context_type is not _SCOPE_ARGUMENT_MISSING
+            or context_ref is not _SCOPE_ARGUMENT_MISSING
+        ):
+            raise ValueError("scope fields require create_conversation_with_scope")
         conversation = Conversation(
             title=title,
             title_source=title_source,
-            mode=mode,
-            context_type=context_type or "workspace",
-            context_ref=context_ref or "",
+            mode="general",
+            context_type="workspace",
+            context_ref="",
+            scope_revision=0,
         )
         with self._session_factory() as session:
             session.add(conversation)
@@ -75,19 +117,36 @@ class ChatRepository:
             session.refresh(conversation)
             return conversation
 
+    def create_conversation_with_scope(
+        self,
+        title: str,
+        mutation: ConversationScopeMutationSnapshot,
+        *,
+        title_source: str = "fallback",
+    ) -> Conversation:
+        """Create a Conversation and its scope as one locked, revision-zero write."""
+
+        if not isinstance(mutation, ConversationScopeMutationSnapshot):
+            raise TypeError("mutation must be ConversationScopeMutationSnapshot")
+        with self._session_factory() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            _require_active_application(session, mutation)
+            conversation = Conversation(
+                title=title,
+                title_source=title_source,
+                mode=mutation.mode,
+                context_type=mutation.context_type,
+                context_ref=mutation.context_ref,
+                scope_revision=0,
+            )
+            session.add(conversation)
+            session.commit()
+            session.refresh(conversation)
+            return conversation
+
     def get_conversation(self, conversation_id: int) -> Conversation | None:
         with self._session_factory() as session:
-            conversation = session.get(Conversation, conversation_id)
-        if (
-            conversation is not None
-            and conversation.pending_tool_name
-            and not conversation.pending_operation_id
-            and self._write_operations is not None
-        ):
-            self.get_pending_action(conversation_id)
-            with self._session_factory() as session:
-                return session.get(Conversation, conversation_id)
-        return conversation
+            return session.get(Conversation, conversation_id)
 
     def list_conversations(self, include_archived: bool = False) -> list[Conversation]:
         statement = select(Conversation)
@@ -100,22 +159,13 @@ class ChatRepository:
             Conversation.id.desc(),
         )
         with self._session_factory() as session:
-            conversations = list(session.scalars(statement))
-        missing_operation_ids = [
-            conversation.id
-            for conversation in conversations
-            if conversation.pending_tool_name and not conversation.pending_operation_id
-        ]
-        for conversation_id in missing_operation_ids:
-            self.get_pending_action(conversation_id)
-        if missing_operation_ids:
-            with self._session_factory() as session:
-                return list(session.scalars(statement))
-        return conversations
+            return list(session.scalars(statement))
 
     def update_conversation(
         self, conversation_id: int, values: dict[str, Any]
     ) -> Conversation | None:
+        if _SCOPE_KEYS.intersection(values):
+            raise ValueError("scope fields require patch_conversation_with_scope")
         if not values:
             return self.get_conversation(conversation_id)
         with self._session_factory() as session:
@@ -125,6 +175,79 @@ class ChatRepository:
             for key, value in values.items():
                 setattr(conversation, key, value)
             conversation.updated_at = datetime.now(timezone.utc)
+            session.commit()
+            session.refresh(conversation)
+            return conversation
+
+    def patch_conversation_with_scope(
+        self,
+        conversation_id: int,
+        values: Mapping[str, object],
+        mutation: ConversationScopeMutationSnapshot | None,
+        *,
+        expected_scope_revision: int,
+    ) -> Conversation | None:
+        """Atomically patch scope and ordinary Conversation fields with a CAS.
+
+        The caller supplies an already validated mutation snapshot.  The row is
+        reloaded while holding ``BEGIN IMMEDIATE`` before visibility and scope
+        comparison, so a scope change and a title/pin/archive change either
+        commit together or none of them does.
+        """
+
+        if _SCOPE_KEYS.intersection(values):
+            raise ValueError("scope fields belong in mutation")
+        if type(expected_scope_revision) is not int or not (
+            0 <= expected_scope_revision <= _MAX_SCOPE_REVISION
+        ):
+            raise ValueError("expected_scope_revision must be a valid integer")
+        if mutation is not None and not isinstance(
+            mutation, ConversationScopeMutationSnapshot
+        ):
+            raise TypeError("mutation must be ConversationScopeMutationSnapshot or None")
+
+        with self._session_factory() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            conversation = session.get(Conversation, conversation_id)
+            if conversation is None or conversation.scope_revision != expected_scope_revision:
+                session.rollback()
+                return None
+            if values.get("archived_at") is not None and conversation.pending_tool_name:
+                session.rollback()
+                return None
+
+            update_values = dict(values)
+            scope_changed = False
+            if mutation is not None:
+                _require_active_application(session, mutation)
+                scope_changed = (
+                    conversation.context_type != mutation.context_type
+                    or conversation.context_ref != mutation.context_ref
+                    or conversation.mode != mutation.mode
+                )
+                if scope_changed:
+                    if conversation.scope_revision >= _MAX_SCOPE_REVISION:
+                        session.rollback()
+                        raise ConversationScopeError("conversation scope revision overflow")
+                    update_values.update(
+                        {
+                            "context_type": mutation.context_type,
+                            "context_ref": mutation.context_ref,
+                            "mode": mutation.mode,
+                            "scope_revision": conversation.scope_revision + 1,
+                        }
+                    )
+
+            if update_values:
+                update_values.setdefault("updated_at", datetime.now(timezone.utc))
+                for key, value in update_values.items():
+                    if key == "updated_at":
+                        continue
+                    if not hasattr(Conversation, key):
+                        raise ValueError(f"unknown conversation field: {key}")
+                    setattr(conversation, key, value)
+                conversation.updated_at = cast(datetime, update_values["updated_at"])
+                session.flush()
             session.commit()
             session.refresh(conversation)
             return conversation
@@ -214,34 +337,13 @@ class ChatRepository:
             conversation = session.get(Conversation, conversation_id)
             if conversation is None or not conversation.pending_tool_name:
                 return None
-            if conversation.pending_operation_id or self._write_operations is None:
-                return PendingAction(
-                    tool_call_id=conversation.pending_tool_call_id,
-                    tool_name=conversation.pending_tool_name,
-                    args=conversation.pending_args,
-                    human=conversation.pending_human or conversation.pending_tool_name,
-                    operation_id=conversation.pending_operation_id,
-                )
-        with self._session_factory() as session:
-            session.execute(text("BEGIN IMMEDIATE"))
-            conversation = session.get(Conversation, conversation_id)
-            if conversation is None or not conversation.pending_tool_name:
-                session.rollback()
-                return None
-            pending = PendingAction(
+            return PendingAction(
                 tool_call_id=conversation.pending_tool_call_id,
                 tool_name=conversation.pending_tool_name,
                 args=conversation.pending_args,
                 human=conversation.pending_human or conversation.pending_tool_name,
                 operation_id=conversation.pending_operation_id,
             )
-            if not pending.operation_id:
-                operation_id = str(uuid4())
-                pending.operation_id = operation_id
-                self._create_operation_for_pending(session, conversation_id, pending)
-                conversation.pending_operation_id = operation_id
-                session.commit()
-            return pending
 
     def set_pending_action(self, conversation_id: int, pending: PendingAction) -> bool:
         if pending.operation_id and self._write_operations is None:
@@ -913,6 +1015,71 @@ class ChatRepository:
             if conversation is not None:
                 session.delete(conversation)
             session.commit()
+
+
+def _canonical_context_type(value: object) -> str:
+    if value is None or value == "":
+        return "workspace"
+    if type(value) is not str:
+        raise ConversationScopeError("context_type must be a string")
+    if value not in _SCOPE_CONTEXT_TYPES:
+        raise ConversationScopeError("context_type is invalid")
+    return value
+
+
+def _canonical_context_ref(context_type: str, value: object) -> str:
+    if context_type != "application":
+        if value is None or value == "":
+            return ""
+        raise ConversationScopeError("context_ref must be empty for this context_type")
+    if value is None or value == "":
+        raise ConversationScopeError("application context_ref is required")
+    if type(value) is int:
+        if not 0 < value <= _MAX_SCOPE_REVISION:
+            raise ConversationScopeError("application context_ref must be a positive integer")
+        return str(value)
+    if type(value) is str and _ASCII_POSITIVE_INTEGER.fullmatch(value):
+        try:
+            integer = int(value)
+        except ValueError as exc:  # pragma: no cover - regex already bounds syntax
+            raise ConversationScopeError("application context_ref is invalid") from exc
+        if integer <= 0 or integer > _MAX_SCOPE_REVISION:
+            raise ConversationScopeError("application context_ref must be a positive integer")
+        return value
+    raise ConversationScopeError("application context_ref must be a canonical positive integer")
+
+
+def _canonical_scope_mode(value: object) -> str:
+    if value is None or value == "":
+        return "general"
+    if type(value) is not str:
+        raise ConversationScopeError("mode must be a string")
+    if value[0].isspace() or value[-1].isspace():
+        raise ConversationScopeError("mode must not have edge whitespace")
+    try:
+        encoded_length = len(value.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise ConversationScopeError("mode must not contain surrogate characters") from exc
+    if len(value) > 64 or encoded_length > 256:
+        raise ConversationScopeError("mode must be at most 64 characters and 256 bytes")
+    if any(ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F for char in value):
+        raise ConversationScopeError("mode must not contain control characters")
+    return value
+
+
+def _require_active_application(
+    session: Session,
+    mutation: ConversationScopeMutationSnapshot,
+) -> None:
+    if mutation.context_type != "application":
+        return
+    application_id = int(cast(str, mutation.context_ref))
+    statement = select(Application.id).where(
+        Application.id == application_id,
+        Application.deleted_at.is_(None),
+    )
+    if session.scalar(statement) is None:
+        raise ConversationScopeUnavailable("application context is unavailable")
 
 
 def _next_conversation_timestamp(

@@ -37,6 +37,11 @@ from offerpilot.ai.tool_authority import (
     PendingAuthorityClaim,
     TrustedContextScope,
 )
+from offerpilot.ai.tool_authority.visibility import (
+    AuthorityApplicationVisibilityError,
+    AuthorityApplicationVisibilityQuery,
+)
+from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import (
     JSONValue,
     PreparedToolCall,
@@ -59,8 +64,9 @@ from offerpilot.ai.write_operations import (
     WriteOperationError,
     ledger_fingerprint,
     operation_request_fingerprint,
+    pending_action_identity,
 )
-from offerpilot.models import Application, Conversation, WriteOperation
+from offerpilot.models import Conversation, WriteOperation
 
 from .contracts import (
     ConfirmationRequiredOutcome,
@@ -248,13 +254,23 @@ class ApprovalAuthorityResolver:
                     context_ref = int(scope_row.context_ref)
                 except (TypeError, ValueError) as exc:
                     raise WriteOperationError("authorization_scope_unavailable") from exc
-                active = session.scalar(
-                    select(Application.id)
-                    .where(Application.id == context_ref)
-                    .where(Application.deleted_at.is_(None))
-                )
-                if active != context_ref:
+                try:
+                    active = AuthorityApplicationVisibilityQuery().execute_on_session(
+                        session, context_ref
+                    )
+                except AuthorityApplicationVisibilityError as exc:
+                    raise WriteOperationError(
+                        "operation_not_committed", retryable=True
+                    ) from exc
+                if active is None:
                     raise WriteOperationError("authorization_scope_unavailable")
+        self._bind_pending_identity(
+            pending,
+            conversation_id=conversation_id,
+            operation_id=operation_id,
+            pending_action_revision=pending_action_revision,
+            effective_args_digest=effective_args_digest,
+        )
         self.factory.register_pending(
             pending,
             conversation_id=conversation_id,
@@ -286,6 +302,44 @@ class ApprovalAuthorityResolver:
             capability_profile_fingerprint=self.capability_profile_fingerprint,
             binding_policy_fingerprint=self.binding_policy_fingerprint,
         )
+
+    @staticmethod
+    def _bind_pending_identity(
+        pending: object,
+        *,
+        conversation_id: int,
+        operation_id: str,
+        pending_action_revision: int,
+        effective_args_digest: str,
+    ) -> None:
+        expected = {
+            "conversation_id": conversation_id,
+            "operation_id": operation_id,
+            "pending_action_revision": pending_action_revision,
+            "arguments_digest": effective_args_digest,
+            "effective_args_digest": effective_args_digest,
+        }
+        current = {name: getattr(pending, name, None) for name in expected}
+        if all(value is None for name, value in current.items() if name != "operation_id"):
+            binder = getattr(pending, "bind_typed_proposal_identity", None)
+            if not callable(binder):
+                raise WriteOperationError("operation_identity_conflict")
+            try:
+                binder(
+                    conversation_id=conversation_id,
+                    pending_action_revision=pending_action_revision,
+                    pending_confirmation_claim_id=operation_id,
+                    arguments_digest=effective_args_digest,
+                )
+            except (TypeError, ValueError) as exc:
+                raise WriteOperationError("operation_identity_conflict") from exc
+            return
+        for name, expected_value in expected.items():
+            if getattr(pending, name, None) != expected_value:
+                raise WriteOperationError("operation_identity_conflict")
+        claim_id = getattr(pending, "pending_confirmation_claim_id", None)
+        if claim_id is not None and claim_id != operation_id:
+            raise WriteOperationError("operation_identity_conflict")
 
 
 class ConfirmationSourceAdapter(Protocol):
@@ -530,6 +584,9 @@ class ConfirmationDependencies:
     context_assembler: ConfirmationContextAssembler | Callable[..., object] | None = None
     journal: object | None = None
     applications: object | None = None
+    approval_context_resolver: Callable[..., ToolExecutionContext] | None = field(
+        default=None, repr=False, compare=False
+    )
     transactional_delivery: object | None = field(default=None, repr=False, compare=False)
     clock: Callable[[], datetime] = field(
         default=lambda: datetime.now(timezone.utc), repr=False, compare=False
@@ -582,6 +639,9 @@ class ConfirmationState:
     undo_update: Mapping[str, Any] | None = field(default=None, repr=False)
     undo_operation_id: str = field(default="", repr=False)
     prepared_call: object | None = field(default=None, repr=False, compare=False)
+    approval_context: ToolExecutionContext | None = field(
+        default=None, repr=False, compare=False
+    )
     delivery_ownership: DeliveryOwnership | None = field(default=None, repr=False)
     delivery_heartbeat: DeliveryHeartbeat | None = field(default=None, repr=False)
     continuation_generation: datetime | None = field(default=None, repr=False)
@@ -640,6 +700,13 @@ class ConfirmationSession:
     @property
     def request_fingerprint(self) -> str:
         return self.state.identity.request_fingerprint
+
+    @property
+    def approval_context(self) -> ToolExecutionContext:
+        context = self.state.approval_context
+        if not isinstance(context, ToolExecutionContext):
+            raise WriteOperationError("operation_unavailable")
+        return context
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -1249,6 +1316,35 @@ class ConfirmationCoordinator:
                     )
                 except ValueError as exc:
                     raise WriteOperationError("invalid_confirmation") from exc
+        approval_context: ToolExecutionContext | None = None
+        context_resolver = self.dependencies.approval_context_resolver
+        if approved and context_resolver is not None:
+            effective_digest, effective_revision = pending_action_identity(
+                effective.tool_call_id,
+                effective.tool_name,
+                effective.args,
+            )
+            try:
+                resolved_context = _invoke(
+                    context_resolver,
+                    {
+                        "operation": operation,
+                        "pending": effective,
+                        "conversation_id": request.conversation_id,
+                        "pending_action_revision": effective_revision,
+                        "effective_args_digest": effective_digest,
+                    },
+                    (),
+                )
+            except WriteOperationError:
+                raise
+            except Exception as exc:
+                raise WriteOperationError(
+                    "operation_not_committed", retryable=True
+                ) from exc
+            if not isinstance(resolved_context, ToolExecutionContext):
+                raise WriteOperationError("operation_not_committed", retryable=True)
+            approval_context = resolved_context
         identity = ConfirmationIdentity(
             conversation_id=request.conversation_id,
             operation_id=operation_id,
@@ -1278,6 +1374,7 @@ class ConfirmationCoordinator:
             rejection_feedback=request.rejection_feedback,
             undo_seed=dict(undo_seed or {}),
             prepared_call=preflight_result,
+            approval_context=approval_context,
             continuation_generation=generation,
         )
         live_session: ConfirmationSession | None = None
@@ -1894,7 +1991,16 @@ class ConfirmationCoordinator:
             if state.active:
                 state.cancelled = True
                 state.active = False
+        self._close_approval_context(state)
         self.stop_heartbeat(state)
+
+    @staticmethod
+    def _close_approval_context(state: ConfirmationState) -> None:
+        with state.lock:
+            context = state.approval_context
+            state.approval_context = None
+        if context is not None:
+            context.authority_factory.close()
 
     @staticmethod
     def _hydrate_terminal_undo(state: ConfirmationState) -> None:
@@ -1932,6 +2038,10 @@ class ConfirmationCoordinator:
         """Persist exactly one origin+continuation bundle under the owner fence."""
 
         state = session.state
+        # Final delivery starts only after the approved origin has returned a
+        # terminal result.  Revoke its one-shot authority before any durable
+        # continuation branch, including every delivery short-circuit.
+        self._close_approval_context(state)
         if isinstance(bundle, DeliveryBundle):
             delivery = bundle
         else:

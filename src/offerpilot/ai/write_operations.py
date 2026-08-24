@@ -31,6 +31,10 @@ from offerpilot.ai.tool_authority import (
     require_authority_spec,
 )
 from offerpilot.ai.tool_authority.fingerprint import authorization_scope_fingerprint
+from offerpilot.ai.tool_authority.visibility import (
+    AuthorityApplicationVisibilityError,
+    AuthorityApplicationVisibilityQuery,
+)
 from offerpilot.ai.tool_runtime.context import audit_bindings, pre_resolver_scope_policy
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import (
@@ -51,7 +55,6 @@ from offerpilot.ai.tool_runtime.validation import (
     parse_arguments,
 )
 from offerpilot.models import (
-    Application,
     ChatMessage,
     Conversation,
     WriteOperation,
@@ -1045,6 +1048,17 @@ def _locked_pending_identity(
         (1 << 63) - 1
     )
     return _LockedPendingIdentity(raw_args, arguments_digest, revision)
+
+
+def pending_action_identity(
+    tool_call_id: str,
+    tool_name: str,
+    raw_args: str,
+) -> tuple[str, int]:
+    """Return the exact digest/revision pair used by the locked approval atom."""
+
+    locked = _locked_pending_identity(tool_call_id, tool_name, raw_args)
+    return locked.arguments_digest, locked.pending_action_revision
 
 
 def compensation_request_fingerprint(
@@ -2237,12 +2251,15 @@ class WriteOperationCoordinator:
         ):
             raise WriteOperationError("authorization_scope_changed")
         if context_ref is not None:
-            active_parent = session.scalar(
-                select(Application.id)
-                .where(Application.id == context_ref)
-                .where(Application.deleted_at.is_(None))
-            )
-            if active_parent != context_ref:
+            try:
+                active_parent = AuthorityApplicationVisibilityQuery().execute_on_session(
+                    session, context_ref
+                )
+            except AuthorityApplicationVisibilityError as exc:
+                raise WriteOperationError(
+                    "operation_not_committed", retryable=True
+                ) from exc
+            if active_parent is None:
                 raise WriteOperationError("authorization_scope_unavailable")
         return _LockedPendingIdentity(
             locked_proposal.raw_args,

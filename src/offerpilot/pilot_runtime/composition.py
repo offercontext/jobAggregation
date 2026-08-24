@@ -37,15 +37,21 @@ from offerpilot.ai.agent_loop import (
     NewTurnSeed,
 )
 from offerpilot.ai.client import ConfiguredAIClient
-from offerpilot.ai.tool_runtime.context import ToolExecutionContext
+from offerpilot.ai.tool_authority import AuthorityFactory
+from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 from offerpilot.ai.tool_specs.legacy import build_legacy_deterministic_catalog
-from offerpilot.ai.write_operations import WriteOperationCoordinator, WriteOperationRepository
+from offerpilot.ai.write_operations import (
+    WriteOperationCoordinator,
+    WriteOperationError,
+    WriteOperationRepository,
+)
 from offerpilot.agent_runtime.journal import NullRunRecorder, RunRecorderFactory
 from offerpilot.ai.types import Message
 from offerpilot.config import Config, load_config
 from offerpilot.context_projector.loader import ContextSourceLoader
 from offerpilot.pilot_runtime.continuation import (
+    ApprovalAuthorityResolver,
     ConfirmationCoordinator,
     ConfirmationDependencies,
 )
@@ -782,6 +788,44 @@ def build_pilot_runtime(
         if write_operations is not None
         else None
     )
+
+    def resolve_approval_context(
+        *,
+        operation: object,
+        pending: object,
+        conversation_id: int,
+        pending_action_revision: int,
+        effective_args_digest: str,
+    ) -> ToolExecutionContext:
+        if write_operations is None:
+            raise WriteOperationError("operation_unavailable")
+        factory = AuthorityFactory()
+        try:
+            authority = ApprovalAuthorityResolver(
+                write_operations,
+                factory,
+                capabilities=frozenset(ToolCapability),
+            ).resolve(
+                operation=operation,
+                pending=pending,
+                conversation_id=conversation_id,
+                pending_action_revision=pending_action_revision,
+                effective_args_digest=effective_args_digest,
+            )
+            return ToolExecutionContext(
+                authority=authority,
+                applications=cast(Any, applications),
+                events=cast(Any, events),
+                notes=cast(Any, notes),
+                offers=cast(Any, offers),
+                resumes=cast(Any, resumes),
+                jd_analyses=cast(Any, jd_analyses),
+                run_recorder=NullRunRecorder(),
+            )
+        except BaseException:
+            factory.close()
+            raise
+
     confirmation = ConfirmationCoordinator(
         ConfirmationDependencies(
             persistence=cast(Any, persistence),
@@ -793,6 +837,7 @@ def build_pilot_runtime(
             context_assembler=cast(Any, assembler),
             journal=cast(Any, run_recorder_factory),
             applications=applications,
+            approval_context_resolver=resolve_approval_context,
             transactional_delivery=transactional_delivery,
             undo_seed_builder=(
                 (

@@ -206,6 +206,38 @@ class ToolExecutionContext(TransientToolRuntimeValue):
     def session_factory(self) -> sessionmaker[Session]:
         return self._session_factory
 
+    def with_runtime_dependencies(
+        self,
+        *,
+        run_recorder: RunRecorder,
+        operation_executor: Any,
+    ) -> "ToolExecutionContext":
+        """Clone an unbound origin while retaining its sealed authority scope."""
+
+        if self._bound_session is not None or self._origin_context is not None:
+            raise AuthorityPhaseError(
+                "runtime dependencies require an unbound ToolExecutionContext origin"
+            )
+        constraint = self.scope_constraint
+        clone = object.__new__(ToolExecutionContext)
+        clone._assign(
+            authority=self.authority,
+            applications=self.applications,
+            events=self.events,
+            notes=self.notes,
+            offers=self.offers,
+            resumes=self.resumes,
+            jd_analyses=self.jd_analyses,
+            run_recorder=run_recorder,
+            operation_executor=operation_executor,
+            authority_factory=self._authority_factory,
+            scope_constraint=constraint,
+            bound_session=None,
+            origin_context=None,
+            repository_factory=self._session_factory,
+        )
+        return clone
+
     def require_bound_origin(
         self,
         origin: "ToolExecutionContext",

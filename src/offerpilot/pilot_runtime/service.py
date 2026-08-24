@@ -14,7 +14,7 @@ import json
 from copy import copy
 from hashlib import sha256
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from enum import Enum
 from math import isfinite
 from types import SimpleNamespace
@@ -1994,14 +1994,14 @@ class PilotRuntime:
         therefore cannot pass the resolver's context through unchanged: doing
         so silently bypasses ``WriteOperationCoordinator`` whenever the
         resolver supplied a context without an executor.  The concrete
-        production context is frozen and gets a typed dataclass replacement;
-        small adapters used by transport tests must explicitly support the two
-        attributes or fail closed.
+        production context creates a sealed runtime clone that retains the
+        exact authority factory and scope constraint; small adapters used by
+        transport tests must explicitly support the two attributes or fail
+        closed.
         """
 
         if isinstance(raw_context, ToolExecutionContext):
-            return replace(
-                raw_context,
+            return raw_context.with_runtime_dependencies(
                 run_recorder=cast(Any, recorder),
                 operation_executor=session.execute_operation,
             )
@@ -2729,7 +2729,13 @@ class PilotRuntime:
             return self._failure(RuntimeFailureCode.CONVERSATION_ARCHIVED, "conversation is archived", 409)
 
         resolved_model: ResolvedModel | None = None
-        if self._dependencies.model_resolver is not None:
+        approval_context_resolver = getattr(
+            coordinator.dependencies, "approval_context_resolver", None
+        )
+        if approval_context_resolver is None and self._dependencies.model_resolver is not None:
+            # Compatibility-only injected coordinators do not own production
+            # approval authority composition.  Production always supplies the
+            # resolver and never enters this legacy test seam.
             model_request = StartTurnRequest(
                 message="继续处理已确认的操作",
                 conversation_id=request.conversation_id,
@@ -2739,7 +2745,11 @@ class PilotRuntime:
                 self._mark_completed_if_active(control)
                 return resolved
             resolved_model = resolved
-        catalog = resolved_model.catalog if resolved_model is not None else self._dependencies.catalog
+        catalog = (
+            resolved_model.catalog
+            if resolved_model is not None
+            else self._dependencies.catalog
+        )
         try:
             session_or_replay = coordinator.approve_modify(
                 request,
@@ -2794,10 +2804,15 @@ class PilotRuntime:
                 control,
                 tool_names=self._journal_tool_names(catalog),
             )
+            raw_context = (
+                session.state.approval_context
+                if session.state.approval_context is not None
+                else resolved_model.tool_context
+                if resolved_model is not None
+                else None
+            )
             tool_context = self._bind_confirmation_context(
-                resolved_model.tool_context if resolved_model is not None else None,
-                session,
-                recorder,
+                raw_context, session, recorder
             )
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
             coordinator.cancel_cleanup(session)
@@ -4995,9 +5010,15 @@ class PilotRuntime:
                 raise
 
         resolved_model: ResolvedModel | None = None
-        if self._dependencies.model_resolver is not None:
+        approval_context_resolver = getattr(
+            coordinator.dependencies, "approval_context_resolver", None
+        )
+        if approval_context_resolver is None and self._dependencies.model_resolver is not None:
             resolved = self._resolve_model(
-                StartTurnRequest(message="继续处理已确认的操作", conversation_id=conversation_id),
+                StartTurnRequest(
+                    message="继续处理已确认的操作",
+                    conversation_id=conversation_id,
+                ),
                 conversation,
             )
             if isinstance(resolved, RuntimeFailureOutcome):
@@ -5116,7 +5137,11 @@ class PilotRuntime:
             return self._failure(RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400)
         self._check_cancel(cancel_check, state.control)
         model_view = state.confirmation_model
-        catalog = model_view.catalog if model_view is not None else self._dependencies.catalog
+        catalog = (
+            model_view.catalog
+            if model_view is not None
+            else self._dependencies.catalog
+        )
         recorder: object = _NoopRecorder()
         journal_started = False
         try:
@@ -5127,10 +5152,15 @@ class PilotRuntime:
                 state.control,
                 tool_names=self._journal_tool_names(catalog),
             )
+            raw_context = (
+                session.state.approval_context
+                if session.state.approval_context is not None
+                else model_view.tool_context
+                if model_view is not None
+                else None
+            )
             tool_context = self._bind_confirmation_context(
-                model_view.tool_context if model_view is not None else None,
-                session,
-                recorder,
+                raw_context, session, recorder
             )
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
             coordinator = cast(ConfirmationCoordinator, self._confirmation_coordinator())

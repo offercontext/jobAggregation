@@ -4,32 +4,73 @@ import ast
 import hashlib
 import json
 import re
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
-from offerpilot.ai.agent_contracts import AgentToolResult, StalePendingActionError
-from offerpilot.ai.agent_loop import _delivery_error_payload
+import pytest
+
+from offerpilot.ai.agent_contracts import (
+    AgentToolCall,
+    AgentToolResult,
+    AgentTurnResult,
+    PendingAction,
+    StalePendingActionError,
+)
+from offerpilot.ai.agent_loop import (
+    AgentLoopInvocation,
+    AgentLoopRunner,
+    ApprovedWriteSeed,
+    NewTurnSeed,
+    _delivery_error_payload,
+)
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import (
     BindingTarget,
+    ConfirmationRequired,
+    ExecutionAuthorization,
     ProviderToolContract,
+    ToolExecutionRecord,
     ToolFailure,
     ToolSpec,
+    ToolSuccess,
+    WriteContract,
 )
-from offerpilot.ai.tool_runtime.pipeline import Rejected, prepare_call
+from offerpilot.ai.tool_runtime.pipeline import Rejected, execute_prepared, prepare_call
 from offerpilot.ai.tool_runtime.rendering import render_compatibility
-from offerpilot.ai.types import ToolCall
-from offerpilot.ai.write_operations import WriteOperationError
+from offerpilot.ai.types import Assistant, Message, ToolCall
+from offerpilot.ai.write_operations import (
+    DeliveryOwnership,
+    OperationCommitted,
+    OperationReplay,
+    TerminalPayload,
+    WriteOperationError,
+    ledger_fingerprint,
+)
 from offerpilot.agent_runtime.journal import NullRunRecorder
 from offerpilot.chat_transport import (
     event_sse_name,
     event_sse_payload,
     outcome_http_payload,
     outcome_http_status,
+    runtime_stream_immediate_response,
 )
-from offerpilot.pilot_runtime.contracts import ErrorEvent, RuntimeFailureOutcome
-from offerpilot.pilot_runtime.service import PilotRuntime
+from offerpilot.pilot_runtime.continuation import (
+    ConfirmationCoordinator,
+    ConfirmationDependencies,
+)
+from offerpilot.pilot_runtime.contracts import (
+    ConfirmationRequest,
+    ErrorEvent,
+    RuntimeFailureOutcome,
+    StartTurnRequest,
+)
+from offerpilot.pilot_runtime.errors import RuntimeFailureCode
+from offerpilot.pilot_runtime.event_sink import InMemoryRuntimeInvocationControl
+from offerpilot.pilot_runtime.persistence import PersistenceResult, PersistenceStatus
+from offerpilot.pilot_runtime.service import PilotRuntime, RuntimeDependencies
 
 from .golden import BASELINE, FIXTURES, canonical_json, load_golden
 
@@ -99,6 +140,8 @@ REAL_USER_CANARIES = (
     "真实职位描述",
 )
 WINDOWS_ABSOLUTE_PATH = re.compile(r"[A-Za-z]:[\\/]")
+TRACEBACK_TEXT = re.compile(r"traceback|stack trace", re.IGNORECASE)
+EXCEPTION_EXPRESSION = re.compile(r"(?:exception|[A-Za-z_][A-Za-z0-9_]*Error)\s*\(")
 SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
@@ -106,11 +149,18 @@ def _walk(value: Any) -> None:
     if isinstance(value, dict):
         lowered = {str(key).lower() for key in value}
         assert not FORBIDDEN_KEYS & lowered
-        for nested in value.values():
+        for key, nested in value.items():
+            assert not WINDOWS_ABSOLUTE_PATH.search(str(key))
             _walk(nested)
     elif isinstance(value, list):
         for nested in value:
             _walk(nested)
+    elif isinstance(value, str):
+        assert not WINDOWS_ABSOLUTE_PATH.search(value)
+        assert not TRACEBACK_TEXT.search(value)
+        assert not EXCEPTION_EXPRESSION.search(value)
+        for canary in REAL_USER_CANARIES:
+            assert canary not in value
 
 
 def _digest(value: Any) -> str:
@@ -120,17 +170,13 @@ def _digest(value: Any) -> str:
 def _fixture_identity(name: str) -> dict[str, Any]:
     path = Path(__file__).parents[1] / "fixtures" / name
     raw = path.read_bytes()
-    value = json.loads(raw)
+    value = load_golden(name)
     return {
         "raw_sha256": "sha256:" + hashlib.sha256(raw).hexdigest(),
         "canonical_sha256": _digest(value),
         "baseline": value.get("baseline"),
         "source_baseline": value.get("source_baseline"),
     }
-
-
-def _load_existing(name: str) -> Any:
-    return json.loads((Path(__file__).parents[1] / "fixtures" / name).read_text(encoding="utf-8"))
 
 
 def test_authority_assets_are_canonical_private_and_pinned() -> None:
@@ -140,19 +186,16 @@ def test_authority_assets_are_canonical_private_and_pinned() -> None:
         "policy_fingerprints_v1.json",
     )
     for name in names:
-        value = load_golden(name)
-        raw = (FIXTURES / name).read_text(encoding="utf-8")
-        assert raw == canonical_json(value) + "\n"
-        assert not WINDOWS_ABSOLUTE_PATH.search(raw)
-        assert "SQLite format 3" not in raw
-        assert "Traceback (most recent call last)" not in raw
-        for canary in REAL_USER_CANARIES:
-            assert canary not in raw
+        value = load_golden(f"tool_authority/{name}")
+        raw = (FIXTURES / name).read_bytes()
+        decoded = raw.decode("utf-8")
+        assert raw == (canonical_json(value) + "\n").encode("utf-8")
+        assert "SQLite format 3" not in decoded
         _walk(value)
 
 
 def test_baseline_references_exact_repository_and_production() -> None:
-    baseline = load_golden("baseline_2427fa6.json")
+    baseline = load_golden("tool_authority/baseline_2427fa6.json")
     assert baseline["schema_version"] == 1
     assert baseline["repository_baseline"] == "1574d0e891391c817c325f598b4f22f8a783833"
     assert baseline["production_baseline"] == "2427fa6"
@@ -163,8 +206,8 @@ def test_baseline_references_exact_repository_and_production() -> None:
 
 
 def test_provider_envelopes_and_schema_fingerprints_are_fully_pinned() -> None:
-    baseline = load_golden("baseline_2427fa6.json")
-    provider = _load_existing("tool_pipeline/provider_manifest_30c944f.json")
+    baseline = load_golden("tool_authority/baseline_2427fa6.json")
+    provider = load_golden("tool_pipeline/provider_manifest_30c944f.json")
     pinned = baseline["provider_manifest"]
     assert pinned["fixture"] == "tool_pipeline/provider_manifest_30c944f.json"
     assert pinned["baseline"] == provider["baseline"] == "30c944f3bda1d99b303f8e9875a170a552f79af7"
@@ -180,8 +223,38 @@ def test_provider_envelopes_and_schema_fingerprints_are_fully_pinned() -> None:
     assert pinned["envelope_fingerprints"] == expected_envelopes
 
 
+def _immediate_transport_projection(
+    outcome: RuntimeFailureOutcome,
+    request: StartTurnRequest | ConfirmationRequest,
+) -> dict[str, Any]:
+    control = InMemoryRuntimeInvocationControl()
+    immediate = PilotRuntime(RuntimeDependencies())._stream_immediate(outcome, control)
+    response = runtime_stream_immediate_response(
+        immediate,
+        run_id="authority-run",
+        request=request,
+    )
+    lines = bytes(response.body).decode("utf-8").splitlines()
+    encoded = next(line.removeprefix("data: ") for line in lines if line.startswith("data: "))
+    envelope = json.loads(encoded)
+    event = ErrorEvent(outcome.code, outcome.message, outcome.retryable, outcome.degraded)
+    typed_event = {"event": event_sse_name(event), "data": event_sse_payload(event)}
+    assert envelope["event"] == typed_event["event"]
+    assert envelope["data"] == typed_event["data"]
+    return {
+        "sync_http": {
+            "status": outcome_http_status(immediate),
+            "body": outcome_http_payload(immediate),
+        },
+        "sse": {
+            "http_status": response.status_code,
+            **typed_event,
+        },
+    }
+
+
 def test_existing_fixture_identities_and_compatibility_facts_are_pinned() -> None:
-    baseline = load_golden("baseline_2427fa6.json")
+    baseline = load_golden("tool_authority/baseline_2427fa6.json")
     expected = {
         "tool_pipeline/provider_manifest_30c944f.json": _fixture_identity(
             "tool_pipeline/provider_manifest_30c944f.json"
@@ -201,26 +274,60 @@ def test_existing_fixture_identities_and_compatibility_facts_are_pinned() -> Non
     }
     assert baseline["existing_fixture_identities"] == expected
 
-    pilot = _load_existing("pilot_runtime/baseline_golden.json")
-    agent = _load_existing("agent_loop/baseline_aaecf5d.json")
+    pilot = load_golden("pilot_runtime/baseline_golden.json")
+    agent = load_golden("agent_loop/baseline_aaecf5d.json")
     compatibility = baseline["compatibility"]
-    assert compatibility["preheader_http"] == {
-        "source_load_failed": {
-            "error_code": "source_load_failed",
-            "message": "上下文暂时无法加载，请稍后重试。",
-            "status": 503,
-        },
-        "stale_pending_action": {
-            "error_code": "stale_pending_action",
-            "message": "待确认操作已过期或正在处理中，请刷新对话后重试。",
-            "status": 409,
-        },
+    preheader_cases = {
+        "source_load_failed": (
+            PilotRuntime._failure(
+                RuntimeFailureCode.SOURCE_LOAD_FAILED,
+                "上下文暂时无法加载，请稍后重试。",
+                503,
+                retryable=True,
+            ),
+            StartTurnRequest(message="synthetic source failure"),
+        ),
+        "stale_pending_action": (
+            PilotRuntime._provider_confirmation_failure(StalePendingActionError()),
+            ConfirmationRequest(conversation_id=1, approved=True),
+        ),
     }
-    assert compatibility["replay_http"] == {
-        "operation_delivery_pending": {"error_code": "operation_delivery_pending", "status": 409},
-        "operation_delivery_unknown": {"error_code": "operation_delivery_unknown", "status": 503},
-        "operation_integrity_error": {"error_code": "operation_integrity_error", "status": 409},
+    for name, (outcome, request) in preheader_cases.items():
+        actual = _immediate_transport_projection(outcome, request)
+        body = actual["sync_http"]["body"]
+        assert compatibility["preheader_http"][name] == {
+            "error_code": body["error_code"],
+            "message": body["error"],
+            "status": actual["sync_http"]["status"],
+            "sse": actual["sse"],
+        }
+    replay_cases = {
+        "operation_delivery_pending": PilotRuntime._failure(
+            RuntimeFailureCode.OPERATION_DELIVERY_PENDING,
+            "确认结果正在处理中，请刷新对话查看结果。",
+            409,
+            retryable=True,
+        ),
+        "operation_delivery_unknown": PilotRuntime._failure(
+            RuntimeFailureCode.OPERATION_DELIVERY_UNKNOWN,
+            "对话结果暂时无法保存。",
+            503,
+            retryable=True,
+        ),
+        "operation_integrity_error": PilotRuntime._confirmation_failure(
+            WriteOperationError("operation_integrity_error")
+        ),
     }
+    replay_request = ConfirmationRequest(conversation_id=1, approved=True)
+    for name, outcome in replay_cases.items():
+        actual = _immediate_transport_projection(outcome, replay_request)
+        body = actual["sync_http"]["body"]
+        assert compatibility["replay_http"][name] == {
+            "error_code": body["error_code"],
+            "message": body["error"],
+            "status": actual["sync_http"]["status"],
+            "sse": actual["sse"],
+        }
     assert compatibility["tool_failure_messages"] == {
         "validation_error": "工具参数验证失败，请检查后重试。",
         "permission_denied": "权限不足，无法执行该操作。",
@@ -250,6 +357,10 @@ class _DecodeProbeError(ValueError):
 
 
 class _BindingProbeError(ValueError):
+    pass
+
+
+class _ClaimProbeError(ValueError):
     pass
 
 
@@ -352,8 +463,36 @@ def _pipeline_projection(spec: ToolSpec[Any, Any], call: ToolCall, context: Tool
 
 
 def test_pre_executor_tool_pipeline_is_produced_by_runtime() -> None:
-    baseline = load_golden("baseline_2427fa6.json")
+    baseline = load_golden("tool_authority/baseline_2427fa6.json")
     pipeline = baseline["compatibility"]["pre_executor"]["tool_pipeline"]
+    metadata = {
+        "schema_missing_required": (
+            "entrypoint.prepare_call_render_agent_delivery_v1",
+            "scenario.schema_missing_required_get_application_id",
+            "origin.schema_missing_required",
+        ),
+        "decode_exception": (
+            "entrypoint.prepare_call_render_agent_delivery_v1",
+            "scenario.decoder_exception_after_schema",
+            "origin.decoder_exception",
+        ),
+        "capability_missing": (
+            "entrypoint.prepare_call_render_agent_delivery_v1",
+            "scenario.missing_applications_read_capability",
+            "origin.missing_capability",
+        ),
+        "binding_exception": (
+            "entrypoint.prepare_call_render_agent_delivery_v1",
+            "scenario.binding_resolver_exception_after_capability",
+            "origin.binding_resolver_exception",
+        ),
+        "preflight_returned_failure": (
+            "entrypoint.prepare_call_render_agent_delivery_v1",
+            "scenario.preflight_returned_stale_tool_failure",
+            "origin.preflight_returned_tool_failure",
+        ),
+    }
+    assert set(pipeline) == set(metadata)
     simple_parameters = {"type": "object", "additionalProperties": False}
     schema_parameters = {
         "type": "object",
@@ -420,15 +559,11 @@ def test_pre_executor_tool_pipeline_is_produced_by_runtime() -> None:
         assert expected["failure"] == actual["failure"]
         assert expected["rendered_message"] == actual["rendered_message"]
         assert expected["agent_tool_result"] == actual["agent_tool_result"]
-        assert isinstance(expected["production_entrypoint"], str)
-        assert isinstance(expected["scenario"], str)
-        assert expected["failure_origin"] in {
-            "schema_missing_required",
-            "decoder_exception",
-            "missing_capability",
-            "binding_resolver_exception",
-            "preflight_returned_tool_failure",
-        }
+        assert (
+            expected["production_entrypoint"],
+            expected["scenario"],
+            expected["failure_origin"],
+        ) == metadata[stage]
 
 
 def _confirmation_route_projection(outcome: Any) -> dict[str, Any]:
@@ -460,8 +595,21 @@ def _confirmation_route_projection(outcome: Any) -> dict[str, Any]:
 
 
 def test_confirmation_routes_use_runtime_mapping_and_transport() -> None:
-    baseline = load_golden("baseline_2427fa6.json")
+    baseline = load_golden("tool_authority/baseline_2427fa6.json")
     confirmation = baseline["compatibility"]["pre_executor"]["confirmation"]
+    metadata = {
+        "approve_stale": (
+            "entrypoint.provider_confirmation_failure_v1",
+            "scenario.approved_continuation_stale",
+            "origin.provider_stale_pending_action",
+        ),
+        "modify_invalid": (
+            "entrypoint.confirmation_failure_v1",
+            "scenario.modify_invalid_confirmation",
+            "origin.confirmation_invalid_confirmation",
+        ),
+    }
+    assert set(confirmation) == set(metadata)
     cases = {
         "approve_stale": PilotRuntime._provider_confirmation_failure(
             StalePendingActionError()
@@ -478,25 +626,549 @@ def test_confirmation_routes_use_runtime_mapping_and_transport() -> None:
         assert expected["sse"] == actual["sse"]
         assert expected["sse"]["http_status"] == 200
         assert expected["sse"]["event"] == "error"
-        assert isinstance(expected["production_entrypoint"], str)
-        assert isinstance(expected["scenario"], str)
+        assert (
+            expected["production_entrypoint"],
+            expected["scenario"],
+            expected["failure_origin"],
+        ) == metadata[action]
 
 
-def test_call_count_and_provider_free_baselines_are_explicit() -> None:
-    baseline = load_golden("baseline_2427fa6.json")
-    assert baseline["call_count_baselines"] == {
-        "new_turn": {"model_calls": 1, "provider_calls": 1, "tool_calls": 1, "provider_free": False},
-        "approve": {"model_calls": 1, "provider_calls": 1, "tool_calls": 1, "provider_free": False},
-        "modify": {"model_calls": 1, "provider_calls": 1, "tool_calls": 1, "provider_free": False},
-        "reject": {"model_calls": 0, "provider_calls": 0, "tool_calls": 0, "provider_free": True},
-        "final_replay": {"model_calls": 0, "provider_calls": 0, "tool_calls": 0, "provider_free": True},
-        "chained_replay": {"model_calls": 0, "provider_calls": 0, "tool_calls": 0, "provider_free": True},
-        "delivery_recovery": {"model_calls": 0, "provider_calls": 0, "tool_calls": 0, "provider_free": True},
+def _prepared_write_probe() -> tuple[ToolSpec[Any, Any], ToolExecutionContext, Any]:
+    spec = replace(
+        _probe_spec(
+            "authority_execute_probe",
+            parameters={"type": "object", "additionalProperties": False},
+            decoder=_identity_decoder,
+        ),
+        kind="write",
+        confirmation_policy="required",
+        write_contract=WriteContract(),
+    )
+    context = _probe_context()
+    catalog = ToolCatalog([spec], expected_names=(spec.name,))
+    prepared_result = prepare_call(
+        catalog,
+        context,
+        ToolCall("execute-call", spec.name, "{}"),
+        pending_identity="execute-call:authority_execute_probe",
+        pending_action_revision=1,
+        record_proposal=False,
+    )
+    assert isinstance(prepared_result, ConfirmationRequired)
+    return spec, context, prepared_result.prepared
+
+
+def _raise_claim(_prepared: object) -> ExecutionAuthorization:
+    raise _ClaimProbeError
+
+
+def _mismatched_authorization(prepared: Any) -> ExecutionAuthorization:
+    return ExecutionAuthorization(
+        pending_identity="mismatched-authority-identity",
+        pending_action_revision=prepared.pending_action_revision or 1,
+        tool_call_id=prepared.tool_call_id,
+        tool_name=prepared.spec.name,
+        arguments_digest=prepared.arguments_digest,
+    )
+
+
+def _run_stale_promotion(mode: str) -> RuntimeFailureOutcome:
+    spec, context, _prepared = _prepared_write_probe()
+    pending = PendingAction(
+        "execute-call",
+        spec.name,
+        "{}",
+        "confirm",
+        "00000000-0000-0000-0000-000000000003",
+    )
+    continuation = _PromotionContinuation(pending, mode)
+
+    def operation_executor(*_args: object) -> ToolExecutionRecord[Any, Any]:
+        raise AssertionError("stale confirmation must not execute")
+
+    invocation = AgentLoopInvocation(
+        seed=ApprovedWriteSeed(continuation),
+        model=_CountingModel(Assistant(content="must not run")),
+        catalog=ToolCatalog([spec], expected_names=(spec.name,)),
+        tool_context=replace(context, operation_executor=operation_executor),
+        auto_approve=False,
+        max_iterations=2,
+        run_recorder=NullRunRecorder(),
+        event_sink=_CountingEventSink(),
+        runtime_signal_sink=None,
+        cancel_check=None,
+    )
+    with pytest.raises(StalePendingActionError) as promoted:
+        AgentLoopRunner().run(invocation)
+    return PilotRuntime._provider_confirmation_failure(promoted.value)
+
+
+def test_execute_prepared_failures_promote_to_one_verified_stale_route() -> None:
+    baseline = load_golden("tool_authority/baseline_2427fa6.json")
+    expected_cases = baseline["compatibility"]["pre_executor"]["execute_prepared"]
+    confirmation = baseline["compatibility"]["pre_executor"]["confirmation"]
+    metadata = {
+        "confirmation_claim_failed": (
+            "entrypoint.execute_prepared_v1",
+            "scenario.execute_prepared_claim_failure",
+            "origin.confirmation_claim_failed",
+        ),
+        "authorization_mismatch": (
+            "entrypoint.execute_prepared_v1",
+            "scenario.execute_prepared_authorization_mismatch",
+            "origin.authorization_mismatch",
+        ),
+    }
+    assert set(expected_cases) == set(metadata)
+    for mode, claimer in {
+        "confirmation_claim_failed": _raise_claim,
+        "authorization_mismatch": _mismatched_authorization,
+    }.items():
+        spec, context, prepared = _prepared_write_probe()
+        record = execute_prepared(
+            prepared,
+            context,
+            confirmation_claimer=claimer,
+        )
+        assert isinstance(record.outcome, ToolFailure)
+        expected = expected_cases[mode]
+        assert expected["failure"] == {
+            "category": record.outcome.category,
+            "code": record.outcome.code,
+            "compatibility_detail": record.outcome.compatibility_detail,
+        }
+        assert expected["rendered_message"] == render_compatibility(
+            spec, record.outcome
+        )
+        assert (
+            expected["production_entrypoint"],
+            expected["scenario"],
+            expected["failure_origin"],
+        ) == metadata[mode]
+        promoted = _run_stale_promotion(mode)
+        route = _confirmation_route_projection(promoted)
+        assert expected["public_route"] == "route.approve_stale"
+        assert route == {
+            key: confirmation["approve_stale"][key]
+            for key in ("outcome", "sync_http", "sse")
+        }
+
+
+class _CountingModel:
+    def __init__(self, *responses: Assistant) -> None:
+        self.responses = list(responses)
+        self.model_calls = 0
+        self.provider_calls = 0
+
+    def complete(self, _messages: list[Message], _tools: list[object]) -> Assistant:
+        self.model_calls += 1
+        self.provider_calls += 1
+        return self.responses.pop(0)
+
+
+class _CountingEventSink:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+
+    def emit(self, event: object) -> None:
+        self.events.append(event)
+
+
+class _CountingContinuation:
+    def __init__(self, pending: PendingAction) -> None:
+        self._pending = pending
+
+    @property
+    def pending(self) -> PendingAction:
+        return self._pending
+
+    def claim(
+        self,
+        pending: PendingAction,
+        prepared: object,
+    ) -> ExecutionAuthorization:
+        return ExecutionAuthorization(
+            pending_identity=getattr(prepared, "pending_identity"),
+            pending_action_revision=getattr(prepared, "pending_action_revision"),
+            tool_call_id=pending.tool_call_id,
+            tool_name=pending.tool_name,
+            arguments_digest=getattr(prepared, "arguments_digest"),
+            operation_id=pending.operation_id,
+        )
+
+    def record_result(
+        self,
+        _pending: PendingAction,
+        _tool_message: Message,
+        _record: ToolExecutionRecord[Any, Any],
+    ) -> None:
+        return None
+
+    def load_continuation_messages(self) -> tuple[Message, ...]:
+        return (Message(role="user", content="continue"),)
+
+    def delivery_fence(self) -> bool:
+        return True
+
+
+class _PromotionContinuation(_CountingContinuation):
+    def __init__(self, pending: PendingAction, mode: str) -> None:
+        super().__init__(pending)
+        self.mode = mode
+
+    def claim(
+        self,
+        pending: PendingAction,
+        prepared: object,
+    ) -> ExecutionAuthorization:
+        if self.mode == "confirmation_claim_failed":
+            return _raise_claim(prepared)
+        return _mismatched_authorization(prepared)
+
+
+def _counted_write_spec(counter: dict[str, int]) -> ToolSpec[Any, Any]:
+    name = "authority_counted_write"
+    parameters: dict[str, Any] = {
+        "type": "object",
+        "properties": {"value": {"type": "string"}},
+    }
+    contract = ProviderToolContract(
+        payload={
+            "type": "function",
+            "function": {"name": name, "description": name, "parameters": parameters},
+        },
+        name=name,
+        description=name,
+        parameters=parameters,
+    )
+
+    def execute(_args: dict[str, Any], _context: ToolExecutionContext) -> dict[str, bool]:
+        counter["executor_calls"] += 1
+        return {"ok": True}
+
+    return ToolSpec(
+        contract=contract,
+        kind="write",
+        decoder=lambda values: dict(values),
+        executor=execute,
+        confirmation_policy="required",
+        write_contract=WriteContract(),
+        declared_failure_categories=frozenset({"internal_error"}),
+        success_renderer=str,
+    )
+
+
+def _run_agent_call_count_case(case: str) -> dict[str, object]:
+    counter = {"executor_calls": 0}
+    spec = _counted_write_spec(counter)
+    catalog = ToolCatalog([spec], expected_names=(spec.name,))
+    sink = _CountingEventSink()
+    if case == "new_turn":
+        model = _CountingModel(
+            Assistant(tool_calls=[ToolCall("new-call", spec.name, "{}")])
+        )
+        seed: NewTurnSeed | ApprovedWriteSeed = NewTurnSeed(
+            (Message(role="user", content="synthetic request"),)
+        )
+        context = _probe_context()
+    else:
+        pending_args = '{"value":"changed"}' if case == "modify" else "{}"
+        pending = PendingAction(
+            f"{case}-call",
+            spec.name,
+            pending_args,
+            "confirm",
+            f"00000000-0000-0000-0000-00000000000{2 if case == 'modify' else 1}",
+        )
+        continuation = _CountingContinuation(pending)
+        model = _CountingModel(Assistant(content="done"))
+
+        def operation_executor(
+            prepared: object,
+            _context: object,
+            authorization: ExecutionAuthorization,
+        ) -> ToolExecutionRecord[Any, Any]:
+            counter["executor_calls"] += 1
+            return ToolExecutionRecord(
+                prepared=prepared,
+                outcome=ToolSuccess({"ok": True}),
+                execution_started=True,
+                operation_id=authorization.operation_id,
+                terminal_persisted=True,
+                persisted_visible_result="saved",
+                persisted_transport={"status": "success"},
+            )
+
+        seed = ApprovedWriteSeed(continuation)
+        context = replace(_probe_context(), operation_executor=operation_executor)
+    invocation = AgentLoopInvocation(
+        seed=seed,
+        model=model,
+        catalog=catalog,
+        tool_context=context,
+        auto_approve=False,
+        max_iterations=4,
+        run_recorder=NullRunRecorder(),
+        event_sink=sink,
+        runtime_signal_sink=None,
+        cancel_check=None,
+    )
+    result = AgentLoopRunner().run(invocation)
+    assert isinstance(result, AgentTurnResult)
+    return {
+        "model_calls": model.model_calls,
+        "provider_calls": model.provider_calls,
+        "tool_calls": sum(isinstance(event, AgentToolCall) for event in sink.events),
+        "executor_calls": counter["executor_calls"],
+        "provider_free": model.provider_calls == 0,
     }
 
 
+class _AuthorityOperations:
+    def __init__(
+        self,
+        *,
+        status: str,
+        delivery_status: str = "completed",
+        delivery_outcome: str = "final_response",
+    ) -> None:
+        self.key = SimpleNamespace(key_id="authority", secret=b"k" * 32)
+        self.operation_id = "00000000-0000-0000-0000-000000000001"
+        self.operation = SimpleNamespace(
+            id=self.operation_id,
+            conversation_id=7,
+            status=status,
+            tool_call_id="call-1",
+            tool_name="create_application",
+            proposal_fingerprint="proposal",
+            confirmation_token_fingerprint="",
+            delivery_status=delivery_status,
+        )
+        self.delivery_status = delivery_status
+        self.delivery_outcome = delivery_outcome
+        self.replay_calls = 0
+        self.converge_calls = 0
+
+        token = "t" * 64
+        self.token = token
+        self.operation.confirmation_token_fingerprint = ledger_fingerprint(
+            self.key,
+            "write-operation-confirmation-token-v1",
+            token.encode("ascii"),
+        )
+
+    def get(self, _operation_id: str) -> object:
+        return self.operation
+
+    def replay(self, _operation: object, _fingerprint: str) -> OperationReplay:
+        self.replay_calls += 1
+        return OperationReplay(
+            self.operation_id,
+            TerminalPayload(
+                status="committed",
+                result_contract="typed_json_v1",
+                result_json='{"ok":true}',
+                visible_result="saved",
+                transport_json=(
+                    '{"tool_call_id":"call-1","tool_name":"create_application",'
+                    '"summary":"saved","evidence":[],"affected_resources":[],"changed_entities":[]}'
+                ),
+                undo_json=None,
+                failure_category=None,
+                failure_code=None,
+                digest="sha256:authority",
+            ),
+            self.delivery_status,
+            1,
+            None,
+            self.delivery_outcome,
+            "saved",
+        )
+
+    def converge_expired_delivery(self, _operation_id: str) -> OperationReplay:
+        self.converge_calls += 1
+        self.delivery_status = "completed"
+        return self.replay(self.operation, "authority")
+
+    def heartbeat(self, _ownership: DeliveryOwnership) -> bool:
+        return True
+
+
+class _AuthorityPersistence:
+    def __init__(self, pending: PendingAction | None) -> None:
+        self.pending = pending
+        self.pending_reads = 0
+
+    def get_pending_action(self, _conversation_id: int) -> PendingAction | None:
+        self.pending_reads += 1
+        return self.pending
+
+    def list_messages(self, _conversation_id: int) -> tuple[object, ...]:
+        return ()
+
+    def persist_confirmation_delivery(self, **_kwargs: object) -> PersistenceResult:
+        return PersistenceResult(PersistenceStatus.PERSISTED, message_ids=(1,))
+
+
+class _AuthorityWriteCoordinator:
+    def __init__(self) -> None:
+        self.reject_calls = 0
+        self.execute_calls = 0
+
+    def reject_primary(self, **kwargs: object) -> object:
+        self.reject_calls += 1
+        return SimpleNamespace(
+            operation_id=str(kwargs["operation_id"]),
+            ownership=DeliveryOwnership(str(kwargs["operation_id"]), 1, b"owner", "owner"),
+            payload=SimpleNamespace(
+                status="rejected",
+                visible_result="已取消这次操作。",
+                undo_json=None,
+            ),
+        )
+
+    def execute_primary(self, **kwargs: object) -> object:
+        self.execute_calls += 1
+        operation_id = str(kwargs["operation_id"])
+        return (
+            OperationCommitted(
+                operation_id,
+                TerminalPayload(
+                    status="committed",
+                    result_contract="typed_json_v1",
+                    result_json='{"ok":true}',
+                    visible_result="saved",
+                    transport_json="{}",
+                    undo_json=None,
+                    failure_category=None,
+                    failure_code=None,
+                    digest="sha256:authority",
+                ),
+                DeliveryOwnership(operation_id, 1, b"owner", "owner"),
+            ),
+            SimpleNamespace(
+                outcome=ToolSuccess({"ok": True}),
+                terminal_persisted=True,
+                replayed=False,
+            ),
+        )
+
+
+class _AuthorityConversations:
+    def __init__(self) -> None:
+        self.load_calls = 0
+
+    def load(self, _conversation_id: int) -> object:
+        self.load_calls += 1
+        return SimpleNamespace(id=7, archived_at=None)
+
+
+def _run_ledger_call_count_case(case: str) -> dict[str, object]:
+    status = "proposed" if case == "reject" else "committed"
+    delivery_status = "pending" if case == "delivery_recovery" else "completed"
+    delivery_outcome = "chained_pending" if case == "chained_replay" else "final_response"
+    operations = _AuthorityOperations(
+        status=status,
+        delivery_status=delivery_status,
+        delivery_outcome=delivery_outcome,
+    )
+    child = (
+        PendingAction(
+            "child-call",
+            "create_application",
+            "{}",
+            "child",
+            "00000000-0000-0000-0000-000000000009",
+        )
+        if case == "chained_replay"
+        else None
+    )
+    pending = (
+        PendingAction(
+            "call-1",
+            "create_application",
+            "{}",
+            "confirm",
+            operations.operation_id,
+        )
+        if case == "reject"
+        else child
+    )
+    persistence = _AuthorityPersistence(pending)
+    write = _AuthorityWriteCoordinator()
+    coordinator = ConfirmationCoordinator(
+        ConfirmationDependencies(
+            persistence=persistence,
+            write_operations=operations,
+            write_coordinator=write,
+        )
+    )
+    counts = {"model_calls": 0, "provider_calls": 0}
+
+    def resolve_model(_request: object, _conversation: object) -> object:
+        counts["provider_calls"] += 1
+        raise AssertionError("provider must not run on provider-free Ledger route")
+
+    class Driver:
+        def execute(self, _invocation: object) -> object:
+            counts["model_calls"] += 1
+            raise AssertionError("AgentLoop must not run on provider-free Ledger route")
+
+    runtime = PilotRuntime(
+        RuntimeDependencies(
+            conversations=_AuthorityConversations(),
+            persistence=persistence,
+            confirmation_coordinator=coordinator,
+            model_resolver=resolve_model,
+            agent_driver=Driver(),
+        )
+    )
+    outcome = runtime.continue_confirmation(
+        ConfirmationRequest(
+            conversation_id=7,
+            approved=case != "reject",
+            operation_id=operations.operation_id,
+            confirmation_token=operations.token,
+        ),
+        invocation_control=InMemoryRuntimeInvocationControl(),
+    )
+    assert outcome is not None
+    if case == "reject":
+        assert write.reject_calls == 1
+        assert operations.replay_calls == 0
+        assert operations.converge_calls == 0
+    elif case == "delivery_recovery":
+        assert write.execute_calls == 0
+        assert operations.converge_calls == 1
+    else:
+        assert write.execute_calls == 0
+        assert operations.replay_calls >= 1
+    return {
+        "model_calls": counts["model_calls"],
+        "provider_calls": counts["provider_calls"],
+        "tool_calls": 0,
+        "executor_calls": write.execute_calls,
+        "provider_free": counts["provider_calls"] == 0,
+    }
+
+
+def test_call_count_and_provider_free_baselines_are_produced_by_real_harnesses() -> None:
+    baseline = load_golden("tool_authority/baseline_2427fa6.json")
+    actual = {
+        case: _run_agent_call_count_case(case)
+        for case in ("new_turn", "approve", "modify")
+    }
+    actual.update(
+        {
+            case: _run_ledger_call_count_case(case)
+            for case in ("reject", "final_replay", "chained_replay", "delivery_recovery")
+        }
+    )
+    assert baseline["call_count_baselines"] == actual
+
+
 def test_authority_manifest_is_the_single_ordered_typed_matrix() -> None:
-    authority = load_golden("authority_manifest_v1.json")
+    authority = load_golden("tool_authority/authority_manifest_v1.json")
     assert authority.keys() == {"schema_version", "tools"}
     assert authority["schema_version"] == 1
     tools = authority["tools"]
@@ -555,8 +1227,8 @@ def test_authority_manifest_is_the_single_ordered_typed_matrix() -> None:
 
 
 def test_policy_fingerprints_are_independent_fixed_reviewed_digests() -> None:
-    policy = load_golden("policy_fingerprints_v1.json")
-    authority = load_golden("authority_manifest_v1.json")
+    policy = load_golden("tool_authority/policy_fingerprints_v1.json")
+    authority = load_golden("tool_authority/authority_manifest_v1.json")
     assert policy.keys() == {"schema_version", "capability_profile", "binding_policy"}
     assert policy["schema_version"] == 1
     profile = policy["capability_profile"]
@@ -611,7 +1283,7 @@ def test_policy_fingerprints_are_independent_fixed_reviewed_digests() -> None:
 
 
 def test_dependency_closure_manifest_pins_current_catalog_coverage() -> None:
-    baseline = load_golden("baseline_2427fa6.json")
+    baseline = load_golden("tool_authority/baseline_2427fa6.json")
     from offerpilot.context_projector.selector import _DEPENDENCIES
 
     closure = baseline["dependency_closure"]

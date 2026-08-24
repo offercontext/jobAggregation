@@ -260,6 +260,9 @@ class AuthorityFactory:
         self._pending: dict[int, _PendingRecord] = {}
         self._prepared: dict[int, tuple[object, PreparedInstanceToken, ToolExecutionAuthority]] = {}
         self._prepared_fields: dict[int, tuple[object, ...]] = {}
+        self._prepared_origins: dict[
+            int, NewTurnPrepareCallIdentity | ApprovedWritePrepareCallIdentity
+        ] = {}
         self._prepared_construction: dict[int, _Lifecycle] = {}
         self._constraints: dict[
             int, tuple[ApplicationScopeConstraint, ToolExecutionAuthority, dict[str, object]]
@@ -288,9 +291,17 @@ class AuthorityFactory:
         self._transactions: dict[int, _RegisteredIdentity] = {}
         self._tool_specs: dict[
             int,
-            tuple[ToolSpec[Any, Any], ToolExecutionAuthority, AuthorityCallIdentity],
+            tuple[ToolSpec[Any, Any], ToolExecutionAuthority],
         ] = {}
         self._tool_spec_fields: dict[int, tuple[object, ...]] = {}
+        self._tool_spec_preparations: dict[
+            int,
+            tuple[
+                NewTurnPrepareCallIdentity | ApprovedWritePrepareCallIdentity,
+                ToolSpec[Any, Any],
+                ToolExecutionAuthority,
+            ],
+        ] = {}
         self._objects: dict[int, object] = {}
         self._attempt_sequence = 0
 
@@ -358,6 +369,7 @@ class AuthorityFactory:
             + len(self._operations)
             + len(self._transactions)
             + len(self._tool_specs)
+            + len(self._tool_spec_preparations)
         )
 
     @property
@@ -383,6 +395,7 @@ class AuthorityFactory:
             self._pending.clear()
             self._prepared.clear()
             self._prepared_fields.clear()
+            self._prepared_origins.clear()
             self._prepared_construction.clear()
             self._constraints.clear()
             self._resolutions.clear()
@@ -407,6 +420,7 @@ class AuthorityFactory:
             self._transactions.clear()
             self._tool_specs.clear()
             self._tool_spec_fields.clear()
+            self._tool_spec_preparations.clear()
             self._objects.clear()
 
     def _register_authority(
@@ -599,6 +613,7 @@ class AuthorityFactory:
                 if owner is authority:
                     del self._prepared[prepared_id]
                     self._prepared_fields.pop(prepared_id, None)
+                    self._prepared_origins.pop(prepared_id, None)
                     self._objects.pop(prepared_id, None)
                     self._objects.pop(id(prepared_token), None)
                     self._drop_object(prepared)
@@ -648,12 +663,15 @@ class AuthorityFactory:
                     del self._repository_binding_tickets[ticket_id]
                     self._objects.pop(ticket_id, None)
                     self._drop_object(ticket)
-            for spec_id, (spec, owner, _) in tuple(self._tool_specs.items()):
+            for spec_id, (spec, owner) in tuple(self._tool_specs.items()):
                 if owner is authority:
                     del self._tool_specs[spec_id]
                     self._tool_spec_fields.pop(spec_id, None)
-                    self._objects.pop(spec_id, None)
-                    self._drop_object(spec)
+            for identity_id, (_, _, owner) in tuple(
+                self._tool_spec_preparations.items()
+            ):
+                if owner is authority:
+                    del self._tool_spec_preparations[identity_id]
             for attempt_id, registration in tuple(self._attempts.items()):
                 if registration.authority is authority:
                     del self._attempts[attempt_id]
@@ -1044,7 +1062,14 @@ class AuthorityFactory:
             spec_registration = self._tool_specs.get(id(spec))
             if spec_registration is None or spec_registration[0] is not spec:
                 raise AuthorityPhaseError("ToolSpec is not registered for this prepare identity")
-            if spec_registration[1] is not authority or spec_registration[2] is not prepare_identity:
+            preparation = self._tool_spec_preparations.get(id(prepare_identity))
+            if (
+                spec_registration[1] is not authority
+                or preparation is None
+                or preparation[0] is not prepare_identity
+                or preparation[1] is not spec
+                or preparation[2] is not authority
+            ):
                 raise AuthorityPhaseError("ToolSpec provenance does not match prepare identity")
             self._validate_registered_tool_spec(spec)
             identity_tool_call_id = getattr(prepare_identity, "tool_call_id")
@@ -1084,6 +1109,7 @@ class AuthorityFactory:
             token = cast(PreparedInstanceToken, _new_opaque_handle(PreparedInstanceToken))
             self._claim_object(token)
             self._prepared[id(prepared)] = (prepared, token, authority)
+            self._prepared_origins[id(prepared)] = prepare_identity
             self._prepared_fields[id(prepared)] = (
                 prepared.tool_call_id,
                 prepared.spec.name,
@@ -1093,6 +1119,7 @@ class AuthorityFactory:
                 prepared.binding,
                 prepared._replacement_guard,
                 _dataclass_snapshot(prepared.binding),
+                _canonical_arguments_digest(prepared.typed_args),
             )
             self._objects[id(prepared)] = prepared
             self._objects[id(token)] = token
@@ -1140,14 +1167,24 @@ class AuthorityFactory:
             spec_snapshot = self._tool_spec_snapshot(spec)
             existing = self._tool_specs.get(id(spec))
             if existing is not None:
-                if existing[0] is not spec or existing[1] is not authority or existing[2] is not prepare_identity:
+                if existing[0] is not spec or existing[1] is not authority:
                     raise AuthorityPhaseError("ToolSpec provenance changed")
                 self._validate_registered_tool_spec(spec)
-                return spec
-            self._claim_object(spec)
-            self._tool_specs[id(spec)] = (spec, authority, prepare_identity)
-            self._tool_spec_fields[id(spec)] = spec_snapshot
-            self._objects[id(spec)] = spec
+            else:
+                self._tool_specs[id(spec)] = (spec, authority)
+                self._tool_spec_fields[id(spec)] = spec_snapshot
+            preparation = self._tool_spec_preparations.get(id(prepare_identity))
+            if preparation is not None and (
+                preparation[0] is not prepare_identity
+                or preparation[1] is not spec
+                or preparation[2] is not authority
+            ):
+                raise AuthorityPhaseError("prepare identity is already bound to another ToolSpec")
+            self._tool_spec_preparations[id(prepare_identity)] = (
+                prepare_identity,
+                spec,
+                authority,
+            )
             return spec
 
     @staticmethod
@@ -1622,9 +1659,36 @@ class AuthorityFactory:
         current_arguments_digest = _canonical_arguments_digest(original.arguments)
         if not constant_time_equal(current_arguments_digest, cast(str, fields[2])):
             raise AuthorityPhaseError("Prepared arguments changed")
+        current_typed_args_digest = _canonical_arguments_digest(original.typed_args)
+        if not constant_time_equal(
+            current_typed_args_digest,
+            cast(str, fields[8]),
+        ):
+            raise AuthorityPhaseError("Prepared typed arguments changed")
         if original.authority_instance_token is not _authority_token(found[2]):
             raise AuthorityPhaseError("PreparedToolCall authority identity changed")
         return (original, found[1], found[2])
+
+    def require_prepared_call(
+        self,
+        prepared: PreparedToolCall[Any, Any],
+        authority: ToolExecutionAuthority,
+    ) -> None:
+        """Revalidate an exact Prepared object immediately before execution."""
+
+        with self._lock:
+            record = self._prepared_record(prepared)
+            if record[2] is not authority:
+                raise AuthorityPhaseError("PreparedToolCall belongs to another authority")
+
+    def _prepared_origin(
+        self,
+        prepared: PreparedToolCall[Any, Any],
+    ) -> NewTurnPrepareCallIdentity | ApprovedWritePrepareCallIdentity:
+        origin = self._prepared_origins.get(id(prepared))
+        if origin is None:
+            raise AuthorityPhaseError("PreparedToolCall origin provenance is missing")
+        return origin
 
     @staticmethod
     def _require_prepared_call_fields(
@@ -2247,6 +2311,12 @@ class AuthorityFactory:
             )
             if prepared_record[2] is not authority:
                 raise AuthorityPhaseError("PreparedToolCall belongs to another authority")
+            origin = self._prepared_origin(prepared)
+            if type(origin) is not NewTurnPrepareCallIdentity:
+                raise AuthorityPhaseError("read PreparedToolCall has an invalid origin phase")
+            if self._call_authority(origin, AuthorityUse.NEW_TURN_PREPARE) is not authority:
+                raise AuthorityPhaseError("read PreparedToolCall origin belongs to another authority")
+            self._require_read_origin_provenance(origin, invocation_identity)
             call = ReadExecutionCallIdentity(
                 authority_instance_token=_authority_token(authority),
                 runner_invocation=invocation_identity.runner_invocation,
@@ -2268,6 +2338,32 @@ class AuthorityFactory:
             )
 
     read_execution_identity = create_read_execution_identity
+
+    @staticmethod
+    def _require_read_origin_provenance(
+        origin: NewTurnPrepareCallIdentity,
+        invocation: ProviderInvocationIdentity,
+    ) -> None:
+        if (
+            origin.runner_invocation is not invocation.runner_invocation
+            or origin.segment_id != invocation.segment_id
+            or origin.tool_context is not invocation.tool_context
+            or origin.model_call_id != invocation.model_call_id
+            or origin.surface is not invocation.surface
+            or origin.model_call_surface_binding
+            is not invocation.model_call_surface_binding
+            or origin.gateway_session is not invocation.gateway_session
+        ):
+            raise AuthorityPhaseError(
+                "read execution does not match PreparedToolCall origin provenance"
+            )
+        if not constant_time_equal(
+            origin.surface_fingerprint,
+            invocation.surface_fingerprint,
+        ):
+            raise AuthorityPhaseError(
+                "read execution surface fingerprint does not match PreparedToolCall origin"
+            )
 
     def create_typed_pending_identity(
         self,

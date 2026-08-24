@@ -63,6 +63,7 @@ def _prepared(
     tool_call_id: str = "call-1",
     tool_name: str = "get_application",
     kind: str = "read",
+    invocation: ProviderInvocationIdentity | None = None,
 ) -> PreparedToolCall[Any, Any]:
     spec = ToolSpec(
         contract=ProviderToolContract(
@@ -86,47 +87,48 @@ def _prepared(
             request_identity=object(),
         )
     else:
-        runner = object()
-        context = object()
-        surface = object()
-        binding = object()
-        gateway = object()
-        factory.register_runner_invocation(runner, authority=authority)
-        factory.register_tool_execution_context(context, authority=authority)
-        build = factory.create_provider_surface_build_identity(
-            authority,
-            runner_invocation=runner,
-            tool_context=context,
-            model_call_id="model-prepare",
-        )
-        factory.register_frozen_surface(
-            surface,
-            surface_fingerprint="sha256:" + "c" * 64,
-            authority=authority,
-            build_identity=build,
-        )
-        factory.register_model_call_surface_binding(
-            binding,
-            surface=surface,
-            surface_fingerprint="sha256:" + "c" * 64,
-            authority=authority,
-            build_identity=build,
-        )
-        factory.register_gateway_session(
-            gateway,
-            authority=authority,
-            build_identity=build,
-            surface=surface,
-            surface_fingerprint="sha256:" + "c" * 64,
-            model_call_surface_binding=binding,
-        )
-        invocation = factory.create_provider_invocation_identity(
-            build,
-            surface=surface,
-            surface_fingerprint="sha256:" + "c" * 64,
-            model_call_surface_binding=binding,
-            gateway_session=gateway,
-        )
+        if invocation is None:
+            runner = object()
+            context = object()
+            surface = object()
+            binding = object()
+            gateway = object()
+            factory.register_runner_invocation(runner, authority=authority)
+            factory.register_tool_execution_context(context, authority=authority)
+            build = factory.create_provider_surface_build_identity(
+                authority,
+                runner_invocation=runner,
+                tool_context=context,
+                model_call_id="model-prepare",
+            )
+            factory.register_frozen_surface(
+                surface,
+                surface_fingerprint="sha256:" + "c" * 64,
+                authority=authority,
+                build_identity=build,
+            )
+            factory.register_model_call_surface_binding(
+                binding,
+                surface=surface,
+                surface_fingerprint="sha256:" + "c" * 64,
+                authority=authority,
+                build_identity=build,
+            )
+            factory.register_gateway_session(
+                gateway,
+                authority=authority,
+                build_identity=build,
+                surface=surface,
+                surface_fingerprint="sha256:" + "c" * 64,
+                model_call_surface_binding=binding,
+            )
+            invocation = factory.create_provider_invocation_identity(
+                build,
+                surface=surface,
+                surface_fingerprint="sha256:" + "c" * 64,
+                model_call_surface_binding=binding,
+                gateway_session=gateway,
+            )
         attempt = factory.issue_provider_attempt(invocation, candidate_ordinal=0)
         prepare_identity = factory.create_new_turn_prepare_identity(
             invocation,
@@ -289,7 +291,7 @@ def test_phase_matrix_rejects_wrong_authority_and_wrong_identity_before_lookup()
             model_call_surface_binding=binding,
             gateway_session=gateway,
         )
-        prepared = _prepared(factory, segment)
+        prepared = _prepared(factory, segment, invocation=invocation)
         read = factory.create_read_execution_identity(
             invocation,
             prepared=prepared,

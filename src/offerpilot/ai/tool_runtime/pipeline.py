@@ -377,6 +377,7 @@ def _execute_read(
         raise AuthorityPhaseError("read identity belongs to another PreparedToolCall")
     if prepared.prepared_instance_token is not call_identity.prepared_instance_token:
         raise AuthorityPhaseError("PreparedToolCall registry token mismatch")
+    context.authority_factory.require_prepared_call(prepared, context.authority)
 
     spec = prepared.spec
     _stage(stage_sink, "authority.postlookup")

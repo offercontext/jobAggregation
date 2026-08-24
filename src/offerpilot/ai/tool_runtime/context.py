@@ -2,13 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Literal, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from offerpilot.agent_runtime.journal import RunRecorder
-from offerpilot.ai.tool_authority.composition import AuthorityFactory, _active_factory
 from offerpilot.ai.tool_authority.contracts import (
     ApplicationScopeConstraint,
     BindingTargetResolution,
@@ -29,6 +28,9 @@ from offerpilot.repositories.jd import JDAnalysesRepository
 from offerpilot.repositories.notes import NotesRepository
 from offerpilot.repositories.offers import OffersRepository
 from offerpilot.repositories.resumes import ResumesRepository
+
+if TYPE_CHECKING:
+    from offerpilot.ai.tool_authority.composition import AuthorityFactory
 
 
 class _UnavailableBindingTarget:
@@ -106,6 +108,8 @@ class ToolExecutionContext(TransientToolRuntimeValue):
         run_recorder: RunRecorder,
         operation_executor: Any = None,
     ) -> None:
+        from offerpilot.ai.tool_authority.composition import _active_factory
+
         factory = _active_factory(authority)
         constraint = factory.create_application_scope_constraint(authority)
         repository_factory = self._require_common_session_factory(

@@ -59,6 +59,7 @@ const ACTIVITY_COPY: Record<PilotMascotActivity, { label: string; detail: string
   speech_paused: { label: '检测到停顿', detail: '可以继续，也可以完成回答' },
   transcribing: { label: '正在整理语音', detail: '请稍后核对回答文字' },
   reviewing_voice: { label: '等待核对文字', detail: '确认后才会进入模拟面试回答' },
+  waiting_confirmation: { label: '等待确认', detail: '有一项操作需要你决定' },
   success: { label: '处理完成', detail: '结果已准备好，来看看吧' },
   error: { label: '需要确认', detail: '打开 Pilot 查看发生了什么' },
 };

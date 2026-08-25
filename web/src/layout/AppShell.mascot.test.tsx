@@ -228,6 +228,7 @@ describe('AppShell Pilot mascot integration', () => {
     await flush();
     expect(host.querySelector('[data-testid="pilot-mascot"]')).not.toBeNull();
     expect(host.querySelector('[data-testid="pilot-rail-chat"]')).toBeNull();
+    expect(host.querySelector('[data-testid="pilot-drawer-chat"]')?.getAttribute('data-controller-active')).toBe('false');
 
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="zoom-mascot"]')?.click());
     await flush();
@@ -237,6 +238,7 @@ describe('AppShell Pilot mascot integration', () => {
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="toggle-mascot-pilot"]')?.click());
     await flush();
     expect(host.querySelector('[data-testid="pilot-drawer-chat"]')).not.toBeNull();
+    expect(host.querySelector('[data-testid="pilot-drawer-chat"]')?.getAttribute('data-controller-active')).toBe('true');
 
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="hide-mascot"]')?.click());
     await flush();
@@ -276,7 +278,7 @@ describe('AppShell Pilot mascot integration', () => {
     const closedPanel = host.querySelector('[data-testid="pilot-drawer-chat"]');
     expect(closedPanel).not.toBeNull();
     expect(closedPanel?.getAttribute('data-open')).toBe('false');
-    expect(closedPanel?.getAttribute('data-controller-active')).toBe('true');
+    expect(closedPanel?.getAttribute('data-controller-active')).toBe('false');
     expect(host.querySelector('[data-testid="pilot-mascot"]')?.getAttribute('data-notification')).toBe('success');
 
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="toggle-mascot-pilot"]')?.click());

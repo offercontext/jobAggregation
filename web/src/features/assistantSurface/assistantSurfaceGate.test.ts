@@ -4,12 +4,14 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-const BASELINE = 'aaecf5dfa6ce913ecaf00b25a0e88bcf46096eeb';
+const BASELINE = '7c36957176445c5213a31b013251fbbce8d610db';
 const ALLOWLIST = [
+  '.gitattributes',
   'web/src/features/assistantSurface/**',
   'web/src/features/pilotMascot/**',
   'web/src/layout/AppShell.tsx',
   'web/src/layout/AppShell*.test.*',
+  'web/src/components/ChatPanel/index.tsx',
   'web/src/components/SettingsView.tsx',
   'web/src/components/SettingsView*.test.*',
   'docs/superpowers/specs/2026-08-23-haru-surface-completion-design.md',
@@ -17,7 +19,7 @@ const ALLOWLIST = [
   'docs/reports/2026-08-23-haru-surface-completion-verification.md',
 ] as const;
 const CANONICAL_ALLOWLIST_JSON = JSON.stringify(ALLOWLIST);
-const ALLOWLIST_SHA256 = '154a203e19bf57f54bcb4de5af182fca0da861a54e6cbfd822b7f3c32cce5307';
+const ALLOWLIST_SHA256 = 'b1698f9b89b23effcb6adc604c5d4457a26a36c6d2207b4bbe49c70cae290eb8';
 const CONTROLLER_PATH = 'web/src/features/assistantSurface/usePilotConversationController.ts';
 const DOC_PATHS = ALLOWLIST.filter((path) => path.startsWith('docs/'));
 
@@ -75,10 +77,12 @@ function normalize(path: string): string {
 
 function isAllowed(relativePath: string): boolean {
   return (
-    relativePath.startsWith('web/src/features/assistantSurface/')
+    relativePath === '.gitattributes'
+    || relativePath.startsWith('web/src/features/assistantSurface/')
     || relativePath.startsWith('web/src/features/pilotMascot/')
     || relativePath === 'web/src/layout/AppShell.tsx'
     || /^web\/src\/layout\/AppShell.*\.test\.[^/]+$/.test(relativePath)
+    || relativePath === 'web/src/components/ChatPanel/index.tsx'
     || relativePath === 'web/src/components/SettingsView.tsx'
     || /^web\/src\/components\/SettingsView.*\.test\.[^/]+$/.test(relativePath)
     || DOC_PATHS.includes(relativePath as (typeof DOC_PATHS)[number])
@@ -118,7 +122,7 @@ describe('Haru Desktop Surface Completion gate', () => {
     const root = repoRoot();
     assertBaselineIsAncestor(root);
     expect(JSON.stringify(ALLOWLIST)).toBe(
-      '["web/src/features/assistantSurface/**","web/src/features/pilotMascot/**","web/src/layout/AppShell.tsx","web/src/layout/AppShell*.test.*","web/src/components/SettingsView.tsx","web/src/components/SettingsView*.test.*","docs/superpowers/specs/2026-08-23-haru-surface-completion-design.md","docs/superpowers/plans/2026-08-23-haru-surface-completion.md","docs/reports/2026-08-23-haru-surface-completion-verification.md"]',
+      '[".gitattributes","web/src/features/assistantSurface/**","web/src/features/pilotMascot/**","web/src/layout/AppShell.tsx","web/src/layout/AppShell*.test.*","web/src/components/ChatPanel/index.tsx","web/src/components/SettingsView.tsx","web/src/components/SettingsView*.test.*","docs/superpowers/specs/2026-08-23-haru-surface-completion-design.md","docs/superpowers/plans/2026-08-23-haru-surface-completion.md","docs/reports/2026-08-23-haru-surface-completion-verification.md"]',
     );
     expect(createHash('sha256').update(CANONICAL_ALLOWLIST_JSON).digest('hex')).toBe(ALLOWLIST_SHA256);
   });

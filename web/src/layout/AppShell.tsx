@@ -631,6 +631,12 @@ function AppShellContent() {
     && assistantSurface.surface === 'mascot'
     && !pilotMascotVisible;
   const contextualPilotOpen = assistantSurface.surface === 'pilot_workspace' || contextualPilotRailMode;
+  const pilotControllerTransportActive = view === 'pilot'
+    || contextualPilotOpen
+    || assistantSurface.surface === 'haru_chat'
+    || pilotController.loading
+    || pilotController.confirmPhase === 'saving'
+    || Boolean(pilotController.pending);
 
   const openChat = (offerId?: number) => {
     setCoachOfferId(offerId);
@@ -1853,7 +1859,7 @@ function AppShellContent() {
               pageActive={view === 'pilot'}
               variant={view === 'pilot' ? 'page' : contextualPilotRailMode ? 'rail' : 'drawer'}
               open={view === 'pilot' || contextualPilotOpen}
-              controllerActive
+              controllerActive={pilotControllerTransportActive}
               onboardingFocusToken={pilotOnboardingFocusToken}
               onOnboardingFocusConsumed={consumePilotOnboardingFocus}
               pilotDropTarget={view !== 'pilot'}

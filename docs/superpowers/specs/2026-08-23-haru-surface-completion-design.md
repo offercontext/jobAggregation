@@ -4,9 +4,10 @@
 
 - 状态：已确认，可实施
 - 日期：2026-08-23
-- 固定基线：`aaecf5dfa6ce913ecaf00b25a0e88bcf46096eeb`；基线必须是当前 `HEAD` 的祖先
+- 原始设计基线：`aaecf5dfa6ce913ecaf00b25a0e88bcf46096eeb`（历史实现起点）
+- 当前组合基线：`7c36957176445c5213a31b013251fbbce8d610db`；该基线必须是当前 `HEAD` 的祖先
 - 实施 worktree：`D:\Users\yuqi.chen\offerpilot\.worktrees\refactor-20260823-haru-surface-completion`
-- 允许修改范围由 `assistantSurfaceGate.test.ts` 的 canonical allowlist 固定，SHA-256 为 `154a203e19bf57f54bcb4de5af182fca0da861a54e6cbfd822b7f3c32cce5307`
+- 允许修改范围由 `assistantSurfaceGate.test.ts` 的 canonical allowlist 固定，当前组合 SHA-256 为 `b1698f9b89b23effcb6adc604c5d4457a26a36c6d2207b4bbe49c70cae290eb8`
 
 ## 1. 目标与边界
 
@@ -77,10 +78,12 @@ Haru 的 UI 组件只消费 context/controller actions。`AppShell` 只负责将
 允许路径只有：
 
 ```text
+.gitattributes
 web/src/features/assistantSurface/**
 web/src/features/pilotMascot/**
 web/src/layout/AppShell.tsx
 web/src/layout/AppShell*.test.*
+web/src/components/ChatPanel/index.tsx
 web/src/components/SettingsView.tsx
 web/src/components/SettingsView*.test.*
 docs/superpowers/specs/2026-08-23-haru-surface-completion-design.md

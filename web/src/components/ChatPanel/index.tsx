@@ -374,9 +374,10 @@ function ChatPanelView({
       confirmationPhase: confirmPhase,
       hasError: Boolean(lastError || confirmError),
       degraded,
+      hasPending: Boolean(pending),
     });
     onActivityChange?.(activity);
-  }, [confirmError, confirmPhase, degraded, lastError, loading, onActivityChange]);
+  }, [confirmError, confirmPhase, degraded, lastError, loading, onActivityChange, pending]);
 
   useEffect(
     () => () => {

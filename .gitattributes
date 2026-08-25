@@ -1,1 +1,2 @@
 tests/fixtures/knowledge/structures/*.md text eol=lf
+tests/fixtures/tool_authority/*.json text eol=lf

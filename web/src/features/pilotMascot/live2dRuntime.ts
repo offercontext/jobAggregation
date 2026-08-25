@@ -10,6 +10,7 @@ export type PilotMascotActivity =
   | 'speech_paused'
   | 'transcribing'
   | 'reviewing_voice'
+  | 'waiting_confirmation'
   | 'success'
   | 'error';
 
@@ -247,7 +248,7 @@ export function createLive2dPilotMascotRuntime(
             void runMotion('Idle', 0);
             return;
           }
-          if (activity === 'speech_paused') {
+          if (activity === 'speech_paused' || activity === 'waiting_confirmation') {
             setExpression('f03');
             void runMotion('Tap', 1);
             return;

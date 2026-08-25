@@ -5,6 +5,7 @@ interface PilotActivityFacts {
   confirmationPhase: 'idle' | 'saving' | 'success' | 'error';
   hasError: boolean;
   degraded: boolean;
+  hasPending: boolean;
 }
 
 export function derivePilotMascotActivity({
@@ -12,8 +13,10 @@ export function derivePilotMascotActivity({
   confirmationPhase,
   hasError,
   degraded,
+  hasPending,
 }: PilotActivityFacts): PilotMascotActivity {
   if (loading || confirmationPhase === 'saving') return 'thinking';
+  if (hasPending) return 'waiting_confirmation';
   if (hasError || degraded || confirmationPhase === 'error') return 'error';
   if (confirmationPhase === 'success') return 'success';
   return 'idle';

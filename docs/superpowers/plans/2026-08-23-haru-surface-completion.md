@@ -2,21 +2,23 @@
 
 > **For agentic workers:** 使用 test-driven-development 按任务推进；每个任务先写可观察的 RED，再实现最小 GREEN，最后运行受影响 gate。所有文件必须落在本计划的 allowlist 内。
 
-**Goal:** 在固定基线 `aaecf5dfa6ce913ecaf00b25a0e88bcf46096eeb` 上完成 Haru desktop surface 的单 Provider、单 controller、稳定 context identity、一次请求一次 lifecycle、可访问性、偏好和桌面布局交接。
+**Goal:** 从原始实现基线 `aaecf5dfa6ce913ecaf00b25a0e88bcf46096eeb` 完成 Haru desktop surface 的单 Provider、单 controller、稳定 context identity、一次请求一次 lifecycle、可访问性、偏好和桌面布局交接，并在当前组合基线 `7c36957176445c5213a31b013251fbbce8d610db` 上收口。
 
 **Architecture:** `AssistantSurfaceProvider` 统一 surface、通知和 request handoff；`usePilotConversationControllerState` 统一 Chat transport、pending/HITL、stop、conversation context 和 task lifecycle；HaruDock/HaruChatWindow/PilotWorkspace 只消费它们。AppShell 只提供页面 context、附件、导航与业务回调，不再镜像 request/notification/lifecycle state。
 
 **Tech Stack:** React 18、TypeScript、Ant Design、CSS Modules、Vitest、现有 Chat service/SSE parser、现有 Live2D runtime。禁止新增 API、后端模型、Journal/AgentRun/Ledger、移动依赖或第二套设计系统。
 
-**Baseline:** `aaecf5dfa6ce913ecaf00b25a0e88bcf46096eeb` 必须为当前 `HEAD` 的 ancestor。
+**Baseline:** `aaecf5dfa6ce913ecaf00b25a0e88bcf46096eeb` 是历史实现起点；当前可执行 gate 使用 `7c36957176445c5213a31b013251fbbce8d610db`，且后者必须为当前 `HEAD` 的 ancestor。
 
 **Allowlist:**
 
 ```text
+.gitattributes
 web/src/features/assistantSurface/**
 web/src/features/pilotMascot/**
 web/src/layout/AppShell.tsx
 web/src/layout/AppShell*.test.*
+web/src/components/ChatPanel/index.tsx
 web/src/components/SettingsView.tsx
 web/src/components/SettingsView*.test.*
 docs/superpowers/specs/2026-08-23-haru-surface-completion-design.md
@@ -24,7 +26,7 @@ docs/superpowers/plans/2026-08-23-haru-surface-completion.md
 docs/reports/2026-08-23-haru-surface-completion-verification.md
 ```
 
-canonical allowlist JSON 的 SHA-256 固定为 `154a203e19bf57f54bcb4de5af182fca0da861a54e6cbfd822b7f3c32cce5307`。
+当前组合 canonical allowlist JSON 的 SHA-256 固定为 `b1698f9b89b23effcb6adc604c5d4457a26a36c6d2207b4bbe49c70cae290eb8`。
 
 ---
 

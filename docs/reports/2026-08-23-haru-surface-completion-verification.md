@@ -3,8 +3,9 @@
 ## 验证基线与范围
 
 - 分支：`refactor/20260823-haru-surface-completion`
-- 固定 baseline：`aaecf5dfa6ce913ecaf00b25a0e88bcf46096eeb`
-- allowlist canonical hash：`154a203e19bf57f54bcb4de5af182fca0da861a54e6cbfd822b7f3c32cce5307`
+- 原始实现 baseline：`aaecf5dfa6ce913ecaf00b25a0e88bcf46096eeb`
+- 当前组合 baseline：`7c36957176445c5213a31b013251fbbce8d610db`
+- 当前 allowlist canonical hash：`b1698f9b89b23effcb6adc604c5d4457a26a36c6d2207b4bbe49c70cae290eb8`
 - 验证日期：2026-08-23 至 2026-08-24（Asia/Shanghai）
 - 本报告仅覆盖桌面前端 Surface、上下文切换、状态所有权、定位、焦点、可访问性和本地外观设置。
 
@@ -61,7 +62,7 @@
 ## 剩余风险与后续顺序
 
 - Compact Confirmation、`ActionPresentationPolicy`、持久主动提醒、Journal/Run 恢复、SSE replay 和后台 Agent Queue 明确未实现。
-- 本分支不得直接合并；需等待 Agent Loop 合并 main 后再更新本分支、解决组合冲突并重跑完整前后端与浏览器矩阵。
+- Agent Loop 与 Scoped Authority 前置主线已经合入当前历史；组合冲突、完整前后端矩阵和浏览器复核已在下方“主线组合收口”中关闭。
 - 对话列表的行按钮命中区在窄栏自动化点击时可能与会话行重叠；该既有 ChatPanel 几何问题不在本期 allowlist，未在本分支扩改。
 - 前端完整测试仍输出既有 jsdom/React `act(...)` 警告，但没有失败用例。
 
@@ -70,3 +71,48 @@
 Haru 桌面 Surface、上下文切换、状态所有权、定位和可访问性完成收口。
 
 不声明原始 Haru/Pilot 全部设计已完成。
+
+## 2026-08-25 主线组合收口
+
+本分支已在 `Scoped Capability & Binding Enforcement` 最终提交
+`7c36957176445c5213a31b013251fbbce8d610db` 之上完成 rebase。原 Haru 两个提交与
+rebase 后提交通过 `git range-diff` 验证为补丁等价；组合期间未改变后端 API、SSE、
+Pending、数据库或领域写入契约。
+
+独立组合 CR 首轮发现并关闭两项问题：
+
+- Pending confirmation 原先未进入 Haru 状态映射；现统一显示为
+  `waiting_confirmation`，使用橙色状态点、明确文案和安全 Live2D 动作。
+- 稳定挂载的 Chat owner 原先始终激活 transport；现只有 Pilot/Haru 对话可见、请求
+  运行、确认保存或存在 Pending 时激活。关闭后的空闲 Haru 保持 owner，但不继续发起
+  settings、Conversation、Chat 或 SSE 请求。
+
+Windows 组合矩阵还发现授权 golden 在重新 checkout 后会被 `core.autocrlf` 改成 CRLF，
+使 canonical byte gate 失败。`.gitattributes` 现将
+`tests/fixtures/tool_authority/*.json` 固定为 LF；资产内容和 canonical fingerprint 均未改变。
+Haru source gate 的组合 baseline、精确 allowlist 与 canonical hash 已同步更新，新的 hash 为
+`b1698f9b89b23effcb6adc604c5d4457a26a36c6d2207b4bbe49c70cae290eb8`。
+
+### 组合验证
+
+| 命令或检查 | 结果 |
+| --- | --- |
+| Haru mascot / Live2D / AppShell 定向 Vitest | 4 files、47 tests 通过 |
+| Haru source gate | 1 file、6 tests 通过 |
+| Assistant Surface / Haru / AppShell / ChatPanel 组合 Vitest | 38 files、376 tests 通过 |
+| 前端全量 `npm test -- --run` | 184 files、1326 tests 通过 |
+| `npx tsc -b --pretty false` | 通过 |
+| `npm run build` | 通过，3951 modules transformed；既有 1.55 MB 主 chunk 警告保留 |
+| `uv run pytest tests/test_chat_api.py -q` | 369 passed |
+| Agent Loop / Pilot Runtime / Tool Authority / Journal 组合矩阵 | 1429 passed；唯一 CRLF byte gate 失败已按根因修复 |
+| 修复后 canonical private asset 定向回归 | 1 passed |
+| `uv run ruff check .` | 通过 |
+| `uv run mypy src` | 140 source files 通过 |
+| `uv run oc smoke --static-dir web/dist` | 通过 |
+| `git diff --check` | 通过，仅 Git 的 LF/CRLF 提示 |
+
+内置浏览器使用隔离临时数据目录检查真实构建：Haru 能打开轻量对话；关闭后 1.2 秒观察窗
+内没有新增 Chat/SSE 网络请求；控制台没有 error 或 warning。浏览器验收服务随后已停止。
+
+最终独立组合 CR 无剩余 P0/P1/P2/P3。Docker daemon 和外置 Application-JD
+baseline/allowlist 不属于本次组合输入，因此不宣称相应发布门禁通过。

@@ -752,6 +752,10 @@ legacy_boundary exact keys:
   adapter_kind
   ordered_names
   chained_policies
+  initial_route_bindings
+
+initial_route_bindings item:
+  {route_source, adapter_ordinal}
 ```
 
 嵌套 validator 还必须机械封闭以下规则，不得只依赖 Golden 全对象比较：
@@ -789,7 +793,11 @@ legacy_boundary exact keys:
   必须等于 §7.2 的固定顺序；`provider_visibility` 只能是
   `forbidden`，`adapter_kind` 只能是 `legacy_deterministic`；
   `chained_policies` 按同一 ordinal 精确为
-  `[same_adapter_only, forbidden, forbidden]`。
+  `[same_adapter_only, forbidden, forbidden]`；`initial_route_bindings` 按
+  `LegacyRouteSourceV1` direct-source ordinal 精确为
+  `[{jd_clarification,1}, {jd_deterministic_action,1},
+  {submission_snapshot_action,2}, {outcome_recording_action,3}]`，ordinal 只能指向上述
+  三个 Adapter，不能包含 `confirmation_resume`。
 - `compensation_operation_order` 长度精确为 4、无重复且必须等于
   §7.2 的固定 Compensation 顺序；每项必须是封闭
   `CompensationKind` 字符串。
@@ -945,8 +953,8 @@ APPROVED_LEGACY_DETERMINISTIC_BOUNDARY_V1
 Provider/Legacy 协议边界的固定 review seal，只能比较整体 canonical input，不能按名称
 查询、选择或路由，因此不是第二份运行时分类 Registry。它们不从当前 Bundle 自动生成
 期望值；变更必须提升 seal version、更新独立 Golden 并走单独契约复审。
-内部 Legacy `chained_policies` 由 Metadata Manifest/bundle fingerprint 保护，不追加到这个
-已固定的 Legacy 外部名称边界 seal 中。
+内部 Legacy `chained_policies` 与 `initial_route_bindings` 由 Metadata Manifest/bundle
+fingerprint 保护，不追加到这个已固定的 Legacy 外部名称边界 seal 中。
 
 `protocol_seals.py` 是生产代码中唯一允许声明 boundary seal 和其固定协议
 input 的模块。AST gate 精确 allowlist 该模块的两个 digest/整体投影，同时禁止：
@@ -1177,7 +1185,8 @@ Port 不接受客户端或 Provider 提供的裸工具名作为分类依据。Ha
 - `TypedWriteHandle` 只能在 Typed Catalog resolve、Surface/Authority/Prepared identity
   验证后签发，并绑定 exact Bundle token、SegmentCatalogToken、Authority token、
   Prepared token、ToolSpec identity 和 Pending/Operation identity；
-- `LegacyWriteHandle` 只能在读取服务端 Pending 并由 exact Legacy Adapter resolve 后签发；
+- `LegacyWriteHandle` 只能从服务端初始 exact route handle，或锁内 issuer 签发且被 exact
+  Legacy Catalog 一次性消费的 proof-derived route handle 继续签发；
 - `CompensationHandle` 只能从 committed primary parent 和 exact handler 签发；
 - read Tool 不能进入 proposal；unknown、Legacy-as-Typed、Compensation-as-primary 或
   identity 不匹配均在 Repository/executor 前 fail-closed。
@@ -1235,13 +1244,17 @@ TypedPendingRouteHandle
   ← SegmentToolSpecHandle + exact PendingAuthorityClaim + Pending primitive digest
 
 LegacyPendingRouteHandle
-  ← server-selected LegacyAdapterRouteHandle + Pending primitive digest
+  ← server-selected LegacyAdapterRouteHandle（初始动作）
+    | proof-resolved LegacyAdapterRouteHandle（确认恢复）
+    + Pending primitive digest
 
 ClarificationPendingRouteHandle
   ← 既有 clarification flow，必须 operation_id=""
 ```
 
-Typed Pipeline 签发 exact Typed Handle；服务端确定性流程签发 exact Legacy Handle。
+Typed Pipeline 签发 exact Typed Handle；服务端确定性初始流程直接签发 exact Legacy
+Handle，确认恢复则必须先经过 §11.2 的锁内 proof issuer，再由 Legacy Catalog 消费
+proof 签发 exact Legacy Handle。
 `set/persist/replace/persist_confirmation_continuation` 等所有初始、替换和 chained
 Pending 路径都消费该 union，Repository 只验证：
 
@@ -1273,7 +1286,10 @@ Metadata 查询是纯内存、无 I/O、无锁等待，不改变业务事务 dea
 ### 10.4 非终态恢复与 chained Pending
 
 终态不重查 Metadata，但 `proposed`/正在 claim/commit-unknown 必须有明确的
-rehydration 边界。请求进入后先按 `operation_id` 读 Ledger：
+rehydration 边界。请求携带安全控制字段 `operation_id` 时先按它读 Ledger；字段缺失时，
+只能从当前 Conversation 的 live `pending_operation_id` 指针锁内引导，再回到同一
+Ledger-first 分支。没有 live Pending 时不得从 tool name/历史消息猜测，也不能恢复已清理
+Pending 的 terminal replay：
 
 ```text
 terminal
@@ -1285,8 +1301,9 @@ non-terminal primary
   → 校验持久 adapter_kind/operation_role/identity/fingerprint
   → typed: 用当前 Segment Catalog resolve persisted tool_name，重跑 prepare/Authority/
            mutable recheck，再签发新 Typed Handle
-  → legacy: 仅当 trusted server-loaded Pending 与 persisted row 一致时，
-            resolve exact Adapter 并签发新 Legacy Handle
+  → legacy: 仅当锁内 trusted Pending/Operation 完整验证后，
+            签发一次性 LegacyRouteProof；Catalog 消费 proof 后 resolve exact Adapter
+            并签发新 Legacy Handle
   → 按现有 claim/CAS 继续
 ```
 
@@ -1447,6 +1464,7 @@ ordered exact names
 provider_visibility = forbidden
 operation adapter kind = legacy_deterministic
 chained policies = same_adapter_only / forbidden / forbidden
+initial route bindings = 四个 direct source → exact Adapter ordinal
 ```
 
 Legacy Adapter 自身继续拥有唯一的 name、editable fields、describe、validate、
@@ -1457,7 +1475,7 @@ presentation 和 execute callable；Boundary 的名称和顺序均从 Adapter Ca
 
 ```text
 LegacyDeterministicAdapterSpec
-├── name / editable fields / chained policy
+├── name / editable fields / chained policy / initial_route_sources
 ├── describe / validate / presentation
 └── execute(encoded_args, LegacyExecutionContext) -> str
 
@@ -1492,25 +1510,268 @@ rollback 与 baseline 展示结果等价。
 | submission snapshot deterministic action | `create_application_submission_snapshot` |
 | outcome recording deterministic action | `record_application_outcome` |
 
-确认恢复的 Catalog API 不接受仅有 `tool_name` 的 Protocol/任意对象，只接受：
+`LegacyRouteSourceV1` 的完整封闭枚举和映射固定为：
 
 ```text
-ServerLoadedLegacyRouteInput（exact type, frozen primitives only）
-├── adapter_kind = legacy_deterministic
-├── operation_role = primary
-├── route_source:
-│     jd_clarification | jd_deterministic_action |
-│     submission_snapshot_action | outcome_recording_action |
-│     confirmation_resume
-├── conversation_id / conversation_scope_revision / pending_claim_identity
-├── operation_id / tool_call_id / tool_name
-└── pending_identity_digest
+jd_clarification            → save_application_jd_version（初始 direct route）
+jd_deterministic_action     → save_application_jd_version（初始 direct route）
+submission_snapshot_action  → create_application_submission_snapshot（初始 direct route）
+outcome_recording_action    → record_application_outcome（初始 direct route）
+confirmation_resume         → 仅 proof issuer；Adapter 来自锁内 persisted protocol name
 ```
 
-该 snapshot 只能由 Repository/Coordinator 在同一事务中锁内交叉比对
-Conversation Pending 与 WriteOperation 后创建；`pending_identity_digest` 覆盖已有
-conversation scope revision/tool call/operation/name/args/claim 身份，不携带原始
-args。`conversation_id` 使用 positive int64，`conversation_scope_revision` 精确映射
+初始 Pending/route handle 保留实际 direct source；该 source 本期不新增持久列。确认恢复不
+猜测或重建初始 source，统一签发 `route_source=confirmation_resume` 的新瞬态 proof/handle。
+因此 issuer、Registry entry、route digest 和测试中的恢复 source 始终相同；其他枚举值
+传入 proof issuer 必须拒绝。
+
+初始 direct route 只能通过 Composition 注入的窄 Port：
+
+```text
+LegacyInitialRoutePort.resolve_initial(
+    exact LegacyRouteSourceV1 direct_source,
+    exact ServerDeterministicInvocationToken,
+) -> LegacyAdapterRouteHandle
+```
+
+Port 从 Adapter Spec 的 `initial_route_sources` 编译四个 source → exact Adapter identity，
+不接收/返回名称查询 map。每个服务端确定性流程只获得与自身 source 绑定的 invocation
+token；Port 校验 exact Runtime container/Catalog/source/token identity 后签发 route handle。
+它拒绝普通字符串、dict、Pending 字段、客户端/Provider tool name 和
+`confirmation_resume`，不进入 Provider Surface，也不与 proof consumer 共用可编辑名称
+API。Initial route handle 绑定 exact source/Adapter/Catalog token，Pending/Operation 仍由
+后续 Route Handle/Repository 边界验证。
+
+`ServerDeterministicInvocationToken` 为 request-local、source-specific、不可复制/序列化的
+一次性 token，只允许 `issued → resolved → revoked` 或 `issued → revoked`；Port consume
+winner 才能得到 Handle。请求结束、Pending persistence 失败、Exception/Cancellation/
+`BaseException` 均在 `finally` revoke token/handle，重复或跨 source/container 使用为绝对
+失败且不能写 Pending/Operation 或调用 Adapter。
+
+确认恢复的 Catalog API 不接受装有普通 server-loaded 字段的 DTO、仅有 `tool_name`
+的 Protocol、dict 或任意调用方构造的 exact-type 对象。锁内事实验证与静态 Catalog
+resolve 拆成两个权限边界：
+
+```text
+approve / modify 的只读 prepare 阶段（claim 前）
+  → API 将已验证确认请求构造为 exact LegacyApprovedConfirmationInput
+  → LegacyRouteProofIssuer.prepare_server_loaded(
+        read_session, lookup_identity, confirmation_input
+    )
+  → verifier 重读并验证 server-loaded Pending/Operation 的 proposed 身份
+  → issuer 内部取得 LegacyPreparationBinding（无 execute capability）
+  → issuer 通过该 binding 执行 prepare_legacy_arguments() + Adapter validate()
+  → PreparedLegacyCall（effective args + exact preparation identity）
+
+现有 confirmation claim transaction
+  → BEGIN IMMEDIATE
+  → 重读 Conversation + Pending + WriteOperation
+  → mutable recheck
+  → Pending claim/CAS 成功，得到 exact LegacyClaimLease
+  → LegacyRouteProofIssuer.issue_after_claim(
+        session, issuance_lease, claim_lease, prepared_legacy_call
+    )
+  → verifier 再次验证锁内身份、claim、effective args 与已有 Ledger HMAC
+  → LegacyRouteProof（一次性、transaction-scoped）
+  → LegacyDeterministicCatalog.resolve_server_loaded(proof)
+  → exact LegacyAdapterRouteHandle
+  → tool.started / executor 恰好一次
+```
+
+这样保持已经批准的顺序：prepare/validate 在 claim 前，锁内 mutable recheck 与 claim
+仍是执行授权前置条件，proof 在 claim 成功后才可能签发。`confirm()` 不得继续先用
+`pending.tool_name` 获得可执行 Adapter；claim 前只能得到不含 execute callable 的
+`LegacyPreparationBinding`。Catalog 是 executable route 的唯一解析边界，执行期不得
+按 name 重建 Catalog/Adapter。
+
+只读 prepare 使用一个 Session-bound read transaction 一次性读取 Conversation/Pending/
+Operation，不调用内部另开 Session 的 Repository helper，也不写 claim 或业务状态；冻结
+必要 primitive 后结束 read transaction，再做纯 CPU prepare/validate。其结果只是候选，
+write transaction 中的权威重读、mutable recheck、claim 和 proof 必须全部重做，不能信任
+旧 Repository/ORM 状态。
+
+`LegacyRouteProofIssuer` 是 Repository/Coordinator 边界内的组合对象；它不是 Catalog
+静态元数据的一部分。只读 prepare API 只接受 read Session、conversation lookup
+identity 和 exact `LegacyApprovedConfirmationInput`；执行 proof API
+只接受当前 caller-owned write Session、该业务
+事务的不透明 `LegacyRouteIssuanceLease`、exact `LegacyClaimLease` 和 exact
+`PreparedLegacyCall`。两者都不接受 tool name、persisted raw args、调用方计算的 digest
+或调用方构造的 evidence；唯一允许的编辑值入口是下述封闭 confirmation input。Issuer
+通过注入的 `LegacyPendingIdentityVerifierPort` 在对应 Session 中重读
+权威行；Port 返回的
+`LockedLegacyRouteEvidence` 同时绑定 exact verifier instance token 与 issuance lease
+token（只读 prepare 使用独立 read-snapshot token），并由 issuer 在同一调用栈中立即消费。
+Evidence 为 `repr=False`，可短暂包含重算
+指纹所需的 canonical args 和持久 primitive；它从不返回给 Coordinator/Catalog，不能
+逃逸事务、进入通用序列化或作为另一个持久 DTO。字段相同但没有 exact verifier/lease
+registry provenance 的伪造 Evidence 必须在 proof 注册前拒绝。
+
+`LegacyApprovedConfirmationInput` 不是授权凭证，而是 API validation 后的封闭瞬态输入：
+
+```text
+LegacyApprovedConfirmationInput（exact type, frozen, repr=False）
+├── decision = approved
+├── operation_id = canonical UUID | missing
+├── edited_args_state = missing | present
+├── edited_args = MISSING sentinel | deep-copied canonical-safe mapping（present）
+├── confirmation_token = bounded opaque string（repr=False）
+├── rejection_feedback_present = false
+└── rejection_feedback = ""
+```
+
+外部 `edited_args` 继续只接受字段缺失、空 object 或非空 object；显式 `null` 维持现有
+422，不能构造 input。Approve 的 `missing` 使用 persisted args；modify 的 `present` 只能
+通过 exact Preparation Binding 的 editable-field policy 合并。Input 不含客户端 tool
+name 或 persisted raw args，token/final mapping 不进入日志、repr 或持久化；issuer 内部
+重算 confirmation-token/request fingerprint，不信任调用方 digest。Reject 不构造该对象。
+
+`lookup_identity` 只含 conversation ID；可选 operation ID 只来自 confirmation input。
+若提供，必须 canonicalize 并与锁内 Conversation/Pending/Operation 全部一致；若缺失，
+non-terminal prepare 只能从
+当前 `Conversation.pending_operation_id` 锁内引导并把结果绑定进 PreparedCall。Pending
+已清理的 terminal replay 必须依赖已有 operation ID 走 Ledger-first 路径；缺失时沿用
+现有 stale/invalid 结果，不能从 tool name 或历史消息猜测。
+
+`LegacyPreparationBinding` 与 `PreparedLegacyCall` 同样是 Registry exact-identity
+对象、`repr=False`、不可复制/序列化。Preparation Binding 只允许访问该 exact Adapter
+的 recursively frozen editable fields、describe/validate/presentation port；不得暴露
+Adapter 对象、execute callable、Repository 或 Session。`PreparedLegacyCall` 绑定
+preparation binding identity、persisted Pending identity、原始 args digest、effective
+args digest、request fingerprint 和 effective args（后者仅瞬态、`repr=False`）。它不
+构成执行授权；只有锁内 proof 消费后签发的 route handle 才能进入 executor。
+
+read-snapshot token 在只读事务结束并形成 PreparedCall 后立即关闭，read Session、
+Locked Evidence 和 live Preparation Binding capability 随即销毁。Registry 原子地把
+Binding entry 转成 immutable preparation-identity tombstone，只保留 opaque binding/
+exact Adapter identity，不保留 callable、Session、Evidence 或 persisted raw args；
+PreparedCall 绑定该 tombstone 与本次 confirmation attempt token。其生命周期唯一为：
+
+```text
+preparation_open → prepared → consumed
+                 ↘ revoked
+prepared         → revoked
+```
+
+`issue_after_claim()` 在全部锁内校验成功后，以一次原子 Registry transition 完成
+`prepared → consumed` 并注册 execution proof；只有 winner 能得到 proof。prepare/
+validation failure、claim CAS failure、proof failure、request 结束、Exception、Cancellation
+或其他 `BaseException` 都在 `finally` revoke 未消费 attempt/PreparedCall。后续请求必须
+重新读取、重新 prepare；同一 Pending 的旧 PreparedCall、同字段 clone 或不同 claim/
+Session/attempt 复用均在 proof/Adapter/executor 前失败。
+
+Consumed preparation-identity tombstone 作为无可复用能力的 provenance 保留到 issuance
+lease 关闭；PreparedCall 的 effective args 私有引用另由 `LegacyPreparationRegistry` 的
+exact consumed-call entry 保留到 executor 返回，以支持 route handle 校验和恰好一次
+调用。`LegacyRouteProofRegistry` 只接收 PreparedCall opaque identity/digest，不持有该
+对象或 effective args。随后无论 commit/rollback/异常都清除引用。read transaction 结束
+时必须销毁 live Binding capability，但不能提前删除 identity tombstone；transaction 退出
+后不得保留 effective args。
+
+Issuer 在签发前必须在锁内逐字段验证：
+
+- Conversation ID/scope revision 及 owning Pending 的真实归属；
+- `adapter_kind=legacy_deterministic`、`operation_role=primary`，且 proof route source
+  必须精确为 `confirmation_resume`；
+- operation/tool call/protocol name 与 Pending/Operation 一致；
+- Pending args、`proposal_fingerprint`、`confirmation_token_fingerprint` 与 Ledger
+  `fingerprint_key_id` 重算一致，其余 fingerprint/null 状态精确符合下表；
+- PreparedCall 仍为当前 confirmation attempt 的 `prepared` 状态，exact Adapter identity、
+  persisted Pending digest、effective args/input fingerprint 和 request fingerprint 均重算一致；
+- claim ID/timestamp 与当前 confirmation claim/CAS 一致；
+- 当前 issuance lease 仍绑定同一 Session/transaction/claim，且未结束。
+
+Legacy proposed/claim 的 fingerprint 真值表必须精确保持 Phase 3：
+
+| 阶段 | proposal | confirmation token | authorization scope | input | operation request | Conversation claim |
+|---|---|---|---|---|---|---|
+| read-only prepare snapshot | 非空并重算一致 | 非空并重算一致 | 必须 `NULL` | 必须 `NULL` | 必须 `NULL` | `"" / NULL` |
+| claim 后、proof 签发前 | 同上 | 同上 | 必须 `NULL` | 行内仍为 `NULL` | 行内仍为 `NULL` | `operation_id / non-null claimed_at` |
+| rejected/replay | 按既有 terminal 完整性规则 | 按既有规则 | 必须 `NULL` | 必须 `NULL` | 非空 | 按 Phase 3 rejection/delivery 状态 |
+| committed/failed/replay | 按既有 terminal 完整性规则 | 按既有规则 | 必须 `NULL` | 非空 | 非空 | 按 Phase 3 delivery/replay 状态 |
+
+proof issuer 在 claim 后计算并绑定 `write-operation-legacy-input-v1` effective input
+fingerprint 与 `write-operation-request-v1` request fingerprint，但不要求它们在 proposed
+row 中提前存在。只有既有 terminal commit 路径把二者写入 Operation；proof/prepare
+失败会 rollback claim，Operation 仍保持 proposed 真值。Legacy 不制造 Typed
+`authorization_scope_fingerprint`。Terminal/replay 不签发 proof，只走既有完整性校验。
+`LegacyClaimLease` 由更新 `Conversation.pending_confirmation_claim_id` 与
+`Conversation.pending_confirmation_claimed_at` 的现有 CAS winner 创建；不在
+WriteOperation 增加 claim 字段，也不能把 claim 前的空值当成执行授权。
+
+`LegacyPendingIdentityVerifierPort` 由 Write Coordinator 注入 issuer，可使用已加载的
+Ledger HMAC verifier/key domain 重算已有指纹；Catalog、Adapter 和 proof registry
+不持有 Ledger key、原始 preimage 或 Repository。事务内不允许因此新增
+keyring/文件 I/O；不可用的 verifier 会在 Adapter、Repository 写入和 executor 前
+fail-closed。
+
+`LegacyRouteProof` 的实际授权来源是注册表中的 exact object identity 与
+issuer provenance，不是 Python 类名或可复制字段：
+
+```text
+LegacyRouteProof
+  exact type / slots / frozen / eq=False / repr=False
+  无 public constructor
+  copy / deepcopy / pickle / generic serialization 显式拒绝
+  只携带不透明 proof identity，不携带 key/args/ORM/Session/Repository
+
+LegacyRouteProofRegistry entry
+  exact proof object identity
+  exact issuer instance token
+  exact Bundle + Legacy Catalog instance token
+  exact Session/transaction/claim lease token
+  adapter_kind=legacy_deterministic / operation_role=primary / route_source
+  conversation scope revision / operation / tool call / protocol name / claim identity
+  pending_identity_digest
+  exact preparation-binding identity token + PreparedLegacyCall opaque identity token
+  effective input fingerprint / operation request fingerprint
+  exact Adapter object identity
+  state = issued | resolved | revoked
+```
+
+Application Composition 从同一个 sealed Legacy Catalog 创建独立、线程安全的
+`LegacyPreparationRegistry` 与 `LegacyRouteProofRegistry`，以及只能签发的 issuer token
+和只能消费 proof 的 exact Catalog token。Preparation Registry 是 issuer/Coordinator
+私有的 request-local args/call lifecycle 边界；Proof Registry 只保存安全 identity/digest/
+exact Adapter binding。Proof Registry 以强引用保持已签发 proof 穿过 resolved 状态，直到 transaction
+lease revoked，
+不以 `id()`、值相等或可控 nonce 作为授权根。即使调用方绕过
+private constructor 制造 exact-type/同字段对象，也不存在对应 registry entry，
+必须拒绝。Registry 不暴露通用 `register()`；只有持有 exact issuer token
+的 `LegacyRouteProofIssuer` 能创建 entry。
+
+为保持 Catalog 递归冻结，Composition 使用内部原子 factory 从 ordered Adapter tuple
+同时创建 Catalog instance token、两个 Registry、issuer-only registration port、consumer
+port 和最终 Catalog；不存在“先构造 Catalog、再可变挂载 Registry”的阶段，也不向
+其他模块暴露半初始化对象。
+
+Registry 在 Composition 时只从实际 sealed Catalog 接收 ordered exact Adapter
+object/name identity，不建立第二份可编辑名称表。Issuer-only registration port 仅在
+`route_source=confirmation_resume` 时，用已验证的 persisted protocol name 命中这三个
+exact Adapter 之一；unknown、其他 source 或客户端 name 均不能创建 entry。表中的四个
+initial direct route source 继续由各自服务端直接流程选择 exact Adapter，不进入 proof
+registry。
+
+`resolve_server_loaded(proof)` 只能以 exact Catalog token 一次性消费 proof。
+Registry 必须验证 proof 对象身份、issuer/Catalog/Bundle/transaction/claim provenance、
+live lease 和 `state=issued`，再返回 registry 已绑定的 exact Adapter identity；
+Catalog 不重算 digest，不从 proof 的普通字段或客户端 tool name 重新选择
+Adapter。成功消费原子地使 proof 进入 `resolved`，然后签发同一事务
+的 `LegacyAdapterRouteHandle`。同一 proof 重用、不同 issuer/Catalog/Bundle/
+transaction/claim 消费、已过期或已撤销 proof 全部在 Adapter/Repository/
+executor 前 fail-closed。
+
+允许的 registry lifecycle 只有 `issued → resolved → revoked` 或
+`issued → revoked`。Resolved entry 作为不可复用 tombstone 保留到 transaction lease
+结束，避免对象 identity/nonce ABA；lease 撤销后清除强引用。并发消费只有一个原子
+winner 能获得 Adapter binding，loser 为绝对失败且不能得到 Handle。
+
+事务在 commit、rollback、Exception、Cancellation 或其他 `BaseException` 退出时，
+Coordinator 必须在 `finally` 关闭 issuance lease，并撤销其下所有 proof 和已派生
+route handle。Proof 或 Handle 不得跨 Session/事务/claim 复用；执行前发现关闭/
+撤销失败时 executor 为 0，执行后的清理异常不得触发第二次 Adapter/executor 调用，
+并按现有事务安全失败路径 rollback/收敛。
+
+`conversation_id` 使用 positive int64，`conversation_scope_revision` 精确映射
 已有 `Conversation.scope_revision`，不引入 `conversation_generation`、`updated_at`
 或另一个持久代数。
 
@@ -1530,32 +1791,79 @@ claim_id != "" → claimed_at 必须存在
 naive 值视为 UTC，aware 值转 UTC，输出固定六位微秒的
 `YYYY-MM-DDTHH:MM:SS.ffffffZ`。时间只是已有 claim 身份的完整性输入，
 不新增独立 CAS 规则；权威 claim/CAS 仍用 Phase 3 现有查询。
-`pending_identity_digest` 使用现有 Ledger HMAC key 和新的域分离
-`legacy-route-pending-identity-v1\0`，输入是上述所有 canonical primitive 及按
-Legacy 现有 codec 规范化的 args；digest/claim identity 均不记录、不持久。
-Repository 必须在锁内逐字段比对 conversation ID/scope revision、operation ID/role/
-adapter kind、tool call/name、Pending args digest、claim ID/timestamp 与 route source，
-不能只比较最终 digest。
-`resolve_server_loaded(input)` 必须先验证 exact type、adapter kind、primary role、
-route source 和 digest，然后才按 persisted protocol name 找 exact Adapter 并签发
-Handle。Typed/Compensation role、unknown source、客户端 dict、字段相同伪造品或
-Pending/Operation 不一致时，Adapter/Repository/executor 均为 0。
+Issuer 计算的 `pending_identity_digest` 使用现有 Ledger HMAC key 和新的
+域分离：调用 `ledger_fingerprint(key, "legacy-route-pending-identity-v1", preimage)`，
+其实际 HMAC 前缀字节为 `b"legacy-route-pending-identity-v1\0"`，避免调用方把 NUL
+重复放进 domain 参数。输入是上述所有 canonical
+primitive 及按 Legacy 现有 codec 规范化的 args。它只放在瞬态 registry
+entry 中用于 route handle 绑定，不是调用方传入 proof 的字段；
+digest/claim identity 均不记录、不持久。Issuer 必须先逐字段比对锁内
+Conversation/Pending/Operation，再重算和比较已有 Ledger 指纹，不能只比较
+最终 route digest。
 
-初始动作由服务端选择 exact Adapter 并获得不可伪造的
-`LegacyAdapterRouteHandle`；确认恢复只读取数据库中的 server-loaded
-Pending，再用 `LegacyDeterministicCatalog.resolve_server_loaded()` 验证封闭名称并签发
-新 Handle。Handle 绑定 exact Catalog/Adapter identity、route source、Pending primitive
-identity/digest，不保存 Pending model 或 arguments。客户端
+route digest 的 canonical preimage 唯一固定为：
+
+```text
+{
+  "schema": "legacy-route-pending-identity-v1",
+  "adapter_kind": "legacy_deterministic",
+  "operation_role": "primary",
+  "route_source": "confirmation_resume",
+  "conversation_id": <positive JSON integer>,
+  "conversation_scope_revision": <non-negative JSON integer>,
+  "pending_claim_identity": {
+    "claim_id": <existing bounded string>,
+    "claimed_at": <canonical_claimed_at | null>
+  },
+  "operation_id": <Phase 3 canonical UUID string>,
+  "tool_call_id": <existing canonical bounded string>,
+  "tool_name": <persisted exact Legacy protocol name>,
+  "fingerprint_key_id": <Phase 3 canonical UUID string>,
+  "normalized_args": <Legacy existing codec canonical JSON object>
+}
+```
+
+采用现有 canonical JSON 的 UTF-8、键排序、紧凑分隔符、有限数和 Unicode 不规范化
+规则；不省略 null、不接受额外字段。该 preimage 只在 issuer 内存中存在，Catalog 和
+Registry 均只接收计算后的 digest 与验证过的安全 primitive。
+
+Legacy args 兼容规则不得由 proof 层另造 decoder：
+
+- read-only prepare 先按当前 Legacy `json.loads`/Adapter validate 行为解析 persisted
+  args；合法 JSON object 才能形成 `PreparedLegacyCall`；
+- 无编辑时保留当前 raw encoded args 供 describe/validate/executor，identity/HMAC 使用其
+  解码后的 canonical object；有编辑时继续由 `prepare_legacy_arguments()` 合并允许字段，
+  生成当前 compact effective encoding，再 validate；
+- current codec 对重复 object key 的 last-value-wins 行为保持兼容；route digest 对解码后
+  object 计算，不假装保留原始数字/键词法；非有限数仍由现有 canonical/HMAC 边界拒绝；
+- scalar、非法 JSON 或 Adapter validation failure 使用现有可见 validation/stale 语义，
+  不签发 `PreparedLegacyCall`/proof，claim/Repository write/executor 为 0；
+- `pending_identity_digest` 只绑定 persisted 原始 Pending 的语义对象；修改后的 effective
+  args 另以现有 `write-operation-legacy-input-v1` fingerprint 绑定。二者不得互换，且
+  route handle 执行前必须同时匹配 exact PreparedLegacyCall identity 与 effective input
+  fingerprint。
+
+初始动作由服务端已知的封闭 route source 直接选择 exact Adapter 并获得
+`LegacyAdapterRouteHandle`，该路径不需要数据库恢复 proof。确认恢复只读取数据库中的
+server-loaded Pending，经过 issuer 锁内验证后，再由
+`LegacyDeterministicCatalog.resolve_server_loaded(proof)` 消费一次性证明并签发新
+Handle。Handle 绑定 exact Catalog/Adapter identity、route source、transaction/claim
+lease 和 Pending primitive identity/digest，不保存 Pending model 或 arguments。客户端
 提交的 `tool_name` 不参与选择；unknown、不匹配或非 server-loaded Pending 按现有
 stale/invalid 路径失败，Adapter、Repository 和 executor 均为 0。
+
+该 proof 路径只服务于 approve/modify 的 non-terminal Legacy resume。Reject 继续只做
+token/Pending/Ledger identity 与 rejection CAS，不解析/规范化 args、不创建 issuance
+lease/proof、不查询 Adapter；terminal replay/delivery recovery 同样不签发 proof，
+Catalog/Adapter/Provider/executor 均为 0。
 
 必须保持：
 
 - Provider builder、Selector、dependency closure 和 Dispatcher 永远看不到 Legacy；
 - Typed Catalog miss 绝不尝试 Legacy；
 - Legacy 初始动作只能由服务端确定性流程创建；
-- confirmation resume 先读取服务端 Pending/Ledger `adapter_kind`，再由
-  Catalog 签发 exact Adapter Handle；
+- confirmation resume 先读取服务端 Pending/Ledger `adapter_kind`，由 issuer 在锁内
+  签发 proof，再由 Catalog 一次性消费 proof 签发 exact Adapter Handle；
 - 客户端 `tool_name` 不能单独进入 Legacy；
 - 专用确认、幂等、CAS、Ledger、写入、恢复和用户可见结果不变。
 
@@ -1618,7 +1926,15 @@ ai/tool_specs/catalog.py
   唯一生产 Composition Root，组装六个领域的 25 个 Spec
 
 ai/tool_runtime/legacy.py
-  Legacy boundary、静态 Adapter、Session-bound execution context 和唯一 Legacy Catalog
+  Legacy boundary、静态 Adapter、Session-bound execution context、
+  LegacyInitialRoutePort 和唯一 Legacy Catalog；direct route 只消费 exact source/token，
+  resume route 只消费已注册 LegacyRouteProof，不持有 Ledger key、Repository 或原始 Pending
+
+ai/tool_runtime/legacy_proof.py
+  LegacyApprovedConfirmationInput、LegacyPreparationBinding、PreparedLegacyCall identity、
+  LegacyRouteProof、opaque issuer/catalog/read-snapshot/preparation/transaction token 和
+  分离的 LegacyPreparationRegistry/LegacyRouteProofRegistry；无 Ledger key、HMAC、
+  Repository、ORM 或 Pilot Runtime 依赖
 
 context_projector/selector.py
   纯选择算法，只消费 injected Discovery/Dependency View
@@ -1636,14 +1952,27 @@ pilot_runtime/primary_undo.py
   四个 required-undo builder binding 的共享 contract/checkpoint helper；工具特有
   seed/build callable 仍在对应领域 Spec 显式绑定
 
+pilot_runtime/legacy_route.py
+  LegacyRouteProofIssuer、LockedLegacyRouteEvidence 和 LegacyPendingIdentityVerifierPort；
+  只读 prepare 签发无 execute capability 的 binding；只在 Write Coordinator 已持有
+  锁内 Session 且 claim CAS 成功后签发 execution proof
+
 pilot_runtime/composition.py
   组装 Typed Catalog + Legacy Adapter Catalog + Compensation Registry，创建完整 Bundle，
-  将其 View/Port 注入 Projector、Agent Loop、Pipeline 和 Ledger
+  创建 exact Legacy initial-route source tokens、proof issuer/consumer token 与两个
+  Registry，并将 View/Port 注入 Projector、Agent Loop、Pipeline 和 Ledger
 ```
 
 依赖规则：
 
 - `tool_runtime` 不导入 `tool_specs`；
+- `legacy_proof.py` 不导入 Ledger、keyring、Repository、ORM 或 Pilot Runtime；
+- Preparation Registry 是唯一可持有 request-local effective args 的 registry；Proof
+  Registry/Catalog/route handle 只接收 identity/digest，不能保留 PreparedCall 或 args；
+- `legacy.py` 只能消费 proof Registry 的窄验证结果，不能导入 Ledger key/HMAC verifier、
+  Repository 或锁内 evidence；
+- `pilot_runtime/legacy_route.py` 是唯一允许把锁内 evidence 与 Ledger verifier 组合后调用
+  proof issuer registration port 的生产模块；
 - Selector、Authority、Ledger 和 Repository 不导入生产 Composition Root singleton；
 - `pilot_runtime/composition.py` 是生产对象装配点；
 - 非 Composition Root 模块不得重新构造 Bundle；
@@ -1673,6 +2002,15 @@ pilot_runtime/composition.py
 - `api.py::_pending_action_details()`、`pilot_runtime/service.py` 的按工具名摘要分支和
   `write_operations.py` 的首次执行 human projection 分支，改为 exact presentation binding；
 - 捕获 Repository/Service 的 Legacy executor lambda 和执行期 Catalog rebuild；
+- `pilot_runtime/deterministic.py::_legacy_catalog()`、`_legacy_adapter(pending)`、当前
+  `_executor()` 内 Session-bound Catalog rebuild，以及 dependencies 中可注入的
+  `legacy_catalog_factory`；改为 read-only preparation binding + claim 后 proof-derived
+  route handle；
+- `LegacyDeterministicCatalog.resolve_server_loaded(pending)` 和接收
+  `ServerLoadedPending` Protocol 的旧 API；Catalog 只保留 proof consumer API；
+- `build_legacy_deterministic_catalog(jd_service, outcomes)` 的 Repository/Service 参数与
+  closure；新 builder 只构造静态 Adapter spec，执行依赖只来自 caller-owned
+  `LegacyExecutionContext`；
 - Authority/Selector/Ledger 中复制的工具静态矩阵；
 - 任何 catalog drift alternate surface、Typed→Legacy fallback 或 shadow path。
 
@@ -1709,6 +2047,22 @@ AST/source gate 必须证明：
 - `protocol_seals.py` 是唯一 boundary seal allowlist，且没有任何单工具查询 API；
 - 所有 operation-bearing Pending Repository 入口都要求 exact route handle；
 - Legacy executor 只消费 caller-owned Session-bound context，不捕获 Repository；
+- Legacy Catalog 不存在接收普通 server-loaded fields/dict/Protocol 的 resolve API，只接受
+  exact `LegacyRouteProof` 并通过 Registry 的 exact object identity 一次性消费；
+- 初始 Legacy route 只能由精确 allowlist 的四个服务端确定性入口调用
+  `LegacyInitialRoutePort`，且必须传 exact direct-source enum + source-bound invocation
+  token；Port/Catalog 不存在按客户端/Pending/tool name 查询 initial Adapter 的 API；
+- Legacy claim 前只允许 Registry-bound `LegacyPreparationBinding` 的
+  editable/describe/validate/presentation port，任何 prepare object 都不能访问 execute
+  callable；execution proof issuance 只能出现在锁内 mutable recheck 与 claim CAS 成功后；
+- 只有 `pilot_runtime/legacy_route.py` 可调用 proof issuance registration port 或
+  `LegacyPendingIdentityVerifierPort`；`legacy.py/legacy_proof.py` 禁止导入 Ledger key、
+  keyring、HMAC helper、Repository、ORM 或锁内 evidence；
+- `LegacyApprovedConfirmationInput`、`LegacyPreparationBinding`、`PreparedLegacyCall`、
+  `ServerDeterministicInvocationToken`、`LockedLegacyRouteEvidence`、
+  read-snapshot/preparation/issuance/claim lease、
+  `LegacyRouteProof`、Preparation/Proof Registry entry、route handle 均不得进入 Pending、Ledger、Journal、
+  ChatMessage、checkpoint、HTTP/SSE、日志、repr、pickle 或通用序列化；
 - 不存在 feature flag、双轨、旧 handler registry 或 fallback。
 
 必要的工具名字符串仍可存在于：
@@ -1740,7 +2094,8 @@ import alias、局部别名、集合字面量和基础反射写法。
 5. 切换 Provider/Selector/Dependency View
 6. 切换 Authority/Pipeline/HITL
 7. 切换 Primary Undo Builder、Ledger/Repository Operation/Pending Route Port
-8. 收口 Session-bound Legacy Boundary、chained topology 与 Compensation Registry
+8. 收口 Session-bound Legacy Boundary、锁内 Legacy proof issuer/Registry、chained topology
+   与 Compensation Registry
 9. 删除全部旧常量、名称分派、隐式补全和 fallback
 10. 运行组合门禁、独立 CR 和发布验收
 ```
@@ -1854,8 +2209,49 @@ Selector Golden 至少覆盖：
   Adapter mutation/copy/pickle/callable replacement。
 - Legacy presentation 的当前 Session/read-only context、跨 Session 拒绝、rollback 和
   confirmation/details/success 兼容输出等价；
-- `ServerLoadedLegacyRouteInput` 对 typed/compensation role、unknown source、
-  tool-name-only 对象、客户端 dict、伪造 digest 和 Pending/Operation 不一致全部拒绝。
+- Legacy proof issuer 对 typed/compensation role、unknown source、伪造/替换 args、错误
+  proposal/confirmation-token/input/authorization-scope/operation-request fingerprint 或 key ID、
+  claim/scope/operation/route mismatch 均不签发 proof，
+  Adapter/Repository/executor 为 0；
+- `LegacyRouteSourceV1` 五个值及映射逐项 Golden；恢复统一使用
+  `confirmation_resume`，四个 direct source 进入 issuer 均拒绝；
+- `LegacyInitialRoutePort` 四个 source/token 正向映射及错误 source/token/container、普通
+  string/dict/Pending/tool name、`confirmation_resume` 负向矩阵；失败时 Pending/Operation/
+  Adapter/executor 为 0；并发单 consume winner、重复/跨 source/退出后 token/handle revoke，
+  且 Provider Surface 永远不出现 Legacy；
+- caller 伪造/复制 `LockedLegacyRouteEvidence`、错误 verifier instance token、错误 Session
+  或 issuance lease 时 proof 注册为 0；Issuer API 不接受 tool name、persisted raw args、
+  caller digest/evidence，只接受 exact validated confirmation input；
+- `LegacyApprovedConfirmationInput` 覆盖 operation ID present/missing、edited args
+  missing/empty/non-empty object、显式 null 422、token mismatch 和 rejection fields 拒绝；
+  operation ID 缺失只从 live Conversation Pending 引导，Pending 已清理的 replay 不猜测；
+- approve/modify 精确顺序为 read-only preparation binding → prepare/validate →
+  `BEGIN IMMEDIATE` → mutable recheck → claim CAS → execution proof → Catalog consume →
+  executor；claim 前对象不得取得 execute capability，claim/proof/Catalog 任一步失败时
+  executor 为 0；reject/terminal replay 的 preparation/proof/Catalog 均为 0；
+- proposed Legacy fingerprint 真值表逐字段覆盖：proposal/token 非空，authorization/input/
+  operation-request 为 `NULL`，claim 前为空、claim 后为 operation ID + timestamp；proof
+  绑定计算出的 effective input/request fingerprint，但失败 rollback 后行仍为 proposed；
+- rejected terminal 的 input 保持 `NULL`、request 非空；committed/failed terminal 的
+  input/request 均非空；三类 Legacy authorization scope 均为 `NULL`，replay 不签发 proof；
+- Legacy args Golden 覆盖无编辑 raw encoding、有编辑 compact encoding、语义 canonical、
+  重复键 baseline 行为、scalar/非法 JSON/非有限数/Adapter validation failure，以及原始
+  pending digest 与 effective input fingerprint 不得互换；
+- Catalog 对 raw dict、tool-name-only Protocol、直接构造的 exact-type proof、同字段 clone、
+  copy/deepcopy/pickle、错误 issuer/Catalog/Bundle/transaction/claim、expired/revoked/reused
+  proof 全部拒绝，且 proof 只能由一次 `issued → resolved` CAS winner 消费；
+- commit/rollback/Exception/Cancellation/其他 `BaseException` 均撤销 transaction lease 下
+  proof 与派生 Handle；late/reused Handle 不能进入 Repository 或 executor；
+- preparation attempt 精确覆盖 `open → prepared → consumed|revoked`、并发单 winner、claim/
+  proof 失败与所有退出路径 revoke；live Binding capability 在 prepare 后消失，identity
+  tombstone 保留到 attempt 结束；tombstone 被替换/提前删除或下一请求复用旧 PreparedCall
+  时 proof 为 0；
+- confirmation input、PreparationBinding、PreparedCall、Locked Evidence、所有 read/
+  preparation/issuance/claim lease、proof/registry/Handle 的 repr、日志、copy/deepcopy/pickle/
+  generic serialization 均不含或泄漏 effective args、token、HMAC key/digest、Pending/
+  Operation identity 或用户内容，且不会进入任何持久/transport State；
+- spy 证明只有 Preparation Registry 短暂持有 effective args，request/transaction 退出后
+  清零；Proof Registry/Catalog/route handle 从未接收 PreparedCall 对象或 raw/effective args；
 - Legacy route identity 覆盖 unclaimed、claim 中、claim 清除、Pending 替换、
   scope revision 变化和 stale resume；空 claim/nullable timestamp 及 UTC 微秒 canonical
   Golden 必须字节稳定。

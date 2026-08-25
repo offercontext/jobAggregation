@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.10+, pytest 8, SQLAlchemy 2, SQLite, FastAPI, jsonschema 4.26.0, the existing Agent Loop/Pilot Runtime/Context Projector/Tool Pipeline/Tool Authority/Write Operation Ledger/Journal, uv, Ruff, Mypy, Vitest, Vite, local verification, controlled real-AI verification, and the in-app browser.
 
-**Scope revisions:** Task 4 was first formally stopped before product edits after the original baseline-only `ToolSpec(` scan missed `dataclasses.replace()` consumers, attribute readers, and the Task 3 synthetic factory. During the reviewed Task 4 full GREEN matrix it was stopped again when two pre-existing Authority tests proved to construct a production Spec as a non-closed one-tool Catalog, and the production Authority capability validator began tripping the existing no-automatic-grant AST gate after `ToolCapability` became the closed enum. The reviewed Task 4 scope below explicitly includes all seven supplemental consumers, migrates the two test Catalogs to explicit closed test metadata, and validates capability values directly without materializing the whole enum. These scope-only revisions do not change the approved design, fixed identities, 25/3/4 boundary, protocol seals, or Golden assets.
+**Scope revisions:** Task 4 was first formally stopped before product edits after the original baseline-only `ToolSpec(` scan missed `dataclasses.replace()` consumers, attribute readers, and the Task 3 synthetic factory. During the reviewed Task 4 full GREEN matrix it was stopped again when two pre-existing Authority tests proved to construct a production Spec as a non-closed one-tool Catalog, and the production Authority capability validator began tripping the existing no-automatic-grant AST gate after `ToolCapability` became the closed enum. Its independent implementation review then found that the temporary compatibility mapping returned mutable nested Provider JSON and left `dict(contract.payload)` materializers in the AI client and Context Projector. Task 4 was stopped a third time before touching those out-of-gate consumers. The reviewed Task 4 scope below explicitly includes all seventeen supplemental consumers, migrates the two test Catalogs to explicit closed test metadata, validates capability values directly without materializing the whole enum, and atomically moves every Provider JSON consumer to one recursively immutable query surface plus one detached materializer. These scope-only revisions do not change the approved design, fixed identities, 25/3/4 boundary, protocol seals, or Golden assets.
 
 ---
 
@@ -61,7 +61,7 @@ $toolSpecConstructorSet = git grep -l 'ToolSpec(' $fixed -- src tests | ForEach-
 $classificationConsumerSet = git grep -l -E 'MODEL_TOOL_NAMES|MODEL_TOOL_CATALOG|DEPENDENCY_POLICY_V1|TRANSACTIONAL_TYPED_WRITE_NAMES|REQUIRED_UNDO_TOOL_NAMES|TYPED_WRITE_OPERATION_NAMES|LEGACY_WRITE_OPERATION_NAMES|COMPENSATION_OPERATION_NAMES|REQUIRED_UNDO_OPERATION_NAMES|WRITE_OPERATION_NAMES|_pending_adapter_kind|_chained_adapter_kind|_with_write_contract|_with_runtime_metadata|editable_fields_for_tool|_undo_seed_for_pending|_build_write_undo|_CREATED_RECORD_FINGERPRINT_FIELDS|legacy_catalog_factory|_legacy_catalog|_legacy_adapter' $fixed -- src tests | ForEach-Object { $_ -replace '^[^:]+:', '' }
 ```
 
-The baseline-only `$toolSpecConstructorSet` is intentionally supplemented in Task 4 by these seven explicitly reviewed paths, because a `ToolSpec(` text scan cannot discover `dataclasses.replace()`, attribute reads, source-gate fallout from the closed enum cutover, or files introduced after the fixed baseline:
+The baseline-only `$toolSpecConstructorSet` is intentionally supplemented in Task 4 by these seventeen explicitly reviewed paths, because a `ToolSpec(` text scan cannot discover `dataclasses.replace()`, attribute reads, source-gate fallout from the closed enum cutover, Provider JSON materializers, or files introduced after the fixed baseline:
 
 ```text
 tests/agent_loop/helpers.py
@@ -71,6 +71,16 @@ tests/tool_authority/test_approval_transaction.py
 tests/tool_authority/test_read_uow.py
 tests/tool_authority/test_replay_topology.py
 tests/tool_metadata/factories.py
+src/offerpilot/ai/client.py
+src/offerpilot/context_projector/gateway.py
+src/offerpilot/context_projector/projector.py
+src/offerpilot/context_projector/selector.py
+tests/tool_pipeline/test_application_events.py
+tests/tool_pipeline/test_applications.py
+tests/tool_pipeline/test_jd_analyses.py
+tests/tool_pipeline/test_notes.py
+tests/tool_pipeline/test_offers.py
+tests/tool_pipeline/test_resumes.py
 ```
 
 Do not replace this explicit supplement with a broader runtime grep or dynamically append scan results to a gate. Future scope discoveries still require the stop/revise/re-review/regenerate procedure below.
@@ -407,9 +417,13 @@ git commit -m "feat: AI 完善工具元数据与运行时绑定"
 - Modify: `src/offerpilot/ai/tool_authority/contracts.py`
 - Modify: `src/offerpilot/ai/tool_authority/composition.py`
 - Modify: `src/offerpilot/ai/agent_loop.py`
+- Modify: `src/offerpilot/ai/client.py`
 - Modify: `src/offerpilot/ai/write_operations.py`
 - Modify: `src/offerpilot/ai/confirmation.py`
 - Modify: `src/offerpilot/context_projector/authority_surface.py`
+- Modify: `src/offerpilot/context_projector/gateway.py`
+- Modify: `src/offerpilot/context_projector/projector.py`
+- Modify: `src/offerpilot/context_projector/selector.py`
 - Modify: `src/offerpilot/pilot_runtime/service.py`
 - Modify: `src/offerpilot/pilot_runtime/composition.py`
 - Modify: `src/offerpilot/pilot_runtime/continuation.py`
@@ -426,6 +440,12 @@ git commit -m "feat: AI 完善工具元数据与运行时绑定"
 - Modify: `tests/tool_authority/test_replay_topology.py`
 - Modify: `tests/tool_metadata/factories.py`
 - Modify: `tests/tool_pipeline/test_catalog.py`
+- Modify: `tests/tool_pipeline/test_application_events.py`
+- Modify: `tests/tool_pipeline/test_applications.py`
+- Modify: `tests/tool_pipeline/test_jd_analyses.py`
+- Modify: `tests/tool_pipeline/test_notes.py`
+- Modify: `tests/tool_pipeline/test_offers.py`
+- Modify: `tests/tool_pipeline/test_resumes.py`
 - Modify: `tests/tool_pipeline/test_pipeline.py`
 - Modify: `tests/tool_pipeline/test_transport.py`
 - Modify: `tests/tool_authority/test_matrix.py`
@@ -436,18 +456,24 @@ git commit -m "feat: AI 完善工具元数据与运行时绑定"
 
 - [ ] **Step 1: Write RED compiler, seal, compatibility, and 25-tool tests**
 
-Tests must cover exact Manifest keys/order/nullability, duplicate names, dependency cycles, self/unknown/Legacy dependencies, read/write union validation, runtime callable identity, Provider payload mutation, Legacy kind/visibility mutation, operation-kind compatibility projection, exact four required-Undo builder bindings, complete confirmation/presentation bindings, and unchanged transport result projection.
+Tests must cover exact Manifest keys/order/nullability, duplicate names, dependency cycles, self/unknown/Legacy dependencies, mechanically closed Binding/editable/write validation, read/write union validation, runtime callable identity, recursively immutable Provider payload/parameters views, fresh detached Provider materializations, same-content Provider component replacement, Catalog topology replacement, Manifest projection replacement, Legacy kind/visibility mutation, operation-kind compatibility projection, exact four required-Undo builder bindings, complete confirmation/presentation bindings, and unchanged transport result projection.
+
+The Manifest negative matrix is parametrized and mechanical rather than Golden-only. It must reject missing/extra/reordered keys at every nested object; wrong fixed top-level values or exact primitive types including `bool` in integer positions; wrong Typed count and wrong/gapped/duplicate/non-integer ordinals; empty/duplicate/non-canonical/unknown domains; duplicate/non-text/non-canonical/self/unknown/Legacy/cyclic dependencies; invalid Provider name/fingerprint/visibility; capability cardinality other than exactly one plus unknown/non-text capability values; every unknown/empty/duplicate/mismatched Binding contract kind/entity/nullability and resolver ID/entity/arg-path/presence/identity/count combination; editable field membership outside the Provider schema's exact top-level `properties`, duplicate fields, unknown value type, non-enum options, empty/duplicate/non-scalar enum options, clearability/clear-value type or relationship violations; confirmation/operation discriminator mismatch; write `adapter_kind`/`result_contract` drift; any write byte budget not the four fixed V1 integer values; every unknown or mismatched Undo policy/payload/Compensation/version/builder/seed combination; exact `selector_version`/`discovery_policy_version` drift; discovery-policy wrong cardinality, closed page/attachment/domain kind, behavior, term content, or ordering; exact `legacy_boundary.boundary_version` drift; Legacy kind/visibility/name/cardinality/policy/source/ordinal drift including non-exact integers; and Compensation kind/cardinality/order drift. Each axis receives an independent same-shape wrong-value mutation, not only a missing-key or whole-Golden comparison.
 
 Presentation tests must prove that replacement bindings are constructed as complete new `ToolPresentationBindingV1` values with fresh callable-identity seals and that the replacement succeeds before a post-seal mutation fails closed. Test callbacks bound into accepted presentation metadata must be module-level named functions: no lambda, local closure, or `partial`. A lambda/local/partial may appear only as a negative constructor-rejection probe inside an assertion that it fails. Stateful cancellation/counting behavior uses a dedicated test probe/state object observed by a module-level callback; it must not place the local test function into a binding.
 
 `test_protocol_seals.py` must independently read the committed baseline Provider and Legacy assets, canonicalize the complete ordered boundaries, recompute both approved digests, and then prove that name, order, full payload, kind, or visibility changes fail. A test that only compares two hard-coded constants is insufficient.
 
-`test_compiler.py` must additionally spy on the production `build_model_tool_catalog()` integration: it passes the complete ordered 25 Provider payloads to `verify_provider_boundary()` before returning, and an injected seal failure prevents a Catalog from being returned or published. Direct verifier tests alone are insufficient.
+`test_compiler.py` must additionally spy on the production `build_model_tool_catalog()` integration: it passes the complete ordered 25 Provider payloads to `verify_provider_boundary()` before returning, and an injected seal failure prevents a Catalog from being returned or published. It must prove that `ProviderToolContract.payload`/`parameters` never materialize mutable nested JSON, that every plain-JSON result comes from the single `materialize_provider_payloads()` operation and is detached from both the contract and other results, and that Catalog registry/order/validator/manifest replacement fails closed. Direct verifier tests alone are insufficient.
+
+Add an AST/source gate over `src/offerpilot` and the affected tests. Provider query nodes use a distinct recursively immutable internal type that the generic `materialize_json()` rejects; only the private decoder called by the one implementation of `materialize_provider_payloads()` can turn those nodes into ordinary JSON. The gate permits that one decoder call and the `ToolCatalog` delegating method, rejects access/import/alias of the private Provider decoder or snapshots anywhere else, and performs assignment-aware provenance tracking from every `.payload`/`.parameters` expression (including `tool.payload`, `spec.contract.payload`, comprehensions, and local aliases). A Provider-derived value may be inspected read-only or passed to the approved materializer, but may not reach `dict()`/`copy()`/`deepcopy()`/generic `materialize_json()`/JSON round-trip/custom mutable-tree construction. It also rejects copy-on-query compatibility mappings and public per-contract `materialize_payload()`/`materialize_parameters()`. Controlled validator cloning from an already precompiled schema remains allowed and is not a Provider-envelope materializer. The gate proves that the AI client and all Context Projector serialization paths call the approved materializer.
+
+Mutation tests must cross the actual downstream boundaries, not stop at a direct field assertion. A same-content Provider component replacement must fail before the AI Provider adapter can return an envelope, and Catalog order/registry/validator/authority-manifest/integrity-cache replacement must fail through Provider materialization and Pipeline prepare/execute probes with Repository/executor counters remaining zero. A replaced Manifest projection must fail before `to_dict()` returns it.
 
 - [ ] **Step 2: Verify RED**
 
 ```powershell
-uv run pytest tests/tool_metadata/test_manifest.py tests/tool_metadata/test_compiler.py tests/tool_metadata/test_protocol_seals.py tests/tool_metadata/test_presentation_bindings.py tests/agent_loop tests/tool_pipeline tests/tool_authority tests/pilot_runtime/test_confirmation.py tests/pilot_runtime/test_confirmation_cutover.py tests/test_chat_api.py tests/test_write_operations.py tests/test_write_operation_acceptance_matrix.py -q
+uv run pytest tests/tool_metadata/test_manifest.py tests/tool_metadata/test_compiler.py tests/tool_metadata/test_protocol_seals.py tests/tool_metadata/test_presentation_bindings.py tests/agent_loop tests/tool_pipeline tests/tool_authority tests/pilot_runtime/test_confirmation.py tests/pilot_runtime/test_confirmation_cutover.py tests/test_ai_client.py tests/test_litellm_client.py tests/test_context_projector.py tests/test_context_projector_source_gates.py tests/test_chat_api.py tests/test_write_operations.py tests/test_write_operation_acceptance_matrix.py -q
 ```
 
 - [ ] **Step 3: Atomically change ToolSpec and migrate all direct consumers**
@@ -458,7 +484,7 @@ Migrate all six domain modules and every direct consumer listed above in this sa
 
 Existing `MODEL_TOOL_NAMES`/`MODEL_TOOL_CATALOG` imports that have not yet moved to Bundle views may remain only until the final Runtime composition cutover in Task 11; they must be derived from the one newly compiled Catalog and must not augment or classify a tool. No placeholder Undo or presentation binding is permitted.
 
-Compile exactly 25 ordered specs. Copy/freeze complete Provider payloads, precompile copied schemas, and verify resolver descriptor object identity. `build_model_tool_catalog()` must pass the 25 complete ordered payloads to `verify_provider_boundary()` before publishing the production Typed Catalog; generic 1..N test catalogs do not use the production seal. Task 4 exposes and independently tests Legacy boundary verification, but the actual ordered Legacy Adapter Catalog is verified only inside the all-or-nothing Task 9 production Composition; Task 4 must not fabricate a Legacy name collection or publish a partial Bundle. The internal `transactional_write` enum must project to existing external `write` everywhere outside V1 metadata.
+Compile exactly 25 ordered specs. Copy/freeze complete Provider payloads, expose only recursively immutable `payload`/`parameters` query views, precompile copied schemas, and verify resolver descriptor object identity. There is exactly one deep-copy operation named `materialize_provider_payloads()`; the Catalog method delegates to it, and the AI Provider adapter, Context Projector, compatibility fingerprints, and tests that require ordinary JSON use that operation instead of `dict(contract.payload)`, generic `materialize_json()` on Provider views, per-contract public materializers, or copy-on-query compatibility mappings. Every materialization is fresh and detached. Seal the Provider component identities and complete Catalog topology so same-value `object.__setattr__` replacement or registry/order/validator/manifest/integrity-cache replacement fails closed before Provider, Repository, or executor. Seal `ToolMetadataManifestV1` projection identity and mechanically validate every nested Binding, editable-field, exact byte-budget, Undo enum/pair/version/builder/seed rule before returning a projection. `build_model_tool_catalog()` must pass the 25 complete ordered payloads to `verify_provider_boundary()` before publishing the production Typed Catalog; generic 1..N test catalogs do not use the production seal. Task 4's Manifest compiler may consume the single whole `approved_legacy_boundary_input()` protocol projection plus one immutable pre-publication internal Legacy Manifest policy value containing exactly the three chained policies and four source-to-ordinal route bindings fixed by the design. It must not derive, cache, or publish a separate Legacy name collection, create an Adapter, or publish a partial Bundle/View. The actual ordered Legacy Adapter Catalog and its callable/provenance seal remain unpublished through Tasks 7-8. Task 9 projects the complete Legacy Manifest section from the actual three adapters, actual chained-policy metadata, and actual initial-route registry; Composition requires byte/exact equality with Task 4's full pre-publication Legacy Manifest projection and also passes the external names/visibility/kind projection independently to `verify_legacy_boundary()` before publishing the production Bundle. The internal `transactional_write` enum must project to existing external `write` everywhere outside V1 metadata.
 
 - [ ] **Step 4: Migrate old tests instead of retaining compatibility exports**
 
@@ -471,9 +497,9 @@ Run `rg -n 'MODEL_TOOL_NAMES|MODEL_TOOL_CATALOG|ToolSpec\(|\.(kind|required_capa
 - [ ] **Step 5: Verify GREEN**
 
 ```powershell
-uv run pytest tests/tool_metadata tests/agent_loop tests/tool_pipeline tests/tool_authority tests/pilot_runtime/test_confirmation.py tests/pilot_runtime/test_confirmation_cutover.py tests/test_chat_api.py tests/test_write_operations.py tests/test_write_operation_acceptance_matrix.py -q
-uv run ruff check src/offerpilot/ai src/offerpilot/api.py src/offerpilot/context_projector/authority_surface.py src/offerpilot/pilot_runtime/service.py src/offerpilot/pilot_runtime/composition.py src/offerpilot/pilot_runtime/continuation.py tests/tool_metadata tests/agent_loop tests/tool_pipeline tests/tool_authority tests/pilot_runtime/test_confirmation.py tests/pilot_runtime/test_confirmation_cutover.py tests/test_chat_api.py tests/test_write_operations.py tests/test_write_operation_acceptance_matrix.py
-uv run mypy src/offerpilot/ai src/offerpilot/api.py src/offerpilot/context_projector/authority_surface.py src/offerpilot/pilot_runtime/service.py src/offerpilot/pilot_runtime/composition.py src/offerpilot/pilot_runtime/continuation.py
+uv run pytest tests/tool_metadata tests/agent_loop tests/tool_pipeline tests/tool_authority tests/pilot_runtime/test_confirmation.py tests/pilot_runtime/test_confirmation_cutover.py tests/test_ai_client.py tests/test_litellm_client.py tests/test_context_projector.py tests/test_context_projector_source_gates.py tests/test_chat_api.py tests/test_write_operations.py tests/test_write_operation_acceptance_matrix.py -q
+uv run ruff check src/offerpilot/ai src/offerpilot/api.py src/offerpilot/context_projector/authority_surface.py src/offerpilot/context_projector/gateway.py src/offerpilot/context_projector/projector.py src/offerpilot/context_projector/selector.py src/offerpilot/pilot_runtime/service.py src/offerpilot/pilot_runtime/composition.py src/offerpilot/pilot_runtime/continuation.py tests/tool_metadata tests/agent_loop tests/tool_pipeline tests/tool_authority tests/pilot_runtime/test_confirmation.py tests/pilot_runtime/test_confirmation_cutover.py tests/test_ai_client.py tests/test_litellm_client.py tests/test_context_projector.py tests/test_context_projector_source_gates.py tests/test_chat_api.py tests/test_write_operations.py tests/test_write_operation_acceptance_matrix.py
+uv run mypy src/offerpilot/ai src/offerpilot/api.py src/offerpilot/context_projector/authority_surface.py src/offerpilot/context_projector/gateway.py src/offerpilot/context_projector/projector.py src/offerpilot/context_projector/selector.py src/offerpilot/pilot_runtime/service.py src/offerpilot/pilot_runtime/composition.py src/offerpilot/pilot_runtime/continuation.py
 ```
 
 Expected: production Catalog imports and all direct `ToolSpec` consumers collect and pass with no compatibility property; Provider/Authority/Journal projections remain byte/canonical equivalent.
@@ -728,7 +754,7 @@ git commit -m "refactor: AI 收口 Legacy 确认恢复证明"
 
 - [ ] **Step 1: Write RED complete-Bundle and Selector tests**
 
-Prove one application Composition factory atomically creates and publishes the complete Bundle containing the compiled 25 Typed specs, static 3 Legacy adapters, 4 Compensation handlers, complete Operation Port, and all six narrow views together with the exact initial Registry/Port, preparation/proof Registries, issuer/consumer ports, verifier port, and Legacy Catalog. Prove initialization failure publishes no Runtime or subcomponent. Spy on the production Legacy seal integration and prove it consumes the projection from the actual three ordered Adapter objects; an injected seal failure publishes no Runtime, Bundle, Catalog, Registry, or Port. Every issuer, proof, Catalog, route handle, Compensation handler, and view must carry the same final Bundle/Catalog provenance; no pre-Bundle identity may escape.
+Prove one application Composition factory atomically creates and publishes the complete Bundle containing the compiled 25 Typed specs, static 3 Legacy adapters, 4 Compensation handlers, complete Operation Port, and all six narrow views together with the exact initial Registry/Port, preparation/proof Registries, issuer/consumer ports, verifier port, and Legacy Catalog. Prove initialization failure publishes no Runtime or subcomponent. Spy on the production Legacy seal integration and prove it consumes the projection from the actual three ordered Adapter objects; an injected seal failure publishes no Runtime, Bundle, Catalog, Registry, or Port. Independently project the complete Legacy Manifest section from those actual adapters, their actual chained-policy metadata, and the actual source-bound initial-route registry, then require exact equality with the Task 4 pre-publication Legacy Manifest projection; mutate each policy and route source/ordinal independently and prove publication remains atomic. Every issuer, proof, Catalog, route handle, Compensation handler, and view must carry the same final Bundle/Catalog provenance; no pre-Bundle identity may escape.
 
 Update the component-factory AST ownership tests: exactly the approved final Composition factory may call them. API, `deterministic.py`, service, continuation, Repository, and every other Runtime builder must receive injected capabilities and may not construct/publish a second instance.
 
@@ -762,7 +788,7 @@ uv run pytest tests/tool_metadata/test_production_bundle.py tests/tool_metadata/
 
 `build_pilot_runtime()` invokes the initial-route, proof, Compensation, and Typed component factories inside one non-publishing assembly scope, binds their opaque registries to the final Bundle/Catalog tokens, validates the complete graph, and only then publishes one Runtime. Provider builder consumes only `ProviderToolMetadataView`; Projector and Agent Loop receive Discovery and Authority views from that same Bundle. Migrate `SegmentSurfaceGate` and every Agent Loop Selector call to `ToolSelectionResult` in this task; no old-signature façade remains. Remove Selector-local domain/dependency/name maps and `DEPENDENCY_POLICY_V1` runtime imports. Update Manifest validation to compare against the injected Provider view rather than `MODEL_TOOL_NAMES`.
 
-Before publication, Composition must pass the exact ordered names, `LegacyBoundaryVisibility.FORBIDDEN`, and `legacy_deterministic` adapter kind projected from the actual three Adapter objects to `verify_legacy_boundary()`. It must not verify a fixture, a separately maintained name tuple, or a Typed Catalog projection.
+Before publication, Composition must pass the exact ordered names, `LegacyBoundaryVisibility.FORBIDDEN`, and `legacy_deterministic` adapter kind projected from the actual three Adapter objects to `verify_legacy_boundary()`. It must separately compare the full actual Legacy Manifest projection—including the three chained policies and four source-to-ordinal initial-route bindings—with the immutable Task 4 pre-publication policy. It must not verify a fixture, a separately maintained name tuple, or a Typed Catalog projection.
 
 Fallback within one `model_call_id` reuses the same frozen Provider surface. An unexposed tool remains fail-closed before Dispatcher. Tool visibility does not replace Pipeline authorization.
 

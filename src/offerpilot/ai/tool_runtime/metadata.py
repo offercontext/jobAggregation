@@ -10,7 +10,16 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields, is_dataclass
 from threading import RLock
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Literal, NoReturn, SupportsIndex, TypeAlias, cast, overload
+from typing import (
+    TYPE_CHECKING,
+    Literal,
+    NoReturn,
+    Protocol,
+    SupportsIndex,
+    TypeAlias,
+    cast,
+    overload,
+)
 
 from offerpilot.ai.tool_runtime.contracts import (
     BindingContract,
@@ -31,6 +40,7 @@ from offerpilot.ai.tool_runtime.policy_types import (
 
 if TYPE_CHECKING:
     from offerpilot.ai.tool_runtime.catalog import (
+        SegmentToolSpecHandle,
         SegmentToolCatalogLease,
         ToolCatalog,
         ToolMetadataManifestV1,
@@ -2144,6 +2154,992 @@ class ToolPresentationBindingV1(TransientToolRuntimeValue):
             raise ValueError("presentation implementation identity seal mismatch")
 
 
+@dataclass(frozen=True, slots=True)
+class OperationRouteEntryV1:
+    """Closed primitive projection used by Ledger/operation routing."""
+
+    ordinal: int
+    operation_name: str
+    operation_role: Literal["primary", "compensation"]
+    adapter_kind: Literal["typed", "legacy_deterministic", "compensation"]
+    operation_kind: Literal["read", "transactional_write"]
+    result_contract: str | None
+    undo_policy: str | None
+
+    def __post_init__(self) -> None:
+        _require_positive_ordinal(self.ordinal, "operation route ordinal")
+        _require_static_text(self.operation_name, "operation route name")
+        if self.operation_role not in {"primary", "compensation"}:
+            raise ValueError("operation route role is invalid")
+        if self.adapter_kind not in {
+            "typed",
+            "legacy_deterministic",
+            "compensation",
+        }:
+            raise ValueError("operation route adapter kind is invalid")
+        if self.operation_kind not in {"read", "transactional_write"}:
+            raise ValueError("operation route kind is invalid")
+        if self.result_contract is not None:
+            _require_static_text(self.result_contract, "operation result contract")
+        if self.undo_policy is not None:
+            _require_static_text(self.undo_policy, "operation Undo policy")
+
+
+@dataclass(frozen=True, slots=True)
+class RequiredUndoRouteEntryV1:
+    """One required primary Undo binding projected from the Typed view."""
+
+    primary_tool: str
+    undo_payload_kind: str
+    compensation_kind: str
+    undo_contract_version: str
+    undo_builder_id: str
+    undo_seed_phase: str
+
+    def __post_init__(self) -> None:
+        for value, field_name in (
+            (self.primary_tool, "required Undo primary tool"),
+            (self.undo_payload_kind, "required Undo payload kind"),
+            (self.compensation_kind, "required Undo compensation kind"),
+            (self.undo_contract_version, "required Undo contract version"),
+            (self.undo_builder_id, "required Undo builder id"),
+            (self.undo_seed_phase, "required Undo seed phase"),
+        ):
+            _require_static_text(value, field_name)
+
+
+@dataclass(frozen=True, slots=True)
+class OperationRouteIdentityV1:
+    """Bounded locked identity for one primary operation route."""
+
+    operation_id: str
+    tool_call_id: str
+    revision: int
+    arguments_digest: str
+
+    def __post_init__(self) -> None:
+        _require_static_text(self.operation_id, "operation route id")
+        _require_static_text(self.tool_call_id, "operation tool call id")
+        if type(self.revision) is not int or self.revision < 0:
+            raise ValueError("operation route revision must be a non-negative integer")
+        _require_sha256_fingerprint(self.arguments_digest, "operation arguments digest")
+
+
+@dataclass(frozen=True, slots=True)
+class CommittedPrimaryOperationIdentityV1:
+    """Primitive identity read from one trusted committed primary Ledger row."""
+
+    operation_id: str
+    primary_tool: str
+    operation_role: Literal["primary"]
+    adapter_kind: Literal["typed"]
+    status: Literal["committed"]
+    terminal_payload_digest: str
+
+    def __post_init__(self) -> None:
+        _require_static_text(self.operation_id, "committed primary operation id")
+        _require_static_text(self.primary_tool, "committed primary tool")
+        if self.operation_role != "primary":
+            raise ValueError("compensation parent must be a primary operation")
+        if self.adapter_kind != "typed":
+            raise ValueError("required Undo parent must be a Typed operation")
+        if self.status != "committed":
+            raise ValueError("compensation parent must be committed")
+        _require_sha256_fingerprint(
+            self.terminal_payload_digest,
+            "parent terminal payload digest",
+        )
+
+
+_OPERATION_HANDLE_CONSTRUCTION_SEAL = object()
+
+
+class _OperationHandleLifecycle:
+    __slots__ = ("active", "lock")
+
+    def __init__(self) -> None:
+        self.active = True
+        self.lock = RLock()
+
+
+class _OperationHandle(TransientToolRuntimeValue):
+    _port_token: object
+    _handle_token: object
+    _lifecycle: _OperationHandleLifecycle
+    _integrity_seal: tuple[object, object, object]
+
+    __slots__ = ("_port_token", "_handle_token", "_lifecycle", "_integrity_seal")
+
+    def __new__(
+        cls,
+        seal: object | None = None,
+        **kwargs: object,
+    ) -> "_OperationHandle":
+        del kwargs
+        if seal is not _OPERATION_HANDLE_CONSTRUCTION_SEAL:
+            raise TypeError("operation handles are Port-created")
+        return object.__new__(cls)
+
+    def __init__(
+        self,
+        seal: object | None = None,
+        *,
+        port_token: object,
+        handle_token: object,
+    ) -> None:
+        if seal is not _OPERATION_HANDLE_CONSTRUCTION_SEAL:
+            raise TypeError("operation handles are Port-created")
+        lifecycle = _OperationHandleLifecycle()
+        object.__setattr__(self, "_port_token", port_token)
+        object.__setattr__(self, "_handle_token", handle_token)
+        object.__setattr__(self, "_lifecycle", lifecycle)
+        object.__setattr__(
+            self,
+            "_integrity_seal",
+            (port_token, handle_token, lifecycle),
+        )
+
+    def __setattr__(self, name: str, value: object) -> NoReturn:
+        del name, value
+        raise AttributeError("operation handle components are sealed")
+
+    def _ensure_integrity(self) -> None:
+        self._require_port_provenance(self._port_token)
+        with self._lifecycle.lock:
+            if self._lifecycle.active is not True:
+                raise ValueError("operation handle is revoked")
+
+    def _require_port_provenance(self, port_token: object) -> None:
+        if (
+            type(self._integrity_seal) is not tuple
+            or len(self._integrity_seal) != 3
+            or self._integrity_seal[0] is not self._port_token
+            or self._integrity_seal[1] is not self._handle_token
+            or self._integrity_seal[2] is not self._lifecycle
+            or type(self._lifecycle) is not _OperationHandleLifecycle
+        ):
+            raise ValueError("operation handle integrity drift")
+        if port_token is not self._port_token:
+            raise ValueError("operation handle has the wrong Port provenance")
+
+    def _revoke(self, port_token: object) -> None:
+        self._require_port_provenance(port_token)
+        with self._lifecycle.lock:
+            self._lifecycle.active = False
+
+
+class TypedWriteHandle(_OperationHandle):
+    """Opaque exact route for one live Typed write claim."""
+
+    __slots__ = ()
+
+
+class LegacyWriteHandle(_OperationHandle):
+    """Opaque exact route derived from one trusted Legacy route handle."""
+
+    __slots__ = ()
+
+
+class CompensationHandle(_OperationHandle):
+    """Opaque exact route from a committed parent to one handler binding."""
+
+    __slots__ = ("_registry_token", "_handler_handle", "_registry_integrity_seal")
+    _registry_token: object
+    _handler_handle: object
+    _registry_integrity_seal: tuple[object, object]
+
+    def __init__(
+        self,
+        seal: object | None = None,
+        *,
+        port_token: object,
+        handle_token: object,
+        registry_token: object,
+        handler_handle: object,
+    ) -> None:
+        super().__init__(
+            seal,
+            port_token=port_token,
+            handle_token=handle_token,
+        )
+        object.__setattr__(self, "_registry_token", registry_token)
+        object.__setattr__(self, "_handler_handle", handler_handle)
+        object.__setattr__(
+            self,
+            "_registry_integrity_seal",
+            (registry_token, handler_handle),
+        )
+
+    def _require_registry(self, registry_token: object) -> tuple[object, object]:
+        self._ensure_integrity()
+        if self._registry_integrity_seal != (
+            self._registry_token,
+            self._handler_handle,
+        ):
+            raise ValueError("Compensation handle integrity drift")
+        if registry_token is not self._registry_token:
+            raise ValueError("Compensation handle has the wrong Registry provenance")
+        return self._port_token, self._handler_handle
+
+
+class _OperationPortState:
+    __slots__ = ("lock", "typed", "legacy", "compensation")
+
+    def __init__(self) -> None:
+        self.lock = RLock()
+        self.typed: dict[
+            int,
+            tuple[
+                TypedWriteHandle,
+                SegmentToolCatalogLease,
+                SegmentToolSpecHandle,
+                OperationRouteIdentityV1,
+                tuple[object, ...],
+                object,
+                OperationRouteEntryV1,
+            ],
+        ] = {}
+        self.legacy: dict[
+            int,
+            tuple[
+                LegacyWriteHandle,
+                object,
+                OperationRouteIdentityV1,
+                tuple[object, ...],
+                OperationRouteEntryV1,
+            ],
+        ] = {}
+        self.compensation: dict[
+            int,
+            tuple[
+                CompensationHandle,
+                CommittedPrimaryOperationIdentityV1,
+                tuple[object, ...],
+                object,
+                OperationRouteEntryV1,
+            ],
+        ] = {}
+
+
+def _operation_route_snapshot(value: OperationRouteEntryV1) -> tuple[object, ...]:
+    return (
+        value.ordinal,
+        value.operation_name,
+        value.operation_role,
+        value.adapter_kind,
+        value.operation_kind,
+        value.result_contract,
+        value.undo_policy,
+    )
+
+
+def _required_undo_snapshot(value: RequiredUndoRouteEntryV1) -> tuple[object, ...]:
+    return (
+        value.primary_tool,
+        value.undo_payload_kind,
+        value.compensation_kind,
+        value.undo_contract_version,
+        value.undo_builder_id,
+        value.undo_seed_phase,
+    )
+
+
+def _operation_identity_snapshot(value: OperationRouteIdentityV1) -> tuple[object, ...]:
+    return (
+        value.operation_id,
+        value.tool_call_id,
+        value.revision,
+        value.arguments_digest,
+    )
+
+
+def _committed_parent_snapshot(
+    value: CommittedPrimaryOperationIdentityV1,
+) -> tuple[object, ...]:
+    return (
+        value.operation_id,
+        value.primary_tool,
+        value.operation_role,
+        value.adapter_kind,
+        value.status,
+        value.terminal_payload_digest,
+    )
+
+
+class _CompensationRegistryPort(Protocol):
+    bundle_instance_token: BundleInstanceToken
+    compensation_view: CompensationMetadataView
+    registry_token: object
+
+    def require_handler_handle(self, handle: object) -> CompensationHandlerBindingV1: ...
+
+    def bind_operation_port(self, port: object, port_token: object) -> None: ...
+
+    def require_operation_port(self, port_token: object) -> None: ...
+
+
+class _LegacyRouteIssuerPort(Protocol):
+    bundle_instance_token: BundleInstanceToken
+    registry_token: object
+
+    def require_route(self, route_handle: object) -> LegacyAdapterBindingV1: ...
+
+
+class ToolOperationMetadataPort(TransientToolRuntimeValue):
+    """Narrow immutable operation classifier and exact route-handle issuer."""
+
+    __slots__ = (
+        "_operation_view",
+        "_legacy_boundary",
+        "_compensation_view",
+        "_compensation_registry",
+        "_legacy_route_issuer_port",
+        "_bundle_instance_token",
+        "_compensation_registry_token",
+        "_legacy_route_registry_token",
+        "_typed_primary_entries",
+        "_legacy_primary_entries",
+        "_compensation_entries",
+        "_required_undo_entries",
+        "_typed_by_operation_id",
+        "_legacy_by_binding_id",
+        "_compensation_by_binding_id",
+        "_required_by_handler_binding_id",
+        "_port_token",
+        "_state",
+        "_integrity_seal",
+    )
+    _operation_view: ToolOperationMetadataView
+    _legacy_boundary: LegacyDeterministicBoundaryV1
+    _compensation_view: CompensationMetadataView
+    _compensation_registry: _CompensationRegistryPort
+    _legacy_route_issuer_port: _LegacyRouteIssuerPort
+    _bundle_instance_token: BundleInstanceToken
+    _compensation_registry_token: object
+    _legacy_route_registry_token: object
+    _typed_primary_entries: tuple[OperationRouteEntryV1, ...]
+    _legacy_primary_entries: tuple[OperationRouteEntryV1, ...]
+    _compensation_entries: tuple[OperationRouteEntryV1, ...]
+    _required_undo_entries: tuple[RequiredUndoRouteEntryV1, ...]
+    _typed_by_operation_id: Mapping[int, OperationRouteEntryV1]
+    _legacy_by_binding_id: Mapping[int, OperationRouteEntryV1]
+    _compensation_by_binding_id: Mapping[int, OperationRouteEntryV1]
+    _required_by_handler_binding_id: Mapping[int, RequiredUndoRouteEntryV1]
+    _port_token: object
+    _state: _OperationPortState
+    _integrity_seal: tuple[object, ...]
+
+    def __init__(
+        self,
+        *,
+        operation_view: ToolOperationMetadataView,
+        legacy_boundary: LegacyDeterministicBoundaryV1,
+        compensation_view: CompensationMetadataView,
+        compensation_registry: object,
+        legacy_route_issuer_port: object,
+    ) -> None:
+        if hasattr(self, "_integrity_seal"):
+            raise TypeError("ToolOperationMetadataPort is already initialized")
+        if type(operation_view) is not ToolOperationMetadataView:
+            raise TypeError("Operation Port requires the exact Operation view")
+        if type(legacy_boundary) is not LegacyDeterministicBoundaryV1:
+            raise TypeError("Operation Port requires the exact Legacy boundary")
+        if type(compensation_view) is not CompensationMetadataView:
+            raise TypeError("Operation Port requires the exact Compensation view")
+        bundle_token = operation_view.bundle_instance_token
+        if (
+            legacy_boundary.bundle_instance_token is not bundle_token
+            or compensation_view.bundle_instance_token is not bundle_token
+        ):
+            raise ValueError("Operation Port views must share one Bundle provenance")
+
+        registry_bundle_token = getattr(
+            compensation_registry,
+            "bundle_instance_token",
+            None,
+        )
+        registry_view = getattr(compensation_registry, "compensation_view", None)
+        registry_token = getattr(compensation_registry, "registry_token", None)
+        require_handler = getattr(
+            compensation_registry,
+            "require_handler_handle",
+            None,
+        )
+        bind_operation_port = getattr(
+            compensation_registry,
+            "bind_operation_port",
+            None,
+        )
+        if (
+            registry_bundle_token is not bundle_token
+            or registry_view is not compensation_view
+            or registry_token is None
+            or not callable(require_handler)
+            or not callable(bind_operation_port)
+        ):
+            raise TypeError("Operation Port requires an exact bound Compensation Registry")
+
+        legacy_bundle_token = getattr(
+            legacy_route_issuer_port,
+            "bundle_instance_token",
+            None,
+        )
+        legacy_registry_token = getattr(
+            legacy_route_issuer_port,
+            "registry_token",
+            None,
+        )
+        require_legacy_route = getattr(
+            legacy_route_issuer_port,
+            "require_route",
+            None,
+        )
+        if (
+            legacy_bundle_token is not bundle_token
+            or legacy_registry_token is None
+            or not callable(require_legacy_route)
+        ):
+            raise TypeError("Operation Port requires an exact Legacy route issuer Port")
+
+        typed_entries: list[OperationRouteEntryV1] = []
+        typed_operation_routes: list[tuple[object, OperationRouteEntryV1]] = []
+        required_entries: list[RequiredUndoRouteEntryV1] = []
+        for entry in operation_view.entries.values():
+            operation = entry.operation
+            if type(operation) is ReadOperationMetadataV1:
+                route = OperationRouteEntryV1(
+                    ordinal=entry.ordinal,
+                    operation_name=entry.provider_name,
+                    operation_role="primary",
+                    adapter_kind="typed",
+                    operation_kind=operation.kind.value,
+                    result_contract=None,
+                    undo_policy=None,
+                )
+            elif type(operation) is WriteOperationMetadataV1:
+                route = OperationRouteEntryV1(
+                    ordinal=entry.ordinal,
+                    operation_name=entry.provider_name,
+                    operation_role="primary",
+                    adapter_kind=operation.adapter_kind,
+                    operation_kind=operation.kind.value,
+                    result_contract=operation.result_contract,
+                    undo_policy=operation.undo_policy.value,
+                )
+                if operation.undo_policy is UndoPolicy.REQUIRED:
+                    if (
+                        operation.undo_payload_kind is None
+                        or operation.compensation_kind is None
+                        or operation.undo_contract_version is None
+                        or operation.undo_builder_id is None
+                        or operation.undo_seed_phase is None
+                    ):
+                        raise ValueError("required Undo metadata is incomplete")
+                    required_entries.append(
+                        RequiredUndoRouteEntryV1(
+                            primary_tool=entry.provider_name,
+                            undo_payload_kind=operation.undo_payload_kind.value,
+                            compensation_kind=operation.compensation_kind.value,
+                            undo_contract_version=operation.undo_contract_version,
+                            undo_builder_id=operation.undo_builder_id,
+                            undo_seed_phase=operation.undo_seed_phase,
+                        )
+                    )
+            else:
+                raise TypeError("Operation view contains an unknown union member")
+            typed_entries.append(route)
+            typed_operation_routes.append((operation, route))
+
+        legacy_entries = tuple(
+            OperationRouteEntryV1(
+                ordinal=binding.ordinal,
+                operation_name=binding.name,
+                operation_role="primary",
+                adapter_kind=binding.adapter_kind,
+                operation_kind="transactional_write",
+                result_contract="legacy_string_v1",
+                undo_policy="none",
+            )
+            for binding in legacy_boundary.ordered_adapter_bindings
+        )
+        compensation_entries = tuple(
+            OperationRouteEntryV1(
+                ordinal=binding.ordinal,
+                operation_name=binding.compensation_kind,
+                operation_role="compensation",
+                adapter_kind="compensation",
+                operation_kind="transactional_write",
+                result_contract="compensation_json_v1",
+                undo_policy="none",
+            )
+            for binding in compensation_view.ordered_handler_bindings
+        )
+        if len(required_entries) != len(compensation_entries):
+            raise ValueError("required Undo bindings do not match Compensation handlers")
+        required_handler_pairs: list[
+            tuple[CompensationHandlerBindingV1, RequiredUndoRouteEntryV1]
+        ] = []
+        for binding in compensation_view.ordered_handler_bindings:
+            matches = tuple(
+                required
+                for required in required_entries
+                if required.compensation_kind == binding.compensation_kind
+            )
+            if len(matches) != 1:
+                raise ValueError("required Undo bindings do not match Compensation handlers")
+            required_handler_pairs.append((binding, matches[0]))
+
+        port_token = object()
+        state = _OperationPortState()
+        typed_tuple = tuple(typed_entries)
+        required_tuple = tuple(required_entries)
+        typed_by_operation_id = MappingProxyType(
+            {id(operation): route for operation, route in typed_operation_routes}
+        )
+        legacy_by_binding_id = MappingProxyType(
+            {
+                id(binding): route
+                for binding, route in zip(
+                    legacy_boundary.ordered_adapter_bindings,
+                    legacy_entries,
+                )
+            }
+        )
+        compensation_by_binding_id = MappingProxyType(
+            {
+                id(binding): route
+                for binding, route in zip(
+                    compensation_view.ordered_handler_bindings,
+                    compensation_entries,
+                )
+            }
+        )
+        required_by_handler_binding_id = MappingProxyType(
+            {id(binding): required for binding, required in required_handler_pairs}
+        )
+
+        object.__setattr__(self, "_operation_view", operation_view)
+        object.__setattr__(self, "_legacy_boundary", legacy_boundary)
+        object.__setattr__(self, "_compensation_view", compensation_view)
+        object.__setattr__(
+            self,
+            "_compensation_registry",
+            cast(_CompensationRegistryPort, compensation_registry),
+        )
+        object.__setattr__(
+            self,
+            "_legacy_route_issuer_port",
+            cast(_LegacyRouteIssuerPort, legacy_route_issuer_port),
+        )
+        object.__setattr__(self, "_bundle_instance_token", bundle_token)
+        object.__setattr__(self, "_compensation_registry_token", registry_token)
+        object.__setattr__(self, "_legacy_route_registry_token", legacy_registry_token)
+        object.__setattr__(self, "_typed_primary_entries", typed_tuple)
+        object.__setattr__(self, "_legacy_primary_entries", legacy_entries)
+        object.__setattr__(self, "_compensation_entries", compensation_entries)
+        object.__setattr__(self, "_required_undo_entries", required_tuple)
+        object.__setattr__(self, "_typed_by_operation_id", typed_by_operation_id)
+        object.__setattr__(self, "_legacy_by_binding_id", legacy_by_binding_id)
+        object.__setattr__(self, "_compensation_by_binding_id", compensation_by_binding_id)
+        object.__setattr__(
+            self,
+            "_required_by_handler_binding_id",
+            required_by_handler_binding_id,
+        )
+        object.__setattr__(self, "_port_token", port_token)
+        object.__setattr__(self, "_state", state)
+        object.__setattr__(
+            self,
+            "_integrity_seal",
+            (
+                id(operation_view),
+                id(legacy_boundary),
+                id(compensation_view),
+                id(compensation_registry),
+                id(legacy_route_issuer_port),
+                id(bundle_token),
+                id(registry_token),
+                id(legacy_registry_token),
+                tuple(_operation_route_snapshot(entry) for entry in typed_tuple),
+                tuple(_operation_route_snapshot(entry) for entry in legacy_entries),
+                tuple(_operation_route_snapshot(entry) for entry in compensation_entries),
+                tuple(_required_undo_snapshot(entry) for entry in required_tuple),
+                id(typed_by_operation_id),
+                id(legacy_by_binding_id),
+                id(compensation_by_binding_id),
+                id(required_by_handler_binding_id),
+                id(port_token),
+                id(state),
+            ),
+        )
+        bind_operation_port(self, port_token)
+
+    def __setattr__(self, name: str, value: object) -> NoReturn:
+        del name, value
+        raise AttributeError("ToolOperationMetadataPort components are sealed")
+
+    def _ensure_integrity(self) -> None:
+        try:
+            if (
+                self._operation_view.bundle_instance_token is not self._bundle_instance_token
+                or self._legacy_boundary.bundle_instance_token is not self._bundle_instance_token
+                or self._compensation_view.bundle_instance_token is not self._bundle_instance_token
+                or getattr(self._compensation_registry, "bundle_instance_token", None)
+                is not self._bundle_instance_token
+                or getattr(self._compensation_registry, "compensation_view", None)
+                is not self._compensation_view
+                or getattr(self._compensation_registry, "registry_token", None)
+                is not self._compensation_registry_token
+                or getattr(self._legacy_route_issuer_port, "bundle_instance_token", None)
+                is not self._bundle_instance_token
+                or getattr(self._legacy_route_issuer_port, "registry_token", None)
+                is not self._legacy_route_registry_token
+            ):
+                raise ValueError("Operation Port provenance drift")
+            self._compensation_registry.require_operation_port(self._port_token)
+            current = (
+                id(self._operation_view),
+                id(self._legacy_boundary),
+                id(self._compensation_view),
+                id(self._compensation_registry),
+                id(self._legacy_route_issuer_port),
+                id(self._bundle_instance_token),
+                id(self._compensation_registry_token),
+                id(self._legacy_route_registry_token),
+                tuple(_operation_route_snapshot(entry) for entry in self._typed_primary_entries),
+                tuple(_operation_route_snapshot(entry) for entry in self._legacy_primary_entries),
+                tuple(_operation_route_snapshot(entry) for entry in self._compensation_entries),
+                tuple(_required_undo_snapshot(entry) for entry in self._required_undo_entries),
+                id(self._typed_by_operation_id),
+                id(self._legacy_by_binding_id),
+                id(self._compensation_by_binding_id),
+                id(self._required_by_handler_binding_id),
+                id(self._port_token),
+                id(self._state),
+            )
+            if current != self._integrity_seal:
+                raise ValueError("Operation Port integrity drift")
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("Operation Port integrity drift") from exc
+
+    @property
+    def bundle_instance_token(self) -> BundleInstanceToken:
+        self._ensure_integrity()
+        return self._bundle_instance_token
+
+    @property
+    def compensation_registry_token(self) -> object:
+        self._ensure_integrity()
+        return self._compensation_registry_token
+
+    @property
+    def legacy_route_registry_token(self) -> object:
+        self._ensure_integrity()
+        return self._legacy_route_registry_token
+
+    @property
+    def typed_primary_entries(self) -> tuple[OperationRouteEntryV1, ...]:
+        self._ensure_integrity()
+        return self._typed_primary_entries
+
+    @property
+    def legacy_primary_entries(self) -> tuple[OperationRouteEntryV1, ...]:
+        self._ensure_integrity()
+        return self._legacy_primary_entries
+
+    @property
+    def compensation_entries(self) -> tuple[OperationRouteEntryV1, ...]:
+        self._ensure_integrity()
+        return self._compensation_entries
+
+    @property
+    def required_undo_entries(self) -> tuple[RequiredUndoRouteEntryV1, ...]:
+        self._ensure_integrity()
+        return self._required_undo_entries
+
+    def bind_typed_write(
+        self,
+        lease: object,
+        spec_handle: object,
+        identity: OperationRouteIdentityV1,
+        live_claim_token: object,
+    ) -> TypedWriteHandle:
+        from offerpilot.ai.tool_runtime.catalog import (
+            SegmentToolCatalogLease,
+            SegmentToolSpecHandle,
+        )
+
+        self._ensure_integrity()
+        if type(lease) is not SegmentToolCatalogLease:
+            raise TypeError("Typed operation route requires an exact Segment lease")
+        if type(spec_handle) is not SegmentToolSpecHandle:
+            raise TypeError("Typed operation route requires an exact Segment handle")
+        if type(identity) is not OperationRouteIdentityV1:
+            raise TypeError("Typed operation route requires an exact locked identity")
+        identity.__post_init__()
+        if live_claim_token is None:
+            raise TypeError("Typed operation route requires a live claim token")
+        try:
+            if lease.bundle_instance_token is not self._bundle_instance_token:
+                raise ValueError("Typed operation route has the wrong Bundle provenance")
+            spec = lease.require_spec(spec_handle)
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            raise ValueError("Typed operation route has invalid Segment provenance") from exc
+        operation = spec.metadata.operation
+        route = self._typed_by_operation_id.get(id(operation))
+        if (
+            route is None
+            or route.result_contract != "typed_json_v1"
+            or type(operation) is not WriteOperationMetadataV1
+        ):
+            raise ValueError("Typed operation route is not a transactional write")
+        handle_token = object()
+        handle = TypedWriteHandle(
+            _OPERATION_HANDLE_CONSTRUCTION_SEAL,
+            port_token=self._port_token,
+            handle_token=handle_token,
+        )
+        with self._state.lock:
+            self._state.typed[id(handle)] = (
+                handle,
+                lease,
+                spec_handle,
+                identity,
+                _operation_identity_snapshot(identity),
+                live_claim_token,
+                route,
+            )
+        return handle
+
+    def require_typed_write(
+        self,
+        handle: object,
+        identity: OperationRouteIdentityV1,
+        live_claim_token: object,
+    ) -> OperationRouteEntryV1:
+        self._ensure_integrity()
+        if type(handle) is not TypedWriteHandle:
+            raise TypeError("Typed operation handle has the wrong type")
+        handle._ensure_integrity()
+        with self._state.lock:
+            issued = self._state.typed.get(id(handle))
+            if issued is None or issued[0] is not handle:
+                raise ValueError("Typed operation handle was not issued by this Port")
+            (
+                _,
+                lease,
+                spec_handle,
+                expected_identity,
+                identity_snapshot,
+                expected_claim,
+                route,
+            ) = issued
+            if type(identity) is not OperationRouteIdentityV1:
+                raise TypeError("Typed operation route requires an exact locked identity")
+            identity.__post_init__()
+            if (
+                identity is not expected_identity
+                or _operation_identity_snapshot(identity) != identity_snapshot
+                or live_claim_token is not expected_claim
+            ):
+                raise ValueError("Typed operation handle identity mismatch")
+            try:
+                from offerpilot.ai.tool_runtime.catalog import SegmentToolCatalogLease
+
+                if type(lease) is not SegmentToolCatalogLease:
+                    raise TypeError("invalid Segment lease")
+                lease.require_spec(spec_handle)
+            except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                raise ValueError("Typed operation handle is revoked") from exc
+            return route
+
+    def bind_legacy(
+        self,
+        route_handle: object,
+        identity: OperationRouteIdentityV1,
+    ) -> LegacyWriteHandle:
+        self._ensure_integrity()
+        if type(identity) is not OperationRouteIdentityV1:
+            raise TypeError("Legacy operation route requires an exact locked identity")
+        identity.__post_init__()
+        try:
+            binding = self._legacy_route_issuer_port.require_route(route_handle)
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            raise ValueError("Legacy route provenance is invalid") from exc
+        if type(binding) is not LegacyAdapterBindingV1:
+            raise TypeError("Legacy route issuer returned an invalid binding")
+        route = self._legacy_by_binding_id.get(id(binding))
+        if route is None or all(
+            candidate is not binding for candidate in self._legacy_boundary.ordered_adapter_bindings
+        ):
+            raise ValueError("Legacy route binding is outside this Bundle")
+        handle_token = object()
+        handle = LegacyWriteHandle(
+            _OPERATION_HANDLE_CONSTRUCTION_SEAL,
+            port_token=self._port_token,
+            handle_token=handle_token,
+        )
+        with self._state.lock:
+            self._state.legacy[id(handle)] = (
+                handle,
+                route_handle,
+                identity,
+                _operation_identity_snapshot(identity),
+                route,
+            )
+        return handle
+
+    def require_legacy(
+        self,
+        handle: object,
+        identity: OperationRouteIdentityV1,
+    ) -> OperationRouteEntryV1:
+        self._ensure_integrity()
+        if type(handle) is not LegacyWriteHandle:
+            raise TypeError("Legacy operation handle has the wrong type")
+        handle._ensure_integrity()
+        with self._state.lock:
+            issued = self._state.legacy.get(id(handle))
+            if issued is None or issued[0] is not handle:
+                raise ValueError("Legacy operation handle was not issued by this Port")
+            _, route_handle, expected_identity, identity_snapshot, route = issued
+            if type(identity) is not OperationRouteIdentityV1:
+                raise TypeError("Legacy operation route requires an exact locked identity")
+            identity.__post_init__()
+            if (
+                identity is not expected_identity
+                or _operation_identity_snapshot(identity) != identity_snapshot
+            ):
+                raise ValueError("Legacy operation handle identity mismatch")
+            try:
+                binding = self._legacy_route_issuer_port.require_route(route_handle)
+            except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                raise ValueError("Legacy operation route is revoked") from exc
+            expected_route = self._legacy_by_binding_id.get(id(binding))
+            if expected_route is not route:
+                raise ValueError("Legacy operation route binding drift")
+            return route
+
+    def bind_compensation(
+        self,
+        parent: CommittedPrimaryOperationIdentityV1,
+        handler_handle: object,
+    ) -> CompensationHandle:
+        self._ensure_integrity()
+        if type(parent) is not CommittedPrimaryOperationIdentityV1:
+            raise TypeError("Compensation route requires an exact committed parent identity")
+        parent.__post_init__()
+        try:
+            binding = self._compensation_registry.require_handler_handle(handler_handle)
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            raise ValueError("Compensation handler provenance is invalid") from exc
+        if type(binding) is not CompensationHandlerBindingV1:
+            raise TypeError("Compensation Registry returned an invalid binding")
+        route = self._compensation_by_binding_id.get(id(binding))
+        if route is None or all(
+            candidate is not binding
+            for candidate in self._compensation_view.ordered_handler_bindings
+        ):
+            raise ValueError("Compensation handler is outside this Bundle")
+        required = self._required_by_handler_binding_id.get(id(binding))
+        if required is None or required.primary_tool != parent.primary_tool:
+            raise ValueError("Compensation handler does not match its committed parent")
+        handle_token = object()
+        handle = CompensationHandle(
+            _OPERATION_HANDLE_CONSTRUCTION_SEAL,
+            port_token=self._port_token,
+            handle_token=handle_token,
+            registry_token=self._compensation_registry_token,
+            handler_handle=handler_handle,
+        )
+        with self._state.lock:
+            self._state.compensation[id(handle)] = (
+                handle,
+                parent,
+                _committed_parent_snapshot(parent),
+                handler_handle,
+                route,
+            )
+        return handle
+
+    def require_compensation(
+        self,
+        handle: object,
+        parent: CommittedPrimaryOperationIdentityV1,
+        handler_handle: object,
+    ) -> OperationRouteEntryV1:
+        self._ensure_integrity()
+        if type(handle) is not CompensationHandle:
+            raise TypeError("Compensation operation handle has the wrong type")
+        handle._ensure_integrity()
+        with self._state.lock:
+            issued = self._state.compensation.get(id(handle))
+            if issued is None or issued[0] is not handle:
+                raise ValueError("Compensation handle was not issued by this Port")
+            _, expected_parent, parent_snapshot, expected_handler, route = issued
+            if type(parent) is not CommittedPrimaryOperationIdentityV1:
+                raise TypeError("Compensation route requires an exact committed parent identity")
+            parent.__post_init__()
+            if (
+                parent is not expected_parent
+                or _committed_parent_snapshot(parent) != parent_snapshot
+                or handler_handle is not expected_handler
+            ):
+                raise ValueError("Compensation handle identity mismatch")
+            binding = self._compensation_registry.require_handler_handle(handler_handle)
+            if self._compensation_by_binding_id.get(id(binding)) is not route:
+                raise ValueError("Compensation handler binding drift")
+            return route
+
+    def revoke_typed_write(self, handle: object) -> None:
+        """Idempotently invalidate one Typed handle at claim/Segment exit."""
+
+        self._ensure_integrity()
+        if type(handle) is not TypedWriteHandle:
+            raise TypeError("Typed operation handle has the wrong type")
+        handle._revoke(self._port_token)
+        with self._state.lock:
+            issued = self._state.typed.get(id(handle))
+            if issued is not None and issued[0] is handle:
+                del self._state.typed[id(handle)]
+
+    def revoke_legacy(self, handle: object) -> None:
+        """Idempotently invalidate one Legacy handle at request/claim exit."""
+
+        self._ensure_integrity()
+        if type(handle) is not LegacyWriteHandle:
+            raise TypeError("Legacy operation handle has the wrong type")
+        handle._revoke(self._port_token)
+        with self._state.lock:
+            issued = self._state.legacy.get(id(handle))
+            if issued is not None and issued[0] is handle:
+                del self._state.legacy[id(handle)]
+
+    def revoke_compensation(self, handle: object) -> None:
+        """Idempotently invalidate one Compensation handle at transaction exit."""
+
+        self._ensure_integrity()
+        if type(handle) is not CompensationHandle:
+            raise TypeError("Compensation operation handle has the wrong type")
+        handle._revoke(self._port_token)
+        with self._state.lock:
+            issued = self._state.compensation.get(id(handle))
+            if issued is not None and issued[0] is handle:
+                del self._state.compensation[id(handle)]
+
+    def require_active_compensation(self, handle: object) -> None:
+        """Validate the exact live Port entry used by Registry resolution."""
+
+        self._ensure_integrity()
+        if type(handle) is not CompensationHandle:
+            raise TypeError("Compensation operation handle has the wrong type")
+        handle._ensure_integrity()
+        with self._state.lock:
+            issued = self._state.compensation.get(id(handle))
+            if issued is None or issued[0] is not handle:
+                raise ValueError("Compensation handle is not active in this Port")
+
+
 @dataclass(frozen=True, slots=True, repr=False, eq=False)
 class ValidatedToolSpecComponents(TransientToolRuntimeValue):
     provider_contract: ProviderToolContract = field(repr=False)
@@ -2271,6 +3267,8 @@ def validate_tool_spec_components(
 
 __all__ = [
     "BundleInstanceToken",
+    "CommittedPrimaryOperationIdentityV1",
+    "CompensationHandle",
     "CompensationHandlerBindingV1",
     "CompensationMetadataView",
     "FrozenJSONArray",
@@ -2284,6 +3282,9 @@ __all__ = [
     "LegacyDeterministicBoundaryV1",
     "LegacyAdapterBindingV1",
     "LegacyInitialRouteBindingV1",
+    "LegacyWriteHandle",
+    "OperationRouteEntryV1",
+    "OperationRouteIdentityV1",
     "ProviderToolMetadataView",
     "ReadOperationMetadataV1",
     "ResolverImplementationBinding",
@@ -2295,11 +3296,14 @@ __all__ = [
     "ToolDiscoveryPolicyV1",
     "ToolOperationMetadataV1",
     "ToolOperationEntryV1",
+    "ToolOperationMetadataPort",
     "ToolOperationMetadataView",
     "ToolMetadataBundleV1",
     "ToolPresentationBindingV1",
     "ToolSurfaceMetadataV1",
+    "TypedWriteHandle",
     "UndoBuilderBinding",
+    "RequiredUndoRouteEntryV1",
     "ValidatedToolSpecComponents",
     "WriteOperationMetadataV1",
     "canonical_json_bytes",

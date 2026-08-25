@@ -1478,9 +1478,23 @@ class WriteOperationCoordinator:
                             arguments_digest=locked_pending.arguments_digest,
                         )
                 try:
+                    # Imported at the runtime leaf to avoid loading the eager
+                    # Pilot Runtime package while this coordinator module is
+                    # itself being initialized.
+                    from offerpilot.pilot_runtime.primary_undo import (
+                        build_primary_undo,
+                        capture_primary_undo,
+                    )
+
                     undo_binding = prepared.spec.undo_builder_binding
-                    undo_seed = (
-                        undo_binding.capture_seed(bound_context, prepared.typed_args)
+                    undo_checkpoint = (
+                        capture_primary_undo(
+                            undo_binding,
+                            session,
+                            outer_transaction,
+                            bound_context,
+                            prepared.typed_args,
+                        )
                         if undo_binding is not None
                         else None
                     )
@@ -1578,14 +1592,16 @@ class WriteOperationCoordinator:
                         record = ToolExecutionRecord(
                             prepared, dispatched.outcome, True, operation_id, False
                         )
-                        undo_value = (
-                            undo_binding.build_undo(undo_seed, record)
-                            if undo_binding is not None
+                        undo = (
+                            build_primary_undo(
+                                undo_checkpoint,
+                                session,
+                                outer_transaction,
+                                record,
+                            )
+                            if undo_checkpoint is not None
                             else None
                         )
-                        if undo_value is not None and not isinstance(undo_value, Mapping):
-                            raise WriteOperationError("operation_projection_failed")
-                        undo = cast(Mapping[str, Any] | None, undo_value)
                         write_contract = prepared.spec.metadata.operation
                         if type(write_contract) is not WriteOperationMetadataV1:
                             raise WriteOperationError("operation_not_transactional")

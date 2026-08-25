@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import fields
+from dataclasses import fields, replace
 from types import SimpleNamespace
 import pytest
 
@@ -16,12 +16,9 @@ from offerpilot.ai.tool_authority import (
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import (
-    BindingContract,
     ConfirmationRequired,
     ProviderToolContract,
     ToolFailure,
-    ToolSpec,
-    WriteContract,
 )
 from offerpilot.ai.tool_runtime.pipeline import execute_prepared, prepare_call
 from offerpilot.ai.types import ToolCall
@@ -32,6 +29,7 @@ from offerpilot.repositories.jd import JDAnalysesRepository
 from offerpilot.repositories.notes import NotesRepository
 from offerpilot.repositories.offers import OffersRepository
 from offerpilot.repositories.resumes import ResumesRepository
+from tests.tool_metadata.factories import synthetic_tool_spec, write_metadata
 
 
 ARGUMENTS = {"value": 1}
@@ -72,6 +70,7 @@ def _setup(tmp_path, executor):
         tool_call_id="call-1",
         tool_name="sealed_write",
         effective_args_digest=ARGUMENTS_DIGEST,
+        capabilities=frozenset({"applications.write"}),
     )
     context = ToolExecutionContext(
         authority=authority,
@@ -83,36 +82,35 @@ def _setup(tmp_path, executor):
         jd_analyses=JDAnalysesRepository(sessions),
         run_recorder=NullRunRecorder(),
     )
-    spec = ToolSpec(
-        contract=ProviderToolContract(
-            payload={
-                "type": "function",
-                "function": {
-                    "name": "sealed_write",
-                    "description": "sealed write",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"value": {"type": "integer"}},
-                        "required": ["value"],
-                        "additionalProperties": False,
-                    },
+    contract = ProviderToolContract(
+        payload={
+            "type": "function",
+            "function": {
+                "name": "sealed_write",
+                "description": "sealed write",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"value": {"type": "integer"}},
+                    "required": ["value"],
+                    "additionalProperties": False,
                 },
             },
-            name="sealed_write",
-            description="sealed write",
-            parameters={
-                "type": "object",
-                "properties": {"value": {"type": "integer"}},
-                "required": ["value"],
-                "additionalProperties": False,
-            },
-        ),
-        kind="write",
+        },
+        name="sealed_write",
+        description="sealed write",
+        parameters={
+            "type": "object",
+            "properties": {"value": {"type": "integer"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+    )
+    metadata = replace(write_metadata("sealed_write"), editable_fields=())
+    spec = replace(
+        synthetic_tool_spec("sealed_write", metadata=metadata),
+        contract=contract,
         decoder=lambda value: dict(value),
         executor=executor,
-        confirmation_policy="required",
-        binding_contract=BindingContract("none"),
-        write_contract=WriteContract(),
     )
     catalog = ToolCatalog((spec,), expected_names=(spec.name,))
     prepare_identity = factory.create_approved_write_prepare_identity(
@@ -145,9 +143,7 @@ def _issue(
         transaction.begin()
     outer_transaction = transaction.get_transaction()
     assert outer_transaction is not None
-    factory.register_execution_transaction(
-        transaction, outer_transaction, authority=authority
-    )
+    factory.register_execution_transaction(transaction, outer_transaction, authority=authority)
     claim = factory.issue_execution_claim(
         authority,
         prepared=prepared,  # type: ignore[arg-type]
@@ -450,9 +446,7 @@ def test_nested_savepoint_uses_outer_transaction_identity(tmp_path) -> None:
                 factory, authority, pending, prepared, prepare_identity, session
             )
             with session.begin_nested() as nested_transaction:
-                record = _execute_claim(
-                    prepared, context, session, claim, execute_identity
-                )
+                record = _execute_claim(prepared, context, session, claim, execute_identity)
             assert record.execution_started
             assert calls == 1
     finally:

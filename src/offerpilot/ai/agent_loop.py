@@ -5,7 +5,7 @@ import json
 from copy import deepcopy
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
-from typing import Any, cast
+from typing import Any, TypeGuard, cast
 from uuid import uuid4
 
 from offerpilot.ai.agent_contracts import (
@@ -44,7 +44,9 @@ from offerpilot.ai.tool_runtime.contracts import (
     ToolFailure,
     ToolSpec,
     TransientToolRuntimeValue,
+    materialize_provider_payloads,
 )
+from offerpilot.ai.tool_runtime.metadata import WriteOperationMetadataV1
 from offerpilot.ai.tool_runtime.pipeline import Rejected, execute_prepared, prepare_call
 from offerpilot.ai.tool_runtime.rendering import render_compatibility
 from offerpilot.ai.tool_runtime.transport import project_transport_event
@@ -1182,7 +1184,7 @@ class AgentLoopRunner:
             raise TypeError("approved bootstrap requires ApprovedWriteSeed")
         pending = seed.pending
         spec = invocation.catalog.resolve(pending.tool_name)
-        if spec is None or spec.kind != "write":
+        if not _is_write_spec(spec):
             raise PendingActionValidationError("approved pending tool is not a write tool")
         prepare_identity = (
             invocation.tool_context.authority_factory.create_approved_write_prepare_identity(
@@ -1341,7 +1343,7 @@ class AgentLoopRunner:
                 continue
             pending_draft: PendingAction | None = None
             pending_revision: int | None = None
-            if spec.kind == "write":
+            if _is_write_spec(spec):
                 pending_revision = max(
                     1,
                     _pending_action_revision(call.id, call.name, call.args),
@@ -1375,7 +1377,7 @@ class AgentLoopRunner:
                     services.event_sink,
                 )
                 continue
-            if spec.kind == "write":
+            if _is_write_spec(spec):
                 if isinstance(prepared, ConfirmationRequired):
                     if type(invocation.tool_context.authority) is not SegmentExecutionAuthority:
                         raise TypeError("Typed Pending requires Segment authority")
@@ -1490,7 +1492,7 @@ class AgentLoopRunner:
         event_sink: AgentEventSink | None,
     ) -> None:
         spec = invocation.catalog.resolve(call.name)
-        is_write = spec is not None and spec.kind == "write"
+        is_write = _is_write_spec(spec)
         self._emit(
             event_sink,
             AgentToolCall(
@@ -1598,16 +1600,22 @@ def _pending_action_revision(tool_call_id: str, tool_name: str, raw_args: str) -
     return int.from_bytes(hashlib.sha256(canonical).digest()[:8], "big") & ((1 << 63) - 1)
 
 
+def _is_write_spec(
+    spec: ToolSpec[Any, Any] | None,
+) -> TypeGuard[ToolSpec[Any, Any]]:
+    return spec is not None and type(spec.metadata.operation) is WriteOperationMetadataV1
+
+
 def _spec_confirmation_description(
     spec: ToolSpec[Any, Any] | None,
     args: str,
     fallback: str,
 ) -> str:
-    if spec is None or spec.confirmation_description is None:
+    if spec is None:
         return fallback
     try:
         parsed = parse_arguments(args)
-        human = spec.confirmation_description(spec.decoder(parsed))
+        human = spec.presentation.confirmation_description(spec.decoder(parsed))
     except Exception:
         return fallback
     return str(human or fallback)
@@ -1617,6 +1625,7 @@ def _journal_model_input(
     messages: list[Message],
     tools: list[ProviderToolContract],
 ) -> dict[str, object]:
+    provider_payloads = materialize_provider_payloads(tools)
     return {
         "messages": [
             {
@@ -1634,9 +1643,9 @@ def _journal_model_input(
             {
                 "name": tool.name,
                 "description": tool.description,
-                "parameters": dict(tool.parameters),
+                "parameters": cast(dict[str, Any], payload["function"])["parameters"],
             }
-            for tool in tools
+            for tool, payload in zip(tools, provider_payloads, strict=True)
         ],
     }
 
@@ -1695,7 +1704,7 @@ def _select_tool_calls(tool_calls: list[Any], catalog: ToolCatalog) -> list[Any]
     if not tool_calls:
         return []
     if all(
-        (spec := catalog.resolve(str(call.name))) is None or spec.kind == "read"
+        not _is_write_spec(catalog.resolve(str(call.name)))
         for call in tool_calls
     ):
         return tool_calls
@@ -1708,7 +1717,7 @@ def _tool_public_label(spec: ToolSpec[Any, Any] | None, fallback: str) -> str:
 
 
 def _tool_call_summary(spec: ToolSpec[Any, Any] | None, args: str, fallback: str) -> str:
-    if spec is not None and spec.kind == "write":
+    if _is_write_spec(spec):
         return _spec_confirmation_description(spec, args, fallback)
     return _tool_public_label(spec, fallback)
 

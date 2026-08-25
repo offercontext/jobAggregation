@@ -4,7 +4,10 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Iterable, Mapping
 
-from offerpilot.ai.tool_runtime.contracts import ProviderToolContract
+from offerpilot.ai.tool_runtime.contracts import (
+    ProviderToolContract,
+    materialize_provider_payloads,
+)
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_NAMES
 from offerpilot.ai.tool_authority.policy import DEPENDENCY_POLICY_VERSION
 from offerpilot.context_projector.contracts import ProjectionError, canonical_json, sha256_hex
@@ -268,7 +271,7 @@ def select_tools(
     if not selected or not set(ordered_names).issubset(MODEL_TOOL_NAMES):
         raise ProjectionError("invalid_tool_surface")
     dependency_policy.validate_closed(ordered_names, names)
-    envelopes = [dict(contract.payload) for contract in selected]
+    envelopes = materialize_provider_payloads(selected)
     return ToolSelection(
         tools=selected,
         names=ordered_names,

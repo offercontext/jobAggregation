@@ -562,12 +562,6 @@ class ConfirmationDependencies:
     write_operations: ConfirmationOperationRepository | None = None
     write_coordinator: ConfirmationWriteCoordinator | None = None
     catalog: object | None = None
-    undo_seed_builder: Callable[..., Mapping[str, Any]] | None = field(
-        default=None, repr=False, compare=False
-    )
-    undo_builder: Callable[..., Mapping[str, Any] | None] | None = field(
-        default=None, repr=False, compare=False
-    )
     approval_context_resolver: Callable[..., ToolExecutionContext] | None = field(
         default=None, repr=False, compare=False
     )
@@ -1773,46 +1767,6 @@ class ConfirmationCoordinator:
         coordinator = _callable(self.dependencies.write_coordinator, ("execute_primary",))
         if coordinator is None:
             raise WriteOperationError("operation_unavailable")
-        undo_seed_builder = self.dependencies.undo_seed_builder
-        if undo_seed_builder is None:
-            def undo_seed_builder(_prepared: object, _context: object) -> Mapping[str, Any]:
-                return dict(state.undo_seed)
-        else:
-            supplied_seed_builder = undo_seed_builder
-
-            def undo_seed_builder(prepared_call: object, context: object) -> Mapping[str, Any]:
-                value = _invoke(
-                    supplied_seed_builder,
-                    {
-                        "prepared": prepared_call,
-                        "context": context,
-                        "state": state,
-                    },
-                    (prepared_call, context),
-                )
-                return dict(value) if isinstance(value, Mapping) else {}
-
-        undo_builder = self.dependencies.undo_builder
-        if undo_builder is not None:
-            supplied_undo_builder = undo_builder
-
-            def undo_builder(
-                prepared_call: object,
-                record: object,
-                seed: object,
-            ) -> Mapping[str, Any] | None:
-                value = _invoke(
-                    supplied_undo_builder,
-                    {
-                        "prepared": prepared_call,
-                        "record": record,
-                        "seed": seed,
-                        "state": state,
-                    },
-                    (prepared_call, record, seed),
-                )
-                return dict(value) if isinstance(value, Mapping) else None
-
         transactional_delivery = self.dependencies.transactional_delivery
         register_delivery = _callable(transactional_delivery, ("register",))
         unregister_delivery = _callable(transactional_delivery, ("unregister",))
@@ -1832,11 +1786,8 @@ class ConfirmationCoordinator:
             "edited_args": (
                 None if state.edited_args.is_missing() else state.edited_args.as_mapping
             ),
-            "undo_seed_builder": undo_seed_builder,
             "approval_decided_callback": state.approval_decided_callback,
         }
-        if undo_builder is not None:
-            values["undo_builder"] = undo_builder
         try:
             execution, record = cast(
                 tuple[OperationExecution, ToolExecutionRecord[Any, Any] | None],

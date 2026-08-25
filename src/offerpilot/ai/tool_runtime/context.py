@@ -16,7 +16,6 @@ from offerpilot.ai.tool_authority.contracts import (
 from offerpilot.ai.tool_authority.policy import decide_binding
 from offerpilot.ai.tool_runtime.contracts import (
     BindingAudit,
-    BindingResolverSpec,
     ToolFailure,
     ToolSpec,
     TransientToolRuntimeValue,
@@ -414,7 +413,9 @@ def require_capabilities(
     spec: ToolSpec[Any, Any],
     context: ToolExecutionContext,
 ) -> ToolFailure | None:
-    if spec.required_capabilities.issubset(cast(Any, context.authority).capabilities):
+    if set(spec.metadata.required_capabilities).issubset(
+        cast(Any, context.authority).capabilities
+    ):
         return None
     return ToolFailure(
         category="permission_denied",
@@ -427,7 +428,7 @@ def pre_resolver_scope_policy(
     spec: ToolSpec[Any, Any], context: ToolExecutionContext
 ) -> ToolFailure | None:
     if (
-        spec.binding_contract.kind == "non_application_only"
+        spec.metadata.binding.contract.kind == "non_application_only"
         and cast(Any, context.authority).trusted_scope.context_type == "application"
     ):
         return scope_access_denied()
@@ -441,11 +442,10 @@ def audit_bindings(
 ) -> tuple[BindingAudit, bool]:
     resolutions: list[dict[str, object]] = []
     entity_kinds: set[str] = set()
-    for resolver in spec.binding_resolvers:
-        if type(resolver) is not BindingResolverSpec:
-            raise TypeError("authority-bound binding resolver requires stable metadata")
-        resolver_context = context.resolver_context(resolver.resolver_id)
-        resolution = resolver(typed_args, cast(Any, resolver_context))
+    for resolver in spec.resolver_bindings:
+        descriptor = resolver.descriptor
+        resolver_context = context.resolver_context(descriptor.resolver_id)
+        resolution = resolver.resolve(typed_args, cast(Any, resolver_context))
         if type(resolution) is not BindingTargetResolution:
             raise TypeError("binding resolver returned an unsealed resolution")
         context.authority_factory.require_binding_target_resolution(
@@ -457,11 +457,11 @@ def audit_bindings(
                 "entity_kind": resolution.entity_kind,
                 "state": resolution.state,
                 "identity": resolution.identity,
-                "presence": resolver.presence,
+                "presence": descriptor.presence,
             }
         )
 
-    contract = spec.binding_contract
+    contract = spec.metadata.binding.contract
     scope = cast(Any, context.authority).trusted_scope
     scope_bound = contract.entity_kind == "application" and scope.context_type == "application"
     bound_identities = (

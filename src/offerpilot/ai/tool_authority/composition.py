@@ -8,7 +8,6 @@ There is no durable or process-wide completed-history store.
 
 from __future__ import annotations
 
-import copy
 from contextlib import contextmanager
 from dataclasses import fields as dataclass_fields
 import hashlib
@@ -22,10 +21,14 @@ from sqlalchemy.orm import Session, SessionTransaction
 from offerpilot.ai.tool_runtime.contracts import (
     BindingAudit,
     BindingContract,
-    BindingResolverSpec,
     PreparedToolCall,
     ProviderToolContract,
     ToolSpec,
+    materialize_provider_payloads,
+)
+from offerpilot.ai.tool_runtime.metadata import (
+    WriteOperationMetadataV1,
+    validate_tool_spec_components,
 )
 
 from .contracts import (
@@ -108,12 +111,18 @@ def _canonical_arguments_digest(arguments: object) -> str:
     return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
-def _canonical_contract_fingerprint(payload: object) -> str:
-    if not isinstance(payload, Mapping):
-        raise AuthorityPhaseError("ToolSpec contract payload must be a mapping")
+def _canonical_contract_fingerprint(
+    contract: ProviderToolContract,
+    *,
+    parameters: bool = False,
+) -> str:
     try:
+        payload: object = materialize_provider_payloads((contract,))[0]
+        if parameters:
+            function = cast(dict[str, object], cast(dict[str, object], payload)["function"])
+            payload = function["parameters"]
         encoded = json.dumps(
-            dict(payload),
+            payload,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -129,16 +138,12 @@ def _surface_gate_contract_snapshot(contract: object) -> tuple[object, ...]:
 
     if type(contract) is not ProviderToolContract:
         raise AuthorityPhaseError("Segment surface selection contains an invalid contract")
-    payload = getattr(contract, "payload", None)
-    parameters = getattr(contract, "parameters", None)
-    if not isinstance(payload, Mapping) or not isinstance(parameters, Mapping):
-        raise AuthorityPhaseError("Segment surface contract payload is not canonical")
     return (
         contract,
         contract.name,
         contract.description,
-        _canonical_contract_fingerprint(payload),
-        _canonical_contract_fingerprint(parameters),
+        _canonical_contract_fingerprint(contract),
+        _canonical_contract_fingerprint(contract, parameters=True),
     )
 
 
@@ -238,8 +243,8 @@ def _surface_gate_catalog_snapshot(value: object) -> tuple[object, ...]:
         tuple(
             (
                 contract.name,
-                _canonical_contract_fingerprint(contract.payload),
-                _canonical_contract_fingerprint(contract.parameters),
+                _canonical_contract_fingerprint(contract),
+                _canonical_contract_fingerprint(contract, parameters=True),
             )
             for contract in contracts
         ),
@@ -1289,7 +1294,7 @@ class AuthorityFactory:
                 arguments_digest, identity_digest
             ):
                 raise AuthorityPhaseError("Prepared digest does not match prepare call")
-            expected_contract_fingerprint = _canonical_contract_fingerprint(spec.contract.payload)
+            expected_contract_fingerprint = _canonical_contract_fingerprint(spec.contract)
             _require_digest(contract_fingerprint, "contract_fingerprint")
             if not constant_time_equal(contract_fingerprint, expected_contract_fingerprint):
                 raise AuthorityPhaseError("Prepared contract fingerprint is not canonical")
@@ -1341,7 +1346,7 @@ class AuthorityFactory:
             if (
                 type(spec) is not ToolSpec
                 or type(spec.contract) is not ProviderToolContract
-                or type(spec.binding_contract) is not BindingContract
+                or type(spec.metadata.binding.contract) is not BindingContract
             ):
                 raise AuthorityPhaseError("ToolSpec must use the exact validated contract type")
             if not callable(spec.decoder) or not callable(spec.executor):
@@ -1356,7 +1361,10 @@ class AuthorityFactory:
                     prepare_identity,
                     AuthorityUse.APPROVED_WRITE_PREPARE,
                 )
-                if spec.kind != "write" or spec.confirmation_policy != "required":
+                if (
+                    type(spec.metadata.operation) is not WriteOperationMetadataV1
+                    or spec.metadata.confirmation_policy != "required"
+                ):
                     raise AuthorityPhaseError("Approved prepare requires a confirmed write spec")
             else:
                 raise AuthorityPhaseError("ToolSpec requires a registered prepare identity")
@@ -1390,39 +1398,64 @@ class AuthorityFactory:
 
     @staticmethod
     def _tool_spec_snapshot(spec: ToolSpec[Any, Any]) -> tuple[object, ...]:
-        if type(spec.binding_contract) is not BindingContract:
+        if type(spec.metadata.binding.contract) is not BindingContract:
             raise AuthorityPhaseError("ToolSpec binding contract type changed")
-
-        resolver_snapshots: list[tuple[object, ...]] = []
-        for resolver in spec.binding_resolvers:
-            if isinstance(resolver, BindingResolverSpec):
-                resolver_snapshots.append(
-                    (
-                        "descriptor",
-                        resolver,
-                        resolver.resolve,
-                        resolver.resolver_id,
-                        resolver.entity_kind,
-                        resolver.arg_path,
-                        resolver.presence,
-                        resolver.identity_type,
-                    )
+        try:
+            validate_tool_spec_components(
+                provider_contract=spec.contract,
+                metadata=spec.metadata,
+                resolver_bindings=spec.resolver_bindings,
+                undo_builder_binding=spec.undo_builder_binding,
+                presentation=spec.presentation,
+            )
+        except (TypeError, ValueError) as exc:
+            raise AuthorityPhaseError("ToolSpec metadata validation failed") from exc
+        resolver_snapshots = tuple(
+            (
+                id(resolver),
+                id(resolver.descriptor),
+                resolver.implementation_id,
+                id(resolver.resolve),
+                resolver.descriptor.resolver_id,
+                resolver.descriptor.entity_kind,
+                resolver.descriptor.arg_path,
+                resolver.descriptor.presence,
+                resolver.descriptor.identity_type,
+            )
+            for resolver in spec.resolver_bindings
+        )
+        metadata = spec.metadata
+        contract = metadata.binding.contract
+        metadata_snapshot = (
+            id(metadata),
+            metadata.metadata_version,
+            tuple(metadata.domains),
+            tuple(metadata.dependencies),
+            metadata.provider_visibility,
+            tuple(metadata.required_capabilities),
+            tuple(
+                (
+                    id(editable),
+                    editable.field,
+                    editable.value_type,
+                    editable.options,
+                    editable.clearable,
+                    editable.clear_value,
                 )
-            else:
-                # Legacy/custom specs may still carry a bare callable.  Its
-                # object identity is the only safe snapshot available.
-                resolver_snapshots.append(("callable", resolver))
+                for editable in metadata.editable_fields
+            ),
+        )
         return (
             spec.contract,
-            _canonical_contract_fingerprint(spec.contract.payload),
-            spec.decoder,
-            spec.executor,
-            spec.kind,
-            spec.confirmation_policy,
-            spec.required_capabilities,
-            spec.binding_contract,
-            (spec.binding_contract.kind, spec.binding_contract.entity_kind),
-            tuple(resolver_snapshots),
+            _canonical_contract_fingerprint(spec.contract),
+            id(spec.decoder),
+            id(spec.executor),
+            "write" if type(metadata.operation) is WriteOperationMetadataV1 else "read",
+            metadata.confirmation_policy,
+            metadata_snapshot,
+            id(contract),
+            (contract.kind, contract.entity_kind),
+            resolver_snapshots,
             AuthorityFactory._tool_spec_execution_snapshot(spec),
         )
 
@@ -1438,31 +1471,52 @@ class AuthorityFactory:
             )
             for mapping in spec.exception_map
         )
-        write_contract = (
+        operation = spec.metadata.operation
+        operation_snapshot = tuple(
+            (field.name, getattr(operation, field.name))
+            for field in dataclass_fields(operation)
+        )
+        undo = spec.undo_builder_binding
+        undo_snapshot = (
             (None,)
-            if spec.write_contract is None
+            if undo is None
             else (
-                spec.write_contract,
-                spec.write_contract.adapter_kind,
-                spec.write_contract.result_contract,
-                spec.write_contract.undo_policy,
-                spec.write_contract.result_bytes,
-                spec.write_contract.visible_bytes,
-                spec.write_contract.transport_bytes,
-                spec.write_contract.undo_bytes,
+                id(undo),
+                id(undo.descriptor),
+                undo.implementation_id,
+                id(undo.capture_seed),
+                id(undo.build_undo),
             )
         )
+        presentation = spec.presentation
         return (
-            spec.preflight,
-            spec.mutable_validator,
-            spec.success_renderer,
-            spec.result_metadata,
-            spec.confirmation_description,
-            spec.schema_failure_renderer,
-            copy.deepcopy(spec.editable_fields),
+            None if spec.preflight is None else id(spec.preflight),
+            None if spec.mutable_validator is None else id(spec.mutable_validator),
+            None if spec.success_renderer is None else id(spec.success_renderer),
+            (
+                None
+                if spec.result_metadata_projector is None
+                else id(spec.result_metadata_projector)
+            ),
+            None if spec.schema_failure_renderer is None else id(spec.schema_failure_renderer),
+            id(presentation),
+            presentation.implementation_id,
+            id(presentation.confirmation_description),
+            id(presentation.pending_details_projector),
+            id(presentation.success_summary_projector),
             spec.declared_failure_categories,
-            exception_map,
-            write_contract,
+            tuple(
+                (
+                    id(item[0]),
+                    id(item[1]),
+                    item[2],
+                    item[3],
+                    None if item[4] is None else id(item[4]),
+                )
+                for item in exception_map
+            ),
+            (id(operation), operation_snapshot),
+            undo_snapshot,
         )
 
     @staticmethod
@@ -1470,49 +1524,14 @@ class AuthorityFactory:
         current: tuple[tuple[object, ...], ...],
         expected: tuple[tuple[object, ...], ...],
     ) -> bool:
-        if len(current) != len(expected):
-            return False
-        for current_item, expected_item in zip(current, expected):
-            if current_item[0] != expected_item[0] or current_item[1] is not expected_item[1]:
-                return False
-            if current_item[0] == "descriptor":
-                if current_item[2] is not expected_item[2] or current_item[3:] != expected_item[3:]:
-                    return False
-        return True
+        return current == expected
 
     @staticmethod
     def _tool_spec_execution_snapshots_match(
         current: tuple[object, ...],
         expected: tuple[object, ...],
     ) -> bool:
-        if len(current) != 10 or len(expected) != 10:
-            return False
-        if any(current[index] is not expected[index] for index in range(6)):
-            return False
-        if current[6:8] != expected[6:8]:
-            return False
-        current_exception_map = cast(tuple[tuple[object, ...], ...], current[8])
-        expected_exception_map = cast(tuple[tuple[object, ...], ...], expected[8])
-        if len(current_exception_map) != len(expected_exception_map):
-            return False
-        for current_item, expected_item in zip(
-            current_exception_map, expected_exception_map
-        ):
-            if current_item[0] is not expected_item[0]:
-                return False
-            if (
-                current_item[1] is not expected_item[1]
-                or current_item[2:4] != expected_item[2:4]
-                or current_item[4] is not expected_item[4]
-            ):
-                return False
-        current_write = cast(tuple[object, ...], current[9])
-        expected_write = cast(tuple[object, ...], expected[9])
-        return (
-            len(current_write) == len(expected_write)
-            and current_write[0] is expected_write[0]
-            and current_write[1:] == expected_write[1:]
-        )
+        return current == expected
 
     def _validate_registered_tool_spec(self, spec: ToolSpec[Any, Any]) -> None:
         snapshot = self._tool_spec_fields.get(id(spec))
@@ -1523,11 +1542,11 @@ class AuthorityFactory:
             cast(str, current[1]), cast(str, snapshot[1])
         ):
             raise AuthorityPhaseError("ToolSpec contract identity changed")
-        if current[2] is not snapshot[2] or current[3] is not snapshot[3]:
+        if current[2] != snapshot[2] or current[3] != snapshot[3]:
             raise AuthorityPhaseError("ToolSpec executor identity changed")
         if current[4:7] != snapshot[4:7]:
             raise AuthorityPhaseError("ToolSpec semantic identity changed")
-        if current[7] is not snapshot[7] or current[8] != snapshot[8]:
+        if current[7] != snapshot[7] or current[8] != snapshot[8]:
             raise AuthorityPhaseError("ToolSpec binding contract identity changed")
         if not self._resolver_snapshots_match(
             cast(tuple[tuple[object, ...], ...], current[9]),
@@ -2016,7 +2035,15 @@ class AuthorityFactory:
         fail-closed before pending/claim/identity state can be mutated.
         """
 
-        if prepared.spec.kind != kind or prepared.spec.confirmation_policy != confirmation_policy:
+        actual_kind = (
+            "write"
+            if type(prepared.spec.metadata.operation) is WriteOperationMetadataV1
+            else "read"
+        )
+        if (
+            actual_kind != kind
+            or prepared.spec.metadata.confirmation_policy != confirmation_policy
+        ):
             raise AuthorityPhaseError("PreparedToolCall spec is not valid for this phase")
 
     def _register_call(
@@ -4048,8 +4075,18 @@ def require_authority_spec(
             raise AuthorityPhaseError("ToolSpec provenance does not match authority")
         factory._validate_registered_tool_spec(spec)
     phase = _use_value(use)
-    kind = getattr(spec, "kind", None)
-    confirmation_policy = getattr(spec, "confirmation_policy", None)
+    kind: Any
+    confirmation_policy: Any
+    if type(spec) is ToolSpec:
+        kind = (
+            "write"
+            if type(spec.metadata.operation) is WriteOperationMetadataV1
+            else "read"
+        )
+        confirmation_policy = spec.metadata.confirmation_policy
+    else:
+        kind = getattr(spec, "kind", None)
+        confirmation_policy = getattr(spec, "confirmation_policy", None)
     if phase == AuthorityUse.READ_EXECUTE.value:
         if not isinstance(authority, SegmentExecutionAuthority):
             raise AuthorityPhaseError("Segment authority is required for read execution")

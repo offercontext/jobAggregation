@@ -55,6 +55,7 @@ def intersect_authority_surface(
     dependency_policy = require_dependency_policy_v1(dependency_policy)
     catalog_contracts = catalog.provider_contracts()
     catalog_names = tuple(contract.name for contract in catalog_contracts)
+    catalog_payloads = dict(zip(catalog_names, catalog.materialize_provider_payloads()))
     if catalog_names != dependency_policy.catalog_names:
         raise ProjectionError("dependency_catalog_mismatch")
     if view.capability_profile_id != PROFILE_ID:
@@ -72,12 +73,14 @@ def intersect_authority_surface(
         spec = catalog.resolve(name)
         if spec is None:
             raise ProjectionError("provider_catalog_resolution_failed")
-        required = frozenset(str(capability) for capability in spec.required_capabilities)
+        required = frozenset(
+            str(capability) for capability in spec.metadata.required_capabilities
+        )
         if not required.issubset(capability_values):
             continue
         if (
             view.context_type == "application"
-            and spec.binding_contract.kind == "non_application_only"
+            and spec.metadata.binding.contract.kind == "non_application_only"
         ):
             continue
         allowed_names.add(name)
@@ -90,7 +93,7 @@ def intersect_authority_surface(
         tools=tools,
         names=names,
         envelope_fingerprint=sha256_hex(
-            canonical_json([dict(contract.payload) for contract in tools])
+            canonical_json([catalog_payloads[name] for name in names])
         ),
         fallback_all=selection.fallback_all,
         domains=selection.domains,

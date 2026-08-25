@@ -13,11 +13,8 @@ from typing import Any, cast
 
 from offerpilot.ai.tool_runtime.contracts import (
     BindingContract,
-    BindingResolverSpec,
     ProviderToolContract,
     ToolSpec,
-    UndoPolicy as LegacyUndoPolicy,
-    WriteContract,
 )
 from offerpilot.ai.tool_runtime.metadata import (
     BindingResolverDescriptorV1,
@@ -46,8 +43,8 @@ def _resolve_application_identity(args: Mapping[str, Any], context: object) -> i
     return cast(int, args["id"])
 
 
-def _capture_undo_seed(args: object, context: object) -> None:
-    del args, context
+def _capture_undo_seed(context: object, args: object) -> None:
+    del context, args
     return None
 
 
@@ -257,68 +254,28 @@ def synthetic_tool_spec(
     name: str = "synthetic_tool",
     metadata: ToolSurfaceMetadataV1 | None = None,
 ) -> ToolSpec[dict[str, Any], dict[str, Any]]:
-    """Build the active ToolSpec shape across the one atomic cutover commit."""
+    """Build only the final ToolSpec shape."""
 
     surface = metadata if metadata is not None else read_metadata(name=name)
     operation = surface.operation
     is_write = isinstance(operation, WriteOperationMetadataV1)
-    if "metadata" in getattr(ToolSpec, "__dataclass_fields__", {}):
-        final_resolver_bindings = tuple(
-            resolver_binding(descriptor)
-            for descriptor in surface.binding.resolver_descriptors
-        )
-        undo_builder = (
-            _undo_builder_binding(operation)
-            if is_write and operation.undo_policy is UndoPolicy.REQUIRED
-            else None
-        )
-        final_tool_spec = cast(Any, ToolSpec)
-        return cast(
-            ToolSpec[dict[str, Any], dict[str, Any]],
-            final_tool_spec(
-                contract=synthetic_provider_contract(name),
-                metadata=surface,
-                resolver_bindings=final_resolver_bindings,
-                undo_builder_binding=undo_builder,
-                decoder=_decode_arguments,
-                executor=_execute_arguments,
-                presentation=presentation_binding(),
-            ),
-        )
-
-    resolver_specs = tuple(
-        BindingResolverSpec(
-            resolver_id=descriptor.resolver_id,
-            entity_kind=descriptor.entity_kind,
-            arg_path=descriptor.arg_path,
-            presence=descriptor.presence,
-            identity_type=descriptor.identity_type,
-            resolve=_resolve_application_identity,
-        )
+    final_resolver_bindings = tuple(
+        resolver_binding(descriptor)
         for descriptor in surface.binding.resolver_descriptors
+    )
+    undo_builder = (
+        _undo_builder_binding(operation)
+        if is_write and operation.undo_policy is UndoPolicy.REQUIRED
+        else None
     )
     return ToolSpec(
         contract=synthetic_provider_contract(name),
-        kind="write" if is_write else "read",
+        metadata=surface,
+        resolver_bindings=final_resolver_bindings,
+        undo_builder_binding=undo_builder,
         decoder=_decode_arguments,
         executor=_execute_arguments,
-        required_capabilities=frozenset(str(capability) for capability in surface.required_capabilities),
-        binding_contract=surface.binding.contract,
-        binding_resolvers=resolver_specs,
-        confirmation_policy=surface.confirmation_policy,
-        editable_fields=tuple(field.to_compat_descriptor() for field in surface.editable_fields),
-        write_contract=(
-            WriteContract(
-                undo_policy=(
-                    LegacyUndoPolicy.REQUIRED
-                    if is_write and cast(WriteOperationMetadataV1, operation).undo_policy.value
-                    == "required"
-                    else LegacyUndoPolicy.NONE
-                )
-            )
-            if is_write
-            else None
-        ),
+        presentation=presentation_binding(),
     )
 
 

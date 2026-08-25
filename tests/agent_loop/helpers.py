@@ -8,6 +8,7 @@ from typing import Any, Callable, Literal
 
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
+from offerpilot.ai.tool_runtime.metadata import ToolPresentationBindingV1, WriteOperationMetadataV1
 from offerpilot.ai.tool_runtime.policy_types import ToolCapability
 from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
 from offerpilot.ai.tool_authority.policy import validate_startup_policy
@@ -30,11 +31,49 @@ _DATA_DIR = Path(tempfile.mkdtemp(prefix="offerpilot-agent-loop-tests-"))
 _SESSIONS = init_database(_DATA_DIR / "agent-loop.db")
 
 
+def _default_raw_executor(_args: str) -> str:
+    return "{}"
+
+
+def _decode_arguments(values: dict[str, Any]) -> dict[str, Any]:
+    return dict(values)
+
+
+def _describe_update_application_status(_args: object) -> str:
+    return "update_application_status"
+
+
+def _describe_delete_note(_args: object) -> str:
+    return "delete_note"
+
+
+def _describe_test_read(_args: object) -> str:
+    return "test read"
+
+
+_CONFIRMATION_DESCRIPTIONS: dict[str, Callable[[object], str]] = {
+    "delete_note": _describe_delete_note,
+    "update_application_status": _describe_update_application_status,
+}
+
+
+def _test_presentation(
+    name: str,
+    original: ToolPresentationBindingV1,
+) -> ToolPresentationBindingV1:
+    return ToolPresentationBindingV1(
+        implementation_id=f"agent_loop_test_{name}_presentation_v1",
+        confirmation_description=_CONFIRMATION_DESCRIPTIONS.get(name, _describe_test_read),
+        pending_details_projector=original.pending_details_projector,
+        success_summary_projector=original.success_summary_projector,
+    )
+
+
 @dataclass(frozen=True)
 class ToolDefinition:
     name: str
     kind: Literal["read", "write"] = "read"
-    executor: Callable[[str], str] = lambda _args: "{}"
+    executor: Callable[[str], str] = _default_raw_executor
     validator: Callable[[str], str] | None = None
 
 
@@ -46,7 +85,10 @@ def runtime(*definitions: ToolDefinition) -> tuple[ToolCatalog, ToolExecutionCon
         if position is None:
             raise ValueError(f"test tool must use a model catalog name: {definition.name}")
         original = specs[position]
-        if definition.kind != original.kind:
+        actual_kind = (
+            "write" if type(original.metadata.operation) is WriteOperationMetadataV1 else "read"
+        )
+        if definition.kind != actual_kind:
             raise ValueError(f"test tool kind differs from model catalog: {definition.name}")
         raw_executor = definition.executor
         raw_validator = definition.validator
@@ -72,12 +114,12 @@ def runtime(*definitions: ToolDefinition) -> tuple[ToolCatalog, ToolExecutionCon
 
         specs[position] = replace(
             original,
-            decoder=lambda values: dict(values),
+            decoder=_decode_arguments,
             executor=executor,
             preflight=preflight if raw_validator is not None else None,
             mutable_validator=preflight if raw_validator is not None else None,
             success_renderer=str,
-            confirmation_description=lambda _args, name=definition.name: name,
+            presentation=_test_presentation(definition.name, original.presentation),
         )
     catalog = ToolCatalog(specs, expected_names=tuple(spec.name for spec in specs))
     policy = validate_startup_policy(catalog.authority_manifest)

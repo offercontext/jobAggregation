@@ -141,9 +141,6 @@ def _require_text(value: object, field_name: str) -> str:
     return value
 
 
-_CAPABILITY_NAMES = frozenset(capability.value for capability in ToolCapability)
-
-
 def _require_capabilities(value: object) -> frozenset[object]:
     if type(value) is not frozenset:
         raise TypeError("capabilities must be a frozenset")
@@ -154,8 +151,11 @@ def _require_capabilities(value: object) -> frozenset[object]:
             normalized = capability.value
         else:
             raise ValueError("capability is not in the closed V1 capability set")
-        if normalized not in _CAPABILITY_NAMES:
-            raise ValueError("capability is not in the closed V1 capability set")
+        try:
+            ToolCapability(normalized)
+        except ValueError as exc:
+            raise ValueError("capability is not in the closed V1 capability set") from exc
+
     return value
 
 

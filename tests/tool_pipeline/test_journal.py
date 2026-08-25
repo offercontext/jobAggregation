@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -32,6 +33,11 @@ from offerpilot.repositories.jd import JDAnalysesRepository
 from offerpilot.repositories.notes import NotesRepository
 from offerpilot.repositories.offers import OffersRepository
 from offerpilot.repositories.resumes import ResumesRepository
+from tests.tool_metadata.factories import (
+    presentation_binding,
+    read_metadata,
+    write_metadata,
+)
 
 
 class FailingStartedRecorder:
@@ -163,6 +169,15 @@ def _execute_read(prepared: Any, context: ToolExecutionContext, invocation: Any)
     return execute_prepared(prepared, context, call_identity=identity)
 
 
+def _decode_mapping(values: Any) -> dict[str, Any]:
+    return dict(values)
+
+
+def _render_empty_items(result: Any) -> str:
+    del result
+    return '{"items":[]}'
+
+
 def _runtime(recorder: FailingStartedRecorder, executor: Any) -> tuple[ToolCatalog, ToolExecutionContext, ToolSpec[Any, Any], AuthorityFactory, Any]:
     parameters = {"properties": {"id": {"type": "integer"}}, "type": "object"}
     spec = ToolSpec(
@@ -179,11 +194,16 @@ def _runtime(recorder: FailingStartedRecorder, executor: Any) -> tuple[ToolCatal
             description="read",
             parameters=parameters,
         ),
-        decoder=lambda values: dict(values),
+        metadata=replace(
+            read_metadata(),
+            required_capabilities=(ToolCapability.APPLICATIONS_READ,),
+        ),
+        resolver_bindings=(),
+        undo_builder_binding=None,
+        decoder=_decode_mapping,
         executor=executor,
-        kind="read",
-        required_capabilities=frozenset({ToolCapability.APPLICATIONS_READ}),
-        success_renderer=lambda result: '{"items":[]}',
+        presentation=presentation_binding(),
+        success_renderer=_render_empty_items,
     )
     context, factory, invocation = _authority_context(
         recorder,
@@ -247,11 +267,15 @@ def _write_runtime(
             description="write",
             parameters=parameters,
         ),
-        decoder=lambda values: dict(values),
+        metadata=replace(
+            write_metadata(),
+            required_capabilities=(ToolCapability.APPLICATIONS_WRITE,),
+        ),
+        resolver_bindings=(),
+        undo_builder_binding=None,
+        decoder=_decode_mapping,
         executor=executor,
-        kind="write",
-        required_capabilities=frozenset({ToolCapability.APPLICATIONS_WRITE}),
-        confirmation_policy="required",
+        presentation=presentation_binding(),
     )
     context, factory, invocation = _authority_context(
         recorder,
@@ -451,10 +475,15 @@ def test_pre_execution_validation_sequence_matches_first_phase_golden() -> None:
             description="read",
             parameters=parameters,
         ),
-        decoder=lambda values: dict(values),
+        metadata=replace(
+            read_metadata(),
+            required_capabilities=(ToolCapability.APPLICATIONS_READ,),
+        ),
+        resolver_bindings=(),
+        undo_builder_binding=None,
+        decoder=_decode_mapping,
         executor=lambda args, runtime: args,
-        kind="read",
-        required_capabilities=frozenset({ToolCapability.APPLICATIONS_READ}),
+        presentation=presentation_binding(),
     )
     context, factory, invocation = _authority_context(
         recorder,

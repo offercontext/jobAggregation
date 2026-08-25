@@ -4,13 +4,21 @@ from collections.abc import Mapping
 from typing import Any, TypedDict, cast
 
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
-from offerpilot.ai.tool_runtime.policy_types import ToolCapability
+from offerpilot.ai.tool_runtime.catalog import build_tool_spec
 from offerpilot.ai.tool_runtime.contracts import (
     BindingContract,
-    BindingResolverSpec,
     JSONValue,
     ToolSpec,
 )
+from offerpilot.ai.tool_runtime.metadata import (
+    BindingResolverDescriptorV1,
+    EditableFieldMetadataV1,
+    ReadOperationMetadataV1,
+    ResolverImplementationBinding,
+    ToolPresentationBindingV1,
+    WriteOperationMetadataV1,
+)
+from offerpilot.ai.tool_runtime.policy_types import ToolCapability, ToolDomain
 from offerpilot.ai.tool_specs.common import (
     INPUT_EXCEPTION_MAP,
     NOT_FOUND_EXCEPTION_MAP,
@@ -58,14 +66,19 @@ def _offer_binding(args: OfferArgs, context: ToolExecutionContext) -> object:
     )
 
 
-_OFFER_PARENT_RESOLVER = BindingResolverSpec(
-    resolver_id="offer_application_parent",
-    entity_kind="application",
-    arg_path="id",
-    presence="required",
-    identity_type="positive_int64",
-    resolve=_offer_binding,
-)
+def _offer_resolver(implementation_id: str) -> ResolverImplementationBinding:
+    descriptor = BindingResolverDescriptorV1(
+        resolver_id="offer_application_parent",
+        entity_kind="application",
+        arg_path="id",
+        presence="required",
+        identity_type="positive_int64",
+    )
+    return ResolverImplementationBinding(
+        descriptor=descriptor,
+        implementation_id=implementation_id,
+        resolve=_offer_binding,
+    )
 
 
 def _list(args: OfferArgs, context: ToolExecutionContext) -> list[dict[str, Any]]:
@@ -162,14 +175,122 @@ def _offer_schema(required: list[JSONValue]) -> dict[str, JSONValue]:
     return {"type": "object", "properties": {"id": {"type": "integer"}, "company_name": {"type": "string"}, "position_name": {"type": "string"}, "status": {"type": "string", "enum": list(OFFER_STATUSES)}, "base_monthly": {"type": "integer"}, "months_per_year": {"type": "integer"}, "signing_bonus": {"type": "integer"}, "equity": {"type": "string"}, "perks": {"type": "string"}, "deadline": {"type": "string"}, "notes": {"type": "string"}, "assessment": {"type": "string"}}, "required": required}
 
 
+def _empty_confirmation_description(args: object) -> str:
+    del args
+    return ""
+
+
+def _empty_pending_details(args: object, context: object | None = None) -> dict[str, object]:
+    del args, context
+    return {}
+
+
+def _describe_update_offer(args: Mapping[str, Any]) -> str:
+    return f"更新 Offer #{args.get('id', '')}"
+
+
+def _describe_save_offer_assessment(args: Mapping[str, Any]) -> str:
+    return f"保存 Offer 评估 #{args.get('id', '')}"
+
+
+def _editable(
+    field: str,
+    value_type: str,
+    *,
+    options: tuple[str, ...] | None = None,
+    clearable: bool = False,
+    clear_value: str | int | None = None,
+) -> EditableFieldMetadataV1:
+    return EditableFieldMetadataV1(
+        field=field,
+        value_type=cast(Any, value_type),
+        options=options,
+        clearable=clearable,
+        clear_value=clear_value,
+    )
+
+
 def offer_specs() -> tuple[ToolSpec[Any, Any], ...]:
-    read = frozenset({ToolCapability.OFFERS_READ})
-    write = frozenset({ToolCapability.OFFERS_WRITE})
     id_schema: dict[str, JSONValue] = {"type": "object", "properties": {"id": {"type": "integer", "description": "Offer id."}}, "required": ["id"]}
+    offer_fields = (
+        _editable("company_name", "string"), _editable("position_name", "string"),
+        _editable("status", "enum", options=OFFER_STATUSES),
+        _editable("base_monthly", "number", clearable=True, clear_value=0),
+        _editable("months_per_year", "number"),
+        _editable("signing_bonus", "number", clearable=True, clear_value=0),
+        _editable("equity", "string"), _editable("perks", "long_text"),
+        _editable("deadline", "datetime", clearable=True, clear_value=""),
+        _editable("notes", "long_text"), _editable("assessment", "long_text"),
+    )
+    get_resolver = _offer_resolver("get_offer_offer_application_parent_v1")
+    update_resolver = _offer_resolver("update_offer_offer_application_parent_v1")
+    assessment_resolver = _offer_resolver("save_offer_assessment_offer_application_parent_v1")
     return (
-        ToolSpec(contract=provider_contract("list_offers", "List offers. The returned id is an offer id, not an application id; use application_id only when it is present.", {"type": "object", "properties": {"status": {"type": "string", "enum": list(OFFER_STATUSES)}}}), kind="read", decoder=_decode, executor=_list, required_capabilities=read, binding_contract=BindingContract("scoped_collection", "application"), success_renderer=compact_json),
-        ToolSpec(contract=provider_contract("get_offer", "Get one offer by offer id. Offer id is not an application id.", id_schema), kind="read", decoder=_decode, executor=_get, required_capabilities=read, binding_contract=BindingContract("enforce_if_bound", "application"), binding_resolvers=(_OFFER_PARENT_RESOLVER,), declared_failure_categories=frozenset({"not_found"}), exception_map=NOT_FOUND_EXCEPTION_MAP, success_renderer=compact_json),
-        ToolSpec(contract=provider_contract("compare_offers", "Compare offers by offer ids. Missing ids are skipped.", {"type": "object", "properties": {"ids": {"type": "array", "items": {"type": "integer"}}}, "required": ["ids"]}), kind="read", decoder=_decode, executor=_compare, required_capabilities=read, binding_contract=BindingContract("non_application_only"), declared_failure_categories=frozenset({"validation_error"}), exception_map=INPUT_EXCEPTION_MAP, success_renderer=compact_json),
-        ToolSpec(contract=provider_contract("update_offer", "Update an offer. Missing fields keep existing values.", _offer_schema(["id"])), kind="write", decoder=_decode, executor=_update, required_capabilities=write, binding_contract=BindingContract("enforce_if_bound", "application"), binding_resolvers=(_OFFER_PARENT_RESOLVER,), confirmation_policy="required", declared_failure_categories=frozenset({"validation_error", "not_found"}), exception_map=INPUT_EXCEPTION_MAP + NOT_FOUND_EXCEPTION_MAP, success_renderer=compact_json),
-        ToolSpec(contract=provider_contract("save_offer_assessment", "Save or replace the assessment text for an offer.", {"type": "object", "properties": {"id": {"type": "integer"}, "assessment": {"type": "string"}}, "required": ["id", "assessment"]}), kind="write", decoder=_decode, executor=_assessment, required_capabilities=write, binding_contract=BindingContract("enforce_if_bound", "application"), binding_resolvers=(_OFFER_PARENT_RESOLVER,), confirmation_policy="required", declared_failure_categories=frozenset({"validation_error", "not_found"}), exception_map=INPUT_EXCEPTION_MAP + NOT_FOUND_EXCEPTION_MAP, success_renderer=compact_json),
+        build_tool_spec(
+            contract=provider_contract("list_offers", "List offers. The returned id is an offer id, not an application id; use application_id only when it is present.", {"type": "object", "properties": {"status": {"type": "string", "enum": list(OFFER_STATUSES)}}}),
+            domains=(ToolDomain.OFFERS,), dependencies=(), required_capability=ToolCapability.OFFERS_READ,
+            binding_contract=BindingContract("scoped_collection", "application"), resolver_bindings=(),
+            confirmation_policy="none", editable_fields=(), operation=ReadOperationMetadataV1(),
+            undo_builder_binding=None, presentation=ToolPresentationBindingV1(
+                implementation_id="list_offers_presentation_v1",
+                confirmation_description=_empty_confirmation_description,
+                pending_details_projector=_empty_pending_details,
+                success_summary_projector=compact_json,
+            ), decoder=_decode, executor=_list, success_renderer=compact_json,
+        ),
+        build_tool_spec(
+            contract=provider_contract("get_offer", "Get one offer by offer id. Offer id is not an application id.", id_schema),
+            domains=(ToolDomain.OFFERS,), dependencies=("list_offers",), required_capability=ToolCapability.OFFERS_READ,
+            binding_contract=BindingContract("enforce_if_bound", "application"), resolver_bindings=(get_resolver,),
+            confirmation_policy="none", editable_fields=(), operation=ReadOperationMetadataV1(),
+            undo_builder_binding=None, presentation=ToolPresentationBindingV1(
+                implementation_id="get_offer_presentation_v1",
+                confirmation_description=_empty_confirmation_description,
+                pending_details_projector=_empty_pending_details,
+                success_summary_projector=compact_json,
+            ), decoder=_decode, executor=_get, declared_failure_categories=frozenset({"not_found"}),
+            exception_map=NOT_FOUND_EXCEPTION_MAP, success_renderer=compact_json,
+        ),
+        build_tool_spec(
+            contract=provider_contract("compare_offers", "Compare offers by offer ids. Missing ids are skipped.", {"type": "object", "properties": {"ids": {"type": "array", "items": {"type": "integer"}}}, "required": ["ids"]}),
+            domains=(ToolDomain.OFFERS,), dependencies=("get_offer", "list_offers"), required_capability=ToolCapability.OFFERS_READ,
+            binding_contract=BindingContract("non_application_only"), resolver_bindings=(),
+            confirmation_policy="none", editable_fields=(), operation=ReadOperationMetadataV1(),
+            undo_builder_binding=None, presentation=ToolPresentationBindingV1(
+                implementation_id="compare_offers_presentation_v1",
+                confirmation_description=_empty_confirmation_description,
+                pending_details_projector=_empty_pending_details,
+                success_summary_projector=compact_json,
+            ), decoder=_decode, executor=_compare, declared_failure_categories=frozenset({"validation_error"}),
+            exception_map=INPUT_EXCEPTION_MAP, success_renderer=compact_json,
+        ),
+        build_tool_spec(
+            contract=provider_contract("update_offer", "Update an offer. Missing fields keep existing values.", _offer_schema(["id"])),
+            domains=(ToolDomain.OFFERS,), dependencies=("get_offer",), required_capability=ToolCapability.OFFERS_WRITE,
+            binding_contract=BindingContract("enforce_if_bound", "application"), resolver_bindings=(update_resolver,),
+            confirmation_policy="required", editable_fields=offer_fields, operation=WriteOperationMetadataV1(),
+            undo_builder_binding=None, presentation=ToolPresentationBindingV1(
+                implementation_id="update_offer_presentation_v1",
+                confirmation_description=_describe_update_offer,
+                pending_details_projector=_empty_pending_details,
+                success_summary_projector=compact_json,
+            ), decoder=_decode, executor=_update,
+            declared_failure_categories=frozenset({"validation_error", "not_found"}),
+            exception_map=INPUT_EXCEPTION_MAP + NOT_FOUND_EXCEPTION_MAP, success_renderer=compact_json,
+        ),
+        build_tool_spec(
+            contract=provider_contract("save_offer_assessment", "Save or replace the assessment text for an offer.", {"type": "object", "properties": {"id": {"type": "integer"}, "assessment": {"type": "string"}}, "required": ["id", "assessment"]}),
+            domains=(ToolDomain.OFFERS,), dependencies=("get_offer",), required_capability=ToolCapability.OFFERS_WRITE,
+            binding_contract=BindingContract("enforce_if_bound", "application"), resolver_bindings=(assessment_resolver,),
+            confirmation_policy="required", editable_fields=(_editable("assessment", "long_text"),),
+            operation=WriteOperationMetadataV1(), undo_builder_binding=None,
+            presentation=ToolPresentationBindingV1(
+                implementation_id="save_offer_assessment_presentation_v1",
+                confirmation_description=_describe_save_offer_assessment,
+                pending_details_projector=_empty_pending_details,
+                success_summary_projector=compact_json,
+            ), decoder=_decode, executor=_assessment,
+            declared_failure_categories=frozenset({"validation_error", "not_found"}),
+            exception_map=INPUT_EXCEPTION_MAP + NOT_FOUND_EXCEPTION_MAP, success_renderer=compact_json,
+        ),
     )

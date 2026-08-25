@@ -4,7 +4,7 @@ import os
 import re
 import sqlite3
 import zipfile
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from hashlib import sha256
 from importlib.metadata import PackageNotFoundError, version as package_version
@@ -12,6 +12,7 @@ from io import BytesIO
 from pathlib import Path
 from secrets import compare_digest
 from time import perf_counter
+from types import SimpleNamespace
 from typing import Any, Callable, Literal, Mapping, Optional, cast
 from uuid import UUID, uuid4
 
@@ -56,14 +57,7 @@ from offerpilot.reliability.trace import (
     record_mock_interview_trace,
 )
 from offerpilot.ai.client import ConfiguredAIClient
-from offerpilot.ai.tool_runtime.contracts import (
-    ToolExecutionRecord,
-    ToolSuccess,
-)
-from offerpilot.ai.tool_specs.catalog import (
-    MODEL_TOOL_CATALOG,
-    editable_fields_for_tool,
-)
+from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.ai.write_operations import (
     OperationFailed,
@@ -1369,15 +1363,6 @@ def create_app(
             _safe_tool_args(pending.args),
             applications,
             application_jd_versions,
-        ),
-        undo_seed_for_pending=lambda pending, current_applications: _undo_seed_for_pending(
-            pending,
-            cast(Any, current_applications),
-        ),
-        build_write_undo=lambda pending, record, seed: _build_write_undo(
-            pending,
-            cast(Any, record),
-            cast(dict[str, Any], seed),
         ),
         title_from_message=_title_from_message,
         catalog=MODEL_TOOL_CATALOG,
@@ -8479,7 +8464,14 @@ def _pending_action_json(
         "human": pending.human,
         "args": args,
         "confirmation_token": _confirmation_token(pending),
-        "editable_fields": editable_fields_for_tool(pending.tool_name),
+        "editable_fields": (
+            [
+                descriptor.to_compat_descriptor()
+                for descriptor in spec.metadata.editable_fields
+            ]
+            if (spec := MODEL_TOOL_CATALOG.resolve(pending.tool_name)) is not None
+            else []
+        ),
     }
     if applications is not None:
         payload.update(
@@ -8505,24 +8497,6 @@ def _confirmation_token(pending: PendingAction) -> str:
         separators=(",", ":"),
     )
     return sha256(identity.encode("utf-8")).hexdigest()
-
-
-_FIELD_FOLLOWUP_LABELS = {
-    "application_id": "关联投递",
-    "company_name": "公司",
-    "position_name": "岗位",
-    "id": "记录编号",
-    "status": "状态",
-    "event_type": "日程类型",
-    "scheduled_at": "日程时间",
-    "duration_minutes": "时长",
-    "company": "公司",
-    "questions": "问题记录",
-    "self_reflection": "自我复盘",
-    "difficulty_points": "难点短板",
-    "mood": "感受",
-    "notes": "备注",
-}
 
 
 def _pending_action_missing_question(
@@ -8619,181 +8593,18 @@ def _pending_action_details(
                 "proposed_version_number": (current_number or 0) + 1,
             }
         return details
-    if tool_name == "create_application":
-        return _pending_create_application_details(args)
-    if tool_name == "create_application_event":
-        return _pending_application_event_details(args, applications)
-    if tool_name == "add_note":
-        return _pending_note_details(args, applications)
-    if tool_name != "update_application_status":
-        return {}
-    app_id = args.get("id")
-    if not isinstance(app_id, (int, str)):
+    spec = MODEL_TOOL_CATALOG.resolve(tool_name)
+    if spec is None:
         return {}
     try:
-        resolved_id = int(app_id)
-    except ValueError:
-        return {}
-    application = applications.get(resolved_id)
-    if application is None:
-        return {}
-    target = {
-        "id": f"application-{application.id}",
-        "kind": "application",
-        "title": application.company_name,
-        "meta": " · ".join(
-            value for value in [application.position_name, application.status] if value
-        ),
-        "source": "pending_action",
-    }
-    if application.notes:
-        target["snippet"] = _short_preview(application.notes)
-    proposed_status = args.get("status")
-    proposed_changes = []
-    if isinstance(proposed_status, str) and proposed_status:
-        proposed_changes.append(
-            {"field": "status", "before": application.status, "after": proposed_status}
+        typed_args = spec.decoder(args)
+        projected_details = spec.presentation.pending_details_projector(
+            typed_args,
+            SimpleNamespace(applications=applications),
         )
-    return {
-        "target": target,
-        "proposed_changes": proposed_changes,
-        "evidence": [target],
-    }
-
-
-def _undo_seed_for_pending(
-    pending: PendingAction,
-    applications: ApplicationsRepository,
-) -> dict[str, Any]:
-    if pending.tool_name != "update_application_status":
+    except (TypeError, ValueError):
         return {}
-    app_id = _safe_tool_args(pending.args).get("id")
-    if not _has_int_like(app_id):
-        return {}
-    application = applications.get(int(str(app_id)))
-    if application is None:
-        return {}
-    return {
-        "application_id": application.id,
-        "status": application.status,
-        "closed_reason": application.closed_reason,
-    }
-
-
-def _build_write_undo(
-    pending: PendingAction,
-    record: ToolExecutionRecord[Any, Any] | None,
-    seed: dict[str, Any],
-) -> dict[str, Any]:
-    payload = _record_payload(record)
-    if pending.tool_name == "update_application_status" and seed:
-        return {
-            "kind": "update_application_status",
-            "label": "撤销更新投递状态",
-            "application_id": seed["application_id"],
-            "before": {
-                "status": seed["status"],
-                "closed_reason": seed["closed_reason"],
-            },
-            "expected_after": {
-                "status": str(payload.get("status") or ""),
-                "closed_reason": str(payload.get("closed_reason") or ""),
-            },
-        }
-    if pending.tool_name == "create_application":
-        application_id = payload.get("application_id") or payload.get("id")
-        if _has_int_like(application_id):
-            return {
-                "kind": "delete_application",
-                "label": "撤销新建投递",
-                "application_id": int(str(application_id)),
-                "expected_after": _created_record_fingerprint("create_application", payload),
-            }
-    if pending.tool_name == "create_application_event":
-        event_id = payload.get("application_event_id") or payload.get("id")
-        if _has_int_like(event_id):
-            return {
-                "kind": "delete_application_event",
-                "label": "撤销新建日程",
-                "application_event_id": int(str(event_id)),
-                "expected_after": _created_record_fingerprint("create_application_event", payload),
-            }
-    if pending.tool_name == "add_note":
-        note_id = payload.get("note_id") or payload.get("id")
-        if _has_int_like(note_id):
-            return {
-                "kind": "delete_note",
-                "label": "撤销保存复盘",
-                "note_id": int(str(note_id)),
-                "expected_after": _created_record_fingerprint("add_note", payload),
-            }
-    return {}
-
-
-def _record_payload(record: ToolExecutionRecord[Any, Any] | None) -> dict[str, Any]:
-    if record is None or not isinstance(record.outcome, ToolSuccess):
-        return {}
-    result = record.outcome.result
-    return cast(dict[str, Any], result) if isinstance(result, dict) else {}
-
-
-_CREATED_RECORD_FINGERPRINT_FIELDS = {
-    "create_application": (
-        "company_name",
-        "position_name",
-        "job_url",
-        "status",
-        "source",
-        "notes",
-        "applied_at",
-        "closed_reason",
-        "updated_at",
-    ),
-    "create_application_event": (
-        "application_id",
-        "event_type",
-        "subtype",
-        "tags",
-        "round",
-        "scheduled_at",
-        "duration_minutes",
-        "location",
-        "notes",
-        "remind_at",
-        "status",
-    ),
-    "add_note": (
-        "application_id",
-        "company",
-        "position",
-        "round",
-        "date",
-        "questions",
-        "self_reflection",
-        "difficulty_points",
-        "mood",
-    ),
-}
-
-
-def _created_record_fingerprint(tool_name: str, payload: dict[str, Any]) -> dict[str, Any]:
-    fields = _CREATED_RECORD_FINGERPRINT_FIELDS.get(tool_name, ())
-    fingerprint = {field: payload.get(field) for field in fields}
-    for field in ("applied_at", "scheduled_at", "remind_at", "updated_at"):
-        if field in fingerprint:
-            fingerprint[field] = _canonical_datetime(fingerprint[field])
-    return fingerprint
-
-
-def _canonical_datetime(value: Any) -> str | None:
-    if value in (None, ""):
-        return None
-    parsed = _parse_optional_datetime(value)
-    if parsed is None:
-        return str(value)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    return dict(projected_details) if isinstance(projected_details, Mapping) else {}
 
 
 def _execute_chat_undo(
@@ -8842,262 +8653,11 @@ def _execute_chat_undo(
     raise ValueError("unsupported undo payload")
 
 
-def _parse_optional_datetime(value: Any) -> datetime | None:
-    if not value:
-        return None
-    if isinstance(value, datetime):
-        return value
-    if isinstance(value, str):
-        try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-    return None
-
-
-def _pending_create_application_details(args: dict[str, Any]) -> dict[str, Any]:
-    company = str(args.get("company_name") or "").strip()
-    position = str(args.get("position_name") or "").strip()
-    status = str(args.get("status") or "applied").strip() or "applied"
-    if not company and not position:
-        return {}
-    target = {
-        "id": f"application-draft-{company or 'unknown'}-{position or 'unknown'}",
-        "kind": "application",
-        "title": company or "公司待补充",
-        "meta": " · ".join(value for value in [position, status] if value),
-        "source": "pending_action",
-    }
-    notes = str(args.get("notes") or "").strip()
-    if notes:
-        target["snippet"] = _short_preview(notes)
-    proposed_changes = [
-        {"field": key, "before": "", "after": value}
-        for key, value in [
-            ("company_name", company),
-            ("position_name", position),
-            ("status", status),
-            ("job_url", str(args.get("job_url") or "").strip()),
-            ("notes", notes),
-        ]
-        if value
-    ]
-    details: dict[str, Any] = {
-        "target": target,
-        "proposed_changes": proposed_changes,
-        "evidence": [],
-    }
-    if status == "interview":
-        details["workflow"] = {
-            "current_step": 1,
-            "total_steps": 2,
-            "current_label": "新建投递",
-            "next_label": "保存面试复盘",
-            "description": "确认后我会继续保存这次面试复盘。",
-        }
-    return details
-
-
-_EVENT_TYPE_LABELS = {
-    "written_test": "笔试",
-    "interview": "面试",
-    "offer_step": "Offer 进展",
-    "deadline": "截止",
-    "custom": "自定义",
-}
-
-
-def _pending_application_event_details(
-    args: dict[str, Any],
-    applications: ApplicationsRepository,
-) -> dict[str, Any]:
-    application_id = args.get("application_id")
-    if not isinstance(application_id, (int, str)):
-        return {}
-    try:
-        resolved_id = int(application_id)
-    except ValueError:
-        return {}
-    application = applications.get(resolved_id)
-    if application is None:
-        return {}
-
-    event_type = str(args.get("event_type") or "")
-    event_label = _EVENT_TYPE_LABELS.get(event_type, "日程")
-    scheduled_at = str(args.get("scheduled_at") or "")
-    duration = args.get("duration_minutes")
-    time_label = _format_pending_datetime(scheduled_at)
-    duration_label = _format_pending_duration(duration)
-    target_meta = " · ".join(value for value in [time_label, duration_label] if value)
-    target = {
-        "id": f"application-event-draft-{application.id}",
-        "kind": "application_event",
-        "title": event_label,
-        "meta": target_meta,
-        "source": "pending_action",
-    }
-    notes = str(args.get("notes") or "")
-    if notes:
-        target["snippet"] = _short_preview(notes)
-
-    evidence = {
-        "id": f"application-{application.id}",
-        "kind": "application",
-        "title": application.company_name,
-        "meta": " · ".join(
-            value for value in [application.position_name, application.status] if value
-        ),
-        "source": "pending_action",
-    }
-    proposed_changes = [
-        {"field": key, "before": "", "after": args[key]}
-        for key in [
-            "event_type",
-            "subtype",
-            "scheduled_at",
-            "duration_minutes",
-            "location",
-            "notes",
-            "remind_at",
-        ]
-        if args.get(key) not in (None, "", [])
-    ]
-    return {
-        "target": target,
-        "proposed_changes": proposed_changes,
-        "evidence": [evidence],
-    }
-
-
-def _format_pending_datetime(value: str) -> str:
-    if not value:
-        return ""
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return value
-    if parsed.tzinfo is not None:
-        parsed = parsed.astimezone(timezone(timedelta(hours=8)))
-    return parsed.strftime("%Y-%m-%d %H:%M")
-
-
-def _format_pending_duration(value: Any) -> str:
-    if value in (None, ""):
-        return ""
-    try:
-        minutes = int(value)
-    except (TypeError, ValueError):
-        return str(value)
-    return f"{minutes} 分钟"
-
-
-def _pending_note_details(
-    args: dict[str, Any],
-    applications: ApplicationsRepository,
-) -> dict[str, Any]:
-    company = str(args.get("company") or "").strip()
-    position = str(args.get("position") or "").strip()
-    application_id = args.get("application_id")
-    application = None
-    if isinstance(application_id, (int, str)) and str(application_id).strip():
-        try:
-            application = applications.get(int(application_id))
-        except ValueError:
-            application = None
-    if application is not None:
-        company = company or application.company_name
-        position = position or application.position_name
-
-    round_name = str(args.get("round") or "").strip()
-    date = str(args.get("date") or "").strip()
-    title = company or "公司待补充"
-    meta = " · ".join(value for value in [position, round_name, date] if value)
-    target = {
-        "id": f"note-draft-{title}-{position or 'unknown'}",
-        "kind": "note",
-        "title": title,
-        "meta": meta,
-        "source": "pending_action",
-    }
-    questions = str(args.get("questions") or "").strip()
-    if questions:
-        target["snippet"] = _short_preview(questions)
-
-    proposed_changes = [
-        {"field": key, "before": "", "after": value}
-        for key, value in [
-            ("company", company),
-            ("position", position),
-            ("round", round_name),
-            ("date", date),
-            ("questions", questions),
-            ("self_reflection", str(args.get("self_reflection") or "").strip()),
-            ("difficulty_points", str(args.get("difficulty_points") or "").strip()),
-            ("mood", str(args.get("mood") or "").strip()),
-        ]
-        if value
-    ]
-    evidence = []
-    if application is not None:
-        evidence.append(
-            {
-                "id": f"application-{application.id}",
-                "kind": "application",
-                "title": application.company_name,
-                "meta": " · ".join(
-                    value for value in [application.position_name, application.status] if value
-                ),
-                "source": "pending_action",
-            }
-        )
-    details: dict[str, Any] = {
-        "target": target,
-        "proposed_changes": proposed_changes,
-        "evidence": evidence,
-        "risk_hint": "基于本轮对话整理，请确认结构化内容无误。",
-        "workflow": {
-            "current_step": 2,
-            "total_steps": 2,
-            "current_label": "保存面试复盘",
-            "description": "这是本次连续写入的最后一步。",
-        },
-    }
-    draft_summary = _pending_note_draft_summary(proposed_changes)
-    if draft_summary:
-        details["draft_summary"] = draft_summary
-    return details
-
-
 def _short_preview(value: str, max_length: int = 180) -> str:
     normalized = " ".join(value.split())
     if len(normalized) <= max_length:
         return normalized
     return normalized[: max_length - 3].rstrip() + "..."
-
-
-def _pending_note_draft_summary(changes: list[dict[str, Any]]) -> dict[str, Any]:
-    fields = []
-    for change in changes:
-        field = str(change.get("field") or "")
-        after = change.get("after")
-        if field not in {"questions", "self_reflection", "difficulty_points", "mood", "notes"}:
-            continue
-        if not isinstance(after, str):
-            continue
-        normalized = " ".join(after.split())
-        if len(normalized) < 80:
-            continue
-        fields.append(
-            {
-                "field": field,
-                "label": _FIELD_FOLLOWUP_LABELS.get(field) or field,
-                "summary": _short_preview(after, 96),
-                "characters": len(normalized),
-            }
-        )
-    return {"title": "复盘草稿", "fields": fields} if fields else {}
-
-
 def _safe_tool_args(raw: str) -> dict[str, Any]:
     try:
         args = json.loads(raw) if raw else {}

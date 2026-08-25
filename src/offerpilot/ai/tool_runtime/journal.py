@@ -11,6 +11,7 @@ from offerpilot.ai.tool_runtime.contracts import (
     ToolFailure,
     ToolSpec,
 )
+from offerpilot.ai.tool_runtime.metadata import WriteOperationMetadataV1
 from offerpilot.ai.types import ToolCall
 
 
@@ -22,11 +23,15 @@ def project_tool_proposed(recorder: RunRecorder, spec: ToolSpec[Any, Any], call:
             facts={
                 "tool_call_id": call.id,
                 "tool_name": spec.name,
-                "tool_kind": spec.kind,
+                "tool_kind": (
+                    "write"
+                    if type(spec.metadata.operation) is WriteOperationMetadataV1
+                    else "read"
+                ),
                 "args_shape_digest": _journal_shape_digest(call.args),
                 "proposal_outcome": (
                     "confirmation_required"
-                    if spec.confirmation_policy == "required"
+                    if spec.metadata.confirmation_policy == "required"
                     else "execution_allowed"
                 ),
             },

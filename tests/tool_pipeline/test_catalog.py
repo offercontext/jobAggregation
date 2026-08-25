@@ -14,21 +14,26 @@ from offerpilot.ai.client import ConfiguredAIClient
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.contracts import (
     BindingContract,
-    BindingResolverSpec,
     BindingAudit,
     PreparedToolCall,
     ProviderToolContract,
     ToolExecutionRecord,
     ToolFailure,
     ToolSpec,
-    WriteContract,
+    materialize_provider_payloads,
 )
+from offerpilot.ai.tool_runtime.metadata import BindingResolverDescriptorV1
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG, MODEL_TOOL_NAMES
 from offerpilot.ai.tool_runtime.legacy import LEGACY_DETERMINISTIC_NAMES
 from offerpilot.ai.types import Message
 from offerpilot.config import Config
 
 from golden import canonical_json, load_golden
+from tests.tool_metadata.factories import (
+    read_metadata,
+    synthetic_tool_spec,
+    write_metadata,
+)
 
 
 def _contract(name: str, schema: dict[str, Any] | None = None) -> ProviderToolContract:
@@ -56,13 +61,11 @@ def _spec(
     kind: str = "read",
     schema: dict[str, Any] | None = None,
 ) -> ToolSpec[dict[str, Any], dict[str, Any]]:
-    return ToolSpec(
+    metadata = write_metadata() if kind == "write" else read_metadata()
+    metadata = replace(metadata, editable_fields=())
+    return replace(
+        synthetic_tool_spec(name, metadata=metadata),
         contract=_contract(name, schema),
-        confirmation_policy="required" if kind == "write" else "none",
-        decoder=lambda values: dict(values),
-        executor=lambda args, context: args,
-        kind=cast(Any, kind),
-        write_contract=WriteContract() if kind == "write" else None,
     )
 
 
@@ -96,7 +99,7 @@ def test_catalog_rejects_missing_duplicate_or_reordered_names(
 
 
 def test_catalog_rejects_invalid_schema_during_construction() -> None:
-    spec = _spec("broken", schema={"type": "not-a-type"})
+    spec = _spec("broken", schema={"type": "not-a-type", "properties": {}})
 
     with pytest.raises(ValueError, match="invalid_tool_schema"):
         ToolCatalog([spec], expected_names=("broken",))
@@ -160,13 +163,14 @@ def test_model_catalog_is_exact_provider_golden_in_exact_order() -> None:
     assert len(MODEL_TOOL_NAMES) == 25
     assert len(set(MODEL_TOOL_NAMES)) == 25
     assert tuple(contract.name for contract in contracts) == MODEL_TOOL_NAMES
-    assert canonical_json([contract.payload for contract in contracts]) == canonical_json(
-        manifest["tools"]
-    )
+    payloads = materialize_provider_payloads(contracts)
+    assert canonical_json(payloads) == canonical_json(manifest["tools"])
     actual_fingerprints = {
         contract.name: "sha256:"
-        + hashlib.sha256(canonical_json(contract.parameters).encode("utf-8")).hexdigest()
-        for contract in contracts
+        + hashlib.sha256(
+            canonical_json(payload["function"]["parameters"]).encode("utf-8")
+        ).hexdigest()
+        for contract, payload in zip(contracts, payloads, strict=True)
     }
     assert actual_fingerprints == manifest["schema_fingerprints"]
 
@@ -199,26 +203,27 @@ def test_complete_tool_classification_is_exactly_twenty_five_typed_plus_three_le
 
 def test_catalog_rejects_unknown_capability_and_resolver_metadata() -> None:
     spec = _spec("read_one")
-    with pytest.raises(ValueError, match="unknown capability"):
-        ToolCatalog(
-            [replace(spec, required_capabilities=frozenset({"future.read"}))],
-            expected_names=("read_one",),
-            authority_manifest={
-                "schema_version": 1,
-                "tools": [],
-            },
-        )
+    original = spec.metadata.required_capabilities
+    object.__setattr__(spec.metadata, "required_capabilities", (cast(Any, "future.read"),))
+    try:
+        with pytest.raises((TypeError, ValueError), match="capabilit|metadata"):
+            ToolCatalog(
+                [spec],
+                expected_names=("read_one",),
+                authority_manifest={"schema_version": 1, "tools": []},
+            )
+    finally:
+        object.__setattr__(spec.metadata, "required_capabilities", original)
 
 
 def test_binding_contract_and_resolver_descriptor_have_closed_fields() -> None:
     contract = BindingContract(kind="enforce_if_bound", entity_kind="application")
-    resolver = BindingResolverSpec(
+    resolver = BindingResolverDescriptorV1(
         resolver_id="application_identity_arg",
         entity_kind="application",
         arg_path="id",
         presence="required",
         identity_type="positive_int64",
-        resolve=lambda args, context: None,
     )
     assert contract.entity_kind == "application"
     assert resolver.arg_path == "id"

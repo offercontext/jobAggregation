@@ -20,8 +20,9 @@ from offerpilot.ai.tool_runtime.contracts import (
     BindingAudit,
     PreparedToolCall,
     ProviderToolContract,
-    ToolSpec,
+    materialize_provider_payloads,
 )
+from tests.tool_metadata.factories import synthetic_tool_spec
 
 
 def _prepared(factory: AuthorityFactory) -> PreparedToolCall[Any, Any]:
@@ -32,17 +33,23 @@ def _prepared(factory: AuthorityFactory) -> PreparedToolCall[Any, Any]:
         trusted_scope=TrustedContextScope("workspace", None, "general"),
         capabilities=frozenset(),
     )
-    spec = ToolSpec(
-        contract=ProviderToolContract(
-            payload={
-                "type": "function",
-                "function": {"name": "get_application", "description": "", "parameters": {}},
+    parameters: dict[str, object] = {"type": "object", "properties": {}}
+    contract = ProviderToolContract(
+        payload={
+            "type": "function",
+            "function": {
+                "name": "get_application",
+                "description": "",
+                "parameters": parameters,
             },
-            name="get_application",
-            description="",
-            parameters={},
-        ),
-        kind="read",
+        },
+        name="get_application",
+        description="",
+        parameters=parameters,
+    )
+    spec = replace(
+        synthetic_tool_spec("get_application"),
+        contract=contract,
         decoder=lambda value: value,
         executor=lambda args, context: args,
     )
@@ -102,15 +109,18 @@ def _prepared(factory: AuthorityFactory) -> PreparedToolCall[Any, Any]:
         authority=authority,
         prepare_identity=prepare_identity,
     )
-    contract_fingerprint = "sha256:" + hashlib.sha256(
-        json.dumps(
-            dict(spec.contract.payload),
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-    ).hexdigest()
+    contract_fingerprint = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                materialize_provider_payloads((spec.contract,))[0],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+    )
     return factory.prepare_tool_call(
         authority,
         prepare_identity=prepare_identity,

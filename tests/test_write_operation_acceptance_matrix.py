@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from threading import Lock
 from types import SimpleNamespace
 from uuid import uuid4
@@ -19,17 +20,14 @@ from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
 from offerpilot.ai.tool_authority.fingerprint import authorization_scope_fingerprint
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
-from offerpilot.ai.tool_runtime.policy_types import ToolCapability
+from offerpilot.ai.tool_runtime.policy_types import ToolCapability, UndoPolicy
 from offerpilot.ai.tool_runtime.contracts import (
-    BindingContract,
     ConfirmationRequired,
     ProviderToolContract,
     REQUIRED_UNDO_TOOL_NAMES,
     ToolExceptionMapping,
-    ToolSpec,
-    UndoPolicy,
-    WriteContract,
 )
+from offerpilot.ai.tool_runtime.metadata import ToolPresentationBindingV1, UndoBuilderBinding
 from offerpilot.ai.tool_runtime.pipeline import prepare_call
 from offerpilot.ai.types import ToolCall
 from offerpilot.ai.write_operations import (
@@ -54,6 +52,7 @@ from offerpilot.repositories.jd import JDAnalysesRepository
 from offerpilot.repositories.notes import NotesRepository
 from offerpilot.repositories.offers import OffersRepository
 from offerpilot.repositories.resumes import ResumesRepository
+from tests.tool_metadata.factories import synthetic_tool_spec, write_metadata
 
 
 _UNDO_KINDS = {
@@ -63,6 +62,20 @@ _UNDO_KINDS = {
     "add_note": "delete_note",
 }
 _TEST_AUTHORITY_FACTORIES: list[AuthorityFactory] = []
+
+
+def _capture_acceptance_undo_seed(_context: object, _args: object) -> None:
+    return None
+
+
+def _build_acceptance_undo(_seed: object, record: object) -> dict[str, object]:
+    prepared = getattr(record, "prepared")
+    tool_name = getattr(getattr(prepared, "spec"), "name")
+    return {"kind": _UNDO_KINDS[tool_name]}
+
+
+def _render_acceptance_success(result: dict[str, object]) -> str:
+    return f"committed:{result['adapter']}"
 
 
 @pytest.fixture(autouse=True)
@@ -187,23 +200,44 @@ def _harness(
         description="acceptance",
         parameters=parameters,
     )
-    spec = ToolSpec(
+    undo_policy = (
+        UndoPolicy.REQUIRED
+        if tool_name in REQUIRED_UNDO_TOOL_NAMES
+        else UndoPolicy.NONE
+    )
+    metadata = replace(
+        write_metadata(
+            name=tool_name,
+            undo_policy=undo_policy,
+            resolver_descriptors=(),
+        ),
+        editable_fields=(),
+    )
+    base = synthetic_tool_spec(tool_name, metadata=metadata)
+    undo_binding = None
+    if undo_policy is UndoPolicy.REQUIRED:
+        operation = metadata.operation
+        assert operation.undo_builder_id is not None
+        undo_binding = UndoBuilderBinding(
+            descriptor=operation,
+            implementation_id=operation.undo_builder_id,
+            capture_seed=_capture_acceptance_undo_seed,
+            build_undo=_build_acceptance_undo,
+        )
+    spec = replace(
+        base,
         contract=contract,
-        kind="write",
-        decoder=lambda values: values,
         executor=executor,
-        confirmation_policy="required",
+        presentation=ToolPresentationBindingV1(
+            implementation_id="acceptance_write_presentation_v1",
+            confirmation_description=base.presentation.confirmation_description,
+            pending_details_projector=base.presentation.pending_details_projector,
+            success_summary_projector=_render_acceptance_success,
+        ),
+        undo_builder_binding=undo_binding,
         declared_failure_categories=declared_failure_categories,
         exception_map=exception_map,
-        success_renderer=lambda result: f"committed:{result['adapter']}",
-        write_contract=WriteContract(
-            undo_policy=(
-                UndoPolicy.REQUIRED
-                if tool_name in REQUIRED_UNDO_TOOL_NAMES
-                else UndoPolicy.NONE
-            )
-        ),
-        binding_contract=BindingContract("none"),
+        success_renderer=_render_acceptance_success,
     )
     catalog = ToolCatalog((spec,), expected_names=(tool_name,))
     prepare_identity = factory.create_approved_write_prepare_identity(
@@ -299,13 +333,6 @@ def _execute_typed_parent(tmp_path, tool_name: str):
         return {"adapter": tool_name, "executions": len(calls)}
 
     harness = _harness(tmp_path, tool_name, execute)
-    undo_builder = None
-    if tool_name in REQUIRED_UNDO_TOOL_NAMES:
-
-        def build_undo(_prepared, _record, _seed):
-            return {"kind": _UNDO_KINDS[tool_name]}
-
-        undo_builder = build_undo
     execution, _record = harness.coordinator.execute_primary(
         operation_id=harness.operation_id,
         conversation_id=harness.conversation.id,
@@ -313,7 +340,6 @@ def _execute_typed_parent(tmp_path, tool_name: str):
         context=harness.context,
         prepare_identity=harness.prepare_identity,
         request_fingerprint=harness.request_fingerprint,
-        undo_builder=undo_builder,
     )
     assert isinstance(execution, OperationCommitted)
     return (

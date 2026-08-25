@@ -121,7 +121,10 @@ def test_policy_resolver_rebuilds_an_independent_segment_catalog() -> None:
     assert fresh.provider_contracts() == MODEL_TOOL_CATALOG.provider_contracts()
     assert fresh.authority_manifest == MODEL_TOOL_CATALOG.authority_manifest
     for original, detached in zip(MODEL_TOOL_CATALOG.specs, fresh.specs, strict=True):
-        assert detached is not original
+        assert detached is original
+        assert detached.metadata is original.metadata
+        assert detached.presentation is original.presentation
+        assert detached.undo_builder_binding is original.undo_builder_binding
 
 
 def test_continuation_activation_marker_is_immutable_and_transient() -> None:
@@ -1837,7 +1840,11 @@ def _persist_real_sqlite_typed_pending(
 def _real_sqlite_approval_catalog(executor: object) -> ToolCatalog:
     base_spec = MODEL_TOOL_CATALOG.resolve("save_offer_assessment")
     assert base_spec is not None
-    spec = replace(base_spec, binding_resolvers=(), executor=cast(Any, executor))
+    spec = replace(
+        base_spec,
+        metadata=replace(base_spec.metadata, dependencies=()),
+        executor=cast(Any, executor),
+    )
     return ToolCatalog((spec,), expected_names=(spec.name,))
 
 

@@ -189,7 +189,11 @@ def test_reparent_after_resolver_rollback_before_final_sql_denies_without_body(
             executor_calls += 1
             return original_executor(args, context)
 
-        selected = replace(selected, executor=counted_executor)
+        selected = replace(
+            selected,
+            metadata=replace(selected.metadata, dependencies=()),
+            executor=counted_executor,
+        )
         catalog = ToolCatalog([selected], expected_names=(selected.name,))
         call = ToolCall(id="get-offer-race", name="get_offer", args=f'{{"id":{offer_id}}}')
         prepared = runtime.prepare(catalog, call)
@@ -255,6 +259,7 @@ def test_cross_application_detached_and_missing_are_publicly_equivalent(tmp_path
             )
         )
         selected = next(spec for spec in offer_specs() if spec.name == "get_offer")
+        selected = replace(selected, metadata=replace(selected.metadata, dependencies=()))
         failures: list[ToolFailure] = []
         visible: list[str] = []
         downstream_event_counts: list[int] = []

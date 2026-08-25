@@ -9,10 +9,22 @@ from offerpilot.ai.agent_contracts import PendingAction
 from offerpilot.ai.confirmation import prepare_pending_action
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.contracts import (
+    BindingContract,
     ProviderToolContract,
     ToolExceptionMapping,
     ToolSpec,
-    WriteContract,
+)
+from offerpilot.ai.tool_runtime.metadata import (
+    EditableFieldMetadataV1,
+    ToolBindingMetadataV1,
+    ToolPresentationBindingV1,
+    ToolSurfaceMetadataV1,
+    WriteOperationMetadataV1,
+)
+from offerpilot.ai.tool_runtime.policy_types import (
+    ProviderVisibility,
+    ToolCapability,
+    ToolDomain,
 )
 from offerpilot.ai.write_operations import (
     OperationReplay,
@@ -24,20 +36,80 @@ from offerpilot.pilot_runtime.contracts import ConfirmationRequiredOutcome
 
 
 _EDITABLE_FIELDS = (
-    {"field": "status", "type": "enum", "options": ["offer", "rejected"]},
-    {"field": "title", "type": "string"},
-    {"field": "score", "type": "number"},
-    {"field": "active", "type": "boolean"},
-    {"field": "remind_at", "type": "datetime", "clearable": True, "clear_value": ""},
+    EditableFieldMetadataV1(
+        field="status",
+        value_type="enum",
+        options=("offer", "rejected"),
+        clearable=False,
+        clear_value=None,
+    ),
+    EditableFieldMetadataV1(
+        field="title",
+        value_type="string",
+        options=None,
+        clearable=False,
+        clear_value=None,
+    ),
+    EditableFieldMetadataV1(
+        field="score",
+        value_type="number",
+        options=None,
+        clearable=False,
+        clear_value=None,
+    ),
+    EditableFieldMetadataV1(
+        field="active",
+        value_type="boolean",
+        options=None,
+        clearable=False,
+        clear_value=None,
+    ),
+    EditableFieldMetadataV1(
+        field="remind_at",
+        value_type="datetime",
+        options=None,
+        clearable=True,
+        clear_value="",
+    ),
 )
+
+
+def _decode_arguments(values: dict[str, Any]) -> dict[str, Any]:
+    return dict(values)
+
+
+def _execute_arguments(args: dict[str, Any], _context: object) -> dict[str, Any]:
+    return args
+
+
+def _describe_confirmation(_args: object) -> str:
+    return "change status"
+
+
+def _project_pending_details(_args: object) -> dict[str, object]:
+    return {}
+
+
+def _project_success_summary(result: object) -> str:
+    return str(result)
 
 
 def editable_catalog(
     *,
-    editable_fields: tuple[dict[str, Any], ...] = _EDITABLE_FIELDS,
+    editable_fields: tuple[EditableFieldMetadataV1, ...] = _EDITABLE_FIELDS,
 ) -> ToolCatalog:
     name = "update_application_status"
-    schema = {"type": "object", "properties": {"id": {"type": "integer"}}}
+    schema = {
+        "type": "object",
+        "properties": {
+            "id": {"type": "integer"},
+            "status": {"type": "string", "enum": ["offer", "rejected"]},
+            "title": {"type": "string"},
+            "score": {"type": "number"},
+            "active": {"type": "boolean"},
+            "remind_at": {"type": "string"},
+        },
+    }
     contract = ProviderToolContract(
         payload={
             "type": "function",
@@ -49,16 +121,29 @@ def editable_catalog(
     )
     spec = ToolSpec(
         contract=contract,
-        kind="write",
-        decoder=lambda values: dict(values),
-        executor=lambda args, _context: args,
-        confirmation_policy="required",
-        editable_fields=editable_fields,
+        metadata=ToolSurfaceMetadataV1(
+            domains=(ToolDomain.APPLICATIONS,),
+            dependencies=(),
+            provider_visibility=ProviderVisibility.MODEL_ELIGIBLE,
+            required_capabilities=(ToolCapability.APPLICATIONS_WRITE,),
+            binding=ToolBindingMetadataV1(contract=BindingContract()),
+            confirmation_policy="required",
+            editable_fields=editable_fields,
+            operation=WriteOperationMetadataV1(),
+        ),
+        resolver_bindings=(),
+        undo_builder_binding=None,
+        decoder=_decode_arguments,
+        executor=_execute_arguments,
+        presentation=ToolPresentationBindingV1(
+            implementation_id="agent_loop_confirmation_test_presentation_v1",
+            confirmation_description=_describe_confirmation,
+            pending_details_projector=_project_pending_details,
+            success_summary_projector=_project_success_summary,
+        ),
         declared_failure_categories=frozenset({"internal_error"}),
         exception_map=(ToolExceptionMapping(Exception, "internal_error", "test_error"),),
         success_renderer=str,
-        confirmation_description=lambda _args: "change status",
-        write_contract=WriteContract(),
     )
     return ToolCatalog((spec,), expected_names=(name,))
 

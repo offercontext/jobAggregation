@@ -28,12 +28,23 @@ from offerpilot.ai.tool_authority import (
 from offerpilot.ai.tool_runtime.contracts import (
     BindingAudit,
     BindingContract,
-    BindingResolverSpec,
     PreparedToolCall,
     ProviderToolContract,
     ToolExceptionMapping,
-    ToolSpec,
-    WriteContract,
+    materialize_provider_payloads,
+)
+from offerpilot.ai.tool_runtime.metadata import (
+    EditableFieldMetadataV1,
+    ToolBindingMetadataV1,
+    ToolPresentationBindingV1,
+    WriteOperationMetadataV1,
+)
+from tests.tool_metadata.factories import (
+    read_metadata,
+    resolver_binding,
+    resolver_descriptor,
+    synthetic_tool_spec,
+    write_metadata,
 )
 
 
@@ -41,6 +52,18 @@ SHA = "sha256:" + hashlib.sha256(b"{}").hexdigest()
 SHA_B = "sha256:" + "b" * 64
 HMAC = "hmac-sha256:" + "c" * 64
 HMAC_B = "hmac-sha256:" + "d" * 64
+
+
+def _forged_confirmation_description(_args: object) -> str:
+    return "forged confirmation"
+
+
+def _forged_pending_details(_args: object) -> dict[str, bool]:
+    return {"forged": True}
+
+
+def _forged_success_summary(_result: object) -> str:
+    return "forged success"
 
 
 @pytest.fixture
@@ -84,20 +107,28 @@ def _prepared(
     tool_name: str = "get_application",
     kind: str = "read",
 ) -> PreparedToolCall[Any, Any]:
-    spec = ToolSpec(
-        contract=ProviderToolContract(
-            payload={
-                "type": "function",
-                "function": {"name": tool_name, "description": "", "parameters": {}},
+    parameters: dict[str, object] = {"type": "object", "properties": {}}
+    contract = ProviderToolContract(
+        payload={
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": "",
+                "parameters": parameters,
             },
-            name=tool_name,
-            description="",
-            parameters={},
-        ),
-        kind=kind,  # type: ignore[arg-type]
+        },
+        name=tool_name,
+        description="",
+        parameters=parameters,
+    )
+    metadata = write_metadata(tool_name) if kind == "write" else read_metadata(tool_name)
+    if kind == "write":
+        metadata = replace(metadata, editable_fields=())
+    spec = replace(
+        synthetic_tool_spec(tool_name, metadata=metadata),
+        contract=contract,
         decoder=lambda value: value,
         executor=lambda args, context: args,
-        confirmation_policy="required" if kind == "write" else "none",
     )
     if isinstance(authority, ApprovalExecutionAuthority):
         prepare_identity = factory.create_approved_write_prepare_identity(
@@ -121,15 +152,18 @@ def _prepared(
         authority=authority,
         prepare_identity=prepare_identity,
     )
-    contract_fingerprint = "sha256:" + hashlib.sha256(
-        json.dumps(
-            dict(spec.contract.payload),
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-    ).hexdigest()
+    contract_fingerprint = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                materialize_provider_payloads((spec.contract,))[0],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+    )
     return factory.prepare_tool_call(
         authority,
         prepare_identity=prepare_identity,
@@ -746,17 +780,23 @@ def test_prepare_port_requires_registered_prepare_call_spec_and_exact_args_diges
             tool_name="get_application",
             arguments_digest=digest,
         )
-        spec = ToolSpec(
-            contract=ProviderToolContract(
-                payload={
-                    "type": "function",
-                    "function": {"name": "get_application", "description": "", "parameters": {}},
+        parameters: dict[str, object] = {"type": "object", "properties": {}}
+        contract = ProviderToolContract(
+            payload={
+                "type": "function",
+                "function": {
+                    "name": "get_application",
+                    "description": "",
+                    "parameters": parameters,
                 },
-                name="get_application",
-                description="",
-                parameters={},
-            ),
-            kind="read",
+            },
+            name="get_application",
+            description="",
+            parameters=parameters,
+        )
+        spec = replace(
+            synthetic_tool_spec("get_application"),
+            contract=contract,
             decoder=lambda value: value,
             executor=lambda args, context: args,
         )
@@ -765,15 +805,18 @@ def test_prepare_port_requires_registered_prepare_call_spec_and_exact_args_diges
             authority=authority,
             prepare_identity=prepare_identity,
         )
-        contract_fingerprint = "sha256:" + hashlib.sha256(
-            json.dumps(
-                dict(spec.contract.payload),
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode("utf-8")
-        ).hexdigest()
+        contract_fingerprint = (
+            "sha256:"
+            + hashlib.sha256(
+                json.dumps(
+                    materialize_provider_payloads((spec.contract,))[0],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+        )
         with pytest.raises(AuthorityPhaseError):
             factory.prepare_tool_call(
                 authority,
@@ -791,12 +834,7 @@ def test_prepare_port_requires_registered_prepare_call_spec_and_exact_args_diges
                 authority,
                 prepare_identity=prepare_identity,
                 tool_call_id="call-1",
-                spec=ToolSpec(
-                    contract=spec.contract,
-                    kind="read",
-                    decoder=spec.decoder,
-                    executor=lambda args, context: "injected",
-                ),
+                spec=replace(spec, executor=lambda args, context: "injected"),
                 arguments={},
                 typed_args={},
                 arguments_digest=_args_digest({}),
@@ -818,7 +856,9 @@ def test_prepare_port_requires_registered_prepare_call_spec_and_exact_args_diges
             )
 
 
-@pytest.mark.parametrize("mutation", ["binding_contract", "resolver_descriptor", "resolver_callable"])
+@pytest.mark.parametrize(
+    "mutation", ["binding_contract", "resolver_descriptor", "resolver_callable"]
+)
 def test_registered_tool_spec_snapshot_rejects_binding_authority_mutation(
     mutation: str,
 ) -> None:
@@ -841,33 +881,31 @@ def test_registered_tool_spec_snapshot_rejects_binding_authority_mutation(
             calls["evil"] += 1
             return object()
 
-        resolver = BindingResolverSpec(
-            resolver_id="application_identity_arg",
-            entity_kind="application",
-            arg_path="id",
-            presence="required",
-            identity_type="positive_int64",
-            resolve=lambda args, context: None,
-        )
-        spec = ToolSpec(
-            contract=ProviderToolContract(
-                payload={
-                    "type": "function",
-                    "function": {
-                        "name": "get_application",
-                        "description": "",
-                        "parameters": {},
-                    },
+        descriptor = resolver_descriptor()
+        resolver = resolver_binding(descriptor)
+        parameters: dict[str, object] = {"type": "object", "properties": {}}
+        contract = ProviderToolContract(
+            payload={
+                "type": "function",
+                "function": {
+                    "name": "get_application",
+                    "description": "",
+                    "parameters": parameters,
                 },
-                name="get_application",
-                description="",
-                parameters={},
+            },
+            name="get_application",
+            description="",
+            parameters=parameters,
+        )
+        spec = replace(
+            synthetic_tool_spec(
+                "get_application",
+                metadata=read_metadata("get_application", resolver_descriptors=(descriptor,)),
             ),
-            kind="read",
+            contract=contract,
             decoder=lambda value: value,
             executor=lambda args, context: args,
-            binding_contract=BindingContract("enforce_if_bound", "application"),
-            binding_resolvers=(resolver,),
+            resolver_bindings=(resolver,),
         )
         factory.register_tool_spec(
             spec,
@@ -877,36 +915,34 @@ def test_registered_tool_spec_snapshot_rejects_binding_authority_mutation(
 
         if mutation == "binding_contract":
             object.__setattr__(
-                spec,
-                "binding_contract",
-                BindingContract("enforce_if_bound", "application"),
+                spec.metadata,
+                "binding",
+                ToolBindingMetadataV1(
+                    contract=BindingContract("enforce_if_bound", "application"),
+                    resolver_descriptors=(descriptor,),
+                ),
             )
         elif mutation == "resolver_descriptor":
+            forged_descriptor = resolver_descriptor("application_event_parent")
             object.__setattr__(
                 spec,
-                "binding_resolvers",
-                (
-                    BindingResolverSpec(
-                        resolver_id="application_identity_arg",
-                        entity_kind="application",
-                        arg_path="id",
-                        presence="required",
-                        identity_type="positive_int64",
-                        resolve=evil_resolver,
-                    ),
-                ),
+                "resolver_bindings",
+                (resolver_binding(forged_descriptor),),
             )
         else:
             object.__setattr__(resolver, "resolve", evil_resolver)
 
-        contract_fingerprint = "sha256:" + hashlib.sha256(
-            json.dumps(
-                dict(spec.contract.payload),
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
+        contract_fingerprint = (
+            "sha256:"
+            + hashlib.sha256(
+                json.dumps(
+                    materialize_provider_payloads((spec.contract,))[0],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+        )
         with pytest.raises(AuthorityPhaseError):
             factory.prepare_tool_call(
                 authority,
@@ -929,16 +965,27 @@ def test_registered_tool_spec_snapshot_rejects_binding_authority_mutation(
         ("preflight", lambda _args, _context: None),
         ("mutable_validator", lambda _args, _context: None),
         ("success_renderer", lambda _result: "forged"),
-        ("result_metadata", lambda _result: None),
-        ("confirmation_description", lambda _args: "forged"),
+        ("result_metadata_projector", lambda _result: None),
+        ("presentation", None),
         ("schema_failure_renderer", lambda _arguments, _detail: "forged"),
-        ("editable_fields", ({"field": "forged", "type": "text"},)),
+        (
+            "editable_fields",
+            (
+                EditableFieldMetadataV1(
+                    field="forged",
+                    value_type="string",
+                    options=None,
+                    clearable=False,
+                    clear_value=None,
+                ),
+            ),
+        ),
         ("declared_failure_categories", frozenset({"conflict"})),
         (
             "exception_map",
             (ToolExceptionMapping(ValueError, "conflict", "forged_conflict"),),
         ),
-        ("write_contract", WriteContract()),
+        ("operation", None),
     ),
 )
 def test_prepared_call_rejects_in_flight_tool_spec_semantic_mutation(
@@ -949,7 +996,27 @@ def test_prepared_call_rejects_in_flight_tool_spec_semantic_mutation(
         authority = _segment(factory)
         prepared = _prepared(factory, authority, kind="write")
 
-        object.__setattr__(prepared.spec, field, replacement)
+        target: object = prepared.spec
+        final_replacement = replacement
+        if field == "editable_fields":
+            target = prepared.spec.metadata
+        elif field == "operation":
+            target = prepared.spec.metadata
+            operation = prepared.spec.metadata.operation
+            assert type(operation) is WriteOperationMetadataV1
+            final_replacement = replace(
+                operation,
+                visible_bytes=operation.visible_bytes - 1,
+            )
+        elif field == "presentation":
+            final_replacement = ToolPresentationBindingV1(
+                implementation_id="forged_presentation_v1",
+                confirmation_description=_forged_confirmation_description,
+                pending_details_projector=_forged_pending_details,
+                success_summary_projector=_forged_success_summary,
+            )
+
+        object.__setattr__(target, field, final_replacement)
 
         with pytest.raises(AuthorityPhaseError):
             factory.require_prepared_call(prepared, authority)
@@ -1619,7 +1686,9 @@ def test_revoke_authority_uses_exact_identity_after_authority_mutation() -> None
         assert factory.active_count == 0
         assert not factory.is_active(authority)
         assert not factory.is_active(claim)
-        assert not any(owner is factory for _, owner in authority_composition._ACTIVE_OBJECTS.values())
+        assert not any(
+            owner is factory for _, owner in authority_composition._ACTIVE_OBJECTS.values()
+        )
 
 
 @pytest.mark.parametrize("extra", [math.nan, object()])
@@ -1636,20 +1705,21 @@ def test_register_tool_spec_validation_is_atomic_for_noncanonical_payload(extra:
             tool_name="invalid_spec",
             arguments_digest=SHA,
         )
-        spec = ToolSpec(
-            contract=ProviderToolContract(
-                payload={
-                    "type": "function",
-                    "function": {"name": "invalid_spec", "description": "", "parameters": {}},
-                    "extra": extra,
+        spec = synthetic_tool_spec("invalid_spec")
+        object.__setattr__(
+            spec.contract,
+            "payload",
+            {
+                "type": "function",
+                "function": {
+                    "name": "invalid_spec",
+                    "description": "invalid_spec description",
+                    "parameters": materialize_provider_payloads((spec.contract,))[0]["function"][
+                        "parameters"
+                    ],
                 },
-                name="invalid_spec",
-                description="",
-                parameters={},
-            ),
-            kind="read",
-            decoder=lambda value: value,
-            executor=lambda args, context: args,
+                "extra": extra,
+            },
         )
         before = factory.active_count
         with pytest.raises((AuthorityPhaseError, ValueError, TypeError)):

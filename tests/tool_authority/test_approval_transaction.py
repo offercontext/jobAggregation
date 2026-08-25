@@ -150,7 +150,11 @@ def _scoped_approval_harness(
         executor_calls.append(dict(args))
         return {"ok": True}
 
-    spec = replace(original_spec, executor=executor)
+    spec = replace(
+        original_spec,
+        metadata=replace(original_spec.metadata, dependencies=()),
+        executor=executor,
+    )
     catalog = ToolCatalog((spec,), expected_names=(tool_name,))
     prepare_identity = factory.create_approved_write_prepare_identity(
         authority,

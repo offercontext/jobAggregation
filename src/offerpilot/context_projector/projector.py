@@ -3,7 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from offerpilot.ai.tool_runtime.contracts import ProviderToolContract
+from offerpilot.ai.tool_runtime.contracts import (
+    ProviderToolContract,
+    materialize_provider_payloads,
+)
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 from offerpilot.context_projector.budget import (
@@ -103,7 +106,8 @@ class ModelSurfaceProjector:
                 selection.names,
                 tuple(contract.name for contract in request.provider_catalog.provider_contracts()),
             )
-        tool_bytes = canonical_json([dict(tool.payload) for tool in selection.tools])
+        tool_payloads = materialize_provider_payloads(selection.tools)
+        tool_bytes = canonical_json(tool_payloads)
         if len(tool_bytes) > PROVIDER_TOOLS_BYTE_CAP:
             raise ProjectionError("provider_tools_byte_cap_exceeded")
 
@@ -190,7 +194,7 @@ class ModelSurfaceProjector:
             {
                 "budget_policy_version": BUDGET_POLICY_VERSION,
                 "messages": [message.canonical_value() for message in messages],
-                "tools": [dict(tool.payload) for tool in selection.tools],
+                "tools": tool_payloads,
             }
         )
         fingerprint = "sha256:" + sha256_hex(canonical_surface)

@@ -25,6 +25,7 @@ from offerpilot.ai.agent_loop import (
 from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
 from offerpilot.ai.tool_authority.policy import validate_startup_policy
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
+from offerpilot.ai.tool_runtime.metadata import ToolPresentationBindingV1
 from offerpilot.ai.tool_runtime.policy_types import ToolCapability
 from offerpilot.ai.tool_runtime.contracts import (
     PreparedToolCall,
@@ -40,6 +41,56 @@ from offerpilot.context_projector.contracts import ProjectionError
 from offerpilot.context_projector.selector import DEPENDENCY_POLICY_V1
 
 from .helpers import RecordingEventSink, ScriptedModel, ToolDefinition, runtime
+
+
+class _PresentationProbe:
+    def __init__(self) -> None:
+        self.cancelled = False
+        self.descriptions = 0
+
+    def reset(self) -> None:
+        self.cancelled = False
+        self.descriptions = 0
+
+
+_PRESENTATION_PROBE = _PresentationProbe()
+
+
+def _probe_confirmation_description(_args: object) -> str:
+    _PRESENTATION_PROBE.descriptions += 1
+    if _PRESENTATION_PROBE.descriptions == 2:
+        _PRESENTATION_PROBE.cancelled = True
+    return "write"
+
+
+def _probe_pending_details(_args: object) -> dict[str, object]:
+    return {}
+
+
+def _probe_success_summary(result: object) -> str:
+    return str(result)
+
+
+def _probe_cancel_check() -> bool:
+    return _PRESENTATION_PROBE.cancelled
+
+
+def _with_probe_presentation(catalog: ToolCatalog) -> ToolCatalog:
+    specs = tuple(
+        replace(
+            item,
+            presentation=ToolPresentationBindingV1(
+                implementation_id="agent_loop_test_probe_presentation_v1",
+                confirmation_description=_probe_confirmation_description,
+                pending_details_projector=_probe_pending_details,
+                success_summary_projector=_probe_success_summary,
+            ),
+        )
+        if item.name == "update_application_status"
+        else item
+        for item in catalog.specs
+    )
+    return ToolCatalog(specs, expected_names=tuple(item.name for item in specs))
 
 
 class _DelegatingRecorder:
@@ -320,42 +371,26 @@ def test_write_tool_pauses_before_execution() -> None:
 
 
 def test_pending_return_rechecks_active_after_confirmation_summary() -> None:
-    cancelled = False
-    descriptions = 0
+    _PRESENTATION_PROBE.reset()
     model = ScriptedModel(
         Assistant(
             tool_calls=[ToolCall("w1", "update_application_status", '{"id":1,"status":"applied"}')]
         )
     )
 
-    def describe(_args: object) -> str:
-        nonlocal cancelled, descriptions
-        descriptions += 1
-        if descriptions == 2:
-            cancelled = True
-        return "write"
-
-    def with_description(catalog: ToolCatalog) -> ToolCatalog:
-        specs = tuple(
-            replace(item, confirmation_description=describe)
-            if item.name == "update_application_status"
-            else item
-            for item in catalog.specs
-        )
-        return ToolCatalog(specs, expected_names=tuple(item.name for item in specs))
-
     base = invocation(
         model,
         (ToolDefinition("update_application_status", kind="write"),),
-        cancel_check=lambda: cancelled,
-        catalog_transform=with_description,
+        cancel_check=_probe_cancel_check,
+        catalog_transform=_with_probe_presentation,
     )
 
     with pytest.raises(ChatRunCancelled):
         AgentLoopRunner().run(base)
 
-    assert descriptions == 2
+    assert _PRESENTATION_PROBE.descriptions == 2
     assert model.calls == 1
+    _PRESENTATION_PROBE.reset()
 
 
 @pytest.mark.parametrize(

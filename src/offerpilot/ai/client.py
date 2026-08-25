@@ -5,7 +5,6 @@ import json
 import os
 import time
 import uuid
-from copy import deepcopy
 from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlparse
@@ -13,7 +12,10 @@ from urllib.parse import urlparse
 from litellm import completion
 
 from offerpilot.ai.types import Assistant, Message, ToolCall
-from offerpilot.ai.tool_runtime.contracts import ProviderToolContract
+from offerpilot.ai.tool_runtime.contracts import (
+    ProviderToolContract,
+    materialize_provider_payloads,
+)
 from offerpilot.ai.tool_authority.contracts import (
     ProviderInvocationIdentity,
     ProviderSurfaceBuildIdentity,
@@ -727,4 +729,4 @@ def _provider_blocks(message: Any) -> dict[str, Any]:
 
 
 def _openai_tool(tool: ProviderToolContract) -> dict[str, Any]:
-    return deepcopy(dict(tool.payload))
+    return materialize_provider_payloads((tool,))[0]

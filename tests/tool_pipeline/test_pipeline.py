@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, cast
 
 import pytest
@@ -12,13 +12,18 @@ from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import (
     BindingContract,
-    BindingResolverSpec,
     ProviderToolContract,
     ReadyToExecute,
     ToolFailure,
     ToolSpec,
     ToolSuccess,
 )
+from offerpilot.ai.tool_runtime.metadata import (
+    BindingResolverDescriptorV1,
+    ResolverImplementationBinding,
+    ToolBindingMetadataV1,
+)
+from offerpilot.ai.tool_runtime.policy_types import ToolCapability
 from offerpilot.ai.tool_runtime.pipeline import Rejected, execute_prepared, prepare_call
 from offerpilot.ai.types import ToolCall
 from offerpilot.db import init_database
@@ -28,6 +33,7 @@ from offerpilot.repositories.jd import JDAnalysesRepository
 from offerpilot.repositories.notes import NotesRepository
 from offerpilot.repositories.offers import OffersRepository
 from offerpilot.repositories.resumes import ResumesRepository
+from tests.tool_metadata.factories import presentation_binding, read_metadata
 
 
 class Recorder:
@@ -37,6 +43,23 @@ class Recorder:
 
     def append_event(self, event: Any) -> None:
         self.events.append(event)
+
+
+_RESOLVER_PROBE: Any | None = None
+
+
+def _resolve_with_probe(args: Any, context: ToolExecutionContext) -> Any:
+    if _RESOLVER_PROBE is None:
+        raise AssertionError("resolver probe is not configured")
+    return _RESOLVER_PROBE(args, context)
+
+
+def _decode_mapping(values: Any) -> dict[str, Any]:
+    return dict(values)
+
+
+def _render_mapping(result: Any) -> str:
+    return str(result)
 
 
 @dataclass
@@ -171,24 +194,43 @@ def _spec(
     preflight: Any | None = None,
     required_capabilities: frozenset[str] = frozenset({"applications.read"}),
 ) -> ToolSpec[dict[str, Any], dict[str, Any]]:
+    global _RESOLVER_PROBE
+
     parameters = {
         "additionalProperties": True,
         "properties": {"id": {"type": "integer"}},
         "required": ["id"],
         "type": "object",
     }
-    resolvers = ()
+    descriptor = None
+    resolver_bindings = ()
     if resolver is not None:
-        resolvers = (
-            BindingResolverSpec(
-                resolver_id="application_identity_arg",
-                entity_kind="application",
-                arg_path="id",
-                presence="required",
-                identity_type="positive_int64",
-                resolve=resolver,
+        _RESOLVER_PROBE = resolver
+        descriptor = BindingResolverDescriptorV1(
+            resolver_id="application_identity_arg",
+            entity_kind="application",
+            arg_path="id",
+            presence="required",
+            identity_type="positive_int64",
+        )
+        resolver_bindings = (
+            ResolverImplementationBinding(
+                descriptor=descriptor,
+                implementation_id="pipeline_probe_resolver_v1",
+                resolve=_resolve_with_probe,
             ),
         )
+    final_binding_contract = binding_contract or BindingContract()
+    surface = replace(
+        read_metadata(),
+        required_capabilities=tuple(
+            ToolCapability(capability) for capability in required_capabilities
+        ),
+        binding=ToolBindingMetadataV1(
+            contract=final_binding_contract,
+            resolver_descriptors=() if descriptor is None else (descriptor,),
+        ),
+    )
     return ToolSpec(
         contract=ProviderToolContract(
             payload={
@@ -203,14 +245,14 @@ def _spec(
             description=name,
             parameters=parameters,
         ),
-        decoder=lambda values: dict(values),
+        metadata=surface,
+        resolver_bindings=resolver_bindings,
+        undo_builder_binding=None,
+        decoder=_decode_mapping,
         executor=executor or (lambda args, context: args),
-        kind="read",
-        required_capabilities=required_capabilities,
-        binding_contract=binding_contract or BindingContract(),
-        binding_resolvers=resolvers,
+        presentation=presentation_binding(),
         preflight=preflight,
-        success_renderer=lambda result: str(result),
+        success_renderer=_render_mapping,
     )
 
 

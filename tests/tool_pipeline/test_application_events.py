@@ -8,6 +8,7 @@ import pytest
 from domain_harness import execute_case
 from golden import load_golden
 
+from offerpilot.ai.tool_runtime.contracts import materialize_provider_payloads
 from offerpilot.ai.tool_specs.application_events import application_event_specs
 
 
@@ -38,7 +39,7 @@ def test_application_event_specs_preserve_provider_contracts() -> None:
     ]
 
     assert tuple(spec.name for spec in specs) == EVENT_TOOLS
-    assert [spec.contract.payload for spec in specs] == expected
+    assert materialize_provider_payloads(tuple(spec.contract for spec in specs)) == expected
 
 
 @pytest.mark.parametrize("case", _cases(), ids=lambda case: f"{case['tool_name']}:{case['case']}")

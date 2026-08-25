@@ -49,6 +49,7 @@ from offerpilot.ai.tool_runtime.contracts import (
     TRANSACTIONAL_TYPED_WRITE_NAMES,
     UndoPolicy,
 )
+from offerpilot.ai.tool_runtime.metadata import WriteOperationMetadataV1
 from offerpilot.ai.tool_runtime.pipeline import execute_prepared
 from offerpilot.ai.tool_runtime.rendering import render_compatibility
 from offerpilot.ai.tool_runtime.journal import project_tool_started_bound
@@ -1265,11 +1266,6 @@ class WriteOperationRepository:
             return OperationUnknown(operation_id, "operation_busy", True)
 
 
-UndoSeedBuilder = Callable[[PreparedToolCall[Any, Any], ToolExecutionContext], Mapping[str, Any]]
-UndoBuilder = Callable[
-    [PreparedToolCall[Any, Any], ToolExecutionRecord[Any, Any], Mapping[str, Any]],
-    Mapping[str, Any] | None,
-]
 LegacyExecutor = Callable[[Session], str]
 CompensationExecutor = Callable[[Session, Mapping[str, Any]], str]
 
@@ -1375,8 +1371,6 @@ class WriteOperationCoordinator:
         request_fingerprint: str,
         edited_args_present: bool = False,
         edited_args: Mapping[str, JSONValue] | None = None,
-        undo_seed_builder: UndoSeedBuilder | None = None,
-        undo_builder: UndoBuilder | None = None,
         approval_decided_callback: Callable[[object | None], None] | None = None,
     ) -> tuple[OperationExecution, ToolExecutionRecord[Any, Any] | None]:
         owner = self.repository.prepare_owner(operation_id)
@@ -1484,10 +1478,11 @@ class WriteOperationCoordinator:
                             arguments_digest=locked_pending.arguments_digest,
                         )
                 try:
+                    undo_binding = prepared.spec.undo_builder_binding
                     undo_seed = (
-                        undo_seed_builder(prepared, bound_context)
-                        if undo_seed_builder is not None
-                        else {}
+                        undo_binding.capture_seed(bound_context, prepared.typed_args)
+                        if undo_binding is not None
+                        else None
                     )
                     factory.register_execution_transaction(
                         session,
@@ -1583,19 +1578,27 @@ class WriteOperationCoordinator:
                         record = ToolExecutionRecord(
                             prepared, dispatched.outcome, True, operation_id, False
                         )
-                        undo = (
-                            undo_builder(prepared, record, undo_seed)
-                            if undo_builder is not None
+                        undo_value = (
+                            undo_binding.build_undo(undo_seed, record)
+                            if undo_binding is not None
                             else None
                         )
-                        write_contract = prepared.spec.write_contract
-                        if write_contract is None:
+                        if undo_value is not None and not isinstance(undo_value, Mapping):
+                            raise WriteOperationError("operation_projection_failed")
+                        undo = cast(Mapping[str, Any] | None, undo_value)
+                        write_contract = prepared.spec.metadata.operation
+                        if type(write_contract) is not WriteOperationMetadataV1:
                             raise WriteOperationError("operation_not_transactional")
                         if write_contract.undo_policy is UndoPolicy.REQUIRED and not undo:
                             raise WriteOperationError("operation_projection_failed")
                         if write_contract.undo_policy is UndoPolicy.NONE and undo is not None:
                             raise WriteOperationError("operation_projection_failed")
-                        visible = render_compatibility(prepared.spec, record.outcome)
+                        visible_value = prepared.spec.presentation.success_summary_projector(
+                            result
+                        )
+                        if not isinstance(visible_value, str):
+                            raise WriteOperationError("operation_projection_failed")
+                        visible = visible_value
                         transport = project_transport_event(prepared.spec, record)
                         payload = build_terminal_payload(
                             status="committed",
@@ -2414,9 +2417,8 @@ class WriteOperationCoordinator:
                 if any(type(key) is not str for key in patch):
                     raise TypeError("edited_args keys must be strings")
                 editable_fields = {
-                    descriptor.get("field")
-                    for descriptor in prepared.spec.editable_fields
-                    if type(descriptor.get("field")) is str
+                    descriptor.field
+                    for descriptor in prepared.spec.metadata.editable_fields
                 }
                 if any(key not in editable_fields for key in patch):
                     raise ValueError("edited_args contains a non-editable field")

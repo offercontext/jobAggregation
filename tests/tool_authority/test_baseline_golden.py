@@ -42,8 +42,8 @@ from offerpilot.ai.tool_runtime.contracts import (
     ToolFailure,
     ToolSpec,
     ToolSuccess,
-    WriteContract,
 )
+from offerpilot.ai.tool_runtime.metadata import ResolverImplementationBinding
 from offerpilot.ai.tool_runtime.pipeline import Rejected, execute_prepared, prepare_call
 from offerpilot.ai.tool_runtime.rendering import render_compatibility
 from offerpilot.ai.types import Assistant, Message, ToolCall
@@ -85,6 +85,12 @@ from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 
 from .golden import BASELINE, FIXTURES, canonical_json, load_golden
 from tests.agent_loop.helpers import runtime as agent_loop_runtime
+from tests.tool_metadata.factories import (
+    read_metadata,
+    resolver_descriptor,
+    synthetic_tool_spec,
+    write_metadata,
+)
 
 
 MODEL_TOOL_NAMES = (
@@ -246,9 +252,7 @@ def test_provider_envelopes_and_schema_fingerprints_are_fully_pinned() -> None:
     assert tuple(pinned["tool_names"]) == MODEL_TOOL_NAMES
     assert pinned["schema_fingerprints"] == provider["schema_fingerprints"]
     assert set(pinned["envelope_fingerprints"]) == set(MODEL_TOOL_NAMES)
-    expected_envelopes = {
-        item["function"]["name"]: _digest(item) for item in provider["tools"]
-    }
+    expected_envelopes = {item["function"]["name"]: _digest(item) for item in provider["tools"]}
     assert pinned["envelope_fingerprints"] == expected_envelopes
 
 
@@ -282,11 +286,7 @@ def _immediate_transport_projection(
     }
     if str(stream_response.media_type).startswith("text/event-stream"):
         lines = bytes(stream_response.body).decode("utf-8").splitlines()
-        encoded = next(
-            line.removeprefix("data: ")
-            for line in lines
-            if line.startswith("data: ")
-        )
+        encoded = next(line.removeprefix("data: ") for line in lines if line.startswith("data: "))
         envelope = json.loads(encoded)
         event = ErrorEvent(
             outcome.code,
@@ -315,7 +315,9 @@ def _postheader_error_projection(outcome: RuntimeFailureOutcome) -> dict[str, An
     encoded = encode_sse_event(event, seq=1, run_id="authority-run")
     lines = encoded.splitlines()
     event_name = next(line.removeprefix("event: ") for line in lines if line.startswith("event: "))
-    data = json.loads(next(line.removeprefix("data: ") for line in lines if line.startswith("data: ")))
+    data = json.loads(
+        next(line.removeprefix("data: ") for line in lines if line.startswith("data: "))
+    )
     assert event_name == event_sse_name(event)
     assert data["event"] == event_name
     assert data["data"] == event_sse_payload(event)
@@ -338,9 +340,7 @@ def test_existing_fixture_identities_and_compatibility_facts_are_pinned() -> Non
         "tool_pipeline/journal_sequences_30c944f.json": _fixture_identity(
             "tool_pipeline/journal_sequences_30c944f.json"
         ),
-        "agent_loop/baseline_aaecf5d.json": _fixture_identity(
-            "agent_loop/baseline_aaecf5d.json"
-        ),
+        "agent_loop/baseline_aaecf5d.json": _fixture_identity("agent_loop/baseline_aaecf5d.json"),
         "pilot_runtime/baseline_golden.json": _fixture_identity(
             "pilot_runtime/baseline_golden.json"
         ),
@@ -538,9 +538,11 @@ def _probe_spec(
     parameters: dict[str, Any],
     decoder: Any,
     required_capabilities: frozenset[ToolCapability] = frozenset(),
-    binding_resolvers: tuple[Any, ...] = (),
+    resolver_bindings: tuple[Any, ...] = (),
     preflight: Any = None,
+    kind: str = "read",
 ) -> ToolSpec[Any, Any]:
+    parameters = {**parameters, "properties": parameters.get("properties", {})}
     contract = ProviderToolContract(
         payload={
             "type": "function",
@@ -554,13 +556,38 @@ def _probe_spec(
         description=name,
         parameters=parameters,
     )
-    return ToolSpec(
+    descriptors = tuple(
+        resolver_descriptor() for _ordinal, _resolver in enumerate(resolver_bindings)
+    )
+    if kind == "write":
+        metadata = replace(write_metadata(name), editable_fields=())
+    else:
+        metadata = read_metadata(name, resolver_descriptors=descriptors)
+    capability = (
+        next(iter(required_capabilities))
+        if required_capabilities
+        else (
+            ToolCapability.APPLICATIONS_WRITE
+            if kind == "write"
+            else ToolCapability.APPLICATIONS_READ
+        )
+    )
+    metadata = replace(metadata, required_capabilities=(capability,))
+    spec = synthetic_tool_spec(name, metadata=metadata)
+    resolver_bindings = tuple(
+        ResolverImplementationBinding(
+            descriptor=descriptor,
+            implementation_id=f"baseline_probe_resolver_{ordinal}_v1",
+            resolve=resolver,
+        )
+        for ordinal, (descriptor, resolver) in enumerate(zip(descriptors, resolver_bindings))
+    )
+    return replace(
+        spec,
         contract=contract,
-        kind="read",
         decoder=decoder,
-        executor=lambda args, _context: args,
-        required_capabilities=required_capabilities,
-        binding_resolvers=binding_resolvers,
+        executor=_identity_executor,
+        resolver_bindings=resolver_bindings,
         preflight=preflight,
         declared_failure_categories=frozenset(
             {"validation_error", "permission_denied", "stale_state", "internal_error"}
@@ -573,6 +600,10 @@ def _identity_decoder(values: dict[str, Any]) -> dict[str, Any]:
     return dict(values)
 
 
+def _identity_executor(args: dict[str, Any], _context: ToolExecutionContext) -> dict[str, Any]:
+    return args
+
+
 def _raise_decode(_values: dict[str, Any]) -> dict[str, Any]:
     raise _DecodeProbeError
 
@@ -581,13 +612,13 @@ def _raise_binding(_args: dict[str, Any], _context: ToolExecutionContext) -> Bin
     raise _BindingProbeError
 
 
-def _return_preflight_failure(
-    _args: dict[str, Any], _context: ToolExecutionContext
-) -> ToolFailure:
+def _return_preflight_failure(_args: dict[str, Any], _context: ToolExecutionContext) -> ToolFailure:
     return ToolFailure("stale_state", "preflight_failed")
 
 
-def _pipeline_projection(spec: ToolSpec[Any, Any], call: ToolCall, context: ToolExecutionContext) -> dict[str, Any]:
+def _pipeline_projection(
+    spec: ToolSpec[Any, Any], call: ToolCall, context: ToolExecutionContext
+) -> dict[str, Any]:
     catalog = ToolCatalog([spec], expected_names=(spec.name,))
     result = prepare_call(
         catalog,
@@ -663,7 +694,7 @@ def test_pre_executor_tool_pipeline_is_produced_by_runtime() -> None:
                 parameters=schema_parameters,
                 decoder=_identity_decoder,
             ),
-            _probe_context(),
+            _probe_context(capabilities=frozenset({ToolCapability.APPLICATIONS_READ})),
             ToolCall("schema-call", "get_application", "{}"),
         ),
         "decode_exception": (
@@ -672,7 +703,7 @@ def test_pre_executor_tool_pipeline_is_produced_by_runtime() -> None:
                 parameters=simple_parameters,
                 decoder=_raise_decode,
             ),
-            _probe_context(),
+            _probe_context(capabilities=frozenset({ToolCapability.APPLICATIONS_READ})),
             ToolCall("decode-call", "authority_decode_probe", "{}"),
         ),
         "capability_missing": (
@@ -690,9 +721,9 @@ def test_pre_executor_tool_pipeline_is_produced_by_runtime() -> None:
                 "authority_binding_probe",
                 parameters=simple_parameters,
                 decoder=_identity_decoder,
-                binding_resolvers=(_raise_binding,),
+                resolver_bindings=(_raise_binding,),
             ),
-            _probe_context(),
+            _probe_context(capabilities=frozenset({ToolCapability.APPLICATIONS_READ})),
             ToolCall("binding-call", "authority_binding_probe", "{}"),
         ),
         "preflight_returned_failure": (
@@ -702,7 +733,7 @@ def test_pre_executor_tool_pipeline_is_produced_by_runtime() -> None:
                 decoder=_identity_decoder,
                 preflight=_return_preflight_failure,
             ),
-            _probe_context(),
+            _probe_context(capabilities=frozenset({ToolCapability.APPLICATIONS_READ})),
             ToolCall("preflight-call", "authority_preflight_probe", "{}"),
         ),
     }
@@ -792,9 +823,7 @@ def test_confirmation_routes_use_phase_specific_runtime_mapping_and_transport() 
         stale_expected["failure_origin"],
     ) == metadata["approve_stale"]
 
-    invalid = PilotRuntime._confirmation_failure(
-        WriteOperationError("invalid_confirmation")
-    )
+    invalid = PilotRuntime._confirmation_failure(WriteOperationError("invalid_confirmation"))
     invalid_preheader_expected = confirmation["modify_invalid_preheader"]
     invalid_preheader = _immediate_transport_projection(
         invalid,
@@ -877,15 +906,11 @@ def _probe_approval_context(
 def _prepared_write_probe() -> tuple[
     ToolSpec[Any, Any], ToolExecutionContext, Any, object, PendingAction
 ]:
-    spec = replace(
-        _probe_spec(
-            "authority_execute_probe",
-            parameters={"type": "object", "additionalProperties": False},
-            decoder=_identity_decoder,
-        ),
+    spec = _probe_spec(
+        "authority_execute_probe",
+        parameters={"type": "object", "additionalProperties": False},
+        decoder=_identity_decoder,
         kind="write",
-        confirmation_policy="required",
-        write_contract=WriteContract(),
     )
     pending = PendingAction(
         "execute-call",
@@ -985,9 +1010,7 @@ def test_execute_prepared_failures_promote_to_one_verified_stale_route() -> None
             "code": record.outcome.code,
             "compatibility_detail": record.outcome.compatibility_detail,
         }
-        assert expected["rendered_message"] == render_compatibility(
-            spec, record.outcome
-        )
+        assert expected["rendered_message"] == render_compatibility(spec, record.outcome)
         assert (
             expected["production_entrypoint"],
             expected["scenario"],
@@ -1154,7 +1177,9 @@ def _counted_write_spec(counter: dict[str, int]) -> ToolSpec[Any, Any]:
 
 
 def _counted_write_catalog(spec: ToolSpec[Any, Any]) -> ToolCatalog:
-    specs = tuple(spec if candidate.name == spec.name else candidate for candidate in MODEL_TOOL_CATALOG.specs)
+    specs = tuple(
+        spec if candidate.name == spec.name else candidate for candidate in MODEL_TOOL_CATALOG.specs
+    )
     return ToolCatalog(
         specs,
         expected_names=MODEL_TOOL_NAMES,
@@ -1222,7 +1247,7 @@ def _run_agent_call_count_case(case: str) -> dict[str, object]:
                 terminal_persisted=True,
                 persisted_visible_result="saved",
                 persisted_transport={"status": "success"},
-        )
+            )
 
         seed = ApprovedWriteSeed(continuation)
         context, _revision, _digest = _probe_approval_context(
@@ -1502,10 +1527,7 @@ def test_call_count_and_provider_free_baselines_are_produced_by_real_harnesses()
         "required_gates": ["task17_pilot_runtime_approve_modify_endpoint"],
         "wire_level_endpoint_claim": False,
     }
-    actual = {
-        case: _run_agent_call_count_case(case)
-        for case in ("new_turn", "approve", "modify")
-    }
+    actual = {case: _run_agent_call_count_case(case) for case in ("new_turn", "approve", "modify")}
     actual.update(
         {
             case: _run_ledger_call_count_case(case)
@@ -1523,7 +1545,19 @@ def test_authority_manifest_is_the_single_ordered_typed_matrix() -> None:
     assert len(tools) == len(MODEL_TOOL_NAMES) == 25
     assert tuple(item["name"] for item in tools) == MODEL_TOOL_NAMES
     assert tuple(item["ordinal"] for item in tools) == tuple(range(1, 26))
-    assert all(set(item) == {"ordinal", "name", "kind", "confirmation_policy", "required_capabilities", "binding", "resolvers"} for item in tools)
+    assert all(
+        set(item)
+        == {
+            "ordinal",
+            "name",
+            "kind",
+            "confirmation_policy",
+            "required_capabilities",
+            "binding",
+            "resolvers",
+        }
+        for item in tools
+    )
     assert not set(item["name"] for item in tools) & set(LEGACY_TOOL_NAMES)
 
     allowed_capabilities = set(CAPABILITIES)
@@ -1538,39 +1572,29 @@ def test_authority_manifest_is_the_single_ordered_typed_matrix() -> None:
     allowed_resolver_presence = {"required", "optional"}
     for item in tools:
         assert item["kind"] in {"read", "write"}
-        assert item["confirmation_policy"] == (
-            "required" if item["kind"] == "write" else "none"
-        )
+        assert item["confirmation_policy"] == ("required" if item["kind"] == "write" else "none")
         assert len(item["required_capabilities"]) == 1
         assert set(item["required_capabilities"]) <= allowed_capabilities
         assert set(item["binding"]) == {"kind", "entity_kind"}
         assert item["binding"]["kind"] in allowed_binding_kinds
         assert item["binding"]["entity_kind"] in allowed_entity_kinds
         assert all(
-            set(resolver)
-            == {"resolver_id", "entity_kind", "arg_path", "presence", "identity_type"}
+            set(resolver) == {"resolver_id", "entity_kind", "arg_path", "presence", "identity_type"}
             for resolver in item["resolvers"]
         )
         assert all(resolver["resolver_id"] for resolver in item["resolvers"])
         assert all(
-            resolver["entity_kind"] in {"application", "resume"}
-            for resolver in item["resolvers"]
+            resolver["entity_kind"] in {"application", "resume"} for resolver in item["resolvers"]
         )
         assert all(resolver["arg_path"] for resolver in item["resolvers"])
         assert all(
-            resolver["presence"] in allowed_resolver_presence
-            for resolver in item["resolvers"]
+            resolver["presence"] in allowed_resolver_presence for resolver in item["resolvers"]
         )
-        assert all(
-            resolver["identity_type"] == "positive_int64"
-            for resolver in item["resolvers"]
-        )
+        assert all(resolver["identity_type"] == "positive_int64" for resolver in item["resolvers"])
     assert {item["binding"]["kind"] for item in tools} == allowed_binding_kinds
     assert {item["binding"]["entity_kind"] for item in tools} == allowed_entity_kinds
     assert {
-        capability
-        for item in tools
-        for capability in item["required_capabilities"]
+        capability for item in tools for capability in item["required_capabilities"]
     } == allowed_capabilities
 
 
@@ -1640,9 +1664,7 @@ def test_dependency_closure_manifest_pins_current_catalog_coverage() -> None:
     assert closure["dependency_policy_version"] == "dependency-policy-v1"
     assert tuple(closure["catalog_names"]) == MODEL_TOOL_NAMES
     assert closure["coverage"] == 25
-    expected = {
-        name: sorted(_DEPENDENCIES.get(name, ())) for name in MODEL_TOOL_NAMES
-    }
+    expected = {name: sorted(_DEPENDENCIES.get(name, ())) for name in MODEL_TOOL_NAMES}
     assert closure["dependencies"] == expected
     assert closure["canonical_sha256"] == _digest(
         {

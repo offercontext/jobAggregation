@@ -1,14 +1,32 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Generic, Literal, NoReturn, SupportsIndex, TypeAlias, TypeVar
+import math
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Generic,
+    Literal,
+    NoReturn,
+    SupportsIndex,
+    TypeAlias,
+    TypeVar,
+    cast,
+    overload,
+)
 
 from offerpilot.ai.tool_runtime.policy_types import UndoPolicy as UndoPolicy
 
 if TYPE_CHECKING:
     from offerpilot.ai.tool_authority.contracts import AuthorityInstanceToken, PreparedInstanceToken
     from offerpilot.ai.tool_runtime.context import ToolExecutionContext
+    from offerpilot.ai.tool_runtime.metadata import (
+        ResolverImplementationBinding,
+        ToolPresentationBindingV1,
+        ToolSurfaceMetadataV1,
+        UndoBuilderBinding,
+    )
 
 
 if TYPE_CHECKING:
@@ -104,23 +122,337 @@ _TRANSIENT_ASDICT_GUARD = _TransientAsdictGuard()
 _PREPARED_REPLACEMENT_SENTINEL = object()
 
 
-@dataclass(frozen=True)
+class _FrozenProviderMapping(Mapping[str, object]):
+    """Provider-only immutable object node.
+
+    This intentionally is neither ``dict`` nor ``MappingProxyType``.  The
+    generic metadata JSON materializer therefore cannot turn Provider query
+    nodes into mutable JSON by accident.
+    """
+
+    __slots__ = ("_entries",)
+    _entries: tuple[tuple[str, object], ...]
+
+    def __init__(self, entries: tuple[tuple[str, object], ...]) -> None:
+        object.__setattr__(self, "_entries", entries)
+
+    def __getitem__(self, key: str) -> object:
+        for candidate, value in self._entries:
+            if candidate == key:
+                return value
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return (key for key, _value in self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def __setattr__(self, name: str, value: object) -> NoReturn:
+        del name, value
+        raise TypeError("Provider JSON query nodes are immutable")
+
+
+class _FrozenProviderSequence(Sequence[object]):
+    """Provider-only immutable array node."""
+
+    __slots__ = ("_values",)
+    _values: tuple[object, ...]
+
+    def __init__(self, values: tuple[object, ...]) -> None:
+        object.__setattr__(self, "_values", values)
+
+    @overload
+    def __getitem__(self, index: int) -> object: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> Sequence[object]: ...
+
+    def __getitem__(self, index: int | slice) -> object | Sequence[object]:
+        return self._values[index]
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __iter__(self) -> Iterator[object]:
+        return iter(self._values)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Sequence) or isinstance(other, (str, bytes, bytearray)):
+            return False
+        return len(self) == len(other) and all(left == right for left, right in zip(self, other))
+
+    def __setattr__(self, name: str, value: object) -> NoReturn:
+        del name, value
+        raise TypeError("Provider JSON query nodes are immutable")
+
+
+def _freeze_provider_json(value: object, *, active: set[int]) -> object:
+    if value is None or type(value) in {bool, int}:
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError("provider JSON numbers must be finite")
+        return value
+    if type(value) is str:
+        if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+            raise ValueError("provider JSON strings must contain valid Unicode")
+        return value
+    if isinstance(value, Mapping):
+        identity = id(value)
+        if identity in active:
+            raise ValueError("cyclic provider payload mappings are not supported")
+        active.add(identity)
+        try:
+            snapshot: list[tuple[str, object]] = []
+            for key, item in value.items():
+                if type(key) is not str:
+                    raise TypeError("provider payload keys must be exact strings")
+                if any(0xD800 <= ord(character) <= 0xDFFF for character in key):
+                    raise ValueError("provider JSON keys must contain valid Unicode")
+                snapshot.append((key, _freeze_provider_json(item, active=active)))
+            return _FrozenProviderMapping(tuple(snapshot))
+        finally:
+            active.remove(identity)
+    if type(value) in {list, tuple, _FrozenProviderSequence}:
+        identity = id(value)
+        if identity in active:
+            raise ValueError("cyclic provider payload sequences are not supported")
+        active.add(identity)
+        try:
+            sequence = cast(Sequence[object], value)
+            return _FrozenProviderSequence(
+                tuple(_freeze_provider_json(item, active=active) for item in sequence)
+            )
+        finally:
+            active.remove(identity)
+    raise TypeError(f"unsupported provider JSON value: {type(value).__name__}")
+
+
+def _provider_content_snapshot(value: object) -> object:
+    if type(value) is _FrozenProviderMapping:
+        return (
+            "object",
+            tuple((key, _provider_content_snapshot(item)) for key, item in value._entries),
+        )
+    if type(value) is _FrozenProviderSequence:
+        return (
+            "array",
+            tuple(_provider_content_snapshot(item) for item in value._values),
+        )
+    if value is None or type(value) in {bool, int, float, str}:
+        return (type(value).__name__, value)
+    raise TypeError("Provider JSON query node has an invalid internal value")
+
+
+def _provider_identity_snapshot(value: object) -> object:
+    if type(value) is _FrozenProviderMapping:
+        return (
+            id(value),
+            id(value._entries),
+            tuple((key, _provider_identity_snapshot(item)) for key, item in value._entries),
+        )
+    if type(value) is _FrozenProviderSequence:
+        return (
+            id(value),
+            id(value._values),
+            tuple(_provider_identity_snapshot(item) for item in value._values),
+        )
+    if value is None or type(value) in {bool, int, float, str}:
+        return None
+    raise TypeError("Provider JSON query node has an invalid internal value")
+
+
+def _provider_nodes_equal(left: object, right: object) -> bool:
+    return _provider_content_snapshot(left) == _provider_content_snapshot(right)
+
+
+@dataclass(frozen=True, init=False)
 class ProviderToolContract:
-    payload: Mapping[str, JSONValue] = field(repr=False)
     name: str
     description: str
-    parameters: Mapping[str, JSONValue] = field(repr=False)
+    _payload_snapshot: object = field(repr=False)
+    _parameters_snapshot: object = field(repr=False)
+    _payload_content_seal: object = field(init=False, repr=False, compare=False)
+    _parameters_content_seal: object = field(init=False, repr=False, compare=False)
+    _payload_identity_seal: object = field(init=False, repr=False, compare=False)
+    _parameters_identity_seal: object = field(init=False, repr=False, compare=False)
+
+    def __init__(
+        self,
+        payload: Mapping[str, Any],
+        name: str,
+        description: str,
+        parameters: Mapping[str, Any],
+    ) -> None:
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "description", description)
+        object.__setattr__(self, "_payload_snapshot", payload)
+        object.__setattr__(self, "_parameters_snapshot", parameters)
+        self.__post_init__()
+
+    @property
+    def payload(self) -> Mapping[str, Any]:
+        self._ensure_provider_integrity()
+        snapshot = object.__getattribute__(self, "_payload_snapshot")
+        if type(snapshot) is not _FrozenProviderMapping:
+            raise ValueError("Provider contract integrity drift")
+        return cast(Mapping[str, Any], snapshot)
+
+    @payload.setter
+    def payload(self, value: Mapping[str, Any]) -> None:
+        # The setter exists solely so adversarial ``object.__setattr__`` probes
+        # can replace the sealed component and be rejected by Catalog integrity.
+        object.__setattr__(self, "_payload_snapshot", value)
+
+    @property
+    def parameters(self) -> Mapping[str, Any]:
+        self._ensure_provider_integrity()
+        snapshot = object.__getattribute__(self, "_parameters_snapshot")
+        if type(snapshot) is not _FrozenProviderMapping:
+            raise ValueError("Provider contract integrity drift")
+        return cast(Mapping[str, Any], snapshot)
+
+    @parameters.setter
+    def parameters(self, value: Mapping[str, Any]) -> None:
+        object.__setattr__(self, "_parameters_snapshot", value)
 
     def __post_init__(self) -> None:
-        function = self.payload.get("function")
-        if self.payload.get("type") != "function" or not isinstance(function, Mapping):
+        seal_fields = (
+            "_payload_content_seal",
+            "_parameters_content_seal",
+            "_payload_identity_seal",
+            "_parameters_identity_seal",
+        )
+        seal_presence = tuple(hasattr(self, name) for name in seal_fields)
+        if any(seal_presence):
+            if not all(seal_presence):
+                raise ValueError("Provider contract integrity drift")
+            self._ensure_provider_integrity()
+            payload = object.__getattribute__(self, "_payload_snapshot")
+            parameters = object.__getattribute__(self, "_parameters_snapshot")
+            if type(payload) is not _FrozenProviderMapping:
+                raise ValueError("Provider contract integrity drift")
+            if type(parameters) is not _FrozenProviderMapping:
+                raise ValueError("Provider contract integrity drift")
+            function = payload.get("function")
+            if type(function) is not _FrozenProviderMapping:
+                raise ValueError("Provider contract integrity drift")
+            if function.get("name") != self.name:
+                raise ValueError("Provider contract integrity drift")
+            if function.get("description") != self.description:
+                raise ValueError("Provider contract integrity drift")
+            if function.get("parameters") is not parameters:
+                raise ValueError("Provider contract integrity drift")
+            return
+
+        raw_payload = object.__getattribute__(self, "_payload_snapshot")
+        raw_parameters = object.__getattribute__(self, "_parameters_snapshot")
+        payload = _freeze_provider_json(raw_payload, active=set())
+        parameters = _freeze_provider_json(raw_parameters, active=set())
+        if type(payload) is not _FrozenProviderMapping:
+            raise TypeError("provider payload must be an object")
+        if type(parameters) is not _FrozenProviderMapping:
+            raise TypeError("provider parameter schema must be an object")
+        function = payload.get("function")
+        if payload.get("type") != "function" or type(function) is not _FrozenProviderMapping:
             raise ValueError("invalid provider tool envelope")
         if function.get("name") != self.name:
             raise ValueError("provider tool name mismatch")
         if function.get("description") != self.description:
             raise ValueError("provider tool description mismatch")
-        if function.get("parameters") != self.parameters:
+        payload_parameters = function.get("parameters")
+        if type(payload_parameters) is not _FrozenProviderMapping:
+            raise TypeError("provider parameter schema must be an object")
+        if not _provider_nodes_equal(payload_parameters, parameters):
             raise ValueError("provider tool parameters mismatch")
+        object.__setattr__(self, "_payload_snapshot", payload)
+        object.__setattr__(self, "_parameters_snapshot", payload_parameters)
+        object.__setattr__(
+            self,
+            "_payload_content_seal",
+            _provider_content_snapshot(payload),
+        )
+        object.__setattr__(
+            self,
+            "_parameters_content_seal",
+            _provider_content_snapshot(payload_parameters),
+        )
+        object.__setattr__(
+            self,
+            "_payload_identity_seal",
+            _provider_identity_snapshot(payload),
+        )
+        object.__setattr__(
+            self,
+            "_parameters_identity_seal",
+            _provider_identity_snapshot(payload_parameters),
+        )
+
+    def _ensure_provider_integrity(self) -> None:
+        payload = object.__getattribute__(self, "_payload_snapshot")
+        parameters = object.__getattribute__(self, "_parameters_snapshot")
+        try:
+            current = (
+                _provider_content_snapshot(payload),
+                _provider_content_snapshot(parameters),
+                _provider_identity_snapshot(payload),
+                _provider_identity_snapshot(parameters),
+            )
+        except TypeError as exc:
+            raise ValueError("Provider contract integrity drift") from exc
+        expected = (
+            object.__getattribute__(self, "_payload_content_seal"),
+            object.__getattribute__(self, "_parameters_content_seal"),
+            object.__getattribute__(self, "_payload_identity_seal"),
+            object.__getattribute__(self, "_parameters_identity_seal"),
+        )
+        if current != expected:
+            raise ValueError("Provider contract integrity drift")
+        if type(payload) is not _FrozenProviderMapping:
+            raise ValueError("Provider contract integrity drift")
+        if type(parameters) is not _FrozenProviderMapping:
+            raise ValueError("Provider contract integrity drift")
+        function = payload.get("function")
+        if payload.get("type") != "function" or type(function) is not _FrozenProviderMapping:
+            raise ValueError("Provider contract integrity drift")
+        if function.get("name") != object.__getattribute__(self, "name"):
+            raise ValueError("Provider contract integrity drift")
+        if function.get("description") != object.__getattribute__(self, "description"):
+            raise ValueError("Provider contract integrity drift")
+        if function.get("parameters") is not parameters:
+            raise ValueError("Provider contract integrity drift")
+
+    def __deepcopy__(self, memo: dict[int, object]) -> ProviderToolContract:
+        del memo
+        self._ensure_provider_integrity()
+        return self
+
+
+def _decode_provider_json(value: object) -> JSONValue:
+    if type(value) is _FrozenProviderMapping:
+        return {key: _decode_provider_json(item) for key, item in value._entries}
+    if type(value) is _FrozenProviderSequence:
+        return [_decode_provider_json(item) for item in value._values]
+    if value is None or type(value) in {bool, int, float, str}:
+        return cast(JSONValue, value)
+    raise TypeError("Provider payload is not an immutable Provider JSON node")
+
+
+def materialize_provider_payloads(
+    contracts: Sequence[ProviderToolContract],
+) -> list[dict[str, JSONValue]]:
+    """Return fresh ordinary JSON payloads through the sole Provider decoder."""
+
+    materialized: list[dict[str, JSONValue]] = []
+    for contract in contracts:
+        if type(contract) is not ProviderToolContract:
+            raise TypeError("Provider materialization requires exact contracts")
+        payload = _decode_provider_json(contract.payload)
+        if type(payload) is not dict:
+            raise TypeError("Provider payload must be an object")
+        materialized.append(payload)
+    return materialized
 
 
 @dataclass(frozen=True)
@@ -205,11 +537,7 @@ class BindingResolverSpec(Generic[ArgsT]):
             raise ValueError("unknown binding resolver id")
         if self.entity_kind not in {"application", "resume"}:
             raise ValueError("unknown binding resolver entity kind")
-        if (
-            type(self.arg_path) is not str
-            or not self.arg_path
-            or not self.arg_path.isidentifier()
-        ):
+        if type(self.arg_path) is not str or not self.arg_path or not self.arg_path.isidentifier():
             raise ValueError("binding resolver arg_path must be a single typed-args field")
         if self.presence not in {"required", "optional"}:
             raise ValueError("unknown binding resolver presence")
@@ -261,7 +589,9 @@ class ToolExceptionMapping:
 ToolDecoder: TypeAlias = Callable[[Mapping[str, JSONValue]], ArgsT]
 ToolCheck: TypeAlias = Callable[[ArgsT, "ToolExecutionContext"], ToolFailure | None]
 ToolExecutor: TypeAlias = Callable[[ArgsT, "ToolExecutionContext"], ResultT]
-BindingResolver: TypeAlias = Callable[[ArgsT, "ToolExecutionContext"], Any] | BindingResolverSpec[ArgsT]
+BindingResolver: TypeAlias = (
+    Callable[[ArgsT, "ToolExecutionContext"], Any] | BindingResolverSpec[ArgsT]
+)
 SuccessRenderer: TypeAlias = Callable[[ResultT], str]
 ResultMetadataProjector: TypeAlias = Callable[[ResultT], ToolResultMetadata]
 ConfirmationDescription: TypeAlias = Callable[[ArgsT], str]
@@ -311,14 +641,12 @@ REQUIRED_UNDO_TOOL_NAMES = frozenset(
 @dataclass(frozen=True)
 class ToolSpec(Generic[ArgsT, ResultT]):
     contract: ProviderToolContract
-    kind: ToolKind
+    metadata: ToolSurfaceMetadataV1
+    resolver_bindings: tuple[ResolverImplementationBinding, ...]
+    undo_builder_binding: UndoBuilderBinding | None
     decoder: ToolDecoder[ArgsT] = field(repr=False, compare=False)
     executor: ToolExecutor[ArgsT, ResultT] = field(repr=False, compare=False)
-    required_capabilities: frozenset[str] = field(default_factory=frozenset)
-    binding_contract: BindingContract = field(default_factory=BindingContract)
-    binding_resolvers: tuple[BindingResolver[ArgsT], ...] = field(default_factory=tuple)
-    confirmation_policy: ConfirmationPolicy = "none"
-    editable_fields: tuple[Mapping[str, JSONValue], ...] = field(default_factory=tuple)
+    presentation: ToolPresentationBindingV1 = field(repr=False, compare=False)
     preflight: ToolCheck[ArgsT] | None = field(default=None, repr=False, compare=False)
     mutable_validator: ToolCheck[ArgsT] | None = field(default=None, repr=False, compare=False)
     declared_failure_categories: frozenset[FailureCategory] = field(default_factory=frozenset)
@@ -326,12 +654,7 @@ class ToolSpec(Generic[ArgsT, ResultT]):
     success_renderer: SuccessRenderer[ResultT] | None = field(
         default=None, repr=False, compare=False
     )
-    result_metadata: ResultMetadataProjector[ResultT] | None = field(
-        default=None,
-        repr=False,
-        compare=False,
-    )
-    confirmation_description: ConfirmationDescription[ArgsT] | None = field(
+    result_metadata_projector: ResultMetadataProjector[ResultT] | None = field(
         default=None,
         repr=False,
         compare=False,
@@ -341,7 +664,6 @@ class ToolSpec(Generic[ArgsT, ResultT]):
         repr=False,
         compare=False,
     )
-    write_contract: WriteContract | None = None
 
     @property
     def name(self) -> str:

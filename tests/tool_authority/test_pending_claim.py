@@ -3,7 +3,7 @@ from __future__ import annotations
 from asyncio import CancelledError
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Callable
 from uuid import uuid4
@@ -22,9 +22,8 @@ from offerpilot.ai.tool_authority import (
 from offerpilot.ai.tool_authority.fingerprint import authorization_scope_fingerprint
 from offerpilot.ai.tool_runtime.contracts import (
     BindingAudit,
-    BindingContract,
     ProviderToolContract,
-    ToolSpec,
+    materialize_provider_payloads,
 )
 from offerpilot.ai.write_operations import (
     WriteOperationRepository,
@@ -37,6 +36,7 @@ from offerpilot.pilot_runtime.persistence import (
     PersistenceStatus,
 )
 from offerpilot.repositories.chat import ChatRepository, ConversationScopeMutationSnapshot
+from tests.tool_metadata.factories import synthetic_tool_spec, write_metadata
 
 
 def _digest(value: object) -> str:
@@ -167,13 +167,14 @@ def _harness(tmp_path: Any, *, segment_id: str = "segment-pending") -> PendingHa
         description="",
         parameters=parameters,
     )
-    spec = ToolSpec(
+    spec = replace(
+        synthetic_tool_spec(
+            pending.tool_name,
+            metadata=replace(write_metadata(pending.tool_name), editable_fields=()),
+        ),
         contract=contract,
-        kind="write",
         decoder=lambda value: value,
         executor=lambda value, _context: value,
-        confirmation_policy="required",
-        binding_contract=BindingContract("none"),
     )
     factory.register_tool_spec(
         spec,
@@ -188,7 +189,7 @@ def _harness(tmp_path: Any, *, segment_id: str = "segment-pending") -> PendingHa
         arguments=arguments,
         typed_args=arguments,
         arguments_digest=arguments_digest,
-        contract_fingerprint=_digest(dict(contract.payload)),
+        contract_fingerprint=_digest(materialize_provider_payloads((contract,))[0]),
         binding=BindingAudit(status="unbound", target_count=0),
     )
     factory.register_pending(
@@ -271,13 +272,14 @@ def _sibling_pending_claim(
         description="",
         parameters=parameters,
     )
-    spec = ToolSpec(
+    spec = replace(
+        synthetic_tool_spec(
+            pending.tool_name,
+            metadata=replace(write_metadata(pending.tool_name), editable_fields=()),
+        ),
         contract=contract,
-        kind="write",
         decoder=lambda value: value,
         executor=lambda value, _context: value,
-        confirmation_policy="required",
-        binding_contract=BindingContract("none"),
     )
     harness.factory.register_tool_spec(
         spec,
@@ -292,7 +294,7 @@ def _sibling_pending_claim(
         arguments=arguments,
         typed_args=arguments,
         arguments_digest=arguments_digest,
-        contract_fingerprint=_digest(dict(contract.payload)),
+        contract_fingerprint=_digest(materialize_provider_payloads((contract,))[0]),
         binding=BindingAudit(status="unbound", target_count=0),
     )
     harness.factory.register_pending(
@@ -494,9 +496,7 @@ def test_typed_pending_identity_mismatch_revokes_before_any_durable_write(
             conversation = session.get(Conversation, harness.conversation_id)
             operation = session.get(WriteOperation, original_operation_id)
             message_count = session.scalar(
-                select(ChatMessage.id).where(
-                    ChatMessage.conversation_id == harness.conversation_id
-                )
+                select(ChatMessage.id).where(ChatMessage.conversation_id == harness.conversation_id)
             )
         assert conversation is not None and conversation.pending_tool_name == ""
         assert operation is None

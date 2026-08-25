@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Mapping
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -10,9 +11,12 @@ from typing import Any
 import pytest
 
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
-from offerpilot.ai.tool_runtime.contracts import (
-    BindingContract,
-    BindingResolverSpec,
+from offerpilot.ai.tool_runtime.contracts import materialize_provider_payloads
+from offerpilot.ai.tool_runtime.metadata import (
+    BindingResolverDescriptorV1,
+    EditableFieldMetadataV1,
+    ToolPresentationBindingV1,
+    WriteOperationMetadataV1,
 )
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG, MODEL_TOOL_NAMES
 from offerpilot.ai.tool_runtime.legacy import LEGACY_DETERMINISTIC_NAMES
@@ -25,7 +29,7 @@ def _manifest() -> dict[str, Any]:
     return json.loads(FIXTURE.read_text(encoding="utf-8"))
 
 
-def _resolver_metadata(resolver: BindingResolverSpec[Any]) -> dict[str, Any]:
+def _resolver_metadata(resolver: BindingResolverDescriptorV1) -> dict[str, Any]:
     return {
         "resolver_id": resolver.resolver_id,
         "entity_kind": resolver.entity_kind,
@@ -51,22 +55,29 @@ def test_matrix_metadata_is_closed_and_exact() -> None:
     assert len(manifest["tools"]) == 25
     for spec, expected in zip(MODEL_TOOL_CATALOG.specs, manifest["tools"]):
         assert spec.name == expected["name"]
-        assert spec.kind == expected["kind"]
-        assert spec.confirmation_policy == expected["confirmation_policy"]
-        assert tuple(map(str, spec.required_capabilities)) == tuple(expected["required_capabilities"])
-        assert spec.binding_contract.kind == expected["binding"]["kind"]
-        assert spec.binding_contract.entity_kind == expected["binding"]["entity_kind"]
-        assert [_resolver_metadata(item) for item in spec.binding_resolvers] == expected["resolvers"]
+        operation_kind = (
+            "write" if type(spec.metadata.operation) is WriteOperationMetadataV1 else "read"
+        )
+        assert operation_kind == expected["kind"]
+        assert spec.metadata.confirmation_policy == expected["confirmation_policy"]
+        assert tuple(map(str, spec.metadata.required_capabilities)) == tuple(
+            expected["required_capabilities"]
+        )
+        assert spec.metadata.binding.contract.kind == expected["binding"]["kind"]
+        assert spec.metadata.binding.contract.entity_kind == expected["binding"]["entity_kind"]
+        assert [_resolver_metadata(item.descriptor) for item in spec.resolver_bindings] == expected[
+            "resolvers"
+        ]
 
     update_event = MODEL_TOOL_CATALOG.resolve("update_application_event")
     assert update_event is not None
-    assert [item.resolver_id for item in update_event.binding_resolvers] == [
+    assert [item.descriptor.resolver_id for item in update_event.resolver_bindings] == [
         "application_event_parent",
         "application_identity_arg",
     ]
     update_note = MODEL_TOOL_CATALOG.resolve("update_note")
     assert update_note is not None
-    assert [item.resolver_id for item in update_note.binding_resolvers] == [
+    assert [item.descriptor.resolver_id for item in update_note.resolver_bindings] == [
         "note_application_parent",
         "application_identity_arg",
     ]
@@ -74,7 +85,10 @@ def test_matrix_metadata_is_closed_and_exact() -> None:
 
 def test_authority_manifest_is_canonical_read_only_and_not_duplicated() -> None:
     raw = FIXTURE.read_text(encoding="utf-8")
-    assert raw == json.dumps(_manifest(), ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    assert (
+        raw
+        == json.dumps(_manifest(), ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    )
     source = Path(__file__).parents[2] / "src" / "offerpilot" / "ai" / "tool_specs" / "catalog.py"
     assert "_EXPECTED_MATRIX" not in source.read_text(encoding="utf-8")
 
@@ -151,24 +165,27 @@ def test_non_typed_legacy_names_cannot_enter_the_typed_catalog() -> None:
 def test_model_catalog_fails_closed_after_provider_or_authority_metadata_mutation() -> None:
     spec = MODEL_TOOL_CATALOG.resolve("get_application")
     assert spec is not None
-    original_payload = copy.deepcopy(spec.contract.payload)
-    original_binding = spec.binding_contract
+    original_description = spec.contract.description
+    original_metadata = spec.metadata
     try:
-        spec.contract.payload["function"]["description"] = "evil provider description"  # type: ignore[index]
+        object.__setattr__(spec.contract, "description", "evil provider description")
         with pytest.raises(ValueError, match="catalog integrity drift"):
             MODEL_TOOL_CATALOG.provider_contracts()
         with pytest.raises(ValueError, match="catalog integrity drift"):
             MODEL_TOOL_CATALOG.authority_manifest
     finally:
-        spec.contract.payload.clear()
-        spec.contract.payload.update(original_payload)
+        object.__setattr__(spec.contract, "description", original_description)
 
     try:
-        object.__setattr__(spec, "binding_contract", BindingContract("none"))
+        object.__setattr__(
+            spec,
+            "metadata",
+            replace(original_metadata, domains=tuple(reversed(original_metadata.domains))),
+        )
         with pytest.raises(ValueError, match="catalog integrity drift"):
             MODEL_TOOL_CATALOG.resolve("get_application")
     finally:
-        object.__setattr__(spec, "binding_contract", original_binding)
+        object.__setattr__(spec, "metadata", original_metadata)
 
 
 @pytest.mark.parametrize(
@@ -179,8 +196,7 @@ def test_model_catalog_fails_closed_after_provider_or_authority_metadata_mutatio
         "preflight",
         "mutable_validator",
         "success_renderer",
-        "result_metadata",
-        "confirmation_description",
+        "result_metadata_projector",
         "schema_failure_renderer",
     ),
 )
@@ -198,10 +214,51 @@ def test_model_catalog_fails_closed_after_execution_callable_mutation(field: str
         object.__setattr__(spec, field, original)
 
 
+def _forged_confirmation_description(_args: object) -> str:
+    return "forged confirmation"
+
+
+def _forged_pending_details(_args: object) -> dict[str, bool]:
+    return {"forged": True}
+
+
+def _forged_success_summary(_result: object) -> str:
+    return "forged success"
+
+
+def test_model_catalog_fails_closed_after_presentation_binding_mutation() -> None:
+    spec = MODEL_TOOL_CATALOG.resolve("get_application")
+    assert spec is not None
+    original = spec.presentation
+    forged = ToolPresentationBindingV1(
+        implementation_id="forged_presentation_v1",
+        confirmation_description=_forged_confirmation_description,
+        pending_details_projector=_forged_pending_details,
+        success_summary_projector=_forged_success_summary,
+    )
+    try:
+        object.__setattr__(spec, "presentation", forged)
+        with pytest.raises(ValueError, match="catalog integrity drift"):
+            MODEL_TOOL_CATALOG.resolve("get_application")
+    finally:
+        object.__setattr__(spec, "presentation", original)
+
+
 @pytest.mark.parametrize(
     ("field", "replacement"),
     (
-        ("editable_fields", ({"field": "forged", "type": "text"},)),
+        (
+            "editable_fields",
+            (
+                EditableFieldMetadataV1(
+                    field="id",
+                    value_type="number",
+                    options=None,
+                    clearable=False,
+                    clear_value=None,
+                ),
+            ),
+        ),
         ("declared_failure_categories", frozenset()),
     ),
 )
@@ -211,24 +268,25 @@ def test_model_catalog_fails_closed_after_execution_metadata_mutation(
 ) -> None:
     spec = MODEL_TOOL_CATALOG.resolve("get_application")
     assert spec is not None
-    original = getattr(spec, field)
+    target = spec.metadata if field == "editable_fields" else spec
+    original = getattr(target, field)
     try:
-        object.__setattr__(spec, field, replacement)
+        object.__setattr__(target, field, replacement)
         with pytest.raises(ValueError, match="catalog integrity drift"):
             MODEL_TOOL_CATALOG.resolve("get_application")
     finally:
-        object.__setattr__(spec, field, original)
+        object.__setattr__(target, field, original)
 
 
-def test_model_catalog_fails_closed_after_exception_map_or_write_contract_mutation() -> None:
+def test_model_catalog_fails_closed_after_exception_map_or_operation_mutation() -> None:
     read_spec = MODEL_TOOL_CATALOG.resolve("get_application")
     write_spec = MODEL_TOOL_CATALOG.resolve("update_application_status")
     assert read_spec is not None
     assert write_spec is not None
     original_exception_map = read_spec.exception_map
-    original_write_contract = write_spec.write_contract
+    original_operation = write_spec.metadata.operation
     assert original_exception_map
-    assert original_write_contract is not None
+    assert type(original_operation) is WriteOperationMetadataV1
     try:
         forged_mapping = replace(
             original_exception_map[0],
@@ -246,27 +304,30 @@ def test_model_catalog_fails_closed_after_exception_map_or_write_contract_mutati
 
     try:
         object.__setattr__(
-            write_spec,
-            "write_contract",
-            replace(original_write_contract, visible_bytes=original_write_contract.visible_bytes - 1),
+            write_spec.metadata,
+            "operation",
+            replace(original_operation, visible_bytes=original_operation.visible_bytes - 1),
         )
         with pytest.raises(ValueError, match="catalog integrity drift"):
             MODEL_TOOL_CATALOG.resolve("update_application_status")
     finally:
-        object.__setattr__(write_spec, "write_contract", original_write_contract)
+        object.__setattr__(write_spec.metadata, "operation", original_operation)
 
 
-def test_provider_contract_projection_is_detached_from_catalog_storage() -> None:
+def test_provider_contract_projection_is_immutable_and_materializes_detached() -> None:
     contracts = MODEL_TOOL_CATALOG.provider_contracts()
-    original = copy.deepcopy(contracts[0].payload)
-    try:
-        contracts[0].payload["function"]["description"] = "evil detached description"  # type: ignore[index]
-        assert MODEL_TOOL_CATALOG.provider_contracts()[0].payload["function"]["description"] != (
-            "evil detached description"
-        )
-    finally:
-        contracts[0].payload.clear()
-        contracts[0].payload.update(original)
+    projected_function = contracts[0].payload["function"]
+    assert isinstance(projected_function, Mapping)
+    assert not isinstance(projected_function, dict)
+    with pytest.raises(TypeError):
+        projected_function["description"] = "evil immutable description"  # type: ignore[index]
+
+    detached = materialize_provider_payloads((contracts[0],))[0]
+    detached["function"]["description"] = "evil detached description"
+    assert (
+        MODEL_TOOL_CATALOG.provider_contracts()[0].payload["function"]["description"]
+        != "evil detached description"
+    )
 
 
 def test_schema_validator_projection_is_detached_from_catalog_storage() -> None:
@@ -298,11 +359,11 @@ def test_resolvers_use_primitive_context_port_and_preserve_resolution_states() -
     assert list_events is not None and get_event is not None
     context = _ResolutionContext(("detached", None))
 
-    omitted = list_events.binding_resolvers[0].resolve({}, context)
-    explicit_unavailable = list_events.binding_resolvers[0].resolve(
+    omitted = list_events.resolver_bindings[0].resolve({}, context)
+    explicit_unavailable = list_events.resolver_bindings[0].resolve(
         {"application_id": True}, context
     )
-    detached = get_event.binding_resolvers[0].resolve({"id": 9}, context)
+    detached = get_event.resolver_bindings[0].resolve({"id": 9}, context)
 
     assert omitted.state == "omitted"
     assert explicit_unavailable.state == "unavailable"
@@ -313,7 +374,10 @@ def test_resolvers_use_primitive_context_port_and_preserve_resolution_states() -
 def test_update_note_has_required_parent_then_optional_explicit_application() -> None:
     spec = MODEL_TOOL_CATALOG.resolve("update_note")
     assert spec is not None
-    assert [(resolver.arg_path, resolver.presence) for resolver in spec.binding_resolvers] == [
+    assert [
+        (resolver.descriptor.arg_path, resolver.descriptor.presence)
+        for resolver in spec.resolver_bindings
+    ] == [
         ("id", "required"),
         ("application_id", "optional"),
     ]

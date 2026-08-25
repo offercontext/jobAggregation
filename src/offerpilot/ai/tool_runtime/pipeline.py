@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from secrets import compare_digest
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, TypeAlias, cast
 
@@ -40,7 +40,10 @@ from offerpilot.ai.tool_runtime.contracts import (
     ToolSpec,
     ToolSuccess,
     TransientToolRuntimeValue,
+    ProviderToolContract,
+    materialize_provider_payloads,
 )
+from offerpilot.ai.tool_runtime.metadata import WriteOperationMetadataV1
 from offerpilot.ai.tool_runtime.journal import (
     prepare_tool_started_draft,
     project_tool_proposed,
@@ -181,7 +184,7 @@ def prepare_call(
         arguments=arguments,
         typed_args=typed_args,
         arguments_digest=_arguments_digest(arguments),
-        contract_fingerprint=_contract_fingerprint(spec.contract.payload),
+        contract_fingerprint=_contract_fingerprint(spec.contract),
         binding=binding,
     )
     object.__setattr__(
@@ -189,7 +192,7 @@ def prepare_call(
         "prepared_instance_token",
         factory.prepared_token(prepared),
     )
-    if spec.kind == "write":
+    if type(spec.metadata.operation) is WriteOperationMetadataV1:
         # The draft is transport compatibility data, not authorization.  It is
         # attached to the exact factory-created Prepared object and never used
         # to reconstruct authority or constraint state.
@@ -203,7 +206,7 @@ def prepare_call(
             prepared, "pending_action_revision", pending_action_revision
         )
     _stage(stage_sink, "prepared")
-    if spec.confirmation_policy == "required":
+    if spec.metadata.confirmation_policy == "required":
         return ConfirmationRequired(prepared)
     return ReadyToExecute(prepared)
 
@@ -218,7 +221,7 @@ def execute_prepared(
     locked_effective_args_digest: str | None = None,
     stage_sink: StageSink | None = None,
 ) -> ToolExecutionRecord[Any, Any]:
-    if prepared.spec.kind == "read":
+    if type(prepared.spec.metadata.operation) is not WriteOperationMetadataV1:
         if execution_claim is not None or locked_effective_args_digest is not None:
             raise AuthorityPhaseError("read execution cannot consume an ExecutionClaim")
         return _execute_read(
@@ -508,13 +511,16 @@ def _schema_validation_failure(
         if detail:
             return ToolFailure("validation_error", code, detail)
     required = spec.contract.parameters.get("required")
-    if isinstance(required, list):
-        missing = [key for key in required if isinstance(key, str) and key not in arguments]
-        if missing:
+    if isinstance(required, Sequence) and not isinstance(required, (str, bytes, bytearray)):
+        missing = next(
+            (key for key in required if isinstance(key, str) and key not in arguments),
+            None,
+        )
+        if missing is not None:
             return ToolFailure(
                 category="validation_error",
                 code=code,
-                compatibility_detail=f"{spec.name} requires {missing[0]}",
+                compatibility_detail=f"{spec.name} requires {missing}",
             )
     return _validation_failure(code)
 
@@ -537,8 +543,9 @@ def _typed_args_digest(typed_args: object) -> str:
         raise AuthorityPhaseError("typed arguments are not canonical JSON") from exc
 
 
-def _contract_fingerprint(payload: Mapping[str, JSONValue]) -> str:
-    encoded = canonical_json(dict(payload)).encode("utf-8")
+def _contract_fingerprint(contract: ProviderToolContract) -> str:
+    payload = materialize_provider_payloads((contract,))[0]
+    encoded = canonical_json(payload).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 

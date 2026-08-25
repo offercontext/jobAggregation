@@ -65,9 +65,7 @@ def test_runtime_rejects_semantically_weakened_dependency_policy_clone() -> None
 
 def test_production_source_has_no_catalog_drift_or_injected_surface_fallback() -> None:
     source_root = Path(__file__).parents[2] / "src"
-    production = "\n".join(
-        path.read_text(encoding="utf-8") for path in source_root.rglob("*.py")
-    )
+    production = "\n".join(path.read_text(encoding="utf-8") for path in source_root.rglob("*.py"))
     assert "typed_catalog_drift" not in production
     assert "_project_injected_surface" not in production
     assert "injected-surface-v1" not in production

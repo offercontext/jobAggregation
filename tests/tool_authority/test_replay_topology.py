@@ -52,8 +52,7 @@ def _typed_pending_human(tool_name: str, args: dict[str, object]) -> str:
 
     spec = MODEL_TOOL_CATALOG.resolve(tool_name)
     assert spec is not None
-    assert spec.confirmation_description is not None
-    return str(spec.confirmation_description(spec.decoder(args)))
+    return str(spec.presentation.confirmation_description(spec.decoder(args)))
 
 
 _ORIGIN_CONFIRMATION_TOKEN = "origin-replay-token"
@@ -102,9 +101,7 @@ def _seed_completed_origin(
     owner = repository.prepare_owner(origin_id)
     payload = build_terminal_payload(
         status="committed",
-        result_contract=(
-            "typed_json_v1" if origin_adapter == "typed" else "legacy_string_v1"
-        ),
+        result_contract=("typed_json_v1" if origin_adapter == "typed" else "legacy_string_v1"),
         result={},
         visible_result="saved",
         transport={"tool_call_id": "origin-call", "tool_name": origin_name},
@@ -172,9 +169,7 @@ def _seed_completed_origin(
             edited_args=None,
             rejection_feedback_present=False,
             rejection_feedback="",
-            confirmation_token_fingerprint=(
-                origin.confirmation_token_fingerprint or ""
-            ),
+            confirmation_token_fingerprint=(origin.confirmation_token_fingerprint or ""),
             proposal_fingerprint=origin.proposal_fingerprint or "",
         )
         origin.input_fingerprint = ledger_fingerprint(key, "test-origin-input-v1", {})
@@ -219,9 +214,7 @@ def _seed_completed_origin(
                         session,
                         owner,
                         outcome=outcome,  # type: ignore[arg-type]
-                        next_operation_id=(
-                            child.id if outcome == "chained_pending" else None
-                        ),
+                        next_operation_id=(child.id if outcome == "chained_pending" else None),
                     )
                 assert origin.delivery_status == "pending"
                 assert origin.delivery_next_operation_id is None
@@ -249,9 +242,7 @@ def _replay(repository: WriteOperationRepository, operation_id: str):
 
 
 def test_typed_chained_replay_returns_one_verified_operation_owned_pending(tmp_path) -> None:
-    _sessions, repository, origin_id, child_id, _conversation_id = _seed_completed_origin(
-        tmp_path
-    )
+    _sessions, repository, origin_id, child_id, _conversation_id = _seed_completed_origin(tmp_path)
     replay = _replay(repository, origin_id)
     assert replay.chained_pending is not None
     assert replay.chained_pending.adapter_kind == "typed"
@@ -342,9 +333,7 @@ def test_typed_chained_replay_integrity_and_runtime_side_effect_boundary(
     tmp_path,
     tampered_human: bool,
 ) -> None:
-    sessions, repository, origin_id, child_id, conversation_id = _seed_completed_origin(
-        tmp_path
-    )
+    sessions, repository, origin_id, child_id, conversation_id = _seed_completed_origin(tmp_path)
     if tampered_human:
         with sessions() as session:
             conversation = session.get(Conversation, conversation_id)
@@ -427,12 +416,8 @@ def test_typed_chained_replay_integrity_and_runtime_side_effect_boundary(
     }
 
 
-def test_manifest_failure_wins_before_malformed_pending_decode(
-    tmp_path, monkeypatch
-) -> None:
-    sessions, repository, origin_id, _child_id, conversation_id = _seed_completed_origin(
-        tmp_path
-    )
+def test_manifest_failure_wins_before_malformed_pending_decode(tmp_path, monkeypatch) -> None:
+    sessions, repository, origin_id, _child_id, conversation_id = _seed_completed_origin(tmp_path)
     with sessions() as session:
         conversation = session.get(Conversation, conversation_id)
         assert conversation is not None
@@ -452,9 +437,7 @@ def test_manifest_failure_wins_before_malformed_pending_decode(
 
 
 def test_typed_replay_decoder_failure_is_integrity(tmp_path) -> None:
-    sessions, repository, origin_id, _child_id, conversation_id = _seed_completed_origin(
-        tmp_path
-    )
+    sessions, repository, origin_id, _child_id, conversation_id = _seed_completed_origin(tmp_path)
     with sessions() as session:
         conversation = session.get(Conversation, conversation_id)
         assert conversation is not None
@@ -468,9 +451,7 @@ def test_typed_replay_decoder_failure_is_integrity(tmp_path) -> None:
 def test_typed_chained_replay_rejects_tampered_confirmation_projection(
     tmp_path,
 ) -> None:
-    sessions, repository, origin_id, _child_id, conversation_id = _seed_completed_origin(
-        tmp_path
-    )
+    sessions, repository, origin_id, _child_id, conversation_id = _seed_completed_origin(tmp_path)
     with sessions() as session:
         conversation = session.get(Conversation, conversation_id)
         assert conversation is not None
@@ -486,9 +467,7 @@ def test_typed_chained_replay_rejects_tampered_confirmation_projection(
 def test_typed_chained_replay_rejects_valid_json_with_wrong_proposal_hmac(
     tmp_path,
 ) -> None:
-    sessions, repository, origin_id, _child_id, conversation_id = _seed_completed_origin(
-        tmp_path
-    )
+    sessions, repository, origin_id, _child_id, conversation_id = _seed_completed_origin(tmp_path)
     with sessions() as session:
         conversation = session.get(Conversation, conversation_id)
         assert conversation is not None
@@ -528,9 +507,7 @@ def test_legacy_chained_replay_rejects_tampered_confirmation_projection(
 
 
 def test_terminal_child_is_not_a_valid_chained_pending(tmp_path) -> None:
-    sessions, repository, origin_id, child_id, _conversation_id = _seed_completed_origin(
-        tmp_path
-    )
+    sessions, repository, origin_id, child_id, _conversation_id = _seed_completed_origin(tmp_path)
     with sessions() as session:
         child = session.get(WriteOperation, child_id)
         assert child is not None

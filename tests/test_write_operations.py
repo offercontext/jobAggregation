@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import hashlib
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -17,16 +17,18 @@ from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
 from offerpilot.ai.tool_authority.fingerprint import authorization_scope_fingerprint
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
-from offerpilot.ai.tool_runtime.policy_types import ToolCapability
+from offerpilot.ai.tool_runtime.policy_types import ToolCapability, UndoPolicy
 from offerpilot.ai.tool_runtime.contracts import (
-    BindingContract,
     ConfirmationRequired,
     ProviderToolContract,
     REQUIRED_UNDO_TOOL_NAMES,
     TRANSACTIONAL_TYPED_WRITE_NAMES,
     ToolExceptionMapping,
-    ToolSpec,
-    WriteContract,
+)
+from offerpilot.ai.tool_runtime.metadata import (
+    EditableFieldMetadataV1,
+    ToolPresentationBindingV1,
+    UndoBuilderBinding,
 )
 from offerpilot.ai.tool_runtime.pipeline import prepare_call
 from offerpilot.ai.types import ToolCall
@@ -59,6 +61,97 @@ from offerpilot.repositories.notes import NotesRepository
 from offerpilot.repositories.offers import OffersRepository
 from offerpilot.repositories.resumes import ResumesRepository
 from offerpilot.models import Conversation, WriteOperation, WriteOperationTransition
+from tests.tool_metadata.factories import synthetic_tool_spec, write_metadata
+
+
+def _capture_empty_undo_seed(_context: object, _args: object) -> None:
+    return None
+
+
+def _build_test_undo(_seed: object, _record: object) -> dict[str, object]:
+    return {"kind": "delete_application"}
+
+
+def _raise_undo_projection_failure(_seed: object, _record: object) -> None:
+    raise RuntimeError("undo failed")
+
+
+def _commit_during_undo_seed(context: object, _args: object) -> dict[str, object]:
+    getattr(context, "bound_session").commit()
+    return {}
+
+
+def _rollback_during_undo_seed(context: object, _args: object) -> dict[str, object]:
+    getattr(context, "bound_session").rollback()
+    return {}
+
+
+def _close_during_undo_seed(context: object, _args: object) -> dict[str, object]:
+    getattr(context, "bound_session").close()
+    return {}
+
+
+def _render_test_success(result: object) -> str:
+    return str(result)
+
+
+def _raise_success_projection_failure(_result: object) -> str:
+    raise RuntimeError("presentation failed")
+
+
+_UNDO_SEED_ENDERS = {
+    "commit": _commit_during_undo_seed,
+    "rollback": _rollback_during_undo_seed,
+    "close": _close_during_undo_seed,
+}
+
+
+def _test_write_spec(
+    contract: ProviderToolContract,
+    executor: object,
+    *,
+    editable_fields: tuple[EditableFieldMetadataV1, ...] = (),
+    declared_failure_categories: frozenset[str] = frozenset(),
+    exception_map: tuple[ToolExceptionMapping, ...] = (),
+    undo_capture: object | None = None,
+    undo_builder: object | None = None,
+    success_projector: object = _render_test_success,
+):
+    undo_required = undo_capture is not None or undo_builder is not None
+    metadata = replace(
+        write_metadata(
+            name=contract.name,
+            undo_policy=(UndoPolicy.REQUIRED if undo_required else UndoPolicy.NONE),
+            resolver_descriptors=(),
+        ),
+        editable_fields=editable_fields,
+    )
+    base = synthetic_tool_spec(contract.name, metadata=metadata)
+    binding = None
+    if undo_required:
+        assert undo_capture is not None and undo_builder is not None
+        operation = metadata.operation
+        assert operation.undo_builder_id is not None
+        binding = UndoBuilderBinding(
+            descriptor=operation,
+            implementation_id=operation.undo_builder_id,
+            capture_seed=undo_capture,
+            build_undo=undo_builder,
+        )
+    return replace(
+        base,
+        contract=contract,
+        executor=executor,
+        presentation=ToolPresentationBindingV1(
+            implementation_id="test_write_presentation_v1",
+            confirmation_description=base.presentation.confirmation_description,
+            pending_details_projector=base.presentation.pending_details_projector,
+            success_summary_projector=success_projector,
+        ),
+        undo_builder_binding=binding,
+        declared_failure_categories=declared_failure_categories,
+        exception_map=exception_map,
+    )
 
 
 def _approval_request_fingerprint(key, operation_id: str, pending: PendingAction) -> str:
@@ -378,16 +471,11 @@ def test_mapped_domain_failure_rolls_back_executor_savepoint(tmp_path) -> None:
         bound_context.applications.create(ApplicationCreate("partial", "write"))
         raise ValueError("conflict")
 
-    spec = ToolSpec(
-        contract=contract,
-        kind="write",
-        decoder=lambda values: values,
-        executor=mutate_then_fail,
-        confirmation_policy="required",
+    spec = _test_write_spec(
+        contract,
+        mutate_then_fail,
         exception_map=(ToolExceptionMapping(ValueError, "conflict", "domain_conflict"),),
         declared_failure_categories=frozenset({"conflict"}),
-        write_contract=WriteContract(),
-        binding_contract=BindingContract("none"),
     )
     catalog = ToolCatalog((spec,), expected_names=(spec.name,))
     prepare_identity = factory.create_approved_write_prepare_identity(
@@ -461,6 +549,9 @@ def _primary_execution_harness(
     effective_args: str | None = None,
     edited_args: dict[str, object] | None = None,
     tool_name: str = "create_application",
+    undo_capture: object | None = None,
+    undo_builder: object | None = None,
+    success_projector: object = _render_test_success,
 ):
     sessions = init_database(tmp_path / "offerpilot.db")
     key = load_or_create_ledger_key(tmp_path, sessions)
@@ -560,7 +651,22 @@ def _primary_execution_harness(
         jd_analyses=JDAnalysesRepository(sessions),
         run_recorder=NullRunRecorder(),
     )
-    parameters = {"type": "object", "properties": {}}
+    editable_fields = tuple(
+        EditableFieldMetadataV1(
+            field=key,
+            value_type="long_text",
+            options=None,
+            clearable=False,
+            clear_value=None,
+        )
+        for key in (edited_args or {})
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            descriptor.field: {"type": "string"} for descriptor in editable_fields
+        },
+    }
     contract = ProviderToolContract(
         payload={
             "type": "function",
@@ -574,17 +680,13 @@ def _primary_execution_harness(
         description="create",
         parameters=parameters,
     )
-    spec = ToolSpec(
-        contract=contract,
-        kind="write",
-        decoder=lambda values: values,
-        executor=executor,
-        confirmation_policy="required",
-        write_contract=WriteContract(),
-        binding_contract=BindingContract("none"),
-        editable_fields=tuple(
-            {"field": key, "type": "long_text"} for key in (edited_args or {})
-        ),
+    spec = _test_write_spec(
+        contract,
+        executor,
+        editable_fields=editable_fields,
+        undo_capture=undo_capture,
+        undo_builder=undo_builder,
+        success_projector=success_projector,
     )
     catalog = ToolCatalog((spec,), expected_names=(spec.name,))
     prepare_identity = factory.create_approved_write_prepare_identity(
@@ -760,7 +862,7 @@ def test_locked_modify_preserves_explicit_patch_presence_when_effective_is_uncha
         harness.factory.close()
 
 
-@pytest.mark.parametrize("failure_site", ("renderer", "transport", "undo"))
+@pytest.mark.parametrize("failure_site", ("presentation", "transport", "undo"))
 def test_post_executor_projection_failure_terminalizes_without_rerun(
     tmp_path, monkeypatch, failure_site: str
 ) -> None:
@@ -771,22 +873,26 @@ def test_post_executor_projection_failure_terminalizes_without_rerun(
         calls += 1
         return {"ok": True}
 
-    harness = _primary_execution_harness(tmp_path, executor)
-    if failure_site == "renderer":
-        monkeypatch.setattr(
-            "offerpilot.ai.write_operations.render_compatibility",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("renderer failed")),
-        )
-    elif failure_site == "transport":
+    harness = _primary_execution_harness(
+        tmp_path,
+        executor,
+        undo_capture=(
+            _capture_empty_undo_seed if failure_site == "undo" else None
+        ),
+        undo_builder=(
+            _raise_undo_projection_failure if failure_site == "undo" else None
+        ),
+        success_projector=(
+            _raise_success_projection_failure
+            if failure_site == "presentation"
+            else _render_test_success
+        ),
+    )
+    if failure_site == "transport":
         monkeypatch.setattr(
             "offerpilot.ai.write_operations.project_transport_event",
             lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("transport failed")),
         )
-    undo_builder = (
-        (lambda *_args: (_ for _ in ()).throw(RuntimeError("undo failed")))
-        if failure_site == "undo"
-        else None
-    )
     arguments = dict(
         operation_id=harness.operation_id,
         conversation_id=harness.conversation.id,
@@ -794,7 +900,6 @@ def test_post_executor_projection_failure_terminalizes_without_rerun(
         context=harness.context,
         prepare_identity=harness.prepare_identity,
         request_fingerprint=harness.request_fingerprint,
-        undo_builder=undo_builder,
     )
     try:
         first, first_record = harness.coordinator.execute_primary(**arguments)
@@ -884,11 +989,12 @@ def test_undo_seed_cannot_end_claim_transaction_before_executor(
         calls += 1
         return {"ok": True}
 
-    def end_outer_transaction(_prepared, context):
-        getattr(context.bound_session, end_transaction)()
-        return {}
-
-    harness = _primary_execution_harness(tmp_path, executor)
+    harness = _primary_execution_harness(
+        tmp_path,
+        executor,
+        undo_capture=_UNDO_SEED_ENDERS[end_transaction],
+        undo_builder=_build_test_undo,
+    )
     try:
         execution, record = harness.coordinator.execute_primary(
             operation_id=harness.operation_id,
@@ -897,7 +1003,6 @@ def test_undo_seed_cannot_end_claim_transaction_before_executor(
             context=harness.context,
             prepare_identity=harness.prepare_identity,
             request_fingerprint=harness.request_fingerprint,
-            undo_seed_builder=end_outer_transaction,
         )
         assert isinstance(execution, OperationUnknown)
         assert execution.code == "operation_not_committed"

@@ -29,7 +29,9 @@ from offerpilot.ai.tool_runtime.contracts import (
     ProviderToolContract,
     ToolSpec,
     TransientToolRuntimeValue,
+    materialize_provider_payloads,
 )
+from tests.tool_metadata.factories import read_metadata, synthetic_tool_spec, write_metadata
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -138,7 +140,7 @@ def _security_runtime_types() -> tuple[type[TransientToolRuntimeValue], ...]:
 
 def _contract_fingerprint(spec: ToolSpec[Any, Any]) -> str:
     raw = json.dumps(
-        dict(spec.contract.payload),
+        materialize_provider_payloads((spec.contract,))[0],
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -204,24 +206,28 @@ def _prepared(
     kind: str,
     invocation: object | None = None,
 ) -> tuple[PreparedToolCall[Any, Any], object]:
-    spec = ToolSpec(
-        contract=ProviderToolContract(
-            payload={
-                "type": "function",
-                "function": {
-                    "name": tool_name,
-                    "description": "",
-                    "parameters": {},
-                },
+    parameters: dict[str, object] = {"type": "object", "properties": {}}
+    contract = ProviderToolContract(
+        payload={
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": "",
+                "parameters": parameters,
             },
-            name=tool_name,
-            description="",
-            parameters={},
-        ),
-        kind=kind,  # type: ignore[arg-type]
+        },
+        name=tool_name,
+        description="",
+        parameters=parameters,
+    )
+    metadata = write_metadata(tool_name) if kind == "write" else read_metadata(tool_name)
+    if kind == "write":
+        metadata = replace(metadata, editable_fields=())
+    spec = replace(
+        synthetic_tool_spec(tool_name, metadata=metadata),
+        contract=contract,
         decoder=lambda value: value,
         executor=lambda args, context: args,
-        confirmation_policy="required" if kind == "write" else "none",
     )
     if type(authority).__name__ == "ApprovalExecutionAuthority":
         prepare_identity = factory.create_approved_write_prepare_identity(
@@ -263,7 +269,9 @@ def _live_security_graph(
     factory: AuthorityFactory,
     execution_session: Session,
     proof_session: Session,
-) -> tuple[tuple[object, ...], PendingAuthorityClaim, ExecutionClaim, TrustedLedgerOmittedTokenProof]:
+) -> tuple[
+    tuple[object, ...], PendingAuthorityClaim, ExecutionClaim, TrustedLedgerOmittedTokenProof
+]:
     segment = _segment(factory, segment_id="privacy-live-segment")
     constraint = factory.create_application_scope_constraint(segment)
     resolution = factory.create_binding_target_resolution(
@@ -628,9 +636,9 @@ def test_public_conversation_http_and_sse_contracts_exclude_private_revision_and
     assert "scope_revision" not in conversation_projection
     assert "authorization_scope_fingerprint" not in conversation_projection
 
-    transport_source = (
-        ROOT / "src" / "offerpilot" / "chat_transport.py"
-    ).read_text(encoding="utf-8")
+    transport_source = (ROOT / "src" / "offerpilot" / "chat_transport.py").read_text(
+        encoding="utf-8"
+    )
     envelope = transport_source[
         transport_source.index("def runtime_sse_envelope(") : transport_source.index(
             "def prepared_stream_metadata(",
@@ -753,11 +761,7 @@ def test_live_authority_graph_is_rejected_by_real_public_boundaries() -> None:
                 _checkpoint_payload(value)
 
         manifest_blob = (
-            ROOT
-            / "tests"
-            / "fixtures"
-            / "tool_authority"
-            / "authority_manifest_v1.json"
+            ROOT / "tests" / "fixtures" / "tool_authority" / "authority_manifest_v1.json"
         ).read_text(encoding="utf-8")
         # Static per-tool required capability names are intentionally public
         # manifest metadata; the request-scoped capability *set* and all

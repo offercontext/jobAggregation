@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import inspect
-from copy import deepcopy
 from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar, Token
 from datetime import datetime, timezone
@@ -234,9 +233,9 @@ class _PolicyCatalogResolver:
 
         if type(catalog) is not RuntimeToolCatalog:
             raise ValueError("segment catalog must be a frozen ToolCatalog")
-        specs = tuple(deepcopy(catalog.specs))
+        specs = catalog.specs
         expected_names = tuple(spec.name for spec in specs)
-        manifest = deepcopy(catalog.authority_manifest)
+        manifest = catalog.authority_manifest
         return RuntimeToolCatalog(
             specs,
             expected_names=expected_names,
@@ -1039,11 +1038,6 @@ def build_pilot_runtime(
     page_context_messages: Callable[[Mapping[str, object] | None], Sequence[object]],
     missing_target_question: Callable[..., str | None] | None = None,
     pending_action_details: Callable[[PendingAction], Mapping[str, object]] | None = None,
-    undo_seed_for_pending: Callable[[PendingAction, object], Mapping[str, object]] | None = None,
-    build_write_undo: Callable[
-        [PendingAction, object | None, dict[str, object]], Mapping[str, object] | None
-    ]
-    | None = None,
     title_from_message: Callable[[str], str] | None = None,
     catalog: object = MODEL_TOOL_CATALOG,
     application_visible: Callable[[int], bool] | None = None,
@@ -1144,33 +1138,6 @@ def build_pilot_runtime(
             catalog=catalog,
             approval_context_resolver=resolve_approval_context,
             transactional_delivery=transactional_delivery,
-            undo_seed_builder=(
-                (
-                    lambda _prepared, context, state: undo_seed_for_pending(
-                        cast(
-                            PendingAction,
-                            _attribute(state, "effective_pending", _attribute(state, "pending")),
-                        ),
-                        _attribute(context, "applications", applications),
-                    )
-                )
-                if undo_seed_for_pending is not None
-                else None
-            ),
-            undo_builder=(
-                (
-                    lambda _prepared, record, seed, state: build_write_undo(
-                        cast(
-                            PendingAction,
-                            _attribute(state, "effective_pending", _attribute(state, "pending")),
-                        ),
-                        record,
-                        dict(seed) if isinstance(seed, Mapping) else {},
-                    )
-                )
-                if build_write_undo is not None
-                else None
-            ),
             clock=cast(Any, clock) if clock is not None else lambda: datetime.now(timezone.utc),
         )
     )

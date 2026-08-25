@@ -33,9 +33,8 @@ def prepare_pending_action(
         "pending arguments must be a valid JSON object",
     )
     editable_fields = {
-        descriptor.get("field"): descriptor
-        for descriptor in spec.editable_fields
-        if isinstance(descriptor.get("field"), str)
+        descriptor.field: descriptor.to_compat_descriptor()
+        for descriptor in spec.metadata.editable_fields
     }
     non_editable = [str(field) for field in edited_args if field not in editable_fields]
     if non_editable:
@@ -142,11 +141,11 @@ def _spec_confirmation_description(
     args: str,
     fallback: str,
 ) -> str:
-    if spec is None or spec.confirmation_description is None:
+    if spec is None:
         return fallback
     try:
         parsed = parse_arguments(args)
-        human = spec.confirmation_description(spec.decoder(parsed))
+        human = spec.presentation.confirmation_description(spec.decoder(parsed))
     except Exception:
         return fallback
     return str(human or fallback)

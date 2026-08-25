@@ -50,7 +50,7 @@ from offerpilot.ai.tool_runtime.contracts import (
 )
 from offerpilot.ai.tool_runtime.legacy import LEGACY_DETERMINISTIC_NAMES
 from offerpilot.ai.tool_runtime.journal import journal_shape_digest
-from offerpilot.ai.tool_specs.catalog import editable_fields_for_tool
+from offerpilot.ai.tool_runtime.metadata import WriteOperationMetadataV1
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.ai.pending_replay import PendingReplayArgsDecoderV1, PendingReplayIntegrityError
 from offerpilot.ai.write_operations import (
@@ -1173,11 +1173,15 @@ def _record_outcome(record: object) -> object | None:
     return _attribute(record, "outcome")
 
 
+def _spec_is_write(spec: object) -> bool:
+    metadata = _attribute(spec, "metadata")
+    return type(_attribute(metadata, "operation")) is WriteOperationMetadataV1
+
+
 def _record_is_write(record: object) -> bool:
     prepared = _attribute(record, "prepared")
     spec = _attribute(prepared, "spec")
-    kind = _attribute(spec, "kind")
-    return str(getattr(kind, "value", kind or "")) == "write"
+    return _spec_is_write(spec)
 
 
 def _failure_detail(failure: object) -> str:
@@ -1340,8 +1344,7 @@ def _catalog_exposes_write(catalog: object | None, tool_name: str) -> bool:
         return False
     if spec is None:
         return False
-    kind = _attribute(spec, "kind")
-    if str(getattr(kind, "value", kind or "")) != "write":
+    if not _spec_is_write(spec):
         return False
     if not isinstance(exposed, Sequence) or isinstance(exposed, (str, bytes)):
         return False
@@ -1515,8 +1518,7 @@ def _write_status(result: NormalizedAgentTurn) -> WriteStatus:
     for record in result.records:
         prepared = _attribute(record, "prepared")
         spec = _attribute(prepared, "spec")
-        kind = _attribute(spec, "kind")
-        if str(getattr(kind, "value", kind or "")) != "write":
+        if not _spec_is_write(spec):
             continue
         attempted = True
         outcome = _attribute(record, "outcome")
@@ -3960,11 +3962,17 @@ class PilotRuntime:
     @staticmethod
     def _pending_editable_fields(
         pending: PendingAction,
-        _catalog: object | None,
+        catalog: object | None,
     ) -> tuple[ImmutablePayload, ...]:
+        resolve = _callable(catalog, ("resolve",))
+        spec = _invoke(resolve, {"name": pending.tool_name}, (pending.tool_name,)) if resolve else None
+        metadata = _attribute(spec, "metadata")
+        editable_fields = _attribute(metadata, "editable_fields", ())
+        if type(editable_fields) is not tuple:
+            return ()
         return tuple(
-            freeze_json_mapping(cast(Mapping[str, object], descriptor))
-            for descriptor in editable_fields_for_tool(pending.tool_name)
+            freeze_json_mapping(cast(Mapping[str, object], descriptor.to_compat_descriptor()))
+            for descriptor in editable_fields
         )
 
     @staticmethod

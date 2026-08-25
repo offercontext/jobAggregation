@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.10+, pytest 8, SQLAlchemy 2, SQLite, FastAPI, jsonschema 4.26.0, the existing Agent Loop/Pilot Runtime/Context Projector/Tool Pipeline/Tool Authority/Write Operation Ledger/Journal, uv, Ruff, Mypy, Vitest, Vite, local verification, controlled real-AI verification, and the in-app browser.
 
-**Scope revisions:** Task 4 was first formally stopped before product edits after the original baseline-only `ToolSpec(` scan missed `dataclasses.replace()` consumers, attribute readers, and the Task 3 synthetic factory. During the reviewed Task 4 full GREEN matrix it was stopped again when two pre-existing Authority tests proved to construct a production Spec as a non-closed one-tool Catalog, and the production Authority capability validator began tripping the existing no-automatic-grant AST gate after `ToolCapability` became the closed enum. Its independent implementation review then found that the temporary compatibility mapping returned mutable nested Provider JSON and left `dict(contract.payload)` materializers in the AI client and Context Projector. Task 4 was stopped a third time before touching those out-of-gate consumers. The reviewed Task 4 scope below explicitly includes all seventeen supplemental consumers, migrates the two test Catalogs to explicit closed test metadata, validates capability values directly without materializing the whole enum, and atomically moves every Provider JSON consumer to one recursively immutable query surface plus one detached materializer. These scope-only revisions do not change the approved design, fixed identities, 25/3/4 boundary, protocol seals, or Golden assets.
+**Scope revisions:** Task 4 was first formally stopped before product edits after the original baseline-only `ToolSpec(` scan missed `dataclasses.replace()` consumers, attribute readers, and the Task 3 synthetic factory. During the reviewed Task 4 full GREEN matrix it was stopped again when two pre-existing Authority tests proved to construct a production Spec as a non-closed one-tool Catalog, and the production Authority capability validator began tripping the existing no-automatic-grant AST gate after `ToolCapability` became the closed enum. Its independent implementation review then found that the temporary compatibility mapping returned mutable nested Provider JSON and left `dict(contract.payload)` materializers in the AI client and Context Projector. Task 4 was stopped a third time before touching those out-of-gate consumers. The reviewed Task 4 scope below explicitly includes all seventeen supplemental consumers, migrates the two test Catalogs to explicit closed test metadata, validates capability values directly without materializing the whole enum, and atomically moves every Provider JSON consumer to one recursively immutable query surface plus one detached materializer. A later independent Task 4 review also found that the baseline-derived Task 12 classification scan could not discover the now-dead `BindingResolverSpec`/`aggregate_binding` compatibility surface or the test-fixture `BindingTarget` fallback in `tool_specs/common.py`. Product work stopped before touching that out-of-allowlist file; the reviewed Task 12 scope now explicitly includes the three defining/export modules and `tool_specs/common.py`, and its deletion gate closes those final compatibility paths after the Authority/Pipeline handle cutover. These scope-only revisions do not change the approved design, fixed identities, 25/3/4 boundary, protocol seals, or Golden assets.
 
 ---
 
@@ -947,6 +947,10 @@ git commit -m "refactor: AI 完成工具元数据生产切换"
 
 **Files:**
 
+- Modify: `src/offerpilot/ai/tool_runtime/__init__.py`
+- Modify: `src/offerpilot/ai/tool_runtime/context.py`
+- Modify: `src/offerpilot/ai/tool_runtime/contracts.py`
+- Modify: `src/offerpilot/ai/tool_specs/common.py`
 - Modify: `src/offerpilot/ai/tool_specs/catalog.py`
 - Modify: `src/offerpilot/ai/tool_specs/__init__.py`
 - Modify: `src/offerpilot/context_projector/selector.py`
@@ -978,6 +982,12 @@ COMPENSATION_OPERATION_NAMES
 REQUIRED_UNDO_OPERATION_NAMES
 WRITE_OPERATION_NAMES
 DEPENDENCY_POLICY_V1
+BindingResolverSpec
+BindingResolver
+BindingTarget
+UNAVAILABLE
+_UnavailableBindingTarget
+aggregate_binding
 _pending_adapter_kind
 _chained_adapter_kind
 _with_write_contract
@@ -994,6 +1004,8 @@ _legacy_adapter
 
 Also reject name-based sets/maps/switches, string-prefix routing, reflective classification, non-Composition Bundle construction, Provider dict registries, Dispatcher Legacy imports, Typed-to-Legacy fallback, feature flags, shadow/double execution, Golden writers, Legacy proof imports of Ledger/keyring/Repository/ORM/Pilot Runtime, initial route calls that pass source/name/Pending rather than an exact token, and any initial/proof component-factory call outside the single approved final Composition factory.
 
+Delete the dead `BindingResolverSpec` descriptor-plus-callable façade, its `BindingResolver` union branch and public re-export, together with the obsolete `BindingTarget` DTO and import-compatible `_UnavailableBindingTarget`/`UNAVAILABLE`/`aggregate_binding` surface. Match `BindingTarget` as an exact AST symbol so the final `BindingTargetResolution` authority type remains legal. `tool_specs/common.py` must require the exact authority-bound resolution port established by the completed Bundle/Segment cutover; the old `BindingTarget` return used only by unit fixtures is an implicit runtime fallback and must be rejected rather than retained. No forwarding alias, optional port lookup, or fixture-only production branch may remain. Add a runtime negative test proving a resolver context without the exact authority-bound resolution port fails closed and never returns an old target-shaped value.
+
 For Legacy specifically, permit only the exact static three-Adapter declaration and proof-bound final Catalog method. AST must reject the old `build_legacy_deterministic_catalog` symbol, any Legacy factory parameter/capture of Repository or Service, any `resolve_server_loaded` parameter typed/named as ordinary Pending, and every call that passes Pending/tool name instead of `LegacyRouteProof`.
 
 Exact allowlists are limited to published `models.py` CHECK text, Journal `_TOOL_NAMES`, Provider declarations, three Legacy Adapter declarations, four Compensation handler declarations, protocol seals, terminal persisted-payload renderers, and read-only test fixtures.
@@ -1001,7 +1013,7 @@ Exact allowlists are limited to published `models.py` CHECK text, Journal `_TOOL
 - [ ] **Step 2: Verify RED**
 
 ```powershell
-uv run pytest tests/tool_metadata/test_deletion_gates.py tests/agent_loop/test_deletion_gates.py tests/tool_pipeline/test_source_gates.py tests/tool_authority/test_source_gates.py tests/test_mock_legacy_removed.py tests/test_pilot_runtime_extraction_gate.py -q
+uv run pytest tests/tool_metadata/test_deletion_gates.py tests/agent_loop/test_deletion_gates.py tests/tool_pipeline tests/tool_authority/test_source_gates.py tests/tool_authority/test_baseline_golden.py tests/tool_authority/test_matrix.py tests/test_mock_legacy_removed.py tests/test_pilot_runtime_extraction_gate.py -q
 ```
 
 - [ ] **Step 3: Delete every old path and migrate all remaining imports**
@@ -1009,7 +1021,7 @@ uv run pytest tests/tool_metadata/test_deletion_gates.py tests/agent_loop/test_d
 Run:
 
 ```powershell
-rg -n "MODEL_TOOL_NAMES|MODEL_TOOL_CATALOG|DEPENDENCY_POLICY_V1|TRANSACTIONAL_TYPED_WRITE_NAMES|REQUIRED_UNDO_TOOL_NAMES|TYPED_WRITE_OPERATION_NAMES|LEGACY_WRITE_OPERATION_NAMES|COMPENSATION_OPERATION_NAMES|WRITE_OPERATION_NAMES|LEGACY_DETERMINISTIC_NAMES|build_legacy_deterministic_catalog|resolve_server_loaded" src tests
+rg -n "\b(MODEL_TOOL_NAMES|MODEL_TOOL_CATALOG|LEGACY_DETERMINISTIC_NAMES|TRANSACTIONAL_TYPED_WRITE_NAMES|REQUIRED_UNDO_TOOL_NAMES|TYPED_WRITE_OPERATION_NAMES|LEGACY_WRITE_OPERATION_NAMES|COMPENSATION_OPERATION_NAMES|REQUIRED_UNDO_OPERATION_NAMES|WRITE_OPERATION_NAMES|DEPENDENCY_POLICY_V1|BindingResolverSpec|BindingResolver|BindingTarget|_UnavailableBindingTarget|UNAVAILABLE|aggregate_binding|_pending_adapter_kind|_chained_adapter_kind|_with_write_contract|_with_runtime_metadata|editable_fields_for_tool|_undo_seed_for_pending|_build_write_undo|_CREATED_RECORD_FINGERPRINT_FIELDS|legacy_catalog_factory|build_legacy_deterministic_catalog|_legacy_catalog|_legacy_adapter|resolve_server_loaded)\b" src tests
 ```
 
 Delete production definitions and update all callers to injected Bundle views/Ports. Do not weaken gates or retain a re-export. Keep published CHECK strings and Journal whitelist byte-identical. Verify `jsonschema==4.26.0` remains exact in `pyproject.toml` and `uv.lock`.
@@ -1017,7 +1029,9 @@ Delete production definitions and update all callers to injected Bundle views/Po
 - [ ] **Step 4: Verify GREEN, privacy, serialization, and SQL assets**
 
 ```powershell
-uv run pytest tests/tool_metadata/test_deletion_gates.py tests/tool_metadata/test_published_operation_checks.py tests/agent_loop/test_deletion_gates.py tests/tool_pipeline/test_source_gates.py tests/tool_pipeline/test_checkpoint.py tests/tool_pipeline/test_journal.py tests/tool_pipeline/test_transport.py tests/tool_authority/test_source_gates.py tests/tool_authority/test_privacy.py tests/tool_authority/test_serialization.py tests/test_agent_run_journal.py tests/test_mock_legacy_removed.py tests/test_pilot_runtime_extraction_gate.py -q
+uv run pytest tests/tool_metadata/test_deletion_gates.py tests/tool_metadata/test_published_operation_checks.py tests/agent_loop/test_deletion_gates.py tests/tool_pipeline tests/tool_authority/test_source_gates.py tests/tool_authority/test_baseline_golden.py tests/tool_authority/test_matrix.py tests/tool_authority/test_privacy.py tests/tool_authority/test_serialization.py tests/test_agent_run_journal.py tests/test_mock_legacy_removed.py tests/test_pilot_runtime_extraction_gate.py -q
+uv run ruff check src/offerpilot tests/tool_metadata/test_deletion_gates.py tests/agent_loop/test_deletion_gates.py tests/tool_pipeline tests/tool_authority/test_source_gates.py tests/tool_authority/test_baseline_golden.py tests/tool_authority/test_matrix.py tests/tool_authority/test_privacy.py tests/tool_authority/test_serialization.py tests/test_agent_run_journal.py tests/test_mock_legacy_removed.py tests/test_pilot_runtime_extraction_gate.py
+uv run mypy src/offerpilot
 ```
 
 Expected: no transient Bundle/view/lease/proof/handle appears in ChatMessage, Pending, Ledger payload, Journal, checkpoint, Prompt, HTTP/SSE, log, repr, pickle, or generic serialization.

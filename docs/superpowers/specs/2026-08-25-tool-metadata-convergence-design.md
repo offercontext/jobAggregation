@@ -1,6 +1,6 @@
 # Tool Metadata Convergence 设计
 
-**状态：待复审**
+**状态：已复审通过**
 
 **固定 baseline：`0c10e05e256eb757d5f89a8b009dcea193f2fc78`**
 
@@ -8,7 +8,7 @@
 
 **Worktree：`D:\Users\yuqi.chen\offerpilot\.worktrees\refactor-20260825-tool-metadata-convergence`**
 
-> 本文只设计下一阶段，不修改生产代码。设计复审通过后再单独编写测试先行实施计划。
+> 本文只定义本阶段架构，不修改生产代码。设计已复审通过，测试先行实施计划另文维护。
 
 ## 1. 背景与问题
 
@@ -1894,9 +1894,10 @@ Legacy args 兼容规则不得由 proof 层另造 decoder：
   route handle 执行前必须同时匹配 exact PreparedLegacyCall identity 与 effective input
   fingerprint。
 
-初始动作由服务端已知的封闭 route source 直接选择 exact Adapter 并获得
-`LegacyAdapterRouteHandle`，该路径不需要数据库恢复 proof。确认恢复只读取数据库中的
-server-loaded Pending，经过 issuer 锁内验证后，再由
+初始动作由对应 source-bound issuer 在 request lease 内签发一次性 token，再由
+`LegacyInitialRoutePort` 从 Registry 中解析 exact Adapter 并获得
+`LegacyAdapterRouteHandle`；服务端流程不直接选择 Adapter，该路径也不需要数据库恢复
+proof。确认恢复只读取数据库中的 server-loaded Pending，经过 issuer 锁内验证后，再由
 `LegacyDeterministicCatalog.resolve_server_loaded(proof)` 消费一次性证明并签发新
 Handle。Handle 绑定 exact Catalog/Adapter identity、route source、transaction/claim
 lease 和 Pending primitive identity/digest，不保存 Pending model 或 arguments。客户端

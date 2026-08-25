@@ -5,8 +5,9 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
+from threading import RLock
 from types import MappingProxyType
-from typing import Any, cast
+from typing import Any, NoReturn, SupportsIndex, cast
 
 from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
 
@@ -16,10 +17,12 @@ from offerpilot.ai.tool_runtime.contracts import (
     FailureCategory,
     ProviderToolContract,
     ToolSpec,
+    TransientToolRuntimeValue,
     materialize_provider_payloads,
 )
 from offerpilot.ai.tool_runtime.metadata import (
     BindingResolverDescriptorV1,
+    BundleInstanceToken,
     EditableFieldMetadataV1,
     FrozenJSONObject,
     ReadOperationMetadataV1,
@@ -625,6 +628,283 @@ class ToolCatalog:
         return copy.deepcopy(self._authority_manifest)
 
 
+_SEGMENT_VALUE_CONSTRUCTION_SEAL = object()
+
+
+class SegmentCatalogToken(TransientToolRuntimeValue):
+    """Opaque identity for one live Segment Catalog lease."""
+
+    __slots__ = ()
+
+    def __new__(cls, seal: object | None = None) -> "SegmentCatalogToken":
+        if seal is not _SEGMENT_VALUE_CONSTRUCTION_SEAL:
+            raise TypeError("Segment Catalog tokens are lease-created")
+        return object.__new__(cls)
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> NoReturn:
+        del protocol
+        raise self._serialization_error()
+
+
+class SegmentToolSpecHandle(TransientToolRuntimeValue):
+    """Opaque route to one shared ToolSpec under a live Segment lease."""
+
+    _bundle_instance_token: BundleInstanceToken
+    _segment_catalog_token: SegmentCatalogToken
+    _tool_name: str
+    _integrity_seal: tuple[object, ...]
+
+    __slots__ = (
+        "_bundle_instance_token",
+        "_segment_catalog_token",
+        "_tool_name",
+        "_integrity_seal",
+    )
+
+    def __new__(
+        cls,
+        seal: object | None = None,
+        **kwargs: object,
+    ) -> "SegmentToolSpecHandle":
+        del kwargs
+        if seal is not _SEGMENT_VALUE_CONSTRUCTION_SEAL:
+            raise TypeError("Segment ToolSpec handles are lease-created")
+        return object.__new__(cls)
+
+    def __init__(
+        self,
+        seal: object | None = None,
+        *,
+        bundle_instance_token: BundleInstanceToken,
+        segment_catalog_token: SegmentCatalogToken,
+        tool_name: str,
+    ) -> None:
+        if seal is not _SEGMENT_VALUE_CONSTRUCTION_SEAL:
+            raise TypeError("Segment ToolSpec handles are lease-created")
+        if type(bundle_instance_token) is not BundleInstanceToken:
+            raise TypeError("Segment handle requires an exact Bundle token")
+        if type(segment_catalog_token) is not SegmentCatalogToken:
+            raise TypeError("Segment handle requires an exact Segment token")
+        if type(tool_name) is not str or not tool_name:
+            raise ValueError("Segment handle requires a Provider tool name")
+        object.__setattr__(self, "_bundle_instance_token", bundle_instance_token)
+        object.__setattr__(self, "_segment_catalog_token", segment_catalog_token)
+        object.__setattr__(self, "_tool_name", tool_name)
+        object.__setattr__(
+            self,
+            "_integrity_seal",
+            (id(bundle_instance_token), id(segment_catalog_token), tool_name),
+        )
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name in self.__slots__ and hasattr(self, name):
+            raise AttributeError(f"SegmentToolSpecHandle component {name} is sealed")
+        object.__setattr__(self, name, value)
+
+    def _ensure_integrity(self) -> None:
+        try:
+            self._bundle_instance_token._ensure_integrity()
+            current = (
+                id(self._bundle_instance_token),
+                id(self._segment_catalog_token),
+                self._tool_name,
+            )
+            if current != self._integrity_seal:
+                raise ValueError("Segment handle integrity drift")
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("Segment handle integrity drift") from exc
+
+    @property
+    def bundle_instance_token(self) -> BundleInstanceToken:
+        self._ensure_integrity()
+        return self._bundle_instance_token
+
+    @property
+    def segment_catalog_token(self) -> SegmentCatalogToken:
+        self._ensure_integrity()
+        return self._segment_catalog_token
+
+    @property
+    def tool_name(self) -> str:
+        self._ensure_integrity()
+        return self._tool_name
+
+
+class _SegmentLeaseState:
+    __slots__ = ("lock", "closed", "issued")
+
+    def __init__(self) -> None:
+        self.lock = RLock()
+        self.closed = False
+        self.issued: dict[
+            int,
+            tuple[SegmentToolSpecHandle, ToolSpec[Any, Any]],
+        ] = {}
+
+
+class SegmentToolCatalogLease(TransientToolRuntimeValue):
+    """Thread-safe revocable Segment identity over a shared immutable Catalog."""
+
+    _catalog: ToolCatalog
+    _bundle_instance_token: BundleInstanceToken
+    _segment_catalog_token: SegmentCatalogToken
+    _generation: int
+    _state: _SegmentLeaseState
+    _integrity_seal: tuple[object, ...]
+
+    __slots__ = (
+        "_catalog",
+        "_bundle_instance_token",
+        "_segment_catalog_token",
+        "_generation",
+        "_state",
+        "_integrity_seal",
+    )
+
+    def __new__(
+        cls,
+        seal: object | None = None,
+        **kwargs: object,
+    ) -> "SegmentToolCatalogLease":
+        del kwargs
+        if seal is not _SEGMENT_VALUE_CONSTRUCTION_SEAL:
+            raise TypeError("Segment Catalog leases are Bundle-created")
+        return object.__new__(cls)
+
+    def __init__(
+        self,
+        seal: object | None = None,
+        *,
+        catalog: ToolCatalog,
+        bundle_instance_token: BundleInstanceToken,
+        generation: int,
+    ) -> None:
+        if seal is not _SEGMENT_VALUE_CONSTRUCTION_SEAL:
+            raise TypeError("Segment Catalog leases are Bundle-created")
+        if type(catalog) is not ToolCatalog:
+            raise TypeError("Segment lease requires an exact ToolCatalog")
+        if type(bundle_instance_token) is not BundleInstanceToken:
+            raise TypeError("Segment lease requires an exact Bundle token")
+        if type(generation) is not int or generation < 1:
+            raise ValueError("Segment lease generation must be positive")
+        token = SegmentCatalogToken(_SEGMENT_VALUE_CONSTRUCTION_SEAL)
+        state = _SegmentLeaseState()
+        object.__setattr__(self, "_catalog", catalog)
+        object.__setattr__(self, "_bundle_instance_token", bundle_instance_token)
+        object.__setattr__(self, "_segment_catalog_token", token)
+        object.__setattr__(self, "_generation", generation)
+        object.__setattr__(self, "_state", state)
+        object.__setattr__(
+            self,
+            "_integrity_seal",
+            (id(catalog), id(bundle_instance_token), id(token), generation, id(state)),
+        )
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name in self.__slots__ and hasattr(self, name):
+            raise AttributeError(f"SegmentToolCatalogLease component {name} is sealed")
+        object.__setattr__(self, name, value)
+
+    def _ensure_integrity(self) -> None:
+        try:
+            self._bundle_instance_token._ensure_integrity()
+            current = (
+                id(self._catalog),
+                id(self._bundle_instance_token),
+                id(self._segment_catalog_token),
+                self._generation,
+                id(self._state),
+            )
+            if current != self._integrity_seal:
+                raise ValueError("Segment Catalog lease integrity drift")
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("Segment Catalog lease integrity drift") from exc
+
+    @property
+    def bundle_instance_token(self) -> BundleInstanceToken:
+        self._ensure_integrity()
+        return self._bundle_instance_token
+
+    @property
+    def segment_catalog_token(self) -> SegmentCatalogToken:
+        self._ensure_integrity()
+        return self._segment_catalog_token
+
+    @property
+    def generation(self) -> int:
+        self._ensure_integrity()
+        return self._generation
+
+    @property
+    def closed(self) -> bool:
+        self._ensure_integrity()
+        with self._state.lock:
+            return self._state.closed
+
+    def resolve(self, name: str) -> SegmentToolSpecHandle | None:
+        self._ensure_integrity()
+        with self._state.lock:
+            self._ensure_integrity()
+            if self._state.closed:
+                raise RuntimeError("Segment Catalog lease is closed")
+            spec = self._catalog.resolve(name)
+            if spec is None:
+                return None
+            handle = SegmentToolSpecHandle(
+                _SEGMENT_VALUE_CONSTRUCTION_SEAL,
+                bundle_instance_token=self._bundle_instance_token,
+                segment_catalog_token=self._segment_catalog_token,
+                tool_name=spec.name,
+            )
+            self._state.issued[id(handle)] = (handle, spec)
+            return handle
+
+    def require_spec(self, handle: object) -> ToolSpec[Any, Any]:
+        self._ensure_integrity()
+        with self._state.lock:
+            self._ensure_integrity()
+            if self._state.closed:
+                raise RuntimeError("Segment Catalog lease is closed and its handles are revoked")
+            if type(handle) is not SegmentToolSpecHandle:
+                raise ValueError("Segment handle provenance is invalid")
+            typed_handle = handle
+            typed_handle._ensure_integrity()
+            if typed_handle.bundle_instance_token is not self._bundle_instance_token:
+                raise ValueError("Segment handle has the wrong Bundle provenance")
+            if typed_handle.segment_catalog_token is not self._segment_catalog_token:
+                raise ValueError("Segment handle has the wrong Segment lease provenance")
+            issued = self._state.issued.get(id(typed_handle))
+            if issued is None or issued[0] is not typed_handle:
+                raise ValueError("Segment handle was not issued by this lease")
+            spec = issued[1]
+            if self._catalog.resolve(typed_handle.tool_name) is not spec:
+                raise ValueError("Segment handle no longer resolves to its sealed ToolSpec")
+            return spec
+
+    def close(self) -> None:
+        self._ensure_integrity()
+        with self._state.lock:
+            self._ensure_integrity()
+            if self._state.closed:
+                return
+            self._state.closed = True
+            self._state.issued.clear()
+
+
+def _open_segment_tool_catalog_lease(
+    *,
+    catalog: ToolCatalog,
+    bundle_instance_token: BundleInstanceToken,
+    generation: int,
+) -> SegmentToolCatalogLease:
+    return SegmentToolCatalogLease(
+        _SEGMENT_VALUE_CONSTRUCTION_SEAL,
+        catalog=catalog,
+        bundle_instance_token=bundle_instance_token,
+        generation=generation,
+    )
+
+
 class ToolMetadataManifestV1:
     """Deeply immutable exact V1 metadata projection."""
 
@@ -658,6 +938,13 @@ class ToolMetadataManifestV1:
             raise ValueError("Manifest projection integrity drift")
         validate_tool_metadata_manifest(projection)
         return cast(dict[str, Any], projection)
+
+    @property
+    def fingerprint(self) -> str:
+        """Return the cached canonical identity of the exact Manifest object."""
+
+        self.to_dict()
+        return self._projection_fingerprint
 
 
 def compile_tool_metadata_manifest(

@@ -7,9 +7,10 @@ import inspect
 import json
 import math
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
+from threading import RLock
 from types import MappingProxyType
-from typing import Literal, NoReturn, TypeAlias, cast, overload
+from typing import TYPE_CHECKING, Literal, NoReturn, SupportsIndex, TypeAlias, cast, overload
 
 from offerpilot.ai.tool_runtime.contracts import (
     BindingContract,
@@ -28,12 +29,17 @@ from offerpilot.ai.tool_runtime.policy_types import (
     UndoPolicy,
 )
 
+if TYPE_CHECKING:
+    from offerpilot.ai.tool_runtime.catalog import (
+        SegmentToolCatalogLease,
+        ToolCatalog,
+        ToolMetadataManifestV1,
+    )
+
 
 JSONScalar: TypeAlias = None | bool | int | float | str
 FrozenJSONValue: TypeAlias = (
-    JSONScalar
-    | tuple["FrozenJSONValue", ...]
-    | MappingProxyType[str, "FrozenJSONValue"]
+    JSONScalar | tuple["FrozenJSONValue", ...] | MappingProxyType[str, "FrozenJSONValue"]
 )
 FrozenJSONObject: TypeAlias = MappingProxyType[str, FrozenJSONValue]
 FrozenJSONArray: TypeAlias = tuple[FrozenJSONValue, ...]
@@ -176,6 +182,7 @@ _DOMAIN_ORDINAL = {value: ordinal for ordinal, value in enumerate(ToolDomain)}
 _CAPABILITY_ORDINAL = {value: ordinal for ordinal, value in enumerate(ToolCapability)}
 _IDENTITY_SNAPSHOT_SENTINEL = object()
 _MAX_STATIC_TEXT_BYTES = 256
+_BUNDLE_VALUE_CONSTRUCTION_SEAL = object()
 
 
 def _require_static_text(value: object, field_name: str) -> str:
@@ -220,6 +227,45 @@ def _has_type_aware_duplicates(values: tuple[object, ...]) -> bool:
             return True
         seen.add(key)
     return False
+
+
+def _require_sha256_fingerprint(value: object, field_name: str) -> str:
+    fingerprint = _require_static_text(value, field_name)
+    digest = fingerprint.removeprefix("sha256:")
+    if (
+        not fingerprint.startswith("sha256:")
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise ValueError(f"{field_name} must be a canonical sha256 fingerprint")
+    return fingerprint
+
+
+def _require_positive_ordinal(value: object, field_name: str = "tool ordinal") -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError(f"{field_name} must be a positive integer")
+    return value
+
+
+def _require_canonical_domains(
+    value: object,
+    field_name: str,
+    *,
+    allow_empty: bool,
+) -> tuple[ToolDomain, ...]:
+    domains = _require_exact_tuple(value, field_name)
+    if any(type(domain) is not ToolDomain for domain in domains):
+        raise TypeError(f"{field_name} requires exact ToolDomain values")
+    if not allow_empty and not domains:
+        raise ValueError(f"{field_name} must be non-empty")
+    if _has_type_aware_duplicates(domains):
+        raise ValueError(f"{field_name} must not contain duplicates")
+    typed_domains = cast(tuple[ToolDomain, ...], domains)
+    if tuple(_DOMAIN_ORDINAL[domain] for domain in typed_domains) != tuple(
+        sorted(_DOMAIN_ORDINAL[domain] for domain in typed_domains)
+    ):
+        raise ValueError(f"{field_name} must use canonical domain order")
+    return typed_domains
 
 
 @dataclass(frozen=True, slots=True)
@@ -491,9 +537,7 @@ class ToolSurfaceMetadataV1:
         dependencies = _require_exact_tuple(self.dependencies, "tool dependencies")
         for dependency in dependencies:
             _require_static_text(dependency, "tool dependency")
-        capabilities = _require_exact_tuple(
-            self.required_capabilities, "required capabilities"
-        )
+        capabilities = _require_exact_tuple(self.required_capabilities, "required capabilities")
         if any(type(value) is not ToolCapability for value in capabilities):
             raise TypeError("required capabilities require the exact ToolCapability type")
         if type(self.provider_visibility) is not ProviderVisibility or (
@@ -521,6 +565,1381 @@ class ToolSurfaceMetadataV1:
             raise TypeError("tool operation metadata must be one exact V1 union member")
 
 
+@dataclass(frozen=True, slots=True)
+class ToolDiscoveryEntryV1:
+    """Static, callable-free facts required by discovery and dependency closure."""
+
+    ordinal: int
+    provider_name: str
+    provider_contract: ProviderToolContract
+    domains: tuple[ToolDomain, ...]
+    dependencies: tuple[str, ...]
+    provider_visibility: ProviderVisibility
+
+    def __post_init__(self) -> None:
+        _require_positive_ordinal(self.ordinal)
+        _require_static_text(self.provider_name, "discovery Provider name")
+        if type(self.provider_contract) is not ProviderToolContract:
+            raise TypeError("discovery entry requires an exact Provider contract")
+        self.provider_contract._ensure_provider_integrity()
+        if self.provider_contract.name != self.provider_name:
+            raise ValueError("discovery entry Provider identity mismatch")
+        _require_canonical_domains(
+            self.domains,
+            "discovery domains",
+            allow_empty=False,
+        )
+        dependencies = _require_exact_tuple(self.dependencies, "discovery dependencies")
+        for dependency in dependencies:
+            _require_static_text(dependency, "discovery dependency")
+        if _has_type_aware_duplicates(dependencies):
+            raise ValueError("discovery dependencies must be unique")
+        if dependencies != tuple(sorted(cast(tuple[str, ...], dependencies))):
+            raise ValueError("discovery dependencies must use canonical order")
+        if self.provider_name in dependencies:
+            raise ValueError("discovery entry cannot depend on itself")
+        if (
+            type(self.provider_visibility) is not ProviderVisibility
+            or self.provider_visibility is not ProviderVisibility.MODEL_ELIGIBLE
+        ):
+            raise ValueError("discovery entry visibility must be model_eligible")
+
+
+@dataclass(frozen=True, slots=True)
+class ToolDiscoveryPolicyV1:
+    """Deeply frozen discovery policy projection for a generic 1..N Catalog.
+
+    Production composition supplies the exact closed V1 Manifest projection.
+    Synthetic Catalogs deliberately keep their smaller explicit projection;
+    this primitive never invents missing production policy values.
+    """
+
+    projection: FrozenJSONObject
+
+    def __init__(self, projection: Mapping[str, object]) -> None:
+        frozen = freeze_json(projection)
+        if type(frozen) is not MappingProxyType or not frozen:
+            raise ValueError("discovery policy must be a non-empty JSON object")
+        object.__setattr__(self, "projection", frozen)
+
+
+@dataclass(frozen=True, slots=True)
+class ToolAuthorityEntryV1:
+    """Static authority facts; resolver implementations deliberately stay on ToolSpec."""
+
+    ordinal: int
+    provider_name: str
+    provider_visibility: ProviderVisibility
+    required_capabilities: tuple[ToolCapability, ...]
+    binding: ToolBindingMetadataV1
+    confirmation_policy: Literal["none", "required"]
+    operation_kind: OperationKind
+
+    def __post_init__(self) -> None:
+        _require_positive_ordinal(self.ordinal)
+        _require_static_text(self.provider_name, "authority Provider name")
+        if (
+            type(self.provider_visibility) is not ProviderVisibility
+            or self.provider_visibility is not ProviderVisibility.MODEL_ELIGIBLE
+        ):
+            raise ValueError("authority entry visibility must be model_eligible")
+        capabilities = _require_exact_tuple(
+            self.required_capabilities,
+            "authority capabilities",
+        )
+        if len(capabilities) != 1 or any(
+            type(capability) is not ToolCapability for capability in capabilities
+        ):
+            raise ValueError("authority entry requires exactly one capability")
+        if type(self.binding) is not ToolBindingMetadataV1:
+            raise TypeError("authority entry requires exact binding metadata")
+        self.binding._ensure_valid()
+        if type(self.confirmation_policy) is not str or self.confirmation_policy not in {
+            "none",
+            "required",
+        }:
+            raise ValueError("authority entry has an unknown confirmation policy")
+        if type(self.operation_kind) is not OperationKind:
+            raise TypeError("authority entry requires an exact operation kind")
+        if (self.operation_kind is OperationKind.READ) != (self.confirmation_policy == "none"):
+            raise ValueError("authority operation and confirmation policy do not match")
+
+
+@dataclass(frozen=True, slots=True)
+class ToolOperationEntryV1:
+    """Static operation and confirmation projection without runtime handlers."""
+
+    ordinal: int
+    provider_name: str
+    confirmation_policy: Literal["none", "required"]
+    editable_fields: tuple[EditableFieldMetadataV1, ...]
+    operation: ToolOperationMetadataV1
+
+    def __post_init__(self) -> None:
+        _require_positive_ordinal(self.ordinal)
+        _require_static_text(self.provider_name, "operation Provider name")
+        if type(self.confirmation_policy) is not str or self.confirmation_policy not in {
+            "none",
+            "required",
+        }:
+            raise ValueError("operation entry has an unknown confirmation policy")
+        editable_fields = _require_exact_tuple(
+            self.editable_fields,
+            "operation editable fields",
+        )
+        if any(type(value) is not EditableFieldMetadataV1 for value in editable_fields):
+            raise TypeError("operation editable fields require exact descriptors")
+        for editable in self.editable_fields:
+            editable._ensure_valid()
+        if type(self.operation) is ReadOperationMetadataV1:
+            self.operation._ensure_valid()
+            if self.confirmation_policy != "none" or self.editable_fields:
+                raise ValueError("read operation projection cannot require confirmation")
+        elif type(self.operation) is WriteOperationMetadataV1:
+            self.operation._ensure_valid()
+            if self.confirmation_policy != "required":
+                raise ValueError("write operation projection must require confirmation")
+        else:
+            raise TypeError("operation entry requires an exact V1 operation descriptor")
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyAdapterBindingV1:
+    ordinal: int
+    name: str
+    provider_visibility: Literal["forbidden"]
+    adapter_kind: Literal["legacy_deterministic"]
+    chained_policy: str | None
+
+    def __post_init__(self) -> None:
+        _require_positive_ordinal(self.ordinal, "Legacy adapter ordinal")
+        _require_static_text(self.name, "Legacy adapter name")
+        if self.provider_visibility != "forbidden":
+            raise ValueError("Legacy adapter visibility must be forbidden")
+        if self.adapter_kind != "legacy_deterministic":
+            raise ValueError("Legacy adapter kind must be legacy_deterministic")
+        if self.chained_policy is not None:
+            _require_static_text(self.chained_policy, "Legacy chained policy")
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyInitialRouteBindingV1:
+    route_source: str
+    adapter_ordinal: int
+
+    def __post_init__(self) -> None:
+        _require_static_text(self.route_source, "Legacy initial route source")
+        _require_positive_ordinal(self.adapter_ordinal, "Legacy route adapter ordinal")
+
+
+@dataclass(frozen=True, slots=True)
+class CompensationHandlerBindingV1:
+    ordinal: int
+    compensation_kind: str
+    handler_id: str
+
+    def __post_init__(self) -> None:
+        _require_positive_ordinal(self.ordinal, "Compensation handler ordinal")
+        _require_static_text(self.compensation_kind, "Compensation operation")
+        _require_static_text(self.handler_id, "Compensation handler id")
+
+
+class BundleInstanceToken(TransientToolRuntimeValue):
+    """Opaque process-local provenance for one complete metadata Bundle."""
+
+    __slots__ = ("_issued", "_lock", "_sealed", "_integrity_seal")
+    _issued: Mapping[type[object], tuple[object, object]]
+    _lock: RLock
+    _sealed: bool
+    _integrity_seal: tuple[object, ...] | None
+
+    def __new__(cls, seal: object | None = None) -> "BundleInstanceToken":
+        if seal is not _BUNDLE_VALUE_CONSTRUCTION_SEAL:
+            raise TypeError("Bundle instance tokens are factory-created")
+        return object.__new__(cls)
+
+    def __init__(self, seal: object | None = None) -> None:
+        if seal is not _BUNDLE_VALUE_CONSTRUCTION_SEAL:
+            raise TypeError("Bundle instance tokens are factory-created")
+        if hasattr(self, "_issued"):
+            raise TypeError("Bundle instance token is already initialized")
+        object.__setattr__(self, "_issued", {})
+        object.__setattr__(self, "_lock", RLock())
+        object.__setattr__(self, "_sealed", False)
+        object.__setattr__(self, "_integrity_seal", None)
+
+    def __setattr__(self, name: str, value: object) -> NoReturn:
+        del name, value
+        raise AttributeError("Bundle instance token components are sealed")
+
+    def _register_view(self, view: object) -> None:
+        with self._lock:
+            if self._sealed or type(self._issued) is not dict:
+                raise ValueError("Bundle instance token registry is finalized")
+            issued = cast(dict[type[object], tuple[object, object]], self._issued)
+            view_type = type(view)
+            if view_type in issued:
+                raise ValueError(f"{view_type.__name__} was already issued")
+            issued[view_type] = (view, _bundle_view_integrity_snapshot(view))
+
+    def _finalize_views(self) -> None:
+        with self._lock:
+            if self._sealed or type(self._issued) is not dict:
+                raise ValueError("Bundle instance token registry is already finalized")
+            issued = MappingProxyType(dict(self._issued))
+            object.__setattr__(self, "_issued", issued)
+            object.__setattr__(self, "_sealed", True)
+            object.__setattr__(
+                self,
+                "_integrity_seal",
+                (
+                    id(issued),
+                    tuple(
+                        (view_type, id(view), snapshot)
+                        for view_type, (view, snapshot) in issued.items()
+                    ),
+                    id(self._lock),
+                ),
+            )
+
+    def _ensure_integrity(self) -> None:
+        try:
+            if not self._sealed or type(self._issued) is not MappingProxyType:
+                raise ValueError("Bundle instance token registry is not finalized")
+            current = (
+                id(self._issued),
+                tuple(
+                    (view_type, id(view), snapshot)
+                    for view_type, (view, snapshot) in self._issued.items()
+                ),
+                id(self._lock),
+            )
+            if current != self._integrity_seal:
+                raise ValueError("Bundle instance token integrity drift")
+            for view, expected_snapshot in self._issued.values():
+                if _bundle_view_integrity_snapshot(view) != expected_snapshot:
+                    raise ValueError("metadata Bundle view integrity drift")
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("Bundle instance token integrity drift") from exc
+
+    def _require_view(self, view: object, expected_type: type[object]) -> None:
+        with self._lock:
+            self._ensure_integrity()
+            issued = self._issued.get(expected_type)
+            if type(view) is not expected_type or issued is None or issued[0] is not view:
+                raise TypeError("metadata view was not issued by this Bundle token")
+            try:
+                current = _bundle_view_integrity_snapshot(view)
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise ValueError("metadata view integrity drift") from exc
+            if current != issued[1]:
+                raise ValueError("metadata view integrity drift")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> NoReturn:
+        del protocol
+        raise self._serialization_error()
+
+
+def _require_bundle_instance_token(value: object) -> BundleInstanceToken:
+    if type(value) is not BundleInstanceToken:
+        raise TypeError("view requires a factory-issued BundleInstanceToken")
+    return value
+
+
+class _SealedBundleView(TransientToolRuntimeValue):
+    __slots__ = ()
+
+    def __getattribute__(self, name: str) -> object:
+        if not name.startswith("_"):
+            token = cast(
+                BundleInstanceToken,
+                object.__getattribute__(self, "bundle_instance_token"),
+            )
+            token._require_view(self, type(self))
+        return object.__getattribute__(self, name)
+
+
+def _freeze_entry_mapping(
+    value: object,
+    *,
+    entry_type: type[ToolAuthorityEntryV1] | type[ToolOperationEntryV1],
+    field_name: str,
+) -> MappingProxyType[str, ToolAuthorityEntryV1 | ToolOperationEntryV1]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{field_name} must be a mapping")
+    frozen: dict[str, ToolAuthorityEntryV1 | ToolOperationEntryV1] = {}
+    ordinals: list[int] = []
+    for name, entry in value.items():
+        if type(name) is not str:
+            raise TypeError(f"{field_name} keys must be exact strings")
+        if type(entry) is not entry_type:
+            raise TypeError(f"{field_name} values have the wrong entry type")
+        if entry.provider_name != name:
+            raise ValueError(f"{field_name} key does not match its Provider name")
+        if name in frozen:
+            raise ValueError(f"{field_name} Provider names must be unique")
+        frozen[name] = entry
+        ordinals.append(entry.ordinal)
+    if tuple(ordinals) != tuple(range(1, len(ordinals) + 1)):
+        raise ValueError(f"{field_name} must preserve contiguous Catalog ordinals")
+    return MappingProxyType(frozen)
+
+
+@dataclass(frozen=True, slots=True, repr=False, eq=False, init=False)
+class ProviderToolMetadataView(_SealedBundleView):
+    ordered_contracts: tuple[ProviderToolContract, ...]
+    provider_boundary_fingerprint: str
+    bundle_instance_token: BundleInstanceToken = field(repr=False, compare=False)
+
+    def __init__(
+        self,
+        ordered_contracts: tuple[ProviderToolContract, ...],
+        provider_boundary_fingerprint: str,
+        bundle_instance_token: BundleInstanceToken,
+        *,
+        _seal: object,
+    ) -> None:
+        if _seal is not _BUNDLE_VALUE_CONSTRUCTION_SEAL:
+            raise TypeError("Provider metadata views are Bundle-created")
+        contracts = _require_exact_tuple(ordered_contracts, "Provider contracts")
+        if not contracts or any(type(value) is not ProviderToolContract for value in contracts):
+            raise TypeError("Provider view requires exact Provider contracts")
+        typed_contracts = cast(tuple[ProviderToolContract, ...], contracts)
+        names: list[str] = []
+        for contract in typed_contracts:
+            contract._ensure_provider_integrity()
+            names.append(contract.name)
+        if len(set(names)) != len(names):
+            raise ValueError("Provider view contracts must have unique names")
+        object.__setattr__(self, "ordered_contracts", typed_contracts)
+        object.__setattr__(
+            self,
+            "provider_boundary_fingerprint",
+            _require_sha256_fingerprint(
+                provider_boundary_fingerprint,
+                "Provider boundary fingerprint",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "bundle_instance_token",
+            _require_bundle_instance_token(bundle_instance_token),
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False, eq=False, init=False)
+class ToolDiscoveryMetadataView(_SealedBundleView):
+    ordered_entries: tuple[ToolDiscoveryEntryV1, ...]
+    policy: ToolDiscoveryPolicyV1
+    discovery_fingerprint: str
+    bundle_instance_token: BundleInstanceToken = field(repr=False, compare=False)
+
+    def __init__(
+        self,
+        ordered_entries: tuple[ToolDiscoveryEntryV1, ...],
+        policy: ToolDiscoveryPolicyV1,
+        discovery_fingerprint: str,
+        bundle_instance_token: BundleInstanceToken,
+        *,
+        _seal: object,
+    ) -> None:
+        if _seal is not _BUNDLE_VALUE_CONSTRUCTION_SEAL:
+            raise TypeError("Discovery metadata views are Bundle-created")
+        entries = _require_exact_tuple(ordered_entries, "discovery entries")
+        if not entries or any(type(value) is not ToolDiscoveryEntryV1 for value in entries):
+            raise TypeError("Discovery view requires exact discovery entries")
+        typed_entries = cast(tuple[ToolDiscoveryEntryV1, ...], entries)
+        if tuple(entry.ordinal for entry in typed_entries) != tuple(
+            range(1, len(typed_entries) + 1)
+        ):
+            raise ValueError("discovery entries must preserve contiguous Catalog ordinals")
+        if len({entry.provider_name for entry in typed_entries}) != len(typed_entries):
+            raise ValueError("discovery entries must have unique Provider names")
+        known_names = {entry.provider_name for entry in typed_entries}
+        if any(
+            dependency not in known_names
+            for entry in typed_entries
+            for dependency in entry.dependencies
+        ):
+            raise ValueError("discovery dependency points outside the Typed view")
+        if type(policy) is not ToolDiscoveryPolicyV1:
+            raise TypeError("Discovery view requires an exact V1 policy")
+        object.__setattr__(self, "ordered_entries", typed_entries)
+        object.__setattr__(self, "policy", policy)
+        object.__setattr__(
+            self,
+            "discovery_fingerprint",
+            _require_sha256_fingerprint(discovery_fingerprint, "discovery fingerprint"),
+        )
+        object.__setattr__(
+            self,
+            "bundle_instance_token",
+            _require_bundle_instance_token(bundle_instance_token),
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False, eq=False, init=False)
+class ToolAuthorityMetadataView(_SealedBundleView):
+    entries: Mapping[str, ToolAuthorityEntryV1]
+    authority_manifest_fingerprint: str
+    bundle_instance_token: BundleInstanceToken = field(repr=False, compare=False)
+
+    def __init__(
+        self,
+        entries: Mapping[str, ToolAuthorityEntryV1],
+        authority_manifest_fingerprint: str,
+        bundle_instance_token: BundleInstanceToken,
+        *,
+        _seal: object,
+    ) -> None:
+        if _seal is not _BUNDLE_VALUE_CONSTRUCTION_SEAL:
+            raise TypeError("Authority metadata views are Bundle-created")
+        frozen = _freeze_entry_mapping(
+            entries,
+            entry_type=ToolAuthorityEntryV1,
+            field_name="authority entries",
+        )
+        object.__setattr__(self, "entries", cast(Mapping[str, ToolAuthorityEntryV1], frozen))
+        object.__setattr__(
+            self,
+            "authority_manifest_fingerprint",
+            _require_sha256_fingerprint(
+                authority_manifest_fingerprint,
+                "Authority Manifest fingerprint",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "bundle_instance_token",
+            _require_bundle_instance_token(bundle_instance_token),
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False, eq=False, init=False)
+class ToolOperationMetadataView(_SealedBundleView):
+    entries: Mapping[str, ToolOperationEntryV1]
+    operation_fingerprint: str
+    bundle_instance_token: BundleInstanceToken = field(repr=False, compare=False)
+
+    def __init__(
+        self,
+        entries: Mapping[str, ToolOperationEntryV1],
+        operation_fingerprint: str,
+        bundle_instance_token: BundleInstanceToken,
+        *,
+        _seal: object,
+    ) -> None:
+        if _seal is not _BUNDLE_VALUE_CONSTRUCTION_SEAL:
+            raise TypeError("Operation metadata views are Bundle-created")
+        frozen = _freeze_entry_mapping(
+            entries,
+            entry_type=ToolOperationEntryV1,
+            field_name="operation entries",
+        )
+        object.__setattr__(self, "entries", cast(Mapping[str, ToolOperationEntryV1], frozen))
+        object.__setattr__(
+            self,
+            "operation_fingerprint",
+            _require_sha256_fingerprint(operation_fingerprint, "operation fingerprint"),
+        )
+        object.__setattr__(
+            self,
+            "bundle_instance_token",
+            _require_bundle_instance_token(bundle_instance_token),
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False, eq=False, init=False)
+class LegacyDeterministicBoundaryV1(_SealedBundleView):
+    ordered_adapter_bindings: tuple[LegacyAdapterBindingV1, ...]
+    initial_route_bindings: tuple[LegacyInitialRouteBindingV1, ...]
+    legacy_boundary_fingerprint: str
+    bundle_instance_token: BundleInstanceToken = field(repr=False, compare=False)
+
+    def __init__(
+        self,
+        ordered_adapter_bindings: tuple[LegacyAdapterBindingV1, ...],
+        initial_route_bindings: tuple[LegacyInitialRouteBindingV1, ...],
+        legacy_boundary_fingerprint: str,
+        bundle_instance_token: BundleInstanceToken,
+        *,
+        _seal: object,
+    ) -> None:
+        if _seal is not _BUNDLE_VALUE_CONSTRUCTION_SEAL:
+            raise TypeError("Legacy boundary views are Bundle-created")
+        adapter_bindings = _require_exact_tuple(
+            ordered_adapter_bindings,
+            "Legacy adapter bindings",
+        )
+        if not adapter_bindings or any(
+            type(binding) is not LegacyAdapterBindingV1 for binding in adapter_bindings
+        ):
+            raise TypeError("Legacy boundary requires exact adapter bindings")
+        typed_adapters = cast(tuple[LegacyAdapterBindingV1, ...], adapter_bindings)
+        if tuple(binding.ordinal for binding in typed_adapters) != tuple(
+            range(1, len(typed_adapters) + 1)
+        ):
+            raise ValueError("Legacy adapter bindings require contiguous ordinals")
+        route_bindings = _require_exact_tuple(
+            initial_route_bindings,
+            "Legacy initial route bindings",
+        )
+        if any(type(binding) is not LegacyInitialRouteBindingV1 for binding in route_bindings):
+            raise TypeError("Legacy boundary requires exact initial route bindings")
+        typed_routes = cast(tuple[LegacyInitialRouteBindingV1, ...], route_bindings)
+        if any(binding.adapter_ordinal > len(typed_adapters) for binding in typed_routes):
+            raise ValueError("Legacy initial route points outside the adapter boundary")
+        object.__setattr__(self, "ordered_adapter_bindings", typed_adapters)
+        object.__setattr__(self, "initial_route_bindings", typed_routes)
+        object.__setattr__(
+            self,
+            "legacy_boundary_fingerprint",
+            _require_sha256_fingerprint(
+                legacy_boundary_fingerprint,
+                "Legacy boundary fingerprint",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "bundle_instance_token",
+            _require_bundle_instance_token(bundle_instance_token),
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False, eq=False, init=False)
+class CompensationMetadataView(_SealedBundleView):
+    ordered_handler_bindings: tuple[CompensationHandlerBindingV1, ...]
+    compensation_fingerprint: str
+    bundle_instance_token: BundleInstanceToken = field(repr=False, compare=False)
+
+    def __init__(
+        self,
+        ordered_handler_bindings: tuple[CompensationHandlerBindingV1, ...],
+        compensation_fingerprint: str,
+        bundle_instance_token: BundleInstanceToken,
+        *,
+        _seal: object,
+    ) -> None:
+        if _seal is not _BUNDLE_VALUE_CONSTRUCTION_SEAL:
+            raise TypeError("Compensation metadata views are Bundle-created")
+        handler_bindings = _require_exact_tuple(
+            ordered_handler_bindings,
+            "Compensation handler bindings",
+        )
+        if not handler_bindings or any(
+            type(binding) is not CompensationHandlerBindingV1 for binding in handler_bindings
+        ):
+            raise TypeError("Compensation view requires exact handler bindings")
+        typed_handlers = cast(
+            tuple[CompensationHandlerBindingV1, ...],
+            handler_bindings,
+        )
+        if tuple(binding.ordinal for binding in typed_handlers) != tuple(
+            range(1, len(typed_handlers) + 1)
+        ):
+            raise ValueError("Compensation handlers require contiguous ordinals")
+        object.__setattr__(self, "ordered_handler_bindings", typed_handlers)
+        object.__setattr__(
+            self,
+            "compensation_fingerprint",
+            _require_sha256_fingerprint(
+                compensation_fingerprint,
+                "Compensation fingerprint",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "bundle_instance_token",
+            _require_bundle_instance_token(bundle_instance_token),
+        )
+
+
+_BundleView: TypeAlias = (
+    ProviderToolMetadataView
+    | ToolDiscoveryMetadataView
+    | ToolAuthorityMetadataView
+    | ToolOperationMetadataView
+    | LegacyDeterministicBoundaryV1
+    | CompensationMetadataView
+)
+
+
+def _bundle_view_integrity_snapshot(value: object) -> object:
+    if type(value) is ProviderToolContract:
+        value._ensure_provider_integrity()
+        return (
+            ProviderToolContract,
+            id(value),
+            value.name,
+            value.description,
+            id(value.payload),
+            id(value.parameters),
+        )
+    if type(value) is BundleInstanceToken:
+        return (BundleInstanceToken, id(value))
+    if is_dataclass(value) and not isinstance(value, type):
+        return (
+            type(value),
+            id(value),
+            tuple(
+                (
+                    descriptor.name,
+                    _bundle_view_integrity_snapshot(
+                        object.__getattribute__(value, descriptor.name)
+                    ),
+                )
+                for descriptor in fields(value)
+            ),
+        )
+    if isinstance(value, Mapping):
+        return (
+            type(value),
+            id(value),
+            tuple(
+                (
+                    _bundle_view_integrity_snapshot(key),
+                    _bundle_view_integrity_snapshot(item),
+                )
+                for key, item in value.items()
+            ),
+        )
+    if type(value) is tuple:
+        return (
+            tuple,
+            id(value),
+            tuple(_bundle_view_integrity_snapshot(item) for item in value),
+        )
+    if value is None or type(value) in {bool, int, float, str}:
+        return (type(value), value)
+    if isinstance(
+        value,
+        (
+            ToolDomain,
+            ToolCapability,
+            ProviderVisibility,
+            OperationKind,
+            UndoPolicy,
+            UndoPayloadKind,
+            CompensationKind,
+        ),
+    ):
+        return (type(value), value.value)
+    raise TypeError(f"unsupported Bundle view component: {type(value).__name__}")
+
+
+class _BundleViewFactory(TransientToolRuntimeValue):
+    """One-shot issuer and exact-identity registry used by the future Bundle."""
+
+    __slots__ = ("_bundle_instance_token",)
+    _bundle_instance_token: BundleInstanceToken
+
+    def __new__(cls, seal: object | None = None) -> "_BundleViewFactory":
+        if seal is not _BUNDLE_VALUE_CONSTRUCTION_SEAL:
+            raise TypeError("Bundle view factories are composition-created")
+        return object.__new__(cls)
+
+    def __init__(self, seal: object | None = None) -> None:
+        if seal is not _BUNDLE_VALUE_CONSTRUCTION_SEAL:
+            raise TypeError("Bundle view factories are composition-created")
+        object.__setattr__(
+            self,
+            "_bundle_instance_token",
+            BundleInstanceToken(_BUNDLE_VALUE_CONSTRUCTION_SEAL),
+        )
+
+    def __setattr__(self, name: str, value: object) -> NoReturn:
+        del name, value
+        raise AttributeError("Bundle view factory components are sealed")
+
+    @property
+    def bundle_instance_token(self) -> BundleInstanceToken:
+        return cast(BundleInstanceToken, object.__getattribute__(self, "_bundle_instance_token"))
+
+    def _register(self, view: _BundleView) -> _BundleView:
+        self.bundle_instance_token._register_view(view)
+        return view
+
+    def require_issued(self, view: object, expected_type: type[_BundleView]) -> None:
+        self.bundle_instance_token._require_view(view, expected_type)
+
+    def finalize(self) -> None:
+        self.bundle_instance_token._finalize_views()
+
+    def provider_view(
+        self,
+        *,
+        ordered_contracts: tuple[ProviderToolContract, ...],
+        provider_boundary_fingerprint: str,
+    ) -> ProviderToolMetadataView:
+        return cast(
+            ProviderToolMetadataView,
+            self._register(
+                ProviderToolMetadataView(
+                    ordered_contracts,
+                    provider_boundary_fingerprint,
+                    self.bundle_instance_token,
+                    _seal=_BUNDLE_VALUE_CONSTRUCTION_SEAL,
+                )
+            ),
+        )
+
+    def discovery_view(
+        self,
+        *,
+        ordered_entries: tuple[ToolDiscoveryEntryV1, ...],
+        policy: ToolDiscoveryPolicyV1,
+        discovery_fingerprint: str,
+    ) -> ToolDiscoveryMetadataView:
+        return cast(
+            ToolDiscoveryMetadataView,
+            self._register(
+                ToolDiscoveryMetadataView(
+                    ordered_entries,
+                    policy,
+                    discovery_fingerprint,
+                    self.bundle_instance_token,
+                    _seal=_BUNDLE_VALUE_CONSTRUCTION_SEAL,
+                )
+            ),
+        )
+
+    def authority_view(
+        self,
+        *,
+        entries: Mapping[str, ToolAuthorityEntryV1],
+        authority_manifest_fingerprint: str,
+    ) -> ToolAuthorityMetadataView:
+        return cast(
+            ToolAuthorityMetadataView,
+            self._register(
+                ToolAuthorityMetadataView(
+                    entries,
+                    authority_manifest_fingerprint,
+                    self.bundle_instance_token,
+                    _seal=_BUNDLE_VALUE_CONSTRUCTION_SEAL,
+                )
+            ),
+        )
+
+    def operation_view(
+        self,
+        *,
+        entries: Mapping[str, ToolOperationEntryV1],
+        operation_fingerprint: str,
+    ) -> ToolOperationMetadataView:
+        return cast(
+            ToolOperationMetadataView,
+            self._register(
+                ToolOperationMetadataView(
+                    entries,
+                    operation_fingerprint,
+                    self.bundle_instance_token,
+                    _seal=_BUNDLE_VALUE_CONSTRUCTION_SEAL,
+                )
+            ),
+        )
+
+    def legacy_boundary(
+        self,
+        *,
+        ordered_adapter_bindings: tuple[LegacyAdapterBindingV1, ...],
+        initial_route_bindings: tuple[LegacyInitialRouteBindingV1, ...],
+        legacy_boundary_fingerprint: str,
+    ) -> LegacyDeterministicBoundaryV1:
+        return cast(
+            LegacyDeterministicBoundaryV1,
+            self._register(
+                LegacyDeterministicBoundaryV1(
+                    ordered_adapter_bindings,
+                    initial_route_bindings,
+                    legacy_boundary_fingerprint,
+                    self.bundle_instance_token,
+                    _seal=_BUNDLE_VALUE_CONSTRUCTION_SEAL,
+                )
+            ),
+        )
+
+    def compensation_view(
+        self,
+        *,
+        ordered_handler_bindings: tuple[CompensationHandlerBindingV1, ...],
+        compensation_fingerprint: str,
+    ) -> CompensationMetadataView:
+        return cast(
+            CompensationMetadataView,
+            self._register(
+                CompensationMetadataView(
+                    ordered_handler_bindings,
+                    compensation_fingerprint,
+                    self.bundle_instance_token,
+                    _seal=_BUNDLE_VALUE_CONSTRUCTION_SEAL,
+                )
+            ),
+        )
+
+
+def _new_bundle_view_factory() -> _BundleViewFactory:
+    return _BundleViewFactory(_BUNDLE_VALUE_CONSTRUCTION_SEAL)
+
+
+def _require_bundle_manifest_names(
+    projection: Mapping[str, object],
+    expected_names: tuple[str, ...],
+) -> None:
+    if projection.get("schema_version") != 1:
+        raise ValueError("Bundle Manifest has an unknown schema version")
+    if projection.get("metadata_version") != "tool-surface-metadata-v1":
+        raise ValueError("Bundle Manifest has an unknown metadata version")
+    typed_tools = projection.get("typed_tools")
+    if not isinstance(typed_tools, (list, tuple)):
+        raise TypeError("Bundle Manifest typed_tools must be an ordered sequence")
+    names: list[str] = []
+    for entry in typed_tools:
+        if type(entry) is str:
+            names.append(entry)
+            continue
+        if isinstance(entry, Mapping) and type(entry.get("provider_name")) is str:
+            names.append(cast(str, entry["provider_name"]))
+            continue
+        raise TypeError("Bundle Manifest typed_tools entries have an invalid shape")
+    if tuple(names) != expected_names:
+        raise ValueError("Bundle Manifest and Typed Catalog names/order mismatch")
+
+
+def _bundle_operation_projection(entry: ToolOperationEntryV1) -> dict[str, object]:
+    operation = entry.operation
+    projection: dict[str, object] = {
+        "ordinal": entry.ordinal,
+        "provider_name": entry.provider_name,
+        "confirmation_policy": entry.confirmation_policy,
+        "editable_fields": [
+            {
+                "field": editable.field,
+                "value_type": editable.value_type,
+                "options": None if editable.options is None else list(editable.options),
+                "clearable": editable.clearable,
+                "clear_value": editable.clear_value,
+            }
+            for editable in entry.editable_fields
+        ],
+    }
+    if type(operation) is ReadOperationMetadataV1:
+        projection["operation"] = {"kind": operation.kind.value}
+        return projection
+    if type(operation) is not WriteOperationMetadataV1:
+        raise TypeError("Bundle operation projection has an invalid descriptor")
+    projection["operation"] = {
+        "kind": operation.kind.value,
+        "adapter_kind": operation.adapter_kind,
+        "result_contract": operation.result_contract,
+        "result_bytes": operation.result_bytes,
+        "visible_bytes": operation.visible_bytes,
+        "transport_bytes": operation.transport_bytes,
+        "undo_bytes": operation.undo_bytes,
+        "undo_policy": operation.undo_policy.value,
+        "undo_payload_kind": (
+            None if operation.undo_payload_kind is None else operation.undo_payload_kind.value
+        ),
+        "compensation_kind": (
+            None if operation.compensation_kind is None else operation.compensation_kind.value
+        ),
+        "undo_contract_version": operation.undo_contract_version,
+        "undo_builder_id": operation.undo_builder_id,
+        "undo_seed_phase": operation.undo_seed_phase,
+    }
+    return projection
+
+
+def _legacy_view_projection(
+    value: Mapping[str, object],
+    *,
+    production: bool,
+) -> tuple[
+    tuple[LegacyAdapterBindingV1, ...],
+    tuple[LegacyInitialRouteBindingV1, ...],
+]:
+    frozen = freeze_json(value)
+    if type(frozen) is not MappingProxyType:
+        raise TypeError("Legacy boundary must be a JSON object")
+    projection = cast(dict[str, object], materialize_json(frozen))
+    if production:
+        expected_keys = (
+            "boundary_version",
+            "provider_visibility",
+            "adapter_kind",
+            "ordered_names",
+            "chained_policies",
+            "initial_route_bindings",
+        )
+        if tuple(projection) != expected_keys:
+            raise ValueError("production Legacy boundary has an invalid exact shape")
+        raw_names = projection["ordered_names"]
+        visibility = projection["provider_visibility"]
+        adapter_kind = projection["adapter_kind"]
+        raw_policies = projection["chained_policies"]
+        raw_routes = projection["initial_route_bindings"]
+    else:
+        if tuple(projection) != ("visibility", "ordered_adapters"):
+            raise ValueError("generic Legacy boundary has an invalid exact shape")
+        raw_names = projection["ordered_adapters"]
+        visibility = projection["visibility"]
+        adapter_kind = "legacy_deterministic"
+        raw_policies = None
+        raw_routes = []
+    if not isinstance(raw_names, list) or not raw_names:
+        raise ValueError("Legacy boundary requires ordered adapter names")
+    names: list[str] = []
+    for name in raw_names:
+        names.append(_require_static_text(name, "Legacy adapter name"))
+    if len(set(names)) != len(names):
+        raise ValueError("Legacy adapter names must be unique")
+    if type(visibility) is not str:
+        raise TypeError("Legacy boundary visibility must be exact text")
+    if type(adapter_kind) is not str:
+        raise TypeError("Legacy adapter kind must be exact text")
+    if raw_policies is None:
+        policies: list[object] = [None] * len(names)
+    elif isinstance(raw_policies, list) and len(raw_policies) == len(names):
+        policies = raw_policies
+    else:
+        raise ValueError("Legacy chained policies do not match adapter order")
+    adapter_bindings = tuple(
+        LegacyAdapterBindingV1(
+            ordinal=ordinal,
+            name=name,
+            provider_visibility=cast(Literal["forbidden"], visibility),
+            adapter_kind=cast(Literal["legacy_deterministic"], adapter_kind),
+            chained_policy=(None if policy is None else cast(str, policy)),
+        )
+        for ordinal, (name, policy) in enumerate(zip(names, policies), start=1)
+    )
+    if not isinstance(raw_routes, list):
+        raise TypeError("Legacy initial route bindings must be an ordered sequence")
+    route_bindings: list[LegacyInitialRouteBindingV1] = []
+    for route in raw_routes:
+        if not isinstance(route, Mapping):
+            raise TypeError("Legacy initial route binding must be an object")
+        route_bindings.append(
+            LegacyInitialRouteBindingV1(
+                route_source=_require_static_text(
+                    route.get("route_source"),
+                    "Legacy initial route source",
+                ),
+                adapter_ordinal=cast(int, route.get("adapter_ordinal")),
+            )
+        )
+    return adapter_bindings, tuple(route_bindings)
+
+
+def _compensation_view_projection(
+    value: Mapping[str, object],
+    *,
+    production: bool,
+) -> tuple[CompensationHandlerBindingV1, ...]:
+    frozen = freeze_json(value)
+    if type(frozen) is not MappingProxyType:
+        raise TypeError("Compensation projection must be a JSON object")
+    projection = cast(dict[str, object], materialize_json(frozen))
+    if production:
+        if tuple(projection) != ("ordered_handler_bindings",):
+            raise ValueError("production Compensation projection has an invalid exact shape")
+        existing = projection["ordered_handler_bindings"]
+        if not isinstance(existing, list):
+            raise TypeError("Compensation handler bindings must be an ordered sequence")
+        if any(not isinstance(item, Mapping) for item in existing):
+            raise TypeError("Compensation handler binding must be an object")
+        return tuple(
+            CompensationHandlerBindingV1(
+                ordinal=cast(int, cast(Mapping[str, object], item).get("ordinal")),
+                compensation_kind=_require_static_text(
+                    cast(Mapping[str, object], item).get("compensation_kind"),
+                    "Compensation operation",
+                ),
+                handler_id=_require_static_text(
+                    cast(Mapping[str, object], item).get("handler_id"),
+                    "Compensation handler id",
+                ),
+            )
+            for item in existing
+        )
+    if tuple(projection) != ("ordered_operations", "handler_ids"):
+        raise ValueError("generic Compensation projection has an invalid exact shape")
+    operations = projection["ordered_operations"]
+    handler_ids = projection["handler_ids"]
+    if not isinstance(operations, list) or not isinstance(handler_ids, list):
+        raise TypeError("Compensation projection requires ordered operations and handlers")
+    if not operations or len(operations) != len(handler_ids):
+        raise ValueError("Compensation operations and handlers do not match")
+    bindings: list[CompensationHandlerBindingV1] = []
+    for ordinal, (operation, handler_id) in enumerate(
+        zip(operations, handler_ids),
+        start=1,
+    ):
+        bindings.append(
+            CompensationHandlerBindingV1(
+                ordinal=ordinal,
+                compensation_kind=_require_static_text(
+                    operation,
+                    "Compensation operation",
+                ),
+                handler_id=_require_static_text(handler_id, "Compensation handler id"),
+            )
+        )
+    return tuple(bindings)
+
+
+def _canonical_legacy_view_projection(
+    adapter_bindings: tuple[LegacyAdapterBindingV1, ...],
+    route_bindings: tuple[LegacyInitialRouteBindingV1, ...],
+) -> dict[str, object]:
+    return {
+        "ordered_adapter_bindings": [
+            {
+                "ordinal": binding.ordinal,
+                "name": binding.name,
+                "provider_visibility": binding.provider_visibility,
+                "adapter_kind": binding.adapter_kind,
+                "chained_policy": binding.chained_policy,
+            }
+            for binding in adapter_bindings
+        ],
+        "initial_route_bindings": [
+            {
+                "route_source": binding.route_source,
+                "adapter_ordinal": binding.adapter_ordinal,
+            }
+            for binding in route_bindings
+        ],
+    }
+
+
+def _canonical_compensation_view_projection(
+    bindings: tuple[CompensationHandlerBindingV1, ...],
+) -> dict[str, object]:
+    return {
+        "ordered_handler_bindings": [
+            {
+                "ordinal": binding.ordinal,
+                "compensation_kind": binding.compensation_kind,
+                "handler_id": binding.handler_id,
+            }
+            for binding in bindings
+        ]
+    }
+
+
+class _BundleLeaseIssuerState:
+    __slots__ = ("lock", "generation")
+
+    def __init__(self) -> None:
+        self.lock = RLock()
+        self.generation = 0
+
+
+class ToolMetadataBundleV1(TransientToolRuntimeValue):
+    """One immutable metadata composition with exact process-local provenance."""
+
+    _typed_catalog: ToolCatalog
+    _view_factory: _BundleViewFactory
+    _provider_view: ProviderToolMetadataView
+    _discovery_view: ToolDiscoveryMetadataView
+    _authority_view: ToolAuthorityMetadataView
+    _operation_view: ToolOperationMetadataView
+    _legacy_boundary_view: LegacyDeterministicBoundaryV1
+    _compensation_view: CompensationMetadataView
+    _bundle_fingerprint: str
+    _lease_state: _BundleLeaseIssuerState
+    _integrity_seal: tuple[object, ...]
+
+    __slots__ = (
+        "_typed_catalog",
+        "_view_factory",
+        "_provider_view",
+        "_discovery_view",
+        "_authority_view",
+        "_operation_view",
+        "_legacy_boundary_view",
+        "_compensation_view",
+        "_bundle_fingerprint",
+        "_lease_state",
+        "_integrity_seal",
+    )
+
+    def __init__(
+        self,
+        *,
+        typed_catalog: ToolCatalog,
+        manifest: ToolMetadataManifestV1 | Mapping[str, object],
+        legacy_boundary: Mapping[str, object],
+        compensation: Mapping[str, object],
+    ) -> None:
+        if hasattr(self, "_integrity_seal"):
+            raise TypeError("ToolMetadataBundleV1 is already initialized and sealed")
+        from offerpilot.ai.tool_runtime.catalog import (
+            ToolCatalog,
+            ToolMetadataManifestV1,
+            compile_tool_metadata_manifest,
+        )
+
+        if type(typed_catalog) is not ToolCatalog:
+            raise TypeError("Bundle requires an exact ToolCatalog")
+        specs = typed_catalog.specs
+        names = tuple(spec.name for spec in specs)
+        if type(manifest) is ToolMetadataManifestV1:
+            production_manifest = True
+            manifest_projection = manifest.to_dict()
+            bundle_fingerprint = manifest.fingerprint
+            if compile_tool_metadata_manifest(specs).to_dict() != manifest_projection:
+                raise ValueError("Bundle Manifest does not match complete Typed Catalog metadata")
+        elif isinstance(manifest, Mapping):
+            production_manifest = False
+            frozen_manifest = freeze_json(manifest)
+            if type(frozen_manifest) is not MappingProxyType:
+                raise TypeError("Bundle Manifest must be a JSON object")
+            manifest_projection = cast(
+                dict[str, object],
+                materialize_json(frozen_manifest),
+            )
+            bundle_fingerprint = canonical_sha256(frozen_manifest)
+        else:
+            raise TypeError("Bundle requires an exact Manifest or generic test projection")
+        _require_bundle_manifest_names(manifest_projection, names)
+        policy_projection = manifest_projection.get("discovery_policy")
+        if not isinstance(policy_projection, Mapping):
+            raise TypeError("Bundle Manifest discovery policy must be an object")
+        policy = ToolDiscoveryPolicyV1(policy_projection)
+
+        provider_contracts = typed_catalog.provider_contracts()
+        provider_payloads = typed_catalog.materialize_provider_payloads()
+        if len(provider_contracts) != len(specs) or len(provider_payloads) != len(specs):
+            raise ValueError("Bundle Provider projection cardinality mismatch")
+        provider_fingerprint = canonical_sha256(
+            freeze_json(
+                {
+                    "schema": "provider-tool-boundary-v1",
+                    "ordered_tools": provider_payloads,
+                }
+            )
+        )
+
+        discovery_entries = tuple(
+            ToolDiscoveryEntryV1(
+                ordinal=ordinal,
+                provider_name=spec.name,
+                provider_contract=spec.contract,
+                domains=spec.metadata.domains,
+                dependencies=spec.metadata.dependencies,
+                provider_visibility=spec.metadata.provider_visibility,
+            )
+            for ordinal, spec in enumerate(specs, start=1)
+        )
+        discovery_fingerprint = canonical_sha256(
+            freeze_json(
+                {
+                    "ordered_entries": [
+                        {
+                            "ordinal": entry.ordinal,
+                            "provider_name": entry.provider_name,
+                            "provider_contract_fingerprint": canonical_sha256(freeze_json(payload)),
+                            "domains": [domain.value for domain in entry.domains],
+                            "dependencies": list(entry.dependencies),
+                            "provider_visibility": entry.provider_visibility.value,
+                        }
+                        for entry, payload in zip(discovery_entries, provider_payloads)
+                    ],
+                    "policy": materialize_json(policy.projection),
+                }
+            )
+        )
+
+        authority_entries = {
+            spec.name: ToolAuthorityEntryV1(
+                ordinal=ordinal,
+                provider_name=spec.name,
+                provider_visibility=spec.metadata.provider_visibility,
+                required_capabilities=spec.metadata.required_capabilities,
+                binding=spec.metadata.binding,
+                confirmation_policy=spec.metadata.confirmation_policy,
+                operation_kind=spec.metadata.operation.kind,
+            )
+            for ordinal, spec in enumerate(specs, start=1)
+        }
+        authority_projection = typed_catalog.authority_manifest
+        authority_fingerprint = canonical_sha256(freeze_json(authority_projection))
+
+        operation_entries = {
+            spec.name: ToolOperationEntryV1(
+                ordinal=ordinal,
+                provider_name=spec.name,
+                confirmation_policy=spec.metadata.confirmation_policy,
+                editable_fields=spec.metadata.editable_fields,
+                operation=spec.metadata.operation,
+            )
+            for ordinal, spec in enumerate(specs, start=1)
+        }
+        operation_fingerprint = canonical_sha256(
+            freeze_json(
+                [_bundle_operation_projection(entry) for entry in operation_entries.values()]
+            )
+        )
+
+        if production_manifest:
+            manifest_legacy = manifest_projection.get("legacy_boundary")
+            if not isinstance(manifest_legacy, Mapping) or canonical_json_bytes(
+                freeze_json(manifest_legacy)
+            ) != canonical_json_bytes(freeze_json(legacy_boundary)):
+                raise ValueError("actual Legacy boundary does not match the exact Manifest")
+        adapter_bindings, route_bindings = _legacy_view_projection(
+            legacy_boundary,
+            production=production_manifest,
+        )
+        compensation_bindings = _compensation_view_projection(
+            compensation,
+            production=production_manifest,
+        )
+        if production_manifest:
+            expected_compensations = manifest_projection.get("compensation_operation_order")
+            actual_compensations = [binding.compensation_kind for binding in compensation_bindings]
+            if expected_compensations != actual_compensations:
+                raise ValueError(
+                    "actual Compensation handlers do not match the exact Manifest order"
+                )
+        legacy_fingerprint = canonical_sha256(
+            freeze_json(_canonical_legacy_view_projection(adapter_bindings, route_bindings))
+        )
+        compensation_fingerprint = canonical_sha256(
+            freeze_json(_canonical_compensation_view_projection(compensation_bindings))
+        )
+
+        factory = _new_bundle_view_factory()
+        provider_view = factory.provider_view(
+            ordered_contracts=provider_contracts,
+            provider_boundary_fingerprint=provider_fingerprint,
+        )
+        discovery_view = factory.discovery_view(
+            ordered_entries=discovery_entries,
+            policy=policy,
+            discovery_fingerprint=discovery_fingerprint,
+        )
+        authority_view = factory.authority_view(
+            entries=authority_entries,
+            authority_manifest_fingerprint=authority_fingerprint,
+        )
+        operation_view = factory.operation_view(
+            entries=operation_entries,
+            operation_fingerprint=operation_fingerprint,
+        )
+        legacy_view = factory.legacy_boundary(
+            ordered_adapter_bindings=adapter_bindings,
+            initial_route_bindings=route_bindings,
+            legacy_boundary_fingerprint=legacy_fingerprint,
+        )
+        compensation_view = factory.compensation_view(
+            ordered_handler_bindings=compensation_bindings,
+            compensation_fingerprint=compensation_fingerprint,
+        )
+        factory.finalize()
+
+        object.__setattr__(self, "_typed_catalog", typed_catalog)
+        object.__setattr__(self, "_view_factory", factory)
+        object.__setattr__(self, "_provider_view", provider_view)
+        object.__setattr__(self, "_discovery_view", discovery_view)
+        object.__setattr__(self, "_authority_view", authority_view)
+        object.__setattr__(self, "_operation_view", operation_view)
+        object.__setattr__(self, "_legacy_boundary_view", legacy_view)
+        object.__setattr__(self, "_compensation_view", compensation_view)
+        object.__setattr__(self, "_bundle_fingerprint", bundle_fingerprint)
+        object.__setattr__(self, "_lease_state", _BundleLeaseIssuerState())
+        object.__setattr__(self, "_integrity_seal", self._integrity_snapshot())
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name in self.__slots__ and hasattr(self, name):
+            raise AttributeError(f"ToolMetadataBundleV1 component {name} is sealed")
+        object.__setattr__(self, name, value)
+
+    def _integrity_snapshot(self) -> tuple[object, ...]:
+        bundle_token = self._view_factory.bundle_instance_token
+        bundle_token._ensure_integrity()
+        return (
+            id(self._typed_catalog),
+            id(self._view_factory),
+            id(bundle_token),
+            id(self._provider_view),
+            id(self._discovery_view),
+            id(self._authority_view),
+            id(self._operation_view),
+            id(self._legacy_boundary_view),
+            id(self._compensation_view),
+            self._bundle_fingerprint,
+            id(self._lease_state),
+        )
+
+    def _ensure_integrity(self) -> None:
+        try:
+            _ = self._typed_catalog.specs
+            if self._integrity_snapshot() != self._integrity_seal:
+                raise ValueError("metadata Bundle integrity drift")
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("metadata Bundle integrity drift") from exc
+
+    @property
+    def bundle_fingerprint(self) -> str:
+        self._ensure_integrity()
+        return self._bundle_fingerprint
+
+    @property
+    def bundle_instance_token(self) -> BundleInstanceToken:
+        self._ensure_integrity()
+        return self._view_factory.bundle_instance_token
+
+    def provider_view(self) -> ProviderToolMetadataView:
+        self._ensure_integrity()
+        self._view_factory.require_issued(self._provider_view, ProviderToolMetadataView)
+        return self._provider_view
+
+    def discovery_view(self) -> ToolDiscoveryMetadataView:
+        self._ensure_integrity()
+        self._view_factory.require_issued(self._discovery_view, ToolDiscoveryMetadataView)
+        return self._discovery_view
+
+    def authority_view(self) -> ToolAuthorityMetadataView:
+        self._ensure_integrity()
+        self._view_factory.require_issued(self._authority_view, ToolAuthorityMetadataView)
+        return self._authority_view
+
+    def operation_view(self) -> ToolOperationMetadataView:
+        self._ensure_integrity()
+        self._view_factory.require_issued(self._operation_view, ToolOperationMetadataView)
+        return self._operation_view
+
+    def legacy_boundary(self) -> LegacyDeterministicBoundaryV1:
+        self._ensure_integrity()
+        self._view_factory.require_issued(
+            self._legacy_boundary_view,
+            LegacyDeterministicBoundaryV1,
+        )
+        return self._legacy_boundary_view
+
+    def compensation_view(self) -> CompensationMetadataView:
+        self._ensure_integrity()
+        self._view_factory.require_issued(self._compensation_view, CompensationMetadataView)
+        return self._compensation_view
+
+    def open_segment_lease(self) -> SegmentToolCatalogLease:
+        from offerpilot.ai.tool_runtime.catalog import _open_segment_tool_catalog_lease
+
+        self._ensure_integrity()
+        with self._lease_state.lock:
+            self._ensure_integrity()
+            generation = self._lease_state.generation + 1
+            self._lease_state.generation = generation
+            return _open_segment_tool_catalog_lease(
+                catalog=self._typed_catalog,
+                bundle_instance_token=self.bundle_instance_token,
+                generation=generation,
+            )
+
+
 class _RuntimeAsdictGuard:
     __slots__ = ()
 
@@ -532,7 +1951,9 @@ class _RuntimeAsdictGuard:
 _RUNTIME_ASDICT_GUARD = _RuntimeAsdictGuard()
 
 
-def _named_callable_identity(value: object, field_name: str) -> tuple[Callable[..., object], str, str]:
+def _named_callable_identity(
+    value: object, field_name: str
+) -> tuple[Callable[..., object], str, str]:
     if not inspect.isfunction(value):
         raise TypeError(f"{field_name} must be a named function, not a lambda or partial")
     callback = cast(Callable[..., object], value)
@@ -849,6 +2270,9 @@ def validate_tool_spec_components(
 
 
 __all__ = [
+    "BundleInstanceToken",
+    "CompensationHandlerBindingV1",
+    "CompensationMetadataView",
     "FrozenJSONArray",
     "FrozenJSONObject",
     "FrozenJSONValue",
@@ -857,10 +2281,22 @@ __all__ = [
     "BindingResolverDescriptorV1",
     "EditableFieldMetadataV1",
     "EditableValueType",
+    "LegacyDeterministicBoundaryV1",
+    "LegacyAdapterBindingV1",
+    "LegacyInitialRouteBindingV1",
+    "ProviderToolMetadataView",
     "ReadOperationMetadataV1",
     "ResolverImplementationBinding",
+    "ToolAuthorityEntryV1",
+    "ToolAuthorityMetadataView",
     "ToolBindingMetadataV1",
+    "ToolDiscoveryEntryV1",
+    "ToolDiscoveryMetadataView",
+    "ToolDiscoveryPolicyV1",
     "ToolOperationMetadataV1",
+    "ToolOperationEntryV1",
+    "ToolOperationMetadataView",
+    "ToolMetadataBundleV1",
     "ToolPresentationBindingV1",
     "ToolSurfaceMetadataV1",
     "UndoBuilderBinding",

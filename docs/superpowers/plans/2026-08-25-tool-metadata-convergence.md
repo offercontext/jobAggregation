@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.10+, pytest 8, SQLAlchemy 2, SQLite, FastAPI, jsonschema 4.26.0, the existing Agent Loop/Pilot Runtime/Context Projector/Tool Pipeline/Tool Authority/Write Operation Ledger/Journal, uv, Ruff, Mypy, Vitest, Vite, local verification, controlled real-AI verification, and the in-app browser.
 
-**Scope revision:** Task 4 was formally stopped before product edits after the original baseline-only `ToolSpec(` scan missed `dataclasses.replace()` consumers, attribute readers, and the Task 3 synthetic factory. The reviewed Task 4 scope below explicitly includes those consumers and expands its RED/GREEN matrix. This scope-only revision does not change the approved design, fixed identities, 25/3/4 boundary, protocol seals, or Golden assets.
+**Scope revisions:** Task 4 was first formally stopped before product edits after the original baseline-only `ToolSpec(` scan missed `dataclasses.replace()` consumers, attribute readers, and the Task 3 synthetic factory. During the reviewed Task 4 full GREEN matrix it was stopped again when two pre-existing Authority tests proved to construct a production Spec as a non-closed one-tool Catalog, and the production Authority capability validator began tripping the existing no-automatic-grant AST gate after `ToolCapability` became the closed enum. The reviewed Task 4 scope below explicitly includes all seven supplemental consumers, migrates the two test Catalogs to explicit closed test metadata, and validates capability values directly without materializing the whole enum. These scope-only revisions do not change the approved design, fixed identities, 25/3/4 boundary, protocol seals, or Golden assets.
 
 ---
 
@@ -61,11 +61,14 @@ $toolSpecConstructorSet = git grep -l 'ToolSpec(' $fixed -- src tests | ForEach-
 $classificationConsumerSet = git grep -l -E 'MODEL_TOOL_NAMES|MODEL_TOOL_CATALOG|DEPENDENCY_POLICY_V1|TRANSACTIONAL_TYPED_WRITE_NAMES|REQUIRED_UNDO_TOOL_NAMES|TYPED_WRITE_OPERATION_NAMES|LEGACY_WRITE_OPERATION_NAMES|COMPENSATION_OPERATION_NAMES|REQUIRED_UNDO_OPERATION_NAMES|WRITE_OPERATION_NAMES|_pending_adapter_kind|_chained_adapter_kind|_with_write_contract|_with_runtime_metadata|editable_fields_for_tool|_undo_seed_for_pending|_build_write_undo|_CREATED_RECORD_FINGERPRINT_FIELDS|legacy_catalog_factory|_legacy_catalog|_legacy_adapter' $fixed -- src tests | ForEach-Object { $_ -replace '^[^:]+:', '' }
 ```
 
-The baseline-only `$toolSpecConstructorSet` is intentionally supplemented in Task 4 by these four explicitly reviewed paths, because a `ToolSpec(` text scan cannot discover `dataclasses.replace()`, attribute reads, or files introduced after the fixed baseline:
+The baseline-only `$toolSpecConstructorSet` is intentionally supplemented in Task 4 by these seven explicitly reviewed paths, because a `ToolSpec(` text scan cannot discover `dataclasses.replace()`, attribute reads, source-gate fallout from the closed enum cutover, or files introduced after the fixed baseline:
 
 ```text
 tests/agent_loop/helpers.py
 tests/agent_loop/test_runner.py
+src/offerpilot/ai/tool_authority/contracts.py
+tests/tool_authority/test_approval_transaction.py
+tests/tool_authority/test_read_uow.py
 tests/tool_authority/test_replay_topology.py
 tests/tool_metadata/factories.py
 ```
@@ -401,6 +404,7 @@ git commit -m "feat: AI 完善工具元数据与运行时绑定"
 - Modify: `src/offerpilot/ai/tool_specs/jd_analyses.py`
 - Modify: `src/offerpilot/ai/tool_specs/catalog.py`
 - Modify: `src/offerpilot/ai/tool_specs/__init__.py`
+- Modify: `src/offerpilot/ai/tool_authority/contracts.py`
 - Modify: `src/offerpilot/ai/tool_authority/composition.py`
 - Modify: `src/offerpilot/ai/agent_loop.py`
 - Modify: `src/offerpilot/ai/write_operations.py`
@@ -417,6 +421,8 @@ git commit -m "feat: AI 完善工具元数据与运行时绑定"
 - Modify: the exact frozen Task 4 `$toolSpecConstructorSet` resolved from the fixed baseline in §0
 - Modify: `tests/agent_loop/helpers.py`
 - Modify: `tests/agent_loop/test_runner.py`
+- Modify: `tests/tool_authority/test_approval_transaction.py`
+- Modify: `tests/tool_authority/test_read_uow.py`
 - Modify: `tests/tool_authority/test_replay_topology.py`
 - Modify: `tests/tool_metadata/factories.py`
 - Modify: `tests/tool_pipeline/test_catalog.py`
@@ -459,6 +465,8 @@ Compile exactly 25 ordered specs. Copy/freeze complete Provider payloads, precom
 Run `rg -n 'MODEL_TOOL_NAMES|MODEL_TOOL_CATALOG|ToolSpec\(|\.(kind|required_capabilities|binding_contract|binding_resolvers|confirmation_policy|editable_fields|write_contract|confirmation_description|result_metadata)\b' tests`. Review every match in the Task 4 scope and update every old `ToolSpec` constructor, `dataclasses.replace()` call, and direct attribute reader to the final shape. Noise from unrelated `.kind` fields is reviewed, not suppressed by narrowing the old-field list. Do not retain a legacy constructor branch or inspect `ToolSpec.__dataclass_fields__` in `tests/tool_metadata/factories.py`; after this task it constructs only the final `ToolSpec` shape.
 
 `tests/agent_loop/helpers.py` and `tests/agent_loop/test_runner.py` must use complete freshly sealed Presentation bindings with module-level named callbacks and test probes as specified in Step 1. Their repeated inclusion is intentional: Task 4 handles only final ToolSpec/Presentation replacement, Task 9 handles Bundle/Selector composition, Task 10 handles Segment route handles, and Task 12 handles mechanical deletion gates. `tests/tool_authority/test_replay_topology.py` migrates only its Typed Presentation field access in Task 4; its Legacy proof/replay route migration remains in Task 11. Do not retain `MODEL_TOOL_NAMES` merely for tests, and do not auto-update a Golden.
+
+`tests/tool_authority/test_approval_transaction.py` and `tests/tool_authority/test_read_uow.py` must replace copied production metadata with complete test-local metadata whose `dependencies=()` before constructing their intentional one-tool Catalogs; generic Catalog dependency closure remains fail-closed and production dependencies remain unchanged. In `src/offerpilot/ai/tool_authority/contracts.py`, validate each supplied capability through the closed `ToolCapability` enum directly; do not iterate/materialize the entire enum, create an automatic grant set, or add another capability-name collection.
 
 - [ ] **Step 5: Verify GREEN**
 

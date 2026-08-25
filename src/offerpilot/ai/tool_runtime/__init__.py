@@ -1,5 +1,6 @@
 from importlib import import_module
 
+from offerpilot.ai.tool_runtime.policy_types import ToolCapability
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.contracts import (
     BindingAudit,
@@ -18,7 +19,6 @@ from offerpilot.ai.tool_runtime.contracts import (
 )
 from offerpilot.ai.tool_runtime.context import (
     UNAVAILABLE,
-    ToolCapability,
     ToolExecutionContext,
     aggregate_binding,
     evaluate_context,

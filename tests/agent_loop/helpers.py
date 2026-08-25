@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
-from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
+from offerpilot.ai.tool_runtime.context import ToolExecutionContext
+from offerpilot.ai.tool_runtime.policy_types import ToolCapability
 from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
 from offerpilot.ai.tool_authority.policy import validate_startup_policy
 from offerpilot.ai.tool_runtime.contracts import (

@@ -4,7 +4,8 @@ import re
 from collections.abc import Mapping
 from typing import Any, TypedDict, cast
 
-from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
+from offerpilot.ai.tool_runtime.context import ToolExecutionContext
+from offerpilot.ai.tool_runtime.policy_types import ToolCapability
 from offerpilot.ai.tool_runtime.contracts import (
     BindingContract,
     BindingResolverSpec,

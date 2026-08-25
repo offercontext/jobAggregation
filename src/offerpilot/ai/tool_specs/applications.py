@@ -4,7 +4,8 @@ from collections.abc import Mapping
 from typing import Any, TypedDict, cast
 
 from offerpilot.application_status import APPLICATION_STATUS_IDS, normalize_application_status
-from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
+from offerpilot.ai.tool_runtime.context import ToolExecutionContext
+from offerpilot.ai.tool_runtime.policy_types import ToolCapability
 from offerpilot.ai.tool_runtime.contracts import (
     BindingContract,
     BindingResolverSpec,

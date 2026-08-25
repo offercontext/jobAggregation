@@ -18,7 +18,8 @@ from offerpilot.ai.agent_contracts import PendingAction
 from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
 from offerpilot.ai.tool_authority.fingerprint import authorization_scope_fingerprint
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
-from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
+from offerpilot.ai.tool_runtime.context import ToolExecutionContext
+from offerpilot.ai.tool_runtime.policy_types import ToolCapability
 from offerpilot.ai.tool_runtime.contracts import ConfirmationRequired
 from offerpilot.ai.tool_runtime.pipeline import Rejected, prepare_call
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG

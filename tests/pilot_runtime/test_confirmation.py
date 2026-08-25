@@ -16,7 +16,8 @@ from offerpilot.ai.agent_contracts import AgentTurnResult, PendingAction
 from offerpilot.ai.agent_loop import ApprovedWriteSeed
 from offerpilot.ai.tool_authority.fingerprint import authorization_scope_fingerprint
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
-from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
+from offerpilot.ai.tool_runtime.context import ToolExecutionContext
+from offerpilot.ai.tool_runtime.policy_types import ToolCapability
 from offerpilot.ai.tool_authority import (
     ApprovalExecutionAuthority,
     AuthorityFactory,

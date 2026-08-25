@@ -13,6 +13,7 @@ from enum import Enum
 from typing import Final, Literal, NoReturn, SupportsIndex
 
 from offerpilot.ai.tool_runtime.contracts import TransientToolRuntimeValue
+from offerpilot.ai.tool_runtime.policy_types import ToolCapability
 
 
 MAX_INT64: Final = 2**63 - 1
@@ -140,43 +141,19 @@ def _require_text(value: object, field_name: str) -> str:
     return value
 
 
-_CAPABILITY_NAMES = frozenset(
-    {
-        "applications.read",
-        "applications.write",
-        "application_events.read",
-        "application_events.write",
-        "notes.read",
-        "notes.write",
-        "offers.read",
-        "offers.write",
-        "resumes.read",
-        "resumes.write",
-        "jd_analyses.read",
-    }
-)
+_CAPABILITY_NAMES = frozenset(capability.value for capability in ToolCapability)
 
 
 def _require_capabilities(value: object) -> frozenset[object]:
     if type(value) is not frozenset:
         raise TypeError("capabilities must be a frozenset")
     for capability in value:
-        # The leaf module cannot import ``tool_runtime.context`` (that module
-        # owns the repository-bearing execution context).  Accept its one
-        # closed enum by its stable module/class identity, or a canonical text
-        # value used by the composition-root tests.  Arbitrary objects with a
-        # convenient ``value`` attribute are deliberately not capabilities.
         if type(capability) is str:
             normalized = capability
+        elif type(capability) is ToolCapability:
+            normalized = capability.value
         else:
-            capability_type = type(capability)
-            if (
-                capability_type.__module__ != "offerpilot.ai.tool_runtime.context"
-                or capability_type.__name__ != "ToolCapability"
-                or not isinstance(capability, str)
-            ):
-                raise ValueError("capability is not in the closed V1 capability set")
-            normalized = str(capability)
+            raise ValueError("capability is not in the closed V1 capability set")
         if normalized not in _CAPABILITY_NAMES:
             raise ValueError("capability is not in the closed V1 capability set")
     return value

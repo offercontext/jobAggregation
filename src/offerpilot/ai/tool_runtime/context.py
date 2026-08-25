@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 
 from sqlalchemy import select
@@ -53,23 +52,6 @@ def aggregate_binding(current: object | None, targets: list[object] | tuple[obje
     if any(target is UNAVAILABLE for target in targets):
         return "unavailable"
     return "matched"
-
-
-class ToolCapability(str, Enum):
-    APPLICATIONS_READ = "applications.read"
-    APPLICATIONS_WRITE = "applications.write"
-    APPLICATION_EVENTS_READ = "application_events.read"
-    APPLICATION_EVENTS_WRITE = "application_events.write"
-    NOTES_READ = "notes.read"
-    NOTES_WRITE = "notes.write"
-    OFFERS_READ = "offers.read"
-    OFFERS_WRITE = "offers.write"
-    RESUMES_READ = "resumes.read"
-    RESUMES_WRITE = "resumes.write"
-    JD_ANALYSES_READ = "jd_analyses.read"
-
-    def __str__(self) -> str:
-        return self.value
 
 
 @dataclass(frozen=True, init=False, repr=False)
@@ -530,7 +512,6 @@ def scope_access_denied() -> ToolFailure:
 
 __all__ = [
     "UNAVAILABLE",
-    "ToolCapability",
     "ToolExecutionContext",
     "aggregate_binding",
     "audit_bindings",

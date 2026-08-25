@@ -8,6 +8,8 @@
 
 **Tech Stack:** Python 3.10+, pytest 8, SQLAlchemy 2, SQLite, FastAPI, jsonschema 4.26.0, the existing Agent Loop/Pilot Runtime/Context Projector/Tool Pipeline/Tool Authority/Write Operation Ledger/Journal, uv, Ruff, Mypy, Vitest, Vite, local verification, controlled real-AI verification, and the in-app browser.
 
+**Scope revision:** Task 4 was formally stopped before product edits after the original baseline-only `ToolSpec(` scan missed `dataclasses.replace()` consumers, attribute readers, and the Task 3 synthetic factory. The reviewed Task 4 scope below explicitly includes those consumers and expands its RED/GREEN matrix. This scope-only revision does not change the approved design, fixed identities, 25/3/4 boundary, protocol seals, or Golden assets.
+
 ---
 
 ## 0. Fixed workspace, baseline, and execution rules
@@ -23,6 +25,7 @@ Fixed identities:
 ```text
 branch: refactor/20260825-tool-metadata-convergence
 fixed production baseline: 0c10e05e256eb757d5f89a8b009dcea193f2fc78
+fixed implementation start: bf879fd8f10575e3996bacf8ff9c6ccc8ab7cc64
 approved design: docs/superpowers/specs/2026-08-25-tool-metadata-convergence-design.md
 implementation plan: docs/superpowers/plans/2026-08-25-tool-metadata-convergence.md
 ```
@@ -42,14 +45,14 @@ Before product edits, create these immutable gate files:
 Rules:
 
 - `baseline.txt` contains only the full fixed production baseline above.
-- `implementation-start.txt` contains only `git rev-parse HEAD` at implementation start.
-- `allowlist.txt` contains the union of all per-Task paths plus the already reviewed design, this implementation plan, and the final verification report.
+- `implementation-start.txt` contains only the full fixed implementation-start identity above. Gate regeneration after a reviewed scope stop must preserve it and must not substitute the then-current `HEAD`.
+- `allowlist.txt` contains exactly the union of all per-Task paths. Task 13 explicitly contains the already reviewed design, this implementation plan, the final verification report, and the inherited Tasks 1-12 path union, so the global equality is mechanical rather than exceptional.
 - each `task-NN.txt` contains the exact repository-relative file paths allowed for that Task; no directory, glob, or prefix entry is valid.
 - locator JSON records absolute worktree, branch, the three core file paths, and the per-Task gate directory.
 - tests and implementation scripts may read these files but may never rewrite, accept, or regenerate them.
 - every final scope comparison uses the fixed baseline, never the implementation-start commit.
 
-Before writing product files, materialize every per-Task path list and its union. Literal `Files` entries are copied exactly. The only computed entries are the three baseline-only scan sets named in Tasks 2, 4, and 12; resolve them from the fixed commit before any source edit:
+Before writing product files, materialize every per-Task path list and its union. Literal `Files` entries are copied exactly. The computed entries are the three baseline-only scan sets named in Tasks 2, 4, and 12 plus Task 13's exact inherited union of Tasks 1-12; resolve the three scan sets from the fixed commit before any source edit:
 
 ```powershell
 $fixed = '0c10e05e256eb757d5f89a8b009dcea193f2fc78'
@@ -57,6 +60,17 @@ $capabilityImportSet = git grep -l 'ToolCapability' $fixed -- src tests | ForEac
 $toolSpecConstructorSet = git grep -l 'ToolSpec(' $fixed -- src tests | ForEach-Object { $_ -replace '^[^:]+:', '' }
 $classificationConsumerSet = git grep -l -E 'MODEL_TOOL_NAMES|MODEL_TOOL_CATALOG|DEPENDENCY_POLICY_V1|TRANSACTIONAL_TYPED_WRITE_NAMES|REQUIRED_UNDO_TOOL_NAMES|TYPED_WRITE_OPERATION_NAMES|LEGACY_WRITE_OPERATION_NAMES|COMPENSATION_OPERATION_NAMES|REQUIRED_UNDO_OPERATION_NAMES|WRITE_OPERATION_NAMES|_pending_adapter_kind|_chained_adapter_kind|_with_write_contract|_with_runtime_metadata|editable_fields_for_tool|_undo_seed_for_pending|_build_write_undo|_CREATED_RECORD_FINGERPRINT_FIELDS|legacy_catalog_factory|_legacy_catalog|_legacy_adapter' $fixed -- src tests | ForEach-Object { $_ -replace '^[^:]+:', '' }
 ```
+
+The baseline-only `$toolSpecConstructorSet` is intentionally supplemented in Task 4 by these four explicitly reviewed paths, because a `ToolSpec(` text scan cannot discover `dataclasses.replace()`, attribute reads, or files introduced after the fixed baseline:
+
+```text
+tests/agent_loop/helpers.py
+tests/agent_loop/test_runner.py
+tests/tool_authority/test_replay_topology.py
+tests/tool_metadata/factories.py
+```
+
+Do not replace this explicit supplement with a broader runtime grep or dynamically append scan results to a gate. Future scope discoveries still require the stop/revise/re-review/regenerate procedure below.
 
 Normalize separators to `/`, sort ordinally, remove duplicates, review the explicit results, then write immutable `task-NN.txt` files and their union. No task may append a path later. If implementation discovers a required path outside the frozen union, stop, document the reason, revise/re-review the plan, and regenerate all gate files before resuming; never silently widen the allowlist.
 
@@ -401,6 +415,10 @@ git commit -m "feat: AI 完善工具元数据与运行时绑定"
 - Create: `tests/tool_metadata/test_protocol_seals.py`
 - Create: `tests/tool_metadata/test_presentation_bindings.py`
 - Modify: the exact frozen Task 4 `$toolSpecConstructorSet` resolved from the fixed baseline in §0
+- Modify: `tests/agent_loop/helpers.py`
+- Modify: `tests/agent_loop/test_runner.py`
+- Modify: `tests/tool_authority/test_replay_topology.py`
+- Modify: `tests/tool_metadata/factories.py`
 - Modify: `tests/tool_pipeline/test_catalog.py`
 - Modify: `tests/tool_pipeline/test_pipeline.py`
 - Modify: `tests/tool_pipeline/test_transport.py`
@@ -414,34 +432,40 @@ git commit -m "feat: AI 完善工具元数据与运行时绑定"
 
 Tests must cover exact Manifest keys/order/nullability, duplicate names, dependency cycles, self/unknown/Legacy dependencies, read/write union validation, runtime callable identity, Provider payload mutation, Legacy kind/visibility mutation, operation-kind compatibility projection, exact four required-Undo builder bindings, complete confirmation/presentation bindings, and unchanged transport result projection.
 
+Presentation tests must prove that replacement bindings are constructed as complete new `ToolPresentationBindingV1` values with fresh callable-identity seals and that the replacement succeeds before a post-seal mutation fails closed. Test callbacks bound into accepted presentation metadata must be module-level named functions: no lambda, local closure, or `partial`. A lambda/local/partial may appear only as a negative constructor-rejection probe inside an assertion that it fails. Stateful cancellation/counting behavior uses a dedicated test probe/state object observed by a module-level callback; it must not place the local test function into a binding.
+
 `test_protocol_seals.py` must independently read the committed baseline Provider and Legacy assets, canonicalize the complete ordered boundaries, recompute both approved digests, and then prove that name, order, full payload, kind, or visibility changes fail. A test that only compares two hard-coded constants is insufficient.
+
+`test_compiler.py` must additionally spy on the production `build_model_tool_catalog()` integration: it passes the complete ordered 25 Provider payloads to `verify_provider_boundary()` before returning, and an injected seal failure prevents a Catalog from being returned or published. Direct verifier tests alone are insufficient.
 
 - [ ] **Step 2: Verify RED**
 
 ```powershell
-uv run pytest tests/tool_metadata/test_manifest.py tests/tool_metadata/test_compiler.py tests/tool_metadata/test_protocol_seals.py tests/tool_pipeline/test_catalog.py tests/tool_authority/test_matrix.py -q
+uv run pytest tests/tool_metadata/test_manifest.py tests/tool_metadata/test_compiler.py tests/tool_metadata/test_protocol_seals.py tests/tool_metadata/test_presentation_bindings.py tests/agent_loop tests/tool_pipeline tests/tool_authority tests/pilot_runtime/test_confirmation.py tests/pilot_runtime/test_confirmation_cutover.py tests/test_chat_api.py tests/test_write_operations.py tests/test_write_operation_acceptance_matrix.py -q
 ```
 
 - [ ] **Step 3: Atomically change ToolSpec and migrate all direct consumers**
 
 Change `ToolSpec` to the approved final shape: Provider contract, metadata, resolver bindings, optional Undo builder binding, decoder/executor/preflight/mutable validator/failure mapping/renderers/projectors, and presentation binding. Remove old top-level classification fields and do not add forwarding properties.
 
-Migrate all six domain modules and every direct consumer listed above in this same task. Encode complete metadata at declaration sites. Define each tool-specific Undo seed/build named callable beside its domain ToolSpec and bind each of the exact four directly; domain specs must not import Pilot Runtime. Bind the existing compatibility renderers, confirmation descriptors, result metadata projector, and transport projector directly in every ToolSpec. Update `api.py`, `pilot_runtime/service.py`, `composition.py`, `continuation.py`, `confirmation.py`, `agent_loop.py`, and `tool_runtime/transport.py` to consume those exact bindings. Remove the two injected Undo callbacks from `build_pilot_runtime()`/`ConfirmationDependencies`; continuation resolves the exact ToolSpec binding from the existing Catalog until Segment handles arrive in Task 10. Remove `_with_write_contract`, `_with_runtime_metadata`, editable-field name lookup, confirmation-description name lookup, `_undo_seed_for_pending`, and `_build_write_undo` in this same atomic task.
+Migrate all six domain modules and every direct consumer listed above in this same task. Encode complete metadata at declaration sites. Define each tool-specific Undo seed/build named callable beside its domain ToolSpec and bind each of the exact four directly; domain specs must not import Pilot Runtime. Bind the existing compatibility renderers, confirmation descriptors, result metadata projector, and Presentation projectors directly in every ToolSpec. The existing generic transport projector remains a compatibility boundary that consumes the exact ToolSpec `success_renderer` and `result_metadata_projector`; it is not a new ToolSpec field. Update `api.py`, `pilot_runtime/service.py`, `composition.py`, `continuation.py`, `confirmation.py`, `agent_loop.py`, and `tool_runtime/transport.py` to consume those exact bindings. Remove the two injected Undo callbacks from `build_pilot_runtime()`/`ConfirmationDependencies`; continuation resolves the exact ToolSpec binding from the existing Catalog until Segment handles arrive in Task 10. Remove `_with_write_contract`, `_with_runtime_metadata`, editable-field name lookup, confirmation-description name lookup, `_undo_seed_for_pending`, and `_build_write_undo` in this same atomic task.
 
 Existing `MODEL_TOOL_NAMES`/`MODEL_TOOL_CATALOG` imports that have not yet moved to Bundle views may remain only until the final Runtime composition cutover in Task 11; they must be derived from the one newly compiled Catalog and must not augment or classify a tool. No placeholder Undo or presentation binding is permitted.
 
-Compile exactly 25 ordered specs. Copy/freeze complete Provider payloads, precompile copied schemas, and verify resolver descriptor object identity. The internal `transactional_write` enum must project to existing external `write` everywhere outside V1 metadata.
+Compile exactly 25 ordered specs. Copy/freeze complete Provider payloads, precompile copied schemas, and verify resolver descriptor object identity. `build_model_tool_catalog()` must pass the 25 complete ordered payloads to `verify_provider_boundary()` before publishing the production Typed Catalog; generic 1..N test catalogs do not use the production seal. Task 4 exposes and independently tests Legacy boundary verification, but the actual ordered Legacy Adapter Catalog is verified only inside the all-or-nothing Task 9 production Composition; Task 4 must not fabricate a Legacy name collection or publish a partial Bundle. The internal `transactional_write` enum must project to existing external `write` everywhere outside V1 metadata.
 
 - [ ] **Step 4: Migrate old tests instead of retaining compatibility exports**
 
-Run `rg -n "MODEL_TOOL_NAMES|MODEL_TOOL_CATALOG|ToolSpec\(" tests`. Update every failing test in this task's focused suite to query the compiled Catalog or compare against independent Golden assets. Do not retain `MODEL_TOOL_NAMES` merely for tests, and do not auto-update a Golden.
+Run `rg -n 'MODEL_TOOL_NAMES|MODEL_TOOL_CATALOG|ToolSpec\(|\.(kind|required_capabilities|binding_contract|binding_resolvers|confirmation_policy|editable_fields|write_contract|confirmation_description|result_metadata)\b' tests`. Review every match in the Task 4 scope and update every old `ToolSpec` constructor, `dataclasses.replace()` call, and direct attribute reader to the final shape. Noise from unrelated `.kind` fields is reviewed, not suppressed by narrowing the old-field list. Do not retain a legacy constructor branch or inspect `ToolSpec.__dataclass_fields__` in `tests/tool_metadata/factories.py`; after this task it constructs only the final `ToolSpec` shape.
+
+`tests/agent_loop/helpers.py` and `tests/agent_loop/test_runner.py` must use complete freshly sealed Presentation bindings with module-level named callbacks and test probes as specified in Step 1. Their repeated inclusion is intentional: Task 4 handles only final ToolSpec/Presentation replacement, Task 9 handles Bundle/Selector composition, Task 10 handles Segment route handles, and Task 12 handles mechanical deletion gates. `tests/tool_authority/test_replay_topology.py` migrates only its Typed Presentation field access in Task 4; its Legacy proof/replay route migration remains in Task 11. Do not retain `MODEL_TOOL_NAMES` merely for tests, and do not auto-update a Golden.
 
 - [ ] **Step 5: Verify GREEN**
 
 ```powershell
-uv run pytest tests/tool_metadata tests/tool_pipeline/test_catalog.py tests/tool_pipeline/test_pipeline.py tests/tool_pipeline/test_transport.py tests/tool_authority/test_matrix.py tests/tool_authority/test_baseline_golden.py tests/tool_authority/test_dependency_policy.py tests/agent_loop/test_runner.py tests/pilot_runtime/test_confirmation.py tests/pilot_runtime/test_confirmation_cutover.py tests/test_chat_api.py tests/test_write_operations.py -q
-uv run ruff check src/offerpilot/ai tests/tool_metadata tests/tool_pipeline tests/tool_authority tests/agent_loop
-uv run mypy src/offerpilot/ai
+uv run pytest tests/tool_metadata tests/agent_loop tests/tool_pipeline tests/tool_authority tests/pilot_runtime/test_confirmation.py tests/pilot_runtime/test_confirmation_cutover.py tests/test_chat_api.py tests/test_write_operations.py tests/test_write_operation_acceptance_matrix.py -q
+uv run ruff check src/offerpilot/ai src/offerpilot/api.py src/offerpilot/context_projector/authority_surface.py src/offerpilot/pilot_runtime/service.py src/offerpilot/pilot_runtime/composition.py src/offerpilot/pilot_runtime/continuation.py tests/tool_metadata tests/agent_loop tests/tool_pipeline tests/tool_authority tests/pilot_runtime/test_confirmation.py tests/pilot_runtime/test_confirmation_cutover.py tests/test_chat_api.py tests/test_write_operations.py tests/test_write_operation_acceptance_matrix.py
+uv run mypy src/offerpilot/ai src/offerpilot/api.py src/offerpilot/context_projector/authority_surface.py src/offerpilot/pilot_runtime/service.py src/offerpilot/pilot_runtime/composition.py src/offerpilot/pilot_runtime/continuation.py
 ```
 
 Expected: production Catalog imports and all direct `ToolSpec` consumers collect and pass with no compatibility property; Provider/Authority/Journal projections remain byte/canonical equivalent.
@@ -696,7 +720,7 @@ git commit -m "refactor: AI 收口 Legacy 确认恢复证明"
 
 - [ ] **Step 1: Write RED complete-Bundle and Selector tests**
 
-Prove one application Composition factory atomically creates and publishes the complete Bundle containing the compiled 25 Typed specs, static 3 Legacy adapters, 4 Compensation handlers, complete Operation Port, and all six narrow views together with the exact initial Registry/Port, preparation/proof Registries, issuer/consumer ports, verifier port, and Legacy Catalog. Prove initialization failure publishes no Runtime or subcomponent. Every issuer, proof, Catalog, route handle, Compensation handler, and view must carry the same final Bundle/Catalog provenance; no pre-Bundle identity may escape.
+Prove one application Composition factory atomically creates and publishes the complete Bundle containing the compiled 25 Typed specs, static 3 Legacy adapters, 4 Compensation handlers, complete Operation Port, and all six narrow views together with the exact initial Registry/Port, preparation/proof Registries, issuer/consumer ports, verifier port, and Legacy Catalog. Prove initialization failure publishes no Runtime or subcomponent. Spy on the production Legacy seal integration and prove it consumes the projection from the actual three ordered Adapter objects; an injected seal failure publishes no Runtime, Bundle, Catalog, Registry, or Port. Every issuer, proof, Catalog, route handle, Compensation handler, and view must carry the same final Bundle/Catalog provenance; no pre-Bundle identity may escape.
 
 Update the component-factory AST ownership tests: exactly the approved final Composition factory may call them. API, `deterministic.py`, service, continuation, Repository, and every other Runtime builder must receive injected capabilities and may not construct/publish a second instance.
 
@@ -729,6 +753,8 @@ uv run pytest tests/tool_metadata/test_production_bundle.py tests/tool_metadata/
 - [ ] **Step 3: Compose once and inject the Bundle views**
 
 `build_pilot_runtime()` invokes the initial-route, proof, Compensation, and Typed component factories inside one non-publishing assembly scope, binds their opaque registries to the final Bundle/Catalog tokens, validates the complete graph, and only then publishes one Runtime. Provider builder consumes only `ProviderToolMetadataView`; Projector and Agent Loop receive Discovery and Authority views from that same Bundle. Migrate `SegmentSurfaceGate` and every Agent Loop Selector call to `ToolSelectionResult` in this task; no old-signature façade remains. Remove Selector-local domain/dependency/name maps and `DEPENDENCY_POLICY_V1` runtime imports. Update Manifest validation to compare against the injected Provider view rather than `MODEL_TOOL_NAMES`.
+
+Before publication, Composition must pass the exact ordered names, `LegacyBoundaryVisibility.FORBIDDEN`, and `legacy_deterministic` adapter kind projected from the actual three Adapter objects to `verify_legacy_boundary()`. It must not verify a fixture, a separately maintained name tuple, or a Typed Catalog projection.
 
 Fallback within one `model_call_id` reuses the same frozen Provider surface. An unexposed tool remains fail-closed before Dispatcher. Tool visibility does not replace Pipeline authorization.
 
@@ -862,6 +888,8 @@ Replace and delete the transitional `resolve_server_loaded(pending)` production 
 
 Consume the exact ToolSpec presentation and Undo bindings established in Task 4 through the new route handles; no name-based presentation/Undo helper may return. Replace `_chained_adapter_kind()` with sealed `ChainedPendingTopologyPolicyV1`. Preserve atomic parent delivery, child proposal, Pending replacement, required Undo before commit, terminal replay, response-loss recovery, and delivery fencing.
 
+Task 11's repeated modification of `tests/tool_authority/test_replay_topology.py` is limited to the Legacy proof/replay route cutover described here. The old Typed `ToolSpec.confirmation_description` attribute read was already removed in Task 4 and must not be reintroduced.
+
 Terminal replay, delivery recovery, and fallback initialize neither Provider, Projector, Bundle resolution, resolver, preflight, proof registry, nor executor. Reject bypasses Schema, binding, preflight, proof, and executor.
 
 - [ ] **Step 4: Verify integrated GREEN**
@@ -973,8 +1001,12 @@ git commit -m "test: AI 固化工具元数据旧路径删除门禁"
 
 **Files:**
 
+- Verify unchanged scope anchor: `docs/superpowers/specs/2026-08-25-tool-metadata-convergence-design.md`
+- Verify unchanged scope anchor: `docs/superpowers/plans/2026-08-25-tool-metadata-convergence.md`
 - Create: `docs/reports/2026-08-25-tool-metadata-convergence-release-verification.md`
-- Modify only when a gate finds a real defect: files already listed by Tasks 1-12
+- Modify only when a gate finds a real defect: the exact materialized union of files already listed by Tasks 1-12
+
+`task-13.txt` contains the two scope anchors, the report, and that inherited Tasks 1-12 union. Consequently, the union of `task-01.txt ... task-13.txt` must equal `allowlist.txt` byte-for-byte after ordinal sorting and duplicate removal.
 
 - [ ] **Step 1: Run focused backend suites in bounded groups**
 
@@ -1046,12 +1078,21 @@ $baselinePath = Join-Path $gateRoot 'baseline.txt'
 $startPath = Join-Path $gateRoot 'implementation-start.txt'
 $allowlistPath = Join-Path $gateRoot 'allowlist.txt'
 $baseline = (Get-Content -LiteralPath $baselinePath -Raw).Trim()
+$start = (Get-Content -LiteralPath $startPath -Raw).Trim()
 $branch = (git branch --show-current).Trim()
 $worktree = (Resolve-Path '.').Path
 if ($baseline -ne '0c10e05e256eb757d5f89a8b009dcea193f2fc78') { throw 'fixed baseline mismatch' }
+if ($start -ne 'bf879fd8f10575e3996bacf8ff9c6ccc8ab7cc64') { throw 'fixed implementation-start mismatch' }
 if ($locator.worktree -ne $worktree -or $locator.branch -ne $branch) { throw 'locator identity mismatch' }
 if ($locator.baseline_file -ne $baselinePath -or $locator.implementation_start_file -ne $startPath -or $locator.allowlist_file -ne $allowlistPath) { throw 'locator gate path mismatch' }
 $allowlist = @(Get-Content -LiteralPath $allowlistPath | Where-Object { $_ } | Sort-Object -Unique)
+$taskGatePaths = @(1..13 | ForEach-Object { Join-Path $gateRoot ("task-{0:D2}.txt" -f $_) })
+$missingTaskGates = @($taskGatePaths | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) })
+if ($missingTaskGates.Count -ne 0) { throw "task gate file is missing: $($missingTaskGates -join ', ')" }
+$taskUnion = @($taskGatePaths | ForEach-Object {
+    Get-Content -LiteralPath $_ -ErrorAction Stop | Where-Object { $_ }
+} | Sort-Object -Unique)
+if (@(Compare-Object $allowlist $taskUnion).Count -ne 0) { throw 'task union does not equal allowlist' }
 $committed = @(git diff --name-only "$baseline..HEAD" | Where-Object { $_ })
 $working = @(git diff --name-only | Where-Object { $_ })
 $staged = @(git diff --cached --name-only | Where-Object { $_ })
@@ -1065,8 +1106,6 @@ if ($outside.Count -ne 0) { throw "changed path outside immutable allowlist: $($
 $dirtyOutsideReport = @(($working + $staged + $untracked) | Sort-Object -Unique | Where-Object { $_ -ne $reportPath })
 if ($dirtyOutsideReport.Count -ne 0) { throw "unexpected dirty paths before report commit: $($dirtyOutsideReport -join ', ')" }
 if (-not (Test-Path -LiteralPath $reportPath)) { throw 'release report is missing' }
-$preCommitDirty = @(git status --porcelain --untracked-files=all)
-if ($preCommitDirty.Count -ne 0) { throw "tracked or non-ignored worktree dirt remains before report commit: $($preCommitDirty -join '; ')" }
 git status --short --branch
 git diff --check
 ```
@@ -1077,6 +1116,15 @@ The report records fixed baseline/final commit, implementation-start commit, int
 
 ```powershell
 $taskPaths = @(Get-Content -LiteralPath "$env:TEMP\offerpilot-tool-metadata-convergence-gate\task-13.txt" | Where-Object { $_ })
+$gateRoot = Join-Path $env:TEMP 'offerpilot-tool-metadata-convergence-gate'
+$allowlist = @(Get-Content -LiteralPath (Join-Path $gateRoot 'allowlist.txt') | Where-Object { $_ } | Sort-Object -Unique)
+$taskGatePaths = @(1..13 | ForEach-Object { Join-Path $gateRoot ("task-{0:D2}.txt" -f $_) })
+$missingTaskGates = @($taskGatePaths | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) })
+if ($missingTaskGates.Count -ne 0) { throw "task gate file is missing: $($missingTaskGates -join ', ')" }
+$taskUnion = @($taskGatePaths | ForEach-Object {
+    Get-Content -LiteralPath $_ -ErrorAction Stop | Where-Object { $_ }
+} | Sort-Object -Unique)
+if (@(Compare-Object $allowlist $taskUnion).Count -ne 0) { throw 'task union does not equal allowlist' }
 git add -f -- $taskPaths
 if (@(git diff --cached --name-only | Where-Object { $taskPaths -notcontains $_ }).Count -ne 0) { throw 'Task 13 staged scope violation' }
 git commit -m "docs: AI 验证工具元数据收敛发布门禁"

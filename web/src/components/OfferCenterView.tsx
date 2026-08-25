@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Alert, Row, Col, Button, Space, Spin, Empty, Typography, message } from 'antd';
 import { PlusOutlined, SwapOutlined } from '@ant-design/icons';
@@ -16,6 +16,14 @@ import { getOfferWorkspaceMode, listMissingOfferFacts } from './offerWorkspaceMo
 interface Props {
   applications: Application[];
   onCoach: (offer: Offer) => void;
+  onAddApplication?: () => void;
+  /** Opens the owning canonical application detail for a bound Offer. */
+  onOpenApplication?: (applicationId: number) => void;
+  /**
+   * A numeric token opens the create flow when it increases. A callback keeps
+   * compatibility with hosts that generate the token inside the click handler.
+   */
+  createRequestToken?: number | (() => string | number | void);
   onAttachToPilot?: (attachment: import('@/types/chat').PilotContextAttachment) => void;
   focusOfferId?: number;
   onEvidenceFocusConsumed?: () => void;
@@ -26,6 +34,9 @@ interface Props {
 export default function OfferCenterView({
   applications,
   onCoach,
+  onAddApplication,
+  onOpenApplication,
+  createRequestToken,
   onAttachToPilot,
   focusOfferId,
   onEvidenceFocusConsumed,
@@ -38,8 +49,42 @@ export default function OfferCenterView({
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
   const [selectedDimensionIds, setSelectedDimensionIds] = useState<number[]>([]);
   const [negotiationOffer, setNegotiationOffer] = useState<Offer | null>(null);
+  const [entryRequestToken, setEntryRequestToken] = useState<string | null>(null);
+  const lastCreateRequestTokenRef = useRef<number | undefined>(
+    typeof createRequestToken === 'number' ? createRequestToken : undefined,
+  );
   const [localNegotiationDrafts, setLocalNegotiationDrafts] = useState<Record<number, OfferNegotiationDraft>>({});
   const negotiationDrafts = controlledNegotiationDrafts ?? localNegotiationDrafts;
+  const openCreateOffer = () => {
+    if (applications.length === 0) {
+      onAddApplication?.();
+      return;
+    }
+    const token = typeof createRequestToken === 'function' ? createRequestToken() : createRequestToken;
+    setEntryRequestToken(token === undefined ? null : String(token));
+    setEditing(null);
+    setAddOpen(true);
+  };
+  const openEditOffer = (offer: Offer) => {
+    setEntryRequestToken(null);
+    setEditing(offer);
+    setAddOpen(true);
+  };
+
+  useEffect(() => {
+    if (typeof createRequestToken !== 'number') return;
+    const previous = lastCreateRequestTokenRef.current;
+    lastCreateRequestTokenRef.current = createRequestToken;
+    if (createRequestToken > 0 && previous !== undefined && createRequestToken > previous) {
+      if (applications.length === 0) {
+        onAddApplication?.();
+        return;
+      }
+      setEntryRequestToken(String(createRequestToken));
+      setEditing(null);
+      setAddOpen(true);
+    }
+  }, [applications.length, createRequestToken, onAddApplication]);
   const openNegotiation = (offer: Offer) => {
     setCompareOpen(false);
     setNegotiationOffer(offer);
@@ -68,6 +113,7 @@ export default function OfferCenterView({
     const offer = findEvidenceFocusRecord(offers, focusOfferId);
     if (offer) {
       setCompareOpen(false);
+      setEntryRequestToken(null);
       setEditing(offer);
       setAddOpen(true);
     } else {
@@ -120,17 +166,19 @@ export default function OfferCenterView({
               <Button icon={<SwapOutlined />} disabled={selectedIds.length < 2} onClick={() => setCompareOpen(true)}>
                 开始比较（已选 {selectedIds.length}）
               </Button>
-              <Button icon={<PlusOutlined />} onClick={() => { setEditing(null); setAddOpen(true); }}>录入 Offer</Button>
+                <Button icon={<PlusOutlined />} onClick={openCreateOffer}>录入 Offer</Button>
             </Space>
           ) : null}
         </Col>
       </Row>
       {mode === 'entry' ? (
         <Empty
-          description="先录入 Offer，再逐步补齐薪酬、截止时间和沟通安排"
+          description={applications.length === 0
+            ? 'Offer 必须绑定所属投递，请先添加投递。'
+            : '先录入 Offer，再逐步补齐薪酬、截止时间和沟通安排'}
         >
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => { setEditing(null); setAddOpen(true); }}>
-            录入第一份 Offer
+          <Button icon={<PlusOutlined />} onClick={openCreateOffer} disabled={applications.length === 0 && !onAddApplication}>
+            {applications.length === 0 ? '先添加投递' : '录入第一份 Offer'}
           </Button>
         </Empty>
       ) : null}
@@ -147,16 +195,18 @@ export default function OfferCenterView({
               <OfferCard
                 offer={offers[0]}
                 selectable={false}
+                emphasis="secondary"
                 selected={false}
                 onToggleSelect={toggleSelect}
                 onCoach={onCoach}
                 onNegotiation={openNegotiation}
                 onAttachToPilot={onAttachToPilot}
-                onView={(o) => { setEditing(o); setAddOpen(true); }}
+                onOpenApplication={onOpenApplication}
+                onView={openEditOffer}
               />
             </Col>
           </Row>
-          <Button style={{ justifySelf: 'start' }} icon={<PlusOutlined />} onClick={() => { setEditing(null); setAddOpen(true); }}>录入另一份 Offer</Button>
+          <Button style={{ justifySelf: 'start' }} icon={<PlusOutlined />} onClick={openCreateOffer}>录入另一份 Offer</Button>
         </>
       ) : null}
       {mode === 'selection' ? (
@@ -165,18 +215,26 @@ export default function OfferCenterView({
             <Col key={offer.id} xs={24} sm={12} md={8}>
               <OfferCard
                 offer={offer}
+                emphasis="secondary"
                 selected={selectedIds.includes(offer.id)}
                 onToggleSelect={toggleSelect}
                 onCoach={onCoach}
                 onNegotiation={openNegotiation}
                 onAttachToPilot={onAttachToPilot}
-                onView={(o) => { setEditing(o); setAddOpen(true); }}
+                onOpenApplication={onOpenApplication}
+                onView={openEditOffer}
               />
             </Col>
           ))}
         </Row>
       ) : null}
-      <AddOfferForm open={addOpen} onClose={() => setAddOpen(false)} applications={applications} editing={editing} />
+      <AddOfferForm
+        open={addOpen}
+        onClose={() => setAddOpen(false)}
+        applications={applications}
+        editing={editing}
+        requestToken={entryRequestToken}
+      />
       {negotiationOffer && (
         <OfferNegotiationDrawer
           key={negotiationOffer.id}

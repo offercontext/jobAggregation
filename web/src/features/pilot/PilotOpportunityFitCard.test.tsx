@@ -272,7 +272,7 @@ describe('PilotOpportunityFitCard', () => {
     const view = await render(initial);
     await click(view, '开始新的岗位评估');
     expect(view.querySelector('select')?.value).toBe('');
-    expect(view.textContent).toContain('开始 Triage');
+    expect(view.textContent).toContain('开始快速判断');
   });
 
   it('keeps historical Triage details read-only and does not offer Deep Review', async () => {
@@ -284,8 +284,8 @@ describe('PilotOpportunityFitCard', () => {
     };
     const view = await render(initial);
     expect(view.textContent).toContain('开始新的岗位评估');
-    expect(view.textContent).not.toContain('开始 Deep Fit Review');
-    expect(view.querySelector('button')?.textContent).not.toContain('开始 Deep Fit Review');
+    expect(view.textContent).not.toContain('开始深入分析');
+    expect(view.querySelector('button')?.textContent).not.toContain('开始深入分析');
     expect(deep).not.toHaveBeenCalled();
   });
 
@@ -293,7 +293,7 @@ describe('PilotOpportunityFitCard', () => {
     const view = await render();
     await act(async () => root?.render(<Harness historyLoading />));
     expect(view.querySelector('[role="status"]')?.textContent).toContain('历史岗位评估');
-    expect(button(view, '开始 Triage').disabled).toBe(true);
+    expect(button(view, '开始快速判断').disabled).toBe(true);
   });
 
   it('normalizes assertions and disables triage for invalid input', async () => {
@@ -302,7 +302,7 @@ describe('PilotOpportunityFitCard', () => {
     await change(labeled(view, '粘贴 JD'), 'JD');
     await change(labeled(view, '补充断言'), Array.from({ length: 11 }, (_, i) => ` fact ${i} `).join('\n'));
     expect(view.textContent).toContain('最多填写 10 条非空断言');
-    expect(button(view, '开始 Triage').disabled).toBe(true);
+    expect(button(view, '开始快速判断').disabled).toBe(true);
     expect(triage).not.toHaveBeenCalled();
   });
 
@@ -310,7 +310,7 @@ describe('PilotOpportunityFitCard', () => {
     const view = await render();
     await change(labeled(view, '选择简历'), '11');
     await change(labeled(view, '粘贴 JD'), 'JD');
-    await click(view, '开始 Triage');
+    await click(view, '开始快速判断');
     expect(view.textContent).toContain('确认将这些内容发送给当前配置的 AI 服务');
     await clickDialog(view, '取消');
     expect(triage).not.toHaveBeenCalled();
@@ -321,7 +321,7 @@ describe('PilotOpportunityFitCard', () => {
     await change(labeled(view, '选择简历'), '11');
     await change(labeled(view, '粘贴 JD'), ' JD ');
     await change(labeled(view, '补充断言'), ' fact one \n\n fact two ');
-    await click(view, '开始 Triage');
+    await click(view, '开始快速判断');
     await click(view, '确认发送');
     expect(triage).toHaveBeenCalledWith(expect.objectContaining({ resumeID: 11, jdText: 'JD', assertionsText: 'fact one\nfact two' }), null);
   });
@@ -332,7 +332,7 @@ describe('PilotOpportunityFitCard', () => {
     await change(view.querySelector('select')!, '11');
     await change(labeled(view, '粘贴 JD'), '  JD  ');
     await change(labeled(view, '补充断言'), '  fact  \n');
-    await click(view, '开始 Triage');
+    await click(view, '开始快速判断');
     const dialog = view.querySelector('[role="dialog"]');
     const confirmButton = dialog?.querySelectorAll('button')[1];
     await act(async () => (confirmButton as HTMLButtonElement).click());
@@ -383,11 +383,11 @@ describe('PilotOpportunityFitCard', () => {
   it('requires a second confirmation before deep review', async () => {
     const initial = { ...createInitialOpportunityFitDraft(7, 'pilot:7'), review: validReview, phase: 'triage_ready' as const };
     const view = await render(initial);
-    await click(view, '开始 Deep Fit Review');
+    await click(view, '开始深入分析');
     expect(view.textContent).toContain('确认开始深入分析');
     await clickDialog(view, '取消');
     expect(deep).not.toHaveBeenCalled();
-    await click(view, '开始 Deep Fit Review');
+    await click(view, '开始深入分析');
     await click(view, '确认深入分析');
     expect(deep).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ id: 17 }));
   });
@@ -454,7 +454,7 @@ describe('PilotOpportunityFitCard', () => {
     const view = await render();
     await change(labeled(view, '补充断言'), 'x'.repeat(501));
     expect(view.textContent).toContain('每条断言最多 500 字');
-    expect(button(view, '开始 Triage').disabled).toBe(true);
+    expect(button(view, '开始快速判断').disabled).toBe(true);
     expect(triage).not.toHaveBeenCalled();
   });
 
@@ -462,7 +462,7 @@ describe('PilotOpportunityFitCard', () => {
     const initial = { ...createInitialOpportunityFitDraft(7, 'pilot:7'), review: validReview, phase: 'deep_review_loading' as const };
     await act(async () => root?.render(<Harness initial={initial} deepLoading />));
     const view = container!;
-    expect(view.querySelector('[role="status"]')?.textContent).toContain('Deep Review');
+    expect(view.querySelector('[role="status"]')?.textContent).toContain('深入分析');
   });
 
   it('safely renders a malformed nested deep review as empty state', async () => {

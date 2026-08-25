@@ -22,9 +22,9 @@ describe('KnowledgeSourcesView', () => {
   it('renders Source library surface with upload, bundle, paste entries and search box', () => {
     const markup = renderWithProviders();
 
-    expect(markup).toContain('资料来源');
+    expect(markup).toContain('素材库');
     expect(markup).toContain('上传 Markdown / Text');
-    expect(markup).toContain('上传图文 Bundle');
+    expect(markup).toContain('上传图文资料');
     expect(markup).toContain('粘贴正文');
     expect(markup).toContain('来源依据');
     // SSR 阶段 React Query 处于 loading 状态；右栏空状态提供引导文案。
@@ -34,7 +34,7 @@ describe('KnowledgeSourcesView', () => {
   });
 
   it('does not claim frozen interview knowledge when the list is empty', () => {
-    expect(renderWithProviders()).not.toContain('已冻结来源');
+    expect(renderWithProviders()).not.toContain('已保留当时版本');
   });
 
   it('does not expose legacy Page/Review/Index/Lint/Config entries', () => {
@@ -65,7 +65,8 @@ describe('KnowledgeSourcesView', () => {
   it('exposes KI-08 evidence search entry with CJK-friendly placeholder', () => {
     const markup = renderWithProviders();
 
-    expect(markup).toContain('搜索来源依据');
+    expect(markup).toContain('搜索资料内容');
+    expect(markup).not.toContain('上传图文 Bundle');
     expect(markup).toContain('中文/英文关键词');
   });
 

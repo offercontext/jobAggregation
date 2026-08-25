@@ -311,4 +311,61 @@ describe('AppShell source contract', () => {
     expect(source).toContain('onOnboardingFocusConsumed={consumePilotOnboardingFocus}');
     expect(source).toContain('onOnboardingAction={handleOnboardingAction}');
   });
+
+  it('keeps five page-aware TopBar action classes and hides the global primary in detail', () => {
+    const topBarSource = source.slice(
+      source.indexOf('let topBarPrimaryAction'),
+      source.indexOf('return (', source.indexOf('let topBarPrimaryAction')),
+    );
+    for (const label of ['添加投递', '开始练习', '上传简历', '添加经历']) {
+      expect(topBarSource).toContain(`label: '${label}'`);
+    }
+    expect(topBarSource).toContain("? '添加投递' : '录入 Offer'");
+    expect(topBarSource).toContain('setResumeUploadRequestToken((token) => token + 1)');
+    expect(topBarSource).toContain("['dashboard', 'reminders', 'board', 'applications-list']");
+    expect(topBarSource).not.toContain("'calendar', 'board'");
+    expect(topBarSource).toContain('if (!selectedApp) {');
+    expect(source).toContain('primaryAction={topBarPrimaryAction}');
+    expect(source).toContain('uploadRequestToken={resumeUploadRequestToken}');
+    expect(source).not.toContain("import ResumeUploadModal from '@/components/ResumeUploadModal'");
+    expect(source).not.toContain('const uploadResumeMut = useMutation');
+  });
+
+  it('hydrates and synchronizes canonical and legacy view deep links through history', () => {
+    expect(source).toContain("from './viewRoute'");
+    expect(source).toContain('pushWorkspaceView');
+    expect(source).toContain('readInitialWorkspaceView');
+    expect(source).toContain('subscribeToWorkspaceView');
+    expect(source).toContain('useState<ViewMode>(readInitialWorkspaceView)');
+    expect(source).toContain('skipNextHistorySyncRef.current = true;');
+    expect(source).toContain('pushWorkspaceView(view);');
+  });
+
+  it('restores main-content focus on view/detail changes and keeps the desktop shell at 100dvh', () => {
+    expect(source).toContain('const contentRef = useRef<HTMLElement | null>(null);');
+    expect(source).toContain('tabIndex={-1}');
+    expect(source).toContain('contentRef.current?.focus({ preventScroll: true })');
+    expect(source).toContain("minHeight: '100dvh'");
+  });
+
+  it('passes the shared Offer collection into ApplicationDetail', () => {
+    const detailStart = source.indexOf('<ApplicationDetail');
+    const detailEnd = source.indexOf('/>', detailStart);
+    expect(detailStart).toBeGreaterThanOrEqual(0);
+    expect(source.slice(detailStart, detailEnd)).toContain('offers={ofrs}');
+  });
+
+  it('keeps Haru to Pilot expansion as a surface change without a second request owner', () => {
+    expect((source.match(/<AssistantSurfaceProvider>/g) ?? [])).toHaveLength(1);
+    expect((source.match(/usePilotConversationController\(\)/g) ?? [])).toHaveLength(1);
+    expect(source).not.toContain('new EventSource');
+    expect(source).not.toContain('streamChat(');
+
+    const applicationChatStart = source.indexOf('const startApplicationChat =');
+    const applicationChatEnd = source.indexOf('const claimChatStartRequest =', applicationChatStart);
+    const applicationChatSource = source.slice(applicationChatStart, applicationChatEnd);
+    expect(applicationChatSource).toContain('assistantSurface.openHaru();');
+    expect(applicationChatSource).not.toContain('streamChat');
+    expect(applicationChatSource).not.toContain('sendMessage');
+  });
 });

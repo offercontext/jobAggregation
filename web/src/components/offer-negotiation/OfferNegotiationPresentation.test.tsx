@@ -87,7 +87,7 @@ describe('Offer negotiation presentation components', () => {
     const rendered = mount(<OfferSnapshotSummary offer={snapshot.offer_snapshot} brief={snapshot.user_brief} sourceState="frozen" />);
     expect(rendered.textContent).toContain('后端工程师');
     expect(rendered.textContent).toContain('28K × 12');
-    expect(rendered.textContent).toContain('已冻结来源');
+    expect(rendered.textContent).toContain('已保留当时版本');
     expect(rendered.textContent).toContain('查看完整来源');
     expect(rendered.textContent).not.toContain('/offer_snapshot/base_monthly');
   });

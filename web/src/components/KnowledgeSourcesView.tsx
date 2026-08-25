@@ -97,6 +97,8 @@ const BRIEF_LABEL: Record<string, string> = {
   outdated: '已过期',
 };
 
+const SAFE_PROCESSING_FAILURE_COPY = '资料处理未完成，请稍后重试。';
+
 // Status Pill 变体：替换 antd 彩色圆点 Badge，统一精致化状态标识
 type PillVariant = 'indigo' | 'green' | 'amber' | 'rose' | 'gray' | 'violet' | 'cyan';
 
@@ -239,7 +241,7 @@ export default function KnowledgeSourcesView() {
       if (data.deduplicated) {
         message.success('资料已导入，已进入已有资料来源');
       } else {
-        message.success('Bundle 已导入，图片以附件形式保留');
+        message.success('图文资料已导入，图片以附件形式保留');
       }
       queryClient.invalidateQueries({ queryKey: KNOWLEDGE_QUERY_KEY });
       setSelectedSourceId(data.source.id);
@@ -247,7 +249,7 @@ export default function KnowledgeSourcesView() {
     },
     onError: (error: unknown) => {
       const detail = extractErrorMessage(error);
-      message.error(`Bundle 上传失败：${detail}`);
+      message.error(`图文资料上传失败：${detail}`);
     },
   });
 
@@ -295,16 +297,16 @@ export default function KnowledgeSourcesView() {
   return (
     <div style={{ padding: 24 }}>
       <div style={{ marginBottom: 24 }}>
-        <Title level={4}>已确认的面试知识</Title>
+        <Title level={4}>复盘沉淀</Title>
         {(confirmedInterviewKnowledgeQuery.data?.length ?? 0) > 0 ? (
           <SourceStateTag state="frozen" detail="用户确认保存的面试原始片段" />
         ) : null}
         <Paragraph type="secondary">
-          仅展示用户确认保存的面试原始片段沉淀；来源已冻结，可继续审阅证据链。
+          仅展示用户确认保存的面试原始片段沉淀；可继续审阅证据链。
         </Paragraph>
         {confirmedInterviewKnowledgeQuery.isLoading ? <Spin /> : null}
         {!confirmedInterviewKnowledgeQuery.isLoading && !(confirmedInterviewKnowledgeQuery.data?.length ?? 0) ? (
-          <Empty description="暂无已确认的面试知识" />
+          <Empty description="暂无复盘沉淀" />
         ) : (
           <List
             bordered
@@ -321,7 +323,7 @@ export default function KnowledgeSourcesView() {
                         {item.title || '未命名面试知识'}
                       </Space>
                     )}
-                  description={`${item.source_status === 'source_changed' ? '原复盘已变化，历史来源仍冻结' : '来源已冻结'} · ${item.content.blocks.length} 个内容块 · ${item.content.blocks.reduce((count, block) => count + block.evidence_refs.length, 0)} 条证据`}
+                  description={`${item.source_status === 'source_changed' ? '原资料已更新，本次结果仍使用旧版' : '已保留当时版本'} · ${item.content.blocks.length} 个内容块 · ${item.content.blocks.reduce((count, block) => count + block.evidence_refs.length, 0)} 条证据`}
                 />
                 <Space direction="vertical" size={4} style={{ width: '100%', marginTop: 8 }}>
                   {(item.evidence ?? []).map((evidence) => (
@@ -351,14 +353,14 @@ export default function KnowledgeSourcesView() {
         <div className="knowledge-page-header-row">
           <span className="knowledge-page-mark" />
           <Title level={3} className="knowledge-page-title">
-            资料来源
+            素材库
           </Title>
           <span className="knowledge-page-count">
             共 <b>{sourcesQuery.data?.length ?? 0}</b> 个来源
           </span>
         </div>
         <Paragraph type="secondary" className="knowledge-page-subtitle">
-          上传 Markdown/Text、上传图文 Bundle，或直接粘贴正文；系统按自然结构生成来源依据，并提供关键词检索。
+          上传 Markdown/Text、上传图文资料，或直接粘贴正文；系统按自然结构生成来源依据，并提供关键词检索。
         </Paragraph>
       </div>
 
@@ -373,14 +375,14 @@ export default function KnowledgeSourcesView() {
             上传 Markdown / Text
           </Button>
           <Button icon={<PictureOutlined />} onClick={() => setBundleOpen(true)}>
-            上传图文 Bundle
+            上传图文资料
           </Button>
           <Button icon={<FormOutlined />} onClick={() => setPasteOpen(true)}>
             粘贴正文
           </Button>
           <span className="knowledge-toolbar-spacer" />
           <Input
-            placeholder="搜索来源依据（中文/英文关键词）"
+            placeholder="搜索资料内容（中文/英文关键词）"
             className="knowledge-sources-search-input"
             style={{ width: 'min(320px, 100%)' }}
             value={searchQuery}
@@ -902,7 +904,7 @@ function SourceDetailContent({
           },
           {
             key: 'jobs',
-            label: '技术详情',
+            label: '高级信息',
             children: (
               <JobsBlock
                 data={jobsQuery.data ?? { jobs: [], origins: [] }}
@@ -1002,10 +1004,9 @@ function StatusBlock({
   briefAttempts: KnowledgeBriefAttempt[];
   onCitationJump: (evidenceId: string) => void;
 }) {
-  const extractionError =
-    source.extraction_status === 'failed' && source.extraction_error_message
-      ? source.extraction_error_message
-      : '';
+  const extractionError = source.extraction_status === 'failed'
+    ? SAFE_PROCESSING_FAILURE_COPY
+    : '';
   const filterSummary = source.evidence_policy_summary;
   const filteredTotal = filterSummary?.filtered_block_total ?? 0;
   return (
@@ -1365,7 +1366,7 @@ function BriefBlock({
   const brief: KnowledgeSourceBrief | null = data?.brief ?? null;
   const latestAttempt: KnowledgeBriefAttempt | null = data?.latest_attempt ?? null;
   const blockReason = data?.brief_block_reason ?? '';
-  const errorMessage = data?.brief_error_message ?? '';
+  const errorMessage = data?.brief_error_message ? SAFE_PROCESSING_FAILURE_COPY : '';
   const showEmpty = briefStatus === 'not_started' || (!brief && !latestAttempt);
   // KI-10：旧 Brief 存在时 processing 表示"正在重建"；outdated 表示配置已变化；
   // rebuildFailed 表示最近重建未通过但旧 Brief 已保留（Spec §10.4）。
@@ -1428,7 +1429,7 @@ function BriefBlock({
           type="warning"
           showIcon
           message="最近一次重建未通过，已保留旧资料导读"
-          description={latestAttempt?.error_message ?? ''}
+          description={SAFE_PROCESSING_FAILURE_COPY}
           style={{ marginTop: 8 }}
         />
       ) : null}
@@ -1445,7 +1446,10 @@ function BriefBlock({
       {brief ? (
         <BriefPayloadView brief={brief} onCitationJump={onCitationJump} />
       ) : null}
-      <div className="knowledge-brief-footer">资料来源内部编号：{sourceId}</div>
+      <details className="knowledge-brief-footer">
+        <summary>高级信息</summary>
+        <span>资料来源内部编号：{sourceId}</span>
+      </details>
     </div>
   );
 }
@@ -1743,7 +1747,7 @@ function EvidenceBlock({
                 ) : null}
                 <MarkdownContent content={item.canonical_excerpt} />
                 <details>
-                  <summary>技术详情</summary>
+                  <summary>高级信息</summary>
                   <span className="knowledge-evidence-loc">
                     行 {item.line_start}-{item.line_end} · 字符 {item.char_start}-{item.char_end}
                   </span>
@@ -1823,7 +1827,7 @@ function AssetEvidenceView({
       {/* eslint-disable-next-line jsx-a11y/alt-text */}
       <img
         src={url}
-        alt={alt || 'Bundle 附件'}
+        alt={alt || '图文资料附件'}
         loading="lazy"
         className="knowledge-evidence-asset"
       />
@@ -1848,9 +1852,8 @@ function JobsBlock({
       message.success('已请求取消');
       queryClient.invalidateQueries({ queryKey: ['knowledge'] });
     },
-    onError: (error) => {
-      const text = error instanceof Error ? error.message : '取消失败';
-      message.error(text);
+    onError: () => {
+      message.error('取消失败，请稍后重试。');
     },
   });
   if (loading) {
@@ -1866,17 +1869,36 @@ function JobsBlock({
           <List.Item>
             <Space direction="vertical" size={2} style={{ width: '100%' }}>
               <Space size={8} wrap>
-                <span className="knowledge-evidence-kind">{item.kind}</span>
+                <span className="knowledge-evidence-kind">{item.kind === 'delete' ? '删除任务' : '资料处理任务'}</span>
                 <Pill variant={jobStatusVariant(item.status)}>
                   {JOB_STATUS_LABEL[item.status] ?? item.status}
                 </Pill>
-                <Text type="secondary">队列：{item.queue}</Text>
                 {item.canceled ? <Pill variant="rose">已取消</Pill> : null}
               </Space>
               {item.progress > 0 ? <Progress percent={item.progress} size="small" /> : null}
-              <Text type="secondary" style={{ fontSize: 12 }}>
-                阶段：{item.stage || '—'} · 创建于 {formatDateTime(item.created_at)}
-              </Text>
+              <details>
+                <summary>高级信息</summary>
+                <Space direction="vertical" size={2}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    任务编号：{item.id}
+                  </Text>
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    任务类型：{item.kind}
+                  </Text>
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    队列：{item.queue}
+                  </Text>
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    阶段：{item.stage || '—'} · 创建于 {formatDateTime(item.created_at)}
+                  </Text>
+                  {item.lease_owner ? (
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      Worker：{item.lease_owner}
+                      {item.heartbeat_at ? ` · 心跳 ${formatDateTime(item.heartbeat_at)}` : ''}
+                    </Text>
+                  ) : null}
+                </Space>
+              </details>
               {(item.retry_count ?? 0) > 0 ? (
                 <Text type="secondary" style={{ fontSize: 12 }}>
                   重试次数：{item.retry_count}
@@ -1885,18 +1907,17 @@ function JobsBlock({
                     : ''}
                 </Text>
               ) : null}
-              {item.lease_owner ? (
-                <Text type="secondary" style={{ fontSize: 12 }}>
-                  Worker：{item.lease_owner}
-                  {item.heartbeat_at ? ` · 心跳 ${formatDateTime(item.heartbeat_at)}` : ''}
-                </Text>
-              ) : null}
-              {item.error_message ? (
+      {item.error_message ? (
                 <Alert
                   type="error"
                   showIcon
-                  message={item.error_message}
-                  description={item.error_code ? `错误码：${item.error_code}` : undefined}
+                  message={SAFE_PROCESSING_FAILURE_COPY}
+                  description={item.error_code ? (
+                    <details>
+                      <summary>高级信息</summary>
+                      <span>错误标识：{item.error_code}</span>
+                    </details>
+                  ) : undefined}
                 />
               ) : null}
               {isJobCancellable(item) ? (
@@ -1943,7 +1964,7 @@ function SearchResultsPanel({
       <Alert
         type="info"
         showIcon
-        message={`未匹配来源依据：${query}`}
+        message={`未匹配资料内容：${query}`}
         description="尝试更宽的关键词，或确认内容整理已完成。"
       />
     );
@@ -1952,7 +1973,7 @@ function SearchResultsPanel({
     <Alert
       type="success"
       showIcon
-      message={`命中 ${hits.length} 条来源依据：${query}`}
+      message={`命中 ${hits.length} 条资料内容：${query}`}
       description={
         <List
           dataSource={hits}
@@ -1971,21 +1992,21 @@ function SearchResultsPanel({
             >
               <Space direction="vertical" size={2} style={{ width: '100%' }}>
                 <Space size={6}>
-                  <Text type="secondary" style={{ fontSize: 12 }}>
-                    资料来源 #{item.source_id}
-                  </Text>
                   <span className="knowledge-evidence-kind">{item.block_kind}</span>
                   {item.heading_path.length ? (
                     <Text type="secondary" style={{ fontSize: 12 }}>
                       {item.heading_path.join(' / ')}
                     </Text>
                   ) : null}
-                  <Text type="secondary" style={{ fontSize: 12 }}>
-                    行 {item.line_start}-{item.line_end}
-                  </Text>
                 </Space>
                 <Text>{item.snippet}</Text>
-                <span className="knowledge-evidence-id">{item.evidence_id}</span>
+                <details>
+                  <summary>高级信息</summary>
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    资料来源编号：#{item.source_id} · 行 {item.line_start}-{item.line_end}
+                  </Text>
+                  <span className="knowledge-evidence-id">{item.evidence_id}</span>
+                </details>
               </Space>
             </List.Item>
           )}
@@ -2083,7 +2104,7 @@ function BundleModal({
       return;
     }
     if (assetFiles.length === 0) {
-      message.warning('Bundle 至少需要一张图片附件');
+      message.warning('图文资料至少需要一张图片附件');
       return;
     }
     onSubmit(mainFile, assetFiles, titleHint);
@@ -2091,7 +2112,7 @@ function BundleModal({
 
   return (
     <Modal
-      title="上传图文 Bundle"
+      title="上传图文资料"
       open={open}
       onCancel={() => {
         setMainFileList([]);
@@ -2139,7 +2160,7 @@ function BundleModal({
             </p>
             <p className="ant-upload-text">点击或拖拽多张图片到此处</p>
             <p className="ant-upload-hint">
-              单图 ≤ 10 MiB / 40 MP；Bundle 总大小 ≤ 50 MiB；附件数量 ≤ 50
+              单图 ≤ 10 MiB / 40 MP；图文资料总大小 ≤ 50 MiB；附件数量 ≤ 50
             </p>
           </Upload.Dragger>
         </div>
@@ -2233,12 +2254,5 @@ function formatDateTime(value: string | null): string {
 }
 
 function extractErrorMessage(error: unknown): string {
-  if (!error) return '未知错误';
-  if (typeof error === 'object' && error !== null) {
-    const maybeResponse = error as { response?: { data?: { error?: unknown } } };
-    if (maybeResponse.response?.data?.error) {
-      return String(maybeResponse.response.data.error);
-    }
-  }
-  return String(error);
+  return error ? '操作未完成，请稍后重试' : '未知错误';
 }

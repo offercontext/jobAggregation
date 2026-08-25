@@ -78,8 +78,8 @@ describe('KnowledgeSourcesView mounted source states', () => {
     renderView();
     await flush();
 
-    expect(container?.textContent).toContain('暂无已确认的面试知识');
-    expect(container?.textContent).not.toContain('已冻结来源');
+    expect(container?.textContent).toContain('暂无复盘沉淀');
+    expect(container?.textContent).not.toContain('已保留当时版本');
   });
 
   it('shows frozen and changed state only for loaded confirmed history', async () => {
@@ -93,7 +93,7 @@ describe('KnowledgeSourcesView mounted source states', () => {
     renderView();
     await flush();
 
-    expect(container?.textContent).toContain('来源已变化');
-    expect(container?.textContent).toContain('已冻结来源');
+    expect(container?.textContent).toContain('原资料已更新，本次结果仍使用旧版');
+    expect(container?.textContent).toContain('已保留当时版本');
   });
 });

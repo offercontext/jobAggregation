@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   Typography,
@@ -16,6 +16,7 @@ import {
   Space,
   Modal,
   Dropdown,
+  Alert,
 } from 'antd';
 import {
   ArrowLeftOutlined,
@@ -25,12 +26,14 @@ import {
 } from '@ant-design/icons';
 import dayjs from 'dayjs';
 import type { Application } from '@/types/application';
+import type { Offer } from '@/types/offer';
 import type { PilotActionRequest } from '@/types/chat';
 import { listNotesByApp, createNote, deleteNote as removeNote, updateNote } from '@/services/notes';
 import { listEvents } from '@/services/events';
 import type { CreateNoteInput, InterviewNote } from '@/types/note';
 import type { ScheduleEvent } from '@/types/event';
 import { EVENT_TYPE_LABELS } from '@/types/event';
+import { OFFER_STATUS_LABELS } from '@/types/offer';
 import ScheduleEventForm from '@/components/ScheduleEventForm';
 import ReviewFormDrawer from './ReviewFormDrawer';
 import InterviewReviewProposalDrawer, {
@@ -82,11 +85,80 @@ const MOOD_OPTIONS = [
   { value: 'bad', label: '差' },
 ];
 
+type ApplicationDetailTab = 'overview' | 'preparation' | 'progress';
+
+const DETAIL_TABS: Array<{ id: ApplicationDetailTab; label: string }> = [
+  { id: 'overview', label: '概览' },
+  { id: 'preparation', label: '准备' },
+  { id: 'progress', label: '进展' },
+];
+
+interface ApplicationProgressItem {
+  id: string;
+  title: string;
+  timestamp?: string | null;
+  detail?: string;
+  kind: 'application' | 'event' | 'note' | 'offer';
+}
+
+const EVENT_SUBTYPE_LABELS: Readonly<Record<string, string>> = {
+  assessment: '测评',
+  technical: '技术面试',
+  behavioral: '行为面试',
+  phone: '电话沟通',
+  onsite: '现场面试',
+  hr: '人事面试',
+  final: '终面',
+  screening: '初筛',
+};
+
+const EVENT_STATUS_LABELS: Readonly<Record<string, string>> = {
+  todo: '待处理',
+  pending: '待确认',
+  scheduled: '已安排',
+  in_progress: '进行中',
+  done: '已完成',
+  completed: '已完成',
+  cancelled: '已取消',
+  deleted: '已取消',
+  soft_deleted: '已取消',
+};
+
+const TERMINAL_EVENT_STATUSES = new Set(['cancelled', 'deleted', 'soft_deleted']);
+
+function isTerminalScheduleEvent(event: ScheduleEvent): boolean {
+  return TERMINAL_EVENT_STATUSES.has(event.status);
+}
+
+function eventSubtypeLabel(value: string): string {
+  if (!value) return '';
+  return EVENT_SUBTYPE_LABELS[value] ?? (/\p{Script=Han}/u.test(value) ? value : '其他环节');
+}
+
+function eventStatusLabel(value: string): string {
+  return EVENT_STATUS_LABELS[value] ?? '状态待确认';
+}
+
+function formatWorkspaceDate(value?: string | null, fallback = '待记录') {
+  if (!value) return fallback;
+  const date = dayjs(value);
+  return date.isValid() ? date.format('YYYY-MM-DD HH:mm') : fallback;
+}
+
+function workspaceTimestamp(value?: string | null) {
+  if (!value) return 0;
+  const timestamp = dayjs(value).valueOf();
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
 interface ApplicationDetailProps {
   application: Application | null;
   open: boolean;
   onClose: () => void;
   onOpenOffers?: () => void;
+  offers?: Offer[];
+  offersError?: boolean;
+  onRetryOffers?: () => void;
   onMockInterview?: (app: Application) => void;
   onAskPilot?: (app: Application, action?: PilotActionRequest) => void;
   onOpenPilotOpportunityFit?: (app: Application) => void;
@@ -124,7 +196,7 @@ interface ApplicationDetailProps {
   onOpportunityFitDraftChange?: (applicationId: number, patch: Partial<OpportunityFitV2Draft> | null) => void;
 }
 
-export default function ApplicationDetail({ application, open, onClose, onOpenOffers, onMockInterview, onAskPilot, onOpenPilotOpportunityFit, pilotInterviewReviewApplicationId, onPilotInterviewReviewFocusConsumed, pilotInterviewPreparationApplicationId, pilotInterviewPreparationEventId, onPilotInterviewPreparationFocusConsumed, onAttachToPilot, interviewReviewProposalAttempts, onInterviewReviewProposalAttemptChange, onInterviewNoteChanged, interviewKnowledgeCaptureDrafts, onInterviewKnowledgeCaptureDraftChange, onInterviewKnowledgeCaptureNoteChanged, resumes = [], interviewPreparationAttempts, onInterviewPreparationAttemptChange, interviewPreparationDrafts, onInterviewPreparationDraftChange, interviewPreparationKnowledgeOptions = [], nextStepSuggestions, nextStepSessionState = null, onSetDisposition, onNextStepNavigate, isNavigationAvailable, onNextStepReadonlyNavigate, isReadonlyNavigationAvailable, applicationJdDraft, onApplicationJdDraftChange, opportunityFitDraft, onOpportunityFitDraftChange }: ApplicationDetailProps) {
+export default function ApplicationDetail({ application, open, onClose, onOpenOffers, offers = [], offersError = false, onRetryOffers, onMockInterview, onAskPilot, onOpenPilotOpportunityFit, pilotInterviewReviewApplicationId, onPilotInterviewReviewFocusConsumed, pilotInterviewPreparationApplicationId, pilotInterviewPreparationEventId, onPilotInterviewPreparationFocusConsumed, onAttachToPilot, interviewReviewProposalAttempts, onInterviewReviewProposalAttemptChange, onInterviewNoteChanged, interviewKnowledgeCaptureDrafts, onInterviewKnowledgeCaptureDraftChange, onInterviewKnowledgeCaptureNoteChanged, resumes = [], interviewPreparationAttempts, onInterviewPreparationAttemptChange, interviewPreparationDrafts, onInterviewPreparationDraftChange, interviewPreparationKnowledgeOptions = [], nextStepSuggestions, nextStepSessionState = null, onSetDisposition, onNextStepNavigate, isNavigationAvailable, onNextStepReadonlyNavigate, isReadonlyNavigationAvailable, applicationJdDraft, onApplicationJdDraftChange, opportunityFitDraft, onOpportunityFitDraftChange }: ApplicationDetailProps) {
   const queryClient = useQueryClient();
   const [form] = Form.useForm();
   const [eventFormOpen, setEventFormOpen] = useState(false);
@@ -148,6 +220,8 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
   const [jdEditorOpen, setJdEditorOpen] = useState(false);
   const [jdHistoryOpen, setJdHistoryOpen] = useState(false);
   const [selectedJdVersion, setSelectedJdVersion] = useState<number | null>(null);
+  const [activeTab, setActiveTab] = useState<ApplicationDetailTab>('overview');
+  const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
   const applicationJdQuery = useQuery({
     queryKey: ['application-jd-current', application?.id],
@@ -202,6 +276,7 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
   });
 
   const startJdEditor = () => {
+    if (applicationJdQuery.isLoading || applicationJdQuery.isError) return;
     const current = applicationJdQuery.data?.current;
     const draft = applicationJdDraft;
     onApplicationJdDraftChange?.(application!.id, {
@@ -228,6 +303,7 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
     setMaterialKitOpen(false);
     setMaterialKitApplicationId(null);
     setApplicationOutcomeOpen(false);
+    setActiveTab('overview');
   }, [application?.id, open]);
 
   useEffect(() => {
@@ -243,16 +319,6 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
     setMaterialKitOpen(true);
   }, [application?.id, open]);
 
-  useEffect(() => {
-    if (!application || !open || pilotInterviewReviewApplicationId !== application.id) return;
-    setEditingNote(null);
-    setReviewEventID(null);
-    setPreparationOpen(false);
-    setPreparationEventID(null);
-    setReviewFormOpen(true);
-    onPilotInterviewReviewFocusConsumed?.();
-  }, [application, open, pilotInterviewReviewApplicationId, onPilotInterviewReviewFocusConsumed]);
-
   const notesQuery = useQuery({
     queryKey: ['notes', application?.id],
     queryFn: () => listNotesByApp(application!.id),
@@ -265,9 +331,40 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
     enabled: !!application && open,
   });
 
+  const activeEvents = useMemo(
+    () => (eventsQuery.data ?? []).filter((event) => !isTerminalScheduleEvent(event)),
+    [eventsQuery.data],
+  );
+  const interviewStageDataReady = application?.status !== 'interview'
+    || (
+      !eventsQuery.isLoading
+      && !eventsQuery.isError
+      && Array.isArray(eventsQuery.data)
+      && !notesQuery.isLoading
+      && !notesQuery.isError
+      && Array.isArray(notesQuery.data)
+    );
+
   useEffect(() => {
-    if (!application || !open || pilotInterviewPreparationApplicationId !== application.id || !eventsQuery.data) return;
-    const interviewEvents = eventsQuery.data.filter((event) => event.event_type === 'interview');
+    if (!application || !open || pilotInterviewReviewApplicationId !== application.id || !interviewStageDataReady) return;
+    const completedInterview = activeEvents
+      .filter((event) => event.event_type === 'interview' && dayjs(event.scheduled_at).isBefore(dayjs()))
+      .sort((left, right) => dayjs(right.scheduled_at).valueOf() - dayjs(left.scheduled_at).valueOf())[0];
+    const linkedNote = completedInterview
+      ? notesQuery.data?.find((note) => note.application_event_id === completedInterview.id)
+      : undefined;
+    setEditingNote(linkedNote ?? null);
+    setReviewEventID(linkedNote?.application_event_id ?? completedInterview?.id ?? null);
+    setPreparationOpen(false);
+    setPreparationEventID(null);
+    setReviewFormOpen(!linkedNote);
+    setReviewProposalOpen(Boolean(linkedNote));
+    onPilotInterviewReviewFocusConsumed?.();
+  }, [activeEvents, application, interviewStageDataReady, notesQuery.data, open, onPilotInterviewReviewFocusConsumed, pilotInterviewReviewApplicationId]);
+
+  useEffect(() => {
+    if (!application || !open || pilotInterviewPreparationApplicationId !== application.id || eventsQuery.isLoading || eventsQuery.isError || !eventsQuery.data) return;
+    const interviewEvents = activeEvents.filter((event) => event.event_type === 'interview');
     if (interviewEvents.length === 0) return;
     const requestedEvent = pilotInterviewPreparationEventId == null
       ? null
@@ -285,7 +382,7 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
       setPilotPreparationChoices(interviewEvents);
     }
     onPilotInterviewPreparationFocusConsumed?.();
-  }, [application, eventsQuery.data, open, pilotInterviewPreparationEventId, onPilotInterviewPreparationFocusConsumed, pilotInterviewPreparationApplicationId]);
+  }, [activeEvents, application, eventsQuery.data, eventsQuery.isError, eventsQuery.isLoading, open, pilotInterviewPreparationEventId, onPilotInterviewPreparationFocusConsumed, pilotInterviewPreparationApplicationId]);
 
   const invalidateNotes = () => {
     if (application) queryClient.invalidateQueries({ queryKey: ['notes', application.id] });
@@ -524,17 +621,30 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
       })
     : undefined;
 
-  const interviewEvents = (eventsQuery.data ?? []).filter((event) => event.event_type === 'interview');
+  const interviewEvents = activeEvents.filter((event) => event.event_type === 'interview');
   const completedInterview = interviewEvents
     .filter((event) => dayjs(event.scheduled_at).isBefore(dayjs()))
     .sort((left, right) => dayjs(right.scheduled_at).valueOf() - dayjs(left.scheduled_at).valueOf())[0];
-  const upcomingEvent = (eventsQuery.data ?? [])
+  const upcomingEvent = activeEvents
     .filter((event) => dayjs(event.scheduled_at).isAfter(dayjs()))
     .sort((left, right) => dayjs(left.scheduled_at).valueOf() - dayjs(right.scheduled_at).valueOf())[0];
   const stage = getApplicationWorkspaceStage(application.status, {
     hasCompletedInterview: Boolean(completedInterview),
     hasInterviewReview: Boolean(completedInterview && notesQuery.data?.some((note) => note.application_event_id === completedInterview.id)),
   });
+  const stageDataBlocked = application.status === 'interview' && !interviewStageDataReady;
+  const stageDataHasError = eventsQuery.isError || notesQuery.isError;
+  const stageLabel = stageDataBlocked
+    ? stageDataHasError ? '面试进展暂不可读' : '面试进展读取中'
+    : stage.label;
+  const stagePrimaryActionLabel = stageDataBlocked
+    ? stageDataHasError ? '重试日程和复盘' : '等待面试进展加载'
+    : stage.primaryActionLabel;
+
+  const retryStageData = () => {
+    if (eventsQuery.isError) void eventsQuery.refetch();
+    if (notesQuery.isError) void notesQuery.refetch();
+  };
 
   const openMaterials = () => {
     const currentJd = applicationJdQuery.data?.current;
@@ -544,6 +654,7 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
   };
 
   const runStageAction = () => {
+    if (stageDataBlocked) return;
     switch (stage.action) {
       case 'materials':
         openMaterials();
@@ -568,10 +679,17 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
         const linkedNote = completedInterview
           ? notesQuery.data?.find((note) => note.application_event_id === completedInterview.id)
           : undefined;
+        if (linkedNote) {
+          setEditingNote(linkedNote);
+          setReviewEventID(linkedNote.application_event_id ?? completedInterview?.id ?? null);
+          setReviewFormOpen(false);
+          setReviewProposalOpen(true);
+          break;
+        }
         setReviewEventID(completedInterview?.id ?? null);
-        setEditingNote(linkedNote ?? null);
-        setReviewFormOpen(!linkedNote);
-        setReviewProposalOpen(Boolean(linkedNote));
+        setEditingNote(null);
+        setReviewFormOpen(true);
+        setReviewProposalOpen(false);
         break;
       }
       case 'offer':
@@ -595,6 +713,83 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
     { key: 'facts', label: '投递事实与结果', onClick: () => setApplicationOutcomeOpen(true) },
     ...(onMockInterview ? [{ key: 'mock', label: '开始模拟面试', onClick: () => onMockInterview(application) }] : []),
   ];
+
+  const linkedOffers = offers.filter((offer) => offer.application_id === application.id);
+  const progressItems: ApplicationProgressItem[] = [
+    {
+      id: `application-created-${application.id}`,
+      kind: 'application' as const,
+      title: '创建投递',
+      timestamp: application.created_at,
+      detail: application.source ? `来源：${application.source}` : undefined,
+    },
+    {
+      id: `application-updated-${application.id}`,
+      kind: 'application' as const,
+      title: `当前阶段：${stageLabel}`,
+      timestamp: application.updated_at,
+      detail: application.notes || undefined,
+    },
+    ...(eventsQuery.data ?? []).map((event) => ({
+      id: `event-${event.id}`,
+      kind: 'event' as const,
+      title: `${EVENT_TYPE_LABELS[event.event_type]}${event.subtype ? ` · ${eventSubtypeLabel(event.subtype)}` : ''}`,
+      timestamp: event.scheduled_at,
+      detail: [
+        eventStatusLabel(event.status),
+        event.location,
+        event.notes,
+      ].filter(Boolean).join(' · ') || undefined,
+    })),
+    ...(notesQuery.data ?? []).map((note) => ({
+      id: `note-${note.id}`,
+      kind: 'note' as const,
+      title: `面试复盘${note.round ? ` · ${note.round}` : ''}`,
+      timestamp: note.created_at || note.date,
+      detail: note.self_reflection || note.questions || note.difficulty_points || undefined,
+    })),
+    ...linkedOffers.map((offer) => ({
+      id: `offer-${offer.id}`,
+      kind: 'offer' as const,
+      title: `Offer · ${offer.company_name} · ${offer.position_name}`,
+      timestamp: offer.updated_at,
+      detail: [
+        `状态：${OFFER_STATUS_LABELS[offer.status]}`,
+        offer.deadline ? `截止：${formatWorkspaceDate(offer.deadline, '未设置')}` : undefined,
+      ].filter(Boolean).join(' · '),
+    })),
+  ].sort((left, right) => workspaceTimestamp(right.timestamp) - workspaceTimestamp(left.timestamp));
+
+  const openOpportunityFit = () => {
+    setActiveTab('preparation');
+    if (onOpenPilotOpportunityFit) {
+      onOpenPilotOpportunityFit(application);
+      return;
+    }
+    setOpportunityFitOpen(true);
+  };
+
+  const handleTabKeyDown = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
+    const direction = event.key === 'ArrowRight' || event.key === 'ArrowDown'
+      ? 1
+      : event.key === 'ArrowLeft' || event.key === 'ArrowUp'
+        ? -1
+        : 0;
+    if (event.key === 'Home' || event.key === 'End') {
+      event.preventDefault();
+      const nextIndex = event.key === 'Home' ? 0 : DETAIL_TABS.length - 1;
+      const nextTab = DETAIL_TABS[nextIndex];
+      setActiveTab(nextTab.id);
+      tabRefs.current[nextIndex]?.focus();
+      return;
+    }
+    if (direction === 0) return;
+    event.preventDefault();
+    const nextIndex = (index + direction + DETAIL_TABS.length) % DETAIL_TABS.length;
+    const nextTab = DETAIL_TABS[nextIndex];
+    setActiveTab(nextTab.id);
+    tabRefs.current[nextIndex]?.focus();
+  };
 
   return (
     <>
@@ -693,15 +888,28 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
                 {application.company_name} · {application.position_name}
               </Title>
               <Space wrap>
-                <Tag color="green">{stage.label}</Tag>
+              <Tag color={stageDataBlocked ? 'orange' : 'green'}>{stageLabel}</Tag>
                 <SourceStateTag state="current" detail="当前投递" />
                 <Text type="secondary">
-                  下一步时间：{upcomingEvent ? dayjs(upcomingEvent.scheduled_at).format('M 月 D 日 HH:mm') : '待安排'}
+                  下一步时间：{eventsQuery.isLoading
+                    ? '读取中'
+                    : eventsQuery.isError
+                      ? '暂时无法读取'
+                      : upcomingEvent
+                        ? dayjs(upcomingEvent.scheduled_at).format('M 月 D 日 HH:mm')
+                        : '待安排'}
                 </Text>
               </Space>
             </div>
             <Space>
-              <Button type="primary" size="large" onClick={runStageAction}>{stage.primaryActionLabel}</Button>
+              <Button
+                type="primary"
+                size="large"
+                disabled={stageDataBlocked && !stageDataHasError}
+                onClick={stageDataBlocked ? retryStageData : runStageAction}
+              >
+                {stagePrimaryActionLabel}
+              </Button>
               <Dropdown menu={{ items: moreActionItems }} trigger={['click']}>
                 <Button size="large" icon={<MoreOutlined />}>更多操作</Button>
               </Dropdown>
@@ -709,23 +917,129 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
           </div>
         </div>
 
-        <section className={styles.workspaceSection} aria-labelledby="application-overview-heading">
-          <Title id="application-overview-heading" level={4} className={styles.workspaceSectionTitle}>概览</Title>
-          {application.notes ? <Paragraph type="secondary">备注：{application.notes}</Paragraph> : <Text type="secondary">暂无补充备注</Text>}
-        </section>
+        <div className={styles.tabList} role="tablist" aria-label="投递详情分段">
+          {DETAIL_TABS.map((tab, index) => (
+            <button
+              key={tab.id}
+              ref={(element) => { tabRefs.current[index] = element; }}
+              type="button"
+              role="tab"
+              id={`application-${tab.id}-tab`}
+              aria-selected={activeTab === tab.id}
+              aria-controls={`application-${tab.id}-panel`}
+              tabIndex={activeTab === tab.id ? 0 : -1}
+              className={`${styles.tab} ${activeTab === tab.id ? styles.tabActive : ''}`}
+              onClick={() => setActiveTab(tab.id)}
+              onKeyDown={(event) => handleTabKeyDown(event, index)}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
 
-        {nextStepSuggestions && onSetDisposition && onNextStepNavigate && (
-          <NextStepSuggestions
-            applicationId={application.id}
-            suggestions={nextStepSuggestions}
-            sessionState={nextStepSessionState}
-            onSetDisposition={onSetDisposition}
-            onNavigate={onNextStepNavigate}
-            isNavigationAvailable={isNavigationAvailable}
-            onNavigateReadonly={onNextStepReadonlyNavigate}
-            isReadonlyNavigationAvailable={isReadonlyNavigationAvailable}
-          />
-        )}
+        <div
+          id="application-overview-panel"
+          role="tabpanel"
+          aria-labelledby="application-overview-tab"
+          tabIndex={0}
+          hidden={activeTab !== 'overview'}
+          className={styles.tabPanel}
+        >
+          <section className={`${styles.workspaceSection} ${styles.overviewSection}`} aria-labelledby="application-overview-heading">
+            <Title id="application-overview-heading" level={4} className={styles.workspaceSectionTitle}>概览</Title>
+            <div className={styles.summaryGrid}>
+              <div className={styles.summaryCard}>
+                <Text type="secondary">当前阶段</Text>
+                <Text strong>{stageLabel}</Text>
+              </div>
+              <div className={styles.summaryCard}>
+                <Text type="secondary">下一时间</Text>
+                <Text strong>
+                  {eventsQuery.isLoading
+                    ? '读取中'
+                    : eventsQuery.isError
+                      ? '暂时无法读取'
+                      : upcomingEvent
+                        ? formatWorkspaceDate(upcomingEvent.scheduled_at)
+                        : '待安排'}
+                </Text>
+              </div>
+              <div className={styles.summaryCard}>
+                <Text type="secondary">最近变化</Text>
+                <Text strong>{formatWorkspaceDate(application.updated_at, '暂无更新')}</Text>
+                <Text type="secondary">投递记录已更新</Text>
+              </div>
+            </div>
+            {eventsQuery.isError ? (
+              <Alert type="warning" showIcon message="日程暂时无法读取" action={<Button size="small" onClick={() => void eventsQuery.refetch()}>重试</Button>} />
+            ) : null}
+            <div className={styles.overviewBlock}>
+              <Text strong>JD 摘要</Text>
+              {applicationJdQuery.isLoading ? <Spin size="small" /> : applicationJdQuery.isError ? (
+                <Alert type="warning" showIcon message="岗位资料暂时无法读取" action={<Button size="small" onClick={() => void applicationJdQuery.refetch()}>重试</Button>} />
+              ) : applicationJdQuery.data?.current ? (
+                <Paragraph ellipsis={{ rows: 3 }} className={styles.overviewText}>
+                  {applicationJdQuery.data.current.jd_text}
+                </Paragraph>
+              ) : <Text type="secondary">尚未确认岗位描述</Text>}
+            </div>
+            <div className={styles.overviewBlock}>
+              <Text strong>备注</Text>
+              <Paragraph type="secondary" className={styles.overviewText}>
+                {application.notes || '暂无补充备注'}
+              </Paragraph>
+            </div>
+          </section>
+
+          {nextStepSuggestions && onSetDisposition && onNextStepNavigate && (
+            <NextStepSuggestions
+              applicationId={application.id}
+              suggestions={nextStepSuggestions}
+              sessionState={nextStepSessionState}
+              onSetDisposition={onSetDisposition}
+              onNavigate={onNextStepNavigate}
+              isNavigationAvailable={isNavigationAvailable}
+              onNavigateReadonly={onNextStepReadonlyNavigate}
+              isReadonlyNavigationAvailable={isReadonlyNavigationAvailable}
+            />
+          )}
+        </div>
+
+        <div
+          id="application-preparation-panel"
+          role="tabpanel"
+          aria-labelledby="application-preparation-tab"
+          tabIndex={0}
+          hidden={activeTab !== 'preparation'}
+          className={styles.tabPanel}
+        >
+          <section className={styles.preparationIntro} aria-labelledby="application-preparation-heading">
+            <Title id="application-preparation-heading" level={4} className={styles.workspaceSectionTitle}>准备</Title>
+            <Text type="secondary">按下一步任务整理岗位判断、材料、沟通与复盘入口。</Text>
+            <div className={styles.taskList}>
+              <div className={styles.taskCard}>
+                <div>
+                  <Text strong>岗位匹配与风险</Text>
+                  <Paragraph type="secondary">先确认是否值得继续，以及需要补充的事实。</Paragraph>
+                </div>
+                <Button size="small" onClick={openOpportunityFit}>开始判断</Button>
+              </div>
+              <div className={styles.taskCard}>
+                <div>
+                  <Text strong>投递准备</Text>
+                  <Paragraph type="secondary">选择简历、查看调整建议并完成提交前检查。</Paragraph>
+                </div>
+                <Button size="small" onClick={openMaterials}>打开准备</Button>
+              </div>
+              <div className={styles.taskCard}>
+                <div>
+                  <Text strong>本次投递记录</Text>
+                  <Paragraph type="secondary">冻结实际使用的简历、JD 与材料，并记录外部结果。</Paragraph>
+                </div>
+                <Button size="small" onClick={() => setApplicationOutcomeOpen(true)}>打开记录</Button>
+              </div>
+            </div>
+          </section>
 
         <section className={styles.workspaceSection} aria-labelledby="application-materials-heading">
           <Title id="application-materials-heading" level={4} className={styles.workspaceSectionTitle}>岗位与材料</Title>
@@ -734,10 +1048,24 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
             <Text strong>{'\u6295\u9012\u5c97\u4f4d\u8d44\u6599'}</Text>
             <Space>
               <Button size="small" onClick={() => { setJdHistoryOpen(true); setSelectedJdVersion(null); }}>{'\u67e5\u770b\u5386\u53f2'}</Button>
-              <Button size="small" onClick={startJdEditor}>{applicationJdQuery.data?.current ? '\u66f4\u65b0 JD' : '\u6dfb\u52a0 JD'}</Button>
+              <Button
+                size="small"
+                disabled={applicationJdQuery.isLoading || applicationJdQuery.isError}
+                onClick={startJdEditor}
+              >
+                {applicationJdQuery.isLoading
+                  ? '读取中'
+                  : applicationJdQuery.isError
+                    ? '暂不可编辑'
+                    : applicationJdQuery.data?.current
+                      ? '\u66f4\u65b0 JD'
+                      : '\u6dfb\u52a0 JD'}
+              </Button>
             </Space>
           </div>
-          {applicationJdQuery.isLoading ? <Spin size="small" /> : applicationJdQuery.data?.current ? (
+          {applicationJdQuery.isLoading ? <Spin size="small" /> : applicationJdQuery.isError ? (
+            <Alert type="warning" showIcon message="岗位资料暂时无法读取" action={<Button size="small" onClick={() => void applicationJdQuery.refetch()}>重试</Button>} />
+          ) : applicationJdQuery.data?.current ? (
             <>
             <Paragraph ellipsis={{ rows: 3 }} style={{ margin: '10px 0 0', whiteSpace: 'pre-wrap' }}>
               {applicationJdQuery.data.current.jd_text}
@@ -773,10 +1101,14 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
           <div style={{ textAlign: 'center', padding: 16 }}>
             <Spin />
           </div>
+        ) : eventsQuery.isError ? (
+          <Alert style={{ marginBottom: 16 }} type="warning" showIcon message="日程暂时无法读取" action={<Button size="small" onClick={() => void eventsQuery.refetch()}>重试</Button>} />
         ) : eventsQuery.data && eventsQuery.data.length > 0 ? (
           <Space direction="vertical" style={{ width: '100%', marginBottom: 16 }}>
             {eventsQuery.data.map((event) => {
-              const linkedNote = notesQuery.data?.find((note) => note.application_event_id === event.id);
+              const notesReady = !notesQuery.isLoading && !notesQuery.isError && Array.isArray(notesQuery.data);
+              const linkedNote = notesReady ? notesQuery.data?.find((note) => note.application_event_id === event.id) : undefined;
+              const terminalEvent = isTerminalScheduleEvent(event);
               return (
               <div key={event.id} style={{ border: '1px solid #e2e8f0', borderRadius: 8, padding: 12 }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
@@ -784,9 +1116,13 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
                   <Text type="secondary">{dayjs(event.scheduled_at).format('YYYY-MM-DD HH:mm')}</Text>
                 </div>
                 <div style={{ color: '#64748b', fontSize: 13, marginTop: 4 }}>
-                  时长 {event.duration_minutes} 分钟{event.location ? ` · ${event.location}` : ''}
+                  时长 {event.duration_minutes} 分钟{event.location ? ` · ${event.location}` : ''}{terminalEvent ? ` · ${eventStatusLabel(event.status)}` : ''}
                 </div>
-                {event.event_type === 'interview' && (
+                {event.event_type === 'interview' && terminalEvent ? (
+                  <Text type="secondary">该面试已结束或取消，暂不提供准备与复盘操作。</Text>
+                ) : event.event_type === 'interview' && !notesReady ? (
+                  <Text type="secondary">面试复盘暂不可用，请先完成读取或重试。</Text>
+                ) : event.event_type === 'interview' && (
                   <Space size={4}>
                     <Button
                       size="small"
@@ -802,7 +1138,7 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
                     </Button>
                     {linkedNote && (
                       <Button size="small" type="link" onClick={() => openKnowledgeCapture(linkedNote)}>
-                        沉淀知识
+                        保存为复盘沉淀
                       </Button>
                     )}
                     <Button
@@ -858,7 +1194,6 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
             <Input.TextArea rows={2} placeholder="哪些知识点没答好" />
           </Form.Item>
           <Button
-            type="primary"
             htmlType="submit"
             icon={<PlusOutlined />}
             loading={addNote.isPending}
@@ -871,6 +1206,8 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
           <div style={{ textAlign: 'center', padding: 24 }}>
             <Spin />
           </div>
+        ) : notesQuery.isError ? (
+          <Alert type="warning" showIcon message="面试复盘暂时无法读取" action={<Button size="small" onClick={() => void notesQuery.refetch()}>重试</Button>} />
         ) : notesQuery.data && notesQuery.data.length > 0 ? (
           <Timeline
             items={notesQuery.data.map((n) => ({
@@ -907,7 +1244,7 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
                         复盘建议
                       </Button>
                       <Button type="text" size="small" onClick={() => openKnowledgeCapture(n)}>
-                        沉淀知识
+                        保存为复盘沉淀
                       </Button>
                       <Popconfirm
                         title="删除这条复盘？"
@@ -957,6 +1294,50 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
                 : '尚未进入结果阶段，后续状态会继续在这里汇总。'}
           </Text>
         </section>
+        </div>
+
+        <div
+          id="application-progress-panel"
+          role="tabpanel"
+          aria-labelledby="application-progress-tab"
+          tabIndex={0}
+          hidden={activeTab !== 'progress'}
+          className={styles.tabPanel}
+        >
+          <section className={`${styles.workspaceSection} ${styles.progressSection}`} aria-labelledby="application-progress-heading">
+            <Title id="application-progress-heading" level={4} className={styles.workspaceSectionTitle}>进展</Title>
+            <Text type="secondary" className={styles.readOnlyNotice}>
+              进展时间线只汇总现有投递、事件、面试复盘与归属 Offer，不会修改投递状态。
+            </Text>
+            {eventsQuery.isError ? (
+              <Alert type="warning" showIcon message="部分日程进展暂时无法读取" action={<Button size="small" onClick={() => void eventsQuery.refetch()}>重试</Button>} />
+            ) : null}
+            {notesQuery.isError ? (
+              <Alert type="warning" showIcon message="部分复盘进展暂时无法读取" action={<Button size="small" onClick={() => void notesQuery.refetch()}>重试</Button>} />
+            ) : null}
+            {offersError ? (
+              <Alert type="warning" showIcon message="部分 Offer 进展暂时无法读取" action={onRetryOffers ? <Button size="small" onClick={onRetryOffers}>重试</Button> : undefined} />
+            ) : null}
+            {progressItems.length > 0 ? (
+              <div className={styles.progressTimeline} role="list" aria-label="进展时间线">
+                {progressItems.map((item) => (
+                  <article key={item.id} className={styles.progressItem} role="listitem">
+                    <span className={styles.progressMarker} aria-hidden="true" />
+                    <div className={styles.progressBody}>
+                      <div className={styles.progressHeader}>
+                        <Text strong>{item.title}</Text>
+                        <Text type="secondary">{formatWorkspaceDate(item.timestamp)}</Text>
+                      </div>
+                      {item.detail && <Paragraph type="secondary" className={styles.progressDetail}>{item.detail}</Paragraph>}
+                    </div>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <Empty description="暂无进展记录" />
+            )}
+          </section>
+        </div>
       </section>
 
     </>

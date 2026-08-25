@@ -140,7 +140,7 @@ describe('MaterialProposalReviewModal', () => {
     const view = render(sourceCoverageProposal);
 
     expect(view.textContent).toContain('简历');
-    expect(view.textContent).toContain('已确认的投递证据快照');
+    expect(view.textContent).toContain('本次投递记录');
     expect(view.textContent).toContain('用户断言');
     expect(view.textContent).toContain('/resume/content_json/experience/0/highlights/0: Built APIs');
     expect(view.textContent).toContain('/user_assertions/0/text: I led the migration.');

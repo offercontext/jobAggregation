@@ -19,4 +19,28 @@ describe('ApplicationDetail staged workspace', () => {
     expect(source).not.toContain('问 Pilot');
     expect(source).not.toContain('在 Pilot 中评估');
   });
+
+  it('exposes a keyboard-reachable three-part detail workspace', () => {
+    expect(source).toContain('role="tablist"');
+    expect(source).toContain('role="tab"');
+    expect(source).toContain('aria-selected');
+    expect(source).toContain('aria-controls');
+    expect(source).toContain('onKeyDown');
+    expect(source).toContain('role="tabpanel"');
+    expect(source).toContain('最近变化');
+    expect(source).toContain('JD 摘要');
+    expect(source).toContain('准备');
+    expect(source).toContain('进展');
+  });
+
+  it('keeps progress read-only while accepting optional application-linked offers', () => {
+    expect(source).toContain('offers?: Offer[]');
+    expect(source).toContain('linkedOffers');
+    expect(source).toContain('进展时间线');
+    expect(source).toContain('OFFER_STATUS_LABELS');
+    expect(source).toContain('offersError?: boolean');
+    expect(source).toContain('部分日程进展暂时无法读取');
+    expect(source).toContain('eventSubtypeLabel');
+    expect(source).toContain('eventStatusLabel');
+  });
 });

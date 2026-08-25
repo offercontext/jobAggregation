@@ -210,7 +210,7 @@ export default function InterviewKnowledgeCaptureDrawer({ open, note, draft, onD
   };
 
   return (
-    <Drawer open={open} onClose={handleClose} title="从面试复盘沉淀知识" width={560} destroyOnClose={false}>
+    <Drawer open={open} onClose={handleClose} title="保存为复盘沉淀" width={560} destroyOnClose={false}>
       <div className={`${workflowStyles.surface} ${workflowStyles.stack}`}>
       <Alert
         type="info"

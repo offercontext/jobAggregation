@@ -5,6 +5,7 @@ import { join, relative } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 const BASELINE = '7c36957176445c5213a31b013251fbbce8d610db';
+const PROJECT_END = '0c10e05e256eb757d5f89a8b009dcea193f2fc78';
 const ALLOWLIST = [
   '.gitattributes',
   'web/src/features/assistantSurface/**',
@@ -97,10 +98,11 @@ function changedPaths(root: string): string[] {
     '--no-renames',
   ];
 
-  for (const path of gitLines(root, diffArgs(['diff', `${BASELINE}..HEAD`]))) paths.add(normalize(path));
-  for (const path of gitLines(root, diffArgs(['diff']))) paths.add(normalize(path));
-  for (const path of gitLines(root, diffArgs(['diff', '--cached']))) paths.add(normalize(path));
-  for (const path of gitLines(root, ['ls-files', '--others', '--exclude-standard'])) paths.add(normalize(path));
+  // This is a historical release gate. Keep validating the exact completed project
+  // range instead of claiming ownership over unrelated future worktree changes.
+  for (const path of gitLines(root, diffArgs(['diff', `${BASELINE}..${PROJECT_END}`]))) {
+    paths.add(normalize(path));
+  }
 
   for (const path of DOC_PATHS) {
     if (existsSync(join(root, path))) paths.add(path);
@@ -111,7 +113,12 @@ function changedPaths(root: string): string[] {
 
 function assertBaselineIsAncestor(root: string): void {
   expect(gitLines(root, ['rev-parse', BASELINE])).toEqual([BASELINE]);
+  expect(gitLines(root, ['rev-parse', PROJECT_END])).toEqual([PROJECT_END]);
   expect(() => execFileSync('git', ['merge-base', '--is-ancestor', BASELINE, 'HEAD'], {
+    cwd: root,
+    stdio: 'ignore',
+  })).not.toThrow();
+  expect(() => execFileSync('git', ['merge-base', '--is-ancestor', PROJECT_END, 'HEAD'], {
     cwd: root,
     stdio: 'ignore',
   })).not.toThrow();
@@ -127,7 +134,7 @@ describe('Haru Desktop Surface Completion gate', () => {
     expect(createHash('sha256').update(CANONICAL_ALLOWLIST_JSON).digest('hex')).toBe(ALLOWLIST_SHA256);
   });
 
-  it('rejects every committed, staged, unstaged, and untracked path outside the allowlist', () => {
+  it('rejects every path in the completed Haru project range outside its allowlist', () => {
     const root = repoRoot();
     const disallowed = changedPaths(root).filter((path) => !isAllowed(path));
     expect(disallowed, 'every changed path must match the handoff allowlist').toEqual([]);

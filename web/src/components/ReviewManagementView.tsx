@@ -263,7 +263,7 @@ export default function ReviewManagementView({ applications, interviewReviewProp
                     );
                     setKnowledgeCaptureNote(note);
                   }}>
-                    沉淀知识
+                    保存为复盘沉淀
                   </Button>
                   <Tooltip title="删除">
                     <Button type="text" onClick={() => setProposalNote(note)}>

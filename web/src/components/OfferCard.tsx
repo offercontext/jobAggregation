@@ -1,8 +1,9 @@
 import { Card, Tag, Button, Checkbox, Space, Typography } from 'antd';
-import { MessageOutlined, EyeOutlined } from '@ant-design/icons';
+import { EyeOutlined, LinkOutlined } from '@ant-design/icons';
 import type { Offer } from '@/types/offer';
 import { OFFER_STATUS_LABELS, OFFER_STATUS_COLORS } from '@/types/offer';
 import { createPilotAttachmentDragBinding } from './PilotAttachmentHandle';
+import { listOfferBindingState } from './offerWorkspaceModel';
 import styles from './OfferCard.module.css';
 
 const { Text } = Typography;
@@ -14,7 +15,9 @@ interface Props {
   onToggleSelect: (id: number) => void;
   onCoach: (offer: Offer) => void;
   onNegotiation?: (offer: Offer) => void;
+  emphasis?: 'primary' | 'secondary';
   onView: (offer: Offer) => void;
+  onOpenApplication?: (applicationId: number) => void;
   onAttachToPilot?: (attachment: import('@/types/chat').PilotContextAttachment) => void;
 }
 
@@ -22,7 +25,9 @@ function formatWan(n: number): string {
   return (n / 10000).toFixed(1) + '万';
 }
 
-export default function OfferCard({ offer, selectable = true, selected, onToggleSelect, onCoach, onNegotiation, onView, onAttachToPilot }: Props) {
+export default function OfferCard({ offer, selectable = true, selected, onToggleSelect, onCoach, onNegotiation, emphasis = 'primary', onView, onOpenApplication, onAttachToPilot }: Props) {
+  const bindingState = listOfferBindingState(offer);
+  const startPreparation = onNegotiation ?? onCoach;
   const offerDragBinding = onAttachToPilot
     ? createPilotAttachmentDragBinding({
         kind: 'offer',
@@ -59,18 +64,25 @@ export default function OfferCard({ offer, selectable = true, selected, onToggle
         {offer.application_id ? ` · 关联投递 #${offer.application_id}` : ' · 无关联投递'}
       </div>
       <div className={styles.actions}>
-        {onNegotiation && (
-          <Button type="primary" data-action="start-negotiation" onClick={() => onNegotiation(offer)}>
-            开始谈薪准备
+        {startPreparation && (
+          <Button type={emphasis === 'primary' ? 'primary' : 'default'} data-action="start-negotiation" onClick={() => startPreparation(offer)}>
+            准备谈薪
           </Button>
         )}
-        <Button data-action="open-negotiation-coach" icon={<MessageOutlined />} onClick={() => onCoach(offer)}>
-          谈薪教练
-        </Button>
+        {bindingState === 'bound' && offer.application_id && onOpenApplication ? (
+          <Button type="link" data-action="open-application" icon={<LinkOutlined />} onClick={() => onOpenApplication(offer.application_id!)}>
+            返回所属投递
+          </Button>
+        ) : null}
         <Button data-action="view-offer" icon={<EyeOutlined />} onClick={() => onView(offer)}>
           详情
         </Button>
       </div>
+      {bindingState === 'unbound' ? (
+        <div role="note" data-binding-warning style={{ marginTop: 10, color: 'var(--op-warning, #b45309)', fontSize: 12, lineHeight: 1.5 }}>
+          历史 Offer 尚未绑定所属投递；可继续查看，但不能返回具体投递。
+        </div>
+      ) : null}
     </Card>
   );
 }

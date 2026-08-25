@@ -9,6 +9,60 @@ interface TodayEvent {
   scheduled_at: string;
 }
 
+interface CompletedApplication {
+  id: number;
+  company_name: string;
+  position_name: string;
+  applied_at?: string;
+}
+
+interface CompletedOffer {
+  id: number;
+  company_name: string;
+  position_name: string;
+  created_at: string;
+}
+
+export function deriveWeeklyCompletedHighlight({
+  applications,
+  offers,
+  now,
+}: {
+  applications: readonly CompletedApplication[];
+  offers: readonly CompletedOffer[];
+  now: ConfigType;
+}) {
+  const current = dayjs(now);
+  const weekStart = current.startOf('week');
+  const inCurrentWeek = (value?: string) => {
+    const timestamp = dayjs(value);
+    return timestamp.isValid()
+      && (timestamp.isAfter(weekStart) || timestamp.isSame(weekStart))
+      && !timestamp.isAfter(current);
+  };
+  const latestOffer = offers
+    .filter((offer) => inCurrentWeek(offer.created_at))
+    .sort((left, right) => dayjs(right.created_at).valueOf() - dayjs(left.created_at).valueOf())[0];
+  if (latestOffer) {
+    return {
+      kind: 'offer' as const,
+      id: latestOffer.id,
+      title: `本周已完成：收到${latestOffer.company_name} Offer`,
+      detail: `${latestOffer.position_name} · 已记录 Offer`,
+    };
+  }
+
+  const latestApplication = applications
+    .filter((application) => inCurrentWeek(application.applied_at))
+    .sort((left, right) => dayjs(right.applied_at).valueOf() - dayjs(left.applied_at).valueOf())[0];
+  return latestApplication ? {
+    kind: 'application' as const,
+    id: latestApplication.id,
+    title: `本周已完成：投递${latestApplication.company_name}`,
+    detail: latestApplication.position_name,
+  } : null;
+}
+
 export function deriveTodayWorkspace<TAction extends TodayAction, TEvent extends TodayEvent>({
   actions,
   events,

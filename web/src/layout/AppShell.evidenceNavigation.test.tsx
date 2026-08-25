@@ -200,6 +200,7 @@ async function flush() {
 }
 
 beforeEach(() => {
+  window.history.replaceState(null, '', '/');
   window.matchMedia = () => ({
     addEventListener: () => undefined,
     matches: false,

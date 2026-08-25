@@ -6,17 +6,17 @@ import { OFFER_STATUS_LABELS, type Offer } from '@/types/offer';
 export type { PilotContextChip, PilotPageContext } from '@/types/chat';
 
 export const PILOT_VIEW_LABELS: Record<ViewMode, string> = {
-  dashboard: '工作台总览',
+  dashboard: '今日',
   board: '投递看板',
   'applications-list': '投递列表',
   calendar: '投递日历',
   reminders: '提醒',
   interview: '面试',
-  reviews: '面试复盘',
+  reviews: '经历素材',
   offers: 'Offer',
-  knowledge: '知识库',
+  knowledge: '参考资料',
   questions: '题库',
-  resumes: '简历库',
+  resumes: '简历',
   pilot: 'Pilot',
   settings: '设置',
 };

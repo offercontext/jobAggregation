@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Application } from '@/types/application';
 import type { EvidenceBundlePreview, EvidenceBundleSummary } from '@/types/evidenceBundle';
 import type { MaterialKitViewModel } from '@/types/materialKit';
+import drawerSource from './MaterialKitDrawer.tsx?raw';
 
 const queryState = vi.hoisted(() => ({
   historyError: null as unknown,
@@ -306,6 +307,14 @@ afterEach(() => {
 });
 
 describe('MaterialKitDrawer evidence confirmation', () => {
+  it('keeps hashes and internal identifiers behind the advanced information disclosure', () => {
+    expect(drawerSource).toContain('<summary>高级信息</summary>');
+    expect(drawerSource).toContain('本次投递记录');
+    expect(drawerSource).toContain('选择本次实际使用的简历版本');
+    expect(drawerSource).not.toContain('选择最匹配的简历版本');
+    expect(drawerSource).not.toContain('投递材料包</Typography.Title>');
+  });
+
   it('uses a neutral error when material kit generation returns a general 409', async () => {
     materialKitService.generateApplicationMaterialKit.mockRejectedValueOnce({ response: { status: 409 } });
     const view = render();
@@ -574,8 +583,8 @@ describe('MaterialKitDrawer evidence confirmation', () => {
     await flush();
 
     const history = view.querySelector<HTMLElement>('[data-testid="evidence-history"]');
-    expect(history?.textContent).toContain('投递证据历史加载失败');
-    expect(history?.textContent).not.toContain('尚无已确认的投递证据');
+    expect(history?.textContent).toContain('本次投递记录加载失败');
+    expect(history?.textContent).not.toContain('尚无本次投递记录');
     clickByText(view, '重新加载历史');
     expect(queryState.historyRefetch).toHaveBeenCalledTimes(1);
   });
@@ -587,8 +596,8 @@ describe('MaterialKitDrawer evidence confirmation', () => {
     await flush();
 
     const history = view.querySelector<HTMLElement>('[data-testid="evidence-history"]');
-    expect(history?.textContent).toContain('正在加载投递证据历史，请稍候');
-    expect(history?.textContent).not.toContain('尚无已确认的投递证据');
+    expect(history?.textContent).toContain('正在加载本次投递记录，请稍候');
+    expect(history?.textContent).not.toContain('尚无本次投递记录');
   });
 
   it('recovers confirmation only after a later current ready preview succeeds', async () => {

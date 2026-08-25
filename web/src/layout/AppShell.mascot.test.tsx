@@ -203,6 +203,7 @@ async function flush() {
 
 describe('AppShell Pilot mascot integration', () => {
   beforeEach(() => {
+    window.history.replaceState(null, '', '/');
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
     localStorage.clear();
     window.matchMedia = vi.fn().mockReturnValue({

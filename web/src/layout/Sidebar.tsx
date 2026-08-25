@@ -3,6 +3,7 @@ import {
   BulbOutlined,
   DashboardOutlined,
   FileTextOutlined,
+  TrophyOutlined,
   RobotOutlined,
   SettingOutlined,
   AudioOutlined,
@@ -10,16 +11,19 @@ import {
 import { Badge } from 'antd';
 import { useThemeMode } from '@/theme/ThemeContext';
 import {
+  NAVIGATION_GROUPS,
   MODULE_NAV,
   resolveModuleForView,
   type ModuleKey,
   type ViewMode,
 } from './navigation';
+import styles from './Sidebar.module.css';
 
 const MODULE_ICONS: Record<ModuleKey, React.ReactNode> = {
   today: <DashboardOutlined />,
   applications: <AppstoreOutlined />,
   interview: <AudioOutlined />,
+  offers: <TrophyOutlined />,
   resources: <FileTextOutlined />,
   pilot: <RobotOutlined />,
   settings: <SettingOutlined />,
@@ -34,111 +38,73 @@ interface Props {
 export default function Sidebar({ view, onChange, reminderCount }: Props) {
   const { mode, toggle } = useThemeMode();
   const activeModule = resolveModuleForView(view);
+  const businessNav = MODULE_NAV.filter((item) => item.key !== 'settings');
+  const settingsItem = MODULE_NAV.find((item) => item.key === 'settings');
 
   return (
     <nav
-      className="op-sidebar"
+      className={`${styles.sidebar} op-sidebar`}
       aria-label="主导航"
-      style={{
-        width: 200,
-        flexShrink: 0,
-        background: 'var(--op-surface)',
-        borderRight: '1px solid var(--op-border)',
-        padding: '16px 12px',
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 2,
-      }}
     >
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 8px 18px' }}>
-        <span
-          style={{
-            width: 26,
-            height: 26,
-            borderRadius: 9,
-            background: 'var(--op-gradient-brand)',
-            display: 'inline-block',
-          }}
-        />
-        <span className="op-gradient-text" style={{ fontSize: 16, fontWeight: 700 }}>
+      <div className={styles.brand}>
+        <span className={styles.brandMark} aria-hidden="true" />
+        <span className={`${styles.brandName} op-gradient-text`}>
           OfferPilot
         </span>
       </div>
 
-      {MODULE_NAV.filter((item) => item.key !== 'settings').map((item) => {
-        const active = activeModule === item.key;
+      {NAVIGATION_GROUPS.filter((group) => group.key !== 'utility').map((group) => {
+        const items = businessNav.filter((item) => item.group === group.key);
+        if (items.length === 0) return null;
         return (
-          <button
-            key={item.key}
-            aria-current={active ? 'page' : undefined}
-            onClick={() => onChange(item.defaultView)}
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: 10,
-              padding: '9px 11px',
-              border: 'none',
-              cursor: 'pointer',
-              borderRadius: 8,
-              fontSize: 14,
-              textAlign: 'left',
-              fontWeight: active ? 600 : 400,
-              color: active ? 'var(--op-primary)' : 'var(--op-muted)',
-              background: active ? 'var(--op-layout-bg)' : 'transparent',
-              boxShadow: active ? 'var(--op-shadow-sm)' : 'none',
-              transition: 'background 0.2s var(--op-ease), color 0.2s var(--op-ease)',
-            }}
-          >
-            <span style={{ fontSize: 16, display: 'inline-flex' }}>{MODULE_ICONS[item.key]}</span>
-            <span style={{ flex: 1 }}>{item.label}</span>
-            {item.key === 'today' && reminderCount > 0 && (
-              <Badge count={reminderCount} size="small" />
-            )}
-          </button>
+          <section key={group.key} className={styles.group} aria-labelledby={`sidebar-group-${group.key}`}>
+            <h2 id={`sidebar-group-${group.key}`} className={styles.groupLabel}>{group.label}</h2>
+            {items.map((item) => {
+              const active = activeModule === item.key;
+              return (
+                <button
+                  key={item.key}
+                  type="button"
+                  aria-label={item.label}
+                  aria-current={active ? 'page' : undefined}
+                  onClick={() => onChange(item.defaultView)}
+                  className={`${styles.navItem} ${active ? styles.active : ''}`}
+                >
+                  <span className={styles.icon} aria-hidden="true">{MODULE_ICONS[item.key]}</span>
+                  <span className={styles.label}>{item.label}</span>
+                  {item.key === 'today' && reminderCount > 0 && (
+                    <Badge count={reminderCount} size="small" />
+                  )}
+                </button>
+              );
+            })}
+          </section>
         );
       })}
 
-      <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <section className={styles.utility} aria-labelledby="sidebar-group-utility">
+        <h2 id="sidebar-group-utility" className={styles.groupLabel}>辅助</h2>
         <button
+          type="button"
           data-navigation-tier="utility"
+          aria-label={settingsItem?.label ?? '设置'}
           aria-current={activeModule === 'settings' ? 'page' : undefined}
           onClick={() => onChange('settings')}
-          style={{
-            border: 'none',
-            cursor: 'pointer',
-            textAlign: 'left',
-            background: activeModule === 'settings' ? 'var(--op-layout-bg)' : 'transparent',
-            borderRadius: 8,
-            padding: '9px 11px',
-            color: activeModule === 'settings' ? 'var(--op-primary)' : 'var(--op-muted)',
-            fontSize: 13,
-            display: 'flex',
-            gap: 8,
-            alignItems: 'center',
-          }}
+          className={`${styles.utilityButton} ${activeModule === 'settings' ? styles.active : ''}`}
         >
-          <SettingOutlined /> 设置
+          <span className={styles.icon} aria-hidden="true"><SettingOutlined /></span>
+          <span className={styles.label}>{settingsItem?.label ?? '设置'}</span>
         </button>
         <button
+          type="button"
           onClick={toggle}
           aria-label="切换明暗模式"
-          style={{
-            border: 'none',
-            cursor: 'pointer',
-            textAlign: 'left',
-            background: 'transparent',
-            borderRadius: 8,
-            padding: '9px 11px',
-            color: 'var(--op-muted)',
-            fontSize: 13,
-            display: 'flex',
-            gap: 8,
-            alignItems: 'center',
-          }}
+          className={styles.utilityButton}
         >
-          <BulbOutlined /> {mode === 'dark' ? '亮色模式' : '暗色模式'}
+          <span className={styles.icon} aria-hidden="true"><BulbOutlined /></span>
+          <span className={styles.label}>{mode === 'dark' ? '亮色模式' : '暗色模式'}</span>
         </button>
-      </div>
+      </section>
     </nav>
   );
 }

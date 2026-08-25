@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { getOfferWorkspaceMode, listMissingOfferFacts } from './offerWorkspaceModel';
+import { getOfferWorkspaceMode, listMissingOfferFacts, listOfferBindingState } from './offerWorkspaceModel';
 
 describe('offer progressive disclosure', () => {
   it('shows entry, single facts and comparison in sequence', () => {
@@ -13,5 +13,10 @@ describe('offer progressive disclosure', () => {
     expect(listMissingOfferFacts({ base_monthly: 0, months_per_year: 0, deadline: '', equity: '' })).toEqual([
       '月薪', '年薪月数', '截止时间', '股权或期权',
     ]);
+  });
+
+  it('identifies offers without an owning application for an explicit warning', () => {
+    expect(listOfferBindingState({ application_id: undefined })).toEqual('unbound');
+    expect(listOfferBindingState({ application_id: 42 })).toEqual('bound');
   });
 });

@@ -38,6 +38,9 @@ const BLANK_RESUME_CONTENT: ResumeContent = {
 };
 
 interface ResumeLibraryViewProps {
+  /** Increases when the shell asks this page to open its existing upload flow. */
+  uploadRequestToken?: number;
+  onUploadRequestConsumed?: () => void;
   onAttachToPilot?: (attachment: import('@/types/chat').PilotContextAttachment) => void;
   focusResumeId?: number;
   onEvidenceFocusConsumed?: () => void;
@@ -45,6 +48,8 @@ interface ResumeLibraryViewProps {
 }
 
 export default function ResumeLibraryView({
+  uploadRequestToken,
+  onUploadRequestConsumed,
   onAttachToPilot,
   focusResumeId,
   onEvidenceFocusConsumed,
@@ -57,6 +62,9 @@ export default function ResumeLibraryView({
   const [keyword, setKeyword] = useState('');
   const [dragActive, setDragActive] = useState(false);
   const dragCounter = useRef(0);
+  const lastUploadRequestTokenRef = useRef<number | undefined>(
+    onUploadRequestConsumed ? 0 : uploadRequestToken,
+  );
   const onboardingEntryRef = useRef<HTMLDivElement>(null);
   const [onboardingFocusActive, setOnboardingFocusActive] = useState(false);
 
@@ -156,6 +164,16 @@ export default function ResumeLibraryView({
   const compareTarget = compareTargetId === null
     ? undefined
     : resumes.find((resume) => resume.id === compareTargetId);
+
+  useEffect(() => {
+    if (uploadRequestToken === undefined) return;
+    const previous = lastUploadRequestTokenRef.current;
+    lastUploadRequestTokenRef.current = uploadRequestToken;
+    if (previous !== undefined && uploadRequestToken > previous) {
+      setUploadOpen(true);
+      onUploadRequestConsumed?.();
+    }
+  }, [onUploadRequestConsumed, uploadRequestToken]);
 
   useEffect(() => {
     if (compareTargetId !== null && !resumes.some((resume) => resume.id === compareTargetId)) {
@@ -308,7 +326,7 @@ export default function ResumeLibraryView({
           >
              和 Haru 创建初稿
            </Button>
-           <Button type="primary" icon={<CloudUploadOutlined />} onClick={() => setUploadOpen(true)}>上传现有简历</Button>
+           <Button icon={<CloudUploadOutlined />} onClick={() => setUploadOpen(true)}>上传现有简历</Button>
            <Dropdown menu={{ items: [{ key: 'sample', label: '用样例开始', icon: <FileAddOutlined />, onClick: () => sampleMut.mutate() }] }}>
              <Button icon={<MoreOutlined />} loading={sampleMut.isPending}>更多创建方式</Button>
            </Dropdown>

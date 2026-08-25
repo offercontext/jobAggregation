@@ -92,7 +92,7 @@ describe('PilotOpportunityFitV2Card', () => {
     const textarea = container.querySelector('textarea');
     expect((textarea as HTMLTextAreaElement).disabled).toBe(true);
     expect(container.textContent).toContain('结果待确认');
-    const retry = [...container.querySelectorAll('button')].find((button) => button.textContent?.includes('使用原尝试重试 Triage'));
+    const retry = [...container.querySelectorAll('button')].find((button) => button.textContent?.includes('使用原尝试重试快速判断'));
     expect(retry).toBeTruthy();
     act(() => retry?.click());
     expect(props.onStartTriage).toHaveBeenCalledWith(expect.objectContaining({ idempotency_key: 'triage-key' }));
@@ -101,7 +101,7 @@ describe('PilotOpportunityFitV2Card', () => {
   it('retains the frozen form for an unknown result and exposes the same-key retry', () => {
     const props = renderCard(draft({ error: 'AI 服务暂不可用', resultUnknown: true }));
     expect((container.querySelector('select') as HTMLSelectElement).disabled).toBe(true);
-    const retry = [...container.querySelectorAll('button')].find((button) => button.textContent?.includes('使用原尝试重试 Triage'));
+    const retry = [...container.querySelectorAll('button')].find((button) => button.textContent?.includes('使用原尝试重试快速判断'));
     act(() => retry?.click());
     expect(props.onStartTriage).toHaveBeenCalledWith(expect.objectContaining({ idempotency_key: 'triage-key' }));
   });
@@ -129,7 +129,7 @@ describe('PilotOpportunityFitV2Card', () => {
 
   it('renders source conflict as a Chinese read-only state with a fresh-start action', () => {
     const props = renderCard(draft({ triage: stage('source_conflict') }));
-    expect(container.textContent).toContain('岗位资料版本已变化');
+    expect(container.textContent).toContain('原资料已更新，本次结果仍使用旧版');
     const restart = [...container.querySelectorAll('button')].find((button) => !button.textContent?.includes('鍙栨秷娴佺▼'));
     act(() => restart?.click());
     expect(props.onStartNew).toHaveBeenCalledTimes(1);

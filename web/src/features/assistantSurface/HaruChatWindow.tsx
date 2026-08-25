@@ -246,8 +246,10 @@ export default function HaruChatWindow({ returnFocusRef, onExpand, anchorRect }:
       <div className={styles.messages} aria-live="polite" aria-relevant="additions text">
         {controller.turns.length === 0 ? (
           <div className={styles.empty}>
-            <strong>想先处理什么？</strong>
-            <span>可以问投递进展、面试准备或下一步安排。</span>
+            <strong>Haru 是 Pilot 的轻量窗口</strong>
+            <span>
+              简单问题可以在这里完成；需要查看资料、编辑内容或确认操作时，会展开到 Pilot。对话不会丢失。
+            </span>
           </div>
         ) : (
           recentConversationTurns(controller.turns).map((turn, index) => (
@@ -264,7 +266,7 @@ export default function HaruChatWindow({ returnFocusRef, onExpand, anchorRect }:
 
       {controller.pending ? (
         <div className={styles.pending} role="status">
-          <span>有一项操作等你确认</span>
+          <span>这一步会修改「{contextLabel}」的内容，需要在完整工作区确认。</span>
           <button
             type="button"
             data-testid="haru-open-pending"
@@ -273,7 +275,7 @@ export default function HaruChatWindow({ returnFocusRef, onExpand, anchorRect }:
               onExpand?.();
             }}
           >
-            到 Pilot 查看并确认
+            查看修改内容
             <ArrowUpOutlined />
           </button>
         </div>

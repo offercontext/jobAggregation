@@ -28,7 +28,7 @@
 
 .progress {
   min-width: 58px;
-  color: var(--op-accent, #2563eb);
+  color: var(--op-primary-strong, #4f46e5);
   font-size: 13px;
   font-weight: 700;
   text-align: right;
@@ -46,7 +46,7 @@
   padding: 12px;
   border: 1px solid var(--op-border, #e2e8f0);
   border-radius: 12px;
-  background: #f8fafc;
+  background: var(--surface-sunken, #f8fafc);
   color: inherit;
   font: inherit;
   text-align: left;
@@ -60,13 +60,13 @@
 }
 
 .step:focus-visible {
-  outline: 3px solid rgb(37 99 235 / 45%);
+  outline: 3px solid var(--op-primary-strong, #4f46e5);
   outline-offset: 2px;
 }
 
 .completed {
-  border-color: #bbf7d0;
-  background: #f0fdf4;
+  border-color: color-mix(in srgb, #16a34a 42%, var(--op-border, #e2e8f0));
+  background: color-mix(in srgb, #16a34a 10%, var(--op-surface, #fff));
 }
 
 .stepIcon {

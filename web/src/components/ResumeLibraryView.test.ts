@@ -23,6 +23,12 @@ describe('ResumeLibraryView onboarding source contract', () => {
     expect(source).toContain('更多创建方式');
     expect(source).not.toContain('和 Pilot 创建薄版');
     expect(source).not.toContain('>上传 PDF<');
+    expect(source).not.toContain('<Button type="primary"');
+  });
+  it('lets the shell trigger the page-owned upload controller without replaying a stale token', () => {
+    expect(source).toContain('uploadRequestToken?: number;');
+    expect(source).toContain('lastUploadRequestTokenRef');
+    expect(source).toContain('uploadRequestToken > previous');
   });
   it('focuses the resume creation entry without creating a resume', () => {
     expect(source).toContain('onboardingFocusToken?: number;');

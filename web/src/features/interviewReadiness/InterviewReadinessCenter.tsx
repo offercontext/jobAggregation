@@ -38,6 +38,11 @@ interface Props {
   applications?: Application[];
   events?: ScheduleEvent[];
   resumes?: Resume[];
+  /** The same readiness surface serves real events and free practice. */
+  initialMode?: 'real' | 'quick';
+  /** When embedded in a task tab, prevent switching into a second formal entry. */
+  fixedMode?: 'real' | 'quick';
+  actionEmphasis?: 'primary' | 'secondary';
   onOpenApplication?: (applicationId: number) => void;
   onOpenPreparation?: (applicationId: number, eventId: number) => void;
   onOpenStudio?: (context: RealInterviewStudioContext | QuickPracticeStudioContext) => void;
@@ -46,7 +51,7 @@ interface Props {
 const STATUS_COPY: Record<ReadinessItem['status'], string> = {
   ready: '已就绪',
   needs_input: '需要补充',
-  source_changed: '来源已变化',
+  source_changed: '原资料已更新，本次结果仍使用旧版',
   unknown: '暂时未知',
   unavailable: '暂时不可用',
 };
@@ -81,11 +86,14 @@ export default function InterviewReadinessCenter({
   applications = [],
   events = [],
   resumes = [],
+  initialMode = 'real',
+  fixedMode,
+  actionEmphasis = 'primary',
   onOpenApplication,
   onOpenPreparation,
   onOpenStudio,
 }: Props) {
-  const [mode, setMode] = useState<'real' | 'quick'>('real');
+  const [mode, setMode] = useState<'real' | 'quick'>(fixedMode ?? initialMode);
   const [applicationId, setApplicationId] = useState<number | null>(null);
   const [eventId, setEventId] = useState<number | null>(null);
   const [resumeId, setResumeId] = useState<number | undefined>();
@@ -233,7 +241,7 @@ export default function InterviewReadinessCenter({
   };
 
   return (
-    <section className={styles.surface} data-testid="interview-readiness-center" aria-labelledby="readiness-title">
+    <section className={styles.surface} data-testid="interview-readiness-center" data-readiness-mode={mode} aria-labelledby="readiness-title">
       <div className={styles.hero}>
         <div>
           <span className={styles.kicker}>面试准备</span>
@@ -243,7 +251,7 @@ export default function InterviewReadinessCenter({
         <div className={styles.heroNote}><span className={styles.liveDot} /> 证据门控已开启</div>
       </div>
 
-      <div className={styles.modeGrid} role="tablist" aria-label="练习模式">
+      {!fixedMode ? <div className={styles.modeGrid} role="tablist" aria-label="练习模式">
         <button type="button" role="tab" aria-selected={mode === 'real'} className={styles.modeCard} data-active={mode === 'real'} onClick={() => setMode('real')}>
           <span className={styles.modeNumber}>01</span>
           <span className={styles.modeTitle}>围绕真实投递练习</span>
@@ -256,7 +264,7 @@ export default function InterviewReadinessCenter({
           <span className={styles.modeDescription}>只针对一个岗位开始，不创建虚假的投递或日程。</span>
           <span className={styles.modeMeta}>适合临时热身与探索岗位</span>
         </button>
-      </div>
+      </div> : null}
 
       <div className={styles.workspaceGrid}>
         <div className={styles.prepPanel}>
@@ -288,7 +296,7 @@ export default function InterviewReadinessCenter({
           {quickError ? <div className={styles.error} role="alert">{quickError}</div> : null}
           <button
             type="button"
-            className={styles.primaryAction}
+            className={actionEmphasis === 'primary' ? styles.primaryAction : styles.secondaryAction}
             disabled={!readiness.ready || creatingCase}
             onClick={() => {
               if (mode === 'quick') void startQuickPractice();

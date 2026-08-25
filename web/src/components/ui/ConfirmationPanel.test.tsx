@@ -31,7 +31,7 @@ describe('ConfirmationPanel', () => {
     ));
 
     expect(container.textContent).toContain('确认生成面试建议');
-    expect(container.textContent).toContain('已冻结来源');
+    expect(container.textContent).toContain('已保留当时版本');
     expect(container.textContent).toContain('已确认岗位描述');
     const button = container.querySelector('button');
     expect(button).not.toBeNull();

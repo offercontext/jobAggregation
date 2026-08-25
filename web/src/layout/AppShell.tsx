@@ -1,12 +1,11 @@
 import { Component, lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { DndContext, PointerSensor, useSensor, useSensors } from '@dnd-kit/core';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Button, Layout, Spin, Tabs, message } from 'antd';
 import { listApplications } from '@/services/applications';
 import { listEvents } from '@/services/events';
 import { listOffers } from '@/services/offers';
 import { ONBOARDING_QUERY_KEY } from '@/services/onboarding';
-import { uploadResume } from '@/services/resumes';
 import { listResumes } from '@/services/resumes';
 import {
   getOpportunityFitReview,
@@ -34,7 +33,7 @@ import {
 import { getOpportunityFitErrorMessage } from '@/components/opportunityFitCopy';
 import type { ChatStartRequest, PilotActionRequest, PilotContextAttachment } from '@/types/chat';
 import Sidebar from './Sidebar';
-import TopBar from './TopBar';
+import TopBar, { type TopBarAction } from './TopBar';
 import AddApplicationForm from '@/components/AddApplicationForm';
 import ApplicationDetail from '@/components/ApplicationDetail';
 import type { InterviewReviewProposalAttemptState } from '@/components/InterviewReviewProposalDrawer';
@@ -47,10 +46,14 @@ import InterviewStoryLibraryView, { type InterviewStoryOpenDraft } from '@/compo
 import InterviewStoryDrawer, { createInterviewStoryDraft, type InterviewStoryDraft } from '@/components/InterviewStoryDrawer';
 import OfferNegotiationDrawer, { type OfferNegotiationDraft } from '@/components/OfferNegotiationDrawer';
 import { discardMockInterviewAttempt } from '@/services/mockInterviews';
-import ResumeUploadModal from '@/components/ResumeUploadModal';
 import type { EvidenceTarget } from '@/components/ChatPanel/model';
 import CommandPalette from './CommandPalette';
 import { moduleTabsForView, type ViewMode } from './navigation';
+import {
+  pushWorkspaceView,
+  readInitialWorkspaceView,
+  subscribeToWorkspaceView,
+} from './viewRoute';
 import {
   derivePipelineInsights,
   toLegacyActionItems,
@@ -176,19 +179,6 @@ class ViewErrorBoundary extends Component<{ children: ReactNode }, { hasError: b
   }
 }
 
-function computeStreak(apps: Application[], now = dayjs()): number {
-  const days = new Set(
-    apps.filter((a) => a.applied_at).map((a) => dayjs(a.applied_at).format('YYYY-MM-DD'))
-  );
-  let streak = 0;
-  let cursor = now;
-  while (days.has(cursor.format('YYYY-MM-DD'))) {
-    streak++;
-    cursor = cursor.subtract(1, 'day');
-  }
-  return streak;
-}
-
 export default function AppShell() {
   return (
     <PilotAttachmentProvider>
@@ -202,13 +192,15 @@ export default function AppShell() {
 function AppShellContent() {
   const assistantSurface = useAssistantSurface();
   const pilotController = usePilotConversationController();
-  const [view, setView] = useState<ViewMode>('dashboard');
+  const [view, setView] = useState<ViewMode>(readInitialWorkspaceView);
   const [applicationViewState, setApplicationViewState] = useState<ApplicationViewState>(
     DEFAULT_APPLICATION_VIEW_STATE,
   );
   const [adaptivePracticeFocus, setAdaptivePracticeFocus] = useState<AdaptivePracticeFocus | undefined>();
   const [addOpen, setAddOpen] = useState(false);
-  const [resumeUploadOpen, setResumeUploadOpen] = useState(false);
+  const [resumeUploadRequestToken, setResumeUploadRequestToken] = useState(0);
+  const [offerCreateRequestToken, setOfferCreateRequestToken] = useState(0);
+  const [interviewPracticeRequestToken, setInterviewPracticeRequestToken] = useState(0);
   const [pilotMascotVisible, setPilotMascotVisible] = useState(readPilotMascotVisible);
   const [pilotMascotZoom, setPilotMascotZoom] = useState(readPilotMascotZoom);
   const [pilotMascotAnimationLevel, setPilotMascotAnimationLevel] = useState(readPilotMascotAnimationLevel);
@@ -278,6 +270,11 @@ function AppShellContent() {
   const consumedChatStartRequestKeysRef = useRef(new Set<number>());
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [now, setNow] = useState(() => dayjs());
+  const contentRef = useRef<HTMLElement | null>(null);
+  const currentViewRef = useRef(view);
+  const skipNextHistorySyncRef = useRef(false);
+  const hasMountedRouteRef = useRef(false);
+  currentViewRef.current = view;
   const [pilotRailAvailable, setPilotRailAvailable] = useState(() =>
     typeof window === 'undefined' ? false : window.matchMedia('(min-width: 1180px)').matches
   );
@@ -513,17 +510,6 @@ function AppShellContent() {
     void qc.invalidateQueries({ queryKey: ONBOARDING_QUERY_KEY });
   };
 
-  const uploadResumeMut = useMutation({
-    mutationFn: (f: File) => uploadResume(f),
-    onSuccess: (res) => {
-      message.success(res.parse_status === 'text-ready' ? '上传成功' : '已上传，文本提取失败，请到简历库校正');
-      qc.invalidateQueries({ queryKey: ['resumes'] });
-      qc.invalidateQueries({ queryKey: ONBOARDING_QUERY_KEY });
-      setResumeUploadOpen(false);
-    },
-    onError: () => message.error('上传失败'),
-  });
-
   useEffect(() => {
     const id = window.setInterval(() => setNow(dayjs()), 60_000);
     return () => window.clearInterval(id);
@@ -556,12 +542,31 @@ function AppShellContent() {
     return () => window.removeEventListener('keydown', onKey);
   }, []);
 
+  useEffect(() => subscribeToWorkspaceView((nextView) => {
+    if (nextView === currentViewRef.current) return;
+    skipNextHistorySyncRef.current = true;
+    setSelected(null);
+    setEvidenceFocus(null);
+    setView(nextView);
+  }), []);
+
+  useEffect(() => {
+    if (!hasMountedRouteRef.current) {
+      hasMountedRouteRef.current = true;
+      return;
+    }
+    if (skipNextHistorySyncRef.current) {
+      skipNextHistorySyncRef.current = false;
+      return;
+    }
+    pushWorkspaceView(view);
+  }, [view]);
+
   const pipelineActions = useMemo(
     () => derivePipelineInsights({ apps, events: evs, offers: ofrs, practiceStats, weeklyTarget: 6, now }),
     [apps, evs, ofrs, practiceStats, now]
   );
   const actions = useMemo(() => toLegacyActionItems(pipelineActions), [pipelineActions]);
-  const streak = useMemo(() => computeStreak(apps, now), [apps, now]);
 
   const selectedApp = selected
     ? apps.find((a) => a.id === selected.id) ?? null
@@ -617,6 +622,8 @@ function AppShellContent() {
 
   useEffect(() => {
     window.scrollTo({ top: 0, left: 0 });
+    const focusMain = window.setTimeout(() => contentRef.current?.focus({ preventScroll: true }), 0);
+    return () => window.clearTimeout(focusMain);
   }, [selectedApp?.id, view]);
 
   useEffect(() => {
@@ -1451,6 +1458,13 @@ function AppShellContent() {
     if (app) openApplicationDetail(app);
   };
 
+  const openCanonicalApplication = (appId: number) => {
+    const app = apps.find((item) => item.id === appId);
+    if (!app) return;
+    navigateToView('board');
+    setSelected(app);
+  };
+
   const runPipelineAction = (item: PipelineInsight) => {
     if (item.primaryAction.target === 'board' && item.appId) {
       goDetailById(item.appId);
@@ -1512,9 +1526,12 @@ function AppShellContent() {
   const offerEvidenceFocus = evidenceFocus?.kind === 'offer' ? evidenceFocus : undefined;
   const resumeEvidenceFocus = evidenceFocus?.kind === 'resume' ? evidenceFocus : undefined;
 
-  const openInterviewStoryDraft = (input: InterviewStoryOpenDraft) => {
+  const openInterviewStoryDraft = (
+    input: InterviewStoryOpenDraft,
+    { preserveView = false }: { preserveView?: boolean } = {},
+  ) => {
     const scope = interviewStoryDraftScope(input);
-    setView('interview');
+    if (!preserveView) setView('interview');
     setVoiceCoachingGrowthOpen(false);
     setInterviewStoryLibraryOpen(true);
     setActiveInterviewStoryDraftScope(scope);
@@ -1561,6 +1578,9 @@ function AppShellContent() {
   const workspaceContent = selectedApp ? (
     <ApplicationDetail
       application={selectedApp}
+      offers={ofrs}
+      offersError={offersError}
+      onRetryOffers={() => void qc.invalidateQueries({ queryKey: ['offers'] })}
       open
       onClose={() => setSelected(null)}
       onOpenOffers={() => {
@@ -1666,6 +1686,9 @@ function AppShellContent() {
           {view === 'offers' && (
             <OfferCenterView
               applications={apps}
+              onAddApplication={() => setAddOpen(true)}
+              createRequestToken={offerCreateRequestToken}
+              onOpenApplication={openCanonicalApplication}
               onCoach={(offer) => openChat(offer.id)}
               onAttachToPilot={attachToPilot}
               negotiationDrafts={offerNegotiationDrafts}
@@ -1703,11 +1726,15 @@ function AppShellContent() {
             />
           ) : (
             <InterviewV01View
+              practiceRequestToken={interviewPracticeRequestToken}
               onOpenApplication={goDetailById}
               onOpenPreparation={openPilotInterviewPreparation}
               onOpenMockInterview={openMockInterview}
               applications={apps}
               events={evs}
+              eventsLoading={eventsLoading}
+              eventsError={eventsError}
+              onRetryEvents={() => void qc.invalidateQueries({ queryKey: ['events'] })}
               resumes={resumes}
               onOpenStudio={(context) => {
                 setInterviewStudioHaruVisible(false);
@@ -1728,6 +1755,8 @@ function AppShellContent() {
           ))}
           {view === 'resumes' && (
             <ResumeLibraryView
+              uploadRequestToken={resumeUploadRequestToken}
+              onUploadRequestConsumed={() => setResumeUploadRequestToken(0)}
               onAttachToPilot={attachToPilot}
               focusResumeId={resumeEvidenceFocus?.id}
               onEvidenceFocusConsumed={resumeEvidenceFocus ? () => clearEvidenceFocus(resumeEvidenceFocus) : undefined}
@@ -1794,11 +1823,48 @@ function AppShellContent() {
     </>
   );
 
+  let topBarPrimaryAction: TopBarAction | undefined;
+  if (!selectedApp) {
+    if (['dashboard', 'reminders', 'board', 'applications-list'].includes(view)) {
+      topBarPrimaryAction = {
+        label: '添加投递',
+        ariaLabel: '添加投递',
+        onClick: () => setAddOpen(true),
+      };
+    } else if (view === 'interview') {
+      topBarPrimaryAction = {
+        label: '开始练习',
+        ariaLabel: '开始面试练习',
+        onClick: () => setInterviewPracticeRequestToken((token) => token + 1),
+      };
+    } else if (view === 'offers') {
+      topBarPrimaryAction = {
+        label: apps.length === 0 ? '添加投递' : '录入 Offer',
+        ariaLabel: apps.length === 0 ? '添加投递后录入 Offer' : '录入 Offer',
+        onClick: apps.length === 0
+          ? () => setAddOpen(true)
+          : () => setOfferCreateRequestToken((token) => token + 1),
+      };
+    } else if (view === 'resumes') {
+      topBarPrimaryAction = {
+        label: '上传简历',
+        ariaLabel: '上传简历',
+        onClick: () => setResumeUploadRequestToken((token) => token + 1),
+      };
+    } else if (view === 'reviews') {
+      topBarPrimaryAction = {
+        label: '添加经历',
+        ariaLabel: '添加经历素材',
+        onClick: () => openInterviewStoryDraft({ entrypoint: 'ui' }, { preserveView: true }),
+      };
+    }
+  }
+
   return (
     <DndContext sensors={kanbanSensors}>
       <Layout
       className="op-app-shell"
-      style={{ minHeight: '100vh', background: 'var(--op-layout-bg)' }}
+      style={{ minHeight: '100dvh', background: 'var(--op-layout-bg)' }}
       hasSider
     >
       <Sidebar
@@ -1816,12 +1882,14 @@ function AppShellContent() {
         }}
       >
         <TopBar
-          streakDays={streak}
-          onAdd={() => setAddOpen(true)}
+          primaryAction={topBarPrimaryAction}
           onSearch={() => setPaletteOpen(true)}
           onOpenSettings={() => navigateToView('settings')}
         />
         <Content
+          ref={contentRef}
+          tabIndex={-1}
+          aria-label="主要内容"
           className={`op-app-content${view === 'pilot' ? ' op-app-content-pilot' : ''}`}
           style={{
             padding: '0 24px 24px',
@@ -1945,12 +2013,6 @@ function AppShellContent() {
       ) : null}
 
       <AddApplicationForm open={addOpen} onClose={() => setAddOpen(false)} />
-      <ResumeUploadModal
-        open={resumeUploadOpen}
-        uploading={uploadResumeMut.isPending}
-        onSubmit={(f) => uploadResumeMut.mutate(f)}
-        onClose={() => setResumeUploadOpen(false)}
-      />
       <CommandPalette
         open={paletteOpen}
         onClose={() => setPaletteOpen(false)}
@@ -1959,7 +2021,10 @@ function AppShellContent() {
         onOpenDetail={openApplicationDetail}
         onAddApplication={() => setAddOpen(true)}
         onOpenResume={() => navigateToView('resumes')}
-        onUploadResume={() => setResumeUploadOpen(true)}
+        onUploadResume={() => {
+          navigateToView('resumes');
+          setResumeUploadRequestToken((token) => token + 1);
+        }}
         onOpenChat={() => openChat(undefined)}
         onOpenPilot={() => navigateToView('pilot')}
         onOpenSettings={() => navigateToView('settings')}

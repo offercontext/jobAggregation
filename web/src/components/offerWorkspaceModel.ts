@@ -1,5 +1,16 @@
 export type OfferWorkspaceMode = 'entry' | 'single' | 'selection' | 'comparison';
 
+export type OfferBindingState = 'bound' | 'unbound';
+
+/**
+ * Offer records created before application binding was required still exist in
+ * the API. Keep them visible, but make the missing canonical owner explicit in
+ * the workspace instead of silently inventing one on the client.
+ */
+export function listOfferBindingState(offer: { application_id?: number | null }): OfferBindingState {
+  return typeof offer.application_id === 'number' && offer.application_id > 0 ? 'bound' : 'unbound';
+}
+
 export function getOfferWorkspaceMode(count: number, comparisonOpen: boolean): OfferWorkspaceMode {
   if (count <= 0) return 'entry';
   if (count === 1) return 'single';

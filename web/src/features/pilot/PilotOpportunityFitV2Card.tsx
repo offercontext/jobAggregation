@@ -9,6 +9,7 @@ import type {
   OpportunityFitV2Draft,
 } from '@/types/opportunityFitReview';
 import type { ScheduleEvent } from '@/types/event';
+import { OPPORTUNITY_FIT_COPY, opportunityFitEvidenceLabel } from '@/components/opportunityFitCopy';
 
 export type PilotOpportunityFitV2Draft = OpportunityFitV2Draft;
 
@@ -50,7 +51,7 @@ function EvidenceRefs({ refs }: { refs: OpportunityFitV2EvidenceRef[] }) {
     <ul>
       {refs.map((ref, index) => (
         <li key={`${ref.source}:${ref.path}:${index}`}>
-          <span>{ref.source === 'jd' ? '岗位描述' : ref.source === 'resume' ? '简历' : '用户断言'}</span>{' · '}
+          <span>{opportunityFitEvidenceLabel(ref.source)}</span>{' · '}
           <code>{ref.path}</code>{' · '}
           <q>{ref.excerpt}</q>
         </li>
@@ -210,7 +211,7 @@ export default function PilotOpportunityFitV2Card({
 
       {draft.error ? <p role="alert">{draft.error}</p> : null}
       {triageSourceConflict || deepSourceConflict ? (
-        <p role="status">岗位资料版本已变化，当前评估仅供只读查看。</p>
+        <p role="status">{OPPORTUNITY_FIT_COPY.drawer.sourceChanged}</p>
       ) : null}
       {isHistorical ? (
         <button type="button" aria-label="重新开始岗位评估" onClick={onStartNew} disabled={restartDisabled}>开始新的岗位评估</button>
@@ -249,48 +250,48 @@ export default function PilotOpportunityFitV2Card({
           {assertions.some((item) => item.length > 500) ? <p role="alert">每条断言最多 500 字</p> : null}
           <p>仅 JD、选定简历和已确认证据会发送给 AI；用户断言仅保存在本次快照中。</p>
           {!draft.triage && !triageLoading ? (
-            <button type="button" disabled={!inputIsValid} onClick={() => setConfirmation('triage')}>开始 Triage</button>
+            <button type="button" disabled={!inputIsValid} onClick={() => setConfirmation('triage')}>{OPPORTUNITY_FIT_COPY.drawer.startTriage}</button>
           ) : null}
         </>
       )}
 
       {triageLoading ? <p role="status">正在等待 AI 返回评估结果</p> : null}
       {draft.error && draft.triageKey && !draft.triage && !isHistorical ? (
-        <button type="button" onClick={() => onStartTriage(input)}>使用原尝试重试 Triage</button>
+        <button type="button" onClick={() => onStartTriage(input)}>使用原尝试重试快速判断</button>
       ) : null}
       {triagePending ? (
         <>
-          <p role="status">结果待确认，请使用原尝试重试 Triage；输入已冻结。</p>
-          <button type="button" onClick={() => onStartTriage(input)}>使用原尝试重试 Triage</button>
+          <p role="status">结果待确认，请使用原尝试重试快速判断；输入已保留。</p>
+          <button type="button" onClick={() => onStartTriage(input)}>使用原尝试重试快速判断</button>
         </>
       ) : null}
       {draft.triage?.proposal ? (
         <section>
-          <h3>Triage（证据化结果）</h3>
+          <h3>{OPPORTUNITY_FIT_COPY.drawer.triage}（证据化结果）</h3>
           <ProposalView proposal={draft.triage.proposal} />
           {triageReady ? (
             <button type="button" onClick={onConfirmTriage}>
-              {draft.resultUnknown ? '使用原尝试重试 Triage' : '确认 Triage'}
+              {draft.resultUnknown ? '使用原尝试重试快速判断' : '确认快速判断'}
             </button>
           ) : null}
         </section>
       ) : null}
       {triageConfirmed && !draft.deep ? (
-        <button type="button" disabled={deepLoading} onClick={() => setConfirmation('deep')}>开始 Deep Review</button>
+        <button type="button" disabled={deepLoading} onClick={() => setConfirmation('deep')}>{OPPORTUNITY_FIT_COPY.drawer.startDeepReview}</button>
       ) : null}
-      {deepLoading ? <p role="status">正在进行 Deep Review</p> : null}
+      {deepLoading ? <p role="status">正在进行{OPPORTUNITY_FIT_COPY.drawer.deepReview}</p> : null}
       {draft.error && draft.deepKey && !draft.deep && !isHistorical ? (
-        <button type="button" onClick={() => onStartDeepReview()}>使用原尝试重试 Deep Review</button>
+        <button type="button" onClick={() => onStartDeepReview()}>使用原尝试重试深入分析</button>
       ) : null}
       {deepPending ? (
         <>
-          <p role="status">结果待确认，请使用原尝试重试 Deep Review；输入已冻结。</p>
-          <button type="button" onClick={() => onStartDeepReview()}>使用原尝试重试 Deep Review</button>
+          <p role="status">结果待确认，请使用原尝试重试深入分析；输入已保留。</p>
+          <button type="button" onClick={() => onStartDeepReview()}>使用原尝试重试深入分析</button>
         </>
       ) : null}
       {deepReady && draft.deep?.proposal ? (
         <section>
-          <h3>Deep Review（证据化结果）</h3>
+          <h3>{OPPORTUNITY_FIT_COPY.drawer.deepReview}（证据化结果）</h3>
           <ProposalView proposal={draft.deep.proposal} />
           {onPrepareMaterials && draft.resumeId && draft.jdVersionId && !isHistorical ? (
             <button type="button" onClick={() => onPrepareMaterials(draft.resumeId!, draft.jdText, draft.jdVersionId!)}>去准备材料</button>
@@ -317,7 +318,7 @@ export default function PilotOpportunityFitV2Card({
       <button type="button" onClick={onCancel}>取消流程</button>
       {confirmation ? (
         <div role="dialog" aria-modal="true">
-          <h3>{confirmation === 'triage' ? '确认发送评估输入' : '确认开始 Deep Review'}</h3>
+          <h3>{confirmation === 'triage' ? '确认发送评估输入' : '确认开始深入分析'}</h3>
           <p>这一步会调用当前配置的 AI 服务；结果仍需你人工确认。</p>
           <button type="button" onClick={() => setConfirmation(null)}>取消</button>
           <button

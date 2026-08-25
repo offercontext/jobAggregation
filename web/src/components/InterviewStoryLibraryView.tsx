@@ -185,7 +185,7 @@ export default function InterviewStoryLibraryView({ onOpenDraft, onBack }: Props
         </div>
         <Space wrap className={styles.headerActions}>
           {onBack ? <Button onClick={onBack}>返回面试</Button> : null}
-          <Button type="primary" onClick={() => onOpenDraft({ entrypoint: 'ui', reviewNoteId: undefined })}>新建故事</Button>
+          <Button onClick={() => onOpenDraft({ entrypoint: 'ui', reviewNoteId: undefined })}>新建故事</Button>
         </Space>
       </header>
 

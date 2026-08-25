@@ -491,9 +491,9 @@ describe('OpportunityFitReviewDrawer', () => {
     const onDraftChange = vi.fn();
     const view = await render(undefined, 'JD text', draft, onDraftChange as never);
     await waitFor(() => expect(getByRole(view, 'button')).toHaveProperty('disabled', false));
-    await click(getByRole(view, 'button', 'Triage'));
+    await click(getByRole(view, 'button', '快速判断'));
     await waitFor(() => expect(state.create).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(view.textContent).toContain('岗位资料版本已变化'));
+    await waitFor(() => expect(view.textContent).toContain('原资料已更新，本次结果仍使用旧版'));
     expect(onDraftChange).toHaveBeenCalledWith(expect.objectContaining({
       triage: expect.objectContaining({ stage_status: 'source_conflict' }),
       triageKey: null,
@@ -526,7 +526,7 @@ describe('OpportunityFitReviewDrawer', () => {
     };
     const view = await render(undefined, 'JD text', draft, onDraftChange);
     await waitFor(() => expect(getByRole(view, 'button')).toHaveProperty('disabled', false));
-    await click(getByRole(view, 'button', 'Triage'));
+    await click(getByRole(view, 'button', '快速判断'));
     await waitFor(() => expect(cleared).toBe(true));
     expect(view.querySelector('select')).not.toBeNull();
     expect(view.textContent).toContain('当前投递或岗位评估已不存在');
@@ -603,8 +603,8 @@ describe('OpportunityFitReviewDrawer', () => {
     if (!(select instanceof HTMLSelectElement)) throw new Error('Expected resume selector');
     await waitFor(() => expect(select.querySelector('option[value="11"]')).toBeTruthy());
     await act(async () => setValue(select, '11'));
-    await waitFor(() => expect(getByRole(view, 'button', 'Triage')).toHaveProperty('disabled', false));
-    await click(getByRole(view, 'button', 'Triage'));
+    await waitFor(() => expect(getByRole(view, 'button', '快速判断')).toHaveProperty('disabled', false));
+    await click(getByRole(view, 'button', '快速判断'));
     await waitFor(() => expect(state.create).toHaveBeenCalledTimes(1));
 
     await waitFor(() => {
@@ -713,8 +713,8 @@ describe('OpportunityFitReviewDrawer', () => {
     await click(historyButton);
     const select = getByLabelText(view, '用于审阅的简历') as HTMLSelectElement;
     await act(async () => setValue(select, '11'));
-    await waitFor(() => expect(getByRole(view, 'button', '开始 Triage')).toHaveProperty('disabled', false));
-    await click(getByRole(view, 'button', '开始 Triage'));
+    await waitFor(() => expect(getByRole(view, 'button', '开始快速判断')).toHaveProperty('disabled', false));
+    await click(getByRole(view, 'button', '开始快速判断'));
     await waitFor(() => expect(state.create).toHaveBeenCalledTimes(1));
 
     resolveHistory?.({
@@ -807,10 +807,10 @@ describe('OpportunityFitReviewDrawer', () => {
     };
     const onDraftChange = vi.fn();
     const view = await render(undefined, 'JD text', draft, onDraftChange as never);
-    await click(getByRole(view, 'button', 'Deep Review'));
+    await click(getByRole(view, 'button', '深入分析'));
     await waitFor(() => expect(state.deepV2).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(state.sourceConflict).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(view.textContent).toContain('岗位资料版本已变化'));
+    await waitFor(() => expect(view.textContent).toContain('原资料已更新，本次结果仍使用旧版'));
     expect(onDraftChange).toHaveBeenCalledWith(expect.objectContaining({
       deep: expect.objectContaining({ stage_status: 'source_conflict' }),
       deepKey: null,
@@ -883,7 +883,7 @@ describe('OpportunityFitReviewDrawer', () => {
       setValue(assertions, Array.from({ length: 11 }, (_, index) => `Fact ${index}`).join('\n'));
     });
     expect(view.textContent).toContain('最多填写 10 条非空断言。');
-    expect(getByRole(view, 'button', '开始 Triage')).toHaveProperty('disabled', true);
+    expect(getByRole(view, 'button', '开始快速判断')).toHaveProperty('disabled', true);
     expect(state.create).not.toHaveBeenCalled();
   });
 
@@ -899,8 +899,8 @@ describe('OpportunityFitReviewDrawer', () => {
       setValue(jd, 'JD text');
       setValue(assertions, ' fact one \n\n fact two ');
     });
-    await waitFor(() => expect(getByRole(view, 'button', '开始 Triage')).toHaveProperty('disabled', false));
-    await click(getByRole(view, 'button', '开始 Triage'));
+    await waitFor(() => expect(getByRole(view, 'button', '开始快速判断')).toHaveProperty('disabled', false));
+    await click(getByRole(view, 'button', '开始快速判断'));
     await waitFor(() => expect(state.create).toHaveBeenCalledWith(7, expect.objectContaining({
       resume_id: 11,
       jd_version_id: 1,
@@ -930,8 +930,8 @@ describe('OpportunityFitReviewDrawer', () => {
     if (!(select instanceof HTMLSelectElement)) throw new Error('Expected resume selector');
     await waitFor(() => expect(select.querySelector('option[value="11"]')).toBeTruthy());
     await act(async () => setValue(select, '11'));
-    await waitFor(() => expect(getByRole(view, 'button', 'Triage')).toHaveProperty('disabled', false));
-    await click(getByRole(view, 'button', 'Triage'));
+    await waitFor(() => expect(getByRole(view, 'button', '快速判断')).toHaveProperty('disabled', false));
+    await click(getByRole(view, 'button', '快速判断'));
     await waitFor(() => expect(view.textContent).toContain('Frozen triage result'));
 
     await act(async () => {
@@ -1044,8 +1044,8 @@ describe('OpportunityFitReviewDrawer', () => {
       setValue(jd, 'JD text');
     });
 
-    await waitFor(() => expect(getByRole(view, 'button', '开始 Triage')).toHaveProperty('disabled', false));
-    await click(getByRole(view, 'button', '开始 Triage'));
+    await waitFor(() => expect(getByRole(view, 'button', '开始快速判断')).toHaveProperty('disabled', false));
+    await click(getByRole(view, 'button', '开始快速判断'));
     await waitFor(() => expect(view.textContent).toContain('AI 输出未通过证据校验，可重试；原简历已保护，未创建草稿。'));
 
     expect(view.textContent).toContain('AI 输出未通过证据校验，可重试；原简历已保护，未创建草稿。');
@@ -1159,7 +1159,7 @@ describe('OpportunityFitReviewDrawer', () => {
       error: null,
     }, onDraftChange);
 
-    await click(getByRole(view, 'button', 'Triage'));
+    await click(getByRole(view, 'button', '快速判断'));
     await waitFor(() => expect(state.getV2).toHaveBeenCalledWith(7, 21));
     expect(onDraftChange).toHaveBeenCalledWith(expect.objectContaining({ triage: confirmed, resultUnknown: false }));
     expect(view.textContent).toContain('Confirmed triage');
@@ -1194,7 +1194,7 @@ describe('OpportunityFitReviewDrawer', () => {
       error: null,
     }, onDraftChange);
 
-    await click(getByRole(view, 'button', 'Triage'));
+    await click(getByRole(view, 'button', '快速判断'));
     await waitFor(() => expect(onDraftChange).toHaveBeenCalledWith(expect.objectContaining({ resultUnknown: true })));
     expect(view.textContent).toContain('操作结果待确认');
   });
@@ -1264,7 +1264,7 @@ describe('OpportunityFitReviewDrawer', () => {
       error: null,
     });
 
-    expect(view.textContent).toContain('岗位资料版本已变化');
+    expect(view.textContent).toContain('原资料已更新，本次结果仍使用旧版');
     expect(view.textContent).not.toContain('loading');
   });
 });

@@ -256,7 +256,7 @@ export function deriveActionItems({
         id: `material-kit-${application.id}`,
         kind: 'material_kit_incomplete',
         priority: 'p2',
-        title: `${application.company_name} · ${application.position_name} 投递材料包待完善`,
+        title: `${application.company_name} · ${application.position_name} 投递准备待完善`,
         detail: '简历建议、沟通话术或投递清单尚未完成。',
         primaryActionLabel: '打开材料包',
         target: 'board',

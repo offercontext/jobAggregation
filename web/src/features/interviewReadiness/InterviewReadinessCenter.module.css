@@ -56,6 +56,10 @@
 .primaryAction:hover:not(:disabled), .primaryAction:focus-visible:not(:disabled) { transform: translateY(-1px); box-shadow: 0 18px 32px color-mix(in srgb, var(--op-primary) 28%, transparent); }
 .primaryAction:active:not(:disabled) { transform: scale(.96); }
 .primaryAction:disabled { cursor: not-allowed; opacity: .42; box-shadow: none; }
+.secondaryAction { width: 100%; min-height: 50px; display: flex; justify-content: space-between; align-items: center; margin-top: 18px; padding: 13px 16px 13px 18px; border: 1px solid color-mix(in srgb, var(--op-primary) 36%, var(--op-border)); border-radius: 12px; background: var(--op-surface); color: var(--op-primary); cursor: pointer; font-size: 14px; font-weight: 800; transition-property: transform, opacity, border-color, background-color; transition-duration: 160ms; }
+.secondaryAction:hover:not(:disabled), .secondaryAction:focus-visible:not(:disabled) { transform: translateY(-1px); border-color: var(--op-primary); background: color-mix(in srgb, var(--op-primary) 7%, var(--op-surface)); }
+.secondaryAction:active:not(:disabled) { transform: scale(.98); }
+.secondaryAction:disabled { cursor: not-allowed; opacity: .42; }
 .privacyNote { margin: 12px 2px 0; color: var(--op-muted); font-size: 11px; line-height: 1.55; }
 .error { margin-top: 13px; padding: 10px 12px; border-radius: 10px; color: var(--op-error); background: color-mix(in srgb, var(--op-error) 9%, transparent); font-size: 12px; }
 
@@ -67,7 +71,12 @@
 
 @media (max-width: 900px) { .surface { padding: 24px 18px 32px; border-radius: 18px; } .hero, .workspaceGrid { grid-template-columns: 1fr; display: grid; } .heroNote { justify-self: start; } .workspaceGrid { gap: 13px; } }
 @media (max-width: 620px) { .modeGrid { grid-template-columns: 1fr; } .prepPanel, .sidePanel { padding: 18px; } .checkItem { flex-wrap: wrap; } .inlineAction { margin-left: 34px; } }
-@media (prefers-reduced-motion: reduce) { .modeCard, .primaryAction { transition: none; } }
+@media (prefers-reduced-motion: reduce) {
+  .modeCard, .primaryAction, .secondaryAction { transition: none; }
+  .modeCard:hover, .modeCard:focus-visible,
+  .primaryAction:hover:not(:disabled), .primaryAction:focus-visible:not(:disabled), .primaryAction:active:not(:disabled),
+  .secondaryAction:hover:not(:disabled), .secondaryAction:focus-visible:not(:disabled), .secondaryAction:active:not(:disabled) { transform: none; }
+}
 
 .controls :global(.ant-select) { width: 100%; }
 .controls :global(.ant-select-selector) { min-height: 42px !important; padding: 5px 12px !important; border-color: var(--op-border) !important; border-radius: 10px !important; background: var(--op-surface) !important; color: var(--op-ink) !important; box-shadow: none !important; }

@@ -113,7 +113,7 @@ function ConfirmationDialog({
   const description = confirmation === 'triage'
     ? '确认将这些内容发送给当前配置的 AI 服务。'
     : confirmation === 'deep_review'
-      ? '这将使用已冻结的评估来源进行 Deep Review。'
+      ? `这将使用${OPPORTUNITY_FIT_COPY.drawer.sourceFrozen}的评估来源进行${OPPORTUNITY_FIT_COPY.drawer.deepReview}。`
       : '当前建议不是准备材料，仍要把冻结简历和 JD 交给材料包吗？';
   const confirmLabel = confirmation === 'triage'
     ? '确认发送'
@@ -268,7 +268,7 @@ export default function PilotOpportunityFitCard({
           <p>最多 10 条，每条最多 500 字。</p>
           {assertions.error ? <p role="alert">{assertions.error}</p> : null}
           <p>这些内容将发送给当前配置的 AI 服务。</p>
-          <button type="submit" disabled={!canStartTriage}>{isTriageLoading ? '正在分析…' : '开始 Triage'}</button>
+          <button type="submit" disabled={!canStartTriage}>{isTriageLoading ? '正在分析…' : OPPORTUNITY_FIT_COPY.drawer.startTriage}</button>
         </form>
       ) : null}
 
@@ -282,8 +282,8 @@ export default function PilotOpportunityFitCard({
       {review && draft.phase !== 'collect_input' && draft.phase !== 'confirm_triage' && draft.phase !== 'triage_loading' ? (
         <div>
           {historicalReview ? <button type="button" onClick={resetForNewReview}>开始新的岗位评估</button> : null}
-          <p>来源已冻结 · 人工确认</p>
-          <h3>Triage</h3>
+          <p>{OPPORTUNITY_FIT_COPY.drawer.sourceFrozen} · 人工确认</p>
+          <h3>{OPPORTUNITY_FIT_COPY.drawer.triage}</h3>
           <ReviewItem statement={review.triage.summary.text} refs={review.triage.summary.evidence_refs} />
 
           <h4>岗位约束</h4>
@@ -309,7 +309,7 @@ export default function PilotOpportunityFitCard({
           ) : null}
 
           {!historicalReview && !isDeepReady ? (
-            isDeepReviewLoading ? <p role="status">正在进行 Deep Review…</p> : null
+            isDeepReviewLoading ? <p role="status">正在进行{OPPORTUNITY_FIT_COPY.drawer.deepReview}…</p> : null
           ) : null}
           {!historicalReview && !isDeepReady ? (
             <button type="button" disabled={isDeepReviewLoading} onClick={() => setConfirmation('deep_review')}>
@@ -317,7 +317,7 @@ export default function PilotOpportunityFitCard({
             </button>
           ) : isDeepReady ? (
             <>
-              <h3>Deep Fit Review</h3>
+              <h3>{OPPORTUNITY_FIT_COPY.drawer.deepReview}</h3>
               <p>{OPPORTUNITY_FIT_COPY.drawer.recommendedPath}：{opportunityFitRecommendedPathLabel(review.deep_review!.recommended_path)}</p>
               <h4>优势</h4>
               {review.deep_review!.strengths.map((item) => <ReviewItem key={item.id} statement={item.statement} refs={item.evidence_refs} />)}

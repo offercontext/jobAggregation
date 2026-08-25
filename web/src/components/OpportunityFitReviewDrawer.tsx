@@ -96,7 +96,7 @@ function V2EvidenceRefs({ refs }: { refs: OpportunityFitV2EvidenceRef[] }) {
     <Space direction="vertical" size={2} style={{ width: '100%' }}>
       {refs.map((ref, index) => (
         <Typography.Text key={`${ref.source}:${ref.path}:${index}`} type="secondary">
-          {ref.source} · {ref.path} · “{ref.excerpt}”
+          {opportunityFitEvidenceLabel(ref.source)} · {ref.path} · “{ref.excerpt}”
         </Typography.Text>
       ))}
     </Space>
@@ -271,7 +271,7 @@ export default function OpportunityFitReviewDrawer({
     return code === 'application_jd_source_conflict' || code === 'opportunity_fit_source_conflict';
   };
 
-  const sourceConflictCopy = '岗位资料版本已变化，当前评估仅供只读查看。';
+  const sourceConflictCopy = OPPORTUNITY_FIT_COPY.drawer.sourceChanged;
 
   const recoverSourceConflict = async (
     stage: 'triage' | 'deep_review',
@@ -734,13 +734,13 @@ export default function OpportunityFitReviewDrawer({
             <Tag color="blue">v2 岗位评估</Tag>
             <SourceStateTag
               state={v2HasSourceConflict ? 'changed' : 'frozen'}
-              detail={v2HasSourceConflict ? '岗位资料版本已变化' : OPPORTUNITY_FIT_COPY.drawer.sourceFrozen}
+              detail={v2HasSourceConflict ? OPPORTUNITY_FIT_COPY.drawer.sourceChanged : OPPORTUNITY_FIT_COPY.drawer.sourceFrozen}
             />
             <Tag>{OPPORTUNITY_FIT_COPY.drawer.humanConfirmation}</Tag>
           </Space>
-          <Typography.Title level={4}>Triage</Typography.Title>
+          <Typography.Title level={4}>{OPPORTUNITY_FIT_COPY.drawer.triage}</Typography.Title>
           {v2Triage.stage_status === 'source_conflict' ? (
-            <Alert type="warning" showIcon message="岗位资料版本已变化，当前评估仅供只读查看。" />
+            <Alert type="warning" showIcon message={OPPORTUNITY_FIT_COPY.drawer.sourceChanged} />
           ) : v2Triage.proposal ? <V2ProposalView proposal={v2Triage.proposal} /> : <Spin />}
           {['generating', 'provider_unknown'].includes(v2Triage.stage_status) ? (
             <Button type="primary" onClick={submit} loading={createMutation.isPending} disabled={!canSubmit}>
@@ -757,7 +757,7 @@ export default function OpportunityFitReviewDrawer({
               }}
               loading={confirmV2Mutation.isPending}
             >
-              {draft?.resultUnknown ? '使用原尝试重试' : '确认 Triage'}
+              {draft?.resultUnknown ? '使用原尝试重试' : '确认快速判断'}
             </Button>
           ) : null}
           {!v2Historical && v2Triage.stage_status === 'confirmed' && !v2Deep ? (
@@ -766,15 +766,15 @@ export default function OpportunityFitReviewDrawer({
               onClick={submitDeepReview}
               loading={deepReviewMutation.isPending}
             >
-              {draft?.deepKey ? '使用原尝试重试' : '开始 Deep Review'}
+              {draft?.deepKey ? '使用原尝试重试' : OPPORTUNITY_FIT_COPY.drawer.startDeepReview}
             </Button>
           ) : null}
           {v2Deep ? (
             <>
               <Divider />
-              <Typography.Title level={4}>Deep Review</Typography.Title>
+              <Typography.Title level={4}>{OPPORTUNITY_FIT_COPY.drawer.deepReview}</Typography.Title>
               {v2Deep.stage_status === 'source_conflict' ? (
-                <Alert type="warning" showIcon message="岗位资料版本已变化，当前评估仅供只读查看。" />
+                <Alert type="warning" showIcon message={OPPORTUNITY_FIT_COPY.drawer.sourceChanged} />
               ) : v2Deep.proposal ? <V2ProposalView proposal={v2Deep.proposal} /> : <Spin />}
               {['generating', 'provider_unknown'].includes(v2Deep.stage_status) ? (
                 <Button type="primary" onClick={submitDeepReview} loading={deepReviewMutation.isPending}>
@@ -782,7 +782,7 @@ export default function OpportunityFitReviewDrawer({
                 </Button>
               ) : null}
               {v2Deep.jd_version_id !== jdVersionId ? (
-                <Alert type="warning" showIcon message="岗位资料版本已变化，当前结果仅供只读查看。请重新开始评估。" />
+                <Alert type="warning" showIcon message={`${OPPORTUNITY_FIT_COPY.drawer.sourceChanged} 请重新开始评估。`} />
               ) : null}
               <Button
                 type="primary"

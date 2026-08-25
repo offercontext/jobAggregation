@@ -14,6 +14,9 @@ const state = vi.hoisted(() => ({
   jdDetail: null as unknown,
   events: [] as unknown[],
   notes: [] as unknown[],
+  queryErrors: new Set<string>(),
+  queryLoading: new Set<string>(),
+  refetch: vi.fn(),
 }));
 
 vi.mock('@/services/ai', () => ({ analyzeJD: state.analyzeJD }));
@@ -44,7 +47,9 @@ vi.mock('@tanstack/react-query', () => ({
           : options.queryKey?.[0] === 'application-jd-detail'
             ? state.jdDetail
         : null,
-    isLoading: false,
+    isLoading: state.queryLoading.has(String(options.queryKey?.[0] ?? '')),
+    isError: state.queryErrors.has(String(options.queryKey?.[0] ?? '')),
+    refetch: state.refetch,
   }),
   useMutation: () => ({ mutate: vi.fn(), isPending: false }),
 }));
@@ -55,8 +60,16 @@ vi.mock('./ApplicationDetail.module.css', () => ({ default: {
 } }));
 vi.mock('./PilotAttachmentHandle', () => ({ createPilotAttachmentDragBinding: () => ({}) }));
 vi.mock('./ScheduleEventForm', () => ({ default: () => null }));
-vi.mock('./ReviewFormDrawer', () => ({ default: () => null }));
-vi.mock('./InterviewReviewProposalDrawer', () => ({ default: () => null }));
+vi.mock('./ReviewFormDrawer', () => ({
+  default: (props: { open?: boolean; note?: unknown }) => props.open
+    ? <div data-testid="review-form-drawer">{props.note ? '编辑复盘' : '新建复盘'}</div>
+    : null,
+}));
+vi.mock('./InterviewReviewProposalDrawer', () => ({
+  default: (props: { open?: boolean }) => props.open
+    ? <div data-testid="review-proposal-drawer">复盘建议</div>
+    : null,
+}));
 vi.mock('./InterviewKnowledgeCaptureDrawer', () => ({
   default: () => null,
   createInterviewKnowledgeCaptureDraft: () => ({}),
@@ -100,6 +113,7 @@ vi.mock('antd', () => {
     Dropdown: (props: { children: ReactNode; menu?: { items?: Array<{ key: string; label: ReactNode; onClick?: () => void }> } }) => (
       <>{props.children}{props.menu?.items?.map((item) => <button key={item.key} onClick={item.onClick}>{item.label}</button>)}</>
     ),
+    Alert: (props: { message?: ReactNode; action?: ReactNode }) => <div role="alert">{props.message}{props.action}</div>,
     Button: ({ children, htmlType: _htmlType, loading: _loading, icon: _icon, ...props }: React.ButtonHTMLAttributes<HTMLButtonElement> & { htmlType?: string; loading?: boolean; icon?: ReactNode }) => (
       <button {...props}>{children}</button>
     ),
@@ -151,6 +165,9 @@ beforeEach(() => {
   state.jdDetail = null;
   state.events = [];
   state.notes = [];
+  state.queryErrors.clear();
+  state.queryLoading.clear();
+  state.refetch.mockReset();
   container = document.createElement('div');
   document.body.appendChild(container);
   root = createRoot(container);
@@ -162,6 +179,157 @@ afterEach(() => {
 });
 
 describe('ApplicationDetail deterministic Pilot JD entry', () => {
+  it('keeps failed JD, event, review, and Offer sources visible instead of presenting false empty states', () => {
+    state.queryErrors.add('application-jd-current');
+    state.queryErrors.add('events');
+    state.queryErrors.add('notes');
+    const retryOffers = vi.fn();
+
+    act(() => root?.render(
+      <ApplicationDetail
+        application={application}
+        open
+        onClose={vi.fn()}
+        offersError
+        onRetryOffers={retryOffers}
+      />,
+    ));
+
+    expect(container?.textContent).toContain('岗位资料暂时无法读取');
+    expect(container?.textContent).toContain('日程暂时无法读取');
+    expect(container?.textContent).toContain('面试复盘暂时无法读取');
+    expect(container?.textContent).toContain('部分 Offer 进展暂时无法读取');
+    expect(container?.textContent).not.toContain('尚未确认岗位描述');
+    expect(container?.textContent).toContain('下一步时间：暂时无法读取');
+    expect(container?.textContent).not.toContain('下一步时间：待安排');
+    const editJd = [...(container?.querySelectorAll('button') ?? [])]
+      .find((button) => button.textContent?.includes('暂不可编辑')) as HTMLButtonElement | undefined;
+    expect(editJd?.disabled).toBe(true);
+  });
+
+  it('keeps the JD write entry disabled until the current-version source finishes loading', () => {
+    state.queryLoading.add('application-jd-current');
+
+    act(() => root?.render(<ApplicationDetail application={application} open onClose={vi.fn()} />));
+
+    const editJd = [...(container?.querySelectorAll('button') ?? [])]
+      .find((button) => button.textContent?.includes('读取中')) as HTMLButtonElement | undefined;
+    expect(editJd?.disabled).toBe(true);
+  });
+
+  it('does not offer a write action while interview events or reviews are loading', () => {
+    state.queryLoading.add('events');
+    state.queryLoading.add('notes');
+    const interviewApplication = { ...application, status: 'interview' } as never;
+
+    act(() => root?.render(<ApplicationDetail application={interviewApplication} open onClose={vi.fn()} />));
+
+    const primary = [...(container?.querySelectorAll('button') ?? [])]
+      .find((button) => button.textContent?.includes('等待面试进展加载')) as HTMLButtonElement | undefined;
+    expect(primary).not.toBeUndefined();
+    expect(primary?.disabled).toBe(true);
+    expect(container?.textContent).toContain('下一时间读取中');
+    expect(container?.textContent).not.toContain('下一时间待安排');
+    expect(container?.querySelector('[data-testid="review-form-drawer"]')).toBeNull();
+  });
+
+  it('replaces the interview write action with retries when required queries fail', () => {
+    state.queryErrors.add('events');
+    state.queryErrors.add('notes');
+    const interviewApplication = { ...application, status: 'interview' } as never;
+
+    act(() => root?.render(<ApplicationDetail application={interviewApplication} open onClose={vi.fn()} />));
+
+    const retry = [...(container?.querySelectorAll('button') ?? [])]
+      .find((button) => button.textContent?.includes('重试日程和复盘')) as HTMLButtonElement | undefined;
+    expect(retry).not.toBeUndefined();
+    expect(retry?.disabled).toBe(false);
+    act(() => retry?.click());
+    expect(state.refetch).toHaveBeenCalledTimes(2);
+    expect(container?.querySelector('[data-testid="review-form-drawer"]')).toBeNull();
+  });
+
+  it.each(['cancelled', 'deleted', 'soft_deleted'])('does not let %s events drive interview history or preparation', (status) => {
+    state.events = [{
+      id: 31,
+      application_id: application.id,
+      event_type: 'interview',
+      subtype: '一面',
+      tags: [],
+      round: 1,
+      scheduled_at: '2099-01-01T00:00:00Z',
+      duration_minutes: 45,
+      location: '线上',
+      notes: '',
+      status,
+      created_at: '2025-12-20T00:00:00Z',
+    }];
+    state.notes = [{ id: 51, application_event_id: 31 }];
+    const interviewApplication = { ...application, status: 'interview' } as never;
+
+    act(() => root?.render(<ApplicationDetail application={interviewApplication} open onClose={vi.fn()} />));
+
+    expect(container?.textContent).toContain('已约面试');
+    expect(container?.textContent).not.toContain('面试结束');
+    expect(container?.textContent).toContain('该面试已结束或取消');
+    expect(container?.textContent).toContain('下一步时间：待安排');
+    expect([...((container?.querySelectorAll('button') ?? []))].some((button) => button.textContent?.includes('查看复盘'))).toBe(false);
+    expect([...((container?.querySelectorAll('button') ?? []))].some((button) => button.textContent?.includes('面试准备建议'))).toBe(false);
+    expect(container?.querySelector('[data-testid="review-proposal-drawer"]')).toBeNull();
+  });
+
+  it('opens an existing interview review instead of opening the create form', () => {
+    state.events = [{
+      id: 31,
+      application_id: application.id,
+      event_type: 'interview',
+      subtype: '一面',
+      tags: [],
+      round: 1,
+      scheduled_at: '2026-01-01T00:00:00Z',
+      duration_minutes: 45,
+      location: '线上',
+      notes: '',
+      status: 'done',
+      created_at: '2025-12-20T00:00:00Z',
+    }];
+    state.notes = [{ id: 51, application_event_id: 31, round: '一面' }];
+    const interviewApplication = { ...application, status: 'interview' } as never;
+
+    act(() => root?.render(<ApplicationDetail application={interviewApplication} open onClose={vi.fn()} />));
+    const primary = [...(container?.querySelectorAll('button') ?? [])]
+      .find((button) => button.textContent?.includes('查看本轮复盘'));
+    expect(primary).not.toBeUndefined();
+    act(() => (primary as HTMLButtonElement).click());
+
+    expect(container?.querySelector('[data-testid="review-proposal-drawer"]')).not.toBeNull();
+    expect(container?.querySelector('[data-testid="review-form-drawer"]')).toBeNull();
+  });
+
+  it('maps event subtype and status enums to user-facing progress copy', () => {
+    state.events = [{
+      id: 12,
+      application_id: application.id,
+      event_type: 'written_test',
+      subtype: 'assessment',
+      tags: [],
+      round: 0,
+      scheduled_at: '2026-08-20T10:00:00Z',
+      duration_minutes: 60,
+      location: '',
+      notes: '',
+      status: 'todo',
+      created_at: '2026-08-01T00:00:00Z',
+    }];
+
+    act(() => root?.render(<ApplicationDetail application={application} open onClose={vi.fn()} />));
+
+    expect(container?.textContent).toContain('笔试 · 测评');
+    expect(container?.textContent).toContain('待处理');
+    expect(container?.textContent).not.toContain('assessment');
+    expect(container?.textContent).not.toContain('todo');
+  });
+
   it('renders the JD editor labels as Chinese text instead of escape sequences', () => {
     act(() => root?.render(<ApplicationDetail application={application} open onClose={vi.fn()} />));
 
@@ -241,6 +409,51 @@ describe('ApplicationDetail deterministic Pilot JD entry', () => {
     expect(container?.textContent).toContain('面试结束');
     expect(container?.textContent).toContain('查看本轮复盘');
     expect(container?.textContent).not.toContain('准备本轮面试');
+  });
+
+  it('supports keyboard tabs and keeps the progress projection read-only', () => {
+    state.events = [{
+      id: 31,
+      event_type: 'interview',
+      subtype: '一面',
+      scheduled_at: '2026-08-20T10:00:00Z',
+      status: 'done',
+      location: '线上',
+      notes: '完成面试',
+    }];
+    const linkedOffer = {
+      id: 18,
+      application_id: application.id,
+      company_name: application.company_name,
+      position_name: application.position_name,
+      status: 'pending' as const,
+      base_monthly: 0,
+      months_per_year: 12,
+      signing_bonus: 0,
+      equity: '',
+      perks: '',
+      deadline: '2026-09-01T00:00:00Z',
+      notes: '',
+      assessment: '',
+      total_cash: 0,
+      created_at: '2026-08-20T00:00:00Z',
+      updated_at: '2026-08-20T00:00:00Z',
+    };
+    act(() => root?.render(<ApplicationDetail application={application} offers={[linkedOffer]} open onClose={vi.fn()} />));
+
+    const tabs = [...(container?.querySelectorAll<HTMLButtonElement>('[role="tab"]') ?? [])];
+    expect(tabs.map((tab) => tab.textContent)).toEqual(['概览', '准备', '进展']);
+    expect(tabs[0]?.getAttribute('aria-selected')).toBe('true');
+
+    act(() => tabs[0]?.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true })));
+    expect(tabs[1]?.getAttribute('aria-selected')).toBe('true');
+    act(() => tabs[1]?.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true })));
+    expect(tabs[2]?.getAttribute('aria-selected')).toBe('true');
+
+    const progressPanel = container?.querySelector<HTMLElement>('[aria-labelledby="application-progress-tab"]');
+    expect(progressPanel?.textContent).toContain('进展时间线');
+    expect(progressPanel?.textContent).toContain('Offer · 示例公司 · 后端工程师');
+    expect(progressPanel?.querySelector('button')).toBeNull();
   });
 
   it('renders long JD history previews and details in dedicated wrapping containers', () => {

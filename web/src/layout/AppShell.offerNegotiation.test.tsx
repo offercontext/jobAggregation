@@ -195,6 +195,7 @@ async function flush() {
 
 describe('AppShell mounted Opportunity Fit confirmation recovery', () => {
   beforeEach(() => {
+    window.history.replaceState(null, '', '/');
     opportunityFitState.createTriage.mockReset();
     opportunityFitState.confirmTriage.mockReset();
     opportunityFitState.createDeep.mockReset();
@@ -282,7 +283,7 @@ describe('AppShell mounted Opportunity Fit confirmation recovery', () => {
     act(() => resumeSelect.dispatchEvent(new Event('change', { bubbles: true })));
     await flush();
     const startButton = Array.from(host?.querySelectorAll<HTMLButtonElement>('button') ?? [])
-      .find((button) => button.textContent?.includes('Triage'));
+      .find((button) => button.textContent?.includes('快速判断'));
     if (!startButton) throw new Error('Pilot Triage start button was not mounted');
     act(() => startButton.click());
     await flush();
@@ -293,7 +294,7 @@ describe('AppShell mounted Opportunity Fit confirmation recovery', () => {
     await flush();
     expect(opportunityFitState.createTriage).toHaveBeenCalledTimes(1);
     const triageButton = Array.from(host?.querySelectorAll<HTMLButtonElement>('button') ?? [])
-      .find((button) => button.textContent?.includes('Triage'));
+      .find((button) => button.textContent?.includes('快速判断'));
     if (!triageButton) throw new Error('Pilot Triage confirmation button was not mounted');
     act(() => triageButton.click());
     await flush();
@@ -327,7 +328,7 @@ describe('AppShell mounted Opportunity Fit confirmation recovery', () => {
     await flush();
 
     const startButton = Array.from(host?.querySelectorAll<HTMLButtonElement>('button') ?? [])
-      .find((button) => button.textContent?.includes('Triage'));
+      .find((button) => button.textContent?.includes('快速判断'));
     if (!startButton) throw new Error('Pilot Triage start button was not mounted');
     act(() => startButton.click());
     await flush();
@@ -338,12 +339,12 @@ describe('AppShell mounted Opportunity Fit confirmation recovery', () => {
     await flush();
 
     const firstRetry = Array.from(host?.querySelectorAll<HTMLButtonElement>('button') ?? [])
-      .find((button) => button.textContent?.includes('Triage'));
+      .find((button) => button.textContent?.includes('快速判断'));
     if (!firstRetry) throw new Error('First Triage retry button was not mounted');
     act(() => firstRetry.click());
     await flush();
     const secondRetry = Array.from(host?.querySelectorAll<HTMLButtonElement>('button') ?? [])
-      .find((button) => button.textContent?.includes('Triage'));
+      .find((button) => button.textContent?.includes('快速判断'));
     if (!secondRetry) throw new Error('Second Triage retry button was not mounted');
     act(() => secondRetry.click());
     await flush();
@@ -387,7 +388,7 @@ describe('AppShell mounted Opportunity Fit confirmation recovery', () => {
     await flush();
 
     const startButton = Array.from(host?.querySelectorAll<HTMLButtonElement>('button') ?? [])
-      .find((button) => button.textContent?.includes('Triage'));
+      .find((button) => button.textContent?.includes('快速判断'));
     if (!startButton) throw new Error('Pilot Triage start button was not mounted');
     act(() => startButton.click());
     await flush();
@@ -397,13 +398,13 @@ describe('AppShell mounted Opportunity Fit confirmation recovery', () => {
     act(() => triageConfirmButton.click());
     await flush();
     const confirmButton = Array.from(host?.querySelectorAll<HTMLButtonElement>('button') ?? [])
-      .find((button) => button.textContent?.includes('确认 Triage'));
+      .find((button) => button.textContent?.includes('确认快速判断'));
     if (!confirmButton) throw new Error('Pilot Triage confirm button was not mounted');
     act(() => confirmButton.click());
     await flush();
 
     const deepButton = Array.from(host?.querySelectorAll<HTMLButtonElement>('button') ?? [])
-      .find((button) => button.textContent?.includes('Deep Review'));
+      .find((button) => button.textContent?.includes('深入分析'));
     if (!deepButton) throw new Error('Pilot Deep Review button was not mounted');
     act(() => deepButton.click());
     await flush();
@@ -453,7 +454,7 @@ describe('AppShell mounted Opportunity Fit confirmation recovery', () => {
     await flush();
 
     const startButton = Array.from(host?.querySelectorAll<HTMLButtonElement>('button') ?? [])
-      .find((button) => button.textContent?.includes('Triage'));
+      .find((button) => button.textContent?.includes('快速判断'));
     if (!startButton) throw new Error('Pilot Triage start button was not mounted');
     act(() => startButton.click());
     await flush();
@@ -522,7 +523,7 @@ describe('AppShell mounted Opportunity Fit confirmation recovery', () => {
     act(() => resumeSelect.dispatchEvent(new Event('change', { bubbles: true })));
     await flush();
     const startButton = Array.from(host?.querySelectorAll<HTMLButtonElement>('button') ?? [])
-      .find((button) => button.textContent?.includes('Triage'));
+      .find((button) => button.textContent?.includes('快速判断'));
     if (!startButton) throw new Error('Pilot Triage start button was not mounted');
     act(() => startButton.click());
     await flush();
@@ -532,13 +533,13 @@ describe('AppShell mounted Opportunity Fit confirmation recovery', () => {
     act(() => triageConfirmButton.click());
     await flush();
     const triageCommitButton = Array.from(host?.querySelectorAll<HTMLButtonElement>('button') ?? [])
-      .find((button) => button.textContent?.includes('确认 Triage'));
+      .find((button) => button.textContent?.includes('确认快速判断'));
     if (!triageCommitButton) throw new Error('Pilot Triage confirm button was not mounted');
     act(() => triageCommitButton.click());
     await flush();
 
     const deepButton = Array.from(host?.querySelectorAll<HTMLButtonElement>('button') ?? [])
-      .find((button) => button.textContent?.includes('Deep Review'));
+      .find((button) => button.textContent?.includes('深入分析'));
     if (!deepButton) throw new Error('Pilot Deep Review button was not mounted');
     act(() => deepButton.click());
     await flush();
@@ -612,7 +613,7 @@ describe('AppShell mounted Opportunity Fit confirmation recovery', () => {
     act(() => resumeSelect.dispatchEvent(new Event('change', { bubbles: true })));
     await flush();
     const startButton = Array.from(host?.querySelectorAll<HTMLButtonElement>('button') ?? [])
-      .find((button) => button.textContent?.includes('Triage'));
+      .find((button) => button.textContent?.includes('快速判断'));
     if (!startButton) throw new Error('Pilot Triage start button was not mounted');
     act(() => startButton.click());
     await flush();
@@ -622,7 +623,7 @@ describe('AppShell mounted Opportunity Fit confirmation recovery', () => {
     act(() => triageConfirmButton.click());
     await flush();
     const triageCommitButton = Array.from(host?.querySelectorAll<HTMLButtonElement>('button') ?? [])
-      .find((button) => button.textContent?.includes('确认 Triage'));
+      .find((button) => button.textContent?.includes('确认快速判断'));
     if (!triageCommitButton) throw new Error('Pilot Triage confirm button was not mounted');
     act(() => triageCommitButton.click());
     await flush();
@@ -803,7 +804,7 @@ describe('AppShell mounted Opportunity Fit confirmation recovery', () => {
     act(() => resumeSelect.dispatchEvent(new Event('change', { bubbles: true })));
     await flush();
     const startButton = Array.from(host?.querySelectorAll<HTMLButtonElement>('button') ?? [])
-      .find((button) => button.textContent?.includes('Triage'));
+      .find((button) => button.textContent?.includes('快速判断'));
     if (!startButton) throw new Error('Pilot Triage start button was not mounted');
     act(() => startButton.click());
     await flush();
@@ -840,7 +841,7 @@ describe('AppShell mounted Opportunity Fit confirmation recovery', () => {
     act(() => resumeSelect.dispatchEvent(new Event('change', { bubbles: true })));
     await flush();
     const startButton = Array.from(host?.querySelectorAll<HTMLButtonElement>('button') ?? [])
-      .find((button) => button.textContent?.includes('Triage'));
+      .find((button) => button.textContent?.includes('快速判断'));
     if (!startButton) throw new Error('Pilot Triage start button was not mounted');
     act(() => startButton.click());
     await flush();
@@ -890,7 +891,7 @@ describe('AppShell mounted Opportunity Fit confirmation recovery', () => {
     act(() => resumeSelect.dispatchEvent(new Event('change', { bubbles: true })));
     await flush();
     const triageButton = Array.from(host?.querySelectorAll<HTMLButtonElement>('button') ?? [])
-      .find((button) => button.textContent?.includes('Triage') && !button.textContent?.includes('确认'));
+      .find((button) => button.textContent?.includes('快速判断') && !button.textContent?.includes('确认'));
     if (!triageButton) throw new Error('Pilot Triage button was not mounted');
     act(() => triageButton.click());
     await flush();
@@ -926,6 +927,7 @@ describe('AppShell mounted Opportunity Fit confirmation recovery', () => {
 
 describe('AppShell Offer negotiation draft isolation', () => {
   beforeEach(() => {
+    window.history.replaceState(null, '', '/');
     window.matchMedia = () => ({ matches: false, addEventListener: () => undefined, removeEventListener: () => undefined }) as unknown as MediaQueryList;
     window.scrollTo = vi.fn();
     host = document.createElement('div');

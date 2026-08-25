@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { deriveTodayWorkspace } from './todayWorkspace';
+import { deriveTodayWorkspace, deriveWeeklyCompletedHighlight } from './todayWorkspace';
 
 const actions = Array.from({ length: 6 }, (_, index) => ({ id: `a-${index}`, title: `行动 ${index}` }));
 
@@ -25,5 +25,28 @@ describe('today workspace model', () => {
     expect(model.primaryAction).toBeNull();
     expect(model.otherActions).toEqual([]);
     expect(model.upcomingEvents.map((item) => item.id)).toEqual([2]);
+  });
+
+  it('falls back to the most important completed fact from this week', () => {
+    expect(deriveWeeklyCompletedHighlight({
+      now: '2026-08-21T09:00:00+08:00',
+      applications: [{
+        id: 1,
+        company_name: '星河科技',
+        position_name: '前端工程师',
+        applied_at: '2026-08-20T10:00:00+08:00',
+      }],
+      offers: [{
+        id: 2,
+        company_name: '远山科技',
+        position_name: '产品经理',
+        created_at: '2026-08-18T10:00:00+08:00',
+      }],
+    })).toEqual({
+      kind: 'offer',
+      id: 2,
+      title: '本周已完成：收到远山科技 Offer',
+      detail: '产品经理 · 已记录 Offer',
+    });
   });
 });

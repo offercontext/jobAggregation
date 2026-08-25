@@ -34,9 +34,10 @@ describe('OfferCard', () => {
     host = null;
   });
 
-  it('renders preparation as the primary action without replacing the coach', () => {
+  it('renders one preparation action and a return-to-application action', () => {
     const onNegotiation = vi.fn();
     const onCoach = vi.fn();
+    const onOpenApplication = vi.fn();
     host = document.createElement('div');
     document.body.appendChild(host);
     root = createRoot(host);
@@ -50,6 +51,7 @@ describe('OfferCard', () => {
           onCoach={onCoach}
           onNegotiation={onNegotiation}
           onView={vi.fn()}
+          onOpenApplication={onOpenApplication}
         />,
       );
     });
@@ -57,9 +59,9 @@ describe('OfferCard', () => {
     const prepare = host.querySelector<HTMLButtonElement>('[data-action="start-negotiation"]');
     const coach = host.querySelector<HTMLButtonElement>('[data-action="open-negotiation-coach"]');
     expect(host.querySelector('input[aria-label]')?.getAttribute('aria-label')).toContain('星云数据');
-    expect(prepare?.textContent).toContain('开始谈薪准备');
+    expect(prepare?.textContent).toContain('准备谈薪');
     expect(prepare?.className).toContain('ant-btn-primary');
-    expect(coach?.textContent).toContain('谈薪教练');
+    expect(coach).toBeNull();
     expect(host.textContent).toContain('星云数据');
     expect(host.textContent).toContain('后端工程师');
     expect(host.textContent).toContain('28K');
@@ -71,9 +73,12 @@ describe('OfferCard', () => {
     act(() => prepare?.click());
     expect(onNegotiation).toHaveBeenCalledWith(offer);
     expect(onCoach).not.toHaveBeenCalled();
+    const back = host.querySelector<HTMLButtonElement>('[data-action="open-application"]');
+    expect(back).toBeNull();
+    expect(onOpenApplication).not.toHaveBeenCalled();
   });
 
-  it('keeps the coach action explicit when preparation is unavailable', () => {
+  it('keeps one preparation entry when the host only provides the legacy coach callback', () => {
     const onCoach = vi.fn();
     host = document.createElement('div');
     document.body.appendChild(host);
@@ -83,8 +88,51 @@ describe('OfferCard', () => {
         <OfferCard offer={offer} selected onToggleSelect={vi.fn()} onCoach={onCoach} onView={vi.fn()} />,
       );
     });
-    expect(host!.querySelector('[data-action="start-negotiation"]')).toBeNull();
-    act(() => host!.querySelector<HTMLButtonElement>('[data-action="open-negotiation-coach"]')?.click());
+    expect(host!.querySelector('[data-action="start-negotiation"]')).not.toBeNull();
+    expect(host!.querySelector('[data-action="open-negotiation-coach"]')).toBeNull();
+    act(() => host!.querySelector<HTMLButtonElement>('[data-action="start-negotiation"]')?.click());
     expect(onCoach).toHaveBeenCalledWith(offer);
+  });
+
+  it('demotes preparation to a regular action when comparison owns the primary action', () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    act(() => {
+      root?.render(
+        <OfferCard
+          offer={offer}
+          selected={false}
+          onToggleSelect={vi.fn()}
+          onCoach={vi.fn()}
+          onNegotiation={vi.fn()}
+          emphasis="secondary"
+          onView={vi.fn()}
+        />,
+      );
+    });
+    expect(host.querySelector('[data-action="start-negotiation"]')?.className).not.toContain('ant-btn-primary');
+  });
+
+  it('returns to the owning application only when an offer is bound', () => {
+    const onOpenApplication = vi.fn();
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    act(() => {
+      root?.render(
+        <OfferCard
+          offer={{ ...offer, application_id: 42 }}
+          selected={false}
+          onToggleSelect={vi.fn()}
+          onCoach={vi.fn()}
+          onNegotiation={vi.fn()}
+          onView={vi.fn()}
+          onOpenApplication={onOpenApplication}
+        />,
+      );
+    });
+    act(() => host?.querySelector<HTMLButtonElement>('[data-action="open-application"]')?.click());
+    expect(onOpenApplication).toHaveBeenCalledWith(42);
   });
 });

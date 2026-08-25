@@ -68,8 +68,9 @@ export function buildPipelineNavigationCommands(
   return [
     { key: 'pipeline-board', label: '打开投递看板', hint: '投递', view: 'board' },
     { key: 'pipeline-list', label: '打开投递列表', hint: '投递', view: 'applications-list' },
-    { key: 'pipeline-calendar', label: '打开事件日历', hint: '投递', view: 'calendar' },
+    { key: 'pipeline-calendar', label: '打开事件日历', hint: '今日', view: 'calendar' },
     { key: 'pipeline-reminders', label: '打开今日提醒', hint: '今日', view: 'reminders' },
+    { key: 'pipeline-offers', label: '打开 Offer 中心', hint: 'Offer', view: 'offers' },
   ].map((item) => ({
     key: item.key,
     label: item.label,
@@ -228,6 +229,7 @@ export default function CommandPalette({
               onClick={c.run}
               onMouseEnter={() => setActiveIndex(index)}
               style={{
+                minHeight: 40,
                 padding: '10px 16px',
                 cursor: 'pointer',
                 background: index === activeIndex ? 'var(--op-layout-bg)' : undefined,

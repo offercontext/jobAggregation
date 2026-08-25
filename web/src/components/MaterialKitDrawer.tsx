@@ -126,7 +126,7 @@ function createDefaultContent(): MaterialKitContent {
     ],
     checklist: [
       { id: 'confirm_jd', label: '确认岗位 JD 和投递入口', done: false },
-      { id: 'select_resume', label: '选择最匹配的简历版本', done: false },
+      { id: 'select_resume', label: '选择本次实际使用的简历版本', done: false },
       { id: 'tailor_resume', label: '按岗位关键词调整简历', done: false },
       { id: 'prepare_message', label: '准备沟通话术和备注', done: false },
       { id: 'submit_application', label: '完成投递', done: false },
@@ -477,7 +477,7 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
       setConfirmationPreviewValid(true);
       confirmationSessionRef.current = null;
       blockedPreviewUpdatedAtRef.current = null;
-      message.success('投递证据已确认');
+      message.success('本次投递记录已保存');
     },
     onError: (error: unknown, variables) => {
       if (!isCurrentConfirmationSession(variables.applicationID, variables.sessionID)) return;
@@ -687,13 +687,13 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
   if (!open) return null;
 
   return (
-    <section className={styles.workspace} aria-label="投递材料包">
+    <section className={styles.workspace} aria-label={MATERIAL_FLOW_COPY.drawer.materialKitTitle}>
       <div className={styles.workspaceHeader}>
         <Button type="link" icon={<ArrowLeftOutlined />} className={styles.backButton} onClick={onClose}>
           返回投递详情
         </Button>
         <Typography.Title level={3} className={styles.workspaceTitle}>
-          投递材料包
+          {MATERIAL_FLOW_COPY.drawer.materialKitTitle}
         </Typography.Title>
       </div>
       <Spin spinning={kitQuery.isFetching && !kitQuery.data}>
@@ -713,7 +713,7 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
             <Form layout="vertical" className={styles.contextForm}>
               <Form.Item label="简历版本" required>
                 <Select
-                  placeholder="选择用于生成材料的简历"
+                  placeholder="选择本次实际使用的简历版本"
                   value={resumeID}
                   onChange={setResumeID}
                   options={resumeOptions}
@@ -812,19 +812,19 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
               ) : null}
             </Space>
 
-            <section className={styles.evidenceHistory} data-testid="evidence-history" aria-label="投递证据历史">
-              <Typography.Text className={styles.evidenceHistoryTitle}>投递证据历史</Typography.Text>
+            <section className={styles.evidenceHistory} data-testid="evidence-history" aria-label={MATERIAL_FLOW_COPY.drawer.evidenceHistoryTitle}>
+              <Typography.Text className={styles.evidenceHistoryTitle}>{MATERIAL_FLOW_COPY.drawer.evidenceHistoryTitle}</Typography.Text>
               {evidenceHistoryQuery.isError ? (
                 <div className={styles.historyError}>
-                  <Typography.Text>投递证据历史加载失败</Typography.Text>
+                  <Typography.Text>本次投递记录加载失败</Typography.Text>
                   <Button size="small" onClick={() => void evidenceHistoryQuery.refetch()}>
                     重新加载历史
                   </Button>
                 </div>
               ) : evidenceHistoryLoading ? (
-                <Typography.Text className={styles.evidenceEmpty}>正在加载投递证据历史，请稍候</Typography.Text>
+                <Typography.Text className={styles.evidenceEmpty}>正在加载本次投递记录，请稍候</Typography.Text>
               ) : evidenceHistory.length === 0 ? (
-                <Typography.Text className={styles.evidenceEmpty}>尚无已确认的投递证据</Typography.Text>
+                <Typography.Text className={styles.evidenceEmpty}>尚无本次投递记录</Typography.Text>
               ) : (
                 <>
                   <div className={styles.evidenceHistorySummary}>
@@ -842,7 +842,10 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
                         <Typography.Text className={styles.evidenceTime}>投递（本地）：{formatEvidenceTimestamp(entry.submitted_at)}</Typography.Text>
                         <Typography.Text className={styles.evidenceTime}>确认（本地）：{formatEvidenceTimestamp(entry.confirmed_at)}</Typography.Text>
                         <Typography.Text className={styles.evidenceTime}>确认方式：{formatConfirmationKind(entry.confirmation_kind)}</Typography.Text>
-                        <Typography.Text className={styles.evidenceHash}>{entry.bundle_sha256}</Typography.Text>
+                        <details>
+                          <summary>高级信息</summary>
+                          <Typography.Text className={styles.evidenceHash}>{entry.bundle_sha256}</Typography.Text>
+                        </details>
                         <Button
                           className={styles.evidenceDetailButton}
                           size="small"
@@ -995,7 +998,7 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
       />
       <Modal
         open={confirmationOpen}
-        title="确认投递证据"
+        title="确认本次投递记录"
         onCancel={closeConfirmation}
         destroyOnClose
         footer={(
@@ -1028,16 +1031,16 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
         )}
       >
         <ConfirmationPanel
-          title="确认投递证据"
-          description="请核对当前展示的来源后再确认；确认不会替你执行平台操作。"
+          title="确认本次投递记录"
+          description="请核对当前展示的来源后再保存；保存不会替你执行平台操作。"
           sources={confirmationPreview?.ready
-            ? [{ state: 'pending', detail: '待确认的证据预览' }]
+            ? [{ state: 'pending', detail: '待确认的本次投递记录预览' }]
             : []}
           className={styles.confirmationBody}
         >
           <Typography.Text className={styles.confirmationKind}>用户确认，非平台回执</Typography.Text>
           <Typography.Paragraph className={styles.confirmationHint}>
-            请根据下方只读来源摘要核对本次投递；确认后会保留这份材料快照的哈希。
+            请根据下方只读来源摘要核对本次投递；保存后会保留这份材料快照。
           </Typography.Paragraph>
 
           {confirmationPreview?.ready ? (
@@ -1045,22 +1048,25 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
               <div className={styles.sourceRow}>
                 <Typography.Text>岗位：{confirmationPreview.sources.application.company_name} · {confirmationPreview.sources.application.position_name}</Typography.Text>
               </div>
-              <div className={styles.sourceRow}>
-                <Typography.Text>简历：{confirmationPreview.sources.resume.title}</Typography.Text>
-                <Typography.Text className={styles.evidenceHash}>{confirmationPreview.sources.resume.sha256}</Typography.Text>
-              </div>
-              <div className={styles.sourceRow}>
-                <Typography.Text>JD：{confirmationPreview.sources.jd.characters} 字符</Typography.Text>
-                <Typography.Text className={styles.evidenceHash}>{confirmationPreview.sources.jd.sha256}</Typography.Text>
-              </div>
-              <div className={styles.sourceRow}>
-                <Typography.Text>材料包：#{confirmationPreview.sources.material_kit.id}</Typography.Text>
-                <Typography.Text className={styles.evidenceHash}>{confirmationPreview.sources.material_kit.sha256}</Typography.Text>
-              </div>
-              <div className={styles.bundleHash}>
-                <Typography.Text>证据哈希</Typography.Text>
-                <Typography.Text className={styles.evidenceHash}>{confirmationPreview.bundle_sha256}</Typography.Text>
-              </div>
+              <Typography.Text>简历：{confirmationPreview.sources.resume.title}</Typography.Text>
+              <Typography.Text>JD：{confirmationPreview.sources.jd.characters} 字符</Typography.Text>
+              <details>
+                <summary>高级信息</summary>
+                <div className={styles.sourceRow}>
+                  <Typography.Text>简历版本摘要：{confirmationPreview.sources.resume.sha256}</Typography.Text>
+                </div>
+                <div className={styles.sourceRow}>
+                  <Typography.Text>JD 摘要：{confirmationPreview.sources.jd.sha256}</Typography.Text>
+                </div>
+                <div className={styles.sourceRow}>
+                  <Typography.Text>投递准备编号：#{confirmationPreview.sources.material_kit.id}</Typography.Text>
+                  <Typography.Text className={styles.evidenceHash}>{confirmationPreview.sources.material_kit.sha256}</Typography.Text>
+                </div>
+                <div className={styles.bundleHash}>
+                  <Typography.Text>本次记录摘要</Typography.Text>
+                  <Typography.Text className={styles.evidenceHash}>{confirmationPreview.bundle_sha256}</Typography.Text>
+                </div>
+              </details>
             </div>
           ) : (
             <div className={styles.previewIssues}>
@@ -1096,7 +1102,7 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
       </Modal>
       <Modal
         open={evidenceDetailOpen}
-        title="投递证据详情"
+        title="本次投递记录详情"
         onCancel={closeEvidenceDetail}
         destroyOnClose
         footer={(
@@ -1108,7 +1114,7 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
         <div className={styles.evidenceDetailBody}>
           <Typography.Text className={styles.confirmationKind}>只读证据快照</Typography.Text>
           {evidenceDetailLoading ? (
-            <Typography.Text className={styles.evidenceEmpty}>正在加载投递证据详情，请稍候</Typography.Text>
+            <Typography.Text className={styles.evidenceEmpty}>正在加载本次投递记录详情，请稍候</Typography.Text>
           ) : evidenceDetailError ? (
             <Alert type="error" showIcon message={evidenceDetailError} />
           ) : evidenceDetail ? (
@@ -1118,9 +1124,12 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
                 <Typography.Text className={styles.evidenceTime}>投递（本地）：{formatEvidenceTimestamp(evidenceDetail.submitted_at)}</Typography.Text>
                 <Typography.Text className={styles.evidenceTime}>确认（本地）：{formatEvidenceTimestamp(evidenceDetail.confirmed_at)}</Typography.Text>
                 <Typography.Text className={styles.evidenceTime}>确认方式：{formatConfirmationKind(evidenceDetail.confirmation_kind)}</Typography.Text>
-                <Typography.Text className={styles.evidenceHash}>{evidenceDetail.bundle_sha256}</Typography.Text>
               </div>
-              <pre className={styles.evidenceSnapshot}>{JSON.stringify(evidenceDetail.snapshot, null, 2)}</pre>
+              <details>
+                <summary>高级信息</summary>
+                <Typography.Text className={styles.evidenceHash}>{evidenceDetail.bundle_sha256}</Typography.Text>
+                <pre className={styles.evidenceSnapshot}>{JSON.stringify(evidenceDetail.snapshot, null, 2)}</pre>
+              </details>
             </>
           ) : null}
         </div>

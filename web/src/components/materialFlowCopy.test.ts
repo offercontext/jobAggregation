@@ -1,7 +1,17 @@
 import { describe, expect, it } from 'vitest';
-import { materialFlowErrorMessage } from './materialFlowCopy';
+import {
+  MATERIAL_FLOW_COPY,
+  materialEvidenceSourceLabel,
+  materialFlowErrorMessage,
+} from './materialFlowCopy';
 
 describe('material flow error copy', () => {
+  it('uses the task language for preparation and the current delivery record', () => {
+    expect(MATERIAL_FLOW_COPY.drawer.materialKitTitle).toBe('投递准备');
+    expect(MATERIAL_FLOW_COPY.drawer.evidenceHistoryTitle).toBe('本次投递记录');
+    expect(materialEvidenceSourceLabel('evidence_bundle')).toBe('本次投递记录');
+  });
+
   it('uses a neutral message for a general HTTP 409', () => {
     expect(materialFlowErrorMessage({ response: { status: 409 } }, 'general'))
       .toBe('操作未完成，请稍后重试');

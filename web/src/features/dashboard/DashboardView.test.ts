@@ -15,8 +15,11 @@ describe('DashboardView onboarding actions', () => {
     expect(source).toContain('数据分析');
     expect(source).toContain('defaultActiveKey={[]}');
     expect(source).toContain('todayWorkspace.otherActions');
+    expect(source).toContain("onNavigate('calendar')");
+    expect(source).toContain('deriveWeeklyCompletedHighlight');
     expect(source).not.toContain('<NextStepSuggestions');
     expect(source).not.toContain('<MissionHeader');
+    expect(source).not.toContain('<Button type="primary"');
   });
 
   it('consumes shell-owned workspace data without refetching the same collections', () => {

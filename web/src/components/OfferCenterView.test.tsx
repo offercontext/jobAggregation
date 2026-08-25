@@ -3,6 +3,7 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Offer } from '@/types/offer';
+import type { Application } from '@/types/application';
 import OfferCenterView from './OfferCenterView';
 import { confirmOfferNegotiationProposal, createOfferNegotiationProposal } from '@/services/offers';
 
@@ -29,10 +30,26 @@ vi.mock('@/services/offers', () => ({
     constructor(public status: number, public code: string | null) { super(code ?? 'error'); }
   },
 }));
-vi.mock('@/components/OfferCard', () => ({ default: ({ offer, onToggleSelect }: { offer: Offer; onToggleSelect: (id: number) => void }) => (
-  <button type="button" data-testid={`select-${offer.id}`} onClick={() => onToggleSelect(offer.id)}>{offer.company_name}</button>
+vi.mock('@/components/OfferCard', () => ({ default: ({
+  offer,
+  onToggleSelect,
+  onOpenApplication,
+  onNegotiation,
+}: {
+  offer: Offer;
+  onToggleSelect: (id: number) => void;
+  onOpenApplication?: (id: number) => void;
+  onNegotiation?: (offer: Offer) => void;
+}) => (
+  <>
+    <button type="button" data-testid={`select-${offer.id}`} onClick={() => onToggleSelect(offer.id)}>{offer.company_name}</button>
+    {offer.application_id ? <button type="button" data-testid={`return-${offer.id}`} onClick={() => onOpenApplication?.(offer.application_id!)}>return</button> : null}
+    {onNegotiation ? <button type="button" data-testid={`prepare-${offer.id}`} onClick={() => onNegotiation(offer)}>prepare</button> : null}
+  </>
 ) }));
-vi.mock('@/components/AddOfferForm', () => ({ default: () => null }));
+vi.mock('@/components/AddOfferForm', () => ({ default: ({ open, requestToken }: { open?: boolean; requestToken?: string | null }) => (
+  <div data-testid="add-offer-form" data-open={String(Boolean(open))} data-request-token={requestToken ?? ''} />
+) }));
 vi.mock('@/components/OfferCompareDrawer', () => ({ default: ({ offers, onNegotiation }: { offers: Offer[]; onNegotiation?: (offer: Offer) => void }) => (
   <div data-testid="compare-offers">
     {offers.map((offer) => offer.id).join(',')}
@@ -58,13 +75,18 @@ describe('OfferCenterView comparison guardrails', () => {
     host = null;
   });
 
-  it('guides entry with one primary action when there are no offers', async () => {
+  it('guides an empty workspace through the required application binding without adding another primary action', async () => {
     queryState.offers = [];
+    const onAddApplication = vi.fn();
     host = document.createElement('div');
     document.body.appendChild(host);
     root = createRoot(host);
-    await act(async () => { root?.render(<OfferCenterView applications={[]} onCoach={vi.fn()} />); });
-    expect(host.textContent).toContain('录入第一份 Offer');
+    await act(async () => { root?.render(<OfferCenterView applications={[]} onCoach={vi.fn()} onAddApplication={onAddApplication} />); });
+    expect(host.textContent).toContain('Offer 必须绑定所属投递');
+    expect(host.textContent).toContain('先添加投递');
+    expect(host.querySelector('.ant-btn-primary')).toBeNull();
+    await act(async () => { [...(host?.querySelectorAll('button') ?? [])].find((button) => button.textContent?.includes('先添加投递'))?.click(); });
+    expect(onAddApplication).toHaveBeenCalledOnce();
     expect(host.textContent).not.toContain('比较维度');
   });
 
@@ -87,6 +109,9 @@ describe('OfferCenterView comparison guardrails', () => {
     await act(async () => { root?.render(<OfferCenterView applications={[]} onCoach={vi.fn()} />); });
     expect(host.textContent).toContain('选择至少两份 Offer 进行比较');
     expect(host.querySelector('[data-selected-comparison-dimensions]')).toBeNull();
+    const compare = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('开始比较'));
+    expect(compare).toBeTruthy();
+    expect(compare?.classList.contains('ant-btn-primary')).toBe(false);
   });
 
   it('does not show unsupported aggregate claims for any offer count', async () => {
@@ -108,7 +133,7 @@ describe('OfferCenterView comparison guardrails', () => {
     await act(async () => { root?.render(<OfferCenterView applications={[]} onCoach={vi.fn()} />); });
     await act(async () => { host?.querySelector<HTMLButtonElement>('[data-testid="select-2"]')?.click(); });
     await act(async () => { host?.querySelector<HTMLButtonElement>('[data-testid="select-1"]')?.click(); });
-    await act(async () => { host?.querySelector<HTMLButtonElement>('button:not([data-testid])')?.click(); });
+    await act(async () => { [...(host?.querySelectorAll('button') ?? [])].find((button) => button.textContent?.includes('开始比较'))?.click(); });
     expect(host?.querySelector('[data-testid="compare-offers"]')?.textContent).toContain('2,1');
   });
 
@@ -120,7 +145,7 @@ describe('OfferCenterView comparison guardrails', () => {
     await act(async () => { root?.render(<OfferCenterView applications={[]} onCoach={vi.fn()} />); });
     await act(async () => { host?.querySelector<HTMLButtonElement>('[data-testid="select-1"]')?.click(); });
     await act(async () => { host?.querySelector<HTMLButtonElement>('[data-testid="select-2"]')?.click(); });
-    await act(async () => { host?.querySelector<HTMLButtonElement>('button:not([data-testid])')?.click(); });
+    await act(async () => { [...(host?.querySelectorAll('button') ?? [])].find((button) => button.textContent?.includes('开始比较'))?.click(); });
     await act(async () => { host?.querySelector<HTMLButtonElement>('[data-testid="compare-negotiate"]')?.click(); });
     expect(host?.querySelector('[data-testid="offer-negotiation-drawer"]')).not.toBeNull();
   });
@@ -135,9 +160,57 @@ describe('OfferCenterView comparison guardrails', () => {
     await act(async () => { root?.render(<OfferCenterView applications={[]} onCoach={vi.fn()} />); });
     await act(async () => { host?.querySelector<HTMLButtonElement>('[data-testid="select-1"]')?.click(); });
     await act(async () => { host?.querySelector<HTMLButtonElement>('[data-testid="select-2"]')?.click(); });
-    await act(async () => { host?.querySelector<HTMLButtonElement>('button:not([data-testid])')?.click(); });
+    await act(async () => { [...(host?.querySelectorAll('button') ?? [])].find((button) => button.textContent?.includes('开始比较'))?.click(); });
     expect(host?.querySelector('[data-testid="compare-offers"]')).not.toBeNull();
     expect(createOfferNegotiationProposal).not.toHaveBeenCalled();
     expect(confirmOfferNegotiationProposal).not.toHaveBeenCalled();
   });
+
+  it('uses a fresh request token for every root-triggered offer entry', async () => {
+    queryState.offers = [];
+    const createRequestToken = vi.fn(() => 'offer-entry-1');
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    await act(async () => { root?.render(<OfferCenterView applications={applications} onCoach={vi.fn()} createRequestToken={createRequestToken} />); });
+    await act(async () => { [...(host?.querySelectorAll('button') ?? [])].find((button) => button.textContent?.includes('录入第一份 Offer'))?.click(); });
+    expect(createRequestToken).toHaveBeenCalledOnce();
+    expect(host?.querySelector('[data-testid="add-offer-form"]')?.getAttribute('data-request-token')).toBe('offer-entry-1');
+  });
+
+  it('consumes only a newly incremented numeric token and does not replay a stale token on mount', async () => {
+    queryState.offers = [];
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    await act(async () => { root?.render(<OfferCenterView applications={applications} onCoach={vi.fn()} createRequestToken={1} />); });
+    expect(host?.querySelector('[data-testid="add-offer-form"]')?.getAttribute('data-open')).toBe('false');
+    await act(async () => { root?.render(<OfferCenterView applications={applications} onCoach={vi.fn()} createRequestToken={2} />); });
+    expect(host?.querySelector('[data-testid="add-offer-form"]')?.getAttribute('data-open')).toBe('true');
+    expect(host?.querySelector('[data-testid="add-offer-form"]')?.getAttribute('data-request-token')).toBe('2');
+  });
+
+  it('returns a bound offer to its canonical application', async () => {
+    queryState.offers = [{ ...offer(1), application_id: 42 }];
+    const onOpenApplication = vi.fn();
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    await act(async () => { root?.render(<OfferCenterView applications={[]} onCoach={vi.fn()} onOpenApplication={onOpenApplication} />); });
+    await act(async () => { host?.querySelector<HTMLButtonElement>('[data-testid="return-1"]')?.click(); });
+    expect(onOpenApplication).toHaveBeenCalledWith(42);
+  });
 });
+
+const applications = [{
+  id: 7,
+  company_name: 'Company 7',
+  position_name: 'Engineer',
+  job_url: '',
+  status: 'offer',
+  source: 'manual',
+  notes: '',
+  applied_at: '2026-07-01T00:00:00Z',
+  created_at: '2026-07-01T00:00:00Z',
+  updated_at: '2026-07-01T00:00:00Z',
+}] satisfies Application[];

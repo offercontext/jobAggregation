@@ -66,6 +66,7 @@ const ACTIVITY_COPY: Record<PilotMascotActivity, { label: string; detail: string
 
 const MASCOT_FRAME = {
   expanded: { width: 238, height: 370 },
+  narrowDesktop: { width: 150, height: 238 },
   compact: { width: 116, height: 174 },
 } as const;
 
@@ -193,7 +194,11 @@ export default function PilotMascot({
       : panelOpen ? '收起 OfferPilot 领航员' : '打开 OfferPilot 领航员';
   const buttonLabel = loadFailed ? `${actionLabel}（Haru 暂时休息中）` : actionLabel;
 
-  const frame = panelOpen || placement === 'pilot-page' || (studioPlacement && viewport.height < 740) ? MASCOT_FRAME.compact : MASCOT_FRAME.expanded;
+  const frame = panelOpen || placement === 'pilot-page' || (studioPlacement && viewport.height < 740)
+    ? MASCOT_FRAME.compact
+    : viewport.width <= 900
+      ? MASCOT_FRAME.narrowDesktop
+      : MASCOT_FRAME.expanded;
   const frameWidth = Math.round(frame.width * normalizedZoom * 10) / 10;
   const frameHeight = Math.round(frame.height * normalizedZoom * 10) / 10;
   const activePosition = position ?? localPosition;

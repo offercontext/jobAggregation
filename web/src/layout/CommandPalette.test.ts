@@ -44,6 +44,8 @@ describe('CommandPalette resume commands', () => {
   it('uses the unified settings destination wording', () => {
     expect(source).toContain("label: '打开设置'");
     expect(source).not.toContain('打开 AI 设置');
+    expect(source).toContain('打开 Offer 中心');
+    expect(source).toContain("hint: '今日'");
   });
 
   it('builds application search commands without soft-deleted rows', () => {
@@ -75,9 +77,12 @@ describe('CommandPalette resume commands', () => {
       '打开投递列表',
       '打开事件日历',
       '打开今日提醒',
+      '打开 Offer 中心',
     ]);
 
     commands[1].run();
     expect(navigated).toEqual(['applications-list']);
+    commands[4].run();
+    expect(navigated).toEqual(['applications-list', 'offers']);
   });
 });

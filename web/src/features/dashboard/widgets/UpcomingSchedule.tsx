@@ -1,9 +1,16 @@
 import dayjs from 'dayjs';
+import { Button } from 'antd';
 import type { ScheduleEvent } from '@/types/event';
 import { EVENT_TYPE_LABELS } from '@/types/event';
 import styles from '../dashboard.module.css';
 
-export default function UpcomingSchedule({ events }: { events: ScheduleEvent[] }) {
+export default function UpcomingSchedule({
+  events,
+  onOpenCalendar,
+}: {
+  events: ScheduleEvent[];
+  onOpenCalendar?: () => void;
+}) {
   const upcoming = events
     .filter((e) => e.scheduled_at && dayjs(e.scheduled_at).isAfter(dayjs()))
     .sort((a, b) => dayjs(a.scheduled_at).valueOf() - dayjs(b.scheduled_at).valueOf())
@@ -11,7 +18,10 @@ export default function UpcomingSchedule({ events }: { events: ScheduleEvent[] }
 
   return (
     <div className={styles.card}>
-      <div className={styles.cardTitle}>近期日程</div>
+      <div className={styles.sectionHeaderLine}>
+        <div className={styles.cardTitle}>近期日程</div>
+        {onOpenCalendar ? <Button type="link" onClick={onOpenCalendar}>打开日历</Button> : null}
+      </div>
       {upcoming.length === 0 ? (
         <div className={styles.empty}>暂无安排</div>
       ) : (

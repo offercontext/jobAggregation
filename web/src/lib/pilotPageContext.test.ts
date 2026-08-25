@@ -48,17 +48,17 @@ const offer: Offer = {
 describe('pilot page context', () => {
   it('labels every current module view', () => {
     expect(PILOT_VIEW_LABELS).toEqual({
-      dashboard: '工作台总览',
+      dashboard: '今日',
       board: '投递看板',
       'applications-list': '投递列表',
       calendar: '投递日历',
       reminders: '提醒',
       interview: '面试',
-      reviews: '面试复盘',
+      reviews: '经历素材',
       offers: 'Offer',
-      knowledge: '知识库',
+      knowledge: '参考资料',
       questions: '题库',
-      resumes: '简历库',
+      resumes: '简历',
       pilot: 'Pilot',
       settings: '设置',
     });
@@ -67,7 +67,7 @@ describe('pilot page context', () => {
   it('builds context for a normal module page', () => {
     expect(buildPilotPageContext({ view: 'dashboard' })).toEqual({
       view: 'dashboard',
-      label: '工作台总览',
+      label: '今日',
     });
   });
 

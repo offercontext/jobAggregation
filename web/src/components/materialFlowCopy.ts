@@ -17,10 +17,12 @@ export const MATERIAL_FLOW_COPY = {
     confirmTitle: '确认创建派生简历',
     createDerivedResume: '创建派生简历',
     backToReview: '返回审核',
-    confirmBody: '这会创建一个新的派生简历版本，并将投递材料包改为指向该版本。不会覆盖来源简历。',
+    confirmBody: '这会创建一个新的派生简历版本，并将投递准备改为指向该版本。不会覆盖来源简历。',
     selectChange: (id: string) => `选择变更 ${id}`,
   },
   drawer: {
+    materialKitTitle: '投递准备',
+    evidenceHistoryTitle: '本次投递记录',
     candidateFactsLabel: '候选人补充事实（每行一条）',
     candidateFactsPlaceholder: '每行填写一条候选人事实',
     generateProposal: '生成基于证据的简历提案',
@@ -44,13 +46,13 @@ export const MATERIAL_FLOW_COPY = {
 
 const EVIDENCE_SOURCE_LABELS: Record<MaterialEvidenceSource, string> = {
   resume: '简历',
-  evidence_bundle: '已确认的投递证据快照',
+  evidence_bundle: '本次投递记录',
   user_assertion: '用户断言',
 };
 
 const EVIDENCE_PREVIEW_ISSUE_LABELS: Record<string, string> = {
-  '缺少投递材料包': '缺少投递材料包',
-  '投递材料包不唯一': '投递材料包不唯一，请保留一份有效材料包',
+  '缺少投递材料包': '缺少投递准备',
+  '投递材料包不唯一': '投递准备不唯一，请保留一份有效投递准备',
   '缺少职位描述': '缺少职位描述，请补充 JD',
   '缺少关联简历': '缺少关联简历，请先选择简历',
   '关联简历不存在或已删除': '关联简历不存在或已删除，请重新选择简历',

@@ -81,6 +81,12 @@ function ContextHarness({
   );
 }
 
+function FirstUseHarness() {
+  const surface = useAssistantSurface();
+  useEffect(() => surface.openHaru(), []);
+  return <HaruChatWindow returnFocusRef={{ current: null }} />;
+}
+
 describe('HaruChatWindow', () => {
   beforeEach(() => {
     host = document.createElement('div');
@@ -100,7 +106,8 @@ describe('HaruChatWindow', () => {
     ));
     expect(host!.querySelector('[role="dialog"]')?.textContent).toContain('先准备项目案例。');
     expect(host!.textContent).toContain('星河科技 · 前端工程师 · 1 个附件');
-    expect(host!.textContent).toContain('有一项操作等你确认');
+    expect(host!.textContent).toContain('这一步会修改「星河科技 · 前端工程师」的内容');
+    expect(host!.textContent).toContain('查看修改内容');
 
     act(() => host!.querySelector<HTMLButtonElement>('[data-testid="haru-open-pending"]')?.click());
     expect(host!.querySelector('[role="dialog"]')).toBeNull();
@@ -192,5 +199,13 @@ describe('HaruChatWindow', () => {
       <AssistantSurfaceProvider><Harness stop={vi.fn()} /></AssistantSurfaceProvider>,
     ));
     expect(document.activeElement).toBe(host!.querySelector('[role="dialog"]'));
+  });
+
+  it('explains the relationship between Haru and Pilot on first use', async () => {
+    await act(async () => root?.render(
+      <AssistantSurfaceProvider><FirstUseHarness /></AssistantSurfaceProvider>,
+    ));
+    expect(host!.textContent).toContain('Haru 是 Pilot 的轻量窗口');
+    expect(host!.textContent).toContain('对话不会丢失');
   });
 });

@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { Modal, Form, Input, InputNumber, Select, App as AntApp } from 'antd';
+import { Alert, Modal, Form, Input, InputNumber, Select, App as AntApp } from 'antd';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import type { Application } from '@/types/application';
 import type { Offer, OfferInput, OfferStatus } from '@/types/offer';
@@ -11,6 +11,7 @@ interface Props {
   onClose: () => void;
   applications: Application[];
   editing?: Offer | null;
+  requestToken?: string | null;
 }
 
 const STATUS_OPTIONS = (Object.keys(OFFER_STATUS_LABELS) as OfferStatus[]).map((s) => ({
@@ -18,7 +19,7 @@ const STATUS_OPTIONS = (Object.keys(OFFER_STATUS_LABELS) as OfferStatus[]).map((
   label: OFFER_STATUS_LABELS[s],
 }));
 
-export default function AddOfferForm({ open, onClose, applications, editing }: Props) {
+export default function AddOfferForm({ open, onClose, applications, editing, requestToken }: Props) {
   const [form] = Form.useForm();
   const { message: toast } = AntApp.useApp();
   const qc = useQueryClient();
@@ -26,13 +27,35 @@ export default function AddOfferForm({ open, onClose, applications, editing }: P
   useEffect(() => {
     if (open) {
       if (editing) {
-        form.setFieldsValue(editing);
+        form.setFieldsValue({ ...editing, application_id: editing.application_id });
       } else {
         form.resetFields();
         form.setFieldsValue({ months_per_year: 12, status: 'pending' });
       }
     }
   }, [open, editing, form]);
+
+  const applicationOptions = applications.map((application) => ({
+    value: application.id,
+    label: `#${application.id} ${application.company_name} - ${application.position_name}`,
+  }));
+  if (editing?.application_id && !applicationOptions.some((option) => option.value === editing.application_id)) {
+    applicationOptions.unshift({
+      value: editing.application_id,
+      label: `#${editing.application_id}（当前绑定投递不可见）`,
+    });
+  }
+
+  const submit = (values: OfferInput) => {
+    if (!editing && (!Number.isInteger(values.application_id) || Number(values.application_id) <= 0)) {
+      form.setFields([{ name: 'application_id', errors: ['请选择所属投递'] }]);
+      return;
+    }
+    const payload: OfferInput = editing
+      ? { ...values, application_id: editing.application_id }
+      : { ...values, application_id: Number(values.application_id) };
+    mutation.mutate(payload);
+  };
 
   const mutation = useMutation({
     mutationFn: async (values: OfferInput) => {
@@ -58,19 +81,34 @@ export default function AddOfferForm({ open, onClose, applications, editing }: P
       onOk={() => form.submit()}
       confirmLoading={mutation.isPending}
       destroyOnHidden
+      data-request-token={requestToken ?? undefined}
     >
-      <Form form={form} layout="vertical" onFinish={(v) => mutation.mutate(v as OfferInput)}>
+      {!editing?.application_id && editing ? (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 16 }}
+          message="历史 Offer 尚未绑定所属投递"
+          description="本次仅可编辑 Offer 信息，不能在这里补绑定；返回投递入口不可用。"
+        />
+      ) : null}
+      <Form form={form} layout="vertical" onFinish={(v) => submit(v as OfferInput)}>
         <Form.Item name="company_name" label="公司" rules={[{ required: true, message: '请输入公司' }]}>
           <Input />
         </Form.Item>
         <Form.Item name="position_name" label="岗位" rules={[{ required: true, message: '请输入岗位' }]}>
           <Input />
         </Form.Item>
-        <Form.Item name="application_id" label="关联投递（可选）">
+        <Form.Item
+          name="application_id"
+          label="关联投递"
+          rules={editing ? undefined : [{ required: true, message: '请选择所属投递' }]}
+        >
           <Select
-            allowClear
+            disabled={Boolean(editing)}
+            allowClear={!editing}
             placeholder="选择投递记录"
-            options={applications.map((a) => ({ value: a.id, label: `#${a.id} ${a.company_name} - ${a.position_name}` }))}
+            options={applicationOptions}
           />
         </Form.Item>
         <Form.Item name="status" label="状态">

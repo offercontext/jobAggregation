@@ -274,6 +274,20 @@
   .statusDot { animation: none !important; }
 }
 
+@media (min-width: 768px) and (max-width: 900px) {
+  .mascot {
+    right: 8px;
+    bottom: 12px;
+    width: 150px;
+    height: 238px;
+  }
+
+  .canvasHost { bottom: 24px; }
+  .nameplate { min-height: 28px; padding: 4px 9px; font-size: 10px; }
+  .normalLayout .bubble,
+  .bubble { right: 70%; max-width: 150px; padding: 8px 10px; }
+}
+
 @media (max-width: 767px) {
   .mascot { display: none; }
 }

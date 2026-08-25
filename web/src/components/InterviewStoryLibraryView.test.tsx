@@ -57,6 +57,7 @@ describe('InterviewStoryLibraryView', () => {
     expect(container?.textContent).toContain('面试故事库');
     expect(container?.textContent).toContain('订单延迟排查');
     const create = [...(container?.querySelectorAll('button') ?? [])].find((button) => button.textContent === '新建故事');
+    expect(create?.className).not.toContain('ant-btn-primary');
     act(() => create?.dispatchEvent(new MouseEvent('click', { bubbles: true })));
     expect(open).toHaveBeenCalledWith({ entrypoint: 'ui', reviewNoteId: undefined });
   });

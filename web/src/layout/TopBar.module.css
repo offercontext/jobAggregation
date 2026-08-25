@@ -1,0 +1,68 @@
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 18px 24px;
+}
+
+.greetingBlock {
+  min-width: 0;
+}
+
+.greeting {
+  overflow: hidden;
+  color: var(--op-ink);
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.date {
+  margin-top: 2px;
+  color: var(--op-muted);
+  font-size: 12px;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.actionButton,
+.primaryAction {
+  min-width: 40px;
+  min-height: 40px;
+}
+
+.actionButton:focus-visible,
+.primaryAction:focus-visible {
+  outline: 2px solid var(--op-primary);
+  outline-offset: 2px;
+  box-shadow: var(--op-focus-ring);
+}
+
+@media (max-width: 720px) {
+  .topbar {
+    align-items: flex-start;
+    flex-direction: column;
+    padding: 16px;
+  }
+
+  .actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .actionButton,
+  .primaryAction {
+    transition: none;
+  }
+}

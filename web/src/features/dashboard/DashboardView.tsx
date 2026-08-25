@@ -28,7 +28,7 @@ import {
   ONBOARDING_QUERY_KEY,
   setOnboardingForceOpen,
 } from '@/services/onboarding';
-import { deriveTodayWorkspace } from './todayWorkspace';
+import { deriveTodayWorkspace, deriveWeeklyCompletedHighlight } from './todayWorkspace';
 import type { Application } from '@/types/application';
 import type { ScheduleEvent } from '@/types/event';
 import type { Offer } from '@/types/offer';
@@ -165,6 +165,10 @@ export default function DashboardView({
     () => deriveTodayWorkspace({ actions: mission.actions, events, now }),
     [events, mission.actions, now],
   );
+  const completedHighlight = useMemo(
+    () => deriveWeeklyCompletedHighlight({ applications: apps, offers, now }),
+    [apps, offers, now],
+  );
   const selectedInsight = useMemo(
     () => insights.find((item) => item.id === selectedInsightId) ?? null,
     [insights, selectedInsightId],
@@ -221,7 +225,7 @@ export default function DashboardView({
           <div style={{ color: 'var(--op-muted)', marginBottom: 16 }}>
             添加投递后，OfferPilot 会自动生成跟进提醒、面试准备和 Offer 截止期行动。
           </div>
-          <Button type="primary" onClick={onAddApplication}>
+          <Button onClick={onAddApplication}>
             添加第一个投递
           </Button>
         </div>
@@ -251,9 +255,16 @@ export default function DashboardView({
               <h1 id="today-primary-title" className={styles.todayPrimaryTitle}>{todayWorkspace.primaryAction.title}</h1>
               <p className={styles.todayPrimaryReason}>{todayWorkspace.primaryAction.reason}</p>
             </div>
-            <Button type="primary" size="large" onClick={() => handleAction(todayWorkspace.primaryAction!)}>
+            <Button size="large" onClick={() => handleAction(todayWorkspace.primaryAction!)}>
               {todayWorkspace.primaryAction.primaryAction.label}
             </Button>
+          </div>
+        ) : completedHighlight ? (
+          <div className={styles.todayPrimaryContent}>
+            <div>
+              <h1 id="today-primary-title" className={styles.todayPrimaryTitle}>{completedHighlight.title}</h1>
+              <p className={styles.todayPrimaryReason}>{completedHighlight.detail}</p>
+            </div>
           </div>
         ) : (
           <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="今天没有需要立即处理的行动。" />
@@ -279,7 +290,7 @@ export default function DashboardView({
 
       <div className={styles.todayLowerGrid}>
         <section aria-label="未来 7 天日程">
-          <UpcomingSchedule events={todayWorkspace.upcomingEvents} />
+          <UpcomingSchedule events={todayWorkspace.upcomingEvents} onOpenCalendar={() => onNavigate('calendar')} />
         </section>
         <section aria-label="本周进度">
           <WeeklyMissionPanel metrics={mission.metrics} unavailableKinds={missionUnavailableKinds} onNavigate={onNavigate} />

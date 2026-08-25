@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   getOpportunityFitErrorMessage,
+  OPPORTUNITY_FIT_COPY,
   opportunityFitEvidenceLabel,
   opportunityFitGapKindLabel,
   opportunityFitRecommendationLabel,
@@ -10,6 +11,15 @@ import {
 } from './opportunityFitCopy';
 
 describe('opportunity fit copy', () => {
+  it('uses the Chinese task language for triage, deep review, and frozen sources', () => {
+    expect(OPPORTUNITY_FIT_COPY.drawer.startTriage).toBe('开始快速判断');
+    expect(OPPORTUNITY_FIT_COPY.drawer.triage).toBe('快速判断');
+    expect(OPPORTUNITY_FIT_COPY.drawer.startDeepReview).toBe('开始深入分析');
+    expect(OPPORTUNITY_FIT_COPY.drawer.deepReview).toBe('深入分析');
+    expect(OPPORTUNITY_FIT_COPY.drawer.sourceFrozen).toBe('已保留当时版本');
+    expect(OPPORTUNITY_FIT_COPY.drawer.sourceChanged).toBe('原资料已更新，本次结果仍使用旧版');
+  });
+
   it('maps a provider 502 to safe configuration copy', () => {
     expect(getOpportunityFitErrorMessage({
       response: {

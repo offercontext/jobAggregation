@@ -112,7 +112,7 @@ export default function OfferComparisonDimensionPanel({ offers, onSelectionChang
           value={draftLabel}
           onChange={(event) => setDraftLabel(event.target.value)}
         />
-        <Button type="primary" data-action="create-dimension" onClick={() => void createDimension()}>新增维度</Button>
+        <Button data-action="create-dimension" onClick={() => void createDimension()}>新增维度</Button>
       </div>
       {dimensions.length === 0 ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有自定义比较维度" /> : dimensions.map((dimension) => {
         const active = dimension.archived_at === null;

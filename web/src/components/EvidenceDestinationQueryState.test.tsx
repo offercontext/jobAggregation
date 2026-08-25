@@ -83,7 +83,9 @@ vi.mock('@/components/OfferCard', () => ({ default: () => <div /> }));
 vi.mock('@/components/AddOfferForm', () => ({ default: () => <div /> }));
 vi.mock('@/components/OfferCompareDrawer', () => ({ default: () => <div /> }));
 vi.mock('@/components/ResumeCard', () => ({ default: () => <div /> }));
-vi.mock('@/components/ResumeUploadModal', () => ({ default: () => <div /> }));
+vi.mock('@/components/ResumeUploadModal', () => ({
+  default: (props: { open?: boolean }) => <div data-testid="resume-upload-modal" data-open={String(Boolean(props.open))} />,
+}));
 vi.mock('@/components/ResumeEditorDrawer', () => ({ default: () => <div /> }));
 vi.mock('@/components/ScheduleEventForm', () => ({ default: () => <div /> }));
 
@@ -162,6 +164,15 @@ describe('evidence destination query states', () => {
     setQueryState({ data: [] });
     expect(() => rerender(<ResumeLibraryView />)).not.toThrow();
     expect(view.textContent).toContain('简历库');
+  });
+
+  it('opens the page-owned Resume upload flow only for a newly incremented shell token', () => {
+    setQueryState({ data: [] });
+    const view = render(<ResumeLibraryView uploadRequestToken={1} />);
+
+    expect(view.querySelector('[data-testid="resume-upload-modal"]')?.getAttribute('data-open')).toBe('false');
+    rerender(<ResumeLibraryView uploadRequestToken={2} />);
+    expect(view.querySelector('[data-testid="resume-upload-modal"]')?.getAttribute('data-open')).toBe('true');
   });
 
   it('prioritises Calendar selected-date loading over empty-day copy', () => {

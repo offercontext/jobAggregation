@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import TYPE_CHECKING, Any, Generic, Literal, NoReturn, SupportsIndex, TypeAlias, TypeVar
+
+from offerpilot.ai.tool_runtime.policy_types import UndoPolicy as UndoPolicy
 
 if TYPE_CHECKING:
     from offerpilot.ai.tool_authority.contracts import AuthorityInstanceToken, PreparedInstanceToken
@@ -265,11 +266,6 @@ SuccessRenderer: TypeAlias = Callable[[ResultT], str]
 ResultMetadataProjector: TypeAlias = Callable[[ResultT], ToolResultMetadata]
 ConfirmationDescription: TypeAlias = Callable[[ArgsT], str]
 SchemaFailureRenderer: TypeAlias = Callable[[Mapping[str, JSONValue], str], str | None]
-
-
-class UndoPolicy(str, Enum):
-    NONE = "none"
-    REQUIRED = "required"
 
 
 @dataclass(frozen=True)

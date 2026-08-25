@@ -90,6 +90,9 @@ from offerpilot.pilot_runtime.service import (
 from offerpilot.pilot_runtime.service import ResolvedModel
 
 
+_STABLE_LEGACY_DETERMINISTIC_NAME = sorted(LEGACY_DETERMINISTIC_NAMES)[0]
+
+
 def test_confirmation_approved_port_is_transient_and_does_not_leak_session() -> None:
     session = SimpleNamespace(secret="confirmation-private")
     port = ConfirmationApprovedWritePort(session)  # type: ignore[arg-type]
@@ -1623,10 +1626,13 @@ def test_reject_preheader_does_not_touch_conversation_or_model() -> None:
 @pytest.mark.parametrize(
     ("adapter_kind", "tool_name", "approved", "expected"),
     [
-        *(("legacy_deterministic", name, True, True) for name in LEGACY_DETERMINISTIC_NAMES),
+        *(
+            ("legacy_deterministic", name, True, True)
+            for name in sorted(LEGACY_DETERMINISTIC_NAMES)
+        ),
         ("legacy_deterministic", "create_application", True, False),
-        ("typed", next(iter(LEGACY_DETERMINISTIC_NAMES)), True, False),
-        ("legacy_deterministic", next(iter(LEGACY_DETERMINISTIC_NAMES)), False, False),
+        ("typed", _STABLE_LEGACY_DETERMINISTIC_NAME, True, False),
+        ("legacy_deterministic", _STABLE_LEGACY_DETERMINISTIC_NAME, False, False),
     ],
 )
 def test_deterministic_confirmation_requires_exact_closed_adapter_identity(
@@ -1664,7 +1670,7 @@ def test_deterministic_confirmation_requires_exact_closed_adapter_identity(
 def test_omitted_id_legacy_classifier_uses_only_bounded_ledger_preheader() -> None:
     operations = _Operations(status="proposed")
     operations.operation.adapter_kind = "legacy_deterministic"
-    operations.operation.tool_name = next(iter(LEGACY_DETERMINISTIC_NAMES))
+    operations.operation.tool_name = _STABLE_LEGACY_DETERMINISTIC_NAME
     persistence = _Persistence(None)
     coordinator = ConfirmationCoordinator(_deps(persistence, operations))
     runtime = PilotRuntime(
@@ -1685,7 +1691,7 @@ def test_omitted_id_legacy_classifier_uses_only_bounded_ledger_preheader() -> No
 def test_deterministic_classifier_never_bootstraps_without_an_operation() -> None:
     operations = _Operations(status="proposed")
     operations.operation.adapter_kind = "legacy_deterministic"
-    operations.operation.tool_name = next(iter(LEGACY_DETERMINISTIC_NAMES))
+    operations.operation.tool_name = _STABLE_LEGACY_DETERMINISTIC_NAME
     persistence = _Persistence(None)
     runtime = PilotRuntime(
         RuntimeDependencies(

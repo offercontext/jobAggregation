@@ -1525,28 +1525,77 @@ confirmation_resume         → 仅 proof issuer；Adapter 来自锁内 persiste
 因此 issuer、Registry entry、route digest 和测试中的恢复 source 始终相同；其他枚举值
 传入 proof issuer 必须拒绝。
 
-初始 direct route 只能通过 Composition 注入的窄 Port：
+初始 direct route 只能通过 Composition 注入的 source-bound issuer capability 与窄 Port：
 
 ```text
+LegacyInitialRouteIssuer.open_request_lease(
+    exact RuntimeRequestOwnerLease,
+) -> exact LegacyInitialRequestLease
+
+LegacyInitialRouteIssuer.issue(
+    exact LegacyInitialRequestLease,
+) -> exact ServerDeterministicInvocationToken
+
 LegacyInitialRoutePort.resolve_initial(
-    exact LegacyRouteSourceV1 direct_source,
     exact ServerDeterministicInvocationToken,
 ) -> LegacyAdapterRouteHandle
 ```
 
-Port 从 Adapter Spec 的 `initial_route_sources` 编译四个 source → exact Adapter identity，
-不接收/返回名称查询 map。每个服务端确定性流程只获得与自身 source 绑定的 invocation
-token；Port 校验 exact Runtime container/Catalog/source/token identity 后签发 route handle。
-它拒绝普通字符串、dict、Pending 字段、客户端/Provider tool name 和
-`confirmation_resume`，不进入 Provider Surface，也不与 proof consumer 共用可编辑名称
-API。Initial route handle 绑定 exact source/Adapter/Catalog token，Pending/Operation 仍由
-后续 Route Handle/Repository 边界验证。
+Composition 从 Adapter Spec 的 `initial_route_sources` 和 Bundle 的
+`initial_route_bindings` 编译四个 exact source → Adapter binding，并原子创建四个不同的
+`LegacyInitialRouteIssuer`：`jd_clarification`、`jd_deterministic_action`、
+`submission_snapshot_action`、`outcome_recording_action`。前两个虽然指向同一个 Adapter，
+issuer identity 仍必须不同。Issuer 是 application/Runtime-container scoped、可重复使用、
+无 public constructor、不可复制/序列化的 capability，不是 invocation token；它永久绑定
+一个 exact source、Adapter identity/ordinal、Runtime container、Catalog、Registry 与
+`LegacyInitialRoutePort` identity。Issuer API 不接受 `source`、Adapter/tool name、Pending、
+dict 或客户端字段，调用方不能要求它为另一 source 签发 token。
 
+每个服务端确定性请求开始时，Pilot Runtime 为当前 request owner 创建 exact、不可构造的
+`RuntimeRequestOwnerLease`，再由对应 source-bound issuer 的私有 lease factory 通过
+`open_request_lease(owner_lease)` 创建新的 `LegacyInitialRequestLease`。该 factory 是 issuer
+capability 的不可分割部分，不作为通用对象单独注入。生成的 Lease 同时绑定 exact issuer
+instance/token、source、Adapter、当前 Runtime container、Initial Route Registry、Port
+identity 与 request owner；`open_request_lease()` 必须验证 owner lease 属于同一 Runtime
+container 且仍 live。它只在当前请求调用栈存在，不从 HTTP/SSE/Pending/Operation 字段构造。
+对应服务端流程只获得自己那一个 source-bound issuer，并在其 live lease 内调用一次
+`issue(lease)`；issuer 必须重新验证 lease 中的 exact issuer token/source 与自身一致。每个
+`(lease, issuer)` 最多签发一个 token；同一 issuer 的后续请求使用新 lease，必须得到不同
+token identity，且前一次 token 的 resolved/revoked 状态不得污染 issuer 或后续请求。
+
+Initial Route Registry 的 token entry 绑定 exact token object、issuer instance、source、
+Adapter、Runtime container、Catalog、Port/Registry identity、request owner lease 与
+source-bound request lease。Port 只接受
+exact token，并从 Registry entry 内部取得 source/Adapter；`resolve_initial()` 不再接收
+调用方提供的 source。它通过一次 `issued → resolved` CAS winner 签发 route handle，拒绝
+普通字符串、dict、Pending 字段、客户端/Provider tool name、伪造/复制 token、错误
+issuer/lease/container/Port/Registry 和 `confirmation_resume`，不进入 Provider Surface，
+也不与 proof consumer 共用可编辑名称 API。Initial route handle 继续绑定 exact
+source/Adapter/Catalog/lease identity，Pending/Operation 仍由后续 Route
+Handle/Repository 边界验证。
+
+Initial Route Registry 必须线程安全，并以强引用保持 token、issuer、lease 和派生 handle，
+直到 request lease 关闭；不得以 `id()`、值相等或调用方提供的 nonce 作为授权根。
+`open_request_lease`、`issue`、`resolve_initial` 与 lease close 在同一 Registry 状态锁内
+线性化：close winner 会
+fence 尚未 resolve 的 token；resolve winner 已生成的 handle 也会由随后的 close 撤销。
+因此 cancellation/退出与 resolve 并发时只有上述两个封闭结果，不存在 close 后仍可取得
+live handle 的中间态或 ABA 复用。
+
+`RuntimeRequestOwnerLease` 和 `LegacyInitialRequestLease` 均只有
+`open → closing → closed`，前者关闭会级联关闭其全部 source-bound child lease；
 `ServerDeterministicInvocationToken` 为 request-local、source-specific、不可复制/序列化的
-一次性 token，只允许 `issued → resolved → revoked` 或 `issued → revoked`；Port consume
-winner 才能得到 Handle。请求结束、Pending persistence 失败、Exception/Cancellation/
-`BaseException` 均在 `finally` revoke token/handle，重复或跨 source/container 使用为绝对
-失败且不能写 Pending/Operation 或调用 Adapter。
+一次性 token，只允许 `issued → resolved → revoked` 或 `issued → revoked`。每个请求必须
+以 `finally` 关闭 lease，并统一 revoke 该 lease 下所有 token 和派生 handle；正常结束、
+Pending persistence 成功后的请求退出、Pending persistence 失败、Exception、Cancellation
+及其他 `BaseException` 均适用。关闭/过期 lease 不得再签发或解析 token。重复、跨请求、
+跨 source/container/Port 使用均绝对失败，Pending/Operation/Adapter/executor 为 0。
+Lease close/revoke 是幂等、no-throw 的内存状态转换，不得覆盖原始 Exception/
+Cancellation/`BaseException`。Issuer capability 本身不随请求关闭，下一请求仍可签发
+全新的 token。
+
+`confirmation_resume` 永远不能获得上述 issuer 或 initial request lease；它只走后文锁内
+验证后签发 `LegacyRouteProof` 的恢复边界。
 
 确认恢复的 Catalog API 不接受装有普通 server-loaded 字段的 DTO、仅有 `tool_name`
 的 Protocol、dict 或任意调用方构造的 exact-type 对象。锁内事实验证与静态 Catalog
@@ -1740,16 +1789,18 @@ private constructor 制造 exact-type/同字段对象，也不存在对应 regis
 的 `LegacyRouteProofIssuer` 能创建 entry。
 
 为保持 Catalog 递归冻结，Composition 使用内部原子 factory 从 ordered Adapter tuple
-同时创建 Catalog instance token、两个 Registry、issuer-only registration port、consumer
-port 和最终 Catalog；不存在“先构造 Catalog、再可变挂载 Registry”的阶段，也不向
-其他模块暴露半初始化对象。
+同时创建 Catalog instance token、两个 confirmation Registry、issuer-only registration
+port、consumer port 和最终 Catalog；不存在“先构造 Catalog、再可变挂载 Registry”的
+阶段，也不向其他模块暴露半初始化对象。Initial Route Registry/Port 与四个 source-bound
+issuer capability 同样在该原子 factory 调用内绑定最终 Catalog identity，但不与
+confirmation proof Registry 共用注册或消费 API。
 
 Registry 在 Composition 时只从实际 sealed Catalog 接收 ordered exact Adapter
 object/name identity，不建立第二份可编辑名称表。Issuer-only registration port 仅在
 `route_source=confirmation_resume` 时，用已验证的 persisted protocol name 命中这三个
 exact Adapter 之一；unknown、其他 source 或客户端 name 均不能创建 entry。表中的四个
-initial direct route source 继续由各自服务端直接流程选择 exact Adapter，不进入 proof
-registry。
+initial direct route source 由对应 source-bound issuer 与 Initial Route Registry 绑定 exact
+Adapter；服务端流程本身不接收或选择 Adapter name，并且它们不进入 proof registry。
 
 `resolve_server_loaded(proof)` 只能以 exact Catalog token 一次性消费 proof。
 Registry 必须验证 proof 对象身份、issuer/Catalog/Bundle/transaction/claim provenance、
@@ -1927,7 +1978,10 @@ ai/tool_specs/catalog.py
 
 ai/tool_runtime/legacy.py
   Legacy boundary、静态 Adapter、Session-bound execution context、
-  LegacyInitialRoutePort 和唯一 Legacy Catalog；direct route 只消费 exact source/token，
+  LegacyInitialRouteIssuer capability、RuntimeRequestOwnerLease、
+  LegacyInitialRequestLease/Registry、
+  LegacyInitialRoutePort 和唯一 Legacy Catalog；direct route issuer 只凭 exact live request
+  lease 签发 token，Port 只消费该 Registry 注册的 exact token，
   resume route 只消费已注册 LegacyRouteProof，不持有 Ledger key、Repository 或原始 Pending
 
 ai/tool_runtime/legacy_proof.py
@@ -1959,8 +2013,11 @@ pilot_runtime/legacy_route.py
 
 pilot_runtime/composition.py
   组装 Typed Catalog + Legacy Adapter Catalog + Compensation Registry，创建完整 Bundle，
-  创建 exact Legacy initial-route source tokens、proof issuer/consumer token 与两个
-  Registry，并将 View/Port 注入 Projector、Agent Loop、Pipeline 和 Ledger
+  原子创建四个 source-bound Legacy initial-route issuer capability（各自封装匹配的私有
+  request-lease factory）、Runtime request-owner lease factory、initial route Port/Registry、
+  proof issuer/consumer token 与 Preparation/Proof
+  Registry，并将精确 capability/View/Port 注入对应确定性流程、Projector、Agent Loop、
+  Pipeline 和 Ledger
 ```
 
 依赖规则：
@@ -1975,6 +2032,10 @@ pilot_runtime/composition.py
   proof issuer registration port 的生产模块；
 - Selector、Authority、Ledger 和 Repository 不导入生产 Composition Root singleton；
 - `pilot_runtime/composition.py` 是生产对象装配点；
+- 四个 Initial Route Issuer 只能由 Composition 创建；每个精确服务端确定性流程只能收到
+  与自身 source 绑定的一个 issuer；通用 Runtime request-owner lease factory 只能注入
+  Pilot Runtime orchestration，source-bound child lease factory 只能封装在对应 issuer 内，
+  二者都不能暴露给 API DTO、通用 Dispatcher 或 confirmation resume；
 - 非 Composition Root 模块不得重新构造 Bundle；
 - Projector 不再默认导入 `MODEL_TOOL_CATALOG`，由 Runtime 显式注入；
 - Write Coordinator 不通过反向导入领域 Spec 获取 Operation metadata；
@@ -2049,9 +2110,15 @@ AST/source gate 必须证明：
 - Legacy executor 只消费 caller-owned Session-bound context，不捕获 Repository；
 - Legacy Catalog 不存在接收普通 server-loaded fields/dict/Protocol 的 resolve API，只接受
   exact `LegacyRouteProof` 并通过 Registry 的 exact object identity 一次性消费；
-- 初始 Legacy route 只能由精确 allowlist 的四个服务端确定性入口调用
-  `LegacyInitialRoutePort`，且必须传 exact direct-source enum + source-bound invocation
-  token；Port/Catalog 不存在按客户端/Pending/tool name 查询 initial Adapter 的 API；
+- Composition 必须恰好创建四个 reusable、exact source-bound
+  `LegacyInitialRouteIssuer` capability；精确 allowlist 的四个服务端确定性入口各自只能接收
+  对应 issuer，并只能从 Pilot Runtime 新建的 live `RuntimeRequestOwnerLease` 派生与该 issuer
+  identity/source 匹配的 `LegacyInitialRequestLease`，再签发一次新 token；生产代码不得
+  直接构造 token/lease、调用通用 `issue(source, ...)`、把 source 传给 issuer、拆出/替换
+  issuer 私有 child-lease factory，或让 `confirmation_resume` 获得 issuer/任一 lease factory；
+- 初始 Legacy route 只能由 `LegacyInitialRoutePort.resolve_initial(exact token)` 消费 Registry
+  注册的 token；Port 内部从 issuer-bound entry 取得 source/Adapter，不接收 source，且
+  Port/Catalog 不存在按客户端/Pending/tool name 查询 initial Adapter 的 API；
 - Legacy claim 前只允许 Registry-bound `LegacyPreparationBinding` 的
   editable/describe/validate/presentation port，任何 prepare object 都不能访问 execute
   callable；execution proof issuance 只能出现在锁内 mutable recheck 与 claim CAS 成功后；
@@ -2059,7 +2126,10 @@ AST/source gate 必须证明：
   `LegacyPendingIdentityVerifierPort`；`legacy.py/legacy_proof.py` 禁止导入 Ledger key、
   keyring、HMAC helper、Repository、ORM 或锁内 evidence；
 - `LegacyApprovedConfirmationInput`、`LegacyPreparationBinding`、`PreparedLegacyCall`、
-  `ServerDeterministicInvocationToken`、`LockedLegacyRouteEvidence`、
+  `LegacyInitialRouteIssuer`、`RuntimeRequestOwnerLease`、
+  `LegacyInitialRequestLease` 及 issuer 私有 child-lease factory、
+  `ServerDeterministicInvocationToken`、Initial Route Registry entry、
+  `LockedLegacyRouteEvidence`、
   read-snapshot/preparation/issuance/claim lease、
   `LegacyRouteProof`、Preparation/Proof Registry entry、route handle 均不得进入 Pending、Ledger、Journal、
   ChatMessage、checkpoint、HTTP/SSE、日志、repr、pickle 或通用序列化；
@@ -2215,10 +2285,24 @@ Selector Golden 至少覆盖：
   Adapter/Repository/executor 为 0；
 - `LegacyRouteSourceV1` 五个值及映射逐项 Golden；恢复统一使用
   `confirmation_resume`，四个 direct source 进入 issuer 均拒绝；
-- `LegacyInitialRoutePort` 四个 source/token 正向映射及错误 source/token/container、普通
-  string/dict/Pending/tool name、`confirmation_resume` 负向矩阵；失败时 Pending/Operation/
-  Adapter/executor 为 0；并发单 consume winner、重复/跨 source/退出后 token/handle revoke，
-  且 Provider Surface 永远不出现 Legacy；
+- 四个 source-bound `LegacyInitialRouteIssuer` 与 Port/Adapter mapping 逐项 Golden；
+  `jd_clarification` 与 `jd_deterministic_action` 虽映射同一 Adapter，issuer identity 仍不同；
+  issuer API 不接受 source/name/dict/Pending，`confirmation_resume` 无 issuer；
+- 同一 source/issuer 连续两个请求都成功，request lease 与 token identity 均不同；消费或撤销
+  前一 token 不影响 issuer 复用及后一请求。两个并发请求使用同一 issuer 时 token 也必须
+  不同，且各自在自身 lease 内独立收敛；
+- A issuer + B source lease、A issuer + B issuer 私有 lease factory、同一 container/
+  Registry/Port 下跨 source 组合全部拒绝；尤其覆盖映射到同一 Adapter 的
+  `jd_clarification` 与 `jd_deterministic_action` 交叉 lease/issuer，失败时 token 为 0；
+- `LegacyInitialRoutePort` 对错误 issuer/lease/token/container/Port/Registry、普通
+  string/dict/Pending/tool name、伪造/复制/重复/跨请求 token 和关闭 lease 的负向矩阵；
+  失败时 Pending/Operation/Adapter/executor 为 0；同一 token 并发仅一个 consume winner；
+- 正常结束、Pending persistence 成功后的请求退出、Pending persistence 失败、Exception、
+  Cancellation、其他 `BaseException` 均关闭 request lease 并 revoke 其 token/handle；不同
+  lease 的 token 不被连带撤销，Provider Surface 永远不出现 Legacy；
+- issue/resolve/close 三方 barrier 覆盖 close-first 与 resolve-first；close 后不能得到 live
+  handle，resolved handle 会在 close 时撤销，重复 finalizer 绝对 no-op，旧 token/handle
+  identity 不得通过新 lease 形成 ABA；
 - caller 伪造/复制 `LockedLegacyRouteEvidence`、错误 verifier instance token、错误 Session
   或 issuance lease 时 proof 注册为 0；Issuer API 不接受 tool name、persisted raw args、
   caller digest/evidence，只接受 exact validated confirmation input；

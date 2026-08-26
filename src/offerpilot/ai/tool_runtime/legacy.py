@@ -3,18 +3,27 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
+import importlib
 import inspect
 import json
 from threading import RLock
 from types import MappingProxyType
-from typing import Literal, NoReturn, Protocol, cast
+from typing import TYPE_CHECKING, Generic, Literal, NoReturn, Protocol, TypeVar, cast
 
 from offerpilot.ai.tool_runtime.contracts import JSONValue, TransientToolRuntimeValue
 from offerpilot.ai.tool_runtime.metadata import (
+    BundleInstanceToken,
     LegacyAdapterBindingV1,
     LegacyDeterministicBoundaryV1,
 )
 from offerpilot.ai.tool_runtime.protocol_seals import verify_legacy_boundary
+
+
+if TYPE_CHECKING:
+    from offerpilot.ai.tool_runtime.legacy_proof import (
+        LegacyRouteProof,
+        LegacyRouteProofConsumerPort,
+    )
 
 
 LEGACY_DETERMINISTIC_NAMES = frozenset(
@@ -37,6 +46,15 @@ class LegacyDeterministicAdapter:
     describe: Callable[[str], str] = field(repr=False, compare=False)
     validate: Callable[[str], str] = field(repr=False, compare=False)
     execute: Callable[[str], str] = field(repr=False, compare=False)
+
+
+class _LegacyArgumentPreparationPort(Protocol):
+    @property
+    def editable_fields(self) -> tuple[Mapping[str, object], ...]: ...
+
+    def describe(self, encoded_args: str) -> str: ...
+
+    def validate(self, encoded_args: str) -> str: ...
 
 
 class LegacyDeterministicCatalog:
@@ -426,11 +444,13 @@ class LegacyStaticAdapterCatalogV1(TransientToolRuntimeValue):
 
 
 _LEGACY_INITIAL_VALUE_SEAL = object()
+_LEGACY_PROOF_CATALOG_SEAL = object()
+_LegacyRegistryT = TypeVar("_LegacyRegistryT")
 
 
-class _LegacyInitialOpaqueValue(TransientToolRuntimeValue):
+class _LegacyInitialOpaqueValue(TransientToolRuntimeValue, Generic[_LegacyRegistryT]):
     __slots__ = ("_registry", "_identity", "_integrity_seal")
-    _registry: _LegacyInitialRouteRegistry
+    _registry: _LegacyRegistryT
     _identity: object
     _integrity_seal: tuple[object, object]
 
@@ -438,7 +458,7 @@ class _LegacyInitialOpaqueValue(TransientToolRuntimeValue):
         self,
         seal: object | None = None,
         *,
-        registry: _LegacyInitialRouteRegistry,
+        registry: _LegacyRegistryT,
     ) -> None:
         if seal is not _LEGACY_INITIAL_VALUE_SEAL:
             raise TypeError("Legacy initial route values are factory-created")
@@ -451,7 +471,7 @@ class _LegacyInitialOpaqueValue(TransientToolRuntimeValue):
         del name, value
         raise AttributeError("Legacy initial route value is sealed")
 
-    def _ensure_integrity(self, registry: _LegacyInitialRouteRegistry) -> None:
+    def _ensure_integrity(self, registry: object) -> None:
         try:
             if (
                 self._registry is not registry
@@ -469,7 +489,7 @@ class _LegacyInitialOpaqueValue(TransientToolRuntimeValue):
             ) from exc
 
 
-class RuntimeRequestOwnerLease(_LegacyInitialOpaqueValue):
+class RuntimeRequestOwnerLease(_LegacyInitialOpaqueValue["_LegacyInitialRouteRegistry"]):
     __slots__ = ()
 
     def close(self) -> None:
@@ -496,7 +516,7 @@ class RuntimeRequestOwnerLease(_LegacyInitialOpaqueValue):
         return False
 
 
-class LegacyInitialRequestLease(_LegacyInitialOpaqueValue):
+class LegacyInitialRequestLease(_LegacyInitialOpaqueValue["_LegacyInitialRouteRegistry"]):
     __slots__ = ()
 
     def close(self) -> None:
@@ -523,17 +543,157 @@ class LegacyInitialRequestLease(_LegacyInitialOpaqueValue):
         return False
 
 
-class ServerDeterministicInvocationToken(_LegacyInitialOpaqueValue):
+class ServerDeterministicInvocationToken(_LegacyInitialOpaqueValue["_LegacyInitialRouteRegistry"]):
     __slots__ = ()
 
 
-class LegacyAdapterRouteHandle(_LegacyInitialOpaqueValue):
+class LegacyAdapterRouteHandle(_LegacyInitialOpaqueValue[object]):
     """Common route-authority handle reserved for initial and proof origins."""
 
     __slots__ = ()
 
 
-class RuntimeRequestOwnerLeaseFactory(_LegacyInitialOpaqueValue):
+def _create_legacy_proof_route_handle(
+    *,
+    registry_identity: object,
+) -> LegacyAdapterRouteHandle:
+    """Create the proof consumer's opaque exact route handle.
+
+    Authorization remains in the proof Registry.  The handle retains only the
+    Registry's caller-owned opaque identity plus its own opaque identity; it
+    never receives an Adapter, callable, arguments, or execution context.
+    """
+
+    if type(registry_identity) is not object:
+        raise TypeError("Legacy proof route handle requires an opaque Registry identity")
+    return LegacyAdapterRouteHandle(
+        _LEGACY_INITIAL_VALUE_SEAL,
+        registry=registry_identity,
+    )
+
+
+def _legacy_proof_consumer_port_type() -> type[object]:
+    proof_module = importlib.import_module("offerpilot.ai.tool_runtime.legacy_proof")
+    consumer_type = getattr(proof_module, "LegacyRouteProofConsumerPort", None)
+    if not isinstance(consumer_type, type):
+        raise TypeError("Legacy proof consumer Port type is unavailable")
+    return cast(type[object], consumer_type)
+
+
+class LegacyProofDeterministicCatalog(TransientToolRuntimeValue):
+    """Unpublished exact Catalog boundary for confirmation-resume proofs."""
+
+    __slots__ = (
+        "_proof_consumer_port",
+        "_bundle_instance_token",
+        "_catalog_instance_token",
+        "_integrity_seal",
+    )
+    _proof_consumer_port: LegacyRouteProofConsumerPort
+    _bundle_instance_token: BundleInstanceToken
+    _catalog_instance_token: object
+    _integrity_seal: tuple[object, object, object]
+
+    def __init__(
+        self,
+        seal: object | None = None,
+        *,
+        proof_consumer_port: LegacyRouteProofConsumerPort,
+        bundle_instance_token: BundleInstanceToken,
+        catalog_instance_token: object,
+    ) -> None:
+        if seal is not _LEGACY_PROOF_CATALOG_SEAL:
+            raise TypeError("Legacy proof Catalog is factory-created")
+        if hasattr(self, "_integrity_seal"):
+            raise TypeError("Legacy proof Catalog is already initialized")
+        if type(proof_consumer_port) is not _legacy_proof_consumer_port_type():
+            raise TypeError("Legacy proof Catalog requires the exact proof consumer Port")
+        if type(bundle_instance_token) is not BundleInstanceToken:
+            raise TypeError("Legacy proof Catalog requires an exact Bundle instance token")
+        if type(catalog_instance_token) is not object:
+            raise TypeError("Legacy proof Catalog requires an opaque Catalog instance token")
+        if proof_consumer_port.bundle_instance_token is not bundle_instance_token:
+            raise ValueError("Legacy proof Catalog Bundle token does not match its consumer Port")
+        if proof_consumer_port.catalog_instance_token is not catalog_instance_token:
+            raise ValueError("Legacy proof Catalog instance token does not match its consumer Port")
+        object.__setattr__(self, "_proof_consumer_port", proof_consumer_port)
+        object.__setattr__(self, "_bundle_instance_token", bundle_instance_token)
+        object.__setattr__(self, "_catalog_instance_token", catalog_instance_token)
+        object.__setattr__(
+            self,
+            "_integrity_seal",
+            (proof_consumer_port, bundle_instance_token, catalog_instance_token),
+        )
+
+    @classmethod
+    def _create(
+        cls,
+        *,
+        proof_consumer_port: LegacyRouteProofConsumerPort,
+        bundle_instance_token: BundleInstanceToken,
+        catalog_instance_token: object,
+    ) -> LegacyProofDeterministicCatalog:
+        return cls(
+            _LEGACY_PROOF_CATALOG_SEAL,
+            proof_consumer_port=proof_consumer_port,
+            bundle_instance_token=bundle_instance_token,
+            catalog_instance_token=catalog_instance_token,
+        )
+
+    def __setattr__(self, name: str, value: object) -> NoReturn:
+        del name, value
+        raise AttributeError("Legacy proof Catalog is sealed")
+
+    def _ensure_integrity(self) -> None:
+        try:
+            current = (
+                self._proof_consumer_port,
+                self._bundle_instance_token,
+                self._catalog_instance_token,
+            )
+            if (
+                type(self._proof_consumer_port) is not _legacy_proof_consumer_port_type()
+                or type(self._bundle_instance_token) is not BundleInstanceToken
+                or type(self._catalog_instance_token) is not object
+                or type(self._integrity_seal) is not tuple
+                or len(self._integrity_seal) != len(current)
+                or any(
+                    expected is not actual
+                    for expected, actual in zip(self._integrity_seal, current)
+                )
+                or self._proof_consumer_port.bundle_instance_token
+                is not self._bundle_instance_token
+                or self._proof_consumer_port.catalog_instance_token
+                is not self._catalog_instance_token
+            ):
+                raise ValueError("Legacy proof Catalog integrity drift")
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("Legacy proof Catalog integrity drift") from exc
+
+    @property
+    def proof_consumer_port(self) -> LegacyRouteProofConsumerPort:
+        self._ensure_integrity()
+        return self._proof_consumer_port
+
+    @property
+    def bundle_instance_token(self) -> BundleInstanceToken:
+        self._ensure_integrity()
+        return self._bundle_instance_token
+
+    @property
+    def catalog_instance_token(self) -> object:
+        self._ensure_integrity()
+        return self._catalog_instance_token
+
+    def resolve_server_loaded(
+        self,
+        proof: LegacyRouteProof,
+    ) -> LegacyAdapterRouteHandle:
+        self._ensure_integrity()
+        return cast(LegacyAdapterRouteHandle, self._proof_consumer_port.consume(proof))
+
+
+class RuntimeRequestOwnerLeaseFactory(_LegacyInitialOpaqueValue["_LegacyInitialRouteRegistry"]):
     __slots__ = ()
 
     def open(self) -> RuntimeRequestOwnerLease:
@@ -541,7 +701,7 @@ class RuntimeRequestOwnerLeaseFactory(_LegacyInitialOpaqueValue):
         return self._registry._open_owner(self)
 
 
-class LegacyInitialRouteIssuer(_LegacyInitialOpaqueValue):
+class LegacyInitialRouteIssuer(_LegacyInitialOpaqueValue["_LegacyInitialRouteRegistry"]):
     __slots__ = ("_source", "_binding", "_issuer_integrity_seal")
     _source: LegacyRouteSourceV1
     _binding: LegacyAdapterBindingV1
@@ -585,7 +745,7 @@ class LegacyInitialRouteIssuer(_LegacyInitialOpaqueValue):
         return self._registry._issue(self, lease)
 
 
-class LegacyInitialRoutePort(_LegacyInitialOpaqueValue):
+class LegacyInitialRoutePort(_LegacyInitialOpaqueValue["_LegacyInitialRouteRegistry"]):
     __slots__ = ("_bundle_instance_token", "_port_integrity_seal")
     _bundle_instance_token: object
     _port_integrity_seal: object
@@ -1333,16 +1493,36 @@ def build_unpublished_legacy_initial_route_components(
     return components
 
 
+def _decode_legacy_arguments_object(encoded_args: object) -> dict[str, JSONValue]:
+    if type(encoded_args) is not str:
+        raise TypeError("Legacy arguments must be exact encoded text")
+    try:
+        decoded = json.loads(encoded_args)
+    except (json.JSONDecodeError, TypeError, UnicodeError, ValueError) as exc:
+        raise ValueError("pending arguments must be valid JSON") from exc
+    if type(decoded) is not dict:
+        raise ValueError("pending arguments must be a valid JSON object")
+    try:
+        json.dumps(decoded, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("pending arguments must contain finite JSON values") from exc
+    return cast(dict[str, JSONValue], decoded)
+
+
 def prepare_legacy_arguments(
-    adapter: LegacyDeterministicAdapter,
+    adapter: _LegacyArgumentPreparationPort,
     encoded_args: str,
     edited_args: Mapping[str, JSONValue] | None,
+    *,
+    validate_unedited: bool = False,
 ) -> tuple[str, str]:
     if edited_args is None:
+        if validate_unedited:
+            validation_error = adapter.validate(encoded_args)
+            if validation_error:
+                raise ValueError(validation_error)
         return encoded_args, adapter.describe(encoded_args)
-    value = json.loads(encoded_args)
-    if not isinstance(value, dict):
-        raise ValueError("pending arguments must be a valid JSON object")
+    value = _decode_legacy_arguments_object(encoded_args)
     editable = {
         str(field["field"]): field
         for field in adapter.editable_fields

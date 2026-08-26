@@ -12,6 +12,8 @@
 
 **Task 9 final scope stop:** The Pilot confirmation policy-resolver compatibility test still required a second exact Segment Catalog. Task 9 now owns that one Catalog-identity migration, while Task 11 retains the same file for the separate Legacy proof/replay cutover. This does not change the approved design, fixed identities, 25/3/4 boundary, protocol seals, or Golden assets.
 
+**Task 11 scope stop:** Product work stopped after the RED suites exposed omissions in the frozen Task 11 scope. The proof-only final `LegacyDeterministicCatalog` is constructed and annotated by `pilot_runtime/legacy_route.py`, while `pilot_runtime/composition.py` still injects the raw Catalog factory and `tool_specs/legacy.py` still defines it; none of these direct production consumers was listed. Deleting the raw-Pending Catalog without migrating all three would require a forbidden forwarding alias or dead dependency façade. The Task 11 GREEN command also runs all of `tests/pilot_runtime`, both Write Operation suites, and the Task 7-8 Legacy metadata suites. `test_deterministic.py`, `test_legacy_initial_route.py`, and `test_legacy_registry_composition.py` still assert the deliberately unpublished raw-Pending Catalog contract; `test_write_operations.py` and `test_write_operation_acceptance_matrix.py` were frozen for Task 12, while the omitted baseline direct consumer `test_persistence.py` was not present in the previous global allowlist. All three directly call the Pending repository methods whose raw claim overload is removed in this Task, so a required exact route-handle signature would make GREEN impossible without an optional compatibility path. Task 11 now owns these nine exact migrations so the proof-only and Pending persistence cutovers can be atomic and compatibility-free. Task 12 may still revisit repeated files for its separate mechanical deletion gates. This scope-only revision does not change the approved design, fixed identities, 25/3/4 boundary, protocol seals, or Golden assets.
+
 ---
 
 ## 0. Fixed workspace, baseline, and execution rules
@@ -944,6 +946,7 @@ git commit -m "refactor: AI 统一工具授权与执行句柄"
 **Files:**
 
 - Modify: `src/offerpilot/ai/tool_runtime/legacy.py`
+- Modify: `src/offerpilot/ai/tool_specs/legacy.py`
 - Modify: `src/offerpilot/ai/confirmation.py`
 - Modify: `src/offerpilot/ai/write_operations.py`
 - Modify: `src/offerpilot/repositories/chat.py`
@@ -951,6 +954,8 @@ git commit -m "refactor: AI 统一工具授权与执行句柄"
 - Modify: `src/offerpilot/pilot_runtime/continuation.py`
 - Modify: `src/offerpilot/pilot_runtime/persistence.py`
 - Modify: `src/offerpilot/pilot_runtime/deterministic.py`
+- Modify: `src/offerpilot/pilot_runtime/legacy_route.py`
+- Modify: `src/offerpilot/pilot_runtime/composition.py`
 - Modify: `src/offerpilot/ai/agent_loop.py`
 - Modify: `src/offerpilot/chat_transport.py`
 - Modify: `src/offerpilot/api.py`
@@ -963,13 +968,21 @@ git commit -m "refactor: AI 统一工具授权与执行句柄"
 - Modify: `tests/tool_authority/test_replay_topology.py`
 - Modify: `tests/pilot_runtime/test_confirmation.py`
 - Modify: `tests/pilot_runtime/test_confirmation_cutover.py`
+- Modify: `tests/pilot_runtime/test_deterministic.py`
+- Modify: `tests/pilot_runtime/test_persistence.py`
 - Modify: `tests/tool_pipeline/test_legacy.py`
+- Modify: `tests/tool_metadata/test_legacy_initial_route.py`
+- Modify: `tests/tool_metadata/test_legacy_registry_composition.py`
 - Modify: `tests/test_chat_repository.py`
 - Modify: `tests/test_chat_api.py`
+- Modify: `tests/test_write_operations.py`
+- Modify: `tests/test_write_operation_acceptance_matrix.py`
 
 - [ ] **Step 1: Write RED presentation, route, and topology tests**
 
 Golden-test success and every declared failure renderer, confirmation descriptions, sync/SSE transport payloads, result shape, and no exception/raw-args/result persistence. Test exact Typed, Legacy-initial, Legacy-proof, and Compensation route handles for initial, replacement, chained, continuation, replay, and compensation paths. Add the production approve/modify order `prepare -> locked mutable recheck -> claim -> proof -> Catalog -> executor`; reject and terminal replay must call all six zero times.
+
+The Task 11 production source gate covers every production path in this Task, including `tool_specs/legacy.py`, `pilot_runtime/legacy_route.py`, and `pilot_runtime/composition.py`. It rejects the exact old `ServerLoadedPending` and raw `LegacyDeterministicAdapter` declarations, the `LegacyProofDeterministicCatalog` second name, `legacy_catalog_factory`, `build_legacy_deterministic_catalog`, and equivalent alias/subclass/dead-dependency forms.
 
 Add the trusted chained matrix:
 
@@ -985,7 +998,7 @@ Compensation -> any child: rejected
 - [ ] **Step 2: Verify RED**
 
 ```powershell
-uv run pytest tests/tool_metadata/test_presentation_bindings.py tests/tool_metadata/test_pending_routes.py tests/tool_metadata/test_runtime_cutover.py tests/tool_authority/test_legacy_replay_preconversation.py tests/tool_authority/test_pending_claim.py tests/tool_authority/test_pending_claim_reissue.py tests/tool_authority/test_replay_topology.py tests/pilot_runtime/test_confirmation.py tests/pilot_runtime/test_confirmation_cutover.py tests/tool_pipeline/test_legacy.py tests/test_chat_repository.py tests/test_chat_api.py -q
+uv run pytest tests/tool_metadata/test_presentation_bindings.py tests/tool_metadata/test_pending_routes.py tests/tool_metadata/test_runtime_cutover.py tests/tool_metadata/test_legacy_initial_route.py tests/tool_metadata/test_legacy_registry_composition.py tests/tool_authority/test_legacy_replay_preconversation.py tests/tool_authority/test_pending_claim.py tests/tool_authority/test_pending_claim_reissue.py tests/tool_authority/test_replay_topology.py tests/pilot_runtime/test_confirmation.py tests/pilot_runtime/test_confirmation_cutover.py tests/pilot_runtime/test_deterministic.py tests/pilot_runtime/test_persistence.py tests/tool_pipeline/test_legacy.py tests/test_chat_repository.py tests/test_chat_api.py tests/test_write_operations.py tests/test_write_operation_acceptance_matrix.py -q
 ```
 
 - [ ] **Step 3: Perform the single persistence/runtime route cutover**
@@ -993,6 +1006,8 @@ uv run pytest tests/tool_metadata/test_presentation_bindings.py tests/tool_metad
 Every proposal, Pending insertion/replacement, chained Pending, confirmation continuation, primary Operation, and Compensation Operation must consume an exact sealed route handle issued by the current Bundle/Segment/Legacy proof registry. Persist only the approved primitive identity fields; never persist the handle or Bundle token.
 
 Replace and delete the transitional `resolve_server_loaded(pending)` production method in this task. Migrate `tests/tool_pipeline/test_legacy.py` from direct `ServerPending` calls to proof-only resolution in the same atomic change. Confirmation resume accepts only the one-shot `LegacyRouteProof`; no old raw-Pending overload, compatibility façade, or runtime fallback remains.
+
+Migrate `pilot_runtime/legacy_route.py` to construct and annotate the final proof-only `LegacyDeterministicCatalog` directly. Remove the raw Catalog factory definition from `tool_specs/legacy.py` and its Composition injection in `pilot_runtime/composition.py`; inject the exact production confirmation-route/Operation/Pending route components needed by the deterministic adapter instead. In the same atomic change, migrate the raw-Catalog expectations in `tests/pilot_runtime/test_deterministic.py`, `tests/tool_metadata/test_legacy_initial_route.py`, and `tests/tool_metadata/test_legacy_registry_composition.py`; the Task 11 GREEN matrix may not be satisfied by retaining the old class under an alias, subclass, dead dependency, fixture-only constructor branch, or second Catalog name.
 
 Consume the exact ToolSpec presentation and Undo bindings established in Task 4 through the new route handles; no name-based presentation/Undo helper may return. Replace `_chained_adapter_kind()` with sealed `ChainedPendingTopologyPolicyV1`. Preserve atomic parent delivery, child proposal, Pending replacement, required Undo before commit, terminal replay, response-loss recovery, and delivery fencing.
 
@@ -1003,7 +1018,11 @@ Terminal replay, delivery recovery, and fallback initialize neither Provider, Pr
 - [ ] **Step 4: Verify integrated GREEN**
 
 ```powershell
-uv run pytest tests/tool_metadata/test_presentation_bindings.py tests/tool_metadata/test_pending_routes.py tests/tool_metadata/test_runtime_cutover.py tests/tool_metadata/test_production_bundle.py tests/tool_metadata/test_operation_port.py tests/tool_metadata/test_legacy_initial_route.py tests/tool_metadata/test_legacy_confirmation_proof.py tests/tool_metadata/test_legacy_registry_composition.py tests/agent_loop tests/pilot_runtime tests/tool_pipeline/test_legacy.py tests/tool_authority/test_replay_topology.py tests/tool_authority/test_pending_replay_decoder.py tests/test_chat_repository.py tests/test_chat_api.py tests/test_write_operations.py tests/test_write_operation_acceptance_matrix.py -q
+uv run pytest tests/tool_metadata/test_presentation_bindings.py tests/tool_metadata/test_pending_routes.py tests/tool_metadata/test_runtime_cutover.py tests/tool_metadata/test_production_bundle.py tests/tool_metadata/test_operation_port.py tests/tool_metadata/test_legacy_initial_route.py tests/tool_metadata/test_legacy_confirmation_proof.py tests/tool_metadata/test_legacy_registry_composition.py tests/agent_loop tests/pilot_runtime tests/tool_pipeline/test_legacy.py tests/tool_authority/test_legacy_replay_preconversation.py tests/tool_authority/test_pending_claim.py tests/tool_authority/test_pending_claim_reissue.py tests/tool_authority/test_replay_topology.py tests/tool_authority/test_pending_replay_decoder.py tests/test_chat_repository.py tests/test_chat_api.py tests/test_write_operations.py tests/test_write_operation_acceptance_matrix.py -q
+$taskPythonPaths = @(Get-Content -LiteralPath "$env:TEMP\offerpilot-tool-metadata-convergence-gate\task-11.txt" | Where-Object { $_ -like '*.py' })
+uv run ruff check -- $taskPythonPaths
+uv run ruff format --check -- $taskPythonPaths
+uv run mypy src/offerpilot/ai/tool_runtime/legacy.py src/offerpilot/ai/tool_specs/legacy.py src/offerpilot/ai/confirmation.py src/offerpilot/ai/write_operations.py src/offerpilot/repositories/chat.py src/offerpilot/pilot_runtime/service.py src/offerpilot/pilot_runtime/continuation.py src/offerpilot/pilot_runtime/persistence.py src/offerpilot/pilot_runtime/deterministic.py src/offerpilot/pilot_runtime/legacy_route.py src/offerpilot/pilot_runtime/composition.py src/offerpilot/ai/agent_loop.py src/offerpilot/chat_transport.py src/offerpilot/api.py
 ```
 
 Expected: Provider/tool call counts, HTTP/SSE order, HITL, Journal events, Ledger state, Undo, and business writes remain externally equivalent.

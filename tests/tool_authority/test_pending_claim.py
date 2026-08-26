@@ -25,6 +25,8 @@ from offerpilot.ai.tool_runtime.contracts import (
     ProviderToolContract,
     materialize_provider_payloads,
 )
+from offerpilot.ai.tool_runtime.catalog import SegmentToolCatalogLease, ToolCatalog
+from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.ai.write_operations import (
     WriteOperationRepository,
     load_or_create_ledger_key,
@@ -36,7 +38,11 @@ from offerpilot.pilot_runtime.persistence import (
     PersistenceStatus,
 )
 from offerpilot.repositories.chat import ChatRepository, ConversationScopeMutationSnapshot
-from tests.tool_metadata.factories import synthetic_tool_spec, write_metadata
+from tests.tool_metadata.factories import (
+    compose_synthetic_bundle,
+    synthetic_tool_spec,
+    write_metadata,
+)
 
 
 def _digest(value: object) -> str:
@@ -106,8 +112,10 @@ class PendingHarness:
     factory: AuthorityFactory
     pending: PendingAction
     claim: PendingAuthorityClaim
+    lease: SegmentToolCatalogLease
 
     def close(self) -> None:
+        self.lease.close()
         self.factory.close()
 
 
@@ -176,16 +184,34 @@ def _harness(tmp_path: Any, *, segment_id: str = "segment-pending") -> PendingHa
         decoder=lambda value: value,
         executor=lambda value, _context: value,
     )
+    catalog = ToolCatalog((spec,), expected_names=(spec.name,))
+    source = compose_synthetic_bundle()
+    bundle = ToolMetadataBundleV1(
+        typed_catalog=catalog,
+        manifest={**source["manifest"], "typed_tools": (spec.name,)},
+        legacy_boundary=source["legacy_boundary"],
+        compensation=source["compensation"],
+    )
+    lease = bundle.open_segment_lease()
+    factory.bind_segment_tool_catalog(
+        authority,
+        authority_metadata_view=bundle.authority_view(),
+        catalog_lease=lease,
+    )
+    spec_handle = lease.resolve(spec.name)
+    assert spec_handle is not None
     factory.register_tool_spec(
-        spec,
+        spec_handle,
+        catalog_lease=lease,
         authority=authority,
         prepare_identity=prepare_identity,
     )
     prepared = factory.prepare_tool_call(
         authority,
+        catalog_lease=lease,
+        spec_handle=spec_handle,
         prepare_identity=prepare_identity,
         tool_call_id=pending.tool_call_id,
-        spec=spec,
         arguments=arguments,
         typed_args=arguments,
         arguments_digest=arguments_digest,
@@ -221,6 +247,7 @@ def _harness(tmp_path: Any, *, segment_id: str = "segment-pending") -> PendingHa
         factory=factory,
         pending=pending,
         claim=claim,
+        lease=lease,
     )
 
 
@@ -258,43 +285,25 @@ def _sibling_pending_claim(
         tool_name=pending.tool_name,
         arguments_digest=arguments_digest,
     )
-    parameters: dict[str, object] = {"type": "object", "properties": {}}
-    contract = ProviderToolContract(
-        payload={
-            "type": "function",
-            "function": {
-                "name": pending.tool_name,
-                "description": "",
-                "parameters": parameters,
-            },
-        },
-        name=pending.tool_name,
-        description="",
-        parameters=parameters,
-    )
-    spec = replace(
-        synthetic_tool_spec(
-            pending.tool_name,
-            metadata=replace(write_metadata(pending.tool_name), editable_fields=()),
-        ),
-        contract=contract,
-        decoder=lambda value: value,
-        executor=lambda value, _context: value,
-    )
+    spec_handle = harness.lease.resolve(pending.tool_name)
+    assert spec_handle is not None
+    spec = harness.lease.require_spec(spec_handle)
     harness.factory.register_tool_spec(
-        spec,
+        spec_handle,
+        catalog_lease=harness.lease,
         authority=authority,
         prepare_identity=prepare_identity,
     )
     prepared = harness.factory.prepare_tool_call(
         authority,
+        catalog_lease=harness.lease,
+        spec_handle=spec_handle,
         prepare_identity=prepare_identity,
         tool_call_id=tool_call_id,
-        spec=spec,
         arguments=arguments,
         typed_args=arguments,
         arguments_digest=arguments_digest,
-        contract_fingerprint=_digest(materialize_provider_payloads((contract,))[0]),
+        contract_fingerprint=_digest(materialize_provider_payloads((spec.contract,))[0]),
         binding=BindingAudit(status="unbound", target_count=0),
     )
     harness.factory.register_pending(
@@ -381,6 +390,25 @@ def test_initial_typed_pending_delegates_and_commits_scope_hmac_atomically(
         assert operation.authorization_scope_fingerprint == expected_scope
         assert operation.adapter_kind == "typed"
         assert [message.role for message in messages] == ["assistant"]
+    finally:
+        harness.close()
+
+
+def test_initial_typed_pending_survives_origin_segment_lease_close(tmp_path: Any) -> None:
+    harness = _harness(tmp_path, segment_id="segment-closed-before-persist")
+    try:
+        harness.lease.close()
+
+        assert harness.chat.persist_pending_action(
+            harness.conversation_id,
+            harness.pending,
+            [{"role": "assistant", "tool_calls": '[{"id":"call"}]'}],
+            pending_authority_claim=harness.claim,
+        )
+        assert harness.factory.claim_state(harness.claim) is None
+        operation = harness.operations.get(harness.pending.operation_id)
+        assert operation is not None
+        assert operation.adapter_kind == "typed"
     finally:
         harness.close()
 

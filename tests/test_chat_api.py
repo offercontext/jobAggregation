@@ -21,6 +21,7 @@ import offerpilot.agent_runtime.journal as journal_module
 import offerpilot.chat_transport as transport_module
 from offerpilot.ai.types import Assistant, Message, ToolCall
 from offerpilot.ai.agent_contracts import PendingAction, StalePendingActionError
+from offerpilot.ai.tool_runtime.catalog import compile_tool_metadata_manifest
 from offerpilot.ai.tool_runtime.contracts import (
     BindingAudit,
     PreparedToolCall,
@@ -28,6 +29,7 @@ from offerpilot.ai.tool_runtime.contracts import (
     ToolFailure,
     ToolSuccess,
 )
+from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 from offerpilot.ai.write_operations import WriteOperationError
 from offerpilot.agent_runtime.journal import NullRunRecorderFactory, RunRecorderFactory
@@ -61,8 +63,13 @@ from offerpilot.pilot_runtime.contracts import (
     PreparationKind,
     StreamExecutionMode,
 )
-from offerpilot.pilot_runtime import InMemoryRuntimeInvocationControl, RuntimeFailureCode
+from offerpilot.pilot_runtime import (
+    InMemoryRuntimeInvocationControl,
+    RuntimeAgentTimedOut,
+    RuntimeFailureCode,
+)
 from offerpilot.pilot_runtime.persistence import ChatPersistenceCoordinator
+from offerpilot.pilot_runtime.compensation import prepare_compensation_handler_components
 from offerpilot.repositories.applications import ApplicationsRepository
 from offerpilot.repositories.agent_runs import AgentRunRepository, JournalConflictError
 from offerpilot.repositories.chat import ChatRepository, ConversationScopeMutationSnapshot
@@ -388,6 +395,21 @@ class SlowAfterPendingModel:
             return Assistant(tool_calls=[self.tool_call])
         time.sleep(1.0)
         return Assistant(content="late reply")
+
+
+class TimeoutAfterPendingModel:
+    def __init__(self, tool_call: ToolCall):
+        self.tool_call = tool_call
+        self.calls = 0
+
+    def complete(self, messages, tools):
+        del messages, tools
+        self.calls += 1
+        if self.calls == 1:
+            return Assistant(tool_calls=[self.tool_call])
+        if self.calls == 2:
+            raise RuntimeAgentTimedOut()
+        raise AssertionError("unexpected provider call")
 
 
 class StreamingModel:
@@ -2068,6 +2090,17 @@ def _successful_tool_record(tool_name: str, result: dict[str, object]) -> ToolEx
 def _tool_record(tool_name: str, outcome: object) -> ToolExecutionRecord:
     spec = MODEL_TOOL_CATALOG.resolve(tool_name)
     assert spec is not None
+    manifest = compile_tool_metadata_manifest(MODEL_TOOL_CATALOG.specs)
+    bundle = ToolMetadataBundleV1(
+        typed_catalog=MODEL_TOOL_CATALOG,
+        manifest=manifest,
+        legacy_boundary=manifest.to_dict()["legacy_boundary"],  # type: ignore[arg-type]
+        compensation=prepare_compensation_handler_components().metadata_projection(),
+    )
+    lease = bundle.open_segment_lease()
+    spec_handle = lease.resolve(tool_name)
+    assert spec_handle is not None
+    assert lease.require_spec(spec_handle) is spec
     prepared = PreparedToolCall(
         tool_call_id="call-1",
         spec=spec,
@@ -2076,6 +2109,7 @@ def _tool_record(tool_name: str, outcome: object) -> ToolExecutionRecord:
         arguments_digest="sha256:" + "0" * 64,
         binding=BindingAudit(status="unbound", target_count=0),
         contract_fingerprint="sha256:" + "0" * 64,
+        spec_handle=spec_handle,
     )
     return ToolExecutionRecord(prepared=prepared, outcome=outcome, execution_started=True)
 
@@ -6969,7 +7003,7 @@ def test_chat_confirm_timeout_after_write_returns_completed_fallback(
 ):
     import offerpilot.api as api_module
 
-    model = SlowAfterPendingModel(
+    model = TimeoutAfterPendingModel(
         ToolCall(
             id="slow-confirm",
             name="update_application_status",
@@ -6977,7 +7011,7 @@ def test_chat_confirm_timeout_after_write_returns_completed_fallback(
         )
     )
     _, client, _, pending = _create_status_confirmation(tmp_path, model)
-    monkeypatch.setattr(api_module, "CHAT_AGENT_TIMEOUT_SECONDS", 0.75)
+    monkeypatch.setattr(api_module, "CHAT_AGENT_TIMEOUT_SECONDS", 5.0)
 
     response = client.post(
         endpoint,
@@ -7073,9 +7107,14 @@ def test_chat_confirm_timeout_during_handler_finalizes_durably_later(
     else:
         assert response.status_code == 409
         assert "仍在后台执行" in response.json()["error"]
-    time.sleep(0.5)
-    conversation = client.get("/api/chat/conversations").json()[0]
-    assert conversation["pending_action"] is None
+    deadline = time.monotonic() + 5
+    while True:
+        conversation = client.get("/api/chat/conversations").json()[0]
+        if conversation["pending_action"] is None:
+            break
+        if time.monotonic() >= deadline:
+            pytest.fail("background confirmation did not clear the durable Pending action")
+        time.sleep(0.01)
     assert conversation["last_write_undo"] is not None
     assert app_client.get(f"/api/applications/{application['id']}").json()["status"] == "offer"
     stored = client.get(f"/api/chat/conversations/{pending['conversation_id']}").json()

@@ -14,12 +14,34 @@ from offerpilot.ai.tool_runtime.contracts import (
     ToolSpec,
     ToolSuccess,
 )
+from offerpilot.ai.tool_runtime.catalog import SegmentToolSpecHandle, ToolCatalog
+from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.ai.tool_runtime.rendering import render_compatibility
 from offerpilot.ai.tool_runtime.transport import project_transport_event
-from tests.tool_metadata.factories import synthetic_tool_spec
+from tests.tool_metadata.factories import compose_synthetic_bundle, synthetic_tool_spec
 
 
-def _spec(*, renderer: Any | None = None, metadata: Any | None = None) -> ToolSpec[dict[str, Any], dict[str, Any]]:
+def _test_spec_handle(spec: ToolSpec[Any, Any]) -> SegmentToolSpecHandle:
+    catalog = ToolCatalog((spec,), expected_names=(spec.name,))
+    source = compose_synthetic_bundle()
+    manifest = dict(cast(dict[str, object], source["manifest"]))
+    manifest["typed_tools"] = (spec.name,)
+    bundle = ToolMetadataBundleV1(
+        typed_catalog=catalog,
+        manifest=manifest,
+        legacy_boundary=cast(dict[str, object], source["legacy_boundary"]),
+        compensation=cast(dict[str, object], source["compensation"]),
+    )
+    lease = bundle.open_segment_lease()
+    handle = lease.resolve(spec.name)
+    assert handle is not None
+    assert lease.require_spec(handle) is spec
+    return handle
+
+
+def _spec(
+    *, renderer: Any | None = None, metadata: Any | None = None
+) -> ToolSpec[dict[str, Any], dict[str, Any]]:
     return replace(
         synthetic_tool_spec("read_one"),
         result_metadata_projector=metadata,
@@ -34,6 +56,7 @@ def _record(spec: ToolSpec[Any, Any], outcome: Any) -> ToolExecutionRecord[Any, 
         binding=BindingAudit("unavailable", 0),
         contract_fingerprint="sha256:" + "b" * 64,
         spec=spec,
+        spec_handle=_test_spec_handle(spec),
         tool_call_id="read-1",
         typed_args={},
     )

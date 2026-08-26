@@ -16,6 +16,7 @@ from offerpilot.ai.tool_authority import (
     AuthorityCallIdentity,
     AuthorityFactory,
     AuthorityPhaseError,
+    AuthorityUse,
     ExecutionClaim,
     PendingAuthorityClaim,
     SegmentExecutionAuthority,
@@ -31,7 +32,14 @@ from offerpilot.ai.tool_runtime.contracts import (
     TransientToolRuntimeValue,
     materialize_provider_payloads,
 )
-from tests.tool_metadata.factories import read_metadata, synthetic_tool_spec, write_metadata
+from offerpilot.ai.tool_runtime.catalog import ToolCatalog
+from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
+from tests.tool_metadata.factories import (
+    compose_synthetic_bundle,
+    read_metadata,
+    synthetic_tool_spec,
+    write_metadata,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -39,6 +47,17 @@ ARG_DIGEST = "sha256:" + hashlib.sha256(b"{}").hexdigest()
 SURFACE_FINGERPRINT = "sha256:" + "c" * 64
 PROPOSAL_HMAC = "hmac-sha256:" + "d" * 64
 TOKEN_HMAC = "hmac-sha256:" + "e" * 64
+_LEASES: list[object] = []
+_ROUTES: dict[int, tuple[object, object, dict[str, ToolSpec[Any, Any]]]] = {}
+
+
+@pytest.fixture(autouse=True)
+def _close_segment_leases():
+    yield
+    _ROUTES.clear()
+    while _LEASES:
+        getattr(_LEASES.pop(), "close")()
+
 
 _PRIVATE_FIELD_NAMES = {
     "authority_instance_token",
@@ -206,29 +225,62 @@ def _prepared(
     kind: str,
     invocation: object | None = None,
 ) -> tuple[PreparedToolCall[Any, Any], object]:
-    parameters: dict[str, object] = {"type": "object", "properties": {}}
-    contract = ProviderToolContract(
-        payload={
-            "type": "function",
-            "function": {
-                "name": tool_name,
-                "description": "",
-                "parameters": parameters,
-            },
-        },
-        name=tool_name,
-        description="",
-        parameters=parameters,
-    )
-    metadata = write_metadata(tool_name) if kind == "write" else read_metadata(tool_name)
-    if kind == "write":
-        metadata = replace(metadata, editable_fields=())
-    spec = replace(
-        synthetic_tool_spec(tool_name, metadata=metadata),
-        contract=contract,
-        decoder=lambda value: value,
-        executor=lambda args, context: args,
-    )
+    route = _ROUTES.get(id(authority))
+    if route is None:
+        specs: list[ToolSpec[Any, Any]] = []
+        for candidate_name, candidate_kind in (
+            ("get_application", "read"),
+            ("create_application", "write"),
+            ("update_application_status", "write"),
+        ):
+            parameters: dict[str, object] = {"type": "object", "properties": {}}
+            contract = ProviderToolContract(
+                payload={
+                    "type": "function",
+                    "function": {
+                        "name": candidate_name,
+                        "description": "",
+                        "parameters": parameters,
+                    },
+                },
+                name=candidate_name,
+                description="",
+                parameters=parameters,
+            )
+            metadata = (
+                write_metadata(candidate_name)
+                if candidate_kind == "write"
+                else read_metadata(candidate_name)
+            )
+            if candidate_kind == "write":
+                metadata = replace(metadata, editable_fields=())
+            specs.append(
+                replace(
+                    synthetic_tool_spec(candidate_name, metadata=metadata),
+                    contract=contract,
+                    decoder=lambda value: value,
+                    executor=lambda args, context: args,
+                )
+            )
+        catalog = ToolCatalog(tuple(specs), expected_names=tuple(spec.name for spec in specs))
+        source = compose_synthetic_bundle()
+        bundle = ToolMetadataBundleV1(
+            typed_catalog=catalog,
+            manifest={**source["manifest"], "typed_tools": tuple(spec.name for spec in specs)},
+            legacy_boundary=source["legacy_boundary"],
+            compensation=source["compensation"],
+        )
+        lease = bundle.open_segment_lease()
+        _LEASES.append(lease)
+        factory.bind_segment_tool_catalog(
+            authority,  # type: ignore[arg-type]
+            authority_metadata_view=bundle.authority_view(),
+            catalog_lease=lease,
+        )
+        route = (bundle, lease, {spec.name: spec for spec in specs})
+        _ROUTES[id(authority)] = route
+    _, lease, specs_by_name = route
+    spec = specs_by_name[tool_name]
     if type(authority).__name__ == "ApprovalExecutionAuthority":
         prepare_identity = factory.create_approved_write_prepare_identity(
             authority,  # type: ignore[arg-type]
@@ -246,16 +298,20 @@ def _prepared(
             tool_name=tool_name,
             arguments_digest=ARG_DIGEST,
         )
+    spec_handle = lease.resolve(tool_name)
+    assert spec_handle is not None
     factory.register_tool_spec(
-        spec,
+        spec_handle,
+        catalog_lease=lease,
         authority=authority,  # type: ignore[arg-type]
         prepare_identity=prepare_identity,  # type: ignore[arg-type]
     )
     prepared = factory.prepare_tool_call(
         authority,  # type: ignore[arg-type]
+        catalog_lease=lease,
+        spec_handle=spec_handle,
         prepare_identity=prepare_identity,  # type: ignore[arg-type]
         tool_call_id=tool_call_id,
-        spec=spec,
         arguments={},
         typed_args={},
         arguments_digest=ARG_DIGEST,
@@ -366,6 +422,11 @@ def _live_security_graph(
         tool_call_id=approval_pending.tool_call_id,
         tool_name=approval_pending.tool_name,
         kind="write",
+    )
+    factory.begin_prepared_execution(
+        approved_prepared,
+        authority=approval,
+        use=AuthorityUse.APPROVED_WRITE_PREPARE,
     )
     execution_transaction = execution_session.begin()
     factory.register_transaction(execution_transaction)

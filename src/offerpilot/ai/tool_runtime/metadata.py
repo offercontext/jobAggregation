@@ -757,8 +757,15 @@ class CompensationHandlerBindingV1:
 class BundleInstanceToken(TransientToolRuntimeValue):
     """Opaque process-local provenance for one complete metadata Bundle."""
 
-    __slots__ = ("_issued", "_lock", "_sealed", "_integrity_seal")
+    __slots__ = (
+        "_issued",
+        "_segment_leases",
+        "_lock",
+        "_sealed",
+        "_integrity_seal",
+    )
     _issued: Mapping[type[object], tuple[object, object]]
+    _segment_leases: dict[int, object]
     _lock: RLock
     _sealed: bool
     _integrity_seal: tuple[object, ...] | None
@@ -774,6 +781,7 @@ class BundleInstanceToken(TransientToolRuntimeValue):
         if hasattr(self, "_issued"):
             raise TypeError("Bundle instance token is already initialized")
         object.__setattr__(self, "_issued", {})
+        object.__setattr__(self, "_segment_leases", {})
         object.__setattr__(self, "_lock", RLock())
         object.__setattr__(self, "_sealed", False)
         object.__setattr__(self, "_integrity_seal", None)
@@ -808,29 +816,34 @@ class BundleInstanceToken(TransientToolRuntimeValue):
                         (view_type, id(view), snapshot)
                         for view_type, (view, snapshot) in issued.items()
                     ),
+                    id(self._segment_leases),
                     id(self._lock),
                 ),
             )
 
     def _ensure_integrity(self) -> None:
         try:
-            if not self._sealed or type(self._issued) is not MappingProxyType:
-                raise ValueError("Bundle instance token registry is not finalized")
-            current = (
-                id(self._issued),
-                tuple(
-                    (view_type, id(view), snapshot)
-                    for view_type, (view, snapshot) in self._issued.items()
-                ),
-                id(self._lock),
-            )
-            if current != self._integrity_seal:
-                raise ValueError("Bundle instance token integrity drift")
+            self._ensure_registry_integrity()
             for view, expected_snapshot in self._issued.values():
-                if _bundle_view_integrity_snapshot(view) != expected_snapshot:
+                if not _bundle_view_matches_integrity_snapshot(view, expected_snapshot):
                     raise ValueError("metadata Bundle view integrity drift")
         except (AttributeError, TypeError, ValueError) as exc:
             raise ValueError("Bundle instance token integrity drift") from exc
+
+    def _ensure_registry_integrity(self) -> None:
+        if not self._sealed or type(self._issued) is not MappingProxyType:
+            raise ValueError("Bundle instance token registry is not finalized")
+        current = (
+            id(self._issued),
+            tuple(
+                (view_type, id(view), snapshot)
+                for view_type, (view, snapshot) in self._issued.items()
+            ),
+            id(self._segment_leases),
+            id(self._lock),
+        )
+        if current != self._integrity_seal:
+            raise ValueError("Bundle instance token integrity drift")
 
     def _require_view(self, view: object, expected_type: type[object]) -> None:
         with self._lock:
@@ -839,11 +852,79 @@ class BundleInstanceToken(TransientToolRuntimeValue):
             if type(view) is not expected_type or issued is None or issued[0] is not view:
                 raise TypeError("metadata view was not issued by this Bundle token")
             try:
-                current = _bundle_view_integrity_snapshot(view)
+                matches = _bundle_view_matches_integrity_snapshot(view, issued[1])
             except (AttributeError, TypeError, ValueError) as exc:
                 raise ValueError("metadata view integrity drift") from exc
-            if current != issued[1]:
+            if not matches:
                 raise ValueError("metadata view integrity drift")
+
+    def _require_issued_view_integrity(
+        self,
+        view: object,
+        expected_type: type[object],
+    ) -> None:
+        """Validate one registered view for its exact internal consumer."""
+
+        with self._lock:
+            self._ensure_registry_integrity()
+            issued = self._issued.get(expected_type)
+            if type(view) is not expected_type or issued is None or issued[0] is not view:
+                raise TypeError("metadata view was not issued by this Bundle token")
+            try:
+                matches = _bundle_view_matches_integrity_snapshot(view, issued[1])
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise ValueError("metadata view integrity drift") from exc
+            if not matches:
+                raise ValueError("metadata view integrity drift")
+
+    def _register_segment_lease(self, lease: object) -> None:
+        from offerpilot.ai.tool_runtime.catalog import SegmentToolCatalogLease
+
+        with self._lock:
+            self._ensure_registry_integrity()
+            if type(lease) is not SegmentToolCatalogLease:
+                raise TypeError("Bundle token can register only an exact Segment lease")
+            lease_bundle = object.__getattribute__(lease, "_bundle_instance_token")
+            lease_state = object.__getattribute__(lease, "_state")
+            if lease_bundle is not self or object.__getattribute__(lease_state, "closed"):
+                raise ValueError("Segment lease has invalid Bundle provenance")
+            key = id(lease)
+            if key in self._segment_leases:
+                raise ValueError("Segment lease is already registered")
+            self._segment_leases[key] = lease
+
+    def _require_registered_segment_lease(self, lease: object) -> None:
+        from offerpilot.ai.tool_runtime.catalog import SegmentToolCatalogLease
+
+        with self._lock:
+            self._ensure_registry_integrity()
+            if type(lease) is not SegmentToolCatalogLease:
+                raise TypeError("Segment lease registry requires an exact lease")
+            lease_bundle = object.__getattribute__(lease, "_bundle_instance_token")
+            lease_state = object.__getattribute__(lease, "_state")
+            if (
+                lease_bundle is not self
+                or self._segment_leases.get(id(lease)) is not lease
+                or object.__getattribute__(lease_state, "closed")
+            ):
+                raise ValueError("Segment lease is not registered or has been revoked")
+
+    def _revoke_segment_lease(self, lease: object) -> None:
+        from offerpilot.ai.tool_runtime.catalog import SegmentToolCatalogLease
+
+        with self._lock:
+            self._ensure_registry_integrity()
+            if type(lease) is not SegmentToolCatalogLease:
+                raise TypeError("Segment lease registry requires an exact lease")
+            if object.__getattribute__(lease, "_bundle_instance_token") is not self:
+                raise ValueError("Segment lease has invalid Bundle provenance")
+            key = id(lease)
+            registered = self._segment_leases.get(key)
+            if registered is None:
+                return
+            if registered is not lease:
+                raise ValueError("Segment lease registry identity drift")
+            del self._segment_leases[key]
 
     def __reduce_ex__(self, protocol: SupportsIndex) -> NoReturn:
         del protocol
@@ -1235,6 +1316,99 @@ def _bundle_view_integrity_snapshot(value: object) -> object:
     ):
         return (type(value), value.value)
     raise TypeError(f"unsupported Bundle view component: {type(value).__name__}")
+
+
+def tool_surface_metadata_integrity_snapshot(metadata: ToolSurfaceMetadataV1) -> object:
+    """Return an exact recursive seal for one validated Tool metadata component."""
+
+    if type(metadata) is not ToolSurfaceMetadataV1:
+        raise TypeError("Tool metadata integrity requires exact surface metadata")
+    metadata._ensure_shape()
+    return _bundle_view_integrity_snapshot(metadata)
+
+
+def _bundle_view_matches_integrity_snapshot(value: object, expected: object) -> bool:
+    """Compare one sealed Bundle view to its frozen snapshot without rebuilding it."""
+
+    if type(expected) is not tuple or not expected:
+        return False
+    snapshot = cast(tuple[object, ...], expected)
+    kind = snapshot[0]
+    if kind is ProviderToolContract:
+        if type(value) is not ProviderToolContract or len(snapshot) != 6:
+            return False
+        value._ensure_provider_integrity()
+        return (
+            id(value) == snapshot[1]
+            and object.__getattribute__(value, "name") == snapshot[2]
+            and object.__getattribute__(value, "description") == snapshot[3]
+            and id(object.__getattribute__(value, "payload")) == snapshot[4]
+            and id(object.__getattribute__(value, "parameters")) == snapshot[5]
+        )
+    if kind is BundleInstanceToken:
+        return (
+            type(value) is BundleInstanceToken and len(snapshot) == 2 and id(value) == snapshot[1]
+        )
+    if is_dataclass(value) and not isinstance(value, type):
+        if type(value) is not kind or len(snapshot) != 3 or id(value) != snapshot[1]:
+            return False
+        expected_fields = snapshot[2]
+        if type(expected_fields) is not tuple:
+            return False
+        descriptors = fields(value)
+        if len(descriptors) != len(expected_fields):
+            return False
+        for descriptor, expected_field in zip(descriptors, expected_fields):
+            if type(expected_field) is not tuple or len(expected_field) != 2:
+                return False
+            field_snapshot = cast(tuple[object, object], expected_field)
+            if field_snapshot[0] != descriptor.name or not _bundle_view_matches_integrity_snapshot(
+                object.__getattribute__(value, descriptor.name),
+                field_snapshot[1],
+            ):
+                return False
+        return True
+    if isinstance(value, Mapping):
+        if type(value) is not kind or len(snapshot) != 3 or id(value) != snapshot[1]:
+            return False
+        expected_items = snapshot[2]
+        if type(expected_items) is not tuple or len(value) != len(expected_items):
+            return False
+        for (key, item), expected_item in zip(value.items(), expected_items):
+            if type(expected_item) is not tuple or len(expected_item) != 2:
+                return False
+            item_snapshot = cast(tuple[object, object], expected_item)
+            if not _bundle_view_matches_integrity_snapshot(
+                key, item_snapshot[0]
+            ) or not _bundle_view_matches_integrity_snapshot(item, item_snapshot[1]):
+                return False
+        return True
+    if type(value) is tuple:
+        if kind is not tuple or len(snapshot) != 3 or id(value) != snapshot[1]:
+            return False
+        expected_items = snapshot[2]
+        if type(expected_items) is not tuple or len(value) != len(expected_items):
+            return False
+        return all(
+            _bundle_view_matches_integrity_snapshot(item, item_snapshot)
+            for item, item_snapshot in zip(value, expected_items)
+        )
+    if value is None or type(value) in {bool, int, float, str}:
+        return len(snapshot) == 2 and kind is type(value) and value == snapshot[1]
+    if isinstance(
+        value,
+        (
+            ToolDomain,
+            ToolCapability,
+            ProviderVisibility,
+            OperationKind,
+            UndoPolicy,
+            UndoPayloadKind,
+            CompensationKind,
+        ),
+    ):
+        return len(snapshot) == 2 and kind is type(value) and value.value == snapshot[1]
+    return False
 
 
 class _BundleViewFactory(TransientToolRuntimeValue):
@@ -1943,11 +2117,17 @@ class ToolMetadataBundleV1(TransientToolRuntimeValue):
             self._ensure_integrity()
             generation = self._lease_state.generation + 1
             self._lease_state.generation = generation
-            return _open_segment_tool_catalog_lease(
+            candidate = _open_segment_tool_catalog_lease(
                 catalog=self._typed_catalog,
                 bundle_instance_token=self.bundle_instance_token,
                 generation=generation,
             )
+            try:
+                self.bundle_instance_token._register_segment_lease(candidate)
+            except BaseException:
+                candidate.close()
+                raise
+            return candidate
 
 
 class _RuntimeAsdictGuard:
@@ -3310,5 +3490,6 @@ __all__ = [
     "canonical_sha256",
     "freeze_json",
     "materialize_json",
+    "tool_surface_metadata_integrity_snapshot",
     "validate_tool_spec_components",
 ]

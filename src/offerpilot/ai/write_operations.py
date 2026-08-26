@@ -28,7 +28,6 @@ from offerpilot.ai.tool_authority import (
     AuthorityPhaseError,
     AuthorityUse,
     require_authority_phase,
-    require_authority_spec,
 )
 from offerpilot.ai.tool_authority.fingerprint import authorization_scope_fingerprint
 from offerpilot.ai.tool_authority.visibility import (
@@ -39,7 +38,6 @@ from offerpilot.ai.pending_replay import (
     PendingReplayArgsDecoderV1,
     PendingReplayIntegrityError,
 )
-from offerpilot.ai.tool_runtime.context import audit_bindings, pre_resolver_scope_policy
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import (
     JSONValue,
@@ -49,8 +47,15 @@ from offerpilot.ai.tool_runtime.contracts import (
     TRANSACTIONAL_TYPED_WRITE_NAMES,
     UndoPolicy,
 )
-from offerpilot.ai.tool_runtime.metadata import WriteOperationMetadataV1
-from offerpilot.ai.tool_runtime.pipeline import execute_prepared
+from offerpilot.ai.tool_runtime.metadata import (
+    ToolAuthorityEntryV1,
+    WriteOperationMetadataV1,
+)
+from offerpilot.ai.tool_runtime.pipeline import (
+    _audit_entry_bindings,
+    _pre_resolver_entry_scope_policy,
+    execute_prepared,
+)
 from offerpilot.ai.tool_runtime.rendering import render_compatibility
 from offerpilot.ai.tool_runtime.journal import project_tool_started_bound
 from offerpilot.ai.tool_runtime.transport import project_transport_event
@@ -582,15 +587,9 @@ def _typed_pending_confirmation_human(
 
     values = dict(arguments)
     if tool_name == "create_application":
-        return (
-            f"新建投递：{values.get('company_name', '')} - "
-            f"{values.get('position_name', '')}"
-        )
+        return f"新建投递：{values.get('company_name', '')} - {values.get('position_name', '')}"
     if tool_name == "update_application_status":
-        return (
-            f"将投递 #{values.get('id', '')} 的状态改为 "
-            f"{values.get('status', '')}"
-        )
+        return f"将投递 #{values.get('id', '')} 的状态改为 {values.get('status', '')}"
     if tool_name == "create_application_event":
         labels = {
             "written_test": "笔试",
@@ -610,9 +609,7 @@ def _typed_pending_confirmation_human(
             shown_time = raw_time
         duration = values.get("duration_minutes")
         shown_duration = f"{duration} 分钟" if duration not in (None, "") else ""
-        details = " · ".join(
-            value for value in (title, shown_time, shown_duration) if value
-        )
+        details = " · ".join(value for value in (title, shown_time, shown_duration) if value)
         return f"新建日程：{details}" if details else "新建日程"
     if tool_name == "add_note":
         details = " · ".join(
@@ -731,9 +728,7 @@ class WriteOperationRepository:
                 operation_id=str(pointer_row.pending_operation_id or ""),
                 tool_call_id=str(pointer_row.pending_tool_call_id or ""),
                 tool_name=str(pointer_row.pending_tool_name or ""),
-                pending_confirmation_claim_id=str(
-                    pointer_row.pending_confirmation_claim_id or ""
-                ),
+                pending_confirmation_claim_id=str(pointer_row.pending_confirmation_claim_id or ""),
             )
             if operation is None:
                 if not pointer.operation_id:
@@ -816,16 +811,12 @@ class WriteOperationRepository:
                 with self.session_factory() as session:
                     current = session.get(WriteOperation, operation.id)
                     if current is None:
-                        raise WriteOperationError(
-                            "operation_delivery_unknown", retryable=True
-                        )
+                        raise WriteOperationError("operation_delivery_unknown", retryable=True)
                     final_message, chained_pending = self._verify_delivery(session, current)
             except WriteOperationError:
                 raise
             except Exception as exc:
-                raise WriteOperationError(
-                    "operation_delivery_unknown", retryable=True
-                ) from exc
+                raise WriteOperationError("operation_delivery_unknown", retryable=True) from exc
         return OperationReplay(
             operation.id,
             payload,
@@ -939,9 +930,7 @@ class WriteOperationRepository:
             expected_proposal = ledger_fingerprint(
                 self.key, "write-operation-proposal-v1", decoded_args
             )
-            if not hmac.compare_digest(
-                expected_proposal, child.proposal_fingerprint or ""
-            ):
+            if not hmac.compare_digest(expected_proposal, child.proposal_fingerprint or ""):
                 raise WriteOperationError("operation_integrity_error")
             token = _pending_confirmation_token(
                 child.tool_call_id or "", child.tool_name, decoded_args
@@ -951,9 +940,7 @@ class WriteOperationRepository:
                 "write-operation-confirmation-token-v1",
                 token.encode("ascii"),
             )
-            if not hmac.compare_digest(
-                expected_token, child.confirmation_token_fingerprint or ""
-            ):
+            if not hmac.compare_digest(expected_token, child.confirmation_token_fingerprint or ""):
                 raise WriteOperationError("operation_integrity_error")
 
         if adapter_kind == "legacy_deterministic":
@@ -965,18 +952,14 @@ class WriteOperationRepository:
             expected_proposal = ledger_fingerprint(
                 self.key, "write-operation-proposal-v1", legacy_arguments
             )
-            if not hmac.compare_digest(
-                expected_proposal, child.proposal_fingerprint or ""
-            ):
+            if not hmac.compare_digest(expected_proposal, child.proposal_fingerprint or ""):
                 raise WriteOperationError("operation_integrity_error")
             expected_token = ledger_fingerprint(
                 self.key,
                 "write-operation-confirmation-token-v1",
                 token.encode("ascii"),
             )
-            if not hmac.compare_digest(
-                expected_token, child.confirmation_token_fingerprint or ""
-            ):
+            if not hmac.compare_digest(expected_token, child.confirmation_token_fingerprint or ""):
                 raise WriteOperationError("operation_integrity_error")
 
         expected_human = _verified_pending_confirmation_human(
@@ -1130,8 +1113,7 @@ class WriteOperationRepository:
                         .where(WriteOperation.delivery_status == "pending")
                         .where(WriteOperation.delivery_generation == ownership.generation)
                         .where(
-                            WriteOperation.delivery_owner_token_fingerprint
-                            == ownership.fingerprint
+                            WriteOperation.delivery_owner_token_fingerprint == ownership.fingerprint
                         )
                         .where(WriteOperation.delivery_lease_expires_at > func.unixepoch("now"))
                         .values(
@@ -1302,9 +1284,10 @@ def _locked_pending_identity(
             separators=(",", ":"),
             allow_nan=False,
         )
-        arguments_digest = "sha256:" + hashlib.sha256(
-            canonical_json(cast(JSONValue, arguments)).encode("utf-8")
-        ).hexdigest()
+        arguments_digest = (
+            "sha256:"
+            + hashlib.sha256(canonical_json(cast(JSONValue, arguments)).encode("utf-8")).hexdigest()
+        )
     except (ArgumentValidationError, TypeError, UnicodeError, ValueError) as exc:
         raise WriteOperationError("operation_identity_conflict") from exc
     revision_payload = json.dumps(
@@ -1397,7 +1380,7 @@ class WriteOperationCoordinator:
                 conversation = session.get(Conversation, conversation_id)
                 if conversation is None:
                     raise WriteOperationError("operation_identity_conflict")
-                locked_pending = self._verify_primary(
+                locked_pending, authority_entry = self._verify_primary(
                     session,
                     operation,
                     conversation,
@@ -1412,12 +1395,14 @@ class WriteOperationCoordinator:
                 )
                 bound_context = context.bind(session)
                 try:
-                    scope_failure = pre_resolver_scope_policy(
-                        prepared.spec, bound_context
+                    scope_failure = _pre_resolver_entry_scope_policy(
+                        authority_entry,
+                        bound_context,
                     )
                     if scope_failure is not None:
                         raise WriteOperationError("scope_access_denied")
-                    _binding, binding_allowed = audit_bindings(
+                    _binding, binding_allowed = _audit_entry_bindings(
+                        authority_entry,
                         prepared.spec,
                         prepared.typed_args,
                         bound_context,
@@ -1425,9 +1410,7 @@ class WriteOperationCoordinator:
                 except WriteOperationError:
                     raise
                 except Exception as exc:
-                    raise WriteOperationError(
-                        "operation_not_committed", retryable=True
-                    ) from exc
+                    raise WriteOperationError("operation_not_committed", retryable=True) from exc
                 if not binding_allowed:
                     raise WriteOperationError("scope_access_denied")
                 if prepared.spec.mutable_validator is not None:
@@ -1504,13 +1487,9 @@ class WriteOperationCoordinator:
                         authority=authority,
                     )
                 except AuthorityPhaseError as exc:
-                    raise WriteOperationError(
-                        "operation_not_committed", retryable=True
-                    ) from exc
+                    raise WriteOperationError("operation_not_committed", retryable=True) from exc
                 except Exception as exc:
-                    raise WriteOperationError(
-                        "operation_not_committed", retryable=True
-                    ) from exc
+                    raise WriteOperationError("operation_not_committed", retryable=True) from exc
                 claimed = session.execute(
                     update(Conversation)
                     .where(Conversation.id == conversation_id)
@@ -1548,7 +1527,10 @@ class WriteOperationCoordinator:
                         execution_claim=execution_claim,
                     )
                 except AuthorityPhaseError as exc:
-                    if execution_claim is not None and factory.claim_state(execution_claim) is not None:
+                    if (
+                        execution_claim is not None
+                        and factory.claim_state(execution_claim) is not None
+                    ):
                         factory.revoke(execution_claim)
                     raise WriteOperationError("operation_identity_conflict") from exc
                 if approval_decided_callback is not None:
@@ -1609,9 +1591,7 @@ class WriteOperationCoordinator:
                             raise WriteOperationError("operation_projection_failed")
                         if write_contract.undo_policy is UndoPolicy.NONE and undo is not None:
                             raise WriteOperationError("operation_projection_failed")
-                        visible_value = prepared.spec.presentation.success_summary_projector(
-                            result
-                        )
+                        visible_value = prepared.spec.presentation.success_summary_projector(result)
                         if not isinstance(visible_value, str):
                             raise WriteOperationError("operation_projection_failed")
                         visible = visible_value
@@ -1856,15 +1836,18 @@ class WriteOperationCoordinator:
                     ).digest()[:8],
                     "big",
                 ) & ((1 << 63) - 1)
-                pointer_digest = "sha256:" + hashlib.sha256(
-                    canonical_json(
-                        {
-                            "operation_id": pointer.operation_id,
-                            "tool_call_id": pointer.tool_call_id,
-                            "tool_name": pointer.tool_name,
-                        }
-                    ).encode("utf-8")
-                ).hexdigest()
+                pointer_digest = (
+                    "sha256:"
+                    + hashlib.sha256(
+                        canonical_json(
+                            {
+                                "operation_id": pointer.operation_id,
+                                "tool_call_id": pointer.tool_call_id,
+                                "tool_name": pointer.tool_name,
+                            }
+                        ).encode("utf-8")
+                    ).hexdigest()
+                )
                 factory.register_pending(
                     pointer,
                     conversation_id=pointer.conversation_id,
@@ -1872,9 +1855,7 @@ class WriteOperationCoordinator:
                     tool_call_id=pointer.tool_call_id,
                     tool_name=pointer.tool_name,
                     pending_action_revision=pointer_revision,
-                    pending_confirmation_claim_id=(
-                        pointer.pending_confirmation_claim_id
-                    ),
+                    pending_confirmation_claim_id=(pointer.pending_confirmation_claim_id),
                     arguments_digest=pointer_digest,
                     effective_args_digest=pointer_digest,
                 )
@@ -1887,12 +1868,8 @@ class WriteOperationCoordinator:
 
                 expected_adapter_kind = operation.adapter_kind
                 expected_proposal_fingerprint = operation.proposal_fingerprint
-                expected_confirmation_token_fingerprint = (
-                    operation.confirmation_token_fingerprint
-                )
-                expected_authorization_scope_fingerprint = (
-                    operation.authorization_scope_fingerprint
-                )
+                expected_confirmation_token_fingerprint = operation.confirmation_token_fingerprint
+                expected_authorization_scope_fingerprint = operation.authorization_scope_fingerprint
                 expected_fingerprint_key_id = operation.fingerprint_key_id
 
                 def reject_cas() -> None:
@@ -1926,10 +1903,7 @@ class WriteOperationCoordinator:
                         .where(WriteOperation.adapter_kind == expected_adapter_kind)
                         .where(WriteOperation.tool_call_id == tool_call_id)
                         .where(WriteOperation.tool_name == tool_name)
-                        .where(
-                            WriteOperation.proposal_fingerprint
-                            == expected_proposal_fingerprint
-                        )
+                        .where(WriteOperation.proposal_fingerprint == expected_proposal_fingerprint)
                         .where(
                             WriteOperation.confirmation_token_fingerprint
                             == expected_confirmation_token_fingerprint
@@ -1938,10 +1912,7 @@ class WriteOperationCoordinator:
                             WriteOperation.authorization_scope_fingerprint
                             == expected_authorization_scope_fingerprint
                         )
-                        .where(
-                            WriteOperation.fingerprint_key_id
-                            == expected_fingerprint_key_id
-                        )
+                        .where(WriteOperation.fingerprint_key_id == expected_fingerprint_key_id)
                         .where(WriteOperation.operation_request_fingerprint.is_(None))
                         .values(
                             status=payload.status,
@@ -1960,8 +1931,7 @@ class WriteOperationCoordinator:
                             delivery_owner_token_fingerprint=owner.fingerprint,
                             delivery_lease_expires_at=cast(
                                 Any,
-                                func.unixepoch("now")
-                                + DELIVERY_OWNER_LEASE_SECONDS,
+                                func.unixepoch("now") + DELIVERY_OWNER_LEASE_SECONDS,
                             ),
                             updated_at=now,
                         )
@@ -2398,7 +2368,7 @@ class WriteOperationCoordinator:
         edited_args_present: bool,
         edited_args: Mapping[str, JSONValue] | None,
         factory: Any,
-    ) -> _LockedPendingIdentity:
+    ) -> tuple[_LockedPendingIdentity, ToolAuthorityEntryV1]:
         if operation.conversation_id is None:
             raise WriteOperationError("operation_unavailable")
         if operation.conversation_id != conversation_id or conversation.id != conversation_id:
@@ -2416,10 +2386,10 @@ class WriteOperationCoordinator:
                 AuthorityUse.APPROVED_WRITE_PREPARE,
                 prepare_identity,
             )
-            require_authority_spec(
-                authority,
-                AuthorityUse.APPROVED_WRITE_PREPARE,
-                prepared.spec,
+            authority_entry = factory.require_prepared_route(
+                prepared,
+                authority=authority,
+                use=AuthorityUse.APPROVED_WRITE_PREPARE,
             )
             persisted_values = parse_arguments(conversation.pending_args)
             prepared_values = cast(dict[str, JSONValue], dict(prepared.arguments))
@@ -2433,8 +2403,7 @@ class WriteOperationCoordinator:
                 if any(type(key) is not str for key in patch):
                     raise TypeError("edited_args keys must be strings")
                 editable_fields = {
-                    descriptor.field
-                    for descriptor in prepared.spec.metadata.editable_fields
+                    descriptor.field for descriptor in prepared.spec.metadata.editable_fields
                 }
                 if any(key not in editable_fields for key in patch):
                     raise ValueError("edited_args contains a non-editable field")
@@ -2491,9 +2460,7 @@ class WriteOperationCoordinator:
             or prepare_identity.pending_action_revision != effective.pending_action_revision
             or prepared_pending_token is not authority.pending_identity
             or prepare_identity.pending_identity is not authority.pending_identity
-            or not _constant_time_text_equal(
-                prepared.arguments_digest, effective.arguments_digest
-            )
+            or not _constant_time_text_equal(prepared.arguments_digest, effective.arguments_digest)
             or not _constant_time_text_equal(
                 authority.effective_args_digest, effective.arguments_digest
             )
@@ -2555,9 +2522,7 @@ class WriteOperationCoordinator:
         except WriteOperationError:
             raise
         except Exception as exc:
-            raise WriteOperationError(
-                "operation_not_committed", retryable=True
-            ) from exc
+            raise WriteOperationError("operation_not_committed", retryable=True) from exc
         if not _constant_time_text_equal(
             operation.authorization_scope_fingerprint,
             locked_scope_fingerprint,
@@ -2569,15 +2534,16 @@ class WriteOperationCoordinator:
                     session, context_ref
                 )
             except AuthorityApplicationVisibilityError as exc:
-                raise WriteOperationError(
-                    "operation_not_committed", retryable=True
-                ) from exc
+                raise WriteOperationError("operation_not_committed", retryable=True) from exc
             if active_parent is None:
                 raise WriteOperationError("authorization_scope_unavailable")
-        return _LockedPendingIdentity(
-            locked_proposal.raw_args,
-            effective.arguments_digest,
-            effective.pending_action_revision,
+        return (
+            _LockedPendingIdentity(
+                locked_proposal.raw_args,
+                effective.arguments_digest,
+                effective.pending_action_revision,
+            ),
+            authority_entry,
         )
 
     def _commit_failure(

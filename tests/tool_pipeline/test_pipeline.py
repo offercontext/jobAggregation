@@ -7,7 +7,11 @@ from typing import Any, cast
 
 import pytest
 
-from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
+from offerpilot.ai.tool_authority import (
+    AuthorityFactory,
+    AuthorityPhaseError,
+    TrustedContextScope,
+)
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import (
@@ -15,6 +19,8 @@ from offerpilot.ai.tool_runtime.contracts import (
     ProviderToolContract,
     ReadyToExecute,
     ToolFailure,
+    ToolExceptionMapping,
+    ToolResultMetadata,
     ToolSpec,
     ToolSuccess,
 )
@@ -22,6 +28,7 @@ from offerpilot.ai.tool_runtime.metadata import (
     BindingResolverDescriptorV1,
     ResolverImplementationBinding,
     ToolBindingMetadataV1,
+    ToolMetadataBundleV1,
 )
 from offerpilot.ai.tool_runtime.policy_types import ToolCapability
 from offerpilot.ai.tool_runtime.pipeline import Rejected, execute_prepared, prepare_call
@@ -33,7 +40,11 @@ from offerpilot.repositories.jd import JDAnalysesRepository
 from offerpilot.repositories.notes import NotesRepository
 from offerpilot.repositories.offers import OffersRepository
 from offerpilot.repositories.resumes import ResumesRepository
-from tests.tool_metadata.factories import presentation_binding, read_metadata
+from tests.tool_metadata.factories import (
+    compose_synthetic_bundle,
+    presentation_binding,
+    read_metadata,
+)
 
 
 class Recorder:
@@ -60,6 +71,19 @@ def _decode_mapping(values: Any) -> dict[str, Any]:
 
 def _render_mapping(result: Any) -> str:
     return str(result)
+
+
+_DRIFTED_CALLBACK_CALLS: list[str] = []
+
+
+def _render_drifted_mapping(_result: Any) -> str:
+    _DRIFTED_CALLBACK_CALLS.append("success_renderer")
+    return "drifted renderer"
+
+
+def _project_drifted_result_metadata(_result: Any) -> ToolResultMetadata:
+    _DRIFTED_CALLBACK_CALLS.append("result_metadata_projector")
+    return ToolResultMetadata(changed_entities=({"kind": "drifted"},))
 
 
 @dataclass
@@ -256,6 +280,26 @@ def _spec(
     )
 
 
+def _lease(runtime: Runtime, spec: ToolSpec[Any, Any]) -> Any:
+    catalog = ToolCatalog((spec,), expected_names=(spec.name,))
+    source = compose_synthetic_bundle()
+    manifest = dict(cast(dict[str, object], source["manifest"]))
+    manifest["typed_tools"] = (spec.name,)
+    bundle = ToolMetadataBundleV1(
+        typed_catalog=catalog,
+        manifest=manifest,
+        legacy_boundary=cast(dict[str, object], source["legacy_boundary"]),
+        compensation=cast(dict[str, object], source["compensation"]),
+    )
+    lease = bundle.open_segment_lease()
+    runtime.factory.bind_segment_tool_catalog(
+        runtime.authority,
+        authority_metadata_view=bundle.authority_view(),
+        catalog_lease=lease,
+    )
+    return lease
+
+
 def test_prepare_and_read_execute_have_exact_stage_order(tmp_path: Any) -> None:
     recorder = Recorder()
     runtime = _runtime(tmp_path, recorder)
@@ -264,7 +308,7 @@ def test_prepare_and_read_execute_have_exact_stage_order(tmp_path: Any) -> None:
         spec = _spec()
         call = ToolCall(id="read-1", name=spec.name, args='{"id":1,"extra":"kept"}')
         prepared = prepare_call(
-            ToolCatalog([spec], expected_names=(spec.name,)),
+            _lease(runtime, spec),
             runtime.context,
             call,
             call_identity=runtime.prepare_identity(call),
@@ -311,6 +355,223 @@ def test_prepare_and_read_execute_have_exact_stage_order(tmp_path: Any) -> None:
         runtime.close()
 
 
+@pytest.mark.parametrize(
+    ("field_name", "replacement"),
+    (
+        ("success_renderer", _render_drifted_mapping),
+        ("result_metadata_projector", _project_drifted_result_metadata),
+    ),
+)
+def test_read_executor_callable_drift_fails_before_terminal_projection(
+    tmp_path: Any,
+    field_name: str,
+    replacement: Any,
+) -> None:
+    recorder = Recorder()
+    runtime = _runtime(tmp_path, recorder)
+    spec_holder: dict[str, ToolSpec[Any, Any]] = {}
+
+    def executor(args: Any, _context: ToolExecutionContext) -> Any:
+        object.__setattr__(spec_holder["spec"], field_name, replacement)
+        return args
+
+    spec = _spec(executor=executor)
+    spec_holder["spec"] = spec
+    original = getattr(spec, field_name)
+    _DRIFTED_CALLBACK_CALLS.clear()
+    lease = _lease(runtime, spec)
+    call = ToolCall(id="read-drift", name=spec.name, args='{"id":1}')
+    try:
+        prepared = prepare_call(
+            lease,
+            runtime.context,
+            call,
+            call_identity=runtime.prepare_identity(call),
+        )
+        assert isinstance(prepared, ReadyToExecute)
+
+        with pytest.raises(AuthorityPhaseError):
+            execute_prepared(
+                prepared.prepared,
+                runtime.context,
+                call_identity=runtime.read_identity(prepared.prepared),
+            )
+
+        assert not any(
+            event.event_type in {"tool.completed", "tool.failed"} for event in recorder.events
+        )
+        assert _DRIFTED_CALLBACK_CALLS == []
+    finally:
+        _DRIFTED_CALLBACK_CALLS.clear()
+        object.__setattr__(spec, field_name, original)
+        lease.close()
+        runtime.close()
+
+
+def test_read_executor_exception_map_drift_fails_before_failure_projection(
+    tmp_path: Any,
+) -> None:
+    recorder = Recorder()
+    runtime = _runtime(tmp_path, recorder)
+    spec_holder: dict[str, ToolSpec[Any, Any]] = {}
+    replacement = (
+        ToolExceptionMapping(
+            exception_type=RuntimeError,
+            category="provider_error",
+            code="drifted_exception_map",
+            compatibility_detail="drifted exception",
+        ),
+    )
+
+    def executor(_args: Any, _context: ToolExecutionContext) -> Any:
+        object.__setattr__(spec_holder["spec"], "exception_map", replacement)
+        raise RuntimeError("executor failed after drift")
+
+    spec = _spec(executor=executor)
+    spec_holder["spec"] = spec
+    original = spec.exception_map
+    lease = _lease(runtime, spec)
+    call = ToolCall(id="read-exception-drift", name=spec.name, args='{"id":1}')
+    try:
+        prepared = prepare_call(
+            lease,
+            runtime.context,
+            call,
+            call_identity=runtime.prepare_identity(call),
+        )
+        assert isinstance(prepared, ReadyToExecute)
+
+        with pytest.raises(AuthorityPhaseError):
+            execute_prepared(
+                prepared.prepared,
+                runtime.context,
+                call_identity=runtime.read_identity(prepared.prepared),
+            )
+
+        assert not any(
+            event.event_type in {"tool.completed", "tool.failed"} for event in recorder.events
+        )
+    finally:
+        object.__setattr__(spec, "exception_map", original)
+        lease.close()
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("raises", "terminal_stage", "field_name", "replacement"),
+    (
+        (False, "tool.completed", "success_renderer", _render_drifted_mapping),
+        (
+            True,
+            "tool.failed",
+            "exception_map",
+            (
+                ToolExceptionMapping(
+                    exception_type=RuntimeError,
+                    category="provider_error",
+                    code="stage_drifted_exception_map",
+                ),
+            ),
+        ),
+    ),
+)
+def test_read_terminal_stage_drift_fails_before_terminal_projection(
+    tmp_path: Any,
+    raises: bool,
+    terminal_stage: str,
+    field_name: str,
+    replacement: Any,
+) -> None:
+    recorder = Recorder()
+    runtime = _runtime(tmp_path, recorder)
+
+    def executor(args: Any, _context: ToolExecutionContext) -> Any:
+        if raises:
+            raise RuntimeError("read failed")
+        return args
+
+    spec = _spec(executor=executor)
+    original = getattr(spec, field_name)
+    lease = _lease(runtime, spec)
+    call = ToolCall(id="read-stage-drift", name=spec.name, args='{"id":1}')
+
+    def stage_sink(stage: str) -> None:
+        if stage == terminal_stage:
+            object.__setattr__(spec, field_name, replacement)
+
+    _DRIFTED_CALLBACK_CALLS.clear()
+    try:
+        prepared = prepare_call(
+            lease,
+            runtime.context,
+            call,
+            call_identity=runtime.prepare_identity(call),
+        )
+        assert isinstance(prepared, ReadyToExecute)
+
+        with pytest.raises(AuthorityPhaseError):
+            execute_prepared(
+                prepared.prepared,
+                runtime.context,
+                call_identity=runtime.read_identity(prepared.prepared),
+                stage_sink=stage_sink,
+            )
+
+        assert not any(
+            event.event_type in {"tool.completed", "tool.failed"} for event in recorder.events
+        )
+        assert _DRIFTED_CALLBACK_CALLS == []
+    finally:
+        _DRIFTED_CALLBACK_CALLS.clear()
+        object.__setattr__(spec, field_name, original)
+        lease.close()
+        runtime.close()
+
+
+def test_read_terminal_recorder_drift_fails_before_returning_record(tmp_path: Any) -> None:
+    recorder = Recorder()
+    runtime = _runtime(tmp_path, recorder)
+    spec = _spec()
+    original = spec.result_metadata_projector
+    lease = _lease(runtime, spec)
+    call = ToolCall(id="read-recorder-drift", name=spec.name, args='{"id":1}')
+    original_append = recorder.append_event
+
+    def append_event(event: Any) -> None:
+        original_append(event)
+        if event.event_type == "tool.completed":
+            object.__setattr__(
+                spec,
+                "result_metadata_projector",
+                _project_drifted_result_metadata,
+            )
+
+    recorder.append_event = append_event
+    _DRIFTED_CALLBACK_CALLS.clear()
+    try:
+        prepared = prepare_call(
+            lease,
+            runtime.context,
+            call,
+            call_identity=runtime.prepare_identity(call),
+        )
+        assert isinstance(prepared, ReadyToExecute)
+
+        with pytest.raises(AuthorityPhaseError):
+            execute_prepared(
+                prepared.prepared,
+                runtime.context,
+                call_identity=runtime.read_identity(prepared.prepared),
+            )
+
+        assert _DRIFTED_CALLBACK_CALLS == []
+    finally:
+        _DRIFTED_CALLBACK_CALLS.clear()
+        object.__setattr__(spec, "result_metadata_projector", original)
+        lease.close()
+        runtime.close()
+
+
 def test_unknown_tool_has_catalog_lookup_only_and_no_proposal(tmp_path: Any) -> None:
     recorder = Recorder()
     runtime = _runtime(tmp_path, recorder)
@@ -319,7 +580,7 @@ def test_unknown_tool_has_catalog_lookup_only_and_no_proposal(tmp_path: Any) -> 
         spec = _spec()
         call = ToolCall(id="unknown-1", name="unknown", args='{"id":1}')
         result = prepare_call(
-            ToolCatalog([spec], expected_names=(spec.name,)),
+            _lease(runtime, spec),
             runtime.context,
             call,
             call_identity=runtime.prepare_identity(call),
@@ -366,7 +627,7 @@ def test_missing_capability_has_zero_resolver_repository_preflight_executor_call
         )
         call = ToolCall(id="read-1", name=spec.name, args='{"id":1}')
         result = prepare_call(
-            ToolCatalog([spec], expected_names=(spec.name,)),
+            _lease(runtime, spec),
             runtime.context,
             call,
             call_identity=runtime.prepare_identity(call),
@@ -398,7 +659,7 @@ def test_non_application_only_denies_before_resolver(tmp_path: Any) -> None:
         call = ToolCall(id="call-1", name=spec.name, args='{"id":1}')
         trace: list[str] = []
         result = prepare_call(
-            ToolCatalog([spec], expected_names=(spec.name,)),
+            _lease(runtime, spec),
             runtime.context,
             call,
             call_identity=runtime.prepare_identity(call),
@@ -419,6 +680,7 @@ def test_resolver_exception_maps_safely_and_base_exception_propagates(tmp_path: 
     runtime = _runtime(tmp_path, recorder)
     try:
         for error in (RuntimeError("private sql detail"),):
+
             def fail(*_args: Any, error: Exception = error) -> Any:
                 raise error
 
@@ -428,7 +690,7 @@ def test_resolver_exception_maps_safely_and_base_exception_propagates(tmp_path: 
             )
             call = ToolCall(id="read-exception", name=spec.name, args='{"id":1}')
             result = prepare_call(
-                ToolCatalog([spec], expected_names=(spec.name,)),
+                _lease(runtime, spec),
                 runtime.context,
                 call,
                 call_identity=runtime.prepare_identity(call),
@@ -437,6 +699,9 @@ def test_resolver_exception_maps_safely_and_base_exception_propagates(tmp_path: 
             assert result.failure == ToolFailure("internal_error", "binding_resolution_failed")
             assert "private" not in repr(result.failure)
 
+        runtime.close()
+        recorder = Recorder()
+        runtime = _runtime(tmp_path, recorder)
         stop = BaseException("stop")
 
         def stop_resolver(*_args: Any) -> Any:
@@ -449,7 +714,7 @@ def test_resolver_exception_maps_safely_and_base_exception_propagates(tmp_path: 
         call = ToolCall(id="read-base", name=spec.name, args='{"id":1}')
         with pytest.raises(BaseException) as raised:
             prepare_call(
-                ToolCatalog([spec], expected_names=(spec.name,)),
+                _lease(runtime, spec),
                 runtime.context,
                 call,
                 call_identity=runtime.prepare_identity(call),
@@ -474,7 +739,7 @@ def test_read_execution_scope_denial_is_started_failure_with_compatibility_shape
         spec = _spec(executor=deny)
         call = ToolCall(id="read-denied", name=spec.name, args='{"id":1}')
         prepared = prepare_call(
-            ToolCatalog([spec], expected_names=(spec.name,)),
+            _lease(runtime, spec),
             runtime.context,
             call,
             call_identity=runtime.prepare_identity(call),

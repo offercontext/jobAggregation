@@ -27,7 +27,11 @@ from offerpilot.ai.agent_loop import (
 from offerpilot.ai.types import Assistant
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.agent_runtime.journal import NullRunRecorder
-from offerpilot.ai.tool_runtime.catalog import ToolCatalog, compile_tool_metadata_manifest
+from offerpilot.ai.tool_runtime.catalog import (
+    SegmentToolCatalogLease,
+    ToolCatalog,
+    compile_tool_metadata_manifest,
+)
 from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.context_projector.binding import BoundProviderResponse, ModelCallSurfaceBinding
 from offerpilot.ai.tool_authority.policy import validate_startup_policy
@@ -46,6 +50,27 @@ def _metadata_bundle(catalog: ToolCatalog) -> ToolMetadataBundleV1:
         legacy_boundary=manifest.to_dict()["legacy_boundary"],  # type: ignore[arg-type]
         compensation=prepare_compensation_handler_components().metadata_projection(),
     )
+
+
+def _segment_gate(
+    catalog: ToolCatalog,
+    context: object,
+    messages: tuple[Message, ...],
+) -> tuple[ToolMetadataBundleV1, SegmentToolCatalogLease, object]:
+    bundle = _metadata_bundle(catalog)
+    lease = bundle.open_segment_lease()
+    gate = build_segment_surface_gate(
+        messages,
+        catalog=catalog,
+        catalog_lease=lease,  # type: ignore[call-arg]
+        context=context,  # type: ignore[arg-type]
+        authority=context.authority,  # type: ignore[union-attr]
+        provider_view=bundle.provider_view(),
+        discovery_view=bundle.discovery_view(),
+        authority_metadata_view=bundle.authority_view(),
+        policy=validate_startup_policy(catalog.authority_manifest),
+    )
+    return bundle, lease, gate
 
 
 def test_agent_driver_has_only_execute_method() -> None:
@@ -274,12 +299,13 @@ def test_injected_two_argument_model_remains_supported_behind_gateway() -> None:
 
 def test_composition_driver_maps_typed_chat_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
     catalog, context = runtime()
-    metadata_bundle = _metadata_bundle(catalog)
     seed = NewTurnSeed((Message(role="user", content="hello"),))
+    _metadata_bundle_value, lease, gate = _segment_gate(catalog, context, seed.messages)
     invocation = AgentLoopInvocation(
         seed=seed,
         model=ScriptedModel(Assistant(content="unused")),
         catalog=catalog,
+        catalog_lease=lease,  # type: ignore[call-arg]
         tool_context=context,
         auto_approve=False,
         max_iterations=1,
@@ -287,16 +313,7 @@ def test_composition_driver_maps_typed_chat_cancellation(monkeypatch: pytest.Mon
         event_sink=None,
         runtime_signal_sink=None,
         cancel_check=None,
-        surface_gate=build_segment_surface_gate(
-            seed.messages,
-            catalog=catalog,
-            context=context,
-            authority=context.authority,
-            provider_view=metadata_bundle.provider_view(),
-            discovery_view=metadata_bundle.discovery_view(),
-            authority_metadata_view=metadata_bundle.authority_view(),
-            policy=validate_startup_policy(catalog.authority_manifest),
-        ),
+        surface_gate=gate,
     )
 
     def cancel(
@@ -311,26 +328,18 @@ def test_composition_driver_maps_typed_chat_cancellation(monkeypatch: pytest.Mon
     with pytest.raises(RuntimeCancelled) as raised:
         _AgentDriver().execute(invocation)
     assert isinstance(raised.value.__cause__, ChatRunCancelled)
+    assert lease.closed is True
 
 
 def test_new_turn_invocation_requires_the_exact_segment_surface_gate() -> None:
     catalog, context = runtime()
-    metadata_bundle = _metadata_bundle(catalog)
     seed = NewTurnSeed((Message(role="user", content="hello"),))
-    gate = build_segment_surface_gate(
-        seed.messages,
-        catalog=catalog,
-        context=context,
-        authority=context.authority,
-        provider_view=metadata_bundle.provider_view(),
-        discovery_view=metadata_bundle.discovery_view(),
-        authority_metadata_view=metadata_bundle.authority_view(),
-        policy=validate_startup_policy(catalog.authority_manifest),
-    )
+    _metadata_bundle_value, lease, gate = _segment_gate(catalog, context, seed.messages)
     invocation = AgentLoopInvocation(
         seed=seed,
         model=ScriptedModel(Assistant(content="unused")),
         catalog=catalog,
+        catalog_lease=lease,  # type: ignore[call-arg]
         tool_context=context,
         auto_approve=False,
         max_iterations=1,
@@ -342,6 +351,8 @@ def test_new_turn_invocation_requires_the_exact_segment_surface_gate() -> None:
     )
 
     assert invocation.surface_gate is gate
+    assert invocation.catalog_lease is lease  # type: ignore[attr-defined]
+    assert gate.catalog_lease is lease  # type: ignore[attr-defined]
     assert gate.authority is context.authority
     assert gate.context is context
     with pytest.raises(TypeError, match="SegmentSurfaceGate"):
@@ -370,11 +381,13 @@ def test_agent_loop_passes_exact_gate_provider_view_to_run_recorder() -> None:
 
     catalog, context = runtime()
     metadata_bundle = _metadata_bundle(catalog)
+    lease = metadata_bundle.open_segment_lease()
     provider_view = metadata_bundle.provider_view()
     seed = NewTurnSeed((Message(role="user", content="hello"),))
     gate = build_segment_surface_gate(
         seed.messages,
         catalog=catalog,
+        catalog_lease=lease,  # type: ignore[call-arg]
         context=context,
         authority=context.authority,
         provider_view=provider_view,
@@ -389,6 +402,7 @@ def test_agent_loop_passes_exact_gate_provider_view_to_run_recorder() -> None:
             seed=seed,
             model=ScriptedModel(Assistant(content="done")),
             catalog=catalog,
+            catalog_lease=lease,  # type: ignore[call-arg]
             tool_context=context,
             auto_approve=False,
             max_iterations=1,
@@ -401,6 +415,7 @@ def test_agent_loop_passes_exact_gate_provider_view_to_run_recorder() -> None:
     )
 
     assert recorder.provider_views == [provider_view]
+    assert lease.closed is True
 
 
 def test_agent_loop_does_not_fallback_to_legacy_manifest_writer() -> None:
@@ -429,10 +444,12 @@ def test_agent_loop_does_not_fallback_to_legacy_manifest_writer() -> None:
 
     catalog, context = runtime()
     metadata_bundle = _metadata_bundle(catalog)
+    lease = metadata_bundle.open_segment_lease()
     seed = NewTurnSeed((Message(role="user", content="hello"),))
     gate = build_segment_surface_gate(
         seed.messages,
         catalog=catalog,
+        catalog_lease=lease,  # type: ignore[call-arg]
         context=context,
         authority=context.authority,
         provider_view=metadata_bundle.provider_view(),
@@ -447,6 +464,7 @@ def test_agent_loop_does_not_fallback_to_legacy_manifest_writer() -> None:
             seed=seed,
             model=ScriptedModel(Assistant(content="done")),
             catalog=catalog,
+            catalog_lease=lease,  # type: ignore[call-arg]
             tool_context=context,
             auto_approve=False,
             max_iterations=1,
@@ -461,6 +479,7 @@ def test_agent_loop_does_not_fallback_to_legacy_manifest_writer() -> None:
     assert result.reply == "done"
     assert recorder.surface_calls == 1
     assert recorder.legacy_calls == 0
+    assert lease.closed is True
 
 
 def test_bound_provider_attempt_identity_is_transient_and_private() -> None:

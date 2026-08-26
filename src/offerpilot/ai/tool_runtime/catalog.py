@@ -576,8 +576,7 @@ class ToolCatalog:
 
     def _ensure_integrity(self) -> None:
         try:
-            if self._topology_snapshot() != self._catalog_seal:
-                raise ValueError("tool catalog topology integrity drift")
+            self._ensure_topology_integrity()
             for spec in self._ordered:
                 expected = self._integrity_snapshots.get(id(spec))
                 current = _spec_integrity_snapshot(spec)
@@ -586,6 +585,31 @@ class ToolCatalog:
             _validate_dependencies(self._ordered)
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
             raise ValueError("tool catalog integrity drift") from exc
+
+    def _ensure_topology_integrity(self) -> None:
+        """Revalidate the sealed Catalog graph without all component semantics."""
+
+        try:
+            if self._topology_snapshot() != self._catalog_seal:
+                raise ValueError("tool catalog topology integrity drift")
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError("tool catalog topology integrity drift") from exc
+
+    def _ensure_spec_integrity(self, spec: ToolSpec[Any, Any]) -> None:
+        """Revalidate one exact Catalog member against its construction-time seal."""
+
+        try:
+            self._ensure_topology_integrity()
+            registered = self._specs.get(spec.name)
+            expected = self._integrity_snapshots.get(id(spec))
+            if (
+                registered is not spec
+                or expected is None
+                or _spec_integrity_snapshot(spec) != expected
+            ):
+                raise ValueError("tool catalog component integrity drift")
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError("tool catalog component integrity drift") from exc
 
     def resolve(self, name: str) -> ToolSpec[Any, Any] | None:
         self._ensure_integrity()
@@ -704,6 +728,12 @@ class SegmentToolSpecHandle(TransientToolRuntimeValue):
     def _ensure_integrity(self) -> None:
         try:
             self._bundle_instance_token._ensure_integrity()
+            self._ensure_identity_integrity()
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("Segment handle integrity drift") from exc
+
+    def _ensure_identity_integrity(self) -> None:
+        try:
             current = (
                 id(self._bundle_instance_token),
                 id(self._segment_catalog_token),
@@ -808,6 +838,12 @@ class SegmentToolCatalogLease(TransientToolRuntimeValue):
     def _ensure_integrity(self) -> None:
         try:
             self._bundle_instance_token._ensure_integrity()
+            self._ensure_identity_integrity()
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("Segment Catalog lease integrity drift") from exc
+
+    def _ensure_identity_integrity(self) -> None:
+        try:
             current = (
                 id(self._catalog),
                 id(self._bundle_instance_token),
@@ -842,11 +878,11 @@ class SegmentToolCatalogLease(TransientToolRuntimeValue):
             return self._state.closed
 
     def resolve(self, name: str) -> SegmentToolSpecHandle | None:
-        self._ensure_integrity()
         with self._state.lock:
             self._ensure_integrity()
             if self._state.closed:
                 raise RuntimeError("Segment Catalog lease is closed")
+            self._bundle_instance_token._require_registered_segment_lease(self)
             spec = self._catalog.resolve(name)
             if spec is None:
                 return None
@@ -860,33 +896,84 @@ class SegmentToolCatalogLease(TransientToolRuntimeValue):
             return handle
 
     def require_spec(self, handle: object) -> ToolSpec[Any, Any]:
-        self._ensure_integrity()
         with self._state.lock:
             self._ensure_integrity()
             if self._state.closed:
                 raise RuntimeError("Segment Catalog lease is closed and its handles are revoked")
+            self._bundle_instance_token._require_registered_segment_lease(self)
+            self._catalog._ensure_topology_integrity()
             if type(handle) is not SegmentToolSpecHandle:
                 raise ValueError("Segment handle provenance is invalid")
             typed_handle = handle
-            typed_handle._ensure_integrity()
-            if typed_handle.bundle_instance_token is not self._bundle_instance_token:
+            typed_handle._ensure_identity_integrity()
+            if (
+                object.__getattribute__(typed_handle, "_bundle_instance_token")
+                is not self._bundle_instance_token
+            ):
                 raise ValueError("Segment handle has the wrong Bundle provenance")
-            if typed_handle.segment_catalog_token is not self._segment_catalog_token:
+            if (
+                object.__getattribute__(typed_handle, "_segment_catalog_token")
+                is not self._segment_catalog_token
+            ):
                 raise ValueError("Segment handle has the wrong Segment lease provenance")
             issued = self._state.issued.get(id(typed_handle))
             if issued is None or issued[0] is not typed_handle:
                 raise ValueError("Segment handle was not issued by this lease")
             spec = issued[1]
-            if self._catalog.resolve(typed_handle.tool_name) is not spec:
-                raise ValueError("Segment handle no longer resolves to its sealed ToolSpec")
+            self._catalog._ensure_spec_integrity(spec)
             return spec
 
+    def _require_issued_spec_identity(self, handle: object) -> ToolSpec[Any, Any]:
+        """Validate one registered route after its public Segment boundary."""
+
+        with self._state.lock:
+            self._ensure_identity_integrity()
+            self._catalog._ensure_topology_integrity()
+            if self._state.closed:
+                raise RuntimeError("Segment Catalog lease is closed and its handles are revoked")
+            self._bundle_instance_token._require_registered_segment_lease(self)
+            if type(handle) is not SegmentToolSpecHandle:
+                raise ValueError("Segment handle provenance is invalid")
+            typed_handle = handle
+            typed_handle._ensure_identity_integrity()
+            if (
+                object.__getattribute__(typed_handle, "_bundle_instance_token")
+                is not self._bundle_instance_token
+            ):
+                raise ValueError("Segment handle has the wrong Bundle provenance")
+            if (
+                object.__getattribute__(typed_handle, "_segment_catalog_token")
+                is not self._segment_catalog_token
+            ):
+                raise ValueError("Segment handle has the wrong Segment lease provenance")
+            issued = self._state.issued.get(id(typed_handle))
+            if issued is None or issued[0] is not typed_handle:
+                raise ValueError("Segment handle was not issued by this lease")
+            return issued[1]
+
+    def require_catalog(self, catalog: object) -> ToolCatalog:
+        """Require the exact fully sealed Catalog owned by this live lease."""
+
+        with self._state.lock:
+            self._ensure_integrity()
+            if self._state.closed:
+                raise RuntimeError("Segment Catalog lease is closed")
+            self._bundle_instance_token._require_registered_segment_lease(self)
+            if type(catalog) is not ToolCatalog or catalog is not self._catalog:
+                raise ValueError("dispatch Catalog does not belong to this Segment lease")
+            self._catalog._ensure_integrity()
+            return self._catalog
+
+    def validator_for(self, handle: object) -> Draft202012Validator:
+        spec = self.require_spec(handle)
+        return self._catalog.validator_for(spec.name)
+
     def close(self) -> None:
-        self._ensure_integrity()
         with self._state.lock:
             self._ensure_integrity()
             if self._state.closed:
                 return
+            self._bundle_instance_token._revoke_segment_lease(self)
             self._state.closed = True
             self._state.issued.clear()
 

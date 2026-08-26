@@ -13,6 +13,7 @@ from uuid import uuid4
 
 import pytest
 
+import offerpilot.pilot_runtime.composition as composition_module
 from offerpilot.chat_transport import PreparedStreamGuard, SseAgentExecutionHost
 from offerpilot.ai.agent_contracts import AgentTurnResult, PendingAction
 from offerpilot.ai.agent_loop import (
@@ -30,8 +31,12 @@ from offerpilot.ai.write_operations import (
     WriteOperationError,
 )
 from offerpilot.ai.tool_authority.policy import validate_startup_policy
-from offerpilot.ai.tool_runtime.catalog import compile_tool_metadata_manifest
+from offerpilot.ai.tool_runtime.catalog import (
+    SegmentToolCatalogLease,
+    compile_tool_metadata_manifest,
+)
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
+from offerpilot.ai.tool_runtime.contracts import TransientToolRuntimeValue
 from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 from offerpilot.agent_runtime.journal import NullRunRecorder, RunRecorderFactory
@@ -107,6 +112,14 @@ def _metadata_bundle() -> ToolMetadataBundleV1:
 
 
 _METADATA_BUNDLE = _metadata_bundle()
+
+
+class _MetadataComponents(TransientToolRuntimeValue):
+    def __init__(self, bundle: ToolMetadataBundleV1) -> None:
+        self.bundle = bundle
+
+
+_METADATA_COMPONENTS = _MetadataComponents(_METADATA_BUNDLE)
 
 
 class Phases:
@@ -456,16 +469,22 @@ def _surface_resolver(
         value if isinstance(value, Message) else Message(role="user", content=str(value))
         for value in assembled
     )
-    return build_segment_surface_gate(
-        messages,
-        catalog=getattr(policy, "catalog"),
-        context=getattr(segment, "context"),
-        authority=getattr(segment, "authority"),
-        provider_view=getattr(policy, "provider_metadata_view"),
-        discovery_view=getattr(policy, "discovery_metadata_view"),
-        authority_metadata_view=getattr(policy, "authority_metadata_view"),
-        policy=getattr(policy, "policy"),
-    )
+    catalog_lease = _METADATA_BUNDLE.open_segment_lease()
+    try:
+        return build_segment_surface_gate(
+            messages,
+            catalog=getattr(policy, "catalog"),
+            catalog_lease=catalog_lease,
+            context=getattr(segment, "context"),
+            authority=getattr(segment, "authority"),
+            provider_view=getattr(policy, "provider_metadata_view"),
+            discovery_view=getattr(policy, "discovery_metadata_view"),
+            authority_metadata_view=getattr(policy, "authority_metadata_view"),
+            policy=getattr(policy, "policy"),
+        )
+    except BaseException:
+        catalog_lease.close()
+        raise
 
 
 def runtime(
@@ -476,7 +495,6 @@ def runtime(
     route: str = "model",
     conversation: Conversation | None = None,
     model: object = "model",
-    catalog: object | None = None,
     assembled: object | None = None,
     surface_resolver: object | None = None,
     policy_resolver: object | None = None,
@@ -524,6 +542,12 @@ def runtime(
             journal=journal,
             route_selector=lambda request, conversation: route,
             phase_sink=phases,
+            catalog=MODEL_TOOL_CATALOG,
+            metadata_bundle=_METADATA_BUNDLE,
+            metadata_components=_METADATA_COMPONENTS,
+            provider_metadata_view=_METADATA_BUNDLE.provider_view(),
+            discovery_metadata_view=_METADATA_BUNDLE.discovery_view(),
+            authority_metadata_view=_METADATA_BUNDLE.authority_view(),
         )
     )
     return instance, resolved_persistence, driver, host, journal
@@ -634,6 +658,7 @@ def test_stream_live_policy_drift_closes_segment_before_provider_or_user() -> No
         assert segment.catalog is None
         assert segment.policy is None
         assert segment.surface_gate is None
+        assert getattr(segment, "catalog_lease", None) is None
         return ResolvedPolicyCatalog(
             catalog=MODEL_TOOL_CATALOG,
             policy=drifted,
@@ -689,6 +714,7 @@ def test_stream_policy_spy_sees_exact_unbound_segment_after_segment_phase() -> N
         assert segment.catalog is None
         assert segment.policy is None
         assert segment.surface_gate is None
+        assert getattr(segment, "catalog_lease", None) is None
         return ResolvedPolicyCatalog(
             catalog=MODEL_TOOL_CATALOG,
             policy=_AUTHORITY_POLICY,
@@ -747,6 +773,44 @@ def test_stream_malformed_surface_gate_closes_before_model_or_user() -> None:
     assert prepared.payload["error_code"] == "operation_unavailable"
     assert close_count == [1]
     assert "model_resolve" not in phases.items
+    assert persistence.user_count == 0
+    assert driver.calls == 0
+    assert host.calls == 0
+    assert journal.recorder.finished == []
+
+
+def test_stream_surface_candidate_failure_closes_unpublished_bundle_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    phases = Phases()
+    opened: list[SegmentToolCatalogLease] = []
+    original_open = ToolMetadataBundleV1.open_segment_lease
+
+    def observe_open(bundle: ToolMetadataBundleV1) -> SegmentToolCatalogLease:
+        lease = original_open(bundle)
+        opened.append(lease)
+        return lease
+
+    def reject_surface(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("surface candidate failed")
+
+    monkeypatch.setattr(ToolMetadataBundleV1, "open_segment_lease", observe_open)
+    monkeypatch.setattr(composition_module, "build_segment_surface_gate", reject_surface)
+    instance, persistence, driver, host, journal = runtime(
+        phases,
+        surface_resolver=composition_module._SegmentSurfaceGateResolver(bundle=_METADATA_BUNDLE),
+    )
+
+    prepared = instance.prepare_stream(
+        StartTurnRequest(message="hi"),
+        transport=transport(),
+        invocation_control=InMemoryRuntimeInvocationControl(),
+    )
+
+    assert isinstance(prepared, ImmediateHttpOutcome)
+    assert prepared.payload["error_code"] == "operation_unavailable"
+    assert len(opened) == 1
+    assert opened[0].closed is True
     assert persistence.user_count == 0
     assert driver.calls == 0
     assert host.calls == 0
@@ -1256,6 +1320,50 @@ def test_model_abort_keeps_user_and_abandons_open_run_without_new_facts() -> Non
     assert len(instance._prepared_models) == 0  # type: ignore[attr-defined]
 
 
+def test_stream_runtime_backstop_closes_published_invocation_before_driver_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    phases = Phases()
+    opened: list[SegmentToolCatalogLease] = []
+    original_open = ToolMetadataBundleV1.open_segment_lease
+
+    def observe_open(bundle: ToolMetadataBundleV1) -> SegmentToolCatalogLease:
+        lease = original_open(bundle)
+        opened.append(lease)
+        return lease
+
+    class RejectingHost:
+        def run(self, thunk: object, control: object) -> object:
+            del thunk, control
+            raise RuntimeTransportAborted()
+
+    monkeypatch.setattr(ToolMetadataBundleV1, "open_segment_lease", observe_open)
+    instance, _persistence, driver, _host, _journal = runtime(phases)
+    prepared = instance.prepare_stream(
+        StartTurnRequest(message="hi"),
+        transport=transport(),
+        invocation_control=InMemoryRuntimeInvocationControl(),
+    )
+    assert isinstance(prepared, PreparedStreamExecution)
+    assert len(opened) == 1
+    assert opened[0].closed is False
+    guard = PreparedStreamGuard(prepared=prepared)
+    assert guard.begin_execution() is True
+    guard._execute = lambda: instance.execute_prepared_stream(
+        prepared,
+        event_sink=None,
+        signal_sink=None,
+        execution_host=RejectingHost(),  # type: ignore[arg-type]
+        cancel_check=lambda: False,
+    )
+
+    with pytest.raises(RuntimeTransportAborted):
+        guard.execute_once()
+
+    assert opened[0].closed is True
+    assert driver.calls == 0
+
+
 def test_model_prepared_stream_adapts_sse_host_queue_once() -> None:
     phases = Phases()
     instance, _persistence, driver, _unused_host, _journal = runtime(phases)
@@ -1334,6 +1442,12 @@ def test_real_stream_run_recorder_keeps_transport_uuid_and_terminal_events(
             context_assembler=Assembler(),
             agent_driver=Driver(),
             journal=journal,
+            catalog=MODEL_TOOL_CATALOG,
+            metadata_bundle=_METADATA_BUNDLE,
+            metadata_components=_METADATA_COMPONENTS,
+            provider_metadata_view=_METADATA_BUNDLE.provider_view(),
+            discovery_metadata_view=_METADATA_BUNDLE.discovery_view(),
+            authority_metadata_view=_METADATA_BUNDLE.authority_view(),
         )
     )
     control = InMemoryRuntimeInvocationControl()
@@ -1392,6 +1506,12 @@ def test_null_journal_recorder_does_not_mark_prepared_run_open() -> None:
             context_assembler=Assembler(),
             agent_driver=Driver(),
             journal=NullJournal(),
+            catalog=MODEL_TOOL_CATALOG,
+            metadata_bundle=_METADATA_BUNDLE,
+            metadata_components=_METADATA_COMPONENTS,
+            provider_metadata_view=_METADATA_BUNDLE.provider_view(),
+            discovery_metadata_view=_METADATA_BUNDLE.discovery_view(),
+            authority_metadata_view=_METADATA_BUNDLE.authority_view(),
         )
     )
     control = InMemoryRuntimeInvocationControl()
@@ -1507,6 +1627,12 @@ def test_terminal_abort_releases_provider_token_and_canary_exactly_once() -> Non
             context_assembler=Assembler(),
             agent_driver=Driver(),
             journal=Journal(),
+            catalog=MODEL_TOOL_CATALOG,
+            metadata_bundle=_METADATA_BUNDLE,
+            metadata_components=_METADATA_COMPONENTS,
+            provider_metadata_view=_METADATA_BUNDLE.provider_view(),
+            discovery_metadata_view=_METADATA_BUNDLE.discovery_view(),
+            authority_metadata_view=_METADATA_BUNDLE.authority_view(),
         )
     )
     control = InMemoryRuntimeInvocationControl()
@@ -1905,10 +2031,7 @@ def test_materialize_stream_value_rejects_unknown_detached_values() -> None:
 
 def test_stream_pending_emits_waiting_status_before_confirmation() -> None:
     phases = Phases()
-    instance, _persistence, driver, host, _journal = runtime(
-        phases,
-        catalog=MODEL_TOOL_CATALOG,
-    )
+    instance, _persistence, driver, host, _journal = runtime(phases)
     driver.result = AgentTurnResult(
         [],
         "",
@@ -2098,9 +2221,11 @@ def test_stream_activation_requires_terminal_and_delivery_ownership() -> None:
         Message(role="tool", content="saved", tool_call_id="write-1"),
         Message(role="assistant", content="已保存"),
     )
+    continuation_lease = _METADATA_BUNDLE.open_segment_lease()
     surface_gate = build_segment_surface_gate(
         messages,
         catalog=MODEL_TOOL_CATALOG,
+        catalog_lease=continuation_lease,  # type: ignore[call-arg]
         context=segment.context,
         authority=segment.authority,
         provider_view=_METADATA_BUNDLE.provider_view(),
@@ -2151,6 +2276,7 @@ def test_stream_activation_requires_terminal_and_delivery_ownership() -> None:
         with pytest.raises(WriteOperationError, match="operation_delivery_unknown"):
             session.activate_continuation_segment()
     finally:
+        continuation_lease.close()
         segment.close()
 
 

@@ -5,8 +5,9 @@ import json
 from copy import deepcopy
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
+from threading import Lock
 from types import MappingProxyType
-from typing import Any, TypeGuard, cast
+from typing import Any, cast
 from uuid import uuid4
 
 from offerpilot.ai.agent_contracts import (
@@ -29,13 +30,15 @@ from offerpilot.ai.agent_contracts import (
 )
 from offerpilot.ai.tool_authority import (
     ApprovalExecutionAuthority,
+    AuthorityPhaseError,
+    AuthorityUse,
     NewTurnPrepareCallIdentity,
     PendingAuthorityClaim,
     ProviderInvocationIdentity,
     SegmentExecutionAuthority,
 )
 from offerpilot.ai.tool_authority.contracts import _ReplacementProtected
-from offerpilot.ai.tool_runtime.catalog import ToolCatalog
+from offerpilot.ai.tool_runtime.catalog import SegmentToolCatalogLease, ToolCatalog
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import (
     ConfirmationRequired,
@@ -43,16 +46,18 @@ from offerpilot.ai.tool_runtime.contracts import (
     ReadyToExecute,
     ToolExecutionRecord,
     ToolFailure,
+    ToolResultMetadata,
     ToolSpec,
     TransientToolRuntimeValue,
     materialize_provider_payloads,
 )
 from offerpilot.ai.tool_runtime.metadata import (
     ProviderToolMetadataView,
+    ToolAuthorityEntryV1,
     ToolAuthorityMetadataView,
     ToolDiscoveryMetadataView,
-    WriteOperationMetadataV1,
 )
+from offerpilot.ai.tool_runtime.policy_types import OperationKind
 from offerpilot.ai.tool_runtime.pipeline import Rejected, execute_prepared, prepare_call
 from offerpilot.ai.tool_runtime.rendering import render_compatibility
 from offerpilot.ai.tool_runtime.transport import project_transport_event
@@ -268,16 +273,6 @@ def _surface_selection_matches(
 
 
 @dataclass(frozen=True, slots=True, repr=False)
-class _SurfaceCatalogSeal:
-    """Bundle-derived Provider topology used by the Task 9 Authority seal."""
-
-    provider_view: ProviderToolMetadataView = field(repr=False)
-
-    def provider_contracts(self) -> tuple[ProviderToolContract, ...]:
-        return self.provider_view.ordered_contracts
-
-
-@dataclass(frozen=True, slots=True, repr=False)
 class _SurfaceDependencyPolicySeal:
     """Bundle-derived dependency topology used until Task 10 owns the gate."""
 
@@ -333,7 +328,7 @@ class SegmentSurfaceGate(_ReplacementProtected, TransientToolRuntimeValue):
 
     authority: SegmentExecutionAuthority = field(repr=False)
     context: ToolExecutionContext = field(repr=False)
-    catalog: _SurfaceCatalogSeal = field(repr=False)
+    catalog_lease: SegmentToolCatalogLease = field(repr=False)
     dispatch_catalog: ToolCatalog = field(repr=False)
     provider_view: ProviderToolMetadataView = field(repr=False)
     discovery_view: ToolDiscoveryMetadataView = field(repr=False)
@@ -354,10 +349,16 @@ class SegmentSurfaceGate(_ReplacementProtected, TransientToolRuntimeValue):
             raise ProjectionError("tool_context_required")
         if self.context.authority is not self.authority:
             raise ProjectionError("segment_context_mismatch")
-        if type(self.catalog) is not _SurfaceCatalogSeal:
-            raise ProjectionError("surface_catalog_seal_required")
+        if type(self.catalog_lease) is not SegmentToolCatalogLease:
+            raise ProjectionError("segment_catalog_lease_required")
+        if self.catalog_lease.closed:
+            raise ProjectionError("segment_catalog_lease_closed")
         if type(self.dispatch_catalog) is not ToolCatalog:
             raise ProjectionError("typed_catalog_required")
+        try:
+            self.catalog_lease.require_catalog(self.dispatch_catalog)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            raise ProjectionError("segment_dispatch_catalog_mismatch") from exc
         if type(self.provider_view) is not ProviderToolMetadataView:
             raise ProjectionError("provider_metadata_view_required")
         if type(self.discovery_view) is not ToolDiscoveryMetadataView:
@@ -365,15 +366,14 @@ class SegmentSurfaceGate(_ReplacementProtected, TransientToolRuntimeValue):
         if type(self.authority_metadata_view) is not ToolAuthorityMetadataView:
             raise ProjectionError("authority_metadata_view_required")
         if not (
-            self.provider_view.bundle_instance_token
+            self.catalog_lease.bundle_instance_token
+            is self.provider_view.bundle_instance_token
             is self.discovery_view.bundle_instance_token
             is self.authority_metadata_view.bundle_instance_token
             is self.selection.bundle_instance_token
         ):
             raise ProjectionError("cross_Bundle_metadata_views")
         provider_contracts = self.provider_view.ordered_contracts
-        if self.catalog.provider_contracts() is not provider_contracts:
-            raise ProjectionError("provider_surface_mismatch")
         dispatch_contracts = tuple(spec.contract for spec in self.dispatch_catalog.specs)
         if len(dispatch_contracts) != len(provider_contracts) or any(
             actual is not expected
@@ -472,13 +472,18 @@ class ApprovedContinuationSegment(TransientToolRuntimeValue):
             raise TypeError("ApprovedContinuationSegment surface_gate is invalid")
         if type(self.max_iterations) is not int or self.max_iterations <= 0:
             raise TypeError("ApprovedContinuationSegment max_iterations is invalid")
+        if self.surface_gate.dispatch_catalog is not self.catalog:
+            raise ProjectionError("approved continuation replaced the Bundle catalog")
         if (
             self.surface_gate.authority is not self.tool_context.authority
             or self.surface_gate.context is not self.tool_context
-            or self.surface_gate.dispatch_catalog is not self.catalog
         ):
             raise ProjectionError("approved continuation Segment bundle mismatch")
         self.surface_gate._validate_current_surface()
+
+    @property
+    def catalog_lease(self) -> SegmentToolCatalogLease:
+        return self.surface_gate.catalog_lease
 
     def __repr__(self) -> str:
         return "<ApprovedContinuationSegment transient>"
@@ -488,6 +493,7 @@ def build_segment_surface_gate(
     messages: tuple[Message, ...] | list[Message],
     *,
     catalog: ToolCatalog,
+    catalog_lease: SegmentToolCatalogLease,
     context: ToolExecutionContext,
     authority: SegmentExecutionAuthority,
     provider_view: ProviderToolMetadataView,
@@ -499,6 +505,14 @@ def build_segment_surface_gate(
 
     if type(catalog) is not ToolCatalog:
         raise ProjectionError("typed_catalog_required")
+    if type(catalog_lease) is not SegmentToolCatalogLease:
+        raise ProjectionError("segment_catalog_lease_required")
+    if catalog_lease.closed:
+        raise ProjectionError("segment_catalog_lease_closed")
+    try:
+        catalog_lease.require_catalog(catalog)
+    except (RuntimeError, TypeError, ValueError) as exc:
+        raise ProjectionError("segment_dispatch_catalog_mismatch") from exc
     if type(context) is not ToolExecutionContext:
         raise ProjectionError("tool_context_required")
     if context.authority is not authority:
@@ -510,7 +524,8 @@ def build_segment_surface_gate(
     if type(authority_metadata_view) is not ToolAuthorityMetadataView:
         raise ProjectionError("authority_metadata_view_required")
     if not (
-        provider_view.bundle_instance_token
+        catalog_lease.bundle_instance_token
+        is provider_view.bundle_instance_token
         is discovery_view.bundle_instance_token
         is authority_metadata_view.bundle_instance_token
     ):
@@ -556,13 +571,17 @@ def build_segment_surface_gate(
         discovery_view,
         version=authority_surface.dependency_policy_version,
     )
-    surface_catalog = _SurfaceCatalogSeal(provider_view)
     factory = context.authority_factory
     factory.register_tool_execution_context(context, authority=authority)
+    factory.bind_segment_tool_catalog(
+        authority,
+        authority_metadata_view=authority_metadata_view,
+        catalog_lease=catalog_lease,
+    )
     gate = SegmentSurfaceGate(
         authority=authority,
         context=context,
-        catalog=surface_catalog,
+        catalog_lease=catalog_lease,
         dispatch_catalog=catalog,
         provider_view=provider_view,
         discovery_view=discovery_view,
@@ -576,7 +595,7 @@ def build_segment_surface_gate(
         gate,
         authority=authority,
         context=context,
-        catalog=surface_catalog,
+        catalog=catalog_lease,
         policy=policy,
         dependency_policy=dependency_policy,
         selection=selection,
@@ -648,7 +667,7 @@ class _LoopServices:
                 gate,
                 authority=authority,
                 context=self.context,
-                catalog=gate.catalog,
+                catalog=gate.catalog_lease,
                 policy=gate.policy,
                 dependency_policy=gate.dependency_policy,
                 selection=gate.selection,
@@ -1094,11 +1113,102 @@ class ApprovedWriteSeed(TransientToolRuntimeValue):
         return "<ApprovedWriteSeed transient>"
 
 
+class _AgentLoopLeaseOwnership:
+    """Transfer one origin Segment lease from Runtime to Runner exactly once."""
+
+    __slots__ = (
+        "_claimed",
+        "_coordinated_release",
+        "_lock",
+        "_origin_release",
+        "_released",
+        "_runner_finished",
+        "_runtime_release_requested",
+    )
+
+    def __init__(self, release: Callable[[], object]) -> None:
+        self._lock = Lock()
+        self._claimed = False
+        self._released = False
+        self._runner_finished = False
+        self._runtime_release_requested = False
+        self._origin_release = release
+        self._coordinated_release: Callable[[], object] | None = None
+
+    def bind_release(self, release: Callable[[], object]) -> None:
+        if not callable(release):
+            raise TypeError("Agent Loop Catalog release must be callable")
+        with self._lock:
+            if self._claimed or self._released:
+                raise RuntimeError("Agent Loop Catalog lease ownership already started")
+            if self._coordinated_release is not None:
+                raise RuntimeError("Agent Loop Catalog release was already bound")
+            self._coordinated_release = release
+
+    def claim(self) -> None:
+        with self._lock:
+            if self._released:
+                raise RuntimeError("Agent Loop Catalog lease was already released")
+            if self._claimed:
+                raise RuntimeError("Agent Loop Catalog lease was already claimed")
+            self._claimed = True
+
+    def release_from_runner(self) -> bool:
+        with self._lock:
+            if self._released:
+                return False
+            if not self._claimed:
+                raise RuntimeError("Agent Loop Catalog lease was not claimed")
+            if self._runner_finished:
+                return False
+            self._runner_finished = True
+            coordinated = self._coordinated_release if self._runtime_release_requested else None
+            if self._coordinated_release is None or coordinated is not None:
+                self._released = True
+            origin = self._origin_release
+        try:
+            origin()
+        finally:
+            if coordinated is not None:
+                coordinated()
+        return True
+
+    def release_backstop(self) -> bool:
+        with self._lock:
+            if self._released or self._claimed or self._runner_finished:
+                return False
+            self._released = True
+            release = self._coordinated_release or self._origin_release
+        release()
+        return True
+
+    def release_from_runtime(self) -> bool:
+        with self._lock:
+            if self._released:
+                return False
+            coordinated = self._coordinated_release
+            if not self._claimed:
+                self._released = True
+                release = coordinated or self._origin_release
+            elif not self._runner_finished:
+                if coordinated is not None:
+                    self._runtime_release_requested = True
+                return False
+            elif coordinated is None:
+                return False
+            else:
+                self._released = True
+                release = coordinated
+        release()
+        return True
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class AgentLoopInvocation(TransientToolRuntimeValue):
     seed: NewTurnSeed | ApprovedWriteSeed
     model: ChatModel | None
     catalog: ToolCatalog
+    catalog_lease: SegmentToolCatalogLease = field(repr=False, compare=False)
     tool_context: ToolExecutionContext
     auto_approve: bool
     max_iterations: int
@@ -1107,6 +1217,11 @@ class AgentLoopInvocation(TransientToolRuntimeValue):
     runtime_signal_sink: AgentRuntimeSignalSink | None
     cancel_check: CancelCheck | None
     surface_gate: SegmentSurfaceGate | None = field(default=None, repr=False, compare=False)
+    _catalog_ownership: _AgentLoopLeaseOwnership = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
     _serialization_guard: object = field(
         default=_TRANSIENT_ASDICT_GUARD, init=False, repr=False, compare=False
     )
@@ -1116,6 +1231,17 @@ class AgentLoopInvocation(TransientToolRuntimeValue):
             raise TypeError("AgentLoopInvocation seed is invalid")
         if type(self.tool_context) is not ToolExecutionContext:
             raise TypeError("AgentLoopInvocation tool_context is invalid")
+        if type(self.catalog) is not ToolCatalog:
+            raise TypeError("AgentLoopInvocation catalog is invalid")
+        if type(self.catalog_lease) is not SegmentToolCatalogLease:
+            raise TypeError("AgentLoopInvocation catalog_lease is invalid")
+        if self.catalog_lease.closed:
+            raise TypeError("AgentLoopInvocation catalog_lease is closed")
+        object.__setattr__(
+            self,
+            "_catalog_ownership",
+            _AgentLoopLeaseOwnership(self.catalog_lease.close),
+        )
         authority_type = type(self.tool_context.authority)
         expected_authority = (
             SegmentExecutionAuthority
@@ -1132,12 +1258,16 @@ class AgentLoopInvocation(TransientToolRuntimeValue):
             raise TypeError("NewTurnSeed requires an exact SegmentSurfaceGate")
         if isinstance(self.seed, NewTurnSeed):
             gate = cast(SegmentSurfaceGate, self.surface_gate)
+            if gate.catalog_lease is not self.catalog_lease:
+                raise TypeError("NewTurnSeed requires the exact Segment catalog lease")
+            if gate.dispatch_catalog is not self.catalog:
+                raise TypeError("NewTurnSeed requires the exact Bundle catalog")
             authority = cast(SegmentExecutionAuthority, self.tool_context.authority)
             self.tool_context.authority_factory.require_segment_surface_gate(
                 gate,
                 authority=authority,
                 context=self.tool_context,
-                catalog=gate.catalog,
+                catalog=gate.catalog_lease,
                 policy=gate.policy,
                 dependency_policy=gate.dependency_policy,
                 selection=gate.selection,
@@ -1152,6 +1282,21 @@ class AgentLoopInvocation(TransientToolRuntimeValue):
         ):
             raise TypeError("ApprovedWriteSeed requires a Ledger operation executor")
 
+    def _bind_catalog_release(self, release: Callable[[], object]) -> None:
+        self._catalog_ownership.bind_release(release)
+
+    def _claim_catalog_lease(self) -> None:
+        self._catalog_ownership.claim()
+
+    def _release_catalog_lease_from_runner(self) -> bool:
+        return self._catalog_ownership.release_from_runner()
+
+    def _release_catalog_lease_backstop(self) -> bool:
+        return self._catalog_ownership.release_backstop()
+
+    def _release_catalog_lease_from_runtime(self) -> bool:
+        return self._catalog_ownership.release_from_runtime()
+
     def __repr__(self) -> str:
         return "<AgentLoopInvocation transient>"
 
@@ -1164,27 +1309,38 @@ class AgentLoopRunner:
         run_recorder: RunRecorder | None = None,
         event_sink: AgentEventSink | None | object = _NO_OVERRIDE,
     ) -> AgentTurnResult:
-        if not isinstance(invocation.catalog, ToolCatalog):
-            raise TypeError("AgentLoopInvocation catalog is invalid")
-        if not isinstance(invocation.tool_context, ToolExecutionContext):
-            raise TypeError("AgentLoopInvocation tool_context is invalid")
-        if isinstance(invocation.seed, NewTurnSeed) and not all(
-            isinstance(message, Message) for message in invocation.seed.messages
-        ):
-            raise TypeError("NewTurnSeed messages must contain Message values")
-        return self._run(
-            invocation,
-            _LoopServices(
+        if type(invocation) is not AgentLoopInvocation:
+            raise TypeError("AgentLoopRunner requires exact AgentLoopInvocation")
+        invocation._claim_catalog_lease()
+        owned_leases: list[SegmentToolCatalogLease] = []
+        try:
+            if not isinstance(invocation.catalog, ToolCatalog):
+                raise TypeError("AgentLoopInvocation catalog is invalid")
+            if not isinstance(invocation.tool_context, ToolExecutionContext):
+                raise TypeError("AgentLoopInvocation tool_context is invalid")
+            if isinstance(invocation.seed, NewTurnSeed) and not all(
+                isinstance(message, Message) for message in invocation.seed.messages
+            ):
+                raise TypeError("NewTurnSeed messages must contain Message values")
+            return self._run(
                 invocation,
-                run_recorder=run_recorder,
-                event_sink=event_sink,
-            ),
-        )
+                _LoopServices(
+                    invocation,
+                    run_recorder=run_recorder,
+                    event_sink=event_sink,
+                ),
+                owned_leases,
+            )
+        finally:
+            for lease in reversed(owned_leases):
+                lease.close()
+            invocation._release_catalog_lease_from_runner()
 
     def _run(
         self,
         invocation: AgentLoopInvocation,
         services: _LoopServices,
+        owned_leases: list[SegmentToolCatalogLease],
     ) -> AgentTurnResult:
         records = services.records
         failures = services.failures
@@ -1203,6 +1359,7 @@ class AgentLoopRunner:
                 services,
                 records,
                 failures,
+                owned_leases,
             )
 
         model_steps = 0
@@ -1222,7 +1379,10 @@ class AgentLoopRunner:
             )
             services.raise_if_cancelled()
             services.require_delivery_fence()
-            selected = _select_tool_calls(assistant.tool_calls, invocation.catalog)
+            selected = _select_tool_calls(
+                assistant.tool_calls,
+                invocation.surface_gate.authority_metadata_view,
+            )
             model_steps += 1
             assistant_message = Message(
                 role="assistant",
@@ -1241,8 +1401,6 @@ class AgentLoopRunner:
                     tuple(records),
                     tuple(failures),
                 )
-            for call in selected:
-                self._emit_tool_call(invocation, call, services.event_sink)
             pending = self._dispatch(
                 invocation,
                 selected,
@@ -1270,15 +1428,13 @@ class AgentLoopRunner:
         services: _LoopServices,
         records: list[ToolExecutionRecord[Any, Any]],
         failures: list[ToolFailure],
+        owned_leases: list[SegmentToolCatalogLease],
     ) -> tuple[AgentLoopInvocation, _LoopServices, list[Message], list[Message]]:
         services.raise_if_cancelled()
         seed = invocation.seed
         if not isinstance(seed, ApprovedWriteSeed):
             raise TypeError("approved bootstrap requires ApprovedWriteSeed")
         pending = seed.pending
-        spec = invocation.catalog.resolve(pending.tool_name)
-        if not _is_write_spec(spec):
-            raise PendingActionValidationError("approved pending tool is not a write tool")
         prepare_identity = (
             invocation.tool_context.authority_factory.create_approved_write_prepare_identity(
                 cast(ApprovalExecutionAuthority, invocation.tool_context.authority),
@@ -1287,7 +1443,7 @@ class AgentLoopRunner:
             )
         )
         prepared_result = prepare_call(
-            invocation.catalog,
+            invocation.catalog_lease,
             invocation.tool_context,
             ToolCall(pending.tool_call_id, pending.tool_name, pending.args),
             call_identity=prepare_identity,
@@ -1306,7 +1462,21 @@ class AgentLoopRunner:
                     prepared_result.failure.compatibility_detail or prepared_result.failure.code
                 )
             raise PendingActionValidationError("pending tool no longer requires confirmation")
-        self._emit_pending_tool_call(invocation, pending, "approved", services.event_sink)
+        spec = prepared_result.prepared.spec
+        authority_entry = invocation.tool_context.authority_factory.require_prepared_route(
+            prepared_result.prepared,
+            authority=invocation.tool_context.authority,
+            use=AuthorityUse.APPROVED_WRITE_PREPARE,
+        )
+        if authority_entry.operation_kind is not OperationKind.TRANSACTIONAL_WRITE:
+            raise PendingActionValidationError("approved pending tool is not a write tool")
+        self._emit_pending_tool_call(
+            pending,
+            spec,
+            authority_entry,
+            "approved",
+            services.event_sink,
+        )
 
         def claim(prepared: Any) -> Any:
             services.raise_if_cancelled()
@@ -1340,7 +1510,6 @@ class AgentLoopRunner:
         else:
             result = render_compatibility(spec, record.outcome)
         self._emit_tool_result(
-            invocation,
             pending.tool_call_id,
             pending.tool_name,
             result,
@@ -1355,11 +1524,21 @@ class AgentLoopRunner:
         # durable delivery before cancellation stops the continuation.
         services.raise_if_cancelled()
         services.require_delivery_fence()
+        invocation.catalog_lease.close()
         segment = continuation.activate_continuation_segment()
         if type(segment) is not ApprovedContinuationSegment:
             raise TypeError("approved continuation port returned an invalid Segment bundle")
+        continuation_lease = segment.catalog_lease
+        owned_leases.append(continuation_lease)
         if segment.catalog is not invocation.catalog:
             raise ProjectionError("approved continuation replaced the Bundle catalog")
+        if continuation_lease is invocation.catalog_lease:
+            raise ProjectionError("approved continuation reused the Approval Segment lease")
+        if (
+            continuation_lease.bundle_instance_token
+            is not invocation.catalog_lease.bundle_instance_token
+        ):
+            raise ProjectionError("approved continuation replaced the Bundle lease provenance")
         if segment.model is invocation.model or segment.tool_context is invocation.tool_context:
             raise ProjectionError("approved continuation reused Approval services")
         fresh_recorder = getattr(segment.tool_context, "run_recorder", None)
@@ -1375,6 +1554,7 @@ class AgentLoopRunner:
             seed=NewTurnSeed(segment.messages),
             model=segment.model,
             catalog=segment.catalog,
+            catalog_lease=continuation_lease,
             tool_context=segment.tool_context,
             surface_gate=segment.surface_gate,
             auto_approve=False,
@@ -1413,28 +1593,15 @@ class AgentLoopRunner:
         for call in calls:
             services.raise_if_cancelled()
             services.require_delivery_fence()
-            spec = invocation.catalog.resolve(call.name)
-            if spec is None:
-                failure = ToolFailure(
-                    "validation_error",
-                    "unknown_tool",
-                    f'未知工具 "{call.name}"',
-                )
-                failures.append(failure)
-                result = "错误：" + failure.compatibility_detail
-                self._append_tool_result(
-                    invocation,
-                    call,
-                    result,
-                    None,
-                    working_messages,
-                    added_messages,
-                    services.event_sink,
-                )
-                continue
+            surface_gate = cast(SegmentSurfaceGate, invocation.surface_gate)
+            authority_entry = surface_gate.authority_metadata_view.entries.get(call.name)
+            is_write = (
+                authority_entry is not None
+                and authority_entry.operation_kind is OperationKind.TRANSACTIONAL_WRITE
+            )
             pending_draft: PendingAction | None = None
             pending_revision: int | None = None
-            if _is_write_spec(spec):
+            if is_write:
                 pending_revision = max(
                     1,
                     _pending_action_revision(call.id, call.name, call.args),
@@ -1443,11 +1610,11 @@ class AgentLoopRunner:
                     tool_call_id=call.id,
                     tool_name=call.name,
                     args=call.args,
-                    human=_spec_confirmation_description(spec, call.args, call.name),
+                    human=call.name,
                     operation_id=str(uuid4()),
                 )
             prepared = prepare_call(
-                invocation.catalog,
+                invocation.catalog_lease,
                 invocation.tool_context,
                 call,
                 call_identity=services._prepare_identities.get(id(call)),
@@ -1455,11 +1622,20 @@ class AgentLoopRunner:
                 pending_action_revision=pending_revision,
             )
             services.raise_if_cancelled()
+            spec = (
+                prepared.prepared.spec
+                if isinstance(prepared, (ConfirmationRequired, ReadyToExecute))
+                else prepared.spec
+            )
+            self._emit_tool_call(spec, authority_entry, call, services.event_sink)
             if isinstance(prepared, Rejected):
                 failures.append(prepared.failure)
-                result = render_compatibility(spec, prepared.failure)
+                result = (
+                    render_compatibility(spec, prepared.failure)
+                    if spec is not None
+                    else "错误：" + (prepared.failure.compatibility_detail or prepared.failure.code)
+                )
                 self._append_tool_result(
-                    invocation,
                     call,
                     result,
                     None,
@@ -1468,13 +1644,16 @@ class AgentLoopRunner:
                     services.event_sink,
                 )
                 continue
-            if _is_write_spec(spec):
+            if spec is None:
+                raise ProjectionError("resolved pipeline result omitted its ToolSpec handle")
+            if is_write:
                 if isinstance(prepared, ConfirmationRequired):
                     if type(invocation.tool_context.authority) is not SegmentExecutionAuthority:
                         raise TypeError("Typed Pending requires Segment authority")
                     if pending_draft is None or pending_revision is None:
                         raise TypeError("Typed Pending draft identity is missing")
                     pending = pending_draft
+                    pending.human = _spec_confirmation_description(spec, call.args, call.name)
                     operation_id = pending.operation_id
                     revision = pending_revision
                     pending.bind_typed_proposal_identity(
@@ -1512,7 +1691,6 @@ class AgentLoopRunner:
                     return pending
                 result = "错误：确认操作状态不一致"
                 self._append_tool_result(
-                    invocation,
                     call,
                     result,
                     None,
@@ -1522,6 +1700,8 @@ class AgentLoopRunner:
                 )
                 continue
             if isinstance(prepared, ReadyToExecute):
+                if authority_entry is None:
+                    raise ProjectionError("read route omitted its Authority metadata entry")
                 services.raise_if_cancelled()
                 services.require_delivery_fence()
                 provider_invocation = services._provider_invocations.get(id(call))
@@ -1546,44 +1726,72 @@ class AgentLoopRunner:
                 records.append(record)
                 if isinstance(record.outcome, ToolFailure):
                     failures.append(record.outcome)
+                self._require_read_record_route(
+                    record,
+                    invocation.tool_context,
+                    authority_entry,
+                )
                 result = render_compatibility(spec, record.outcome)
+                self._require_read_record_route(
+                    record,
+                    invocation.tool_context,
+                    authority_entry,
+                )
             else:
                 record = None
                 result = "错误：只读工具不能请求确认"
             self._append_tool_result(
-                invocation,
                 call,
                 result,
                 record,
                 working_messages,
                 added_messages,
                 services.event_sink,
+                route_context=invocation.tool_context if record is not None else None,
+                authority_entry=authority_entry if record is not None else None,
             )
         return None
 
     def _append_tool_result(
         self,
-        invocation: AgentLoopInvocation,
         call: ToolCall,
         result: str,
         record: ToolExecutionRecord[Any, Any] | None,
         working_messages: list[Message],
         added_messages: list[Message],
         event_sink: AgentEventSink | None,
+        *,
+        route_context: ToolExecutionContext | None = None,
+        authority_entry: ToolAuthorityEntryV1 | None = None,
     ) -> None:
-        self._emit_tool_result(invocation, call.id, call.name, result, record, event_sink)
+        if record is not None and route_context is not None and authority_entry is not None:
+            self._require_read_record_route(record, route_context, authority_entry)
+        self._emit_tool_result(
+            call.id,
+            call.name,
+            result,
+            record,
+            event_sink,
+            route_context=route_context,
+            authority_entry=authority_entry,
+        )
+        if record is not None and route_context is not None and authority_entry is not None:
+            self._require_read_record_route(record, route_context, authority_entry)
         message = Message(role="tool", content=result, tool_call_id=call.id)
         working_messages.append(message)
         added_messages.append(message)
 
     def _emit_tool_call(
         self,
-        invocation: AgentLoopInvocation,
+        spec: ToolSpec[Any, Any] | None,
+        authority_entry: ToolAuthorityEntryV1 | None,
         call: ToolCall,
         event_sink: AgentEventSink | None,
     ) -> None:
-        spec = invocation.catalog.resolve(call.name)
-        is_write = _is_write_spec(spec)
+        is_write = (
+            authority_entry is not None
+            and authority_entry.operation_kind is OperationKind.TRANSACTIONAL_WRITE
+        )
         self._emit(
             event_sink,
             AgentToolCall(
@@ -1592,19 +1800,26 @@ class AgentLoopRunner:
                 public_label=_tool_public_label(spec, call.name),
                 kind="write" if is_write else "read",
                 confirm_mode="hitl" if is_write else "none",
-                summary=_tool_call_summary(spec, call.args, call.name),
+                summary=_tool_call_summary(
+                    spec,
+                    call.args,
+                    call.name,
+                    is_write=is_write,
+                ),
                 args_summary=cast(dict[str, Any], _args_summary(call.args)),
             ),
         )
 
     def _emit_pending_tool_call(
         self,
-        invocation: AgentLoopInvocation,
         pending: PendingAction,
+        spec: ToolSpec[Any, Any],
+        authority_entry: ToolAuthorityEntryV1,
         confirm_mode: str,
         event_sink: AgentEventSink | None,
     ) -> None:
-        spec = invocation.catalog.resolve(pending.tool_name)
+        if authority_entry.operation_kind is not OperationKind.TRANSACTIONAL_WRITE:
+            raise PendingActionValidationError("pending Authority entry is not a write tool")
         self._emit(
             event_sink,
             AgentToolCall(
@@ -1620,21 +1835,31 @@ class AgentLoopRunner:
 
     def _emit_tool_result(
         self,
-        invocation: AgentLoopInvocation,
         tool_call_id: str,
         tool_name: str,
         result: str,
         record: ToolExecutionRecord[Any, Any] | None,
         event_sink: AgentEventSink | None,
+        *,
+        route_context: ToolExecutionContext | None = None,
+        authority_entry: ToolAuthorityEntryV1 | None = None,
     ) -> None:
         payload: dict[str, Any]
         if record is not None and record.terminal_persisted:
             if record.persisted_transport is None:
                 raise RuntimeError("persisted operation transport is missing")
             payload = dict(record.persisted_transport)
-        elif record is not None and (spec := invocation.catalog.resolve(tool_name)) is not None:
+        elif record is not None:
             try:
-                payload = project_transport_event(spec, record)
+                if route_context is not None and authority_entry is not None:
+                    payload = self._project_read_transport(
+                        record,
+                        result,
+                        route_context,
+                        authority_entry,
+                    )
+                else:
+                    payload = project_transport_event(record.prepared.spec, record)
             except Exception:
                 payload = _delivery_error_payload(tool_call_id, tool_name, result)
         else:
@@ -1643,6 +1868,8 @@ class AgentLoopRunner:
         if record is not None and record.operation_id:
             payload.setdefault("operation_id", record.operation_id)
         payload.setdefault("summary", _summarize_tool_result(result))
+        if record is not None and route_context is not None and authority_entry is not None:
+            self._require_read_record_route(record, route_context, authority_entry)
         self._emit(
             event_sink,
             AgentToolResult(
@@ -1651,6 +1878,50 @@ class AgentLoopRunner:
                 payload=cast(Mapping[str, JsonValue], payload),
             ),
         )
+        if record is not None and route_context is not None and authority_entry is not None:
+            self._require_read_record_route(record, route_context, authority_entry)
+
+    @staticmethod
+    def _require_read_record_route(
+        record: ToolExecutionRecord[Any, Any],
+        context: ToolExecutionContext,
+        expected_entry: ToolAuthorityEntryV1,
+    ) -> None:
+        current_entry = context.authority_factory.require_prepared_route(
+            record.prepared,
+            authority=context.authority,
+            use=AuthorityUse.READ_EXECUTE,
+        )
+        if current_entry is not expected_entry:
+            raise AuthorityPhaseError("read result Authority entry identity changed")
+
+    @classmethod
+    def _project_read_transport(
+        cls,
+        record: ToolExecutionRecord[Any, Any],
+        visible_result: str,
+        context: ToolExecutionContext,
+        authority_entry: ToolAuthorityEntryV1,
+    ) -> dict[str, Any]:
+        cls._require_read_record_route(record, context, authority_entry)
+        spec = record.prepared.spec
+        projector = spec.result_metadata_projector
+        cls._require_read_record_route(record, context, authority_entry)
+        metadata = ToolResultMetadata()
+        if not isinstance(record.outcome, ToolFailure) and projector is not None:
+            metadata = projector(record.outcome.result)
+            cls._require_read_record_route(record, context, authority_entry)
+        payload: dict[str, Any] = {
+            "tool_call_id": record.prepared.tool_call_id,
+            "tool_name": spec.name,
+            "status": "error" if isinstance(record.outcome, ToolFailure) else "success",
+            "summary": visible_result[:500],
+            "evidence": [dict(item) for item in metadata.evidence],
+            "affected_resources": [dict(item) for item in metadata.affected_resources],
+            "changed_entities": [dict(item) for item in metadata.changed_entities],
+        }
+        cls._require_read_record_route(record, context, authority_entry)
+        return payload
 
     @staticmethod
     def _emit(event_sink: AgentEventSink | None, event: AgentLoopEvent) -> None:
@@ -1689,12 +1960,6 @@ def _pending_action_revision(tool_call_id: str, tool_name: str, raw_args: str) -
         allow_nan=False,
     ).encode("utf-8")
     return int.from_bytes(hashlib.sha256(canonical).digest()[:8], "big") & ((1 << 63) - 1)
-
-
-def _is_write_spec(
-    spec: ToolSpec[Any, Any] | None,
-) -> TypeGuard[ToolSpec[Any, Any]]:
-    return spec is not None and type(spec.metadata.operation) is WriteOperationMetadataV1
 
 
 def _spec_confirmation_description(
@@ -1791,10 +2056,17 @@ def _journal_assistant_kind(assistant: Assistant) -> str:
     return "empty"
 
 
-def _select_tool_calls(tool_calls: list[Any], catalog: ToolCatalog) -> list[Any]:
+def _select_tool_calls(
+    tool_calls: list[Any],
+    authority_view: ToolAuthorityMetadataView,
+) -> list[Any]:
     if not tool_calls:
         return []
-    if all(not _is_write_spec(catalog.resolve(str(call.name))) for call in tool_calls):
+    if all(
+        (entry := authority_view.entries.get(str(call.name))) is None
+        or entry.operation_kind is OperationKind.READ
+        for call in tool_calls
+    ):
         return tool_calls
     return tool_calls[:1]
 
@@ -1804,8 +2076,14 @@ def _tool_public_label(spec: ToolSpec[Any, Any] | None, fallback: str) -> str:
     return description or fallback
 
 
-def _tool_call_summary(spec: ToolSpec[Any, Any] | None, args: str, fallback: str) -> str:
-    if _is_write_spec(spec):
+def _tool_call_summary(
+    spec: ToolSpec[Any, Any] | None,
+    args: str,
+    fallback: str,
+    *,
+    is_write: bool,
+) -> str:
+    if is_write and spec is not None:
         return _spec_confirmation_description(spec, args, fallback)
     return _tool_public_label(spec, fallback)
 

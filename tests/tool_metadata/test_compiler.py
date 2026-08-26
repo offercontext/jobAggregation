@@ -24,6 +24,7 @@ from offerpilot.ai.tool_runtime.catalog import (
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import ToolSpec, ToolSuccess
 from offerpilot.ai.tool_runtime.metadata import (
+    ToolMetadataBundleV1,
     WriteOperationMetadataV1,
     freeze_json,
     materialize_json,
@@ -36,6 +37,7 @@ from offerpilot.ai.types import Message, ToolCall
 from offerpilot.config import Config
 
 from .factories import (
+    compose_synthetic_bundle,
     presentation_binding,
     read_metadata,
     resolver_descriptor,
@@ -726,6 +728,22 @@ def test_catalog_topology_replacement_fails_at_materialization_and_real_pipeline
         preflight=_PreflightRepositoryProbe(counters),
     )
     catalog = _catalog((spec,))
+    source = compose_synthetic_bundle()
+    manifest = dict(cast(dict[str, object], source["manifest"]))
+    manifest["typed_tools"] = (spec.name,)
+    bundle = ToolMetadataBundleV1(
+        typed_catalog=catalog,
+        manifest=manifest,
+        legacy_boundary=cast(dict[str, object], source["legacy_boundary"]),
+        compensation=cast(dict[str, object], source["compensation"]),
+    )
+    lease = bundle.open_segment_lease()
+    probe = _PipelineProbe(counters)
+    probe.factory.bind_segment_tool_catalog(
+        probe.context.authority,
+        authority_metadata_view=bundle.authority_view(),
+        catalog_lease=lease,
+    )
     _replace_catalog_component(catalog, component)
 
     materialization_rejected = False
@@ -735,13 +753,12 @@ def test_catalog_topology_replacement_fails_at_materialization_and_real_pipeline
         assert "integrity" in str(exc).lower() or "seal" in str(exc).lower()
         materialization_rejected = True
 
-    probe = _PipelineProbe(counters)
     call = ToolCall(id="catalog-integrity", name=spec.name, args='{"id":1}')
     pipeline_rejected = False
     try:
         try:
             prepare_call(
-                catalog,
+                lease,
                 probe.context,
                 call,
                 call_identity=probe.prepare_identity(call),
@@ -886,7 +903,6 @@ def test_provider_materialization_source_gate_tracks_aliases_and_single_operatio
 
     required_materializer_callers = (
         PRODUCTION_ROOT / "ai" / "client.py",
-        PRODUCTION_ROOT / "context_projector" / "authority_surface.py",
         PRODUCTION_ROOT / "context_projector" / "gateway.py",
         PRODUCTION_ROOT / "context_projector" / "projector.py",
         PRODUCTION_ROOT / "context_projector" / "selector.py",

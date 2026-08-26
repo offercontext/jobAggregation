@@ -507,21 +507,25 @@ class _SegmentContextResolver:
 class _SegmentSurfaceGateResolver:
     """Freeze Catalog/Profile/Selector/Authority visibility before Provider."""
 
-    __slots__ = ("_provider_view", "_discovery_view", "_authority_view")
+    __slots__ = ("_bundle", "_provider_view", "_discovery_view", "_authority_view")
 
     def __init__(
         self,
         *,
-        provider_view: ProviderToolMetadataView,
-        discovery_view: ToolDiscoveryMetadataView,
-        authority_view: ToolAuthorityMetadataView,
+        bundle: ToolMetadataBundleV1,
     ) -> None:
+        if type(bundle) is not ToolMetadataBundleV1:
+            raise TypeError("surface resolver requires exact Tool Metadata Bundle")
+        provider_view = bundle.provider_view()
+        discovery_view = bundle.discovery_view()
+        authority_view = bundle.authority_view()
         token = provider_view.bundle_instance_token
         if (
             discovery_view.bundle_instance_token is not token
             or authority_view.bundle_instance_token is not token
         ):
             raise ValueError("surface resolver metadata views have mixed Bundle provenance")
+        self._bundle = bundle
         self._provider_view = provider_view
         self._discovery_view = discovery_view
         self._authority_view = authority_view
@@ -566,16 +570,22 @@ class _SegmentSurfaceGateResolver:
             )
             for value in assembled
         )
-        return build_segment_surface_gate(
-            messages,
-            catalog=cast(Any, segment.catalog),
-            context=segment.context,
-            authority=cast(Any, segment.authority),
-            provider_view=self._provider_view,
-            discovery_view=self._discovery_view,
-            authority_metadata_view=self._authority_view,
-            policy=cast(Any, _attribute(policy, "policy")),
-        )
+        catalog_lease = self._bundle.open_segment_lease()
+        try:
+            return build_segment_surface_gate(
+                messages,
+                catalog=cast(Any, segment.catalog),
+                catalog_lease=catalog_lease,
+                context=segment.context,
+                authority=cast(Any, segment.authority),
+                provider_view=self._provider_view,
+                discovery_view=self._discovery_view,
+                authority_metadata_view=self._authority_view,
+                policy=cast(Any, _attribute(policy, "policy")),
+            )
+        except BaseException:
+            catalog_lease.close()
+            raise
 
 
 class _SourceAdapter(SourceLoader):
@@ -857,6 +867,11 @@ class _AgentDriver:
             # proposal facts available for a later turn.
             recorder.discard_proposals()
             raise
+        finally:
+            # Runner normally owns this close.  Keep the composition driver
+            # as the final boundary when a substituted/failing Runner exits
+            # before taking that ownership.
+            invocation._release_catalog_lease_backstop()
 
 
 class _AtomicTimeoutDelivery:
@@ -1545,9 +1560,7 @@ def build_pilot_runtime(
     )
     continuation_model_resolver = _ContinuationModelResolver(chat_model, data_dir)
     surface_gate_resolver = _SegmentSurfaceGateResolver(
-        provider_view=metadata_bundle.provider_view(),
-        discovery_view=metadata_bundle.discovery_view(),
-        authority_view=metadata_bundle.authority_view(),
+        bundle=metadata_bundle,
     )
     policy_snapshot = validate_startup_policy(
         cast(Mapping[str, object], getattr(catalog, "authority_manifest"))

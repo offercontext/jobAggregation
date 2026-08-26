@@ -20,6 +20,7 @@ from offerpilot.ai.tool_runtime.policy_types import UndoPolicy as UndoPolicy
 
 if TYPE_CHECKING:
     from offerpilot.ai.tool_authority.contracts import AuthorityInstanceToken, PreparedInstanceToken
+    from offerpilot.ai.tool_runtime.catalog import SegmentToolSpecHandle
     from offerpilot.ai.tool_runtime.context import ToolExecutionContext
     from offerpilot.ai.tool_runtime.metadata import (
         ResolverImplementationBinding,
@@ -32,12 +33,14 @@ if TYPE_CHECKING:
 if TYPE_CHECKING:
     AuthorityInstanceTokenLike: TypeAlias = AuthorityInstanceToken
     PreparedInstanceTokenLike: TypeAlias = PreparedInstanceToken
+    SegmentToolSpecHandleLike: TypeAlias = SegmentToolSpecHandle
 else:
     # Resolve annotations safely while the leaf authority module imports this
     # runtime module.  Static type checkers still see the opaque handle type;
     # runtime callers cannot use this alias to construct a token.
     AuthorityInstanceTokenLike: TypeAlias = Any
     PreparedInstanceTokenLike: TypeAlias = Any
+    SegmentToolSpecHandleLike: TypeAlias = Any
 
 
 JSONValue: TypeAlias = None | bool | int | float | str | list["JSONValue"] | dict[str, "JSONValue"]
@@ -670,7 +673,7 @@ class ToolSpec(Generic[ArgsT, ResultT]):
         return self.contract.name
 
 
-@dataclass(frozen=True, repr=False)
+@dataclass(frozen=True, slots=True, repr=False)
 class PreparedToolCall(TransientToolRuntimeValue, Generic[ArgsT, ResultT]):
     tool_call_id: str
     spec: ToolSpec[ArgsT, ResultT] = field(repr=False)
@@ -679,6 +682,10 @@ class PreparedToolCall(TransientToolRuntimeValue, Generic[ArgsT, ResultT]):
     arguments_digest: str
     contract_fingerprint: str
     binding: BindingAudit
+    spec_handle: SegmentToolSpecHandleLike = field(
+        repr=False,
+        compare=False,
+    )
     pending_identity: object | None = field(default=None, repr=False, compare=False)
     pending_action_revision: int | None = None
     journal_started_draft: object | None = field(default=None, repr=False, compare=False)
@@ -718,6 +725,11 @@ class PreparedToolCall(TransientToolRuntimeValue, Generic[ArgsT, ResultT]):
             if self.authority_instance_token is not None:
                 raise TypeError("transient tool runtime value cannot be replaced")
         object.__setattr__(self, "_replacement_guard", object())
+
+    def __getstate__(self) -> NoReturn:
+        # ``dataclass(slots=True)`` synthesizes a state reader for frozen
+        # instances unless the concrete class closes that serialization port.
+        raise self._serialization_error()
 
 
 @dataclass(frozen=True)

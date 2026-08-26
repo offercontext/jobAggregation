@@ -11,14 +11,49 @@ import pytest
 from offerpilot.ai.tool_authority import AuthorityPhaseError
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
+from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.ai.tool_runtime.pipeline import execute_prepared, prepare_call
 from offerpilot.ai.types import ToolCall
 from tests.tool_pipeline.test_pipeline import Recorder, Runtime, _runtime, _spec
+from tests.tool_metadata.factories import compose_synthetic_bundle
+
+
+_LEASES: list[object] = []
+_RUNTIME_ROUTES: dict[int, tuple[object, object, object]] = {}
+
+
+@pytest.fixture(autouse=True)
+def _close_segment_leases():
+    yield
+    _RUNTIME_ROUTES.clear()
+    while _LEASES:
+        getattr(_LEASES.pop(), "close")()
 
 
 def _prepare(runtime: Runtime, spec: Any, call: ToolCall) -> Any:
+    route = _RUNTIME_ROUTES.get(id(runtime))
+    if route is None:
+        catalog = ToolCatalog([spec], expected_names=(spec.name,))
+        source = compose_synthetic_bundle()
+        bundle = ToolMetadataBundleV1(
+            typed_catalog=catalog,
+            manifest={**source["manifest"], "typed_tools": (spec.name,)},
+            legacy_boundary=source["legacy_boundary"],
+            compensation=source["compensation"],
+        )
+        lease = bundle.open_segment_lease()
+        _LEASES.append(lease)
+        runtime.factory.bind_segment_tool_catalog(
+            runtime.authority,
+            authority_metadata_view=bundle.authority_view(),
+            catalog_lease=lease,
+        )
+        route = (bundle, lease, spec)
+        _RUNTIME_ROUTES[id(runtime)] = route
+    _, lease, registered_spec = route
+    assert registered_spec is spec
     prepared = prepare_call(
-        ToolCatalog([spec], expected_names=(spec.name,)),
+        lease,
         runtime.context,
         call,
         call_identity=runtime.prepare_identity(call),

@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 
 from offerpilot.agent_runtime.journal import NullRunRecorder
 from offerpilot.ai.agent_contracts import PendingAction
-from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
+from offerpilot.ai.tool_authority import AuthorityFactory, AuthorityUse, TrustedContextScope
 from offerpilot.ai.tool_authority.fingerprint import authorization_scope_fingerprint
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
@@ -27,7 +27,11 @@ from offerpilot.ai.tool_runtime.contracts import (
     REQUIRED_UNDO_TOOL_NAMES,
     ToolExceptionMapping,
 )
-from offerpilot.ai.tool_runtime.metadata import ToolPresentationBindingV1, UndoBuilderBinding
+from offerpilot.ai.tool_runtime.metadata import (
+    ToolMetadataBundleV1,
+    ToolPresentationBindingV1,
+    UndoBuilderBinding,
+)
 from offerpilot.ai.tool_runtime.pipeline import prepare_call
 from offerpilot.ai.types import ToolCall
 from offerpilot.ai.write_operations import (
@@ -52,7 +56,11 @@ from offerpilot.repositories.jd import JDAnalysesRepository
 from offerpilot.repositories.notes import NotesRepository
 from offerpilot.repositories.offers import OffersRepository
 from offerpilot.repositories.resumes import ResumesRepository
-from tests.tool_metadata.factories import synthetic_tool_spec, write_metadata
+from tests.tool_metadata.factories import (
+    compose_synthetic_bundle,
+    synthetic_tool_spec,
+    write_metadata,
+)
 
 
 _UNDO_KINDS = {
@@ -62,6 +70,7 @@ _UNDO_KINDS = {
     "add_note": "delete_note",
 }
 _TEST_AUTHORITY_FACTORIES: list[AuthorityFactory] = []
+_TEST_SEGMENT_LEASES: list[object] = []
 
 
 def _capture_acceptance_undo_seed(_context: object, _args: object) -> None:
@@ -83,6 +92,8 @@ def _close_test_authority_factories():
     try:
         yield
     finally:
+        while _TEST_SEGMENT_LEASES:
+            getattr(_TEST_SEGMENT_LEASES.pop(), "close")()
         while _TEST_AUTHORITY_FACTORIES:
             factory = _TEST_AUTHORITY_FACTORIES.pop()
             factory.close()
@@ -114,9 +125,7 @@ def _harness(
     pending_action_revision = _pending_revision(
         pending.tool_call_id, pending.tool_name, pending.args
     )
-    proposal_fingerprint = ledger_fingerprint(
-        key, "write-operation-proposal-v1", {}
-    )
+    proposal_fingerprint = ledger_fingerprint(key, "write-operation-proposal-v1", {})
     confirmation_token_fingerprint = ledger_fingerprint(
         key, "write-operation-confirmation-token-v1", b"synthetic-token"
     )
@@ -200,11 +209,7 @@ def _harness(
         description="acceptance",
         parameters=parameters,
     )
-    undo_policy = (
-        UndoPolicy.REQUIRED
-        if tool_name in REQUIRED_UNDO_TOOL_NAMES
-        else UndoPolicy.NONE
-    )
+    undo_policy = UndoPolicy.REQUIRED if tool_name in REQUIRED_UNDO_TOOL_NAMES else UndoPolicy.NONE
     metadata = replace(
         write_metadata(
             name=tool_name,
@@ -240,13 +245,27 @@ def _harness(
         success_renderer=_render_acceptance_success,
     )
     catalog = ToolCatalog((spec,), expected_names=(tool_name,))
+    source = compose_synthetic_bundle()
+    bundle = ToolMetadataBundleV1(
+        typed_catalog=catalog,
+        manifest={**source["manifest"], "typed_tools": (tool_name,)},
+        legacy_boundary=source["legacy_boundary"],
+        compensation=source["compensation"],
+    )
+    lease = bundle.open_segment_lease()
+    _TEST_SEGMENT_LEASES.append(lease)
+    factory.bind_segment_tool_catalog(
+        authority,
+        authority_metadata_view=bundle.authority_view(),
+        catalog_lease=lease,
+    )
     prepare_identity = factory.create_approved_write_prepare_identity(
         authority,
         approval_context=context,
         request_identity=object(),
     )
     prepared_result = prepare_call(
-        catalog,
+        lease,
         context,
         ToolCall(pending.tool_call_id, pending.tool_name, pending.args),
         call_identity=prepare_identity,
@@ -279,6 +298,7 @@ def _harness(
         prepare_identity=prepare_identity,
         request_fingerprint=request_fingerprint,
         factory=factory,
+        lease=lease,
     )
 
 
@@ -333,6 +353,7 @@ def _execute_typed_parent(tmp_path, tool_name: str):
         return {"adapter": tool_name, "executions": len(calls)}
 
     harness = _harness(tmp_path, tool_name, execute)
+    _consume_outer_approval_transition(harness)
     execution, _record = harness.coordinator.execute_primary(
         operation_id=harness.operation_id,
         conversation_id=harness.conversation.id,
@@ -355,6 +376,14 @@ def _execute_typed_parent(tmp_path, tool_name: str):
         harness.request_fingerprint,
         calls,
         execution,
+    )
+
+
+def _consume_outer_approval_transition(harness: SimpleNamespace) -> None:
+    harness.factory.begin_prepared_execution(
+        harness.prepared,
+        authority=harness.context.authority,
+        use=AuthorityUse.APPROVED_WRITE_PREPARE,
     )
 
 
@@ -515,16 +544,18 @@ def test_expired_takeover_fences_late_owner_and_detects_message_and_manifest_tam
     replay = repository.replay(operation, request_fingerprint)
     assert replay.final_message == "操作已提交，但后续说明生成失败。"
 
-    with sessions() as session, pytest.raises(
-        IntegrityError, match="operation delivery message is immutable"
+    with (
+        sessions() as session,
+        pytest.raises(IntegrityError, match="operation delivery message is immutable"),
     ):
         message = session.query(ChatMessage).filter_by(operation_id=operation_id).first()
         assert message is not None
         message.content += "tampered"
         session.commit()
 
-    with sessions() as session, pytest.raises(
-        IntegrityError, match="write operation delivery is immutable"
+    with (
+        sessions() as session,
+        pytest.raises(IntegrityError, match="write operation delivery is immutable"),
     ):
         operation = session.get(WriteOperation, operation_id)
         assert operation is not None
@@ -546,6 +577,7 @@ def test_two_connections_choose_one_primary_executor_winner(tmp_path) -> None:
             return {"adapter": "delete_note", "executions": len(calls)}
 
     harness = _harness(tmp_path, "delete_note", synchronized_executor)
+    _consume_outer_approval_transition(harness)
 
     def approve():
         return harness.coordinator.execute_primary(
@@ -575,6 +607,7 @@ def test_primary_commit_unknown_reconciles_without_second_executor_call(
         return {"adapter": "delete_note", "executions": len(calls)}
 
     harness = _harness(tmp_path, "delete_note", execute)
+    _consume_outer_approval_transition(harness)
     real_commit = Session.commit
     injected = False
 
@@ -623,6 +656,7 @@ def test_deterministic_failure_commit_unknown_replays_failed_terminal(
         declared_failure_categories=frozenset({"conflict"}),
         exception_map=(ToolExceptionMapping(ValueError, "conflict", "domain_conflict"),),
     )
+    _consume_outer_approval_transition(harness)
     real_commit = Session.commit
     injected = False
 
@@ -719,9 +753,7 @@ def test_commit_unknown_reconciliation_distinguishes_primary_and_compensation_st
     assert unreadable.code == "operation_result_unknown"
 
 
-def test_compensation_commit_unknown_and_parent_conflict_are_stable(
-    tmp_path, monkeypatch
-) -> None:
+def test_compensation_commit_unknown_and_parent_conflict_are_stable(tmp_path, monkeypatch) -> None:
     (
         _sessions,
         _repository,

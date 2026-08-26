@@ -5,11 +5,13 @@ from dataclasses import fields, replace
 from types import SimpleNamespace
 import pytest
 
+import offerpilot.ai.tool_authority.composition as authority_composition
 from offerpilot.agent_runtime.journal import NullRunRecorder
 from offerpilot.ai.tool_authority import (
     ApprovalExecutionAuthority,
     AuthorityFactory,
     AuthorityPhaseError,
+    AuthorityUse,
     ExecutionClaim,
     TrustedContextScope,
 )
@@ -21,6 +23,7 @@ from offerpilot.ai.tool_runtime.contracts import (
     ToolFailure,
 )
 from offerpilot.ai.tool_runtime.pipeline import execute_prepared, prepare_call
+from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.ai.types import ToolCall
 from offerpilot.db import init_database
 from offerpilot.repositories.application_events import ApplicationEventsRepository
@@ -29,12 +32,24 @@ from offerpilot.repositories.jd import JDAnalysesRepository
 from offerpilot.repositories.notes import NotesRepository
 from offerpilot.repositories.offers import OffersRepository
 from offerpilot.repositories.resumes import ResumesRepository
-from tests.tool_metadata.factories import synthetic_tool_spec, write_metadata
+from tests.tool_metadata.factories import (
+    compose_synthetic_bundle,
+    synthetic_tool_spec,
+    write_metadata,
+)
 
 
 ARGUMENTS = {"value": 1}
 ARGUMENTS_JSON = '{"value":1}'
 ARGUMENTS_DIGEST = "sha256:" + hashlib.sha256(ARGUMENTS_JSON.encode()).hexdigest()
+_LEASES: list[object] = []
+
+
+@pytest.fixture(autouse=True)
+def _close_segment_leases():
+    yield
+    while _LEASES:
+        getattr(_LEASES.pop(), "close")()
 
 
 class Cancelled(BaseException):
@@ -113,13 +128,28 @@ def _setup(tmp_path, executor):
         executor=executor,
     )
     catalog = ToolCatalog((spec,), expected_names=(spec.name,))
+    source = compose_synthetic_bundle()
+    manifest = {**source["manifest"], "typed_tools": (spec.name,)}
+    bundle = ToolMetadataBundleV1(
+        typed_catalog=catalog,
+        manifest=manifest,
+        legacy_boundary=source["legacy_boundary"],
+        compensation=source["compensation"],
+    )
+    lease = bundle.open_segment_lease()
+    _LEASES.append(lease)
+    factory.bind_segment_tool_catalog(
+        authority,
+        authority_metadata_view=bundle.authority_view(),
+        catalog_lease=lease,
+    )
     prepare_identity = factory.create_approved_write_prepare_identity(
         authority,
         approval_context=context,
         request_identity=object(),
     )
     result = prepare_call(
-        catalog,
+        lease,
         context,
         ToolCall("call-1", "sealed_write", ARGUMENTS_JSON),
         call_identity=prepare_identity,
@@ -139,6 +169,11 @@ def _issue(
     prepare_identity: object,
     transaction: object,
 ):
+    factory.begin_prepared_execution(
+        prepared,  # type: ignore[arg-type]
+        authority=authority,
+        use=AuthorityUse.APPROVED_WRITE_PREPARE,
+    )
     if not transaction.in_transaction():
         transaction.begin()
     outer_transaction = transaction.get_transaction()
@@ -193,6 +228,124 @@ def test_write_without_operation_executor_fails_closed(tmp_path) -> None:
         assert isinstance(record.outcome, ToolFailure)
         assert record.outcome.code == "confirmation_claim_required"
         assert calls == 0
+    finally:
+        factory.close()
+
+
+def test_execution_claim_requires_consumed_outer_prepare_transition(tmp_path) -> None:
+    factory, authority, _context, pending, prepared, _prepare_identity, sessions = _setup(
+        tmp_path,
+        lambda _args, _context: {"ok": True},
+    )
+    try:
+        with sessions() as session:
+            session.begin()
+            outer_transaction = session.get_transaction()
+            assert outer_transaction is not None
+            factory.register_execution_transaction(
+                session,
+                outer_transaction,
+                authority=authority,
+            )
+
+            with pytest.raises(AuthorityPhaseError, match="outer approval transition"):
+                factory.issue_execution_claim(
+                    authority,
+                    prepared=prepared,
+                    pending=pending,
+                    operation_id="operation-1",
+                    tool_call_id="call-1",
+                    tool_name="sealed_write",
+                    effective_args_digest=ARGUMENTS_DIGEST,
+                    session=session,
+                    transaction=outer_transaction,
+                )
+    finally:
+        factory.close()
+
+
+def test_approved_outer_execution_requires_exact_prepared_origin(tmp_path) -> None:
+    factory, authority, context, _pending, prepared, origin, _sessions = _setup(
+        tmp_path,
+        lambda args, _context: args,
+    )
+    try:
+        sibling = factory.create_approved_write_prepare_identity(
+            authority,
+            approval_context=context,
+            request_identity=object(),
+        )
+
+        with pytest.raises(AuthorityPhaseError, match="origin"):
+            execute_prepared(
+                prepared,
+                context,
+                call_identity=sibling,
+                confirmation_claimer=lambda _prepared: None,
+            )
+
+        assert factory._prepared_origins[id(prepared)] is origin
+        assert factory._prepared_execution_states[id(prepared)] == set()
+    finally:
+        factory.close()
+
+
+def test_approved_inner_identity_requires_exact_prepared_origin(tmp_path) -> None:
+    factory, authority, context, pending, prepared, origin, sessions = _setup(
+        tmp_path,
+        lambda args, _context: args,
+    )
+    try:
+        factory.begin_prepared_execution(
+            prepared,
+            authority=authority,
+            use=AuthorityUse.APPROVED_WRITE_PREPARE,
+        )
+        with sessions() as session:
+            transaction = session.begin()
+            factory.register_execution_transaction(session, transaction, authority=authority)
+            claim = factory.issue_execution_claim(
+                authority,
+                prepared=prepared,
+                pending=pending,
+                operation_id="operation-1",
+                tool_call_id="call-1",
+                tool_name="sealed_write",
+                effective_args_digest=ARGUMENTS_DIGEST,
+                session=session,
+                transaction=transaction,
+            )
+            sibling = factory.create_approved_write_prepare_identity(
+                authority,
+                approval_context=context,
+                request_identity=object(),
+            )
+
+            with pytest.raises(AuthorityPhaseError, match="origin"):
+                factory.create_approved_write_execute_identity(
+                    sibling,
+                    prepared=prepared,
+                    execution_claim=claim,
+                )
+
+            assert factory._prepared_origins[id(prepared)] is origin
+            factory.revoke(claim)
+    finally:
+        factory.close()
+
+
+def test_revoke_authority_clears_prepared_execution_state(tmp_path) -> None:
+    factory, authority, _context, _pending, prepared, _origin, _sessions = _setup(
+        tmp_path,
+        lambda args, _context: args,
+    )
+    try:
+        prepared_id = id(prepared)
+        assert prepared_id in factory._prepared_execution_states
+
+        factory.revoke_authority(authority)
+
+        assert prepared_id not in factory._prepared_execution_states
     finally:
         factory.close()
 
@@ -258,6 +411,7 @@ def test_changed_typed_args_revoke_claim_before_executor(tmp_path) -> None:
 
 def test_legal_claim_is_consumed_once_even_when_executor_raises(tmp_path) -> None:
     calls = 0
+    stages: list[str] = []
 
     def executor(_args, _context):
         nonlocal calls
@@ -278,10 +432,26 @@ def test_legal_claim_is_consumed_once_even_when_executor_raises(tmp_path) -> Non
                 call_identity=execute_identity,
                 execution_claim=claim,
                 locked_effective_args_digest=ARGUMENTS_DIGEST,
+                stage_sink=stages.append,
             )
             assert isinstance(record.outcome, ToolFailure)
             assert calls == 1
             assert factory.claim_state(claim) is None
+            first_stages = tuple(stages)
+            outer_transaction = session.get_transaction()
+            assert outer_transaction is not None
+            with pytest.raises(AuthorityPhaseError, match="execution transition"):
+                factory.issue_execution_claim(
+                    authority,
+                    prepared=prepared,
+                    pending=pending,
+                    operation_id="operation-1",
+                    tool_call_id="call-1",
+                    tool_name="sealed_write",
+                    effective_args_digest=ARGUMENTS_DIGEST,
+                    session=session,
+                    transaction=outer_transaction,
+                )
             with pytest.raises(AuthorityPhaseError):
                 execute_prepared(
                     prepared,
@@ -289,14 +459,17 @@ def test_legal_claim_is_consumed_once_even_when_executor_raises(tmp_path) -> Non
                     call_identity=execute_identity,
                     execution_claim=claim,
                     locked_effective_args_digest=ARGUMENTS_DIGEST,
+                    stage_sink=stages.append,
                 )
             assert calls == 1
+            assert tuple(stages) == first_stages
     finally:
         factory.close()
 
 
 def test_base_exception_revokes_claim_and_propagates(tmp_path) -> None:
     calls = 0
+    stages: list[str] = []
 
     def executor(_args, _context):
         nonlocal calls
@@ -318,9 +491,22 @@ def test_base_exception_revokes_claim_and_propagates(tmp_path) -> None:
                     call_identity=execute_identity,
                     execution_claim=claim,
                     locked_effective_args_digest=ARGUMENTS_DIGEST,
+                    stage_sink=stages.append,
                 )
             assert calls == 1
             assert factory.claim_state(claim) is None
+            first_stages = tuple(stages)
+            with pytest.raises(AuthorityPhaseError):
+                execute_prepared(
+                    prepared,
+                    context.bind(session),
+                    call_identity=execute_identity,
+                    execution_claim=claim,
+                    locked_effective_args_digest=ARGUMENTS_DIGEST,
+                    stage_sink=stages.append,
+                )
+            assert calls == 1
+            assert tuple(stages) == first_stages
     finally:
         factory.close()
 
@@ -481,5 +667,34 @@ def test_nested_transaction_cannot_replace_outer_claim_identity(tmp_path) -> Non
                         transaction=nested_transaction,
                     )
         assert calls == 0
+    finally:
+        factory.close()
+
+
+def test_execution_claim_revoke_cleans_issued_token_after_token_field_mutation(
+    tmp_path,
+) -> None:
+    factory, authority, _context, pending, prepared, prepare_identity, sessions = _setup(
+        tmp_path,
+        lambda _args, _context: {"ok": True},
+    )
+    try:
+        with sessions() as session:
+            claim, _execute_identity = _issue(
+                factory,
+                authority,
+                pending,
+                prepared,
+                prepare_identity,
+                session,
+            )
+            issued_token = claim.execution_claim_instance_token
+            object.__setattr__(claim, "execution_claim_instance_token", object())
+
+            assert factory.is_active(issued_token)
+            factory.revoke(claim)
+
+            assert id(issued_token) not in factory._objects
+            assert id(issued_token) not in authority_composition._ACTIVE_OBJECTS
     finally:
         factory.close()

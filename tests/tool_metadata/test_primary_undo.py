@@ -17,17 +17,45 @@ from offerpilot.ai.tool_runtime.contracts import (
     BindingAudit,
     PreparedToolCall,
     ToolExecutionRecord,
+    ToolSpec,
     ToolSuccess,
 )
-from offerpilot.ai.tool_runtime.metadata import UndoBuilderBinding, freeze_json
+from offerpilot.ai.tool_runtime.catalog import SegmentToolSpecHandle, ToolCatalog
+from offerpilot.ai.tool_runtime.metadata import (
+    ToolMetadataBundleV1,
+    UndoBuilderBinding,
+    freeze_json,
+)
 from offerpilot.ai.tool_runtime.policy_types import CompensationKind, UndoPayloadKind, UndoPolicy
-from tests.tool_metadata.factories import synthetic_tool_spec, write_metadata
+from tests.tool_metadata.factories import (
+    compose_synthetic_bundle,
+    synthetic_tool_spec,
+    write_metadata,
+)
 
 
 _PROBE: list[str] = []
 _SEED = freeze_json({"status": "applied"})
 _TRANSACTION_TO_ROLLBACK: SessionTransaction | None = None
 _NESTED_TRANSACTION_TO_ROLLBACK: SessionTransaction | None = None
+
+
+def _test_spec_handle(spec: ToolSpec[Any, Any]) -> SegmentToolSpecHandle:
+    catalog = ToolCatalog((spec,), expected_names=(spec.name,))
+    source = compose_synthetic_bundle()
+    manifest = dict(cast(dict[str, object], source["manifest"]))
+    manifest["typed_tools"] = (spec.name,)
+    bundle = ToolMetadataBundleV1(
+        typed_catalog=catalog,
+        manifest=manifest,
+        legacy_boundary=cast(dict[str, object], source["legacy_boundary"]),
+        compensation=cast(dict[str, object], source["compensation"]),
+    )
+    lease = bundle.open_segment_lease()
+    handle = lease.resolve(spec.name)
+    assert handle is not None
+    assert lease.require_spec(handle) is spec
+    return handle
 
 
 def _capture_probe(context: object, args: object) -> object:
@@ -141,6 +169,7 @@ def _binding_and_record(
         arguments_digest="sha256:" + "1" * 64,
         contract_fingerprint="sha256:" + "2" * 64,
         binding=BindingAudit("allowed", 1, ("application",)),
+        spec_handle=_test_spec_handle(spec),
     )
     record = ToolExecutionRecord(
         prepared=prepared,

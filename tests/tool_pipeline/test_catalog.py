@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import inspect
 import pickle
 from dataclasses import replace
 from pathlib import Path
@@ -11,7 +12,7 @@ import pytest
 
 from offerpilot.ai import client as ai_client
 from offerpilot.ai.client import ConfiguredAIClient
-from offerpilot.ai.tool_runtime.catalog import ToolCatalog
+from offerpilot.ai.tool_runtime.catalog import SegmentToolSpecHandle, ToolCatalog
 from offerpilot.ai.tool_runtime.contracts import (
     BindingContract,
     BindingAudit,
@@ -22,7 +23,10 @@ from offerpilot.ai.tool_runtime.contracts import (
     ToolSpec,
     materialize_provider_payloads,
 )
-from offerpilot.ai.tool_runtime.metadata import BindingResolverDescriptorV1
+from offerpilot.ai.tool_runtime.metadata import (
+    BindingResolverDescriptorV1,
+    ToolMetadataBundleV1,
+)
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG, MODEL_TOOL_NAMES
 from offerpilot.ai.tool_runtime.legacy import LEGACY_DETERMINISTIC_NAMES
 from offerpilot.ai.types import Message
@@ -30,10 +34,29 @@ from offerpilot.config import Config
 
 from golden import canonical_json, load_golden
 from tests.tool_metadata.factories import (
+    compose_synthetic_bundle,
     read_metadata,
     synthetic_tool_spec,
     write_metadata,
 )
+
+
+def _test_spec_handle(spec: ToolSpec[Any, Any]) -> SegmentToolSpecHandle:
+    catalog = ToolCatalog((spec,), expected_names=(spec.name,))
+    source = compose_synthetic_bundle()
+    manifest = dict(cast(dict[str, object], source["manifest"]))
+    manifest["typed_tools"] = (spec.name,)
+    bundle = ToolMetadataBundleV1(
+        typed_catalog=catalog,
+        manifest=manifest,
+        legacy_boundary=cast(dict[str, object], source["legacy_boundary"]),
+        compensation=cast(dict[str, object], source["compensation"]),
+    )
+    lease = bundle.open_segment_lease()
+    handle = lease.resolve(spec.name)
+    assert handle is not None
+    assert lease.require_spec(handle) is spec
+    return handle
 
 
 def _contract(name: str, schema: dict[str, Any] | None = None) -> ProviderToolContract:
@@ -136,6 +159,7 @@ def test_transient_runtime_values_reject_pickle_and_hide_sensitive_fields() -> N
         binding=BindingAudit(status="unavailable", target_count=0),
         contract_fingerprint="sha256:" + "b" * 64,
         spec=spec,
+        spec_handle=_test_spec_handle(spec),
         tool_call_id="call-1",
         typed_args={"private": "sensitive-argument-value"},
     )
@@ -154,6 +178,14 @@ def test_transient_runtime_values_reject_pickle_and_hide_sensitive_fields() -> N
     rendered = repr((failure, prepared, record))
     assert "private exception text" not in rendered
     assert "sensitive-argument-value" not in rendered
+
+
+def test_prepared_tool_call_requires_a_typed_segment_spec_handle() -> None:
+    parameter = inspect.signature(PreparedToolCall).parameters["spec_handle"]
+
+    assert parameter.default is inspect.Parameter.empty
+    assert parameter.annotation == "SegmentToolSpecHandleLike"
+    assert PreparedToolCall.__dataclass_params__.frozen is True
 
 
 def test_model_catalog_is_exact_provider_golden_in_exact_order() -> None:

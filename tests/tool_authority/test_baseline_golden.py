@@ -95,6 +95,7 @@ from offerpilot.repositories.resumes import ResumesRepository
 
 from .golden import BASELINE, FIXTURES, canonical_json, load_golden
 from tests.tool_metadata.factories import (
+    compose_synthetic_bundle,
     read_metadata,
     resolver_descriptor,
     synthetic_tool_spec,
@@ -109,6 +110,19 @@ def _metadata_bundle(catalog: ToolCatalog) -> ToolMetadataBundleV1:
         manifest=manifest,
         legacy_boundary=manifest.to_dict()["legacy_boundary"],  # type: ignore[arg-type]
         compensation=prepare_compensation_handler_components().metadata_projection(),
+    )
+
+
+def _test_metadata_bundle(catalog: ToolCatalog) -> ToolMetadataBundleV1:
+    source = compose_synthetic_bundle()
+    return ToolMetadataBundleV1(
+        typed_catalog=catalog,
+        manifest={
+            **source["manifest"],
+            "typed_tools": tuple(spec.name for spec in catalog.specs),
+        },
+        legacy_boundary=source["legacy_boundary"],
+        compensation=source["compensation"],
     )
 
 
@@ -463,6 +477,7 @@ _PROBE_SESSIONS: Any = None
 _PROBE_REPOSITORY_CONTEXT: SimpleNamespace | None = None
 _PROBE_POLICY = validate_startup_policy(MODEL_TOOL_CATALOG.authority_manifest)
 _PROBE_INVOCATIONS: dict[int, object] = {}
+_PROBE_LEASES: list[object] = []
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -481,6 +496,8 @@ def _probe_repository_fixture(tmp_path_factory: pytest.TempPathFactory) -> Any:
         jd_analyses=JDAnalysesRepository(_PROBE_SESSIONS),
     )
     yield
+    while _PROBE_LEASES:
+        getattr(_PROBE_LEASES.pop(), "close")()
     factory = _PROBE_FACTORY
     if factory is not None:
         factory.close()
@@ -684,8 +701,16 @@ def _pipeline_projection(
     spec: ToolSpec[Any, Any], call: ToolCall, context: ToolExecutionContext
 ) -> dict[str, Any]:
     catalog = ToolCatalog([spec], expected_names=(spec.name,))
+    bundle = _test_metadata_bundle(catalog)
+    lease = bundle.open_segment_lease()
+    _PROBE_LEASES.append(lease)
+    context.authority_factory.bind_segment_tool_catalog(
+        context.authority,
+        authority_metadata_view=bundle.authority_view(),
+        catalog_lease=lease,
+    )
     result = prepare_call(
-        catalog,
+        lease,
         context,
         call,
         call_identity=_probe_prepare_identity(context, call),
@@ -969,7 +994,13 @@ def _probe_approval_context(
 
 
 def _prepared_write_probe() -> tuple[
-    ToolSpec[Any, Any], ToolExecutionContext, Any, object, PendingAction
+    ToolSpec[Any, Any],
+    ToolCatalog,
+    object,
+    ToolExecutionContext,
+    Any,
+    object,
+    PendingAction,
 ]:
     spec = _probe_spec(
         "authority_execute_probe",
@@ -991,9 +1022,16 @@ def _prepared_write_probe() -> tuple[
         request_identity=pending,
     )
     catalog = ToolCatalog([spec], expected_names=(spec.name,))
+    bundle = _test_metadata_bundle(catalog)
+    lease = bundle.open_segment_lease()
+    context.authority_factory.bind_segment_tool_catalog(
+        context.authority,
+        authority_metadata_view=bundle.authority_view(),
+        catalog_lease=lease,
+    )
     call = ToolCall("execute-call", spec.name, "{}")
     prepared_result = prepare_call(
-        catalog,
+        lease,
         context,
         call,
         call_identity=prepare_identity,
@@ -1002,7 +1040,15 @@ def _prepared_write_probe() -> tuple[
         record_proposal=False,
     )
     assert isinstance(prepared_result, ConfirmationRequired)
-    return spec, context, prepared_result.prepared, prepare_identity, pending
+    return (
+        spec,
+        catalog,
+        lease,
+        context,
+        prepared_result.prepared,
+        prepare_identity,
+        pending,
+    )
 
 
 def _raise_claim(_prepared: object) -> None:
@@ -1014,8 +1060,7 @@ def _mismatched_claim_failure(_prepared: Any) -> ToolFailure:
 
 
 def _run_stale_promotion(mode: str) -> RuntimeFailureOutcome:
-    spec, context, _prepared, _prepare_identity, pending = _prepared_write_probe()
-    catalog = ToolCatalog([spec], expected_names=(spec.name,))
+    spec, catalog, lease, context, _prepared, _prepare_identity, pending = _prepared_write_probe()
     continuation = _PromotionContinuation(pending, mode)
 
     def operation_executor(*_args: object) -> ToolExecutionRecord[Any, Any]:
@@ -1025,6 +1070,7 @@ def _run_stale_promotion(mode: str) -> RuntimeFailureOutcome:
         seed=ApprovedWriteSeed(continuation),
         model=cast(Any, _CountingModel(Assistant(content="must not run"))),
         catalog=catalog,
+        catalog_lease=cast(Any, lease),
         tool_context=context.with_runtime_dependencies(
             run_recorder=NullRunRecorder(),
             operation_executor=operation_executor,
@@ -1036,9 +1082,13 @@ def _run_stale_promotion(mode: str) -> RuntimeFailureOutcome:
         runtime_signal_sink=None,
         cancel_check=None,
     )
-    with pytest.raises(StalePendingActionError) as promoted:
-        AgentLoopRunner().run(invocation)
-    return PilotRuntime._provider_confirmation_failure(promoted.value)
+    try:
+        with pytest.raises(StalePendingActionError) as promoted:
+            AgentLoopRunner().run(invocation)
+        return PilotRuntime._provider_confirmation_failure(promoted.value)
+    finally:
+        cast(Any, lease).close()
+        context.authority_factory.close()
 
 
 def test_execute_prepared_failures_promote_to_one_verified_stale_route() -> None:
@@ -1062,7 +1112,9 @@ def test_execute_prepared_failures_promote_to_one_verified_stale_route() -> None
         "confirmation_claim_failed": _raise_claim,
         "authorization_mismatch": _mismatched_claim_failure,
     }.items():
-        spec, context, prepared, prepare_identity, _pending = _prepared_write_probe()
+        spec, _catalog, lease, context, prepared, prepare_identity, _pending = (
+            _prepared_write_probe()
+        )
         record = execute_prepared(
             prepared,
             context,
@@ -1089,6 +1141,8 @@ def test_execute_prepared_failures_promote_to_one_verified_stale_route() -> None
             key: confirmation["approve_stale"][key]
             for key in ("outcome", "sync_http", "postheader_stream")
         }
+        cast(Any, lease).close()
+        context.authority_factory.close()
 
 
 class _CountingModel:
@@ -1141,6 +1195,7 @@ def _approved_segment_for_count_harness(
     pending: PendingAction,
     model: object,
     catalog: ToolCatalog,
+    metadata_bundle: ToolMetadataBundleV1,
 ) -> ApprovedContinuationSegment:
     """Build the strict fresh Segment required by the approved Agent Loop path."""
 
@@ -1159,10 +1214,12 @@ def _approved_segment_for_count_harness(
         Message(role="tool", content="saved", tool_call_id=pending.tool_call_id),
         Message(role="user", content="continue"),
     )
-    metadata_bundle = _metadata_bundle(catalog)
+    catalog_lease = metadata_bundle.open_segment_lease()
+    _PROBE_LEASES.append(catalog_lease)
     surface_gate = build_segment_surface_gate(
         messages,
         catalog=catalog,
+        catalog_lease=catalog_lease,
         context=segment_context,
         authority=segment_context.authority,
         provider_view=metadata_bundle.provider_view(),
@@ -1286,12 +1343,14 @@ def _run_agent_call_count_case(case: str) -> dict[str, object]:
             )
         )
         catalog = _counted_write_catalog(spec)
+        metadata_bundle = _metadata_bundle(catalog)
         seed: NewTurnSeed | ApprovedWriteSeed = NewTurnSeed(
             (Message(role="user", content="synthetic request"),)
         )
         context = _probe_context(capabilities=frozenset(ToolCapability))
     else:
         catalog = _counted_write_catalog(spec)
+        metadata_bundle = _metadata_bundle(catalog)
         pending_args = (
             '{"company_name":"Synthetic Co","position_name":"Changed"}'
             if case == "modify"
@@ -1307,7 +1366,12 @@ def _run_agent_call_count_case(case: str) -> dict[str, object]:
         model = _CountingModel(Assistant(content="done"))
         continuation = _CountingContinuation(
             pending,
-            _approved_segment_for_count_harness(pending, model, catalog),
+            _approved_segment_for_count_harness(
+                pending,
+                model,
+                catalog,
+                metadata_bundle,
+            ),
         )
 
         def operation_executor(
@@ -1336,12 +1400,14 @@ def _run_agent_call_count_case(case: str) -> dict[str, object]:
             pending,
             operation_executor=operation_executor,
         )
+    catalog_lease = metadata_bundle.open_segment_lease()
+    _PROBE_LEASES.append(catalog_lease)
     surface_gate = None
     if isinstance(seed, NewTurnSeed):
-        metadata_bundle = _metadata_bundle(catalog)
         surface_gate = build_segment_surface_gate(
             seed.messages,
             catalog=catalog,
+            catalog_lease=catalog_lease,
             context=context,
             authority=cast(Any, context.authority),
             provider_view=metadata_bundle.provider_view(),
@@ -1349,10 +1415,17 @@ def _run_agent_call_count_case(case: str) -> dict[str, object]:
             authority_metadata_view=metadata_bundle.authority_view(),
             policy=validate_startup_policy(catalog.authority_manifest),
         )
+    else:
+        context.authority_factory.bind_segment_tool_catalog(
+            context.authority,
+            authority_metadata_view=metadata_bundle.authority_view(),
+            catalog_lease=catalog_lease,
+        )
     invocation = AgentLoopInvocation(
         seed=seed,
         model=cast(Any, model),
         catalog=catalog,
+        catalog_lease=catalog_lease,
         tool_context=context,
         auto_approve=False,
         max_iterations=4,

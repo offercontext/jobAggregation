@@ -4,7 +4,7 @@ import copy
 import hashlib
 import json
 import pickle
-from dataclasses import asdict, replace
+from dataclasses import FrozenInstanceError, asdict, replace
 from typing import Any
 
 import pytest
@@ -16,13 +16,14 @@ from offerpilot.ai.tool_authority import (
     TrustedContextScope,
     execution_scope,
 )
+from offerpilot.ai.tool_runtime.catalog import SegmentToolSpecHandle, ToolCatalog
 from offerpilot.ai.tool_runtime.contracts import (
     BindingAudit,
     PreparedToolCall,
-    ProviderToolContract,
     materialize_provider_payloads,
 )
-from tests.tool_metadata.factories import synthetic_tool_spec
+from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
+from tests.tool_metadata.factories import compose_synthetic_bundle, synthetic_tool_spec
 
 
 def _prepared(factory: AuthorityFactory) -> PreparedToolCall[Any, Any]:
@@ -33,26 +34,23 @@ def _prepared(factory: AuthorityFactory) -> PreparedToolCall[Any, Any]:
         trusted_scope=TrustedContextScope("workspace", None, "general"),
         capabilities=frozenset(),
     )
-    parameters: dict[str, object] = {"type": "object", "properties": {}}
-    contract = ProviderToolContract(
-        payload={
-            "type": "function",
-            "function": {
-                "name": "get_application",
-                "description": "",
-                "parameters": parameters,
-            },
-        },
-        name="get_application",
-        description="",
-        parameters=parameters,
+    spec = synthetic_tool_spec()
+    catalog = ToolCatalog((spec,), expected_names=(spec.name,))
+    source = compose_synthetic_bundle()
+    bundle = ToolMetadataBundleV1(
+        typed_catalog=catalog,
+        manifest=source["manifest"],
+        legacy_boundary=source["legacy_boundary"],
+        compensation=source["compensation"],
     )
-    spec = replace(
-        synthetic_tool_spec("get_application"),
-        contract=contract,
-        decoder=lambda value: value,
-        executor=lambda args, context: args,
+    lease = bundle.open_segment_lease()
+    factory.bind_segment_tool_catalog(
+        authority,
+        authority_metadata_view=bundle.authority_view(),
+        catalog_lease=lease,
     )
+    spec_handle = lease.resolve(spec.name)
+    assert spec_handle is not None
     runner = object()
     context = object()
     surface = object()
@@ -105,7 +103,8 @@ def _prepared(factory: AuthorityFactory) -> PreparedToolCall[Any, Any]:
         arguments_digest="sha256:" + hashlib.sha256(b"{}").hexdigest(),
     )
     factory.register_tool_spec(
-        spec,
+        spec_handle,
+        catalog_lease=lease,
         authority=authority,
         prepare_identity=prepare_identity,
     )
@@ -125,7 +124,8 @@ def _prepared(factory: AuthorityFactory) -> PreparedToolCall[Any, Any]:
         authority,
         prepare_identity=prepare_identity,
         tool_call_id="call-serialization",
-        spec=spec,
+        catalog_lease=lease,
+        spec_handle=spec_handle,
         arguments={},
         typed_args={},
         arguments_digest="sha256:" + hashlib.sha256(b"{}").hexdigest(),
@@ -217,9 +217,22 @@ def test_prepared_tool_call_carries_opaque_authority_handle_and_is_transient() -
     with execution_scope() as factory:
         prepared = _prepared(factory)
         assert prepared.authority_instance_token is not None
+        assert type(prepared.spec_handle) is SegmentToolSpecHandle
+        assert "spec_handle" in PreparedToolCall.__dataclass_fields__
+        assert not hasattr(prepared, "__dict__")
         assert "0x" not in repr(prepared)
         assert "sha256:" not in repr(prepared)
+        assert prepared.spec_handle.tool_name not in repr(prepared)
+        for operation in (copy.copy, copy.deepcopy, pickle.dumps, asdict):
+            with pytest.raises(TypeError):
+                operation(prepared)
         with pytest.raises(TypeError):
-            copy.deepcopy(prepared)
+            json.dumps(prepared)
         with pytest.raises(TypeError):
-            asdict(prepared)
+            prepared.to_json()
+        with pytest.raises(TypeError):
+            replace(prepared, spec_handle=prepared.spec_handle)
+        with pytest.raises((AttributeError, FrozenInstanceError)):
+            prepared.spec_handle = prepared.spec_handle
+        with pytest.raises((AttributeError, FrozenInstanceError, TypeError)):
+            prepared.dynamic_handle = prepared.spec_handle

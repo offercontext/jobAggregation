@@ -18,7 +18,11 @@ from offerpilot.ai.agent_contracts import AgentTurnResult, PendingAction
 from offerpilot.ai.agent_loop import ApprovedWriteSeed
 from offerpilot.ai.tool_authority.fingerprint import authorization_scope_fingerprint
 from offerpilot.ai.tool_authority.policy import validate_startup_policy
-from offerpilot.ai.tool_runtime.catalog import ToolCatalog, compile_tool_metadata_manifest
+from offerpilot.ai.tool_runtime.catalog import (
+    SegmentToolCatalogLease,
+    ToolCatalog,
+    compile_tool_metadata_manifest,
+)
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.ai.tool_runtime.policy_types import ToolCapability
@@ -29,7 +33,12 @@ from offerpilot.ai.tool_authority import (
 )
 from offerpilot.ai.tool_runtime.legacy import LEGACY_DETERMINISTIC_NAMES
 from offerpilot.ai.tool_runtime.pipeline import execute_prepared, prepare_call
-from offerpilot.ai.tool_runtime.contracts import ConfirmationRequired, ToolFailure, ToolSuccess
+from offerpilot.ai.tool_runtime.contracts import (
+    ConfirmationRequired,
+    ToolFailure,
+    ToolSuccess,
+    TransientToolRuntimeValue,
+)
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.ai.write_operations import (
@@ -98,6 +107,34 @@ from offerpilot.pilot_runtime.service import ResolvedModel
 
 
 _STABLE_LEGACY_DETERMINISTIC_NAME = sorted(LEGACY_DETERMINISTIC_NAMES)[0]
+
+
+class _TestMetadataComponents(TransientToolRuntimeValue):
+    def __init__(self, bundle: ToolMetadataBundleV1) -> None:
+        self.bundle = bundle
+
+
+def _runtime_metadata_bundle(catalog: ToolCatalog = MODEL_TOOL_CATALOG) -> ToolMetadataBundleV1:
+    manifest = compile_tool_metadata_manifest(catalog.specs)
+    projection = manifest.to_dict()
+    return ToolMetadataBundleV1(
+        typed_catalog=catalog,
+        manifest=manifest,
+        legacy_boundary=cast(dict[str, object], projection["legacy_boundary"]),
+        compensation=prepare_compensation_handler_components().metadata_projection(),
+    )
+
+
+def _runtime_metadata_dependencies() -> dict[str, object]:
+    bundle = _runtime_metadata_bundle()
+    return {
+        "catalog": MODEL_TOOL_CATALOG,
+        "metadata_bundle": bundle,
+        "metadata_components": _TestMetadataComponents(bundle),
+        "provider_metadata_view": bundle.provider_view(),
+        "discovery_metadata_view": bundle.discovery_view(),
+        "authority_metadata_view": bundle.authority_view(),
+    }
 
 
 def test_task8_keeps_current_confirmation_server_loaded_path_until_final_cutover() -> None:
@@ -1369,6 +1406,7 @@ def test_approved_resume_injects_session_executor_and_loads_source_once_after_te
             agent_driver=Driver(),
             source_loader=SimpleNamespace(load=load_source),  # type: ignore[arg-type]
             journal=Journal(),
+            **_runtime_metadata_dependencies(),
         )
     )
     outcome = runtime.continue_confirmation(
@@ -1472,6 +1510,7 @@ def test_sync_confirmation_defers_origin_tool_result_until_authoritative_deliver
                 model=object()
             ),
             agent_driver=Driver(),
+            **_runtime_metadata_dependencies(),
         )
     )
     outcome = runtime.continue_confirmation(
@@ -1580,6 +1619,7 @@ def test_missing_delivery_heartbeat_maps_runtime_confirmation_to_503() -> None:
                 model=object()
             ),
             agent_driver=Driver(),
+            **_runtime_metadata_dependencies(),
         )
     )
     outcome = runtime.continue_confirmation(
@@ -1978,14 +2018,21 @@ def _real_sqlite_approval_catalog(executor: object) -> ToolCatalog:
         metadata=replace(base_spec.metadata, dependencies=()),
         executor=cast(Any, executor),
     )
-    return ToolCatalog((spec,), expected_names=(spec.name,))
+    specs = tuple(spec if item.name == spec.name else item for item in MODEL_TOOL_CATALOG.specs)
+    return ToolCatalog(specs, expected_names=tuple(item.name for item in specs))
 
 
 def _prepare_real_sqlite_approval(
     session: object,
     catalog: ToolCatalog,
     request: ConfirmationRequest,
-) -> tuple[PendingAction, ToolExecutionContext, object, object]:
+) -> tuple[
+    PendingAction,
+    ToolExecutionContext,
+    object,
+    object,
+    SegmentToolCatalogLease,
+]:
     pending = cast(Any, session).pending
     assert isinstance(pending, PendingAction)
     digest, revision = pending_action_identity(
@@ -2000,13 +2047,20 @@ def _prepare_real_sqlite_approval(
     assert isinstance(context, ToolExecutionContext)
     assert isinstance(context.authority, ApprovalExecutionAuthority)
     factory = context.authority_factory
+    bundle = _runtime_metadata_bundle(catalog)
+    catalog_lease = bundle.open_segment_lease()
+    factory.bind_segment_tool_catalog(
+        context.authority,
+        authority_metadata_view=bundle.authority_view(),
+        catalog_lease=catalog_lease,
+    )
     prepare_identity = factory.create_approved_write_prepare_identity(
         context.authority,
         approval_context=context,
         request_identity=request,
     )
     result = prepare_call(
-        catalog,
+        catalog_lease,
         context,
         ToolCall(pending.tool_call_id, pending.tool_name, pending.args),
         call_identity=prepare_identity,
@@ -2015,7 +2069,7 @@ def _prepare_real_sqlite_approval(
         record_proposal=False,
     )
     assert isinstance(result, ConfirmationRequired)
-    return pending, context, result.prepared, prepare_identity
+    return pending, context, result.prepared, prepare_identity, catalog_lease
 
 
 def _close_real_sqlite_factories(factories: list[AuthorityFactory]) -> None:
@@ -2067,11 +2121,16 @@ def test_real_sqlite_coordinator_executes_prepared_call_once_and_persists_delive
         confirmation_token=_confirmation_token(pending),
     )
     session = None
+    catalog_lease = None
     try:
         session = coordinator.approve_modify(request, catalog=catalog)
-        live_pending, context, prepared, prepare_identity = _prepare_real_sqlite_approval(
-            session, catalog, request
-        )
+        (
+            live_pending,
+            context,
+            prepared,
+            prepare_identity,
+            catalog_lease,
+        ) = _prepare_real_sqlite_approval(session, catalog, request)
         record = execute_prepared(
             cast(Any, prepared),
             context,
@@ -2103,6 +2162,8 @@ def test_real_sqlite_coordinator_executes_prepared_call_once_and_persists_delive
         assert operation.status == "committed"
         assert operation.delivery_status == "completed"
     finally:
+        if catalog_lease is not None:
+            catalog_lease.close()
         if session is not None:
             coordinator.cancel_cleanup(session)
         _close_real_sqlite_factories(factories)
@@ -2164,6 +2225,7 @@ def test_real_sqlite_two_connections_have_one_claim_and_one_executor(
             )
         )
         session = None
+        catalog_lease = None
         try:
             try:
                 session = coordinator.approve_modify(request, catalog=catalog)
@@ -2176,9 +2238,13 @@ def test_real_sqlite_two_connections_have_one_claim_and_one_executor(
                 if exc.code == "operation_delivery_pending":
                     return "in_progress"
                 raise
-            live_pending, context, prepared, prepare_identity = _prepare_real_sqlite_approval(
-                session, catalog, request
-            )
+            (
+                live_pending,
+                context,
+                prepared,
+                prepare_identity,
+                catalog_lease,
+            ) = _prepare_real_sqlite_approval(session, catalog, request)
             if worker_ordinal == 2:
                 second_worker_ready_for_claim.set()
                 assert release_first_executor.wait(10)
@@ -2212,6 +2278,8 @@ def test_real_sqlite_two_connections_have_one_claim_and_one_executor(
             assert getattr(delivered, "status", None) is PersistenceStatus.PERSISTED
             return "committed"
         finally:
+            if catalog_lease is not None:
+                catalog_lease.close()
             if session is not None:
                 coordinator.cancel_cleanup(session)
 
@@ -2585,6 +2653,7 @@ def test_approved_stream_orders_meta_status_tool_result_assistant_completed() ->
             agent_driver=Driver(),
             source_loader=SimpleNamespace(load=load_source),  # type: ignore[arg-type]
             journal=Journal(),
+            **_runtime_metadata_dependencies(),
         )
     )
     transport = RuntimeTransportContext(
@@ -2705,6 +2774,7 @@ def test_slow_stream_drops_late_chained_pending_after_fallback_delivery() -> Non
                 model=object()
             ),
             agent_driver=Driver(),
+            **_runtime_metadata_dependencies(),
         )
     )
     request = ConfirmationRequest(
@@ -2777,6 +2847,7 @@ def test_stream_provider_failure_is_502_and_does_not_clear_pending() -> None:
                 model=object()
             ),
             agent_driver=Driver(),
+            **_runtime_metadata_dependencies(),
         )
     )
     prepared = runtime.prepare_stream(
@@ -3040,6 +3111,7 @@ def _run_confirmation_journal_case(
         journal=cast(Any, journal),
         continuation_model_resolver=resolve if case != "reject" else None,
         agent_driver=Driver() if case != "reject" else None,
+        **_runtime_metadata_dependencies(),
     )
     runtime = PilotRuntime(dependencies)
     request = ConfirmationRequest(

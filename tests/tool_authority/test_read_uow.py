@@ -13,6 +13,7 @@ from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import ReadyToExecute, ToolFailure
+from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.ai.tool_runtime.pipeline import Rejected, execute_prepared, prepare_call
 from offerpilot.ai.tool_runtime.rendering import render_compatibility
 from offerpilot.ai.tool_specs.application_events import application_event_specs
@@ -30,6 +31,7 @@ from offerpilot.repositories.notes import NotesRepository
 from offerpilot.repositories.offers import OfferCreate, OffersRepository
 from offerpilot.repositories.resumes import ResumesRepository
 from offerpilot.repositories.session_binding import ScopeAccessDenied
+from tests.tool_metadata.factories import compose_synthetic_bundle
 
 
 def _digest(raw: str) -> str:
@@ -49,8 +51,31 @@ class Runtime:
     context: ToolExecutionContext
     invocation: Any
     session_factory: Any
+    catalog: ToolCatalog | None = None
+    bundle: ToolMetadataBundleV1 | None = None
+    lease: Any = None
 
     def prepare(self, catalog: ToolCatalog, call: ToolCall) -> Any:
+        if self.lease is None:
+            source = compose_synthetic_bundle()
+            self.bundle = ToolMetadataBundleV1(
+                typed_catalog=catalog,
+                manifest={
+                    **source["manifest"],
+                    "typed_tools": tuple(spec.name for spec in catalog.specs),
+                },
+                legacy_boundary=source["legacy_boundary"],
+                compensation=source["compensation"],
+            )
+            self.lease = self.bundle.open_segment_lease()
+            self.catalog = catalog
+            self.factory.bind_segment_tool_catalog(
+                self.context.authority,
+                authority_metadata_view=self.bundle.authority_view(),
+                catalog_lease=self.lease,
+            )
+        elif catalog is not self.catalog:
+            raise AssertionError("one Runtime uses one exact test Catalog")
         attempt = self.factory.issue_provider_attempt(self.invocation, candidate_ordinal=0)
         identity = self.factory.create_new_turn_prepare_identity(
             self.invocation,
@@ -60,7 +85,12 @@ class Runtime:
             tool_name=call.name,
             arguments_digest=_digest(call.args),
         )
-        return prepare_call(catalog, self.context, call, call_identity=identity)
+        return prepare_call(self.lease, self.context, call, call_identity=identity)
+
+    def close(self) -> None:
+        if self.lease is not None:
+            self.lease.close()
+        self.factory.close()
 
     def execute(self, prepared: Any) -> Any:
         identity = self.factory.create_read_execution_identity(
@@ -173,6 +203,7 @@ def test_reparent_after_resolver_rollback_before_final_sql_denies_without_body(
     executor_calls = 0
     target_sql_after_started: list[str] = []
     try:
+
         def writer() -> None:
             with runtime.session_factory() as session:
                 session.execute(
@@ -232,7 +263,7 @@ def test_reparent_after_resolver_rollback_before_final_sql_denies_without_body(
             assert session.get(Offer, offer_id).application_id == app_b_id
         assert app_a_id != app_b_id
     finally:
-        runtime.factory.close()
+        runtime.close()
         runtime.session_factory.kw["bind"].dispose()
 
 
@@ -260,15 +291,12 @@ def test_cross_application_detached_and_missing_are_publicly_equivalent(tmp_path
         )
         selected = next(spec for spec in offer_specs() if spec.name == "get_offer")
         selected = replace(selected, metadata=replace(selected.metadata, dependencies=()))
+        invocation_catalog = ToolCatalog([selected], expected_names=(selected.name,))
         failures: list[ToolFailure] = []
         visible: list[str] = []
         downstream_event_counts: list[int] = []
         for ordinal, identity in enumerate((other.id, detached.id, 2**31), start=1):
             before = len(recorder.events)
-            invocation_spec = replace(selected)
-            invocation_catalog = ToolCatalog(
-                [invocation_spec], expected_names=(invocation_spec.name,)
-            )
             call = ToolCall(
                 id=f"denied-{ordinal}",
                 name="get_offer",
@@ -280,14 +308,15 @@ def test_cross_application_detached_and_missing_are_publicly_equivalent(tmp_path
             visible.append(render_compatibility(selected, result.failure))
             downstream_event_counts.append(len(recorder.events) - before)
 
-        assert failures == [
-            ToolFailure("permission_denied", "scope_access_denied", "permission denied")
-        ] * 3
+        assert (
+            failures
+            == [ToolFailure("permission_denied", "scope_access_denied", "permission denied")] * 3
+        )
         assert visible == ["错误：permission denied"] * 3
         assert downstream_event_counts == [1, 1, 1]
         assert all(event.event_type == "tool.proposed" for event in recorder.events)
     finally:
-        runtime.factory.close()
+        runtime.close()
         runtime.session_factory.kw["bind"].dispose()
 
 
@@ -313,9 +342,7 @@ def test_delete_event_executor_rechecks_reparented_target_in_final_scoped_sql(
             )
             writer.commit()
         spec = next(
-            item
-            for item in application_event_specs()
-            if item.name == "delete_application_event"
+            item for item in application_event_specs() if item.name == "delete_application_event"
         )
         with runtime.session_factory() as session:
             bound = runtime.context.bind(session)
@@ -327,7 +354,7 @@ def test_delete_event_executor_rechecks_reparented_target_in_final_scoped_sql(
             assert persisted is not None
             assert persisted.application_id == app_b_id
     finally:
-        runtime.factory.close()
+        runtime.close()
         runtime.session_factory.kw["bind"].dispose()
 
 
@@ -342,9 +369,7 @@ def test_assessment_executor_cannot_mutate_target_deleted_after_prepare(
             assert target is not None
             writer.delete(target)
             writer.commit()
-        spec = next(
-            item for item in offer_specs() if item.name == "save_offer_assessment"
-        )
+        spec = next(item for item in offer_specs() if item.name == "save_offer_assessment")
         with runtime.session_factory() as session:
             bound = runtime.context.bind(session)
             with pytest.raises(ScopeAccessDenied):
@@ -353,5 +378,5 @@ def test_assessment_executor_cannot_mutate_target_deleted_after_prepare(
         with runtime.session_factory() as session:
             assert session.get(Offer, offer_id) is None
     finally:
-        runtime.factory.close()
+        runtime.close()
         runtime.session_factory.kw["bind"].dispose()

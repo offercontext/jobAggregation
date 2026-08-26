@@ -42,6 +42,7 @@ from offerpilot.ai.agent_loop import (
 )
 from offerpilot.ai.tool_authority import PendingAuthorityClaim
 from offerpilot.ai.tool_authority.contracts import SegmentExecutionAuthority
+from offerpilot.ai.tool_runtime.catalog import SegmentToolCatalogLease
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import (
     ToolFailure,
@@ -423,6 +424,7 @@ class SegmentExecution:
         default=None, repr=False, compare=False
     )
     policy: ResolvedPolicyCatalog | None = field(default=None, repr=False, compare=False)
+    catalog_lease: SegmentToolCatalogLease | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -506,19 +508,59 @@ class _PreparedConfirmationCell:
 class _PreparedModelLease:
     """Independent once-only release gate for a prepared provider token."""
 
-    __slots__ = ("_lock", "_released", "_release")
+    __slots__ = ("_catalog_lease", "_invocation", "_lock", "_released", "_release")
 
     def __init__(self, release: Callable[[], object]) -> None:
         self._lock = Lock()
         self._released = False
         self._release = release
+        self._catalog_lease: SegmentToolCatalogLease | None = None
+        self._invocation: AgentLoopInvocation | None = None
+
+    def bind_catalog_lease(self, catalog_lease: SegmentToolCatalogLease) -> None:
+        if type(catalog_lease) is not SegmentToolCatalogLease:
+            raise TypeError("prepared model requires exact Segment Catalog lease")
+        with self._lock:
+            if self._released:
+                raise RuntimeError("prepared model lease was already released")
+            if self._catalog_lease is not None:
+                raise RuntimeError("prepared model Catalog lease was already bound")
+            self._catalog_lease = catalog_lease
+
+    def bind_invocation(self, invocation: AgentLoopInvocation) -> None:
+        if type(invocation) is not AgentLoopInvocation:
+            raise TypeError("prepared model requires exact Agent Loop invocation")
+        with self._lock:
+            if self._released:
+                raise RuntimeError("prepared model lease was already released")
+            if self._invocation is not None:
+                raise RuntimeError("prepared model invocation was already bound")
+        invocation._bind_catalog_release(self._release_owned)
+        with self._lock:
+            if self._released:
+                raise RuntimeError("prepared model lease was already released")
+            self._invocation = invocation
 
     def release_once(self) -> bool:
+        with self._lock:
+            invocation = self._invocation
+        if invocation is not None:
+            return invocation._release_catalog_lease_from_runtime()
+        return self._release_owned()
+
+    def _release_owned(self) -> bool:
         with self._lock:
             if self._released:
                 return False
             self._released = True
-        self._release()
+            catalog_lease = self._catalog_lease
+            self._catalog_lease = None
+            self._invocation = None
+        try:
+            if catalog_lease is not None:
+                catalog_lease.close()
+        finally:
+            self._release()
         return True
 
 
@@ -535,6 +577,11 @@ class _PreparedStreamState:
     conversation_id: int | None = field(default=None, compare=False)
     model_token: object | None = field(default=None, repr=False, compare=False)
     segment_token: object | None = field(default=None, repr=False, compare=False)
+    segment_lease: _PreparedModelLease | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
     surface_gate: SegmentSurfaceGate | object | None = field(
         default=None, repr=False, compare=False
     )
@@ -1669,6 +1716,28 @@ class PilotRuntime:
         _ = bundle.bundle_instance_token
         return bundle
 
+    def _open_approval_catalog_lease(
+        self,
+        tool_context: ToolExecutionContext,
+        catalog: object,
+    ) -> SegmentToolCatalogLease:
+        if catalog is not self._dependencies.catalog:
+            raise RuntimeError("approval Catalog drifted from the Runtime Bundle")
+        authority_view = self._dependencies.authority_metadata_view
+        if type(authority_view) is not ToolAuthorityMetadataView:
+            raise RuntimeError("approval authority metadata view is unavailable")
+        catalog_lease = self.metadata_bundle.open_segment_lease()
+        try:
+            tool_context.authority_factory.bind_segment_tool_catalog(
+                tool_context.authority,
+                authority_metadata_view=authority_view,
+                catalog_lease=catalog_lease,
+            )
+        except BaseException:
+            catalog_lease.close()
+            raise
+        return catalog_lease
+
     def start_turn(
         self,
         request: StartTurnRequest,
@@ -1987,6 +2056,7 @@ class PilotRuntime:
             raise
         if isinstance(surface_gate, RuntimeFailureOutcome):
             return complete_early(surface_gate)
+        segment_lease.bind_catalog_lease(surface_gate.catalog_lease)
         segment = SegmentExecution(
             authority=segment.authority,
             context=segment.context,
@@ -1994,6 +2064,7 @@ class PilotRuntime:
             close=segment.close,
             surface_gate=surface_gate,
             policy=policy,
+            catalog_lease=surface_gate.catalog_lease,
         )
 
         phase_with_segment("model_resolve")
@@ -2265,6 +2336,7 @@ class PilotRuntime:
                 safe_signal_sink,
                 checked_cancel,
             )
+            segment_lease.bind_invocation(invocation)
         except BaseException:
             abandon_once()
             raise
@@ -3443,6 +3515,7 @@ class PilotRuntime:
                 close=segment.close,
                 surface_gate=surface_gate,
                 policy=policy,
+                catalog_lease=surface_gate.catalog_lease,
             )
             resolved = self._resolve_continuation_model(activation_request, conversation, policy)
             require_activation_identity()
@@ -3480,7 +3553,9 @@ class PilotRuntime:
             # bundle has been constructed.  If any constructor/validation
             # above fails, the outer candidate cleanup owns the sole close.
             with session.state.lock:
-                session.state.continuation_segment_close = segment.close
+                session.state.continuation_segment_close = lambda: (
+                    self._safe_close_segment_candidate(segment)
+                )
             return bundle
         except BaseException:
             self._safe_close_segment_candidate(segment)
@@ -3638,6 +3713,7 @@ class PilotRuntime:
             # fresh Segment is activated; passing a proxy here would make the
             # Driver wrap proxy->gate->proxy recursively.
             tool_context = session.approval_execution_context(recorder)
+            approval_catalog_lease = self._open_approval_catalog_lease(tool_context, catalog)
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
             coordinator.cancel_cleanup(session)
             self._abandon(recorder, journal_started)
@@ -3660,12 +3736,14 @@ class PilotRuntime:
             else None
         )
         invocation_construction_failed = False
+        invocation: AgentLoopInvocation | None = None
         try:
             try:
                 invocation = AgentLoopInvocation(
                     seed=ApprovedWriteSeed(ConfirmationApprovedWritePort(session)),
                     model=None,
                     catalog=cast(Any, catalog),
+                    catalog_lease=approval_catalog_lease,
                     tool_context=cast(Any, tool_context),
                     auto_approve=False,
                     max_iterations=DEFAULT_MAX_ITERATIONS,
@@ -3863,6 +3941,10 @@ class PilotRuntime:
             # ``stop_heartbeat`` is idempotent and is the final safety net for
             # provider failures, sink aborts, and uncancellable late results.
             self._stop_confirmation_heartbeat(coordinator, session)
+            if invocation is None:
+                approval_catalog_lease.close()
+            else:
+                invocation._release_catalog_lease_from_runtime()
 
     def _finish_ledger_confirmation(
         self,
@@ -4964,6 +5046,7 @@ class PilotRuntime:
         if isinstance(surface_gate, RuntimeFailureOutcome):
             release_segment_now()
             return self._stream_immediate(surface_gate, invocation_control)
+        segment_lease.bind_catalog_lease(surface_gate.catalog_lease)
         segment = SegmentExecution(
             authority=segment.authority,
             context=segment.context,
@@ -4971,6 +5054,7 @@ class PilotRuntime:
             close=segment.close,
             surface_gate=surface_gate,
             policy=policy,
+            catalog_lease=surface_gate.catalog_lease,
         )
         self._prepared_segments[segment_token] = segment
 
@@ -5255,6 +5339,7 @@ class PilotRuntime:
                 conversation_id=conversation_id,
                 model_token=model_token,
                 segment_token=segment_token,
+                segment_lease=segment_lease,
                 surface_gate=surface_gate,
                 assembled=assembled_values,
                 recorder=recorder,
@@ -5563,6 +5648,9 @@ class PilotRuntime:
                     safe_signal_sink,
                     checked_cancel,
                 )
+                if state.segment_lease is None:
+                    raise RuntimeTransportAborted()
+                state.segment_lease.bind_invocation(invocation)
                 invocation_holder["value"] = invocation
                 return invocation
 
@@ -6453,6 +6541,7 @@ class PilotRuntime:
             # journal recorder.  The post-terminal Segment owns the gated
             # proxy used for any chained Pending.
             tool_context = session.approval_execution_context(recorder)
+            approval_catalog_lease = self._open_approval_catalog_lease(tool_context, catalog)
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
             coordinator = cast(ConfirmationCoordinator, self._confirmation_coordinator())
             coordinator.cancel_cleanup(session)
@@ -6475,6 +6564,7 @@ class PilotRuntime:
         deferred_origin_events: list[RuntimeEvent] = []
         origin_tool_call_id = session.pending.tool_call_id
         invocation_construction_failed = False
+        invocation_holder: dict[str, AgentLoopInvocation] = {}
 
         def invoke_driver(agent_events: RuntimeEventSink) -> object:
             nonlocal invocation_construction_failed
@@ -6503,6 +6593,7 @@ class PilotRuntime:
                         seed=ApprovedWriteSeed(ConfirmationApprovedWritePort(session)),
                         model=None,
                         catalog=cast(Any, catalog),
+                        catalog_lease=approval_catalog_lease,
                         tool_context=cast(Any, tool_context),
                         auto_approve=auto_approve,
                         max_iterations=max_iter,
@@ -6514,6 +6605,7 @@ class PilotRuntime:
                         runtime_signal_sink=signal_sink,
                         cancel_check=self._confirmation_cancel_check(state.control, cancel_check),
                     )
+                    invocation_holder["value"] = invocation
                 except Exception:
                     invocation_construction_failed = True
                     raise
@@ -6726,6 +6818,11 @@ class PilotRuntime:
             raise
         finally:
             self._stop_confirmation_heartbeat(coordinator, session)
+            invocation = invocation_holder.get("value")
+            if invocation is None:
+                approval_catalog_lease.close()
+            else:
+                invocation._release_catalog_lease_from_runtime()
 
     @staticmethod
     def _mark_completed_if_active(control: RuntimeInvocationControl) -> None:
@@ -7043,6 +7140,15 @@ class PilotRuntime:
     @staticmethod
     def _safe_close_segment_candidate(value: object) -> None:
         try:
+            catalog_lease = getattr(value, "catalog_lease", None)
+        except BaseException:
+            catalog_lease = None
+        if type(catalog_lease) is SegmentToolCatalogLease:
+            try:
+                catalog_lease.close()
+            except BaseException:
+                pass
+        try:
             close = getattr(value, "close", None)
         except BaseException:
             return
@@ -7061,7 +7167,7 @@ class PilotRuntime:
         assembled: object,
         policy: ResolvedPolicyCatalog,
         segment: SegmentExecution,
-    ) -> SegmentSurfaceGate | object | RuntimeFailureOutcome:
+    ) -> SegmentSurfaceGate | RuntimeFailureOutcome:
         resolver = self._require_dependency("surface_gate_resolver")
         function = _callable(resolver, ("resolve", "resolve_surface_gate", "resolve_gate"))
         if function is None:
@@ -7097,8 +7203,12 @@ class PilotRuntime:
             or value.authority is not segment.authority
             or value.context is not segment.context
             or value.dispatch_catalog is not segment.catalog
+            or type(value.catalog_lease) is not SegmentToolCatalogLease
+            or value.catalog_lease.closed
             or segment.policy is not policy
         ):
+            if type(value) is SegmentSurfaceGate:
+                value.catalog_lease.close()
             return self._failure(
                 RuntimeFailureCode.OPERATION_UNAVAILABLE,
                 "工具权限暂时不可用，请稍后重试。",
@@ -7110,15 +7220,17 @@ class PilotRuntime:
                 value,
                 authority=segment.authority,
                 context=segment.context,
-                catalog=value.catalog,
+                catalog=value.catalog_lease,
                 policy=value.policy,
                 dependency_policy=value.dependency_policy,
                 selection=value.selection,
                 authority_surface=value.authority_surface,
             )
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            value.catalog_lease.close()
             raise
         except Exception:
+            value.catalog_lease.close()
             return self._failure(
                 RuntimeFailureCode.OPERATION_UNAVAILABLE,
                 "工具权限暂时不可用，请稍后重试。",
@@ -7126,6 +7238,7 @@ class PilotRuntime:
                 retryable=True,
             )
         except BaseException:
+            value.catalog_lease.close()
             raise
         return value
 
@@ -8221,6 +8334,7 @@ class PilotRuntime:
             seed=NewTurnSeed(messages),
             model=resolved.model,
             catalog=cast(Any, segment.catalog),
+            catalog_lease=cast(Any, segment.catalog_lease),
             tool_context=cast(Any, segment.context),
             auto_approve=resolved.auto_approve,
             max_iterations=resolved.max_iter,

@@ -218,8 +218,7 @@ def _constant_bindings(tree: ast.AST) -> dict[str, object]:
                 continue
             value = node.value
             if isinstance(value, ast.Constant) and (
-                value.value is None
-                or isinstance(value.value, (bool, int, float, str))
+                value.value is None or isinstance(value.value, (bool, int, float, str))
             ):
                 resolved = value.value
             elif isinstance(value, ast.Name) and value.id in bindings:
@@ -373,9 +372,7 @@ def _expect_rejected(source: str, validator: Callable[[ast.AST], None]) -> None:
         validator(ast.parse(source))
 
 
-ROUTE_NAMES = frozenset(
-    {"send_chat", "send_chat_stream", "confirm_chat", "confirm_chat_stream"}
-)
+ROUTE_NAMES = frozenset({"send_chat", "send_chat_stream", "confirm_chat", "confirm_chat_stream"})
 ROUTE_OWNERSHIP_NAMES = frozenset(
     {
         "run_turn",
@@ -428,9 +425,7 @@ ROUTE_TRANSPORT_NAMES = frozenset(
         "build_guarded_streaming_response",
     }
 )
-TRANSPORT_PRIMITIVE_IMPORTS = frozenset(
-    {"concurrent.futures", "queue", "threading"}
-)
+TRANSPORT_PRIMITIVE_IMPORTS = frozenset({"concurrent.futures", "queue", "threading"})
 LEGACY_SWITCH_FRAGMENTS = frozenset(
     {
         "dual_run",
@@ -492,6 +487,33 @@ TRANSIENT_SECURITY_NAMES = frozenset(
         "TransientToolRuntimeValue",
         "TrustedContextScope",
         "TrustedLedgerOmittedTokenProof",
+        "ToolMetadataBundleV1",
+        "BundleInstanceToken",
+        "ProviderToolMetadataView",
+        "ToolDiscoveryMetadataView",
+        "ToolAuthorityMetadataView",
+        "ToolOperationMetadataView",
+        "LegacyDeterministicBoundaryV1",
+        "CompensationMetadataView",
+        "SegmentToolCatalogLease",
+        "SegmentCatalogToken",
+        "SegmentToolSpecHandle",
+    }
+)
+
+CURRENT_METADATA_SECURITY_NAMES = frozenset(
+    {
+        "ToolMetadataBundleV1",
+        "BundleInstanceToken",
+        "ProviderToolMetadataView",
+        "ToolDiscoveryMetadataView",
+        "ToolAuthorityMetadataView",
+        "ToolOperationMetadataView",
+        "LegacyDeterministicBoundaryV1",
+        "CompensationMetadataView",
+        "SegmentToolCatalogLease",
+        "SegmentCatalogToken",
+        "SegmentToolSpecHandle",
     }
 )
 
@@ -516,6 +538,7 @@ CHAT_RUNTIME_SEMANTIC_NAMES = frozenset(
 )
 CHAT_RUNTIME_SEMANTIC_MARKERS = tuple(CHAT_RUNTIME_SEMANTIC_NAMES)
 
+
 def _validate_routes_are_runtime_only(tree: ast.AST) -> None:
     found = _functions(tree, set(ROUTE_NAMES))
     assert set(found) == set(ROUTE_NAMES)
@@ -530,21 +553,15 @@ def _validate_routes_are_runtime_only(tree: ast.AST) -> None:
             terminal = _call_terminal(child, aliases)
             if terminal in ROUTE_OWNERSHIP_NAMES | ROUTE_TRANSPORT_NAMES:
                 raise AssertionError(f"{name} directly constructs/owns {terminal}")
-            if (
-                _call_terminal(child, aliases) == "getattr"
-                and len(child.args) >= 2
-            ):
+            if _call_terminal(child, aliases) == "getattr" and len(child.args) >= 2:
                 dynamic_names = _dynamic_attribute_strings(
                     node,
                     bindings=string_bindings,
                     aliases=aliases,
                 )
-                forbidden_dynamic = dynamic_names & (
-                    ROUTE_OWNERSHIP_NAMES | ROUTE_TRANSPORT_NAMES
-                )
+                forbidden_dynamic = dynamic_names & (ROUTE_OWNERSHIP_NAMES | ROUTE_TRANSPORT_NAMES)
                 assert not forbidden_dynamic, (
-                    f"{name} reaches forbidden helper through getattr: "
-                    f"{sorted(forbidden_dynamic)}"
+                    f"{name} reaches forbidden helper through getattr: {sorted(forbidden_dynamic)}"
                 )
 
 
@@ -624,7 +641,8 @@ def _validate_execution_host_boundary(tree: ast.AST) -> None:
         "offerpilot.ai.write_operations",
     }
     assert not any(
-        module in forbidden_modules or any(module.startswith(prefix + ".") for prefix in forbidden_modules)
+        module in forbidden_modules
+        or any(module.startswith(prefix + ".") for prefix in forbidden_modules)
         for module in imports
     )
     host_names = {node.name for node in ast.walk(tree) if isinstance(node, ast.ClassDef)}
@@ -671,11 +689,7 @@ def _validate_execution_host_boundary(tree: ast.AST) -> None:
             f"{node.name} reaches persistence boundary through getattr: "
             f"{sorted(dynamic_names.intersection(forbidden_names))}"
         )
-        attrs = {
-            child.attr.lower()
-            for child in ast.walk(node)
-            if isinstance(child, ast.Attribute)
-        }
+        attrs = {child.attr.lower() for child in ast.walk(node) if isinstance(child, ast.Attribute)}
         attrs.update(
             value.lower()
             for value in _dynamic_attribute_strings(
@@ -709,8 +723,7 @@ def _validate_prepared_streams_are_guarded(runtime_tree: ast.AST, api_tree: ast.
 
         def constant_truth(value: ast.AST) -> bool | None:
             if isinstance(value, ast.Constant) and (
-                value.value is None
-                or isinstance(value.value, (bool, int, float, str))
+                value.value is None or isinstance(value.value, (bool, int, float, str))
             ):
                 return bool(value.value)
             if isinstance(value, ast.Name) and value.id in constant_bindings:
@@ -763,8 +776,7 @@ def _validate_prepared_streams_are_guarded(runtime_tree: ast.AST, api_tree: ast.
                     and len(test.args) >= 2
                     and isinstance(test.args[0], ast.Name)
                     and test.args[0].id in prepared_targets
-                    and "ImmediateHttpOutcome"
-                    in _resolved_names(test.args[1], aliases)
+                    and "ImmediateHttpOutcome" in _resolved_names(test.args[1], aliases)
                 ):
                     return True
             current = parent
@@ -778,8 +790,7 @@ def _validate_prepared_streams_are_guarded(runtime_tree: ast.AST, api_tree: ast.
 
         def constant_truth(value: ast.AST) -> bool | None:
             if isinstance(value, ast.Constant) and (
-                value.value is None
-                or isinstance(value.value, (bool, int, float, str))
+                value.value is None or isinstance(value.value, (bool, int, float, str))
             ):
                 return bool(value.value)
             if isinstance(value, ast.Name) and value.id in constant_bindings:
@@ -848,21 +859,16 @@ def _validate_prepared_streams_are_guarded(runtime_tree: ast.AST, api_tree: ast.
         if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         parents = {
-            child: parent
-            for parent in ast.walk(function)
-            for child in ast.iter_child_nodes(parent)
+            child: parent for parent in ast.walk(function) for child in ast.iter_child_nodes(parent)
         }
         scoped_nodes = [
-            node
-            for node in ast.walk(function)
-            if not nested_in_function(node, function, parents)
+            node for node in ast.walk(function) if not nested_in_function(node, function, parents)
         ]
         prepared_calls_in_function = [
             node
             for node in scoped_nodes
             if isinstance(node, ast.Call)
-            and _dynamic_call_terminal(node, callable_aliases, string_bindings)
-            == "prepare_stream"
+            and _dynamic_call_terminal(node, callable_aliases, string_bindings) == "prepare_stream"
         ]
         if not prepared_calls_in_function:
             continue
@@ -871,12 +877,9 @@ def _validate_prepared_streams_are_guarded(runtime_tree: ast.AST, api_tree: ast.
         for prepared_call in prepared_calls_in_function:
             parent = parents.get(prepared_call)
             if not (
-                isinstance(parent, (ast.Assign, ast.AnnAssign))
-                and parent.value is prepared_call
+                isinstance(parent, (ast.Assign, ast.AnnAssign)) and parent.value is prepared_call
             ):
-                raise AssertionError(
-                    "PreparedStreamExecution must be owned by a guarded handle"
-                )
+                raise AssertionError("PreparedStreamExecution must be owned by a guarded handle")
             targets = assigned_names(parent)
             if not targets:
                 raise AssertionError("prepared stream handle must have a named owner")
@@ -982,8 +985,7 @@ def _validate_prepared_streams_are_guarded(runtime_tree: ast.AST, api_tree: ast.
 
         first_prepare_line = min(node.lineno for node in prepared_assignments)
         returned_response_ids = {
-            id(return_node)
-            for return_node, _response, _guard_value in returned_responses
+            id(return_node) for return_node, _response, _guard_value in returned_responses
         }
         for node in scoped_nodes:
             if not isinstance(node, (ast.Return, ast.Raise)):
@@ -1002,11 +1004,7 @@ def _validate_prepared_streams_are_guarded(runtime_tree: ast.AST, api_tree: ast.
 
 
 def _validate_runtime_event_contract(tree: ast.AST) -> None:
-    classes = {
-        node.name: node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ClassDef)
-    }
+    classes = {node.name: node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)}
     user_event = classes.get("UserMessageSavedEvent")
     assert user_event is not None
     fields = [
@@ -1055,11 +1053,14 @@ def _validate_no_legacy_switches(paths: tuple[Path, ...]) -> None:
             path in {API, TRANSPORT}
             or path.parent == RUNTIME
             or bool(
-                (semantic_names | _dynamic_attribute_strings(
-                    tree,
-                    bindings=string_bindings,
-                    aliases=aliases,
-                ))
+                (
+                    semantic_names
+                    | _dynamic_attribute_strings(
+                        tree,
+                        bindings=string_bindings,
+                        aliases=aliases,
+                    )
+                )
                 & CHAT_RUNTIME_SEMANTIC_NAMES
             )
         )
@@ -1085,9 +1086,7 @@ def _validate_no_legacy_switches(paths: tuple[Path, ...]) -> None:
                 aliases=aliases,
                 prefix_aliases=error_prefix_aliases,
                 bindings=string_bindings,
-            ) and path not in {
-                SRC / "ai" / "tool_runtime" / "rendering.py"
-            }:
+            ) and path not in {SRC / "ai" / "tool_runtime" / "rendering.py"}:
                 findings.append(f"{path.relative_to(ROOT)}:{node.lineno}:错误前缀解析")
     assert findings == []
 
@@ -1142,11 +1141,7 @@ def _error_prefix_aliases(
     bindings: dict[str, str] | None = None,
 ) -> set[str]:
     bindings = _string_bindings(tree) if bindings is None else bindings
-    return {
-        name
-        for name, value in bindings.items()
-        if value == "错误："
-    }
+    return {name for name, value in bindings.items() if value == "错误："}
 
 
 def _is_error_prefix_call(
@@ -1160,23 +1155,17 @@ def _is_error_prefix_call(
     aliases = _binding_aliases(tree) if aliases is None else aliases
     bindings = _string_bindings(tree) if bindings is None else bindings
     prefix_aliases = (
-        _error_prefix_aliases(tree, bindings=bindings)
-        if prefix_aliases is None
-        else prefix_aliases
+        _error_prefix_aliases(tree, bindings=bindings) if prefix_aliases is None else prefix_aliases
     )
-    if not (
-        isinstance(node, ast.Call)
-        and node.args
-    ):
+    if not (isinstance(node, ast.Call) and node.args):
         return False
     function_name = _dynamic_call_terminal(node, aliases, bindings)
     if function_name != "startswith":
         return False
     prefix = node.args[0]
-    return (
-        isinstance(prefix, ast.Constant)
-        and prefix.value == "错误："
-    ) or (isinstance(prefix, ast.Name) and prefix.id in prefix_aliases)
+    return (isinstance(prefix, ast.Constant) and prefix.value == "错误：") or (
+        isinstance(prefix, ast.Name) and prefix.id in prefix_aliases
+    )
 
 
 def _validate_boundary_names_absent(tree: ast.AST) -> None:
@@ -1188,12 +1177,16 @@ def _validate_boundary_names_absent(tree: ast.AST) -> None:
 
 def _validate_no_generic_asdict_boundary(tree: ast.AST) -> None:
     aliases = _binding_aliases(tree)
-    forbidden = PRIVATE_BOUNDARY_NAMES | TRANSIENT_SECURITY_NAMES | {
-        "MessageOutcome",
-        "ConfirmationRequiredOutcome",
-        "OperationPendingOutcome",
-        "OperationReplayOutcome",
-    }
+    forbidden = (
+        PRIVATE_BOUNDARY_NAMES
+        | TRANSIENT_SECURITY_NAMES
+        | {
+            "MessageOutcome",
+            "ConfirmationRequiredOutcome",
+            "OperationPendingOutcome",
+            "OperationReplayOutcome",
+        }
+    )
 
     def direct_forbidden(value: ast.AST) -> bool:
         return bool(_resolved_names(value, aliases) & forbidden)
@@ -1236,8 +1229,7 @@ def _validate_no_generic_asdict_boundary(tree: ast.AST) -> None:
                             changed = True
                 continue
             value_tainted = direct_forbidden(value) or any(
-                isinstance(child, ast.Name) and child.id in tainted
-                for child in ast.walk(value)
+                isinstance(child, ast.Name) and child.id in tainted for child in ast.walk(value)
             )
             if value_tainted:
                 for target in target_names(node):
@@ -1252,7 +1244,9 @@ def _validate_no_generic_asdict_boundary(tree: ast.AST) -> None:
         if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         positional_parameters = (*function.args.posonlyargs, *function.args.args)
-        parameters = {parameter.arg for parameter in (*positional_parameters, *function.args.kwonlyargs)}
+        parameters = {
+            parameter.arg for parameter in (*positional_parameters, *function.args.kwonlyargs)
+        }
         parameter_aliases = {parameter: parameter for parameter in parameters}
         for _ in range(3):
             changed = False
@@ -1263,7 +1257,11 @@ def _validate_no_generic_asdict_boundary(tree: ast.AST) -> None:
                 if not isinstance(value, ast.Name) or value.id not in parameter_aliases:
                     continue
                 root = parameter_aliases[value.id]
-                targets = assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
+                targets = (
+                    assignment.targets
+                    if isinstance(assignment, ast.Assign)
+                    else [assignment.target]
+                )
                 for target in targets:
                     if isinstance(target, ast.Name) and target.id not in parameter_aliases:
                         parameter_aliases[target.id] = root
@@ -1326,7 +1324,11 @@ def _validate_no_generic_asdict_boundary(tree: ast.AST) -> None:
                         "runtime-private DTOs/outcomes cannot flow into generic asdict helpers"
                     )
         for keyword in node.keywords:
-            if keyword.arg in parameters and isinstance(keyword.value, ast.Name) and keyword.value.id in tainted:
+            if (
+                keyword.arg in parameters
+                and isinstance(keyword.value, ast.Name)
+                and keyword.value.id in tainted
+            ):
                 raise AssertionError(
                     "runtime-private DTOs/outcomes cannot flow into generic asdict helpers"
                 )
@@ -1368,16 +1370,11 @@ def _validate_no_transient_generic_serializers(tree: ast.AST) -> None:
                     continue
                 value = assignment.value
                 direct_constructor = (
-                    _call_terminal(value, aliases)
-                    if isinstance(value, ast.Call)
-                    else None
+                    _call_terminal(value, aliases) if isinstance(value, ast.Call) else None
                 )
                 if not (
                     direct_constructor in TRANSIENT_SECURITY_NAMES
-                    or (
-                        isinstance(value, ast.Name)
-                        and value.id in parameter_aliases
-                    )
+                    or (isinstance(value, ast.Name) and value.id in parameter_aliases)
                 ):
                     continue
                 targets = (
@@ -1394,9 +1391,7 @@ def _validate_no_transient_generic_serializers(tree: ast.AST) -> None:
         for call in ast.walk(function):
             argument = call.args[0] if isinstance(call, ast.Call) and call.args else None
             direct_constructor = (
-                _call_terminal(argument, aliases)
-                if isinstance(argument, ast.Call)
-                else None
+                _call_terminal(argument, aliases) if isinstance(argument, ast.Call) else None
             )
             if (
                 isinstance(call, ast.Call)
@@ -1404,8 +1399,7 @@ def _validate_no_transient_generic_serializers(tree: ast.AST) -> None:
                 and argument is not None
                 and (
                     any(
-                        isinstance(item, ast.Name)
-                        and item.id in parameter_aliases
+                        isinstance(item, ast.Name) and item.id in parameter_aliases
                         for item in ast.walk(argument)
                     )
                     or any(
@@ -1416,9 +1410,7 @@ def _validate_no_transient_generic_serializers(tree: ast.AST) -> None:
                     or direct_constructor in TRANSIENT_SECURITY_NAMES
                 )
             ):
-                raise AssertionError(
-                    "transient authority values cannot reach a generic serializer"
-                )
+                raise AssertionError("transient authority values cannot reach a generic serializer")
 
 
 def _validate_no_asdict_in_extraction_scope(tree: ast.AST) -> None:
@@ -1427,9 +1419,7 @@ def _validate_no_asdict_in_extraction_scope(tree: ast.AST) -> None:
     aliases = _binding_aliases(tree)
     bindings = _string_bindings(tree)
     asdict_aliases = {
-        name
-        for name, source in aliases.items()
-        if source.rsplit(".", 1)[-1] == "asdict"
+        name for name, source in aliases.items() if source.rsplit(".", 1)[-1] == "asdict"
     }
     asdict_aliases.add("asdict")
 
@@ -1449,9 +1439,7 @@ def _validate_no_asdict_in_extraction_scope(tree: ast.AST) -> None:
             if not isinstance(assignment, (ast.Assign, ast.AnnAssign)):
                 continue
             value = assignment.value
-            is_alias = (
-                isinstance(value, ast.Name) and value.id in asdict_aliases
-            ) or (
+            is_alias = (isinstance(value, ast.Name) and value.id in asdict_aliases) or (
                 isinstance(value, ast.Call)
                 and (
                     _dynamic_call_terminal(value, aliases, bindings) == "asdict"
@@ -1460,7 +1448,9 @@ def _validate_no_asdict_in_extraction_scope(tree: ast.AST) -> None:
             )
             if not is_alias:
                 continue
-            targets = assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
+            targets = (
+                assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
+            )
             for target in targets:
                 if isinstance(target, ast.Name) and target.id not in asdict_aliases:
                     asdict_aliases.add(target.id)
@@ -1470,9 +1460,8 @@ def _validate_no_asdict_in_extraction_scope(tree: ast.AST) -> None:
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        if (
-            _dynamic_call_terminal(node, aliases, bindings) == "asdict"
-            or (isinstance(node.func, ast.Name) and node.func.id in asdict_aliases)
+        if _dynamic_call_terminal(node, aliases, bindings) == "asdict" or (
+            isinstance(node.func, ast.Name) and node.func.id in asdict_aliases
         ):
             raise AssertionError(
                 "Pilot Runtime extraction scope must use explicit public projections"
@@ -1565,7 +1554,9 @@ def test_negative_source_fixtures_prove_mechanical_validators_reject_forbidden_p
         "name = 'runtime_sse_content'\ngetattr(transport, name)",
         _validate_no_stream_primitive_in_api,
     )
-    _expect_rejected("from offerpilot.repositories.chat import ChatRepository", _validate_execution_host_boundary)
+    _expect_rejected(
+        "from offerpilot.repositories.chat import ChatRepository", _validate_execution_host_boundary
+    )
     _expect_rejected(
         "class SyncAgentExecutionHost:\n"
         "    def __init__(self, pending):\n        self.pending = pending\n",
@@ -1583,7 +1574,10 @@ def test_negative_source_fixtures_prove_mechanical_validators_reject_forbidden_p
         "        self.store = getattr(value, 'journal')\n",
         _validate_execution_host_boundary,
     )
-    _expect_rejected("def _runtime_sse_content():\n    return encode_sse_event({}, seq=1)", _validate_no_stream_primitive_in_api)
+    _expect_rejected(
+        "def _runtime_sse_content():\n    return encode_sse_event({}, seq=1)",
+        _validate_no_stream_primitive_in_api,
+    )
     _expect_rejected(
         "from dataclasses import dataclass\n"
         "@dataclass\n"
@@ -1627,8 +1621,7 @@ def test_negative_source_fixtures_prove_mechanical_validators_reject_forbidden_p
         _validate_no_error_prefix_expansion,
     )
     _expect_rejected(
-        "ERROR_PREFIX = '错误：'\n"
-        "def render(value):\n    return value.startswith(ERROR_PREFIX)",
+        "ERROR_PREFIX = '错误：'\ndef render(value):\n    return value.startswith(ERROR_PREFIX)",
         _validate_no_error_prefix_expansion,
     )
     _expect_rejected(
@@ -1657,7 +1650,9 @@ def test_negative_source_fixtures_prove_mechanical_validators_reject_forbidden_p
         "    second = runtime.prepare_stream()\n"
         "    return Guard(prepared=first)",
         lambda tree: _validate_prepared_streams_are_guarded(
-            ast.parse("PreparedStreamExecution('id', PreparationKind.REPLAY, StreamExecutionMode.DIRECT, {})"),
+            ast.parse(
+                "PreparedStreamExecution('id', PreparationKind.REPLAY, StreamExecutionMode.DIRECT, {})"
+            ),
             tree,
         ),
     )
@@ -1742,7 +1737,9 @@ def test_negative_source_fixtures_prove_mechanical_validators_reject_forbidden_p
         "    return build_guarded_streaming_response((), guard=guard)\n"
     )
     _validate_prepared_streams_are_guarded(
-        ast.parse("PreparedStreamExecution('id', PreparationKind.REPLAY, StreamExecutionMode.DIRECT, {})"),
+        ast.parse(
+            "PreparedStreamExecution('id', PreparationKind.REPLAY, StreamExecutionMode.DIRECT, {})"
+        ),
         ast.parse(positional_guard_source),
     )
     _expect_rejected(
@@ -1751,7 +1748,9 @@ def test_negative_source_fixtures_prove_mechanical_validators_reject_forbidden_p
             "    if False:\n        guard = Guard(prepared, on_execute=lambda: None)\n",
         ),
         lambda tree: _validate_prepared_streams_are_guarded(
-            ast.parse("PreparedStreamExecution('id', PreparationKind.REPLAY, StreamExecutionMode.DIRECT, {})"),
+            ast.parse(
+                "PreparedStreamExecution('id', PreparationKind.REPLAY, StreamExecutionMode.DIRECT, {})"
+            ),
             tree,
         ),
     )
@@ -1761,7 +1760,9 @@ def test_negative_source_fixtures_prove_mechanical_validators_reject_forbidden_p
             "    return None\n    guard = Guard(prepared, on_execute=lambda: None)\n",
         ),
         lambda tree: _validate_prepared_streams_are_guarded(
-            ast.parse("PreparedStreamExecution('id', PreparationKind.REPLAY, StreamExecutionMode.DIRECT, {})"),
+            ast.parse(
+                "PreparedStreamExecution('id', PreparationKind.REPLAY, StreamExecutionMode.DIRECT, {})"
+            ),
             tree,
         ),
     )
@@ -1856,8 +1857,7 @@ def test_production_does_not_asdict_transient_authority_or_claim_values() -> Non
         "def dump(value: TransientToolRuntimeValue): return asdict(value)\n",
         "from dataclasses import replace\n"
         "def dump(value: PendingAuthorityClaim): return replace(value)\n",
-        "from copy import deepcopy\n"
-        "def dump(value: ExecutionClaim): return deepcopy(value)\n",
+        "from copy import deepcopy\ndef dump(value: ExecutionClaim): return deepcopy(value)\n",
         "import pickle\n"
         "def checkpoint(value: TrustedLedgerOmittedTokenProof): "
         "return pickle.dumps(value)\n",
@@ -1872,6 +1872,43 @@ def test_transient_security_values_cannot_reach_generic_serializers(
 ) -> None:
     with pytest.raises(AssertionError):
         _validate_no_transient_generic_serializers(ast.parse(source))
+
+
+def test_current_metadata_security_types_are_fixed_transient_markers() -> None:
+    assert CURRENT_METADATA_SECURITY_NAMES <= TRANSIENT_SECURITY_NAMES
+
+
+@pytest.mark.parametrize("security_name", sorted(CURRENT_METADATA_SECURITY_NAMES))
+def test_current_metadata_security_values_cannot_reach_generic_serializers(
+    security_name: str,
+) -> None:
+    source = (
+        "import json\n"
+        f"def checkpoint(value: {security_name}):\n"
+        "    return json.dumps({'private': value}, default=str)\n"
+    )
+    with pytest.raises(AssertionError):
+        _validate_no_transient_generic_serializers(ast.parse(source))
+
+
+def test_api_transport_and_persistence_do_not_reference_metadata_security_values() -> None:
+    boundary_paths = (
+        API,
+        TRANSPORT,
+        RUNTIME / "persistence.py",
+        SRC / "repositories" / "chat.py",
+        SRC / "models.py",
+        SRC / "schemas.py",
+    )
+    for path in boundary_paths:
+        tree = _tree(path)
+        aliases = _binding_aliases(tree)
+        dynamic = _dynamic_attribute_strings(tree, aliases=aliases)
+        assert not ((_resolved_names(tree, aliases) | dynamic) & CURRENT_METADATA_SECURITY_NAMES), (
+            f"{path.relative_to(ROOT)} leaks metadata security values"
+        )
+        _validate_no_generic_asdict_boundary(tree)
+        _validate_no_transient_generic_serializers(tree)
 
 
 def test_extraction_scope_has_no_generic_asdict_calls() -> None:
@@ -1919,16 +1956,11 @@ def test_task11_negative_fixtures_cover_dynamic_and_reachability_bypasses() -> N
         _validate_no_error_prefix_expansion,
     )
     _expect_rejected(
-        "from dataclasses import asdict\n"
-        "values = [object()]\n"
-        "asdict(values[0])\n",
+        "from dataclasses import asdict\nvalues = [object()]\nasdict(values[0])\n",
         _validate_no_asdict_in_extraction_scope,
     )
     _expect_rejected(
-        "from dataclasses import asdict\n"
-        "dump = asdict\n"
-        "values = [object()]\n"
-        "dump(values[0])\n",
+        "from dataclasses import asdict\ndump = asdict\nvalues = [object()]\ndump(values[0])\n",
         _validate_no_asdict_in_extraction_scope,
     )
     _expect_rejected(
@@ -1956,7 +1988,9 @@ def test_task11_negative_fixtures_cover_dynamic_and_reachability_bypasses() -> N
         "        return build_guarded_streaming_response((), guard=guard)\n"
         "    return Response()\n",
         lambda tree: _validate_prepared_streams_are_guarded(
-            ast.parse("PreparedStreamExecution('id', PreparationKind.REPLAY, StreamExecutionMode.DIRECT, {})"),
+            ast.parse(
+                "PreparedStreamExecution('id', PreparationKind.REPLAY, StreamExecutionMode.DIRECT, {})"
+            ),
             tree,
         ),
     )
@@ -1969,7 +2003,9 @@ def test_task11_negative_fixtures_cover_dynamic_and_reachability_bypasses() -> N
         "    guard = None\n"
         "    return build_guarded_streaming_response((), guard=guard)\n",
         lambda tree: _validate_prepared_streams_are_guarded(
-            ast.parse("PreparedStreamExecution('id', PreparationKind.REPLAY, StreamExecutionMode.DIRECT, {})"),
+            ast.parse(
+                "PreparedStreamExecution('id', PreparationKind.REPLAY, StreamExecutionMode.DIRECT, {})"
+            ),
             tree,
         ),
     )
@@ -1981,7 +2017,9 @@ def test_task11_negative_fixtures_cover_dynamic_and_reachability_bypasses() -> N
         "    guard = Guard(prepared)\n"
         "    return None\n",
         lambda tree: _validate_prepared_streams_are_guarded(
-            ast.parse("PreparedStreamExecution('id', PreparationKind.REPLAY, StreamExecutionMode.DIRECT, {})"),
+            ast.parse(
+                "PreparedStreamExecution('id', PreparationKind.REPLAY, StreamExecutionMode.DIRECT, {})"
+            ),
             tree,
         ),
     )
@@ -1995,7 +2033,9 @@ def test_task11_negative_fixtures_cover_dynamic_and_reachability_bypasses() -> N
         "        guard = Guard(prepared)\n"
         "    return build_guarded_streaming_response((), guard=guard)\n",
         lambda tree: _validate_prepared_streams_are_guarded(
-            ast.parse("PreparedStreamExecution('id', PreparationKind.REPLAY, StreamExecutionMode.DIRECT, {})"),
+            ast.parse(
+                "PreparedStreamExecution('id', PreparationKind.REPLAY, StreamExecutionMode.DIRECT, {})"
+            ),
             tree,
         ),
     )
@@ -2003,9 +2043,7 @@ def test_task11_negative_fixtures_cover_dynamic_and_reachability_bypasses() -> N
 
 def test_task11_positive_fixtures_keep_dynamic_helpers_scoped() -> None:
     _validate_unbounded_queue(ast.parse("import queue\ngetattr(queue, 'Queue')()\n"))
-    _validate_unbounded_queue(
-        ast.parse("import queue\nname = 'Queue'\ngetattr(queue, name)()\n")
-    )
+    _validate_unbounded_queue(ast.parse("import queue\nname = 'Queue'\ngetattr(queue, name)()\n"))
     _validate_execution_host_boundary(
         ast.parse(
             "class SyncAgentExecutionHost:\n"
@@ -2033,8 +2071,7 @@ def test_task11_positive_fixtures_keep_dynamic_helpers_scoped() -> None:
     )
     _validate_prepared_streams_are_guarded(
         ast.parse(
-            "PreparedStreamExecution('id', PreparationKind.REPLAY, "
-            "StreamExecutionMode.DIRECT, {})"
+            "PreparedStreamExecution('id', PreparationKind.REPLAY, StreamExecutionMode.DIRECT, {})"
         ),
         ast.parse(dynamic_prepare_source),
     )
@@ -2042,8 +2079,7 @@ def test_task11_positive_fixtures_keep_dynamic_helpers_scoped() -> None:
 
 def test_task11_prepared_gate_rejects_dynamic_prepare_aliases() -> None:
     runtime_tree = ast.parse(
-        "PreparedStreamExecution('id', PreparationKind.REPLAY, "
-        "StreamExecutionMode.DIRECT, {})"
+        "PreparedStreamExecution('id', PreparationKind.REPLAY, StreamExecutionMode.DIRECT, {})"
     )
     valid_then_dynamic = (
         "from offerpilot.chat_transport import PreparedStreamGuard as Guard\n"
@@ -2061,16 +2097,14 @@ def test_task11_prepared_gate_rejects_dynamic_prepare_aliases() -> None:
     _expect_rejected(
         valid_then_dynamic.replace(
             "hidden = getattr(runtime, 'prepare_stream')()\n",
-            "method_name = 'prepare_stream'\n"
-            "    hidden = getattr(runtime, method_name)()\n",
+            "method_name = 'prepare_stream'\n    hidden = getattr(runtime, method_name)()\n",
         ),
         lambda tree: _validate_prepared_streams_are_guarded(runtime_tree, tree),
     )
     _expect_rejected(
         valid_then_dynamic.replace(
             "hidden = getattr(runtime, 'prepare_stream')()\n",
-            "prepare = getattr(runtime, 'prepare_stream')\n"
-            "    hidden = prepare()\n",
+            "prepare = getattr(runtime, 'prepare_stream')\n    hidden = prepare()\n",
         ),
         lambda tree: _validate_prepared_streams_are_guarded(runtime_tree, tree),
     )
@@ -2137,7 +2171,37 @@ def test_runtime_outcomes_and_events_are_safe_json_shapes() -> None:
     for event in events:
         payload = runtime_event_payload(event)
         assert json.dumps(payload, ensure_ascii=False)
-        assert set(payload) <= {"stream_version", "supports_delta", "supports_tool_events", "supports_confirmation", "role", "phase", "label", "delta", "tool_call_id", "tool_name", "public_label", "kind", "confirm_mode", "summary", "status", "evidence", "affected_resources", "changed_entities", "operation_id", "message", "visible_result", "write_status", "confirmation_token", "pending_action", "code", "retryable", "degraded", "response", "persisted"}
+        assert set(payload) <= {
+            "stream_version",
+            "supports_delta",
+            "supports_tool_events",
+            "supports_confirmation",
+            "role",
+            "phase",
+            "label",
+            "delta",
+            "tool_call_id",
+            "tool_name",
+            "public_label",
+            "kind",
+            "confirm_mode",
+            "summary",
+            "status",
+            "evidence",
+            "affected_resources",
+            "changed_entities",
+            "operation_id",
+            "message",
+            "visible_result",
+            "write_status",
+            "confirmation_token",
+            "pending_action",
+            "code",
+            "retryable",
+            "degraded",
+            "response",
+            "persisted",
+        }
     for value in (outcome, failure):
         payload = runtime_outcome_payload(value)
         encoded = json.dumps(payload, ensure_ascii=False)
@@ -2233,9 +2297,7 @@ def test_canary_private_values_do_not_enter_journal_trace_sse_or_error_log_paylo
         def __repr__(self) -> str:
             return sentinel
 
-    nested_private = MappingProxyType(
-        {"nested": MappingProxyType({"internal": _PrivateCanary()})}
-    )
+    nested_private = MappingProxyType({"nested": MappingProxyType({"internal": _PrivateCanary()})})
     # Tool event and outcome constructors reject an ORM/framework/provider value
     # before it can reach any public serializer.
     with pytest.raises(TypeError):
@@ -2393,7 +2455,9 @@ def test_canary_private_values_do_not_enter_journal_trace_sse_or_error_log_paylo
                 run_id="transport-private",
                 envelope=envelope,
             )
-            for index, event in enumerate((tool_call, tool_result, CompletedEvent(response=outcome)), 1)
+            for index, event in enumerate(
+                (tool_call, tool_result, CompletedEvent(response=outcome)), 1
+            )
         )
         assert "public tool call" in sse
         assert "public tool result" in sse
@@ -2542,9 +2606,7 @@ def test_canary_private_values_do_not_enter_journal_trace_sse_or_error_log_paylo
             enabled=True,
             segment_budget_seconds=10.0,
             disposition_budget_seconds=2.0,
-        ).start_run(
-            command
-        )
+        ).start_run(command)
         assert recorder.run_id == run_id, getattr(recorder, "diagnostics", None)
         with pytest.raises(JournalEventValidationError):
             prepare_event(
@@ -2618,13 +2680,16 @@ def test_canary_private_values_do_not_enter_journal_trace_sse_or_error_log_paylo
             tmp_path,
             "ERROR",
             "runtime_failure "
-            + json.dumps(runtime_outcome_payload(
-                RuntimeFailureOutcome(
-                    code=RuntimeFailureCode.AI_PROVIDER_ERROR,
-                    message="public failure",
-                    conversation_id=7,
-                )
-            ), ensure_ascii=False),
+            + json.dumps(
+                runtime_outcome_payload(
+                    RuntimeFailureOutcome(
+                        code=RuntimeFailureCode.AI_PROVIDER_ERROR,
+                        message="public failure",
+                        conversation_id=7,
+                    )
+                ),
+                ensure_ascii=False,
+            ),
         )
         log_blob = json.dumps(read_recent_log_entries(tmp_path), ensure_ascii=False)
         serialized = json.dumps(

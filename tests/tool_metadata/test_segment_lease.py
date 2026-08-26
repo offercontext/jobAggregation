@@ -200,6 +200,88 @@ def test_close_linearizes_against_resolve_and_revokes_every_returned_handle() ->
                 lease.require_spec(handle)
 
 
+def test_public_open_registers_the_exact_candidate_before_it_can_resolve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle, _, spec = _bundle()
+    token = bundle.bundle_instance_token  # type: ignore[attr-defined]
+    register = getattr(type(token), "_register_segment_lease", None)
+    require_registered = getattr(type(token), "_require_registered_segment_lease", None)
+
+    assert callable(register), "Bundle token must own the live Segment lease registry"
+    assert callable(require_registered), "Segment operations must verify the live lease registry"
+
+    registrations: list[object] = []
+
+    def counted_register(self: object, candidate: object) -> None:
+        registrations.append(candidate)
+        register(self, candidate)
+
+    monkeypatch.setattr(type(token), "_register_segment_lease", counted_register)
+
+    lease = bundle.open_segment_lease()  # type: ignore[attr-defined]
+    assert registrations == [lease]
+    handle = lease.resolve(spec.name)
+    assert lease.require_spec(handle) is spec
+
+
+def test_failed_public_registration_closes_the_unpublished_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle, _, spec = _bundle()
+    token = bundle.bundle_instance_token  # type: ignore[attr-defined]
+    candidates: list[object] = []
+
+    def reject_registration(_self: object, candidate: object) -> None:
+        candidates.append(candidate)
+        raise RuntimeError("registration rejected")
+
+    monkeypatch.setattr(
+        type(token),
+        "_register_segment_lease",
+        reject_registration,
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="registration rejected"):
+        bundle.open_segment_lease()  # type: ignore[attr-defined]
+
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate.closed is True
+    with pytest.raises((RuntimeError, ValueError), match="closed|lease|registered|revoked"):
+        candidate.resolve(spec.name)
+    candidate.close()
+
+
+def test_close_revokes_the_registered_lease_once_before_issued_handles_are_cleared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle, _, spec = _bundle()
+    lease = bundle.open_segment_lease()  # type: ignore[attr-defined]
+    handle = lease.resolve(spec.name)
+    token = lease.bundle_instance_token
+    revoke = getattr(type(token), "_revoke_segment_lease", None)
+    assert callable(revoke), "Bundle token must own exact Segment lease revocation"
+    revocations: list[object] = []
+
+    def counted_revoke(self: object, candidate: object) -> None:
+        issued = object.__getattribute__(candidate, "_state").issued
+        assert issued[id(handle)][0] is handle
+        revocations.append(candidate)
+        revoke(self, candidate)
+
+    monkeypatch.setattr(type(token), "_revoke_segment_lease", counted_revoke)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        tuple(executor.map(lambda _: lease.close(), range(32)))
+
+    assert revocations == [lease]
+    assert lease.closed is True
+    with pytest.raises((RuntimeError, ValueError), match="closed|lease|revoked"):
+        lease.require_spec(handle)
+
+
 def test_forged_handle_with_copied_fields_is_not_registered() -> None:
     bundle, _, spec = _bundle()
     lease = bundle.open_segment_lease()  # type: ignore[attr-defined]
@@ -214,3 +296,31 @@ def test_forged_handle_with_copied_fields_is_not_registered() -> None:
 
     with pytest.raises((RuntimeError, ValueError), match="segment|lease|provenance"):
         lease.require_spec(forged)
+
+
+def test_each_public_segment_operation_verifies_bundle_integrity_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle, _, spec = _bundle()
+    lease = bundle.open_segment_lease()  # type: ignore[attr-defined]
+    token = lease.bundle_instance_token
+    ensure_integrity = type(token)._ensure_integrity
+    calls = 0
+
+    def counted(self: object) -> None:
+        nonlocal calls
+        calls += 1
+        ensure_integrity(self)
+
+    monkeypatch.setattr(type(token), "_ensure_integrity", counted)
+
+    handle = lease.resolve(spec.name)
+    assert calls == 1
+    calls = 0
+
+    assert lease.require_spec(handle) is spec
+    assert calls == 1
+    calls = 0
+
+    assert handle.tool_name == spec.name
+    assert calls == 1

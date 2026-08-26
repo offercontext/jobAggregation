@@ -13,23 +13,31 @@ from dataclasses import fields as dataclass_fields
 import hashlib
 import json
 from threading import RLock
-from typing import Any, Iterator, Literal, Mapping, cast
+from typing import TYPE_CHECKING, Any, Iterator, Literal, Mapping, cast
 from uuid import uuid4
 
 from sqlalchemy.orm import Session, SessionTransaction
 
 from offerpilot.ai.tool_runtime.contracts import (
     BindingAudit,
-    BindingContract,
     PreparedToolCall,
     ProviderToolContract,
     ToolSpec,
     materialize_provider_payloads,
 )
 from offerpilot.ai.tool_runtime.metadata import (
-    WriteOperationMetadataV1,
+    ToolAuthorityEntryV1,
+    ToolAuthorityMetadataView,
+    tool_surface_metadata_integrity_snapshot,
     validate_tool_spec_components,
 )
+from offerpilot.ai.tool_runtime.policy_types import OperationKind
+
+if TYPE_CHECKING:
+    from offerpilot.ai.tool_runtime.catalog import (
+        SegmentToolCatalogLease,
+        SegmentToolSpecHandle,
+    )
 
 from .contracts import (
     ApprovedWriteExecuteCallIdentity,
@@ -73,6 +81,16 @@ _ACTIVE_AUTHORITIES: dict[int, tuple[ToolExecutionAuthority, "AuthorityFactory"]
 _ACTIVE_AUTHORITIES_LOCK = RLock()
 _ACTIVE_OBJECTS: dict[int, tuple[object, "AuthorityFactory"]] = {}
 _ACTIVE_REPOSITORY_BINDINGS: dict[int, tuple[object, "AuthorityFactory"]] = {}
+_APPROVED_WRITE_CLAIM_TRANSITION = "approved_write_claim"
+
+
+def _segment_catalog_types() -> tuple[type[Any], type[Any]]:
+    from offerpilot.ai.tool_runtime.catalog import (
+        SegmentToolCatalogLease,
+        SegmentToolSpecHandle,
+    )
+
+    return SegmentToolCatalogLease, SegmentToolSpecHandle
 
 
 def _authority_token(authority: ToolExecutionAuthority) -> AuthorityInstanceToken:
@@ -235,19 +253,18 @@ def _surface_gate_dependency_policy_snapshot(value: object) -> tuple[object, ...
 
 
 def _surface_gate_catalog_snapshot(value: object) -> tuple[object, ...]:
-    contracts = getattr(value, "provider_contracts", lambda: ())()
-    if type(contracts) is not tuple:
-        raise AuthorityPhaseError("Segment tool catalog contracts are not canonical")
+    lease_type, _ = _segment_catalog_types()
+    if type(value) is not lease_type:
+        raise AuthorityPhaseError("Segment surface gate requires an exact Catalog lease")
+    lease = cast("SegmentToolCatalogLease", value)
+    if lease.closed:
+        raise AuthorityPhaseError("Segment surface gate Catalog lease is closed")
     return (
-        type(value),
-        tuple(
-            (
-                contract.name,
-                _canonical_contract_fingerprint(contract),
-                _canonical_contract_fingerprint(contract, parameters=True),
-            )
-            for contract in contracts
-        ),
+        type(lease),
+        id(lease),
+        id(lease.bundle_instance_token),
+        id(lease.segment_catalog_token),
+        lease.generation,
     )
 
 
@@ -270,7 +287,7 @@ def _surface_gate_snapshots(value: object) -> dict[str, object]:
         "dependency_policy": _surface_gate_dependency_policy_snapshot(
             getattr(value, "dependency_policy", None)
         ),
-        "catalog": _surface_gate_catalog_snapshot(getattr(value, "catalog", None)),
+        "catalog_lease": _surface_gate_catalog_snapshot(getattr(value, "catalog_lease", None)),
     }
 
 
@@ -301,7 +318,12 @@ def _surface_gate_snapshots_match(
             or current_contract[1:] != expected_contract[1:]
         ):
             return False
-    for name in ("authority_surface", "policy", "dependency_policy", "catalog"):
+    for name in (
+        "authority_surface",
+        "policy",
+        "dependency_policy",
+        "catalog_lease",
+    ):
         if current.get(name) != expected.get(name):
             return False
     return True
@@ -328,6 +350,7 @@ def _validate_snapshot(value: object, snapshot: Mapping[str, object], label: str
 class _Lifecycle:
     __slots__ = (
         "value",
+        "token",
         "state",
         "authority",
         "prepared",
@@ -341,6 +364,7 @@ class _Lifecycle:
         self,
         value: object,
         *,
+        token: object,
         authority: ToolExecutionAuthority | None = None,
         prepared: object | None = None,
         pending: object | None = None,
@@ -349,6 +373,7 @@ class _Lifecycle:
         operation: object | None = None,
     ) -> None:
         self.value = value
+        self.token = token
         self.state: Literal["issued", "in_flight"] = "issued"
         self.authority = authority
         self.prepared = prepared
@@ -436,6 +461,48 @@ class _AuthorityRecord:
         self.trusted_scope_fields = _dataclass_snapshot(trusted_scope)
 
 
+class _AuthorityCatalogBinding:
+    __slots__ = ("authority", "view", "lease")
+
+    def __init__(
+        self,
+        authority: ToolExecutionAuthority,
+        view: ToolAuthorityMetadataView,
+        lease: SegmentToolCatalogLease,
+    ) -> None:
+        self.authority = authority
+        self.view = view
+        self.lease = lease
+
+
+class _ToolRouteRecord:
+    __slots__ = (
+        "handle",
+        "lease",
+        "spec",
+        "entry",
+        "authority",
+        "prepare_identity",
+    )
+
+    def __init__(
+        self,
+        *,
+        handle: SegmentToolSpecHandle,
+        lease: SegmentToolCatalogLease,
+        spec: ToolSpec[Any, Any],
+        entry: ToolAuthorityEntryV1,
+        authority: ToolExecutionAuthority,
+        prepare_identity: NewTurnPrepareCallIdentity | ApprovedWritePrepareCallIdentity,
+    ) -> None:
+        self.handle = handle
+        self.lease = lease
+        self.spec = spec
+        self.entry = entry
+        self.authority = authority
+        self.prepare_identity = prepare_identity
+
+
 class AuthorityFactory:
     """Factory plus bounded registry for one explicit execution scope."""
 
@@ -477,19 +544,14 @@ class AuthorityFactory:
         self._attempts: dict[str, _RegisteredIdentity] = {}
         self._operations: dict[int, _RegisteredIdentity] = {}
         self._transactions: dict[int, _RegisteredIdentity] = {}
-        self._tool_specs: dict[
-            int,
-            tuple[ToolSpec[Any, Any], ToolExecutionAuthority],
-        ] = {}
+        self._authority_catalogs: dict[int, _AuthorityCatalogBinding] = {}
+        self._tool_specs: dict[int, _ToolRouteRecord] = {}
         self._tool_spec_fields: dict[int, tuple[object, ...]] = {}
         self._tool_spec_preparations: dict[
             int,
-            tuple[
-                NewTurnPrepareCallIdentity | ApprovedWritePrepareCallIdentity,
-                ToolSpec[Any, Any],
-                ToolExecutionAuthority,
-            ],
+            _ToolRouteRecord,
         ] = {}
+        self._prepared_execution_states: dict[int, set[str]] = {}
         self._objects: dict[int, object] = {}
         self._attempt_sequence = 0
 
@@ -557,6 +619,7 @@ class AuthorityFactory:
             + len(self._attempts)
             + len(self._operations)
             + len(self._transactions)
+            + len(self._authority_catalogs)
             + len(self._tool_specs)
             + len(self._tool_spec_preparations)
         )
@@ -609,9 +672,11 @@ class AuthorityFactory:
             self._attempts.clear()
             self._operations.clear()
             self._transactions.clear()
+            self._authority_catalogs.clear()
             self._tool_specs.clear()
             self._tool_spec_fields.clear()
             self._tool_spec_preparations.clear()
+            self._prepared_execution_states.clear()
             self._objects.clear()
 
     def _register_authority(
@@ -779,14 +844,8 @@ class AuthorityFactory:
                     self._drop_claim_key(claim_id)
                     del self._claims[claim_id]
                     self._claim_fields.pop(claim_id, None)
-                    claim_token = getattr(lifecycle.value, "pending_claim_instance_token", None)
-                    if claim_token is None:
-                        claim_token = getattr(
-                            lifecycle.value, "execution_claim_instance_token", None
-                        )
-                    if claim_token is not None:
-                        self._objects.pop(id(claim_token), None)
-                        self._drop_object(claim_token)
+                    self._objects.pop(id(lifecycle.token), None)
+                    self._drop_object(lifecycle.token)
                     self._objects.pop(claim_id, None)
                     self._drop_object(lifecycle.value)
             for proof_id, lifecycle in tuple(self._proofs.items()):
@@ -794,12 +853,8 @@ class AuthorityFactory:
                     self._drop_proof_key(proof_id)
                     del self._proofs[proof_id]
                     self._proof_fields.pop(proof_id, None)
-                    proof_token = getattr(
-                        lifecycle.value, "omitted_token_proof_instance_token", None
-                    )
-                    if proof_token is not None:
-                        self._objects.pop(id(proof_token), None)
-                        self._drop_object(proof_token)
+                    self._objects.pop(id(lifecycle.token), None)
+                    self._drop_object(lifecycle.token)
                     self._objects.pop(proof_id, None)
                     self._drop_object(lifecycle.value)
             for prepared_id, (prepared, prepared_token, owner) in tuple(self._prepared.items()):
@@ -807,6 +862,7 @@ class AuthorityFactory:
                     del self._prepared[prepared_id]
                     self._prepared_fields.pop(prepared_id, None)
                     self._prepared_origins.pop(prepared_id, None)
+                    self._prepared_execution_states.pop(prepared_id, None)
                     self._objects.pop(prepared_id, None)
                     self._objects.pop(id(prepared_token), None)
                     self._drop_object(prepared)
@@ -856,12 +912,18 @@ class AuthorityFactory:
                     del self._repository_binding_tickets[ticket_id]
                     self._objects.pop(ticket_id, None)
                     self._drop_object(ticket)
-            for spec_id, (spec, owner) in tuple(self._tool_specs.items()):
-                if owner is authority:
-                    del self._tool_specs[spec_id]
-                    self._tool_spec_fields.pop(spec_id, None)
-            for identity_id, (_, _, owner) in tuple(self._tool_spec_preparations.items()):
-                if owner is authority:
+            catalog_binding = self._authority_catalogs.pop(id(authority), None)
+            if catalog_binding is not None:
+                self._objects.pop(id(catalog_binding.lease), None)
+                self._drop_object(catalog_binding.lease)
+            for handle_id, route in tuple(self._tool_specs.items()):
+                if route.authority is authority:
+                    del self._tool_specs[handle_id]
+                    self._tool_spec_fields.pop(handle_id, None)
+                    self._objects.pop(handle_id, None)
+                    self._drop_object(route.handle)
+            for identity_id, route in tuple(self._tool_spec_preparations.items()):
+                if route.authority is authority:
                     del self._tool_spec_preparations[identity_id]
             for attempt_id, registration in tuple(self._attempts.items()):
                 if registration.authority is authority:
@@ -1226,11 +1288,129 @@ class AuthorityFactory:
             self._authority_record(authority)
             existing = self._prepared.get(id(prepared))
             if existing is not None and existing[0] is prepared and existing[2] is authority:
-                self._prepared_record(prepared)
+                self._prepared_record(prepared, require_live_route=True)
                 return existing[1]
             raise AuthorityPhaseError(
                 "PreparedToolCall must be created through the controlled prepare port"
             )
+
+    def bind_segment_tool_catalog(
+        self,
+        authority: ToolExecutionAuthority,
+        *,
+        authority_metadata_view: ToolAuthorityMetadataView,
+        catalog_lease: SegmentToolCatalogLease,
+    ) -> None:
+        """Bind one exact Bundle view and live lease to an execution authority."""
+
+        with self._lock:
+            self._authority_record(authority)
+            lease_type, _ = _segment_catalog_types()
+            if type(authority_metadata_view) is not ToolAuthorityMetadataView:
+                raise AuthorityPhaseError("authority metadata view has an invalid type")
+            if type(catalog_lease) is not lease_type:
+                raise AuthorityPhaseError("authority requires an exact Segment Catalog lease")
+            if catalog_lease.closed:
+                raise AuthorityPhaseError("authority cannot bind a closed Segment Catalog lease")
+            if (
+                authority_metadata_view.bundle_instance_token
+                is not catalog_lease.bundle_instance_token
+            ):
+                raise AuthorityPhaseError("authority view and lease Bundle provenance differ")
+            existing = self._authority_catalogs.get(id(authority))
+            if existing is not None:
+                if (
+                    existing.authority is not authority
+                    or existing.view is not authority_metadata_view
+                    or existing.lease is not catalog_lease
+                ):
+                    raise AuthorityPhaseError("authority Catalog binding changed")
+                return
+            self._claim_object(catalog_lease)
+            self._objects[id(catalog_lease)] = catalog_lease
+            self._authority_catalogs[id(authority)] = _AuthorityCatalogBinding(
+                authority,
+                authority_metadata_view,
+                catalog_lease,
+            )
+
+    def _authority_catalog_binding(
+        self,
+        authority: ToolExecutionAuthority,
+    ) -> _AuthorityCatalogBinding:
+        self._authority_record(authority)
+        binding = self._authority_catalogs.get(id(authority))
+        if binding is None or binding.authority is not authority:
+            raise AuthorityPhaseError("authority has no bound metadata view and Segment lease")
+        lease_state = object.__getattribute__(binding.lease, "_state")
+        if object.__getattribute__(lease_state, "closed"):
+            raise AuthorityPhaseError("authority Segment Catalog lease is closed")
+        view_token = object.__getattribute__(binding.view, "bundle_instance_token")
+        lease_token = object.__getattribute__(binding.lease, "_bundle_instance_token")
+        if view_token is not lease_token:
+            raise AuthorityPhaseError("authority Catalog Bundle provenance changed")
+        return binding
+
+    def _resolve_route(
+        self,
+        authority: ToolExecutionAuthority,
+        catalog_lease: SegmentToolCatalogLease,
+        spec_handle: object,
+    ) -> tuple[ToolSpec[Any, Any], ToolAuthorityEntryV1]:
+        binding = self._authority_catalog_binding(authority)
+        if binding.lease is not catalog_lease:
+            raise AuthorityPhaseError("Segment lease does not match the authority binding")
+        _, handle_type = _segment_catalog_types()
+        if type(spec_handle) is not handle_type:
+            raise AuthorityPhaseError("Typed route requires an exact Segment ToolSpec handle")
+        typed_handle = cast("SegmentToolSpecHandle", spec_handle)
+        try:
+            spec = catalog_lease.require_spec(typed_handle)
+            tool_name = object.__getattribute__(typed_handle, "_tool_name")
+            entry = binding.view.entries.get(tool_name)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            raise AuthorityPhaseError("Segment ToolSpec handle provenance is invalid") from exc
+        if type(spec) is not ToolSpec or type(spec.contract) is not ProviderToolContract:
+            raise AuthorityPhaseError("Segment route resolved an invalid ToolSpec")
+        if type(entry) is not ToolAuthorityEntryV1 or entry.provider_name != tool_name:
+            raise AuthorityPhaseError("Segment route has no exact Authority metadata entry")
+        if spec.name != entry.provider_name:
+            raise AuthorityPhaseError("Segment route Spec and Authority entry names differ")
+        return spec, entry
+
+    def _resolve_registered_route(
+        self,
+        authority: ToolExecutionAuthority,
+        catalog_lease: SegmentToolCatalogLease,
+        spec_handle: object,
+    ) -> tuple[ToolSpec[Any, Any], ToolAuthorityEntryV1]:
+        """Revalidate one registered Authority route without unrelated Bundle views."""
+
+        binding = self._authority_catalog_binding(authority)
+        if binding.lease is not catalog_lease:
+            raise AuthorityPhaseError("Segment lease does not match the authority binding")
+        _, handle_type = _segment_catalog_types()
+        if type(spec_handle) is not handle_type:
+            raise AuthorityPhaseError("Typed route requires an exact Segment ToolSpec handle")
+        typed_handle = cast("SegmentToolSpecHandle", spec_handle)
+        try:
+            spec = catalog_lease._require_issued_spec_identity(typed_handle)
+            bundle_token = object.__getattribute__(catalog_lease, "_bundle_instance_token")
+            cast(Any, bundle_token)._require_issued_view_integrity(
+                binding.view,
+                ToolAuthorityMetadataView,
+            )
+            tool_name = object.__getattribute__(typed_handle, "_tool_name")
+            entry = binding.view.entries.get(tool_name)
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            raise AuthorityPhaseError("Segment ToolSpec handle provenance is invalid") from exc
+        if type(spec) is not ToolSpec or type(spec.contract) is not ProviderToolContract:
+            raise AuthorityPhaseError("Segment route resolved an invalid ToolSpec")
+        if type(entry) is not ToolAuthorityEntryV1 or entry.provider_name != tool_name:
+            raise AuthorityPhaseError("Segment route has no exact Authority metadata entry")
+        if spec.name != entry.provider_name:
+            raise AuthorityPhaseError("Segment route Spec and Authority entry names differ")
+        return spec, entry
 
     def prepare_tool_call(
         self,
@@ -1238,18 +1418,18 @@ class AuthorityFactory:
         *,
         prepare_identity: NewTurnPrepareCallIdentity | ApprovedWritePrepareCallIdentity,
         tool_call_id: str,
-        spec: ToolSpec[Any, Any],
+        catalog_lease: SegmentToolCatalogLease,
+        spec_handle: SegmentToolSpecHandle,
         arguments: Any,
         typed_args: Any,
         arguments_digest: str,
         contract_fingerprint: str,
         binding: BindingAudit,
     ) -> PreparedToolCall[Any, Any]:
-        """Construct and bind PreparedToolCall at the controlled prepare port."""
+        """Construct a Prepared call from one registered exact route handle."""
 
         with self._lock:
             self._ensure_open()
-            self._authority_record(authority)
             if type(prepare_identity) is NewTurnPrepareCallIdentity:
                 identity_authority = self._call_authority(
                     prepare_identity,
@@ -1264,19 +1444,19 @@ class AuthorityFactory:
                 raise AuthorityPhaseError("PreparedToolCall requires a registered prepare identity")
             if identity_authority is not authority:
                 raise AuthorityPhaseError("prepare identity belongs to another authority")
-            spec_registration = self._tool_specs.get(id(spec))
-            if spec_registration is None or spec_registration[0] is not spec:
-                raise AuthorityPhaseError("ToolSpec is not registered for this prepare identity")
+            route = self._tool_specs.get(id(spec_handle))
             preparation = self._tool_spec_preparations.get(id(prepare_identity))
             if (
-                spec_registration[1] is not authority
-                or preparation is None
-                or preparation[0] is not prepare_identity
-                or preparation[1] is not spec
-                or preparation[2] is not authority
+                route is None
+                or route.handle is not spec_handle
+                or route.lease is not catalog_lease
+                or route.authority is not authority
+                or route.prepare_identity is not prepare_identity
+                or preparation is not route
             ):
-                raise AuthorityPhaseError("ToolSpec provenance does not match prepare identity")
-            self._validate_registered_tool_spec(spec)
+                raise AuthorityPhaseError("route provenance does not match prepare identity")
+            self._validate_registered_tool_spec(spec_handle)
+            spec = route.spec
             identity_tool_call_id = getattr(prepare_identity, "tool_call_id")
             identity_tool_name = getattr(prepare_identity, "tool_name")
             identity_digest = getattr(
@@ -1284,7 +1464,10 @@ class AuthorityFactory:
                 "arguments_digest",
                 getattr(prepare_identity, "effective_args_digest", None),
             )
-            if tool_call_id != identity_tool_call_id or spec.name != identity_tool_name:
+            if (
+                tool_call_id != identity_tool_call_id
+                or route.entry.provider_name != identity_tool_name
+            ):
                 raise AuthorityPhaseError("PreparedToolCall identity does not match prepare call")
             expected_digest = _canonical_arguments_digest(arguments)
             _require_digest(arguments_digest, "arguments_digest")
@@ -1301,6 +1484,7 @@ class AuthorityFactory:
             prepared = PreparedToolCall(
                 tool_call_id=tool_call_id,
                 spec=spec,
+                spec_handle=spec_handle,
                 arguments=arguments,
                 typed_args=typed_args,
                 arguments_digest=arguments_digest,
@@ -1315,12 +1499,15 @@ class AuthorityFactory:
             self._claim_object(token)
             self._prepared[id(prepared)] = (prepared, token, authority)
             self._prepared_origins[id(prepared)] = prepare_identity
+            self._prepared_execution_states[id(prepared)] = set()
             self._prepared_fields[id(prepared)] = (
                 prepared.tool_call_id,
-                prepared.spec.name,
+                route.entry.provider_name,
                 prepared.arguments_digest,
                 prepared.contract_fingerprint,
                 prepared.spec,
+                prepared.spec_handle,
+                catalog_lease,
                 prepared.binding,
                 prepared._replacement_guard,
                 _dataclass_snapshot(prepared.binding),
@@ -1333,22 +1520,17 @@ class AuthorityFactory:
 
     def register_tool_spec(
         self,
-        spec: ToolSpec[Any, Any],
+        spec_handle: SegmentToolSpecHandle,
         *,
+        catalog_lease: SegmentToolCatalogLease,
         authority: ToolExecutionAuthority,
         prepare_identity: NewTurnPrepareCallIdentity | ApprovedWritePrepareCallIdentity,
     ) -> ToolSpec[Any, Any]:
-        """Register one exact, composition-root-validated ToolSpec for prepare."""
+        """Register one exact lease-issued route for one prepare identity."""
 
         with self._lock:
             self._ensure_open()
-            self._authority_record(authority)
-            if (
-                type(spec) is not ToolSpec
-                or type(spec.contract) is not ProviderToolContract
-                or type(spec.metadata.binding.contract) is not BindingContract
-            ):
-                raise AuthorityPhaseError("ToolSpec must use the exact validated contract type")
+            spec, entry = self._resolve_route(authority, catalog_lease, spec_handle)
             if not callable(spec.decoder) or not callable(spec.executor):
                 raise AuthorityPhaseError("ToolSpec decoder/executor must be callable")
             if type(prepare_identity) is NewTurnPrepareCallIdentity:
@@ -1361,45 +1543,52 @@ class AuthorityFactory:
                     prepare_identity,
                     AuthorityUse.APPROVED_WRITE_PREPARE,
                 )
-                if (
-                    type(spec.metadata.operation) is not WriteOperationMetadataV1
-                    or spec.metadata.confirmation_policy != "required"
-                ):
-                    raise AuthorityPhaseError("Approved prepare requires a confirmed write spec")
+                self._require_entry_phase(
+                    entry,
+                    kind="write",
+                    confirmation_policy="required",
+                )
             else:
-                raise AuthorityPhaseError("ToolSpec requires a registered prepare identity")
+                raise AuthorityPhaseError("ToolSpec route requires a registered prepare identity")
             if identity_authority is not authority:
                 raise AuthorityPhaseError("prepare identity belongs to another authority")
-            identity_tool_name = getattr(prepare_identity, "tool_name")
-            if spec.name != identity_tool_name:
-                raise AuthorityPhaseError("ToolSpec name does not match prepare identity")
-            spec_snapshot = self._tool_spec_snapshot(spec)
-            existing = self._tool_specs.get(id(spec))
-            if existing is not None:
-                if existing[0] is not spec or existing[1] is not authority:
-                    raise AuthorityPhaseError("ToolSpec provenance changed")
-                self._validate_registered_tool_spec(spec)
-            else:
-                self._tool_specs[id(spec)] = (spec, authority)
-                self._tool_spec_fields[id(spec)] = spec_snapshot
-            preparation = self._tool_spec_preparations.get(id(prepare_identity))
-            if preparation is not None and (
-                preparation[0] is not prepare_identity
-                or preparation[1] is not spec
-                or preparation[2] is not authority
-            ):
-                raise AuthorityPhaseError("prepare identity is already bound to another ToolSpec")
-            self._tool_spec_preparations[id(prepare_identity)] = (
-                prepare_identity,
-                spec,
-                authority,
+            if entry.provider_name != getattr(prepare_identity, "tool_name"):
+                raise AuthorityPhaseError("route name does not match prepare identity")
+            route = _ToolRouteRecord(
+                handle=spec_handle,
+                lease=catalog_lease,
+                spec=spec,
+                entry=entry,
+                authority=authority,
+                prepare_identity=prepare_identity,
             )
+            spec_snapshot = self._tool_spec_snapshot(spec)
+            existing = self._tool_specs.get(id(spec_handle))
+            if existing is not None:
+                if (
+                    existing.handle is not spec_handle
+                    or existing.lease is not catalog_lease
+                    or existing.spec is not spec
+                    or existing.entry is not entry
+                    or existing.authority is not authority
+                    or existing.prepare_identity is not prepare_identity
+                ):
+                    raise AuthorityPhaseError("ToolSpec route provenance changed")
+                self._validate_registered_tool_spec(spec_handle)
+                route = existing
+            preparation = self._tool_spec_preparations.get(id(prepare_identity))
+            if preparation is not None and preparation is not route:
+                raise AuthorityPhaseError("prepare identity is already bound to another route")
+            if existing is None:
+                self._claim_object(spec_handle)
+                self._objects[id(spec_handle)] = spec_handle
+                self._tool_specs[id(spec_handle)] = route
+                self._tool_spec_fields[id(spec_handle)] = spec_snapshot
+            self._tool_spec_preparations[id(prepare_identity)] = route
             return spec
 
     @staticmethod
     def _tool_spec_snapshot(spec: ToolSpec[Any, Any]) -> tuple[object, ...]:
-        if type(spec.metadata.binding.contract) is not BindingContract:
-            raise AuthorityPhaseError("ToolSpec binding contract type changed")
         try:
             validate_tool_spec_components(
                 provider_contract=spec.contract,
@@ -1424,37 +1613,12 @@ class AuthorityFactory:
             )
             for resolver in spec.resolver_bindings
         )
-        metadata = spec.metadata
-        contract = metadata.binding.contract
-        metadata_snapshot = (
-            id(metadata),
-            metadata.metadata_version,
-            tuple(metadata.domains),
-            tuple(metadata.dependencies),
-            metadata.provider_visibility,
-            tuple(metadata.required_capabilities),
-            tuple(
-                (
-                    id(editable),
-                    editable.field,
-                    editable.value_type,
-                    editable.options,
-                    editable.clearable,
-                    editable.clear_value,
-                )
-                for editable in metadata.editable_fields
-            ),
-        )
         return (
             spec.contract,
             _canonical_contract_fingerprint(spec.contract),
+            tool_surface_metadata_integrity_snapshot(spec.metadata),
             id(spec.decoder),
             id(spec.executor),
-            "write" if type(metadata.operation) is WriteOperationMetadataV1 else "read",
-            metadata.confirmation_policy,
-            metadata_snapshot,
-            id(contract),
-            (contract.kind, contract.entity_kind),
             resolver_snapshots,
             AuthorityFactory._tool_spec_execution_snapshot(spec),
         )
@@ -1470,11 +1634,6 @@ class AuthorityFactory:
                 mapping.compatibility_detail,
             )
             for mapping in spec.exception_map
-        )
-        operation = spec.metadata.operation
-        operation_snapshot = tuple(
-            (field.name, getattr(operation, field.name))
-            for field in dataclass_fields(operation)
         )
         undo = spec.undo_builder_binding
         undo_snapshot = (
@@ -1515,7 +1674,6 @@ class AuthorityFactory:
                 )
                 for item in exception_map
             ),
-            (id(operation), operation_snapshot),
             undo_snapshot,
         )
 
@@ -1533,29 +1691,33 @@ class AuthorityFactory:
     ) -> bool:
         return current == expected
 
-    def _validate_registered_tool_spec(self, spec: ToolSpec[Any, Any]) -> None:
-        snapshot = self._tool_spec_fields.get(id(spec))
-        if snapshot is None:
-            raise AuthorityPhaseError("ToolSpec registration snapshot is missing")
+    def _validate_registered_tool_spec(self, spec_handle: SegmentToolSpecHandle) -> None:
+        route = self._tool_specs.get(id(spec_handle))
+        snapshot = self._tool_spec_fields.get(id(spec_handle))
+        if route is None or route.handle is not spec_handle or snapshot is None:
+            raise AuthorityPhaseError("ToolSpec route registration snapshot is missing")
+        spec, entry = self._resolve_registered_route(
+            route.authority,
+            route.lease,
+            spec_handle,
+        )
+        if spec is not route.spec or entry is not route.entry:
+            raise AuthorityPhaseError("ToolSpec route identity changed")
         current = self._tool_spec_snapshot(spec)
         if current[0] is not snapshot[0] or not constant_time_equal(
             cast(str, current[1]), cast(str, snapshot[1])
         ):
             raise AuthorityPhaseError("ToolSpec contract identity changed")
-        if current[2] != snapshot[2] or current[3] != snapshot[3]:
-            raise AuthorityPhaseError("ToolSpec executor identity changed")
-        if current[4:7] != snapshot[4:7]:
-            raise AuthorityPhaseError("ToolSpec semantic identity changed")
-        if current[7] != snapshot[7] or current[8] != snapshot[8]:
-            raise AuthorityPhaseError("ToolSpec binding contract identity changed")
+        if current[2:5] != snapshot[2:5]:
+            raise AuthorityPhaseError("ToolSpec metadata or executor identity changed")
         if not self._resolver_snapshots_match(
-            cast(tuple[tuple[object, ...], ...], current[9]),
-            cast(tuple[tuple[object, ...], ...], snapshot[9]),
+            cast(tuple[tuple[object, ...], ...], current[5]),
+            cast(tuple[tuple[object, ...], ...], snapshot[5]),
         ):
             raise AuthorityPhaseError("ToolSpec binding resolver identity changed")
         if not self._tool_spec_execution_snapshots_match(
-            cast(tuple[object, ...], current[10]),
-            cast(tuple[object, ...], snapshot[10]),
+            cast(tuple[object, ...], current[6]),
+            cast(tuple[object, ...], snapshot[6]),
         ):
             raise AuthorityPhaseError("ToolSpec execution semantic identity changed")
 
@@ -1588,7 +1750,12 @@ class AuthorityFactory:
     def _prepared_shape_is_controlled(prepared: object) -> bool:
         if type(prepared) is not PreparedToolCall:
             return False
-        if type(prepared.spec) is not ToolSpec or type(prepared.binding) is not BindingAudit:
+        _, handle_type = _segment_catalog_types()
+        if (
+            type(prepared.spec) is not ToolSpec
+            or type(prepared.spec_handle) is not handle_type
+            or type(prepared.binding) is not BindingAudit
+        ):
             return False
         try:
             _require_text(prepared.tool_call_id, "tool_call_id")
@@ -1936,7 +2103,10 @@ class AuthorityFactory:
             return found[1]
 
     def _prepared_record(
-        self, prepared: object
+        self,
+        prepared: object,
+        *,
+        require_live_route: bool = False,
     ) -> tuple[PreparedToolCall[Any, Any], PreparedInstanceToken, ToolExecutionAuthority]:
         self.prepared_token(prepared)
         found = self._prepared[id(prepared)]
@@ -1946,9 +2116,10 @@ class AuthorityFactory:
         if fields is None:
             raise AuthorityPhaseError("PreparedToolCall construction record is missing")
         original = cast(PreparedToolCall[Any, Any], prepared)
+        spec_handle = original.spec_handle
         current = (
             original.tool_call_id,
-            original.spec.name,
+            object.__getattribute__(spec_handle, "_tool_name"),
             original.arguments_digest,
             original.contract_fingerprint,
         )
@@ -1958,23 +2129,34 @@ class AuthorityFactory:
             raise AuthorityPhaseError("PreparedToolCall contract identity changed")
         if (
             original.spec is not fields[4]
-            or original.binding is not fields[5]
-            or original._replacement_guard is not fields[6]
+            or spec_handle is not fields[5]
+            or original.binding is not fields[7]
+            or original._replacement_guard is not fields[8]
         ):
             raise AuthorityPhaseError("PreparedToolCall object identity changed")
-        self._validate_registered_tool_spec(original.spec)
+        route = self._tool_specs.get(id(spec_handle))
+        if (
+            route is None
+            or route.handle is not spec_handle
+            or route.lease is not fields[6]
+            or route.spec is not original.spec
+            or route.authority is not found[2]
+        ):
+            raise AuthorityPhaseError("PreparedToolCall route provenance changed")
+        if require_live_route:
+            self._validate_registered_tool_spec(spec_handle)
         _validate_snapshot(
-            original.binding, cast(Mapping[str, object], fields[7]), "Prepared binding"
+            original.binding, cast(Mapping[str, object], fields[9]), "Prepared binding"
         )
         current_arguments_digest = _canonical_arguments_digest(original.arguments)
         if not constant_time_equal(current_arguments_digest, cast(str, fields[2])):
             raise AuthorityPhaseError("Prepared arguments changed")
-        if original.typed_args is not fields[8]:
+        if original.typed_args is not fields[10]:
             raise AuthorityPhaseError("Prepared typed arguments object identity changed")
         current_typed_args_digest = _canonical_arguments_digest(original.typed_args)
         if not constant_time_equal(
             current_typed_args_digest,
-            cast(str, fields[9]),
+            cast(str, fields[11]),
         ):
             raise AuthorityPhaseError("Prepared typed arguments changed")
         if original.authority_instance_token is not _authority_token(found[2]):
@@ -1989,9 +2171,108 @@ class AuthorityFactory:
         """Revalidate an exact Prepared object immediately before execution."""
 
         with self._lock:
-            record = self._prepared_record(prepared)
+            record = self._prepared_record(prepared, require_live_route=True)
             if record[2] is not authority:
                 raise AuthorityPhaseError("PreparedToolCall belongs to another authority")
+
+    def require_prepared_route(
+        self,
+        prepared: PreparedToolCall[Any, Any],
+        *,
+        authority: ToolExecutionAuthority,
+        use: str | AuthorityUse,
+    ) -> ToolAuthorityEntryV1:
+        with self._lock:
+            record = self._prepared_record(prepared, require_live_route=True)
+            if record[2] is not authority:
+                raise AuthorityPhaseError("PreparedToolCall belongs to another authority")
+            spec_handle = prepared.spec_handle
+            return require_authority_spec(authority, use, spec_handle)
+
+    def begin_prepared_execution(
+        self,
+        prepared: PreparedToolCall[Any, Any],
+        *,
+        authority: ToolExecutionAuthority,
+        use: str | AuthorityUse,
+    ) -> None:
+        """Atomically consume one execution transition before any side effect."""
+
+        with self._lock:
+            record = self._prepared_record(prepared, require_live_route=True)
+            if record[2] is not authority:
+                raise AuthorityPhaseError("PreparedToolCall belongs to another authority")
+            phase = _use_value(use)
+            if phase == AuthorityUse.READ_EXECUTE.value:
+                if not isinstance(authority, SegmentExecutionAuthority):
+                    raise AuthorityPhaseError("read execution requires Segment authority")
+                self._require_prepared_phase(
+                    prepared,
+                    kind="read",
+                    confirmation_policy="none",
+                )
+            elif phase in {
+                AuthorityUse.APPROVED_WRITE_PREPARE.value,
+                AuthorityUse.APPROVED_WRITE_EXECUTE.value,
+            }:
+                if not isinstance(authority, ApprovalExecutionAuthority):
+                    raise AuthorityPhaseError("approved execution requires Approval authority")
+                self._require_prepared_phase(
+                    prepared,
+                    kind="write",
+                    confirmation_policy="required",
+                )
+            else:
+                raise AuthorityPhaseError("unknown PreparedToolCall execution transition")
+            states = self._prepared_execution_states.get(id(prepared))
+            if states is None:
+                raise AuthorityPhaseError("PreparedToolCall execution state is missing")
+            if (
+                phase == AuthorityUse.APPROVED_WRITE_EXECUTE.value
+                and AuthorityUse.APPROVED_WRITE_PREPARE.value not in states
+            ):
+                raise AuthorityPhaseError(
+                    "approved inner execution requires the consumed outer approval transition"
+                )
+            if (
+                phase == AuthorityUse.APPROVED_WRITE_EXECUTE.value
+                and _APPROVED_WRITE_CLAIM_TRANSITION not in states
+            ):
+                raise AuthorityPhaseError(
+                    "approved inner execution requires the issued execution claim transition"
+                )
+            if phase in states:
+                raise AuthorityPhaseError("PreparedToolCall execution transition was consumed")
+            states.add(phase)
+
+    def _require_consumed_prepared_transition(
+        self,
+        prepared: PreparedToolCall[Any, Any],
+        phase: AuthorityUse,
+    ) -> None:
+        states = self._prepared_execution_states.get(id(prepared))
+        if states is None:
+            raise AuthorityPhaseError("PreparedToolCall execution state is missing")
+        if phase.value not in states:
+            raise AuthorityPhaseError(
+                "ExecutionClaim requires the consumed outer approval transition"
+            )
+
+    def _require_available_execution_claim_transition(
+        self,
+        prepared: PreparedToolCall[Any, Any],
+    ) -> set[str]:
+        self._require_consumed_prepared_transition(
+            prepared,
+            AuthorityUse.APPROVED_WRITE_PREPARE,
+        )
+        states = self._prepared_execution_states[id(prepared)]
+        if (
+            _APPROVED_WRITE_CLAIM_TRANSITION in states
+            or AuthorityUse.APPROVED_WRITE_EXECUTE.value in states
+        ):
+            raise AuthorityPhaseError("approved execution transition was already claimed")
+        return states
 
     def _prepared_origin(
         self,
@@ -2001,6 +2282,18 @@ class AuthorityFactory:
         if origin is None:
             raise AuthorityPhaseError("PreparedToolCall origin provenance is missing")
         return origin
+
+    def require_prepared_origin(
+        self,
+        prepared: PreparedToolCall[Any, Any],
+        prepare_identity: NewTurnPrepareCallIdentity | ApprovedWritePrepareCallIdentity,
+    ) -> None:
+        """Require the exact prepare identity retained by one Prepared call."""
+
+        with self._lock:
+            self._prepared_record(prepared, require_live_route=True)
+            if self._prepared_origin(prepared) is not prepare_identity:
+                raise AuthorityPhaseError("PreparedToolCall prepare origin identity changed")
 
     @staticmethod
     def _require_prepared_call_fields(
@@ -2014,37 +2307,43 @@ class AuthorityFactory:
 
         if tool_call_id != prepared.tool_call_id:
             raise AuthorityPhaseError("tool_call_id does not match PreparedToolCall")
-        if tool_name != prepared.spec.name:
-            raise AuthorityPhaseError("tool_name does not match PreparedToolCall spec")
+        spec_handle = prepared.spec_handle
+        if tool_name != object.__getattribute__(spec_handle, "_tool_name"):
+            raise AuthorityPhaseError("tool_name does not match PreparedToolCall route")
         _require_digest(arguments_digest, "arguments_digest")
         if not constant_time_equal(arguments_digest, prepared.arguments_digest):
             raise AuthorityPhaseError("arguments digest does not match PreparedToolCall")
 
     @staticmethod
+    def _require_entry_phase(
+        entry: ToolAuthorityEntryV1,
+        *,
+        kind: Literal["read", "write"],
+        confirmation_policy: Literal["none", "required"],
+    ) -> None:
+        actual_kind = "read" if entry.operation_kind is OperationKind.READ else "write"
+        if actual_kind != kind or entry.confirmation_policy != confirmation_policy:
+            raise AuthorityPhaseError("Authority metadata entry is not valid for this phase")
+
     def _require_prepared_phase(
+        self,
         prepared: PreparedToolCall[Any, Any],
         *,
         kind: Literal["read", "write"],
         confirmation_policy: Literal["none", "required"],
     ) -> None:
-        """Enforce the phase/spec pairing at every factory port.
+        """Enforce the phase pairing from the bound Authority metadata view."""
 
-        The public ``require_authority_spec`` gate is useful for callers, but
-        execution ports must not rely on callers invoking it first.  Checking
-        the exact registered Prepared spec here keeps wrong-phase requests
-        fail-closed before pending/claim/identity state can be mutated.
-        """
-
-        actual_kind = (
-            "write"
-            if type(prepared.spec.metadata.operation) is WriteOperationMetadataV1
-            else "read"
+        spec_handle = prepared.spec_handle
+        route = self._tool_specs.get(id(spec_handle))
+        if route is None or route.handle is not spec_handle:
+            raise AuthorityPhaseError("PreparedToolCall route is not registered")
+        self._validate_registered_tool_spec(route.handle)
+        self._require_entry_phase(
+            route.entry,
+            kind=kind,
+            confirmation_policy=confirmation_policy,
         )
-        if (
-            actual_kind != kind
-            or prepared.spec.metadata.confirmation_policy != confirmation_policy
-        ):
-            raise AuthorityPhaseError("PreparedToolCall spec is not valid for this phase")
 
     def _register_call(
         self, call: AuthorityCallIdentity, authority: ToolExecutionAuthority, use: AuthorityUse
@@ -2328,7 +2627,7 @@ class AuthorityFactory:
                 raise AuthorityPhaseError("Segment surface gate semantics changed")
             current = (
                 getattr(value, "context", None),
-                getattr(value, "catalog", None),
+                getattr(value, "catalog_lease", None),
                 getattr(value, "policy", None),
                 getattr(value, "dependency_policy", None),
                 getattr(value, "selection", None),
@@ -2790,7 +3089,7 @@ class AuthorityFactory:
     ) -> ReadExecutionCallIdentity:
         with self._lock:
             authority = self._call_authority(invocation_identity, AuthorityUse.PROVIDER_INVOKE)
-            prepared_record = self._prepared_record(prepared)
+            prepared_record = self._prepared_record(prepared, require_live_route=True)
             self._require_prepared_phase(
                 prepared,
                 kind="read",
@@ -2881,7 +3180,7 @@ class AuthorityFactory:
             self._registered_authority_identity(
                 self._tool_contexts, tool_context, authority, "tool context"
             )
-            prepared_record = self._prepared_record(prepared)
+            prepared_record = self._prepared_record(prepared, require_live_route=True)
             self._require_prepared_phase(
                 prepared,
                 kind="write",
@@ -2967,9 +3266,18 @@ class AuthorityFactory:
             authority = self._call_authority(prepare_identity, AuthorityUse.APPROVED_WRITE_PREPARE)
             if not isinstance(authority, ApprovalExecutionAuthority):
                 raise AuthorityPhaseError("Approval authority is required")
-            prepared_record = self._prepared_record(prepared)
+            prepared_record = self._prepared_record(prepared, require_live_route=True)
             if prepared_record[2] is not authority:
                 raise AuthorityPhaseError("PreparedToolCall belongs to another authority")
+            if self._prepared_origin(prepared) is not prepare_identity:
+                raise AuthorityPhaseError("approved execute identity has the wrong Prepared origin")
+            self._require_consumed_prepared_transition(
+                prepared,
+                AuthorityUse.APPROVED_WRITE_PREPARE,
+            )
+            states = self._prepared_execution_states.get(id(prepared))
+            if states is None or _APPROVED_WRITE_CLAIM_TRANSITION not in states:
+                raise AuthorityPhaseError("approved execute identity requires an issued claim")
             self._require_prepared_phase(
                 prepared,
                 kind="write",
@@ -3123,7 +3431,7 @@ class AuthorityFactory:
     ) -> PendingAuthorityClaim:
         with self._lock:
             self._segment_record(authority)
-            prepared_record = self._prepared_record(prepared)
+            prepared_record = self._prepared_record(prepared, require_live_route=True)
             self._require_prepared_phase(
                 prepared,
                 kind="write",
@@ -3218,6 +3526,7 @@ class AuthorityFactory:
             )
             self._claims[id(claim)] = _Lifecycle(
                 claim,
+                token=claim_token,
                 authority=authority,
                 prepared=prepared,
                 pending=pending,
@@ -3248,6 +3557,14 @@ class AuthorityFactory:
     ) -> ExecutionClaim:
         with self._lock:
             self._approval_record(authority)
+            prepared_record = self._prepared_record(prepared, require_live_route=True)
+            if prepared_record[2] is not authority:
+                raise AuthorityPhaseError("PreparedToolCall belongs to another authority")
+            self._require_consumed_prepared_transition(
+                prepared,
+                AuthorityUse.APPROVED_WRITE_PREPARE,
+            )
+            execution_states = self._require_available_execution_claim_transition(prepared)
             if session is None or transaction is None:
                 raise AuthorityPhaseError("ExecutionClaim requires an active Session transaction")
             self._require_current_outer_transaction(session, transaction)
@@ -3257,9 +3574,6 @@ class AuthorityFactory:
                 and transaction_record.authority is not authority
             ):
                 raise AuthorityPhaseError("transaction belongs to another authority")
-            prepared_record = self._prepared_record(prepared)
-            if prepared_record[2] is not authority:
-                raise AuthorityPhaseError("PreparedToolCall belongs to another authority")
             self._require_prepared_phase(
                 prepared,
                 kind="write",
@@ -3315,6 +3629,7 @@ class AuthorityFactory:
             )
             if key in self._claim_keys:
                 raise AuthorityPhaseError("an equivalent ExecutionClaim is already active")
+            execution_states.add(_APPROVED_WRITE_CLAIM_TRANSITION)
             self._claim_pending_owner(pending_record, authority)
             if transaction_record.authority is None:
                 transaction_record.authority = authority
@@ -3337,6 +3652,7 @@ class AuthorityFactory:
             )
             self._claims[id(claim)] = _Lifecycle(
                 claim,
+                token=claim_token,
                 authority=authority,
                 prepared=prepared,
                 pending=pending,
@@ -3501,6 +3817,7 @@ class AuthorityFactory:
             )
             self._proofs[id(proof)] = _Lifecycle(
                 proof,
+                token=proof_token,
                 authority=proof_authority,
                 pending=pending_pointer,
                 transaction=transaction,
@@ -3525,7 +3842,10 @@ class AuthorityFactory:
         self._authority_record(authority)
         if lifecycle.prepared is None:
             raise AuthorityPhaseError("claim Prepared provenance is missing")
-        prepared_record = self._prepared_record(lifecycle.prepared)
+        prepared_record = self._prepared_record(
+            lifecycle.prepared,
+            require_live_route=isinstance(lifecycle.value, ExecutionClaim),
+        )
         if prepared_record[2] is not authority:
             raise AuthorityPhaseError("claim Prepared provenance changed")
         if lifecycle.pending is None:
@@ -3764,26 +4084,20 @@ class AuthorityFactory:
                 table = self._claims
             if lifecycle.state != "in_flight":
                 raise AuthorityPhaseError("one-shot value must be in flight before consume")
-            token: object | None = None
             if table is self._claims:
                 self._drop_claim_key(
                     id(value),
                     finalize_pending=isinstance(value, PendingAuthorityClaim),
                 )
-                token = getattr(value, "pending_claim_instance_token", None)
-                if token is None:
-                    token = getattr(value, "execution_claim_instance_token", None)
                 self._claim_fields.pop(id(value), None)
             else:
                 self._drop_proof_key(id(value))
-                token = getattr(value, "omitted_token_proof_instance_token", None)
                 self._proof_fields.pop(id(value), None)
             table.pop(id(value), None)
             self._objects.pop(id(value), None)
             self._drop_object(value)
-            if token is not None:
-                self._objects.pop(id(token), None)
-                self._drop_object(token)
+            self._objects.pop(id(lifecycle.token), None)
+            self._drop_object(lifecycle.token)
 
     consume_claim = consume
 
@@ -3799,27 +4113,21 @@ class AuthorityFactory:
                 table = self._claims
             if lifecycle.state not in {"issued", "in_flight"}:
                 raise AuthorityPhaseError("one-shot value is already finalized")
-            token: object | None = None
             if table is self._claims:
                 self._drop_claim_key(
                     id(value),
                     finalize_pending=isinstance(value, PendingAuthorityClaim),
                 )
-                token = getattr(value, "pending_claim_instance_token", None)
-                if token is None:
-                    token = getattr(value, "execution_claim_instance_token", None)
                 self._claim_fields.pop(id(value), None)
                 self._release_claim_pending_owner(lifecycle)
             else:
                 self._drop_proof_key(id(value))
-                token = getattr(value, "omitted_token_proof_instance_token", None)
                 self._proof_fields.pop(id(value), None)
             table.pop(id(value), None)
             self._objects.pop(id(value), None)
             self._drop_object(value)
-            if token is not None:
-                self._objects.pop(id(token), None)
-                self._drop_object(token)
+            self._objects.pop(id(lifecycle.token), None)
+            self._drop_object(lifecycle.token)
 
     revoke_claim = revoke
 
@@ -3900,11 +4208,7 @@ class AuthorityFactory:
                 except AuthorityPhaseError:
                     return False
                 return True
-            if any(
-                value is getattr(lifecycle.value, "pending_claim_instance_token", None)
-                or value is getattr(lifecycle.value, "execution_claim_instance_token", None)
-                for lifecycle in self._claims.values()
-            ):
+            if any(value is lifecycle.token for lifecycle in self._claims.values()):
                 return True
             proof = self._proofs.get(id(value))
             if proof is not None and proof.value is value:
@@ -3913,10 +4217,7 @@ class AuthorityFactory:
                 except AuthorityPhaseError:
                     return False
                 return True
-            if any(
-                value is getattr(lifecycle.value, "omitted_token_proof_instance_token", None)
-                for lifecycle in self._proofs.values()
-            ):
+            if any(value is lifecycle.token for lifecycle in self._proofs.values()):
                 return True
             repository_binding = self._repository_bindings.get(id(value))
             if repository_binding is not None and repository_binding.value is value:
@@ -3945,8 +4246,8 @@ class AuthorityFactory:
                 found = table.get(id(value))
                 if found is not None and found.value is value:
                     return True
-            spec_registration = self._tool_specs.get(id(value))
-            if spec_registration is not None and spec_registration[0] is value:
+            route = self._tool_specs.get(id(value))
+            if route is not None and route.handle is value:
                 try:
                     self._validate_registered_tool_spec(value)
                 except AuthorityPhaseError:
@@ -4061,50 +4362,40 @@ def require_authority_phase(
 def require_authority_spec(
     authority: ToolExecutionAuthority,
     use: str | AuthorityUse,
-    spec: object,
-) -> None:
-    """Validate the post-Catalog ToolSpec phase gate, still before resolver/SQL."""
+    spec_handle: object,
+) -> ToolAuthorityEntryV1:
+    """Validate one exact route and return its bound Authority metadata entry."""
 
     factory = _active_factory(authority)
-    factory._authority_record(authority)
-    if type(spec) is ToolSpec:
-        registration = factory._tool_specs.get(id(spec))
-        if registration is None or registration[0] is not spec:
-            raise AuthorityPhaseError("ToolSpec is not registered for this authority")
-        if registration[1] is not authority:
-            raise AuthorityPhaseError("ToolSpec provenance does not match authority")
-        factory._validate_registered_tool_spec(spec)
+    _, handle_type = _segment_catalog_types()
+    if type(spec_handle) is not handle_type:
+        raise AuthorityPhaseError("authority requires an exact Segment ToolSpec handle")
+    typed_handle = cast("SegmentToolSpecHandle", spec_handle)
+    registration = factory._tool_specs.get(id(typed_handle))
+    if (
+        registration is None
+        or registration.handle is not typed_handle
+        or registration.authority is not authority
+    ):
+        raise AuthorityPhaseError("Segment route is not registered for this authority")
+    factory._validate_registered_tool_spec(typed_handle)
+    entry = registration.entry
     phase = _use_value(use)
-    kind: Any
-    confirmation_policy: Any
-    if type(spec) is ToolSpec:
-        kind = (
-            "write"
-            if type(spec.metadata.operation) is WriteOperationMetadataV1
-            else "read"
-        )
-        confirmation_policy = spec.metadata.confirmation_policy
-    else:
-        kind = getattr(spec, "kind", None)
-        confirmation_policy = getattr(spec, "confirmation_policy", None)
     if phase == AuthorityUse.READ_EXECUTE.value:
         if not isinstance(authority, SegmentExecutionAuthority):
             raise AuthorityPhaseError("Segment authority is required for read execution")
-        if kind != "read":
-            raise AuthorityPhaseError("read execution requires a read ToolSpec")
+        factory._require_entry_phase(entry, kind="read", confirmation_policy="none")
     elif phase == AuthorityUse.TYPED_PENDING_CLAIM.value:
         if not isinstance(authority, SegmentExecutionAuthority):
             raise AuthorityPhaseError("Segment authority is required for Pending claims")
-        if kind != "write" or confirmation_policy != "required":
-            raise AuthorityPhaseError("write authority requires confirmation")
+        factory._require_entry_phase(entry, kind="write", confirmation_policy="required")
     elif phase in {
         AuthorityUse.APPROVED_WRITE_PREPARE.value,
         AuthorityUse.APPROVED_WRITE_EXECUTE.value,
     }:
         if not isinstance(authority, ApprovalExecutionAuthority):
             raise AuthorityPhaseError("approval authority is required")
-        if kind != "write" or confirmation_policy != "required":
-            raise AuthorityPhaseError("write authority requires confirmation")
+        factory._require_entry_phase(entry, kind="write", confirmation_policy="required")
     elif phase in {
         AuthorityUse.PROVIDER_SURFACE_BUILD.value,
         AuthorityUse.PROVIDER_INVOKE.value,
@@ -4115,6 +4406,7 @@ def require_authority_spec(
     else:
         # Every unknown use is rejected rather than inferred.
         raise AuthorityPhaseError("unknown authority phase")
+    return entry
 
 
 def execution_scope() -> AuthorityFactory:

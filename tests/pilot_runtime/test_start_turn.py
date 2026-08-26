@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import offerpilot.pilot_runtime.service as service_module
 from offerpilot.pilot_runtime.contracts import (
     AssistantMessageEvent,
     CancelReason,
@@ -44,11 +45,14 @@ from offerpilot.ai.agent_loop import NewTurnSeed, SegmentSurfaceGate, build_segm
 from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
 from offerpilot.ai.tool_authority.contracts import SegmentExecutionAuthority
 from offerpilot.ai.tool_authority.policy import validate_startup_policy
-from offerpilot.ai.tool_runtime.catalog import compile_tool_metadata_manifest
+from offerpilot.ai.tool_runtime.catalog import (
+    SegmentToolCatalogLease,
+    compile_tool_metadata_manifest,
+)
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
-from offerpilot.ai.tool_runtime.contracts import ToolFailure
+from offerpilot.ai.tool_runtime.contracts import ToolFailure, TransientToolRuntimeValue
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.api import _confirmation_token as baseline_confirmation_token
 from offerpilot.pilot_runtime.service import _confirmation_token
@@ -92,6 +96,14 @@ def _metadata_bundle() -> ToolMetadataBundleV1:
 _METADATA_BUNDLE = _metadata_bundle()
 
 
+class _MetadataComponents(TransientToolRuntimeValue):
+    def __init__(self, bundle: ToolMetadataBundleV1) -> None:
+        self.bundle = bundle
+
+
+_METADATA_COMPONENTS = _MetadataComponents(_METADATA_BUNDLE)
+
+
 class _Phases:
     def __init__(self) -> None:
         self.items: list[str] = []
@@ -123,24 +135,6 @@ class _ConversationStore:
     def load(self, conversation_id: int) -> _Conversation | None:
         del conversation_id
         return self.conversation
-
-
-class _Catalog:
-    def __init__(self, *, write_names: tuple[str, ...] = ("write", "create_application")) -> None:
-        self._write_names = frozenset(write_names)
-
-    def resolve(self, name: str) -> object | None:
-        if name in self._write_names:
-            return SimpleNamespace(name=name, kind="write")
-        if name == "read_tool":
-            return SimpleNamespace(name=name, kind="read")
-        return None
-
-    def write_names(self) -> frozenset[str]:
-        return self._write_names
-
-    def provider_contracts(self) -> tuple[object, ...]:
-        return tuple(SimpleNamespace(name=name) for name in sorted(self._write_names))
 
 
 def _real_segment(
@@ -473,8 +467,6 @@ def _runtime(
     model: object = "model",
     route: object = "model",
     missing_target_question: object | None = None,
-    catalog: object | None = None,
-    dependency_catalog: object | None = None,
     model_resolver: object | None = None,
     surface_resolver: object | None = None,
     policy_resolver: object | None = None,
@@ -532,16 +524,22 @@ def _runtime(
             value if isinstance(value, Message) else Message(role="user", content=str(value))
             for value in assembled
         )
-        return build_segment_surface_gate(
-            messages,
-            catalog=getattr(policy, "catalog"),
-            context=getattr(segment, "context"),
-            authority=getattr(segment, "authority"),
-            provider_view=getattr(policy, "provider_metadata_view"),
-            discovery_view=getattr(policy, "discovery_metadata_view"),
-            authority_metadata_view=getattr(policy, "authority_metadata_view"),
-            policy=getattr(policy, "policy"),
-        )
+        catalog_lease = _METADATA_BUNDLE.open_segment_lease()
+        try:
+            return build_segment_surface_gate(
+                messages,
+                catalog=getattr(policy, "catalog"),
+                catalog_lease=catalog_lease,
+                context=getattr(segment, "context"),
+                authority=getattr(segment, "authority"),
+                provider_view=getattr(policy, "provider_metadata_view"),
+                discovery_view=getattr(policy, "discovery_metadata_view"),
+                authority_metadata_view=getattr(policy, "authority_metadata_view"),
+                policy=getattr(policy, "policy"),
+            )
+        except BaseException:
+            catalog_lease.close()
+            raise
 
     runtime = PilotRuntime(
         RuntimeDependencies(
@@ -558,7 +556,12 @@ def _runtime(
             agent_driver=driver or _Driver(phases),
             phase_sink=phases,
             missing_target_question=missing_target_question,
-            catalog=dependency_catalog,
+            catalog=resolved_catalog,
+            metadata_bundle=_METADATA_BUNDLE,
+            metadata_components=_METADATA_COMPONENTS,
+            provider_metadata_view=_METADATA_BUNDLE.provider_view(),
+            discovery_metadata_view=_METADATA_BUNDLE.discovery_view(),
+            authority_metadata_view=_METADATA_BUNDLE.authority_view(),
         )
     )
     return runtime, resolved_persistence, resolved_journal
@@ -677,6 +680,7 @@ def test_sync_live_policy_drift_closes_segment_before_provider_or_user() -> None
         assert segment.catalog is None
         assert segment.policy is None
         assert segment.surface_gate is None
+        assert getattr(segment, "catalog_lease", None) is None
         return ResolvedPolicyCatalog(
             catalog=MODEL_TOOL_CATALOG,
             policy=drifted,
@@ -721,6 +725,7 @@ def test_sync_policy_spy_sees_exact_unbound_segment_after_segment_phase() -> Non
         assert segment.catalog is None
         assert segment.policy is None
         assert segment.surface_gate is None
+        assert getattr(segment, "catalog_lease", None) is None
         return ResolvedPolicyCatalog(
             catalog=MODEL_TOOL_CATALOG,
             policy=_AUTHORITY_POLICY,
@@ -1011,16 +1016,22 @@ def test_real_run_recorder_factory_accepts_runtime_builder_and_records_terminal_
             value if isinstance(value, Message) else Message(role="user", content=str(value))
             for value in assembled
         )
-        return build_segment_surface_gate(
-            messages,
-            catalog=getattr(policy, "catalog"),
-            context=getattr(segment, "context"),
-            authority=getattr(segment, "authority"),
-            provider_view=getattr(policy, "provider_metadata_view"),
-            discovery_view=getattr(policy, "discovery_metadata_view"),
-            authority_metadata_view=getattr(policy, "authority_metadata_view"),
-            policy=getattr(policy, "policy"),
-        )
+        catalog_lease = _METADATA_BUNDLE.open_segment_lease()
+        try:
+            return build_segment_surface_gate(
+                messages,
+                catalog=getattr(policy, "catalog"),
+                catalog_lease=catalog_lease,
+                context=getattr(segment, "context"),
+                authority=getattr(segment, "authority"),
+                provider_view=getattr(policy, "provider_metadata_view"),
+                discovery_view=getattr(policy, "discovery_metadata_view"),
+                authority_metadata_view=getattr(policy, "authority_metadata_view"),
+                policy=getattr(policy, "policy"),
+            )
+        except BaseException:
+            catalog_lease.close()
+            raise
 
     runtime = PilotRuntime(
         RuntimeDependencies(
@@ -1044,6 +1055,12 @@ def test_real_run_recorder_factory_accepts_runtime_builder_and_records_terminal_
             source_loader=_Source(phases),
             context_assembler=_Assembler(phases),
             agent_driver=_Driver(phases),
+            catalog=MODEL_TOOL_CATALOG,
+            metadata_bundle=_METADATA_BUNDLE,
+            metadata_components=_METADATA_COMPONENTS,
+            provider_metadata_view=_METADATA_BUNDLE.provider_view(),
+            discovery_metadata_view=_METADATA_BUNDLE.discovery_view(),
+            authority_metadata_view=_METADATA_BUNDLE.authority_view(),
             journal=journal,
             phase_sink=phases,
         )
@@ -1141,6 +1158,58 @@ def test_source_failure_stops_before_user_and_journal() -> None:
     assert persistence.message_count == 0
     assert journal.recorder.dispositions == []
     assert control.state is InvocationState.COMPLETED
+
+
+def test_sync_invocation_candidate_failure_closes_unpublished_bundle_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    phases = _Phases()
+    opened: list[SegmentToolCatalogLease] = []
+    original_open = ToolMetadataBundleV1.open_segment_lease
+
+    def observe_open(bundle: ToolMetadataBundleV1) -> SegmentToolCatalogLease:
+        lease = original_open(bundle)
+        opened.append(lease)
+        return lease
+
+    def reject_invocation(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("invocation construction failed")
+
+    monkeypatch.setattr(ToolMetadataBundleV1, "open_segment_lease", observe_open)
+    monkeypatch.setattr(service_module, "AgentLoopInvocation", reject_invocation)
+    runtime, persistence, journal = _runtime(phases)
+
+    with pytest.raises(RuntimeError, match="invocation construction failed"):
+        _start(runtime, _Host(phases))
+
+    assert len(opened) == 1
+    assert opened[0].closed is True
+    assert persistence.user_count == 1
+    assert journal.recorder.abandoned == 1
+
+
+def test_sync_runtime_backstop_closes_published_invocation_before_driver_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    phases = _Phases()
+    opened: list[SegmentToolCatalogLease] = []
+    original_open = ToolMetadataBundleV1.open_segment_lease
+
+    def observe_open(bundle: ToolMetadataBundleV1) -> SegmentToolCatalogLease:
+        lease = original_open(bundle)
+        opened.append(lease)
+        return lease
+
+    monkeypatch.setattr(ToolMetadataBundleV1, "open_segment_lease", observe_open)
+    driver = _Driver(phases)
+    runtime, _persistence, _journal = _runtime(phases, driver=driver)
+
+    outcome = _start(runtime, _Host(phases, error=RuntimeError("host failed")))
+
+    assert isinstance(outcome, RuntimeFailureOutcome)
+    assert len(opened) == 1
+    assert opened[0].closed is True
+    assert driver.provider_calls == 0
 
 
 @pytest.mark.parametrize("failure_mode", ["exception", "none", "failed"])
@@ -1623,17 +1692,17 @@ def test_invalid_pending_is_rejected_before_any_pending_persistence(pending: obj
     assert journal.recorder.dispositions == [("failed", "unknown")]
 
 
-def test_pending_uses_resolved_catalog_not_global_dependency_catalog() -> None:
+def test_pending_uses_exact_bundle_catalog() -> None:
     phases = _Phases()
     pending = PendingAction("call-1", "write", "{}", "write", "op-1")
     persistence = _Persistence(phases)
     runtime, _, journal = _runtime(
         phases,
         persistence=persistence,
-        catalog=MODEL_TOOL_CATALOG,
-        dependency_catalog=_Catalog(write_names=("write",)),
         driver=_Driver(phases, result=AgentTurnResult([], "", pending)),
     )
+
+    assert runtime._dependencies.catalog is _METADATA_BUNDLE._typed_catalog
 
     result = _start(runtime, _Host(phases))
 

@@ -14,12 +14,18 @@ from offerpilot.ai.tool_authority import (
     ApprovalExecutionAuthority,
     AuthorityFactory,
     AuthorityPhaseError,
+    AuthorityUse,
 )
 from offerpilot.ai.tool_authority.fingerprint import authorization_scope_fingerprint
 from offerpilot.ai.tool_authority.visibility import AuthorityApplicationVisibilityQuery
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.policy_types import ToolCapability
-from offerpilot.ai.tool_runtime.contracts import ConfirmationRequired
+from offerpilot.ai.tool_runtime.catalog import compile_tool_metadata_manifest
+from offerpilot.ai.tool_runtime.contracts import (
+    ConfirmationRequired,
+    TransientToolRuntimeValue,
+)
+from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.ai.tool_runtime.pipeline import execute_prepared, prepare_call
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 from offerpilot.ai.types import Message, ToolCall
@@ -41,6 +47,7 @@ from offerpilot.pilot_runtime.continuation import (
     ConfirmationReplayError,
 )
 from offerpilot.pilot_runtime.composition import _AgentDriver
+from offerpilot.pilot_runtime.compensation import prepare_compensation_handler_components
 from offerpilot.pilot_runtime.contracts import (
     ConfirmationRequest,
     PreparedStreamExecution,
@@ -60,6 +67,27 @@ from offerpilot.repositories.offers import OffersRepository
 from offerpilot.repositories.resumes import ResumesRepository
 
 
+def _production_metadata_bundle() -> ToolMetadataBundleV1:
+    manifest = compile_tool_metadata_manifest(MODEL_TOOL_CATALOG.specs)
+    return ToolMetadataBundleV1(
+        typed_catalog=MODEL_TOOL_CATALOG,
+        manifest=manifest,
+        legacy_boundary=manifest.to_dict()["legacy_boundary"],  # type: ignore[arg-type]
+        compensation=prepare_compensation_handler_components().metadata_projection(),
+    )
+
+
+_METADATA_BUNDLE = _production_metadata_bundle()
+
+
+class _MetadataComponents(TransientToolRuntimeValue):
+    def __init__(self, bundle: ToolMetadataBundleV1) -> None:
+        self.bundle = bundle
+
+
+_METADATA_COMPONENTS = _MetadataComponents(_METADATA_BUNDLE)
+
+
 def _revision(tool_call_id: str, tool_name: str, raw_args: str) -> int:
     normalized = json.dumps(json.loads(raw_args), separators=(",", ":"))
     payload = json.dumps(
@@ -67,9 +95,7 @@ def _revision(tool_call_id: str, tool_name: str, raw_args: str) -> int:
         sort_keys=True,
         separators=(",", ":"),
     ).encode()
-    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & (
-        (1 << 63) - 1
-    )
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & ((1 << 63) - 1)
 
 
 def _approval_harness(tmp_path) -> SimpleNamespace:
@@ -86,17 +112,13 @@ def _approval_harness(tmp_path) -> SimpleNamespace:
     operation_id = str(uuid4())
     proposal = {"id": note.id, "questions": "approved"}
     raw_args = json.dumps(proposal, sort_keys=True, separators=(",", ":"))
-    pending = PendingAction(
-        "scoped-call", "update_note", raw_args, "update_note", operation_id
-    )
+    pending = PendingAction("scoped-call", "update_note", raw_args, "update_note", operation_id)
     revision = _revision(pending.tool_call_id, pending.tool_name, raw_args)
     digest = "sha256:" + hashlib.sha256(raw_args.encode()).hexdigest()
     token_fingerprint = ledger_fingerprint(
         key, "write-operation-confirmation-token-v1", b"scoped-token"
     )
-    proposal_fingerprint = ledger_fingerprint(
-        key, "write-operation-proposal-v1", proposal
-    )
+    proposal_fingerprint = ledger_fingerprint(key, "write-operation-proposal-v1", proposal)
     with sessions() as session:
         owner = session.get(Conversation, conversation.id)
         assert owner is not None
@@ -261,6 +283,7 @@ def test_real_typed_approval_uses_canonical_visibility_in_both_snapshots(
         tracked_visibility,
     )
     factory = AuthorityFactory()
+    catalog_lease = None
     try:
         authority = ApprovalAuthorityResolver(
             harness.repository,
@@ -289,8 +312,14 @@ def test_real_typed_approval_uses_canonical_visibility_in_both_snapshots(
             approval_context=context,
             request_identity=object(),
         )
+        catalog_lease = _METADATA_BUNDLE.open_segment_lease()
+        factory.bind_segment_tool_catalog(
+            authority,
+            authority_metadata_view=_METADATA_BUNDLE.authority_view(),
+            catalog_lease=catalog_lease,
+        )
         prepared_result = prepare_call(
-            MODEL_TOOL_CATALOG,
+            catalog_lease,
             context,
             ToolCall(
                 harness.pending.tool_call_id,
@@ -303,6 +332,11 @@ def test_real_typed_approval_uses_canonical_visibility_in_both_snapshots(
             record_proposal=False,
         )
         assert isinstance(prepared_result, ConfirmationRequired)
+        factory.begin_prepared_execution(
+            prepared_result.prepared,
+            authority=authority,
+            use=AuthorityUse.APPROVED_WRITE_PREPARE,
+        )
 
         execution, record = harness.coordinator.execute_primary(
             operation_id=harness.operation_id,
@@ -324,6 +358,8 @@ def test_real_typed_approval_uses_canonical_visibility_in_both_snapshots(
         assert updated is not None
         assert updated.questions == "approved"
     finally:
+        if catalog_lease is not None:
+            catalog_lease.close()
         factory.close()
 
 
@@ -378,7 +414,7 @@ def test_runtime_real_typed_origin_is_provider_and_source_free(tmp_path) -> None
                 request_identity=seed,
             )
             prepared = prepare_call(
-                invocation.catalog,
+                invocation.catalog_lease,
                 context,
                 ToolCall(pending.tool_call_id, pending.tool_name, pending.args),
                 call_identity=prepare_identity,
@@ -396,9 +432,7 @@ def test_runtime_real_typed_origin_is_provider_and_source_free(tmp_path) -> None
             assert record.terminal_persisted
             visible = record.persisted_visible_result
             assert isinstance(visible, str)
-            origin = Message(
-                role="tool", content=visible, tool_call_id=pending.tool_call_id
-            )
+            origin = Message(role="tool", content=visible, tool_call_id=pending.tool_call_id)
             continuation.record_result(pending, origin, record)
             return AgentTurnResult(
                 added=[origin, Message(role="assistant", content="done")],
@@ -416,6 +450,11 @@ def test_runtime_real_typed_origin_is_provider_and_source_free(tmp_path) -> None
             continuation_model_resolver=forbidden_model,
             agent_driver=OriginDriver(),
             catalog=MODEL_TOOL_CATALOG,
+            metadata_bundle=_METADATA_BUNDLE,
+            metadata_components=_METADATA_COMPONENTS,
+            provider_metadata_view=_METADATA_BUNDLE.provider_view(),
+            discovery_metadata_view=_METADATA_BUNDLE.discovery_view(),
+            authority_metadata_view=_METADATA_BUNDLE.authority_view(),
         )
     )
 
@@ -472,10 +511,17 @@ def test_production_agent_driver_retains_approval_context_seals(tmp_path) -> Non
         run_recorder=NullRunRecorder(),
         operation_executor=session.execute_operation,
     )
+    catalog_lease = _METADATA_BUNDLE.open_segment_lease()
+    origin.authority_factory.bind_segment_tool_catalog(
+        origin.authority,
+        authority_metadata_view=_METADATA_BUNDLE.authority_view(),
+        catalog_lease=catalog_lease,
+    )
     invocation = AgentLoopInvocation(
         seed=ApprovedWriteSeed(ConfirmationApprovedWritePort(session)),
         model=None,
         catalog=MODEL_TOOL_CATALOG,
+        catalog_lease=catalog_lease,
         tool_context=context,
         auto_approve=False,
         max_iterations=1,
@@ -510,6 +556,7 @@ def test_production_agent_driver_retains_approval_context_seals(tmp_path) -> Non
         assert rebound.scope_constraint is origin.scope_constraint
         assert rebound.operation_executor is session.execute_operation
     finally:
+        catalog_lease.close()
         origin.authority_factory.close()
 
 
@@ -602,6 +649,11 @@ def test_replay_exit_closes_approval_authority(
             confirmation_coordinator=coordinator,
             agent_driver=ReplayDriver(),
             catalog=MODEL_TOOL_CATALOG,
+            metadata_bundle=_METADATA_BUNDLE,
+            metadata_components=_METADATA_COMPONENTS,
+            provider_metadata_view=_METADATA_BUNDLE.provider_view(),
+            discovery_metadata_view=_METADATA_BUNDLE.discovery_view(),
+            authority_metadata_view=_METADATA_BUNDLE.authority_view(),
         )
     )
     request = ConfirmationRequest(

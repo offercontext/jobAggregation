@@ -16,6 +16,7 @@ from offerpilot.agent_runtime.journal import NullRunRecorder
 from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
+from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.ai.tool_runtime.policy_types import ToolCapability
 from offerpilot.ai.tool_runtime.contracts import (
     ConfirmationRequired,
@@ -29,13 +30,24 @@ from offerpilot.ai.tool_runtime.pipeline import Rejected, execute_prepared, prep
 from offerpilot.ai.tool_runtime.rendering import render_compatibility
 from offerpilot.ai.types import ToolCall
 from offerpilot.db import init_database
-from offerpilot.models import Application, ApplicationEvent, InterviewNote, JDAnalysis, Offer, Resume
-from offerpilot.repositories.application_events import ApplicationEventCreate, ApplicationEventsRepository
+from offerpilot.models import (
+    Application,
+    ApplicationEvent,
+    InterviewNote,
+    JDAnalysis,
+    Offer,
+    Resume,
+)
+from offerpilot.repositories.application_events import (
+    ApplicationEventCreate,
+    ApplicationEventsRepository,
+)
 from offerpilot.repositories.applications import ApplicationCreate, ApplicationsRepository
 from offerpilot.repositories.jd import JDAnalysesRepository, JDAnalysisCreate
 from offerpilot.repositories.notes import NoteCreate, NotesRepository
 from offerpilot.repositories.offers import OfferCreate, OffersRepository
 from offerpilot.repositories.resumes import ResumeCreate, ResumeMatchCreate, ResumesRepository
+from tests.tool_metadata.factories import compose_synthetic_bundle
 
 
 DYNAMIC_TIME_FIELD = re.compile(
@@ -159,9 +171,7 @@ def build_harness(path: Path, tool_name: str, case: str) -> Harness:
                 source="manual",
                 content_json={
                     "career_intent": {"target_roles": []},
-                    "experience": [
-                        {"company": "Synthetic Co", "highlights": ["Built APIs"]}
-                    ],
+                    "experience": [{"company": "Synthetic Co", "highlights": ["Built APIs"]}],
                 },
             )
         )
@@ -273,14 +283,29 @@ def execute_case(
             instrumented,
             expected_names=tuple(spec.name for spec in instrumented),
         )
-        spec = cast(ToolSpec[Any, Any], catalog.resolve(case["tool_name"]))
+        source = compose_synthetic_bundle()
+        manifest = dict(cast(dict[str, object], source["manifest"]))
+        manifest["typed_tools"] = tuple(spec.name for spec in instrumented)
+        bundle = ToolMetadataBundleV1(
+            typed_catalog=catalog,
+            manifest=manifest,
+            legacy_boundary=cast(dict[str, object], source["legacy_boundary"]),
+            compensation=cast(dict[str, object], source["compensation"]),
+        )
+        catalog_lease = bundle.open_segment_lease()
+        harness.authority_factory.bind_segment_tool_catalog(
+            harness.context.authority,
+            authority_metadata_view=bundle.authority_view(),
+            catalog_lease=catalog_lease,
+        )
+        spec = next(spec for spec in instrumented if spec.name == case["tool_name"])
         tool_call = ToolCall(
             id="golden-call",
             name=case["tool_name"],
             args=_canonical_arguments(case["arguments"]),
         )
         prepared = prepare_call(
-            catalog,
+            catalog_lease,
             harness.context,
             tool_call,
             call_identity=harness.prepare_identity(tool_call),
@@ -382,13 +407,19 @@ def execute_case(
                 approval_factory.register_tool_execution_context(
                     approval_context, authority=authority
                 )
+                approval_lease = bundle.open_segment_lease()
+                approval_factory.bind_segment_tool_catalog(
+                    authority,
+                    authority_metadata_view=bundle.authority_view(),
+                    catalog_lease=approval_lease,
+                )
                 prepare_identity = approval_factory.create_approved_write_prepare_identity(
                     authority,
                     approval_context=approval_context,
                     request_identity=object(),
                 )
                 approved = prepare_call(
-                    catalog,
+                    approval_lease,
                     approval_context,
                     tool_call,
                     call_identity=prepare_identity,
@@ -416,9 +447,7 @@ def execute_case(
             with harness.session_factory() as session:
                 projection = {
                     "table": table,
-                    "row_count": int(
-                        session.scalar(select(func.count()).select_from(model)) or 0
-                    ),
+                    "row_count": int(session.scalar(select(func.count()).select_from(model)) or 0),
                 }
         return normalize_visible(visible), projection, compatibility_handler_calls
     finally:

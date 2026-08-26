@@ -14,6 +14,8 @@
 
 **Task 11 scope stop:** Product work stopped after the RED suites exposed omissions in the frozen Task 11 scope. The proof-only final `LegacyDeterministicCatalog` is constructed and annotated by `pilot_runtime/legacy_route.py`, while `pilot_runtime/composition.py` still injects the raw Catalog factory and `tool_specs/legacy.py` still defines it; none of these direct production consumers was listed. Deleting the raw-Pending Catalog without migrating all three would require a forbidden forwarding alias or dead dependency façade. The Task 11 GREEN command also runs all of `tests/pilot_runtime`, both Write Operation suites, and the Task 7-8 Legacy metadata suites. `test_deterministic.py`, `test_legacy_initial_route.py`, and `test_legacy_registry_composition.py` still assert the deliberately unpublished raw-Pending Catalog contract; `test_write_operations.py` and `test_write_operation_acceptance_matrix.py` were frozen for Task 12, while the omitted baseline direct consumer `test_persistence.py` was not present in the previous global allowlist. All three directly call the Pending repository methods whose raw claim overload is removed in this Task, so a required exact route-handle signature would make GREEN impossible without an optional compatibility path. Task 11 now owns these nine exact migrations so the proof-only and Pending persistence cutovers can be atomic and compatibility-free. Task 12 may still revisit repeated files for its separate mechanical deletion gates. This scope-only revision does not change the approved design, fixed identities, 25/3/4 boundary, protocol seals, or Golden assets.
 
+**Task 11 second scope stop:** Product work stopped again before retaining any production edit when the proof-only cutover removed the old `build_static_legacy_adapter_catalog` name. `test_legacy_confirmation_proof.py` and `test_production_bundle.py` are both in the required Task 11 GREEN matrix and directly call or monkeypatch that old builder, but neither test was in the frozen Task 11 file list. Leaving the old name reachable would be the compatibility facade expressly forbidden by this Task, while renaming it without migrating both direct consumers makes GREEN impossible. Independent scope review then found two Pilot Runtime persistence fakes selected by GREEN but absent from the Task file list, one Agent Loop confirmation test that directly passes the removed raw Catalog to `prepare_pending_action()`, and six Authority/extraction suites that directly create primary Ledger rows without the exact sealed route required by this Task. Task 11 now owns these eleven exact test migrations and runs each in RED and GREEN. No production path, public contract, fixed identity, 25/3/4 boundary, protocol seal, or Golden asset changes as a result of this scope-only correction.
+
 ---
 
 ## 0. Fixed workspace, baseline, and execution rules
@@ -960,21 +962,32 @@ git commit -m "refactor: AI 统一工具授权与执行句柄"
 - Modify: `src/offerpilot/chat_transport.py`
 - Modify: `src/offerpilot/api.py`
 - Modify: `tests/tool_metadata/test_presentation_bindings.py`
+- Modify: `tests/tool_metadata/test_legacy_confirmation_proof.py`
+- Modify: `tests/tool_metadata/test_production_bundle.py`
 - Create: `tests/tool_metadata/test_pending_routes.py`
 - Create: `tests/tool_metadata/test_runtime_cutover.py`
 - Modify: `tests/tool_authority/test_legacy_replay_preconversation.py`
+- Modify: `tests/tool_authority/test_approval_authority_resolver.py`
+- Modify: `tests/tool_authority/test_approval_transaction.py`
+- Modify: `tests/tool_authority/test_ledger_preheader.py`
 - Modify: `tests/tool_authority/test_pending_claim.py`
 - Modify: `tests/tool_authority/test_pending_claim_reissue.py`
+- Modify: `tests/tool_authority/test_reject_privacy.py`
 - Modify: `tests/tool_authority/test_replay_topology.py`
+- Modify: `tests/tool_authority/test_task13_production_approval.py`
+- Modify: `tests/agent_loop/test_confirmation.py`
 - Modify: `tests/pilot_runtime/test_confirmation.py`
 - Modify: `tests/pilot_runtime/test_confirmation_cutover.py`
 - Modify: `tests/pilot_runtime/test_deterministic.py`
 - Modify: `tests/pilot_runtime/test_persistence.py`
+- Modify: `tests/pilot_runtime/test_start_turn.py`
+- Modify: `tests/pilot_runtime/test_stream_preparation.py`
 - Modify: `tests/tool_pipeline/test_legacy.py`
 - Modify: `tests/tool_metadata/test_legacy_initial_route.py`
 - Modify: `tests/tool_metadata/test_legacy_registry_composition.py`
 - Modify: `tests/test_chat_repository.py`
 - Modify: `tests/test_chat_api.py`
+- Modify: `tests/test_pilot_runtime_extraction_gate.py`
 - Modify: `tests/test_write_operations.py`
 - Modify: `tests/test_write_operation_acceptance_matrix.py`
 
@@ -998,7 +1011,7 @@ Compensation -> any child: rejected
 - [ ] **Step 2: Verify RED**
 
 ```powershell
-uv run pytest tests/tool_metadata/test_presentation_bindings.py tests/tool_metadata/test_pending_routes.py tests/tool_metadata/test_runtime_cutover.py tests/tool_metadata/test_legacy_initial_route.py tests/tool_metadata/test_legacy_registry_composition.py tests/tool_authority/test_legacy_replay_preconversation.py tests/tool_authority/test_pending_claim.py tests/tool_authority/test_pending_claim_reissue.py tests/tool_authority/test_replay_topology.py tests/pilot_runtime/test_confirmation.py tests/pilot_runtime/test_confirmation_cutover.py tests/pilot_runtime/test_deterministic.py tests/pilot_runtime/test_persistence.py tests/tool_pipeline/test_legacy.py tests/test_chat_repository.py tests/test_chat_api.py tests/test_write_operations.py tests/test_write_operation_acceptance_matrix.py -q
+uv run pytest tests/tool_metadata/test_presentation_bindings.py tests/tool_metadata/test_pending_routes.py tests/tool_metadata/test_runtime_cutover.py tests/tool_metadata/test_legacy_initial_route.py tests/tool_metadata/test_legacy_confirmation_proof.py tests/tool_metadata/test_legacy_registry_composition.py tests/tool_metadata/test_production_bundle.py tests/tool_authority/test_legacy_replay_preconversation.py tests/tool_authority/test_approval_authority_resolver.py tests/tool_authority/test_approval_transaction.py tests/tool_authority/test_ledger_preheader.py tests/tool_authority/test_pending_claim.py tests/tool_authority/test_pending_claim_reissue.py tests/tool_authority/test_reject_privacy.py tests/tool_authority/test_replay_topology.py tests/tool_authority/test_task13_production_approval.py tests/agent_loop/test_confirmation.py tests/pilot_runtime/test_confirmation.py tests/pilot_runtime/test_confirmation_cutover.py tests/pilot_runtime/test_deterministic.py tests/pilot_runtime/test_persistence.py tests/pilot_runtime/test_start_turn.py tests/pilot_runtime/test_stream_preparation.py tests/tool_pipeline/test_legacy.py tests/test_chat_repository.py tests/test_chat_api.py tests/test_pilot_runtime_extraction_gate.py tests/test_write_operations.py tests/test_write_operation_acceptance_matrix.py -q
 ```
 
 - [ ] **Step 3: Perform the single persistence/runtime route cutover**
@@ -1018,7 +1031,7 @@ Terminal replay, delivery recovery, and fallback initialize neither Provider, Pr
 - [ ] **Step 4: Verify integrated GREEN**
 
 ```powershell
-uv run pytest tests/tool_metadata/test_presentation_bindings.py tests/tool_metadata/test_pending_routes.py tests/tool_metadata/test_runtime_cutover.py tests/tool_metadata/test_production_bundle.py tests/tool_metadata/test_operation_port.py tests/tool_metadata/test_legacy_initial_route.py tests/tool_metadata/test_legacy_confirmation_proof.py tests/tool_metadata/test_legacy_registry_composition.py tests/agent_loop tests/pilot_runtime tests/tool_pipeline/test_legacy.py tests/tool_authority/test_legacy_replay_preconversation.py tests/tool_authority/test_pending_claim.py tests/tool_authority/test_pending_claim_reissue.py tests/tool_authority/test_replay_topology.py tests/tool_authority/test_pending_replay_decoder.py tests/test_chat_repository.py tests/test_chat_api.py tests/test_write_operations.py tests/test_write_operation_acceptance_matrix.py -q
+uv run pytest tests/tool_metadata/test_presentation_bindings.py tests/tool_metadata/test_pending_routes.py tests/tool_metadata/test_runtime_cutover.py tests/tool_metadata/test_production_bundle.py tests/tool_metadata/test_operation_port.py tests/tool_metadata/test_legacy_initial_route.py tests/tool_metadata/test_legacy_confirmation_proof.py tests/tool_metadata/test_legacy_registry_composition.py tests/agent_loop tests/pilot_runtime tests/tool_pipeline/test_legacy.py tests/tool_authority/test_legacy_replay_preconversation.py tests/tool_authority/test_approval_authority_resolver.py tests/tool_authority/test_approval_transaction.py tests/tool_authority/test_ledger_preheader.py tests/tool_authority/test_pending_claim.py tests/tool_authority/test_pending_claim_reissue.py tests/tool_authority/test_reject_privacy.py tests/tool_authority/test_replay_topology.py tests/tool_authority/test_task13_production_approval.py tests/tool_authority/test_pending_replay_decoder.py tests/test_chat_repository.py tests/test_chat_api.py tests/test_pilot_runtime_extraction_gate.py tests/test_write_operations.py tests/test_write_operation_acceptance_matrix.py -q
 $taskPythonPaths = @(Get-Content -LiteralPath "$env:TEMP\offerpilot-tool-metadata-convergence-gate\task-11.txt" | Where-Object { $_ -like '*.py' })
 uv run ruff check -- $taskPythonPaths
 uv run ruff format --check -- $taskPythonPaths

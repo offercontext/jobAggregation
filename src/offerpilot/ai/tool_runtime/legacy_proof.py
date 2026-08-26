@@ -1778,6 +1778,38 @@ class LegacyRouteProofRegistry(TransientToolRuntimeValue):
                     prepared_identity=entry.prepared_identity,
                 )
 
+    def _require_route_identity(
+        self,
+        *,
+        consumer_port: LegacyRouteProofConsumerPort,
+        handle: object,
+    ) -> tuple[int, str, str]:
+        """Verify one proof-derived handle without borrowing args or executing it."""
+
+        with self._lock:
+            self._require_integrity()
+            consumer_port._require_port(self, self._consumer_token)
+            if consumer_port is not self._consumer_port:
+                raise ValueError("Legacy route handle has the wrong consumer Port")
+            self._require_handle_integrity(handle)
+            entry = self._handles.get(handle)
+            if entry is None or entry.handle is not handle:
+                raise ValueError("Legacy route handle is revoked or has the wrong Registry")
+            self._require_entry_integrity(entry)
+            entry.issuance_lease._require_live(
+                lock=self._lock,
+                runtime_container_token=self._runtime_container_token,
+            )
+            if entry.state != "resolved":
+                raise ValueError("Legacy route handle is revoked or unresolved")
+            adapter = entry.adapter
+            adapter.require_integrity()
+            return (
+                adapter.ordinal,
+                adapter.name,
+                cast(str, entry.safe_metadata["route_source"]),
+            )
+
     def _revoke_lease(self, issuance_lease: LegacyRouteIssuanceLease) -> None:
         seal = getattr(self, "_integrity_seal", ())
         sealed_lock = seal[0] if type(seal) is tuple and len(seal) == 15 else None
@@ -1980,6 +2012,14 @@ class LegacyRouteProofConsumerPort(_SealedValue):
 
     def consume(self, proof: LegacyRouteProof) -> object:
         return self._proof_registry._consume(consumer_port=self, proof=proof)
+
+    def require_route_identity(self, handle: object) -> tuple[int, str, str]:
+        """Validate a live route and return only its closed routing identity."""
+
+        return self._proof_registry._require_route_identity(
+            consumer_port=self,
+            handle=handle,
+        )
 
     def execute(self, handle: object, context: object) -> str:
         return self._proof_registry._execute(

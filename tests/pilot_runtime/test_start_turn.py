@@ -44,9 +44,10 @@ from offerpilot.ai.agent_loop import NewTurnSeed, SegmentSurfaceGate, build_segm
 from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
 from offerpilot.ai.tool_authority.contracts import SegmentExecutionAuthority
 from offerpilot.ai.tool_authority.policy import validate_startup_policy
+from offerpilot.ai.tool_runtime.catalog import compile_tool_metadata_manifest
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
+from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
-from offerpilot.context_projector.selector import DEPENDENCY_POLICY_V1
 from offerpilot.ai.tool_runtime.contracts import ToolFailure
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.api import _confirmation_token as baseline_confirmation_token
@@ -60,6 +61,7 @@ from offerpilot.pilot_runtime.persistence import (
     PersistenceResult,
     PersistenceStatus,
 )
+from offerpilot.pilot_runtime.compensation import prepare_compensation_handler_components
 from offerpilot.repositories.agent_runs import AgentRunRepository
 from offerpilot.repositories.chat import ChatRepository
 from offerpilot.repositories.agent_runs import StartRunCommand
@@ -75,6 +77,19 @@ _AUTHORITY_SESSIONS = init_database(
     Path(tempfile.mkdtemp(prefix="offerpilot-pilot-authority-")) / "authority.db"
 )
 _AUTHORITY_POLICY = validate_startup_policy(MODEL_TOOL_CATALOG.authority_manifest)
+
+
+def _metadata_bundle() -> ToolMetadataBundleV1:
+    manifest = compile_tool_metadata_manifest(MODEL_TOOL_CATALOG.specs)
+    return ToolMetadataBundleV1(
+        typed_catalog=MODEL_TOOL_CATALOG,
+        manifest=manifest,
+        legacy_boundary=manifest.to_dict()["legacy_boundary"],  # type: ignore[arg-type]
+        compensation=prepare_compensation_handler_components().metadata_projection(),
+    )
+
+
+_METADATA_BUNDLE = _metadata_bundle()
 
 
 class _Phases:
@@ -483,7 +498,10 @@ def _runtime(
         return ResolvedPolicyCatalog(
             catalog=resolved_catalog,
             policy=_AUTHORITY_POLICY,
-            dependency_policy=DEPENDENCY_POLICY_V1,
+            dependency_policy=_METADATA_BUNDLE.discovery_view().policy,
+            provider_metadata_view=_METADATA_BUNDLE.provider_view(),
+            discovery_metadata_view=_METADATA_BUNDLE.discovery_view(),
+            authority_metadata_view=_METADATA_BUNDLE.authority_view(),
         )
 
     def resolve_segment(
@@ -519,7 +537,9 @@ def _runtime(
             catalog=getattr(policy, "catalog"),
             context=getattr(segment, "context"),
             authority=getattr(segment, "authority"),
-            dependency_policy=getattr(policy, "dependency_policy"),
+            provider_view=getattr(policy, "provider_metadata_view"),
+            discovery_view=getattr(policy, "discovery_metadata_view"),
+            authority_metadata_view=getattr(policy, "authority_metadata_view"),
             policy=getattr(policy, "policy"),
         )
 
@@ -609,7 +629,10 @@ def test_sync_segment_failure_stops_before_policy_catalog_and_side_effects() -> 
         return ResolvedPolicyCatalog(
             catalog=MODEL_TOOL_CATALOG,
             policy=_AUTHORITY_POLICY,
-            dependency_policy=DEPENDENCY_POLICY_V1,
+            dependency_policy=_METADATA_BUNDLE.discovery_view().policy,
+            provider_metadata_view=_METADATA_BUNDLE.provider_view(),
+            discovery_metadata_view=_METADATA_BUNDLE.discovery_view(),
+            authority_metadata_view=_METADATA_BUNDLE.authority_view(),
         )
 
     runtime, persistence, journal = _runtime(
@@ -657,7 +680,10 @@ def test_sync_live_policy_drift_closes_segment_before_provider_or_user() -> None
         return ResolvedPolicyCatalog(
             catalog=MODEL_TOOL_CATALOG,
             policy=drifted,
-            dependency_policy=DEPENDENCY_POLICY_V1,
+            dependency_policy=_METADATA_BUNDLE.discovery_view().policy,
+            provider_metadata_view=_METADATA_BUNDLE.provider_view(),
+            discovery_metadata_view=_METADATA_BUNDLE.discovery_view(),
+            authority_metadata_view=_METADATA_BUNDLE.authority_view(),
         )
 
     runtime, persistence, journal = _runtime(
@@ -698,7 +724,10 @@ def test_sync_policy_spy_sees_exact_unbound_segment_after_segment_phase() -> Non
         return ResolvedPolicyCatalog(
             catalog=MODEL_TOOL_CATALOG,
             policy=_AUTHORITY_POLICY,
-            dependency_policy=DEPENDENCY_POLICY_V1,
+            dependency_policy=_METADATA_BUNDLE.discovery_view().policy,
+            provider_metadata_view=_METADATA_BUNDLE.provider_view(),
+            discovery_metadata_view=_METADATA_BUNDLE.discovery_view(),
+            authority_metadata_view=_METADATA_BUNDLE.authority_view(),
         )
 
     runtime, _persistence, _journal = _runtime(phases, policy_resolver=policy_spy)
@@ -987,7 +1016,9 @@ def test_real_run_recorder_factory_accepts_runtime_builder_and_records_terminal_
             catalog=getattr(policy, "catalog"),
             context=getattr(segment, "context"),
             authority=getattr(segment, "authority"),
-            dependency_policy=getattr(policy, "dependency_policy"),
+            provider_view=getattr(policy, "provider_metadata_view"),
+            discovery_view=getattr(policy, "discovery_metadata_view"),
+            authority_metadata_view=getattr(policy, "authority_metadata_view"),
             policy=getattr(policy, "policy"),
         )
 
@@ -998,7 +1029,10 @@ def test_real_run_recorder_factory_accepts_runtime_builder_and_records_terminal_
             policy_catalog_resolver=lambda request, conversation, source: ResolvedPolicyCatalog(
                 catalog=MODEL_TOOL_CATALOG,
                 policy=_AUTHORITY_POLICY,
-                dependency_policy=DEPENDENCY_POLICY_V1,
+                dependency_policy=_METADATA_BUNDLE.discovery_view().policy,
+                provider_metadata_view=_METADATA_BUNDLE.provider_view(),
+                discovery_metadata_view=_METADATA_BUNDLE.discovery_view(),
+                authority_metadata_view=_METADATA_BUNDLE.authority_view(),
             ),
             segment_context_resolver=lambda request, conversation, source, recorder: _real_segment(
                 conversation, recorder, MODEL_TOOL_CATALOG
@@ -1784,8 +1818,10 @@ def test_final_projection_redacts_internal_tool_names_and_uses_safe_write_error(
             return PersistenceResult(PersistenceStatus.PERSISTED, message_id=12)
 
     persistence = CapturingPersistence(phases)
+    write_spec = MODEL_TOOL_CATALOG.resolve("update_application_status")
+    assert write_spec is not None
     write_record = SimpleNamespace(
-        prepared=SimpleNamespace(spec=SimpleNamespace(kind="write")),
+        prepared=SimpleNamespace(spec=write_spec),
         outcome=SimpleNamespace(code="company_required", compatibility_detail="company_required"),
     )
     result_value = AgentTurnResult(

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any, Callable
+from typing import Any, Callable, NoReturn
 
 import pytest
 
+import offerpilot.ai.agent_loop as agent_loop_module
+import offerpilot.context_projector.selector as selector_module
 from offerpilot.ai.agent_contracts import (
     AgentAssistantDelta,
     AgentToolCall,
@@ -33,12 +35,20 @@ from offerpilot.ai.tool_runtime.contracts import (
     ToolFailure,
     ToolSuccess,
 )
-from offerpilot.ai.tool_runtime.catalog import ToolCatalog
+from offerpilot.ai.tool_runtime.catalog import ToolCatalog, compile_tool_metadata_manifest
+from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.ai.types import Assistant, Message, ToolCall
 from offerpilot.agent_runtime.journal import NullRunRecorder
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.config import AIProviderProfile
 from offerpilot.context_projector.contracts import ProjectionError
-from offerpilot.context_projector.selector import DEPENDENCY_POLICY_V1
+from offerpilot.context_projector.gateway import (
+    AgentProviderGatewaySession,
+    FrozenProviderExecutionChain,
+    SingleCandidateAgentTransport,
+)
+from offerpilot.context_projector.projector import ModelSurfaceProjector
+from offerpilot.pilot_runtime.compensation import prepare_compensation_handler_components
 
 from .helpers import RecordingEventSink, ScriptedModel, ToolDefinition, runtime
 
@@ -169,10 +179,7 @@ def invocation(
             run_recorder=recorder,
             operation_executor=execute_operation,
         )
-        segment_catalog = ToolCatalog(
-            tuple(catalog.specs),
-            expected_names=tuple(spec.name for spec in catalog.specs),
-        )
+        segment_catalog = catalog
         segment_context = segment_origin.with_runtime_dependencies(
             run_recorder=_DelegatingRecorder(recorder),
             operation_executor=None,
@@ -187,13 +194,10 @@ def invocation(
             Message(role="tool", content="已写入", tool_call_id=pending.tool_call_id),
             Message(role="user", content="继续"),
         )
-        segment_gate = build_segment_surface_gate(
+        segment_gate, _segment_bundle = _task9_surface_gate(
+            segment_catalog,
+            segment_context,
             segment_messages,
-            catalog=segment_catalog,
-            context=segment_context,
-            authority=segment_context.authority,
-            dependency_policy=DEPENDENCY_POLICY_V1,
-            policy=validate_startup_policy(segment_catalog.authority_manifest),
         )
         segment = ApprovedContinuationSegment(
             messages=segment_messages,
@@ -211,14 +215,7 @@ def invocation(
             operation_executor=None,
         )
     surface_gate = (
-        build_segment_surface_gate(
-            resolved_seed.messages,
-            catalog=catalog,
-            context=context,
-            authority=context.authority,
-            dependency_policy=DEPENDENCY_POLICY_V1,
-            policy=validate_startup_policy(catalog.authority_manifest),
-        )
+        _task9_surface_gate(catalog, context, tuple(resolved_seed.messages))[0]
         if isinstance(resolved_seed, NewTurnSeed)
         else None
     )
@@ -260,7 +257,7 @@ class RecordingJournal(NullRunRecorder):
         super().__init__()
         self.events: list[object] = []
 
-    def capture_context(self, *_args: object, **_kwargs: object) -> str:
+    def capture_surface_context(self, *_args: object, **_kwargs: object) -> str:
         return f"snapshot-{len(self.events) + 1}"
 
     def append_event(self, event: object) -> None:
@@ -770,6 +767,49 @@ def test_approval_authority_switches_to_fresh_segment_model_loop() -> None:
     ] == ["write-1"]
 
 
+def test_approved_continuation_rejects_a_replacement_catalog() -> None:
+    phases: list[str] = []
+    pending = PendingAction(
+        "write-1",
+        "update_application_status",
+        '{"id":1,"status":"applied"}',
+        "确认",
+        "operation-1",
+    )
+    port = ApprovedPort(pending, phases)
+    continuation_model = ScriptedModel(Assistant(content="不应调用"))
+    base = invocation(
+        continuation_model,
+        (ToolDefinition("update_application_status", kind="write"),),
+        seed=ApprovedWriteSeed(port),
+    )
+    segment = port._segment
+    assert segment is not None
+    replacement = ToolCatalog(
+        tuple(base.catalog.specs),
+        expected_names=tuple(spec.name for spec in base.catalog.specs),
+    )
+    _, replacement_context = runtime(ToolDefinition("update_application_status", kind="write"))
+    replacement_gate, _ = _task9_surface_gate(
+        replacement,
+        replacement_context,
+        segment.messages,
+    )
+    port.set_continuation_segment(
+        replace(
+            segment,
+            catalog=replacement,
+            tool_context=replacement_context,
+            surface_gate=replacement_gate,
+        )
+    )
+
+    with pytest.raises(ProjectionError, match="[Bb]undle catalog"):
+        AgentLoopRunner().run(base)
+
+    assert continuation_model.calls == 0
+
+
 def test_approved_activation_failure_does_not_repeat_origin_executor() -> None:
     phases: list[str] = []
     executed: list[str] = []
@@ -1123,14 +1163,7 @@ def test_mixed_known_and_unknown_surface_tool_calls_fail_closed_before_events_or
         event_sink=events,
         runtime_signal_sink=None,
         cancel_check=None,
-        surface_gate=build_segment_surface_gate(
-            seed.messages,
-            catalog=MODEL_TOOL_CATALOG,
-            context=context,
-            authority=context.authority,
-            dependency_policy=DEPENDENCY_POLICY_V1,
-            policy=validate_startup_policy(MODEL_TOOL_CATALOG.authority_manifest),
-        ),
+        surface_gate=_task9_surface_gate(MODEL_TOOL_CATALOG, context, seed.messages)[0],
     )
 
     from offerpilot.context_projector.contracts import ProjectionError
@@ -1208,3 +1241,211 @@ def test_streaming_unknown_surface_tool_drops_buffered_delta_before_binding() ->
 
     assert events.events == []
     assert executed == []
+
+
+def _task9_metadata_bundle(catalog: ToolCatalog) -> ToolMetadataBundleV1:
+    manifest = compile_tool_metadata_manifest(catalog.specs)
+    projection = manifest.to_dict()
+    return ToolMetadataBundleV1(
+        typed_catalog=catalog,
+        manifest=manifest,
+        legacy_boundary=projection["legacy_boundary"],  # type: ignore[arg-type]
+        compensation=prepare_compensation_handler_components().metadata_projection(),
+    )
+
+
+def _task9_surface_gate(
+    catalog: ToolCatalog,
+    context: ToolExecutionContext,
+    messages: tuple[Message, ...],
+) -> tuple[object, ToolMetadataBundleV1]:
+    bundle = _task9_metadata_bundle(catalog)
+    gate = build_segment_surface_gate(
+        messages,
+        catalog=catalog,
+        context=context,
+        authority=context.authority,
+        provider_view=bundle.provider_view(),
+        discovery_view=bundle.discovery_view(),
+        authority_metadata_view=bundle.authority_view(),
+        policy=validate_startup_policy(catalog.authority_manifest),
+    )
+    return gate, bundle
+
+
+def test_segment_surface_gate_consumes_same_bundle_views_and_selector_result_directly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog, context = runtime()
+    bundle = _task9_metadata_bundle(catalog)
+    provider_view = bundle.provider_view()
+    discovery_view = bundle.discovery_view()
+    authority_view = bundle.authority_view()
+    signals = selector_module.ToolSelectionSignals(
+        page_kind="offers",
+        current_request="比较 offer",
+    )
+    selection_type = getattr(selector_module, "ToolSelectionResult", None)
+    assert selection_type is not None, "Task 9 must publish the final ToolSelectionResult"
+    expected = selector_module.select_tools(discovery_view, authority_view, signals)
+    assert type(expected) is selection_type
+    selector_calls: list[tuple[object, object, object]] = []
+
+    def select_once(
+        actual_discovery: object,
+        actual_authority: object,
+        actual_signals: object,
+    ) -> object:
+        selector_calls.append((actual_discovery, actual_authority, actual_signals))
+        return expected
+
+    def forbidden_catalog_rebuild(_self: object) -> NoReturn:
+        raise AssertionError("Agent Loop must consume ToolSelectionResult provider contracts")
+
+    monkeypatch.setattr(agent_loop_module, "select_tools", select_once)
+    monkeypatch.setattr(ToolCatalog, "provider_contracts", forbidden_catalog_rebuild)
+    messages = (
+        Message(
+            role="user",
+            content="比较 offer",
+            surface_page_kind="offers",
+        ),
+    )
+    gate = build_segment_surface_gate(
+        messages,
+        catalog=catalog,
+        context=context,
+        authority=context.authority,
+        provider_view=provider_view,
+        discovery_view=discovery_view,
+        authority_metadata_view=authority_view,
+        policy=validate_startup_policy(catalog.authority_manifest),
+    )
+
+    assert selector_calls == [(discovery_view, authority_view, signals)]
+    assert gate.provider_view is provider_view
+    assert gate.discovery_view is discovery_view
+    assert gate.authority_metadata_view is authority_view
+    assert gate.selection is expected
+    assert gate.selection.provider_contracts is expected.provider_contracts
+    assert gate.selection.provider_envelope_fingerprint == expected.provider_envelope_fingerprint
+    assert provider_view.bundle_instance_token is discovery_view.bundle_instance_token
+    assert discovery_view.bundle_instance_token is authority_view.bundle_instance_token
+
+
+def test_unexposed_tool_fails_before_dispatcher_with_bundle_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog, context = runtime(
+        ToolDefinition("delete_note", kind="write", executor=lambda raw: raw),
+    )
+    messages = (Message(role="user", content="比较 offer", surface_page_kind="offers"),)
+    gate, _bundle = _task9_surface_gate(catalog, context, messages)
+    dispatcher_calls: list[str] = []
+
+    def forbidden_dispatch(*_args: object, **_kwargs: object) -> NoReturn:
+        dispatcher_calls.append("prepare_call")
+        raise AssertionError("an unexposed tool reached Dispatcher")
+
+    def forbidden_catalog_rebuild(_self: object) -> NoReturn:
+        raise AssertionError("Agent Loop rebuilt Provider contracts from Catalog")
+
+    monkeypatch.setattr(agent_loop_module, "prepare_call", forbidden_dispatch)
+    monkeypatch.setattr(ToolCatalog, "provider_contracts", forbidden_catalog_rebuild)
+    invocation_value = AgentLoopInvocation(
+        seed=NewTurnSeed(messages),
+        model=ScriptedModel(
+            Assistant(tool_calls=[ToolCall("hidden", "delete_note", '{"id":1}')]),
+        ),
+        catalog=catalog,
+        tool_context=context,
+        auto_approve=False,
+        max_iterations=2,
+        run_recorder=NullRunRecorder(),
+        event_sink=None,
+        runtime_signal_sink=None,
+        cancel_check=None,
+        surface_gate=gate,
+    )
+
+    with pytest.raises(ProjectionError, match="unknown_tool|not_exposed|surface"):
+        AgentLoopRunner().run(invocation_value)
+    assert dispatcher_calls == []
+
+
+def test_same_model_call_fallback_reuses_one_frozen_provider_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog, context = runtime()
+    messages = (Message(role="user", content="比较 offer", surface_page_kind="offers"),)
+    gate, _bundle = _task9_surface_gate(catalog, context, messages)
+    expected_contracts = gate.selection.provider_contracts
+    attempted_tools: list[tuple[object, ...]] = []
+    attempted_candidates: list[str] = []
+    chain = FrozenProviderExecutionChain.freeze(
+        [
+            AIProviderProfile(id="primary", api_key="a", base_url="https://a.test/v1"),
+            AIProviderProfile(id="fallback", api_key="b", base_url="https://b.test/v1"),
+        ]
+    )
+
+    def complete(*_args: object) -> Assistant:
+        raise AssertionError("Agent Loop uses the deferred stream boundary")
+
+    def stream(
+        candidate: object,
+        _messages: object,
+        tools: object,
+        _emit: object,
+    ) -> Assistant:
+        assert isinstance(tools, list)
+        attempted_candidates.append(str(getattr(candidate, "provider_id")))
+        attempted_tools.append(tuple(tools))
+        if len(attempted_candidates) == 1:
+            raise ConnectionError("primary unavailable")
+        return Assistant(content="fallback success")
+
+    transport = SingleCandidateAgentTransport(complete, stream)
+
+    class FallbackSurfaceModel:
+        def new_agent_provider_session(self) -> AgentProviderGatewaySession:
+            return AgentProviderGatewaySession(chain, transport)
+
+        def complete_agent_surface(self, *_args: object, **_kwargs: object) -> NoReturn:
+            raise AssertionError("the per-call gateway wrapper must own completion")
+
+        def stream_agent_surface(self, *_args: object, **_kwargs: object) -> NoReturn:
+            raise AssertionError("the per-call gateway wrapper must own streaming")
+
+    project_calls: list[object] = []
+    original_project = ModelSurfaceProjector.project
+
+    def project_once(self: object, request: object) -> object:
+        project_calls.append(request)
+        return original_project(self, request)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(ModelSurfaceProjector, "project", project_once)
+    invocation_value = AgentLoopInvocation(
+        seed=NewTurnSeed(messages),
+        model=FallbackSurfaceModel(),  # type: ignore[arg-type]
+        catalog=catalog,
+        tool_context=context,
+        auto_approve=False,
+        max_iterations=2,
+        run_recorder=NullRunRecorder(),
+        event_sink=None,
+        runtime_signal_sink=None,
+        cancel_check=None,
+        surface_gate=gate,
+    )
+    result = AgentLoopRunner().run(invocation_value)
+
+    assert result.reply == "fallback success"
+    assert attempted_candidates == ["primary", "fallback"]
+    assert len(project_calls) == 1
+    assert len(attempted_tools) == 2
+    assert all(
+        len(tools) == len(expected_contracts)
+        and all(actual is expected for actual, expected in zip(tools, expected_contracts))
+        for tools in attempted_tools
+    )

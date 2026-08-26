@@ -17,8 +17,10 @@ import pytest
 from offerpilot.ai.agent_contracts import AgentTurnResult, PendingAction
 from offerpilot.ai.agent_loop import ApprovedWriteSeed
 from offerpilot.ai.tool_authority.fingerprint import authorization_scope_fingerprint
-from offerpilot.ai.tool_runtime.catalog import ToolCatalog
+from offerpilot.ai.tool_authority.policy import validate_startup_policy
+from offerpilot.ai.tool_runtime.catalog import ToolCatalog, compile_tool_metadata_manifest
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
+from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.ai.tool_runtime.policy_types import ToolCapability
 from offerpilot.ai.tool_authority import (
     ApprovalExecutionAuthority,
@@ -51,6 +53,7 @@ from offerpilot.chat_transport import SseAgentExecutionHost, outcome_http_payloa
 from offerpilot.db import init_database
 from offerpilot.models import Conversation
 from offerpilot.pilot_runtime.persistence import ChatPersistenceCoordinator
+from offerpilot.pilot_runtime.compensation import prepare_compensation_handler_components
 from offerpilot.repositories.application_events import ApplicationEventsRepository
 from offerpilot.repositories.applications import ApplicationsRepository
 from offerpilot.repositories.chat import ChatRepository
@@ -68,6 +71,7 @@ from offerpilot.pilot_runtime.contracts import (
     PreparedStreamExecution,
     RuntimeFailureOutcome,
     RuntimeTransportContext,
+    StartTurnRequest,
     StatusEvent,
     ToolCallEvent,
     ToolResultEvent,
@@ -122,22 +126,65 @@ def test_confirmation_approved_port_is_transient_and_does_not_leak_session() -> 
         json.dumps(port)
 
 
-def test_policy_resolver_rebuilds_an_independent_segment_catalog() -> None:
-    resolver = composition_module._PolicyCatalogResolver(MODEL_TOOL_CATALOG)
-
-    fresh = resolver._fresh_segment_catalog(MODEL_TOOL_CATALOG)
-
-    assert fresh is not MODEL_TOOL_CATALOG
-    assert tuple(spec.name for spec in fresh.specs) == tuple(
-        spec.name for spec in MODEL_TOOL_CATALOG.specs
+def test_policy_resolver_reuses_the_bundle_owned_segment_catalog(tmp_path: Any) -> None:
+    manifest = compile_tool_metadata_manifest(MODEL_TOOL_CATALOG.specs)
+    projection = manifest.to_dict()
+    bundle = ToolMetadataBundleV1(
+        typed_catalog=MODEL_TOOL_CATALOG,
+        manifest=manifest,
+        legacy_boundary=cast(dict[str, object], projection["legacy_boundary"]),
+        compensation=prepare_compensation_handler_components().metadata_projection(),
     )
-    assert fresh.provider_contracts() == MODEL_TOOL_CATALOG.provider_contracts()
-    assert fresh.authority_manifest == MODEL_TOOL_CATALOG.authority_manifest
-    for original, detached in zip(MODEL_TOOL_CATALOG.specs, fresh.specs, strict=True):
-        assert detached is original
-        assert detached.metadata is original.metadata
-        assert detached.presentation is original.presentation
-        assert detached.undo_builder_binding is original.undo_builder_binding
+    provider_view = bundle.provider_view()
+    discovery_view = bundle.discovery_view()
+    authority_view = bundle.authority_view()
+    resolver = composition_module._PolicyCatalogResolver(
+        MODEL_TOOL_CATALOG,
+        provider_view=provider_view,
+        discovery_view=discovery_view,
+        authority_view=authority_view,
+    )
+
+    assert resolver._catalog is MODEL_TOOL_CATALOG
+    assert resolver._provider_view is provider_view
+    assert resolver._discovery_view is discovery_view
+    assert resolver._authority_view is authority_view
+    assert not hasattr(resolver, "_fresh_segment_catalog")
+
+    request = StartTurnRequest("catalog identity", conversation_id=7)
+    conversation = SimpleNamespace(
+        id=7,
+        context_type="workspace",
+        context_ref="",
+        mode="general",
+        scope_revision=0,
+    )
+    source = SimpleNamespace(
+        conversation_id=7,
+        context_type="workspace",
+        context_ref="",
+        mode="general",
+        scope_revision=0,
+    )
+    sessions = init_database(tmp_path / "catalog-identity.sqlite3")
+    segment = composition_module._SegmentContextResolver(
+        applications=ApplicationsRepository(sessions),
+        events=ApplicationEventsRepository(sessions),
+        notes=NotesRepository(sessions),
+        offers=OffersRepository(sessions),
+        resumes=ResumesRepository(sessions),
+        jd_analyses=JDAnalysesRepository(sessions),
+        policy_snapshot=validate_startup_policy(MODEL_TOOL_CATALOG.authority_manifest),
+    ).resolve(request, conversation, source, NullRunRecorder())
+    try:
+        resolved = resolver.resolve(request, conversation, source, segment)
+        assert resolved.catalog is bundle._typed_catalog
+        assert resolved.catalog is MODEL_TOOL_CATALOG
+    finally:
+        segment.close()
+        engine = sessions.kw.get("bind")
+        if engine is not None:
+            engine.dispose()
 
 
 def test_continuation_activation_marker_is_immutable_and_transient() -> None:

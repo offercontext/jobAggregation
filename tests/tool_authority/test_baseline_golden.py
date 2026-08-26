@@ -31,7 +31,7 @@ from offerpilot.ai.agent_loop import (
 )
 from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
 from offerpilot.ai.tool_authority.policy import validate_startup_policy
-from offerpilot.ai.tool_runtime.catalog import ToolCatalog
+from offerpilot.ai.tool_runtime.catalog import ToolCatalog, compile_tool_metadata_manifest
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.policy_types import ToolCapability
 from offerpilot.ai.tool_runtime.contracts import (
@@ -43,7 +43,10 @@ from offerpilot.ai.tool_runtime.contracts import (
     ToolSpec,
     ToolSuccess,
 )
-from offerpilot.ai.tool_runtime.metadata import ResolverImplementationBinding
+from offerpilot.ai.tool_runtime.metadata import (
+    ResolverImplementationBinding,
+    ToolMetadataBundleV1,
+)
 from offerpilot.ai.tool_runtime.pipeline import Rejected, execute_prepared, prepare_call
 from offerpilot.ai.tool_runtime.rendering import render_compatibility
 from offerpilot.ai.types import Assistant, Message, ToolCall
@@ -56,7 +59,7 @@ from offerpilot.ai.write_operations import (
     ledger_fingerprint,
 )
 from offerpilot.agent_runtime.journal import NullRunRecorder
-from offerpilot.context_projector.selector import DEPENDENCY_POLICY_V1
+from offerpilot.db import init_database
 from offerpilot.chat_transport import (
     encode_sse_event,
     event_sse_name,
@@ -78,19 +81,35 @@ from offerpilot.pilot_runtime.contracts import (
     StartTurnRequest,
 )
 from offerpilot.pilot_runtime.errors import RuntimeFailureCode
+from offerpilot.pilot_runtime.compensation import prepare_compensation_handler_components
 from offerpilot.pilot_runtime.event_sink import InMemoryRuntimeInvocationControl
 from offerpilot.pilot_runtime.persistence import PersistenceResult, PersistenceStatus
 from offerpilot.pilot_runtime.service import PilotRuntime, RuntimeDependencies
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.repositories.application_events import ApplicationEventsRepository
+from offerpilot.repositories.applications import ApplicationsRepository
+from offerpilot.repositories.jd import JDAnalysesRepository
+from offerpilot.repositories.notes import NotesRepository
+from offerpilot.repositories.offers import OffersRepository
+from offerpilot.repositories.resumes import ResumesRepository
 
 from .golden import BASELINE, FIXTURES, canonical_json, load_golden
-from tests.agent_loop.helpers import runtime as agent_loop_runtime
 from tests.tool_metadata.factories import (
     read_metadata,
     resolver_descriptor,
     synthetic_tool_spec,
     write_metadata,
 )
+
+
+def _metadata_bundle(catalog: ToolCatalog) -> ToolMetadataBundleV1:
+    manifest = compile_tool_metadata_manifest(catalog.specs)
+    return ToolMetadataBundleV1(
+        typed_catalog=catalog,
+        manifest=manifest,
+        legacy_boundary=manifest.to_dict()["legacy_boundary"],  # type: ignore[arg-type]
+        compensation=prepare_compensation_handler_components().metadata_projection(),
+    )
 
 
 MODEL_TOOL_NAMES = (
@@ -439,17 +458,61 @@ class _ClaimProbeError(ValueError):
     pass
 
 
-_PROBE_FACTORY = AuthorityFactory()
-_PROBE_REPOSITORY_CONTEXT = agent_loop_runtime()[1]
+_PROBE_FACTORY: AuthorityFactory | None = None
+_PROBE_SESSIONS: Any = None
+_PROBE_REPOSITORY_CONTEXT: SimpleNamespace | None = None
 _PROBE_POLICY = validate_startup_policy(MODEL_TOOL_CATALOG.authority_manifest)
 _PROBE_INVOCATIONS: dict[int, object] = {}
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _probe_repository_fixture(tmp_path_factory: pytest.TempPathFactory) -> Any:
+    global _PROBE_FACTORY, _PROBE_REPOSITORY_CONTEXT, _PROBE_SESSIONS
+    _PROBE_FACTORY = AuthorityFactory()
+    _PROBE_SESSIONS = init_database(
+        tmp_path_factory.mktemp("offerpilot-baseline-probes") / "baseline.db"
+    )
+    _PROBE_REPOSITORY_CONTEXT = SimpleNamespace(
+        applications=ApplicationsRepository(_PROBE_SESSIONS),
+        events=ApplicationEventsRepository(_PROBE_SESSIONS),
+        notes=NotesRepository(_PROBE_SESSIONS),
+        offers=OffersRepository(_PROBE_SESSIONS),
+        resumes=ResumesRepository(_PROBE_SESSIONS),
+        jd_analyses=JDAnalysesRepository(_PROBE_SESSIONS),
+    )
+    yield
+    factory = _PROBE_FACTORY
+    if factory is not None:
+        factory.close()
+        assert factory.active_count == 0
+    _PROBE_INVOCATIONS.clear()
+    _PROBE_REPOSITORY_CONTEXT = None
+    _PROBE_FACTORY = None
+    engine = _PROBE_SESSIONS.kw.get("bind")
+    if engine is not None:
+        engine.dispose()
+    _PROBE_SESSIONS = None
+
+
+def _probe_repositories() -> SimpleNamespace:
+    if _PROBE_REPOSITORY_CONTEXT is None:
+        raise AssertionError("probe repository fixture is unavailable")
+    return _PROBE_REPOSITORY_CONTEXT
+
+
+def _probe_factory() -> AuthorityFactory:
+    if _PROBE_FACTORY is None:
+        raise AssertionError("probe Authority factory is unavailable")
+    return _PROBE_FACTORY
 
 
 def _probe_context(
     *, capabilities: frozenset[ToolCapability] = frozenset()
 ) -> ToolExecutionContext:
+    repositories = _probe_repositories()
+    factory = _probe_factory()
     ordinal = len(_PROBE_INVOCATIONS)
-    authority = _PROBE_FACTORY.create_segment_authority(
+    authority = factory.create_segment_authority(
         conversation_id=1,
         conversation_scope_revision=0,
         segment_id=f"baseline-probe-segment-{ordinal}",
@@ -463,42 +526,42 @@ def _probe_context(
     )
     context = ToolExecutionContext(
         authority=authority,
-        applications=_PROBE_REPOSITORY_CONTEXT.applications,
-        events=_PROBE_REPOSITORY_CONTEXT.events,
-        notes=_PROBE_REPOSITORY_CONTEXT.notes,
-        offers=_PROBE_REPOSITORY_CONTEXT.offers,
-        resumes=_PROBE_REPOSITORY_CONTEXT.resumes,
-        jd_analyses=_PROBE_REPOSITORY_CONTEXT.jd_analyses,
+        applications=repositories.applications,
+        events=repositories.events,
+        notes=repositories.notes,
+        offers=repositories.offers,
+        resumes=repositories.resumes,
+        jd_analyses=repositories.jd_analyses,
         run_recorder=NullRunRecorder(),
     )
     runner_invocation = object()
     surface = object()
     binding = object()
     gateway = object()
-    _PROBE_FACTORY.register_runner_invocation(runner_invocation, authority=authority)
-    _PROBE_FACTORY.register_tool_execution_context(context, authority=authority)
-    build_identity = _PROBE_FACTORY.create_provider_surface_build_identity(
+    factory.register_runner_invocation(runner_invocation, authority=authority)
+    factory.register_tool_execution_context(context, authority=authority)
+    build_identity = factory.create_provider_surface_build_identity(
         authority,
         runner_invocation=runner_invocation,
         tool_context=context,
         model_call_id=f"baseline-probe-model-{ordinal}",
     )
     surface_fingerprint = "sha256:" + "e" * 64
-    _PROBE_FACTORY.register_frozen_surface(
+    factory.register_frozen_surface(
         surface,
         surface_fingerprint=surface_fingerprint,
         candidate_count=1,
         authority=authority,
         build_identity=build_identity,
     )
-    _PROBE_FACTORY.register_model_call_surface_binding(
+    factory.register_model_call_surface_binding(
         binding,
         surface=surface,
         surface_fingerprint=surface_fingerprint,
         authority=authority,
         build_identity=build_identity,
     )
-    _PROBE_FACTORY.register_gateway_session(
+    factory.register_gateway_session(
         gateway,
         authority=authority,
         build_identity=build_identity,
@@ -506,7 +569,7 @@ def _probe_context(
         surface_fingerprint=surface_fingerprint,
         model_call_surface_binding=binding,
     )
-    _PROBE_INVOCATIONS[id(context)] = _PROBE_FACTORY.create_provider_invocation_identity(
+    _PROBE_INVOCATIONS[id(context)] = factory.create_provider_invocation_identity(
         build_identity,
         surface=surface,
         surface_fingerprint=surface_fingerprint,
@@ -518,11 +581,12 @@ def _probe_context(
 
 def _probe_prepare_identity(context: ToolExecutionContext, call: ToolCall) -> object:
     invocation = cast(Any, _PROBE_INVOCATIONS[id(context)])
-    attempt_id = _PROBE_FACTORY.issue_provider_attempt(
+    factory = _probe_factory()
+    attempt_id = factory.issue_provider_attempt(
         invocation,
         candidate_ordinal=0,
     )
-    return _PROBE_FACTORY.create_new_turn_prepare_identity(
+    return factory.create_new_turn_prepare_identity(
         invocation,
         attempt_id=attempt_id,
         candidate_ordinal=0,
@@ -861,6 +925,7 @@ def _probe_approval_context(
     *,
     operation_executor: Any = None,
 ) -> tuple[ToolExecutionContext, int, str]:
+    repositories = _probe_repositories()
     revision = _pending_action_revision(pending.tool_call_id, pending.tool_name, pending.args)
     digest = _provider_arguments_digest(pending.args)
     if pending.conversation_id is None:
@@ -891,12 +956,12 @@ def _probe_approval_context(
     )
     context = ToolExecutionContext(
         authority=authority,
-        applications=_PROBE_REPOSITORY_CONTEXT.applications,
-        events=_PROBE_REPOSITORY_CONTEXT.events,
-        notes=_PROBE_REPOSITORY_CONTEXT.notes,
-        offers=_PROBE_REPOSITORY_CONTEXT.offers,
-        resumes=_PROBE_REPOSITORY_CONTEXT.resumes,
-        jd_analyses=_PROBE_REPOSITORY_CONTEXT.jd_analyses,
+        applications=repositories.applications,
+        events=repositories.events,
+        notes=repositories.notes,
+        offers=repositories.offers,
+        resumes=repositories.resumes,
+        jd_analyses=repositories.jd_analyses,
         run_recorder=NullRunRecorder(),
         operation_executor=operation_executor,
     )
@@ -950,6 +1015,7 @@ def _mismatched_claim_failure(_prepared: Any) -> ToolFailure:
 
 def _run_stale_promotion(mode: str) -> RuntimeFailureOutcome:
     spec, context, _prepared, _prepare_identity, pending = _prepared_write_probe()
+    catalog = ToolCatalog([spec], expected_names=(spec.name,))
     continuation = _PromotionContinuation(pending, mode)
 
     def operation_executor(*_args: object) -> ToolExecutionRecord[Any, Any]:
@@ -958,7 +1024,7 @@ def _run_stale_promotion(mode: str) -> RuntimeFailureOutcome:
     invocation = AgentLoopInvocation(
         seed=ApprovedWriteSeed(continuation),
         model=cast(Any, _CountingModel(Assistant(content="must not run"))),
-        catalog=ToolCatalog([spec], expected_names=(spec.name,)),
+        catalog=catalog,
         tool_context=context.with_runtime_dependencies(
             run_recorder=NullRunRecorder(),
             operation_executor=operation_executor,
@@ -1074,10 +1140,11 @@ class _DelegatingRecorder:
 def _approved_segment_for_count_harness(
     pending: PendingAction,
     model: object,
+    catalog: ToolCatalog,
 ) -> ApprovedContinuationSegment:
     """Build the strict fresh Segment required by the approved Agent Loop path."""
 
-    segment_catalog, segment_origin = agent_loop_runtime()
+    segment_origin = _probe_context(capabilities=frozenset(ToolCapability))
     segment_context = segment_origin.with_runtime_dependencies(
         run_recorder=_DelegatingRecorder(NullRunRecorder()),
         operation_executor=None,
@@ -1092,18 +1159,21 @@ def _approved_segment_for_count_harness(
         Message(role="tool", content="saved", tool_call_id=pending.tool_call_id),
         Message(role="user", content="continue"),
     )
+    metadata_bundle = _metadata_bundle(catalog)
     surface_gate = build_segment_surface_gate(
         messages,
-        catalog=segment_catalog,
+        catalog=catalog,
         context=segment_context,
         authority=segment_context.authority,
-        dependency_policy=DEPENDENCY_POLICY_V1,
-        policy=validate_startup_policy(segment_catalog.authority_manifest),
+        provider_view=metadata_bundle.provider_view(),
+        discovery_view=metadata_bundle.discovery_view(),
+        authority_metadata_view=metadata_bundle.authority_view(),
+        policy=validate_startup_policy(catalog.authority_manifest),
     )
     return ApprovedContinuationSegment(
         messages=messages,
         model=_ContinuationModel(model),
-        catalog=segment_catalog,
+        catalog=catalog,
         tool_context=segment_context,
         surface_gate=surface_gate,
     )
@@ -1144,16 +1214,14 @@ class _CountingContinuation:
         return True
 
 
-class _PromotionContinuation(_CountingContinuation):
+class _PromotionContinuation:
     def __init__(self, pending: PendingAction, mode: str) -> None:
-        super().__init__(
-            pending,
-            _approved_segment_for_count_harness(
-                pending,
-                _CountingModel(Assistant(content="done")),
-            ),
-        )
+        self._pending = pending
         self.mode = mode
+
+    @property
+    def pending(self) -> PendingAction:
+        return self._pending
 
     def claim(
         self,
@@ -1163,6 +1231,20 @@ class _PromotionContinuation(_CountingContinuation):
         if self.mode == "confirmation_claim_failed":
             return _raise_claim(prepared)
         return _mismatched_claim_failure(prepared)
+
+    def record_result(
+        self,
+        _pending: PendingAction,
+        _tool_message: Message,
+        _record: ToolExecutionRecord[Any, Any],
+    ) -> None:
+        raise AssertionError("stale claim must fail before recording a result")
+
+    def activate_continuation_segment(self) -> ApprovedContinuationSegment:
+        raise AssertionError("stale claim must fail before Segment activation")
+
+    def delivery_fence(self) -> bool:
+        raise AssertionError("stale claim must fail before the delivery fence")
 
 
 def _counted_write_spec(counter: dict[str, int]) -> ToolSpec[Any, Any]:
@@ -1209,7 +1291,7 @@ def _run_agent_call_count_case(case: str) -> dict[str, object]:
         )
         context = _probe_context(capabilities=frozenset(ToolCapability))
     else:
-        catalog = ToolCatalog([spec], expected_names=(spec.name,))
+        catalog = _counted_write_catalog(spec)
         pending_args = (
             '{"company_name":"Synthetic Co","position_name":"Changed"}'
             if case == "modify"
@@ -1225,7 +1307,7 @@ def _run_agent_call_count_case(case: str) -> dict[str, object]:
         model = _CountingModel(Assistant(content="done"))
         continuation = _CountingContinuation(
             pending,
-            _approved_segment_for_count_harness(pending, model),
+            _approved_segment_for_count_harness(pending, model, catalog),
         )
 
         def operation_executor(
@@ -1254,18 +1336,19 @@ def _run_agent_call_count_case(case: str) -> dict[str, object]:
             pending,
             operation_executor=operation_executor,
         )
-    surface_gate = (
-        build_segment_surface_gate(
+    surface_gate = None
+    if isinstance(seed, NewTurnSeed):
+        metadata_bundle = _metadata_bundle(catalog)
+        surface_gate = build_segment_surface_gate(
             seed.messages,
             catalog=catalog,
             context=context,
             authority=cast(Any, context.authority),
-            dependency_policy=DEPENDENCY_POLICY_V1,
+            provider_view=metadata_bundle.provider_view(),
+            discovery_view=metadata_bundle.discovery_view(),
+            authority_metadata_view=metadata_bundle.authority_view(),
             policy=validate_startup_policy(catalog.authority_manifest),
         )
-        if isinstance(seed, NewTurnSeed)
-        else None
-    )
     invocation = AgentLoopInvocation(
         seed=seed,
         model=cast(Any, model),
@@ -1658,13 +1741,15 @@ def test_policy_fingerprints_are_independent_fixed_reviewed_digests() -> None:
 
 def test_dependency_closure_manifest_pins_current_catalog_coverage() -> None:
     baseline = load_golden("tool_authority/baseline_2427fa6.json")
-    from offerpilot.context_projector.selector import _DEPENDENCIES
+    discovery_view = _metadata_bundle(MODEL_TOOL_CATALOG).discovery_view()
 
     closure = baseline["dependency_closure"]
     assert closure["dependency_policy_version"] == "dependency-policy-v1"
     assert tuple(closure["catalog_names"]) == MODEL_TOOL_NAMES
     assert closure["coverage"] == 25
-    expected = {name: sorted(_DEPENDENCIES.get(name, ())) for name in MODEL_TOOL_NAMES}
+    expected = {
+        entry.provider_name: sorted(entry.dependencies) for entry in discovery_view.ordered_entries
+    }
     assert closure["dependencies"] == expected
     assert closure["canonical_sha256"] == _digest(
         {

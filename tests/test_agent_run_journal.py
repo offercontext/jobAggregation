@@ -29,6 +29,11 @@ from offerpilot.agent_runtime.events import (
     prepare_event,
 )
 from offerpilot.agent_runtime.keyring import JournalKeyDomain
+from offerpilot.ai.tool_runtime.catalog import compile_tool_metadata_manifest
+from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
+from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.context_projector.contracts import RuntimeSurfaceAudit
+from offerpilot.context_projector.manifest import CONTRIBUTOR_ORDER
 from offerpilot.db import init_database
 from offerpilot.agent_runtime.journal import (
     EventInput,
@@ -40,6 +45,7 @@ from offerpilot.agent_runtime.journal import (
     TerminalDisposition,
 )
 from offerpilot.models import AgentEvent, ChatMessage, Conversation
+from offerpilot.pilot_runtime.compensation import prepare_compensation_handler_components
 from offerpilot.repositories.agent_runs import (
     AgentRunRepository,
     DispositionCommand,
@@ -55,6 +61,30 @@ SEGMENT_A = "22222222-2222-4222-8222-222222222222"
 SEGMENT_B = "33333333-3333-4333-8333-333333333333"
 CALL_A = "44444444-4444-4444-8444-444444444444"
 CALL_B = "55555555-5555-4555-8555-555555555555"
+
+
+def _metadata_bundle() -> ToolMetadataBundleV1:
+    manifest = compile_tool_metadata_manifest(MODEL_TOOL_CATALOG.specs)
+    return ToolMetadataBundleV1(
+        typed_catalog=MODEL_TOOL_CATALOG,
+        manifest=manifest,
+        legacy_boundary=manifest.to_dict()["legacy_boundary"],  # type: ignore[arg-type]
+        compensation=prepare_compensation_handler_components().metadata_projection(),
+    )
+
+
+def _surface_audit(tool_name: str) -> RuntimeSurfaceAudit:
+    return RuntimeSurfaceAudit(
+        budget_policy_version="model-surface-budget-v1",
+        contributor_statuses=tuple((name, "ready") for name in CONTRIBUTOR_ORDER),
+        selected_history_group_ids=(),
+        selected_tool_names=(tool_name,),
+        source_fingerprints=(),
+        estimated_input_units=1,
+        canonical_message_bytes=1,
+        canonical_tool_bytes=1,
+        truncated=False,
+    )
 
 
 class FailingGuard:
@@ -261,8 +291,7 @@ def test_manifest_is_bounded_versioned_and_preserves_ordered_summaries() -> None
         {"id": index + 1, "revision": index, "kind": "resume"} for index in range(100)
     )
     sources = tuple(
-        {"id": index + 1, "revision": index, "kind": "application"}
-        for index in range(100)
+        {"id": index + 1, "revision": index, "kind": "application"} for index in range(100)
     )
     prepared = prepare_context_snapshot(
         logical_input={"messages": [{"role": "user", "content": "private input"}]},
@@ -331,9 +360,9 @@ def test_journal_sha256_is_initialized_before_bounded_updates(relative_path: Pat
 def test_event_sha_paths_update_fixed_utf8_byte_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
     chunks: list[bytes] = []
     baseline = _model_completed()
-    expected_ordered = "sha256:" + hashlib.sha256(
-        canonical_json(["界" * 5000]).encode("utf-8")
-    ).hexdigest()
+    expected_ordered = (
+        "sha256:" + hashlib.sha256(canonical_json(["界" * 5000]).encode("utf-8")).hexdigest()
+    )
     monkeypatch.setattr(
         events_module,
         "hashlib",
@@ -354,8 +383,7 @@ def test_event_hmac_paths_update_fixed_utf8_byte_chunks(
     value = "界" * 5000
     expected_fingerprint = hmac.new(
         KEY.secret,
-        b"offerpilot-agent-pending-v1\0"
-        + canonical_json(value).encode("utf-8"),
+        b"offerpilot-agent-pending-v1\0" + canonical_json(value).encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
     monkeypatch.setattr(
@@ -372,8 +400,7 @@ def test_event_hmac_paths_update_fixed_utf8_byte_chunks(
     )
     expected_logical = hmac.new(
         KEY.secret,
-        b"offerpilot-agent-input-v1\0"
-        + canonical_json({"content": value}).encode("utf-8"),
+        b"offerpilot-agent-input-v1\0" + canonical_json({"content": value}).encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
     assert prepared.logical_input_fingerprint == expected_logical
@@ -587,9 +614,7 @@ class RecordingJournalRepository:
             raise self.append_failure
         return draft
 
-    def capture_context(
-        self, _run_id: str, command: object, **_kwargs: object
-    ) -> object:
+    def capture_context(self, _run_id: str, command: object, **_kwargs: object) -> object:
         self.capture_calls += 1
         return command
 
@@ -608,9 +633,7 @@ class RecordingJournalRepository:
             raise self.mark_degraded_failure
         return SimpleNamespace(id=run_id, recording_status="degraded")
 
-    def create_run_and_initial_segment(
-        self, command: object, **_kwargs: object
-    ) -> object:
+    def create_run_and_initial_segment(self, command: object, **_kwargs: object) -> object:
         self.create_calls += 1
         self.create_kwargs.append(dict(_kwargs))
         if self.create_failure is not None:
@@ -654,6 +677,42 @@ def _recorder(
         clock=clock or ManualClock(),
         event_preparer=event_preparer,  # type: ignore[arg-type]
     )
+
+
+def test_surface_capture_uses_injected_provider_view_and_remains_fail_open() -> None:
+    provider_view = _metadata_bundle().provider_view()
+    valid_repository = RecordingJournalRepository()
+    valid = _recorder(valid_repository)
+
+    snapshot_id = valid.capture_surface_context(
+        {"messages": []},
+        _surface_audit("list_offers"),
+        ("provider",),
+        provider_view=provider_view,
+        model_step=1,
+        model_call_id=CALL_A,
+    )
+
+    assert type(snapshot_id) is str
+    assert valid_repository.capture_calls == 1
+    assert valid.recording_status == "healthy"
+
+    rejected_repository = RecordingJournalRepository()
+    rejected = _recorder(rejected_repository)
+    assert (
+        rejected.capture_surface_context(
+            {"messages": []},
+            _surface_audit("attacker_tool"),
+            ("provider",),
+            provider_view=provider_view,
+            model_step=1,
+            model_call_id=CALL_B,
+        )
+        is None
+    )
+    assert rejected_repository.capture_calls == 0
+    assert rejected.recording_status == "degraded"
+    assert rejected.diagnostics == ["journal_context_write_failed"]
 
 
 BOUND_RUN_ID = "77777777-7777-4777-8777-777777777777"
@@ -809,9 +868,7 @@ def _seed_bound_resume_recorder(
     tmp_path: Path,
     clock: ManualClock,
 ) -> tuple[_BoundRepository, object, SafeRunRecorder, int]:
-    repository, session_factory, initial, _, conversation_id = _seed_bound_recorder(
-        tmp_path, clock
-    )
+    repository, session_factory, initial, _, conversation_id = _seed_bound_recorder(tmp_path, clock)
     initial.suspend(_suspended_command())
     repository.start_segment(
         StartSegmentCommand(
@@ -1032,8 +1089,8 @@ def test_combined_bound_resume_uses_caller_session_and_preserves_event_order(
     tmp_path: Path,
 ) -> None:
     clock = ManualClock()
-    repository, session_factory, recorder, conversation_id = (
-        _seed_bound_resume_recorder(tmp_path, clock)
+    repository, session_factory, recorder, conversation_id = _seed_bound_resume_recorder(
+        tmp_path, clock
     )
     original_factory = repository.session_factory
 
@@ -1062,9 +1119,10 @@ def test_combined_bound_resume_uses_caller_session_and_preserves_event_order(
     assert repository.get_run(BOUND_RUN_ID).status == "running"  # type: ignore[union-attr]
 
     with session_factory() as session:  # type: ignore[operator]
-        assert session.scalar(
-            select(ChatMessage).where(ChatMessage.content == "bound-domain-marker")
-        ) is not None
+        assert (
+            session.scalar(select(ChatMessage).where(ChatMessage.content == "bound-domain-marker"))
+            is not None
+        )
 
 
 @pytest.mark.parametrize("combined", (False, True))
@@ -1072,9 +1130,7 @@ def test_bound_resume_requires_active_caller_transaction(
     tmp_path: Path,
     combined: bool,
 ) -> None:
-    repository, session_factory, recorder, _ = _seed_bound_resume_recorder(
-        tmp_path, ManualClock()
-    )
+    repository, session_factory, recorder, _ = _seed_bound_resume_recorder(tmp_path, ManualClock())
 
     with session_factory() as session:  # type: ignore[operator]
         if combined:
@@ -1099,30 +1155,32 @@ def test_bound_resume_requires_active_caller_transaction(
 
 
 def test_combined_bound_resume_is_idempotent_on_same_recorder(tmp_path: Path) -> None:
-    repository, session_factory, recorder, _ = _seed_bound_resume_recorder(
-        tmp_path, ManualClock()
-    )
+    repository, session_factory, recorder, _ = _seed_bound_resume_recorder(tmp_path, ManualClock())
     draft = _approval_decided_draft()
 
     with session_factory() as session:  # type: ignore[operator]
         with session.begin():
             assert recorder.record_approval_and_resume_bound(
-                session, draft, _resumed_command()  # type: ignore[arg-type]
+                session,
+                draft,
+                _resumed_command(),  # type: ignore[arg-type]
             )
             assert recorder.record_approval_and_resume_bound(
-                session, draft, _resumed_command()  # type: ignore[arg-type]
+                session,
+                draft,
+                _resumed_command(),  # type: ignore[arg-type]
             )
 
     assert repository.bound_calls == 1
     assert repository.bound_disposition_calls == 1
-    assert [
-        event.event_type for event in repository.list_events(BOUND_RUN_ID)
-    ].count("run.resumed") == 1
+    assert [event.event_type for event in repository.list_events(BOUND_RUN_ID)].count(
+        "run.resumed"
+    ) == 1
 
 
 def test_combined_bound_resume_rolls_back_with_outer_transaction(tmp_path: Path) -> None:
-    repository, session_factory, recorder, conversation_id = (
-        _seed_bound_resume_recorder(tmp_path, ManualClock())
+    repository, session_factory, recorder, conversation_id = _seed_bound_resume_recorder(
+        tmp_path, ManualClock()
     )
 
     with session_factory() as session:  # type: ignore[operator]
@@ -1144,9 +1202,10 @@ def test_combined_bound_resume_rolls_back_with_outer_transaction(tmp_path: Path)
     assert run.status == "waiting_confirmation"
     assert run.waiting_tool_call_id == BOUND_TOOL_CALL_ID
     with session_factory() as session:  # type: ignore[operator]
-        assert session.scalar(
-            select(ChatMessage).where(ChatMessage.content == "bound-domain-marker")
-        ) is None
+        assert (
+            session.scalar(select(ChatMessage).where(ChatMessage.content == "bound-domain-marker"))
+            is None
+        )
 
 
 def test_combined_bound_resume_replays_on_same_recorder_after_outer_rollback(
@@ -1162,14 +1221,18 @@ def test_combined_bound_resume_replays_on_same_recorder_after_outer_rollback(
         _write_bound_marker(session, conversation_id)
         session.flush()
         assert recorder.record_approval_and_resume_bound(
-            session, draft, _resumed_command()  # type: ignore[arg-type]
+            session,
+            draft,
+            _resumed_command(),  # type: ignore[arg-type]
         )
         session.rollback()
 
     with session_factory() as session:  # type: ignore[operator]
         with session.begin():
             assert recorder.record_approval_and_resume_bound(
-                session, draft, _resumed_command()  # type: ignore[arg-type]
+                session,
+                draft,
+                _resumed_command(),  # type: ignore[arg-type]
             )
 
     event_types = [event.event_type for event in repository.list_events(BOUND_RUN_ID)]
@@ -1207,8 +1270,8 @@ def test_resume_bound_replays_on_same_recorder_after_outer_rollback(
 def test_combined_bound_resume_replay_after_commit_remains_idempotent(
     tmp_path: Path,
 ) -> None:
-    repository, session_factory, recorder, conversation_id = (
-        _seed_bound_resume_recorder(tmp_path, ManualClock())
+    repository, session_factory, recorder, conversation_id = _seed_bound_resume_recorder(
+        tmp_path, ManualClock()
     )
     draft = _approval_decided_draft()
 
@@ -1217,13 +1280,17 @@ def test_combined_bound_resume_replay_after_commit_remains_idempotent(
             _write_bound_marker(session, conversation_id)
             session.flush()
             assert recorder.record_approval_and_resume_bound(
-                session, draft, _resumed_command()  # type: ignore[arg-type]
+                session,
+                draft,
+                _resumed_command(),  # type: ignore[arg-type]
             )
 
     with session_factory() as session:  # type: ignore[operator]
         with session.begin():
             assert recorder.record_approval_and_resume_bound(
-                session, draft, _resumed_command()  # type: ignore[arg-type]
+                session,
+                draft,
+                _resumed_command(),  # type: ignore[arg-type]
             )
 
     event_types = [event.event_type for event in repository.list_events(BOUND_RUN_ID)]
@@ -1237,12 +1304,10 @@ def test_combined_bound_resume_replay_after_commit_remains_idempotent(
 def test_combined_bound_failure_recovers_degraded_resume_after_caller_transaction(
     tmp_path: Path,
 ) -> None:
-    repository, session_factory, recorder, conversation_id = (
-        _seed_bound_resume_recorder(tmp_path, ManualClock())
+    repository, session_factory, recorder, conversation_id = _seed_bound_resume_recorder(
+        tmp_path, ManualClock()
     )
-    repository.after_bound = lambda: (_ for _ in ()).throw(
-        RuntimeError("bound-approval-canary")
-    )
+    repository.after_bound = lambda: (_ for _ in ()).throw(RuntimeError("bound-approval-canary"))
     approval_draft = _approval_decided_draft()
     command = _resumed_command()
 
@@ -1285,16 +1350,17 @@ def test_combined_bound_failure_recovers_degraded_resume_after_caller_transactio
     assert recorder.recording_status == "degraded"
     assert recorder.diagnostics == ["journal_resume_failed"]
     with session_factory() as session:  # type: ignore[operator]
-        assert session.scalar(
-            select(ChatMessage).where(ChatMessage.content == "bound-domain-marker")
-        ) is not None
+        assert (
+            session.scalar(select(ChatMessage).where(ChatMessage.content == "bound-domain-marker"))
+            is not None
+        )
 
 
 def test_resume_bound_ordinary_conflict_is_fail_open_and_degrades_recorder(
     tmp_path: Path,
 ) -> None:
-    repository, session_factory, recorder, conversation_id = (
-        _seed_bound_resume_recorder(tmp_path, ManualClock())
+    repository, session_factory, recorder, conversation_id = _seed_bound_resume_recorder(
+        tmp_path, ManualClock()
     )
     conflicting = ResumedDisposition(
         confirmation_attempt_id=BOUND_CONFIRMATION_ATTEMPT_ID,
@@ -1829,9 +1895,7 @@ def test_degraded_recorder_attempts_final_convergence_only_once(
         recorder.finish(command)
 
     assert repository.converge_calls == 1
-    event_types = [
-        event.event_type for event in getattr(repository.dispositions[0], "events")
-    ]
+    event_types = [event.event_type for event in getattr(repository.dispositions[0], "events")]
     if disposition_kind == "suspended":
         assert event_types == [
             "tool.proposed",
@@ -1971,9 +2035,7 @@ def test_factory_final_clock_invalid_authoritatively_replaces_generic_failure() 
             OperationalError(
                 "private statement",
                 {"private": "params"},
-                type("LockedError", (Exception,), {"sqlite_errorcode": 5})(
-                    "private lock"
-                ),
+                type("LockedError", (Exception,), {"sqlite_errorcode": 5})("private lock"),
             ),
             ManualClock(),
             "journal_budget_exhausted",
@@ -2300,10 +2362,7 @@ def test_resume_and_finalizer_event_order_is_claim_ordered(
     recorder._acquire_operation = tracked_acquire  # type: ignore[method-assign]
 
     def prepare(value: EventInput, deadline: float) -> object:
-        if (
-            threading.current_thread().name == "finalizer"
-            and claim_order == "finalizer_first"
-        ):
+        if threading.current_thread().name == "finalizer" and claim_order == "finalizer_first":
             finalizer_started.set()
             assert release_finalizer.wait(timeout=1.0)
         return original_prepare(value, deadline)
@@ -2632,6 +2691,7 @@ def test_final_cleanup_sync_base_exception_preserves_priority(
     recorder = _recorder(repository)
 
     if primary_error is not None:
+
         def fail_converge(_run_id: str, _command: object, **_kwargs: object) -> object:
             repository.converge_calls += 1
             raise primary_error
@@ -2773,9 +2833,7 @@ def test_final_budget_finishes_after_cleanup_and_preserves_segment_budget(
         assert exhausted is True
         assert clock_invalid_latched is True
     else:
-        assert exhausted is (
-            expected_diagnostic == "journal_disposition_budget_exhausted"
-        )
+        assert exhausted is (expected_diagnostic == "journal_disposition_budget_exhausted")
         assert clock_invalid_latched is False
     assert used_seconds == pytest.approx(expected_used)
     assert recorder.active_budget.used_seconds == active_used_before

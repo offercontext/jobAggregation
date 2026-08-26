@@ -50,7 +50,13 @@ from offerpilot.ai.tool_runtime.contracts import (
 )
 from offerpilot.ai.tool_runtime.legacy import LEGACY_DETERMINISTIC_NAMES
 from offerpilot.ai.tool_runtime.journal import journal_shape_digest
-from offerpilot.ai.tool_runtime.metadata import WriteOperationMetadataV1
+from offerpilot.ai.tool_runtime.metadata import (
+    ProviderToolMetadataView,
+    ToolAuthorityMetadataView,
+    ToolDiscoveryMetadataView,
+    ToolMetadataBundleV1,
+    WriteOperationMetadataV1,
+)
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.ai.pending_replay import PendingReplayArgsDecoderV1, PendingReplayIntegrityError
 from offerpilot.ai.write_operations import (
@@ -179,6 +185,7 @@ class _ContinuationActivationRequest(TransientToolRuntimeValue):
 
     def __repr__(self) -> str:
         return "<_ContinuationActivationRequest transient>"
+
 
 _RuntimeRequest: TypeAlias = StartTurnRequest | _ContinuationActivationRequest
 
@@ -382,6 +389,21 @@ class ResolvedPolicyCatalog:
     catalog: object
     policy: object
     dependency_policy: object | None = None
+    provider_metadata_view: ProviderToolMetadataView | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    discovery_metadata_view: ToolDiscoveryMetadataView | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    authority_metadata_view: ToolAuthorityMetadataView | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -585,6 +607,31 @@ class RuntimeDependencies:
     route_selector: RouteSelector | None = None
     journal: JournalFactory | None = None
     catalog: ToolCatalog | None = None
+    metadata_bundle: ToolMetadataBundleV1 | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    metadata_components: TransientToolRuntimeValue | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    provider_metadata_view: ProviderToolMetadataView | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    discovery_metadata_view: ToolDiscoveryMetadataView | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    authority_metadata_view: ToolAuthorityMetadataView | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
     missing_target_question: Callable[..., str | None] | None = None
     pending_action_details: Callable[[PendingAction], Mapping[str, object]] | None = None
     conversation_store: ConversationGateway | None = None
@@ -598,6 +645,44 @@ class RuntimeDependencies:
         default=None, repr=False, compare=False
     )
     continuation: ConfirmationCoordinator | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        metadata_values = (
+            self.metadata_bundle,
+            self.provider_metadata_view,
+            self.discovery_metadata_view,
+            self.authority_metadata_view,
+            self.metadata_components,
+        )
+        if all(value is None for value in metadata_values):
+            return
+        if any(value is None for value in metadata_values):
+            raise TypeError("Runtime Tool Metadata dependencies must be injected atomically")
+        bundle = self.metadata_bundle
+        provider = self.provider_metadata_view
+        discovery = self.discovery_metadata_view
+        authority = self.authority_metadata_view
+        components = self.metadata_components
+        if (
+            type(bundle) is not ToolMetadataBundleV1
+            or type(provider) is not ProviderToolMetadataView
+            or type(discovery) is not ToolDiscoveryMetadataView
+            or type(authority) is not ToolAuthorityMetadataView
+            or not isinstance(components, TransientToolRuntimeValue)
+        ):
+            raise ValueError("Runtime Tool Metadata dependencies have mixed Bundle provenance")
+        exact_bundle = bundle
+        exact_provider = provider
+        exact_discovery = discovery
+        exact_authority = authority
+        if (
+            self.catalog is not exact_bundle._typed_catalog
+            or getattr(components, "bundle", None) is not exact_bundle
+            or exact_provider is not exact_bundle.provider_view()
+            or exact_discovery is not exact_bundle.discovery_view()
+            or exact_authority is not exact_bundle.authority_view()
+        ):
+            raise ValueError("Runtime Tool Metadata dependencies have mixed Bundle provenance")
 
 
 RuntimeDependenciesLike: TypeAlias = RuntimeDependencies | Mapping[str, object]
@@ -723,7 +808,10 @@ class _NegotiatedConfirmationEventSink:
 
     def emit(self, event: RuntimeEvent) -> None:
         with self._lock:
-            if isinstance(event, ToolResultEvent) and event.tool_call_id == self._origin_tool_call_id:
+            if (
+                isinstance(event, ToolResultEvent)
+                and event.tool_call_id == self._origin_tool_call_id
+            ):
                 if event not in self._deferred:
                     self._deferred.append(event)
                 return
@@ -1572,6 +1660,14 @@ class PilotRuntime:
             else:
                 values = {**_dependency_object_values(dependencies)}
             self._dependencies = RuntimeDependencies(**cast(Any, _dependency_values(values)))
+
+    @property
+    def metadata_bundle(self) -> ToolMetadataBundleV1:
+        bundle = self._dependencies.metadata_bundle
+        if type(bundle) is not ToolMetadataBundleV1:
+            raise RuntimeError("Pilot Runtime has no production Tool Metadata Bundle")
+        _ = bundle.bundle_instance_token
+        return bundle
 
     def start_turn(
         self,
@@ -2833,9 +2929,7 @@ class PilotRuntime:
             # tool.started, degraded recovery deliberately omits both sides
             # rather than create an orphan completion. Rejection has no tool
             # terminal at all, and is represented only by approval.decided.
-            terminal_persisted = (
-                _attribute(execution_record, "terminal_persisted") is True
-            )
+            terminal_persisted = _attribute(execution_record, "terminal_persisted") is True
             journal_started_recorded = (
                 _attribute(execution_record, "journal_started_recorded") is True
             )
@@ -3229,9 +3323,7 @@ class PilotRuntime:
         ):
             raise WriteOperationError("operation_delivery_unknown", retryable=True)
         persisted_visible_result = _attribute(execution_record, "persisted_visible_result")
-        terminal_visible_result = _attribute(
-            _attribute(terminal, "payload"), "visible_result"
-        )
+        terminal_visible_result = _attribute(_attribute(terminal, "payload"), "visible_result")
         if (
             type(persisted_visible_result) is not str
             or type(terminal_visible_result) is not str
@@ -3326,9 +3418,7 @@ class PilotRuntime:
                 raise WriteOperationError("operation_integrity_error")
             elif proposal_matches[0][0] >= origin_indices[0]:
                 raise WriteOperationError("operation_integrity_error")
-            policy = self._resolve_policy_catalog(
-                activation_request, conversation, source, segment
-            )
+            policy = self._resolve_policy_catalog(activation_request, conversation, source, segment)
             require_activation_identity()
             if isinstance(policy, RuntimeFailureOutcome):
                 raise WriteOperationError(str(policy.code.value))
@@ -3354,9 +3444,7 @@ class PilotRuntime:
                 surface_gate=surface_gate,
                 policy=policy,
             )
-            resolved = self._resolve_continuation_model(
-                activation_request, conversation, policy
-            )
+            resolved = self._resolve_continuation_model(activation_request, conversation, policy)
             require_activation_identity()
             if isinstance(resolved, RuntimeFailureOutcome):
                 raise WriteOperationError(str(resolved.code.value))
@@ -3965,7 +4053,9 @@ class PilotRuntime:
         catalog: object | None,
     ) -> tuple[ImmutablePayload, ...]:
         resolve = _callable(catalog, ("resolve",))
-        spec = _invoke(resolve, {"name": pending.tool_name}, (pending.tool_name,)) if resolve else None
+        spec = (
+            _invoke(resolve, {"name": pending.tool_name}, (pending.tool_name,)) if resolve else None
+        )
         metadata = _attribute(spec, "metadata")
         editable_fields = _attribute(metadata, "editable_fields", ())
         if type(editable_fields) is not tuple:
@@ -5340,12 +5430,8 @@ class PilotRuntime:
                 except BaseException:
                     pass
 
-        if (
-            isinstance(state.request, ConfirmationRequest)
-            and (
-                state.confirmation_session is not None
-                or state.confirmation_pending is not None
-            )
+        if isinstance(state.request, ConfirmationRequest) and (
+            state.confirmation_session is not None or state.confirmation_pending is not None
         ):
             try:
                 confirmation_outcome = self._execute_prepared_ledger_confirmation(
@@ -6362,9 +6448,7 @@ class PilotRuntime:
                 state.control,
                 tool_names=self._journal_tool_names(catalog),
             )
-            activation_request = _ContinuationActivationRequest(
-                cast(int, state.conversation_id)
-            )
+            activation_request = _ContinuationActivationRequest(cast(int, state.conversation_id))
             # See the synchronous path: the approval origin uses the raw
             # journal recorder.  The post-terminal Segment owns the gated
             # proxy used for any chained Pending.
@@ -7012,7 +7096,7 @@ class PilotRuntime:
             type(value) is not SegmentSurfaceGate
             or value.authority is not segment.authority
             or value.context is not segment.context
-            or value.catalog is not segment.catalog
+            or value.dispatch_catalog is not segment.catalog
             or segment.policy is not policy
         ):
             return self._failure(
@@ -7026,7 +7110,7 @@ class PilotRuntime:
                 value,
                 authority=segment.authority,
                 context=segment.context,
-                catalog=segment.catalog,
+                catalog=value.catalog,
                 policy=value.policy,
                 dependency_policy=value.dependency_policy,
                 selection=value.selection,

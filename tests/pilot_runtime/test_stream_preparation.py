@@ -30,13 +30,15 @@ from offerpilot.ai.write_operations import (
     WriteOperationError,
 )
 from offerpilot.ai.tool_authority.policy import validate_startup_policy
+from offerpilot.ai.tool_runtime.catalog import compile_tool_metadata_manifest
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
+from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
-from offerpilot.context_projector.selector import DEPENDENCY_POLICY_V1
 from offerpilot.agent_runtime.journal import NullRunRecorder, RunRecorderFactory
 from offerpilot.agent_runtime.keyring import JournalKeyDomain
 from offerpilot.db import init_database
 from offerpilot.pilot_runtime.persistence import ChatPersistenceCoordinator
+from offerpilot.pilot_runtime.compensation import prepare_compensation_handler_components
 from offerpilot.repositories.agent_runs import AgentRunRepository
 from offerpilot.repositories.chat import ChatRepository
 from offerpilot.repositories.application_events import ApplicationEventsRepository
@@ -92,6 +94,19 @@ _AUTHORITY_SESSIONS = init_database(
     Path(tempfile.mkdtemp(prefix="offerpilot-stream-authority-")) / "authority.db"
 )
 _AUTHORITY_POLICY = validate_startup_policy(MODEL_TOOL_CATALOG.authority_manifest)
+
+
+def _metadata_bundle() -> ToolMetadataBundleV1:
+    manifest = compile_tool_metadata_manifest(MODEL_TOOL_CATALOG.specs)
+    return ToolMetadataBundleV1(
+        typed_catalog=MODEL_TOOL_CATALOG,
+        manifest=manifest,
+        legacy_boundary=manifest.to_dict()["legacy_boundary"],  # type: ignore[arg-type]
+        compensation=prepare_compensation_handler_components().metadata_projection(),
+    )
+
+
+_METADATA_BUNDLE = _metadata_bundle()
 
 
 class Phases:
@@ -355,7 +370,10 @@ def _policy_resolver(catalog: object) -> object:
         return ResolvedPolicyCatalog(
             catalog=catalog,
             policy=_AUTHORITY_POLICY,
-            dependency_policy=DEPENDENCY_POLICY_V1,
+            dependency_policy=_METADATA_BUNDLE.discovery_view().policy,
+            provider_metadata_view=_METADATA_BUNDLE.provider_view(),
+            discovery_metadata_view=_METADATA_BUNDLE.discovery_view(),
+            authority_metadata_view=_METADATA_BUNDLE.authority_view(),
         )
 
     return resolve
@@ -443,7 +461,9 @@ def _surface_resolver(
         catalog=getattr(policy, "catalog"),
         context=getattr(segment, "context"),
         authority=getattr(segment, "authority"),
-        dependency_policy=getattr(policy, "dependency_policy"),
+        provider_view=getattr(policy, "provider_metadata_view"),
+        discovery_view=getattr(policy, "discovery_metadata_view"),
+        authority_metadata_view=getattr(policy, "authority_metadata_view"),
         policy=getattr(policy, "policy"),
     )
 
@@ -561,7 +581,10 @@ def test_stream_segment_failure_stops_before_policy_catalog_and_side_effects() -
         return ResolvedPolicyCatalog(
             catalog=MODEL_TOOL_CATALOG,
             policy=_AUTHORITY_POLICY,
-            dependency_policy=DEPENDENCY_POLICY_V1,
+            dependency_policy=_METADATA_BUNDLE.discovery_view().policy,
+            provider_metadata_view=_METADATA_BUNDLE.provider_view(),
+            discovery_metadata_view=_METADATA_BUNDLE.discovery_view(),
+            authority_metadata_view=_METADATA_BUNDLE.authority_view(),
         )
 
     instance, persistence, driver, host, journal = runtime(
@@ -614,7 +637,10 @@ def test_stream_live_policy_drift_closes_segment_before_provider_or_user() -> No
         return ResolvedPolicyCatalog(
             catalog=MODEL_TOOL_CATALOG,
             policy=drifted,
-            dependency_policy=DEPENDENCY_POLICY_V1,
+            dependency_policy=_METADATA_BUNDLE.discovery_view().policy,
+            provider_metadata_view=_METADATA_BUNDLE.provider_view(),
+            discovery_metadata_view=_METADATA_BUNDLE.discovery_view(),
+            authority_metadata_view=_METADATA_BUNDLE.authority_view(),
         )
 
     instance, persistence, driver, host, journal = runtime(
@@ -666,7 +692,10 @@ def test_stream_policy_spy_sees_exact_unbound_segment_after_segment_phase() -> N
         return ResolvedPolicyCatalog(
             catalog=MODEL_TOOL_CATALOG,
             policy=_AUTHORITY_POLICY,
-            dependency_policy=DEPENDENCY_POLICY_V1,
+            dependency_policy=_METADATA_BUNDLE.discovery_view().policy,
+            provider_metadata_view=_METADATA_BUNDLE.provider_view(),
+            discovery_metadata_view=_METADATA_BUNDLE.discovery_view(),
+            authority_metadata_view=_METADATA_BUNDLE.authority_view(),
         )
 
     def malformed_gate(*args: object, **kwargs: object) -> object:
@@ -2074,7 +2103,9 @@ def test_stream_activation_requires_terminal_and_delivery_ownership() -> None:
         catalog=MODEL_TOOL_CATALOG,
         context=segment.context,
         authority=segment.authority,
-        dependency_policy=DEPENDENCY_POLICY_V1,
+        provider_view=_METADATA_BUNDLE.provider_view(),
+        discovery_view=_METADATA_BUNDLE.discovery_view(),
+        authority_metadata_view=_METADATA_BUNDLE.authority_view(),
         policy=_AUTHORITY_POLICY,
     )
     bundle = ApprovedContinuationSegment(

@@ -1156,25 +1156,33 @@ def test_transient_route_values_are_rejected_by_every_persistence_and_transport_
     owner.close()
 
 
-def test_unpublished_initial_component_factory_has_no_production_caller() -> None:
+def test_initial_component_factory_has_only_final_composition_caller() -> None:
     factory_name = "build_unpublished_legacy_initial_route_components"
-    consumers: list[str] = []
+    consumers: list[tuple[str, str]] = []
     for path in PRODUCTION_ROOT.rglob("*.py"):
         if path == PRODUCTION_ROOT / "ai" / "tool_runtime" / "legacy.py":
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and any(
-                alias.name == factory_name for alias in node.names
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if any(
+                isinstance(child, ast.Call)
+                and (
+                    isinstance(child.func, ast.Name)
+                    and child.func.id == factory_name
+                    or isinstance(child.func, ast.Attribute)
+                    and child.func.attr == factory_name
+                )
+                for child in ast.walk(node)
             ):
-                consumers.append(str(path.relative_to(ROOT)))
-            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
-                if node.id == factory_name:
-                    consumers.append(str(path.relative_to(ROOT)))
-            elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
-                if node.attr == factory_name:
-                    consumers.append(str(path.relative_to(ROOT)))
-    assert consumers == []
+                consumers.append((path.relative_to(ROOT).as_posix(), node.name))
+    assert consumers == [
+        (
+            "src/offerpilot/pilot_runtime/composition.py",
+            "build_production_tool_metadata_components",
+        )
+    ]
 
 
 def test_existing_legacy_factory_and_server_loaded_resolver_remain_unchanged() -> None:

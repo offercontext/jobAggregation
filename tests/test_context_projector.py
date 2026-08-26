@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import inspect
 import json
 import sqlite3
 import time
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 from sqlalchemy import select, text
@@ -24,10 +26,10 @@ from offerpilot.agent_runtime.budget import JournalBudgetExhausted
 from offerpilot.agent_runtime.journal import RunRecorderFactory
 from offerpilot.agent_runtime.keyring import load_or_create_journal_key
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG, MODEL_TOOL_NAMES
+from offerpilot.ai.tool_runtime.catalog import compile_tool_metadata_manifest
+from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.ai.tool_authority.policy import (
     AGENT_TYPED_V1_PROFILE,
-    CAPABILITY_POLICY_VERSION,
-    DEPENDENCY_POLICY_VERSION,
 )
 from offerpilot.ai.tool_authority.composition import AuthorityFactory
 from offerpilot.ai.tool_authority.contracts import TrustedContextScope
@@ -36,7 +38,6 @@ from offerpilot.context_projector.binding import (
     BoundProviderResponse,
     ModelCallSurfaceBinding,
 )
-from offerpilot.context_projector.authority_surface import AuthoritySurfaceView
 from offerpilot.context_projector.chunking import chunk_structured_source
 from offerpilot.context_projector.budget import (
     OPTIONAL_HISTORY_MESSAGE_BYTE_CAP,
@@ -78,6 +79,7 @@ from offerpilot.pilot_runtime.errors import (
     RuntimeCancelled,
     RuntimeTransportAborted,
 )
+from offerpilot.pilot_runtime.compensation import prepare_compensation_handler_components
 from offerpilot.config import AIProviderProfile, Config, save_config
 from offerpilot.db import init_database, journal_session_factory_for_data_dir
 from offerpilot.models import AgentContextSnapshot, AgentEvent, AgentRun, Conversation
@@ -85,14 +87,21 @@ from offerpilot.repositories.agent_runs import AgentRunRepository
 from offerpilot.api import create_app
 
 
-def _authority_surface(*, application: bool = False) -> AuthoritySurfaceView:
-    return AuthoritySurfaceView(
-        capability_profile_id="agent_typed_v1",
-        capability_policy_version=CAPABILITY_POLICY_VERSION,
-        dependency_policy_version=DEPENDENCY_POLICY_VERSION,
-        capabilities=frozenset(AGENT_TYPED_V1_PROFILE.capabilities),
-        context_type="application" if application else "workspace",
+def _selector_bundle() -> ToolMetadataBundleV1:
+    manifest = compile_tool_metadata_manifest(MODEL_TOOL_CATALOG.specs)
+    projection = manifest.to_dict()
+    compensation = prepare_compensation_handler_components()
+    return ToolMetadataBundleV1(
+        typed_catalog=MODEL_TOOL_CATALOG,
+        manifest=manifest,
+        legacy_boundary=cast(dict[str, object], projection["legacy_boundary"]),
+        compensation=compensation.metadata_projection(),
     )
+
+
+def _selection_for(signals: ToolSelectionSignals) -> object:
+    bundle = _selector_bundle()
+    return select_tools(bundle.discovery_view(), bundle.authority_view(), signals)
 
 
 _GATEWAY_AUTHORITY_FACTORIES: list[AuthorityFactory] = []
@@ -321,24 +330,33 @@ def test_endpoint_normalization_is_strict_and_stable() -> None:
 
 
 def test_tool_selector_uses_original_catalog_order_and_dependency_closure() -> None:
+    bundle = _selector_bundle()
     selection = select_tools(
-        MODEL_TOOL_CATALOG.provider_contracts(),
+        bundle.discovery_view(),
+        bundle.authority_view(),
         ToolSelectionSignals(page_kind="offers", current_request="比较薪资"),
     )
-    assert selection.names == tuple(name for name in MODEL_TOOL_NAMES if name in selection.names)
-    assert {"list_offers", "get_offer", "compare_offers"}.issubset(selection.names)
-    assert len(selection.envelope_fingerprint) == 64
+    assert selection.selected_names == tuple(
+        name for name in MODEL_TOOL_NAMES if name in selection.selected_names
+    )
+    assert {"list_offers", "get_offer", "compare_offers"}.issubset(selection.dependency_closure)
+    assert len(selection.provider_envelope_fingerprint) == 64
 
 
 def test_tool_selector_falls_back_to_all_typed_tools_and_fails_on_bad_signal() -> None:
+    bundle = _selector_bundle()
     selection = select_tools(
-        MODEL_TOOL_CATALOG.provider_contracts(), ToolSelectionSignals(page_kind="workspace")
+        bundle.discovery_view(),
+        bundle.authority_view(),
+        ToolSelectionSignals(page_kind="workspace"),
     )
-    assert selection.names == MODEL_TOOL_NAMES
-    assert selection.fallback_all is True
+    assert selection.selected_names == MODEL_TOOL_NAMES
+    assert selection.full_catalog_fallback is True
     with pytest.raises(ProjectionError, match="unknown_page_kind"):
         select_tools(
-            MODEL_TOOL_CATALOG.provider_contracts(), ToolSelectionSignals(page_kind="evil")
+            bundle.discovery_view(),
+            bundle.authority_view(),
+            ToolSelectionSignals(page_kind="evil"),
         )
 
 
@@ -418,46 +436,49 @@ def test_structured_chunker_records_paths_sizes_and_truncation() -> None:
 
 
 def test_projection_is_repeatable_and_preserves_current_request() -> None:
+    bundle = _selector_bundle()
+    signals = ToolSelectionSignals(page_kind="offers", current_request="比较 offer")
+    selection = select_tools(bundle.discovery_view(), bundle.authority_view(), signals)
     request = ProjectionRequest(
         model_call_id="call-1",
         contributors=contributors(),
         history=(frozen("user", "old", message_id=1), frozen("assistant", "answer", message_id=2)),
-        provider_tools=MODEL_TOOL_CATALOG.provider_contracts(),
-        tool_signals=ToolSelectionSignals(page_kind="offers", current_request="比较 offer"),
+        tool_signals=signals,
         provider_budgets=(ProviderBudget(),),
-        authority_surface=_authority_surface(),
+        selection=selection,
     )
     first = ModelSurfaceProjector().project(request)
     second = ModelSurfaceProjector().project(request)
     assert first.runtime_surface_fingerprint == second.runtime_surface_fingerprint
     assert first.messages[-1].content == "比较 offer"
-    assert first.audit.selected_tool_names
+    assert first.tools is selection.provider_contracts
+    assert first.audit.selected_tool_names == selection.selected_names
 
 
 def test_projection_mandatory_overflow_fails_before_provider() -> None:
+    signals = ToolSelectionSignals(current_request="offer")
     request = ProjectionRequest(
         model_call_id="call-1",
         contributors=contributors("x" * 40_000),
         history=(),
-        provider_tools=MODEL_TOOL_CATALOG.provider_contracts(),
-        tool_signals=ToolSelectionSignals(current_request="offer"),
+        tool_signals=signals,
         provider_budgets=(ProviderBudget(context_window=10_000),),
-        authority_surface=_authority_surface(),
+        selection=_selection_for(signals),
     )
     with pytest.raises(ProjectionError, match="mandatory_surface_over_budget"):
         ModelSurfaceProjector().project(request)
 
 
 def test_bound_response_rejects_unexposed_tool_without_executor() -> None:
+    signals = ToolSelectionSignals(page_kind="offers", current_request="offer")
     surface = ModelSurfaceProjector().project(
         ProjectionRequest(
             "call-1",
             contributors(),
             (),
-            MODEL_TOOL_CATALOG.provider_contracts(),
-            ToolSelectionSignals(page_kind="offers", current_request="offer"),
+            signals,
             (ProviderBudget(),),
-            _authority_surface(),
+            _selection_for(signals),
         )
     )
     chain = FrozenProviderExecutionChain.freeze(
@@ -510,15 +531,15 @@ def test_gateway_reuses_surface_and_stops_stream_fallback_after_delta() -> None:
         AIProviderProfile(id="b", api_key="b", base_url="https://b.test/v1"),
     ]
     chain = FrozenProviderExecutionChain.freeze(profiles)
+    signals = ToolSelectionSignals(page_kind="offers", current_request="offer")
     surface = ModelSurfaceProjector().project(
         ProjectionRequest(
             "call-1",
             contributors(),
             (),
-            MODEL_TOOL_CATALOG.provider_contracts(),
-            ToolSelectionSignals(page_kind="offers", current_request="offer"),
+            signals,
             tuple(candidate.budget() for candidate in chain.candidates),
-            _authority_surface(),
+            _selection_for(signals),
         )
     )
     calls: list[str] = []
@@ -546,15 +567,15 @@ def test_gateway_deferred_stream_discards_failed_candidate_deltas_before_fallbac
             AIProviderProfile(id="b", api_key="b", base_url="https://b.test/v1"),
         ]
     )
+    signals = ToolSelectionSignals(page_kind="offers", current_request="offer")
     surface = ModelSurfaceProjector().project(
         ProjectionRequest(
             "call-deferred",
             contributors(),
             (),
-            MODEL_TOOL_CATALOG.provider_contracts(),
-            ToolSelectionSignals(page_kind="offers", current_request="offer"),
+            signals,
             tuple(candidate.budget() for candidate in chain.candidates),
-            _authority_surface(),
+            _selection_for(signals),
         )
     )
     calls: list[str] = []
@@ -590,15 +611,15 @@ def test_gateway_deferred_stream_callback_failure_does_not_retry_completed_provi
             AIProviderProfile(id="b", api_key="b", base_url="https://b.test/v1"),
         ]
     )
+    signals = ToolSelectionSignals(page_kind="offers", current_request="offer")
     surface = ModelSurfaceProjector().project(
         ProjectionRequest(
             "call-deferred-sink",
             contributors(),
             (),
-            MODEL_TOOL_CATALOG.provider_contracts(),
-            ToolSelectionSignals(page_kind="offers", current_request="offer"),
+            signals,
             tuple(candidate.budget() for candidate in chain.candidates),
-            _authority_surface(),
+            _selection_for(signals),
         )
     )
     calls: list[str] = []
@@ -632,15 +653,15 @@ def test_gateway_checks_active_before_each_fallback_attempt(mode: str) -> None:
             AIProviderProfile(id="b", api_key="b", base_url="https://b.test/v1"),
         ]
     )
+    signals = ToolSelectionSignals(page_kind="offers", current_request="offer")
     surface = ModelSurfaceProjector().project(
         ProjectionRequest(
             "call-active",
             contributors(),
             (),
-            MODEL_TOOL_CATALOG.provider_contracts(),
-            ToolSelectionSignals(page_kind="offers", current_request="offer"),
+            signals,
             tuple(candidate.budget() for candidate in chain.candidates),
-            _authority_surface(),
+            _selection_for(signals),
         )
     )
     calls: list[str] = []
@@ -708,15 +729,15 @@ def test_gateway_discards_attempt_on_raw_base_exception(
             AIProviderProfile(id="b", api_key="b", base_url="https://b.test/v1"),
         ]
     )
+    signals = ToolSelectionSignals(page_kind="offers", current_request="offer")
     surface = ModelSurfaceProjector().project(
         ProjectionRequest(
             "call-base-exception",
             contributors(),
             (),
-            MODEL_TOOL_CATALOG.provider_contracts(),
-            ToolSelectionSignals(page_kind="offers", current_request="offer"),
+            signals,
             tuple(candidate.budget() for candidate in chain.candidates),
-            _authority_surface(),
+            _selection_for(signals),
         )
     )
     calls: list[str] = []
@@ -760,15 +781,15 @@ def test_gateway_discards_attempt_on_raw_sink_base_exception(
             AIProviderProfile(id="b", api_key="b", base_url="https://b.test/v1"),
         ]
     )
+    signals = ToolSelectionSignals(page_kind="offers", current_request="offer")
     surface = ModelSurfaceProjector().project(
         ProjectionRequest(
             "call-sink-base-exception",
             contributors(),
             (),
-            MODEL_TOOL_CATALOG.provider_contracts(),
-            ToolSelectionSignals(page_kind="offers", current_request="offer"),
+            signals,
             tuple(candidate.budget() for candidate in chain.candidates),
-            _authority_surface(),
+            _selection_for(signals),
         )
     )
     calls: list[str] = []
@@ -815,15 +836,15 @@ def test_gateway_never_falls_back_after_runtime_control_error(
             AIProviderProfile(id="b", api_key="b", base_url="https://b.test/v1"),
         ]
     )
+    signals = ToolSelectionSignals(page_kind="offers", current_request="offer")
     surface = ModelSurfaceProjector().project(
         ProjectionRequest(
             "call-control",
             contributors(),
             (),
-            MODEL_TOOL_CATALOG.provider_contracts(),
-            ToolSelectionSignals(page_kind="offers", current_request="offer"),
+            signals,
             tuple(candidate.budget() for candidate in chain.candidates),
-            _authority_surface(),
+            _selection_for(signals),
         )
     )
     calls: list[str] = []
@@ -855,15 +876,15 @@ def test_gateway_never_falls_back_after_runtime_control_error(
 def test_gateway_attempt_identity_is_session_owned_and_single_use() -> None:
     profile = AIProviderProfile(id="a", api_key="a", base_url="https://a.test/v1")
     chain = FrozenProviderExecutionChain.freeze([profile])
+    signals = ToolSelectionSignals(page_kind="offers", current_request="offer")
     surface = ModelSurfaceProjector().project(
         ProjectionRequest(
             "call-owned",
             contributors(),
             (),
-            MODEL_TOOL_CATALOG.provider_contracts(),
-            ToolSelectionSignals(page_kind="offers", current_request="offer"),
+            signals,
             tuple(candidate.budget() for candidate in chain.candidates),
-            _authority_surface(),
+            _selection_for(signals),
         )
     )
 
@@ -958,6 +979,7 @@ def test_manifest_v2_is_canonical_private_and_validated_by_shared_entrypoint() -
         key_id="11111111-1111-4111-8111-111111111111",
         secret=b"secret",
         provider_identities=("private-provider/model",),
+        provider_view=_selector_bundle().provider_view(),
         signals=("trusted_page",),
     )
     validated = validate_context_manifest_json(prepared.manifest_json)
@@ -984,6 +1006,62 @@ def test_manifest_v2_rejects_65537_bytes() -> None:
         validate_surface_manifest_v2(json.dumps(base, separators=(",", ":"), sort_keys=True))
 
 
+def test_manifest_v2_prepare_rejects_tool_outside_injected_bundle_provider_view() -> None:
+    bundle = _selector_bundle()
+    audit = RuntimeSurfaceAudit(
+        "model-surface-budget-v1",
+        tuple((name, "ready") for name in CONTRIBUTOR_ORDER),
+        (),
+        ("attacker_tool",),
+        (),
+        1,
+        1,
+        1,
+        False,
+    )
+
+    with pytest.raises(ManifestV2ValidationError, match="unapproved tool"):
+        prepare_surface_manifest_v2(
+            audit,
+            key_id="11111111-1111-4111-8111-111111111111",
+            secret=b"secret",
+            provider_identities=("provider",),
+            provider_view=bundle.provider_view(),
+        )
+
+
+def test_manifest_v2_prepare_requires_exact_provider_view_before_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parameter = inspect.signature(prepare_surface_manifest_v2).parameters["provider_view"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is inspect.Parameter.empty
+    audit = RuntimeSurfaceAudit(
+        "model-surface-budget-v1",
+        tuple((name, "ready") for name in CONTRIBUTOR_ORDER),
+        (),
+        (MODEL_TOOL_NAMES[0],),
+        (),
+        1,
+        1,
+        1,
+        False,
+    )
+
+    def forbidden_build(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("invalid Provider view reached Manifest projection")
+
+    monkeypatch.setattr(manifest_module, "_build_manifest_payload", forbidden_build)
+    with pytest.raises(ManifestV2ValidationError, match="Provider metadata view"):
+        prepare_surface_manifest_v2(
+            audit,
+            key_id="11111111-1111-4111-8111-111111111111",
+            secret=b"secret",
+            provider_identities=("provider",),
+            provider_view=None,  # type: ignore[arg-type]
+        )
+
+
 @pytest.mark.parametrize("field", ["tools", "signals"])
 def test_manifest_v2_safely_rejects_non_string_set_members(field: str) -> None:
     audit = RuntimeSurfaceAudit(
@@ -1002,6 +1080,7 @@ def test_manifest_v2_safely_rejects_non_string_set_members(field: str) -> None:
         key_id="11111111-1111-4111-8111-111111111111",
         secret=b"secret",
         provider_identities=("provider",),
+        provider_view=_selector_bundle().provider_view(),
         signals=("trusted_page",),
     )
     manifest = json.loads(prepared.manifest_json)
@@ -1031,6 +1110,7 @@ def test_manifest_v2_safely_rejects_non_string_contributor_status() -> None:
         key_id="11111111-1111-4111-8111-111111111111",
         secret=b"secret",
         provider_identities=("provider",),
+        provider_view=_selector_bundle().provider_view(),
     )
     manifest = json.loads(prepared.manifest_json)
     manifest["contributors"][0]["status"] = []
@@ -1080,6 +1160,7 @@ def test_maximal_semantic_manifest_reaches_every_array_limit_under_cap() -> None
         key_id="11111111-1111-4111-8111-111111111111",
         secret=b"k" * 32,
         provider_identities=tuple(f"provider-{index}" for index in range(8)),
+        provider_view=_selector_bundle().provider_view(),
         signals=MANIFEST_SIGNAL_VALUES,
     )
     manifest = validate_surface_manifest_v2(prepared.manifest_json)
@@ -1134,6 +1215,7 @@ def test_manifest_v2_budget_guard_interrupts_maximal_audit_at_exact_checkpoint()
             key_id="11111111-1111-4111-8111-111111111111",
             secret=b"k" * 32,
             provider_identities=tuple(f"provider-{index}" for index in range(8)),
+            provider_view=_selector_bundle().provider_view(),
             signals=MANIFEST_SIGNAL_VALUES,
             budget_check=guard,
         )
@@ -1221,6 +1303,7 @@ def test_manifest_v2_sha_updates_fixed_byte_chunks(monkeypatch: pytest.MonkeyPat
         key_id="11111111-1111-4111-8111-111111111111",
         secret=b"k" * 32,
         provider_identities=tuple(f"provider-{index}" for index in range(8)),
+        provider_view=_selector_bundle().provider_view(),
         signals=MANIFEST_SIGNAL_VALUES,
     )
 
@@ -1265,6 +1348,7 @@ def test_manifest_budget_guard_reaches_source_chunk_validation_and_sha_phases(
             key_id="11111111-1111-4111-8111-111111111111",
             secret=b"k" * 32,
             provider_identities=(large_identity,),
+            provider_view=_selector_bundle().provider_view(),
             budget_check=guard,
         )
 

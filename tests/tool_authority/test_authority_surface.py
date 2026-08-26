@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any
-
 import pytest
 
 from offerpilot.ai.client import ConfiguredAIClient
@@ -15,6 +13,8 @@ from offerpilot.ai.tool_authority.policy import (
     DEPENDENCY_POLICY_VERSION,
 )
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG, MODEL_TOOL_NAMES
+from offerpilot.ai.tool_runtime.catalog import compile_tool_metadata_manifest
+from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.context_projector.authority_surface import (
     AuthoritySurfaceView,
     intersect_authority_surface,
@@ -34,10 +34,11 @@ from offerpilot.context_projector.gateway import (
 from offerpilot.config import AIProviderProfile, Config
 from offerpilot.ai.types import Assistant
 from offerpilot.context_projector.selector import (
-    DEPENDENCY_POLICY_V1,
+    ToolSelectionResult,
     ToolSelectionSignals,
     select_tools,
 )
+from offerpilot.pilot_runtime.compensation import prepare_compensation_handler_components
 
 
 def _view(
@@ -54,59 +55,75 @@ def _view(
     )
 
 
-def _all_selection() -> Any:
+def _bundle() -> ToolMetadataBundleV1:
+    manifest = compile_tool_metadata_manifest(MODEL_TOOL_CATALOG.specs)
+    return ToolMetadataBundleV1(
+        typed_catalog=MODEL_TOOL_CATALOG,
+        manifest=manifest,
+        legacy_boundary=manifest.to_dict()["legacy_boundary"],
+        compensation=prepare_compensation_handler_components().metadata_projection(),
+    )
+
+
+def _all_selection(bundle: ToolMetadataBundleV1) -> ToolSelectionResult:
     return select_tools(
-        MODEL_TOOL_CATALOG.provider_contracts(),
+        bundle.discovery_view(),
+        bundle.authority_view(),
         ToolSelectionSignals(page_kind="workspace"),
-        dependency_policy=DEPENDENCY_POLICY_V1,
     )
 
 
 def test_application_surface_removes_only_complete_forbidden_envelopes() -> None:
-    selection = _all_selection()
+    bundle = _bundle()
+    selection = _all_selection(bundle)
     result = intersect_authority_surface(
-        MODEL_TOOL_CATALOG,
+        bundle.discovery_view(),
+        bundle.authority_view(),
         selection,
         _view(application=True),
-        dependency_policy=DEPENDENCY_POLICY_V1,
     )
-    assert result.names == tuple(
+    assert result.selected_names == tuple(
         name for name in MODEL_TOOL_NAMES if name not in {"create_application", "compare_offers"}
     )
-    expected = {tool.name: tool.payload for tool in MODEL_TOOL_CATALOG.provider_contracts()}
-    assert [tool.payload for tool in result.tools] == [expected[name] for name in result.names]
+    assert result.provider_contracts == tuple(
+        contract
+        for contract in MODEL_TOOL_CATALOG.provider_contracts()
+        if contract.name in result.selected_names
+    )
 
 
 def test_capability_intersection_preserves_catalog_order_and_payload() -> None:
+    bundle = _bundle()
     applications_read = next(
         capability
         for capability in AGENT_TYPED_V1_PROFILE.capabilities
         if str(capability) == "applications.read"
     )
     result = intersect_authority_surface(
-        MODEL_TOOL_CATALOG,
-        _all_selection(),
+        bundle.discovery_view(),
+        bundle.authority_view(),
+        _all_selection(bundle),
         _view(capabilities=frozenset({applications_read})),
-        dependency_policy=DEPENDENCY_POLICY_V1,
     )
-    assert result.names == ("list_applications", "get_application")
-    assert result.tools == MODEL_TOOL_CATALOG.provider_contracts()[:2]
+    assert result.selected_names == ("list_applications", "get_application")
+    assert result.provider_contracts == MODEL_TOOL_CATALOG.provider_contracts()[:2]
 
 
 def test_empty_policy_and_dependency_fail_closed() -> None:
+    bundle = _bundle()
     with pytest.raises(ProjectionError, match="empty_authority_surface"):
         intersect_authority_surface(
-            MODEL_TOOL_CATALOG,
-            _all_selection(),
+            bundle.discovery_view(),
+            bundle.authority_view(),
+            _all_selection(bundle),
             _view(capabilities=frozenset()),
-            dependency_policy=DEPENDENCY_POLICY_V1,
         )
     with pytest.raises(ProjectionError, match="unsupported_capability_policy_version"):
         intersect_authority_surface(
-            MODEL_TOOL_CATALOG,
-            _all_selection(),
+            bundle.discovery_view(),
+            bundle.authority_view(),
+            _all_selection(bundle),
             replace(_view(), capability_policy_version="capability-policy-v2"),
-            dependency_policy=DEPENDENCY_POLICY_V1,
         )
 
 

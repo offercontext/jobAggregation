@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
+from typing import NoReturn
 from uuid import uuid4
 
 import pytest
 
+from offerpilot.ai.tool_runtime import legacy as legacy_runtime
+from offerpilot.ai.tool_runtime.catalog import compile_tool_metadata_manifest
 from offerpilot.ai.tool_runtime.legacy import LegacyDeterministicAdapter, LegacyDeterministicCatalog
+from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.ai.write_operations import (
     OperationCommitted,
     OperationFailed,
@@ -37,6 +42,8 @@ from offerpilot.pilot_runtime import (
     StreamExecutionMode,
     freeze_json_mapping,
 )
+from offerpilot.ai.tool_specs import legacy as legacy_specs
+from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 from offerpilot.ai.tool_specs.legacy import build_legacy_deterministic_catalog
 from offerpilot.chat_transport import (
     PreparedStreamGuard,
@@ -49,6 +56,7 @@ from offerpilot.pilot_runtime.deterministic import (
     _invoke as deterministic_invoke,
 )
 from offerpilot.pilot_runtime.event_sink import InMemoryRuntimeInvocationControl
+from offerpilot.pilot_runtime.compensation import prepare_compensation_handler_components
 from offerpilot.pilot_runtime.service import PilotRuntime, RuntimeDependencies, _invoke
 
 
@@ -98,12 +106,16 @@ class _Persistence:
     def get_pending_clarification(self, _conversation_id: int) -> object | None:
         return self.clarification
 
-    def persist_initial_pending(self, _conversation_id: int, messages: object, pending: object) -> object:
+    def persist_initial_pending(
+        self, _conversation_id: int, messages: object, pending: object
+    ) -> object:
         self.pending = pending
         self.message_ids += len(tuple(messages))
         return SimpleNamespace(persisted=True, message_ids=(self.message_ids - 1, self.message_ids))
 
-    def persist_clarification(self, _conversation_id: int, messages: object, pending: object, question: str) -> object:
+    def persist_clarification(
+        self, _conversation_id: int, messages: object, pending: object, question: str
+    ) -> object:
         self.clarification = SimpleNamespace(pending=pending, question=question)
         self.message_ids += len(tuple(messages)) + 1
         return SimpleNamespace(persisted=True, message_ids=(self.message_ids - 1, self.message_ids))
@@ -120,7 +132,9 @@ class _Persistence:
         self.message_ids += 1
         return SimpleNamespace(persisted=True, message_id=self.message_ids)
 
-    def resolve_pending_confirmation(self, _conversation_id: int, *_args: object, **_kwargs: object) -> object | None:
+    def resolve_pending_confirmation(
+        self, _conversation_id: int, *_args: object, **_kwargs: object
+    ) -> object | None:
         self.resolve_calls += 1
         if self.resolve_result is None:
             return None
@@ -202,7 +216,14 @@ class _ReplacePersistence(_Persistence):
         self.replacement_result = replacement_result
         self.replace_calls = 0
 
-    def replace_pending_confirmation(self, _conversation_id: int, _pending: object, replacement: object, *_args: object, **_kwargs: object) -> object | None:
+    def replace_pending_confirmation(
+        self,
+        _conversation_id: int,
+        _pending: object,
+        replacement: object,
+        *_args: object,
+        **_kwargs: object,
+    ) -> object | None:
         self.replace_calls += 1
         if self.replacement_result is not None:
             self.pending = replacement
@@ -231,7 +252,10 @@ def _catalog_factory(counter: list[int]) -> object:
             LegacyDeterministicAdapter(
                 name=name,
                 editable_fields=(
-                    ({"field": "jd_text", "type": "long_text"}, {"field": "source_url", "type": "string"})
+                    (
+                        {"field": "jd_text", "type": "long_text"},
+                        {"field": "source_url", "type": "string"},
+                    )
                     if name == "save_application_jd_version"
                     else ()
                 ),
@@ -250,7 +274,9 @@ def _catalog_factory(counter: list[int]) -> object:
     return factory
 
 
-def _adapter(persistence: _Persistence, *, execute_counter: list[int] | None = None) -> tuple[DeterministicPilotAdapter, _Operations, _Coordinator]:
+def _adapter(
+    persistence: _Persistence, *, execute_counter: list[int] | None = None
+) -> tuple[DeterministicPilotAdapter, _Operations, _Coordinator]:
     operations = _Operations()
     coordinator = _Coordinator(operations)
     adapter = DeterministicPilotAdapter(
@@ -260,6 +286,7 @@ def _adapter(persistence: _Persistence, *, execute_counter: list[int] | None = N
         application_outcomes=object(),
         write_operations=operations,
         write_coordinator=coordinator,
+        **_initial_route_dependencies(_initial_route_components()),
         legacy_catalog_factory=_catalog_factory(execute_counter or [0]),
         id_factory=lambda: "call-deterministic-jd-1",
         key_factory=lambda: "key-deterministic-jd-1",
@@ -269,7 +296,9 @@ def _adapter(persistence: _Persistence, *, execute_counter: list[int] | None = N
 
 class _JournalPersistence(_Persistence):
     def list_messages(self, _conversation_id: int) -> tuple[object, ...]:
-        return tuple(SimpleNamespace(id=index + 1, role="assistant") for index in range(self.message_ids))
+        return tuple(
+            SimpleNamespace(id=index + 1, role="assistant") for index in range(self.message_ids)
+        )
 
 
 class _StrictRecorder:
@@ -870,6 +899,7 @@ def test_chained_pending_replay_keeps_only_baseline_replay_metadata() -> None:
         application_outcomes=object(),
         write_operations=operations,
         write_coordinator=coordinator,
+        **_initial_route_dependencies(_initial_route_components()),
         legacy_catalog_factory=_catalog_factory([0]),
     )
     adapter.start_turn(StartTurnRequest(message="保存 JD：岗位"), _Conversation())
@@ -921,18 +951,24 @@ def test_stream_initial_is_direct_and_pending_replay_does_not_reexecute() -> Non
     execution = adapter.prepare_stream(
         StartTurnRequest(message="保存 JD：职位：后端工程师"),
         _Conversation(),
-        transport=RuntimeTransportContext(mode="stream", transport_run_id=uuid4(), stream_version="pilot-sse-v1"),
+        transport=RuntimeTransportContext(
+            mode="stream", transport_run_id=uuid4(), stream_version="pilot-sse-v1"
+        ),
     )
     assert execution.execution_mode is StreamExecutionMode.DIRECT
     assert [type(event).__name__ for event in execution.events[:3]] == [
-        "MetaEvent", "UserMessageSavedEvent", "StatusEvent"
+        "MetaEvent",
+        "UserMessageSavedEvent",
+        "StatusEvent",
     ]
     assert coordinator.execute_calls == 0
 
     replay = adapter.prepare_stream(
         StartTurnRequest(message="替换文本"),
         _Conversation(),
-        transport=RuntimeTransportContext(mode="stream", transport_run_id=uuid4(), stream_version="pilot-sse-v1"),
+        transport=RuntimeTransportContext(
+            mode="stream", transport_run_id=uuid4(), stream_version="pilot-sse-v1"
+        ),
     )
     assert replay.pending_replay is True
     replay_payload = outcome_http_payload(replay.outcome)
@@ -1004,6 +1040,7 @@ def test_stale_cas_uses_typed_pending_projection_and_never_resolves_twice(
         application_outcomes=object(),
         write_operations=operations,
         write_coordinator=coordinator,
+        **_initial_route_dependencies(_initial_route_components()),
         legacy_catalog_factory=_catalog_factory([0]),
         id_factory=lambda: "call-stale-cas-1",
         key_factory=lambda: "key-stale-cas-0001",
@@ -1372,6 +1409,7 @@ def test_terminal_replay_is_ledger_first_and_does_not_read_pending_or_execute() 
         application_outcomes=object(),
         write_operations=operations,
         write_coordinator=coordinator,
+        **_initial_route_dependencies(_initial_route_components()),
         legacy_catalog_factory=_catalog_factory([0]),
     )
 
@@ -1482,3 +1520,324 @@ def test_runtime_confirmation_stream_is_precomputed_and_never_enters_agent_host(
     assert host.calls == 0
     assert seen[-1] == "CompletedEvent"
     assert guard.complete(CompletionReason.NORMAL) is True
+
+
+class _InitialEntryAbort(BaseException):
+    pass
+
+
+class _InitialEntryPersistence(_Persistence):
+    def __init__(self, failure: str | None = None) -> None:
+        super().__init__()
+        self.failure = failure
+
+    def _raise_after_persist(self) -> None:
+        if self.failure == "exception":
+            raise RuntimeError("deterministic entry failed")
+        if self.failure == "cancelled":
+            raise asyncio.CancelledError
+        if self.failure == "base_exception":
+            raise _InitialEntryAbort
+
+    def persist_initial_pending(
+        self,
+        conversation_id: int,
+        messages: object,
+        pending: object,
+    ) -> object:
+        result = super().persist_initial_pending(conversation_id, messages, pending)
+        self._raise_after_persist()
+        return result
+
+    def persist_clarification(
+        self,
+        conversation_id: int,
+        messages: object,
+        pending: object,
+        question: str,
+    ) -> object:
+        result = super().persist_clarification(
+            conversation_id,
+            messages,
+            pending,
+            question,
+        )
+        self._raise_after_persist()
+        return result
+
+
+def _initial_route_components() -> object:
+    manifest = compile_tool_metadata_manifest(MODEL_TOOL_CATALOG.specs)
+    projection = manifest.to_dict()
+    bundle = ToolMetadataBundleV1(
+        typed_catalog=MODEL_TOOL_CATALOG,
+        manifest=manifest,
+        legacy_boundary=projection["legacy_boundary"],  # type: ignore[arg-type]
+        compensation=prepare_compensation_handler_components().metadata_projection(),
+    )
+    return legacy_runtime.build_unpublished_legacy_initial_route_components(
+        catalog=legacy_specs.build_static_legacy_adapter_catalog(),
+        legacy_boundary=bundle.legacy_boundary(),
+        runtime_container_token=object(),
+    )
+
+
+def _initial_entry_request(source: str) -> StartTurnRequest:
+    if source == "jd_clarification":
+        return StartTurnRequest(message="保存 JD")
+    if source == "jd_deterministic_action":
+        return StartTurnRequest(message="保存 JD：后端工程师")
+    if source == "submission_snapshot_action":
+        payload = {
+            "type": "application_submission_snapshot",
+            "resumeId": 1,
+            "jdVersionId": 1,
+            "materialKitId": None,
+            "submittedAt": "2026-08-26T00:00:00+00:00",
+            "note": "submitted",
+        }
+        return StartTurnRequest(
+            message="冻结本次投递材料",
+            pilot_action=PilotActionDescriptor(
+                kind="application_submission_snapshot",
+                value=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            ),
+        )
+    if source == "outcome_recording_action":
+        payload = {
+            "type": "application_outcome_record",
+            "snapshotId": 1,
+            "eventId": None,
+            "stage": "interview",
+            "result": "advanced",
+            "feedbackText": "clear communication",
+            "reflectionText": "prepare system design",
+            "nextActionText": "schedule next round",
+            "feedbackTags": ["communication"],
+            "occurredAt": "2026-08-26T00:00:00+00:00",
+        }
+        return StartTurnRequest(
+            message="记录本次投递结果",
+            pilot_action=PilotActionDescriptor(
+                kind="application_outcome_record",
+                value=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            ),
+        )
+    raise AssertionError(f"unsupported test source: {source}")
+
+
+def _initial_route_dependencies(components: object) -> dict[str, object]:
+    source_type = legacy_runtime.LegacyRouteSourceV1
+    return {
+        "legacy_request_owner_lease_factory": components.owner_lease_factory,
+        "legacy_initial_route_port": components.initial_route_port,
+        "legacy_jd_clarification_issuer": components.initial_issuer_for(
+            source_type("jd_clarification")
+        ),
+        "legacy_jd_deterministic_action_issuer": components.initial_issuer_for(
+            source_type("jd_deterministic_action")
+        ),
+        "legacy_submission_snapshot_issuer": components.initial_issuer_for(
+            source_type("submission_snapshot_action")
+        ),
+        "legacy_outcome_recording_issuer": components.initial_issuer_for(
+            source_type("outcome_recording_action")
+        ),
+    }
+
+
+def _adapter_with_initial_routes(
+    persistence: _Persistence,
+    components: object,
+) -> DeterministicPilotAdapter:
+    return DeterministicPilotAdapter(
+        persistence=persistence,
+        applications=_Applications(),
+        application_jd_versions=_JD(),
+        application_outcomes=object(),
+        **_initial_route_dependencies(components),
+        id_factory=lambda: "call-deterministic-route-1",
+        key_factory=lambda: "key-deterministic-route-1",
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "jd_clarification",
+        "jd_deterministic_action",
+        "submission_snapshot_action",
+        "outcome_recording_action",
+    ),
+)
+@pytest.mark.parametrize(
+    "exit_mode",
+    ("success", "pending_created", "exception", "cancelled", "base_exception"),
+)
+def test_real_deterministic_entries_use_only_the_matching_source_issuer_and_revoke(
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+    exit_mode: str,
+) -> None:
+    components = _initial_route_components()
+    owner_factory = components.owner_lease_factory
+    port = components.initial_route_port
+    source_type = legacy_runtime.LegacyRouteSourceV1
+    issuers = {
+        value: components.initial_issuer_for(source_type(value))
+        for value in (
+            "jd_clarification",
+            "jd_deterministic_action",
+            "submission_snapshot_action",
+            "outcome_recording_action",
+        )
+    }
+    issuer_type = type(next(iter(issuers.values())))
+    owner_factory_type = type(owner_factory)
+    port_type = type(port)
+    selected_issuers: list[object] = []
+    owners: list[object] = []
+    child_leases: list[object] = []
+    tokens: list[object] = []
+    handles: list[object] = []
+
+    original_open = owner_factory_type.open
+    original_open_child = issuer_type.open_request_lease
+    original_issue = issuer_type.issue
+    original_resolve = port_type.resolve_initial
+
+    def open_owner(self: object) -> object:
+        owner = original_open(self)
+        owners.append(owner)
+        return owner
+
+    def open_child(self: object, owner: object) -> object:
+        selected_issuers.append(self)
+        child = original_open_child(self, owner)
+        child_leases.append(child)
+        return child
+
+    def issue(self: object, lease: object) -> object:
+        token = original_issue(self, lease)
+        tokens.append(token)
+        return token
+
+    def resolve(self: object, token: object) -> object:
+        handle = original_resolve(self, token)
+        handles.append(handle)
+        return handle
+
+    monkeypatch.setattr(owner_factory_type, "open", open_owner)
+    monkeypatch.setattr(issuer_type, "open_request_lease", open_child)
+    monkeypatch.setattr(issuer_type, "issue", issue)
+    monkeypatch.setattr(port_type, "resolve_initial", resolve)
+
+    failure = exit_mode if exit_mode in {"exception", "cancelled", "base_exception"} else None
+    persistence = _InitialEntryPersistence(failure)
+    adapter = _adapter_with_initial_routes(persistence, components)
+    expected_error: type[BaseException] | None = {
+        "exception": RuntimeError,
+        "cancelled": asyncio.CancelledError,
+        "base_exception": _InitialEntryAbort,
+    }.get(exit_mode)
+    if expected_error is None:
+        execution = adapter.start_turn(_initial_entry_request(source), _Conversation())
+        assert isinstance(execution.outcome, (MessageOutcome, ConfirmationRequiredOutcome))
+        if exit_mode == "pending_created":
+            assert persistence.pending is not None or persistence.clarification is not None
+    else:
+        with pytest.raises(expected_error):
+            adapter.start_turn(_initial_entry_request(source), _Conversation())
+
+    assert selected_issuers == [issuers[source]]
+    assert len(owners) == len(child_leases) == len(tokens) == len(handles) == 1
+    expected_issuer = issuers[source]
+    assert object.__getattribute__(child_leases[0], "_registry") is object.__getattribute__(
+        expected_issuer,
+        "_registry",
+    )
+    with pytest.raises((TypeError, ValueError), match="closed|revoked|lease|handle"):
+        port.require_route(handles[0])
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "jd_clarification",
+        "jd_deterministic_action",
+        "submission_snapshot_action",
+        "outcome_recording_action",
+    ),
+)
+def test_consecutive_real_deterministic_requests_open_fresh_owner_and_child_leases(
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+) -> None:
+    components = _initial_route_components()
+    owner_factory_type = type(components.owner_lease_factory)
+    issuer_type = type(components.initial_issuer_for(legacy_runtime.LegacyRouteSourceV1(source)))
+    original_open = owner_factory_type.open
+    original_open_child = issuer_type.open_request_lease
+    owners: list[object] = []
+    children: list[object] = []
+
+    def open_owner(self: object) -> object:
+        owner = original_open(self)
+        owners.append(owner)
+        return owner
+
+    def open_child(self: object, owner: object) -> object:
+        child = original_open_child(self, owner)
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(owner_factory_type, "open", open_owner)
+    monkeypatch.setattr(issuer_type, "open_request_lease", open_child)
+    persistence = _InitialEntryPersistence()
+    adapter = _adapter_with_initial_routes(persistence, components)
+    for _index in range(2):
+        persistence.pending = None
+        persistence.clarification = None
+        adapter.start_turn(_initial_entry_request(source), _Conversation())
+
+    assert len(owners) == len(children) == 2
+    assert owners[0] is not owners[1]
+    assert children[0] is not children[1]
+
+
+def test_confirmation_resume_never_requests_an_initial_source_issuer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    components = _initial_route_components()
+    owner_factory_type = type(components.owner_lease_factory)
+    issuer_type = type(
+        components.initial_issuer_for(legacy_runtime.LegacyRouteSourceV1("jd_clarification"))
+    )
+    initial_calls: list[str] = []
+
+    def forbidden_owner(_self: object) -> NoReturn:
+        initial_calls.append("owner")
+        raise AssertionError("confirmation resume cannot open an initial owner lease")
+
+    def forbidden_child(_self: object, _owner: object) -> NoReturn:
+        initial_calls.append("child")
+        raise AssertionError("confirmation resume cannot open an initial child lease")
+
+    persistence = _InitialEntryPersistence()
+    adapter = _adapter_with_initial_routes(persistence, components)
+    adapter.start_turn(_initial_entry_request("jd_deterministic_action"), _Conversation())
+    pending = persistence.pending
+    assert pending is not None
+    token = _confirmation_token(pending)
+    monkeypatch.setattr(owner_factory_type, "open", forbidden_owner)
+    monkeypatch.setattr(issuer_type, "open_request_lease", forbidden_child)
+
+    adapter.confirm(
+        ConfirmationRequest(
+            conversation_id=7,
+            approved=False,
+            confirmation_token=token,
+        ),
+        _Conversation(),
+    )
+    assert initial_calls == []

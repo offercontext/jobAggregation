@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from offerpilot.ai.tool_runtime.contracts import JSONValue, TransientToolRuntimeValue
 from offerpilot.ai.tool_runtime.legacy import (
     LegacyDeterministicAdapterSpec,
+    LegacyInitialRoutePort,
     LegacyProofDeterministicCatalog,
     LegacyStaticAdapterCatalogV1,
     _create_legacy_proof_route_handle,
@@ -38,6 +39,7 @@ from offerpilot.ai.tool_runtime.legacy_proof import (
 )
 from offerpilot.ai.tool_runtime.metadata import (
     BundleInstanceToken,
+    LegacyAdapterBindingV1,
     LegacyDeterministicBoundaryV1,
     freeze_json,
 )
@@ -517,11 +519,11 @@ class LegacyPendingIdentityVerifierPort(_SealedValue):
         object,
     ]
     _locked_recheck_backend: Callable[
-        [Session, LegacyRouteIssuanceLease, PreparedLegacyCall],
+        [Session, LegacyConfirmationLookupIdentity, LegacyApprovedConfirmationInput],
         object,
     ]
     _claim_cas_backend: Callable[
-        [Session, LegacyRouteIssuanceLease, PreparedLegacyCall],
+        [Session, LegacyConfirmationLookupIdentity, LegacyApprovedConfirmationInput],
         object,
     ]
     _ledger_key: LedgerKeyDomain
@@ -585,14 +587,14 @@ class LegacyPendingIdentityVerifierPort(_SealedValue):
         )
         typed_locked_recheck = cast(
             Callable[
-                [Session, LegacyRouteIssuanceLease, PreparedLegacyCall],
+                [Session, LegacyConfirmationLookupIdentity, LegacyApprovedConfirmationInput],
                 object,
             ],
             locked_recheck,
         )
         typed_claim_cas = cast(
             Callable[
-                [Session, LegacyRouteIssuanceLease, PreparedLegacyCall],
+                [Session, LegacyConfirmationLookupIdentity, LegacyApprovedConfirmationInput],
                 object,
             ],
             claim_cas,
@@ -1427,11 +1429,6 @@ class LegacyPendingIdentityVerifierPort(_SealedValue):
                 state.locked_evidence = None
                 self._seal_issuance_state(state)
 
-            raw_claimed = self._claim_cas_backend(
-                write_session,
-                issuance_lease,
-                state.prepared_call,
-            )
             (
                 _adapter,
                 _raw_args,
@@ -1440,6 +1437,11 @@ class LegacyPendingIdentityVerifierPort(_SealedValue):
                 lookup,
                 confirmation_input,
             ) = self._prepared_identity_inputs(state.prepared_call)
+            raw_claimed = self._claim_cas_backend(
+                write_session,
+                lookup,
+                confirmation_input,
+            )
             claimed_snapshot = self._validate_snapshot_shape(
                 raw_claimed,
                 lookup_identity=lookup,
@@ -1526,8 +1528,8 @@ class LegacyPendingIdentityVerifierPort(_SealedValue):
                 ) = self._prepared_identity_inputs(prepared_call)
             raw = self._locked_recheck_backend(
                 write_session,
-                issuance_lease,
-                prepared_call,
+                lookup,
+                confirmation_input,
             )
             snapshot = self._validate_snapshot_shape(
                 raw,
@@ -1854,6 +1856,143 @@ def build_legacy_pending_identity_verifier_port(
     return LegacyPendingIdentityVerifierPort._configuration(
         backend=backend,
         ledger_key=ledger_key,
+    )
+
+
+_LEGACY_COMPOSITE_ROUTE_SEAL = object()
+
+
+class LegacyCompositeRouteVerifier(TransientToolRuntimeValue):
+    """One sealed verifier for initial and confirmation-proof route handles."""
+
+    __slots__ = (
+        "_initial_route_port",
+        "_proof_consumer_port",
+        "_legacy_boundary",
+        "_bundle_instance_token",
+        "_registry_token",
+        "_integrity_seal",
+    )
+    _initial_route_port: LegacyInitialRoutePort
+    _proof_consumer_port: LegacyRouteProofConsumerPort
+    _legacy_boundary: LegacyDeterministicBoundaryV1
+    _bundle_instance_token: BundleInstanceToken
+    _registry_token: object
+    _integrity_seal: tuple[object, ...]
+
+    def __init__(
+        self,
+        seal: object | None = None,
+        *,
+        initial_route_port: LegacyInitialRoutePort,
+        proof_consumer_port: LegacyRouteProofConsumerPort,
+        legacy_boundary: LegacyDeterministicBoundaryV1,
+    ) -> None:
+        if seal is not _LEGACY_COMPOSITE_ROUTE_SEAL:
+            raise TypeError("Legacy composite route verifiers are factory-created")
+        if type(initial_route_port) is not LegacyInitialRoutePort:
+            raise TypeError("Legacy composite verifier requires the exact initial Port")
+        if type(proof_consumer_port) is not LegacyRouteProofConsumerPort:
+            raise TypeError("Legacy composite verifier requires the exact proof consumer Port")
+        if type(legacy_boundary) is not LegacyDeterministicBoundaryV1:
+            raise TypeError("Legacy composite verifier requires the exact Legacy boundary")
+        bundle_token = legacy_boundary.bundle_instance_token
+        if (
+            initial_route_port.bundle_instance_token is not bundle_token
+            or proof_consumer_port.bundle_instance_token is not bundle_token
+        ):
+            raise ValueError("Legacy composite verifier requires same-Bundle Ports")
+        registry_token = object()
+        values = (
+            initial_route_port,
+            proof_consumer_port,
+            legacy_boundary,
+            bundle_token,
+            registry_token,
+        )
+        for slot, value in zip(self.__slots__[:-1], values):
+            object.__setattr__(self, slot, value)
+        object.__setattr__(self, "_integrity_seal", values)
+        self._require_integrity()
+
+    def __setattr__(self, name: str, value: object) -> NoReturn:
+        del name, value
+        raise AttributeError("Legacy composite route verifier is sealed")
+
+    def _require_integrity(self) -> None:
+        try:
+            current = (
+                self._initial_route_port,
+                self._proof_consumer_port,
+                self._legacy_boundary,
+                self._bundle_instance_token,
+                self._registry_token,
+            )
+            if (
+                not _same_identity_tuple(self._integrity_seal, current)
+                or self._legacy_boundary.bundle_instance_token is not self._bundle_instance_token
+                or self._initial_route_port.bundle_instance_token is not self._bundle_instance_token
+                or self._proof_consumer_port.bundle_instance_token
+                is not self._bundle_instance_token
+            ):
+                raise ValueError("Legacy composite route verifier integrity drift")
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("Legacy composite route verifier integrity drift") from exc
+
+    @property
+    def bundle_instance_token(self) -> BundleInstanceToken:
+        self._require_integrity()
+        return self._bundle_instance_token
+
+    @property
+    def registry_token(self) -> object:
+        self._require_integrity()
+        return self._registry_token
+
+    def _require_boundary_binding(self, binding: object) -> LegacyAdapterBindingV1:
+        if type(binding) is not LegacyAdapterBindingV1 or all(
+            candidate is not binding for candidate in self._legacy_boundary.ordered_adapter_bindings
+        ):
+            raise ValueError("Legacy route binding is outside the exact Bundle")
+        return binding
+
+    def require_route(self, route_handle: object) -> LegacyAdapterBindingV1:
+        """Resolve either route origin to its exact Bundle boundary binding."""
+
+        self._require_integrity()
+        try:
+            initial_binding = self._initial_route_port.require_route(route_handle)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            initial_binding = None
+        if initial_binding is not None:
+            return self._require_boundary_binding(initial_binding)
+        try:
+            ordinal, name, source = self._proof_consumer_port.require_route_identity(route_handle)
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            raise ValueError("Legacy route has foreign or revoked provenance") from exc
+        if source != "confirmation_resume":
+            raise ValueError("Legacy proof route source is outside confirmation resume")
+        matches = tuple(
+            binding
+            for binding in self._legacy_boundary.ordered_adapter_bindings
+            if binding.ordinal == ordinal and binding.name == name
+        )
+        if len(matches) != 1:
+            raise ValueError("Legacy proof route binding is outside the exact Bundle")
+        return self._require_boundary_binding(matches[0])
+
+
+def build_legacy_composite_route_verifier(
+    *,
+    initial_route_port: LegacyInitialRoutePort,
+    proof_consumer_port: LegacyRouteProofConsumerPort,
+    legacy_boundary: LegacyDeterministicBoundaryV1,
+) -> LegacyCompositeRouteVerifier:
+    return LegacyCompositeRouteVerifier(
+        _LEGACY_COMPOSITE_ROUTE_SEAL,
+        initial_route_port=initial_route_port,
+        proof_consumer_port=proof_consumer_port,
+        legacy_boundary=legacy_boundary,
     )
 
 
@@ -2268,8 +2407,10 @@ def build_unpublished_legacy_confirmation_components(
 
 __all__ = [
     "LegacyConfirmationRouteComponents",
+    "LegacyCompositeRouteVerifier",
     "LegacyPendingIdentityVerifierPort",
     "LegacyRouteProofIssuer",
+    "build_legacy_composite_route_verifier",
     "build_legacy_pending_identity_verifier_port",
     "build_unpublished_legacy_confirmation_components",
 ]

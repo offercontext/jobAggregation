@@ -6,6 +6,7 @@ import re
 import sqlite3
 from collections.abc import Iterable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -326,6 +327,49 @@ def test_operation_port_projection_equals_published_sqlite_allow_set() -> None:
     )
 
     assert len(typed_entries) == 25
+    assert actual_routes == _all_published_routes()
+
+
+def test_completed_production_bundle_operation_port_equals_published_allow_set() -> None:
+    composition = importlib.import_module("offerpilot.pilot_runtime.composition")
+    factory = getattr(composition, "build_production_tool_metadata_components", None)
+    assert callable(factory), "Task 9 must expose the production metadata component factory"
+    legacy_route = importlib.import_module("offerpilot.pilot_runtime.legacy_route")
+    verifier_builder = getattr(
+        legacy_route,
+        "build_legacy_pending_identity_verifier_port",
+        None,
+    )
+    assert callable(verifier_builder)
+    verifier = verifier_builder(
+        backend=SimpleNamespace(
+            read_snapshot=lambda *_args, **_kwargs: {},
+            locked_recheck=lambda *_args, **_kwargs: {},
+            claim_cas=lambda *_args, **_kwargs: {},
+        ),
+        ledger_key=SimpleNamespace(
+            key_id="00000000-0000-0000-0000-000000000001",
+            secret=b"k" * 32,
+        ),
+    )
+
+    components = factory(pending_identity_verifier_port=verifier)
+    port = components.operation_port
+    bundle = components.bundle
+    actual_routes = frozenset(
+        (entry.operation_role, entry.adapter_kind, entry.operation_name)
+        for entry in (
+            *port.typed_primary_entries,
+            *port.legacy_primary_entries,
+            *port.compensation_entries,
+        )
+        if entry.result_contract is not None
+    )
+
+    assert port.bundle_instance_token is bundle.bundle_instance_token
+    assert port.bundle_instance_token is bundle.operation_view().bundle_instance_token
+    assert port.bundle_instance_token is bundle.legacy_boundary().bundle_instance_token
+    assert port.bundle_instance_token is bundle.compensation_view().bundle_instance_token
     assert actual_routes == _all_published_routes()
 
 

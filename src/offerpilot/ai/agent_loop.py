@@ -5,6 +5,7 @@ import json
 from copy import deepcopy
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
+from types import MappingProxyType
 from typing import Any, TypeGuard, cast
 from uuid import uuid4
 
@@ -46,13 +47,17 @@ from offerpilot.ai.tool_runtime.contracts import (
     TransientToolRuntimeValue,
     materialize_provider_payloads,
 )
-from offerpilot.ai.tool_runtime.metadata import WriteOperationMetadataV1
+from offerpilot.ai.tool_runtime.metadata import (
+    ProviderToolMetadataView,
+    ToolAuthorityMetadataView,
+    ToolDiscoveryMetadataView,
+    WriteOperationMetadataV1,
+)
 from offerpilot.ai.tool_runtime.pipeline import Rejected, execute_prepared, prepare_call
 from offerpilot.ai.tool_runtime.rendering import render_compatibility
 from offerpilot.ai.tool_runtime.transport import project_transport_event
 from offerpilot.ai.tool_runtime.validation import ArgumentValidationError, parse_arguments
 from offerpilot.ai.types import Assistant, Message, ToolCall
-from offerpilot.agent_runtime.events import ContextManifestInput
 from offerpilot.agent_runtime.journal import EventInput, RunRecorder
 from offerpilot.config import AIProviderProfile
 from offerpilot.context_projector.binding import ModelCallSurfaceBinding
@@ -76,10 +81,8 @@ from offerpilot.context_projector.gateway import (
 )
 from offerpilot.context_projector.projector import ModelSurfaceProjector, ProjectionRequest
 from offerpilot.context_projector.selector import (
-    DependencyPolicyV1,
-    ToolSelection,
+    ToolSelectionResult,
     ToolSelectionSignals,
-    require_dependency_policy_v1,
     select_tools,
 )
 from offerpilot.context_projector.authority_surface import (
@@ -240,22 +243,82 @@ class _PerCallSurfaceModel:
         return self._gateway.consume_attempt(attempt_id)
 
 
-def _surface_selection_matches(left: ToolSelection, right: ToolSelection) -> bool:
+def _surface_selection_matches(
+    left: ToolSelectionResult,
+    right: ToolSelectionResult,
+) -> bool:
     if (
-        left.names != right.names
-        or left.envelope_fingerprint != right.envelope_fingerprint
-        or left.fallback_all != right.fallback_all
-        or left.domains != right.domains
-        or len(left.tools) != len(right.tools)
+        left.selected_names != right.selected_names
+        or left.provider_envelope_fingerprint != right.provider_envelope_fingerprint
+        or left.full_catalog_fallback != right.full_catalog_fallback
+        or left.selected_domains != right.selected_domains
+        or left.dependency_closure != right.dependency_closure
+        or left.fallback_reason != right.fallback_reason
+        or left.diagnostics != right.diagnostics
+        or len(left.provider_contracts) != len(right.provider_contracts)
     ):
         return False
     return all(
-        left_tool.name == right_tool.name
-        and left_tool.description == right_tool.description
-        and left_tool.payload == right_tool.payload
-        and left_tool.parameters == right_tool.parameters
-        for left_tool, right_tool in zip(left.tools, right.tools)
+        left_contract is right_contract
+        for left_contract, right_contract in zip(
+            left.provider_contracts,
+            right.provider_contracts,
+        )
     )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _SurfaceCatalogSeal:
+    """Bundle-derived Provider topology used by the Task 9 Authority seal."""
+
+    provider_view: ProviderToolMetadataView = field(repr=False)
+
+    def provider_contracts(self) -> tuple[ProviderToolContract, ...]:
+        return self.provider_view.ordered_contracts
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _SurfaceDependencyPolicySeal:
+    """Bundle-derived dependency topology used until Task 10 owns the gate."""
+
+    version: str
+    catalog_names: tuple[str, ...]
+    dependencies: Mapping[str, frozenset[str]] = field(repr=False)
+    canonical_fingerprint: str
+
+    @classmethod
+    def from_view(
+        cls,
+        view: ToolDiscoveryMetadataView,
+        *,
+        version: str,
+    ) -> "_SurfaceDependencyPolicySeal":
+        entries = view.ordered_entries
+        return cls(
+            version=version,
+            catalog_names=tuple(entry.provider_name for entry in entries),
+            dependencies=MappingProxyType(
+                {entry.provider_name: frozenset(entry.dependencies) for entry in entries}
+            ),
+            canonical_fingerprint=view.discovery_fingerprint,
+        )
+
+    def validate_closed(
+        self,
+        selected_names: tuple[str, ...],
+        available_names: tuple[str, ...],
+    ) -> None:
+        if available_names != self.catalog_names:
+            raise ProjectionError("dependency_catalog_mismatch")
+        selected = frozenset(selected_names)
+        if not selected or any(name not in self.dependencies for name in selected):
+            raise ProjectionError("invalid_tool_surface")
+        if any(
+            not dependencies.issubset(selected)
+            for name, dependencies in self.dependencies.items()
+            if name in selected
+        ):
+            raise ProjectionError("tool_dependency_not_closed")
 
 
 @dataclass(frozen=True, slots=True, repr=False, eq=False)
@@ -270,10 +333,14 @@ class SegmentSurfaceGate(_ReplacementProtected, TransientToolRuntimeValue):
 
     authority: SegmentExecutionAuthority = field(repr=False)
     context: ToolExecutionContext = field(repr=False)
-    catalog: ToolCatalog = field(repr=False)
+    catalog: _SurfaceCatalogSeal = field(repr=False)
+    dispatch_catalog: ToolCatalog = field(repr=False)
+    provider_view: ProviderToolMetadataView = field(repr=False)
+    discovery_view: ToolDiscoveryMetadataView = field(repr=False)
+    authority_metadata_view: ToolAuthorityMetadataView = field(repr=False)
     authority_surface: AuthoritySurfaceView = field(repr=False)
-    selection: ToolSelection = field(repr=False)
-    dependency_policy: DependencyPolicyV1 = field(repr=False)
+    selection: ToolSelectionResult = field(repr=False)
+    dependency_policy: _SurfaceDependencyPolicySeal = field(repr=False)
     policy: object = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -287,12 +354,35 @@ class SegmentSurfaceGate(_ReplacementProtected, TransientToolRuntimeValue):
             raise ProjectionError("tool_context_required")
         if self.context.authority is not self.authority:
             raise ProjectionError("segment_context_mismatch")
-        if type(self.catalog) is not ToolCatalog:
+        if type(self.catalog) is not _SurfaceCatalogSeal:
+            raise ProjectionError("surface_catalog_seal_required")
+        if type(self.dispatch_catalog) is not ToolCatalog:
             raise ProjectionError("typed_catalog_required")
+        if type(self.provider_view) is not ProviderToolMetadataView:
+            raise ProjectionError("provider_metadata_view_required")
+        if type(self.discovery_view) is not ToolDiscoveryMetadataView:
+            raise ProjectionError("discovery_metadata_view_required")
+        if type(self.authority_metadata_view) is not ToolAuthorityMetadataView:
+            raise ProjectionError("authority_metadata_view_required")
+        if not (
+            self.provider_view.bundle_instance_token
+            is self.discovery_view.bundle_instance_token
+            is self.authority_metadata_view.bundle_instance_token
+            is self.selection.bundle_instance_token
+        ):
+            raise ProjectionError("cross_Bundle_metadata_views")
+        provider_contracts = self.provider_view.ordered_contracts
+        if self.catalog.provider_contracts() is not provider_contracts:
+            raise ProjectionError("provider_surface_mismatch")
+        dispatch_contracts = tuple(spec.contract for spec in self.dispatch_catalog.specs)
+        if len(dispatch_contracts) != len(provider_contracts) or any(
+            actual is not expected
+            for actual, expected in zip(dispatch_contracts, provider_contracts)
+        ):
+            raise ProjectionError("provider_surface_mismatch")
         expected_view = AuthoritySurfaceView.from_authority(self.authority)
         if self.authority_surface != expected_view:
             raise ProjectionError("authority_surface_mismatch")
-        require_dependency_policy_v1(self.dependency_policy)
         profile = getattr(self.policy, "capability_profile", None)
         if profile is None:
             raise ProjectionError("capability_profile_required")
@@ -309,23 +399,26 @@ class SegmentSurfaceGate(_ReplacementProtected, TransientToolRuntimeValue):
         ):
             raise ProjectionError("capability_profile_drift")
         if (
-            not self.selection.tools
-            or tuple(contract.name for contract in self.selection.tools) != self.selection.names
+            not self.selection.provider_contracts
+            or tuple(contract.name for contract in self.selection.provider_contracts)
+            != self.selection.selected_names
         ):
             raise ProjectionError("invalid_tool_surface")
-        contracts = self.catalog.provider_contracts()
-        if any(contract not in contracts for contract in self.selection.tools):
+        if any(
+            not any(contract is available for available in provider_contracts)
+            for contract in self.selection.provider_contracts
+        ):
             raise ProjectionError("preselected_surface_mismatch")
         self.dependency_policy.validate_closed(
-            self.selection.names,
-            tuple(contract.name for contract in contracts),
+            self.selection.dependency_closure,
+            tuple(contract.name for contract in provider_contracts),
         )
         try:
             projected = intersect_authority_surface(
-                self.catalog,
+                self.discovery_view,
+                self.authority_metadata_view,
                 self.selection,
                 self.authority_surface,
-                dependency_policy=self.dependency_policy,
             )
         except ProjectionError:
             raise
@@ -340,7 +433,8 @@ class ApprovedContinuationSegment(TransientToolRuntimeValue):
     The approval port is deliberately the only producer of this value.  It
     carries the canonical post-terminal source messages and all Segment-bound
     Provider inputs together, so the loop cannot accidentally retain the
-    Approval context, catalog, model, or surface gate after the origin write.
+    Approval context, model, or surface gate after the origin write, while the
+    one Bundle-owned immutable catalog remains the exact Runtime catalog.
     ``messages`` are the complete source snapshot after the origin ToolMessage
     has been durably committed; the runner never appends a second local copy.
     """
@@ -381,7 +475,7 @@ class ApprovedContinuationSegment(TransientToolRuntimeValue):
         if (
             self.surface_gate.authority is not self.tool_context.authority
             or self.surface_gate.context is not self.tool_context
-            or self.surface_gate.catalog is not self.catalog
+            or self.surface_gate.dispatch_catalog is not self.catalog
         ):
             raise ProjectionError("approved continuation Segment bundle mismatch")
         self.surface_gate._validate_current_surface()
@@ -396,7 +490,9 @@ def build_segment_surface_gate(
     catalog: ToolCatalog,
     context: ToolExecutionContext,
     authority: SegmentExecutionAuthority,
-    dependency_policy: DependencyPolicyV1,
+    provider_view: ProviderToolMetadataView,
+    discovery_view: ToolDiscoveryMetadataView,
+    authority_metadata_view: ToolAuthorityMetadataView,
     policy: object,
 ) -> SegmentSurfaceGate:
     """Build the provider-free selection gate for one trusted Segment."""
@@ -407,6 +503,18 @@ def build_segment_surface_gate(
         raise ProjectionError("tool_context_required")
     if context.authority is not authority:
         raise ProjectionError("segment_context_mismatch")
+    if type(provider_view) is not ProviderToolMetadataView:
+        raise ProjectionError("provider_metadata_view_required")
+    if type(discovery_view) is not ToolDiscoveryMetadataView:
+        raise ProjectionError("discovery_metadata_view_required")
+    if type(authority_metadata_view) is not ToolAuthorityMetadataView:
+        raise ProjectionError("authority_metadata_view_required")
+    if not (
+        provider_view.bundle_instance_token
+        is discovery_view.bundle_instance_token
+        is authority_metadata_view.bundle_instance_token
+    ):
+        raise ProjectionError("cross_Bundle_metadata_views")
     values = tuple(messages)
     user_indexes = [index for index, message in enumerate(values) if message.role == "user"]
     if not user_indexes:
@@ -436,22 +544,29 @@ def build_segment_surface_gate(
         attachment_kinds=attachment_kinds,
         trusted_domains=trusted_domains,
     )
-    provider_tools = tuple(catalog.provider_contracts())
-    dependency_policy = require_dependency_policy_v1(dependency_policy)
-    selection = select_tools(provider_tools, signals, dependency_policy=dependency_policy)
+    selection = select_tools(discovery_view, authority_metadata_view, signals)
     authority_surface = AuthoritySurfaceView.from_authority(authority)
     selection = intersect_authority_surface(
-        catalog,
+        discovery_view,
+        authority_metadata_view,
         selection,
         authority_surface,
-        dependency_policy=dependency_policy,
     )
+    dependency_policy = _SurfaceDependencyPolicySeal.from_view(
+        discovery_view,
+        version=authority_surface.dependency_policy_version,
+    )
+    surface_catalog = _SurfaceCatalogSeal(provider_view)
     factory = context.authority_factory
     factory.register_tool_execution_context(context, authority=authority)
     gate = SegmentSurfaceGate(
         authority=authority,
         context=context,
-        catalog=catalog,
+        catalog=surface_catalog,
+        dispatch_catalog=catalog,
+        provider_view=provider_view,
+        discovery_view=discovery_view,
+        authority_metadata_view=authority_metadata_view,
         authority_surface=authority_surface,
         selection=selection,
         dependency_policy=dependency_policy,
@@ -461,7 +576,7 @@ def build_segment_surface_gate(
         gate,
         authority=authority,
         context=context,
-        catalog=catalog,
+        catalog=surface_catalog,
         policy=policy,
         dependency_policy=dependency_policy,
         selection=selection,
@@ -533,7 +648,7 @@ class _LoopServices:
                 gate,
                 authority=authority,
                 context=self.context,
-                catalog=self.catalog,
+                catalog=gate.catalog,
                 policy=gate.policy,
                 dependency_policy=gate.dependency_policy,
                 selection=gate.selection,
@@ -583,7 +698,6 @@ class _LoopServices:
         )
         surface = self.project_model_surface(
             messages,
-            tools,
             model_call_id=model_call_id,
             build_identity=build_identity,
             model=model,
@@ -724,7 +838,6 @@ class _LoopServices:
     def project_model_surface(
         self,
         messages: list[Message],
-        tools: list[ProviderToolContract],
         *,
         model_call_id: str,
         build_identity: object,
@@ -844,14 +957,10 @@ class _LoopServices:
             )
         if gate is None:
             raise ProjectionError("segment_surface_gate_required")
-        preselected_tools = gate.selection
-        dependency_policy = gate.dependency_policy
-        authority = cast(SegmentExecutionAuthority, self.context.authority)
         request = ProjectionRequest(
             model_call_id=model_call_id,
             contributors=tuple(contributors),
             history=history,
-            provider_tools=tuple(tools),
             tool_signals=ToolSelectionSignals(
                 current_request=current.content,
                 page_kind=page_kinds[0] if page_kinds else "workspace",
@@ -859,12 +968,9 @@ class _LoopServices:
                 trusted_domains=trusted_domains,
             ),
             provider_budgets=tuple(budgets),
-            authority_surface=AuthoritySurfaceView.from_authority(authority),
-            provider_catalog=self.catalog,
-            dependency_policy=dependency_policy,
+            selection=gate.selection,
             sources=tuple(sources),
             provider_surface_build_identity=build_identity,
-            preselected_tools=preselected_tools,
         )
         return ModelSurfaceProjector().project(request)
 
@@ -888,37 +994,22 @@ class _LoopServices:
     ) -> str | None:
         try:
             capture_surface = getattr(self.run_recorder, "capture_surface_context", None)
-            if surface is not None and callable(capture_surface):
-                capture_model = self.model if model is None else model
-                identities = tuple(
-                    getattr(
-                        capture_model, "agent_provider_manifest_identities", ("agent-provider",)
-                    )
-                )
-                captured = capture_surface(
-                    _journal_model_input(messages, tools),
-                    surface.audit,
-                    identities,
-                    model_step=model_step,
-                    model_call_id=model_call_id,
-                )
-                if type(captured) is str:
-                    return captured
-                # Lightweight/test recorders may only implement the legacy
-                # capture_context hook.  A missing surface snapshot must not
-                # erase the existing model.requested/completed journal path.
-            return self.run_recorder.capture_context(
+            if surface is None or not callable(capture_surface):
+                return None
+            gate = self._require_surface_gate()
+            capture_model = self.model if model is None else model
+            identities = tuple(
+                getattr(capture_model, "agent_provider_manifest_identities", ("agent-provider",))
+            )
+            captured = capture_surface(
                 _journal_model_input(messages, tools),
-                ContextManifestInput(
-                    conversation_message_ids=(),
-                    tool_names=tuple(tool.name for tool in tools),
-                    attachment_refs=(),
-                    domain_source_refs=(),
-                ),
-                snapshot_kind="model_input",
+                surface.audit,
+                identities,
+                provider_view=gate.provider_view,
                 model_step=model_step,
                 model_call_id=model_call_id,
             )
+            return captured if type(captured) is str else None
         except Exception:
             return None
 
@@ -1046,7 +1137,7 @@ class AgentLoopInvocation(TransientToolRuntimeValue):
                 gate,
                 authority=authority,
                 context=self.tool_context,
-                catalog=self.catalog,
+                catalog=gate.catalog,
                 policy=gate.policy,
                 dependency_policy=gate.dependency_policy,
                 selection=gate.selection,
@@ -1116,7 +1207,9 @@ class AgentLoopRunner:
 
         model_steps = 0
         max_iterations = invocation.max_iterations or DEFAULT_MAX_ITERATIONS
-        provider_tools = list(invocation.catalog.provider_contracts())
+        if type(invocation.surface_gate) is not SegmentSurfaceGate:
+            raise ProjectionError("segment_surface_gate_required")
+        provider_tools = list(invocation.surface_gate.selection.provider_contracts)
         while True:
             services.raise_if_cancelled()
             services.require_delivery_fence()
@@ -1265,11 +1358,9 @@ class AgentLoopRunner:
         segment = continuation.activate_continuation_segment()
         if type(segment) is not ApprovedContinuationSegment:
             raise TypeError("approved continuation port returned an invalid Segment bundle")
-        if (
-            segment.model is invocation.model
-            or segment.catalog is invocation.catalog
-            or segment.tool_context is invocation.tool_context
-        ):
+        if segment.catalog is not invocation.catalog:
+            raise ProjectionError("approved continuation replaced the Bundle catalog")
+        if segment.model is invocation.model or segment.tool_context is invocation.tool_context:
             raise ProjectionError("approved continuation reused Approval services")
         fresh_recorder = getattr(segment.tool_context, "run_recorder", None)
         set_recorder = getattr(fresh_recorder, "set_delegate", None)
@@ -1703,10 +1794,7 @@ def _journal_assistant_kind(assistant: Assistant) -> str:
 def _select_tool_calls(tool_calls: list[Any], catalog: ToolCatalog) -> list[Any]:
     if not tool_calls:
         return []
-    if all(
-        not _is_write_spec(catalog.resolve(str(call.name)))
-        for call in tool_calls
-    ):
+    if all(not _is_write_spec(catalog.resolve(str(call.name))) for call in tool_calls):
         return tool_calls
     return tool_calls[:1]
 

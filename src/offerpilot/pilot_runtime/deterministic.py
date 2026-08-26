@@ -38,9 +38,12 @@ from offerpilot.ai.deterministic_actions import (
 )
 from offerpilot.ai.tool_runtime.contracts import JSONValue
 from offerpilot.ai.tool_runtime.legacy import (
+    LegacyInitialRouteIssuer,
+    LegacyInitialRoutePort,
     LegacyDeterministicAdapter,
     LegacyDeterministicCatalog,
     LEGACY_DETERMINISTIC_NAMES,
+    RuntimeRequestOwnerLeaseFactory,
     prepare_legacy_arguments,
 )
 from offerpilot.ai.tool_specs.legacy import build_legacy_deterministic_catalog
@@ -122,7 +125,14 @@ _LEGACY_EDITABLE_FIELDS: dict[str, tuple[dict[str, JSONValue], ...]] = {
         {
             "field": "result",
             "type": "enum",
-            "options": ["advanced", "no_response", "offer_received", "other", "rejected", "withdrawn"],
+            "options": [
+                "advanced",
+                "no_response",
+                "offer_received",
+                "other",
+                "rejected",
+                "withdrawn",
+            ],
         },
         {"field": "feedback_text", "type": "long_text"},
         {"field": "reflection_text", "type": "long_text"},
@@ -171,6 +181,24 @@ class DeterministicDependencies:
     write_operations: object | None = None
     write_coordinator: object | None = None
     chat: object | None = None
+    legacy_request_owner_lease_factory: RuntimeRequestOwnerLeaseFactory | None = field(
+        default=None, repr=False, compare=False
+    )
+    legacy_initial_route_port: LegacyInitialRoutePort | None = field(
+        default=None, repr=False, compare=False
+    )
+    legacy_jd_clarification_issuer: LegacyInitialRouteIssuer | None = field(
+        default=None, repr=False, compare=False
+    )
+    legacy_jd_deterministic_action_issuer: LegacyInitialRouteIssuer | None = field(
+        default=None, repr=False, compare=False
+    )
+    legacy_submission_snapshot_issuer: LegacyInitialRouteIssuer | None = field(
+        default=None, repr=False, compare=False
+    )
+    legacy_outcome_recording_issuer: LegacyInitialRouteIssuer | None = field(
+        default=None, repr=False, compare=False
+    )
     legacy_catalog_factory: Callable[[object, object], LegacyDeterministicCatalog] | None = None
     id_factory: Callable[[], str] = field(default=lambda: uuid4().hex, repr=False, compare=False)
     key_factory: Callable[[], str] = field(default=lambda: uuid4().hex, repr=False, compare=False)
@@ -189,9 +217,16 @@ class DeterministicExecution:
     journal_started: bool = False
 
     def __post_init__(self) -> None:
-        if not isinstance(self.outcome, (MessageOutcome, ConfirmationRequiredOutcome,
-                                         RuntimeFailureOutcome, OperationPendingOutcome,
-                                         OperationReplayOutcome)):
+        if not isinstance(
+            self.outcome,
+            (
+                MessageOutcome,
+                ConfirmationRequiredOutcome,
+                RuntimeFailureOutcome,
+                OperationPendingOutcome,
+                OperationReplayOutcome,
+            ),
+        ):
             raise TypeError("outcome must be a RuntimeOutcome")
         if type(self.events) is not tuple:
             raise TypeError("events must be a tuple")
@@ -249,7 +284,9 @@ def _callable(value: object | None, names: tuple[str, ...]) -> Callable[..., obj
     return None
 
 
-def _invoke(function: Callable[..., object], named: Mapping[str, object], positional: tuple[object, ...]) -> object:
+def _invoke(
+    function: Callable[..., object], named: Mapping[str, object], positional: tuple[object, ...]
+) -> object:
     """Call an injected seam once after binding a supported argument shape.
 
     Binding is completed before entering the callable.  Consequently a
@@ -312,10 +349,14 @@ def _invoke(function: Callable[..., object], named: Mapping[str, object], positi
             if parameter.kind is inspect.Parameter.VAR_KEYWORD:
                 has_var_keyword = True
                 continue
-            if parameter.kind in {
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                inspect.Parameter.KEYWORD_ONLY,
-            } and parameter.name in named:
+            if (
+                parameter.kind
+                in {
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                }
+                and parameter.name in named
+            ):
                 kwargs[parameter.name] = named[parameter.name]
                 consumed_named.add(parameter.name)
         if has_var_keyword:
@@ -377,9 +418,17 @@ def _pending(value: object | None) -> PendingAction | None:
     args = _attribute(value, "args", None)
     human = _attribute(value, "human", "")
     operation_id = _attribute(value, "operation_id", "")
-    if not all(isinstance(item, str) for item in (tool_call_id, tool_name, args, human, operation_id)):
+    if not all(
+        isinstance(item, str) for item in (tool_call_id, tool_name, args, human, operation_id)
+    ):
         return None
-    return PendingAction(cast(str, tool_call_id), cast(str, tool_name), cast(str, args), cast(str, human), cast(str, operation_id))
+    return PendingAction(
+        cast(str, tool_call_id),
+        cast(str, tool_name),
+        cast(str, args),
+        cast(str, human),
+        cast(str, operation_id),
+    )
 
 
 def _result_ok(value: object) -> bool:
@@ -453,8 +502,7 @@ def _confirmation_payload(
         args=freeze_json_mapping(_safe_args(pending.args)),
         confirmation_token=_confirmation_token(pending),
         editable_fields=tuple(
-            freeze_json_mapping(item)
-            for item in _LEGACY_EDITABLE_FIELDS.get(pending.tool_name, ())
+            freeze_json_mapping(item) for item in _LEGACY_EDITABLE_FIELDS.get(pending.tool_name, ())
         ),
         details=freeze_json_mapping(details or {}),
     )
@@ -476,7 +524,10 @@ class DeterministicPilotAdapter:
         **kwargs: object,
     ) -> None:
         if dependencies is not None and kwargs:
-            values = {name: getattr(dependencies, name) for name in DeterministicDependencies.__dataclass_fields__}
+            values = {
+                name: getattr(dependencies, name)
+                for name in DeterministicDependencies.__dataclass_fields__
+            }
             values.update(kwargs)
             dependencies = DeterministicDependencies(**cast(Any, values))
         elif dependencies is None:
@@ -500,13 +551,17 @@ class DeterministicPilotAdapter:
         return value
 
     @staticmethod
-    def _action_from_request(request: StartTurnRequest) -> PilotAction | PilotSubmissionSnapshotAction | PilotOutcomeAction | None:
+    def _action_from_request(
+        request: StartTurnRequest,
+    ) -> PilotAction | PilotSubmissionSnapshotAction | PilotOutcomeAction | None:
         descriptor = request.pilot_action
         if descriptor is None:
             return None
         kind = descriptor.kind
         if kind not in _DETERMINISTIC_ACTION_KINDS and kind not in {
-            "application_jd_save", "application_submission_snapshot", "application_outcome_record",
+            "application_jd_save",
+            "application_submission_snapshot",
+            "application_outcome_record",
         }:
             raise ValueError("unsupported pilot action")
         raw: object
@@ -527,26 +582,59 @@ class DeterministicPilotAdapter:
         # remains the single validation authority and has no side effects.
         return parse_pilot_action(raw)
 
+    def _run_initial_route(
+        self,
+        issuer: LegacyInitialRouteIssuer | None,
+        *,
+        expected_adapter_name: str,
+        body: Callable[[], DeterministicExecution],
+    ) -> DeterministicExecution:
+        owner_factory = self.dependencies.legacy_request_owner_lease_factory
+        port = self.dependencies.legacy_initial_route_port
+        if type(owner_factory) is not RuntimeRequestOwnerLeaseFactory:
+            raise TypeError("deterministic entry requires the exact Legacy request owner factory")
+        if type(port) is not LegacyInitialRoutePort:
+            raise TypeError("deterministic entry requires the exact Legacy initial route Port")
+        if type(issuer) is not LegacyInitialRouteIssuer:
+            raise TypeError("deterministic entry requires its exact source-bound Legacy issuer")
+        with owner_factory.open() as owner:
+            with issuer.open_request_lease(owner) as request_lease:
+                token = issuer.issue(request_lease)
+                handle = port.resolve_initial(token)
+                binding = port.require_route(handle)
+                if binding.name != expected_adapter_name:
+                    raise ValueError("Legacy initial route resolved the wrong Adapter")
+                return body()
+
     def matches(self, request: StartTurnRequest, conversation: object) -> bool:
         if request.pilot_action is not None:
             self._action_from_request(request)
             return True
         clarification = self._clarification_for(conversation)
-        if clarification is not None and clarification[0].tool_name == "save_application_jd_version":
+        if (
+            clarification is not None
+            and clarification[0].tool_name == "save_application_jd_version"
+        ):
             return True
         application = self._application(conversation, missing_ok=True)
         if application is None:
-            return decide_pilot_action(
-                request.message,
-                has_current_jd=False,
-                collecting_jd=False,
-            ).kind != "normal_agent"
+            return (
+                decide_pilot_action(
+                    request.message,
+                    has_current_jd=False,
+                    collecting_jd=False,
+                ).kind
+                != "normal_agent"
+            )
         current = self._current_jd(application)
-        return decide_pilot_action(
-            request.message,
-            has_current_jd=current is not None,
-            collecting_jd=False,
-        ).kind != "normal_agent"
+        return (
+            decide_pilot_action(
+                request.message,
+                has_current_jd=current is not None,
+                collecting_jd=False,
+            ).kind
+            != "normal_agent"
+        )
 
     def pending_action(self, conversation: object) -> PendingAction | None:
         """Return the detached trusted pending action for Journal orchestration."""
@@ -573,7 +661,9 @@ class DeterministicPilotAdapter:
             raise ValueError("application context is invalid") from exc
         getter = _callable(self.dependencies.applications, ("get", "find"))
         application = (
-            _invoke(getter, {"application_id": application_id, "id": application_id}, (application_id,))
+            _invoke(
+                getter, {"application_id": application_id, "id": application_id}, (application_id,)
+            )
             if getter is not None
             else None
         )
@@ -714,7 +804,10 @@ class DeterministicPilotAdapter:
         current_jd = self._current_jd(application)
         clarification_view = self._clarification_for(conversation)
         clarification_pending = clarification_view[0] if clarification_view is not None else None
-        collecting = clarification_pending is not None and clarification_pending.tool_name == "save_application_jd_version"
+        collecting = (
+            clarification_pending is not None
+            and clarification_pending.tool_name == "save_application_jd_version"
+        )
 
         if isinstance(action, (PilotSubmissionSnapshotAction, PilotOutcomeAction)):
             if existing is not None:
@@ -738,11 +831,20 @@ class DeterministicPilotAdapter:
                     key_factory=self.dependencies.key_factory,
                 )
             )
-            return self._persist_pending(
-                conversation_id,
-                request.message,
-                pending,
-                on_user_message_persisted=on_user_message_persisted,
+            issuer = (
+                self.dependencies.legacy_submission_snapshot_issuer
+                if isinstance(action, PilotSubmissionSnapshotAction)
+                else self.dependencies.legacy_outcome_recording_issuer
+            )
+            return self._run_initial_route(
+                issuer,
+                expected_adapter_name=pending.tool_name,
+                body=lambda: self._persist_pending(
+                    conversation_id,
+                    request.message,
+                    pending,
+                    on_user_message_persisted=on_user_message_persisted,
+                ),
             )
 
         if action is not None and action.jd_text is None:
@@ -798,14 +900,22 @@ class DeterministicPilotAdapter:
                 id_factory=self.dependencies.id_factory,
                 key_factory=self.dependencies.key_factory,
             )
-            return self._persist_clarification(
-                conversation_id,
-                request.message,
-                pending,
-                decision.question,
-                on_user_message_persisted=on_user_message_persisted,
+            return self._run_initial_route(
+                self.dependencies.legacy_jd_clarification_issuer,
+                expected_adapter_name=pending.tool_name,
+                body=lambda: self._persist_clarification(
+                    conversation_id,
+                    request.message,
+                    pending,
+                    decision.question,
+                    on_user_message_persisted=on_user_message_persisted,
+                ),
             )
-        if decision.kind != "pending_confirmation" or not isinstance(decision.jd_text, str) or not decision.jd_text.strip():
+        if (
+            decision.kind != "pending_confirmation"
+            or not isinstance(decision.jd_text, str)
+            or not decision.jd_text.strip()
+        ):
             # A caller that selected deterministic for a normal message has an
             # invalid trusted route; it must not silently invoke the model.
             return DeterministicExecution(
@@ -820,6 +930,7 @@ class DeterministicPilotAdapter:
             previous_key = previous_args.get("idempotency_key")
             previous_url = previous_args.get("source_url")
             if isinstance(previous_key, str):
+
                 def previous_key_factory(previous_key: str = previous_key) -> str:
                     return previous_key
 
@@ -842,11 +953,20 @@ class DeterministicPilotAdapter:
             id_factory=id_factory,
             key_factory=key_factory,
         )
-        return self._persist_pending(
-            conversation_id,
-            request.message,
-            pending,
-            on_user_message_persisted=on_user_message_persisted,
+        issuer = (
+            self.dependencies.legacy_jd_clarification_issuer
+            if clarification_pending is not None
+            else self.dependencies.legacy_jd_deterministic_action_issuer
+        )
+        return self._run_initial_route(
+            issuer,
+            expected_adapter_name=pending.tool_name,
+            body=lambda: self._persist_pending(
+                conversation_id,
+                request.message,
+                pending,
+                on_user_message_persisted=on_user_message_persisted,
+            ),
         )
 
     # Common spelling used by composition roots during the extraction.
@@ -993,7 +1113,11 @@ class DeterministicPilotAdapter:
         adapter = self._legacy_adapter(pending)
         if adapter is None:
             return DeterministicExecution(
-                _error(RuntimeFailureCode.OPERATION_IDENTITY_CONFLICT, "pending action is no longer available", 409),
+                _error(
+                    RuntimeFailureCode.OPERATION_IDENTITY_CONFLICT,
+                    "pending action is no longer available",
+                    409,
+                ),
                 preparation_kind=PreparationKind.DETERMINISTIC_CONFIRMATION,
             )
         edited = (
@@ -1006,7 +1130,11 @@ class DeterministicPilotAdapter:
                 effective_args, human = prepare_legacy_arguments(adapter, pending.args, edited)
             except ValueError as exc:
                 return DeterministicExecution(
-                    _error(RuntimeFailureCode.INVALID_CONFIRMATION, f"invalid confirmation edits: {exc}", 422),
+                    _error(
+                        RuntimeFailureCode.INVALID_CONFIRMATION,
+                        f"invalid confirmation edits: {exc}",
+                        422,
+                    ),
                     preparation_kind=PreparationKind.DETERMINISTIC_CONFIRMATION,
                 )
             effective_pending = PendingAction(
@@ -1019,7 +1147,9 @@ class DeterministicPilotAdapter:
             validation_error = adapter.validate(effective_args)
             if validation_error:
                 return DeterministicExecution(
-                    _error(RuntimeFailureCode.APPLICATION_JD_INVALID_REQUEST, validation_error, 422),
+                    _error(
+                        RuntimeFailureCode.APPLICATION_JD_INVALID_REQUEST, validation_error, 422
+                    ),
                     preparation_kind=PreparationKind.DETERMINISTIC_CONFIRMATION,
                 )
             if on_confirmation_attempt is not None:
@@ -1044,17 +1174,26 @@ class DeterministicPilotAdapter:
                     preparation_kind=PreparationKind.DETERMINISTIC_CONFIRMATION,
                 )
             if isinstance(execution, OperationReplay):
-                return self._replay_execution(conversation_id, execution, fingerprint, transport=transport)
+                return self._replay_execution(
+                    conversation_id, execution, fingerprint, transport=transport
+                )
             if not isinstance(execution, (OperationCommitted, OperationFailed)):
                 return DeterministicExecution(
-                    _error(RuntimeFailureCode.OPERATION_RESULT_UNKNOWN, "写入结果暂时无法确认，请保留确认卡后重试。", 503, retryable=True),
+                    _error(
+                        RuntimeFailureCode.OPERATION_RESULT_UNKNOWN,
+                        "写入结果暂时无法确认，请保留确认卡后重试。",
+                        503,
+                        retryable=True,
+                    ),
                     preparation_kind=PreparationKind.DETERMINISTIC_CONFIRMATION,
                 )
             result = execution.payload.visible_result
             succeeded = execution.payload.status == "committed"
             if on_tool_result is not None:
                 on_tool_result(effective_pending, result, succeeded)
-            origin = Message(role="tool", content=result, tool_call_id=effective_pending.tool_call_id)
+            origin = Message(
+                role="tool", content=result, tool_call_id=effective_pending.tool_call_id
+            )
             if not succeeded:
                 return self._persist_failure(
                     conversation_id,
@@ -1090,7 +1229,9 @@ class DeterministicPilotAdapter:
                 preparation_kind=PreparationKind.DETERMINISTIC_CONFIRMATION,
             )
         if isinstance(rejection, OperationReplay):
-            return self._replay_execution(conversation_id, rejection, fingerprint, transport=transport)
+            return self._replay_execution(
+                conversation_id, rejection, fingerprint, transport=transport
+            )
         if not isinstance(rejection, (OperationCommitted, OperationFailed)):
             return DeterministicExecution(
                 _error(
@@ -1247,11 +1388,15 @@ class DeterministicPilotAdapter:
     # ---- persistence/read side -------------------------------------------
 
     def _pending_for(self, conversation: object) -> PendingAction | None:
-        value = self.dependencies.persistence.get_pending_action(self._conversation_id(conversation))
+        value = self.dependencies.persistence.get_pending_action(
+            self._conversation_id(conversation)
+        )
         return _pending(value)
 
     def _clarification_for(self, conversation: object) -> tuple[PendingAction, str] | None:
-        value = self.dependencies.persistence.get_pending_clarification(self._conversation_id(conversation))
+        value = self.dependencies.persistence.get_pending_clarification(
+            self._conversation_id(conversation)
+        )
         if value is None:
             return None
         if isinstance(value, tuple) and len(value) == 2:
@@ -1273,7 +1418,13 @@ class DeterministicPilotAdapter:
                 return None
             raise ValueError("application context is invalid") from exc
         getter = _callable(self.dependencies.applications, ("get", "find"))
-        application = _invoke(getter, {"application_id": application_id, "id": application_id}, (application_id,)) if getter is not None else None
+        application = (
+            _invoke(
+                getter, {"application_id": application_id, "id": application_id}, (application_id,)
+            )
+            if getter is not None
+            else None
+        )
         if application is None and not missing_ok:
             raise LookupError("application not found")
         return application
@@ -1287,7 +1438,18 @@ class DeterministicPilotAdapter:
 
     def _current_jd(self, application: object) -> object | None:
         getter = _callable(self.dependencies.application_jd_versions, ("get_current", "current"))
-        return _invoke(getter, {"application_id": self._application_id(application), "id": self._application_id(application)}, (self._application_id(application),)) if getter is not None else None
+        return (
+            _invoke(
+                getter,
+                {
+                    "application_id": self._application_id(application),
+                    "id": self._application_id(application),
+                },
+                (self._application_id(application),),
+            )
+            if getter is not None
+            else None
+        )
 
     def _persist_pending(
         self,
@@ -1353,7 +1515,9 @@ class DeterministicPilotAdapter:
         *,
         on_user_message_persisted: Callable[[int], object] | None,
     ) -> DeterministicExecution:
-        user_result = self.dependencies.persistence.persist_initial_user_message(conversation_id, user_message)
+        user_result = self.dependencies.persistence.persist_initial_user_message(
+            conversation_id, user_message
+        )
         if not _result_ok(user_result):
             return DeterministicExecution(self._persistence_error(user_result))
         message_id = _result_message_id(user_result)
@@ -1362,7 +1526,9 @@ class DeterministicPilotAdapter:
         cleared = self.dependencies.persistence.clear_pending_clarification(conversation_id)
         if not _result_ok(cleared):
             return DeterministicExecution(self._persistence_error(cleared))
-        assistant = self.dependencies.persistence.persist_assistant_message(conversation_id, "已取消保存岗位资料。")
+        assistant = self.dependencies.persistence.persist_assistant_message(
+            conversation_id, "已取消保存岗位资料。"
+        )
         if not _result_ok(assistant):
             return DeterministicExecution(self._persistence_error(assistant))
         outcome = MessageOutcome("已取消保存岗位资料。", conversation_id=conversation_id)
@@ -1382,7 +1548,9 @@ class DeterministicPilotAdapter:
             return _error(RuntimeFailureCode.CONVERSATION_ARCHIVED, "conversation is archived", 409)
         if status is PersistenceStatus.NOT_FOUND or str(status) == "not_found":
             return _error(RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404)
-        return _error(RuntimeFailureCode.OPERATION_FAILED, "对话当前不可写入。", 503, retryable=True)
+        return _error(
+            RuntimeFailureCode.OPERATION_FAILED, "对话当前不可写入。", 503, retryable=True
+        )
 
     def _confirmation_required(
         self,
@@ -1426,7 +1594,9 @@ class DeterministicPilotAdapter:
             return {}
         getter = _callable(self.dependencies.applications, ("get", "find"))
         application = (
-            _invoke(getter, {"application_id": application_id, "id": application_id}, (application_id,))
+            _invoke(
+                getter, {"application_id": application_id, "id": application_id}, (application_id,)
+            )
             if getter is not None
             else None
         )
@@ -1450,7 +1620,9 @@ class DeterministicPilotAdapter:
                     {"application_id": application_id, "version_id": expected},
                     (application_id, expected),
                 )
-        raw_current_number = _attribute(version, "version_number", None) if version is not None else None
+        raw_current_number = (
+            _attribute(version, "version_number", None) if version is not None else None
+        )
         current_number = raw_current_number if type(raw_current_number) is int else None
         details["application_jd"] = {
             "current_version_number": current_number,
@@ -1481,7 +1653,9 @@ class DeterministicPilotAdapter:
     def _legacy_catalog(self) -> LegacyDeterministicCatalog:
         factory = self.dependencies.legacy_catalog_factory
         if factory is not None:
-            return factory(self.dependencies.application_jd_versions, self.dependencies.application_outcomes)
+            return factory(
+                self.dependencies.application_jd_versions, self.dependencies.application_outcomes
+            )
         return cast(
             LegacyDeterministicCatalog,
             cast(Any, build_legacy_deterministic_catalog)(
@@ -1504,7 +1678,11 @@ class DeterministicPilotAdapter:
             jd_service = self._bind(self.dependencies.application_jd_versions, session)
             outcome_repo = self._bind(self.dependencies.application_outcomes, session)
             factory = self.dependencies.legacy_catalog_factory
-            catalog = (cast(Any, factory) if factory is not None else cast(Any, build_legacy_deterministic_catalog))(
+            catalog = (
+                cast(Any, factory)
+                if factory is not None
+                else cast(Any, build_legacy_deterministic_catalog)
+            )(
                 jd_service,
                 outcome_repo,
             )
@@ -1520,7 +1698,9 @@ class DeterministicPilotAdapter:
         binder = _callable(value, ("bind",))
         return binder(session) if binder is not None else value
 
-    def _request_fingerprint(self, pending: PendingAction, request: ConfirmationRequest, token: str) -> str:
+    def _request_fingerprint(
+        self, pending: PendingAction, request: ConfirmationRequest, token: str
+    ) -> str:
         operations = self.dependencies.write_operations
         if operations is None:
             raise WriteOperationError("operation_unavailable")
@@ -1561,7 +1741,11 @@ class DeterministicPilotAdapter:
         stored = str(_attribute(operation, "confirmation_token_fingerprint", "") or "")
         if not compare_digest(token_fingerprint, stored):
             raise WriteOperationError("operation_input_conflict")
-        edited = None if request.edited_args.is_missing() else cast(Mapping[str, JSONValue], dict(request.edited_args.as_mapping))
+        edited = (
+            None
+            if request.edited_args.is_missing()
+            else cast(Mapping[str, JSONValue], dict(request.edited_args.as_mapping))
+        )
         return operation_request_fingerprint(
             cast(Any, operations).key,
             operation_id=operation_id,
@@ -1647,12 +1831,21 @@ class DeterministicPilotAdapter:
         )
         if result is None:
             return DeterministicExecution(
-                _error(RuntimeFailureCode.STALE_PENDING_ACTION, "待确认操作已被更新，请刷新后重试。", 409),
+                _error(
+                    RuntimeFailureCode.STALE_PENDING_ACTION,
+                    "待确认操作已被更新，请刷新后重试。",
+                    409,
+                ),
                 preparation_kind=PreparationKind.DETERMINISTIC_CONFIRMATION,
             )
         if result is False:
             return DeterministicExecution(
-                _error(RuntimeFailureCode.OPERATION_DELIVERY_FAILED, "写入结果已提交，但暂时无法生成后续说明。", 503, retryable=True),
+                _error(
+                    RuntimeFailureCode.OPERATION_DELIVERY_FAILED,
+                    "写入结果已提交，但暂时无法生成后续说明。",
+                    503,
+                    retryable=True,
+                ),
                 preparation_kind=PreparationKind.DETERMINISTIC_CONFIRMATION,
             )
         outcome = MessageOutcome(
@@ -1748,7 +1941,9 @@ class DeterministicPilotAdapter:
                         application_id=application_id,
                         current_version_id=current_id if type(current_id) is int else None,
                         jd_text=jd_text,
-                        source_url=args.get("source_url") if isinstance(args.get("source_url"), str) else None,
+                        source_url=args.get("source_url")
+                        if isinstance(args.get("source_url"), str)
+                        else None,
                         id_factory=self.dependencies.id_factory,
                         key_factory=self.dependencies.key_factory,
                     )
@@ -1795,13 +1990,41 @@ class DeterministicPilotAdapter:
                 except (ValueError, KeyError):
                     pass
         messages: dict[str, tuple[RuntimeFailureCode, int, str]] = {
-            "application_jd_invalid_request": (RuntimeFailureCode.APPLICATION_JD_INVALID_REQUEST, 422, "岗位资料参数无效，请修改后重试。"),
-            "application_archive_idempotency_conflict": (RuntimeFailureCode.APPLICATION_ARCHIVE_IDEMPOTENCY_CONFLICT, 409, "投递事实已发生变化，请刷新后重新确认。"),
-            "application_archive_source_conflict": (RuntimeFailureCode.APPLICATION_ARCHIVE_SOURCE_CONFLICT, 409, "投递事实已发生变化，请刷新后重新确认。"),
-            "application_outcome_idempotency_conflict": (RuntimeFailureCode.APPLICATION_OUTCOME_IDEMPOTENCY_CONFLICT, 409, "投递事实已发生变化，请刷新后重新确认。"),
-            "application_outcome_source_conflict": (RuntimeFailureCode.APPLICATION_OUTCOME_SOURCE_CONFLICT, 409, "投递事实已发生变化，请刷新后重新确认。"),
-            "application_archive_invalid_request": (RuntimeFailureCode.APPLICATION_ARCHIVE_INVALID_REQUEST, 422, "投递事实参数无效，请修改后重试。"),
-            "application_outcome_invalid_request": (RuntimeFailureCode.APPLICATION_OUTCOME_INVALID_REQUEST, 422, "投递事实参数无效，请修改后重试。"),
+            "application_jd_invalid_request": (
+                RuntimeFailureCode.APPLICATION_JD_INVALID_REQUEST,
+                422,
+                "岗位资料参数无效，请修改后重试。",
+            ),
+            "application_archive_idempotency_conflict": (
+                RuntimeFailureCode.APPLICATION_ARCHIVE_IDEMPOTENCY_CONFLICT,
+                409,
+                "投递事实已发生变化，请刷新后重新确认。",
+            ),
+            "application_archive_source_conflict": (
+                RuntimeFailureCode.APPLICATION_ARCHIVE_SOURCE_CONFLICT,
+                409,
+                "投递事实已发生变化，请刷新后重新确认。",
+            ),
+            "application_outcome_idempotency_conflict": (
+                RuntimeFailureCode.APPLICATION_OUTCOME_IDEMPOTENCY_CONFLICT,
+                409,
+                "投递事实已发生变化，请刷新后重新确认。",
+            ),
+            "application_outcome_source_conflict": (
+                RuntimeFailureCode.APPLICATION_OUTCOME_SOURCE_CONFLICT,
+                409,
+                "投递事实已发生变化，请刷新后重新确认。",
+            ),
+            "application_archive_invalid_request": (
+                RuntimeFailureCode.APPLICATION_ARCHIVE_INVALID_REQUEST,
+                422,
+                "投递事实参数无效，请修改后重试。",
+            ),
+            "application_outcome_invalid_request": (
+                RuntimeFailureCode.APPLICATION_OUTCOME_INVALID_REQUEST,
+                422,
+                "投递事实参数无效，请修改后重试。",
+            ),
         }
         failure_code, status, message = messages.get(
             code,
@@ -1816,7 +2039,11 @@ class DeterministicPilotAdapter:
         )
         if delivered is None:
             return DeterministicExecution(
-                _error(RuntimeFailureCode.STALE_PENDING_ACTION, "待确认操作已被更新，请刷新后重试。", 409),
+                _error(
+                    RuntimeFailureCode.STALE_PENDING_ACTION,
+                    "待确认操作已被更新，请刷新后重试。",
+                    409,
+                ),
                 preparation_kind=PreparationKind.DETERMINISTIC_CONFIRMATION,
             )
         if delivered is False:
@@ -1890,7 +2117,9 @@ class DeterministicPilotAdapter:
         getter = _callable(self.dependencies.application_jd_versions, ("get_current", "current"))
         if getter is None:
             return None
-        return _invoke(getter, {"application_id": application_id, "id": application_id}, (application_id,))
+        return _invoke(
+            getter, {"application_id": application_id, "id": application_id}, (application_id,)
+        )
 
     def _replay_execution(
         self,
@@ -1912,11 +2141,18 @@ class DeterministicPilotAdapter:
                 repository = cast(Any, operations)
                 converged = repository.converge_expired_delivery(replay.operation_id)
                 if isinstance(converged, OperationUnknown):
-                    return DeterministicExecution(self._write_unknown(converged), preparation_kind=PreparationKind.REPLAY)
+                    return DeterministicExecution(
+                        self._write_unknown(converged), preparation_kind=PreparationKind.REPLAY
+                    )
                 refreshed = repository.get(replay.operation_id)
                 if refreshed is None:
                     return DeterministicExecution(
-                        _error(RuntimeFailureCode.OPERATION_RESULT_UNKNOWN, "写入结果暂时无法确认，请保留确认卡后重试。", 503, retryable=True),
+                        _error(
+                            RuntimeFailureCode.OPERATION_RESULT_UNKNOWN,
+                            "写入结果暂时无法确认，请保留确认卡后重试。",
+                            503,
+                            retryable=True,
+                        ),
                         preparation_kind=PreparationKind.REPLAY,
                     )
                 replay = repository.replay(refreshed, request_fingerprint)
@@ -1928,9 +2164,7 @@ class DeterministicPilotAdapter:
                     or verified.tool_name != "save_application_jd_version"
                     or verified.conversation_id != conversation_id
                 ):
-                    raise WriteOperationError(
-                        "operation_delivery_unknown", retryable=True
-                    )
+                    raise WriteOperationError("operation_delivery_unknown", retryable=True)
                 pending = PendingAction(
                     verified.tool_call_id,
                     verified.tool_name,
@@ -1944,9 +2178,7 @@ class DeterministicPilotAdapter:
                     "write-operation-confirmation-token-v1",
                     token.encode("ascii"),
                 )
-                if not compare_digest(
-                    expected_token, verified.confirmation_token_fingerprint
-                ):
+                if not compare_digest(expected_token, verified.confirmation_token_fingerprint):
                     raise WriteOperationError("operation_integrity_error")
                 confirmation = self._confirmation_required(
                     pending,
@@ -1966,7 +2198,10 @@ class DeterministicPilotAdapter:
             elif status == "rejected":
                 message, write_status = replay.final_message or "已取消本次操作。", "cancelled"
             else:
-                message, write_status = replay.final_message or replay.payload.visible_result, "failed"
+                message, write_status = (
+                    replay.final_message or replay.payload.visible_result,
+                    "failed",
+                )
             undo: Mapping[str, JSONValue] | None = None
             if replay.payload.undo_json is not None:
                 raw_undo = json.loads(replay.payload.undo_json)
@@ -1995,7 +2230,9 @@ class DeterministicPilotAdapter:
                 preparation_kind=PreparationKind.REPLAY,
             )
         except WriteOperationError as exc:
-            return DeterministicExecution(self._write_error(exc), preparation_kind=PreparationKind.REPLAY)
+            return DeterministicExecution(
+                self._write_error(exc), preparation_kind=PreparationKind.REPLAY
+            )
 
 
 __all__ = [

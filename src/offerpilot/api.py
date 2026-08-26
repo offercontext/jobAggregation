@@ -64,7 +64,6 @@ from offerpilot.ai.write_operations import (
     OperationReplay,
     OperationUnknown,
     WriteOperationCoordinator,
-    WriteOperationError,
     WriteOperationRepository,
     compensation_kind_for_undo,
     load_or_create_ledger_key,
@@ -1146,19 +1145,24 @@ def create_app(
     resolved_data_dir = data_dir or resolve_data_dir()
     resolved_static_dir = static_dir or _find_static_dir()
     session_factory = session_factory_for_data_dir(resolved_data_dir)
-    context_source_loader: ContextSourceLoader[Any, Any] = ContextSourceLoader(
-        resolved_data_dir / "data.db"
-    )
     app_config = load_config(resolved_data_dir)
     applications = ApplicationsRepository(session_factory)
     try:
         ledger_key = load_or_create_ledger_key(resolved_data_dir, session_factory)
-        repository = WriteOperationRepository(session_factory, ledger_key)
-        write_operations: WriteOperationRepository | None = repository
-        write_coordinator: WriteOperationCoordinator | None = WriteOperationCoordinator(repository)
-    except WriteOperationError:
-        write_operations = None
-        write_coordinator = None
+    except BaseException:
+        primary_engine = session_factory.kw.get("bind")
+        if primary_engine is not None:
+            try:
+                primary_engine.dispose()
+            except BaseException:
+                pass
+        raise
+    repository = WriteOperationRepository(session_factory, ledger_key)
+    write_operations = repository
+    write_coordinator = WriteOperationCoordinator(repository)
+    context_source_loader: ContextSourceLoader[Any, Any] = ContextSourceLoader(
+        resolved_data_dir / "data.db"
+    )
     journal_engine = None
     if run_recorder_factory is None:
         try:
@@ -8465,10 +8469,7 @@ def _pending_action_json(
         "args": args,
         "confirmation_token": _confirmation_token(pending),
         "editable_fields": (
-            [
-                descriptor.to_compat_descriptor()
-                for descriptor in spec.metadata.editable_fields
-            ]
+            [descriptor.to_compat_descriptor() for descriptor in spec.metadata.editable_fields]
             if (spec := MODEL_TOOL_CATALOG.resolve(pending.tool_name)) is not None
             else []
         ),
@@ -8658,6 +8659,8 @@ def _short_preview(value: str, max_length: int = 180) -> str:
     if len(normalized) <= max_length:
         return normalized
     return normalized[: max_length - 3].rstrip() + "..."
+
+
 def _safe_tool_args(raw: str) -> dict[str, Any]:
     try:
         args = json.loads(raw) if raw else {}

@@ -27,13 +27,25 @@ from offerpilot.ai.agent_loop import (
 from offerpilot.ai.types import Assistant
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.agent_runtime.journal import NullRunRecorder
+from offerpilot.ai.tool_runtime.catalog import ToolCatalog, compile_tool_metadata_manifest
+from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.context_projector.binding import BoundProviderResponse, ModelCallSurfaceBinding
-from offerpilot.context_projector.selector import DEPENDENCY_POLICY_V1
 from offerpilot.ai.tool_authority.policy import validate_startup_policy
+from offerpilot.pilot_runtime.compensation import prepare_compensation_handler_components
 from offerpilot.pilot_runtime.composition import _AgentDriver
 from offerpilot.pilot_runtime.errors import RuntimeCancelled
 
 from tests.agent_loop.helpers import ScriptedModel, runtime
+
+
+def _metadata_bundle(catalog: ToolCatalog) -> ToolMetadataBundleV1:
+    manifest = compile_tool_metadata_manifest(catalog.specs)
+    return ToolMetadataBundleV1(
+        typed_catalog=catalog,
+        manifest=manifest,
+        legacy_boundary=manifest.to_dict()["legacy_boundary"],  # type: ignore[arg-type]
+        compensation=prepare_compensation_handler_components().metadata_projection(),
+    )
 
 
 def test_agent_driver_has_only_execute_method() -> None:
@@ -262,6 +274,7 @@ def test_injected_two_argument_model_remains_supported_behind_gateway() -> None:
 
 def test_composition_driver_maps_typed_chat_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
     catalog, context = runtime()
+    metadata_bundle = _metadata_bundle(catalog)
     seed = NewTurnSeed((Message(role="user", content="hello"),))
     invocation = AgentLoopInvocation(
         seed=seed,
@@ -279,7 +292,9 @@ def test_composition_driver_maps_typed_chat_cancellation(monkeypatch: pytest.Mon
             catalog=catalog,
             context=context,
             authority=context.authority,
-            dependency_policy=DEPENDENCY_POLICY_V1,
+            provider_view=metadata_bundle.provider_view(),
+            discovery_view=metadata_bundle.discovery_view(),
+            authority_metadata_view=metadata_bundle.authority_view(),
             policy=validate_startup_policy(catalog.authority_manifest),
         ),
     )
@@ -300,13 +315,16 @@ def test_composition_driver_maps_typed_chat_cancellation(monkeypatch: pytest.Mon
 
 def test_new_turn_invocation_requires_the_exact_segment_surface_gate() -> None:
     catalog, context = runtime()
+    metadata_bundle = _metadata_bundle(catalog)
     seed = NewTurnSeed((Message(role="user", content="hello"),))
     gate = build_segment_surface_gate(
         seed.messages,
         catalog=catalog,
         context=context,
         authority=context.authority,
-        dependency_policy=DEPENDENCY_POLICY_V1,
+        provider_view=metadata_bundle.provider_view(),
+        discovery_view=metadata_bundle.discovery_view(),
+        authority_metadata_view=metadata_bundle.authority_view(),
         policy=validate_startup_policy(catalog.authority_manifest),
     )
     invocation = AgentLoopInvocation(
@@ -328,6 +346,121 @@ def test_new_turn_invocation_requires_the_exact_segment_surface_gate() -> None:
     assert gate.context is context
     with pytest.raises(TypeError, match="SegmentSurfaceGate"):
         replace(invocation, surface_gate=None)
+
+
+def test_agent_loop_passes_exact_gate_provider_view_to_run_recorder() -> None:
+    class Recorder(NullRunRecorder):
+        def __init__(self) -> None:
+            super().__init__()
+            self.provider_views: list[object] = []
+
+        def capture_surface_context(
+            self,
+            _logical_input: object,
+            _audit: object,
+            _provider_identities: tuple[str, ...],
+            *,
+            provider_view: object,
+            model_step: int,
+            model_call_id: str,
+        ) -> str:
+            del model_step, model_call_id
+            self.provider_views.append(provider_view)
+            return "surface-snapshot"
+
+    catalog, context = runtime()
+    metadata_bundle = _metadata_bundle(catalog)
+    provider_view = metadata_bundle.provider_view()
+    seed = NewTurnSeed((Message(role="user", content="hello"),))
+    gate = build_segment_surface_gate(
+        seed.messages,
+        catalog=catalog,
+        context=context,
+        authority=context.authority,
+        provider_view=provider_view,
+        discovery_view=metadata_bundle.discovery_view(),
+        authority_metadata_view=metadata_bundle.authority_view(),
+        policy=validate_startup_policy(catalog.authority_manifest),
+    )
+    recorder = Recorder()
+
+    AgentLoopRunner().run(
+        AgentLoopInvocation(
+            seed=seed,
+            model=ScriptedModel(Assistant(content="done")),
+            catalog=catalog,
+            tool_context=context,
+            auto_approve=False,
+            max_iterations=1,
+            run_recorder=recorder,
+            event_sink=None,
+            runtime_signal_sink=None,
+            cancel_check=None,
+            surface_gate=gate,
+        )
+    )
+
+    assert recorder.provider_views == [provider_view]
+
+
+def test_agent_loop_does_not_fallback_to_legacy_manifest_writer() -> None:
+    class Recorder(NullRunRecorder):
+        def __init__(self) -> None:
+            super().__init__()
+            self.surface_calls = 0
+            self.legacy_calls = 0
+
+        def capture_surface_context(
+            self,
+            _logical_input: object,
+            _audit: object,
+            _provider_identities: tuple[str, ...],
+            *,
+            provider_view: object,
+            model_step: int,
+            model_call_id: str,
+        ) -> None:
+            del provider_view, model_step, model_call_id
+            self.surface_calls += 1
+
+        def capture_context(self, *_args: object, **_kwargs: object) -> str:
+            self.legacy_calls += 1
+            return "legacy-snapshot"
+
+    catalog, context = runtime()
+    metadata_bundle = _metadata_bundle(catalog)
+    seed = NewTurnSeed((Message(role="user", content="hello"),))
+    gate = build_segment_surface_gate(
+        seed.messages,
+        catalog=catalog,
+        context=context,
+        authority=context.authority,
+        provider_view=metadata_bundle.provider_view(),
+        discovery_view=metadata_bundle.discovery_view(),
+        authority_metadata_view=metadata_bundle.authority_view(),
+        policy=validate_startup_policy(catalog.authority_manifest),
+    )
+    recorder = Recorder()
+
+    result = AgentLoopRunner().run(
+        AgentLoopInvocation(
+            seed=seed,
+            model=ScriptedModel(Assistant(content="done")),
+            catalog=catalog,
+            tool_context=context,
+            auto_approve=False,
+            max_iterations=1,
+            run_recorder=recorder,
+            event_sink=None,
+            runtime_signal_sink=None,
+            cancel_check=None,
+            surface_gate=gate,
+        )
+    )
+
+    assert result.reply == "done"
+    assert recorder.surface_calls == 1
+    assert recorder.legacy_calls == 0
 
 
 def test_bound_provider_attempt_identity_is_transient_and_private() -> None:

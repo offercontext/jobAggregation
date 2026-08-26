@@ -10,8 +10,8 @@ from typing import Any
 from uuid import UUID
 
 from offerpilot.agent_runtime.events import update_digest_in_chunks
+from offerpilot.ai.tool_runtime.metadata import ProviderToolMetadataView
 from offerpilot.context_projector.contracts import CONTRIBUTOR_ORDER, RuntimeSurfaceAudit
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_NAMES
 
 MANIFEST_SCHEMA_VERSION = 2
 MANIFEST_BYTE_CAP = 65_536
@@ -255,11 +255,14 @@ def prepare_surface_manifest_v2(
     key_id: str,
     secret: bytes,
     provider_identities: tuple[str, ...],
+    provider_view: ProviderToolMetadataView,
     signals: tuple[str, ...] = (),
     budget_check: Callable[[], None] | None = None,
 ) -> PreparedSurfaceManifestV2:
     """Failing helper; callers/recorders must catch all failures (journal is fail-open)."""
     _check_budget(budget_check)
+    if type(provider_view) is not ProviderToolMetadataView:
+        raise ManifestV2ValidationError("invalid Provider metadata view")
     manifest = _build_manifest_payload(
         audit,
         key_id=key_id,
@@ -273,7 +276,11 @@ def prepare_surface_manifest_v2(
     _check_budget(budget_check)
     encoded = rendered.encode("utf-8")
     _check_budget(budget_check)
-    validate_surface_manifest_v2(rendered, budget_check=budget_check)
+    validate_surface_manifest_v2(
+        rendered,
+        provider_view=provider_view,
+        budget_check=budget_check,
+    )
     _check_budget(budget_check)
     digest = hashlib.sha256()
     update_digest_in_chunks(digest, encoded, budget_check=budget_check)
@@ -290,6 +297,7 @@ def prepare_surface_manifest_v2(
 def validate_surface_manifest_v2(
     value: str,
     *,
+    provider_view: ProviderToolMetadataView | None = None,
     budget_check: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     _check_budget(budget_check)
@@ -362,11 +370,21 @@ def validate_surface_manifest_v2(
     if len(set(tools)) != len(tools):
         raise ManifestV2ValidationError("invalid tools")
     _check_budget(budget_check)
-    for item in tools:
-        _check_budget(budget_check)
-        if item not in MODEL_TOOL_NAMES:
-            raise ManifestV2ValidationError("unapproved tool")
-        _check_budget(budget_check)
+    if provider_view is not None:
+        if type(provider_view) is not ProviderToolMetadataView:
+            raise ManifestV2ValidationError("invalid Provider metadata view")
+        try:
+            approved_tools = tuple(contract.name for contract in provider_view.ordered_contracts)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ManifestV2ValidationError("invalid Provider metadata view") from exc
+        approved = frozenset(approved_tools)
+        if len(approved) != len(approved_tools):
+            raise ManifestV2ValidationError("invalid Provider metadata view")
+        for item in tools:
+            _check_budget(budget_check)
+            if item not in approved:
+                raise ManifestV2ValidationError("unapproved tool")
+            _check_budget(budget_check)
     _check_budget(budget_check)
     signals = manifest["signals"]
     if type(signals) is not list or len(signals) > 32:
@@ -400,9 +418,7 @@ def validate_surface_manifest_v2(
             "chunks",
         }:
             raise ManifestV2ValidationError("invalid source")
-        if not _is_hex64(
-            source["source_hmac"], budget_check=budget_check
-        ) or not _is_hex64(
+        if not _is_hex64(source["source_hmac"], budget_check=budget_check) or not _is_hex64(
             source["content_revision_fingerprint"], budget_check=budget_check
         ):
             raise ManifestV2ValidationError("invalid source fingerprint")

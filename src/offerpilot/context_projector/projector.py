@@ -4,11 +4,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from offerpilot.ai.tool_runtime.contracts import (
-    ProviderToolContract,
     materialize_provider_payloads,
 )
-from offerpilot.ai.tool_runtime.catalog import ToolCatalog
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 from offerpilot.context_projector.budget import (
     BUDGET_POLICY_VERSION,
     CANONICAL_MESSAGES_BYTE_CAP,
@@ -38,12 +35,7 @@ from offerpilot.context_projector.history import (
     rank_history,
     validate_message_integrity,
 )
-from offerpilot.context_projector.selector import ToolSelection, ToolSelectionSignals, select_tools
-from offerpilot.context_projector.authority_surface import (
-    AuthoritySurfaceView,
-    intersect_authority_surface,
-)
-from offerpilot.context_projector.selector import DEPENDENCY_POLICY_V1, DependencyPolicyV1
+from offerpilot.context_projector.selector import ToolSelectionResult, ToolSelectionSignals
 
 
 @dataclass(frozen=True)
@@ -51,18 +43,11 @@ class ProjectionRequest:
     model_call_id: str
     contributors: tuple[ContributorResult, ...]
     history: tuple[FrozenMessage, ...]
-    provider_tools: tuple[ProviderToolContract, ...]
     tool_signals: ToolSelectionSignals
     provider_budgets: tuple[ProviderBudget, ...]
-    authority_surface: AuthoritySurfaceView
-    provider_catalog: ToolCatalog = MODEL_TOOL_CATALOG
-    dependency_policy: DependencyPolicyV1 = DEPENDENCY_POLICY_V1
+    selection: ToolSelectionResult
     sources: tuple[FrozenSource, ...] = ()
     provider_surface_build_identity: object | None = None
-    # A Segment owns the provider-free selector/authority intersection.  When
-    # present, the projector only performs budget/message projection over this
-    # sealed selection; it must not re-run selector or authority intersection.
-    preselected_tools: ToolSelection | None = None
 
 
 class ModelSurfaceProjector:
@@ -76,37 +61,13 @@ class ModelSurfaceProjector:
         if any(len(source.chunks) > 32 for source in request.sources):
             raise ProjectionError("source_chunk_limit_exceeded")
         contributors = self._validate_contributors(request.contributors)
-        if request.preselected_tools is None:
-            if request.provider_catalog.provider_contracts() != request.provider_tools:
-                raise ProjectionError("provider_catalog_mismatch")
-            selection = select_tools(
-                request.provider_tools,
-                request.tool_signals,
-                dependency_policy=request.dependency_policy,
-            )
-            selection = intersect_authority_surface(
-                request.provider_catalog,
-                selection,
-                request.authority_surface,
-                dependency_policy=request.dependency_policy,
-            )
-        else:
-            selection = request.preselected_tools
-            if tuple(selection.tools) != tuple(
-                contract
-                for contract in request.provider_catalog.provider_contracts()
-                if contract.name in selection.names
-            ):
-                raise ProjectionError("preselected_surface_mismatch")
-            if tuple(contract.name for contract in selection.tools) != selection.names:
-                raise ProjectionError("preselected_surface_mismatch")
-            if not selection.tools:
-                raise ProjectionError("empty_authority_surface")
-            request.dependency_policy.validate_closed(
-                selection.names,
-                tuple(contract.name for contract in request.provider_catalog.provider_contracts()),
-            )
-        tool_payloads = materialize_provider_payloads(selection.tools)
+        selection = request.selection
+        if type(selection) is not ToolSelectionResult:
+            raise ProjectionError("tool_selection_result_required")
+        selection._ensure_integrity()
+        if len(selection.provider_envelope_fingerprint) != 64:
+            raise ProjectionError("preselected_surface_mismatch")
+        tool_payloads = materialize_provider_payloads(selection.provider_contracts)
         tool_bytes = canonical_json(tool_payloads)
         if len(tool_bytes) > PROVIDER_TOOLS_BYTE_CAP:
             raise ProjectionError("provider_tools_byte_cap_exceeded")
@@ -204,7 +165,7 @@ class ModelSurfaceProjector:
                 (name, contributors[name].status) for name in CONTRIBUTOR_ORDER
             ),
             selected_history_group_ids=tuple(group.group_id for group in selected_groups),
-            selected_tool_names=selection.names,
+            selected_tool_names=selection.selected_names,
             source_fingerprints=tuple(
                 source.content_revision_fingerprint for source in request.sources
             ),
@@ -227,14 +188,14 @@ class ModelSurfaceProjector:
             ),
             signals=(
                 ("fallback_all_tools",)
-                if selection.fallback_all
+                if selection.full_catalog_fallback
                 else ("catalog_domain_union", "catalog_dependency_closure")
             ),
         )
         return FrozenModelSurface(
             model_call_id=request.model_call_id,
             messages=messages,
-            tools=selection.tools,
+            tools=selection.provider_contracts,
             runtime_surface_fingerprint=fingerprint,
             provider_candidate_count=len(request.provider_budgets),
             audit=audit,

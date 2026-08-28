@@ -22,6 +22,8 @@
 
 **Task 11 fifth scope stop:** The required directory-wide Agent Loop GREEN matrix exposed six direct `AgentLoopRunner` Typed-Pending tests in `tests/agent_loop/test_runner.py` that still constructed a Segment invocation without binding the exact Operation/Pending persistence Ports. Production now correctly fails closed before releasing such an unbound Pending, so retaining those fixtures would make the required GREEN command impossible unless product code restored a forbidden raw-Pending fallback. Product work stopped without weakening that boundary. Task 11 now revisits exactly this existing Task 4 test consumer and migrates its shared invocation fixture to a test-owned exact Operation/Pending Port graph and persistence consumer. No production optional branch, fallback, public contract, fixed identity, 25/3/4 boundary, Provider/Legacy seal, Golden asset, schema, migration, or business behavior changes as a result of this scope-only correction.
 
+**Task 12 scope stop:** Product work stopped before any Task 12 production edit when independent scope review proved that the baseline-only classification scan did not include `LEGACY_DETERMINISTIC_NAMES`, so it omitted both the defining `ai/tool_runtime/legacy.py` module and the public `pilot_runtime/__init__.py` re-export. The same baseline-only scan necessarily could not discover twelve Task 4-11 tests introduced after the fixed baseline that still consume the global Typed Catalog; two of them are selected directly by the required Task 12 GREEN command, while the remainder are selected by Task 13's full metadata matrix. Removing the global Catalog without migrating these exact consumers would require a forbidden test-only production façade or leave collection failures. The reviewed Task 12 scope now includes those fourteen exact production/test paths, supplements the immutable baseline scan explicitly, and runs every frozen Task 12 test consumer before the deletion commit. This scope-only correction does not change the approved design, fixed identities, 25/3/4 boundary, protocol seals, Golden assets, public API, schema, migration, or business behavior.
+
 ---
 
 ## 0. Fixed workspace, baseline, and execution rules
@@ -70,7 +72,7 @@ Before writing product files, materialize every per-Task path list and its union
 $fixed = '0c10e05e256eb757d5f89a8b009dcea193f2fc78'
 $capabilityImportSet = git grep -l 'ToolCapability' $fixed -- src tests | ForEach-Object { $_ -replace '^[^:]+:', '' }
 $toolSpecConstructorSet = git grep -l 'ToolSpec(' $fixed -- src tests | ForEach-Object { $_ -replace '^[^:]+:', '' }
-$classificationConsumerSet = git grep -l -E 'MODEL_TOOL_NAMES|MODEL_TOOL_CATALOG|DEPENDENCY_POLICY_V1|TRANSACTIONAL_TYPED_WRITE_NAMES|REQUIRED_UNDO_TOOL_NAMES|TYPED_WRITE_OPERATION_NAMES|LEGACY_WRITE_OPERATION_NAMES|COMPENSATION_OPERATION_NAMES|REQUIRED_UNDO_OPERATION_NAMES|WRITE_OPERATION_NAMES|_pending_adapter_kind|_chained_adapter_kind|_with_write_contract|_with_runtime_metadata|editable_fields_for_tool|_undo_seed_for_pending|_build_write_undo|_CREATED_RECORD_FINGERPRINT_FIELDS|legacy_catalog_factory|_legacy_catalog|_legacy_adapter' $fixed -- src tests | ForEach-Object { $_ -replace '^[^:]+:', '' }
+$classificationConsumerSet = git grep -l -E 'MODEL_TOOL_NAMES|MODEL_TOOL_CATALOG|LEGACY_DETERMINISTIC_NAMES|DEPENDENCY_POLICY_V1|TRANSACTIONAL_TYPED_WRITE_NAMES|REQUIRED_UNDO_TOOL_NAMES|TYPED_WRITE_OPERATION_NAMES|LEGACY_WRITE_OPERATION_NAMES|COMPENSATION_OPERATION_NAMES|REQUIRED_UNDO_OPERATION_NAMES|WRITE_OPERATION_NAMES|_pending_adapter_kind|_chained_adapter_kind|_with_write_contract|_with_runtime_metadata|editable_fields_for_tool|_undo_seed_for_pending|_build_write_undo|_CREATED_RECORD_FINGERPRINT_FIELDS|legacy_catalog_factory|_legacy_catalog|_legacy_adapter' $fixed -- src tests | ForEach-Object { $_ -replace '^[^:]+:', '' }
 ```
 
 The baseline-only `$toolSpecConstructorSet` is intentionally supplemented in Task 4 by these seventeen explicitly reviewed paths, because a `ToolSpec(` text scan cannot discover `dataclasses.replace()`, attribute reads, source-gate fallout from the closed enum cutover, Provider JSON materializers, or files introduced after the fixed baseline:
@@ -93,6 +95,25 @@ tests/tool_pipeline/test_jd_analyses.py
 tests/tool_pipeline/test_notes.py
 tests/tool_pipeline/test_offers.py
 tests/tool_pipeline/test_resumes.py
+```
+
+Task 12 uses this explicitly reviewed fourteen-path closure: the revised baseline scan now captures the two production Legacy definition/re-export paths, while the remaining twelve test supplements cannot be discovered from the fixed commit because Tasks 4-11 introduced them later. Sorting and de-duplication make the closure mechanical when the scan and supplements overlap:
+
+```text
+src/offerpilot/ai/tool_runtime/legacy.py
+src/offerpilot/pilot_runtime/__init__.py
+tests/test_agent_run_journal.py
+tests/tool_metadata/test_compensation_registry.py
+tests/tool_metadata/test_compiler.py
+tests/tool_metadata/test_legacy_confirmation_proof.py
+tests/tool_metadata/test_legacy_initial_route.py
+tests/tool_metadata/test_legacy_registry_composition.py
+tests/tool_metadata/test_manifest.py
+tests/tool_metadata/test_operation_port.py
+tests/tool_metadata/test_presentation_bindings.py
+tests/tool_metadata/test_production_bundle.py
+tests/tool_metadata/test_published_operation_checks.py
+tests/tool_metadata/test_selector_views.py
 ```
 
 Do not replace this explicit supplement with a broader runtime grep or dynamically append scan results to a gate. Future scope discoveries still require the stop/revise/re-review/regenerate procedure below.
@@ -1075,18 +1096,32 @@ git commit -m "refactor: AI 完成工具元数据生产切换"
 - Modify: `src/offerpilot/ai/tool_runtime/__init__.py`
 - Modify: `src/offerpilot/ai/tool_runtime/context.py`
 - Modify: `src/offerpilot/ai/tool_runtime/contracts.py`
+- Modify: `src/offerpilot/ai/tool_runtime/legacy.py`
 - Modify: `src/offerpilot/ai/tool_specs/common.py`
 - Modify: `src/offerpilot/ai/tool_specs/catalog.py`
 - Modify: `src/offerpilot/ai/tool_specs/__init__.py`
 - Modify: `src/offerpilot/context_projector/selector.py`
 - Modify: `src/offerpilot/context_projector/manifest.py`
 - Modify: `src/offerpilot/context_projector/projector.py`
+- Modify: `src/offerpilot/pilot_runtime/__init__.py`
 - Modify: `src/offerpilot/pilot_runtime/composition.py`
 - Modify: `src/offerpilot/api.py`
 - Modify: `tests/agent_loop/test_deletion_gates.py`
+- Modify: `tests/test_agent_run_journal.py`
 - Modify: `tests/tool_pipeline/test_source_gates.py`
 - Modify: `tests/tool_authority/test_source_gates.py`
+- Modify: `tests/tool_metadata/test_compensation_registry.py`
+- Modify: `tests/tool_metadata/test_compiler.py`
 - Create: `tests/tool_metadata/test_deletion_gates.py`
+- Modify: `tests/tool_metadata/test_legacy_confirmation_proof.py`
+- Modify: `tests/tool_metadata/test_legacy_initial_route.py`
+- Modify: `tests/tool_metadata/test_legacy_registry_composition.py`
+- Modify: `tests/tool_metadata/test_manifest.py`
+- Modify: `tests/tool_metadata/test_operation_port.py`
+- Modify: `tests/tool_metadata/test_presentation_bindings.py`
+- Modify: `tests/tool_metadata/test_production_bundle.py`
+- Modify: `tests/tool_metadata/test_published_operation_checks.py`
+- Modify: `tests/tool_metadata/test_selector_views.py`
 - Modify: `tests/test_mock_legacy_removed.py`
 - Modify: `tests/test_pilot_runtime_extraction_gate.py`
 - Modify: the exact frozen Task 12 `$classificationConsumerSet` resolved from the fixed baseline in §0
@@ -1159,7 +1194,8 @@ Delete production definitions and update all callers to injected Bundle views/Po
 
 ```powershell
 uv run pytest tests/tool_metadata/test_deletion_gates.py tests/tool_metadata/test_published_operation_checks.py tests/agent_loop/test_deletion_gates.py tests/tool_pipeline tests/tool_authority/test_source_gates.py tests/tool_authority/test_baseline_golden.py tests/tool_authority/test_matrix.py tests/tool_authority/test_privacy.py tests/tool_authority/test_serialization.py tests/test_agent_run_journal.py tests/test_mock_legacy_removed.py tests/test_pilot_runtime_extraction_gate.py -q
-uv run ruff check src/offerpilot tests/tool_metadata/test_deletion_gates.py tests/agent_loop/test_deletion_gates.py tests/tool_pipeline tests/tool_authority/test_source_gates.py tests/tool_authority/test_baseline_golden.py tests/tool_authority/test_matrix.py tests/tool_authority/test_privacy.py tests/tool_authority/test_serialization.py tests/test_agent_run_journal.py tests/test_mock_legacy_removed.py tests/test_pilot_runtime_extraction_gate.py
+uv run pytest tests/tool_metadata tests/agent_loop tests/tool_pipeline tests/tool_authority tests/pilot_runtime tests/test_agent_run_journal.py tests/test_chat_api.py tests/test_context_projector.py tests/test_knowledge_sources_api.py tests/test_mock_legacy_removed.py tests/test_pilot_runtime_extraction_gate.py tests/test_write_operations.py tests/test_write_operation_acceptance_matrix.py -q
+uv run ruff check src/offerpilot tests/tool_metadata tests/agent_loop tests/tool_pipeline tests/tool_authority tests/pilot_runtime tests/test_agent_run_journal.py tests/test_chat_api.py tests/test_context_projector.py tests/test_knowledge_sources_api.py tests/test_mock_legacy_removed.py tests/test_pilot_runtime_extraction_gate.py tests/test_write_operations.py tests/test_write_operation_acceptance_matrix.py
 uv run mypy src/offerpilot
 ```
 

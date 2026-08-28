@@ -27,8 +27,8 @@ from offerpilot.ai.tool_runtime.metadata import (
     BindingResolverDescriptorV1,
     ToolMetadataBundleV1,
 )
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG, MODEL_TOOL_NAMES
-from offerpilot.ai.tool_runtime.legacy import LEGACY_DETERMINISTIC_NAMES
+from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
+from offerpilot.ai.tool_specs.legacy import build_static_adapter_catalog
 from offerpilot.ai.types import Message
 from offerpilot.config import Config
 
@@ -38,6 +38,13 @@ from tests.tool_metadata.factories import (
     read_metadata,
     synthetic_tool_spec,
     write_metadata,
+)
+
+
+_TEST_TOOL_CATALOG = build_model_tool_catalog()
+_TEST_TOOL_NAMES = tuple(spec.name for spec in _TEST_TOOL_CATALOG.specs)
+_TEST_LEGACY_NAMES = frozenset(
+    adapter.name for adapter in build_static_adapter_catalog().ordered_adapters
 )
 
 
@@ -190,11 +197,11 @@ def test_prepared_tool_call_requires_a_typed_segment_spec_handle() -> None:
 
 def test_model_catalog_is_exact_provider_golden_in_exact_order() -> None:
     manifest = load_golden("provider_manifest_30c944f.json")
-    contracts = MODEL_TOOL_CATALOG.provider_contracts()
+    contracts = _TEST_TOOL_CATALOG.provider_contracts()
 
-    assert len(MODEL_TOOL_NAMES) == 25
-    assert len(set(MODEL_TOOL_NAMES)) == 25
-    assert tuple(contract.name for contract in contracts) == MODEL_TOOL_NAMES
+    assert len(_TEST_TOOL_NAMES) == 25
+    assert len(set(_TEST_TOOL_NAMES)) == 25
+    assert tuple(contract.name for contract in contracts) == _TEST_TOOL_NAMES
     payloads = materialize_provider_payloads(contracts)
     assert canonical_json(payloads) == canonical_json(manifest["tools"])
     actual_fingerprints = {
@@ -218,19 +225,19 @@ def test_final_provider_adapter_receives_exact_golden_envelopes(monkeypatch) -> 
     monkeypatch.setattr(ai_client, "completion", fake_completion)
     ConfiguredAIClient(Config(api_key="synthetic-key")).complete(
         [Message(role="user", content="synthetic")],
-        list(MODEL_TOOL_CATALOG.provider_contracts()),
+        list(_TEST_TOOL_CATALOG.provider_contracts()),
     )
 
     assert canonical_json(captured["tools"]) == canonical_json(manifest["tools"])
 
 
 def test_complete_tool_classification_is_exactly_twenty_five_typed_plus_three_legacy() -> None:
-    typed = frozenset(MODEL_TOOL_NAMES)
+    typed = frozenset(_TEST_TOOL_NAMES)
 
     assert len(typed) == 25
-    assert len(LEGACY_DETERMINISTIC_NAMES) == 3
-    assert typed.isdisjoint(LEGACY_DETERMINISTIC_NAMES)
-    assert len(typed | LEGACY_DETERMINISTIC_NAMES) == 28
+    assert len(_TEST_LEGACY_NAMES) == 3
+    assert typed.isdisjoint(_TEST_LEGACY_NAMES)
+    assert len(typed | _TEST_LEGACY_NAMES) == 28
 
 
 def test_catalog_rejects_unknown_capability_and_resolver_metadata() -> None:

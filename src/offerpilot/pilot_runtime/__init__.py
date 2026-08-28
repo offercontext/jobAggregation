@@ -63,7 +63,6 @@ from .deterministic import (
     DeterministicDependencies,
     DeterministicExecution,
     DeterministicPilotAdapter,
-    LEGACY_DETERMINISTIC_NAMES,
 )
 from .continuation import (
     ConfirmationCoordinator,
@@ -106,7 +105,6 @@ from .service import (
     RuntimePersistence,
     SourceLoader,
     StartTurnDependencies,
-    ToolCatalog,
 )
 from .composition import build_pilot_runtime
 
@@ -134,7 +132,6 @@ __all__ = [
     "ConfirmationState",
     "ConfirmationWriteCoordinator",
     "DeliveryBundle",
-    "LEGACY_DETERMINISTIC_NAMES",
     "ContextAssembler",
     "CompletedEvent",
     "CompletionReason",
@@ -198,7 +195,6 @@ __all__ = [
     "StartTurnRequest",
     "SourceLoader",
     "StartTurnDependencies",
-    "ToolCatalog",
     "StatusEvent",
     "StreamVersion",
     "StreamExecutionMode",

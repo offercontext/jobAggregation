@@ -17,7 +17,7 @@ from offerpilot.ai.tool_authority.policy import (
 from offerpilot.ai.tool_runtime.catalog import compile_tool_metadata_manifest
 from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.ai.tool_runtime.policy_types import ToolDomain
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
 from offerpilot.context_projector.authority_surface import (
     AuthoritySurfaceView,
     intersect_authority_surface,
@@ -32,12 +32,15 @@ from offerpilot.context_projector.selector import (
 from offerpilot.pilot_runtime.compensation import prepare_compensation_handler_components
 
 
+_TEST_TOOL_CATALOG = build_model_tool_catalog()
+
+
 def _bundle() -> ToolMetadataBundleV1:
-    manifest = compile_tool_metadata_manifest(MODEL_TOOL_CATALOG.specs)
+    manifest = compile_tool_metadata_manifest(_TEST_TOOL_CATALOG.specs)
     projection = manifest.to_dict()
     compensation = prepare_compensation_handler_components()
     return ToolMetadataBundleV1(
-        typed_catalog=MODEL_TOOL_CATALOG,
+        typed_catalog=_TEST_TOOL_CATALOG,
         manifest=manifest,
         legacy_boundary=cast(dict[str, object], projection["legacy_boundary"]),
         compensation=compensation.metadata_projection(),
@@ -74,9 +77,9 @@ def test_selector_requires_discovery_and_authority_views_from_one_bundle() -> No
 def test_no_trusted_signal_returns_the_complete_ordered_typed_catalog() -> None:
     bundle = _bundle()
     result = _select(bundle, ToolSelectionSignals(page_kind="workspace"))
-    expected_names = tuple(spec.name for spec in MODEL_TOOL_CATALOG.specs)
+    expected_names = tuple(spec.name for spec in _TEST_TOOL_CATALOG.specs)
 
-    assert result.provider_contracts == MODEL_TOOL_CATALOG.provider_contracts()
+    assert result.provider_contracts == _TEST_TOOL_CATALOG.provider_contracts()
     assert result.selected_names == expected_names
     assert result.selected_domains == ()
     assert result.dependency_closure == expected_names
@@ -95,8 +98,8 @@ def test_declared_ambiguity_returns_the_complete_catalog_with_a_distinct_reason(
 
     result = _select(bundle, signals)
 
-    assert result.selected_names == tuple(spec.name for spec in MODEL_TOOL_CATALOG.specs)
-    assert result.provider_contracts == MODEL_TOOL_CATALOG.provider_contracts()
+    assert result.selected_names == tuple(spec.name for spec in _TEST_TOOL_CATALOG.specs)
+    assert result.provider_contracts == _TEST_TOOL_CATALOG.provider_contracts()
     assert result.full_catalog_fallback is True
     assert _reason_value(result.fallback_reason) == "declared_ambiguous_input"
 
@@ -197,12 +200,12 @@ def test_provider_envelopes_are_materialized_and_fingerprinted_exactly_once(
 
 
 def test_unknown_discovery_policy_version_fails_closed() -> None:
-    manifest = compile_tool_metadata_manifest(MODEL_TOOL_CATALOG.specs)
+    manifest = compile_tool_metadata_manifest(_TEST_TOOL_CATALOG.specs)
     projection = manifest.to_dict()
     policy = cast(dict[str, object], projection["discovery_policy"])
     policy["discovery_policy_version"] = "future-discovery-policy-v999"
     bundle = ToolMetadataBundleV1(
-        typed_catalog=MODEL_TOOL_CATALOG,
+        typed_catalog=_TEST_TOOL_CATALOG,
         manifest=projection,
         legacy_boundary={
             "visibility": "forbidden",
@@ -222,7 +225,7 @@ def test_tool_selection_result_cannot_be_constructed_outside_selector_issuer() -
     bundle = _bundle()
     contract = next(
         contract
-        for contract in MODEL_TOOL_CATALOG.provider_contracts()
+        for contract in _TEST_TOOL_CATALOG.provider_contracts()
         if contract.name == "delete_note"
     )
     result_type = getattr(selector_module, "ToolSelectionResult")

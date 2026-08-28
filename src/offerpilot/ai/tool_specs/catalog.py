@@ -30,8 +30,4 @@ def build_model_tool_catalog() -> ToolCatalog:
     return catalog
 
 
-MODEL_TOOL_CATALOG = build_model_tool_catalog()
-MODEL_TOOL_NAMES = tuple(spec.name for spec in MODEL_TOOL_CATALOG.specs)
-
-
-__all__ = ["MODEL_TOOL_CATALOG", "MODEL_TOOL_NAMES", "build_model_tool_catalog"]
+__all__ = ["build_model_tool_catalog"]

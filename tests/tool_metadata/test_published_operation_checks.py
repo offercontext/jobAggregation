@@ -15,9 +15,11 @@ from sqlalchemy import CheckConstraint
 from offerpilot.ai.tool_runtime import metadata as metadata_module
 from offerpilot.ai.tool_runtime.catalog import compile_tool_metadata_manifest
 from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
 from offerpilot.models import WriteOperation
 
+
+_TEST_TOOL_CATALOG = build_model_tool_catalog()
 
 BASELINE_COMMIT = "0c10e05e256eb757d5f89a8b009dcea193f2fc78"
 MANIFEST_CONSTRAINT = "ck_write_operations_manifest"
@@ -299,10 +301,10 @@ def test_operation_port_projection_equals_published_sqlite_allow_set() -> None:
         "prepare_compensation_handler_components",
     )
     components = prepare_components()
-    manifest = compile_tool_metadata_manifest(MODEL_TOOL_CATALOG.specs)
+    manifest = compile_tool_metadata_manifest(_TEST_TOOL_CATALOG.specs)
     projection = manifest.to_dict()
     bundle = ToolMetadataBundleV1(
-        typed_catalog=MODEL_TOOL_CATALOG,
+        typed_catalog=_TEST_TOOL_CATALOG,
         manifest=manifest,
         legacy_boundary=cast(dict[str, object], projection["legacy_boundary"]),
         compensation=components.metadata_projection(),

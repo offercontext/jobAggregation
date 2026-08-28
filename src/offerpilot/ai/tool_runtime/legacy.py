@@ -26,15 +26,6 @@ if TYPE_CHECKING:
     )
 
 
-LEGACY_DETERMINISTIC_NAMES = frozenset(
-    {
-        "save_application_jd_version",
-        "create_application_submission_snapshot",
-        "record_application_outcome",
-    }
-)
-
-
 class _LegacyArgumentPreparationPort(Protocol):
     @property
     def editable_fields(self) -> tuple[Mapping[str, object], ...]: ...
@@ -734,6 +725,13 @@ class LegacyInitialRouteIssuer(_LegacyInitialOpaqueValue["_LegacyInitialRouteReg
             or self._issuer_integrity_seal[1] is not self._binding
         ):
             raise ValueError("Legacy initial issuer integrity drift")
+
+    @property
+    def route_binding(self) -> LegacyAdapterBindingV1:
+        """Return the exact Bundle-owned binding sealed to this source issuer."""
+
+        self._ensure_issuer_integrity()
+        return self._binding
 
     def open_request_lease(
         self,
@@ -1610,7 +1608,6 @@ def prepare_legacy_arguments(
 
 
 __all__ = [
-    "LEGACY_DETERMINISTIC_NAMES",
     "LegacyArgumentPreparationError",
     "LegacyAdapterRouteHandle",
     "LegacyDeterministicAdapterSpec",

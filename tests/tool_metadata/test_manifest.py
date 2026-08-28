@@ -13,10 +13,12 @@ from offerpilot.ai.tool_runtime.catalog import (
     validate_tool_metadata_manifest,
 )
 from offerpilot.ai.tool_runtime.metadata import freeze_json
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
 
 from .golden import load_asset
 
+
+_TEST_TOOL_CATALOG = build_model_tool_catalog()
 
 TOP_LEVEL_KEYS = (
     "schema_version",
@@ -565,7 +567,7 @@ def _projection(value: object) -> dict[str, Any]:
 
 
 def _compile_manifest(specs: Sequence[object] | None = None) -> ToolMetadataManifestV1:
-    ordered_specs = tuple(MODEL_TOOL_CATALOG.specs if specs is None else specs)
+    ordered_specs = tuple(_TEST_TOOL_CATALOG.specs if specs is None else specs)
     value = compile_tool_metadata_manifest(ordered_specs)
     assert isinstance(value, ToolMetadataManifestV1)
     return value

@@ -22,7 +22,6 @@ from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.policy_types import ToolCapability
 from offerpilot.ai.tool_runtime.contracts import ConfirmationRequired
 from offerpilot.ai.tool_runtime.pipeline import execute_prepared, prepare_call
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.ai.write_operations import (
     OperationCommitted,
@@ -65,6 +64,7 @@ from tests.tool_metadata.test_production_bundle import _production_components
 
 _METADATA_COMPONENTS = _production_components()
 _METADATA_BUNDLE = _METADATA_COMPONENTS.bundle
+_TEST_TOOL_CATALOG = _METADATA_BUNDLE._typed_catalog
 
 
 def _revision(tool_call_id: str, tool_name: str, raw_args: str) -> int:
@@ -199,7 +199,7 @@ def _confirmation_dependencies(
         persistence=ChatPersistenceCoordinator(harness.chat),
         write_operations=harness.repository,
         write_coordinator=harness.coordinator,
-        catalog=MODEL_TOOL_CATALOG,
+        catalog=_TEST_TOOL_CATALOG,
         operation_port=_METADATA_COMPONENTS.operation_port,
         pending_persistence_route_port=(_METADATA_COMPONENTS.pending_persistence_route_port),
         approval_context_resolver=approval_context_resolver,
@@ -443,7 +443,7 @@ def test_runtime_real_typed_origin_is_provider_and_source_free(tmp_path) -> None
             confirmation_coordinator=coordinator,
             continuation_model_resolver=forbidden_model,
             agent_driver=OriginDriver(),
-            catalog=MODEL_TOOL_CATALOG,
+            catalog=_TEST_TOOL_CATALOG,
             metadata_bundle=_METADATA_BUNDLE,
             metadata_components=_METADATA_COMPONENTS,
             provider_metadata_view=_METADATA_BUNDLE.provider_view(),
@@ -510,7 +510,7 @@ def test_production_agent_driver_retains_approval_context_seals(tmp_path) -> Non
     invocation = AgentLoopInvocation(
         seed=ApprovedWriteSeed(ConfirmationApprovedWritePort(session)),
         model=None,
-        catalog=MODEL_TOOL_CATALOG,
+        catalog=_TEST_TOOL_CATALOG,
         catalog_lease=catalog_lease,
         tool_context=context,
         auto_approve=False,
@@ -630,7 +630,7 @@ def test_replay_exit_closes_approval_authority(
             persistence=ChatPersistenceCoordinator(harness.chat),
             confirmation_coordinator=coordinator,
             agent_driver=ReplayDriver(),
-            catalog=MODEL_TOOL_CATALOG,
+            catalog=_TEST_TOOL_CATALOG,
             metadata_bundle=_METADATA_BUNDLE,
             metadata_components=_METADATA_COMPONENTS,
             provider_metadata_view=_METADATA_BUNDLE.provider_view(),

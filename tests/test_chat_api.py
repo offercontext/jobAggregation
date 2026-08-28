@@ -30,7 +30,7 @@ from offerpilot.ai.tool_runtime.contracts import (
     ToolSuccess,
 )
 from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
 from offerpilot.ai.write_operations import (
     TypedPendingRouteHandle,
     WriteOperationError,
@@ -85,6 +85,7 @@ from offerpilot.pilot_runtime.service import PilotRuntime, _has_write_attempt, _
 
 _LEGACY_JD_EXECUTION_EVENTS: list[str] | None = None
 _LEGACY_JD_EXECUTION_ORIGINAL: Any = None
+_TEST_TOOL_CATALOG = build_model_tool_catalog()
 
 
 def _timeout_after_agent_signal_host(signal: Event):
@@ -2314,14 +2315,34 @@ def test_write_status_uses_registry_metadata_for_all_write_tools():
 
     record = _successful_tool_record("update_offer", {"offer_id": 1})
 
-    assert _has_write_attempt(added, (), MODEL_TOOL_CATALOG) is True
-    assert _write_outcome((record,), attempted=True) == ("success", "")
+    bundle = _test_tool_bundle()
+    assert (
+        _has_write_attempt(
+            added,
+            (),
+            bundle.operation_view(),
+            bundle.provider_view(),
+        )
+        is True
+    )
+    assert _write_outcome(
+        (record,),
+        attempted=True,
+        operation_view=bundle.operation_view(),
+        provider_view=bundle.provider_view(),
+    ) == ("success", "")
 
 
 def test_write_status_does_not_report_missing_delete_as_success():
     record = _successful_tool_record("delete_note", {"deleted": False})
+    bundle = _test_tool_bundle()
 
-    assert _write_outcome((record,), attempted=True) == ("failed", "目标记录不存在")
+    assert _write_outcome(
+        (record,),
+        attempted=True,
+        operation_view=bundle.operation_view(),
+        provider_view=bundle.provider_view(),
+    ) == ("failed", "目标记录不存在")
 
 
 def test_write_status_scans_failed_write_before_later_successful_read():
@@ -2330,10 +2351,13 @@ def test_write_status_scans_failed_write_before_later_successful_read():
         ToolFailure("not_found", "record_not_found", "application not found"),
     )
     successful_read = _tool_record("list_applications", ToolSuccess([]))
+    bundle = _test_tool_bundle()
 
     assert _write_outcome(
         (failed_write, successful_read),
         attempted=True,
+        operation_view=bundle.operation_view(),
+        provider_view=bundle.provider_view(),
     ) == ("failed", "application not found")
 
 
@@ -2341,16 +2365,20 @@ def _successful_tool_record(tool_name: str, result: dict[str, object]) -> ToolEx
     return _tool_record(tool_name, ToolSuccess(result))
 
 
-def _tool_record(tool_name: str, outcome: object) -> ToolExecutionRecord:
-    spec = MODEL_TOOL_CATALOG.resolve(tool_name)
-    assert spec is not None
-    manifest = compile_tool_metadata_manifest(MODEL_TOOL_CATALOG.specs)
-    bundle = ToolMetadataBundleV1(
-        typed_catalog=MODEL_TOOL_CATALOG,
+def _test_tool_bundle() -> ToolMetadataBundleV1:
+    manifest = compile_tool_metadata_manifest(_TEST_TOOL_CATALOG.specs)
+    return ToolMetadataBundleV1(
+        typed_catalog=_TEST_TOOL_CATALOG,
         manifest=manifest,
         legacy_boundary=manifest.to_dict()["legacy_boundary"],  # type: ignore[arg-type]
         compensation=prepare_compensation_handler_components().metadata_projection(),
     )
+
+
+def _tool_record(tool_name: str, outcome: object) -> ToolExecutionRecord:
+    spec = _TEST_TOOL_CATALOG.resolve(tool_name)
+    assert spec is not None
+    bundle = _test_tool_bundle()
     lease = bundle.open_segment_lease()
     spec_handle = lease.resolve(tool_name)
     assert spec_handle is not None

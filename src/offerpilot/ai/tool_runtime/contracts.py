@@ -469,19 +469,6 @@ class BindingAudit:
             raise ValueError("binding target_count must be non-negative")
 
 
-@dataclass(frozen=True)
-class BindingTarget:
-    entity_kind: str
-    identity: int | str | None = field(repr=False)
-    available: bool
-
-    def __post_init__(self) -> None:
-        if not self.entity_kind:
-            raise ValueError("binding target entity_kind is required")
-        if self.available != (self.identity is not None):
-            raise ValueError("binding target availability is inconsistent")
-
-
 @dataclass(frozen=True, slots=True)
 class BindingContract:
     """Closed V1 binding strategy declared by one Typed Tool.
@@ -508,51 +495,6 @@ class BindingContract:
                 raise ValueError("unbound binding contract cannot declare an entity kind")
         elif self.entity_kind not in {"application", "resume"}:
             raise ValueError("bound binding contract requires an entity kind")
-
-
-@dataclass(frozen=True, slots=True)
-class BindingResolverSpec(Generic[ArgsT]):
-    """Stable resolver metadata plus its request-scoped implementation.
-
-    The metadata is the authority identity.  The callable is deliberately
-    excluded from equality/repr/fingerprint; it is only the execution hook.
-    """
-
-    resolver_id: BindingResolverId
-    entity_kind: BindingEntityKind
-    arg_path: str
-    presence: Literal["required", "optional"]
-    identity_type: Literal["positive_int64"]
-    resolve: Callable[[ArgsT, "ToolExecutionContext"], Any] = field(
-        repr=False,
-        compare=False,
-    )
-
-    def __post_init__(self) -> None:
-        if self.resolver_id not in {
-            "application_identity_arg",
-            "application_event_parent",
-            "note_application_parent",
-            "offer_application_parent",
-            "resume_identity_arg",
-            "jd_analysis_application_parent",
-        }:
-            raise ValueError("unknown binding resolver id")
-        if self.entity_kind not in {"application", "resume"}:
-            raise ValueError("unknown binding resolver entity kind")
-        if type(self.arg_path) is not str or not self.arg_path or not self.arg_path.isidentifier():
-            raise ValueError("binding resolver arg_path must be a single typed-args field")
-        if self.presence not in {"required", "optional"}:
-            raise ValueError("unknown binding resolver presence")
-        if self.identity_type != "positive_int64":
-            raise ValueError("unknown binding resolver identity type")
-        if not callable(self.resolve):
-            raise TypeError("binding resolver implementation must be callable")
-
-    def __call__(self, args: ArgsT, context: "ToolExecutionContext") -> Any:
-        """Keep the existing Pipeline call site source-compatible."""
-
-        return self.resolve(args, context)
 
 
 @dataclass(frozen=True)
@@ -592,9 +534,6 @@ class ToolExceptionMapping:
 ToolDecoder: TypeAlias = Callable[[Mapping[str, JSONValue]], ArgsT]
 ToolCheck: TypeAlias = Callable[[ArgsT, "ToolExecutionContext"], ToolFailure | None]
 ToolExecutor: TypeAlias = Callable[[ArgsT, "ToolExecutionContext"], ResultT]
-BindingResolver: TypeAlias = (
-    Callable[[ArgsT, "ToolExecutionContext"], Any] | BindingResolverSpec[ArgsT]
-)
 SuccessRenderer: TypeAlias = Callable[[ResultT], str]
 ResultMetadataProjector: TypeAlias = Callable[[ResultT], ToolResultMetadata]
 ConfirmationDescription: TypeAlias = Callable[[ArgsT], str]
@@ -618,27 +557,6 @@ class WriteContract:
         values = (self.result_bytes, self.visible_bytes, self.transport_bytes, self.undo_bytes)
         if any(value <= 0 or value > maximum for value, maximum in zip(values, maxima)):
             raise ValueError("write contract byte budget exceeds ledger limit")
-
-
-TRANSACTIONAL_TYPED_WRITE_NAMES = frozenset(
-    {
-        "create_application",
-        "update_application_status",
-        "create_application_event",
-        "update_application_event",
-        "delete_application_event",
-        "add_note",
-        "update_note",
-        "delete_note",
-        "update_offer",
-        "save_offer_assessment",
-        "resume_update_career_intent",
-        "resume_rewrite_highlight",
-    }
-)
-REQUIRED_UNDO_TOOL_NAMES = frozenset(
-    {"create_application", "update_application_status", "create_application_event", "add_note"}
-)
 
 
 @dataclass(frozen=True)

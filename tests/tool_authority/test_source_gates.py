@@ -579,7 +579,7 @@ def _validate_chat_read_paths(source: str) -> None:
         "delete",
         "flush",
         "merge",
-        "persist_typed_pending",
+        "persist_pending_action",
     }
     mutating_fragments = ("backfill", "create_", "insert", "persist_", "replace_", "update_")
     for name in ("get_conversation", "list_conversations", "get_pending_action"):
@@ -598,13 +598,21 @@ def _validate_chat_read_paths(source: str) -> None:
 
 def _validate_typed_pending_routes(source: str) -> None:
     tree = _tree(source)
-    persist = _function(tree, "persist_typed_pending")
-    argument_names = {argument.arg for argument in persist.args.args}
-    if "pending_authority_claim" not in argument_names:
-        raise SourceGateViolation("typed-pending-claim-parameter")
-    if not _calls(persist, "_validate_typed_pending"):
-        raise SourceGateViolation("typed-pending-claim-validation")
+    persist = _function(tree, "persist_pending_action")
+    argument_names = {argument.arg for argument in (*persist.args.args, *persist.args.kwonlyargs)}
+    if "route_handle" not in argument_names:
+        raise SourceGateViolation("typed-pending-route-handle-parameter")
+    if not _calls(persist, "_pending_route_transaction"):
+        raise SourceGateViolation("typed-pending-route-transaction")
+    if not _calls(persist, "_validate_typed_pending") or not _calls(
+        persist, "_persist_routed_pending"
+    ):
+        raise SourceGateViolation("typed-pending-route-validation")
+    transaction_line = _call_line(persist, "_pending_route_transaction")
     validation_line = _call_line(persist, "_validate_typed_pending")
+    routed_persist_line = _call_line(persist, "_persist_routed_pending")
+    if not transaction_line < validation_line < routed_persist_line:
+        raise SourceGateViolation("typed-pending-route-order")
     for call in (item for item in ast.walk(persist) if isinstance(item, ast.Call)):
         terminal = _terminal(call.func) or ""
         if "legacy" in terminal:
@@ -878,8 +886,8 @@ def _validate_authority_callsite_ownership(paths: dict[Path, str]) -> None:
             SRC / "ai" / "agent_loop.py",
             SRC / "ai" / "tool_authority" / "composition.py",
         },
-        "persist_typed_pending": {
-            SRC / "repositories" / "chat.py",
+        "bind_typed_pending": {
+            SRC / "ai" / "agent_loop.py",
         },
     }
     for path, source in paths.items():
@@ -907,9 +915,9 @@ def _validate_authority_callsite_ownership(paths: dict[Path, str]) -> None:
             terminal = _resolved_terminal(call.func, aliases)
             if terminal in owners and path not in owners[terminal]:
                 raise SourceGateViolation(f"authority-call-owner:{terminal}:{path.name}")
-            if terminal == "persist_typed_pending":
-                has_claim = len(call.args) >= 4 or any(
-                    keyword.arg == "pending_authority_claim" for keyword in call.keywords
+            if terminal == "bind_typed_pending":
+                has_claim = len(call.args) >= 3 or any(
+                    keyword.arg == "claim" for keyword in call.keywords
                 )
                 if not has_claim:
                     raise SourceGateViolation("typed-pending-call-without-claim")
@@ -1200,7 +1208,7 @@ def _validate_dependency_policy_and_autoapprove(source: str) -> None:
             if isinstance(item, ast.Call)
         }
         if body_calls.intersection(
-            {"execute_prepared", "issue_execution_claim", "persist_typed_pending"}
+            {"bind_typed_pending", "execute_prepared", "issue_execution_claim"}
         ):
             raise SourceGateViolation("auto-approve-authority-bypass")
 
@@ -1630,150 +1638,6 @@ def _validate_raw_authority_metadata_access(paths: dict[Path, str]) -> None:
                     )
 
 
-def _validate_legacy_context_helpers_unreachable(paths: dict[Path, str]) -> None:
-    context_path = SRC / "ai" / "tool_runtime" / "context.py"
-    context_module = "offerpilot.ai.tool_runtime.context"
-    runtime_module = "offerpilot.ai.tool_runtime"
-    helper_internal_callers = {
-        "require_capabilities": frozenset({"evaluate_context"}),
-        "pre_resolver_scope_policy": frozenset({"evaluate_context"}),
-        "audit_bindings": frozenset({"evaluate_context"}),
-        "evaluate_context": frozenset(),
-    }
-
-    for path, source in paths.items():
-        tree = _tree(source, filename=str(path))
-        aliases = _import_aliases(tree)
-        strings = _string_bindings(tree)
-        helper_bindings: dict[str, set[str]] = {}
-        module_bindings: set[str] = set()
-
-        def dotted_name(node: ast.AST) -> str | None:
-            if isinstance(node, ast.Name):
-                return node.id
-            if isinstance(node, ast.Attribute):
-                prefix = dotted_name(node.value)
-                return None if prefix is None else f"{prefix}.{node.attr}"
-            return None
-
-        def is_context_module(node: ast.AST) -> bool:
-            return (isinstance(node, ast.Name) and node.id in module_bindings) or dotted_name(
-                node
-            ) == context_module
-
-        if path == context_path:
-            helper_bindings.update((name, {name}) for name in helper_internal_callers)
-
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom):
-                if node.module in {context_module, runtime_module}:
-                    for item in node.names:
-                        if item.name in helper_internal_callers:
-                            helper_bindings.setdefault(item.asname or item.name, set()).add(
-                                item.name
-                            )
-                if node.module == runtime_module:
-                    module_bindings.update(
-                        item.asname or item.name for item in node.names if item.name == "context"
-                    )
-            elif isinstance(node, ast.Import):
-                module_bindings.update(
-                    item.asname
-                    for item in node.names
-                    if item.name == context_module and item.asname is not None
-                )
-
-        def helpers_from_value(node: ast.AST) -> set[str]:
-            if isinstance(node, ast.Name):
-                return set(helper_bindings.get(node.id, set()))
-            if (
-                isinstance(node, ast.Attribute)
-                and is_context_module(node.value)
-                and node.attr in helper_internal_callers
-            ):
-                return {node.attr}
-            if isinstance(node, ast.Call):
-                reflected = _reflected_attribute(node, aliases, strings)
-                if reflected is not None and is_context_module(reflected[0]):
-                    return {reflected[1]} if reflected[1] in helper_internal_callers else set()
-                return set()
-            if isinstance(node, (ast.Subscript, ast.Starred, ast.NamedExpr)):
-                return helpers_from_value(node.value)
-            if isinstance(node, (ast.List, ast.Set, ast.Tuple)):
-                return set().union(*(helpers_from_value(item) for item in node.elts))
-            if isinstance(node, ast.Dict):
-                return set().union(
-                    *(
-                        helpers_from_value(item)
-                        for item in (*node.keys, *node.values)
-                        if item is not None
-                    )
-                )
-            if isinstance(node, ast.IfExp):
-                return helpers_from_value(node.body) | helpers_from_value(node.orelse)
-            if isinstance(node, ast.BoolOp):
-                return set().union(*(helpers_from_value(item) for item in node.values))
-            return set()
-
-        while True:
-            changed = False
-            for node in ast.walk(tree):
-                value: ast.AST | None = None
-                targets: list[ast.AST] = []
-                if isinstance(node, ast.Assign):
-                    value = node.value
-                    targets = list(node.targets)
-                elif isinstance(node, ast.AnnAssign) and node.value is not None:
-                    value = node.value
-                    targets = [node.target]
-                elif isinstance(node, ast.NamedExpr):
-                    value = node.value
-                    targets = [node.target]
-                elif isinstance(node, (ast.For, ast.AsyncFor)):
-                    value = node.iter
-                    targets = [node.target]
-                elif isinstance(node, ast.comprehension):
-                    value = node.iter
-                    targets = [node.target]
-                if value is None:
-                    continue
-                if is_context_module(value):
-                    for target in targets:
-                        new_names = _bound_names(target).difference(module_bindings)
-                        if new_names:
-                            module_bindings.update(new_names)
-                            changed = True
-
-                helpers = helpers_from_value(value)
-                if not helpers:
-                    continue
-                for target in targets:
-                    for name in _bound_names(target):
-                        before = len(helper_bindings.get(name, set()))
-                        helper_bindings.setdefault(name, set()).update(helpers)
-                        if len(helper_bindings[name]) != before:
-                            changed = True
-            if not changed:
-                break
-
-        parents = _parent_map(tree)
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            helpers = helpers_from_value(node.func)
-            if not helpers:
-                continue
-            owner = _direct_method_owner(node, parents)
-            for helper in sorted(helpers):
-                if path == context_path and owner in {
-                    ("<module>", caller) for caller in helper_internal_callers[helper]
-                }:
-                    continue
-                raise SourceGateViolation(
-                    f"legacy-context-helper-caller:{helper}:{path}:{owner}:{node.lineno}"
-                )
-
-
 def test_scoped_authority_source_gates_hold_across_production() -> None:
     production = {path: path.read_text(encoding="utf-8") for path in sorted(SRC.rglob("*.py"))}
     for path, source in production.items():
@@ -1790,7 +1654,6 @@ def test_scoped_authority_source_gates_hold_across_production() -> None:
     _validate_authority_callsite_ownership(production)
     _validate_segment_lease_ownership(production)
     _validate_raw_authority_metadata_access(production)
-    _validate_legacy_context_helpers_unreachable(production)
     for repository_name in (
         "application_events.py",
         "applications.py",
@@ -1805,13 +1668,6 @@ def test_scoped_authority_source_gates_hold_across_production() -> None:
         _validate_no_transient_generic_serializers(source)
         if path != SRC / "context_projector" / "selector.py":
             _validate_dependency_policy_and_autoapprove(source)
-
-    from offerpilot.ai.tool_runtime.legacy import LEGACY_DETERMINISTIC_NAMES
-    from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
-
-    assert LEGACY_DETERMINISTIC_NAMES.isdisjoint(
-        contract.name for contract in MODEL_TOOL_CATALOG.provider_contracts()
-    )
 
 
 @pytest.mark.parametrize(
@@ -1852,14 +1708,17 @@ def test_scoped_authority_source_gates_hold_across_production() -> None:
         ),
         (
             _validate_typed_pending_routes,
-            "def persist_typed_pending(session, pending):\n    return session\n",
-            "typed-pending-claim-parameter",
+            "def persist_pending_action(conversation_id, pending, messages):\n"
+            "    return _pending_route_transaction(pending)\n",
+            "typed-pending-route-handle-parameter",
         ),
         (
             _validate_typed_pending_routes,
-            "def persist_typed_pending(session, pending, pending_authority_claim):\n"
+            "def persist_pending_action(conversation_id, pending, messages, route_handle):\n"
+            "    _pending_route_transaction(pending, route_handle)\n"
             "    if bypass:\n        return persist_legacy_pending(session, pending)\n"
-            "    _validate_typed_pending(pending_authority_claim)\n",
+            "    _validate_typed_pending(pending)\n"
+            "    _persist_routed_pending(pending, route_handle)\n",
             "typed-pending-legacy-fallback",
         ),
         (
@@ -2207,122 +2066,6 @@ def test_agent_loop_raw_non_authority_metadata_field_remains_allowed() -> None:
 @pytest.mark.parametrize(
     "source",
     [
-        (
-            "from offerpilot.ai.tool_runtime.context import "
-            "evaluate_context as evaluate\n"
-            "def dispatch(spec, args, context):\n"
-            "    call = evaluate\n"
-            "    return call(spec, args, context)\n"
-        ),
-        (
-            "from offerpilot.ai.tool_runtime import context as runtime_context\n"
-            "def dispatch(spec, context):\n"
-            "    policy = runtime_context\n"
-            "    return policy.require_capabilities(spec, context)\n"
-        ),
-        (
-            "import offerpilot.ai.tool_runtime.context\n"
-            "def dispatch(spec, args, context):\n"
-            "    return offerpilot.ai.tool_runtime.context.evaluate_context(\n"
-            "        spec, args, context\n"
-            "    )\n"
-        ),
-    ],
-)
-def test_legacy_context_helper_gate_rejects_external_alias_callers(source: str) -> None:
-    with pytest.raises(SourceGateViolation, match="legacy-context-helper-caller"):
-        _validate_legacy_context_helpers_unreachable({SRC / "api.py": source})
-
-
-def test_legacy_context_helper_gate_allows_only_exact_internal_call_graph() -> None:
-    context_path = SRC / "ai" / "tool_runtime" / "context.py"
-    source = (
-        "def require_capabilities(spec, context): return None\n"
-        "def pre_resolver_scope_policy(spec, context): return None\n"
-        "def audit_bindings(spec, args, context): return audit, True\n"
-        "def evaluate_context(spec, args, context):\n"
-        "    require_capabilities(spec, context)\n"
-        "    pre_resolver_scope_policy(spec, context)\n"
-        "    return audit_bindings(spec, args, context)\n"
-    )
-    _validate_legacy_context_helpers_unreachable({context_path: source})
-
-    with pytest.raises(SourceGateViolation, match="legacy-context-helper-caller"):
-        _validate_legacy_context_helpers_unreachable(
-            {
-                context_path: source + "def bypass(spec, context):\n"
-                "    return require_capabilities(spec, context)\n"
-            }
-        )
-
-
-def test_legacy_context_helper_gate_rejects_lambda_nested_in_exact_owner() -> None:
-    context_path = SRC / "ai" / "tool_runtime" / "context.py"
-    source = (
-        "def require_capabilities(spec, context): return None\n"
-        "def evaluate_context(spec, context):\n"
-        "    return (lambda: require_capabilities(spec, context))()\n"
-    )
-    with pytest.raises(SourceGateViolation, match="legacy-context-helper-caller"):
-        _validate_legacy_context_helpers_unreachable({context_path: source})
-
-
-def test_legacy_context_helper_gate_ignores_unrelated_local_spelling() -> None:
-    source = (
-        "def evaluate_context(value): return value\n"
-        "def dispatch(value): return evaluate_context(value)\n"
-    )
-    _validate_legacy_context_helpers_unreachable({SRC / "api.py": source})
-
-
-def test_legacy_context_helper_gate_rejects_reflective_callers() -> None:
-    source = (
-        "import offerpilot.ai.tool_runtime.context as context_module\n"
-        "def bypass(spec, context):\n"
-        "    helper = getattr(context_module, 'require_capabilities')\n"
-        "    return helper(spec, context)\n"
-    )
-    with pytest.raises(SourceGateViolation, match="legacy-context-helper-caller"):
-        _validate_legacy_context_helpers_unreachable({SRC / "api.py": source})
-
-
-@pytest.mark.parametrize(
-    "source",
-    (
-        "import offerpilot.ai.tool_runtime.context as context_module\n"
-        "def bypass(spec, args, context):\n"
-        "    helper = context_module.__getattribute__('evaluate_context')\n"
-        "    return helper(spec, args, context)\n",
-        "from offerpilot.ai.tool_runtime.context import evaluate_context\n"
-        "def bypass(spec, args, context):\n"
-        "    (helper,) = (evaluate_context,)\n"
-        "    return helper(spec, args, context)\n",
-        "from offerpilot.ai.tool_runtime.context import evaluate_context\n"
-        "def bypass(spec, args, context):\n"
-        "    if (helper := evaluate_context):\n"
-        "        return helper(spec, args, context)\n",
-    ),
-)
-def test_legacy_context_helper_gate_rejects_dunder_and_control_flow_aliases(
-    source: str,
-) -> None:
-    with pytest.raises(SourceGateViolation, match="legacy-context-helper-caller"):
-        _validate_legacy_context_helpers_unreachable({SRC / "api.py": source})
-
-
-def test_legacy_context_helper_gate_allows_unrelated_reflective_callers() -> None:
-    source = (
-        "import offerpilot.ai.tool_runtime.context as context_module\n"
-        "def allowed(value):\n"
-        "    helper = getattr(context_module, 'scope_access_denied')\n"
-        "    return helper(value)\n"
-    )
-    _validate_legacy_context_helpers_unreachable({SRC / "api.py": source})
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
         "def f(request): return frozenset(request.capabilities)\n",
         "def f(payload): return payload.get('current_bindings')\n",
         "from x import ToolExecutionContext as Ctx\ndef f(): return Ctx()\n",
@@ -2357,9 +2100,9 @@ def test_callsite_owner_and_claim_negative_fixtures_are_live() -> None:
     with pytest.raises(SourceGateViolation, match="typed-pending-call-without-claim"):
         _validate_authority_callsite_ownership(
             {
-                SRC / "repositories" / "chat.py": (
-                    "def route(repo, session, conversation, pending):\n"
-                    "    repo.persist_typed_pending(session, conversation, pending)\n"
+                SRC / "ai" / "agent_loop.py": (
+                    "def route(pending_port, operation_handle, identity):\n"
+                    "    pending_port.bind_typed_pending(operation_handle, identity)\n"
                 )
             }
         )

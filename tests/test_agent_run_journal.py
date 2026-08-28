@@ -31,7 +31,7 @@ from offerpilot.agent_runtime.events import (
 from offerpilot.agent_runtime.keyring import JournalKeyDomain
 from offerpilot.ai.tool_runtime.catalog import compile_tool_metadata_manifest
 from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
 from offerpilot.context_projector.contracts import RuntimeSurfaceAudit
 from offerpilot.context_projector.manifest import CONTRIBUTOR_ORDER
 from offerpilot.db import init_database
@@ -57,6 +57,7 @@ KEY = JournalKeyDomain(
     key_id="11111111-1111-4111-8111-111111111111",
     secret=b"k" * 32,
 )
+_TEST_TOOL_CATALOG = build_model_tool_catalog()
 SEGMENT_A = "22222222-2222-4222-8222-222222222222"
 SEGMENT_B = "33333333-3333-4333-8333-333333333333"
 CALL_A = "44444444-4444-4444-8444-444444444444"
@@ -64,9 +65,9 @@ CALL_B = "55555555-5555-4555-8555-555555555555"
 
 
 def _metadata_bundle() -> ToolMetadataBundleV1:
-    manifest = compile_tool_metadata_manifest(MODEL_TOOL_CATALOG.specs)
+    manifest = compile_tool_metadata_manifest(_TEST_TOOL_CATALOG.specs)
     return ToolMetadataBundleV1(
-        typed_catalog=MODEL_TOOL_CATALOG,
+        typed_catalog=_TEST_TOOL_CATALOG,
         manifest=manifest,
         legacy_boundary=manifest.to_dict()["legacy_boundary"],  # type: ignore[arg-type]
         compensation=prepare_compensation_handler_components().metadata_projection(),

@@ -31,14 +31,13 @@ from offerpilot.ai.tool_authority import (
     AuthorityFactory,
     TrustedContextScope,
 )
-from offerpilot.ai.tool_runtime.legacy import LEGACY_DETERMINISTIC_NAMES
 from offerpilot.ai.tool_runtime.pipeline import execute_prepared, prepare_call
 from offerpilot.ai.tool_runtime.contracts import (
     ConfirmationRequired,
     ToolFailure,
     ToolSuccess,
 )
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.ai.tool_specs.legacy import build_static_adapter_catalog
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.ai.write_operations import (
     DeliveryHeartbeat,
@@ -109,10 +108,15 @@ from tests.tool_metadata.test_pending_routes import issued_typed_pending_route
 from tests.tool_metadata.test_production_bundle import _production_components
 
 
-_STABLE_LEGACY_DETERMINISTIC_NAME = sorted(LEGACY_DETERMINISTIC_NAMES)[0]
+_PRODUCTION_METADATA_COMPONENTS = _production_components()
+_TEST_TOOL_CATALOG = _PRODUCTION_METADATA_COMPONENTS.typed_catalog
+_TEST_LEGACY_NAMES = frozenset(
+    adapter.name for adapter in build_static_adapter_catalog().ordered_adapters
+)
+_STABLE_LEGACY_DETERMINISTIC_NAME = sorted(_TEST_LEGACY_NAMES)[0]
 
 
-def _runtime_metadata_bundle(catalog: ToolCatalog = MODEL_TOOL_CATALOG) -> ToolMetadataBundleV1:
+def _runtime_metadata_bundle(catalog: ToolCatalog = _TEST_TOOL_CATALOG) -> ToolMetadataBundleV1:
     manifest = compile_tool_metadata_manifest(catalog.specs)
     projection = manifest.to_dict()
     return ToolMetadataBundleV1(
@@ -123,14 +127,11 @@ def _runtime_metadata_bundle(catalog: ToolCatalog = MODEL_TOOL_CATALOG) -> ToolM
     )
 
 
-_PRODUCTION_METADATA_COMPONENTS = _production_components()
-
-
 def _runtime_metadata_dependencies() -> dict[str, object]:
     components = _PRODUCTION_METADATA_COMPONENTS
     bundle = components.bundle
     return {
-        "catalog": MODEL_TOOL_CATALOG,
+        "catalog": _TEST_TOOL_CATALOG,
         "metadata_bundle": bundle,
         "metadata_components": components,
         "provider_metadata_view": bundle.provider_view(),
@@ -166,10 +167,10 @@ def test_confirmation_approved_port_is_transient_and_does_not_leak_session() -> 
 
 
 def test_policy_resolver_reuses_the_bundle_owned_segment_catalog(tmp_path: Any) -> None:
-    manifest = compile_tool_metadata_manifest(MODEL_TOOL_CATALOG.specs)
+    manifest = compile_tool_metadata_manifest(_TEST_TOOL_CATALOG.specs)
     projection = manifest.to_dict()
     bundle = ToolMetadataBundleV1(
-        typed_catalog=MODEL_TOOL_CATALOG,
+        typed_catalog=_TEST_TOOL_CATALOG,
         manifest=manifest,
         legacy_boundary=cast(dict[str, object], projection["legacy_boundary"]),
         compensation=prepare_compensation_handler_components().metadata_projection(),
@@ -178,13 +179,13 @@ def test_policy_resolver_reuses_the_bundle_owned_segment_catalog(tmp_path: Any) 
     discovery_view = bundle.discovery_view()
     authority_view = bundle.authority_view()
     resolver = composition_module._PolicyCatalogResolver(
-        MODEL_TOOL_CATALOG,
+        _TEST_TOOL_CATALOG,
         provider_view=provider_view,
         discovery_view=discovery_view,
         authority_view=authority_view,
     )
 
-    assert resolver._catalog is MODEL_TOOL_CATALOG
+    assert resolver._catalog is _TEST_TOOL_CATALOG
     assert resolver._provider_view is provider_view
     assert resolver._discovery_view is discovery_view
     assert resolver._authority_view is authority_view
@@ -213,12 +214,12 @@ def test_policy_resolver_reuses_the_bundle_owned_segment_catalog(tmp_path: Any) 
         offers=OffersRepository(sessions),
         resumes=ResumesRepository(sessions),
         jd_analyses=JDAnalysesRepository(sessions),
-        policy_snapshot=validate_startup_policy(MODEL_TOOL_CATALOG.authority_manifest),
+        policy_snapshot=validate_startup_policy(_TEST_TOOL_CATALOG.authority_manifest),
     ).resolve(request, conversation, source, NullRunRecorder())
     try:
         resolved = resolver.resolve(request, conversation, source, segment)
         assert resolved.catalog is bundle._typed_catalog
-        assert resolved.catalog is MODEL_TOOL_CATALOG
+        assert resolved.catalog is _TEST_TOOL_CATALOG
     finally:
         segment.close()
         engine = sessions.kw.get("bind")
@@ -270,9 +271,11 @@ class _Operations:
         self.converge_calls = 0
         self.heartbeat_calls = 0
         self.preheader_calls = 0
+        self.get_calls = 0
         self.chained_pending: VerifiedPendingReplay | None = None
 
     def get(self, _operation_id: str) -> object:
+        self.get_calls += 1
         return self.operation
 
     def operation_preheader(
@@ -404,7 +407,7 @@ def _approve_modify(
     request: ConfirmationRequest,
     *,
     pending: PendingAction | None = None,
-    catalog: ToolCatalog = MODEL_TOOL_CATALOG,
+    catalog: ToolCatalog = _TEST_TOOL_CATALOG,
 ) -> ConfirmationSession:
     live = pending
     if live is None:
@@ -419,7 +422,7 @@ def _approve_modify(
         tool_name = live.tool_name
     bundle = (
         _PRODUCTION_METADATA_COMPONENTS.bundle
-        if catalog is MODEL_TOOL_CATALOG
+        if catalog is _TEST_TOOL_CATALOG
         else _runtime_metadata_bundle(catalog)
     )
     lease = bundle.open_segment_lease()
@@ -1957,11 +1960,8 @@ def test_reject_preheader_does_not_touch_conversation_or_model() -> None:
 @pytest.mark.parametrize(
     ("adapter_kind", "tool_name", "approved", "expected"),
     [
-        *(
-            ("legacy_deterministic", name, True, True)
-            for name in sorted(LEGACY_DETERMINISTIC_NAMES)
-        ),
-        ("legacy_deterministic", "create_application", True, False),
+        *(("legacy_deterministic", name, True, True) for name in sorted(_TEST_LEGACY_NAMES)),
+        ("legacy_deterministic", "create_application", True, None),
         ("typed", _STABLE_LEGACY_DETERMINISTIC_NAME, True, False),
         ("legacy_deterministic", _STABLE_LEGACY_DETERMINISTIC_NAME, False, False),
     ],
@@ -1970,7 +1970,7 @@ def test_deterministic_confirmation_requires_exact_closed_adapter_identity(
     adapter_kind: str,
     tool_name: str,
     approved: bool,
-    expected: bool,
+    expected: bool | None,
 ) -> None:
     operations = _Operations(status="proposed")
     operations.operation.adapter_kind = adapter_kind
@@ -1981,19 +1981,25 @@ def test_deterministic_confirmation_requires_exact_closed_adapter_identity(
         RuntimeDependencies(
             persistence=persistence,  # type: ignore[arg-type]
             confirmation_coordinator=coordinator,
+            **_runtime_metadata_dependencies(),
         )
     )
 
-    result = runtime._is_deterministic_confirmation(
-        ConfirmationRequest(
-            conversation_id=7,
-            approved=approved,
-            operation_id=operations.operation_id,
-        ),
-        operation=operations.operation,
-    )
+    def classify() -> bool:
+        return runtime._is_deterministic_confirmation(
+            ConfirmationRequest(
+                conversation_id=7,
+                approved=approved,
+                operation_id=operations.operation_id,
+            ),
+            preheader=LedgerOperationPreheader(operations.operation, None),  # type: ignore[arg-type]
+        )
 
-    assert result is expected
+    if expected is None:
+        with pytest.raises(WriteOperationError, match="operation_identity_conflict"):
+            classify()
+    else:
+        assert classify() is expected
     assert operations.preheader_calls == 0
     assert persistence.pending_reads == 0
 
@@ -2008,15 +2014,134 @@ def test_omitted_id_legacy_classifier_uses_only_bounded_ledger_preheader() -> No
         RuntimeDependencies(
             persistence=persistence,  # type: ignore[arg-type]
             confirmation_coordinator=coordinator,
+            **_runtime_metadata_dependencies(),
         )
     )
 
     request = ConfirmationRequest(conversation_id=7, approved=True)
     preheader = coordinator.operation_preheader(request)
 
-    assert runtime._is_deterministic_confirmation(request, operation=preheader.operation)
+    assert runtime._is_deterministic_confirmation(request, preheader=preheader)
     assert operations.preheader_calls == 1
+    assert operations.get_calls == 0
     assert persistence.pending_reads == 0
+
+
+def test_confirmation_preheader_rejects_legacy_loader_alias_without_get() -> None:
+    operations = _Operations(status="proposed")
+
+    class AliasOnlyRepository:
+        def __init__(self) -> None:
+            self.alias_calls = 0
+            self.get_calls = 0
+
+        def load_operation_preheader(
+            self, *, conversation_id: int, operation_id: str | None
+        ) -> LedgerOperationPreheader:
+            self.alias_calls += 1
+            assert operation_id == operations.operation_id
+            return LedgerOperationPreheader(
+                operations.operation,  # type: ignore[arg-type]
+                LedgerPendingPointer(
+                    conversation_id=conversation_id,
+                    operation_id=operations.operation_id,
+                    tool_call_id="call-1",
+                    tool_name="create_application",
+                    pending_confirmation_claim_id="",
+                ),
+            )
+
+        def get(self, _operation_id: str) -> object:
+            self.get_calls += 1
+            return operations.operation
+
+    repository = AliasOnlyRepository()
+    coordinator = ConfirmationCoordinator(_deps(_Persistence(None), repository))
+
+    with pytest.raises(WriteOperationError, match="operation_unavailable"):
+        coordinator.operation_preheader(
+            ConfirmationRequest(
+                conversation_id=7,
+                approved=True,
+                operation_id=operations.operation_id,
+            )
+        )
+
+    assert repository.alias_calls == 0
+    assert repository.get_calls == 0
+
+
+@pytest.mark.parametrize("wrapper_kind", ("mapping", "duck"))
+def test_confirmation_preheader_rejects_wrapper_projection_without_get(
+    wrapper_kind: str,
+) -> None:
+    operations = _Operations(status="proposed")
+    pointer = LedgerPendingPointer(
+        conversation_id=7,
+        operation_id=operations.operation_id,
+        tool_call_id="call-1",
+        tool_name="create_application",
+        pending_confirmation_claim_id="",
+    )
+
+    class WrapperRepository:
+        def __init__(self) -> None:
+            self.preheader_calls = 0
+            self.get_calls = 0
+
+        def operation_preheader(self, *, conversation_id: int, operation_id: str | None) -> object:
+            self.preheader_calls += 1
+            assert conversation_id == 7
+            assert operation_id == operations.operation_id
+            if wrapper_kind == "mapping":
+                return {"operation": operations.operation, "pending_pointer": pointer}
+            return SimpleNamespace(operation=operations.operation, pending_pointer=pointer)
+
+        def get(self, _operation_id: str) -> object:
+            self.get_calls += 1
+            return operations.operation
+
+    repository = WrapperRepository()
+    coordinator = ConfirmationCoordinator(_deps(_Persistence(None), repository))
+
+    with pytest.raises(WriteOperationError, match="operation_unavailable"):
+        coordinator.operation_preheader(
+            ConfirmationRequest(
+                conversation_id=7,
+                approved=True,
+                operation_id=operations.operation_id,
+            )
+        )
+
+    assert repository.preheader_calls == 1
+    assert repository.get_calls == 0
+
+
+def test_confirmation_preheader_missing_exact_port_never_loads_full_operation() -> None:
+    operations = _Operations(status="proposed")
+
+    class FullOperationOnlyRepository:
+        def __init__(self) -> None:
+            self.get_calls = 0
+
+        def get(self, operation_id: str) -> object:
+            self.get_calls += 1
+            assert operation_id == operations.operation_id
+            return operations.operation
+
+    repository = FullOperationOnlyRepository()
+    coordinator = ConfirmationCoordinator(_deps(_Persistence(None), repository))
+
+    with pytest.raises(WriteOperationError, match="operation_unavailable"):
+        coordinator.operation_preheader(
+            ConfirmationRequest(
+                conversation_id=7,
+                approved=True,
+                operation_id=operations.operation_id,
+            )
+        )
+
+    assert repository.get_calls == 0
 
 
 def test_deterministic_classifier_never_bootstraps_without_an_operation() -> None:
@@ -2028,6 +2153,7 @@ def test_deterministic_classifier_never_bootstraps_without_an_operation() -> Non
         RuntimeDependencies(
             persistence=persistence,  # type: ignore[arg-type]
             confirmation_coordinator=ConfirmationCoordinator(_deps(persistence, operations)),
+            **_runtime_metadata_dependencies(),
         )
     )
 
@@ -2225,14 +2351,14 @@ def _persist_real_sqlite_typed_pending(
 
 
 def _real_sqlite_approval_catalog(executor: object) -> ToolCatalog:
-    base_spec = MODEL_TOOL_CATALOG.resolve("save_offer_assessment")
+    base_spec = _TEST_TOOL_CATALOG.resolve("save_offer_assessment")
     assert base_spec is not None
     spec = replace(
         base_spec,
         metadata=replace(base_spec.metadata, dependencies=()),
         executor=cast(Any, executor),
     )
-    specs = tuple(spec if item.name == spec.name else item for item in MODEL_TOOL_CATALOG.specs)
+    specs = tuple(spec if item.name == spec.name else item for item in _TEST_TOOL_CATALOG.specs)
     return ToolCatalog(specs, expected_names=tuple(item.name for item in specs))
 
 
@@ -2261,7 +2387,7 @@ def _prepare_real_sqlite_approval(
     assert isinstance(context, ToolExecutionContext)
     assert isinstance(context.authority, ApprovalExecutionAuthority)
     factory = context.authority_factory
-    assert catalog is MODEL_TOOL_CATALOG
+    assert catalog is _TEST_TOOL_CATALOG
     bundle = _PRODUCTION_METADATA_COMPONENTS.bundle
     catalog_lease = cast(Any, session).state.approval_catalog_lease
     assert isinstance(catalog_lease, SegmentToolCatalogLease)
@@ -2322,7 +2448,7 @@ def test_real_sqlite_coordinator_executes_prepared_call_once_and_persists_delive
         return original_execute(repository, *args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(OffersRepository, "save_offer_assessment_scoped", execute)
-    catalog = MODEL_TOOL_CATALOG
+    catalog = _TEST_TOOL_CATALOG
     factories: list[AuthorityFactory] = []
     coordinator = ConfirmationCoordinator(
         ConfirmationDependencies(
@@ -2432,7 +2558,7 @@ def test_real_sqlite_two_connections_have_one_claim_and_one_executor(
         return original_execute(repository, *args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(OffersRepository, "save_offer_assessment_scoped", execute)
-    catalog = MODEL_TOOL_CATALOG
+    catalog = _TEST_TOOL_CATALOG
     factories: list[AuthorityFactory] = []
     request = ConfirmationRequest(
         conversation_id=conversation.id,

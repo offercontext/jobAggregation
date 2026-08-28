@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+import inspect
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ import pytest
 from sqlalchemy import text
 
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog, compile_tool_metadata_manifest
+from offerpilot.ai.tool_runtime.contracts import TransientToolRuntimeValue
 from offerpilot.ai.tool_runtime.legacy import LegacyRouteSourceV1
 from offerpilot.ai.tool_runtime.legacy_proof import (
     LegacyApprovedConfirmationInput,
@@ -19,7 +21,7 @@ from offerpilot.ai.tool_runtime.legacy_proof import (
 )
 from offerpilot.ai.tool_runtime.metadata import OperationRouteIdentityV1, ToolMetadataBundleV1
 from offerpilot.ai.tool_specs import legacy as legacy_specs
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
 from offerpilot.ai.write_operations import (
     WriteOperationCoordinator,
     WriteOperationError,
@@ -29,7 +31,15 @@ from offerpilot.ai.write_operations import (
 )
 from offerpilot.db import init_database
 from offerpilot.models import Conversation
+from offerpilot.pilot_runtime.continuation import (
+    ConfirmationCoordinator,
+    ConfirmationDependencies,
+)
 from offerpilot.pilot_runtime.legacy_route import build_legacy_pending_identity_verifier_port
+from offerpilot.pilot_runtime.deterministic import (
+    DeterministicDependencies,
+    DeterministicPilotAdapter,
+)
 from offerpilot.pilot_runtime.service import RuntimeDependencies
 
 
@@ -86,22 +96,21 @@ def _production_components() -> Any:
 
 
 def _second_exact_typed_catalog() -> ToolCatalog:
+    source = build_model_tool_catalog()
     return ToolCatalog(
-        MODEL_TOOL_CATALOG.specs,
-        expected_names=tuple(spec.name for spec in MODEL_TOOL_CATALOG.specs),
-        authority_manifest=MODEL_TOOL_CATALOG.authority_manifest,
+        source.specs,
+        expected_names=tuple(spec.name for spec in source.specs),
+        authority_manifest=source.authority_manifest,
     )
 
 
-def _minimal_runtime(tmp_path: Path, *, catalog: ToolCatalog) -> Any:
-    runtime, _repository = _minimal_runtime_with_repository(tmp_path, catalog=catalog)
+def _minimal_runtime(tmp_path: Path) -> Any:
+    runtime, _repository = _minimal_runtime_with_repository(tmp_path)
     return runtime
 
 
 def _minimal_runtime_with_repository(
     tmp_path: Path,
-    *,
-    catalog: ToolCatalog,
 ) -> tuple[Any, WriteOperationRepository]:
     composition = _composition_module()
     dependency = object()
@@ -128,7 +137,6 @@ def _minimal_runtime_with_repository(
         system_message=lambda: dependency,
         clarification_message=lambda *_args, **_kwargs: None,
         page_context_messages=lambda _page: (),
-        catalog=catalog,
     )
     return runtime, repository
 
@@ -240,21 +248,10 @@ def test_production_components_publish_one_complete_25_3_4_bundle_graph() -> Non
         assert compensation_registry.require_handler_handle(handler) is binding
 
 
-def test_build_pilot_runtime_rejects_a_second_exact_typed_catalog(
-    tmp_path: Path,
-) -> None:
-    second_catalog = _second_exact_typed_catalog()
-    assert second_catalog is not MODEL_TOOL_CATALOG
-    assert all(
-        duplicate is production
-        for duplicate, production in zip(
-            second_catalog.provider_contracts(),
-            MODEL_TOOL_CATALOG.provider_contracts(),
-        )
-    )
+def test_build_pilot_runtime_has_no_raw_catalog_injection_surface() -> None:
+    signature = inspect.signature(_composition_module().build_pilot_runtime)
 
-    with pytest.raises(ValueError, match="Catalog|catalog|Bundle"):
-        _minimal_runtime(tmp_path, catalog=second_catalog)
+    assert "catalog" not in signature.parameters
 
 
 def test_runtime_dependencies_reject_catalog_outside_the_exact_bundle() -> None:
@@ -272,10 +269,113 @@ def test_runtime_dependencies_reject_catalog_outside_the_exact_bundle() -> None:
         )
 
 
+def test_runtime_dependencies_reject_legacy_operation_port_outside_the_exact_bundle() -> None:
+    components = _production_components()
+    bundle = components.bundle
+    foreign_components = _production_components()
+    deterministic = DeterministicPilotAdapter(
+        DeterministicDependencies(
+            persistence=SimpleNamespace(),
+            applications=SimpleNamespace(),
+            application_jd_versions=SimpleNamespace(),
+            application_outcomes=SimpleNamespace(),
+            operation_port=foreign_components.operation_port,
+        )
+    )
+
+    with pytest.raises(ValueError, match="Bundle provenance"):
+        RuntimeDependencies(
+            catalog=components.typed_catalog,
+            metadata_bundle=bundle,
+            metadata_components=components,
+            provider_metadata_view=bundle.provider_view(),
+            discovery_metadata_view=bundle.discovery_view(),
+            authority_metadata_view=bundle.authority_view(),
+            deterministic=deterministic,
+        )
+
+
+def test_runtime_dependencies_reject_forwarded_foreign_legacy_operation_port() -> None:
+    components = _production_components()
+    bundle = components.bundle
+    foreign_components = _production_components()
+
+    class ForwardingComponents(TransientToolRuntimeValue):
+        def __init__(self) -> None:
+            self.bundle = bundle
+            self.operation_port = foreign_components.operation_port
+
+    deterministic = DeterministicPilotAdapter(
+        DeterministicDependencies(
+            persistence=SimpleNamespace(),
+            applications=SimpleNamespace(),
+            application_jd_versions=SimpleNamespace(),
+            application_outcomes=SimpleNamespace(),
+            operation_port=foreign_components.operation_port,
+        )
+    )
+
+    with pytest.raises(ValueError, match="Bundle provenance"):
+        RuntimeDependencies(
+            catalog=components.typed_catalog,
+            metadata_bundle=bundle,
+            metadata_components=ForwardingComponents(),
+            provider_metadata_view=bundle.provider_view(),
+            discovery_metadata_view=bundle.discovery_view(),
+            authority_metadata_view=bundle.authority_view(),
+            deterministic=deterministic,
+        )
+
+
+def test_runtime_dependencies_reject_forwarded_foreign_pending_route_port() -> None:
+    components = _production_components()
+    bundle = components.bundle
+    foreign_components = _production_components()
+
+    class ForwardingComponents(TransientToolRuntimeValue):
+        def __init__(self) -> None:
+            self.bundle = bundle
+            self.operation_port = components.operation_port
+            self.pending_persistence_route_port = foreign_components.pending_persistence_route_port
+
+    with pytest.raises(ValueError, match="Bundle provenance"):
+        RuntimeDependencies(
+            catalog=components.typed_catalog,
+            metadata_bundle=bundle,
+            metadata_components=ForwardingComponents(),
+            provider_metadata_view=bundle.provider_view(),
+            discovery_metadata_view=bundle.discovery_view(),
+            authority_metadata_view=bundle.authority_view(),
+        )
+
+
+def test_runtime_dependencies_reject_foreign_confirmation_route_ports() -> None:
+    components = _production_components()
+    bundle = components.bundle
+    foreign_components = _production_components()
+    coordinator = ConfirmationCoordinator(
+        ConfirmationDependencies(
+            operation_port=foreign_components.operation_port,
+            pending_persistence_route_port=(foreign_components.pending_persistence_route_port),
+        )
+    )
+
+    with pytest.raises(ValueError, match="Bundle provenance"):
+        RuntimeDependencies(
+            catalog=components.typed_catalog,
+            metadata_bundle=bundle,
+            metadata_components=components,
+            provider_metadata_view=bundle.provider_view(),
+            discovery_metadata_view=bundle.discovery_view(),
+            authority_metadata_view=bundle.authority_view(),
+            confirmation_coordinator=coordinator,
+        )
+
+
 def test_build_pilot_runtime_publishes_the_bundle_typed_catalog_identity(
     tmp_path: Path,
 ) -> None:
-    runtime = _minimal_runtime(tmp_path, catalog=MODEL_TOOL_CATALOG)
+    runtime = _minimal_runtime(tmp_path)
 
     assert runtime._dependencies.catalog is runtime.metadata_bundle._typed_catalog
 
@@ -297,10 +397,7 @@ def test_build_pilot_runtime_wires_real_legacy_verifier_to_repository_key(
         "build_legacy_pending_identity_verifier_port",
         capture,
     )
-    runtime, repository = _minimal_runtime_with_repository(
-        tmp_path,
-        catalog=MODEL_TOOL_CATALOG,
-    )
+    runtime, repository = _minimal_runtime_with_repository(tmp_path)
 
     assert len(calls) == 1
     backend, ledger_key = calls[0]
@@ -419,7 +516,9 @@ def test_production_legacy_verifier_backend_reads_locks_and_claims_real_rows(
 
 def test_actual_adapter_policy_and_initial_registry_projection_equals_manifest() -> None:
     components = _production_components()
-    expected = compile_tool_metadata_manifest(MODEL_TOOL_CATALOG.specs).to_dict()["legacy_boundary"]
+    expected = compile_tool_metadata_manifest(build_model_tool_catalog().specs).to_dict()[
+        "legacy_boundary"
+    ]
 
     assert _actual_legacy_projection(components) == expected
 

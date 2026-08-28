@@ -57,7 +57,6 @@ from offerpilot.reliability.trace import (
     record_mock_interview_trace,
 )
 from offerpilot.ai.client import ConfiguredAIClient
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 from offerpilot.ai.tool_runtime.metadata import (
     CommittedPrimaryOperationIdentityV1,
     FrozenJSONValue,
@@ -1371,13 +1370,7 @@ def create_app(
         page_context_messages=lambda page: _chat_page_context_messages(
             dict(page) if page is not None else None
         ),
-        missing_target_question=lambda pending, _conversation_id: _pending_action_missing_question(
-            cast(PendingAction, pending),
-            applications,
-        ),
         title_from_message=_title_from_message,
-        catalog=MODEL_TOOL_CATALOG,
-        application_visible=lambda application_id: applications.get(application_id) is not None,
     )
 
     @app.on_event("startup")
@@ -8641,60 +8634,6 @@ def _confirmation_token(pending: PendingAction) -> str:
         separators=(",", ":"),
     )
     return sha256(identity.encode("utf-8")).hexdigest()
-
-
-def _pending_action_missing_question(
-    pending: PendingAction,
-    applications: ApplicationsRepository,
-) -> str:
-    args = _safe_tool_args(pending.args)
-    if pending.tool_name == "create_application":
-        if not str(args.get("company_name") or "").strip():
-            return "要新建投递记录的话，还需要公司名称。请告诉我公司是哪一家。"
-        if not str(args.get("position_name") or "").strip():
-            return "要新建投递记录的话，还需要岗位名称。请告诉我投递的具体岗位。"
-    if pending.tool_name == "update_application_status":
-        if not _has_int_like(args.get("id")):
-            return "要更新投递状态的话，还需要明确是哪条投递记录。请告诉我公司/岗位或记录编号。"
-        if not str(args.get("status") or "").strip():
-            return "要更新投递状态的话，还需要目标状态。请告诉我是已投递、笔试、面试、Offer 还是已结束。"
-    if pending.tool_name == "create_application_event":
-        application_id = args.get("application_id")
-        if not _has_existing_application(application_id, applications):
-            return "这条日程要关联哪条投递记录？请告诉我公司/岗位或记录编号。"
-        if not str(args.get("event_type") or "").strip():
-            return "这条日程是什么类型？比如笔试、面试、Offer 进展或截止事项。"
-        if not str(args.get("scheduled_at") or "").strip():
-            return "这条日程的具体时间是什么？请补充日期和开始时间。"
-        if not _has_int_like(args.get("duration_minutes")):
-            return "这条日程预计持续多久？请补充时长，例如 30 分钟。"
-    if pending.tool_name == "add_note":
-        if (
-            not _has_int_like(args.get("application_id"))
-            and not str(args.get("company") or "").strip()
-        ):
-            return "这次复盘还缺少公司信息。请告诉我公司名称，或先说明不关联具体公司。"
-        if not str(args.get("date") or "").strip():
-            return "这次复盘还缺少面试日期。请告诉我具体日期，或回复“日期待定”。"
-    return ""
-
-
-def _has_int_like(value: Any) -> bool:
-    if value in (None, ""):
-        return False
-    try:
-        return int(value) > 0
-    except (TypeError, ValueError):
-        return False
-
-
-def _has_existing_application(value: Any, applications: ApplicationsRepository) -> bool:
-    if not _has_int_like(value):
-        return False
-    try:
-        return applications.get(int(value)) is not None
-    except (TypeError, ValueError):
-        return False
 
 
 def _short_preview(value: str, max_length: int = 180) -> str:

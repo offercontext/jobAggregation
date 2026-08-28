@@ -30,7 +30,7 @@ from offerpilot.ai.tool_runtime.metadata import (
 )
 from offerpilot.ai.tool_runtime.protocol_seals import verify_legacy_boundary
 from offerpilot.ai.tool_specs import legacy as legacy_specs
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
 from offerpilot.agent_runtime.events import canonical_json as journal_canonical_json
 from offerpilot.pilot_runtime import contracts as runtime_contracts
 from offerpilot.pilot_runtime.compensation import prepare_compensation_handler_components
@@ -39,6 +39,7 @@ from offerpilot.schemas import ChatMessageOut
 
 ROOT = Path(__file__).parents[2]
 PRODUCTION_ROOT = ROOT / "src" / "offerpilot"
+_TEST_TOOL_CATALOG = build_model_tool_catalog()
 
 ORDERED_ADAPTERS = (
     "save_application_jd_version",
@@ -115,11 +116,11 @@ def _component_graph() -> tuple[Any, ToolMetadataBundleV1, object]:
         None,
     )
     assert callable(factory), "Task 7 must expose the unpublished all-or-nothing factory"
-    manifest = compile_tool_metadata_manifest(MODEL_TOOL_CATALOG.specs)
+    manifest = compile_tool_metadata_manifest(_TEST_TOOL_CATALOG.specs)
     projection = manifest.to_dict()
     compensation = prepare_compensation_handler_components()
     bundle = ToolMetadataBundleV1(
-        typed_catalog=MODEL_TOOL_CATALOG,
+        typed_catalog=_TEST_TOOL_CATALOG,
         manifest=manifest,
         legacy_boundary=projection["legacy_boundary"],  # type: ignore[arg-type]
         compensation=compensation.metadata_projection(),
@@ -1307,7 +1308,12 @@ def test_legacy_runtime_exposes_only_final_proof_catalog() -> None:
         .annotation
     )
     assert getattr(proof_annotation, "__name__", proof_annotation) == "LegacyRouteProof"
-    assert legacy_runtime.LEGACY_DETERMINISTIC_NAMES == frozenset(ORDERED_ADAPTERS)
+    assert (
+        tuple(
+            adapter.name for adapter in legacy_specs.build_static_adapter_catalog().ordered_adapters
+        )
+        == ORDERED_ADAPTERS
+    )
     assert type(MappingProxyType({})) is MappingProxyType
 
 

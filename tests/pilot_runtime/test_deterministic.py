@@ -333,10 +333,13 @@ def _operation_for_pending(operations: _Operations, pending: object, token: str)
 
 
 def _adapter(
-    persistence: _Persistence, *, execute_counter: list[int] | None = None
+    persistence: _Persistence,
+    *,
+    execute_counter: list[int] | None = None,
+    components: object | None = None,
 ) -> tuple[DeterministicPilotAdapter, _Operations, _Coordinator]:
     operations = _Operations()
-    components = _initial_route_components()
+    components = components or _initial_route_components()
     persistence.backing_chat = components.chat
     coordinator = _Coordinator(
         operations,
@@ -414,7 +417,8 @@ class _StrictJournal:
 
 def test_deterministic_initial_journal_suspends_closed_legacy_pending() -> None:
     persistence = _JournalPersistence()
-    adapter, _operations, coordinator = _adapter(persistence)
+    components = _initial_route_components()
+    adapter, _operations, coordinator = _adapter(persistence, components=components)
     journal = _StrictJournal()
     runtime = PilotRuntime(
         RuntimeDependencies(
@@ -422,6 +426,7 @@ def test_deterministic_initial_journal_suspends_closed_legacy_pending() -> None:
             persistence=persistence,
             deterministic=adapter,
             journal=journal,
+            **_runtime_metadata_dependencies(components),
         )
     )
 
@@ -444,7 +449,8 @@ def test_deterministic_initial_journal_suspends_closed_legacy_pending() -> None:
 
 def test_deterministic_chained_journal_suspends_replacement_on_same_run() -> None:
     persistence = _JournalPersistence()
-    adapter, _operations, _coordinator = _adapter(persistence)
+    components = _initial_route_components()
+    adapter, _operations, _coordinator = _adapter(persistence, components=components)
     old_pending = SimpleNamespace(
         tool_call_id="old-call",
         tool_name="save_application_jd_version",
@@ -463,7 +469,13 @@ def test_deterministic_chained_journal_suspends_replacement_on_same_run() -> Non
     original = adapter.pending_action(_Conversation())
     assert original is not None
     journal = _StrictJournal()
-    runtime = PilotRuntime(RuntimeDependencies(persistence=persistence, deterministic=adapter))
+    runtime = PilotRuntime(
+        RuntimeDependencies(
+            persistence=persistence,
+            deterministic=adapter,
+            **_runtime_metadata_dependencies(components),
+        )
+    )
     control = InMemoryRuntimeInvocationControl()
 
     persistence.pending = new_pending
@@ -1748,6 +1760,9 @@ def _initial_route_components() -> object:
     )
     initial = components.initial_routes
     return SimpleNamespace(
+        metadata_components=components,
+        bundle=components.bundle,
+        typed_catalog=components.typed_catalog,
         owner_lease_factory=initial.owner_lease_factory,
         initial_route_port=initial.initial_route_port,
         initial_issuer_for=initial.initial_issuer_for,
@@ -1759,6 +1774,18 @@ def _initial_route_components() -> object:
         jd_service=jd_service,
         chat=chat,
     )
+
+
+def _runtime_metadata_dependencies(components: object) -> dict[str, object]:
+    bundle = components.bundle
+    return {
+        "catalog": components.typed_catalog,
+        "metadata_bundle": bundle,
+        "metadata_components": components.metadata_components,
+        "provider_metadata_view": bundle.provider_view(),
+        "discovery_metadata_view": bundle.discovery_view(),
+        "authority_metadata_view": bundle.authority_view(),
+    }
 
 
 def _initial_entry_request(source: str) -> StartTurnRequest:

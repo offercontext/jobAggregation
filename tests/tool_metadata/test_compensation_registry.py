@@ -22,9 +22,12 @@ from offerpilot.ai.tool_runtime.metadata import (
     canonical_json_bytes,
     freeze_json,
 )
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
 from offerpilot.models import Application, ApplicationEvent, Base, InterviewNote
 from tests.tool_metadata.golden import load_asset
+
+
+_TEST_TOOL_CATALOG = build_model_tool_catalog()
 
 
 def _required_module(name: str) -> ModuleType:
@@ -60,10 +63,10 @@ class _LegacyIssuerProbe:
 def _components_bundle_registry() -> tuple[object, ToolMetadataBundleV1, object]:
     module = _required_module("offerpilot.pilot_runtime.compensation")
     components = _required_api(module, "prepare_compensation_handler_components")()
-    manifest = compile_tool_metadata_manifest(MODEL_TOOL_CATALOG.specs)
+    manifest = compile_tool_metadata_manifest(_TEST_TOOL_CATALOG.specs)
     projection = manifest.to_dict()
     bundle = ToolMetadataBundleV1(
-        typed_catalog=MODEL_TOOL_CATALOG,
+        typed_catalog=_TEST_TOOL_CATALOG,
         manifest=manifest,
         legacy_boundary=cast(dict[str, object], projection["legacy_boundary"]),
         compensation=components.metadata_projection(),

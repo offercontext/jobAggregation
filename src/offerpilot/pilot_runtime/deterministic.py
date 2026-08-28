@@ -41,7 +41,6 @@ from offerpilot.ai.tool_runtime.contracts import JSONValue
 from offerpilot.ai.tool_runtime.legacy import (
     LegacyInitialRouteIssuer,
     LegacyInitialRoutePort,
-    LEGACY_DETERMINISTIC_NAMES,
     LegacyPendingPresentationV1,
     RuntimeRequestOwnerLeaseFactory,
 )
@@ -780,6 +779,45 @@ class DeterministicPilotAdapter:
             dependencies = DeterministicDependencies(**cast(Any, kwargs))
         self.dependencies = dependencies
 
+    def accepts_legacy_route(self, tool_name: str) -> bool:
+        """Classify a route only through the exact Bundle-owned Operation Port."""
+
+        if type(tool_name) is not str or not tool_name:
+            return False
+        operation_port = self.dependencies.operation_port
+        if type(operation_port) is not ToolOperationMetadataPort:
+            return False
+        matches = tuple(
+            entry
+            for entry in operation_port.legacy_primary_entries
+            if entry.operation_name == tool_name
+        )
+        return bool(
+            len(matches) == 1
+            and matches[0].adapter_kind == "legacy_deterministic"
+            and matches[0].operation_role == "primary"
+        )
+
+    @staticmethod
+    def _tool_matches_issuer(
+        tool_name: str,
+        issuer: LegacyInitialRouteIssuer | None,
+    ) -> bool:
+        if type(tool_name) is not str or type(issuer) is not LegacyInitialRouteIssuer:
+            return False
+        try:
+            return tool_name == issuer.route_binding.name
+        except (AttributeError, TypeError, ValueError):
+            return False
+
+    @classmethod
+    def _pending_matches_issuer(
+        cls,
+        pending: PendingAction | None,
+        issuer: LegacyInitialRouteIssuer | None,
+    ) -> bool:
+        return pending is not None and cls._tool_matches_issuer(pending.tool_name, issuer)
+
     # ---- trusted route and initial action ---------------------------------
 
     @staticmethod
@@ -927,9 +965,9 @@ class DeterministicPilotAdapter:
             self._action_from_request(request)
             return True
         clarification = self._clarification_for(conversation)
-        if (
-            clarification is not None
-            and clarification[0].tool_name == "save_application_jd_version"
+        if self._pending_matches_issuer(
+            clarification[0] if clarification is not None else None,
+            self.dependencies.legacy_jd_clarification_issuer,
         ):
             return True
         application = self._application(conversation, missing_ok=True)
@@ -1037,18 +1075,17 @@ class DeterministicPilotAdapter:
             return _DeterministicConfirmationPreflight(None, False)
         if type(preheader) is not LedgerOperationPreheader:
             raise TypeError("preheader must be an exact LedgerOperationPreheader")
-        operation = _attribute(preheader, "operation", None)
-        adapter_kind = str(_attribute(operation, "adapter_kind", "") or "")
-        if adapter_kind != "legacy_deterministic":
+        operation = preheader.operation
+        if operation.adapter_kind != "legacy_deterministic":
             return _DeterministicConfirmationPreflight(preheader, False)
-        tool_name = str(_attribute(operation, "tool_name", "") or "")
+        tool_name = str(operation.tool_name or "")
         route_identity = (
             request.conversation_id,
             str(_attribute(operation, "id", "") or ""),
             str(_attribute(operation, "tool_call_id", "") or ""),
             tool_name,
         )
-        if tool_name not in LEGACY_DETERMINISTIC_NAMES:
+        if not self.accepts_legacy_route(tool_name):
             return _DeterministicConfirmationPreflight(
                 preheader,
                 True,
@@ -1058,7 +1095,7 @@ class DeterministicPilotAdapter:
                 ),
                 route_identity,
             )
-        pointer = _attribute(preheader, "pending_pointer", None)
+        pointer = preheader.pending_pointer
         proposed = str(_attribute(operation, "status", "") or "") == "proposed"
         proposed_identity_matches = bool(
             not proposed
@@ -1108,7 +1145,7 @@ class DeterministicPilotAdapter:
         conversation_id = self._conversation_id(conversation)
         action = self._action_from_request(request)
         existing = self._pending_for(conversation)
-        if existing is not None and existing.tool_name in LEGACY_DETERMINISTIC_NAMES:
+        if existing is not None and self.accepts_legacy_route(existing.tool_name):
             execution = self._confirmation_required(
                 existing,
                 conversation_id,
@@ -1124,9 +1161,9 @@ class DeterministicPilotAdapter:
         current_jd = self._current_jd(application)
         clarification_view = self._clarification_for(conversation)
         clarification_pending = clarification_view[0] if clarification_view is not None else None
-        collecting = (
-            clarification_pending is not None
-            and clarification_pending.tool_name == "save_application_jd_version"
+        collecting = self._pending_matches_issuer(
+            clarification_pending,
+            self.dependencies.legacy_jd_clarification_issuer,
         )
 
         if isinstance(action, (PilotSubmissionSnapshotAction, PilotOutcomeAction)):
@@ -1191,7 +1228,10 @@ class DeterministicPilotAdapter:
                 )
 
         if existing is not None:
-            if existing.tool_name == "save_application_jd_version":
+            if self._pending_matches_issuer(
+                existing,
+                self.dependencies.legacy_jd_clarification_issuer,
+            ):
                 return self._confirmation_required(
                     existing,
                     conversation_id,
@@ -1372,7 +1412,7 @@ class DeterministicPilotAdapter:
         if terminal is not None:
             return terminal
         pending = self._pending_for(conversation)
-        if pending is None or pending.tool_name not in LEGACY_DETERMINISTIC_NAMES:
+        if pending is None or not self.accepts_legacy_route(pending.tool_name):
             return DeterministicExecution(
                 _error(
                     RuntimeFailureCode.STALE_PENDING_ACTION, "待确认操作已过期，请刷新后重试。", 409
@@ -1613,8 +1653,8 @@ class DeterministicPilotAdapter:
         )
         if (
             current_identity != route_identity
-            or str(_attribute(operation, "adapter_kind", "") or "") != "legacy_deterministic"
-            or current_identity[3] not in LEGACY_DETERMINISTIC_NAMES
+            or cast(Any, operation).adapter_kind != "legacy_deterministic"
+            or not self.accepts_legacy_route(current_identity[3])
         ):
             return DeterministicExecution(
                 self._write_error(WriteOperationError("operation_identity_conflict")),
@@ -2534,7 +2574,10 @@ class DeterministicPilotAdapter:
                 if (
                     verified is None
                     or verified.adapter_kind != "legacy_deterministic"
-                    or verified.tool_name != "save_application_jd_version"
+                    or not self._tool_matches_issuer(
+                        verified.tool_name,
+                        self.dependencies.legacy_jd_clarification_issuer,
+                    )
                     or verified.conversation_id != conversation_id
                 ):
                     raise WriteOperationError("operation_delivery_unknown", retryable=True)
@@ -2613,5 +2656,4 @@ __all__ = [
     "DeterministicDependencies",
     "DeterministicExecution",
     "DeterministicPilotAdapter",
-    "LEGACY_DETERMINISTIC_NAMES",
 ]

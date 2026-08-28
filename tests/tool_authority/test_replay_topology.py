@@ -11,7 +11,7 @@ from sqlalchemy import event, select
 
 import offerpilot.ai.write_operations as write_operations
 from offerpilot.ai.agent_contracts import PendingAction
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
 from offerpilot.ai.write_operations import (
     OperationReplay,
     WriteOperationError,
@@ -53,12 +53,13 @@ _LEGACY_PENDING_HUMAN = {
     ),
     "record_application_outcome": "请确认记录这次投递进展、原始反馈和下一步行动。",
 }
+_TEST_TOOL_CATALOG = build_model_tool_catalog()
 
 
 def _typed_pending_human(tool_name: str, args: dict[str, object]) -> str:
     """Use the frozen production metadata only as an independent test oracle."""
 
-    spec = MODEL_TOOL_CATALOG.resolve(tool_name)
+    spec = _TEST_TOOL_CATALOG.resolve(tool_name)
     assert spec is not None
     return str(spec.presentation.confirmation_description(spec.decoder(args)))
 
@@ -743,7 +744,7 @@ def test_closed_replay_renderer_matches_frozen_typed_confirmation_projection(
     tool_name: str,
     args: dict[str, object],
 ) -> None:
-    spec = MODEL_TOOL_CATALOG.resolve(tool_name)
+    spec = _TEST_TOOL_CATALOG.resolve(tool_name)
     assert spec is not None
     assert _typed_pending_human(tool_name, args) == str(
         spec.presentation.confirmation_description(spec.decoder(args))

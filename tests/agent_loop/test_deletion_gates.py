@@ -64,9 +64,7 @@ def _imports(tree: ast.AST) -> set[str]:
         if isinstance(node, ast.Import)
         for alias in node.names
     }
-    result.update(
-        node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
-    )
+    result.update(node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom))
     return result
 
 
@@ -124,21 +122,13 @@ def _calls_named(tree: ast.AST, name: str) -> list[ast.Call]:
         for node in ast.walk(tree):
             bindings: tuple[tuple[str, str], ...] = ()
             if isinstance(node, ast.ImportFrom):
-                bindings = tuple(
-                    (item.asname or item.name, item.name) for item in node.names
-                )
+                bindings = tuple((item.asname or item.name, item.name) for item in node.names)
             elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
                 if isinstance(node.value, ast.Name):
                     resolved = aliases.get(node.value.id, node.value.id)
-                    targets = (
-                        node.targets
-                        if isinstance(node, ast.Assign)
-                        else [node.target]
-                    )
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
                     bindings = tuple(
-                        (target.id, resolved)
-                        for target in targets
-                        if isinstance(target, ast.Name)
+                        (target.id, resolved) for target in targets if isinstance(target, ast.Name)
                     )
             for local, source in bindings:
                 if aliases.get(local) != source:
@@ -172,8 +162,7 @@ def _calls_named(tree: ast.AST, name: str) -> list[ast.Call]:
         if not isinstance(node, ast.Call):
             continue
         matched = (
-            isinstance(node.func, ast.Name)
-            and aliases.get(node.func.id, node.func.id) == name
+            isinstance(node.func, ast.Name) and aliases.get(node.func.id, node.func.id) == name
         ) or (isinstance(node.func, ast.Attribute) and node.func.attr == name)
         if not matched and isinstance(node.func, ast.Call):
             dynamic = node.func
@@ -191,9 +180,7 @@ def _calls_named(tree: ast.AST, name: str) -> list[ast.Call]:
 
 def _function(tree: ast.Module, name: str) -> ast.FunctionDef:
     matches = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == name
+        node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == name
     ]
     if len(matches) != 1:
         raise GateViolation(f"function:{name}")
@@ -207,9 +194,7 @@ def _validate_common_source(source: str) -> None:
     found = _symbols(tree) & _LEGACY_AGENT_SYMBOLS
     if found:
         raise GateViolation(f"legacy:symbol:{sorted(found)[0]}")
-    reflected = {
-        symbol for symbol in _LEGACY_AGENT_SYMBOLS if _calls_named(tree, symbol)
-    }
+    reflected = {symbol for symbol in _LEGACY_AGENT_SYMBOLS if _calls_named(tree, symbol)}
     if reflected:
         raise GateViolation(f"legacy:symbol:{sorted(reflected)[0]}")
     lowered = {name.lower() for name in _symbols(tree)}
@@ -221,8 +206,7 @@ def _validate_common_source(source: str) -> None:
         if (
             isinstance(node, ast.Attribute)
             and isinstance(node.value, ast.Name)
-            and node.value.id
-            in {"ResolvedModel", "model_resolution", "resolved", "resolved_model"}
+            and node.value.id in {"ResolvedModel", "model_resolution", "resolved", "resolved_model"}
             and node.attr == "tool_context"
         ):
             raise GateViolation("authority:resolved-model-tool-context")
@@ -374,8 +358,7 @@ def test_agent_loop_dependency_and_composition_cutover_are_closed() -> None:
         ),
         (
             _validate_agent_loop_boundary,
-            "from fastapi import Request\n"
-            "def _emit(invocation, event: AgentLoopEvent): pass\n",
+            "from fastapi import Request\ndef _emit(invocation, event: AgentLoopEvent): pass\n",
             "loop:forbidden-import:fastapi",
         ),
         (
@@ -404,14 +387,12 @@ def test_agent_loop_dependency_and_composition_cutover_are_closed() -> None:
         ),
         (
             _validate_runtime_driver_entry,
-            "def _run_driver(driver, invocation):\n"
-            "    return driver.run_turn(invocation)\n",
+            "def _run_driver(driver, invocation):\n    return driver.run_turn(invocation)\n",
             "runtime:execute-count",
         ),
         (
             _validate_agent_event_adapter,
-            "class _AgentEventAdapter:\n"
-            "    def emit(self, event: object): pass\n",
+            "class _AgentEventAdapter:\n    def emit(self, event: object): pass\n",
             "event-adapter:open",
         ),
     ],
@@ -445,25 +426,20 @@ def test_negative_fixture_proves_bound_response_import_alias_is_enforced() -> No
 
 
 def test_negative_fixture_proves_bound_response_reflection_is_enforced() -> None:
-    source = (
-        "name = 'BoundProviderResponse'\n"
-        "response = getattr(binding, name)()\n"
-    )
+    source = "name = 'BoundProviderResponse'\nresponse = getattr(binding, name)()\n"
     with pytest.raises(GateViolation, match="provenance:constructor-owner"):
         _validate_bound_response_owner(AI / "agent_loop.py", source)
 
 
 def test_negative_fixture_proves_computed_reflection_is_enforced() -> None:
     legacy_source = (
-        "def resume(old):\n"
-        "    return getattr(old, ''.join(['load_continuation_', 'messages']))()\n"
+        "def resume(old):\n    return getattr(old, ''.join(['load_continuation_', 'messages']))()\n"
     )
     with pytest.raises(GateViolation, match="legacy:symbol:load_continuation_messages"):
         _validate_common_source(legacy_source)
 
     response_source = (
-        "def bind(module):\n"
-        "    return getattr(module, 'BoundProvider' + 'Response')()\n"
+        "def bind(module):\n    return getattr(module, 'BoundProvider' + 'Response')()\n"
     )
     with pytest.raises(GateViolation, match="provenance:constructor-owner"):
         _validate_bound_response_owner(AI / "agent_loop.py", response_source)

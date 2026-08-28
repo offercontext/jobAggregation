@@ -56,7 +56,6 @@ from offerpilot.ai.write_operations import (
     DeliveryHeartbeat,
     DeliveryOwnership,
     LedgerOperationPreheader,
-    LedgerPendingPointer,
     OperationCommitted,
     OperationExecution,
     OperationFailed,
@@ -831,17 +830,21 @@ def _replayed_pending_payload(
     pending = replay.chained_pending
     if pending is None or pending.decoded_args is None:
         raise WriteOperationError("operation_delivery_unknown", retryable=True)
-    parent_adapter_kind = str(_attribute(operation, "adapter_kind", "") or "")
-    parent_tool_name = str(_attribute(operation, "tool_name", "") or "")
     if operation is None:
         if pending.adapter_kind != "typed":
             raise WriteOperationError("operation_delivery_unknown", retryable=True)
-    elif (
-        pending.adapter_kind != parent_adapter_kind
-        or parent_adapter_kind not in {"typed", "legacy_deterministic"}
-        or (parent_adapter_kind == "legacy_deterministic" and pending.tool_name != parent_tool_name)
-    ):
-        raise WriteOperationError("operation_delivery_unknown", retryable=True)
+    else:
+        parent_adapter_kind = str(cast(Any, operation).adapter_kind or "")
+        parent_tool_name = str(_attribute(operation, "tool_name", "") or "")
+        if (
+            pending.adapter_kind != parent_adapter_kind
+            or parent_adapter_kind not in {"typed", "legacy_deterministic"}
+            or (
+                parent_adapter_kind == "legacy_deterministic"
+                and pending.tool_name != parent_tool_name
+            )
+        ):
+            raise WriteOperationError("operation_delivery_unknown", retryable=True)
     canonical_args = json.dumps(
         pending.decoded_args,
         ensure_ascii=False,
@@ -994,46 +997,16 @@ class ConfirmationCoordinator:
 
     def _preheader(self, request: ConfirmationRequest) -> LedgerOperationPreheader:
         repository = self.dependencies.write_operations
-        loader = _callable(repository, ("operation_preheader", "load_operation_preheader"))
-        if loader is not None:
-            value = _invoke(
-                loader,
-                {
-                    "conversation_id": request.conversation_id,
-                    "operation_id": request.operation_id,
-                },
-                (),
-            )
-            if not isinstance(value, LedgerOperationPreheader):
-                operation = _attribute(value, "operation")
-                pointer = _attribute(value, "pending_pointer")
-                if operation is None or not isinstance(pointer, LedgerPendingPointer):
-                    raise WriteOperationError("operation_unavailable")
-                value = LedgerOperationPreheader(cast(Any, operation), pointer)
-            return value
-        # Compatibility for narrow test doubles with an explicit Ledger id.
-        # Production repositories always expose the bounded projection above;
-        # an omitted id never falls back to reading a full Pending object.
-        if not request.operation_id:
-            raise WriteOperationError("operation_unavailable")
-        operation = self._operation(request.operation_id)
-        if operation is None:
-            raise WriteOperationError("operation_result_unknown", retryable=True)
-        operation_conversation_id = _attribute(operation, "conversation_id")
-        if operation_conversation_id is None:
-            raise WriteOperationError("operation_unavailable")
-        if operation_conversation_id != request.conversation_id:
-            raise WriteOperationError("operation_identity_conflict")
-        return LedgerOperationPreheader(
-            cast(Any, operation),
-            LedgerPendingPointer(
+        try:
+            value = cast(Any, repository).operation_preheader(
                 conversation_id=request.conversation_id,
-                operation_id=str(_attribute(operation, "id", "") or ""),
-                tool_call_id=str(_attribute(operation, "tool_call_id", "") or ""),
-                tool_name=str(_attribute(operation, "tool_name", "") or ""),
-                pending_confirmation_claim_id="",
-            ),
-        )
+                operation_id=request.operation_id,
+            )
+        except AttributeError as exc:
+            raise WriteOperationError("operation_unavailable") from exc
+        if type(value) is not LedgerOperationPreheader:
+            raise WriteOperationError("operation_unavailable")
+        return value
 
     def operation_preheader(self, request: ConfirmationRequest) -> LedgerOperationPreheader:
         """Load the bounded Ledger route identity exactly once for Runtime dispatch."""
@@ -1348,7 +1321,7 @@ class ConfirmationCoordinator:
                 raise ConfirmationReplayError(changed)
             raise WriteOperationError("operation_result_unknown", retryable=True)
         if (
-            _attribute(operation, "adapter_kind") == "typed"
+            cast(Any, operation).adapter_kind == "typed"
             and _attribute(operation, "authorization_scope_fingerprint") is None
         ):
             raise WriteOperationError("authorization_scope_unbound")
@@ -1396,7 +1369,7 @@ class ConfirmationCoordinator:
             )
         if (
             approved
-            and _attribute(operation, "adapter_kind") == "typed"
+            and cast(Any, operation).adapter_kind == "typed"
             and _attribute(operation, "authorization_scope_fingerprint") is None
         ):
             raise WriteOperationError("authorization_scope_unbound")

@@ -50,7 +50,7 @@ from offerpilot.ai.tool_runtime.catalog import (
 from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.ai.types import Assistant, Message, ToolCall
 from offerpilot.agent_runtime.journal import NullRunRecorder
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
 from offerpilot.config import AIProviderProfile
 from offerpilot.context_projector.contracts import ProjectionError
 from offerpilot.context_projector.gateway import (
@@ -66,6 +66,9 @@ from offerpilot.ai.write_operations import (
 )
 
 from .helpers import RecordingEventSink, ScriptedModel, ToolDefinition, runtime
+
+
+_TEST_TOOL_CATALOG = build_model_tool_catalog()
 
 
 class _PresentationProbe:
@@ -1366,12 +1369,12 @@ def test_mixed_known_and_unknown_surface_tool_calls_fail_closed_before_events_or
             )
 
     seed = NewTurnSeed((Message(role="user", content="offer"),))
-    bundle = _task9_metadata_bundle(MODEL_TOOL_CATALOG)
+    bundle = _task9_metadata_bundle(_TEST_TOOL_CATALOG)
     lease = bundle.open_segment_lease()
     invocation_value = AgentLoopInvocation(
         seed=seed,
         model=MixedModel(),
-        catalog=MODEL_TOOL_CATALOG,
+        catalog=_TEST_TOOL_CATALOG,
         catalog_lease=lease,  # type: ignore[call-arg]
         tool_context=context,
         auto_approve=False,
@@ -1381,7 +1384,7 @@ def test_mixed_known_and_unknown_surface_tool_calls_fail_closed_before_events_or
         runtime_signal_sink=None,
         cancel_check=None,
         surface_gate=_task9_surface_gate(
-            MODEL_TOOL_CATALOG,
+            _TEST_TOOL_CATALOG,
             context,
             seed.messages,
             bundle=bundle,

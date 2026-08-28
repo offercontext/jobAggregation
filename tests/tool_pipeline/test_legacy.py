@@ -2,25 +2,27 @@ from __future__ import annotations
 
 import inspect
 
-from offerpilot.ai.tool_runtime.legacy import (
-    LEGACY_DETERMINISTIC_NAMES,
-    LegacyDeterministicCatalog,
-)
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.ai.tool_runtime.legacy import LegacyDeterministicCatalog
+from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
+from offerpilot.ai.tool_specs.legacy import build_static_adapter_catalog
 
 
 def test_legacy_catalog_is_exact_and_never_model_visible() -> None:
-    assert LEGACY_DETERMINISTIC_NAMES == frozenset(
+    legacy_names = frozenset(
+        adapter.name for adapter in build_static_adapter_catalog().ordered_adapters
+    )
+    assert legacy_names == frozenset(
         {
             "save_application_jd_version",
             "create_application_submission_snapshot",
             "record_application_outcome",
         }
     )
-    assert all(MODEL_TOOL_CATALOG.resolve(name) is None for name in LEGACY_DETERMINISTIC_NAMES)
+    typed_catalog = build_model_tool_catalog()
+    assert all(typed_catalog.resolve(name) is None for name in legacy_names)
     assert all(
-        name not in {contract.name for contract in MODEL_TOOL_CATALOG.provider_contracts()}
-        for name in LEGACY_DETERMINISTIC_NAMES
+        name not in {contract.name for contract in typed_catalog.provider_contracts()}
+        for name in legacy_names
     )
     assert not hasattr(LegacyDeterministicCatalog, "resolve")
 

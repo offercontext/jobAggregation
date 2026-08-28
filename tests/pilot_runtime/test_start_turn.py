@@ -49,8 +49,12 @@ from offerpilot.ai.tool_runtime.catalog import (
 )
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
-from offerpilot.ai.tool_runtime.contracts import ToolFailure
+from offerpilot.ai.tool_runtime.contracts import (
+    BindingAudit,
+    PreparedToolCall,
+    ToolExecutionRecord,
+    ToolFailure,
+)
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.api import _confirmation_token as baseline_confirmation_token
 from offerpilot.pilot_runtime.service import _confirmation_token
@@ -75,14 +79,13 @@ from offerpilot.repositories.resumes import ResumesRepository
 from tests.tool_metadata.test_production_bundle import _production_components
 
 
+_METADATA_COMPONENTS = _production_components()
+_METADATA_BUNDLE = _METADATA_COMPONENTS.bundle
+_TEST_TOOL_CATALOG = _METADATA_COMPONENTS.typed_catalog
 _AUTHORITY_SESSIONS = init_database(
     Path(tempfile.mkdtemp(prefix="offerpilot-pilot-authority-")) / "authority.db"
 )
-_AUTHORITY_POLICY = validate_startup_policy(MODEL_TOOL_CATALOG.authority_manifest)
-
-
-_METADATA_COMPONENTS = _production_components()
-_METADATA_BUNDLE = _METADATA_COMPONENTS.bundle
+_AUTHORITY_POLICY = validate_startup_policy(_TEST_TOOL_CATALOG.authority_manifest)
 
 
 class _Phases:
@@ -473,7 +476,7 @@ def _runtime(
     resolved_journal = journal or _Journal(phases)
     # Segment visibility is issued only against the reviewed typed catalog;
     # pending/readback tests use unknown names when they need a rejection.
-    resolved_catalog = MODEL_TOOL_CATALOG
+    resolved_catalog = _TEST_TOOL_CATALOG
 
     def resolve_model(request: object, conversation: object) -> object:
         del request, conversation
@@ -626,7 +629,7 @@ def test_sync_segment_failure_stops_before_policy_catalog_and_side_effects() -> 
     def policy_spy(*args: object, **kwargs: object) -> object:
         policy_calls.append((args, kwargs))
         return ResolvedPolicyCatalog(
-            catalog=MODEL_TOOL_CATALOG,
+            catalog=_TEST_TOOL_CATALOG,
             policy=_AUTHORITY_POLICY,
             dependency_policy=_METADATA_BUNDLE.discovery_view().policy,
             provider_metadata_view=_METADATA_BUNDLE.provider_view(),
@@ -678,7 +681,7 @@ def test_sync_live_policy_drift_closes_segment_before_provider_or_user() -> None
         assert segment.surface_gate is None
         assert getattr(segment, "catalog_lease", None) is None
         return ResolvedPolicyCatalog(
-            catalog=MODEL_TOOL_CATALOG,
+            catalog=_TEST_TOOL_CATALOG,
             policy=drifted,
             dependency_policy=_METADATA_BUNDLE.discovery_view().policy,
             provider_metadata_view=_METADATA_BUNDLE.provider_view(),
@@ -723,7 +726,7 @@ def test_sync_policy_spy_sees_exact_unbound_segment_after_segment_phase() -> Non
         assert segment.surface_gate is None
         assert getattr(segment, "catalog_lease", None) is None
         return ResolvedPolicyCatalog(
-            catalog=MODEL_TOOL_CATALOG,
+            catalog=_TEST_TOOL_CATALOG,
             policy=_AUTHORITY_POLICY,
             dependency_policy=_METADATA_BUNDLE.discovery_view().policy,
             provider_metadata_view=_METADATA_BUNDLE.provider_view(),
@@ -1034,7 +1037,7 @@ def test_real_run_recorder_factory_accepts_runtime_builder_and_records_terminal_
             conversations=Gateway(),
             persistence=coordinator,
             policy_catalog_resolver=lambda request, conversation, source: ResolvedPolicyCatalog(
-                catalog=MODEL_TOOL_CATALOG,
+                catalog=_TEST_TOOL_CATALOG,
                 policy=_AUTHORITY_POLICY,
                 dependency_policy=_METADATA_BUNDLE.discovery_view().policy,
                 provider_metadata_view=_METADATA_BUNDLE.provider_view(),
@@ -1042,7 +1045,7 @@ def test_real_run_recorder_factory_accepts_runtime_builder_and_records_terminal_
                 authority_metadata_view=_METADATA_BUNDLE.authority_view(),
             ),
             segment_context_resolver=lambda request, conversation, source, recorder: _real_segment(
-                conversation, recorder, MODEL_TOOL_CATALOG
+                conversation, recorder, _TEST_TOOL_CATALOG
             )[0],
             surface_gate_resolver=resolve_surface,
             continuation_model_resolver=lambda request, conversation, policy: ResolvedModel(
@@ -1051,7 +1054,7 @@ def test_real_run_recorder_factory_accepts_runtime_builder_and_records_terminal_
             source_loader=_Source(phases),
             context_assembler=_Assembler(phases),
             agent_driver=_Driver(phases),
-            catalog=MODEL_TOOL_CATALOG,
+            catalog=_TEST_TOOL_CATALOG,
             metadata_bundle=_METADATA_BUNDLE,
             metadata_components=_METADATA_COMPONENTS,
             provider_metadata_view=_METADATA_BUNDLE.provider_view(),
@@ -1889,18 +1892,33 @@ def test_final_projection_redacts_internal_tool_names_and_uses_safe_write_error(
             return PersistenceResult(PersistenceStatus.PERSISTED, message_id=12)
 
     persistence = CapturingPersistence(phases)
-    write_spec = MODEL_TOOL_CATALOG.resolve("update_application_status")
+    write_spec = _TEST_TOOL_CATALOG.resolve("update_application_status")
     assert write_spec is not None
-    write_record = SimpleNamespace(
-        prepared=SimpleNamespace(spec=write_spec),
-        outcome=SimpleNamespace(code="company_required", compatibility_detail="company_required"),
+    lease = _METADATA_BUNDLE.open_segment_lease()
+    spec_handle = lease.resolve("update_application_status")
+    assert spec_handle is not None
+    prepared = PreparedToolCall(
+        tool_call_id="call-1",
+        spec=write_spec,
+        arguments={},
+        typed_args={},
+        arguments_digest="sha256:" + "0" * 64,
+        contract_fingerprint="sha256:" + "0" * 64,
+        binding=BindingAudit(status="unbound", target_count=0),
+        spec_handle=spec_handle,
+    )
+    failure = ToolFailure("validation_error", "company_required", "company_required")
+    write_record = ToolExecutionRecord(
+        prepared=prepared,
+        outcome=failure,
+        execution_started=True,
     )
     result_value = AgentTurnResult(
         added=[],
         reply="请继续调用 update_application_status。",
         pending=None,
         records=(write_record,),
-        failures=(ToolFailure("validation_error", "company_required", "company_required"),),
+        failures=(failure,),
     )
     runtime, _, _journal = _runtime(
         phases,
@@ -1908,7 +1926,10 @@ def test_final_projection_redacts_internal_tool_names_and_uses_safe_write_error(
         driver=_Driver(phases, result=result_value),
     )
 
-    result = _start(runtime, _Host(phases))
+    try:
+        result = _start(runtime, _Host(phases))
+    finally:
+        lease.close()
 
     assert isinstance(result, MessageOutcome)
     assert result.message == "这次复盘还缺少公司信息。请告诉我公司名称，或先说明不关联具体公司。"

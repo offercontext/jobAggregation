@@ -15,7 +15,7 @@ from offerpilot.ai.tool_authority.policy import validate_startup_policy
 from offerpilot.ai.tool_runtime.contracts import (
     ToolFailure,
 )
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
 from offerpilot.ai.types import Assistant
 from offerpilot.agent_runtime.journal import NullRunRecorder
 from offerpilot.db import init_database
@@ -29,6 +29,7 @@ from offerpilot.repositories.resumes import ResumesRepository
 
 _DATA_DIR = Path(tempfile.mkdtemp(prefix="offerpilot-agent-loop-tests-"))
 _SESSIONS = init_database(_DATA_DIR / "agent-loop.db")
+_TEST_TOOL_CATALOG = build_model_tool_catalog()
 
 
 def _default_raw_executor(_args: str) -> str:
@@ -78,7 +79,7 @@ class ToolDefinition:
 
 
 def runtime(*definitions: ToolDefinition) -> tuple[ToolCatalog, ToolExecutionContext]:
-    specs = list(MODEL_TOOL_CATALOG.specs)
+    specs = list(_TEST_TOOL_CATALOG.specs)
     positions = {spec.name: index for index, spec in enumerate(specs)}
     for definition in definitions:
         position = positions.get(definition.name)

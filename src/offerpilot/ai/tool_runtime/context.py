@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
@@ -13,11 +13,8 @@ from offerpilot.ai.tool_authority.contracts import (
     BindingTargetResolution,
     ToolExecutionAuthority,
 )
-from offerpilot.ai.tool_authority.policy import decide_binding
 from offerpilot.ai.tool_runtime.contracts import (
-    BindingAudit,
     ToolFailure,
-    ToolSpec,
     TransientToolRuntimeValue,
 )
 from offerpilot.models import ApplicationEvent, InterviewNote, JDAnalysis, Offer
@@ -30,27 +27,6 @@ from offerpilot.repositories.resumes import ResumesRepository
 
 if TYPE_CHECKING:
     from offerpilot.ai.tool_authority.composition import AuthorityFactory
-
-
-class _UnavailableBindingTarget:
-    __slots__ = ()
-
-
-# Kept only as an import-compatible pure aggregation sentinel.  Authority-bound
-# execution never uses it or accepts it from a resolver.
-UNAVAILABLE = _UnavailableBindingTarget()
-
-
-def aggregate_binding(current: object | None, targets: list[object] | tuple[object, ...]) -> str:
-    if current is None:
-        return "unbound"
-    if not targets:
-        return "unavailable"
-    if any(target is not UNAVAILABLE and target != current for target in targets):
-        return "mismatched"
-    if any(target is UNAVAILABLE for target in targets):
-        return "unavailable"
-    return "matched"
 
 
 @dataclass(frozen=True, init=False, repr=False)
@@ -76,9 +52,7 @@ class ToolExecutionContext(TransientToolRuntimeValue):
     _session_factory: sessionmaker[Session] = field(repr=False, compare=False)
     operation_executor: Any = field(default=None, repr=False, compare=False)
     _bound_session: Session | None = field(default=None, repr=False, compare=False)
-    _origin_context: "ToolExecutionContext | None" = field(
-        default=None, repr=False, compare=False
-    )
+    _origin_context: "ToolExecutionContext | None" = field(default=None, repr=False, compare=False)
 
     def __init__(
         self,
@@ -174,9 +148,7 @@ class ToolExecutionContext(TransientToolRuntimeValue):
 
     @property
     def scope_constraint(self) -> ApplicationScopeConstraint:
-        self._authority_factory.require_scope_constraint(
-            self._scope_constraint, self.authority
-        )
+        self._authority_factory.require_scope_constraint(self._scope_constraint, self.authority)
         return self._scope_constraint
 
     @property
@@ -256,9 +228,7 @@ class ToolExecutionContext(TransientToolRuntimeValue):
                 or getattr(bound, "_session_factory", None)
                 is not getattr(source, "_session_factory", None)
             ):
-                raise AuthorityPhaseError(
-                    "bound ToolExecutionContext repository carrier mismatch"
-                )
+                raise AuthorityPhaseError("bound ToolExecutionContext repository carrier mismatch")
 
     def bind(self, session: Session) -> "ToolExecutionContext":
         if not isinstance(session, Session):
@@ -322,8 +292,6 @@ class ToolExecutionContext(TransientToolRuntimeValue):
             state=state,
             identity=identity,
         )
-
-    create_binding_target_resolution = binding_target_resolution
 
     def resolver_context(self, resolver_id: str) -> "_BindingResolverContext":
         return _BindingResolverContext(self, resolver_id)
@@ -398,108 +366,10 @@ class _BindingResolverContext:
     def binding_target_resolution(self, **values: Any) -> BindingTargetResolution:
         return self._context.binding_target_resolution(**values)
 
-    create_binding_target_resolution = binding_target_resolution
-
     def resolve_parent_identity(self, entity_kind: str, identity: int) -> tuple[str, int | None]:
         if entity_kind != "application":
             return ("unavailable", None)
         return self._context._resolve_parent_identity(self._resolver_id, identity)
-
-
-ArgsT = TypeVar("ArgsT")
-
-
-def require_capabilities(
-    spec: ToolSpec[Any, Any],
-    context: ToolExecutionContext,
-) -> ToolFailure | None:
-    if set(spec.metadata.required_capabilities).issubset(
-        cast(Any, context.authority).capabilities
-    ):
-        return None
-    return ToolFailure(
-        category="permission_denied",
-        code="missing_capability",
-        compatibility_detail="permission denied",
-    )
-
-
-def pre_resolver_scope_policy(
-    spec: ToolSpec[Any, Any], context: ToolExecutionContext
-) -> ToolFailure | None:
-    if (
-        spec.metadata.binding.contract.kind == "non_application_only"
-        and cast(Any, context.authority).trusted_scope.context_type == "application"
-    ):
-        return scope_access_denied()
-    return None
-
-
-def audit_bindings(
-    spec: ToolSpec[ArgsT, Any],
-    typed_args: ArgsT,
-    context: ToolExecutionContext,
-) -> tuple[BindingAudit, bool]:
-    resolutions: list[dict[str, object]] = []
-    entity_kinds: set[str] = set()
-    for resolver in spec.resolver_bindings:
-        descriptor = resolver.descriptor
-        resolver_context = context.resolver_context(descriptor.resolver_id)
-        resolution = resolver.resolve(typed_args, cast(Any, resolver_context))
-        if type(resolution) is not BindingTargetResolution:
-            raise TypeError("binding resolver returned an unsealed resolution")
-        context.authority_factory.require_binding_target_resolution(
-            resolution, context.authority
-        )
-        entity_kinds.add(resolution.entity_kind)
-        resolutions.append(
-            {
-                "entity_kind": resolution.entity_kind,
-                "state": resolution.state,
-                "identity": resolution.identity,
-                "presence": descriptor.presence,
-            }
-        )
-
-    contract = spec.metadata.binding.contract
-    scope = cast(Any, context.authority).trusted_scope
-    scope_bound = contract.entity_kind == "application" and scope.context_type == "application"
-    bound_identities = (
-        (cast(int, scope.context_ref),)
-        if scope_bound
-        else ()
-    )
-    decision = decide_binding(
-        contract.kind,
-        scope_bound=scope_bound,
-        bound_identities=bound_identities,
-        resolutions=resolutions,
-    )
-    if contract.entity_kind is not None:
-        entity_kinds.add(contract.entity_kind)
-    return (
-        BindingAudit(
-            status=decision.status,
-            target_count=len(resolutions),
-            entity_kinds=tuple(sorted(entity_kinds)),
-        ),
-        decision.allowed,
-    )
-
-
-def evaluate_context(
-    spec: ToolSpec[ArgsT, Any],
-    typed_args: ArgsT,
-    context: ToolExecutionContext,
-) -> BindingAudit | ToolFailure:
-    permission = require_capabilities(spec, context)
-    if permission is not None:
-        return permission
-    scope_failure = pre_resolver_scope_policy(spec, context)
-    if scope_failure is not None:
-        return scope_failure
-    audit, allowed = audit_bindings(spec, typed_args, context)
-    return audit if allowed else scope_access_denied()
 
 
 def scope_access_denied() -> ToolFailure:
@@ -511,12 +381,6 @@ def scope_access_denied() -> ToolFailure:
 
 
 __all__ = [
-    "UNAVAILABLE",
     "ToolExecutionContext",
-    "aggregate_binding",
-    "audit_bindings",
-    "evaluate_context",
-    "pre_resolver_scope_policy",
-    "require_capabilities",
     "scope_access_denied",
 ]

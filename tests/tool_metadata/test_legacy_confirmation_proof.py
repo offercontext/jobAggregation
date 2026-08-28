@@ -22,11 +22,13 @@ from offerpilot.ai.tool_runtime.catalog import compile_tool_metadata_manifest
 from offerpilot.ai.tool_runtime.contracts import TransientToolRuntimeValue
 from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1, freeze_json
 from offerpilot.ai.tool_specs import legacy as legacy_specs
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
 from offerpilot.ai.write_operations import ledger_fingerprint, load_or_create_ledger_key
 from offerpilot.pilot_runtime.compensation import prepare_compensation_handler_components
 from offerpilot.pilot_runtime.contracts import EditedArgs
 
+
+_TEST_TOOL_CATALOG = build_model_tool_catalog()
 
 ORDERED_ADAPTERS = (
     "save_application_jd_version",
@@ -224,9 +226,9 @@ def _catalog_with_spy_executor(*, describe: Any = None) -> Any:
 
 
 def _boundary() -> Any:
-    manifest = compile_tool_metadata_manifest(MODEL_TOOL_CATALOG.specs)
+    manifest = compile_tool_metadata_manifest(_TEST_TOOL_CATALOG.specs)
     bundle = ToolMetadataBundleV1(
-        typed_catalog=MODEL_TOOL_CATALOG,
+        typed_catalog=_TEST_TOOL_CATALOG,
         manifest=manifest,
         legacy_boundary=manifest.to_dict()["legacy_boundary"],  # type: ignore[arg-type]
         compensation=prepare_compensation_handler_components().metadata_projection(),

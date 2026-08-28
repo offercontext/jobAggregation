@@ -32,7 +32,7 @@ from offerpilot.ai.tool_runtime.metadata import (
 from offerpilot.ai.tool_runtime.pipeline import prepare_call
 from offerpilot.ai.tool_runtime.policy_types import UndoPolicy
 from offerpilot.ai.tool_runtime.transport import project_transport_event
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.config import Config
 
@@ -56,6 +56,7 @@ REQUIRED_UNDO = {
 ROOT = Path(__file__).parents[2]
 PRODUCTION_ROOT = ROOT / "src" / "offerpilot"
 TEST_ROOT = ROOT / "tests"
+_TEST_TOOL_CATALOG = build_model_tool_catalog()
 
 
 class _ExecutionProbe:
@@ -441,7 +442,7 @@ def _patch_provider_verifier(monkeypatch: pytest.MonkeyPatch, verifier: Any) -> 
 
 
 def test_compiler_exposes_exact_ordered_25_typed_specs() -> None:
-    catalog = MODEL_TOOL_CATALOG
+    catalog = _TEST_TOOL_CATALOG
     specs = catalog.specs
     assert len(specs) == 25
     assert len({spec.name for spec in specs}) == 25
@@ -459,13 +460,16 @@ def test_production_catalog_verifies_complete_ordered_provider_boundary_before_r
     original_verifier = protocol_module.verify_provider_boundary
     captured: list[tuple[dict[str, Any], ...]] = []
     catalog_module = importlib.import_module("offerpilot.ai.tool_specs.catalog")
-    published_before = catalog_module.MODEL_TOOL_CATALOG
+    published_before = tuple(
+        value for value in vars(catalog_module).values() if type(value) is ToolCatalog
+    )
+    assert published_before == ()
 
     def spy_verifier(*args: Any, **kwargs: Any) -> None:
         payloads = args[0] if args else kwargs.get("payloads")
         assert payloads is not None
         captured.append(tuple(copy.deepcopy(payloads)))
-        assert catalog_module.MODEL_TOOL_CATALOG is published_before
+        assert not any(type(value) is ToolCatalog for value in vars(catalog_module).values())
         original_verifier(*args, **kwargs)
 
     _patch_provider_verifier(monkeypatch, spy_verifier)
@@ -480,7 +484,10 @@ def test_production_catalog_does_not_publish_after_provider_seal_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     catalog_module = importlib.import_module("offerpilot.ai.tool_specs.catalog")
-    published_before = catalog_module.MODEL_TOOL_CATALOG
+    published_before = tuple(
+        value for value in vars(catalog_module).values() if type(value) is ToolCatalog
+    )
+    assert published_before == ()
 
     def reject_provider_boundary(*args: Any, **kwargs: Any) -> None:
         del args, kwargs
@@ -489,7 +496,10 @@ def test_production_catalog_does_not_publish_after_provider_seal_failure(
     _patch_provider_verifier(monkeypatch, reject_provider_boundary)
     with pytest.raises(ValueError, match="provider|boundary|seal|rejected"):
         catalog_module.build_model_tool_catalog()
-    assert catalog_module.MODEL_TOOL_CATALOG is published_before
+    assert (
+        tuple(value for value in vars(catalog_module).values() if type(value) is ToolCatalog)
+        == published_before
+    )
 
 
 def test_generic_compiler_rejects_duplicate_names_and_missing_order() -> None:
@@ -557,8 +567,8 @@ def test_compiler_enforces_read_write_union_and_operation_projection() -> None:
     with pytest.raises((TypeError, ValueError), match="write|confirmation|operation"):
         _catalog((bad_write,))
 
-    manifest = MODEL_TOOL_CATALOG.authority_manifest
-    for spec, projected in zip(MODEL_TOOL_CATALOG.specs, manifest["tools"]):
+    manifest = _TEST_TOOL_CATALOG.authority_manifest
+    for spec, projected in zip(_TEST_TOOL_CATALOG.specs, manifest["tools"]):
         expected_kind = (
             "write" if isinstance(spec.metadata.operation, WriteOperationMetadataV1) else "read"
         )
@@ -775,7 +785,7 @@ def test_catalog_topology_replacement_fails_at_materialization_and_real_pipeline
 
 
 def test_manifest_same_content_projection_replacement_fails_before_to_dict() -> None:
-    manifest = compile_tool_metadata_manifest(MODEL_TOOL_CATALOG.specs)
+    manifest = compile_tool_metadata_manifest(_TEST_TOOL_CATALOG.specs)
     original = manifest._projection  # type: ignore[attr-defined]
     replacement = freeze_json(materialize_json(original))
     assert replacement == original
@@ -940,7 +950,7 @@ def test_catalog_precompiles_schema_once_and_returns_detached_validators(
 
 
 def test_exact_four_required_undo_bindings_and_complete_presentation_bindings() -> None:
-    specs = MODEL_TOOL_CATALOG.specs
+    specs = _TEST_TOOL_CATALOG.specs
     actual_required = {
         spec.name
         for spec in specs

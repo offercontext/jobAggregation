@@ -60,12 +60,13 @@ from offerpilot.ai.tool_runtime.metadata import (
     ToolAuthorityMetadataView,
     ToolDiscoveryMetadataView,
     ToolMetadataBundleV1,
+    ToolOperationMetadataView,
     ToolOperationMetadataPort,
     canonical_json_bytes,
     freeze_json,
 )
 from offerpilot.ai.tool_runtime.protocol_seals import verify_legacy_boundary
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
 from offerpilot.ai.tool_specs.legacy import (
     build_static_adapter_catalog,
 )
@@ -315,6 +316,139 @@ class _PolicyCatalogResolver:
             discovery_metadata_view=self._discovery_view,
             authority_metadata_view=self._authority_view,
         )
+
+
+class _MissingTargetQuestionResolver:
+    """Resolve clarification questions from one exact Bundle projection."""
+
+    __slots__ = ("_applications", "_routes")
+
+    def __init__(
+        self,
+        applications: object,
+        *,
+        operation_view: ToolOperationMetadataView,
+        provider_view: ProviderToolMetadataView,
+    ) -> None:
+        if type(operation_view) is not ToolOperationMetadataView:
+            raise TypeError("missing-target resolver requires the exact Operation view")
+        if type(provider_view) is not ProviderToolMetadataView:
+            raise TypeError("missing-target resolver requires the exact Provider view")
+        if operation_view.bundle_instance_token is not provider_view.bundle_instance_token:
+            raise ValueError("missing-target resolver metadata views have mixed Bundle provenance")
+        operations = tuple(operation_view.entries.values())
+        contracts = provider_view.ordered_contracts
+        if len(operations) != len(contracts) or any(
+            operation.ordinal != ordinal or operation.provider_name != contract.name
+            for ordinal, (operation, contract) in enumerate(
+                zip(operations, contracts, strict=True),
+                start=1,
+            )
+        ):
+            raise ValueError("missing-target resolver metadata views are not aligned")
+        self._applications = applications
+        self._routes = tuple(zip(operations, contracts, strict=True))
+
+    @staticmethod
+    def _arguments(raw: str) -> Mapping[str, object]:
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        return cast(Mapping[str, object], parsed) if isinstance(parsed, Mapping) else {}
+
+    @staticmethod
+    def _positive_int_like(value: object) -> bool:
+        if value in (None, ""):
+            return False
+        try:
+            return int(cast(Any, value)) > 0
+        except (TypeError, ValueError):
+            return False
+
+    def application_visible(self, application_id: int) -> bool:
+        try:
+            return cast(Any, self._applications).get(application_id) is not None
+        except (TypeError, ValueError):
+            return False
+
+    def resolve(self, pending: PendingAction, conversation_id: int) -> str | None:
+        del conversation_id
+        if type(pending) is not PendingAction:
+            raise TypeError("missing-target resolver requires an exact Pending action")
+        route = next(
+            (
+                (operation, contract)
+                for operation, contract in self._routes
+                if contract.name == pending.tool_name
+            ),
+            None,
+        )
+        if route is None:
+            return None
+        operation, contract = route
+        if operation.confirmation_policy != "required":
+            return None
+        properties_value = contract.parameters.get("properties")
+        required_value = contract.parameters.get("required", ())
+        if not isinstance(properties_value, Mapping) or not isinstance(required_value, Sequence):
+            return None
+        properties = frozenset(str(field) for field in properties_value)
+        required = tuple(str(field) for field in required_value)
+        editable = tuple(descriptor.field for descriptor in operation.editable_fields)
+        arguments = self._arguments(pending.args)
+
+        if required == ("company_name", "position_name") and required == editable[:2]:
+            if not str(arguments.get("company_name") or "").strip():
+                return "要新建投递记录的话，还需要公司名称。请告诉我公司是哪一家。"
+            if not str(arguments.get("position_name") or "").strip():
+                return "要新建投递记录的话，还需要岗位名称。请告诉我投递的具体岗位。"
+            return None
+        if required == ("id", "status") and editable[:1] == ("status",):
+            if not self._positive_int_like(arguments.get("id")):
+                return "要更新投递状态的话，还需要明确是哪条投递记录。请告诉我公司/岗位或记录编号。"
+            if not str(arguments.get("status") or "").strip():
+                return "要更新投递状态的话，还需要目标状态。请告诉我是已投递、笔试、面试、Offer 还是已结束。"
+            return None
+        if required == (
+            "application_id",
+            "event_type",
+            "scheduled_at",
+            "duration_minutes",
+        ) and editable[:4] == (
+            "event_type",
+            "subtype",
+            "scheduled_at",
+            "remind_at",
+        ):
+            application_id = arguments.get("application_id")
+            if not self._positive_int_like(application_id) or not self.application_visible(
+                int(cast(Any, application_id))
+            ):
+                return "这条日程要关联哪条投递记录？请告诉我公司/岗位或记录编号。"
+            if not str(arguments.get("event_type") or "").strip():
+                return "这条日程是什么类型？比如笔试、面试、Offer 进展或截止事项。"
+            if not str(arguments.get("scheduled_at") or "").strip():
+                return "这条日程的具体时间是什么？请补充日期和开始时间。"
+            if not self._positive_int_like(arguments.get("duration_minutes")):
+                return "这条日程预计持续多久？请补充时长，例如 30 分钟。"
+            return None
+        if (
+            not required
+            and {"application_id", "company", "date"}.issubset(properties)
+            and editable[:4] == ("company", "position", "round", "date")
+        ):
+            if (
+                not self._positive_int_like(arguments.get("application_id"))
+                and not str(arguments.get("company") or "").strip()
+            ):
+                return "这次复盘还缺少公司信息。请告诉我公司名称，或先说明不关联具体公司。"
+            if not str(arguments.get("date") or "").strip():
+                return "这次复盘还缺少面试日期。请告诉我具体日期，或回复“日期待定”。"
+        return None
+
+    def __call__(self, pending: PendingAction, conversation_id: int) -> str | None:
+        return self.resolve(pending, conversation_id)
 
 
 class _ContinuationModelResolver:
@@ -1155,6 +1289,7 @@ class ProductionToolMetadataComponents(TransientToolRuntimeValue):
     """One sealed application-level Tool Metadata graph."""
 
     __slots__ = (
+        "_typed_catalog",
         "_bundle",
         "_operation_port",
         "_pending_persistence_route_port",
@@ -1165,6 +1300,7 @@ class ProductionToolMetadataComponents(TransientToolRuntimeValue):
         "_integrity_seal",
     )
     _bundle: ToolMetadataBundleV1
+    _typed_catalog: RuntimeToolCatalog
     _operation_port: ToolOperationMetadataPort
     _pending_persistence_route_port: PendingPersistenceRoutePort
     _compensation_registry: CompensationHandlerRegistry
@@ -1186,6 +1322,7 @@ class ProductionToolMetadataComponents(TransientToolRuntimeValue):
         self,
         seal: object | None = None,
         *,
+        typed_catalog: RuntimeToolCatalog,
         bundle: ToolMetadataBundleV1,
         operation_port: ToolOperationMetadataPort,
         pending_persistence_route_port: PendingPersistenceRoutePort,
@@ -1196,7 +1333,10 @@ class ProductionToolMetadataComponents(TransientToolRuntimeValue):
     ) -> None:
         if seal is not _PRODUCTION_METADATA_COMPONENT_SEAL:
             raise TypeError("production Tool Metadata components are Composition-created")
+        if type(typed_catalog) is not RuntimeToolCatalog:
+            raise TypeError("production Tool Metadata components require the exact Typed Catalog")
         values = (
+            typed_catalog,
             bundle,
             operation_port,
             pending_persistence_route_port,
@@ -1217,6 +1357,7 @@ class ProductionToolMetadataComponents(TransientToolRuntimeValue):
     def _ensure_integrity(self) -> None:
         try:
             current = (
+                self._typed_catalog,
                 self._bundle,
                 self._operation_port,
                 self._pending_persistence_route_port,
@@ -1249,6 +1390,11 @@ class ProductionToolMetadataComponents(TransientToolRuntimeValue):
                 raise ValueError("production Tool Metadata Bundle provenance drift")
         except (AttributeError, TypeError, ValueError) as exc:
             raise ValueError("production Tool Metadata component integrity drift") from exc
+
+    @property
+    def typed_catalog(self) -> RuntimeToolCatalog:
+        self._ensure_integrity()
+        return self._typed_catalog
 
     @property
     def bundle(self) -> ToolMetadataBundleV1:
@@ -1289,7 +1435,8 @@ def build_production_tool_metadata_components(
 
     if type(pending_identity_verifier_port) is not LegacyPendingIdentityVerifierPort:
         raise TypeError("production metadata requires the exact Legacy verifier Port")
-    manifest = compile_tool_metadata_manifest(MODEL_TOOL_CATALOG.specs)
+    typed_catalog = build_model_tool_catalog()
+    manifest = compile_tool_metadata_manifest(typed_catalog.specs)
     manifest_projection = manifest.to_dict()
     expected_legacy = manifest_projection["legacy_boundary"]
     adapter_catalog = build_static_adapter_catalog()
@@ -1303,7 +1450,7 @@ def build_production_tool_metadata_components(
         raise ValueError("actual Legacy Adapter policy does not match the exact Manifest")
     compensation_components = prepare_compensation_handler_components()
     bundle = ToolMetadataBundleV1(
-        typed_catalog=MODEL_TOOL_CATALOG,
+        typed_catalog=typed_catalog,
         manifest=manifest,
         legacy_boundary=actual_legacy,
         compensation=compensation_components.metadata_projection(),
@@ -1341,6 +1488,7 @@ def build_production_tool_metadata_components(
     )
     return ProductionToolMetadataComponents(
         _PRODUCTION_METADATA_COMPONENT_SEAL,
+        typed_catalog=typed_catalog,
         bundle=bundle,
         operation_port=operation_port,
         pending_persistence_route_port=pending_persistence_route_port,
@@ -1392,12 +1540,12 @@ class _SqlAlchemyLegacyPendingIdentityBackend:
         pending_tool_name = str(getattr(conversation, "pending_tool_name", "") or "")
         if (
             pending_operation_id != operation_id
-            or getattr(operation, "operation_role", None) != "primary"
-            or getattr(operation, "adapter_kind", None) != "legacy_deterministic"
-            or getattr(operation, "status", None) != "proposed"
-            or getattr(operation, "conversation_id", None) != conversation_id
-            or getattr(operation, "tool_call_id", None) != pending_tool_call_id
-            or getattr(operation, "tool_name", None) != pending_tool_name
+            or operation.operation_role != "primary"
+            or operation.adapter_kind != "legacy_deterministic"
+            or operation.status != "proposed"
+            or operation.conversation_id != conversation_id
+            or operation.tool_call_id != pending_tool_call_id
+            or operation.tool_name != pending_tool_name
         ):
             raise WriteOperationError("operation_identity_conflict")
         return {
@@ -1410,26 +1558,14 @@ class _SqlAlchemyLegacyPendingIdentityBackend:
             "operation_id": operation_id,
             "tool_call_id": pending_tool_call_id,
             "tool_name": pending_tool_name,
-            "fingerprint_key_id": getattr(operation, "fingerprint_key_id", None),
+            "fingerprint_key_id": operation.fingerprint_key_id,
             "raw_args": raw_args,
             "normalized_args": dict(normalized_args),
-            "proposal_fingerprint": getattr(operation, "proposal_fingerprint", None),
-            "confirmation_token_fingerprint": getattr(
-                operation,
-                "confirmation_token_fingerprint",
-                None,
-            ),
-            "authorization_scope_fingerprint": getattr(
-                operation,
-                "authorization_scope_fingerprint",
-                None,
-            ),
-            "input_fingerprint": getattr(operation, "input_fingerprint", None),
-            "operation_request_fingerprint": getattr(
-                operation,
-                "operation_request_fingerprint",
-                None,
-            ),
+            "proposal_fingerprint": operation.proposal_fingerprint,
+            "confirmation_token_fingerprint": operation.confirmation_token_fingerprint,
+            "authorization_scope_fingerprint": operation.authorization_scope_fingerprint,
+            "input_fingerprint": operation.input_fingerprint,
+            "operation_request_fingerprint": operation.operation_request_fingerprint,
             "pending_confirmation_claim_id": str(
                 getattr(conversation, "pending_confirmation_claim_id", "") or ""
             ),
@@ -1532,16 +1668,11 @@ def build_pilot_runtime(
     system_message: Callable[[], object],
     clarification_message: Callable[[tuple[PendingAction, str] | None, str], object | None],
     page_context_messages: Callable[[Mapping[str, object] | None], Sequence[object]],
-    missing_target_question: Callable[..., str | None] | None = None,
     title_from_message: Callable[[str], str] | None = None,
-    catalog: object = MODEL_TOOL_CATALOG,
-    application_visible: Callable[[int], bool] | None = None,
     clock: Callable[[], object] | None = None,
 ) -> PilotRuntime:
     """Build one frozen production Runtime graph from app-owned dependencies."""
 
-    if catalog is not MODEL_TOOL_CATALOG:
-        raise ValueError("Pilot Runtime requires the exact Bundle-owned Typed Catalog")
     if (
         type(write_operations) is not WriteOperationRepository
         or type(write_coordinator) is not WriteOperationCoordinator
@@ -1556,7 +1687,15 @@ def build_pilot_runtime(
         pending_identity_verifier_port=pending_identity_verifier,
     )
     metadata_bundle = metadata_components.bundle
+    typed_catalog = metadata_components.typed_catalog
     initial_routes = metadata_components.initial_routes
+    provider_view = metadata_bundle.provider_view()
+    operation_view = metadata_bundle.operation_view()
+    missing_target_question = _MissingTargetQuestionResolver(
+        applications,
+        operation_view=operation_view,
+        provider_view=provider_view,
+    )
     persistence = ChatPersistenceCoordinator(cast(Any, chat))
     gateway = _ConversationGateway(chat, title_from_message)
     source = _SourceAdapter(source_loader)
@@ -1568,8 +1707,8 @@ def build_pilot_runtime(
     )
     driver = _AgentDriver()
     policy_resolver = _PolicyCatalogResolver(
-        catalog,
-        provider_view=metadata_bundle.provider_view(),
+        typed_catalog,
+        provider_view=provider_view,
         discovery_view=metadata_bundle.discovery_view(),
         authority_view=metadata_bundle.authority_view(),
     )
@@ -1577,9 +1716,7 @@ def build_pilot_runtime(
     surface_gate_resolver = _SegmentSurfaceGateResolver(
         bundle=metadata_bundle,
     )
-    policy_snapshot = validate_startup_policy(
-        cast(Mapping[str, object], getattr(catalog, "authority_manifest"))
-    )
+    policy_snapshot = validate_startup_policy(typed_catalog.authority_manifest)
     segment_resolver = _SegmentContextResolver(
         applications=applications,
         events=events,
@@ -1671,14 +1808,11 @@ def build_pilot_runtime(
             write_coordinator=cast(Any, write_coordinator),
             operation_port=metadata_components.operation_port,
             pending_persistence_route_port=metadata_components.pending_persistence_route_port,
-            catalog=catalog,
+            catalog=typed_catalog,
             approval_context_resolver=resolve_approval_context,
             transactional_delivery=transactional_delivery,
             clock=cast(Any, clock) if clock is not None else lambda: datetime.now(timezone.utc),
         )
-    )
-    visible = application_visible or (
-        lambda application_id: getattr(applications, "get")(application_id) is not None
     )
     dependencies = RuntimeDependencies(
         conversations=gateway,
@@ -1691,14 +1825,14 @@ def build_pilot_runtime(
         context_assembler=assembler,
         agent_driver=cast(Any, driver),
         journal=cast(Any, run_recorder_factory),
-        catalog=cast(Any, catalog),
+        catalog=typed_catalog,
         metadata_bundle=metadata_bundle,
         metadata_components=metadata_components,
-        provider_metadata_view=metadata_bundle.provider_view(),
+        provider_metadata_view=provider_view,
         discovery_metadata_view=metadata_bundle.discovery_view(),
         authority_metadata_view=metadata_bundle.authority_view(),
         missing_target_question=missing_target_question,
-        application_visible=visible,
+        application_visible=missing_target_question.application_visible,
         deterministic=deterministic,
         confirmation_coordinator=confirmation,
     )

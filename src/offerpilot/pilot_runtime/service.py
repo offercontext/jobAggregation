@@ -50,13 +50,13 @@ from offerpilot.ai.tool_runtime.contracts import (
     ToolSuccess,
     TransientToolRuntimeValue,
 )
-from offerpilot.ai.tool_runtime.legacy import LEGACY_DETERMINISTIC_NAMES
 from offerpilot.ai.tool_runtime.journal import journal_shape_digest
 from offerpilot.ai.tool_runtime.metadata import (
     ProviderToolMetadataView,
     ToolAuthorityMetadataView,
     ToolDiscoveryMetadataView,
     ToolMetadataBundleV1,
+    ToolOperationMetadataView,
     ToolOperationMetadataPort,
     WriteOperationMetadataV1,
 )
@@ -269,14 +269,6 @@ class ContextAssembler(Protocol):
         conversation: object,
         request: StartTurnRequest,
     ) -> object: ...
-
-
-class ToolCatalog(Protocol):
-    def resolve(self, name: str) -> object | None: ...
-
-    def write_names(self) -> Iterable[str]: ...
-
-    def provider_contracts(self) -> Sequence[object]: ...
 
 
 class RuntimePersistence(Protocol):
@@ -663,7 +655,7 @@ class RuntimeDependencies:
     agent_driver: AgentDriver | None = None
     route_selector: RouteSelector | None = None
     journal: JournalFactory | None = None
-    catalog: ToolCatalog | None = None
+    catalog: object | None = None
     metadata_bundle: ToolMetadataBundleV1 | None = field(
         default=None,
         repr=False,
@@ -739,6 +731,33 @@ class RuntimeDependencies:
             or exact_authority is not exact_bundle.authority_view()
         ):
             raise ValueError("Runtime Tool Metadata dependencies have mixed Bundle provenance")
+        deterministic = self.deterministic
+        component_operation_port = getattr(components, "operation_port", None)
+        component_pending_port = getattr(components, "pending_persistence_route_port", None)
+        if (
+            type(component_operation_port) is not ToolOperationMetadataPort
+            or component_operation_port.bundle_instance_token
+            is not exact_bundle.bundle_instance_token
+            or type(component_pending_port) is not PendingPersistenceRoutePort
+            or component_pending_port.bundle_instance_token
+            is not exact_bundle.bundle_instance_token
+        ):
+            raise ValueError("Runtime Tool Metadata dependencies have mixed Bundle provenance")
+        if (
+            type(deterministic) is DeterministicPilotAdapter
+            and deterministic.dependencies.operation_port is not component_operation_port
+        ):
+            raise ValueError("Runtime Tool Metadata dependencies have mixed Bundle provenance")
+        for coordinator in (self.confirmation_coordinator, self.continuation):
+            if type(coordinator) is not ConfirmationCoordinator:
+                continue
+            coordinator_dependencies = coordinator.dependencies
+            if (
+                coordinator_dependencies.operation_port is not component_operation_port
+                or coordinator_dependencies.pending_persistence_route_port
+                is not component_pending_port
+            ):
+                raise ValueError("Runtime Tool Metadata dependencies have mixed Bundle provenance")
 
 
 RuntimeDependenciesLike: TypeAlias = RuntimeDependencies | Mapping[str, object]
@@ -1317,15 +1336,18 @@ def _record_outcome(record: object) -> object | None:
     return _attribute(record, "outcome")
 
 
-def _spec_is_write(spec: object) -> bool:
-    metadata = _attribute(spec, "metadata")
-    return type(_attribute(metadata, "operation")) is WriteOperationMetadataV1
-
-
-def _record_is_write(record: object) -> bool:
-    prepared = _attribute(record, "prepared")
-    spec = _attribute(prepared, "spec")
-    return _spec_is_write(spec)
+def _record_is_write(
+    record: object,
+    operation_view: ToolOperationMetadataView | None,
+    provider_view: ProviderToolMetadataView | None,
+) -> bool:
+    if type(record) is not ToolExecutionRecord:
+        return False
+    return _published_typed_write(
+        operation_view,
+        provider_view,
+        record.prepared.spec.name,
+    )
 
 
 def _failure_detail(failure: object) -> str:
@@ -1386,10 +1408,15 @@ def _write_outcome(
     records: Sequence[object],
     attempted: bool,
     failures: Sequence[object] = (),
+    *,
+    operation_view: ToolOperationMetadataView | None,
+    provider_view: ProviderToolMetadataView | None,
 ) -> tuple[str, str]:
     if not attempted:
         return "none", ""
-    write_records = tuple(record for record in records if _record_is_write(record))
+    write_records = tuple(
+        record for record in records if _record_is_write(record, operation_view, provider_view)
+    )
     for record in reversed(write_records):
         outcome = _record_outcome(record)
         if isinstance(outcome, ToolFailure):
@@ -1440,47 +1467,49 @@ def _apply_exact_success_presentation(
     return f"{summary}\n\n{reply}".strip()
 
 
-def _catalog_write_names(catalog: object | None) -> set[str]:
-    function = _callable(catalog, ("write_names",))
-    if function is None:
-        return set()
-    try:
-        values = function()
-    except Exception:
-        return set()
-    if isinstance(values, (str, bytes)):
-        return set()
-    try:
-        return {str(value) for value in cast(Iterable[object], values)}
-    except TypeError:
-        return set()
+def _published_typed_write(
+    operation_view: ToolOperationMetadataView | None,
+    provider_view: ProviderToolMetadataView | None,
+    tool_name: str,
+) -> bool:
+    if (
+        type(operation_view) is not ToolOperationMetadataView
+        or type(provider_view) is not ProviderToolMetadataView
+        or type(tool_name) is not str
+        or not tool_name
+        or operation_view.bundle_instance_token is not provider_view.bundle_instance_token
+    ):
+        return False
+    entry = operation_view.entries.get(tool_name)
+    if entry is None or type(entry.operation) is not WriteOperationMetadataV1:
+        return False
+    return any(contract.name == tool_name for contract in provider_view.ordered_contracts)
 
 
-def _catalog_exposes_write(catalog: object | None, tool_name: str) -> bool:
-    if catalog is None or not tool_name:
+def _published_legacy_write(
+    operation_port: ToolOperationMetadataPort | None,
+    tool_name: str,
+) -> bool:
+    if type(operation_port) is not ToolOperationMetadataPort:
         return False
-    resolver = _callable(catalog, ("resolve",))
-    contracts = _callable(catalog, ("provider_contracts",))
-    if resolver is None or contracts is None:
-        return False
-    try:
-        spec = _invoke(resolver, {"name": tool_name}, (tool_name,))
-        exposed = contracts()
-    except Exception:
-        return False
-    if spec is None:
-        return False
-    if not _spec_is_write(spec):
-        return False
-    if not isinstance(exposed, Sequence) or isinstance(exposed, (str, bytes)):
-        return False
-    return any(_attribute(contract, "name") == tool_name for contract in exposed)
+    matches = tuple(
+        entry
+        for entry in operation_port.legacy_primary_entries
+        if entry.operation_name == tool_name
+    )
+    return bool(
+        len(matches) == 1
+        and matches[0].adapter_kind == "legacy_deterministic"
+        and matches[0].operation_role == "primary"
+    )
 
 
 def _valid_pending_action(
     pending: PendingAction,
-    catalog: object | None,
+    operation_view: ToolOperationMetadataView | None,
+    provider_view: ProviderToolMetadataView | None,
     *,
+    operation_port: ToolOperationMetadataPort | None = None,
     require_operation_id: bool = True,
     trusted_legacy: bool = False,
 ) -> bool:
@@ -1501,37 +1530,40 @@ def _valid_pending_action(
     except (TypeError, ValueError, json.JSONDecodeError):
         return False
     if trusted_legacy:
-        if pending.tool_name not in LEGACY_DETERMINISTIC_NAMES:
+        if not _published_legacy_write(operation_port, pending.tool_name):
             return False
-    elif not _catalog_exposes_write(catalog, pending.tool_name):
+    elif not _published_typed_write(operation_view, provider_view, pending.tool_name):
         return False
     return bool(_confirmation_token(pending))
 
 
 def _has_write_attempt(
-    added: Sequence[object], records: Sequence[object], catalog: object | None
+    added: Sequence[object],
+    records: Sequence[object],
+    operation_view: ToolOperationMetadataView | None,
+    provider_view: ProviderToolMetadataView | None,
 ) -> bool:
-    write_names = _catalog_write_names(catalog)
     for item in added:
         message = _message(item)
         if message.role == "assistant" and any(
-            call.name in write_names for call in message.tool_calls
+            _published_typed_write(operation_view, provider_view, call.name)
+            for call in message.tool_calls
         ):
             return True
-    return any(_record_is_write(record) for record in records)
+    return any(_record_is_write(record, operation_view, provider_view) for record in records)
 
 
 def _pending_action_from_added_write_call(
     added: Sequence[object],
-    catalog: object | None,
+    operation_view: ToolOperationMetadataView | None,
+    provider_view: ProviderToolMetadataView | None,
 ) -> PendingAction | None:
-    write_names = _catalog_write_names(catalog)
     for item in reversed(added):
         message = _message(item)
         if message.role != "assistant" or not message.tool_calls:
             continue
         call = message.tool_calls[0]
-        if write_names and call.name not in write_names:
+        if not _published_typed_write(operation_view, provider_view, call.name):
             continue
         return PendingAction(call.id, call.name, call.args, call.name, call.id)
     return None
@@ -1635,25 +1667,6 @@ def _safe_pending_payload(pending: PendingAction) -> tuple[ImmutablePayload, str
     return args, _confirmation_token(pending)
 
 
-def _write_status(result: NormalizedAgentTurn) -> WriteStatus:
-    """Project only the public write status from opaque tool records."""
-
-    attempted = False
-    failed = False
-    for record in result.records:
-        prepared = _attribute(record, "prepared")
-        spec = _attribute(prepared, "spec")
-        if not _spec_is_write(spec):
-            continue
-        attempted = True
-        outcome = _attribute(record, "outcome")
-        if outcome is not None and _attribute(outcome, "code") is not None:
-            failed = True
-    if not attempted:
-        return "none"
-    return "failed" if failed or result.failures else "success"
-
-
 class PilotRuntime:
     """The synchronous model-only Start Turn state machine."""
 
@@ -1714,6 +1727,36 @@ class PilotRuntime:
         if getattr(components, "bundle", None) is not self.metadata_bundle:
             raise RuntimeError("Pilot Runtime Tool Metadata provenance mismatch")
         return components
+
+    def _operation_metadata_view(self) -> ToolOperationMetadataView | None:
+        bundle = self._dependencies.metadata_bundle
+        if type(bundle) is not ToolMetadataBundleV1:
+            return None
+        view = bundle.operation_view()
+        return view if type(view) is ToolOperationMetadataView else None
+
+    def _provider_metadata_view(self) -> ProviderToolMetadataView | None:
+        provider = self._dependencies.provider_metadata_view
+        bundle = self._dependencies.metadata_bundle
+        if (
+            type(provider) is not ProviderToolMetadataView
+            or type(bundle) is not ToolMetadataBundleV1
+            or provider is not bundle.provider_view()
+        ):
+            return None
+        return provider
+
+    def _operation_metadata_port(self) -> ToolOperationMetadataPort | None:
+        components = self._dependencies.metadata_components
+        bundle = self._dependencies.metadata_bundle
+        operation_port = getattr(components, "operation_port", None)
+        if (
+            type(operation_port) is not ToolOperationMetadataPort
+            or type(bundle) is not ToolMetadataBundleV1
+            or operation_port.bundle_instance_token is not bundle.bundle_instance_token
+        ):
+            return None
+        return operation_port
 
     def _open_approval_catalog_lease(
         self,
@@ -2570,21 +2613,14 @@ class PilotRuntime:
             except Exception as exc:
                 self._mark_completed_if_active(control)
                 return self._confirmation_failure(exc)
-            route_operation = route_preheader.operation
-            adapter_kind = str(_attribute(route_operation, "adapter_kind", "") or "")
-            route_tool_name = str(_attribute(route_operation, "tool_name", "") or "")
-            if (
-                adapter_kind == "legacy_deterministic"
-                and route_tool_name not in LEGACY_DETERMINISTIC_NAMES
-            ):
-                self._mark_completed_if_active(control)
-                return DeterministicPilotAdapter._write_error(
-                    WriteOperationError("operation_identity_conflict")
+            try:
+                legacy_deterministic = self._is_deterministic_confirmation(
+                    request,
+                    preheader=route_preheader,
                 )
-            legacy_deterministic = self._is_deterministic_confirmation(
-                request,
-                operation=route_operation,
-            )
+            except WriteOperationError as exc:
+                self._mark_completed_if_active(control)
+                return DeterministicPilotAdapter._write_error(exc)
             if legacy_deterministic:
                 if type(deterministic) is not DeterministicPilotAdapter:
                     self._mark_completed_if_active(control)
@@ -2788,18 +2824,30 @@ class PilotRuntime:
         self,
         request: ConfirmationRequest,
         *,
-        operation: object | None = None,
+        preheader: LedgerOperationPreheader | None = None,
     ) -> bool:
         """Select the closed deterministic adapter from the persisted operation kind."""
 
         if not isinstance(request, ConfirmationRequest) or not request.approved:
             return False
-        if operation is None:
+        if type(preheader) is not LedgerOperationPreheader:
             return False
-        return (
-            str(_attribute(operation, "adapter_kind", "") or "") == "legacy_deterministic"
-            and str(_attribute(operation, "tool_name", "") or "") in LEGACY_DETERMINISTIC_NAMES
-        )
+        operation = preheader.operation
+        if operation.adapter_kind != "legacy_deterministic":
+            return False
+        deterministic = self._dependencies.deterministic
+        operation_port = self._operation_metadata_port()
+        if type(deterministic) is DeterministicPilotAdapter:
+            route_is_published = deterministic.accepts_legacy_route(operation.tool_name)
+        elif type(operation_port) is ToolOperationMetadataPort:
+            route_is_published = _published_legacy_write(operation_port, operation.tool_name)
+        else:
+            # The persisted adapter kind still selects the closed Legacy route.
+            # The caller will fail it with 400 when no exact adapter is installed.
+            route_is_published = True
+        if not route_is_published:
+            raise WriteOperationError("operation_identity_conflict")
+        return True
 
     def _open_ledger_journal(
         self,
@@ -3738,7 +3786,7 @@ class PilotRuntime:
                 None,
                 transport,
                 control,
-                tool_names=self._journal_tool_names(catalog),
+                tool_names=self._journal_tool_names(self._provider_metadata_view()),
             )
             activation_request = _ContinuationActivationRequest(
                 session.state.identity.conversation_id
@@ -4234,10 +4282,18 @@ class PilotRuntime:
         components = self._dependencies.metadata_components
         operation_port = getattr(components, "operation_port", None)
         pending_port = getattr(components, "pending_persistence_route_port", None)
+        bundle = self._dependencies.metadata_bundle
         if type(operation_port) is not ToolOperationMetadataPort:
             raise RuntimeError("Runtime Tool Operation Metadata Port is unavailable")
         if type(pending_port) is not PendingPersistenceRoutePort:
             raise RuntimeError("Runtime Pending Persistence Route Port is unavailable")
+        if (
+            type(bundle) is not ToolMetadataBundleV1
+            or operation_port.bundle_instance_token is not bundle.bundle_instance_token
+            or pending_port.bundle_instance_token is not bundle.bundle_instance_token
+            or pending_port._operation_port is not operation_port
+        ):
+            raise RuntimeError("Runtime Tool Metadata Port provenance mismatch")
         return operation_port, pending_port
 
     def _bind_invocation_pending_persistence(
@@ -4456,23 +4512,16 @@ class PilotRuntime:
                 raise
             except Exception as exc:
                 return self._stream_immediate(self._confirmation_failure(exc), invocation_control)
-            route_operation = route_preheader.operation
-            adapter_kind = str(_attribute(route_operation, "adapter_kind", "") or "")
-            route_tool_name = str(_attribute(route_operation, "tool_name", "") or "")
-            if (
-                adapter_kind == "legacy_deterministic"
-                and route_tool_name not in LEGACY_DETERMINISTIC_NAMES
-            ):
+            try:
+                legacy_deterministic = self._is_deterministic_confirmation(
+                    request,
+                    preheader=route_preheader,
+                )
+            except WriteOperationError as exc:
                 return self._stream_immediate(
-                    DeterministicPilotAdapter._write_error(
-                        WriteOperationError("operation_identity_conflict")
-                    ),
+                    DeterministicPilotAdapter._write_error(exc),
                     invocation_control,
                 )
-            legacy_deterministic = self._is_deterministic_confirmation(
-                request,
-                operation=route_operation,
-            )
             if legacy_deterministic:
                 if type(deterministic) is not DeterministicPilotAdapter:
                     return self._stream_immediate(
@@ -6752,7 +6801,7 @@ class PilotRuntime:
                 state.conversation,
                 state.transport or RuntimeTransportContext(mode="stream"),
                 state.control,
-                tool_names=self._journal_tool_names(catalog),
+                tool_names=self._journal_tool_names(self._provider_metadata_view()),
             )
             activation_request = _ContinuationActivationRequest(cast(int, state.conversation_id))
             # See the synchronous path: the approval origin uses the raw
@@ -8249,8 +8298,8 @@ class PilotRuntime:
         if conversation_id is None:
             raise LookupError("conversation not found")
         pending_before = adapter.pending_action(conversation)
-        replay = (
-            pending_before is not None and pending_before.tool_name in LEGACY_DETERMINISTIC_NAMES
+        replay = pending_before is not None and adapter.accepts_legacy_route(
+            pending_before.tool_name
         )
         if replay:
             assert pending_before is not None
@@ -8370,7 +8419,7 @@ class PilotRuntime:
         if conversation_id is None:
             raise LookupError("conversation not found")
         pending = adapter.pending_action(conversation)
-        replay = pending is not None and pending.tool_name in LEGACY_DETERMINISTIC_NAMES
+        replay = pending is not None and adapter.accepts_legacy_route(pending.tool_name)
         if replay:
             assert pending is not None
             recorder, started = self._resume_journal_replay(conversation_id, pending, transport)
@@ -8464,24 +8513,13 @@ class PilotRuntime:
         )
 
     @staticmethod
-    def _journal_tool_names(catalog: object | None) -> tuple[str, ...]:
-        if catalog is None:
-            return ()
-        provider_contracts = _callable(catalog, ("provider_contracts",))
-        if provider_contracts is None:
-            return ()
-        try:
-            contracts = provider_contracts()
-        except BaseException:
-            return ()
-        if not isinstance(contracts, Sequence) or isinstance(contracts, (str, bytes)):
+    def _journal_tool_names(
+        provider_view: ProviderToolMetadataView | None,
+    ) -> tuple[str, ...]:
+        if type(provider_view) is not ProviderToolMetadataView:
             return ()
         try:
-            return tuple(
-                str(name)
-                for contract in contracts
-                if (name := _attribute(contract, "name")) is not None
-            )
+            return tuple(contract.name for contract in provider_view.ordered_contracts)
         except BaseException:
             return ()
 
@@ -8541,11 +8579,11 @@ class PilotRuntime:
             "context_ref": str(_attribute(conversation, "context_ref", "") or ""),
             "mode": str(_attribute(conversation, "mode", "general") or "general"),
             "message_count": len(message_ids),
-            "tool_names": list(self._journal_tool_names(catalog)),
+            "tool_names": list(self._journal_tool_names(self._provider_metadata_view())),
         }
         manifest = ContextManifestInput(
             conversation_message_ids=message_ids,
-            tool_names=self._journal_tool_names(catalog),
+            tool_names=self._journal_tool_names(self._provider_metadata_view()),
             attachment_refs=(),
             domain_source_refs=(),
         )
@@ -8838,6 +8876,8 @@ class PilotRuntime:
         control: RuntimeInvocationControl,
     ) -> _PersistedTurn:
         del request
+        operation_view = self._operation_metadata_view()
+        provider_view = self._provider_metadata_view()
         pending = result.pending
         if pending is not None and (
             type(route_handle) is not TypedPendingRouteHandle
@@ -8859,8 +8899,15 @@ class PilotRuntime:
         reply = forced_reply or _user_facing_assistant_content(result.reply)
         write_status, write_error = _write_outcome(
             result.records,
-            _has_write_attempt(result.added, result.records, catalog),
+            _has_write_attempt(
+                result.added,
+                result.records,
+                operation_view,
+                provider_view,
+            ),
             result.failures,
+            operation_view=operation_view,
+            provider_view=provider_view,
         )
         messages = [
             Message(
@@ -9001,10 +9048,15 @@ class PilotRuntime:
         if forced_reply:
             forced_pending = _pending_action_from_added_write_call(
                 result.added,
-                catalog,
+                operation_view,
+                provider_view,
             )
             if forced_pending is not None:
-                if not _valid_pending_action(forced_pending, catalog):
+                if not _valid_pending_action(
+                    forced_pending,
+                    operation_view,
+                    provider_view,
+                ):
                     return _PersistedTurn(
                         self._failure(
                             RuntimeFailureCode.OPERATION_FAILED,
@@ -9057,7 +9109,8 @@ class PilotRuntime:
         elif clarification is not None and _looks_like_followup_question(reply):
             if not _valid_pending_action(
                 clarification[0],
-                catalog,
+                operation_view,
+                provider_view,
                 require_operation_id=False,
             ):
                 return _PersistedTurn(
@@ -9342,7 +9395,11 @@ class PilotRuntime:
         ensure_active: Callable[[], None],
         control: RuntimeInvocationControl,
     ) -> _PersistedTurn:
-        if not _valid_pending_action(pending, catalog):
+        if not _valid_pending_action(
+            pending,
+            self._operation_metadata_view(),
+            self._provider_metadata_view(),
+        ):
             return _PersistedTurn(
                 self._failure(
                     RuntimeFailureCode.OPERATION_FAILED,
@@ -9646,7 +9703,13 @@ class PilotRuntime:
     ) -> None:
         if not started or pending is None:
             return
-        if not _valid_pending_action(pending, catalog, trusted_legacy=trusted_legacy):
+        if not _valid_pending_action(
+            pending,
+            self._operation_metadata_view(),
+            self._provider_metadata_view(),
+            operation_port=self._operation_metadata_port(),
+            trusted_legacy=trusted_legacy,
+        ):
             return
         require_runtime_active(control)
         self._phase("run_suspend")
@@ -9760,5 +9823,4 @@ __all__ = [
     "RuntimePersistence",
     "SourceLoader",
     "StartTurnDependencies",
-    "ToolCatalog",
 ]

@@ -26,6 +26,7 @@ from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
 from offerpilot.ai.tool_authority.contracts import SegmentExecutionAuthority
 from offerpilot.ai.write_operations import (
     DeliveryOwnership,
+    LedgerOperationPreheader,
     OperationCommitted,
     OperationReplay,
     TerminalPayload,
@@ -37,7 +38,6 @@ from offerpilot.ai.tool_runtime.catalog import (
 )
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 from offerpilot.agent_runtime.journal import NullRunRecorder, RunRecorderFactory
 from offerpilot.agent_runtime.keyring import JournalKeyDomain
 from offerpilot.db import init_database
@@ -95,14 +95,13 @@ from offerpilot.ai.types import Assistant, Message, ToolCall
 from tests.tool_metadata.test_production_bundle import _production_components
 
 
+_METADATA_COMPONENTS = _production_components()
+_METADATA_BUNDLE = _METADATA_COMPONENTS.bundle
+_TEST_TOOL_CATALOG = _METADATA_COMPONENTS.typed_catalog
 _AUTHORITY_SESSIONS = init_database(
     Path(tempfile.mkdtemp(prefix="offerpilot-stream-authority-")) / "authority.db"
 )
-_AUTHORITY_POLICY = validate_startup_policy(MODEL_TOOL_CATALOG.authority_manifest)
-
-
-_METADATA_COMPONENTS = _production_components()
-_METADATA_BUNDLE = _METADATA_COMPONENTS.bundle
+_AUTHORITY_POLICY = validate_startup_policy(_TEST_TOOL_CATALOG.authority_manifest)
 
 
 class Phases:
@@ -357,9 +356,9 @@ class ConfirmationProbe:
             state=SimpleNamespace(approval_context=self.approval_context),
         )
 
-    def operation_preheader(self, request: object, **kwargs: object) -> object:
+    def operation_preheader(self, request: object, **kwargs: object) -> LedgerOperationPreheader:
         del request, kwargs
-        return SimpleNamespace(operation=self.operation)
+        return LedgerOperationPreheader(self.operation, None)  # type: ignore[arg-type]
 
     def replay_outcome(self, request: object, **kwargs: object) -> None:
         del request, kwargs
@@ -455,7 +454,7 @@ def _segment_resolver(
     recorder: object,
 ) -> SegmentExecution:
     del request, source
-    return _real_segment(conversation, recorder, MODEL_TOOL_CATALOG)[0]
+    return _real_segment(conversation, recorder, _TEST_TOOL_CATALOG)[0]
 
 
 def _surface_resolver(
@@ -511,7 +510,7 @@ def runtime(
 
     # Segment visibility is issued only against the reviewed typed catalog;
     # pending/readback tests use typed tool names for their assertions.
-    resolved_catalog = MODEL_TOOL_CATALOG
+    resolved_catalog = _TEST_TOOL_CATALOG
 
     def resolve_segment(
         request: object,
@@ -545,7 +544,7 @@ def runtime(
             journal=journal,
             route_selector=lambda request, conversation: route,
             phase_sink=phases,
-            catalog=MODEL_TOOL_CATALOG,
+            catalog=_TEST_TOOL_CATALOG,
             metadata_bundle=_METADATA_BUNDLE,
             metadata_components=_METADATA_COMPONENTS,
             provider_metadata_view=_METADATA_BUNDLE.provider_view(),
@@ -606,7 +605,7 @@ def test_stream_segment_failure_stops_before_policy_catalog_and_side_effects() -
     def policy_spy(*args: object, **kwargs: object) -> object:
         policy_calls.append((args, kwargs))
         return ResolvedPolicyCatalog(
-            catalog=MODEL_TOOL_CATALOG,
+            catalog=_TEST_TOOL_CATALOG,
             policy=_AUTHORITY_POLICY,
             dependency_policy=_METADATA_BUNDLE.discovery_view().policy,
             provider_metadata_view=_METADATA_BUNDLE.provider_view(),
@@ -663,7 +662,7 @@ def test_stream_live_policy_drift_closes_segment_before_provider_or_user() -> No
         assert segment.surface_gate is None
         assert getattr(segment, "catalog_lease", None) is None
         return ResolvedPolicyCatalog(
-            catalog=MODEL_TOOL_CATALOG,
+            catalog=_TEST_TOOL_CATALOG,
             policy=drifted,
             dependency_policy=_METADATA_BUNDLE.discovery_view().policy,
             provider_metadata_view=_METADATA_BUNDLE.provider_view(),
@@ -719,7 +718,7 @@ def test_stream_policy_spy_sees_exact_unbound_segment_after_segment_phase() -> N
         assert segment.surface_gate is None
         assert getattr(segment, "catalog_lease", None) is None
         return ResolvedPolicyCatalog(
-            catalog=MODEL_TOOL_CATALOG,
+            catalog=_TEST_TOOL_CATALOG,
             policy=_AUTHORITY_POLICY,
             dependency_policy=_METADATA_BUNDLE.discovery_view().policy,
             provider_metadata_view=_METADATA_BUNDLE.provider_view(),
@@ -1435,7 +1434,7 @@ def test_real_stream_run_recorder_keeps_transport_uuid_and_terminal_events(
         RuntimeDependencies(
             conversations=Gateway(),
             persistence=persistence,
-            policy_catalog_resolver=_policy_resolver(MODEL_TOOL_CATALOG),
+            policy_catalog_resolver=_policy_resolver(_TEST_TOOL_CATALOG),
             segment_context_resolver=_segment_resolver,
             surface_gate_resolver=_surface_resolver,
             continuation_model_resolver=lambda request, current, policy: ResolvedModel(
@@ -1445,7 +1444,7 @@ def test_real_stream_run_recorder_keeps_transport_uuid_and_terminal_events(
             context_assembler=Assembler(),
             agent_driver=Driver(),
             journal=journal,
-            catalog=MODEL_TOOL_CATALOG,
+            catalog=_TEST_TOOL_CATALOG,
             metadata_bundle=_METADATA_BUNDLE,
             metadata_components=_METADATA_COMPONENTS,
             provider_metadata_view=_METADATA_BUNDLE.provider_view(),
@@ -1499,7 +1498,7 @@ def test_null_journal_recorder_does_not_mark_prepared_run_open() -> None:
         RuntimeDependencies(
             conversations=Conversations(),
             persistence=Persistence(),
-            policy_catalog_resolver=_policy_resolver(MODEL_TOOL_CATALOG),
+            policy_catalog_resolver=_policy_resolver(_TEST_TOOL_CATALOG),
             segment_context_resolver=_segment_resolver,
             surface_gate_resolver=_surface_resolver,
             continuation_model_resolver=lambda request, conversation, policy: ResolvedModel(
@@ -1509,7 +1508,7 @@ def test_null_journal_recorder_does_not_mark_prepared_run_open() -> None:
             context_assembler=Assembler(),
             agent_driver=Driver(),
             journal=NullJournal(),
-            catalog=MODEL_TOOL_CATALOG,
+            catalog=_TEST_TOOL_CATALOG,
             metadata_bundle=_METADATA_BUNDLE,
             metadata_components=_METADATA_COMPONENTS,
             provider_metadata_view=_METADATA_BUNDLE.provider_view(),
@@ -1622,7 +1621,7 @@ def test_terminal_abort_releases_provider_token_and_canary_exactly_once() -> Non
         RuntimeDependencies(
             conversations=Conversations(),
             persistence=Persistence(),
-            policy_catalog_resolver=_policy_resolver(MODEL_TOOL_CATALOG),
+            policy_catalog_resolver=_policy_resolver(_TEST_TOOL_CATALOG),
             segment_context_resolver=_segment_resolver,
             surface_gate_resolver=_surface_resolver,
             continuation_model_resolver=resolver,
@@ -1630,7 +1629,7 @@ def test_terminal_abort_releases_provider_token_and_canary_exactly_once() -> Non
             context_assembler=Assembler(),
             agent_driver=Driver(),
             journal=Journal(),
-            catalog=MODEL_TOOL_CATALOG,
+            catalog=_TEST_TOOL_CATALOG,
             metadata_bundle=_METADATA_BUNDLE,
             metadata_components=_METADATA_COMPONENTS,
             provider_metadata_view=_METADATA_BUNDLE.provider_view(),
@@ -2239,8 +2238,8 @@ def test_stream_activation_requires_terminal_and_delivery_ownership() -> None:
         payload,
         DeliveryOwnership("operation-stream-task17", 1, b"owner", "owner-fingerprint"),
     )
-    segment = _real_segment(Conversation(), object(), MODEL_TOOL_CATALOG)[0]
-    segment = replace(segment, catalog=MODEL_TOOL_CATALOG)
+    segment = _real_segment(Conversation(), object(), _TEST_TOOL_CATALOG)[0]
+    segment = replace(segment, catalog=_TEST_TOOL_CATALOG)
     messages = (
         Message(role="user", content="continue"),
         Message(role="tool", content="saved", tool_call_id="write-1"),
@@ -2249,7 +2248,7 @@ def test_stream_activation_requires_terminal_and_delivery_ownership() -> None:
     continuation_lease = _METADATA_BUNDLE.open_segment_lease()
     surface_gate = build_segment_surface_gate(
         messages,
-        catalog=MODEL_TOOL_CATALOG,
+        catalog=_TEST_TOOL_CATALOG,
         catalog_lease=continuation_lease,  # type: ignore[call-arg]
         context=segment.context,
         authority=segment.authority,
@@ -2261,7 +2260,7 @@ def test_stream_activation_requires_terminal_and_delivery_ownership() -> None:
     bundle = ApprovedContinuationSegment(
         messages=messages,
         model=SimpleNamespace(complete=lambda *_args, **_kwargs: object()),
-        catalog=MODEL_TOOL_CATALOG,
+        catalog=_TEST_TOOL_CATALOG,
         tool_context=segment.context,
         surface_gate=surface_gate,
     )

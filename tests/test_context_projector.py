@@ -25,7 +25,7 @@ from offerpilot.agent_runtime.events import (
 from offerpilot.agent_runtime.budget import JournalBudgetExhausted
 from offerpilot.agent_runtime.journal import RunRecorderFactory
 from offerpilot.agent_runtime.keyring import load_or_create_journal_key
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG, MODEL_TOOL_NAMES
+from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
 from offerpilot.ai.tool_runtime.catalog import compile_tool_metadata_manifest
 from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.ai.tool_authority.policy import (
@@ -87,12 +87,16 @@ from offerpilot.repositories.agent_runs import AgentRunRepository
 from offerpilot.api import create_app
 
 
+_TEST_TOOL_CATALOG = build_model_tool_catalog()
+_TEST_TOOL_NAMES = tuple(spec.name for spec in _TEST_TOOL_CATALOG.specs)
+
+
 def _selector_bundle() -> ToolMetadataBundleV1:
-    manifest = compile_tool_metadata_manifest(MODEL_TOOL_CATALOG.specs)
+    manifest = compile_tool_metadata_manifest(_TEST_TOOL_CATALOG.specs)
     projection = manifest.to_dict()
     compensation = prepare_compensation_handler_components()
     return ToolMetadataBundleV1(
-        typed_catalog=MODEL_TOOL_CATALOG,
+        typed_catalog=_TEST_TOOL_CATALOG,
         manifest=manifest,
         legacy_boundary=cast(dict[str, object], projection["legacy_boundary"]),
         compensation=compensation.metadata_projection(),
@@ -337,7 +341,7 @@ def test_tool_selector_uses_original_catalog_order_and_dependency_closure() -> N
         ToolSelectionSignals(page_kind="offers", current_request="比较薪资"),
     )
     assert selection.selected_names == tuple(
-        name for name in MODEL_TOOL_NAMES if name in selection.selected_names
+        name for name in _TEST_TOOL_NAMES if name in selection.selected_names
     )
     assert {"list_offers", "get_offer", "compare_offers"}.issubset(selection.dependency_closure)
     assert len(selection.provider_envelope_fingerprint) == 64
@@ -350,7 +354,7 @@ def test_tool_selector_falls_back_to_all_typed_tools_and_fails_on_bad_signal() -
         bundle.authority_view(),
         ToolSelectionSignals(page_kind="workspace"),
     )
-    assert selection.selected_names == MODEL_TOOL_NAMES
+    assert selection.selected_names == _TEST_TOOL_NAMES
     assert selection.full_catalog_fallback is True
     with pytest.raises(ProjectionError, match="unknown_page_kind"):
         select_tools(
@@ -967,7 +971,7 @@ def test_manifest_v2_is_canonical_private_and_validated_by_shared_entrypoint() -
             for name in CONTRIBUTOR_ORDER
         ),  # type: ignore[arg-type]
         ("group-1",),
-        MODEL_TOOL_NAMES,
+        _TEST_TOOL_NAMES,
         ("a" * 64,),
         100,
         80,
@@ -1040,7 +1044,7 @@ def test_manifest_v2_prepare_requires_exact_provider_view_before_projection(
         "model-surface-budget-v1",
         tuple((name, "ready") for name in CONTRIBUTOR_ORDER),
         (),
-        (MODEL_TOOL_NAMES[0],),
+        (_TEST_TOOL_NAMES[0],),
         (),
         1,
         1,
@@ -1068,7 +1072,7 @@ def test_manifest_v2_safely_rejects_non_string_set_members(field: str) -> None:
         "model-surface-budget-v1",
         tuple((name, "ready") for name in CONTRIBUTOR_ORDER),
         (),
-        MODEL_TOOL_NAMES,
+        _TEST_TOOL_NAMES,
         (),
         1,
         1,
@@ -1098,7 +1102,7 @@ def test_manifest_v2_safely_rejects_non_string_contributor_status() -> None:
         "model-surface-budget-v1",
         tuple((name, "ready") for name in CONTRIBUTOR_ORDER),
         (),
-        MODEL_TOOL_NAMES,
+        _TEST_TOOL_NAMES,
         (),
         1,
         1,
@@ -1147,7 +1151,7 @@ def test_maximal_semantic_manifest_reaches_every_array_limit_under_cap() -> None
         "model-surface-budget-v1",
         tuple((name, "ready") for name in CONTRIBUTOR_ORDER),
         tuple(f"group-{index}" for index in range(32)),
-        MODEL_TOOL_NAMES,
+        _TEST_TOOL_NAMES,
         tuple(source.content_revision_fingerprint for source in sources),
         100,
         80,
@@ -1199,7 +1203,7 @@ def test_manifest_v2_budget_guard_interrupts_maximal_audit_at_exact_checkpoint()
         "model-surface-budget-v1",
         tuple((name, "ready") for name in CONTRIBUTOR_ORDER),
         tuple(f"group-{index}" for index in range(32)),
-        MODEL_TOOL_NAMES,
+        _TEST_TOOL_NAMES,
         tuple(source.content_revision_fingerprint for source in sources),
         100,
         80,
@@ -1283,7 +1287,7 @@ def test_manifest_v2_sha_updates_fixed_byte_chunks(monkeypatch: pytest.MonkeyPat
         "model-surface-budget-v1",
         tuple((name, "ready") for name in CONTRIBUTOR_ORDER),
         tuple(f"group-{index}" for index in range(32)),
-        MODEL_TOOL_NAMES,
+        _TEST_TOOL_NAMES,
         tuple(source.content_revision_fingerprint for source in sources),
         100,
         80,
@@ -1332,7 +1336,7 @@ def test_manifest_budget_guard_reaches_source_chunk_validation_and_sha_phases(
         "model-surface-budget-v1",
         tuple((name, "ready") for name in CONTRIBUTOR_ORDER),
         (large_identity,),
-        (MODEL_TOOL_NAMES[0],),
+        (_TEST_TOOL_NAMES[0],),
         (source.content_revision_fingerprint,),
         100,
         80,

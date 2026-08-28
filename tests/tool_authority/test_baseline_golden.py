@@ -24,6 +24,7 @@ from offerpilot.ai.agent_loop import (
     ApprovedContinuationSegment,
     ApprovedWriteSeed,
     NewTurnSeed,
+    PendingPresentationSnapshot,
     build_segment_surface_gate,
     _pending_action_revision,
     _provider_arguments_digest,
@@ -35,7 +36,6 @@ from offerpilot.ai.tool_runtime.catalog import ToolCatalog, compile_tool_metadat
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.policy_types import ToolCapability
 from offerpilot.ai.tool_runtime.contracts import (
-    BindingTarget,
     ConfirmationRequired,
     ProviderToolContract,
     ToolExecutionRecord,
@@ -46,15 +46,20 @@ from offerpilot.ai.tool_runtime.contracts import (
 from offerpilot.ai.tool_runtime.metadata import (
     ResolverImplementationBinding,
     ToolMetadataBundleV1,
+    ToolOperationMetadataPort,
 )
 from offerpilot.ai.tool_runtime.pipeline import Rejected, execute_prepared, prepare_call
 from offerpilot.ai.tool_runtime.rendering import render_compatibility
 from offerpilot.ai.types import Assistant, Message, ToolCall
 from offerpilot.ai.write_operations import (
     DeliveryOwnership,
+    LedgerOperationPreheader,
+    LedgerPendingPointer,
     OperationCommitted,
     OperationReplay,
+    PendingPersistenceRoutePort,
     TerminalPayload,
+    TypedPendingRouteHandle,
     WriteOperationError,
     ledger_fingerprint,
 )
@@ -85,7 +90,7 @@ from offerpilot.pilot_runtime.compensation import prepare_compensation_handler_c
 from offerpilot.pilot_runtime.event_sink import InMemoryRuntimeInvocationControl
 from offerpilot.pilot_runtime.persistence import PersistenceResult, PersistenceStatus
 from offerpilot.pilot_runtime.service import PilotRuntime, RuntimeDependencies
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
 from offerpilot.repositories.application_events import ApplicationEventsRepository
 from offerpilot.repositories.applications import ApplicationsRepository
 from offerpilot.repositories.jd import JDAnalysesRepository
@@ -126,6 +131,52 @@ def _test_metadata_bundle(catalog: ToolCatalog) -> ToolMetadataBundleV1:
     )
 
 
+class _BaselineLegacyRouteIssuer:
+    def __init__(self, bundle: ToolMetadataBundleV1) -> None:
+        self.bundle_instance_token = bundle.bundle_instance_token
+        self.registry_token = object()
+        self._route_handle = object()
+        self._binding = bundle.legacy_boundary().ordered_adapter_bindings[0]
+
+    def require_route(self, route_handle: object) -> object:
+        if route_handle is not self._route_handle:
+            raise ValueError("Baseline Legacy route provenance mismatch")
+        return self._binding
+
+
+def _consume_baseline_pending(
+    turn: object,
+    route_handle: object,
+    presentation: object,
+) -> object:
+    if type(route_handle) is not TypedPendingRouteHandle:
+        raise TypeError("Baseline requires an exact Typed Pending route")
+    if type(presentation) is not PendingPresentationSnapshot:
+        raise TypeError("Baseline requires an exact Pending presentation")
+    return turn
+
+
+def _bind_baseline_pending_persistence(
+    invocation: AgentLoopInvocation,
+    bundle: ToolMetadataBundleV1,
+) -> None:
+    compensation = prepare_compensation_handler_components()
+    registry = compensation.bind(bundle.compensation_view())
+    operation_port = ToolOperationMetadataPort(
+        operation_view=bundle.operation_view(),
+        legacy_boundary=bundle.legacy_boundary(),
+        compensation_view=bundle.compensation_view(),
+        compensation_registry=registry,
+        legacy_route_issuer_port=_BaselineLegacyRouteIssuer(bundle),
+    )
+    pending_port = PendingPersistenceRoutePort(operation_port=operation_port)
+    invocation._bind_pending_persistence(
+        _consume_baseline_pending,
+        operation_port,
+        pending_port,
+    )
+
+
 MODEL_TOOL_NAMES = (
     "list_applications",
     "get_application",
@@ -153,6 +204,7 @@ MODEL_TOOL_NAMES = (
     "list_jd_analyses",
     "get_jd_analysis",
 )
+MODEL_TOOL_CATALOG = build_model_tool_catalog()
 LEGACY_TOOL_NAMES = (
     "save_application_jd_version",
     "create_application_submission_snapshot",
@@ -689,7 +741,7 @@ def _raise_decode(_values: dict[str, Any]) -> dict[str, Any]:
     raise _DecodeProbeError
 
 
-def _raise_binding(_args: dict[str, Any], _context: ToolExecutionContext) -> BindingTarget:
+def _raise_binding(_args: dict[str, Any], _context: ToolExecutionContext) -> object:
     raise _BindingProbeError
 
 
@@ -1435,6 +1487,7 @@ def _run_agent_call_count_case(case: str) -> dict[str, object]:
         cancel_check=None,
         surface_gate=surface_gate,
     )
+    _bind_baseline_pending_persistence(invocation, metadata_bundle)
     result = AgentLoopRunner().run(invocation)
     assert isinstance(result, AgentTurnResult)
     return {
@@ -1461,6 +1514,7 @@ class _AuthorityOperations:
             id=self.operation_id,
             conversation_id=7,
             status=status,
+            adapter_kind="typed",
             tool_call_id="call-1",
             tool_name="create_application",
             proposal_fingerprint="proposal",
@@ -1482,6 +1536,25 @@ class _AuthorityOperations:
 
     def get(self, _operation_id: str) -> object:
         return self.operation
+
+    def operation_preheader(
+        self,
+        *,
+        conversation_id: int,
+        operation_id: str | None,
+    ) -> LedgerOperationPreheader:
+        assert conversation_id == 7
+        assert operation_id in {None, self.operation_id}
+        return LedgerOperationPreheader(
+            self.operation,
+            LedgerPendingPointer(
+                conversation_id=7,
+                operation_id=self.operation_id,
+                tool_call_id="call-1",
+                tool_name="create_application",
+                pending_confirmation_claim_id="",
+            ),
+        )
 
     def replay(self, _operation: object, _fingerprint: str) -> OperationReplay:
         self.replay_calls += 1

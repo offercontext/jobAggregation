@@ -12,7 +12,7 @@ from offerpilot.ai.tool_authority.policy import (
 )
 from offerpilot.ai.tool_runtime.catalog import compile_tool_metadata_manifest
 from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG, MODEL_TOOL_NAMES
+from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
 from offerpilot.context_projector.authority_surface import (
     AuthoritySurfaceView,
     intersect_authority_surface,
@@ -23,6 +23,8 @@ from offerpilot.pilot_runtime.compensation import prepare_compensation_handler_c
 
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "tool_authority" / "dependency_policy_v1.json"
+_TEST_TOOL_CATALOG = build_model_tool_catalog()
+_TEST_TOOL_NAMES = tuple(spec.name for spec in _TEST_TOOL_CATALOG.specs)
 
 
 def _fixture() -> dict[str, object]:
@@ -30,9 +32,9 @@ def _fixture() -> dict[str, object]:
 
 
 def _bundle() -> ToolMetadataBundleV1:
-    manifest = compile_tool_metadata_manifest(MODEL_TOOL_CATALOG.specs)
+    manifest = compile_tool_metadata_manifest(_TEST_TOOL_CATALOG.specs)
     return ToolMetadataBundleV1(
-        typed_catalog=MODEL_TOOL_CATALOG,
+        typed_catalog=_TEST_TOOL_CATALOG,
         manifest=manifest,
         legacy_boundary=manifest.to_dict()["legacy_boundary"],
         compensation=prepare_compensation_handler_components().metadata_projection(),
@@ -50,7 +52,7 @@ def test_dependency_policy_v1_matches_read_only_canonical_golden() -> None:
         },
     }
     assert actual["dependency_policy_version"] == DEPENDENCY_POLICY_VERSION
-    assert actual["catalog_names"] == list(MODEL_TOOL_NAMES)
+    assert actual["catalog_names"] == list(_TEST_TOOL_NAMES)
     assert actual["dependencies"] == expected["dependencies"]
     assert "sha256:" + sha256_hex(canonical_json(actual)) == expected["canonical_sha256"]
 

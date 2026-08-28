@@ -14,7 +14,7 @@ from offerpilot.ai.tool_runtime.metadata import (
     ToolPresentationBindingV1,
 )
 from offerpilot.ai.tool_runtime.policy_types import UndoPolicy
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
 from offerpilot.ai.tool_runtime.rendering import render_compatibility
 from offerpilot.ai.tool_runtime.transport import project_transport_event
 
@@ -26,6 +26,8 @@ from .factories import (
     write_metadata,
 )
 
+
+_TEST_TOOL_CATALOG = build_model_tool_catalog()
 
 LEGACY_TOP_LEVEL_FIELDS = (
     "kind",
@@ -92,7 +94,7 @@ def test_final_tool_spec_shape_has_metadata_and_no_legacy_forwarding_fields() ->
 
 
 def test_every_production_spec_has_complete_named_presentation_binding() -> None:
-    specs = MODEL_TOOL_CATALOG.specs
+    specs = _TEST_TOOL_CATALOG.specs
     assert len(specs) == 25
     for spec in specs:
         presentation = spec.presentation
@@ -142,7 +144,7 @@ def test_special_write_success_summaries_are_owned_by_exact_presentation_binding
     result: dict[str, object],
     expected: str,
 ) -> None:
-    spec = MODEL_TOOL_CATALOG.resolve(tool_name)
+    spec = _TEST_TOOL_CATALOG.resolve(tool_name)
     assert spec is not None
     assert spec.presentation.success_summary_projector(result) == expected
 
@@ -252,7 +254,7 @@ def test_resolver_and_undo_bindings_are_direct_runtime_fields() -> None:
 
 def test_every_declared_failure_renderer_and_transport_shape_is_public_and_bounded() -> None:
     sentinel = "raw-exception-and-arguments-must-not-leak"
-    for spec in MODEL_TOOL_CATALOG.specs:
+    for spec in _TEST_TOOL_CATALOG.specs:
         for category in spec.declared_failure_categories:
             failure = ToolFailure(category=category, code=f"{spec.name}_{category}")
             visible = render_compatibility(spec, failure)
@@ -283,7 +285,7 @@ def test_typed_presentation_is_resolved_only_through_an_exact_live_route_handle(
     components = _production_components()
     lease = components.bundle.open_segment_lease()
     try:
-        for expected in MODEL_TOOL_CATALOG.specs:
+        for expected in components.typed_catalog.specs:
             route_handle = lease.resolve(expected.name)
             assert route_handle is not None
             resolved = lease.require_spec(route_handle)

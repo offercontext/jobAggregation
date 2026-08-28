@@ -31,7 +31,7 @@ from offerpilot.ai.tool_runtime.legacy_proof import (
     LegacyConfirmationLookupIdentity,
 )
 from offerpilot.ai.tool_specs import legacy as legacy_specs
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
 from offerpilot.ai.types import ToolCall
 from offerpilot.ai.write_operations import (
     OperationCommitted,
@@ -53,6 +53,9 @@ from offerpilot.repositories.offers import OffersRepository
 from offerpilot.repositories.resumes import ResumesRepository
 from tests.tool_metadata.factories import compose_synthetic_bundle
 from tests.tool_authority.test_pending_claim import create_primary_with_typed_route
+
+
+_TEST_TOOL_CATALOG = build_model_tool_catalog()
 
 
 _PREPARED_LEGACY_EXECUTION_ARGS: list[str] = []
@@ -172,7 +175,7 @@ def _scoped_approval_harness(
         jd_analyses=JDAnalysesRepository(sessions),
         run_recorder=NullRunRecorder(),
     )
-    original_spec = MODEL_TOOL_CATALOG.resolve(tool_name)
+    original_spec = _TEST_TOOL_CATALOG.resolve(tool_name)
     assert original_spec is not None
     executor_calls: list[object] = []
 

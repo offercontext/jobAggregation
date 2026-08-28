@@ -13,12 +13,13 @@ from offerpilot.ai.tool_runtime import legacy as legacy_runtime
 from offerpilot.ai.tool_runtime.catalog import compile_tool_metadata_manifest
 from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.ai.tool_specs import legacy as legacy_specs
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
 from offerpilot.pilot_runtime.compensation import prepare_compensation_handler_components
 
 
 ROOT = Path(__file__).parents[2]
 PRODUCTION_ROOT = ROOT / "src" / "offerpilot"
+_TEST_TOOL_CATALOG = build_model_tool_catalog()
 ORDERED_ADAPTERS = (
     "save_application_jd_version",
     "create_application_submission_snapshot",
@@ -53,9 +54,9 @@ def _factory() -> Any:
 
 
 def _boundary() -> Any:
-    manifest = compile_tool_metadata_manifest(MODEL_TOOL_CATALOG.specs)
+    manifest = compile_tool_metadata_manifest(_TEST_TOOL_CATALOG.specs)
     bundle = ToolMetadataBundleV1(
-        typed_catalog=MODEL_TOOL_CATALOG,
+        typed_catalog=_TEST_TOOL_CATALOG,
         manifest=manifest,
         legacy_boundary=manifest.to_dict()["legacy_boundary"],  # type: ignore[arg-type]
         compensation=prepare_compensation_handler_components().metadata_projection(),
@@ -319,5 +320,10 @@ def test_legacy_catalog_has_one_final_proof_only_identity() -> None:
     assert all(
         isinstance(adapter, legacy_runtime.LegacyDeterministicAdapterSpec) for adapter in adapters
     )
-    assert legacy_runtime.LEGACY_DETERMINISTIC_NAMES == frozenset(ORDERED_ADAPTERS)
+    assert (
+        tuple(
+            adapter.name for adapter in legacy_specs.build_static_adapter_catalog().ordered_adapters
+        )
+        == ORDERED_ADAPTERS
+    )
     assert type(MappingProxyType({})) is MappingProxyType

@@ -24,6 +24,8 @@
 
 **Task 12 scope stop:** Product work stopped before any Task 12 production edit when independent scope review proved that the baseline-only classification scan did not include `LEGACY_DETERMINISTIC_NAMES`, so it omitted both the defining `ai/tool_runtime/legacy.py` module and the public `pilot_runtime/__init__.py` re-export. The same baseline-only scan necessarily could not discover twelve Task 4-11 tests introduced after the fixed baseline that still consume the global Typed Catalog; two of them are selected directly by the required Task 12 GREEN command, while the remainder are selected by Task 13's full metadata matrix. Removing the global Catalog without migrating these exact consumers would require a forbidden test-only production façade or leave collection failures. The reviewed Task 12 scope now includes those fourteen exact production/test paths, supplements the immutable baseline scan explicitly, and runs every frozen Task 12 test consumer before the deletion commit. This scope-only correction does not change the approved design, fixed identities, 25/3/4 boundary, protocol seals, Golden assets, public API, schema, migration, or business behavior.
 
+**Task 12 second scope stop:** Product work stopped again before editing an out-of-gate production file when independent implementation review strengthened the required reflective-classification AST gate and exposed four surviving `_attribute(..., "operation"|"adapter_kind")` decisions in `pilot_runtime/continuation.py`. The fixed-baseline name scan cannot discover helper-mediated reflection, and this already-reviewed Task 11 owner was therefore absent from the frozen Task 12 list even though the Task 12 gate scans the complete production tree. Weakening the gate or retaining those decisions would violate the mechanical-deletion requirement; changing the file without a reviewed gate would violate the immutable scope. Task 12 now revisits exactly `src/offerpilot/pilot_runtime/continuation.py` to replace those four reflective classifications with exact bounded Ledger/route fields and remove the remaining preheader compatibility shape. The strengthened gate also adds explicit negative probes for helper-mediated reflection, generic Provider dict registries, Legacy proof Repository capture/query, generic initial-route receivers, aliased Golden writers, and name switches inside `tool_specs`. This scope-only correction does not change the approved design, fixed identities, 25/3/4 boundary, Provider/Legacy seals, Golden assets, public API, schema, migration, or business behavior.
+
 ---
 
 ## 0. Fixed workspace, baseline, and execution rules
@@ -97,11 +99,12 @@ tests/tool_pipeline/test_offers.py
 tests/tool_pipeline/test_resumes.py
 ```
 
-Task 12 uses this explicitly reviewed fourteen-path closure: the revised baseline scan now captures the two production Legacy definition/re-export paths, while the remaining twelve test supplements cannot be discovered from the fixed commit because Tasks 4-11 introduced them later. Sorting and de-duplication make the closure mechanical when the scan and supplements overlap:
+Task 12 uses this explicitly reviewed fifteen-path closure: the revised baseline scan captures the two production Legacy definition/re-export paths, the helper-mediated reflective decisions require the explicit Continuation owner, and the remaining twelve test supplements cannot be discovered from the fixed commit because Tasks 4-11 introduced them later. Sorting and de-duplication make the closure mechanical when the scan and supplements overlap:
 
 ```text
 src/offerpilot/ai/tool_runtime/legacy.py
 src/offerpilot/pilot_runtime/__init__.py
+src/offerpilot/pilot_runtime/continuation.py
 tests/test_agent_run_journal.py
 tests/tool_metadata/test_compensation_registry.py
 tests/tool_metadata/test_compiler.py
@@ -1105,6 +1108,7 @@ git commit -m "refactor: AI 完成工具元数据生产切换"
 - Modify: `src/offerpilot/context_projector/projector.py`
 - Modify: `src/offerpilot/pilot_runtime/__init__.py`
 - Modify: `src/offerpilot/pilot_runtime/composition.py`
+- Modify: `src/offerpilot/pilot_runtime/continuation.py`
 - Modify: `src/offerpilot/api.py`
 - Modify: `tests/agent_loop/test_deletion_gates.py`
 - Modify: `tests/test_agent_run_journal.py`
@@ -1172,12 +1176,14 @@ Delete the dead `BindingResolverSpec` descriptor-plus-callable façade, its `Bin
 
 For Legacy specifically, permit only the exact static three-Adapter declaration and proof-bound final Catalog method. AST must reject the old `build_legacy_deterministic_catalog` symbol, any Legacy factory parameter/capture of Repository or Service, any `resolve_server_loaded` parameter typed/named as ordinary Pending, and every call that passes Pending/tool name instead of `LegacyRouteProof`.
 
+For the bounded confirmation Ledger preheader, add RED coverage in `tests/pilot_runtime/test_confirmation.py` proving that Continuation calls only the exact `operation_preheader` Port and accepts only an exact `LedgerOperationPreheader`. A mapping or duck-typed wrapper, the old `load_operation_preheader` alias, and a repository without the exact Port must fail closed without calling `get()` or reconstructing a preheader from a full operation. The AST gate must reject either compatibility method name, wrapper projection, or full-operation fallback even if ordinary attribute access replaces `_attribute()`.
+
 Exact allowlists are limited to published `models.py` CHECK text, Journal `_TOOL_NAMES`, Provider declarations, three Legacy Adapter declarations, four Compensation handler declarations, protocol seals, terminal persisted-payload renderers, and read-only test fixtures.
 
 - [ ] **Step 2: Verify RED**
 
 ```powershell
-uv run pytest tests/tool_metadata/test_deletion_gates.py tests/agent_loop/test_deletion_gates.py tests/tool_pipeline tests/tool_authority/test_source_gates.py tests/tool_authority/test_baseline_golden.py tests/tool_authority/test_matrix.py tests/test_mock_legacy_removed.py tests/test_pilot_runtime_extraction_gate.py -q
+uv run pytest tests/tool_metadata/test_deletion_gates.py tests/agent_loop/test_deletion_gates.py tests/tool_pipeline tests/tool_authority/test_source_gates.py tests/tool_authority/test_baseline_golden.py tests/tool_authority/test_matrix.py tests/pilot_runtime/test_confirmation.py tests/test_mock_legacy_removed.py tests/test_pilot_runtime_extraction_gate.py -q
 ```
 
 - [ ] **Step 3: Delete every old path and migrate all remaining imports**

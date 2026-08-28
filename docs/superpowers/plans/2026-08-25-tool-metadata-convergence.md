@@ -1193,9 +1193,10 @@ Delete production definitions and update all callers to injected Bundle views/Po
 - [ ] **Step 4: Verify GREEN, privacy, serialization, and SQL assets**
 
 ```powershell
-uv run pytest tests/tool_metadata/test_deletion_gates.py tests/tool_metadata/test_published_operation_checks.py tests/agent_loop/test_deletion_gates.py tests/tool_pipeline tests/tool_authority/test_source_gates.py tests/tool_authority/test_baseline_golden.py tests/tool_authority/test_matrix.py tests/tool_authority/test_privacy.py tests/tool_authority/test_serialization.py tests/test_agent_run_journal.py tests/test_mock_legacy_removed.py tests/test_pilot_runtime_extraction_gate.py -q
-uv run pytest tests/tool_metadata tests/agent_loop tests/tool_pipeline tests/tool_authority tests/pilot_runtime tests/test_agent_run_journal.py tests/test_chat_api.py tests/test_context_projector.py tests/test_knowledge_sources_api.py tests/test_mock_legacy_removed.py tests/test_pilot_runtime_extraction_gate.py tests/test_write_operations.py tests/test_write_operation_acceptance_matrix.py -q
-uv run ruff check src/offerpilot tests/tool_metadata tests/agent_loop tests/tool_pipeline tests/tool_authority tests/pilot_runtime tests/test_agent_run_journal.py tests/test_chat_api.py tests/test_context_projector.py tests/test_knowledge_sources_api.py tests/test_mock_legacy_removed.py tests/test_pilot_runtime_extraction_gate.py tests/test_write_operations.py tests/test_write_operation_acceptance_matrix.py
+uv run pytest tests/tool_metadata tests/agent_loop tests/tool_pipeline tests/tool_authority tests/pilot_runtime tests/test_agent_run_journal.py tests/test_chat_api.py tests/test_context_projector.py tests/test_context_projector_source_gates.py tests/test_knowledge_sources_api.py tests/test_mock_legacy_removed.py tests/test_pilot_runtime_extraction_gate.py tests/test_write_operations.py tests/test_write_operation_acceptance_matrix.py -q
+$task12PythonPaths = @(Get-Content -LiteralPath "$env:TEMP\offerpilot-tool-metadata-convergence-gate\task-12.txt" | Where-Object { $_.EndsWith('.py') })
+uv run ruff check @task12PythonPaths
+uv run ruff format --check @task12PythonPaths
 uv run mypy src/offerpilot
 ```
 

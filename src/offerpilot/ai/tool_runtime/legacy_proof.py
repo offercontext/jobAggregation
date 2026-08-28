@@ -3,12 +3,13 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+import json
 from threading import RLock
 from typing import Literal, NoReturn, Protocol, cast
 from uuid import UUID
 
-from offerpilot.ai.tool_runtime.contracts import TransientToolRuntimeValue
-from offerpilot.ai.tool_runtime.metadata import freeze_json
+from offerpilot.ai.tool_runtime.contracts import JSONValue, TransientToolRuntimeValue
+from offerpilot.ai.tool_runtime.metadata import FrozenJSONValue, canonical_json_bytes, freeze_json
 
 
 _VALUE_SEAL = object()
@@ -378,6 +379,154 @@ class PreparedLegacyCall(_RegistryOpaqueValue):
         return False
 
 
+class PreparedLegacyInputV1(_SealedValue):
+    """Factory-only exact effective input projected from one PreparedCall."""
+
+    __slots__ = (
+        "_canonical_args",
+        "_encoded_args",
+        "_confirmation_human",
+        "_integrity_seal",
+    )
+    _canonical_args: Mapping[str, JSONValue]
+    _encoded_args: str
+    _confirmation_human: str
+    _integrity_seal: tuple[str, str]
+
+    def __init__(
+        self,
+        seal: object | None = None,
+        *,
+        canonical_args: Mapping[str, JSONValue],
+        encoded_args: str,
+        confirmation_human: str,
+    ) -> None:
+        if seal is not _VALUE_SEAL:
+            raise TypeError("Legacy prepared inputs are Port-created")
+        frozen = _freeze_mapping(canonical_args, "prepared canonical arguments")
+        encoded = _require_text(encoded_args, "prepared encoded arguments", maximum=131072)
+        canonical_encoded = canonical_json_bytes(cast(FrozenJSONValue, frozen)).decode("utf-8")
+        if encoded != canonical_encoded:
+            raise ValueError("Legacy prepared argument representations drifted")
+        human = _require_text(confirmation_human, "prepared confirmation human")
+        object.__setattr__(
+            self,
+            "_canonical_args",
+            cast(Mapping[str, JSONValue], frozen),
+        )
+        object.__setattr__(self, "_encoded_args", encoded)
+        object.__setattr__(self, "_confirmation_human", human)
+        object.__setattr__(self, "_integrity_seal", (encoded, human))
+
+    def _require_integrity(self) -> None:
+        try:
+            canonical_encoded = canonical_json_bytes(
+                cast(FrozenJSONValue, self._canonical_args)
+            ).decode("utf-8")
+            if canonical_encoded != self._encoded_args or self._integrity_seal != (
+                self._encoded_args,
+                self._confirmation_human,
+            ):
+                raise ValueError("Legacy prepared input identity drift")
+            _require_text(self._confirmation_human, "prepared confirmation human")
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("Legacy prepared input identity drift") from exc
+
+    @property
+    def canonical_args(self) -> Mapping[str, JSONValue]:
+        self._require_integrity()
+        return self._canonical_args
+
+    @property
+    def encoded_args(self) -> str:
+        self._require_integrity()
+        return self._encoded_args
+
+    @property
+    def confirmation_human(self) -> str:
+        self._require_integrity()
+        return self._confirmation_human
+
+
+class LegacyPreparedInputPort(_SealedValue):
+    """Read-only projection Port bound to one exact Preparation Registry."""
+
+    __slots__ = ("_registry", "_integrity_seal")
+    _registry: LegacyPreparationRegistry
+    _integrity_seal: tuple[object, ...]
+
+    def __init__(
+        self,
+        seal: object | None = None,
+        *,
+        registry: LegacyPreparationRegistry,
+    ) -> None:
+        if seal is not _VALUE_SEAL:
+            raise TypeError("Legacy prepared-input Ports are factory-created")
+        if type(registry) is not LegacyPreparationRegistry:
+            raise TypeError("Legacy prepared-input Port requires the exact Registry")
+        object.__setattr__(self, "_registry", registry)
+        object.__setattr__(self, "_integrity_seal", (registry,))
+
+    @classmethod
+    def _create(cls, registry: LegacyPreparationRegistry) -> LegacyPreparedInputPort:
+        return cls(_VALUE_SEAL, registry=registry)
+
+    def _require_integrity(self) -> None:
+        try:
+            if not _same_identity_tuple(self._integrity_seal, (self._registry,)):
+                raise ValueError("Legacy prepared-input Port identity drift")
+            self._registry._require_integrity()
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("Legacy prepared-input Port identity drift") from exc
+
+    def require(
+        self,
+        prepared: PreparedLegacyCall,
+        *,
+        operation_id: str,
+        tool_call_id: str,
+        tool_name: str,
+    ) -> PreparedLegacyInputV1:
+        self._require_integrity()
+        inspected = False
+        try:
+            adapter, _raw_args, effective_args, metadata, _binding, _identity = (
+                self._registry._inspect_prepared(prepared)
+            )
+            inspected = True
+            expected_operation = _canonical_uuid(operation_id, "prepared operation id")
+            expected_call = _require_text(tool_call_id, "prepared tool-call id")
+            expected_name = _require_text(tool_name, "prepared tool name")
+            if (
+                metadata.get("operation_id") != expected_operation
+                or metadata.get("tool_call_id") != expected_call
+                or metadata.get("tool_name") != expected_name
+                or adapter.name != expected_name
+            ):
+                raise ValueError("Legacy prepared operation/tool identity mismatch")
+            try:
+                decoded = json.loads(effective_args)
+            except json.JSONDecodeError as exc:
+                raise ValueError("Legacy prepared arguments are not valid JSON") from exc
+            if not isinstance(decoded, Mapping):
+                raise ValueError("Legacy prepared arguments must be a JSON object")
+            adapter.require_integrity()
+            human = adapter.describe(effective_args)
+            if type(human) is not str:
+                raise TypeError("Legacy prepared confirmation human must be exact text")
+            return PreparedLegacyInputV1(
+                _VALUE_SEAL,
+                canonical_args=cast(Mapping[str, JSONValue], decoded),
+                encoded_args=effective_args,
+                confirmation_human=human,
+            )
+        except BaseException:
+            if inspected:
+                self._registry._revoke_prepared(prepared)
+            raise
+
+
 class LegacyRouteProof(_RegistryOpaqueValue):
     __slots__ = ()
 
@@ -554,53 +703,79 @@ class LegacyRouteIssuanceLease(_SealedValue):
                 object.__setattr__(self, "_cleanup_roots", tuple(callbacks))
                 self._seal()
 
+    def _run_bound_projection(self, callback: Callable[[], object]) -> None:
+        self._require_integrity()
+        if not callable(callback):
+            raise TypeError("Legacy bound projection requires an exact callable")
+        provenance_port = self._provenance_port
+        run_bound = getattr(provenance_port, "_run_bound_projection", None)
+        if not callable(run_bound):
+            raise ValueError("Legacy bound projection provenance is unavailable")
+        run_bound(self, callback)
+
+    def _run_verified_executor(self, callback: Callable[[], str]) -> str:
+        self._require_integrity()
+        if not callable(callback):
+            raise TypeError("Legacy executor requires an exact callable")
+        provenance_port = self._provenance_port
+        run_executor = getattr(provenance_port, "_run_verified_executor", None)
+        if not callable(run_executor):
+            raise ValueError("Legacy executor transaction provenance is unavailable")
+        return cast(str, run_executor(self, callback))
+
     def close(self, *, outcome: str | None = None) -> None:
         del outcome
         seal = getattr(self, "_integrity_seal", ())
-        sealed_lock = seal[1] if type(seal) is tuple and len(seal) == 8 else None
-        lock = sealed_lock if type(sealed_lock) is _RLOCK_TYPE else getattr(self, "_lock", None)
-        if type(lock) is not _RLOCK_TYPE:
+        if type(seal) is not tuple or len(seal) != 8 or seal[0] is not self:
+            try:
+                object.__setattr__(self, "_status", "closed")
+            except BaseException:
+                pass
+            return
+        lock = seal[1]
+        session_token = seal[2]
+        runtime_container_token = seal[3]
+        provenance = seal[4]
+        sealed_status = seal[5]
+        sealed_cleanup = seal[6]
+        sealed_roots = seal[7]
+        if (
+            type(lock) is not _RLOCK_TYPE
+            or type(session_token) is not object
+            or type(runtime_container_token) is not object
+            or not callable(getattr(provenance, "_close_issuance", None))
+            or type(sealed_status) is not str
+            or sealed_status not in ("open", "closing", "closed")
+            or type(sealed_cleanup) is not list
+            or type(sealed_roots) is not tuple
+            or any(
+                type(candidate) is not tuple or len(candidate) != 2 or not callable(candidate[1])
+                for candidate in sealed_roots
+            )
+            or len({id(candidate[0]) for candidate in sealed_roots}) != len(sealed_roots)
+        ):
+            try:
+                object.__setattr__(self, "_status", "closed")
+            except BaseException:
+                pass
             return
         try:
             with lock:
-                integrity_valid = True
-                try:
-                    self._require_integrity()
-                except (TypeError, ValueError):
-                    integrity_valid = False
-                if integrity_valid and self._status == "closed":
+                if sealed_status == "closed":
                     return
-                sealed_roots = seal[7] if type(seal) is tuple and len(seal) == 8 else ()
-                current_cleanup = getattr(self, "_cleanup", None)
-                current_roots = tuple(current_cleanup) if type(current_cleanup) is list else ()
-                roots: list[tuple[object, Callable[[], None]]] = []
-                for candidates in (
-                    sealed_roots,
-                    getattr(self, "_cleanup_roots", ()),
-                    current_roots,
-                ):
-                    if type(candidates) is not tuple:
-                        continue
-                    for candidate in candidates:
-                        if (
-                            type(candidate) is tuple
-                            and len(candidate) == 2
-                            and callable(candidate[1])
-                            and all(existing[0] is not candidate[0] for existing in roots)
-                        ):
-                            roots.append(cast(tuple[object, Callable[[], None]], candidate))
-                provenance = seal[4] if type(seal) is tuple and len(seal) == 8 else None
-                if not callable(getattr(provenance, "_close_issuance", None)):
-                    provenance = getattr(self, "_provenance_port", None)
+                roots = cast(tuple[tuple[object, Callable[[], None]], ...], sealed_roots)
+                object.__setattr__(self, "_lock", lock)
+                object.__setattr__(self, "_session_token", session_token)
+                object.__setattr__(self, "_runtime_container_token", runtime_container_token)
+                object.__setattr__(self, "_provenance_port", provenance)
                 object.__setattr__(self, "_status", "closing")
                 object.__setattr__(self, "_cleanup", list(roots))
-                object.__setattr__(self, "_cleanup_roots", tuple(roots))
+                object.__setattr__(self, "_cleanup_roots", roots)
                 self._seal()
-                if callable(getattr(provenance, "_close_issuance", None)):
-                    try:
-                        cast(_LegacyIssuanceProvenancePort, provenance)._close_issuance(self)
-                    except BaseException:
-                        pass
+                try:
+                    cast(_LegacyIssuanceProvenancePort, provenance)._close_issuance(self)
+                except BaseException:
+                    pass
                 for _owner, callback in roots:
                     try:
                         callback()
@@ -1745,6 +1920,7 @@ class LegacyRouteProofRegistry(TransientToolRuntimeValue):
         consumer_port: LegacyRouteProofConsumerPort,
         handle: object,
         context: object,
+        before_execute: Callable[[], object] | None,
     ) -> str:
         with self._lock:
             self._require_integrity()
@@ -1771,8 +1947,12 @@ class LegacyRouteProofRegistry(TransientToolRuntimeValue):
                     adapter=entry.adapter,
                     issuance_lease=entry.issuance_lease,
                 )
+                if before_execute is not None:
+                    entry.issuance_lease._run_bound_projection(before_execute)
                 execute = entry.adapter.execute
-                return execute(encoded_args, context)
+                return entry.issuance_lease._run_verified_executor(
+                    lambda: execute(encoded_args, context)
+                )
             finally:
                 self._preparation_registry._finish_execute(
                     prepared_identity=entry.prepared_identity,
@@ -2021,11 +2201,18 @@ class LegacyRouteProofConsumerPort(_SealedValue):
             handle=handle,
         )
 
-    def execute(self, handle: object, context: object) -> str:
+    def execute(
+        self,
+        handle: object,
+        context: object,
+        *,
+        before_execute: Callable[[], object] | None = None,
+    ) -> str:
         return self._proof_registry._execute(
             consumer_port=self,
             handle=handle,
             context=context,
+            before_execute=before_execute,
         )
 
 
@@ -2035,9 +2222,11 @@ __all__ = [
     "LegacyConfirmationLookupIdentity",
     "LegacyPreparationBinding",
     "LegacyPreparationRegistry",
+    "LegacyPreparedInputPort",
     "LegacyRouteIssuanceLease",
     "LegacyRouteProof",
     "LegacyRouteProofConsumerPort",
     "LegacyRouteProofRegistry",
     "PreparedLegacyCall",
+    "PreparedLegacyInputV1",
 ]

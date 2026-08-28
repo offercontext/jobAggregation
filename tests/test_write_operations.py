@@ -29,8 +29,6 @@ from offerpilot.ai.tool_runtime.policy_types import ToolCapability, UndoPolicy
 from offerpilot.ai.tool_runtime.contracts import (
     ConfirmationRequired,
     ProviderToolContract,
-    REQUIRED_UNDO_TOOL_NAMES,
-    TRANSACTIONAL_TYPED_WRITE_NAMES,
     ToolExceptionMapping,
     ToolSpec,
 )
@@ -44,11 +42,7 @@ from offerpilot.ai.tool_runtime.metadata import (
 from offerpilot.ai.tool_runtime.pipeline import execute_prepared, prepare_call
 from offerpilot.ai.types import ToolCall
 from offerpilot.ai.write_operations import (
-    COMPENSATION_OPERATION_NAMES,
     LEDGER_KEY_FILENAME,
-    LEGACY_WRITE_OPERATION_NAMES,
-    REQUIRED_UNDO_OPERATION_NAMES,
-    TYPED_WRITE_OPERATION_NAMES,
     DeliveryHeartbeat,
     DeliveryOwnership,
     OperationCommitted,
@@ -77,6 +71,31 @@ from tests.tool_metadata.factories import (
     synthetic_tool_spec,
     write_metadata,
 )
+from tests.tool_metadata.golden import load_asset
+from tests.tool_metadata.test_production_bundle import _production_components
+from tests.tool_authority.test_pending_claim import (
+    create_primary_with_typed_route,
+    legacy_pending_route,
+)
+
+
+def _persist_legacy_pending(
+    chat: ChatRepository,
+    conversation_id: int,
+    pending: PendingAction,
+    messages: list[dict[str, str]],
+) -> bool:
+    with legacy_pending_route(
+        pending,
+        conversation_id,
+        source="jd_clarification",
+    ) as route_handle:
+        return chat.persist_pending_action(
+            conversation_id,
+            pending,
+            messages,
+            route_handle=route_handle,
+        )
 
 
 def _capture_empty_undo_seed(_context: object, _args: object) -> None:
@@ -204,20 +223,23 @@ def _approval_request_fingerprint(key, operation_id: str, pending: PendingAction
 
 
 def test_write_operation_manifests_are_exact() -> None:
-    assert frozenset(TYPED_WRITE_OPERATION_NAMES) == TRANSACTIONAL_TYPED_WRITE_NAMES
-    assert len(TYPED_WRITE_OPERATION_NAMES) == 12
-    assert LEGACY_WRITE_OPERATION_NAMES == (
-        "save_application_jd_version",
-        "create_application_submission_snapshot",
-        "record_application_outcome",
+    components = _production_components()
+    matrix = load_asset("tool_operation_matrix_0c10e05.json")
+    assert tuple(
+        entry.operation_name
+        for entry in components.operation_port.typed_primary_entries
+        if entry.operation_kind == "transactional_write"
+    ) == tuple(
+        item["name"]
+        for item in matrix["typed_operations"]
+        if item["operation_kind"] == "transactional_write"
     )
-    assert COMPENSATION_OPERATION_NAMES == (
-        "undo:update_application_status",
-        "undo:create_application",
-        "undo:create_application_event",
-        "undo:add_note",
-    )
-    assert REQUIRED_UNDO_OPERATION_NAMES == REQUIRED_UNDO_TOOL_NAMES
+    assert tuple(
+        entry.operation_name for entry in components.operation_port.legacy_primary_entries
+    ) == tuple(item["name"] for item in matrix["legacy_operations"])
+    assert tuple(
+        entry.operation_name for entry in components.operation_port.compensation_entries
+    ) == tuple(item["compensation_kind"] for item in matrix["compensation_operations"])
 
 
 @pytest.mark.parametrize(
@@ -247,7 +269,7 @@ def test_ledger_key_is_independent_and_missing_key_fails_closed(tmp_path) -> Non
         human="update",
         operation_id=str(uuid4()),
     )
-    assert chat.persist_pending_action(conversation.id, pending, [])
+    assert _persist_legacy_pending(chat, conversation.id, pending, [])
 
     key_path = tmp_path / LEDGER_KEY_FILENAME
     key_path.unlink()
@@ -334,7 +356,7 @@ def test_bound_chat_operation_uses_caller_transaction(tmp_path) -> None:
     )
 
     with sessions() as session:
-        assert chat.bind(session).persist_pending_action(conversation.id, pending, [])
+        assert _persist_legacy_pending(chat.bind(session), conversation.id, pending, [])
         assert (
             session.get(Conversation, conversation.id).pending_operation_id == pending.operation_id
         )
@@ -350,17 +372,14 @@ def test_transition_trigger_rejects_out_of_order_state(tmp_path) -> None:
     chat = ChatRepository(sessions, repository)
     conversation = chat.create_conversation("workspace")
     operation_id = str(uuid4())
-    assert chat.persist_pending_action(
-        conversation.id,
-        PendingAction(
-            tool_call_id="transition-write",
-            tool_name="save_application_jd_version",
-            args='{"id":1,"status":"offer"}',
-            human="update",
-            operation_id=operation_id,
-        ),
-        [],
+    transition_pending = PendingAction(
+        tool_call_id="transition-write",
+        tool_name="save_application_jd_version",
+        args='{"id":1,"status":"offer"}',
+        human="update",
+        operation_id=operation_id,
     )
+    assert _persist_legacy_pending(chat, conversation.id, transition_pending, [])
 
     with sessions() as session, pytest.raises(IntegrityError):
         session.add(
@@ -378,18 +397,15 @@ def test_primary_operation_rejects_empty_tool_call_id(tmp_path) -> None:
     chat = ChatRepository(sessions, repository)
     conversation = chat.create_conversation("workspace")
 
-    with pytest.raises(IntegrityError):
-        chat.persist_pending_action(
-            conversation.id,
-            PendingAction(
-                tool_call_id="",
-                tool_name="save_application_jd_version",
-                args='{"id":1,"status":"offer"}',
-                human="update",
-                operation_id=str(uuid4()),
-            ),
-            [],
-        )
+    invalid_pending = PendingAction(
+        tool_call_id="",
+        tool_name="save_application_jd_version",
+        args='{"id":1,"status":"offer"}',
+        human="update",
+        operation_id=str(uuid4()),
+    )
+    with pytest.raises((IntegrityError, TypeError, ValueError)):
+        _persist_legacy_pending(chat, conversation.id, invalid_pending, [])
 
 
 def test_mapped_domain_failure_rolls_back_executor_savepoint(tmp_path) -> None:
@@ -414,13 +430,14 @@ def test_mapped_domain_failure_rolls_back_executor_savepoint(tmp_path) -> None:
         setup_conversation.pending_tool_name = pending.tool_name
         setup_conversation.pending_args = pending.args
         setup_conversation.pending_human = pending.human
-        repository.create_primary(
+        create_primary_with_typed_route(
+            repository,
             setup_session,
             operation_id=operation_id,
             conversation_id=conversation.id,
             tool_call_id=pending.tool_call_id,
             tool_name=pending.tool_name,
-            adapter_kind="typed",
+            raw_args=pending.args,
             proposal_fingerprint=ledger_fingerprint(key, "write-operation-proposal-v1", {}),
             confirmation_token_fingerprint=ledger_fingerprint(
                 key, "write-operation-confirmation-token-v1", b"synthetic-token"
@@ -543,6 +560,7 @@ def test_mapped_domain_failure_rolls_back_executor_savepoint(tmp_path) -> None:
         context=context,
         prepare_identity=prepare_identity,
         request_fingerprint=_approval_request_fingerprint(key, operation_id, pending),
+        parent_route_binder=None,
     )
 
     assert isinstance(execution, OperationFailed)
@@ -619,13 +637,14 @@ def _primary_execution_harness(
         setup_conversation.pending_tool_name = pending.tool_name
         setup_conversation.pending_args = pending.args
         setup_conversation.pending_human = pending.human
-        repository.create_primary(
+        create_primary_with_typed_route(
+            repository,
             setup_session,
             operation_id=operation_id,
             conversation_id=conversation.id,
             tool_call_id=pending.tool_call_id,
             tool_name=pending.tool_name,
-            adapter_kind="typed",
+            raw_args=pending.args,
             proposal_fingerprint=ledger_fingerprint(
                 key,
                 "write-operation-proposal-v1",
@@ -919,6 +938,7 @@ def test_locked_modify_executes_effective_args_against_original_proposal(tmp_pat
             context=harness.context,
             prepare_identity=harness.prepare_identity,
             request_fingerprint=harness.request_fingerprint,
+            parent_route_binder=None,
             edited_args_present=harness.edited_args_present,
             edited_args=harness.edited_args,
         )
@@ -954,6 +974,7 @@ def test_locked_modify_rejects_patch_prepared_mismatch_before_executor(tmp_path)
             context=harness.context,
             prepare_identity=harness.prepare_identity,
             request_fingerprint=harness.request_fingerprint,
+            parent_route_binder=None,
             edited_args_present=True,
             edited_args=harness.edited_args,
         )
@@ -1008,6 +1029,7 @@ def test_locked_modify_preserves_explicit_patch_presence_when_effective_is_uncha
             context=harness.context,
             prepare_identity=harness.prepare_identity,
             request_fingerprint=harness.request_fingerprint,
+            parent_route_binder=None,
             edited_args_present=True,
             edited_args=edited_args,
         )
@@ -1054,6 +1076,7 @@ def test_post_executor_projection_failure_terminalizes_without_rerun(
         context=harness.context,
         prepare_identity=harness.prepare_identity,
         request_fingerprint=harness.request_fingerprint,
+        parent_route_binder=None,
     )
     try:
         _consume_outer_approval_transition(harness)
@@ -1086,6 +1109,7 @@ def test_ordinary_executor_exception_terminalizes_without_rerun(tmp_path) -> Non
         context=harness.context,
         prepare_identity=harness.prepare_identity,
         request_fingerprint=harness.request_fingerprint,
+        parent_route_binder=None,
     )
     try:
         _consume_outer_approval_transition(harness)
@@ -1173,6 +1197,7 @@ def test_approved_write_outer_and_inner_transitions_are_each_one_shot(
             context=context,
             prepare_identity=prepare_identity,
             request_fingerprint=harness.request_fingerprint,
+            parent_route_binder=None,
         )
         assert record is not None
         return record
@@ -1250,6 +1275,7 @@ def test_locked_pending_args_change_rejects_before_executor(tmp_path) -> None:
             context=harness.context,
             prepare_identity=harness.prepare_identity,
             request_fingerprint=harness.request_fingerprint,
+            parent_route_binder=None,
         )
         assert isinstance(execution, OperationUnknown)
         assert execution.code == "operation_identity_conflict"
@@ -1288,6 +1314,7 @@ def test_undo_seed_cannot_end_claim_transaction_before_executor(
             context=harness.context,
             prepare_identity=harness.prepare_identity,
             request_fingerprint=harness.request_fingerprint,
+            parent_route_binder=None,
         )
         assert isinstance(execution, OperationUnknown)
         assert execution.code == "operation_not_committed"

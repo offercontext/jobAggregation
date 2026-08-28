@@ -5,7 +5,7 @@ import re
 import sqlite3
 import zipfile
 from datetime import datetime, timezone
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 from importlib.metadata import PackageNotFoundError, version as package_version
 from io import BytesIO
@@ -20,7 +20,7 @@ from fastapi import BackgroundTasks, Body, FastAPI, File, Form, Query, Request, 
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pypdf import PdfReader
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from offerpilot.ai.agent_contracts import ChatModel, PendingAction
 from offerpilot.ai.deterministic_actions import (
@@ -58,6 +58,16 @@ from offerpilot.reliability.trace import (
 )
 from offerpilot.ai.client import ConfiguredAIClient
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.ai.tool_runtime.metadata import (
+    CommittedPrimaryOperationIdentityV1,
+    FrozenJSONValue,
+    ToolOperationMetadataPort,
+    materialize_json,
+)
+from offerpilot.ai.tool_runtime.legacy_proof import (
+    LegacyApprovedConfirmationInput,
+    LegacyConfirmationLookupIdentity,
+)
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.ai.write_operations import (
     OperationFailed,
@@ -65,8 +75,8 @@ from offerpilot.ai.write_operations import (
     OperationUnknown,
     WriteOperationCoordinator,
     WriteOperationRepository,
-    compensation_kind_for_undo,
     load_or_create_ledger_key,
+    payload_from_operation,
 )
 from offerpilot.agent_runtime.journal import (
     NullRunRecorderFactory,
@@ -88,16 +98,23 @@ from offerpilot.pilot_runtime import (
     AttachmentReference,
     ConfirmationRequest,
     EditedArgs,
+    PilotRuntime,
     PilotActionDescriptor,
     RuntimeFailureOutcome,
     StartTurnRequest,
     build_pilot_runtime,
     freeze_json_mapping,
 )
+from offerpilot.pilot_runtime.contracts import LegacyReadContext
+from offerpilot.pilot_runtime.legacy_route import (
+    LegacyConfirmationRouteComponents,
+    LegacyPersistedPresentationPort,
+)
 from offerpilot.pilot_runtime.event_sink import (
     ClosedAgentSignalSink,
     RuntimeSignalLatch,
 )
+from offerpilot.pilot_runtime.compensation import CompensationHandlerRegistry
 from offerpilot.pilot_runtime.errors import (
     RuntimeAgentTimedOut,
     RuntimeCancelled,
@@ -813,10 +830,6 @@ def _resolve_knowledge_download_path(
     return candidate
 
 
-class UndoConflictError(RuntimeError):
-    pass
-
-
 def _mock_interview_proposal_json(record: Any) -> dict[str, Any]:
     return {
         "proposal_id": record.id,
@@ -1361,12 +1374,6 @@ def create_app(
         missing_target_question=lambda pending, _conversation_id: _pending_action_missing_question(
             cast(PendingAction, pending),
             applications,
-        ),
-        pending_action_details=lambda pending: _pending_action_details(
-            pending.tool_name,
-            _safe_tool_args(pending.args),
-            applications,
-            application_jd_versions,
         ),
         title_from_message=_title_from_message,
         catalog=MODEL_TOOL_CATALOG,
@@ -4499,6 +4506,13 @@ def create_app(
         typed_request = _normalize_runtime_confirmation_request(payload)
         if isinstance(typed_request, JSONResponse):
             return typed_request
+        if typed_request.operation_id is None:
+            live_pending = chat.get_pending_action(typed_request.conversation_id)
+            if live_pending is not None and live_pending.operation_id:
+                typed_request = replace(
+                    typed_request,
+                    operation_id=live_pending.operation_id,
+                )
         runtime = http_request.app.state.pilot_runtime
         try:
             outcome = execute_runtime_sync(
@@ -4542,30 +4556,69 @@ def create_app(
             return error_response(
                 409, "operation integrity error", code="operation_integrity_error"
             )
+        runtime = cast(PilotRuntime, app.state.pilot_runtime)
+        components = runtime.metadata_components
+        operation_port = getattr(components, "operation_port", None)
+        compensation_registry = getattr(components, "compensation_registry", None)
+        if (
+            type(operation_port) is not ToolOperationMetadataPort
+            or type(compensation_registry) is not CompensationHandlerRegistry
+        ):
+            return error_response(
+                409, "operation integrity error", code="operation_integrity_error"
+            )
         try:
-            compensation_kind = compensation_kind_for_undo(str(immutable_undo.get("kind") or ""))
-        except ValueError:
+            parent_payload = payload_from_operation(parent)
+            parent_identity = CommittedPrimaryOperationIdentityV1(
+                operation_id=parent.id,
+                primary_tool=parent.tool_name,
+                operation_role=cast(Any, parent.operation_role),
+                adapter_kind=cast(Any, parent.adapter_kind),
+                status=cast(Any, parent.status),
+                terminal_payload_digest=parent_payload.digest,
+            )
+            required_entries = tuple(
+                entry
+                for entry in operation_port.required_undo_entries
+                if entry.primary_tool == parent_identity.primary_tool
+            )
+            if len(required_entries) != 1:
+                raise ValueError("required Undo metadata is not unique")
+            required = required_entries[0]
+            bindings = tuple(
+                binding
+                for binding in runtime.metadata_bundle.compensation_view().ordered_handler_bindings
+                if binding.compensation_kind == required.compensation_kind
+            )
+            if len(bindings) != 1:
+                raise ValueError("compensation binding is not unique")
+            handler_handle = compensation_registry.bind_handler(bindings[0])
+            route_handle = operation_port.bind_compensation(parent_identity, handler_handle)
+            handler = compensation_registry.resolve(route_handle)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
             return error_response(
                 409, "operation integrity error", code="operation_integrity_error"
             )
 
         def execute_undo(session: Session, undo: Mapping[str, Any]) -> str:
             try:
-                return _execute_chat_undo(
-                    dict(undo),
-                    applications.bind(session),
-                    events.bind(session),
-                    notes.bind(session),
-                )
-            except UndoConflictError as exc:
+                frozen_undo = freeze_json_mapping(dict(undo))
+                handler.validate_undo_payload(cast(Any, frozen_undo))
+                return handler.execute(session, cast(Any, frozen_undo))
+            except ValueError as exc:
                 raise ValueError("undo_conflict") from exc
 
-        execution = write_coordinator.execute_compensation(
-            parent_operation_id=parent_operation_id,
-            conversation_id=conversation_id,
-            compensation_kind=compensation_kind,
-            executor=execute_undo,
-        )
+        try:
+            execution = write_coordinator.execute_compensation(
+                parent=parent_identity,
+                conversation_id=conversation_id,
+                operation_port=operation_port,
+                route_handle=route_handle,
+                handler_handle=handler_handle,
+                executor=execute_undo,
+            )
+        finally:
+            operation_port.revoke_compensation(route_handle)
         if isinstance(execution, OperationUnknown):
             return error_response(
                 409 if execution.code.endswith("conflict") else 503,
@@ -4599,6 +4652,13 @@ def create_app(
         typed_request = _normalize_runtime_confirmation_request(payload)
         if isinstance(typed_request, JSONResponse):
             return typed_request
+        if typed_request.operation_id is None:
+            live_pending = chat.get_pending_action(typed_request.conversation_id)
+            if live_pending is not None and live_pending.operation_id:
+                typed_request = replace(
+                    typed_request,
+                    operation_id=live_pending.operation_id,
+                )
         runtime = http_request.app.state.pilot_runtime
         try:
             return runtime_stream_response(
@@ -4612,7 +4672,12 @@ def create_app(
     @app.get("/api/chat/conversations")
     def list_conversations(include_archived: bool = False) -> list[dict[str, Any]]:
         return [
-            _conversation_json(item, applications, application_jd_versions)
+            _conversation_json(
+                item,
+                applications,
+                cast(PilotRuntime, app.state.pilot_runtime),
+                session_factory,
+            )
             for item in chat.list_conversations(include_archived=include_archived)
         ]
 
@@ -4694,7 +4759,14 @@ def create_app(
                 return error_response(409, "该对话有待确认操作，完成或取消后才能归档")
             return error_response(409, "conversation changed; please retry", code="scope_conflict")
         assert conversation is not None
-        return JSONResponse(_conversation_json(conversation, applications, application_jd_versions))
+        return JSONResponse(
+            _conversation_json(
+                conversation,
+                applications,
+                cast(PilotRuntime, app.state.pilot_runtime),
+                session_factory,
+            )
+        )
 
     @app.delete("/api/chat/conversations/{conversation_id}")
     def delete_conversation(conversation_id: int) -> dict[str, str]:
@@ -8397,7 +8469,8 @@ def _snapshot_attachment_messages(rows: tuple[tuple[str, str, Any], ...]) -> lis
 def _conversation_json(
     conversation: Any,
     applications: ApplicationsRepository,
-    application_jd_versions: ApplicationJDService | None = None,
+    runtime: PilotRuntime,
+    session_factory: sessionmaker[Session],
 ) -> dict[str, Any]:
     payload = ConversationOut.model_validate(conversation).model_dump(mode="json")
     payload["context_label"] = _conversation_context_label(conversation, applications)
@@ -8410,8 +8483,10 @@ def _conversation_json(
                 human=conversation.pending_human or conversation.pending_tool_name,
                 operation_id=conversation.pending_operation_id,
             ),
-            applications,
-            application_jd_versions,
+            runtime=runtime,
+            applications=applications,
+            session_factory=session_factory,
+            conversation_id=conversation.id,
         )
     if conversation.clarification_tool_name:
         payload["pending_clarification"] = _pending_action_json(
@@ -8421,8 +8496,10 @@ def _conversation_json(
                 args=conversation.clarification_args,
                 human=conversation.clarification_human or conversation.clarification_tool_name,
             ),
-            applications,
-            application_jd_versions,
+            runtime=runtime,
+            applications=applications,
+            session_factory=session_factory,
+            conversation_id=conversation.id,
         )
         payload["pending_clarification"]["question"] = conversation.clarification_question
     else:
@@ -8458,26 +8535,92 @@ def _conversation_context_label(conversation: Any, applications: ApplicationsRep
 
 def _pending_action_json(
     pending: PendingAction,
-    applications: ApplicationsRepository | None = None,
-    application_jd_versions: ApplicationJDService | None = None,
+    *,
+    runtime: PilotRuntime,
+    applications: ApplicationsRepository,
+    session_factory: sessionmaker[Session],
+    conversation_id: int,
 ) -> dict[str, Any]:
     args = _safe_tool_args(pending.args)
+    human = pending.human
+    details: dict[str, Any] = {}
+    editable_fields: list[dict[str, Any]] = []
+    typed_route_found = False
+    lease = runtime.metadata_bundle.open_segment_lease()
+    try:
+        spec_handle = lease.resolve(pending.tool_name)
+        if spec_handle is not None:
+            typed_route_found = True
+            spec = lease.require_spec(spec_handle)
+            decoded = spec.decoder(args)
+            projected = spec.presentation.pending_details_projector(
+                decoded,
+                SimpleNamespace(applications=applications),
+            )
+            details = dict(projected) if isinstance(projected, Mapping) else {}
+            editable_fields = [
+                descriptor.to_compat_descriptor() for descriptor in spec.metadata.editable_fields
+            ]
+    except (TypeError, ValueError):
+        details = {}
+        editable_fields = []
+    finally:
+        lease.close()
+    if not typed_route_found:
+        try:
+            components = runtime.metadata_components
+            routes = getattr(components, "confirmation_routes", None)
+            if type(routes) is not LegacyConfirmationRouteComponents:
+                raise TypeError("Legacy Pending presentation routes are unavailable")
+            port = routes.persisted_presentation_port
+            if type(port) is not LegacyPersistedPresentationPort:
+                raise TypeError("Legacy Pending presentation Port is unavailable")
+            with session_factory() as identity_session:
+                with identity_session.begin():
+                    with session_factory() as context_session:
+                        with context_session.begin():
+                            projected = port.project_pending(
+                                identity_session,
+                                LegacyConfirmationLookupIdentity(conversation_id=conversation_id),
+                                LegacyApprovedConfirmationInput(
+                                    decision="approved",
+                                    operation_id=pending.operation_id,
+                                    confirmation_token=_confirmation_token(pending),
+                                    edited_args_present=False,
+                                    edited_args=None,
+                                    rejection_feedback_present=False,
+                                    rejection_feedback="",
+                                ),
+                                LegacyReadContext(
+                                    context_session,
+                                    applications,
+                                    ApplicationJDService(session_factory),
+                                ),
+                            )
+            human = projected.human
+            details = cast(
+                dict[str, Any],
+                materialize_json(cast(FrozenJSONValue, projected.details)),
+            )
+            editable_fields = [
+                cast(
+                    dict[str, Any],
+                    materialize_json(cast(FrozenJSONValue, descriptor)),
+                )
+                for descriptor in projected.editable_fields
+            ]
+        except (TypeError, ValueError):
+            details = {}
+            editable_fields = []
     payload: dict[str, Any] = {
         "tool_name": pending.tool_name,
         "operation_id": pending.operation_id,
-        "human": pending.human,
+        "human": human,
         "args": args,
         "confirmation_token": _confirmation_token(pending),
-        "editable_fields": (
-            [descriptor.to_compat_descriptor() for descriptor in spec.metadata.editable_fields]
-            if (spec := MODEL_TOOL_CATALOG.resolve(pending.tool_name)) is not None
-            else []
-        ),
+        "editable_fields": editable_fields,
     }
-    if applications is not None:
-        payload.update(
-            _pending_action_details(pending.tool_name, args, applications, application_jd_versions)
-        )
+    payload.update(details)
     return payload
 
 
@@ -8552,106 +8695,6 @@ def _has_existing_application(value: Any, applications: ApplicationsRepository) 
         return applications.get(int(value)) is not None
     except (TypeError, ValueError):
         return False
-
-
-def _pending_action_details(
-    tool_name: str,
-    args: dict[str, Any],
-    applications: ApplicationsRepository,
-    application_jd_versions: ApplicationJDService | None = None,
-) -> dict[str, Any]:
-    if tool_name == "save_application_jd_version":
-        app_id = args.get("application_id")
-        if not isinstance(app_id, (int, str)):
-            return {}
-        try:
-            resolved_id = int(app_id)
-        except (TypeError, ValueError):
-            return {}
-        application = applications.get(resolved_id)
-        if application is None:
-            return {}
-        target = {
-            "id": f"application-{application.id}",
-            "kind": "application",
-            "title": application.company_name,
-            "meta": application.position_name,
-            "source": "pending_action",
-        }
-        details: dict[str, Any] = {"target": target, "evidence": [target]}
-        if application_jd_versions is not None:
-            expected_version_id = args.get("expected_current_version_id")
-            expected_version = (
-                application_jd_versions.get_version(application.id, expected_version_id)
-                if type(expected_version_id) is int
-                else None
-            )
-            current_number = (
-                expected_version.version_number if expected_version is not None else None
-            )
-            details["application_jd"] = {
-                "current_version_number": current_number,
-                "proposed_version_number": (current_number or 0) + 1,
-            }
-        return details
-    spec = MODEL_TOOL_CATALOG.resolve(tool_name)
-    if spec is None:
-        return {}
-    try:
-        typed_args = spec.decoder(args)
-        projected_details = spec.presentation.pending_details_projector(
-            typed_args,
-            SimpleNamespace(applications=applications),
-        )
-    except (TypeError, ValueError):
-        return {}
-    return dict(projected_details) if isinstance(projected_details, Mapping) else {}
-
-
-def _execute_chat_undo(
-    undo: dict[str, Any],
-    applications: ApplicationsRepository,
-    events: ApplicationEventsRepository,
-    notes: NotesRepository,
-) -> str:
-    kind = str(undo.get("kind") or "")
-    if kind == "update_application_status":
-        before = undo.get("before")
-        expected_after = undo.get("expected_after")
-        if not isinstance(before, dict) or not isinstance(expected_after, dict):
-            raise ValueError("undo payload is invalid")
-        restored = applications.restore_status_if_matches(
-            int(undo["application_id"]),
-            expected_status=str(expected_after.get("status") or ""),
-            expected_closed_reason=str(expected_after.get("closed_reason") or ""),
-            status=str(before.get("status") or "applied"),
-            closed_reason=str(before.get("closed_reason") or ""),
-        )
-        if not restored:
-            raise UndoConflictError("当前投递已被修改，无法安全撤销。")
-        return "已撤销最近一次 AI 写入：投递状态已恢复。"
-    if kind == "delete_application":
-        expected_after = undo.get("expected_after")
-        if not isinstance(expected_after, dict) or not applications.delete_if_matches(
-            int(undo["application_id"]), expected_after
-        ):
-            raise UndoConflictError("新建投递已被修改或不存在，无法安全撤销。")
-        return "已撤销最近一次 AI 写入：新建投递已删除。"
-    if kind == "delete_application_event":
-        expected_after = undo.get("expected_after")
-        if not isinstance(expected_after, dict) or not events.delete_if_matches(
-            int(undo["application_event_id"]), expected_after
-        ):
-            raise UndoConflictError("新建日程已被修改或不存在，无法安全撤销。")
-        return "已撤销最近一次 AI 写入：新建日程已删除。"
-    if kind == "delete_note":
-        expected_after = undo.get("expected_after")
-        if not isinstance(expected_after, dict) or not notes.delete_if_matches(
-            int(undo["note_id"]), expected_after
-        ):
-            raise UndoConflictError("复盘记录已被修改或不存在，无法安全撤销。")
-        return "已撤销最近一次 AI 写入：复盘记录已删除。"
-    raise ValueError("unsupported undo payload")
 
 
 def _short_preview(value: str, max_length: int = 180) -> str:

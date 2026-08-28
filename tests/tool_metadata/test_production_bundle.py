@@ -322,6 +322,9 @@ def test_production_composition_has_no_unavailable_or_synthetic_legacy_verifier(
 def test_production_legacy_verifier_backend_reads_locks_and_claims_real_rows(
     tmp_path: Path,
 ) -> None:
+    from offerpilot.ai.agent_contracts import PendingAction
+    from tests.tool_metadata.test_pending_routes import issued_legacy_pending_route
+
     sessions = init_database(tmp_path / "legacy-verifier.sqlite3")
     key = load_or_create_ledger_key(tmp_path, sessions)
     repository = WriteOperationRepository(sessions, key)
@@ -347,24 +350,39 @@ def test_production_legacy_verifier_backend_reads_locks_and_claims_real_rows(
         )
         session.add(conversation)
         session.flush()
-        repository.create_primary(
-            session,
-            operation_id=operation_id,
-            conversation_id=conversation.id,
-            tool_call_id=tool_call_id,
-            tool_name=tool_name,
-            adapter_kind="legacy_deterministic",
-            proposal_fingerprint=ledger_fingerprint(
-                key,
-                "write-operation-proposal-v1",
-                normalized_args,
-            ),
-            confirmation_token_fingerprint=ledger_fingerprint(
-                key,
-                "write-operation-confirmation-token-v1",
-                confirmation_token.encode("ascii"),
-            ),
+        pending = PendingAction(
+            tool_call_id,
+            tool_name,
+            raw_args,
+            "confirm",
+            operation_id,
         )
+        with issued_legacy_pending_route(
+            pending,
+            conversation.id,
+            source="jd_deterministic_action",
+        ) as (route_handle, identity):
+            repository.create_primary(
+                session,
+                route_handle=route_handle,
+                operation_id=operation_id,
+                conversation_id=conversation.id,
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                pending_action_revision=identity.pending_action_revision,
+                pending_confirmation_claim_id=identity.pending_confirmation_claim_id,
+                arguments_digest=identity.arguments_digest,
+                proposal_fingerprint=ledger_fingerprint(
+                    key,
+                    "write-operation-proposal-v1",
+                    normalized_args,
+                ),
+                confirmation_token_fingerprint=ledger_fingerprint(
+                    key,
+                    "write-operation-confirmation-token-v1",
+                    confirmation_token.encode("ascii"),
+                ),
+            )
         session.commit()
         conversation_id = conversation.id
 
@@ -477,7 +495,7 @@ def test_composition_verifies_actual_ordered_adapters_before_publication(
     composition = _composition_module()
     built_catalogs: list[Any] = []
     seal_calls: list[tuple[tuple[str, ...], str, str]] = []
-    original_builder = legacy_specs.build_static_legacy_adapter_catalog
+    original_builder = legacy_specs.build_static_adapter_catalog
 
     def build_catalog() -> Any:
         catalog = original_builder()
@@ -489,7 +507,7 @@ def test_composition_verifies_actual_ordered_adapters_before_publication(
 
     monkeypatch.setattr(
         composition,
-        "build_static_legacy_adapter_catalog",
+        "build_static_adapter_catalog",
         build_catalog,
         raising=False,
     )
@@ -559,7 +577,7 @@ def test_actual_legacy_manifest_drift_fails_atomically(
     mutation: str,
     index: int,
 ) -> None:
-    catalog = legacy_specs.build_static_legacy_adapter_catalog()
+    catalog = legacy_specs.build_static_adapter_catalog()
     mutators = {
         "policy": _mutate_policy,
         "route": _mutate_route,
@@ -569,7 +587,7 @@ def test_actual_legacy_manifest_drift_fails_atomically(
     composition = _composition_module()
     monkeypatch.setattr(
         composition,
-        "build_static_legacy_adapter_catalog",
+        "build_static_adapter_catalog",
         lambda: catalog,
         raising=False,
     )

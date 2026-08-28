@@ -35,19 +35,6 @@ LEGACY_DETERMINISTIC_NAMES = frozenset(
 )
 
 
-class ServerLoadedPending(Protocol):
-    tool_name: str
-
-
-@dataclass(frozen=True)
-class LegacyDeterministicAdapter:
-    name: str
-    editable_fields: tuple[Mapping[str, JSONValue], ...]
-    describe: Callable[[str], str] = field(repr=False, compare=False)
-    validate: Callable[[str], str] = field(repr=False, compare=False)
-    execute: Callable[[str], str] = field(repr=False, compare=False)
-
-
 class _LegacyArgumentPreparationPort(Protocol):
     @property
     def editable_fields(self) -> tuple[Mapping[str, object], ...]: ...
@@ -57,19 +44,8 @@ class _LegacyArgumentPreparationPort(Protocol):
     def validate(self, encoded_args: str) -> str: ...
 
 
-class LegacyDeterministicCatalog:
-    def __init__(self, adapters: Sequence[LegacyDeterministicAdapter]) -> None:
-        ordered = tuple(adapters)
-        names = tuple(adapter.name for adapter in ordered)
-        if len(set(names)) != len(names) or frozenset(names) != LEGACY_DETERMINISTIC_NAMES:
-            raise ValueError("legacy deterministic catalog mismatch")
-        self._adapters = {adapter.name: adapter for adapter in ordered}
-
-    def resolve_server_loaded(
-        self,
-        pending: ServerLoadedPending,
-    ) -> LegacyDeterministicAdapter | None:
-        return self._adapters.get(pending.tool_name)
+class LegacyArgumentPreparationError(ValueError):
+    """Caller-correctable Legacy confirmation argument failure."""
 
 
 class LegacyRouteSourceV1(str, Enum):
@@ -160,8 +136,9 @@ def _freeze_legacy_json(value: JSONValue) -> JSONValue:
                 raise TypeError("Legacy editable-field keys must be exact strings")
             frozen[key] = _freeze_legacy_json(child)
         return cast(JSONValue, MappingProxyType(frozen))
-    if type(value) is list:
-        return cast(JSONValue, tuple(_freeze_legacy_json(child) for child in value))
+    if type(value) in {list, tuple}:
+        sequence = cast(Sequence[JSONValue], value)
+        return cast(JSONValue, tuple(_freeze_legacy_json(child) for child in sequence))
     if value is None or type(value) in {bool, int, float, str}:
         return value
     raise TypeError("Legacy editable fields must contain JSON values")
@@ -279,6 +256,34 @@ class LegacyPresentationBindingV1(TransientToolRuntimeValue):
                 raise ValueError("Legacy presentation identity seal mismatch")
         except (AttributeError, TypeError, ValueError) as exc:
             raise ValueError("Legacy presentation integrity drift") from exc
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class LegacyPendingPresentationV1(TransientToolRuntimeValue):
+    """Frozen public Pending-card projection from one exact Legacy route."""
+
+    human: str
+    editable_fields: tuple[Mapping[str, JSONValue], ...]
+    details: Mapping[str, JSONValue]
+
+    def __post_init__(self) -> None:
+        if type(self.human) is not str:
+            raise TypeError("Legacy Pending presentation human must be exact text")
+        if type(self.editable_fields) is not tuple:
+            raise TypeError("Legacy Pending editable fields must be an exact tuple")
+        frozen_fields: list[Mapping[str, JSONValue]] = []
+        for descriptor in self.editable_fields:
+            if not isinstance(descriptor, Mapping):
+                raise TypeError("Legacy Pending editable-field descriptor must be an object")
+            frozen = _freeze_legacy_json(cast(JSONValue, dict(descriptor)))
+            if not isinstance(frozen, Mapping):
+                raise TypeError("Legacy Pending editable-field descriptor must be an object")
+            frozen_fields.append(cast(Mapping[str, JSONValue], frozen))
+        frozen_details = _freeze_legacy_json(cast(JSONValue, dict(self.details)))
+        if not isinstance(frozen_details, Mapping):
+            raise TypeError("Legacy Pending details must be an object")
+        object.__setattr__(self, "editable_fields", tuple(frozen_fields))
+        object.__setattr__(self, "details", cast(Mapping[str, JSONValue], frozen_details))
 
 
 @dataclass(frozen=True, slots=True, repr=False, eq=False)
@@ -580,7 +585,7 @@ def _legacy_proof_consumer_port_type() -> type[object]:
     return cast(type[object], consumer_type)
 
 
-class LegacyProofDeterministicCatalog(TransientToolRuntimeValue):
+class LegacyDeterministicCatalog(TransientToolRuntimeValue):
     """Unpublished exact Catalog boundary for confirmation-resume proofs."""
 
     __slots__ = (
@@ -632,7 +637,7 @@ class LegacyProofDeterministicCatalog(TransientToolRuntimeValue):
         proof_consumer_port: LegacyRouteProofConsumerPort,
         bundle_instance_token: BundleInstanceToken,
         catalog_instance_token: object,
-    ) -> LegacyProofDeterministicCatalog:
+    ) -> LegacyDeterministicCatalog:
         return cls(
             _LEGACY_PROOF_CATALOG_SEAL,
             proof_consumer_port=proof_consumer_port,
@@ -786,6 +791,21 @@ class LegacyInitialRoutePort(_LegacyInitialOpaqueValue["_LegacyInitialRouteRegis
     def require_route(self, handle: object) -> LegacyAdapterBindingV1:
         self._ensure_port_integrity()
         return self._registry._require_route(self, handle)
+
+    def project_pending(
+        self,
+        handle: LegacyAdapterRouteHandle,
+        *,
+        encoded_args: str,
+        context: LegacyReadContextPort,
+    ) -> LegacyPendingPresentationV1:
+        self._ensure_port_integrity()
+        return self._registry._project_pending(
+            self,
+            handle,
+            encoded_args=encoded_args,
+            context=context,
+        )
 
 
 @dataclass(eq=False)
@@ -1172,6 +1192,42 @@ class _LegacyInitialRouteRegistry(TransientToolRuntimeValue):
                 raise ValueError("Legacy route handle binding is outside the Bundle")
             return state.binding
 
+    def _project_pending(
+        self,
+        port: LegacyInitialRoutePort,
+        handle: LegacyAdapterRouteHandle,
+        *,
+        encoded_args: str,
+        context: LegacyReadContextPort,
+    ) -> LegacyPendingPresentationV1:
+        if type(encoded_args) is not str:
+            raise TypeError("Legacy Pending presentation requires exact encoded arguments")
+        with self._lock:
+            binding = self._require_route(port, handle)
+            adapters = self._catalog.ordered_adapters
+            bindings = self._legacy_boundary.ordered_adapter_bindings
+            matches = tuple(
+                adapter for adapter, candidate in zip(adapters, bindings) if candidate is binding
+            )
+            if len(matches) != 1:
+                raise ValueError("Legacy route presentation is outside the exact Bundle")
+            adapter = matches[0]
+            adapter.require_integrity()
+            validation_error = adapter.validate(encoded_args)
+            if validation_error:
+                raise ValueError(validation_error)
+            presentation = adapter.presentation
+            presentation.require_integrity()
+            human = presentation.confirmation_description(encoded_args)
+            details = presentation.pending_details_projector(encoded_args, context)
+            if not isinstance(details, Mapping):
+                raise TypeError("Legacy Pending details projector must return an object")
+            return LegacyPendingPresentationV1(
+                human=human,
+                editable_fields=adapter.editable_fields,
+                details=cast(Mapping[str, JSONValue], details),
+            )
+
     def _revoke_child_locked(self, state: _ChildState) -> None:
         if state.status == "closed":
             return
@@ -1520,9 +1576,12 @@ def prepare_legacy_arguments(
         if validate_unedited:
             validation_error = adapter.validate(encoded_args)
             if validation_error:
-                raise ValueError(validation_error)
+                raise LegacyArgumentPreparationError(validation_error)
         return encoded_args, adapter.describe(encoded_args)
-    value = _decode_legacy_arguments_object(encoded_args)
+    try:
+        value = _decode_legacy_arguments_object(encoded_args)
+    except ValueError as exc:
+        raise LegacyArgumentPreparationError(str(exc)) from exc
     editable = {
         str(field["field"]): field
         for field in adapter.editable_fields
@@ -1530,21 +1589,30 @@ def prepare_legacy_arguments(
     }
     forbidden = sorted(str(key) for key in edited_args if key not in editable)
     if forbidden:
-        raise ValueError("non-editable fields: " + ", ".join(forbidden))
+        raise LegacyArgumentPreparationError("non-editable fields: " + ", ".join(forbidden))
     effective = {**value, **edited_args}
-    encoded = json.dumps(
-        effective, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
-    )
+    try:
+        encoded = json.dumps(
+            effective,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise LegacyArgumentPreparationError(
+            "edited arguments must contain finite JSON values"
+        ) from exc
     validation_error = adapter.validate(encoded)
     if validation_error:
-        raise ValueError(validation_error)
+        raise LegacyArgumentPreparationError(validation_error)
     return encoded, adapter.describe(encoded)
 
 
 __all__ = [
     "LEGACY_DETERMINISTIC_NAMES",
+    "LegacyArgumentPreparationError",
     "LegacyAdapterRouteHandle",
-    "LegacyDeterministicAdapter",
     "LegacyDeterministicAdapterSpec",
     "LegacyDeterministicCatalog",
     "LegacyExecutionContextPort",
@@ -1552,6 +1620,7 @@ __all__ = [
     "LegacyInitialRouteComponents",
     "LegacyInitialRouteIssuer",
     "LegacyInitialRoutePort",
+    "LegacyPendingPresentationV1",
     "LegacyPresentationBindingV1",
     "LegacyReadContextPort",
     "LegacyRouteSourceV1",

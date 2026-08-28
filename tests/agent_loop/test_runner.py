@@ -21,6 +21,7 @@ from offerpilot.ai.agent_loop import (
     AgentLoopRunner,
     ApprovedWriteSeed,
     NewTurnSeed,
+    PendingPresentationSnapshot,
     build_segment_surface_gate,
     _pending_action_revision,
     _provider_arguments_digest,
@@ -28,7 +29,10 @@ from offerpilot.ai.agent_loop import (
 from offerpilot.ai.tool_authority import AuthorityFactory, AuthorityPhaseError, TrustedContextScope
 from offerpilot.ai.tool_authority.policy import validate_startup_policy
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
-from offerpilot.ai.tool_runtime.metadata import ToolPresentationBindingV1
+from offerpilot.ai.tool_runtime.metadata import (
+    ToolOperationMetadataPort,
+    ToolPresentationBindingV1,
+)
 from offerpilot.ai.tool_runtime.policy_types import ToolCapability
 from offerpilot.ai.tool_runtime.contracts import (
     PreparedToolCall,
@@ -56,6 +60,10 @@ from offerpilot.context_projector.gateway import (
 )
 from offerpilot.context_projector.projector import ModelSurfaceProjector
 from offerpilot.pilot_runtime.compensation import prepare_compensation_handler_components
+from offerpilot.ai.write_operations import (
+    PendingPersistenceRoutePort,
+    TypedPendingRouteHandle,
+)
 
 from .helpers import RecordingEventSink, ScriptedModel, ToolDefinition, runtime
 
@@ -160,6 +168,52 @@ class _DelegatingRecorder:
 
     def __getattr__(self, name: str) -> object:
         return getattr(self._delegate, name)
+
+
+class _AgentLoopLegacyIssuer:
+    def __init__(self, bundle: ToolMetadataBundleV1) -> None:
+        self.bundle_instance_token = bundle.bundle_instance_token
+        self.registry_token = object()
+        self._route_handle = object()
+        self._binding = bundle.legacy_boundary().ordered_adapter_bindings[0]
+
+    def require_route(self, route_handle: object) -> object:
+        if route_handle is not self._route_handle:
+            raise ValueError("Agent Loop test Legacy route provenance mismatch")
+        return self._binding
+
+
+def _consume_test_pending(
+    turn: object,
+    route_handle: object,
+    presentation: object,
+) -> object:
+    if type(route_handle) is not TypedPendingRouteHandle:
+        raise TypeError("Agent Loop test requires an exact Typed Pending route")
+    if type(presentation) is not PendingPresentationSnapshot:
+        raise TypeError("Agent Loop test requires an exact Pending presentation")
+    return turn
+
+
+def _bind_test_pending_persistence(
+    invocation: AgentLoopInvocation,
+    bundle: ToolMetadataBundleV1,
+) -> None:
+    compensation = prepare_compensation_handler_components()
+    registry = compensation.bind(bundle.compensation_view())
+    operation_port = ToolOperationMetadataPort(
+        operation_view=bundle.operation_view(),
+        legacy_boundary=bundle.legacy_boundary(),
+        compensation_view=bundle.compensation_view(),
+        compensation_registry=registry,
+        legacy_route_issuer_port=_AgentLoopLegacyIssuer(bundle),
+    )
+    pending_port = PendingPersistenceRoutePort(operation_port=operation_port)
+    invocation._bind_pending_persistence(
+        _consume_test_pending,
+        operation_port,
+        pending_port,
+    )
 
 
 def invocation(
@@ -292,7 +346,7 @@ def invocation(
         else None
     )
     try:
-        return AgentLoopInvocation(
+        invocation_value = AgentLoopInvocation(
             seed=resolved_seed,
             model=model,
             catalog=catalog,
@@ -306,6 +360,8 @@ def invocation(
             cancel_check=cancel_check,
             surface_gate=surface_gate,
         )
+        _bind_test_pending_persistence(invocation_value, bundle)
+        return invocation_value
     except BaseException:
         catalog_lease.close()
         raise
@@ -1466,21 +1522,23 @@ def _task10_new_turn_invocation(
         authority_metadata_view=bundle.authority_view(),
         policy=validate_startup_policy(catalog.authority_manifest),
     )
+    invocation_value = AgentLoopInvocation(
+        seed=NewTurnSeed(messages),
+        model=model,  # type: ignore[arg-type]
+        catalog=catalog,
+        catalog_lease=lease,  # type: ignore[call-arg]
+        tool_context=context,
+        auto_approve=False,
+        max_iterations=4,
+        run_recorder=NullRunRecorder(),
+        event_sink=None,
+        runtime_signal_sink=None,
+        cancel_check=cancel_check,
+        surface_gate=gate,
+    )
+    _bind_test_pending_persistence(invocation_value, bundle)
     return (
-        AgentLoopInvocation(
-            seed=NewTurnSeed(messages),
-            model=model,  # type: ignore[arg-type]
-            catalog=catalog,
-            catalog_lease=lease,  # type: ignore[call-arg]
-            tool_context=context,
-            auto_approve=False,
-            max_iterations=4,
-            run_recorder=NullRunRecorder(),
-            event_sink=None,
-            runtime_signal_sink=None,
-            cancel_check=cancel_check,
-            surface_gate=gate,
-        ),
+        invocation_value,
         bundle,
         lease,
     )

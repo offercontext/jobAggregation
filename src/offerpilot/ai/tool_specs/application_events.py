@@ -141,11 +141,14 @@ def _get(args: EventArgs, context: ToolExecutionContext) -> dict[str, Any]:
     return event_json(event)
 
 
-def _event_create(args: EventArgs, context: ToolExecutionContext, tool_name: str) -> ApplicationEventCreate:
+def _event_create(
+    args: EventArgs, context: ToolExecutionContext, tool_name: str
+) -> ApplicationEventCreate:
     application_id = integer(args, "application_id", tool_name)
-    if context.applications.get_application_scoped(
-        context.scope_constraint, application_id
-    ) is None:
+    if (
+        context.applications.get_application_scoped(context.scope_constraint, application_id)
+        is None
+    ):
         raise ToolRecordNotFound("application not found")
     event_type = str(args.get("event_type") or "")
     if event_type not in EVENT_TYPES:
@@ -221,7 +224,10 @@ def _event_schema(required: list[JSONValue]) -> dict[str, JSONValue]:
             "id": {"type": "integer"},
             "application_id": {"type": "integer"},
             "event_type": {"type": "string", "enum": list(EVENT_TYPES)},
-            "subtype": {"type": "string", "description": "Mutually exclusive detail under event_type, e.g. written_test.subtype=assessment."},
+            "subtype": {
+                "type": "string",
+                "description": "Mutually exclusive detail under event_type, e.g. written_test.subtype=assessment.",
+            },
             "tags": {"type": "array", "items": {"type": "string"}},
             "scheduled_at": {"type": "string", "description": "RFC3339 datetime."},
             "remind_at": {"type": "string", "description": "Optional RFC3339 reminder datetime."},
@@ -281,6 +287,13 @@ def _describe_delete_application_event(args: Mapping[str, Any]) -> str:
     return f"删除日程 #{args.get('id', '')}"
 
 
+def _project_create_application_event_success(result: object) -> str:
+    if not isinstance(result, Mapping):
+        return ""
+    record_id = result.get("application_event_id") or result.get("id")
+    return f"✅ 创建成功：日程 #{record_id} 已保存。" if record_id else ""
+
+
 def _short_preview(value: str, max_length: int = 180) -> str:
     normalized = " ".join(value.split())
     if len(normalized) <= max_length:
@@ -332,8 +345,13 @@ def _pending_create_application_event(
         "source": "pending_action",
     }
     fields = (
-        "event_type", "subtype", "scheduled_at", "duration_minutes",
-        "location", "notes", "remind_at",
+        "event_type",
+        "subtype",
+        "scheduled_at",
+        "duration_minutes",
+        "location",
+        "notes",
+        "remind_at",
     )
     proposed_changes = [
         {"field": key, "before": "", "after": args[key]}
@@ -373,8 +391,17 @@ def _canonical_datetime(value: Any) -> str | None:
 
 def _event_fingerprint(payload: Mapping[str, Any]) -> dict[str, Any]:
     fields = (
-        "application_id", "event_type", "subtype", "tags", "round",
-        "scheduled_at", "duration_minutes", "location", "notes", "remind_at", "status",
+        "application_id",
+        "event_type",
+        "subtype",
+        "tags",
+        "round",
+        "scheduled_at",
+        "duration_minutes",
+        "location",
+        "notes",
+        "remind_at",
+        "status",
     )
     result = {field: payload.get(field) for field in fields}
     result["scheduled_at"] = _canonical_datetime(result["scheduled_at"])
@@ -418,7 +445,11 @@ def _editable(
 
 
 def application_event_specs() -> tuple[ToolSpec[Any, Any], ...]:
-    id_schema: dict[str, JSONValue] = {"type": "object", "properties": {"id": {"type": "integer", "description": "Application event id."}}, "required": ["id"]}
+    id_schema: dict[str, JSONValue] = {
+        "type": "object",
+        "properties": {"id": {"type": "integer", "description": "Application event id."}},
+        "required": ["id"],
+    }
     event_fields = (
         _editable("event_type", "enum", options=EVENT_TYPES),
         _editable("subtype", "string"),
@@ -446,119 +477,186 @@ def application_event_specs() -> tuple[ToolSpec[Any, Any], ...]:
     )
     list_resolver = _resolver(
         implementation_id="list_application_events_application_identity_arg_v1",
-        resolver_id="application_identity_arg", arg_path="application_id",
-        presence="optional", resolve=_application_optional_binding,
+        resolver_id="application_identity_arg",
+        arg_path="application_id",
+        presence="optional",
+        resolve=_application_optional_binding,
     )
     get_resolver = _resolver(
         implementation_id="get_application_event_application_event_parent_v1",
-        resolver_id="application_event_parent", arg_path="id",
-        presence="required", resolve=_event_binding,
+        resolver_id="application_event_parent",
+        arg_path="id",
+        presence="required",
+        resolve=_event_binding,
     )
     create_resolver = _resolver(
         implementation_id="create_application_event_application_identity_arg_v1",
-        resolver_id="application_identity_arg", arg_path="application_id",
-        presence="required", resolve=_application_required_binding,
+        resolver_id="application_identity_arg",
+        arg_path="application_id",
+        presence="required",
+        resolve=_application_required_binding,
     )
     update_parent = _resolver(
         implementation_id="update_application_event_application_event_parent_v1",
-        resolver_id="application_event_parent", arg_path="id",
-        presence="required", resolve=_event_binding,
+        resolver_id="application_event_parent",
+        arg_path="id",
+        presence="required",
+        resolve=_event_binding,
     )
     update_application = _resolver(
         implementation_id="update_application_event_application_identity_arg_v1",
-        resolver_id="application_identity_arg", arg_path="application_id",
-        presence="required", resolve=_application_required_binding,
+        resolver_id="application_identity_arg",
+        arg_path="application_id",
+        presence="required",
+        resolve=_application_required_binding,
     )
     delete_resolver = _resolver(
         implementation_id="delete_application_event_application_event_parent_v1",
-        resolver_id="application_event_parent", arg_path="id",
-        presence="required", resolve=_event_binding,
+        resolver_id="application_event_parent",
+        arg_path="id",
+        presence="required",
+        resolve=_event_binding,
     )
     return (
         build_tool_spec(
             contract=provider_contract(
                 "list_application_events",
                 "List application events such as written tests, interviews, offer steps, deadlines, or custom events.",
-                {"type": "object", "properties": {"month": {"type": "string", "description": "Optional YYYY-MM month filter."}, "application_id": {"type": "integer"}, "event_type": {"type": "string", "enum": list(EVENT_TYPES)}}},
+                {
+                    "type": "object",
+                    "properties": {
+                        "month": {
+                            "type": "string",
+                            "description": "Optional YYYY-MM month filter.",
+                        },
+                        "application_id": {"type": "integer"},
+                        "event_type": {"type": "string", "enum": list(EVENT_TYPES)},
+                    },
+                },
             ),
-            domains=(ToolDomain.EVENTS,), dependencies=(),
+            domains=(ToolDomain.EVENTS,),
+            dependencies=(),
             required_capability=ToolCapability.APPLICATION_EVENTS_READ,
             binding_contract=BindingContract("scoped_collection", "application"),
-            resolver_bindings=(list_resolver,), confirmation_policy="none", editable_fields=(),
-            operation=ReadOperationMetadataV1(), undo_builder_binding=None,
+            resolver_bindings=(list_resolver,),
+            confirmation_policy="none",
+            editable_fields=(),
+            operation=ReadOperationMetadataV1(),
+            undo_builder_binding=None,
             presentation=ToolPresentationBindingV1(
                 implementation_id="list_application_events_presentation_v1",
                 confirmation_description=_empty_confirmation_description,
                 pending_details_projector=_empty_pending_details,
                 success_summary_projector=compact_json,
-            ), decoder=_decode, executor=_list, success_renderer=compact_json,
+            ),
+            decoder=_decode,
+            executor=_list,
+            success_renderer=compact_json,
         ),
         build_tool_spec(
-            contract=provider_contract("get_application_event", "Get one application event by id.", id_schema),
-            domains=(ToolDomain.EVENTS,), dependencies=("list_application_events",),
+            contract=provider_contract(
+                "get_application_event", "Get one application event by id.", id_schema
+            ),
+            domains=(ToolDomain.EVENTS,),
+            dependencies=("list_application_events",),
             required_capability=ToolCapability.APPLICATION_EVENTS_READ,
             binding_contract=BindingContract("enforce_if_bound", "application"),
-            resolver_bindings=(get_resolver,), confirmation_policy="none", editable_fields=(),
-            operation=ReadOperationMetadataV1(), undo_builder_binding=None,
+            resolver_bindings=(get_resolver,),
+            confirmation_policy="none",
+            editable_fields=(),
+            operation=ReadOperationMetadataV1(),
+            undo_builder_binding=None,
             presentation=ToolPresentationBindingV1(
                 implementation_id="get_application_event_presentation_v1",
                 confirmation_description=_empty_confirmation_description,
                 pending_details_projector=_empty_pending_details,
                 success_summary_projector=compact_json,
-            ), decoder=_decode, executor=_get,
+            ),
+            decoder=_decode,
+            executor=_get,
             declared_failure_categories=frozenset({"not_found"}),
-            exception_map=NOT_FOUND_EXCEPTION_MAP, success_renderer=compact_json,
+            exception_map=NOT_FOUND_EXCEPTION_MAP,
+            success_renderer=compact_json,
         ),
         build_tool_spec(
-            contract=provider_contract("create_application_event", "Create an application event. Use written_test.subtype=assessment for assessments.", _event_schema(["application_id", "event_type", "scheduled_at", "duration_minutes"])),
-            domains=(ToolDomain.EVENTS,), dependencies=(),
+            contract=provider_contract(
+                "create_application_event",
+                "Create an application event. Use written_test.subtype=assessment for assessments.",
+                _event_schema(["application_id", "event_type", "scheduled_at", "duration_minutes"]),
+            ),
+            domains=(ToolDomain.EVENTS,),
+            dependencies=(),
             required_capability=ToolCapability.APPLICATION_EVENTS_WRITE,
             binding_contract=BindingContract("enforce_if_bound", "application"),
-            resolver_bindings=(create_resolver,), confirmation_policy="required",
-            editable_fields=event_fields, operation=create_operation,
+            resolver_bindings=(create_resolver,),
+            confirmation_policy="required",
+            editable_fields=event_fields,
+            operation=create_operation,
             undo_builder_binding=create_undo,
             presentation=ToolPresentationBindingV1(
                 implementation_id="create_application_event_presentation_v1",
                 confirmation_description=_describe_create_application_event,
                 pending_details_projector=_pending_create_application_event,
-                success_summary_projector=compact_json,
-            ), decoder=_decode, executor=_create,
+                success_summary_projector=_project_create_application_event_success,
+            ),
+            decoder=_decode,
+            executor=_create,
             declared_failure_categories=frozenset({"validation_error", "not_found"}),
             exception_map=INPUT_EXCEPTION_MAP + NOT_FOUND_EXCEPTION_MAP,
             success_renderer=compact_json,
         ),
         build_tool_spec(
-            contract=provider_contract("update_application_event", "Update an existing application event.", _event_schema(["id", "application_id", "event_type", "scheduled_at", "duration_minutes"])),
-            domains=(ToolDomain.EVENTS,), dependencies=("get_application_event",),
+            contract=provider_contract(
+                "update_application_event",
+                "Update an existing application event.",
+                _event_schema(
+                    ["id", "application_id", "event_type", "scheduled_at", "duration_minutes"]
+                ),
+            ),
+            domains=(ToolDomain.EVENTS,),
+            dependencies=("get_application_event",),
             required_capability=ToolCapability.APPLICATION_EVENTS_WRITE,
             binding_contract=BindingContract("enforce_if_bound", "application"),
             resolver_bindings=(update_parent, update_application),
-            confirmation_policy="required", editable_fields=event_fields,
-            operation=WriteOperationMetadataV1(), undo_builder_binding=None,
+            confirmation_policy="required",
+            editable_fields=event_fields,
+            operation=WriteOperationMetadataV1(),
+            undo_builder_binding=None,
             presentation=ToolPresentationBindingV1(
                 implementation_id="update_application_event_presentation_v1",
                 confirmation_description=_describe_update_application_event,
                 pending_details_projector=_empty_pending_details,
                 success_summary_projector=compact_json,
-            ), decoder=_decode, executor=_update,
+            ),
+            decoder=_decode,
+            executor=_update,
             declared_failure_categories=frozenset({"validation_error", "not_found"}),
             exception_map=INPUT_EXCEPTION_MAP + NOT_FOUND_EXCEPTION_MAP,
             success_renderer=compact_json,
         ),
         build_tool_spec(
-            contract=provider_contract("delete_application_event", "Delete an application event by id.", id_schema),
-            domains=(ToolDomain.EVENTS,), dependencies=("get_application_event",),
+            contract=provider_contract(
+                "delete_application_event", "Delete an application event by id.", id_schema
+            ),
+            domains=(ToolDomain.EVENTS,),
+            dependencies=("get_application_event",),
             required_capability=ToolCapability.APPLICATION_EVENTS_WRITE,
             binding_contract=BindingContract("enforce_if_bound", "application"),
-            resolver_bindings=(delete_resolver,), confirmation_policy="required", editable_fields=(),
-            operation=WriteOperationMetadataV1(), undo_builder_binding=None,
+            resolver_bindings=(delete_resolver,),
+            confirmation_policy="required",
+            editable_fields=(),
+            operation=WriteOperationMetadataV1(),
+            undo_builder_binding=None,
             presentation=ToolPresentationBindingV1(
                 implementation_id="delete_application_event_presentation_v1",
                 confirmation_description=_describe_delete_application_event,
                 pending_details_projector=_empty_pending_details,
                 success_summary_projector=compact_json,
-            ), decoder=_decode, executor=_delete,
+            ),
+            decoder=_decode,
+            executor=_delete,
             declared_failure_categories=frozenset({"not_found"}),
-            exception_map=NOT_FOUND_EXCEPTION_MAP, success_renderer=compact_json,
+            exception_map=NOT_FOUND_EXCEPTION_MAP,
+            success_renderer=compact_json,
         ),
     )

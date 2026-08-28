@@ -38,7 +38,11 @@ from offerpilot.ai.tool_authority import (
     SegmentExecutionAuthority,
 )
 from offerpilot.ai.tool_authority.contracts import _ReplacementProtected
-from offerpilot.ai.tool_runtime.catalog import SegmentToolCatalogLease, ToolCatalog
+from offerpilot.ai.tool_runtime.catalog import (
+    SegmentToolCatalogLease,
+    SegmentToolSpecHandle,
+    ToolCatalog,
+)
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import (
     ConfirmationRequired,
@@ -52,10 +56,14 @@ from offerpilot.ai.tool_runtime.contracts import (
     materialize_provider_payloads,
 )
 from offerpilot.ai.tool_runtime.metadata import (
+    OperationRouteIdentityV1,
     ProviderToolMetadataView,
     ToolAuthorityEntryV1,
     ToolAuthorityMetadataView,
     ToolDiscoveryMetadataView,
+    ToolOperationMetadataPort,
+    canonical_json_bytes,
+    freeze_json,
 )
 from offerpilot.ai.tool_runtime.policy_types import OperationKind
 from offerpilot.ai.tool_runtime.pipeline import Rejected, execute_prepared, prepare_call
@@ -63,6 +71,11 @@ from offerpilot.ai.tool_runtime.rendering import render_compatibility
 from offerpilot.ai.tool_runtime.transport import project_transport_event
 from offerpilot.ai.tool_runtime.validation import ArgumentValidationError, parse_arguments
 from offerpilot.ai.types import Assistant, Message, ToolCall
+from offerpilot.ai.write_operations import (
+    PendingPersistenceRouteHandle,
+    PendingPersistenceRoutePort,
+    PendingRouteIdentityV1,
+)
 from offerpilot.agent_runtime.journal import EventInput, RunRecorder
 from offerpilot.config import AIProviderProfile
 from offerpilot.context_projector.binding import ModelCallSurfaceBinding
@@ -98,6 +111,187 @@ from offerpilot.context_projector.authority_surface import (
 
 DEFAULT_MAX_ITERATIONS = 20
 _NO_OVERRIDE = object()
+
+
+@dataclass(frozen=True, slots=True)
+class PendingPresentationSnapshot:
+    editable_fields: tuple[Mapping[str, object], ...]
+    details: Mapping[str, object]
+
+
+def _freeze_pending_public_value(value: object, *, depth: int = 0) -> object:
+    if depth > 16:
+        raise ValueError("Pending presentation exceeds the public nesting limit")
+    if value is None or type(value) in {bool, int, float, str}:
+        return freeze_json(cast(None | bool | int | float | str, value))
+    if isinstance(value, Mapping):
+        return freeze_json(
+            {
+                key: _freeze_pending_public_value(child, depth=depth + 1)
+                for key, child in value.items()
+            }
+        )
+    if isinstance(value, (list, tuple)):
+        return freeze_json(
+            tuple(_freeze_pending_public_value(child, depth=depth + 1) for child in value)
+        )
+    raise TypeError("Pending presentation contains a non-public value")
+
+
+def _pending_presentation_snapshot(
+    pending: PendingAction,
+    spec: ToolSpec[Any, Any],
+    context: ToolExecutionContext,
+) -> PendingPresentationSnapshot:
+    editable = tuple(
+        cast(
+            Mapping[str, object],
+            _freeze_pending_public_value(descriptor.to_compat_descriptor()),
+        )
+        for descriptor in spec.metadata.editable_fields
+    )
+    try:
+        decoded = spec.decoder(json.loads(pending.args))
+        projected = spec.presentation.pending_details_projector(decoded, context)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        projected = {}
+    details = cast(
+        Mapping[str, object],
+        _freeze_pending_public_value(projected if isinstance(projected, Mapping) else {}),
+    )
+    frozen_snapshot = freeze_json({"editable_fields": editable, "details": details})
+    if len(canonical_json_bytes(frozen_snapshot)) > 65_536:
+        raise ValueError("Pending presentation exceeds the public size limit")
+    return PendingPresentationSnapshot(editable, details)
+
+
+PendingPersistenceConsumer = Callable[
+    [AgentTurnResult, PendingPersistenceRouteHandle, PendingPresentationSnapshot], object
+]
+
+
+class _PendingPersistenceCell:
+    """One private handoff from the live Segment to Runtime persistence."""
+
+    __slots__ = ("_consumer", "_lock", "_operation_port", "_pending_port", "_result", "_turn")
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._consumer: PendingPersistenceConsumer | None = None
+        self._operation_port: ToolOperationMetadataPort | None = None
+        self._pending_port: PendingPersistenceRoutePort | None = None
+        self._turn: AgentTurnResult | None = None
+        self._result: object | None = None
+
+    def bind(
+        self,
+        consumer: PendingPersistenceConsumer,
+        operation_port: ToolOperationMetadataPort | None,
+        pending_port: PendingPersistenceRoutePort | None,
+    ) -> None:
+        if not callable(consumer):
+            raise TypeError("Pending persistence consumer must be callable")
+        if (operation_port is None) is not (pending_port is None):
+            raise TypeError("Pending persistence Ports must be bound atomically")
+        if operation_port is not None:
+            if type(operation_port) is not ToolOperationMetadataPort:
+                raise TypeError("Pending persistence requires an exact Operation Port")
+            if type(pending_port) is not PendingPersistenceRoutePort:
+                raise TypeError("Pending persistence requires an exact Pending Port")
+            if pending_port.bundle_instance_token is not operation_port.bundle_instance_token:
+                raise ValueError("Pending persistence Port provenance mismatch")
+        with self._lock:
+            if self._consumer is not None:
+                raise RuntimeError("Pending persistence consumer was already bound")
+            if self._turn is not None:
+                raise RuntimeError("Pending persistence handoff already started")
+            self._consumer = consumer
+            self._operation_port = operation_port
+            self._pending_port = pending_port
+
+    def persist(
+        self,
+        turn: AgentTurnResult,
+        lease: SegmentToolCatalogLease,
+        spec_handle: SegmentToolSpecHandle,
+        claim: PendingAuthorityClaim,
+        pending: PendingAction,
+        presentation: PendingPresentationSnapshot,
+    ) -> object:
+        if type(lease) is not SegmentToolCatalogLease or lease.closed:
+            raise TypeError("Pending persistence requires a live exact Segment lease")
+        if type(spec_handle) is not SegmentToolSpecHandle:
+            raise TypeError("Pending persistence requires an exact Segment handle")
+        if type(claim) is not PendingAuthorityClaim:
+            raise TypeError("Pending persistence requires an exact Pending claim")
+        if pending.conversation_id is None or pending.pending_action_revision is None:
+            raise TypeError("Typed Pending route identity is incomplete")
+        if (
+            pending.arguments_digest is None
+            or pending.pending_confirmation_claim_id != pending.operation_id
+        ):
+            raise TypeError("Typed Pending locked identity is incomplete")
+        with self._lock:
+            if self._turn is not None:
+                if self._turn is turn:
+                    return self._result
+                raise RuntimeError("Pending persistence handoff was already consumed")
+            consumer = self._consumer
+            operation_port = self._operation_port
+            pending_port = self._pending_port
+            if consumer is None or operation_port is None or pending_port is None:
+                raise RuntimeError("Pending persistence consumer is not bound")
+            self._turn = turn
+        identity = PendingRouteIdentityV1(
+            conversation_id=pending.conversation_id,
+            operation_id=pending.operation_id,
+            tool_call_id=pending.tool_call_id,
+            tool_name=pending.tool_name,
+            pending_action_revision=pending.pending_action_revision,
+            pending_confirmation_claim_id=pending.pending_confirmation_claim_id,
+            arguments_digest=pending.arguments_digest,
+        )
+        try:
+            operation_handle = operation_port.bind_typed_write(
+                lease,
+                spec_handle,
+                OperationRouteIdentityV1(
+                    operation_id=identity.operation_id,
+                    tool_call_id=identity.tool_call_id,
+                    revision=identity.pending_action_revision,
+                    arguments_digest=identity.arguments_digest,
+                ),
+                claim,
+            )
+        except BaseException:
+            with self._lock:
+                self._turn = None
+            raise
+        try:
+            route_handle = pending_port.bind_typed_pending(operation_handle, identity, claim)
+        except BaseException:
+            operation_port.revoke_typed_write(operation_handle)
+            with self._lock:
+                self._turn = None
+            raise
+        try:
+            result = consumer(turn, route_handle, presentation)
+        except BaseException:
+            with self._lock:
+                self._turn = None
+            raise
+        finally:
+            pending_port.revoke_pending(route_handle)
+            operation_port.revoke_typed_write(operation_handle)
+        with self._lock:
+            self._result = result
+        return result
+
+    def result_for(self, turn: AgentTurnResult) -> object:
+        with self._lock:
+            if self._turn is not turn or self._result is None:
+                raise RuntimeError("Pending persistence result is unavailable")
+            return self._result
 
 
 class _InjectedSurfaceAdapter:
@@ -647,6 +841,7 @@ class _LoopServices:
         self._prepare_identities: dict[int, NewTurnPrepareCallIdentity] = {}
         self._provider_invocations: dict[int, ProviderInvocationIdentity] = {}
         self._pending_claims: dict[int, PendingAuthorityClaim] = {}
+        self._pending_spec_handles: dict[int, SegmentToolSpecHandle] = {}
         if type(self.context.authority) is SegmentExecutionAuthority:
             factory = self.context.authority_factory
             factory.register_runner_invocation(invocation, authority=self.context.authority)
@@ -1052,6 +1247,19 @@ class _LoopServices:
         if self.cancel_check is not None and self.cancel_check():
             raise ChatRunCancelled("chat run cancelled")
 
+    def persist_pending_before_release(
+        self,
+        turn: AgentTurnResult,
+        pending: PendingAction,
+    ) -> None:
+        claim = self._pending_claims.get(id(pending))
+        spec_handle = self._pending_spec_handles.get(id(pending))
+        if type(claim) is not PendingAuthorityClaim:
+            raise TypeError("Typed Pending claim is unavailable for persistence")
+        if type(spec_handle) is not SegmentToolSpecHandle:
+            raise TypeError("Typed Pending Spec handle is unavailable for persistence")
+        self.runner_invocation._persist_pending_before_release(turn, spec_handle, claim)
+
 
 @dataclass(frozen=True, slots=True, repr=False)
 class NewTurnSeed(TransientToolRuntimeValue):
@@ -1222,6 +1430,11 @@ class AgentLoopInvocation(TransientToolRuntimeValue):
         repr=False,
         compare=False,
     )
+    _pending_persistence: _PendingPersistenceCell = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
     _serialization_guard: object = field(
         default=_TRANSIENT_ASDICT_GUARD, init=False, repr=False, compare=False
     )
@@ -1242,6 +1455,7 @@ class AgentLoopInvocation(TransientToolRuntimeValue):
             "_catalog_ownership",
             _AgentLoopLeaseOwnership(self.catalog_lease.close),
         )
+        object.__setattr__(self, "_pending_persistence", _PendingPersistenceCell())
         authority_type = type(self.tool_context.authority)
         expected_authority = (
             SegmentExecutionAuthority
@@ -1284,6 +1498,46 @@ class AgentLoopInvocation(TransientToolRuntimeValue):
 
     def _bind_catalog_release(self, release: Callable[[], object]) -> None:
         self._catalog_ownership.bind_release(release)
+
+    def _bind_pending_persistence(
+        self,
+        consumer: PendingPersistenceConsumer,
+        operation_port: ToolOperationMetadataPort | None = None,
+        pending_port: PendingPersistenceRoutePort | None = None,
+    ) -> None:
+        self._pending_persistence.bind(consumer, operation_port, pending_port)
+
+    def _share_pending_persistence(self, origin: "AgentLoopInvocation") -> None:
+        if type(origin) is not AgentLoopInvocation:
+            raise TypeError("Pending persistence origin must be an exact invocation")
+        if self._pending_persistence is origin._pending_persistence:
+            return
+        object.__setattr__(self, "_pending_persistence", origin._pending_persistence)
+
+    def _persist_pending_before_release(
+        self,
+        turn: AgentTurnResult,
+        spec_handle: SegmentToolSpecHandle,
+        claim: PendingAuthorityClaim,
+    ) -> object:
+        pending = turn.pending
+        if not isinstance(pending, PendingAction):
+            raise TypeError("Pending persistence requires a Pending result")
+        spec = self.catalog_lease.require_spec(spec_handle)
+        if spec.name != pending.tool_name:
+            raise ValueError("Pending presentation Spec identity mismatch")
+        presentation = _pending_presentation_snapshot(pending, spec, self.tool_context)
+        return self._pending_persistence.persist(
+            turn,
+            self.catalog_lease,
+            spec_handle,
+            claim,
+            pending,
+            presentation,
+        )
+
+    def _pending_persistence_result(self, turn: AgentTurnResult) -> object:
+        return self._pending_persistence.result_for(turn)
 
     def _claim_catalog_lease(self) -> None:
         self._catalog_ownership.claim()
@@ -1412,14 +1666,15 @@ class AgentLoopRunner:
             )
             if pending is not None:
                 services.require_active()
-                return AgentTurnResult(
+                turn = AgentTurnResult(
                     added_messages,
                     "",
                     pending,
                     tuple(records),
                     tuple(failures),
-                    pending_authority_claim=services._pending_claims.get(id(pending)),
                 )
+                services.persist_pending_before_release(turn, pending)
+                return turn
 
     def _bootstrap_approved(
         self,
@@ -1561,6 +1816,7 @@ class AgentLoopRunner:
             max_iterations=segment.max_iterations,
             run_recorder=services.run_recorder,
         )
+        active_invocation._share_pending_persistence(invocation)
         active_services = _LoopServices(
             active_invocation,
             run_recorder=services.run_recorder,
@@ -1688,6 +1944,7 @@ class AgentLoopRunner:
                         pending_confirmation_claim_id=operation_id,
                     )
                     services._pending_claims[id(pending)] = pending_claim
+                    services._pending_spec_handles[id(pending)] = prepared.prepared.spec_handle
                     return pending
                 result = "错误：确认操作状态不一致"
                 self._append_tool_result(

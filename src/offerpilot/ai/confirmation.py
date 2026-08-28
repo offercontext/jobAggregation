@@ -7,26 +7,33 @@ from datetime import datetime
 from typing import Any, cast
 
 from offerpilot.ai.agent_contracts import PendingAction
-from offerpilot.ai.tool_runtime.catalog import ToolCatalog
+from offerpilot.ai.tool_runtime.catalog import SegmentToolCatalogLease, SegmentToolSpecHandle
 from offerpilot.ai.tool_runtime.contracts import ToolSpec
 from offerpilot.ai.tool_runtime.validation import ArgumentValidationError, parse_arguments
 
 
 def prepare_pending_action(
     pending: PendingAction,
-    catalog: ToolCatalog,
+    catalog_lease: SegmentToolCatalogLease,
+    spec_handle: SegmentToolSpecHandle,
     edited_args: dict[str, Any] | None,
 ) -> PendingAction:
     """Validate editable confirmation fields and return the effective Pending."""
 
+    if type(catalog_lease) is not SegmentToolCatalogLease:
+        raise TypeError("Pending preparation requires an exact Segment Catalog lease")
+    if type(spec_handle) is not SegmentToolSpecHandle:
+        raise TypeError("Pending preparation requires an exact Segment Spec handle")
+    try:
+        spec = catalog_lease.require_spec(spec_handle)
+    except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError("Pending preparation route is unavailable") from exc
+    if spec.name != pending.tool_name:
+        raise ValueError(f'unknown pending tool "{pending.tool_name}"')
     if edited_args is None:
         return pending
     if not isinstance(edited_args, dict):
         raise ValueError("edited arguments must be a JSON object")
-
-    spec = catalog.resolve(pending.tool_name)
-    if spec is None:
-        raise ValueError(f'unknown pending tool "{pending.tool_name}"')
 
     original_args = _parse_json_object(
         pending.args,

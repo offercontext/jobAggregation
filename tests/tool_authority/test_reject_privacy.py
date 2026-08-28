@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from hashlib import sha256
 from uuid import uuid4
 
 import pytest
@@ -15,6 +16,7 @@ from offerpilot.ai.write_operations import (
 from offerpilot.db import init_database
 from offerpilot.models import ChatMessage, Conversation, WriteOperation
 from offerpilot.repositories.chat import ChatRepository
+from tests.tool_authority.test_pending_claim import create_primary_with_typed_route
 
 
 def _setup(tmp_path, raw_args: str):
@@ -28,6 +30,7 @@ def _setup(tmp_path, raw_args: str):
     token_fingerprint = ledger_fingerprint(
         key, "write-operation-confirmation-token-v1", token.encode("ascii")
     )
+    trusted_arguments_digest = "sha256:" + sha256(b"reject-privacy-trusted-identity-v1").hexdigest()
     with sessions() as session:
         owner = session.get(Conversation, conversation.id)
         assert owner is not None
@@ -36,13 +39,16 @@ def _setup(tmp_path, raw_args: str):
         owner.pending_tool_name = "create_application"
         owner.pending_args = raw_args
         owner.pending_human = "must-not-be-read"
-        repository.create_primary(
+        create_primary_with_typed_route(
+            repository,
             session,
             operation_id=operation_id,
             conversation_id=conversation.id,
             tool_call_id="call-privacy",
             tool_name="create_application",
-            adapter_kind="typed",
+            raw_args=raw_args,
+            pending_action_revision=1,
+            arguments_digest=trusted_arguments_digest,
             proposal_fingerprint=proposal,
             confirmation_token_fingerprint=token_fingerprint,
             authorization_scope_fingerprint=ledger_fingerprint(

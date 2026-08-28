@@ -5,24 +5,24 @@ from datetime import datetime, timezone
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, cast, get_type_hints
+from typing import Any, get_type_hints
 from uuid import uuid4
 
 import pytest
 
 from offerpilot.ai.agent_contracts import PendingAction
-from offerpilot.ai.tool_authority import AuthorityPhaseError, PendingAuthorityClaim
+from offerpilot.ai.tool_authority import AuthorityPhaseError
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.ai.write_operations import (
     DeliveryOwnership,
     OperationCommitted,
-    WriteOperationCoordinator,
     WriteOperationRepository,
     ledger_fingerprint,
-    load_or_create_ledger_key,
+    operation_request_fingerprint,
 )
 from offerpilot.db import init_database
 from offerpilot.repositories.chat import ChatRepository
+from offerpilot.repositories.applications import ApplicationCreate, ApplicationsRepository
 from offerpilot.pilot_runtime.persistence import (
     ChatPersistenceCoordinator,
     DeliveryOutcome,
@@ -34,6 +34,17 @@ from offerpilot.pilot_runtime.persistence import (
     _persistable_ai_messages,
 )
 from tests.tool_authority.test_pending_claim import _harness
+from tests.tool_metadata.test_pending_routes import (
+    issued_clarification_pending_route,
+    issued_legacy_pending_route,
+    issued_typed_pending_route,
+)
+from tests.test_write_operation_acceptance_matrix import (
+    _legacy_confirmation_token,
+    _legacy_harness,
+    _legacy_route_binder,
+    _propose,
+)
 
 
 _NON_LEDGER_PENDING_TOOL = "display_pending_notice"
@@ -55,36 +66,45 @@ def make_delivery_fixtures(
     PendingAction,
     DeliveryOwnership,
 ]:
-    sessions = init_database(tmp_path / "offerpilot.db")
-    key = load_or_create_ledger_key(tmp_path, sessions)
-    operations = WriteOperationRepository(sessions, key)
-    chat = ChatRepository(sessions, operations)
-    conversation = chat.create_conversation("delivery")
-    pending = PendingAction(
-        "call-1",
+    sessions, operations, chat, write_coordinator, components = _legacy_harness(tmp_path)
+    application = ApplicationsRepository(sessions).create(ApplicationCreate("delivery", "backend"))
+    assert application.id == 1
+    conversation, pending = _propose(
+        chat,
         "save_application_jd_version",
-        '{"application_id":1,"jd_text":"origin"}',
-        "保存岗位资料",
-        str(uuid4()),
+        "jd_deterministic_action",
     )
-    assert chat.persist_pending_action(conversation.id, pending, [])
-    request_fingerprint = ledger_fingerprint(
-        key,
-        "write-operation-request-v1",
-        {"conversation_id": conversation.id, "operation_id": pending.operation_id},
+    pending._test_route_components = components
+    operation = operations.get(pending.operation_id)
+    assert operation is not None
+    confirmation_token = _legacy_confirmation_token(pending)
+    request_fingerprint = operation_request_fingerprint(
+        operations.key,
+        operation_id=pending.operation_id,
+        tool_call_id=pending.tool_call_id,
+        approved=True,
+        edited_args_present=False,
+        edited_args=None,
+        rejection_feedback_present=False,
+        rejection_feedback="",
+        confirmation_token_fingerprint=ledger_fingerprint(
+            operations.key,
+            "write-operation-confirmation-token-v1",
+            confirmation_token.encode("ascii"),
+        ),
+        proposal_fingerprint=operation.proposal_fingerprint,
     )
-    terminal = WriteOperationCoordinator(operations).execute_legacy(
+    terminal = write_coordinator.execute_legacy(
         operation_id=pending.operation_id,
         conversation_id=conversation.id,
         tool_call_id=pending.tool_call_id,
         tool_name=pending.tool_name,
-        input_fingerprint=ledger_fingerprint(
-            key,
-            "write-operation-input-v1",
-            {"operation_id": pending.operation_id},
-        ),
         request_fingerprint=request_fingerprint,
-        executor=lambda _session: "已提交",
+        route_binder=_legacy_route_binder(
+            sessions=sessions,
+            components=components,
+            pending=pending,
+        ),
     )
     assert isinstance(terminal, OperationCommitted)
     assert terminal.ownership is not None
@@ -111,7 +131,7 @@ def _message_projection(message: object) -> dict[str, str]:
     }
 
 
-def test_initial_pending_forwards_exact_transient_authority_claim(
+def test_initial_pending_forwards_exact_transient_route_handle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     harness = _harness(tmp_path)
@@ -124,42 +144,46 @@ def test_initial_pending_forwards_exact_transient_authority_claim(
         actual_pending: PendingAction,
         _messages: object,
         *,
-        pending_authority_claim: PendingAuthorityClaim | None = None,
+        route_handle: object,
     ) -> bool:
         captured.update(
             conversation_id=actual_conversation_id,
             pending=actual_pending,
-            claim=pending_authority_claim,
+            route_handle=route_handle,
         )
         return original(
             actual_conversation_id,
             actual_pending,
             [],
-            pending_authority_claim=pending_authority_claim,
+            route_handle=route_handle,
         )
 
     monkeypatch.setattr(harness.chat, "persist_pending_action", persist)
     try:
-        result = coordinator.persist_initial_pending(
-            harness.conversation_id,
-            [],
+        with issued_typed_pending_route(
             harness.pending,
-            pending_authority_claim=harness.claim,
-        )
+            harness.conversation_id,
+            claim=harness.claim,
+        ) as (route_handle, _identity):
+            result = coordinator.persist_initial_pending(
+                harness.conversation_id,
+                [],
+                harness.pending,
+                route_handle=route_handle,
+            )
 
         assert result.persisted
         assert captured == {
             "conversation_id": harness.conversation_id,
             "pending": harness.pending,
-            "claim": harness.claim,
+            "route_handle": route_handle,
         }
-        forged = cast(PendingAuthorityClaim, object())
-        with pytest.raises(AuthorityPhaseError):
+        with pytest.raises((AuthorityPhaseError, TypeError, ValueError)):
             coordinator.persist_initial_pending(
                 harness.conversation_id,
                 [],
                 harness.pending,
-                pending_authority_claim=forged,
+                route_handle=object(),
             )
     finally:
         harness.close()
@@ -169,10 +193,7 @@ def _raw_agent_messages() -> list[Message]:
     return [
         Message(
             role="assistant",
-            content=(
-                "将执行 `update_application_status`；"
-                "update_application_status 已准备。"
-            ),
+            content=("将执行 `update_application_status`；update_application_status 已准备。"),
             tool_calls=[
                 ToolCall(
                     id="call-malicious-1",
@@ -212,12 +233,19 @@ def _raw_agent_messages() -> list[Message]:
 def test_initial_pending_matches_baseline_message_sanitization(tmp_path: Path) -> None:
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
     messages = _raw_agent_messages()
-    pending = PendingAction(
-        "call-malicious-1", _NON_LEDGER_PENDING_TOOL, '{"id": 7}', "更新状态"
-    )
+    pending = PendingAction("call-malicious-1", _NON_LEDGER_PENDING_TOOL, '{"id": 7}', "更新状态")
     expected = _persistable_ai_messages(messages)
 
-    result = coordinator.persist_initial_pending(conversation_id, messages, pending)
+    with issued_clarification_pending_route(pending, conversation_id) as (
+        route_handle,
+        _identity,
+    ):
+        result = coordinator.persist_initial_pending(
+            conversation_id,
+            messages,
+            pending,
+            route_handle=route_handle,
+        )
 
     assert result.persisted is True
     stored = coordinator._chat.list_messages(conversation_id)[-len(messages) :]
@@ -244,14 +272,28 @@ def test_clarification_replaces_stale_clarification_and_reports_assistant_id(
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
     stale = PendingAction("old-call", _NON_LEDGER_PENDING_TOOL, '{"company":"旧"}', "旧复盘")
     fresh = PendingAction("new-call", _NON_LEDGER_PENDING_TOOL, '{"company":"新"}', "新复盘")
-    assert coordinator.set_pending_clarification(conversation_id, stale, "旧问题").persisted
+    with issued_clarification_pending_route(stale, conversation_id) as (
+        stale_route,
+        _identity,
+    ):
+        assert coordinator.set_pending_clarification(
+            conversation_id,
+            stale,
+            "旧问题",
+            route_handle=stale_route,
+        ).persisted
 
-    result = coordinator.persist_clarification(
-        conversation_id,
-        [Message(role="assistant", content="需要补充")],
-        fresh,
-        "新问题",
-    )
+    with issued_clarification_pending_route(fresh, conversation_id) as (
+        fresh_route,
+        _identity,
+    ):
+        result = coordinator.persist_clarification(
+            conversation_id,
+            [Message(role="assistant", content="需要补充")],
+            fresh,
+            "新问题",
+            route_handle=fresh_route,
+        )
 
     assert result.persisted is True
     assert type(result.message_id) is int
@@ -280,6 +322,7 @@ def test_confirmation_continuation_matches_baseline_message_sanitization(
         ownership,
         origin,
         continuation,
+        route_handle=None,
         expected_generation=conversation_generation(chat, conversation_id),
         expected_pending=pending,
         claim_id=pending.operation_id,
@@ -287,10 +330,7 @@ def test_confirmation_continuation_matches_baseline_message_sanitization(
 
     assert result.persisted is True
     stored = chat.list_messages(conversation_id)[-len(expected) :]
-    assert {
-        field: getattr(stored[0], field)
-        for field in ("role", "content", "tool_call_id")
-    } == {
+    assert {field: getattr(stored[0], field) for field in ("role", "content", "tool_call_id")} == {
         field: expected[0][field] for field in ("role", "content", "tool_call_id")
     }
     assert _message_projection(stored[1]) == expected[1]
@@ -317,9 +357,7 @@ def test_mapping_tool_args_preserve_nested_json_and_do_not_alias_input(
         }
     ]
     tool_calls: object = (
-        json.dumps(tool_call_values, ensure_ascii=False)
-        if as_json_string
-        else tool_call_values
+        json.dumps(tool_call_values, ensure_ascii=False) if as_json_string else tool_call_values
     )
     mapping = {
         "role": "assistant",
@@ -379,7 +417,16 @@ def test_initial_pending_persists_atomic_tool_chain_and_pending(tmp_path: Path) 
         {"role": "tool", "content": "pending", "tool_call_id": "call-1"},
     ]
 
-    result = coordinator.persist_initial_pending(conversation_id, messages, pending)
+    with issued_clarification_pending_route(pending, conversation_id) as (
+        route_handle,
+        _identity,
+    ):
+        result = coordinator.persist_initial_pending(
+            conversation_id,
+            messages,
+            pending,
+            route_handle=route_handle,
+        )
 
     assert result.persisted is True
     assert coordinator._chat.get_pending_action(conversation_id) == pending
@@ -394,22 +441,72 @@ def test_confirmation_delivery_atomically_replaces_chained_pending(tmp_path: Pat
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
     current = PendingAction("old-call", _NON_LEDGER_PENDING_TOOL, '{"id": 1}', "旧卡")
     replacement = PendingAction("new-call", _NON_LEDGER_PENDING_TOOL, '{"id": 2}', "新卡")
-    assert coordinator._chat.set_pending_action(conversation_id, current)
+    with issued_clarification_pending_route(current, conversation_id) as (
+        route_handle,
+        _identity,
+    ):
+        assert coordinator._chat.set_pending_action(
+            conversation_id,
+            current,
+            route_handle=route_handle,
+        )
     generation = conversation_generation(coordinator._chat, conversation_id)
     ownership = DeliveryOwnership("missing-operation", 1, b"raw", "fingerprint")
 
     # A bad owner must fail before it can leave a partial origin/continuation.
-    result = coordinator.persist_confirmation_delivery(
-        conversation_id,
-        ownership,
-        Message(role="tool", content="result", tool_call_id="old-call"),
-        [Message(role="assistant", content="继续")],
-        replacement,
-        expected_generation=generation,
-        expected_pending=current,
-    )
+    with issued_clarification_pending_route(replacement, conversation_id) as (
+        route_handle,
+        _identity,
+    ):
+        with pytest.raises(TypeError, match="exact parent route"):
+            coordinator.persist_confirmation_delivery(
+                conversation_id,
+                ownership,
+                Message(role="tool", content="result", tool_call_id="old-call"),
+                [Message(role="assistant", content="继续")],
+                replacement,
+                route_handle=route_handle,
+                expected_generation=generation,
+                expected_pending=current,
+            )
 
-    assert result.persisted is False
+    assert coordinator._chat.get_pending_action(conversation_id) == current
+    assert coordinator._chat.list_messages(conversation_id) == []
+
+
+def test_confirmation_delivery_rejects_chained_pending_without_parent_ownership(
+    tmp_path: Path,
+) -> None:
+    coordinator, conversation_id = make_persistence_coordinator(tmp_path)
+    current = PendingAction("old-call", _NON_LEDGER_PENDING_TOOL, '{"id": 1}', "旧卡")
+    replacement = PendingAction("new-call", _NON_LEDGER_PENDING_TOOL, '{"id": 2}', "新卡")
+    with issued_clarification_pending_route(current, conversation_id) as (
+        route_handle,
+        _identity,
+    ):
+        assert coordinator._chat.set_pending_action(
+            conversation_id,
+            current,
+            route_handle=route_handle,
+        )
+    generation = conversation_generation(coordinator._chat, conversation_id)
+
+    with issued_clarification_pending_route(replacement, conversation_id) as (
+        route_handle,
+        _identity,
+    ):
+        with pytest.raises(TypeError, match="parent|ownership"):
+            coordinator.persist_confirmation_delivery(
+                conversation_id,
+                None,
+                Message(role="tool", content="result", tool_call_id="old-call"),
+                [Message(role="assistant", content="继续")],
+                replacement,
+                route_handle=route_handle,
+                expected_generation=generation,
+                expected_pending=current,
+            )
+
     assert coordinator._chat.get_pending_action(conversation_id) == current
     assert coordinator._chat.list_messages(conversation_id) == []
 
@@ -424,15 +521,20 @@ def test_confirmation_delivery_rejects_conflicting_pending_and_clarification_inp
     origin = Message(role="tool", content="结果", tool_call_id=current.tool_call_id)
     continuation = [Message(role="assistant", content="继续")]
 
-    with pytest.raises(ValueError, match="clarification.*pending"):
-        coordinator.persist_confirmation_delivery(
-            conversation_id,
-            None,
-            origin,
-            continuation,
-            pending=current,
-            clarification=clarification,
-        )
+    with issued_clarification_pending_route(replacement, conversation_id) as (
+        route_handle,
+        _identity,
+    ):
+        with pytest.raises(ValueError, match="clarification.*pending"):
+            coordinator.persist_confirmation_delivery(
+                conversation_id,
+                None,
+                origin,
+                continuation,
+                route_handle=route_handle,
+                pending=current,
+                clarification=clarification,
+            )
 
     assert coordinator._chat.list_messages(conversation_id) == []
 
@@ -444,15 +546,20 @@ def test_confirmation_delivery_rejects_both_pending_parameter_names_without_writ
     current = PendingAction("old-call", _NON_LEDGER_PENDING_TOOL, '{"id": 1}', "旧卡")
     replacement = PendingAction("new-call", _NON_LEDGER_PENDING_TOOL, '{"id": 2}', "新卡")
 
-    with pytest.raises(ValueError, match="pending"):
-        coordinator.persist_confirmation_delivery(
-            conversation_id,
-            None,
-            Message(role="tool", content="结果", tool_call_id=current.tool_call_id),
-            [Message(role="assistant", content="继续")],
-            replacement,
-            pending=current,
-        )
+    with issued_clarification_pending_route(replacement, conversation_id) as (
+        route_handle,
+        _identity,
+    ):
+        with pytest.raises(ValueError, match="pending"):
+            coordinator.persist_confirmation_delivery(
+                conversation_id,
+                None,
+                Message(role="tool", content="结果", tool_call_id=current.tool_call_id),
+                [Message(role="assistant", content="继续")],
+                replacement,
+                route_handle=route_handle,
+                pending=current,
+            )
 
     assert coordinator._chat.list_messages(conversation_id) == []
 
@@ -462,20 +569,31 @@ def test_legacy_confirmation_rejects_unsupported_clarification_without_writes(
 ) -> None:
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
     current = PendingAction("old-call", _NON_LEDGER_PENDING_TOOL, '{"id": 1}', "旧卡")
-    clarification = PendingAction(
-        "clarify-call", _NON_LEDGER_PENDING_TOOL, '{"id": 2}', "补充"
-    )
-    assert coordinator._chat.set_pending_action(conversation_id, current)
-
-    with pytest.raises(ValueError, match="clarification"):
-        coordinator.persist_confirmation_delivery(
+    clarification = PendingAction("clarify-call", _NON_LEDGER_PENDING_TOOL, '{"id": 2}', "补充")
+    with issued_clarification_pending_route(current, conversation_id) as (
+        route_handle,
+        _identity,
+    ):
+        assert coordinator._chat.set_pending_action(
             conversation_id,
-            None,
-            Message(role="tool", content="结果", tool_call_id=current.tool_call_id),
-            [Message(role="assistant", content="继续")],
-            expected_pending=current,
-            clarification=(clarification, "请补充信息"),
+            current,
+            route_handle=route_handle,
         )
+
+    with issued_clarification_pending_route(clarification, conversation_id) as (
+        route_handle,
+        _identity,
+    ):
+        with pytest.raises(ValueError, match="clarification"):
+            coordinator.persist_confirmation_delivery(
+                conversation_id,
+                None,
+                Message(role="tool", content="结果", tool_call_id=current.tool_call_id),
+                [Message(role="assistant", content="继续")],
+                route_handle=route_handle,
+                expected_pending=current,
+                clarification=(clarification, "请补充信息"),
+            )
 
     assert coordinator._chat.list_messages(conversation_id) == []
     assert coordinator._chat.get_pending_action(conversation_id) == current
@@ -484,7 +602,15 @@ def test_legacy_confirmation_rejects_unsupported_clarification_without_writes(
 def test_legacy_origin_mapping_keeps_delivery_when_metadata_is_opaque(tmp_path: Path) -> None:
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
     pending = PendingAction("call-1", _NON_LEDGER_PENDING_TOOL, '{"id": 1}', "更新状态")
-    assert coordinator._chat.set_pending_action(conversation_id, pending)
+    with issued_clarification_pending_route(pending, conversation_id) as (
+        route_handle,
+        _identity,
+    ):
+        assert coordinator._chat.set_pending_action(
+            conversation_id,
+            pending,
+            route_handle=route_handle,
+        )
 
     result = coordinator.persist_confirmation_delivery(
         conversation_id,
@@ -497,11 +623,14 @@ def test_legacy_origin_mapping_keeps_delivery_when_metadata_is_opaque(tmp_path: 
             "provider_blocks": "legacy-opaque",
         },
         [Message(role="assistant", content="已完成。")],
+        route_handle=None,
         expected_pending=pending,
     )
 
     assert result.persisted is True
-    assert [(item.role, item.tool_call_id) for item in coordinator._chat.list_messages(conversation_id)] == [
+    assert [
+        (item.role, item.tool_call_id) for item in coordinator._chat.list_messages(conversation_id)
+    ] == [
         ("tool", "call-1"),
         ("assistant", ""),
     ]
@@ -520,6 +649,7 @@ def test_confirmation_delivery_persists_origin_and_continuation_with_ledger(
         ownership,
         Message(role="tool", content="已拒绝", tool_call_id=pending.tool_call_id),
         [Message(role="assistant", content="已按你的选择取消。")],
+        route_handle=None,
         expected_generation=generation,
         expected_pending=pending,
         claim_id=pending.operation_id,
@@ -550,18 +680,25 @@ def test_confirmation_delivery_atomically_chains_a_new_pending_with_ledger(
         "保存第二份岗位资料",
         str(uuid4()),
     )
+    replacement._test_route_components = pending._test_route_components
     generation = conversation_generation(chat, conversation_id)
 
-    result = coordinator.persist_confirmation_delivery(
-        conversation_id,
-        ownership,
-        Message(role="tool", content="需要重新确认", tool_call_id=pending.tool_call_id),
-        [Message(role="assistant", content="请确认下一步。")],
+    with issued_legacy_pending_route(
         replacement,
-        expected_generation=generation,
-        expected_pending=pending,
-        claim_id=pending.operation_id,
-    )
+        conversation_id,
+        source="jd_deterministic_action",
+    ) as (route_handle, _identity):
+        result = coordinator.persist_confirmation_delivery(
+            conversation_id,
+            ownership,
+            Message(role="tool", content="需要重新确认", tool_call_id=pending.tool_call_id),
+            [Message(role="assistant", content="请确认下一步。")],
+            replacement,
+            route_handle=route_handle,
+            expected_generation=generation,
+            expected_pending=pending,
+            claim_id=pending.operation_id,
+        )
 
     assert result.persisted is True
     assert result.delivery_outcome is DeliveryOutcome.CHAINED_PENDING
@@ -586,18 +723,23 @@ def test_confirmation_clarification_is_persisted_atomically_with_delivery(
     )
     generation = conversation_generation(chat, conversation_id)
 
-    result = coordinator.persist_confirmation_continuation(
-        conversation_id,
-        generation,
-        [Message(role="assistant", content="还需要一个信息。")],
-        clarification=(clarification, "请补充第二条状态。"),
-        delivery_ownership=ownership,
-        expected_pending=pending,
-        claim_id=pending.operation_id,
-        origin_message=Message(
-            role="tool", content="字段缺失", tool_call_id=pending.tool_call_id
-        ),
-    )
+    with issued_clarification_pending_route(clarification, conversation_id) as (
+        route_handle,
+        _identity,
+    ):
+        result = coordinator.persist_confirmation_continuation(
+            conversation_id,
+            generation,
+            [Message(role="assistant", content="还需要一个信息。")],
+            route_handle=route_handle,
+            clarification=(clarification, "请补充第二条状态。"),
+            delivery_ownership=ownership,
+            expected_pending=pending,
+            claim_id=pending.operation_id,
+            origin_message=Message(
+                role="tool", content="字段缺失", tool_call_id=pending.tool_call_id
+            ),
+        )
 
     assert result.persisted is True
     assert chat.get_pending_action(conversation_id) is None
@@ -624,6 +766,7 @@ def test_confirmation_delivery_cas_loss_has_no_partial_messages(tmp_path: Path) 
         ownership,
         Message(role="tool", content="过期结果", tool_call_id=pending.tool_call_id),
         [Message(role="assistant", content="不应写入")],
+        route_handle=None,
         expected_generation=conversation_generation(chat, conversation_id),
         expected_pending=newer,
         claim_id=pending.operation_id,
@@ -647,6 +790,7 @@ def test_confirmation_delivery_rollback_leaves_no_partial_messages(tmp_path: Pat
             # A tool continuation with an empty call id violates the existing
             # delivery atom's shape check after the origin has been staged.
             [Message(role="tool", content="坏的 continuation")],
+            route_handle=None,
             expected_generation=conversation_generation(chat, conversation_id),
             expected_pending=pending,
             claim_id=pending.operation_id,
@@ -660,7 +804,16 @@ def test_clarification_set_and_clear_are_typed(tmp_path: Path) -> None:
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
     pending = PendingAction("call-1", _NON_LEDGER_PENDING_TOOL, '{"id": 1}', "更新状态")
 
-    set_result = coordinator.set_pending_clarification(conversation_id, pending, "缺什么？")
+    with issued_clarification_pending_route(pending, conversation_id) as (
+        route_handle,
+        _identity,
+    ):
+        set_result = coordinator.set_pending_clarification(
+            conversation_id,
+            pending,
+            "缺什么？",
+            route_handle=route_handle,
+        )
     assert set_result.status is PersistenceStatus.PERSISTED
     assert coordinator._chat.get_pending_clarification(conversation_id) == (pending, "缺什么？")
 
@@ -681,7 +834,16 @@ def test_clarification_set_ignores_ledger_operation_id_not_stored_by_chat_atom(
         str(uuid4()),
     )
 
-    result = coordinator.set_pending_clarification(conversation_id, pending, "缺什么？")
+    with issued_clarification_pending_route(pending, conversation_id) as (
+        route_handle,
+        _identity,
+    ):
+        result = coordinator.set_pending_clarification(
+            conversation_id,
+            pending,
+            "缺什么？",
+            route_handle=route_handle,
+        )
 
     assert result.status is PersistenceStatus.PERSISTED
     stored = coordinator._chat.get_pending_clarification(conversation_id)
@@ -697,7 +859,16 @@ def test_archived_initial_pending_is_closed_without_messages(tmp_path: Path) -> 
     )
     pending = PendingAction("call-1", _NON_LEDGER_PENDING_TOOL, '{"id": 1}', "更新状态")
 
-    result = coordinator.persist_initial_pending(conversation_id, [], pending)
+    with issued_clarification_pending_route(pending, conversation_id) as (
+        route_handle,
+        _identity,
+    ):
+        result = coordinator.persist_initial_pending(
+            conversation_id,
+            [],
+            pending,
+            route_handle=route_handle,
+        )
 
     assert result.status is PersistenceStatus.CLOSED
     assert result.persisted is False
@@ -725,6 +896,7 @@ def test_archived_confirmation_delivery_is_closed_without_calling_atom(
         owner,
         Message(role="tool", content="结果", tool_call_id="call-1"),
         [Message(role="assistant", content="不应写入")],
+        route_handle=None,
     )
 
     assert result.status is PersistenceStatus.CLOSED
@@ -736,9 +908,26 @@ def test_pending_cas_loss_is_typed_and_non_mutating(tmp_path: Path) -> None:
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
     first = PendingAction("call-1", _NON_LEDGER_PENDING_TOOL, '{"id": 1}', "第一张")
     second = PendingAction("call-2", _NON_LEDGER_PENDING_TOOL, '{"id": 2}', "第二张")
-    assert coordinator._chat.set_pending_action(conversation_id, first)
+    with issued_clarification_pending_route(first, conversation_id) as (
+        route_handle,
+        _identity,
+    ):
+        assert coordinator._chat.set_pending_action(
+            conversation_id,
+            first,
+            route_handle=route_handle,
+        )
 
-    result = coordinator.persist_initial_pending(conversation_id, [], second)
+    with issued_clarification_pending_route(second, conversation_id) as (
+        route_handle,
+        _identity,
+    ):
+        result = coordinator.persist_initial_pending(
+            conversation_id,
+            [],
+            second,
+            route_handle=route_handle,
+        )
 
     assert result.status is PersistenceStatus.CAS_LOST
     assert coordinator._chat.get_pending_action(conversation_id) == first
@@ -750,7 +939,15 @@ def test_confirmation_fallback_and_replay_have_typed_delivery_outcomes(
 ) -> None:
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
     pending = PendingAction("call-1", _NON_LEDGER_PENDING_TOOL, '{"id": 1}', "更新状态")
-    assert coordinator._chat.set_pending_action(conversation_id, pending)
+    with issued_clarification_pending_route(pending, conversation_id) as (
+        route_handle,
+        _identity,
+    ):
+        assert coordinator._chat.set_pending_action(
+            conversation_id,
+            pending,
+            route_handle=route_handle,
+        )
     owner = DeliveryOwnership("operation-1", 1, b"raw", "fingerprint")
     generation = conversation_generation(coordinator._chat, conversation_id)
     captured: list[dict[str, object]] = []
@@ -766,6 +963,7 @@ def test_confirmation_fallback_and_replay_have_typed_delivery_outcomes(
         owner,
         Message(role="tool", content="result", tool_call_id="call-1"),
         "后续说明生成失败。",
+        route_handle=None,
         expected_generation=generation,
         expected_pending=pending,
     )
@@ -774,6 +972,7 @@ def test_confirmation_fallback_and_replay_have_typed_delivery_outcomes(
         owner,
         Message(role="tool", content="result", tool_call_id="call-1"),
         [Message(role="assistant", content="重放结果")],
+        route_handle=None,
         expected_generation=generation,
         expected_pending=pending,
     )
@@ -796,6 +995,7 @@ def test_confirmation_fallback_marks_ledger_delivery_failed(tmp_path: Path) -> N
         ownership,
         Message(role="tool", content="工具已完成", tool_call_id=pending.tool_call_id),
         "后续说明生成失败。",
+        route_handle=None,
         expected_generation=conversation_generation(chat, conversation_id),
         expected_pending=pending,
         claim_id=pending.operation_id,
@@ -822,18 +1022,25 @@ def test_duplicate_chained_delivery_without_pending_has_no_inferred_outcome(
         "保存第二份岗位资料",
         str(uuid4()),
     )
+    replacement._test_route_components = pending._test_route_components
     origin = Message(role="tool", content="结果", tool_call_id=pending.tool_call_id)
     continuation = [Message(role="assistant", content="请确认下一步。")]
-    first = coordinator.persist_confirmation_delivery(
+    with issued_legacy_pending_route(
+        replacement,
         conversation_id,
-        ownership,
-        origin,
-        continuation,
-        chained_pending=replacement,
-        expected_generation=conversation_generation(chat, conversation_id),
-        expected_pending=pending,
-        claim_id=pending.operation_id,
-    )
+        source="jd_deterministic_action",
+    ) as (route_handle, _identity):
+        first = coordinator.persist_confirmation_delivery(
+            conversation_id,
+            ownership,
+            origin,
+            continuation,
+            route_handle=route_handle,
+            chained_pending=replacement,
+            expected_generation=conversation_generation(chat, conversation_id),
+            expected_pending=pending,
+            claim_id=pending.operation_id,
+        )
     before = [
         (item.id, item.role, item.content, item.operation_id, item.delivery_ordinal)
         for item in chat.list_messages(conversation_id)
@@ -844,6 +1051,7 @@ def test_duplicate_chained_delivery_without_pending_has_no_inferred_outcome(
         ownership,
         origin,
         continuation,
+        route_handle=None,
         expected_generation=first.generation,
         claim_id=pending.operation_id,
     )
@@ -871,6 +1079,7 @@ def test_replay_delivery_returns_duplicate_after_delivery_without_new_messages(
         ownership,
         origin,
         continuation,
+        route_handle=None,
         expected_generation=conversation_generation(chat, conversation_id),
         expected_pending=pending,
         claim_id=pending.operation_id,
@@ -882,6 +1091,7 @@ def test_replay_delivery_returns_duplicate_after_delivery_without_new_messages(
         ownership,
         origin,
         continuation,
+        route_handle=None,
         expected_generation=first.generation,
         expected_pending=pending,
         claim_id=pending.operation_id,
@@ -923,6 +1133,7 @@ def test_duplicate_delivery_is_idempotent_and_does_not_call_atom(
         owner,
         Message(role="tool", content="result", tool_call_id="call-1"),
         [Message(role="assistant", content="重放结果")],
+        route_handle=None,
     )
 
     assert result.status is PersistenceStatus.DUPLICATE
@@ -1079,13 +1290,32 @@ def test_public_message_reads_are_frozen_detached_snapshots(tmp_path: Path) -> N
 
 def test_public_pending_reads_are_frozen_snapshots(tmp_path: Path) -> None:
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
-    pending = PendingAction(
-        "call-1", _NON_LEDGER_PENDING_TOOL, '{"id": 7}', "更新状态"
-    )
-    assert coordinator._chat.set_pending_action(conversation_id, pending) is True
-    assert coordinator._chat.set_pending_clarification(
-        conversation_id, pending, "还缺什么？"
-    ) is None
+    pending = PendingAction("call-1", _NON_LEDGER_PENDING_TOOL, '{"id": 7}', "更新状态")
+    with issued_clarification_pending_route(pending, conversation_id) as (
+        pending_route,
+        _identity,
+    ):
+        assert (
+            coordinator._chat.set_pending_action(
+                conversation_id,
+                pending,
+                route_handle=pending_route,
+            )
+            is True
+        )
+    with issued_clarification_pending_route(pending, conversation_id) as (
+        clarification_route,
+        _identity,
+    ):
+        assert (
+            coordinator._chat.set_pending_clarification(
+                conversation_id,
+                pending,
+                "还缺什么？",
+                route_handle=clarification_route,
+            )
+            is None
+        )
 
     pending_view = coordinator.get_pending_action(conversation_id)
     clarification_view = coordinator.get_pending_clarification(conversation_id)
@@ -1120,9 +1350,9 @@ def test_public_read_annotations_are_closed_snapshot_types() -> None:
         "get_pending_action",
         "get_pending_clarification",
     ):
-        return_annotation = get_type_hints(
-            getattr(ChatPersistenceCoordinator, method_name)
-        )["return"]
+        return_annotation = get_type_hints(getattr(ChatPersistenceCoordinator, method_name))[
+            "return"
+        ]
         rendered = str(return_annotation)
         assert return_annotation is not Any
         assert "Any" not in rendered
@@ -1135,7 +1365,6 @@ def test_public_read_annotations_are_closed_snapshot_types() -> None:
     assert PendingClarificationView.__slots__
 
 
-
 @pytest.mark.parametrize("method", ["persist_timeout_assistant", "persist_initial_user_message"])
 def test_message_helpers_preserve_identity_fields(tmp_path: Path, method: str) -> None:
     coordinator, conversation_id = make_persistence_coordinator(tmp_path)
@@ -1143,7 +1372,16 @@ def test_message_helpers_preserve_identity_fields(tmp_path: Path, method: str) -
         result = coordinator.persist_initial_user_message(conversation_id, "用户消息")
     else:
         pending = PendingAction("call-1", _NON_LEDGER_PENDING_TOOL, '{"id": 1}', "更新状态")
-        coordinator._chat.set_pending_clarification(conversation_id, pending, "缺什么？")
+        with issued_clarification_pending_route(pending, conversation_id) as (
+            route_handle,
+            _identity,
+        ):
+            coordinator._chat.set_pending_clarification(
+                conversation_id,
+                pending,
+                "缺什么？",
+                route_handle=route_handle,
+            )
         result = coordinator.persist_timeout_assistant(conversation_id, "超时，请重试。")
     assert result.persisted is True
     assert coordinator._chat.list_messages(conversation_id)[-1].content

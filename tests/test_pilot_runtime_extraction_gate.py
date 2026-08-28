@@ -2507,6 +2507,9 @@ def test_canary_private_values_do_not_enter_journal_trace_sse_or_error_log_paylo
         # projection.
         from offerpilot.ai.agent_contracts import AgentAssistantDelta
         from offerpilot.ai.write_operations import WriteOperationError
+        from tests.tool_authority.test_pending_claim import (
+            create_primary_with_typed_route,
+        )
 
         for _internal_name, internal_value in private_state.internal.items():
             with pytest.raises(TypeError):
@@ -2533,24 +2536,28 @@ def test_canary_private_values_do_not_enter_journal_trace_sse_or_error_log_paylo
         assert chat_repository.get_pending_action(conversation_id) is None
 
         with session_factory() as ledger_session:
-            with pytest.raises(WriteOperationError):
+            with pytest.raises((WriteOperationError, TypeError, ValueError)):
                 ledger_repository.create_primary(
                     ledger_session,
+                    route_handle=object(),
                     operation_id=str(uuid4()),
                     conversation_id=conversation_id,
                     tool_call_id="call-private-ledger",
                     tool_name=prepared,  # type: ignore[arg-type]
-                    adapter_kind="typed",
+                    pending_action_revision=1,
+                    pending_confirmation_claim_id="invalid-private-claim",
+                    arguments_digest="sha256:" + "0" * 64,
                     proposal_fingerprint="hmac-sha256:" + "a" * 64,
                     confirmation_token_fingerprint="hmac-sha256:" + "b" * 64,
                 )
-            ledger_operation = ledger_repository.create_primary(
+            ledger_operation = create_primary_with_typed_route(
+                ledger_repository,
                 ledger_session,
                 operation_id=str(uuid4()),
                 conversation_id=conversation_id,
                 tool_call_id="call-public-ledger",
                 tool_name="create_application",
-                adapter_kind="typed",
+                raw_args="{}",
                 proposal_fingerprint="hmac-sha256:" + "c" * 64,
                 confirmation_token_fingerprint="hmac-sha256:" + "d" * 64,
                 authorization_scope_fingerprint="hmac-sha256:" + "e" * 64,

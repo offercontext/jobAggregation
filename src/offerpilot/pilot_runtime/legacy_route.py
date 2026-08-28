@@ -17,9 +17,13 @@ from sqlalchemy.orm import Session
 
 from offerpilot.ai.tool_runtime.contracts import JSONValue, TransientToolRuntimeValue
 from offerpilot.ai.tool_runtime.legacy import (
+    LegacyArgumentPreparationError,
     LegacyDeterministicAdapterSpec,
     LegacyInitialRoutePort,
-    LegacyProofDeterministicCatalog,
+    LegacyDeterministicCatalog,
+    LegacyPendingPresentationV1,
+    LegacyPresentationBindingV1,
+    LegacyReadContextPort,
     LegacyStaticAdapterCatalogV1,
     _create_legacy_proof_route_handle,
     _decode_legacy_arguments_object,
@@ -29,6 +33,7 @@ from offerpilot.ai.tool_runtime.legacy_proof import (
     LegacyApprovedConfirmationInput,
     LegacyClaimLease,
     LegacyConfirmationLookupIdentity,
+    LegacyPreparedInputPort,
     LegacyPreparationRegistry,
     LegacyRouteIssuanceLease,
     LegacyRouteProof,
@@ -47,6 +52,7 @@ from offerpilot.ai.tool_runtime.protocol_seals import verify_legacy_boundary
 from offerpilot.ai.tool_runtime.validation import canonical_json
 from offerpilot.ai.write_operations import (
     LedgerKeyDomain,
+    WriteOperationError,
     ledger_fingerprint,
     operation_request_fingerprint,
 )
@@ -79,6 +85,18 @@ _EXPECTED_SNAPSHOT_KEYS = frozenset(
 )
 _TRANSACTION_CONTROL_KEYWORDS = frozenset(
     {"ABORT", "BEGIN", "COMMIT", "END", "RELEASE", "ROLLBACK", "SAVEPOINT"}
+)
+_BOUND_JOURNAL_WRITE_TABLES = frozenset({"agent_events", "agent_runs"})
+_BOUND_PROJECTION_WRITE_SQL = frozenset({("INSERT", "agent_events"), ("UPDATE", "agent_runs")})
+_BOUND_PROJECTION_READ_KEYWORDS = frozenset({"SELECT"})
+_BOUND_PROJECTION_NON_TABLE_READ_ACTIONS = frozenset(
+    {sqlite3.SQLITE_FUNCTION, sqlite3.SQLITE_RECURSIVE, sqlite3.SQLITE_SELECT}
+)
+_BOUND_PROJECTION_WRITE_ACTIONS = frozenset(
+    {
+        (sqlite3.SQLITE_INSERT, "agent_events"),
+        (sqlite3.SQLITE_UPDATE, "agent_runs"),
+    }
 )
 _RegistryKey = TypeVar("_RegistryKey")
 _RegistryValue = TypeVar("_RegistryValue")
@@ -170,7 +188,7 @@ def _require_outer_transaction(session: object) -> object:
     return transaction
 
 
-def _leading_sql_keyword(statement: object) -> str | None:
+def _leading_sql_statement(statement: object) -> str | None:
     if type(statement) is not str:
         return None
     candidate = statement.lstrip()
@@ -193,7 +211,40 @@ def _leading_sql_keyword(statement: object) -> str | None:
         break
     if not candidate:
         return None
+    return candidate
+
+
+def _leading_sql_keyword(statement: object) -> str | None:
+    candidate = _leading_sql_statement(statement)
+    if candidate is None:
+        return None
     return candidate.split(None, 1)[0].rstrip(";").upper()
+
+
+def _bound_projection_write_table(statement: object) -> str | None:
+    candidate = _leading_sql_statement(statement)
+    if candidate is None:
+        return None
+    tokens = candidate.replace('"', "").replace("`", "").replace("[", "").replace("]", "").split()
+    if not tokens:
+        return None
+    keyword = tokens[0].rstrip(";").upper()
+    table_index: int | None = None
+    if keyword in {"INSERT", "REPLACE"}:
+        try:
+            table_index = next(
+                index + 1 for index, token in enumerate(tokens) if token.upper() == "INTO"
+            )
+        except StopIteration:
+            return None
+    elif keyword == "DELETE":
+        if len(tokens) > 2 and tokens[1].upper() == "FROM":
+            table_index = 2
+    elif keyword == "UPDATE":
+        table_index = 3 if len(tokens) > 3 and tokens[1].upper() == "OR" else 1
+    if table_index is None or table_index >= len(tokens):
+        return None
+    return tokens[table_index].rstrip(";,(").split(".")[-1].lower()
 
 
 def _require_unbegun_session(session: object) -> Session:
@@ -264,12 +315,26 @@ class _TransactionControlFence(_SealedValue):
         "_identity",
         "_violated",
         "_internal_depth",
+        "_projection_depth",
+        "_execution_depth",
+        "_boundary_closed",
+        "_expected_savepoint_kind",
+        "_expected_savepoint_operation",
+        "_expected_savepoint_name",
+        "_projection_savepoints",
         "_authorizer_observations",
         "_integrity_seal",
     )
     _identity: object
     _violated: bool
     _internal_depth: int
+    _projection_depth: int
+    _execution_depth: int
+    _boundary_closed: bool
+    _expected_savepoint_kind: Literal["guard", "projection"] | None
+    _expected_savepoint_operation: str | None
+    _expected_savepoint_name: str | None
+    _projection_savepoints: tuple[str, ...]
     _authorizer_observations: int
     _integrity_seal: tuple[object, ...]
 
@@ -278,6 +343,13 @@ class _TransactionControlFence(_SealedValue):
         object.__setattr__(self, "_identity", identity)
         object.__setattr__(self, "_violated", False)
         object.__setattr__(self, "_internal_depth", 0)
+        object.__setattr__(self, "_projection_depth", 0)
+        object.__setattr__(self, "_execution_depth", 0)
+        object.__setattr__(self, "_boundary_closed", False)
+        object.__setattr__(self, "_expected_savepoint_kind", None)
+        object.__setattr__(self, "_expected_savepoint_operation", None)
+        object.__setattr__(self, "_expected_savepoint_name", None)
+        object.__setattr__(self, "_projection_savepoints", ())
         object.__setattr__(self, "_authorizer_observations", 0)
         self._seal()
 
@@ -290,6 +362,13 @@ class _TransactionControlFence(_SealedValue):
                 self._identity,
                 self._violated,
                 self._internal_depth,
+                self._projection_depth,
+                self._execution_depth,
+                self._boundary_closed,
+                self._expected_savepoint_kind,
+                self._expected_savepoint_operation,
+                self._expected_savepoint_name,
+                self._projection_savepoints,
                 self._authorizer_observations,
             ),
         )
@@ -300,6 +379,40 @@ class _TransactionControlFence(_SealedValue):
                 type(self._violated) is not bool
                 or type(self._internal_depth) is not int
                 or self._internal_depth < 0
+                or type(self._projection_depth) is not int
+                or self._projection_depth < 0
+                or self._projection_depth > self._internal_depth
+                or type(self._execution_depth) is not int
+                or self._execution_depth not in {0, 1}
+                or (self._execution_depth > 0 and self._projection_depth > 0)
+                or type(self._boundary_closed) is not bool
+                or self._expected_savepoint_kind not in {None, "guard", "projection"}
+                or (
+                    (self._expected_savepoint_kind is None)
+                    != (self._expected_savepoint_operation is None)
+                )
+                or (
+                    self._expected_savepoint_operation is not None
+                    and self._expected_savepoint_operation not in {"BEGIN", "RELEASE", "ROLLBACK"}
+                )
+                or (
+                    self._expected_savepoint_kind is None
+                    and self._expected_savepoint_name is not None
+                )
+                or (
+                    self._expected_savepoint_kind == "guard"
+                    and self._expected_savepoint_name is None
+                )
+                or (
+                    self._expected_savepoint_kind == "projection"
+                    and self._expected_savepoint_operation != "BEGIN"
+                    and self._expected_savepoint_name is None
+                )
+                or type(self._projection_savepoints) is not tuple
+                or any(
+                    type(name) is not str or not name.startswith("sa_savepoint_")
+                    for name in self._projection_savepoints
+                )
                 or type(self._authorizer_observations) is not int
                 or self._authorizer_observations < 0
                 or not _same_identity_tuple(
@@ -309,6 +422,13 @@ class _TransactionControlFence(_SealedValue):
                         self._identity,
                         self._violated,
                         self._internal_depth,
+                        self._projection_depth,
+                        self._execution_depth,
+                        self._boundary_closed,
+                        self._expected_savepoint_kind,
+                        self._expected_savepoint_operation,
+                        self._expected_savepoint_name,
+                        self._projection_savepoints,
                         self._authorizer_observations,
                     ),
                 )
@@ -339,30 +459,165 @@ class _TransactionControlFence(_SealedValue):
         object.__setattr__(self, "_internal_depth", self._internal_depth - 1)
         self._seal()
 
-    def _observe(self, statement: object) -> None:
+    def _enter_projection(self) -> None:
+        self._require_integrity()
+        object.__setattr__(self, "_internal_depth", self._internal_depth + 1)
+        object.__setattr__(self, "_projection_depth", self._projection_depth + 1)
+        self._seal()
+
+    def _exit_projection(self) -> None:
+        self._require_integrity()
+        if self._projection_depth <= 0 or self._internal_depth <= 0:
+            raise ValueError("Legacy transaction-control fence is not projecting")
+        if self._expected_savepoint_kind is not None or self._projection_savepoints:
+            self._violate()
+            raise ValueError("Legacy bound projection savepoint ownership did not close")
+        object.__setattr__(self, "_projection_depth", self._projection_depth - 1)
+        object.__setattr__(self, "_internal_depth", self._internal_depth - 1)
+        self._seal()
+
+    def _enter_execution(self) -> None:
+        self._require_integrity()
+        if self._internal_depth != 0 or self._projection_depth != 0 or self._execution_depth != 0:
+            raise WriteOperationError("operation_not_committed", retryable=True)
+        object.__setattr__(self, "_execution_depth", 1)
+        self._seal()
+
+    def _exit_execution(self) -> None:
+        self._require_integrity()
+        if self._execution_depth != 1:
+            raise WriteOperationError("operation_not_committed", retryable=True)
+        object.__setattr__(self, "_execution_depth", 0)
+        self._seal()
+
+    def _claim_boundary_close(self) -> bool:
+        self._require_integrity()
+        if self._boundary_closed:
+            return False
+        object.__setattr__(self, "_boundary_closed", True)
+        self._seal()
+        return True
+
+    def _expect_savepoint(
+        self,
+        *,
+        kind: Literal["guard", "projection"],
+        operation: Literal["BEGIN", "RELEASE", "ROLLBACK"],
+        name: str | None,
+    ) -> None:
         self._require_integrity()
         if (
-            self._internal_depth == 0
-            and _leading_sql_keyword(statement) in _TRANSACTION_CONTROL_KEYWORDS
+            self._expected_savepoint_kind is not None
+            or self._internal_depth <= 0
+            or (kind == "projection" and self._projection_depth <= 0)
+            or (kind == "guard" and self._projection_depth != 0)
+            or (name is not None and type(name) is not str)
+            or (
+                kind == "projection"
+                and operation in {"RELEASE", "ROLLBACK"}
+                and (not self._projection_savepoints or name != self._projection_savepoints[-1])
+            )
         ):
+            self._violate()
+            raise ValueError("Legacy savepoint expectation is invalid")
+        object.__setattr__(self, "_expected_savepoint_kind", kind)
+        object.__setattr__(self, "_expected_savepoint_operation", operation)
+        object.__setattr__(self, "_expected_savepoint_name", name)
+        self._seal()
+
+    def _authorize_savepoint(self, operation: str | None, name: str | None) -> int:
+        kind = self._expected_savepoint_kind
+        expected_operation = self._expected_savepoint_operation
+        expected_name = self._expected_savepoint_name
+        valid_generated_name = (
+            kind == "projection"
+            and expected_operation == "BEGIN"
+            and expected_name is None
+            and type(name) is str
+            and name.startswith("sa_savepoint_")
+        )
+        if (
+            kind is None
+            or type(operation) is not str
+            or operation.upper() != expected_operation
+            or (not valid_generated_name and name != expected_name)
+        ):
+            self._violate()
+            return sqlite3.SQLITE_DENY
+        object.__setattr__(self, "_expected_savepoint_kind", None)
+        object.__setattr__(self, "_expected_savepoint_operation", None)
+        object.__setattr__(self, "_expected_savepoint_name", None)
+        if kind == "projection" and expected_operation == "BEGIN":
+            object.__setattr__(self, "_projection_savepoints", (*self._projection_savepoints, name))
+        elif kind == "projection":
+            object.__setattr__(self, "_projection_savepoints", self._projection_savepoints[:-1])
+        object.__setattr__(
+            self,
+            "_authorizer_observations",
+            self._authorizer_observations + 1,
+        )
+        self._seal()
+        return sqlite3.SQLITE_OK
+
+    def _observe(self, statement: object) -> None:
+        self._require_integrity()
+        keyword = _leading_sql_keyword(statement)
+        if keyword in _TRANSACTION_CONTROL_KEYWORDS:
+            savepoint_control = keyword in {"RELEASE", "SAVEPOINT"} or (
+                keyword == "ROLLBACK"
+                and type(statement) is str
+                and " TO " in f" {statement.upper()} "
+            )
+            if self._internal_depth > 0 and savepoint_control:
+                return
             self._violate()
             raise ValueError("Legacy issuance forbids transaction control SQL")
 
-    def _authorize(self, action: int, _operation: str | None) -> int:
+        if self._projection_depth == 0:
+            return
+        if keyword in _BOUND_PROJECTION_READ_KEYWORDS:
+            return
+        if (keyword, _bound_projection_write_table(statement)) in _BOUND_PROJECTION_WRITE_SQL:
+            return
+        self._violate()
+        raise ValueError("Legacy bound projection forbids non-Journal SQL")
+
+    def _authorize(
+        self,
+        action: int,
+        operation: str | None,
+        detail: str | None,
+        database: str | None,
+        trigger: str | None,
+    ) -> int:
         try:
             self._require_integrity()
-            if action not in {sqlite3.SQLITE_SAVEPOINT, sqlite3.SQLITE_TRANSACTION}:
-                return sqlite3.SQLITE_OK
-            if self._internal_depth == 0:
+            if action == sqlite3.SQLITE_TRANSACTION:
                 self._violate()
                 return sqlite3.SQLITE_DENY
-            object.__setattr__(
-                self,
-                "_authorizer_observations",
-                self._authorizer_observations + 1,
-            )
-            self._seal()
-            return sqlite3.SQLITE_OK
+            if action == sqlite3.SQLITE_SAVEPOINT:
+                return self._authorize_savepoint(operation, detail)
+            if self._projection_depth == 0:
+                return sqlite3.SQLITE_OK
+            if action in _BOUND_PROJECTION_NON_TABLE_READ_ACTIONS:
+                return sqlite3.SQLITE_OK
+            if (
+                action == sqlite3.SQLITE_READ
+                and type(operation) is str
+                and operation.lower() in _BOUND_JOURNAL_WRITE_TABLES
+                and database == "main"
+                and trigger is None
+            ):
+                return sqlite3.SQLITE_OK
+            if (
+                (action, operation.lower() if type(operation) is str else None)
+                in _BOUND_PROJECTION_WRITE_ACTIONS
+                and database == "main"
+                and trigger is None
+            ):
+                return sqlite3.SQLITE_OK
+            self._violate()
+            return sqlite3.SQLITE_DENY
         except BaseException:
             return sqlite3.SQLITE_DENY
 
@@ -402,12 +657,98 @@ class _IssuanceState:
     session_token: object
     prepared_call: PreparedLegacyCall
     transaction_control_listener: Callable[..., None]
+    transaction_control_savepoint_listeners: tuple[tuple[str, Callable[..., None]], ...]
     locked_evidence: LockedLegacyRouteEvidence | None = None
     locked_snapshot: Mapping[str, object] | None = None
     claim_lease: LegacyClaimLease | None = None
     claimed_snapshot: Mapping[str, object] | None = None
     proof_snapshot_consumed: bool = False
     integrity_seal: tuple[object, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _IssuanceCleanupIdentity:
+    session: Session
+    connection: Connection
+    transaction_guard_name: str
+    transaction_control_fence: _TransactionControlFence
+    dbapi_connection: sqlite3.Connection
+    prepared_call: PreparedLegacyCall
+    transaction_control_listener: Callable[..., None]
+    transaction_control_savepoint_listeners: tuple[tuple[str, Callable[..., None]], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _EvidenceCleanupIdentity:
+    issuance_lease: LegacyRouteIssuanceLease | None
+    prepared_call: PreparedLegacyCall | None
+
+
+def _sealed_issuance_cleanup_identity(
+    candidate: _IssuanceState,
+    issuance_lease: LegacyRouteIssuanceLease,
+) -> _IssuanceCleanupIdentity | None:
+    seal = candidate.integrity_seal
+    if type(seal) is not tuple or len(seal) != 19:
+        return None
+    owner = seal[0]
+    if (
+        type(owner) is not _IssuanceState
+        or owner is not candidate
+        or owner.integrity_seal is not seal
+        or seal[1] is not issuance_lease
+        or owner.lease is not issuance_lease
+        or not isinstance(seal[2], Session)
+        or seal[3] is None
+        or not isinstance(seal[4], Connection)
+        or seal[5] is None
+        or type(seal[6]) is not str
+        or type(seal[7]) is not _TransactionControlFence
+        or not isinstance(seal[8], sqlite3.Connection)
+        or not callable(seal[9])
+        or type(seal[10]) is not object
+        or type(seal[11]) is not PreparedLegacyCall
+        or not callable(seal[12])
+        or type(seal[13]) is not tuple
+        or any(
+            type(item) is not tuple or len(item) != 2 or not callable(item[1]) for item in seal[13]
+        )
+    ):
+        return None
+    return _IssuanceCleanupIdentity(
+        session=seal[2],
+        connection=seal[4],
+        transaction_guard_name=seal[6],
+        transaction_control_fence=seal[7],
+        dbapi_connection=seal[8],
+        prepared_call=seal[11],
+        transaction_control_listener=seal[12],
+        transaction_control_savepoint_listeners=seal[13],
+    )
+
+
+def _sealed_evidence_cleanup_identity(
+    evidence: LockedLegacyRouteEvidence,
+    candidate: _EvidenceState,
+) -> _EvidenceCleanupIdentity | None:
+    seal = candidate.integrity_seal
+    if type(seal) is not tuple or len(seal) != 10:
+        return None
+    owner = seal[0]
+    if (
+        type(owner) is not _EvidenceState
+        or owner is not candidate
+        or owner.integrity_seal is not seal
+        or seal[1] is not evidence
+        or owner.evidence is not evidence
+        or (seal[7] is not None and type(seal[7]) is not LegacyRouteIssuanceLease)
+        or (seal[9] is not None and type(seal[9]) is not PreparedLegacyCall)
+    ):
+        return None
+    return _EvidenceCleanupIdentity(
+        issuance_lease=seal[7],
+        prepared_call=seal[9],
+    )
 
 
 def _transaction_guard_statement(command: Literal["RELEASE", "SAVEPOINT"], name: str) -> str:
@@ -428,8 +769,18 @@ def _verify_transaction_guard(state: _IssuanceState) -> None:
     nonce = uuid4().hex
     fence._enter_internal()
     try:
+        fence._expect_savepoint(
+            kind="guard",
+            operation="RELEASE",
+            name=state.transaction_guard_name,
+        )
         state.connection.exec_driver_sql(
             f"{_transaction_guard_statement('RELEASE', state.transaction_guard_name)} /* {nonce} */"
+        )
+        fence._expect_savepoint(
+            kind="guard",
+            operation="BEGIN",
+            name=state.transaction_guard_name,
         )
         state.connection.exec_driver_sql(
             f"{_transaction_guard_statement('SAVEPOINT', state.transaction_guard_name)} "
@@ -452,6 +803,11 @@ def _release_transaction_guard(
     try:
         fence._enter_internal()
         try:
+            fence._expect_savepoint(
+                kind="guard",
+                operation="RELEASE",
+                name=guard_name,
+            )
             connection.exec_driver_sql(_transaction_guard_statement("RELEASE", guard_name))
         finally:
             fence._exit_internal()
@@ -470,6 +826,18 @@ def _remove_transaction_control_listener(
         pass
 
 
+def _remove_savepoint_listeners(
+    connection: Connection,
+    listeners: tuple[tuple[str, Callable[..., None]], ...],
+) -> None:
+    for identifier, listener in listeners:
+        try:
+            if event.contains(connection, identifier, listener):
+                event.remove(connection, identifier, listener)
+        except BaseException:
+            pass
+
+
 def _remove_transaction_control_authorizer(
     dbapi_connection: sqlite3.Connection,
 ) -> None:
@@ -484,11 +852,47 @@ def _close_transaction_control_boundary(
     fence: _TransactionControlFence,
     guard_name: str,
     listener: Callable[..., None],
+    savepoint_listeners: tuple[tuple[str, Callable[..., None]], ...],
     dbapi_connection: sqlite3.Connection,
 ) -> None:
+    try:
+        first_close = fence._claim_boundary_close()
+    except BaseException:
+        first_close = True
+    if not first_close:
+        return
+    _remove_savepoint_listeners(connection, savepoint_listeners)
     _remove_transaction_control_listener(connection, listener)
     _release_transaction_guard(connection, fence, guard_name)
     _remove_transaction_control_authorizer(dbapi_connection)
+
+
+def _abort_violated_issuance_transaction(identity: _IssuanceCleanupIdentity) -> None:
+    _remove_savepoint_listeners(
+        identity.connection,
+        identity.transaction_control_savepoint_listeners,
+    )
+    _remove_transaction_control_listener(
+        identity.connection,
+        identity.transaction_control_listener,
+    )
+    _remove_transaction_control_authorizer(identity.dbapi_connection)
+    failed = False
+    try:
+        if identity.session.in_transaction():
+            identity.session.rollback()
+    except BaseException:
+        failed = True
+    try:
+        if identity.dbapi_connection.in_transaction:
+            identity.dbapi_connection.rollback()
+    except BaseException:
+        failed = True
+    if failed:
+        try:
+            identity.connection.invalidate()
+        except BaseException:
+            pass
 
 
 class LegacyPendingIdentityVerifierPort(_SealedValue):
@@ -791,6 +1195,7 @@ class LegacyPendingIdentityVerifierPort(_SealedValue):
             state.session_token,
             state.prepared_call,
             state.transaction_control_listener,
+            state.transaction_control_savepoint_listeners,
             state.locked_evidence,
             state.locked_snapshot,
             state.claim_lease,
@@ -824,6 +1229,14 @@ class LegacyPendingIdentityVerifierPort(_SealedValue):
                 or type(state.session_token) is not object
                 or type(state.prepared_call) is not PreparedLegacyCall
                 or not callable(state.transaction_control_listener)
+                or type(state.transaction_control_savepoint_listeners) is not tuple
+                or any(
+                    type(item) is not tuple
+                    or len(item) != 2
+                    or type(item[0]) is not str
+                    or not callable(item[1])
+                    for item in state.transaction_control_savepoint_listeners
+                )
                 or type(state.proof_snapshot_consumed) is not bool
             ):
                 raise ValueError("Legacy issuance Registry state identity drift")
@@ -1188,6 +1601,7 @@ class LegacyPendingIdentityVerifierPort(_SealedValue):
             fence: _TransactionControlFence | None = None
             guard_name: str | None = None
             listener: Callable[..., None] | None = None
+            savepoint_listeners: tuple[tuple[str, Callable[..., None]], ...] = ()
             dbapi_connection: sqlite3.Connection | None = None
             authorizer: (
                 Callable[[int, str | None, str | None, str | None, str | None], int] | None
@@ -1218,13 +1632,18 @@ class LegacyPendingIdentityVerifierPort(_SealedValue):
                     _database: str | None,
                     _trigger: str | None,
                 ) -> int:
-                    return fence._authorize(action, _arg1)
+                    return fence._authorize(action, _arg1, _arg2, _database, _trigger)
 
                 authorizer = authorize_transaction_control
                 dbapi_connection.set_authorizer(authorizer)
                 observations = fence.authorizer_observations
                 fence._enter_internal()
                 try:
+                    fence._expect_savepoint(
+                        kind="guard",
+                        operation="BEGIN",
+                        name=guard_name,
+                    )
                     connection.exec_driver_sql(
                         f"{_transaction_guard_statement('SAVEPOINT', guard_name)} "
                         f"/* {uuid4().hex} */"
@@ -1245,6 +1664,44 @@ class LegacyPendingIdentityVerifierPort(_SealedValue):
                     fence._observe(statement)
 
                 listener = reject_transaction_control
+
+                def expect_nested_begin(
+                    _connection: object,
+                    name: str | None,
+                ) -> None:
+                    fence._expect_savepoint(
+                        kind="projection",
+                        operation="BEGIN",
+                        name=name,
+                    )
+
+                def expect_nested_release(
+                    _connection: object,
+                    name: str,
+                    _context: object,
+                ) -> None:
+                    fence._expect_savepoint(
+                        kind="projection",
+                        operation="RELEASE",
+                        name=name,
+                    )
+
+                def expect_nested_rollback(
+                    _connection: object,
+                    name: str,
+                    _context: object,
+                ) -> None:
+                    fence._expect_savepoint(
+                        kind="projection",
+                        operation="ROLLBACK",
+                        name=name,
+                    )
+
+                savepoint_listeners = (
+                    ("savepoint", expect_nested_begin),
+                    ("release_savepoint", expect_nested_release),
+                    ("rollback_savepoint", expect_nested_rollback),
+                )
                 session_token = object()
                 lease = LegacyRouteIssuanceLease._create(
                     lock=lock,
@@ -1265,10 +1722,15 @@ class LegacyPendingIdentityVerifierPort(_SealedValue):
                     session_token=session_token,
                     prepared_call=prepared_call,
                     transaction_control_listener=listener,
+                    transaction_control_savepoint_listeners=savepoint_listeners,
                 )
                 self._seal_issuance_state(state)
                 self._issuance[lease] = state
                 event.listen(connection, "before_cursor_execute", listener)
+                for listener_entry in savepoint_listeners:
+                    identifier = listener_entry[0]
+                    savepoint_listener: Callable[..., None] = listener_entry[1]
+                    event.listen(connection, identifier, savepoint_listener)
                 lease._attach_cleanup(
                     lock=lock,
                     runtime_container_token=runtime,
@@ -1278,6 +1740,7 @@ class LegacyPendingIdentityVerifierPort(_SealedValue):
                         fence,
                         guard_name,
                         listener,
+                        savepoint_listeners,
                         dbapi_connection,
                     ),
                 )
@@ -1298,6 +1761,8 @@ class LegacyPendingIdentityVerifierPort(_SealedValue):
                 if lease is not None:
                     self._close_issuance(lease)
                     lease.close()
+                if connection is not None and savepoint_listeners:
+                    _remove_savepoint_listeners(connection, savepoint_listeners)
                 if (
                     connection is not None
                     and fence is not None
@@ -1310,6 +1775,7 @@ class LegacyPendingIdentityVerifierPort(_SealedValue):
                         fence,
                         guard_name,
                         listener,
+                        savepoint_listeners,
                         dbapi_connection,
                     )
                 elif dbapi_connection is not None:
@@ -1352,6 +1818,70 @@ class LegacyPendingIdentityVerifierPort(_SealedValue):
                 raise ValueError("Legacy issuance transaction provenance changed")
             _verify_transaction_guard(state)
             return state
+
+    def _run_bound_projection(
+        self,
+        issuance_lease: LegacyRouteIssuanceLease,
+        callback: Callable[[], object],
+    ) -> None:
+        if not callable(callback):
+            raise TypeError("Legacy bound projection requires an exact callable")
+        lock, _preparation, _proof, _issuer, _runtime = self._topology()
+        with lock:
+            state = self._require_issuance_transaction(issuance_lease)
+            fence = state.transaction_control_fence
+            fence._enter_projection()
+            try:
+                callback()
+            finally:
+                try:
+                    fence._exit_projection()
+                finally:
+                    if fence.violated:
+                        cleanup_identity = _sealed_issuance_cleanup_identity(
+                            state,
+                            issuance_lease,
+                        )
+                        if cleanup_identity is None:
+                            raise ValueError("Legacy issuance cleanup identity drift")
+                        _abort_violated_issuance_transaction(cleanup_identity)
+                        raise WriteOperationError(
+                            "operation_not_committed",
+                            retryable=True,
+                        )
+                self._require_issuance_transaction(issuance_lease)
+
+    def _run_verified_executor(
+        self,
+        issuance_lease: LegacyRouteIssuanceLease,
+        callback: Callable[[], str],
+    ) -> str:
+        if not callable(callback):
+            raise TypeError("Legacy executor requires an exact callable")
+        lock, _preparation, _proof, _issuer, _runtime = self._topology()
+        with lock:
+            state = self._require_issuance_transaction(issuance_lease)
+            fence = state.transaction_control_fence
+            fence._enter_execution()
+            try:
+                return callback()
+            finally:
+                try:
+                    fence._exit_execution()
+                finally:
+                    if fence.violated:
+                        cleanup_identity = _sealed_issuance_cleanup_identity(
+                            state,
+                            issuance_lease,
+                        )
+                        if cleanup_identity is None:
+                            raise ValueError("Legacy issuance cleanup identity drift")
+                        _abort_violated_issuance_transaction(cleanup_identity)
+                        raise WriteOperationError(
+                            "operation_not_committed",
+                            retryable=True,
+                        )
+                self._require_issuance_transaction(issuance_lease)
 
     def _require_execution_context(
         self,
@@ -1745,103 +2275,61 @@ class LegacyPendingIdentityVerifierPort(_SealedValue):
                 if state is not None and all(existing is not state for existing in states):
                     states.append(state)
             prepared_calls: list[PreparedLegacyCall] = []
-            boundaries: list[
-                tuple[
-                    Connection,
-                    _TransactionControlFence,
-                    str,
-                    Callable[..., None],
-                    sqlite3.Connection,
-                ]
-            ] = []
+            boundaries: list[_IssuanceCleanupIdentity] = []
             for state in states:
-                candidates: list[tuple[object, object, object, object, object]] = [
-                    (
-                        state.connection,
-                        state.transaction_control_fence,
-                        state.transaction_guard_name,
-                        state.transaction_control_listener,
-                        state.dbapi_connection,
-                    )
-                ]
-                if type(state.integrity_seal) is tuple and len(state.integrity_seal) == 18:
-                    candidates.append(
-                        (
-                            state.integrity_seal[4],
-                            state.integrity_seal[7],
-                            state.integrity_seal[6],
-                            state.integrity_seal[12],
-                            state.integrity_seal[8],
-                        )
-                    )
-                    sealed_prepared = state.integrity_seal[11]
-                    if type(sealed_prepared) is PreparedLegacyCall:
-                        prepared_calls.append(sealed_prepared)
-                if type(state.prepared_call) is PreparedLegacyCall and all(
-                    existing is not state.prepared_call for existing in prepared_calls
+                cleanup_identity = _sealed_issuance_cleanup_identity(
+                    state,
+                    issuance_lease,
+                )
+                if cleanup_identity is None:
+                    continue
+                try:
+                    try:
+                        violated = cleanup_identity.transaction_control_fence.violated
+                    except BaseException:
+                        violated = True
+                    if violated:
+                        _abort_violated_issuance_transaction(cleanup_identity)
+                except BaseException:
+                    try:
+                        cleanup_identity.connection.invalidate()
+                    except BaseException:
+                        pass
+                if all(
+                    existing is not cleanup_identity.prepared_call for existing in prepared_calls
                 ):
-                    prepared_calls.append(state.prepared_call)
-                for connection, fence, guard_name, listener, dbapi_connection in candidates:
-                    if (
-                        isinstance(connection, Connection)
-                        and type(fence) is _TransactionControlFence
-                        and type(guard_name) is str
-                        and callable(listener)
-                        and isinstance(dbapi_connection, sqlite3.Connection)
-                        and all(
-                            existing[0] is not connection or existing[3] is not listener
-                            for existing in boundaries
-                        )
-                    ):
-                        boundaries.append(
-                            (
-                                connection,
-                                fence,
-                                guard_name,
-                                cast(Callable[..., None], listener),
-                                dbapi_connection,
-                            )
-                        )
-            evidence_entries: list[tuple[LockedLegacyRouteEvidence, _EvidenceState]] = []
+                    prepared_calls.append(cleanup_identity.prepared_call)
+                if all(
+                    existing.connection is not cleanup_identity.connection
+                    or existing.transaction_control_listener
+                    is not cleanup_identity.transaction_control_listener
+                    for existing in boundaries
+                ):
+                    boundaries.append(cleanup_identity)
             for evidence_map in evidence_maps:
                 for evidence, evidence_state in tuple(evidence_map.items()):
-                    sealed_lease = (
-                        evidence_state.integrity_seal[7]
-                        if type(evidence_state.integrity_seal) is tuple
-                        and len(evidence_state.integrity_seal) == 10
-                        else None
+                    evidence_cleanup = _sealed_evidence_cleanup_identity(
+                        evidence,
+                        evidence_state,
                     )
                     if (
-                        evidence_state.issuance_lease is issuance_lease
-                        or sealed_lease is issuance_lease
+                        evidence_cleanup is not None
+                        and evidence_cleanup.issuance_lease is issuance_lease
                     ):
                         evidence_map.pop(evidence, None)
-                        if all(
-                            existing_state is not evidence_state
-                            for _existing_evidence, existing_state in evidence_entries
+                        prepared_call = evidence_cleanup.prepared_call
+                        if type(prepared_call) is PreparedLegacyCall and all(
+                            existing is not prepared_call for existing in prepared_calls
                         ):
-                            evidence_entries.append((evidence, evidence_state))
-            for _evidence, evidence_state in evidence_entries:
-                for candidate in (
-                    evidence_state.prepared_call,
-                    (
-                        evidence_state.integrity_seal[9]
-                        if type(evidence_state.integrity_seal) is tuple
-                        and len(evidence_state.integrity_seal) == 10
-                        else None
-                    ),
-                ):
-                    if type(candidate) is PreparedLegacyCall and all(
-                        existing is not candidate for existing in prepared_calls
-                    ):
-                        prepared_calls.append(candidate)
-            for connection, fence, guard_name, listener, dbapi_connection in boundaries:
+                            prepared_calls.append(prepared_call)
+            for cleanup_identity in boundaries:
                 _close_transaction_control_boundary(
-                    connection,
-                    fence,
-                    guard_name,
-                    listener,
-                    dbapi_connection,
+                    cleanup_identity.connection,
+                    cleanup_identity.transaction_control_fence,
+                    cleanup_identity.transaction_guard_name,
+                    cleanup_identity.transaction_control_listener,
+                    cleanup_identity.transaction_control_savepoint_listeners,
+                    cleanup_identity.dbapi_connection,
                 )
             for prepared_call in prepared_calls:
                 preparation._revoke_prepared(prepared_call)
@@ -2127,15 +2615,18 @@ class LegacyRouteProofIssuer(_SealedValue):
             persisted = _decode_legacy_arguments_object(snapshot["raw_args"])
             if not _same_json_value(snapshot["normalized_args"], persisted):
                 raise ValueError("Legacy persisted normalized arguments mismatch")
+            canonical_persisted = canonical_json(cast(JSONValue, persisted))
             if confirmation_input.edited_args_present:
                 edits = confirmation_input.edited_args
                 if edits is None:
-                    raise ValueError("Legacy explicit-null edited arguments are invalid")
+                    raise LegacyArgumentPreparationError(
+                        "Legacy explicit-null edited arguments are invalid"
+                    )
             else:
                 edits = None
             effective_args, _description = prepare_legacy_arguments(
                 binding,
-                cast(str, snapshot["raw_args"]),
+                canonical_persisted,
                 cast(Mapping[str, JSONValue] | None, edits),
                 validate_unedited=True,
             )
@@ -2173,6 +2664,39 @@ class LegacyRouteProofIssuer(_SealedValue):
         finally:
             self._pending_identity_verifier_port._revoke_evidence(evidence)
 
+    def _project_server_loaded_pending(
+        self,
+        read_session: Session,
+        lookup_identity: LegacyConfirmationLookupIdentity,
+        confirmation_input: LegacyApprovedConfirmationInput,
+        context: LegacyReadContextPort,
+    ) -> LegacyPendingPresentationV1:
+        prepared = self.prepare_server_loaded(
+            read_session,
+            lookup_identity,
+            confirmation_input,
+        )
+        try:
+            adapter, _raw_args, effective_args, _metadata, _binding, _identity = (
+                self._preparation_registry._inspect_prepared(prepared)
+            )
+            adapter.require_integrity()
+            presentation = cast(LegacyPresentationBindingV1, adapter.presentation)
+            presentation.require_integrity()
+            details = presentation.pending_details_projector(effective_args, context)
+            if not isinstance(details, Mapping):
+                raise TypeError("Legacy Pending details projector must return an object")
+            return LegacyPendingPresentationV1(
+                human=presentation.confirmation_description(effective_args),
+                editable_fields=cast(
+                    tuple[Mapping[str, JSONValue], ...],
+                    adapter.editable_fields,
+                ),
+                details=cast(Mapping[str, JSONValue], details),
+            )
+        finally:
+            self._preparation_registry._revoke_prepared(prepared)
+
     def issue_after_claim(
         self,
         write_session: Session,
@@ -2203,11 +2727,57 @@ class LegacyRouteProofIssuer(_SealedValue):
             raise
 
 
+class LegacyPersistedPresentationPort(_SealedValue):
+    """Read-only exact presentation projection for one server-loaded Pending."""
+
+    __slots__ = ("_issuer", "_integrity_seal")
+    _issuer: LegacyRouteProofIssuer
+    _integrity_seal: tuple[object, ...]
+
+    def __init__(
+        self,
+        seal: object | None = None,
+        *,
+        issuer: LegacyRouteProofIssuer,
+    ) -> None:
+        if seal is not _VALUE_SEAL:
+            raise TypeError("Legacy persisted presentation Ports are factory-created")
+        if type(issuer) is not LegacyRouteProofIssuer:
+            raise TypeError("Legacy persisted presentation Port requires the exact issuer")
+        object.__setattr__(self, "_issuer", issuer)
+        object.__setattr__(self, "_integrity_seal", (issuer,))
+
+    def _require_integrity(self) -> None:
+        try:
+            if not _same_identity_tuple(self._integrity_seal, (self._issuer,)):
+                raise ValueError("Legacy persisted presentation Port integrity drift")
+            self._issuer._require_integrity()
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("Legacy persisted presentation Port integrity drift") from exc
+
+    def project_pending(
+        self,
+        read_session: Session,
+        lookup_identity: LegacyConfirmationLookupIdentity,
+        confirmation_input: LegacyApprovedConfirmationInput,
+        context: LegacyReadContextPort,
+    ) -> LegacyPendingPresentationV1:
+        self._require_integrity()
+        return self._issuer._project_server_loaded_pending(
+            read_session,
+            lookup_identity,
+            confirmation_input,
+            context,
+        )
+
+
 class LegacyConfirmationRouteComponents(_SealedValue):
     __slots__ = (
         "_preparation_registry",
         "_proof_registry",
         "_proof_issuer",
+        "_prepared_input_port",
+        "_persisted_presentation_port",
         "_proof_consumer_port",
         "_pending_identity_verifier_port",
         "_catalog",
@@ -2218,9 +2788,11 @@ class LegacyConfirmationRouteComponents(_SealedValue):
     _preparation_registry: LegacyPreparationRegistry
     _proof_registry: LegacyRouteProofRegistry
     _proof_issuer: LegacyRouteProofIssuer
+    _prepared_input_port: LegacyPreparedInputPort
+    _persisted_presentation_port: LegacyPersistedPresentationPort
     _proof_consumer_port: LegacyRouteProofConsumerPort
     _pending_identity_verifier_port: LegacyPendingIdentityVerifierPort
-    _catalog: LegacyProofDeterministicCatalog
+    _catalog: LegacyDeterministicCatalog
     _bundle_instance_token: BundleInstanceToken
     _catalog_instance_token: object
     _integrity_seal: tuple[object, ...]
@@ -2232,9 +2804,11 @@ class LegacyConfirmationRouteComponents(_SealedValue):
         preparation_registry: LegacyPreparationRegistry,
         proof_registry: LegacyRouteProofRegistry,
         proof_issuer: LegacyRouteProofIssuer,
+        prepared_input_port: LegacyPreparedInputPort,
+        persisted_presentation_port: LegacyPersistedPresentationPort,
         proof_consumer_port: LegacyRouteProofConsumerPort,
         pending_identity_verifier_port: LegacyPendingIdentityVerifierPort,
-        catalog: LegacyProofDeterministicCatalog,
+        catalog: LegacyDeterministicCatalog,
         bundle_instance_token: BundleInstanceToken,
         catalog_instance_token: object,
     ) -> None:
@@ -2244,6 +2818,8 @@ class LegacyConfirmationRouteComponents(_SealedValue):
             preparation_registry,
             proof_registry,
             proof_issuer,
+            prepared_input_port,
+            persisted_presentation_port,
             proof_consumer_port,
             pending_identity_verifier_port,
             catalog,
@@ -2260,6 +2836,8 @@ class LegacyConfirmationRouteComponents(_SealedValue):
                 self._preparation_registry,
                 self._proof_registry,
                 self._proof_issuer,
+                self._prepared_input_port,
+                self._persisted_presentation_port,
                 self._proof_consumer_port,
                 self._pending_identity_verifier_port,
                 self._catalog,
@@ -2294,12 +2872,22 @@ class LegacyConfirmationRouteComponents(_SealedValue):
         return self._proof_consumer_port
 
     @property
+    def prepared_input_port(self) -> LegacyPreparedInputPort:
+        self._require_integrity()
+        return self._prepared_input_port
+
+    @property
+    def persisted_presentation_port(self) -> LegacyPersistedPresentationPort:
+        self._require_integrity()
+        return self._persisted_presentation_port
+
+    @property
     def pending_identity_verifier_port(self) -> LegacyPendingIdentityVerifierPort:
         self._require_integrity()
         return self._pending_identity_verifier_port
 
     @property
-    def catalog(self) -> LegacyProofDeterministicCatalog:
+    def catalog(self) -> LegacyDeterministicCatalog:
         self._require_integrity()
         return self._catalog
 
@@ -2374,7 +2962,7 @@ def build_unpublished_legacy_confirmation_components(
         issuer_instance_token=issuer_instance_token,
         runtime_container_token=runtime_container_token,
     )
-    proof_catalog = LegacyProofDeterministicCatalog._create(
+    proof_catalog = LegacyDeterministicCatalog._create(
         proof_consumer_port=consumer_port,
         bundle_instance_token=bundle_token,
         catalog_instance_token=catalog_token,
@@ -2390,11 +2978,18 @@ def build_unpublished_legacy_confirmation_components(
         catalog_instance_token=catalog_token,
         issuer_instance_token=issuer_instance_token,
     )
+    prepared_input_port = LegacyPreparedInputPort._create(preparation_registry)
+    persisted_presentation_port = LegacyPersistedPresentationPort(
+        _VALUE_SEAL,
+        issuer=issuer,
+    )
     components = LegacyConfirmationRouteComponents(
         _VALUE_SEAL,
         preparation_registry=preparation_registry,
         proof_registry=proof_registry,
         proof_issuer=issuer,
+        prepared_input_port=prepared_input_port,
+        persisted_presentation_port=persisted_presentation_port,
         proof_consumer_port=consumer_port,
         pending_identity_verifier_port=verifier,
         catalog=proof_catalog,
@@ -2409,6 +3004,7 @@ __all__ = [
     "LegacyConfirmationRouteComponents",
     "LegacyCompositeRouteVerifier",
     "LegacyPendingIdentityVerifierPort",
+    "LegacyPersistedPresentationPort",
     "LegacyRouteProofIssuer",
     "build_legacy_composite_route_verifier",
     "build_legacy_pending_identity_verifier_port",

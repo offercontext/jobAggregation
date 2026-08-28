@@ -17,6 +17,7 @@ import offerpilot.pilot_runtime.composition as composition_module
 from offerpilot.chat_transport import PreparedStreamGuard, SseAgentExecutionHost
 from offerpilot.ai.agent_contracts import AgentTurnResult, PendingAction
 from offerpilot.ai.agent_loop import (
+    AgentLoopInvocation,
     ApprovedContinuationSegment,
     SegmentSurfaceGate,
     build_segment_surface_gate,
@@ -33,17 +34,14 @@ from offerpilot.ai.write_operations import (
 from offerpilot.ai.tool_authority.policy import validate_startup_policy
 from offerpilot.ai.tool_runtime.catalog import (
     SegmentToolCatalogLease,
-    compile_tool_metadata_manifest,
 )
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
-from offerpilot.ai.tool_runtime.contracts import TransientToolRuntimeValue
 from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 from offerpilot.agent_runtime.journal import NullRunRecorder, RunRecorderFactory
 from offerpilot.agent_runtime.keyring import JournalKeyDomain
 from offerpilot.db import init_database
 from offerpilot.pilot_runtime.persistence import ChatPersistenceCoordinator
-from offerpilot.pilot_runtime.compensation import prepare_compensation_handler_components
 from offerpilot.repositories.agent_runs import AgentRunRepository
 from offerpilot.repositories.chat import ChatRepository
 from offerpilot.repositories.application_events import ApplicationEventsRepository
@@ -73,6 +71,7 @@ from offerpilot.pilot_runtime.contracts import (
     StartTurnRequest,
     StatusEvent,
     StreamExecutionMode,
+    ToolCallEvent,
     UserMessageSavedEvent,
 )
 from offerpilot.pilot_runtime.event_sink import InMemoryRuntimeInvocationControl
@@ -92,7 +91,8 @@ from offerpilot.pilot_runtime.service import (
     _freeze_stream_value,
     _materialize_stream_value,
 )
-from offerpilot.ai.types import Message, ToolCall
+from offerpilot.ai.types import Assistant, Message, ToolCall
+from tests.tool_metadata.test_production_bundle import _production_components
 
 
 _AUTHORITY_SESSIONS = init_database(
@@ -101,25 +101,8 @@ _AUTHORITY_SESSIONS = init_database(
 _AUTHORITY_POLICY = validate_startup_policy(MODEL_TOOL_CATALOG.authority_manifest)
 
 
-def _metadata_bundle() -> ToolMetadataBundleV1:
-    manifest = compile_tool_metadata_manifest(MODEL_TOOL_CATALOG.specs)
-    return ToolMetadataBundleV1(
-        typed_catalog=MODEL_TOOL_CATALOG,
-        manifest=manifest,
-        legacy_boundary=manifest.to_dict()["legacy_boundary"],  # type: ignore[arg-type]
-        compensation=prepare_compensation_handler_components().metadata_projection(),
-    )
-
-
-_METADATA_BUNDLE = _metadata_bundle()
-
-
-class _MetadataComponents(TransientToolRuntimeValue):
-    def __init__(self, bundle: ToolMetadataBundleV1) -> None:
-        self.bundle = bundle
-
-
-_METADATA_COMPONENTS = _MetadataComponents(_METADATA_BUNDLE)
+_METADATA_COMPONENTS = _production_components()
+_METADATA_BUNDLE = _METADATA_COMPONENTS.bundle
 
 
 class Phases:
@@ -198,8 +181,14 @@ class Persistence:
         return PersistenceResult(PersistenceStatus.PERSISTED, message_ids=ids)
 
     def persist_initial_pending(
-        self, conversation_id: int, messages: object, pending: object
+        self,
+        conversation_id: int,
+        messages: object,
+        pending: object,
+        *,
+        route_handle: object,
     ) -> PersistenceResult:
+        assert route_handle is not None
         self.pending = pending
         return self.persist_initial_messages(conversation_id, messages)
 
@@ -216,15 +205,28 @@ class Persistence:
         return self.persist_initial_assistant_message(conversation_id, content, **kwargs)
 
     def persist_clarification(
-        self, conversation_id: int, messages: object, pending: object, question: str
+        self,
+        conversation_id: int,
+        messages: object,
+        pending: object,
+        question: str,
+        *,
+        route_handle: object,
     ) -> PersistenceResult:
+        assert route_handle is not None
         del question
         self.pending = pending
         return self.persist_initial_messages(conversation_id, messages)
 
     def set_pending_clarification(
-        self, conversation_id: int, pending: object, question: str
+        self,
+        conversation_id: int,
+        pending: object,
+        question: str,
+        *,
+        route_handle: object,
     ) -> PersistenceResult:
+        assert route_handle is not None
         del conversation_id, question
         self.pending = pending
         return PersistenceResult(PersistenceStatus.PERSISTED)
@@ -500,9 +502,10 @@ def runtime(
     policy_resolver: object | None = None,
     segment_resolver: object | None = None,
     close_counter: list[int] | None = None,
+    agent_driver: Driver | None = None,
 ) -> tuple[PilotRuntime, Persistence, Driver, Host, Journal]:
     resolved_persistence = persistence or Persistence()
-    driver = Driver()
+    driver = agent_driver or Driver()
     host = Host()
     journal = Journal()
 
@@ -1384,7 +1387,7 @@ def test_model_prepared_stream_adapts_sse_host_queue_once() -> None:
         prepared,
         event_sink=Sink(),
         signal_sink=None,
-        execution_host=SseAgentExecutionHost(timeout_seconds=1.0),
+        execution_host=SseAgentExecutionHost(timeout_seconds=30.0),
         cancel_check=lambda: False,
     )
     result = guard.execute_once()
@@ -2031,17 +2034,38 @@ def test_materialize_stream_value_rejects_unknown_detached_values() -> None:
 
 def test_stream_pending_emits_waiting_status_before_confirmation() -> None:
     phases = Phases()
-    instance, _persistence, driver, host, _journal = runtime(phases)
-    driver.result = AgentTurnResult(
-        [],
-        "",
-        PendingAction(
-            "call-1",
-            "update_application_status",
-            "{}",
-            "更新状态",
-            "op-1",
-        ),
+    model = SimpleNamespace(
+        complete=lambda messages, tools: Assistant(
+            tool_calls=[
+                ToolCall(
+                    "call-1",
+                    "update_application_status",
+                    '{"id":1,"status":"applied"}',
+                )
+            ]
+        )
+    )
+
+    class ExactPendingDriver(Driver):
+        def __init__(self) -> None:
+            super().__init__()
+            self._delegate = composition_module._AgentDriver()
+
+        def execute(self, invocation: object) -> object:
+            self.calls += 1
+            assert isinstance(invocation, AgentLoopInvocation)
+            try:
+                return self._delegate.execute(invocation)
+            except BaseException as exc:
+                self.error = exc
+                raise
+
+    driver = ExactPendingDriver()
+    instance, _persistence, _driver, host, _journal = runtime(
+        phases,
+        model=model,
+        assembled=(Message(role="user", content="hi"),),
+        agent_driver=driver,
     )
     control = InMemoryRuntimeInvocationControl()
     prepared = instance.prepare_stream(
@@ -2066,17 +2090,18 @@ def test_stream_pending_emits_waiting_status_before_confirmation() -> None:
         cancel_check=lambda: False,
     )
     result = guard.execute_once()
-    assert result.__class__.__name__ == "ConfirmationRequiredOutcome"
+    assert result.__class__.__name__ == "ConfirmationRequiredOutcome", (result, driver.error)
     assert [type(event) for event in seen] == [
         MetaEvent,
         UserMessageSavedEvent,
         StatusEvent,
+        ToolCallEvent,
         StatusEvent,
         ConfirmationRequiredEvent,
         CompletedEvent,
     ]
-    assert isinstance(seen[3], StatusEvent)
-    assert seen[3].phase == "waiting_confirmation"
+    assert isinstance(seen[4], StatusEvent)
+    assert seen[4].phase == "waiting_confirmation"
     assert guard.complete(CompletionReason.NORMAL) is True
 
 
@@ -2325,6 +2350,69 @@ def test_stream_approval_prepare_defers_activation_and_does_not_capture_approval
     assert getattr(state, "conversation", None) is None
     assert getattr(state, "confirmation_session", None) is None
     assert getattr(state, "confirmation_model", None) is None
+
+
+@pytest.mark.parametrize("mode", ("sync", "stream"))
+def test_approval_entry_cancelled_error_closes_unpublished_catalog_lease(
+    mode: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CancelledConfirmationProbe(ConfirmationProbe):
+        def approve_modify(self, request: object, **kwargs: object) -> object:
+            del request, kwargs
+            raise asyncio.CancelledError
+
+    opened: list[SegmentToolCatalogLease] = []
+    original_open = ToolMetadataBundleV1.open_segment_lease
+
+    def observe_open(bundle: ToolMetadataBundleV1) -> SegmentToolCatalogLease:
+        lease = original_open(bundle)
+        opened.append(lease)
+        return lease
+
+    monkeypatch.setattr(ToolMetadataBundleV1, "open_segment_lease", observe_open)
+    phases = Phases()
+    instance, _persistence, _driver, host, _journal = runtime(phases)
+    probe = CancelledConfirmationProbe()
+    object.__setattr__(instance._dependencies, "confirmation_coordinator", probe)
+    request = ConfirmationRequest(
+        conversation_id=7,
+        operation_id=probe.operation.id,
+        approved=True,
+        confirmation_token="stream-token",
+    )
+    control = InMemoryRuntimeInvocationControl()
+
+    if mode == "sync":
+        with pytest.raises(asyncio.CancelledError):
+            instance.continue_confirmation(
+                request,
+                invocation_control=control,
+                execution_host=host,
+                cancel_check=lambda: False,
+            )
+    else:
+        prepared = instance.prepare_stream(
+            request,
+            transport=transport(),
+            invocation_control=control,
+        )
+        assert isinstance(prepared, PreparedStreamExecution)
+        guard = PreparedStreamGuard(prepared=prepared)
+        assert guard.begin_execution() is True
+        guard._execute = lambda: instance.execute_prepared_stream(
+            prepared,
+            event_sink=None,
+            signal_sink=None,
+            execution_host=host,
+            cancel_check=lambda: False,
+        )
+        with pytest.raises(asyncio.CancelledError):
+            guard.execute_once()
+
+    assert len(opened) == 1
+    assert opened[0].closed is True
+    assert host.calls == 0
 
 
 def test_stream_deferred_approval_claim_failure_emits_meta_and_closes_control() -> None:

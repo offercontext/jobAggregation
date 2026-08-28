@@ -121,7 +121,9 @@ def _validate_create(args: ApplicationArgs, context: ToolExecutionContext) -> To
     if not company or not position or args.get("confirmed_new_position") is True:
         return None
     same_company = [
-        item for item in context.applications.list() if item.company_name.strip().casefold() == company.casefold()
+        item
+        for item in context.applications.list()
+        if item.company_name.strip().casefold() == company.casefold()
     ]
     if not same_company:
         return None
@@ -183,14 +185,21 @@ def _empty_pending_details(args: object, context: object | None = None) -> dict[
 
 
 def _describe_create_application(args: Mapping[str, Any]) -> str:
-    return (
-        f"新建投递：{args.get('company_name', '')} - "
-        f"{args.get('position_name', '')}"
-    )
+    return f"新建投递：{args.get('company_name', '')} - {args.get('position_name', '')}"
 
 
 def _describe_update_application_status(args: Mapping[str, Any]) -> str:
     return f"将投递 #{args.get('id', '')} 的状态改为 {args.get('status', '')}"
+
+
+def _project_create_application_success(result: object) -> str:
+    if not isinstance(result, Mapping):
+        return ""
+    record_id = result.get("application_id") or result.get("id")
+    company = str(result.get("company_name") or "").strip()
+    position = str(result.get("position_name") or "").strip()
+    meta = " · ".join(value for value in (company, position) if value)
+    return f"✅ 创建成功：投递记录 #{record_id} 已保存（{meta}）。" if record_id and meta else ""
 
 
 def _short_preview(value: str, max_length: int = 180) -> str:
@@ -425,9 +434,7 @@ def application_specs() -> tuple[ToolSpec[Any, Any], ...]:
         capture_seed=_capture_status_undo_seed,
         build_undo=_build_update_application_status_undo,
     )
-    get_resolver = _application_identity_resolver(
-        "get_application_application_identity_arg_v1"
-    )
+    get_resolver = _application_identity_resolver("get_application_application_identity_arg_v1")
     update_resolver = _application_identity_resolver(
         "update_application_status_application_identity_arg_v1"
     )
@@ -436,88 +443,168 @@ def application_specs() -> tuple[ToolSpec[Any, Any], ...]:
             contract=provider_contract(
                 "list_applications",
                 "List job applications. Optionally filter by canonical application status.",
-                {"type": "object", "properties": {"status": {"type": "string", "enum": statuses, "description": "Optional status filter."}}},
+                {
+                    "type": "object",
+                    "properties": {
+                        "status": {
+                            "type": "string",
+                            "enum": statuses,
+                            "description": "Optional status filter.",
+                        }
+                    },
+                },
             ),
-            domains=(ToolDomain.APPLICATIONS,), dependencies=(),
+            domains=(ToolDomain.APPLICATIONS,),
+            dependencies=(),
             required_capability=ToolCapability.APPLICATIONS_READ,
             binding_contract=BindingContract("scoped_collection", "application"),
-            resolver_bindings=(), confirmation_policy="none", editable_fields=(),
-            operation=ReadOperationMetadataV1(), undo_builder_binding=None,
+            resolver_bindings=(),
+            confirmation_policy="none",
+            editable_fields=(),
+            operation=ReadOperationMetadataV1(),
+            undo_builder_binding=None,
             presentation=ToolPresentationBindingV1(
                 implementation_id="list_applications_presentation_v1",
                 confirmation_description=_empty_confirmation_description,
                 pending_details_projector=_empty_pending_details,
                 success_summary_projector=spaced_json,
-            ), decoder=_decode, executor=_list, success_renderer=spaced_json,
+            ),
+            decoder=_decode,
+            executor=_list,
+            success_renderer=spaced_json,
         ),
         build_tool_spec(
             contract=provider_contract(
                 "get_application",
                 "Get one job application by id. Use an id returned by list_applications.",
-                {"type": "object", "properties": {"id": {"type": "integer", "description": "Application id returned by list_applications."}}, "required": ["id"]},
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "integer",
+                            "description": "Application id returned by list_applications.",
+                        }
+                    },
+                    "required": ["id"],
+                },
             ),
-            domains=(ToolDomain.APPLICATIONS,), dependencies=("list_applications",),
+            domains=(ToolDomain.APPLICATIONS,),
+            dependencies=("list_applications",),
             required_capability=ToolCapability.APPLICATIONS_READ,
             binding_contract=BindingContract("enforce_if_bound", "application"),
-            resolver_bindings=(get_resolver,), confirmation_policy="none", editable_fields=(),
-            operation=ReadOperationMetadataV1(), undo_builder_binding=None,
+            resolver_bindings=(get_resolver,),
+            confirmation_policy="none",
+            editable_fields=(),
+            operation=ReadOperationMetadataV1(),
+            undo_builder_binding=None,
             presentation=ToolPresentationBindingV1(
                 implementation_id="get_application_presentation_v1",
                 confirmation_description=_empty_confirmation_description,
                 pending_details_projector=_empty_pending_details,
                 success_summary_projector=spaced_json,
-            ), decoder=_decode, executor=_get,
+            ),
+            decoder=_decode,
+            executor=_get,
             declared_failure_categories=frozenset({"not_found"}),
-            exception_map=NOT_FOUND_EXCEPTION_MAP, success_renderer=spaced_json,
+            exception_map=NOT_FOUND_EXCEPTION_MAP,
+            success_renderer=spaced_json,
         ),
         build_tool_spec(
             contract=provider_contract(
                 "create_application",
                 "Create a job application record. If the same company already has records but this is a new position, ask the user before creating it; set confirmed_new_position=true only after the user explicitly confirms the new position should be added.",
-                {"type": "object", "properties": {"company_name": {"type": "string"}, "position_name": {"type": "string"}, "job_url": {"type": "string"}, "status": {"type": "string", "enum": statuses}, "confirmed_new_position": {"type": "boolean", "description": "Set true only when the user explicitly confirmed creating a new position for an existing company."}, "closed_reason": {"type": "string", "description": "Required when status is closed."}}, "required": ["company_name", "position_name"]},
+                {
+                    "type": "object",
+                    "properties": {
+                        "company_name": {"type": "string"},
+                        "position_name": {"type": "string"},
+                        "job_url": {"type": "string"},
+                        "status": {"type": "string", "enum": statuses},
+                        "confirmed_new_position": {
+                            "type": "boolean",
+                            "description": "Set true only when the user explicitly confirmed creating a new position for an existing company.",
+                        },
+                        "closed_reason": {
+                            "type": "string",
+                            "description": "Required when status is closed.",
+                        },
+                    },
+                    "required": ["company_name", "position_name"],
+                },
             ),
-            domains=(ToolDomain.APPLICATIONS,), dependencies=(),
+            domains=(ToolDomain.APPLICATIONS,),
+            dependencies=(),
             required_capability=ToolCapability.APPLICATIONS_WRITE,
-            binding_contract=BindingContract("non_application_only"), resolver_bindings=(),
+            binding_contract=BindingContract("non_application_only"),
+            resolver_bindings=(),
             confirmation_policy="required",
             editable_fields=(
-                _editable("company_name", "string"), _editable("position_name", "string"),
-                _editable("job_url", "string"), _editable("status", "enum", options=status_options),
+                _editable("company_name", "string"),
+                _editable("position_name", "string"),
+                _editable("job_url", "string"),
+                _editable("status", "enum", options=status_options),
                 _editable("closed_reason", "long_text"),
-            ), operation=create_operation, undo_builder_binding=create_undo,
+            ),
+            operation=create_operation,
+            undo_builder_binding=create_undo,
             presentation=ToolPresentationBindingV1(
                 implementation_id="create_application_presentation_v1",
                 confirmation_description=_describe_create_application,
                 pending_details_projector=_pending_create_application,
-                success_summary_projector=spaced_json,
-            ), decoder=_decode, executor=_create, preflight=_validate_create,
+                success_summary_projector=_project_create_application_success,
+            ),
+            decoder=_decode,
+            executor=_create,
+            preflight=_validate_create,
             mutable_validator=_validate_create,
             declared_failure_categories=frozenset({"validation_error", "conflict"}),
-            exception_map=INPUT_EXCEPTION_MAP, success_renderer=spaced_json,
+            exception_map=INPUT_EXCEPTION_MAP,
+            success_renderer=spaced_json,
             schema_failure_renderer=_status_schema_failure,
         ),
         build_tool_spec(
             contract=provider_contract(
                 "update_application_status",
                 "Update one job application's status. Use an id returned by list_applications.",
-                {"type": "object", "properties": {"id": {"type": "integer", "description": "Application id returned by list_applications."}, "status": {"type": "string", "enum": statuses}, "closed_reason": {"type": "string", "description": "Required when status is closed."}}, "required": ["id", "status"]},
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "integer",
+                            "description": "Application id returned by list_applications.",
+                        },
+                        "status": {"type": "string", "enum": statuses},
+                        "closed_reason": {
+                            "type": "string",
+                            "description": "Required when status is closed.",
+                        },
+                    },
+                    "required": ["id", "status"],
+                },
             ),
-            domains=(ToolDomain.APPLICATIONS,), dependencies=("get_application",),
+            domains=(ToolDomain.APPLICATIONS,),
+            dependencies=("get_application",),
             required_capability=ToolCapability.APPLICATIONS_WRITE,
             binding_contract=BindingContract("enforce_if_bound", "application"),
-            resolver_bindings=(update_resolver,), confirmation_policy="required",
+            resolver_bindings=(update_resolver,),
+            confirmation_policy="required",
             editable_fields=(
                 _editable("status", "enum", options=status_options),
                 _editable("closed_reason", "long_text"),
-            ), operation=update_operation, undo_builder_binding=update_undo,
+            ),
+            operation=update_operation,
+            undo_builder_binding=update_undo,
             presentation=ToolPresentationBindingV1(
                 implementation_id="update_application_status_presentation_v1",
                 confirmation_description=_describe_update_application_status,
                 pending_details_projector=_pending_update_application_status,
                 success_summary_projector=spaced_json,
-            ), decoder=_decode, executor=_update,
+            ),
+            decoder=_decode,
+            executor=_update,
             declared_failure_categories=frozenset({"validation_error", "not_found", "conflict"}),
             exception_map=INPUT_EXCEPTION_MAP + NOT_FOUND_EXCEPTION_MAP + CONFLICT_EXCEPTION_MAP,
-            success_renderer=spaced_json, schema_failure_renderer=_status_schema_failure,
+            success_renderer=spaced_json,
+            schema_failure_renderer=_status_schema_failure,
         ),
     )

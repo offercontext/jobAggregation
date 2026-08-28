@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 from types import SimpleNamespace
 from typing import Any, cast
@@ -165,6 +166,108 @@ def _deterministic_adapter(operations: _LegacyTerminalOperations) -> Determinist
             write_operations=operations,
         )
     )
+
+
+def test_confirmation_catalog_exposes_only_the_one_shot_legacy_route_proof() -> None:
+    from offerpilot.ai.tool_runtime import legacy as legacy_runtime
+
+    assert not hasattr(legacy_runtime, "ServerLoadedPending")
+    signature = inspect.signature(legacy_runtime.LegacyDeterministicCatalog.resolve_server_loaded)
+    parameters = tuple(signature.parameters.values())
+    assert tuple(parameter.name for parameter in parameters) == ("self", "proof")
+    assert "LegacyRouteProof" in str(parameters[1].annotation)
+
+
+def test_terminal_legacy_replay_bypasses_all_live_route_surfaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from offerpilot.ai.tool_runtime.legacy import LegacyDeterministicCatalog
+    from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
+    from offerpilot.pilot_runtime.legacy_route import LegacyRouteProofIssuer
+
+    operations = _LegacyTerminalOperations(chained=False)
+    counters = {
+        "provider": 0,
+        "projector": 0,
+        "bundle": 0,
+        "resolver": 0,
+        "preflight": 0,
+        "proof": 0,
+        "catalog": 0,
+        "executor": 0,
+    }
+
+    def forbidden(name: str):
+        def call(*_args: object, **_kwargs: object) -> object:
+            counters[name] += 1
+            raise AssertionError(f"terminal replay must not initialize {name}")
+
+        return call
+
+    monkeypatch.setattr(
+        ToolMetadataBundleV1,
+        "open_segment_lease",
+        forbidden("bundle"),
+    )
+    monkeypatch.setattr(
+        LegacyRouteProofIssuer,
+        "prepare_server_loaded",
+        forbidden("proof"),
+    )
+    monkeypatch.setattr(
+        LegacyRouteProofIssuer,
+        "issue_after_claim",
+        forbidden("proof"),
+    )
+    monkeypatch.setattr(
+        LegacyDeterministicCatalog,
+        "resolve_server_loaded",
+        forbidden("catalog"),
+    )
+    if hasattr(DeterministicPilotAdapter, "preflight_confirmation"):
+        monkeypatch.setattr(
+            DeterministicPilotAdapter,
+            "preflight_confirmation",
+            forbidden("preflight"),
+        )
+    if hasattr(DeterministicPilotAdapter, "confirm"):
+        monkeypatch.setattr(
+            DeterministicPilotAdapter,
+            "confirm",
+            forbidden("executor"),
+        )
+
+    outcome = PilotRuntime(
+        RuntimeDependencies(
+            conversations=cast(Any, _ConversationBodyReadSpy()),
+            deterministic=_deterministic_adapter(operations),
+            continuation_model_resolver=cast(Any, forbidden("resolver")),
+            agent_driver=cast(Any, forbidden("provider")),
+            confirmation_coordinator=ConfirmationCoordinator(
+                ConfirmationDependencies(write_operations=cast(Any, operations))
+            ),
+        )
+    ).continue_confirmation(
+        ConfirmationRequest(
+            conversation_id=7,
+            approved=True,
+            operation_id=operations.operation_id,
+            confirmation_token=operations.token,
+        ),
+        invocation_control=InMemoryRuntimeInvocationControl(),
+    )
+
+    assert counters == {
+        "provider": 0,
+        "projector": 0,
+        "bundle": 0,
+        "resolver": 0,
+        "preflight": 0,
+        "proof": 0,
+        "catalog": 0,
+        "executor": 0,
+    }
+    assert isinstance(outcome, OperationReplayOutcome)
 
 
 @pytest.mark.parametrize("mode", ("sync", "stream"))

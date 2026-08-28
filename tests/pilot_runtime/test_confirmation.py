@@ -37,11 +37,11 @@ from offerpilot.ai.tool_runtime.contracts import (
     ConfirmationRequired,
     ToolFailure,
     ToolSuccess,
-    TransientToolRuntimeValue,
 )
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.ai.write_operations import (
+    DeliveryHeartbeat,
     DeliveryOwnership,
     LedgerOperationPreheader,
     LedgerPendingPointer,
@@ -68,7 +68,7 @@ from offerpilot.repositories.applications import ApplicationsRepository
 from offerpilot.repositories.chat import ChatRepository
 from offerpilot.repositories.jd import JDAnalysesRepository
 from offerpilot.repositories.notes import NotesRepository
-from offerpilot.repositories.offers import OffersRepository
+from offerpilot.repositories.offers import OfferCreate, OffersRepository
 from offerpilot.repositories.resumes import ResumesRepository
 from offerpilot.pilot_runtime.contracts import (
     AssistantDeltaEvent,
@@ -91,6 +91,7 @@ from offerpilot.pilot_runtime.continuation import (
     ConfirmationCoordinator,
     ConfirmationDependencies,
     ConfirmationReplayError,
+    ConfirmationSession,
     DeliveryBundle,
     _confirmation_token,
 )
@@ -104,14 +105,11 @@ from offerpilot.pilot_runtime.service import (
     _ContinuationActivationRequest,
 )
 from offerpilot.pilot_runtime.service import ResolvedModel
+from tests.tool_metadata.test_pending_routes import issued_typed_pending_route
+from tests.tool_metadata.test_production_bundle import _production_components
 
 
 _STABLE_LEGACY_DETERMINISTIC_NAME = sorted(LEGACY_DETERMINISTIC_NAMES)[0]
-
-
-class _TestMetadataComponents(TransientToolRuntimeValue):
-    def __init__(self, bundle: ToolMetadataBundleV1) -> None:
-        self.bundle = bundle
 
 
 def _runtime_metadata_bundle(catalog: ToolCatalog = MODEL_TOOL_CATALOG) -> ToolMetadataBundleV1:
@@ -125,26 +123,30 @@ def _runtime_metadata_bundle(catalog: ToolCatalog = MODEL_TOOL_CATALOG) -> ToolM
     )
 
 
+_PRODUCTION_METADATA_COMPONENTS = _production_components()
+
+
 def _runtime_metadata_dependencies() -> dict[str, object]:
-    bundle = _runtime_metadata_bundle()
+    components = _PRODUCTION_METADATA_COMPONENTS
+    bundle = components.bundle
     return {
         "catalog": MODEL_TOOL_CATALOG,
         "metadata_bundle": bundle,
-        "metadata_components": _TestMetadataComponents(bundle),
+        "metadata_components": components,
         "provider_metadata_view": bundle.provider_view(),
         "discovery_metadata_view": bundle.discovery_view(),
         "authority_metadata_view": bundle.authority_view(),
     }
 
 
-def test_task8_keeps_current_confirmation_server_loaded_path_until_final_cutover() -> None:
-    """Task 8 publishes no proof graph and does not switch the production caller."""
+def test_task11_confirmation_resume_accepts_only_a_legacy_route_proof() -> None:
+    """The final cutover removes the transitional raw-Pending lookup."""
 
     from offerpilot.pilot_runtime import deterministic as deterministic_module
 
     source = inspect.getsource(deterministic_module.DeterministicPilotAdapter)
-    assert ".resolve_server_loaded(pending)" in source
-    assert "LegacyRouteProof" not in source
+    assert ".resolve_server_loaded(pending)" not in source
+    assert "route_binder" in source
     assert "build_unpublished_legacy_confirmation_components" not in source
 
 
@@ -252,6 +254,9 @@ class _Operations:
             proposal_fingerprint="proposal",
             confirmation_token_fingerprint="",
             delivery_status="completed",
+            adapter_kind="typed",
+            operation_role="primary",
+            authorization_scope_fingerprint="scope",
         )
         self.delivery_outcome = delivery_outcome
         token = "t" * 64
@@ -386,8 +391,49 @@ def _deps(
         persistence=persistence,
         write_operations=operations,
         write_coordinator=write_coordinator,
+        operation_port=_PRODUCTION_METADATA_COMPONENTS.operation_port,
+        pending_persistence_route_port=(
+            _PRODUCTION_METADATA_COMPONENTS.pending_persistence_route_port
+        ),
         approval_context_resolver=cast(Any, approval_context_resolver),
     )
+
+
+def _approve_modify(
+    coordinator: ConfirmationCoordinator,
+    request: ConfirmationRequest,
+    *,
+    pending: PendingAction | None = None,
+    catalog: ToolCatalog = MODEL_TOOL_CATALOG,
+) -> ConfirmationSession:
+    live = pending
+    if live is None:
+        reader = coordinator.dependencies.persistence
+        loaded = getattr(reader, "get_pending_action", lambda _conversation_id: None)(
+            request.conversation_id
+        )
+        tool_name = str(getattr(loaded, "tool_name", "") or "")
+        if not tool_name:
+            raise AssertionError("test approval requires a Pending tool identity")
+    else:
+        tool_name = live.tool_name
+    bundle = (
+        _PRODUCTION_METADATA_COMPONENTS.bundle
+        if catalog is MODEL_TOOL_CATALOG
+        else _runtime_metadata_bundle(catalog)
+    )
+    lease = bundle.open_segment_lease()
+    try:
+        spec_handle = lease.resolve(tool_name)
+        return coordinator.approve_modify(
+            request,
+            pending=pending,
+            catalog_lease=lease,
+            spec_handle=spec_handle,
+        )
+    except BaseException:
+        lease.close()
+        raise
 
 
 def _test_approval_context_resolver() -> object:
@@ -487,10 +533,6 @@ def test_unbound_typed_proposal_fails_before_token_or_catalog_on_approval() -> N
     persistence = _Persistence(pending)
     coordinator = ConfirmationCoordinator(_deps(persistence, operations))
 
-    class ForbiddenCatalog:
-        def get(self, *_args: object, **_kwargs: object) -> object:
-            raise AssertionError("catalog must not be reached for an unbound Typed proposal")
-
     request = ConfirmationRequest(
         conversation_id=7,
         approved=True,
@@ -499,7 +541,7 @@ def test_unbound_typed_proposal_fails_before_token_or_catalog_on_approval() -> N
     )
 
     with pytest.raises(WriteOperationError) as raised:
-        coordinator.preflight_live(request, catalog=ForbiddenCatalog())
+        coordinator.preflight_live(request)
 
     assert raised.value.code == "authorization_scope_unbound"
 
@@ -770,7 +812,7 @@ def test_real_nonapproval_paths_keep_legacy_proof_pipeline_at_zero_calls(
     monkeypatch: pytest.MonkeyPatch,
     decision: str,
 ) -> None:
-    """Spy on the real Coordinator path; no proof-only façade participates."""
+    """Reject and terminal replay bypass every proof-only execution stage."""
 
     importlib.import_module("offerpilot.ai.tool_runtime.legacy_proof")
     route_module = importlib.import_module("offerpilot.pilot_runtime.legacy_route")
@@ -812,7 +854,7 @@ def test_real_nonapproval_paths_keep_legacy_proof_pipeline_at_zero_calls(
         forbidden("proof"),
     )
     monkeypatch.setattr(
-        legacy_module.LegacyProofDeterministicCatalog,
+        legacy_module.LegacyDeterministicCatalog,
         "resolve_server_loaded",
         forbidden("catalog"),
     )
@@ -836,9 +878,9 @@ def test_real_nonapproval_paths_keep_legacy_proof_pipeline_at_zero_calls(
     persistence = _Persistence(pending if decision == "reject" else None)
 
     class CountingWriteCoordinator(_WriteCoordinator):
-        def execute_primary(self, **kwargs: object) -> object:
+        def execute_legacy(self, **kwargs: object) -> object:
             counts["executor"] += 1
-            return super().execute_primary(**kwargs)
+            raise AssertionError(f"{decision} reached forbidden Legacy executor: {kwargs}")
 
     write = CountingWriteCoordinator()
     coordinator = ConfirmationCoordinator(_deps(persistence, operations, write))
@@ -899,7 +941,7 @@ def test_approve_claims_executes_once_and_delivers_once() -> None:
         operation_id=operations.operation_id,
         confirmation_token=operations.token,
     )
-    session = coordinator.approve_modify(request, pending=pending)
+    session = _approve_modify(coordinator, request, pending=pending)
     prepared = SimpleNamespace(
         pending_identity="call-1:create_application",
         pending_action_revision=1,
@@ -948,7 +990,8 @@ def test_locked_approval_denial_projects_only_stale_pending_action(
 
     write = DeniedWriteCoordinator()
     coordinator = ConfirmationCoordinator(_deps(_Persistence(pending), operations, write))
-    session = coordinator.approve_modify(
+    session = _approve_modify(
+        coordinator,
         ConfirmationRequest(
             conversation_id=7,
             approved=True,
@@ -981,7 +1024,8 @@ def test_journal_approval_decision_waits_for_ledger_claim_callback(
     pending = PendingAction("call-1", "create_application", "{}", "create", operations.operation_id)
     persistence = _Persistence(pending)
     coordinator = ConfirmationCoordinator(_deps(persistence, operations, _WriteCoordinator()))
-    session = coordinator.approve_modify(
+    session = _approve_modify(
+        coordinator,
         ConfirmationRequest(
             conversation_id=7,
             approved=True,
@@ -1116,6 +1160,114 @@ def test_cancel_before_claim_never_reaches_rejection_cas() -> None:
     assert write.reject_calls == 0
 
 
+def test_cancel_after_terminal_handoff_revokes_parent_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    operations = _Operations(status="proposed")
+    pending = PendingAction("call-1", "create_application", "{}", "create", operations.operation_id)
+    coordinator = ConfirmationCoordinator(
+        _deps(_Persistence(pending), operations, _WriteCoordinator())
+    )
+    session = coordinator.reject(
+        ConfirmationRequest(
+            conversation_id=7,
+            approved=False,
+            operation_id=operations.operation_id,
+            confirmation_token=operations.token,
+        ),
+        pending=pending,
+    )
+    assert session.on_confirmation_attempt(pending, None) is None
+    ownership = session.state.delivery_ownership
+    assert isinstance(ownership, DeliveryOwnership)
+    revoked: list[DeliveryOwnership] = []
+    monkeypatch.setattr(
+        DeliveryOwnership,
+        "revoke_parent_route",
+        lambda current: revoked.append(current),
+    )
+
+    coordinator.cancel_cleanup(session)
+
+    assert revoked == [ownership]
+    assert session.state.delivery_ownership is None
+    assert session.state.delivery_heartbeat is None
+
+
+def test_cancel_before_terminal_handoff_revokes_incoming_parent_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    operations = _Operations(status="proposed")
+    pending = PendingAction("call-1", "create_application", "{}", "create", operations.operation_id)
+    coordinator = ConfirmationCoordinator(
+        _deps(_Persistence(pending), operations, _WriteCoordinator())
+    )
+    session = coordinator.reject(
+        ConfirmationRequest(
+            conversation_id=7,
+            approved=False,
+            operation_id=operations.operation_id,
+            confirmation_token=operations.token,
+        ),
+        pending=pending,
+    )
+    coordinator.cancel_cleanup(session)
+    ownership = DeliveryOwnership(operations.operation_id, 1, b"owner", "owner")
+    revoked: list[DeliveryOwnership] = []
+    monkeypatch.setattr(
+        DeliveryOwnership,
+        "revoke_parent_route",
+        lambda current: revoked.append(current),
+    )
+
+    coordinator._set_ownership(session.state, SimpleNamespace(ownership=ownership))
+
+    assert revoked == [ownership]
+    assert session.state.delivery_ownership is None
+    assert session.state.delivery_heartbeat is None
+
+
+def test_heartbeat_start_base_exception_revokes_incoming_parent_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class HeartbeatStartAbort(BaseException):
+        pass
+
+    operations = _Operations(status="proposed")
+    pending = PendingAction("call-1", "create_application", "{}", "create", operations.operation_id)
+    coordinator = ConfirmationCoordinator(
+        _deps(_Persistence(pending), operations, _WriteCoordinator())
+    )
+    session = coordinator.reject(
+        ConfirmationRequest(
+            conversation_id=7,
+            approved=False,
+            operation_id=operations.operation_id,
+            confirmation_token=operations.token,
+        ),
+        pending=pending,
+    )
+    ownership = DeliveryOwnership(operations.operation_id, 1, b"owner", "owner")
+    revoked: list[DeliveryOwnership] = []
+    monkeypatch.setattr(
+        DeliveryOwnership,
+        "revoke_parent_route",
+        lambda current: revoked.append(current),
+    )
+    monkeypatch.setattr(
+        DeliveryHeartbeat,
+        "start",
+        lambda _heartbeat: (_ for _ in ()).throw(HeartbeatStartAbort()),
+    )
+
+    with pytest.raises(HeartbeatStartAbort):
+        coordinator._set_ownership(session.state, SimpleNamespace(ownership=ownership))
+
+    assert revoked == [ownership]
+    assert session.state.delivery_ownership is None
+    assert session.state.delivery_heartbeat is None
+
+
 def test_reject_claim_race_keeps_terminal_replay_without_delivery_lease() -> None:
     operations = _Operations(status="proposed")
     pending = PendingAction("call-1", "create_application", "{}", "create", operations.operation_id)
@@ -1157,7 +1309,8 @@ def test_timeout_before_claim_closes_session_without_delivery_or_late_work() -> 
             approval_context_resolver=_test_approval_context_resolver(),
         )
     )
-    session = coordinator.approve_modify(
+    session = _approve_modify(
+        coordinator,
         ConfirmationRequest(
             conversation_id=7,
             approved=True,
@@ -1551,7 +1704,8 @@ def test_missing_delivery_heartbeat_fails_closed_before_executor_or_delivery() -
             approval_context_resolver=_test_approval_context_resolver(),
         )
     )
-    session = coordinator.approve_modify(
+    session = _approve_modify(
+        coordinator,
         ConfirmationRequest(
             conversation_id=7,
             approved=True,
@@ -1921,6 +2075,56 @@ def test_reject_session_does_not_load_conversation_for_generation() -> None:
     assert session.state.continuation_generation is None
 
 
+@pytest.mark.parametrize("persistence_outcome", ["exception", "cas_lost", "persisted"])
+def test_final_delivery_always_revokes_parent_route_after_topology_use(
+    monkeypatch: pytest.MonkeyPatch,
+    persistence_outcome: str,
+) -> None:
+    operations = _Operations(status="proposed")
+    pending = PendingAction("call-1", "create_application", "{}", "create", operations.operation_id)
+    persistence = _Persistence(pending)
+
+    def persist_confirmation_delivery(**_kwargs: object) -> PersistenceResult:
+        if persistence_outcome == "exception":
+            raise RuntimeError("delivery failed")
+        return PersistenceResult(PersistenceStatus(persistence_outcome))
+
+    persistence.persist_confirmation_delivery = persist_confirmation_delivery  # type: ignore[attr-defined]
+    coordinator = ConfirmationCoordinator(_deps(persistence, operations, _WriteCoordinator()))
+    session = coordinator.reject(
+        ConfirmationRequest(
+            conversation_id=7,
+            approved=False,
+            operation_id=operations.operation_id,
+            confirmation_token=operations.token,
+        ),
+        pending=pending,
+    )
+    assert session.on_confirmation_attempt(pending, None) is None
+    session.on_confirmation_result(
+        pending,
+        False,
+        Message(role="tool", content="cancelled", tool_call_id=pending.tool_call_id),
+        None,
+    )
+    ownership = session.state.delivery_ownership
+    assert isinstance(ownership, DeliveryOwnership)
+    revoked: list[DeliveryOwnership] = []
+    monkeypatch.setattr(
+        DeliveryOwnership,
+        "revoke_parent_route",
+        lambda current: revoked.append(current),
+    )
+
+    if persistence_outcome == "exception":
+        with pytest.raises(RuntimeError, match="delivery failed"):
+            coordinator.final_delivery(session)
+    else:
+        coordinator.final_delivery(session)
+
+    assert revoked == [ownership]
+
+
 def _real_sqlite_approval_context_resolver(
     sessions: Any,
     operations: WriteOperationRepository,
@@ -1969,7 +2173,14 @@ def _persist_real_sqlite_typed_pending(
         "save assessment",
         str(uuid4()),
     )
-    with sessions() as setup_session:
+    with (
+        issued_typed_pending_route(
+            pending,
+            conversation.id,
+            claim=object(),
+        ) as (route_handle, route_identity),
+        sessions() as setup_session,
+    ):
         owner = setup_session.get(Conversation, conversation.id)
         assert owner is not None
         owner.pending_operation_id = pending.operation_id
@@ -1979,11 +2190,14 @@ def _persist_real_sqlite_typed_pending(
         owner.pending_human = pending.human
         operations.create_primary(
             setup_session,
+            route_handle=route_handle,
             operation_id=pending.operation_id,
             conversation_id=conversation.id,
             tool_call_id=pending.tool_call_id,
             tool_name=pending.tool_name,
-            adapter_kind="typed",
+            pending_action_revision=route_identity.pending_action_revision,
+            pending_confirmation_claim_id=route_identity.pending_confirmation_claim_id,
+            arguments_digest=route_identity.arguments_digest,
             proposal_fingerprint=ledger_fingerprint(
                 key, "write-operation-proposal-v1", json.loads(pending.args)
             ),
@@ -2047,8 +2261,10 @@ def _prepare_real_sqlite_approval(
     assert isinstance(context, ToolExecutionContext)
     assert isinstance(context.authority, ApprovalExecutionAuthority)
     factory = context.authority_factory
-    bundle = _runtime_metadata_bundle(catalog)
-    catalog_lease = bundle.open_segment_lease()
+    assert catalog is MODEL_TOOL_CATALOG
+    bundle = _PRODUCTION_METADATA_COMPONENTS.bundle
+    catalog_lease = cast(Any, session).state.approval_catalog_lease
+    assert isinstance(catalog_lease, SegmentToolCatalogLease)
     factory.bind_segment_tool_catalog(
         context.authority,
         authority_metadata_view=bundle.authority_view(),
@@ -2080,6 +2296,7 @@ def _close_real_sqlite_factories(factories: list[AuthorityFactory]) -> None:
 
 def test_real_sqlite_coordinator_executes_prepared_call_once_and_persists_delivery(
     tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The confirmation seam must exercise the production Ledger coordinator."""
 
@@ -2088,20 +2305,24 @@ def test_real_sqlite_coordinator_executes_prepared_call_once_and_persists_delive
     operations = WriteOperationRepository(sessions, key)
     chat = ChatRepository(sessions, operations)
     persistence = ChatPersistenceCoordinator(chat)
+    offer = OffersRepository(sessions).create(OfferCreate("Acme", "Engineer"))
     conversation, pending = _persist_real_sqlite_typed_pending(
         sessions,
         operations,
         key,
         tool_call_id="real-call",
-        raw_args='{"id":1,"assessment":"ok"}',
+        raw_args=json.dumps({"id": offer.id, "assessment": "ok"}),
     )
     calls: list[str] = []
 
-    def execute(_args: object, _context: object) -> dict[str, object]:
-        calls.append("executor")
-        return {"ok": True}
+    original_execute = OffersRepository.save_offer_assessment_scoped
 
-    catalog = _real_sqlite_approval_catalog(execute)
+    def execute(repository: OffersRepository, *args: object, **kwargs: object) -> object:
+        calls.append("executor")
+        return original_execute(repository, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(OffersRepository, "save_offer_assessment_scoped", execute)
+    catalog = MODEL_TOOL_CATALOG
     factories: list[AuthorityFactory] = []
     coordinator = ConfirmationCoordinator(
         ConfirmationDependencies(
@@ -2109,6 +2330,10 @@ def test_real_sqlite_coordinator_executes_prepared_call_once_and_persists_delive
             write_operations=cast(Any, operations),
             write_coordinator=cast(Any, WriteOperationCoordinator(operations)),
             catalog=catalog,
+            operation_port=_PRODUCTION_METADATA_COMPONENTS.operation_port,
+            pending_persistence_route_port=(
+                _PRODUCTION_METADATA_COMPONENTS.pending_persistence_route_port
+            ),
             approval_context_resolver=_real_sqlite_approval_context_resolver(
                 sessions, operations, factories
             ),
@@ -2123,7 +2348,7 @@ def test_real_sqlite_coordinator_executes_prepared_call_once_and_persists_delive
     session = None
     catalog_lease = None
     try:
-        session = coordinator.approve_modify(request, catalog=catalog)
+        session = _approve_modify(coordinator, request, catalog=catalog)
         (
             live_pending,
             context,
@@ -2171,6 +2396,7 @@ def test_real_sqlite_coordinator_executes_prepared_call_once_and_persists_delive
 
 def test_real_sqlite_two_connections_have_one_claim_and_one_executor(
     tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Two confirmation workers must converge on one Ledger executor."""
 
@@ -2179,12 +2405,13 @@ def test_real_sqlite_two_connections_have_one_claim_and_one_executor(
     operations = WriteOperationRepository(sessions, key)
     chat = ChatRepository(sessions, operations)
     persistence = ChatPersistenceCoordinator(chat)
+    offer = OffersRepository(sessions).create(OfferCreate("Acme", "Engineer"))
     conversation, pending = _persist_real_sqlite_typed_pending(
         sessions,
         operations,
         key,
         tool_call_id="race-call",
-        raw_args='{"id":1,"assessment":"race"}',
+        raw_args=json.dumps({"id": offer.id, "assessment": "race"}),
     )
     calls = 0
     calls_lock = Lock()
@@ -2192,7 +2419,9 @@ def test_real_sqlite_two_connections_have_one_claim_and_one_executor(
     release_first_executor = Event()
     second_worker_ready_for_claim = Event()
 
-    def execute(_args: object, _context: object) -> dict[str, object]:
+    original_execute = OffersRepository.save_offer_assessment_scoped
+
+    def execute(repository: OffersRepository, *args: object, **kwargs: object) -> object:
         nonlocal calls
         with calls_lock:
             calls += 1
@@ -2200,9 +2429,10 @@ def test_real_sqlite_two_connections_have_one_claim_and_one_executor(
         if ordinal == 1:
             first_executor_entered.set()
             assert release_first_executor.wait(10)
-        return {"ok": True}
+        return original_execute(repository, *args, **kwargs)  # type: ignore[arg-type]
 
-    catalog = _real_sqlite_approval_catalog(execute)
+    monkeypatch.setattr(OffersRepository, "save_offer_assessment_scoped", execute)
+    catalog = MODEL_TOOL_CATALOG
     factories: list[AuthorityFactory] = []
     request = ConfirmationRequest(
         conversation_id=conversation.id,
@@ -2219,6 +2449,10 @@ def test_real_sqlite_two_connections_have_one_claim_and_one_executor(
                 write_operations=cast(Any, operations),
                 write_coordinator=cast(Any, WriteOperationCoordinator(operations)),
                 catalog=catalog,
+                operation_port=_PRODUCTION_METADATA_COMPONENTS.operation_port,
+                pending_persistence_route_port=(
+                    _PRODUCTION_METADATA_COMPONENTS.pending_persistence_route_port
+                ),
                 approval_context_resolver=_real_sqlite_approval_context_resolver(
                     sessions, operations, factories
                 ),
@@ -2228,7 +2462,7 @@ def test_real_sqlite_two_connections_have_one_claim_and_one_executor(
         catalog_lease = None
         try:
             try:
-                session = coordinator.approve_modify(request, catalog=catalog)
+                session = _approve_modify(coordinator, request, catalog=catalog)
             except ConfirmationReplayError:
                 return "replay"
             except WriteOperationError as exc:
@@ -2417,7 +2651,7 @@ def test_timeout_after_terminal_preserves_authoritative_undo_payload() -> None:
         operation_id=operations.operation_id,
         confirmation_token=operations.token,
     )
-    session = coordinator.approve_modify(request, pending=pending)
+    session = _approve_modify(coordinator, request, pending=pending)
     prepared = SimpleNamespace(
         pending_identity="call-1:create_application",
         pending_action_revision=1,
@@ -2461,7 +2695,7 @@ def test_timeout_during_executor_late_terminal_fallback_clears_once() -> None:
         operation_id=operations.operation_id,
         confirmation_token=operations.token,
     )
-    session = coordinator.approve_modify(request, pending=pending)
+    session = _approve_modify(coordinator, request, pending=pending)
     prepared = SimpleNamespace(
         pending_identity="call-1:create_application",
         pending_action_revision=1,
@@ -2683,7 +2917,7 @@ def test_approved_stream_orders_meta_status_tool_result_assistant_completed() ->
         prepared,
         event_sink=Sink(),
         signal_sink=None,
-        execution_host=SseAgentExecutionHost(timeout_seconds=0.5, poll_seconds=0.005),
+        execution_host=SseAgentExecutionHost(timeout_seconds=5, poll_seconds=0.005),
         cancel_check=lambda: False,
     )
 
@@ -2802,7 +3036,7 @@ def test_slow_stream_drops_late_chained_pending_after_fallback_delivery() -> Non
         prepared,
         event_sink=Sink(),
         signal_sink=None,
-        execution_host=SseAgentExecutionHost(timeout_seconds=0.05, poll_seconds=0.005),
+        execution_host=SseAgentExecutionHost(timeout_seconds=2, poll_seconds=0.005),
         cancel_check=lambda: False,
     )
 
@@ -3213,6 +3447,7 @@ def test_confirmation_journal_base_exception_is_propagated_unchanged() -> None:
             ),
             agent_driver=Driver(),
             journal=cast(Any, journal),
+            **_runtime_metadata_dependencies(),
         )
     )
     outcome = runtime.continue_confirmation(

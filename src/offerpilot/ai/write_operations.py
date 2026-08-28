@@ -7,14 +7,14 @@ import json
 import os
 import secrets
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import asdict, dataclass, field, is_dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event, RLock, Thread
 from time import monotonic
-from typing import Any, Literal, NoReturn, SupportsIndex, cast
+from typing import Any, Literal, NoReturn, Protocol, SupportsIndex, cast
 from uuid import UUID, uuid4, uuid5
 
 from sqlalchemy import func, select, text, update
@@ -27,6 +27,7 @@ from offerpilot.ai.tool_authority import (
     AuthorityFactory,
     AuthorityPhaseError,
     AuthorityUse,
+    PendingAuthorityClaim,
     require_authority_phase,
 )
 from offerpilot.ai.tool_authority.fingerprint import authorization_scope_fingerprint
@@ -44,12 +45,22 @@ from offerpilot.ai.tool_runtime.contracts import (
     PreparedToolCall,
     ToolExecutionRecord,
     ToolFailure,
-    TRANSACTIONAL_TYPED_WRITE_NAMES,
+    TransientToolRuntimeValue,
     UndoPolicy,
 )
 from offerpilot.ai.tool_runtime.metadata import (
+    CommittedPrimaryOperationIdentityV1,
+    CompensationHandle,
+    FrozenJSONValue,
+    LegacyAdapterBindingV1,
+    LegacyWriteHandle,
+    OperationRouteEntryV1,
+    OperationRouteIdentityV1,
     ToolAuthorityEntryV1,
+    ToolOperationMetadataPort,
+    TypedWriteHandle,
     WriteOperationMetadataV1,
+    materialize_json,
 )
 from offerpilot.ai.tool_runtime.pipeline import (
     _audit_entry_bindings,
@@ -58,6 +69,12 @@ from offerpilot.ai.tool_runtime.pipeline import (
 )
 from offerpilot.ai.tool_runtime.rendering import render_compatibility
 from offerpilot.ai.tool_runtime.journal import project_tool_started_bound
+from offerpilot.ai.tool_runtime.legacy_proof import (
+    LegacyPreparedInputPort,
+    PreparedLegacyCall,
+    PreparedLegacyInputV1,
+)
+from offerpilot.ai.tool_runtime.legacy import LegacyArgumentPreparationError
 from offerpilot.ai.tool_runtime.transport import project_transport_event
 from offerpilot.ai.tool_runtime.validation import (
     ArgumentValidationError,
@@ -73,35 +90,771 @@ from offerpilot.models import (
 from offerpilot.context_projector.loader import WORK_DEADLINE_SECONDS, database_coordinator
 
 
-TYPED_WRITE_OPERATION_NAMES = tuple(sorted(TRANSACTIONAL_TYPED_WRITE_NAMES))
-LEGACY_WRITE_OPERATION_NAMES = (
-    "save_application_jd_version",
-    "create_application_submission_snapshot",
-    "record_application_outcome",
-)
-COMPENSATION_OPERATION_NAMES = (
-    "undo:update_application_status",
-    "undo:create_application",
-    "undo:create_application_event",
-    "undo:add_note",
-)
-REQUIRED_UNDO_OPERATION_NAMES = frozenset(
-    {
-        "create_application",
-        "update_application_status",
-        "create_application_event",
-        "add_note",
-    }
-)
-WRITE_OPERATION_NAMES = frozenset(
-    (*TYPED_WRITE_OPERATION_NAMES, *LEGACY_WRITE_OPERATION_NAMES, *COMPENSATION_OPERATION_NAMES)
-)
-
 LEDGER_KEY_FILENAME = "write-operation-ledger.key"
 DELIVERY_OWNER_LEASE_SECONDS = 120
 DELIVERY_OWNER_HEARTBEAT_SECONDS = 30
-COMPENSATION_OPERATION_NAMESPACE = UUID("4079900d-84a6-5cff-aa63-65089c4ccccd")
+COMPENSATION_ID_NAMESPACE = UUID("4079900d-84a6-5cff-aa63-65089c4ccccd")
 _TERMINAL_STATUSES = frozenset({"committed", "failed", "rejected"})
+
+
+def _require_pending_digest(value: object) -> str:
+    if (
+        type(value) is not str
+        or len(value) != 71
+        or not value.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in value[7:])
+    ):
+        raise ValueError("Pending route arguments digest is invalid")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class PendingRouteIdentityV1:
+    """Primitive locked identity for one transient Pending persistence route."""
+
+    conversation_id: int
+    operation_id: str
+    tool_call_id: str
+    tool_name: str
+    pending_action_revision: int
+    pending_confirmation_claim_id: str
+    arguments_digest: str
+
+    def __post_init__(self) -> None:
+        if type(self.conversation_id) is not int or self.conversation_id <= 0:
+            raise ValueError("Pending route conversation id must be positive")
+        if type(self.tool_call_id) is not str or not self.tool_call_id:
+            raise ValueError("Pending route tool call id is required")
+        if type(self.tool_name) is not str:
+            raise TypeError("Pending route tool name must be text")
+        if type(self.operation_id) is not str:
+            raise TypeError("Pending route operation id must be text")
+        if type(self.pending_confirmation_claim_id) is not str:
+            raise TypeError("Pending route claim id must be text")
+        if type(self.pending_action_revision) is not int or self.pending_action_revision <= 0:
+            raise ValueError("Pending route revision must be positive")
+        _require_pending_digest(self.arguments_digest)
+        operationless = self.operation_id == ""
+        if operationless != (self.pending_confirmation_claim_id == ""):
+            raise ValueError("Pending route operation and claim identities must agree")
+        if not operationless and not self.tool_name:
+            raise ValueError("Operation-bearing Pending route requires a tool name")
+
+
+def _pending_identity_snapshot(value: PendingRouteIdentityV1) -> tuple[object, ...]:
+    value.__post_init__()
+    return (
+        value.conversation_id,
+        value.operation_id,
+        value.tool_call_id,
+        value.tool_name,
+        value.pending_action_revision,
+        value.pending_confirmation_claim_id,
+        value.arguments_digest,
+    )
+
+
+_PENDING_HANDLE_CONSTRUCTION_SEAL = object()
+_PENDING_CLAIM_NOT_PROVIDED = object()
+
+
+class _PendingHandleLifecycle:
+    __slots__ = ("active", "lock")
+
+    def __init__(self) -> None:
+        self.active = True
+        self.lock = RLock()
+
+
+class _PendingRouteHandle(TransientToolRuntimeValue):
+    __slots__ = ("_port", "_port_token", "_handle_token", "_lifecycle", "_seal")
+    _port: PendingPersistenceRoutePort
+    _port_token: object
+    _handle_token: object
+    _lifecycle: _PendingHandleLifecycle
+    _seal: tuple[
+        PendingPersistenceRoutePort,
+        object,
+        object,
+        _PendingHandleLifecycle,
+    ]
+
+    def __new__(cls, seal: object | None = None, **kwargs: object) -> "_PendingRouteHandle":
+        del kwargs
+        if seal is not _PENDING_HANDLE_CONSTRUCTION_SEAL:
+            raise TypeError("Pending route handles are Port-created")
+        return object.__new__(cls)
+
+    def __init__(
+        self,
+        seal: object | None = None,
+        *,
+        port: "PendingPersistenceRoutePort",
+        port_token: object,
+        handle_token: object,
+    ) -> None:
+        if seal is not _PENDING_HANDLE_CONSTRUCTION_SEAL:
+            raise TypeError("Pending route handles are Port-created")
+        lifecycle = _PendingHandleLifecycle()
+        object.__setattr__(self, "_port", port)
+        object.__setattr__(self, "_port_token", port_token)
+        object.__setattr__(self, "_handle_token", handle_token)
+        object.__setattr__(self, "_lifecycle", lifecycle)
+        object.__setattr__(self, "_seal", (port, port_token, handle_token, lifecycle))
+
+    def __setattr__(self, name: str, value: object) -> NoReturn:
+        del name, value
+        raise AttributeError("Pending route handle components are sealed")
+
+    def _require(self, port: "PendingPersistenceRoutePort") -> None:
+        self._require_provenance(port)
+        with self._lifecycle.lock:
+            if self._lifecycle.active is not True:
+                raise ValueError("Pending route handle is revoked")
+
+    def _require_provenance(self, port: "PendingPersistenceRoutePort") -> None:
+        if (
+            self._seal != (self._port, self._port_token, self._handle_token, self._lifecycle)
+            or self._port is not port
+            or self._port_token is not port._port_token
+            or type(self._lifecycle) is not _PendingHandleLifecycle
+        ):
+            raise ValueError("Pending route handle provenance drift")
+
+    def _revoke(self, port: "PendingPersistenceRoutePort") -> None:
+        self._require(port)
+        with self._lifecycle.lock:
+            self._lifecycle.active = False
+
+
+class TypedPendingRouteHandle(_PendingRouteHandle):
+    __slots__ = ()
+
+
+class LegacyPendingRouteHandle(_PendingRouteHandle):
+    __slots__ = ()
+
+
+class ClarificationPendingRouteHandle(_PendingRouteHandle):
+    __slots__ = ()
+
+
+class _PrimaryParentRouteHandle(_PendingRouteHandle):
+    __slots__ = ()
+
+
+class _CompensationParentRouteHandle(_PendingRouteHandle):
+    __slots__ = ()
+
+
+PendingPersistenceRouteHandle = (
+    TypedPendingRouteHandle | LegacyPendingRouteHandle | ClarificationPendingRouteHandle
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingRouteResolution:
+    identity: PendingRouteIdentityV1
+    route: OperationRouteEntryV1 | None
+    adapter_kind: Literal["typed", "legacy_deterministic", "clarification"]
+    claim: object | None
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingIssuedRecord:
+    handle: _PendingRouteHandle
+    upstream_handle: object | None
+    identity: PendingRouteIdentityV1 | CommittedPrimaryOperationIdentityV1
+    identity_snapshot: tuple[object, ...]
+    route: OperationRouteEntryV1 | None
+    legacy_binding: LegacyAdapterBindingV1 | None
+    claim: object | None
+    role: Literal["pending", "primary_parent", "compensation_parent"]
+
+
+def _operation_identity_from_pending(value: PendingRouteIdentityV1) -> OperationRouteIdentityV1:
+    return OperationRouteIdentityV1(
+        operation_id=value.operation_id,
+        tool_call_id=value.tool_call_id,
+        revision=value.pending_action_revision,
+        arguments_digest=value.arguments_digest,
+    )
+
+
+class ChainedPendingTopologyPolicyV1(TransientToolRuntimeValue):
+    """Exact parent/child topology verifier issued by one Pending Port."""
+
+    __slots__ = ("_port",)
+    _port: PendingPersistenceRoutePort
+
+    def __init__(self, port: "PendingPersistenceRoutePort") -> None:
+        object.__setattr__(self, "_port", port)
+
+    def __setattr__(self, name: str, value: object) -> NoReturn:
+        del name, value
+        raise AttributeError("Pending topology policy is sealed")
+
+    def require_transition(self, parent: object, child: object) -> None:
+        parent_record = self._port._require_parent(parent)
+        child_record = self._port._require_child(child)
+        if parent_record.role != "primary_parent" or parent_record.route is None:
+            raise ValueError("Compensation routes cannot parent Pending actions")
+        if child_record.route is None:
+            raise ValueError("Clarification routes cannot be chained operation children")
+        parent_route = parent_record.route
+        child_route = child_record.route
+        if parent_route.adapter_kind == "typed" and child_route.adapter_kind == "typed":
+            return
+        parent_binding = parent_record.legacy_binding
+        child_binding = child_record.legacy_binding
+        if (
+            parent_route.adapter_kind == "legacy_deterministic"
+            and child_route.adapter_kind == "legacy_deterministic"
+            and type(parent_binding) is LegacyAdapterBindingV1
+            and child_binding is parent_binding
+            and parent_binding.chained_policy == "same_adapter_only"
+        ):
+            return
+        raise ValueError("Pending chained topology is not permitted")
+
+
+class PendingPersistenceRoutePort(TransientToolRuntimeValue):
+    """Sealed wrapper from exact Operation handles to persistence-only routes."""
+
+    __slots__ = (
+        "_operation_port",
+        "_bundle_token",
+        "_port_token",
+        "_lock",
+        "_records",
+        "_policy",
+        "_integrity_seal",
+    )
+    _operation_port: ToolOperationMetadataPort
+    _bundle_token: object
+    _port_token: object
+    _lock: RLock
+    _records: dict[int, _PendingIssuedRecord]
+    _policy: ChainedPendingTopologyPolicyV1
+    _integrity_seal: tuple[
+        ToolOperationMetadataPort,
+        object,
+        object,
+        RLock,
+        dict[int, _PendingIssuedRecord],
+        ChainedPendingTopologyPolicyV1,
+    ]
+
+    def __init__(self, *, operation_port: ToolOperationMetadataPort) -> None:
+        if type(operation_port) is not ToolOperationMetadataPort:
+            raise TypeError("Pending Port requires an exact Operation Port")
+        bundle_token = operation_port.bundle_instance_token
+        port_token = object()
+        lock = RLock()
+        records: dict[int, _PendingIssuedRecord] = {}
+        object.__setattr__(self, "_operation_port", operation_port)
+        object.__setattr__(self, "_bundle_token", bundle_token)
+        object.__setattr__(self, "_port_token", port_token)
+        object.__setattr__(self, "_lock", lock)
+        object.__setattr__(self, "_records", records)
+        policy = ChainedPendingTopologyPolicyV1(self)
+        object.__setattr__(self, "_policy", policy)
+        object.__setattr__(
+            self,
+            "_integrity_seal",
+            (operation_port, bundle_token, port_token, lock, records, policy),
+        )
+
+    def __setattr__(self, name: str, value: object) -> NoReturn:
+        del name, value
+        raise AttributeError("Pending Persistence Route Port is sealed")
+
+    def _ensure_integrity(self) -> None:
+        if (
+            self._integrity_seal
+            != (
+                self._operation_port,
+                self._bundle_token,
+                self._port_token,
+                self._lock,
+                self._records,
+                self._policy,
+            )
+            or self._operation_port.bundle_instance_token is not self._bundle_token
+        ):
+            raise ValueError("Pending Persistence Route Port integrity drift")
+
+    @property
+    def chained_topology_policy(self) -> ChainedPendingTopologyPolicyV1:
+        self._ensure_integrity()
+        return self._policy
+
+    @property
+    def bundle_instance_token(self) -> object:
+        self._ensure_integrity()
+        return self._bundle_token
+
+    def _issue(
+        self,
+        handle_type: type[_PendingRouteHandle],
+        *,
+        upstream_handle: object | None,
+        identity: PendingRouteIdentityV1 | CommittedPrimaryOperationIdentityV1,
+        snapshot: tuple[object, ...],
+        route: OperationRouteEntryV1 | None,
+        legacy_binding: LegacyAdapterBindingV1 | None,
+        claim: object | None,
+        role: Literal["pending", "primary_parent", "compensation_parent"],
+    ) -> _PendingRouteHandle:
+        handle = handle_type(
+            _PENDING_HANDLE_CONSTRUCTION_SEAL,
+            port=self,
+            port_token=self._port_token,
+            handle_token=object(),
+        )
+        record = _PendingIssuedRecord(
+            handle,
+            upstream_handle,
+            identity,
+            snapshot,
+            route,
+            legacy_binding,
+            claim,
+            role,
+        )
+        with self._lock:
+            self._records[id(handle)] = record
+        return handle
+
+    def bind_typed_pending(
+        self,
+        operation_handle: TypedWriteHandle,
+        identity: PendingRouteIdentityV1,
+        claim: object,
+    ) -> TypedPendingRouteHandle:
+        self._ensure_integrity()
+        if type(identity) is not PendingRouteIdentityV1 or not identity.operation_id:
+            raise TypeError("Typed Pending requires an exact operation-bearing identity")
+        route, legacy_binding = self._snapshot_primary(operation_handle, identity, claim=claim)
+        if legacy_binding is not None:
+            raise ValueError("Typed Pending cannot carry a Legacy binding")
+        if route.operation_name != identity.tool_name:
+            raise ValueError("Typed Pending operation name mismatch")
+        return cast(
+            TypedPendingRouteHandle,
+            self._issue(
+                TypedPendingRouteHandle,
+                upstream_handle=operation_handle,
+                identity=identity,
+                snapshot=_pending_identity_snapshot(identity),
+                route=route,
+                legacy_binding=None,
+                claim=claim,
+                role="pending",
+            ),
+        )
+
+    def require_typed_pending(
+        self,
+        handle: TypedPendingRouteHandle,
+        identity: PendingRouteIdentityV1,
+        claim: object,
+    ) -> OperationRouteEntryV1:
+        record = self._require_record(handle, TypedPendingRouteHandle, "pending")
+        if (
+            identity is not record.identity
+            or _pending_identity_snapshot(identity) != record.identity_snapshot
+            or claim is not record.claim
+        ):
+            raise ValueError("Typed Pending identity mismatch")
+        route, legacy_binding = self._snapshot_primary(
+            record.upstream_handle,
+            identity,
+            claim=claim,
+        )
+        if route is not record.route or legacy_binding is not None:
+            raise ValueError("Typed Pending route drift")
+        return route
+
+    def bind_legacy_pending(
+        self,
+        operation_handle: LegacyWriteHandle,
+        identity: PendingRouteIdentityV1,
+    ) -> LegacyPendingRouteHandle:
+        self._ensure_integrity()
+        if type(identity) is not PendingRouteIdentityV1 or not identity.operation_id:
+            raise TypeError("Legacy Pending requires an exact operation-bearing identity")
+        route, legacy_binding = self._snapshot_primary(operation_handle, identity)
+        if type(legacy_binding) is not LegacyAdapterBindingV1:
+            raise ValueError("Legacy Pending requires an exact Adapter binding")
+        if route.operation_name != identity.tool_name:
+            raise ValueError("Legacy Pending operation name mismatch")
+        return cast(
+            LegacyPendingRouteHandle,
+            self._issue(
+                LegacyPendingRouteHandle,
+                upstream_handle=operation_handle,
+                identity=identity,
+                snapshot=_pending_identity_snapshot(identity),
+                route=route,
+                legacy_binding=legacy_binding,
+                claim=None,
+                role="pending",
+            ),
+        )
+
+    def require_legacy_pending(
+        self,
+        handle: LegacyPendingRouteHandle,
+        identity: PendingRouteIdentityV1,
+    ) -> OperationRouteEntryV1:
+        record = self._require_record(handle, LegacyPendingRouteHandle, "pending")
+        if (
+            identity is not record.identity
+            or _pending_identity_snapshot(identity) != record.identity_snapshot
+        ):
+            raise ValueError("Legacy Pending identity mismatch")
+        route, legacy_binding = self._snapshot_primary(record.upstream_handle, identity)
+        if route is not record.route or legacy_binding is not record.legacy_binding:
+            raise ValueError("Legacy Pending route drift")
+        return route
+
+    def bind_clarification_pending(
+        self,
+        identity: PendingRouteIdentityV1,
+    ) -> ClarificationPendingRouteHandle:
+        self._ensure_integrity()
+        if type(identity) is not PendingRouteIdentityV1 or identity.operation_id:
+            raise TypeError("Clarification Pending must be operationless")
+        return cast(
+            ClarificationPendingRouteHandle,
+            self._issue(
+                ClarificationPendingRouteHandle,
+                upstream_handle=None,
+                identity=identity,
+                snapshot=_pending_identity_snapshot(identity),
+                route=None,
+                legacy_binding=None,
+                claim=None,
+                role="pending",
+            ),
+        )
+
+    def require_clarification_pending(
+        self,
+        handle: ClarificationPendingRouteHandle,
+        identity: PendingRouteIdentityV1,
+    ) -> None:
+        record = self._require_record(handle, ClarificationPendingRouteHandle, "pending")
+        if (
+            identity is not record.identity
+            or _pending_identity_snapshot(identity) != record.identity_snapshot
+        ):
+            raise ValueError("Clarification Pending identity mismatch")
+
+    def _snapshot_primary(
+        self,
+        handle: object,
+        identity: PendingRouteIdentityV1,
+        *,
+        claim: object = _PENDING_CLAIM_NOT_PROVIDED,
+    ) -> tuple[OperationRouteEntryV1, LegacyAdapterBindingV1 | None]:
+        operation_identity = _operation_identity_from_pending(identity)
+        state = self._operation_port._state
+        with state.lock:
+            if type(handle) is TypedWriteHandle:
+                handle._ensure_integrity()
+                typed_issued = state.typed.get(id(handle))
+                if typed_issued is None or typed_issued[0] is not handle:
+                    raise ValueError("Typed primary parent was not issued by this Operation Port")
+                _, lease, spec_handle, _expected, snapshot, expected_claim, route = typed_issued
+                if snapshot != (
+                    operation_identity.operation_id,
+                    operation_identity.tool_call_id,
+                    operation_identity.revision,
+                    operation_identity.arguments_digest,
+                ) or (claim is not _PENDING_CLAIM_NOT_PROVIDED and claim is not expected_claim):
+                    raise ValueError("Typed primary parent identity mismatch")
+                try:
+                    lease.require_spec(spec_handle)
+                except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                    raise ValueError("Typed primary route is revoked") from exc
+                return route, None
+            if type(handle) is LegacyWriteHandle:
+                handle._ensure_integrity()
+                legacy_issued = state.legacy.get(id(handle))
+                if legacy_issued is None or legacy_issued[0] is not handle:
+                    raise ValueError("Legacy primary parent was not issued by this Operation Port")
+                _, route_handle, _expected, snapshot, route = legacy_issued
+                if snapshot != (
+                    operation_identity.operation_id,
+                    operation_identity.tool_call_id,
+                    operation_identity.revision,
+                    operation_identity.arguments_digest,
+                ):
+                    raise ValueError("Legacy primary parent identity mismatch")
+                try:
+                    binding = self._operation_port._legacy_route_issuer_port.require_route(
+                        route_handle
+                    )
+                except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                    raise ValueError("Legacy primary route is revoked") from exc
+                if (
+                    type(binding) is not LegacyAdapterBindingV1
+                    or binding.name != route.operation_name
+                    or binding.adapter_kind != route.adapter_kind
+                ):
+                    raise ValueError("Legacy primary Adapter binding drift")
+                return route, binding
+        raise TypeError("Primary parent requires a Typed or Legacy operation handle")
+
+    def bind_primary_parent(
+        self,
+        operation_handle: TypedWriteHandle | LegacyWriteHandle,
+        identity: PendingRouteIdentityV1,
+    ) -> _PrimaryParentRouteHandle:
+        if type(identity) is not PendingRouteIdentityV1 or not identity.operation_id:
+            raise TypeError("Primary parent requires an operation-bearing identity")
+        route, legacy_binding = self._snapshot_primary(operation_handle, identity)
+        if route.operation_name != identity.tool_name or route.operation_role != "primary":
+            raise ValueError("Primary parent route mismatch")
+        return cast(
+            _PrimaryParentRouteHandle,
+            self._issue(
+                _PrimaryParentRouteHandle,
+                upstream_handle=None,
+                identity=identity,
+                snapshot=_pending_identity_snapshot(identity),
+                route=route,
+                legacy_binding=legacy_binding,
+                claim=None,
+                role="primary_parent",
+            ),
+        )
+
+    def bind_compensation_parent(
+        self,
+        operation_handle: CompensationHandle,
+        parent: CommittedPrimaryOperationIdentityV1,
+        handler_handle: object,
+    ) -> _CompensationParentRouteHandle:
+        route = self._operation_port.require_compensation(
+            operation_handle,
+            parent,
+            handler_handle,
+        )
+        return cast(
+            _CompensationParentRouteHandle,
+            self._issue(
+                _CompensationParentRouteHandle,
+                upstream_handle=None,
+                identity=parent,
+                snapshot=(
+                    parent.operation_id,
+                    parent.primary_tool,
+                    parent.operation_role,
+                    parent.adapter_kind,
+                    parent.status,
+                    parent.terminal_payload_digest,
+                ),
+                route=route,
+                legacy_binding=None,
+                claim=None,
+                role="compensation_parent",
+            ),
+        )
+
+    def _require_record(
+        self,
+        handle: object,
+        handle_type: type[_PendingRouteHandle],
+        role: Literal["pending", "primary_parent", "compensation_parent"],
+    ) -> _PendingIssuedRecord:
+        self._ensure_integrity()
+        if type(handle) is not handle_type:
+            raise TypeError("Pending route handle has the wrong type")
+        typed_handle = handle
+        typed_handle._require(self)
+        with self._lock:
+            record = self._records.get(id(handle))
+            if record is None or record.handle is not handle or record.role != role:
+                raise ValueError("Pending route handle was not issued by this Port")
+            identity = record.identity
+            if type(identity) is PendingRouteIdentityV1:
+                current_identity_snapshot = _pending_identity_snapshot(identity)
+            elif type(identity) is CommittedPrimaryOperationIdentityV1:
+                identity.__post_init__()
+                current_identity_snapshot = (
+                    identity.operation_id,
+                    identity.primary_tool,
+                    identity.operation_role,
+                    identity.adapter_kind,
+                    identity.status,
+                    identity.terminal_payload_digest,
+                )
+            else:
+                raise ValueError("Pending route identity has the wrong type")
+            if current_identity_snapshot != record.identity_snapshot:
+                raise ValueError("Pending route identity drift")
+            if record.route is None:
+                if record.legacy_binding is not None:
+                    raise ValueError("Operationless Pending route carries a Legacy binding")
+            elif record.route.adapter_kind == "legacy_deterministic":
+                if type(record.legacy_binding) is not LegacyAdapterBindingV1:
+                    raise ValueError("Legacy Pending route lost its exact Adapter binding")
+            elif record.legacy_binding is not None:
+                raise ValueError("Non-Legacy Pending route carries a Legacy binding")
+            return record
+
+    def _require_parent(self, handle: object) -> _PendingIssuedRecord:
+        if type(handle) is _PrimaryParentRouteHandle:
+            return self._require_record(handle, _PrimaryParentRouteHandle, "primary_parent")
+        if type(handle) is _CompensationParentRouteHandle:
+            return self._require_record(
+                handle,
+                _CompensationParentRouteHandle,
+                "compensation_parent",
+            )
+        raise TypeError("Pending topology parent handle has the wrong type")
+
+    def _require_child(self, handle: object) -> _PendingIssuedRecord:
+        if type(handle) is TypedPendingRouteHandle:
+            return self._require_record(handle, TypedPendingRouteHandle, "pending")
+        if type(handle) is LegacyPendingRouteHandle:
+            return self._require_record(handle, LegacyPendingRouteHandle, "pending")
+        if type(handle) is ClarificationPendingRouteHandle:
+            return self._require_record(handle, ClarificationPendingRouteHandle, "pending")
+        raise TypeError("Pending topology child handle has the wrong type")
+
+    def resolve_for_persistence(
+        self,
+        handle: PendingPersistenceRouteHandle,
+        *,
+        conversation_id: int,
+        operation_id: str,
+        tool_call_id: str,
+        tool_name: str,
+        pending_action_revision: int,
+        pending_confirmation_claim_id: str,
+        arguments_digest: str,
+    ) -> _PendingRouteResolution:
+        expected = (
+            conversation_id,
+            operation_id,
+            tool_call_id,
+            tool_name,
+            pending_action_revision,
+            pending_confirmation_claim_id,
+            arguments_digest,
+        )
+        record = self._require_child(handle)
+        if record.identity_snapshot != expected:
+            raise ValueError("Pending persistence route identity mismatch")
+        identity = cast(PendingRouteIdentityV1, record.identity)
+        if type(handle) is TypedPendingRouteHandle:
+            route = self.require_typed_pending(handle, identity, record.claim)
+            return _PendingRouteResolution(identity, route, "typed", record.claim)
+        if type(handle) is LegacyPendingRouteHandle:
+            route = self.require_legacy_pending(handle, identity)
+            return _PendingRouteResolution(identity, route, "legacy_deterministic", None)
+        self.require_clarification_pending(cast(ClarificationPendingRouteHandle, handle), identity)
+        return _PendingRouteResolution(identity, None, "clarification", None)
+
+    def revoke_pending(self, handle: object) -> None:
+        if not isinstance(handle, _PendingRouteHandle):
+            raise TypeError("Pending route handle has the wrong type")
+        handle._require_provenance(self)
+        with handle._lifecycle.lock:
+            if handle._lifecycle.active is not True:
+                return
+            handle._lifecycle.active = False
+        with self._lock:
+            record = self._records.get(id(handle))
+            if record is not None and record.handle is handle:
+                del self._records[id(handle)]
+
+
+def build_pending_persistence_route_port(
+    *,
+    operation_port: ToolOperationMetadataPort,
+) -> PendingPersistenceRoutePort:
+    return PendingPersistenceRoutePort(operation_port=operation_port)
+
+
+def require_pending_persistence_route(
+    route_handle: PendingPersistenceRouteHandle,
+    *,
+    conversation_id: int,
+    operation_id: str,
+    tool_call_id: str,
+    tool_name: str,
+    pending_action_revision: int,
+    pending_confirmation_claim_id: str,
+    arguments_digest: str,
+) -> _PendingRouteResolution:
+    if not isinstance(route_handle, _PendingRouteHandle):
+        raise TypeError("Pending persistence requires an exact route handle")
+    return route_handle._port.resolve_for_persistence(
+        route_handle,
+        conversation_id=conversation_id,
+        operation_id=operation_id,
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+        pending_action_revision=pending_action_revision,
+        pending_confirmation_claim_id=pending_confirmation_claim_id,
+        arguments_digest=arguments_digest,
+    )
+
+
+def require_chained_pending_transition(
+    parent_route_handle: object,
+    child_route_handle: PendingPersistenceRouteHandle,
+) -> None:
+    if not isinstance(parent_route_handle, _PendingRouteHandle):
+        raise TypeError("Chained Pending requires an exact parent route")
+    if not isinstance(child_route_handle, _PendingRouteHandle):
+        raise TypeError("Chained Pending requires an exact child route")
+    if parent_route_handle._port is not child_route_handle._port:
+        raise ValueError("Chained Pending routes have different Port provenance")
+    parent_route_handle._port.chained_topology_policy.require_transition(
+        parent_route_handle,
+        child_route_handle,
+    )
+
+
+def pending_route_claim_for_cleanup(
+    route_handle: PendingPersistenceRouteHandle,
+) -> object | None:
+    if type(route_handle) is not TypedPendingRouteHandle:
+        return None
+    record = route_handle._port._require_record(
+        route_handle,
+        TypedPendingRouteHandle,
+        "pending",
+    )
+    return record.claim
+
+
+def abandon_pending_persistence_route(
+    route_handle: PendingPersistenceRouteHandle,
+) -> None:
+    """Revoke an unconsumed exact Pending route and its Typed authority claim."""
+
+    if not isinstance(route_handle, _PendingRouteHandle):
+        raise TypeError("Pending persistence requires an exact route handle")
+    port = route_handle._port
+    claim = pending_route_claim_for_cleanup(route_handle)
+    if claim is not None:
+        if type(claim) is not PendingAuthorityClaim:
+            raise AuthorityPhaseError("Typed Pending claim has an invalid type")
+        from offerpilot.ai.tool_authority import composition
+
+        with composition._ACTIVE_AUTHORITIES_LOCK:
+            found = composition._ACTIVE_OBJECTS.get(id(claim))
+        if found is None or found[0] is not claim or type(found[1]) is not AuthorityFactory:
+            raise AuthorityPhaseError("Typed Pending claim is not active")
+        found[1]._revoke_lifecycle_after_entry_failure(claim, owns_in_flight=False)
+    port.revoke_pending(route_handle)
 
 
 class WriteOperationError(RuntimeError):
@@ -129,7 +882,16 @@ class _Transient:
 
 
 class DeliveryOwnership(_Transient):
-    __slots__ = ("operation_id", "generation", "__raw_token", "fingerprint")
+    __slots__ = (
+        "operation_id",
+        "generation",
+        "__raw_token",
+        "fingerprint",
+        "parent_route_handle",
+        "child_route_handle",
+    )
+    parent_route_handle: object | None
+    child_route_handle: PendingPersistenceRouteHandle | None
 
     def __init__(
         self, operation_id: str, generation: int, raw_token: bytes, fingerprint: str
@@ -138,6 +900,78 @@ class DeliveryOwnership(_Transient):
         self.generation = generation
         self.__raw_token = raw_token
         self.fingerprint = fingerprint
+        self.parent_route_handle: object | None = None
+        self.child_route_handle: object | None = None
+
+    def bind_parent_route(self, handle: object) -> None:
+        if self.parent_route_handle is not None:
+            raise ValueError("delivery parent route is already bound")
+        if type(handle) not in {_PrimaryParentRouteHandle, _CompensationParentRouteHandle}:
+            raise TypeError("delivery parent route has the wrong type")
+        self.parent_route_handle = handle
+
+    def bind_chained_transition(
+        self,
+        child_route_handle: PendingPersistenceRouteHandle,
+    ) -> None:
+        if self.child_route_handle is not None:
+            raise ValueError("delivery child route is already bound")
+        parent_route_handle = self.parent_route_handle
+        if parent_route_handle is None:
+            raise TypeError("chained Pending delivery requires an exact parent route")
+        require_chained_pending_transition(parent_route_handle, child_route_handle)
+        self.child_route_handle = child_route_handle
+
+    def require_chained_transition(
+        self,
+        *,
+        parent: WriteOperation,
+        child: WriteOperation,
+    ) -> None:
+        parent_route_handle = self.parent_route_handle
+        child_route_handle = self.child_route_handle
+        if parent_route_handle is None or child_route_handle is None:
+            raise TypeError("chained Pending delivery route is incomplete")
+        if not isinstance(parent_route_handle, _PendingRouteHandle):
+            raise TypeError("chained Pending delivery parent route is invalid")
+        require_chained_pending_transition(parent_route_handle, child_route_handle)
+        port = parent_route_handle._port
+        parent_record = port._require_parent(parent_route_handle)
+        child_record = port._require_child(child_route_handle)
+        parent_identity = parent_record.identity
+        child_identity = child_record.identity
+        if (
+            type(parent_identity) is not PendingRouteIdentityV1
+            or type(child_identity) is not PendingRouteIdentityV1
+            or parent_record.route is None
+            or child_record.route is None
+            or parent_identity.operation_id != parent.id
+            or parent_identity.conversation_id != parent.conversation_id
+            or parent_identity.tool_call_id != parent.tool_call_id
+            or parent_identity.tool_name != parent.tool_name
+            or parent_record.route.adapter_kind != parent.adapter_kind
+            or child_identity.operation_id != child.id
+            or child_identity.conversation_id != child.conversation_id
+            or child_identity.tool_call_id != child.tool_call_id
+            or child_identity.tool_name != child.tool_name
+            or child_record.route.adapter_kind != child.adapter_kind
+        ):
+            raise ValueError("chained Pending delivery operation identity mismatch")
+
+    def revoke_parent_route(self) -> None:
+        child = self.child_route_handle
+        if child is not None:
+            if not isinstance(child, _PendingRouteHandle):
+                raise ValueError("delivery child route integrity drift")
+            child._port.revoke_pending(child)
+            self.child_route_handle = None
+        handle = self.parent_route_handle
+        if handle is None:
+            return
+        if not isinstance(handle, _PendingRouteHandle):
+            raise ValueError("delivery parent route integrity drift")
+        handle._port.revoke_pending(handle)
+        self.parent_route_handle = None
 
     @property
     def raw_token(self) -> bytes:
@@ -392,22 +1226,9 @@ def operation_request_fingerprint(
 
 def compensation_operation_id(parent_operation_id: str, compensation_kind: str) -> str:
     parent = str(UUID(parent_operation_id))
-    if compensation_kind not in COMPENSATION_OPERATION_NAMES:
-        raise ValueError("unsupported compensation kind")
-    return str(uuid5(COMPENSATION_OPERATION_NAMESPACE, parent + ":" + compensation_kind))
-
-
-def compensation_kind_for_undo(undo_kind: str) -> str:
-    mapping = {
-        "update_application_status": "undo:update_application_status",
-        "delete_application": "undo:create_application",
-        "delete_application_event": "undo:create_application_event",
-        "delete_note": "undo:add_note",
-    }
-    try:
-        return mapping[undo_kind]
-    except KeyError as exc:
-        raise ValueError("unsupported compensation kind") from exc
+    if type(compensation_kind) is not str or not compensation_kind:
+        raise ValueError("compensation kind is required")
+    return str(uuid5(COMPENSATION_ID_NAMESPACE, parent + ":" + compensation_kind))
 
 
 def _json_value(value: Any) -> JSONValue:
@@ -511,7 +1332,7 @@ def _undo_digest(undo_json: str | None) -> str | None:
     return "sha256:" + hashlib.sha256(canonical).hexdigest()
 
 
-def _chained_manifest(operation: WriteOperation | None) -> JSONValue:
+def _chained_manifest_v1(operation: WriteOperation | None) -> JSONValue:
     if operation is None:
         return None
     return {
@@ -522,7 +1343,29 @@ def _chained_manifest(operation: WriteOperation | None) -> JSONValue:
     }
 
 
-def _chained_adapter_kind(
+def _chained_manifest_v2(
+    operation: WriteOperation | None,
+    *,
+    pending_args: str | None,
+    pending_human: str | None,
+) -> JSONValue:
+    if operation is None:
+        return None
+    if pending_args is None or pending_human is None:
+        raise WriteOperationError("operation_delivery_unknown")
+    return {
+        "operation_id": operation.id,
+        "tool_call_id": operation.tool_call_id,
+        "tool_name": operation.tool_name,
+        "adapter_kind": operation.adapter_kind,
+        "proposal_fingerprint": operation.proposal_fingerprint,
+        "confirmation_token_fingerprint": operation.confirmation_token_fingerprint,
+        "pending_args": pending_args,
+        "pending_human": pending_human,
+    }
+
+
+def _validated_delivery_adapter(
     operation: WriteOperation,
     child: WriteOperation,
 ) -> Literal["typed", "legacy_deterministic"] | None:
@@ -533,8 +1376,7 @@ def _chained_adapter_kind(
     if (
         operation.adapter_kind == "legacy_deterministic"
         and child.adapter_kind == "legacy_deterministic"
-        and operation.tool_name == "save_application_jd_version"
-        and child.tool_name == "save_application_jd_version"
+        and child.tool_name == operation.tool_name
     ):
         return "legacy_deterministic"
     return None
@@ -577,75 +1419,6 @@ def _legacy_pending_confirmation_token(
         separators=(",", ":"),
     )
     return hashlib.sha256(identity.encode("utf-8")).hexdigest(), decoded
-
-
-def _typed_pending_confirmation_human(
-    tool_name: str,
-    arguments: Mapping[str, JSONValue],
-) -> str:
-    """Render a replay card without Catalog, schema, Authority, or Tool access."""
-
-    values = dict(arguments)
-    if tool_name == "create_application":
-        return f"新建投递：{values.get('company_name', '')} - {values.get('position_name', '')}"
-    if tool_name == "update_application_status":
-        return f"将投递 #{values.get('id', '')} 的状态改为 {values.get('status', '')}"
-    if tool_name == "create_application_event":
-        labels = {
-            "written_test": "笔试",
-            "interview": "面试",
-            "offer_step": "Offer 进展",
-            "deadline": "截止",
-            "custom": "自定义",
-        }
-        title = labels.get(str(values.get("event_type") or ""), "日程")
-        raw_time = str(values.get("scheduled_at") or "")
-        try:
-            parsed = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
-            if parsed.tzinfo is not None:
-                parsed = parsed.astimezone(timezone(timedelta(hours=8)))
-            shown_time = parsed.strftime("%Y-%m-%d %H:%M")
-        except ValueError:
-            shown_time = raw_time
-        duration = values.get("duration_minutes")
-        shown_duration = f"{duration} 分钟" if duration not in (None, "") else ""
-        details = " · ".join(value for value in (title, shown_time, shown_duration) if value)
-        return f"新建日程：{details}" if details else "新建日程"
-    if tool_name == "add_note":
-        details = " · ".join(
-            str(values.get(key) or "").strip()
-            for key in ("company", "position", "round")
-            if str(values.get(key) or "").strip()
-        )
-        return f"新增复盘：{details}" if details else "新增复盘"
-    actions = {
-        "update_application_event": "更新日程",
-        "delete_application_event": "删除日程",
-        "update_note": "更新复盘",
-        "delete_note": "删除复盘",
-        "update_offer": "更新 Offer",
-        "save_offer_assessment": "保存 Offer 评估",
-        "resume_update_career_intent": "更新简历求职意向",
-        "resume_rewrite_highlight": "改写简历亮点",
-    }
-    action = actions.get(tool_name)
-    if action is None:
-        raise WriteOperationError("operation_delivery_unknown", retryable=True)
-    return f"{action} #{values.get('id', '')}"
-
-
-def _verified_pending_confirmation_human(
-    adapter_kind: Literal["typed", "legacy_deterministic"],
-    tool_name: str,
-    decoded_args: Mapping[str, JSONValue] | None,
-) -> str:
-    if adapter_kind == "typed":
-        if decoded_args is None:
-            raise WriteOperationError("operation_integrity_error")
-        return _typed_pending_confirmation_human(tool_name, decoded_args)
-    if tool_name != "save_application_jd_version":
-        raise WriteOperationError("operation_delivery_unknown", retryable=True)
-    return "请确认将这份岗位资料保存到当前投递。"
 
 
 def _valid_delivery_messages(
@@ -746,18 +1519,32 @@ class WriteOperationRepository:
         self,
         session: Session,
         *,
+        route_handle: PendingPersistenceRouteHandle,
         operation_id: str,
         conversation_id: int,
         tool_call_id: str,
         tool_name: str,
-        adapter_kind: Literal["typed", "legacy_deterministic"],
+        pending_action_revision: int,
+        pending_confirmation_claim_id: str,
+        arguments_digest: str,
         proposal_fingerprint: str,
         confirmation_token_fingerprint: str,
         authorization_scope_fingerprint: str | None = None,
         agent_run_id: str | None = None,
     ) -> WriteOperation:
-        if tool_name not in (*TYPED_WRITE_OPERATION_NAMES, *LEGACY_WRITE_OPERATION_NAMES):
+        route = require_pending_persistence_route(
+            route_handle,
+            conversation_id=conversation_id,
+            operation_id=operation_id,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            pending_action_revision=pending_action_revision,
+            pending_confirmation_claim_id=pending_confirmation_claim_id,
+            arguments_digest=arguments_digest,
+        )
+        if route.route is None or route.adapter_kind == "clarification":
             raise WriteOperationError("operation_not_transactional")
+        adapter_kind = route.adapter_kind
         operation = WriteOperation(
             id=str(UUID(operation_id)),
             operation_role="primary",
@@ -860,6 +1647,7 @@ class WriteOperationRepository:
             else None
         )
         adapter_kind: Literal["typed", "legacy_deterministic"] | None = None
+        pending_row = None
         if operation.delivery_outcome == "chained_pending":
             if (
                 child is None
@@ -869,12 +1657,32 @@ class WriteOperationRepository:
                 or child.conversation_id != operation.conversation_id
             ):
                 raise WriteOperationError("operation_delivery_unknown", retryable=True)
-            adapter_kind = _chained_adapter_kind(operation, child)
+            adapter_kind = _validated_delivery_adapter(operation, child)
             if adapter_kind is None:
+                raise WriteOperationError("operation_delivery_unknown", retryable=True)
+            pending_row = session.execute(
+                select(
+                    Conversation.id,
+                    Conversation.pending_operation_id,
+                    Conversation.pending_tool_call_id,
+                    Conversation.pending_tool_name,
+                    Conversation.pending_args,
+                    Conversation.pending_human,
+                )
+                .where(Conversation.id == operation.conversation_id)
+                .where(Conversation.pending_operation_id == child.id)
+            ).one_or_none()
+            if (
+                pending_row is None
+                or pending_row.pending_operation_id != child.id
+                or pending_row.pending_tool_call_id != child.tool_call_id
+                or pending_row.pending_tool_name != child.tool_name
+            ):
                 raise WriteOperationError("operation_delivery_unknown", retryable=True)
         elif operation.delivery_next_operation_id is not None:
             raise WriteOperationError("operation_delivery_unknown", retryable=True)
-        manifest: dict[str, JSONValue] = {
+        manifest_v2: dict[str, JSONValue] = {
+            "delivery_manifest_version": 2,
             "operation_id": operation.id,
             "status": operation.status,
             "terminal_payload_sha256": operation.terminal_payload_sha256,
@@ -887,11 +1695,29 @@ class WriteOperationRepository:
                 "replaced" if operation.delivery_outcome == "chained_pending" else "cleared"
             ),
             "validated_undo_digest": _undo_digest(operation.undo_json),
-            "chained_operation": _chained_manifest(child),
+            "chained_operation": _chained_manifest_v2(
+                child,
+                pending_args=(pending_row.pending_args if pending_row is not None else None),
+                pending_human=(pending_row.pending_human if pending_row is not None else None),
+            ),
         }
-        digest = "sha256:" + hashlib.sha256(canonical_json(manifest).encode("utf-8")).hexdigest()
-        if not hmac.compare_digest(digest, operation.delivery_manifest_sha256 or ""):
-            raise WriteOperationError("operation_delivery_unknown", retryable=True)
+        stored_digest = operation.delivery_manifest_sha256 or ""
+        v2_digest = (
+            "sha256:" + hashlib.sha256(canonical_json(manifest_v2).encode("utf-8")).hexdigest()
+        )
+        historical_v1 = False
+        if not hmac.compare_digest(v2_digest, stored_digest):
+            manifest_v1 = dict(manifest_v2)
+            del manifest_v1["delivery_manifest_version"]
+            manifest_v1["chained_operation"] = _chained_manifest_v1(child)
+            v1_digest = (
+                "sha256:" + hashlib.sha256(canonical_json(manifest_v1).encode("utf-8")).hexdigest()
+            )
+            if not hmac.compare_digest(v1_digest, stored_digest):
+                if adapter_kind is not None:
+                    raise WriteOperationError("operation_integrity_error")
+                raise WriteOperationError("operation_delivery_unknown", retryable=True)
+            historical_v1 = True
         final = next(
             (item.content for item in reversed(messages) if item.role == "assistant"), None
         )
@@ -900,26 +1726,7 @@ class WriteOperationRepository:
         if adapter_kind is None:
             return final, None
 
-        assert child is not None
-        pending_row = session.execute(
-            select(
-                Conversation.id,
-                Conversation.pending_operation_id,
-                Conversation.pending_tool_call_id,
-                Conversation.pending_tool_name,
-                Conversation.pending_args,
-                Conversation.pending_human,
-            )
-            .where(Conversation.id == operation.conversation_id)
-            .where(Conversation.pending_operation_id == child.id)
-        ).one_or_none()
-        if (
-            pending_row is None
-            or pending_row.pending_operation_id != child.id
-            or pending_row.pending_tool_call_id != child.tool_call_id
-            or pending_row.pending_tool_name != child.tool_name
-        ):
-            raise WriteOperationError("operation_delivery_unknown", retryable=True)
+        assert child is not None and pending_row is not None
 
         decoded_args: dict[str, JSONValue] | None = None
         if adapter_kind == "typed":
@@ -961,14 +1768,9 @@ class WriteOperationRepository:
             )
             if not hmac.compare_digest(expected_token, child.confirmation_token_fingerprint or ""):
                 raise WriteOperationError("operation_integrity_error")
-
-        expected_human = _verified_pending_confirmation_human(
-            adapter_kind,
-            child.tool_name,
-            decoded_args,
-        )
-        if not _constant_time_text_equal(expected_human, pending_row.pending_human):
-            raise WriteOperationError("operation_integrity_error")
+            if not isinstance(legacy_arguments, dict):
+                raise WriteOperationError("operation_integrity_error")
+            decoded_args = legacy_arguments
 
         return final, VerifiedPendingReplay(
             adapter_kind=adapter_kind,
@@ -977,7 +1779,7 @@ class WriteOperationRepository:
             tool_call_id=child.tool_call_id or "",
             tool_name=child.tool_name,
             raw_args=pending_row.pending_args,
-            human=expected_human,
+            human=("请确认此待处理操作。" if historical_v1 else pending_row.pending_human),
             confirmation_token_fingerprint=child.confirmation_token_fingerprint or "",
             decoded_args=decoded_args,
         )
@@ -1037,13 +1839,25 @@ class WriteOperationRepository:
             for item in messages
         ]
         child = session.get(WriteOperation, next_operation_id) if next_operation_id else None
+        pending_identity = None
         if outcome == "chained_pending":
+            if child is None:
+                raise WriteOperationError("operation_delivery_unknown")
+            try:
+                ownership.require_chained_transition(
+                    parent=operation,
+                    child=child,
+                )
+            except (TypeError, ValueError):
+                raise WriteOperationError("operation_delivery_unknown") from None
             pending_identity = session.execute(
                 select(
                     Conversation.id,
                     Conversation.pending_operation_id,
                     Conversation.pending_tool_call_id,
                     Conversation.pending_tool_name,
+                    Conversation.pending_args,
+                    Conversation.pending_human,
                 ).where(Conversation.id == operation.conversation_id)
             ).one_or_none()
             if (
@@ -1055,10 +1869,12 @@ class WriteOperationRepository:
                 or pending_identity.pending_operation_id != child.id
                 or pending_identity.pending_tool_call_id != child.tool_call_id
                 or pending_identity.pending_tool_name != child.tool_name
-                or _chained_adapter_kind(operation, child) is None
+                or _validated_delivery_adapter(operation, child) is None
             ):
                 raise WriteOperationError("operation_delivery_unknown")
         else:
+            if ownership.child_route_handle is not None:
+                raise WriteOperationError("operation_delivery_unknown")
             conversation_id = session.scalar(
                 select(Conversation.id)
                 .where(Conversation.id == operation.conversation_id)
@@ -1067,6 +1883,7 @@ class WriteOperationRepository:
             if conversation_id is None or next_operation_id is not None:
                 raise WriteOperationError("operation_delivery_unknown")
         manifest: dict[str, JSONValue] = {
+            "delivery_manifest_version": 2,
             "operation_id": operation.id,
             "status": operation.status,
             "terminal_payload_sha256": operation.terminal_payload_sha256,
@@ -1077,7 +1894,15 @@ class WriteOperationRepository:
             "next_operation_id": next_operation_id,
             "old_pending_disposition": ("replaced" if outcome == "chained_pending" else "cleared"),
             "validated_undo_digest": _undo_digest(operation.undo_json),
-            "chained_operation": _chained_manifest(child),
+            "chained_operation": _chained_manifest_v2(
+                child,
+                pending_args=(
+                    pending_identity.pending_args if pending_identity is not None else None
+                ),
+                pending_human=(
+                    pending_identity.pending_human if pending_identity is not None else None
+                ),
+            ),
         }
         digest = "sha256:" + hashlib.sha256(canonical_json(manifest).encode("utf-8")).hexdigest()
         operation.delivery_status = "failed" if outcome == "fallback" else "completed"
@@ -1091,6 +1916,7 @@ class WriteOperationRepository:
         operation.delivered_at = datetime.now(timezone.utc)
         operation.updated_at = datetime.now(timezone.utc)
         session.flush()
+        ownership.revoke_parent_route()
         return True
 
     def heartbeat(self, ownership: DeliveryOwnership) -> bool:
@@ -1248,7 +2074,26 @@ class WriteOperationRepository:
             return OperationUnknown(operation_id, "operation_busy", True)
 
 
-LegacyExecutor = Callable[[Session], str]
+class LegacyApprovedBoundRoute(Protocol):
+    """One same-transaction approved Legacy proof route."""
+
+    def prepared_call(self) -> PreparedLegacyCall: ...
+
+    def prepared_input_port(self) -> LegacyPreparedInputPort: ...
+
+    def accept_prepared_input(
+        self,
+        prepared: PreparedLegacyCall,
+        projected: PreparedLegacyInputV1,
+    ) -> None: ...
+
+    def execute(self, prepared: PreparedLegacyCall) -> str: ...
+
+    def primary_parent_route_handle(self) -> object: ...
+
+
+LegacyApprovedRouteBinder = Callable[[Session], AbstractContextManager[LegacyApprovedBoundRoute]]
+PrimaryParentRouteBinder = Callable[[PendingRouteIdentityV1, object], object]
 CompensationExecutor = Callable[[Session, Mapping[str, Any]], str]
 
 
@@ -1352,11 +2197,13 @@ class WriteOperationCoordinator:
         context: ToolExecutionContext,
         prepare_identity: ApprovedWritePrepareCallIdentity,
         request_fingerprint: str,
+        parent_route_binder: PrimaryParentRouteBinder | None,
         edited_args_present: bool = False,
         edited_args: Mapping[str, JSONValue] | None = None,
         approval_decided_callback: Callable[[object | None], None] | None = None,
     ) -> tuple[OperationExecution, ToolExecutionRecord[Any, Any] | None]:
         owner = self.repository.prepare_owner(operation_id)
+        owner_handed_off = False
         try:
             with self.repository.session_factory() as session:
                 session.execute(text("BEGIN IMMEDIATE"))
@@ -1621,6 +2468,23 @@ class WriteOperationCoordinator:
                         self._set_terminal(operation, payload, owner)
                         self.repository.append_transition(session, operation_id, 4, "committed")
                         session.flush()
+                        if parent_route_binder is not None:
+                            owner.bind_parent_route(
+                                parent_route_binder(
+                                    PendingRouteIdentityV1(
+                                        conversation_id=conversation_id,
+                                        operation_id=operation_id,
+                                        tool_call_id=prepared.tool_call_id,
+                                        tool_name=prepared.spec.name,
+                                        pending_action_revision=(
+                                            locked_pending.pending_action_revision
+                                        ),
+                                        pending_confirmation_claim_id=operation_id,
+                                        arguments_digest=locked_pending.arguments_digest,
+                                    ),
+                                    execution_claim,
+                                )
+                            )
                         record = ToolExecutionRecord(
                             prepared,
                             record.outcome,
@@ -1710,6 +2574,7 @@ class WriteOperationCoordinator:
                         ),
                         None,
                     )
+                owner_handed_off = True
                 return OperationCommitted(operation_id, payload, owner), record
         except WriteOperationError as exc:
             return OperationUnknown(operation_id, exc.code, exc.retryable), None
@@ -1725,6 +2590,9 @@ class WriteOperationCoordinator:
             )
         except BaseException:
             raise
+        finally:
+            if not owner_handed_off:
+                owner.revoke_parent_route()
 
     def reject_primary(
         self,
@@ -2007,46 +2875,65 @@ class WriteOperationCoordinator:
         conversation_id: int,
         tool_call_id: str,
         tool_name: str,
-        input_fingerprint: str,
         request_fingerprint: str,
-        executor: LegacyExecutor,
+        route_binder: LegacyApprovedRouteBinder,
     ) -> OperationExecution:
         owner = self.repository.prepare_owner(operation_id)
+        owner_handed_off = False
         try:
-            with self.repository.session_factory() as session:
-                session.execute(text("BEGIN IMMEDIATE"))
-                operation = session.get(WriteOperation, operation_id)
-                if operation is None:
+            with self.repository.session_factory() as read_session:
+                observed = read_session.get(WriteOperation, operation_id)
+                if observed is None:
                     raise WriteOperationError("operation_result_unknown", retryable=True)
-                if operation.status in _TERMINAL_STATUSES:
-                    replay = self.repository.replay(operation, request_fingerprint)
-                    session.rollback()
-                    return replay
+                if observed.status in _TERMINAL_STATUSES:
+                    return self.repository.replay(observed, request_fingerprint)
                 if (
-                    operation.conversation_id != conversation_id
-                    or operation.tool_call_id != tool_call_id
-                    or operation.tool_name != tool_name
-                    or operation.adapter_kind != "legacy_deterministic"
+                    observed.conversation_id != conversation_id
+                    or observed.tool_call_id != tool_call_id
+                    or observed.tool_name != tool_name
+                    or observed.adapter_kind != "legacy_deterministic"
                 ):
                     raise WriteOperationError("operation_identity_conflict")
-                claimed = session.execute(
-                    update(Conversation)
-                    .where(Conversation.id == conversation_id)
-                    .where(Conversation.pending_operation_id == operation_id)
-                    .where(Conversation.pending_tool_call_id == tool_call_id)
-                    .where(Conversation.pending_tool_name == tool_name)
-                    .values(
-                        pending_confirmation_claim_id=operation_id,
-                        pending_confirmation_claimed_at=datetime.now(timezone.utc),
+
+            with self.repository.session_factory() as session:
+                with route_binder(session) as bound_route:
+                    operation = session.get(WriteOperation, operation_id)
+                    if operation is None:
+                        raise WriteOperationError("operation_result_unknown", retryable=True)
+                    if operation.status in _TERMINAL_STATUSES:
+                        raise WriteOperationError("operation_not_committed", retryable=True)
+                    if (
+                        operation.conversation_id != conversation_id
+                        or operation.tool_call_id != tool_call_id
+                        or operation.tool_name != tool_name
+                        or operation.adapter_kind != "legacy_deterministic"
+                    ):
+                        raise WriteOperationError("operation_identity_conflict")
+                    prepared_call = bound_route.prepared_call()
+                    prepared_input_port = bound_route.prepared_input_port()
+                    if type(prepared_call) is not PreparedLegacyCall:
+                        raise WriteOperationError("operation_not_committed", retryable=True)
+                    if type(prepared_input_port) is not LegacyPreparedInputPort:
+                        raise WriteOperationError("operation_not_committed", retryable=True)
+                    prepared_input = prepared_input_port.require(
+                        prepared_call,
+                        operation_id=operation_id,
+                        tool_call_id=tool_call_id,
+                        tool_name=tool_name,
                     )
-                )
-                if getattr(claimed, "rowcount", 0) != 1:
-                    raise WriteOperationError("operation_identity_conflict")
-                self.repository.append_transition(session, operation_id, 2, "approved")
-                self.repository.append_transition(session, operation_id, 3, "claimed")
-                try:
-                    with session.begin_nested():
-                        visible = executor(session)
+                    bound_route.accept_prepared_input(prepared_call, prepared_input)
+                    input_fingerprint = ledger_fingerprint(
+                        self.repository.key,
+                        "write-operation-legacy-input-v1",
+                        materialize_json(cast(FrozenJSONValue, prepared_input.canonical_args)),
+                    )
+                    self.repository.append_transition(session, operation_id, 2, "approved")
+                    self.repository.append_transition(session, operation_id, 3, "claimed")
+                    try:
+                        visible = bound_route.execute(prepared_call)
+                        owner.bind_parent_route(bound_route.primary_parent_route_handle())
+                        if type(visible) is not str:
+                            raise WriteOperationError("operation_projection_failed")
                         payload = build_terminal_payload(
                             status="committed",
                             result_contract="legacy_string_v1",
@@ -2067,31 +2954,33 @@ class WriteOperationCoordinator:
                         self._set_terminal(operation, payload, owner)
                         self.repository.append_transition(session, operation_id, 4, "committed")
                         session.flush()
-                except ValueError as exc:
-                    code = str(exc)
-                    if not code.isascii() or not code or len(code) > 128:
-                        raise WriteOperationError(
-                            "operation_not_committed", retryable=True
-                        ) from exc
-                    payload = build_terminal_payload(
-                        status="failed",
-                        result_contract="legacy_string_v1",
-                        result={"code": code},
-                        visible_result="错误：" + code,
-                        transport={
-                            "tool_call_id": tool_call_id,
-                            "tool_name": tool_name,
-                            "status": "error",
-                            "summary": "",
-                        },
-                        undo=None,
-                        failure_category="conflict",
-                        failure_code=code,
-                    )
-                    operation.operation_request_fingerprint = request_fingerprint
-                    operation.input_fingerprint = input_fingerprint
-                    self._set_terminal(operation, payload, owner)
-                    self.repository.append_transition(session, operation_id, 4, "failed")
+                    except ValueError as exc:
+                        if owner.parent_route_handle is None:
+                            owner.bind_parent_route(bound_route.primary_parent_route_handle())
+                        code = str(exc)
+                        if not code.isascii() or not code or len(code) > 128:
+                            raise WriteOperationError(
+                                "operation_not_committed", retryable=True
+                            ) from exc
+                        payload = build_terminal_payload(
+                            status="failed",
+                            result_contract="legacy_string_v1",
+                            result={"code": code},
+                            visible_result="错误：" + code,
+                            transport={
+                                "tool_call_id": tool_call_id,
+                                "tool_name": tool_name,
+                                "status": "error",
+                                "summary": "",
+                            },
+                            undo=None,
+                            failure_category="conflict",
+                            failure_code=code,
+                        )
+                        operation.operation_request_fingerprint = request_fingerprint
+                        operation.input_fingerprint = input_fingerprint
+                        self._set_terminal(operation, payload, owner)
+                        self.repository.append_transition(session, operation_id, 4, "failed")
                 try:
                     session.commit()
                 except OperationalError:
@@ -2102,8 +2991,12 @@ class WriteOperationCoordinator:
                         proposed_code="operation_not_committed",
                     )
                 if payload.status == "committed":
+                    owner_handed_off = True
                     return OperationCommitted(operation_id, payload, owner)
+                owner_handed_off = True
                 return OperationFailed(operation_id, payload, owner)
+        except LegacyArgumentPreparationError:
+            return OperationUnknown(operation_id, "invalid_confirmation", False)
         except WriteOperationError as exc:
             return OperationUnknown(operation_id, exc.code, exc.retryable)
         except OperationalError:
@@ -2115,15 +3008,33 @@ class WriteOperationCoordinator:
             )
         except Exception:
             return OperationUnknown(operation_id, "operation_not_committed", True)
+        finally:
+            if not owner_handed_off:
+                owner.revoke_parent_route()
 
     def execute_compensation(
         self,
         *,
-        parent_operation_id: str,
+        parent: CommittedPrimaryOperationIdentityV1,
         conversation_id: int,
-        compensation_kind: str,
+        operation_port: ToolOperationMetadataPort,
+        route_handle: CompensationHandle,
+        handler_handle: object,
         executor: CompensationExecutor,
     ) -> OperationExecution:
+        committed_parent = parent
+        if type(operation_port) is not ToolOperationMetadataPort:
+            return OperationUnknown("", "operation_identity_conflict", False)
+        try:
+            route = operation_port.require_compensation(
+                route_handle,
+                parent,
+                handler_handle,
+            )
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return OperationUnknown("", "operation_identity_conflict", False)
+        parent_operation_id = parent.operation_id
+        compensation_kind = route.operation_name
         operation_id = compensation_operation_id(parent_operation_id, compensation_kind)
         request_fingerprint = compensation_request_fingerprint(
             self.repository.key,
@@ -2139,19 +3050,23 @@ class WriteOperationCoordinator:
                 session.execute(text("BEGIN IMMEDIATE"))
                 operation = session.get(WriteOperation, operation_id)
                 if operation is None:
-                    parent = session.get(WriteOperation, parent_operation_id)
+                    parent_row = session.get(WriteOperation, parent_operation_id)
                     if (
-                        parent is None
-                        or parent.operation_role != "primary"
-                        or parent.status != "committed"
-                        or parent.conversation_id != conversation_id
-                        or parent.undo_json is None
+                        parent_row is None
+                        or parent_row.operation_role != "primary"
+                        or parent_row.status != "committed"
+                        or parent_row.conversation_id != conversation_id
+                        or parent_row.undo_json is None
                     ):
                         raise WriteOperationError("operation_identity_conflict")
-                    parent_payload = payload_from_operation(parent)
-                    undo = json.loads(parent.undo_json)
-                    expected_kind = compensation_kind_for_undo(str(undo.get("kind") or ""))
-                    if compensation_kind != expected_kind:
+                    parent_payload = payload_from_operation(parent_row)
+                    undo = json.loads(parent_row.undo_json)
+                    if (
+                        parent_row.id != parent_operation_id
+                        or parent_row.tool_name != committed_parent.primary_tool
+                        or parent_row.adapter_kind != "typed"
+                        or parent_payload.digest != committed_parent.terminal_payload_digest
+                    ):
                         raise WriteOperationError("operation_identity_conflict")
                     operation = WriteOperation(
                         id=operation_id,
@@ -2205,20 +3120,23 @@ class WriteOperationCoordinator:
                     replay = self.repository.replay(operation, request_fingerprint)
                     session.rollback()
                     return replay
-                parent = session.get(WriteOperation, parent_operation_id)
+                parent_row = session.get(WriteOperation, parent_operation_id)
                 if (
-                    parent is None
-                    or parent.operation_role != "primary"
-                    or parent.status != "committed"
-                    or parent.conversation_id != conversation_id
-                    or parent.undo_json is None
+                    parent_row is None
+                    or parent_row.operation_role != "primary"
+                    or parent_row.status != "committed"
+                    or parent_row.conversation_id != conversation_id
+                    or parent_row.undo_json is None
                 ):
                     raise WriteOperationError("operation_integrity_error")
-                parent_payload = payload_from_operation(parent)
-                undo = cast(dict[str, Any], json.loads(parent.undo_json))
+                parent_payload = payload_from_operation(parent_row)
+                undo = cast(dict[str, Any], json.loads(parent_row.undo_json))
                 if (
                     operation.parent_terminal_payload_sha256 != parent_payload.digest
-                    or compensation_kind != compensation_kind_for_undo(str(undo.get("kind") or ""))
+                    or parent_row.id != parent_operation_id
+                    or parent_row.tool_name != committed_parent.primary_tool
+                    or parent_row.adapter_kind != "typed"
+                    or parent_payload.digest != committed_parent.terminal_payload_digest
                 ):
                     raise WriteOperationError("operation_integrity_error")
                 input_fingerprint = ledger_fingerprint(

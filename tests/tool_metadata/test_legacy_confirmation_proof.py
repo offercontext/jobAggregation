@@ -19,6 +19,7 @@ from uuid import uuid4
 import pytest
 
 from offerpilot.ai.tool_runtime.catalog import compile_tool_metadata_manifest
+from offerpilot.ai.tool_runtime.contracts import TransientToolRuntimeValue
 from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1, freeze_json
 from offerpilot.ai.tool_specs import legacy as legacy_specs
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
@@ -45,6 +46,13 @@ RAW_ARGS = json.dumps(
     },
     ensure_ascii=False,
     separators=(",", ":"),
+)
+CANONICAL_ARGS = json.dumps(
+    json.loads(RAW_ARGS),
+    ensure_ascii=False,
+    sort_keys=True,
+    separators=(",", ":"),
+    allow_nan=False,
 )
 
 
@@ -151,6 +159,8 @@ class _VerifierBackend:
 _EXECUTION_EVENTS: list[tuple[str, str, object]] = []
 _EXECUTION_FAILURE: BaseException | None = None
 _EXECUTION_OBSERVER: Any = None
+_DESCRIPTION_EVENTS: list[str] = []
+_DESCRIPTION_MODE = "edited"
 
 
 def _spy_execute(encoded_args: str, context: object) -> str:
@@ -160,6 +170,13 @@ def _spy_execute(encoded_args: str, context: object) -> str:
     if _EXECUTION_FAILURE is not None:
         raise _EXECUTION_FAILURE
     return '{"ok":true}'
+
+
+def _stateful_describe(encoded_args: str) -> Any:
+    _DESCRIPTION_EVENTS.append(encoded_args)
+    if _DESCRIPTION_MODE == "invalid_after_prepare" and len(_DESCRIPTION_EVENTS) > 1:
+        return object()
+    return "confirm edited " + str(json.loads(encoded_args)["jd_text"])
 
 
 def _proof_module() -> Any:
@@ -182,9 +199,15 @@ def _symbol(module: Any, name: str) -> Any:
     return value
 
 
-def _catalog_with_spy_executor() -> Any:
+def _task11_symbol(module: Any, name: str) -> Any:
+    value = getattr(module, name, None)
+    assert value is not None, f"Task 11 must expose {module.__name__}.{name}"
+    return value
+
+
+def _catalog_with_spy_executor(*, describe: Any = None) -> Any:
     legacy_runtime = importlib.import_module("offerpilot.ai.tool_runtime.legacy")
-    baseline = legacy_specs.build_static_legacy_adapter_catalog()
+    baseline = legacy_specs.build_static_adapter_catalog()
     first, *rest = baseline.ordered_adapters
     replaced = legacy_runtime.LegacyDeterministicAdapterSpec(
         ordinal=first.ordinal,
@@ -192,7 +215,7 @@ def _catalog_with_spy_executor() -> Any:
         editable_fields=first.editable_fields,
         chained_policy=first.chained_policy,
         initial_route_sources=first.initial_route_sources,
-        describe=first.describe,
+        describe=first.describe if describe is None else describe,
         validate=first.validate,
         presentation=first.presentation,
         execute=_spy_execute,
@@ -211,7 +234,11 @@ def _boundary() -> Any:
     return bundle.legacy_boundary()
 
 
-def _components(tmp_path: Any) -> tuple[Any, _VerifierBackend, Any]:
+def _components(
+    tmp_path: Any,
+    *,
+    describe: Any = None,
+) -> tuple[Any, _VerifierBackend, Any]:
     route_module = _route_module()
     from offerpilot.db import init_database
 
@@ -225,7 +252,7 @@ def _components(tmp_path: Any) -> tuple[Any, _VerifierBackend, Any]:
     verifier = verifier_builder(backend=backend, ledger_key=key)
     factory = _symbol(route_module, "build_unpublished_legacy_confirmation_components")
     components = factory(
-        catalog=_catalog_with_spy_executor(),
+        catalog=_catalog_with_spy_executor(describe=describe),
         legacy_boundary=_boundary(),
         runtime_container_token=object(),
         pending_identity_verifier_port=verifier,
@@ -322,13 +349,18 @@ def _close_issuance(lease: Any, session: Any, *, outcome: str | None = None) -> 
     _dispose_caller_session(session)
 
 
-def _prepare(components: Any, backend: _VerifierBackend) -> tuple[Any, Any]:
+def _prepare(
+    components: Any,
+    backend: _VerifierBackend,
+    *,
+    confirmation_input: Any = None,
+) -> tuple[Any, Any]:
     read_session = _open_caller_session(backend, "read")
     try:
         prepared = components.proof_issuer.prepare_server_loaded(
             read_session,
             _lookup(),
-            _approved_input(),
+            _approved_input() if confirmation_input is None else confirmation_input,
         )
         assert not read_session.in_transaction()
         assert read_session.is_active
@@ -418,11 +450,212 @@ def test_prepare_reuses_the_single_legacy_argument_preparer_through_binding(
         assert len(calls) == 1
         binding, encoded_args, edited_args, validate_unedited = calls[0]
         assert type(binding).__name__ == "LegacyPreparationBinding"
-        assert encoded_args == RAW_ARGS
+        assert encoded_args == CANONICAL_ARGS
         assert edited_args is None
         assert validate_unedited is True
     finally:
         prepared.close()
+
+
+def test_prepared_input_port_projects_exact_edited_canonical_arguments_and_human(
+    tmp_path: Any,
+) -> None:
+    global _DESCRIPTION_MODE
+
+    _DESCRIPTION_EVENTS.clear()
+    _DESCRIPTION_MODE = "edited"
+    components, backend, _key = _components(tmp_path, describe=_stateful_describe)
+    edits = EditedArgs.from_mapping(
+        MappingProxyType(
+            {
+                "jd_text": "edited JD",
+                "source_url": "https://example.com/job",
+            }
+        )
+    )
+    prepared, _read_session = _prepare(
+        components,
+        backend,
+        confirmation_input=_approved_input(edited_args=edits),
+    )
+    expected_args = {
+        "application_id": 7,
+        "expected_current_version_id": None,
+        "idempotency_key": "legacy-proof-test-0001",
+        "jd_text": "edited JD",
+        "source_url": "https://example.com/job",
+    }
+    expected_encoded = json.dumps(
+        expected_args,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    proof_module = _proof_module()
+    input_type = _task11_symbol(proof_module, "PreparedLegacyInputV1")
+    port_type = _task11_symbol(proof_module, "LegacyPreparedInputPort")
+    port = components.prepared_input_port
+
+    projected = port.require(
+        prepared,
+        operation_id=OPERATION_ID,
+        tool_call_id="legacy-call-1",
+        tool_name=ORDERED_ADAPTERS[0],
+    )
+
+    assert type(port) is port_type
+    assert type(projected) is input_type
+    assert isinstance(projected, TransientToolRuntimeValue)
+    public_fields = {
+        name
+        for name, member in vars(input_type).items()
+        if not name.startswith("_")
+        and (isinstance(member, property) or type(member).__name__ == "member_descriptor")
+    }
+    assert public_fields == {"canonical_args", "encoded_args", "confirmation_human"}
+    require_parameters = inspect.signature(port.require).parameters
+    assert tuple(require_parameters) == (
+        "prepared",
+        "operation_id",
+        "tool_call_id",
+        "tool_name",
+    )
+    assert require_parameters["prepared"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    for parameter in ("operation_id", "tool_call_id", "tool_name"):
+        assert require_parameters[parameter].kind is inspect.Parameter.KEYWORD_ONLY
+    port_surface = {
+        name
+        for name, member in vars(port_type).items()
+        if not name.startswith("_") and (isinstance(member, property) or callable(member))
+    }
+    assert port_surface == {"require"}
+    assert dict(projected.canonical_args) == expected_args
+    assert projected.encoded_args == expected_encoded
+    assert projected.confirmation_human == "confirm edited edited JD"
+    assert _DESCRIPTION_EVENTS == [expected_encoded, expected_encoded]
+    _assert_transient_privacy(port)
+    _assert_transient_privacy(projected)
+    for forbidden in (
+        "execute",
+        "adapter",
+        "catalog",
+        "registry",
+        "preparation_registry",
+        "proof_registry",
+    ):
+        assert not hasattr(projected, forbidden)
+        assert not hasattr(port, forbidden)
+    with pytest.raises(TypeError, match="factory|Port|port|created"):
+        input_type(
+            canonical_args=expected_args,
+            encoded_args=expected_encoded,
+            confirmation_human="confirm edited edited JD",
+        )
+    with pytest.raises(TypeError, match="factory|Port|port|created"):
+        port_type(registry=components.preparation_registry)
+    with pytest.raises((AttributeError, TypeError)):
+        projected.encoded_args = RAW_ARGS
+    with pytest.raises(TypeError):
+        projected.canonical_args["jd_text"] = "forged"
+    original_canonical = object.__getattribute__(projected, "_canonical_args")
+    object.__setattr__(
+        projected,
+        "_canonical_args",
+        freeze_json({**expected_args, "jd_text": "drifted JD"}),
+    )
+    with pytest.raises((TypeError, ValueError), match="canonical|drift|integrity|sealed"):
+        _ = projected.canonical_args
+    object.__setattr__(projected, "_canonical_args", original_canonical)
+    drift_field = "_encoded_args" if hasattr(projected, "_encoded_args") else "encoded_args"
+    object.__setattr__(projected, drift_field, RAW_ARGS)
+    with pytest.raises((TypeError, ValueError), match="canonical|drift|integrity|sealed"):
+        _ = projected.encoded_args
+    prepared.close()
+
+
+def test_prepared_input_port_rejects_foreign_wrong_identity_and_revoked_calls(
+    tmp_path: Any,
+) -> None:
+    left, left_backend, _key = _components(tmp_path / "left-prepared-input")
+    right, _right_backend, _other_key = _components(tmp_path / "right-prepared-input")
+    foreign, _read_session = _prepare(left, left_backend)
+
+    with pytest.raises((TypeError, ValueError), match="Registry|registry|foreign|identity"):
+        right.prepared_input_port.require(
+            foreign,
+            operation_id=OPERATION_ID,
+            tool_call_id="legacy-call-1",
+            tool_name=ORDERED_ADAPTERS[0],
+        )
+    foreign.close()
+
+    for identity in (
+        {
+            "operation_id": "ea8d7442-ebc8-4b5e-8b66-87914110eb39",
+            "tool_call_id": "legacy-call-1",
+            "tool_name": ORDERED_ADAPTERS[0],
+        },
+        {
+            "operation_id": OPERATION_ID,
+            "tool_call_id": "other-call",
+            "tool_name": ORDERED_ADAPTERS[0],
+        },
+        {
+            "operation_id": OPERATION_ID,
+            "tool_call_id": "legacy-call-1",
+            "tool_name": ORDERED_ADAPTERS[1],
+        },
+    ):
+        wrong_identity, _read_session = _prepare(left, left_backend)
+        try:
+            with pytest.raises((TypeError, ValueError), match="operation|tool|identity|prepared"):
+                left.prepared_input_port.require(wrong_identity, **identity)
+        finally:
+            wrong_identity.close()
+
+    revoked, _read_session = _prepare(left, left_backend)
+    revoked.close()
+    with pytest.raises((TypeError, ValueError), match="revoked|closed|authority|prepared"):
+        left.prepared_input_port.require(
+            revoked,
+            operation_id=OPERATION_ID,
+            tool_call_id="legacy-call-1",
+            tool_name=ORDERED_ADAPTERS[0],
+        )
+
+
+def test_invalid_recomputed_confirmation_human_revokes_before_claim_or_executor(
+    tmp_path: Any,
+) -> None:
+    global _DESCRIPTION_MODE
+
+    _EXECUTION_EVENTS.clear()
+    _DESCRIPTION_EVENTS.clear()
+    _DESCRIPTION_MODE = "invalid_after_prepare"
+    components, backend, _key = _components(tmp_path, describe=_stateful_describe)
+    prepared, _read_session = _prepare(components, backend)
+
+    with pytest.raises((TypeError, ValueError), match="human|description|text|string"):
+        components.prepared_input_port.require(
+            prepared,
+            operation_id=OPERATION_ID,
+            tool_call_id="legacy-call-1",
+            tool_name=ORDERED_ADAPTERS[0],
+        )
+
+    assert len(_DESCRIPTION_EVENTS) == 2
+    assert backend.events == ["read_snapshot"]
+    assert _EXECUTION_EVENTS == []
+    write_session = _open_unbegun_write_session(backend, "invalid-description")
+    try:
+        with pytest.raises((TypeError, ValueError), match="revoked|closed|authority|prepared"):
+            components.pending_identity_verifier_port.open_issuance_lease(
+                write_session,
+                prepared,
+            )
+    finally:
+        _dispose_caller_session(write_session)
 
 
 def _assert_prepared_attempt_is_cleared(
@@ -452,7 +685,7 @@ def test_prepared_call_is_the_explicit_idempotent_attempt_owner_before_issuance(
     prepared, _read = _prepare(components, backend)
     registry = components.preparation_registry
     entry = registry._prepared[prepared]
-    assert entry.effective_args == RAW_ARGS
+    assert entry.effective_args == CANONICAL_ARGS
     assert entry.metadata["confirmation_token"] == CONFIRMATION_TOKEN
     assert _retained_argument_material(components)
 
@@ -1806,27 +2039,120 @@ def test_aborted_sqlalchemy_transaction_event_cannot_arm_direct_dbapi_end(
 def test_executor_cannot_end_the_caller_transaction_while_lease_is_live(
     tmp_path: Any,
 ) -> None:
-    from sqlalchemy.exc import DatabaseError as SQLAlchemyDatabaseError
+    from sqlalchemy import text
+
+    from offerpilot.ai.write_operations import WriteOperationError
 
     global _EXECUTION_OBSERVER
 
     components, backend, _key = _components(tmp_path)
+    with backend.session_factory.begin() as seed_session:
+        seed_session.execute(
+            text(
+                "INSERT INTO applications "
+                "(id, company_name, position_name, status, source) "
+                "VALUES (7, 'Executor Fence Co', 'Engineer', 'interview', 'test')"
+            )
+        )
     _prepared, _proof, handle, lease_and_session = _issue_route(components, backend)
     lease, write_session = lease_and_session
     context = _execution_context(backend, write_session)
 
     def attempt_commit(_encoded_args: str, execution_context: Any) -> None:
+        execution_context.session.execute(text("UPDATE applications SET status='offer' WHERE id=7"))
         execution_context.session.commit()
 
     _EXECUTION_OBSERVER = attempt_commit
     try:
-        with pytest.raises(SQLAlchemyDatabaseError, match="authorized"):
+        with pytest.raises(WriteOperationError, match="operation_not_committed"):
             components.proof_consumer_port.execute(handle, context)
-        assert write_session.in_transaction()
-        assert _EXECUTION_EVENTS == [("executor", RAW_ARGS, context)]
+        assert not write_session.in_transaction()
+        assert _EXECUTION_EVENTS == [("executor", CANONICAL_ARGS, context)]
     finally:
         _EXECUTION_OBSERVER = None
         _close_issuance(lease, write_session)
+
+    with backend.session_factory() as verification_session:
+        status = verification_session.scalar(text("SELECT status FROM applications WHERE id=7"))
+    assert status == "interview"
+
+
+@pytest.mark.parametrize(
+    "projection_action",
+    (
+        "commit",
+        "rollback",
+        "close",
+        "business_dml",
+        "raw_business_dml",
+        "forbidden_journal_dml",
+        "raw_savepoint",
+        "sa_rollback_guard",
+        "sa_release_guard",
+    ),
+)
+def test_bound_projection_cannot_take_ledger_transaction_or_business_write_authority(
+    tmp_path: Any,
+    projection_action: str,
+) -> None:
+    from sqlalchemy import text
+
+    from offerpilot.ai.write_operations import WriteOperationError
+
+    _EXECUTION_EVENTS.clear()
+    components, backend, _key = _components(tmp_path)
+    with backend.session_factory.begin() as seed_session:
+        seed_session.execute(
+            text(
+                "INSERT INTO applications "
+                "(id, company_name, position_name, status, source) "
+                "VALUES (7, 'Projection Fence Co', 'Engineer', 'interview', 'test')"
+            )
+        )
+    _prepared, _proof, handle, lease_and_session = _issue_route(components, backend)
+    lease, write_session = lease_and_session
+    context = _execution_context(backend, write_session)
+    projection_events: list[str] = []
+
+    def hostile_projection() -> None:
+        projection_events.append("projection")
+        if projection_action == "business_dml":
+            write_session.execute(text("UPDATE applications SET status='offer' WHERE id=7"))
+        elif projection_action == "raw_business_dml":
+            state = components.pending_identity_verifier_port._issuance[lease]
+            state.dbapi_connection.execute("UPDATE applications SET status='offer' WHERE id=7")
+        elif projection_action == "forbidden_journal_dml":
+            write_session.execute(text("UPDATE agent_events SET event_type=event_type WHERE 0"))
+        elif projection_action == "raw_savepoint":
+            state = components.pending_identity_verifier_port._issuance[lease]
+            state.dbapi_connection.execute("SAVEPOINT attacker_nested")
+        elif projection_action == "sa_rollback_guard":
+            state = components.pending_identity_verifier_port._issuance[lease]
+            state.connection._rollback_to_savepoint_impl(state.transaction_guard_name)
+        elif projection_action == "sa_release_guard":
+            state = components.pending_identity_verifier_port._issuance[lease]
+            state.connection._release_savepoint_impl(state.transaction_guard_name)
+        else:
+            write_session.execute(text("UPDATE agent_runs SET status=status WHERE 0"))
+            getattr(write_session, projection_action)()
+        projection_events.append("authority_escaped")
+
+    try:
+        with pytest.raises(WriteOperationError, match="operation_not_committed"):
+            components.proof_consumer_port.execute(
+                handle,
+                context,
+                before_execute=hostile_projection,
+            )
+        assert projection_events == ["projection"]
+        assert _EXECUTION_EVENTS == []
+        assert not write_session.in_transaction()
+    finally:
+        _close_issuance(lease, write_session)
+
+    with backend.session_factory() as verification_session:
+        status = verification_session.scalar(text("SELECT status FROM applications WHERE id=7"))
+    assert status == "interview"
 
 
 @pytest.mark.parametrize("protected_stage", ("catalog_resolve", "execute"))
@@ -2202,6 +2528,242 @@ def test_copied_issuance_state_cannot_rebind_proof_to_a_new_transaction(
         _dispose_caller_session(write_session)
 
 
+def test_issuance_close_uses_only_sealed_cleanup_identity_after_live_state_drift(
+    tmp_path: Any,
+) -> None:
+    from sqlalchemy import event
+
+    components, backend, _key = _components(tmp_path / "source")
+    _foreign_components, foreign_backend, _foreign_key = _components(tmp_path / "foreign")
+    prepared, _read_session = _prepare(components, backend)
+    foreign_prepared, _foreign_read_session = _prepare(components, backend)
+    write_session = _open_unbegun_write_session(backend, "sealed-cleanup-source")
+    foreign_session = _open_unbegun_write_session(
+        foreign_backend,
+        "sealed-cleanup-foreign",
+    )
+    verifier = components.pending_identity_verifier_port
+    lease = verifier.open_issuance_lease(write_session, prepared)
+    foreign_lease = verifier.open_issuance_lease(foreign_session, foreign_prepared)
+    state = verifier._issuance[lease]
+    foreign_state = verifier._issuance[foreign_lease]
+    sealed_fence = state.transaction_control_fence
+    foreign_listener = foreign_state.transaction_control_listener
+    sealed_fence._violate()
+
+    for field_name in (
+        "session",
+        "transaction",
+        "connection",
+        "connection_transaction",
+        "transaction_guard_name",
+        "transaction_control_fence",
+        "dbapi_connection",
+        "transaction_control_authorizer",
+        "session_token",
+        "prepared_call",
+        "transaction_control_listener",
+        "transaction_control_savepoint_listeners",
+    ):
+        setattr(state, field_name, getattr(foreign_state, field_name))
+
+    foreign_evidence = None
+    try:
+        lease.close()
+
+        assert sealed_fence._boundary_closed is True
+        assert not write_session.in_transaction()
+        assert foreign_state.transaction_control_fence._boundary_closed is False
+        assert foreign_session.in_transaction()
+        assert event.contains(
+            foreign_state.connection,
+            "before_cursor_execute",
+            foreign_listener,
+        )
+        assert foreign_prepared in components.preparation_registry._prepared
+        foreign_evidence = verifier.locked_recheck(
+            foreign_session,
+            foreign_lease,
+            foreign_prepared,
+        )
+    finally:
+        if foreign_evidence is not None:
+            verifier._revoke_evidence(foreign_evidence)
+        verifier._close_issuance(lease)
+        foreign_lease.close()
+        prepared.close()
+        foreign_prepared.close()
+        _dispose_caller_session(foreign_session)
+        _dispose_caller_session(write_session)
+
+
+@pytest.mark.parametrize("drift_kind", ("foreign_registry_state", "foreign_seal"))
+def test_invalid_issuance_cleanup_identity_cannot_close_a_foreign_lease(
+    tmp_path: Any,
+    drift_kind: str,
+) -> None:
+    from sqlalchemy import event
+
+    components, backend, _key = _components(tmp_path / "source")
+    _foreign_components, foreign_backend, _foreign_key = _components(tmp_path / "foreign")
+    prepared, _read_session = _prepare(components, backend)
+    foreign_prepared, _foreign_read_session = _prepare(components, backend)
+    write_session = _open_unbegun_write_session(backend, "invalid-cleanup-source")
+    foreign_session = _open_unbegun_write_session(
+        foreign_backend,
+        "invalid-cleanup-foreign",
+    )
+    verifier = components.pending_identity_verifier_port
+    lease = verifier.open_issuance_lease(write_session, prepared)
+    foreign_lease = verifier.open_issuance_lease(foreign_session, foreign_prepared)
+    state = verifier._issuance[lease]
+    foreign_state = verifier._issuance[foreign_lease]
+    foreign_listener = foreign_state.transaction_control_listener
+    if drift_kind == "foreign_registry_state":
+        verifier._issuance[lease] = foreign_state
+    else:
+        state.integrity_seal = foreign_state.integrity_seal
+        for field_name in (
+            "session",
+            "transaction",
+            "connection",
+            "connection_transaction",
+            "transaction_guard_name",
+            "transaction_control_fence",
+            "dbapi_connection",
+            "transaction_control_authorizer",
+            "session_token",
+            "prepared_call",
+            "transaction_control_listener",
+            "transaction_control_savepoint_listeners",
+        ):
+            setattr(state, field_name, getattr(foreign_state, field_name))
+
+    foreign_evidence = None
+    try:
+        lease.close()
+
+        assert foreign_state.transaction_control_fence._boundary_closed is False
+        assert foreign_session.in_transaction()
+        assert event.contains(
+            foreign_state.connection,
+            "before_cursor_execute",
+            foreign_listener,
+        )
+        assert foreign_prepared in components.preparation_registry._prepared
+        foreign_evidence = verifier.locked_recheck(
+            foreign_session,
+            foreign_lease,
+            foreign_prepared,
+        )
+    finally:
+        if foreign_evidence is not None:
+            verifier._revoke_evidence(foreign_evidence)
+        verifier._close_issuance(lease)
+        foreign_lease.close()
+        prepared.close()
+        foreign_prepared.close()
+        _dispose_caller_session(foreign_session)
+        _dispose_caller_session(write_session)
+
+
+@pytest.mark.parametrize("drift_kind", ("foreign_callbacks", "foreign_seal"))
+def test_lease_close_uses_only_its_own_sealed_callback_roots(
+    tmp_path: Any,
+    drift_kind: str,
+) -> None:
+    from sqlalchemy import event
+
+    components, backend, _key = _components(tmp_path / "source")
+    _foreign_components, foreign_backend, _foreign_key = _components(tmp_path / "foreign")
+    prepared, _read_session = _prepare(components, backend)
+    foreign_prepared, _foreign_read_session = _prepare(components, backend)
+    write_session = _open_unbegun_write_session(backend, "lease-cleanup-source")
+    foreign_session = _open_unbegun_write_session(
+        foreign_backend,
+        "lease-cleanup-foreign",
+    )
+    verifier = components.pending_identity_verifier_port
+    lease = verifier.open_issuance_lease(write_session, prepared)
+    foreign_lease = verifier.open_issuance_lease(foreign_session, foreign_prepared)
+    foreign_state = verifier._issuance[foreign_lease]
+    foreign_listener = foreign_state.transaction_control_listener
+    if drift_kind == "foreign_callbacks":
+        lease._cleanup.extend(foreign_lease._cleanup)
+        object.__setattr__(lease, "_cleanup_roots", tuple(lease._cleanup))
+    else:
+        object.__setattr__(lease, "_integrity_seal", foreign_lease._integrity_seal)
+
+    foreign_evidence = None
+    try:
+        lease.close()
+
+        assert foreign_state.transaction_control_fence._boundary_closed is False
+        assert foreign_session.in_transaction()
+        assert event.contains(
+            foreign_state.connection,
+            "before_cursor_execute",
+            foreign_listener,
+        )
+        assert foreign_prepared in components.preparation_registry._prepared
+        foreign_evidence = verifier.locked_recheck(
+            foreign_session,
+            foreign_lease,
+            foreign_prepared,
+        )
+    finally:
+        if foreign_evidence is not None:
+            verifier._revoke_evidence(foreign_evidence)
+        verifier._close_issuance(lease)
+        foreign_lease.close()
+        prepared.close()
+        foreign_prepared.close()
+        _dispose_caller_session(foreign_session)
+        _dispose_caller_session(write_session)
+
+
+def test_invalid_evidence_seal_cannot_revoke_a_foreign_prepared_call(
+    tmp_path: Any,
+) -> None:
+    components, backend, _key = _components(tmp_path / "source")
+    _foreign_components, foreign_backend, _foreign_key = _components(tmp_path / "foreign")
+    prepared, _read_session = _prepare(components, backend)
+    foreign_prepared, _foreign_read_session = _prepare(components, backend)
+    write_session = _open_unbegun_write_session(backend, "evidence-cleanup-source")
+    foreign_session = _open_unbegun_write_session(
+        foreign_backend,
+        "evidence-cleanup-foreign",
+    )
+    verifier = components.pending_identity_verifier_port
+    lease = verifier.open_issuance_lease(write_session, prepared)
+    foreign_lease = verifier.open_issuance_lease(foreign_session, foreign_prepared)
+    evidence = verifier.locked_recheck(write_session, lease, prepared)
+    foreign_evidence = verifier.locked_recheck(
+        foreign_session,
+        foreign_lease,
+        foreign_prepared,
+    )
+    evidence_state = verifier._evidence[evidence]
+    foreign_evidence_state = verifier._evidence[foreign_evidence]
+    evidence_state.integrity_seal = foreign_evidence_state.integrity_seal
+    evidence_state.prepared_call = foreign_prepared
+
+    try:
+        lease.close()
+
+        assert foreign_prepared in components.preparation_registry._prepared
+        assert verifier._evidence[foreign_evidence] is foreign_evidence_state
+        verifier._require_issuance_transaction(foreign_lease)
+    finally:
+        verifier._revoke_evidence(evidence)
+        verifier._revoke_evidence(foreign_evidence)
+        foreign_lease.close()
+        prepared.close()
+        foreign_prepared.close()
+        _dispose_caller_session(foreign_session)
+        _dispose_caller_session(write_session)
+
+
 def test_lease_close_cleans_all_attempt_state_after_issuance_map_is_cleared(
     tmp_path: Any,
 ) -> None:
@@ -2225,6 +2787,8 @@ def test_lease_close_cleans_all_attempt_state_after_issuance_map_is_cleared(
         assert components.preparation_registry._prepared == {}
         assert components.preparation_registry._entries == {}
         assert _retained_argument_material(components) == []
+        assert state.transaction_control_fence._boundary_closed is True
+        assert state.transaction_control_fence._expected_savepoint_kind is None
         if listener is not None:
             assert not event.contains(state.connection, "before_cursor_execute", listener)
     finally:
@@ -2334,7 +2898,7 @@ def test_consumed_preparation_clears_persisted_raw_args_immediately(
         assert len(retained) == 1
         raw_args, effective_args = retained[0]
         assert raw_args is None
-        assert effective_args == RAW_ARGS
+        assert effective_args == CANONICAL_ARGS
     finally:
         _close_issuance(lease, write_session)
 

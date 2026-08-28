@@ -31,7 +31,11 @@ from offerpilot.ai.tool_runtime.contracts import (
 )
 from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
-from offerpilot.ai.write_operations import WriteOperationError
+from offerpilot.ai.write_operations import (
+    TypedPendingRouteHandle,
+    WriteOperationError,
+    pending_route_claim_for_cleanup,
+)
 from offerpilot.agent_runtime.journal import NullRunRecorderFactory, RunRecorderFactory
 from offerpilot.agent_runtime.keyring import load_or_create_journal_key
 from offerpilot.agent_runtime.trace import reconstruct_agent_run
@@ -68,34 +72,87 @@ from offerpilot.pilot_runtime import (
     RuntimeAgentTimedOut,
     RuntimeFailureCode,
 )
-from offerpilot.pilot_runtime.persistence import ChatPersistenceCoordinator
+from offerpilot.pilot_runtime.persistence import (
+    ChatPersistenceCoordinator,
+    PersistenceResult,
+    PersistenceStatus,
+)
 from offerpilot.pilot_runtime.compensation import prepare_compensation_handler_components
 from offerpilot.repositories.applications import ApplicationsRepository
 from offerpilot.repositories.agent_runs import AgentRunRepository, JournalConflictError
 from offerpilot.repositories.chat import ChatRepository, ConversationScopeMutationSnapshot
 from offerpilot.pilot_runtime.service import PilotRuntime, _has_write_attempt, _write_outcome
 
+_LEGACY_JD_EXECUTION_EVENTS: list[str] | None = None
+_LEGACY_JD_EXECUTION_ORIGINAL: Any = None
+
+
+def _timeout_after_agent_signal_host(signal: Event):
+    """Return a deterministic non-joining host that times out after Agent work starts."""
+
+    class TimeoutAfterAgentSignalHost:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def run(self, thunk, invocation_control):
+            executor = transport_module.ThreadPoolExecutor(max_workers=1)
+            executor.submit(thunk)
+            try:
+                assert signal.wait(timeout=5), "Agent work did not reach the timeout probe"
+                assert invocation_control.request_timeout()
+                raise RuntimeAgentTimedOut()
+            finally:
+                executor.shutdown(wait=False, cancel_futures=False)
+
+    return TimeoutAfterAgentSignalHost
+
+
+def _record_legacy_jd_execution(service: Any, encoded_args: str) -> str:
+    assert _LEGACY_JD_EXECUTION_EVENTS is not None
+    assert callable(_LEGACY_JD_EXECUTION_ORIGINAL)
+    _LEGACY_JD_EXECUTION_EVENTS.append("executor")
+    return _LEGACY_JD_EXECUTION_ORIGINAL(service, encoded_args)
+
 
 def _force_replace_claimed_pending_for_cas_test(
     repo: ChatRepository,
     conversation_id: int,
     pending: PendingAction,
+    *,
+    clarification_question: str | None = None,
+    undo: dict[str, Any] | None = None,
 ) -> None:
     """Simulate an out-of-band generation change after a confirmation claim."""
 
+    values: dict[str, Any] = {
+        "pending_tool_call_id": pending.tool_call_id,
+        "pending_confirmation_claim_id": "",
+        "pending_confirmation_claimed_at": None,
+        "pending_tool_name": pending.tool_name,
+        "pending_args": pending.args,
+        "pending_human": pending.human,
+        "updated_at": datetime.now(timezone.utc),
+    }
+    if clarification_question is not None:
+        values.update(
+            {
+                "clarification_tool_call_id": pending.tool_call_id,
+                "clarification_tool_name": pending.tool_name,
+                "clarification_args": pending.args,
+                "clarification_human": pending.human,
+                "clarification_question": clarification_question,
+            }
+        )
+    if undo is not None:
+        values.update(
+            {
+                "last_write_undo_json": json.dumps(undo, ensure_ascii=False),
+                "last_write_operation_id": "",
+            }
+        )
     with repo._session_factory() as session:
         session.execute(
-            update(Conversation)
-            .where(Conversation.id == conversation_id)
-            .values(
-                pending_tool_call_id=pending.tool_call_id,
-                pending_confirmation_claim_id="",
-                pending_confirmation_claimed_at=None,
-                pending_tool_name=pending.tool_name,
-                pending_args=pending.args,
-                pending_human=pending.human,
-                updated_at=datetime.now(timezone.utc),
-            )
+            update(Conversation).where(Conversation.id == conversation_id).values(**values)
         )
         session.commit()
 
@@ -1300,7 +1357,19 @@ def test_deterministic_action_records_waiting_run_without_model_events(tmp_path)
     assert model.calls == 0
 
 
-def test_deterministic_pending_replay_uses_original_journal_run(tmp_path):
+def test_deterministic_pending_replay_uses_original_journal_run(tmp_path, monkeypatch):
+    import offerpilot.ai.tool_specs.legacy as legacy_specs
+
+    from offerpilot.ai.tool_runtime.legacy import (
+        LegacyDeterministicCatalog,
+        LegacyInitialRouteIssuer,
+    )
+    from offerpilot.pilot_runtime.contracts import LegacyReadContext
+    from offerpilot.pilot_runtime.legacy_route import (
+        LegacyPersistedPresentationPort,
+        LegacyRouteProofIssuer,
+    )
+
     model = CountingFailingModel()
     client = TestClient(
         create_app(
@@ -1326,6 +1395,45 @@ def test_deterministic_pending_replay_uses_original_journal_run(tmp_path):
         },
     )
 
+    observed_read_contexts = []
+    original_project_pending = LegacyPersistedPresentationPort.project_pending
+
+    def record_persisted_projection(
+        self,
+        read_session,
+        lookup_identity,
+        confirmation_input,
+        context,
+    ):
+        assert type(self) is LegacyPersistedPresentationPort
+        assert type(context) is LegacyReadContext
+        context.require_integrity()
+        observed_read_contexts.append(context)
+        return original_project_pending(
+            self,
+            read_session,
+            lookup_identity,
+            confirmation_input,
+            context,
+        )
+
+    def forbid_replay_side_effect(*_args, **_kwargs):
+        raise AssertionError("Legacy Pending presentation replay must remain read-only")
+
+    monkeypatch.setattr(
+        LegacyPersistedPresentationPort,
+        "project_pending",
+        record_persisted_projection,
+    )
+    monkeypatch.setattr(LegacyInitialRouteIssuer, "issue", forbid_replay_side_effect)
+    monkeypatch.setattr(LegacyRouteProofIssuer, "issue_after_claim", forbid_replay_side_effect)
+    monkeypatch.setattr(
+        LegacyDeterministicCatalog,
+        "resolve_server_loaded",
+        forbid_replay_side_effect,
+    )
+    monkeypatch.setattr(legacy_specs, "_execute_jd", forbid_replay_side_effect)
+
     replay = client.post(
         "/api/chat",
         json={
@@ -1335,7 +1443,36 @@ def test_deterministic_pending_replay_uses_original_journal_run(tmp_path):
         },
     )
 
-    assert replay.status_code == 200
+    assert replay.status_code == 200, replay.text
+    replay_pending = replay.json()["pending_action"]
+    assert replay_pending["human"] == (
+        f"Confirm saving the job description to application {application['id']}. "
+        "The source URL will not be opened."
+    )
+    assert replay_pending["editable_fields"] == [
+        {"field": "jd_text", "type": "long_text"},
+        {
+            "field": "source_url",
+            "type": "string",
+            "clearable": True,
+            "clear_value": None,
+        },
+    ]
+    target = {
+        "id": f"application-{application['id']}",
+        "kind": "application",
+        "title": "启明智能",
+        "meta": "后端工程师",
+        "source": "pending_action",
+    }
+    assert replay_pending["target"] == target
+    assert replay_pending["evidence"] == [target]
+    assert replay_pending["application_jd"] == {
+        "current_version_number": None,
+        "proposed_version_number": 1,
+    }
+    assert len(observed_read_contexts) == 1
+    assert model.calls == 0
     replay_predicate = _journal_terminal_predicate(
         required_event_types=("run.waiting_confirmation",)
     )
@@ -1836,7 +1973,123 @@ def test_deterministic_pilot_confirmation_allows_only_jd_edits_without_ai(tmp_pa
     assert json.loads(decisions[0].payload_json)["facts"]["decision"] == "edited"
 
 
-def test_deterministic_pilot_rejection_does_not_write_without_ai(tmp_path):
+def _legacy_confirmation_stage_spy(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    import offerpilot.ai.tool_specs.legacy as legacy_specs
+
+    from offerpilot.ai.tool_runtime.legacy import LegacyDeterministicCatalog
+    from offerpilot.pilot_runtime.legacy_route import (
+        LegacyPendingIdentityVerifierPort,
+        LegacyRouteProofIssuer,
+    )
+
+    stages: list[str] = []
+
+    def wrap(owner: type[Any], method_name: str, stage: str) -> None:
+        original = getattr(owner, method_name)
+
+        def recorded(*args: Any, **kwargs: Any) -> Any:
+            stages.append(stage)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(owner, method_name, recorded)
+
+    wrap(LegacyRouteProofIssuer, "prepare_server_loaded", "prepare")
+    wrap(LegacyPendingIdentityVerifierPort, "locked_recheck", "locked_recheck")
+    wrap(LegacyPendingIdentityVerifierPort, "bind_claim", "claim")
+    wrap(LegacyRouteProofIssuer, "issue_after_claim", "proof")
+    wrap(LegacyDeterministicCatalog, "resolve_server_loaded", "catalog")
+    global _LEGACY_JD_EXECUTION_EVENTS, _LEGACY_JD_EXECUTION_ORIGINAL
+    _LEGACY_JD_EXECUTION_EVENTS = stages
+    _LEGACY_JD_EXECUTION_ORIGINAL = legacy_specs._execute_jd
+    monkeypatch.setattr(legacy_specs, "_execute_jd", _record_legacy_jd_execution)
+    return stages
+
+
+@pytest.mark.parametrize("endpoint", ["/api/chat/confirm", "/api/chat/confirm/stream"])
+@pytest.mark.parametrize(
+    "edited_args, expected_jd_text",
+    [
+        (None, "职位：后端工程师"),
+        ({"jd_text": "修改后的岗位描述", "source_url": None}, "修改后的岗位描述"),
+    ],
+)
+def test_legacy_approve_and_modify_use_exact_proof_order_with_equivalent_transport(
+    tmp_path,
+    monkeypatch,
+    endpoint,
+    edited_args,
+    expected_jd_text,
+):
+    stages = _legacy_confirmation_stage_spy(monkeypatch)
+
+    model = CountingFailingModel()
+    client = TestClient(create_app(data_dir=tmp_path, chat_model=model, title_model=model))
+    application = client.post(
+        "/api/applications",
+        json={"company_name": "启明智能", "position_name": "后端工程师", "status": "interview"},
+    ).json()
+    pending = client.post(
+        "/api/chat",
+        json={
+            "message": "保存 JD：职位：后端工程师",
+            "conversation_id": 0,
+            "context_type": "application",
+            "context_ref": str(application["id"]),
+        },
+    ).json()
+    request: dict[str, Any] = {
+        "conversation_id": pending["conversation_id"],
+        "approved": True,
+        "confirmation_token": pending["pending_action"]["confirmation_token"],
+    }
+    if edited_args is not None:
+        request["edited_args"] = edited_args
+
+    response = client.post(endpoint, json=request)
+
+    assert response.status_code == 200
+    if endpoint.endswith("/stream"):
+        events = _parse_sse_events(response.text)
+        assert events[-1]["event"] == "completed"
+        public = events[-1]["data"]["data"]["response"]
+    else:
+        public = response.json()
+    assert public["write_status"] == "success"
+    assert public["message"] == "岗位资料已保存。"
+    versions = client.get(f"/api/applications/{application['id']}/job-description/versions").json()
+    detail = client.get(
+        f"/api/applications/{application['id']}/job-description/versions/{versions[0]['id']}"
+    ).json()
+    assert detail["jd_text"] == expected_jd_text
+    assert model.calls == 0
+    assert stages == [
+        "prepare",
+        "locked_recheck",
+        "claim",
+        "proof",
+        "catalog",
+        "executor",
+    ]
+    stages.clear()
+
+    replay = client.post(
+        endpoint,
+        json={**request, "operation_id": public["operation_id"]},
+    )
+
+    assert replay.status_code == 200
+    if endpoint.endswith("/stream"):
+        replay_events = _parse_sse_events(replay.text)
+        replay_public = replay_events[-1]["data"]["data"]["response"]
+    else:
+        replay_public = replay.json()
+    assert replay_public["write_status"] == public["write_status"]
+    assert replay_public["message"] == public["message"]
+    assert stages == []
+
+
+def test_deterministic_pilot_rejection_does_not_write_without_ai(tmp_path, monkeypatch):
+    stages = _legacy_confirmation_stage_spy(monkeypatch)
     model = CountingFailingModel()
     client = TestClient(
         create_app(
@@ -1891,6 +2144,7 @@ def test_deterministic_pilot_rejection_does_not_write_without_ai(tmp_path):
     decisions = [event for event in journal_events if event.event_type == "approval.decided"]
     assert len(decisions) == 1
     assert json.loads(decisions[0].payload_json)["facts"]["decision"] == "rejected"
+    assert stages == []
     assert not any(
         event.event_type == "tool.started"
         and event.execution_segment_id == decisions[0].execution_segment_id
@@ -1983,7 +2237,7 @@ def test_deterministic_pilot_retries_same_key_after_chat_cas_failure(
             "context_ref": str(application["id"]),
         },
     ).json()
-    original_resolve = ChatRepository.resolve_pending_confirmation
+    original_persist = ChatRepository.persist_confirmation_continuation
     calls = 0
 
     def fail_once(self, *args, **kwargs):
@@ -1991,9 +2245,9 @@ def test_deterministic_pilot_retries_same_key_after_chat_cas_failure(
         calls += 1
         if calls == 1:
             return None
-        return original_resolve(self, *args, **kwargs)
+        return original_persist(self, *args, **kwargs)
 
-    monkeypatch.setattr(ChatRepository, "resolve_pending_confirmation", fail_once)
+    monkeypatch.setattr(ChatRepository, "persist_confirmation_continuation", fail_once)
     confirmation = {
         "conversation_id": pending["conversation_id"],
         "approved": True,
@@ -5167,6 +5421,32 @@ def test_chat_confirmed_status_update_can_be_undone(tmp_path):
     assert replayed_undo.status_code == 200
     assert replayed_undo.json()["replayed"] is True
     assert replayed_undo.json()["operation_id"] == undone.json()["operation_id"]
+    sessions = session_factory_for_data_dir(tmp_path)
+    with sessions() as session:
+        primary = session.get(WriteOperation, parent_operation_id)
+        compensation = session.get(WriteOperation, undone.json()["operation_id"])
+        assert primary is not None
+        assert compensation is not None
+        assert (
+            primary.operation_role,
+            primary.adapter_kind,
+            primary.tool_name,
+            primary.tool_call_id,
+            primary.parent_operation_id,
+        ) == ("primary", "typed", "update_application_status", "w1", None)
+        assert (
+            compensation.operation_role,
+            compensation.adapter_kind,
+            compensation.tool_name,
+            compensation.tool_call_id,
+            compensation.parent_operation_id,
+        ) == (
+            "compensation",
+            "compensation",
+            "undo:update_application_status",
+            None,
+            parent_operation_id,
+        )
     runs, events, _ = _wait_for_journal_status(
         tmp_path,
         "completed",
@@ -6444,7 +6724,13 @@ def test_chat_confirm_invalid_edits_return_422_and_preserve_pending(
         },
     )
 
-    assert response.status_code == 422
+    if endpoint.endswith("/stream"):
+        assert response.status_code == 200
+        error = _parse_sse_events(response.text)[-1]
+        assert error["event"] == "error"
+        assert error["data"]["data"]["code"] == "invalid_confirmation"
+    else:
+        assert response.status_code == 422
     assert client.get("/api/chat/conversations").json()[0]["pending_action"] is not None
 
 
@@ -6659,8 +6945,17 @@ def test_chat_confirm_result_cas_loss_preserves_newer_pending(tmp_path, monkeypa
     )
     _, client, _, pending = _create_status_confirmation(tmp_path, model)
 
-    def lose_cas(self, conversation_id, expected_generation, messages, **kwargs):
+    def lose_cas(
+        self,
+        conversation_id,
+        expected_generation,
+        messages,
+        *,
+        route_handle,
+        **kwargs,
+    ):
         del expected_generation, messages
+        assert route_handle is None
         _force_replace_claimed_pending_for_cas_test(self, conversation_id, newer)
         return None
 
@@ -6731,15 +7026,39 @@ def test_chat_confirm_cas_loss_aborts_before_auto_approved_second_write(
         "newer",
     )
     newer_undo = {"kind": "create_application", "application_id": 404}
+    captured_routes = []
 
-    def lose_cas(self, conversation_id, expected_generation, messages, **kwargs):
-        del expected_generation, messages
-        _force_replace_claimed_pending_for_cas_test(self, conversation_id, newer)
-        self.set_pending_clarification(conversation_id, newer, "newer question")
-        self.set_last_write_undo(conversation_id, newer_undo)
-        return None
+    def lose_cas(
+        self,
+        conversation_id,
+        ownership,
+        origin_tool_message,
+        continuation,
+        chained_pending=None,
+        *,
+        route_handle,
+        **kwargs,
+    ):
+        del origin_tool_message, continuation, chained_pending, kwargs
+        assert type(route_handle) is TypedPendingRouteHandle
+        captured_routes.append(route_handle)
+        _force_replace_claimed_pending_for_cas_test(
+            self._chat,
+            conversation_id,
+            newer,
+            clarification_question="newer question",
+            undo=newer_undo,
+        )
+        return PersistenceResult(
+            PersistenceStatus.CAS_LOST,
+            operation_id=ownership.operation_id,
+        )
 
-    monkeypatch.setattr(ChatRepository, "persist_confirmation_continuation", lose_cas)
+    monkeypatch.setattr(
+        ChatPersistenceCoordinator,
+        "persist_confirmation_delivery",
+        lose_cas,
+    )
 
     response = client.post(
         endpoint,
@@ -6763,6 +7082,9 @@ def test_chat_confirm_cas_loss_aborts_before_auto_approved_second_write(
     assert conversation["pending_clarification"]["question"] == "newer question"
     assert conversation["last_write_undo"] == newer_undo
     assert len(model.turns) == 0
+    assert len(captured_routes) == 1
+    with pytest.raises(ValueError, match="revoked|was not issued"):
+        pending_route_claim_for_cleanup(captured_routes[0])
 
 
 @pytest.mark.parametrize("endpoint", ["/api/chat/confirm", "/api/chat/confirm/stream"])
@@ -6789,8 +7111,17 @@ def test_chat_confirm_tool_error_uses_expected_pending_cas(tmp_path, monkeypatch
     )
     _, client, _, pending = _create_status_confirmation(tmp_path, model)
 
-    def lose_cas(self, conversation_id, expected_generation, messages, **kwargs):
+    def lose_cas(
+        self,
+        conversation_id,
+        expected_generation,
+        messages,
+        *,
+        route_handle,
+        **kwargs,
+    ):
         del expected_generation, messages
+        assert route_handle is None
         tool_message = kwargs["origin_message"]
         assert tool_message.content.startswith("错误：")
         _force_replace_claimed_pending_for_cas_test(self, conversation_id, newer)
@@ -6916,8 +7247,6 @@ def test_chat_confirm_result_cas_loss_stays_stale_on_followup_failure(
     endpoint,
     failure_kind,
 ):
-    import offerpilot.api as api_module
-
     newer = PendingAction(
         "newer-after-failure",
         "update_application_status",
@@ -6932,21 +7261,34 @@ def test_chat_confirm_result_cas_loss_stays_stale_on_followup_failure(
     model = (
         FailAfterWriteModel(tool_call)
         if failure_kind == "provider"
-        else SlowAfterPendingModel(tool_call)
+        else TimeoutAfterPendingModel(tool_call)
     )
     _, client, _, pending = _create_status_confirmation(tmp_path, model, stable_journal=True)
-    if failure_kind == "timeout":
-        # The follow-up model sleeps for one second, so this still exercises the
-        # timeout path while leaving enough scheduling time for the deliberately
-        # injected CAS loss to be recorded first under a full serial test group.
-        monkeypatch.setattr(api_module, "CHAT_AGENT_TIMEOUT_SECONDS", 0.75)
 
-    def lose_cas(self, conversation_id, expected_generation, messages, **kwargs):
-        del expected_generation, messages
-        _force_replace_claimed_pending_for_cas_test(self, conversation_id, newer)
-        return None
+    def lose_cas(
+        self,
+        conversation_id,
+        ownership,
+        origin_tool_message,
+        continuation,
+        chained_pending=None,
+        *,
+        route_handle,
+        **kwargs,
+    ):
+        del origin_tool_message, continuation, chained_pending, kwargs
+        assert route_handle is None
+        _force_replace_claimed_pending_for_cas_test(self._chat, conversation_id, newer)
+        return PersistenceResult(
+            PersistenceStatus.CAS_LOST,
+            operation_id=ownership.operation_id,
+        )
 
-    monkeypatch.setattr(ChatRepository, "persist_confirmation_continuation", lose_cas)
+    monkeypatch.setattr(
+        ChatPersistenceCoordinator,
+        "persist_confirmation_delivery",
+        lose_cas,
+    )
     response = client.post(
         endpoint,
         json={
@@ -7041,15 +7383,23 @@ def test_chat_confirm_timeout_after_write_returns_completed_fallback(
         endpoint,
         json={
             "conversation_id": pending["conversation_id"],
+            "operation_id": body["operation_id"],
             "approved": True,
             "confirmation_token": pending["pending_action"]["confirmation_token"],
         },
     )
+    assert retry.status_code == 200
     if endpoint.endswith("/stream"):
-        retry_error = _parse_sse_events(retry.text)[-1]
-        assert retry_error["data"]["data"]["code"] == "stale_pending_action"
+        retry_events = _parse_sse_events(retry.text)
+        assert retry_events[-1]["event"] == "completed"
+        retry_body = retry_events[-1]["data"]["data"]["response"]
     else:
-        assert retry.status_code == 409
+        retry_body = retry.json()
+    assert retry_body["replayed"] is True
+    assert retry_body["message"] == body["message"]
+    assert retry_body["undo"] == body["undo"]
+    assert retry_body["operation_id"] == body["operation_id"]
+    assert retry_body["write_status"] == body["write_status"]
 
 
 @pytest.mark.parametrize("endpoint", ["/api/chat/confirm", "/api/chat/confirm/stream"])
@@ -7058,8 +7408,6 @@ def test_chat_confirm_timeout_during_handler_finalizes_durably_later(
     monkeypatch,
     endpoint,
 ):
-    import offerpilot.api as api_module
-
     model = ScriptedModel(
         [
             Assistant(
@@ -7079,25 +7427,34 @@ def test_chat_confirm_timeout_during_handler_finalizes_durably_later(
         model,
         stable_journal=True,
     )
+    handler_started = Event()
+    release_handler = Event()
     original_update = ApplicationsRepository.update_application_status_scoped
 
-    def slow_update(self, constraint, app_id, status, closed_reason=""):
-        time.sleep(1.0)
+    def blocked_update(self, constraint, app_id, status, closed_reason=""):
+        handler_started.set()
+        assert release_handler.wait(timeout=5)
         return original_update(self, constraint, app_id, status, closed_reason)
 
-    monkeypatch.setattr(ApplicationsRepository, "update_application_status_scoped", slow_update)
-    # Leave enough headroom for prepare/claim work under the full serial gate;
-    # the executor itself remains slower than the timeout by construction.
-    monkeypatch.setattr(api_module, "CHAT_AGENT_TIMEOUT_SECONDS", 0.75)
-
-    response = client.post(
-        endpoint,
-        json={
-            "conversation_id": pending["conversation_id"],
-            "approved": True,
-            "confirmation_token": pending["pending_action"]["confirmation_token"],
-        },
+    monkeypatch.setattr(ApplicationsRepository, "update_application_status_scoped", blocked_update)
+    monkeypatch.setattr(
+        transport_module,
+        "SyncAgentExecutionHost",
+        _timeout_after_agent_signal_host(handler_started),
     )
+
+    try:
+        response = client.post(
+            endpoint,
+            json={
+                "conversation_id": pending["conversation_id"],
+                "approved": True,
+                "confirmation_token": pending["pending_action"]["confirmation_token"],
+            },
+        )
+        assert handler_started.is_set()
+    finally:
+        release_handler.set()
 
     if endpoint.endswith("/stream"):
         error = _parse_sse_events(response.text)[-1]
@@ -7150,8 +7507,6 @@ def test_chat_confirm_slow_handler_atomically_finishes_without_chained_continuat
     monkeypatch,
     endpoint,
 ):
-    import offerpilot.api as api_module
-
     handler_started = Event()
     release_handler = Event()
     continuation_started = Event()
@@ -7194,35 +7549,39 @@ def test_chat_confirm_slow_handler_atomically_finishes_without_chained_continuat
         return original_update(self, constraint, app_id, status, closed_reason)
 
     monkeypatch.setattr(ApplicationsRepository, "update_application_status_scoped", blocked_update)
-    # The handler intentionally remains blocked for up to five seconds.  Keep
-    # the timeout below that bound, while allowing the worker enough time to
-    # enter the handler under the serial release gate before it expires.
-    monkeypatch.setattr(api_module, "CHAT_AGENT_TIMEOUT_SECONDS", 0.75)
-
-    response = client.post(
-        endpoint,
-        json={
-            "conversation_id": pending["conversation_id"],
-            "approved": True,
-            "confirmation_token": pending["pending_action"]["confirmation_token"],
-        },
-    )
-
-    assert handler_started.is_set()
-    if endpoint.endswith("/stream"):
-        error = _parse_sse_events(response.text)[-1]
-        assert error["data"]["data"]["code"] == "confirmation_in_progress"
-    else:
-        assert response.status_code == 409
-    before_release = client.get("/api/chat/conversations").json()[0]
-    assert before_release["pending_action"] is not None
-    assert all(
-        "写入已完成" not in message["content"]
-        for message in client.get(f"/api/chat/conversations/{pending['conversation_id']}").json()
+    monkeypatch.setattr(
+        transport_module,
+        "SyncAgentExecutionHost",
+        _timeout_after_agent_signal_host(handler_started),
     )
 
     try:
+        response = client.post(
+            endpoint,
+            json={
+                "conversation_id": pending["conversation_id"],
+                "approved": True,
+                "confirmation_token": pending["pending_action"]["confirmation_token"],
+            },
+        )
+        assert handler_started.is_set()
+        if endpoint.endswith("/stream"):
+            error = _parse_sse_events(response.text)[-1]
+            assert error["data"]["data"]["code"] == "confirmation_in_progress"
+        else:
+            assert response.status_code == 409
+        before_release = client.get("/api/chat/conversations").json()[0]
+        assert before_release["pending_action"] is not None
+        assert all(
+            "写入已完成" not in message["content"]
+            for message in client.get(
+                f"/api/chat/conversations/{pending['conversation_id']}"
+            ).json()
+        )
+    finally:
         release_handler.set()
+
+    try:
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             if app_client.get(f"/api/applications/{application['id']}").json()["status"] == "offer":
@@ -7389,7 +7748,6 @@ def test_chat_confirm_fallback_timeout_before_handler_keeps_retry_claim(
     endpoint,
 ):
     import offerpilot.ai.agent_loop as agent_module
-    import offerpilot.api as api_module
 
     model = ScriptedModel(
         [
@@ -7425,7 +7783,11 @@ def test_chat_confirm_fallback_timeout_before_handler_keeps_retry_claim(
 
     monkeypatch.setattr(agent_module, "prepare_call", block_first_prepare)
     monkeypatch.setattr(ApplicationsRepository, "update_application_status_scoped", record_update)
-    monkeypatch.setattr(api_module, "CHAT_AGENT_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(
+        transport_module,
+        "SyncAgentExecutionHost",
+        _timeout_after_agent_signal_host(validation_started),
+    )
 
     first = client.post(
         endpoint,
@@ -7447,7 +7809,9 @@ def test_chat_confirm_fallback_timeout_before_handler_keeps_retry_claim(
     assert client.get("/api/chat/conversations").json()[0]["pending_action"] is not None
 
     release_validation.set()
-    monkeypatch.setattr(api_module, "CHAT_AGENT_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.undo()
+    monkeypatch.setattr(agent_module, "prepare_call", block_first_prepare)
+    monkeypatch.setattr(ApplicationsRepository, "update_application_status_scoped", record_update)
     retry = client.post(
         endpoint,
         json={
@@ -7467,24 +7831,72 @@ def test_chat_confirm_fallback_timeout_before_handler_keeps_retry_claim(
     assert client.get("/api/chat/conversations").json()[0]["pending_action"] is None
 
 
-def test_chat_confirm_add_note_returns_saved_record_summary(tmp_path):
+@pytest.mark.parametrize("endpoint", ["/api/chat/confirm", "/api/chat/confirm/stream"])
+@pytest.mark.parametrize(
+    ("tool_name", "request_message", "tool_args", "expected_summary"),
+    (
+        (
+            "create_application",
+            "先新建牛客网软件测试工程师投递",
+            {
+                "company_name": "牛客网",
+                "position_name": "软件测试工程师",
+                "status": "interview",
+            },
+            "✅ 创建成功：投递记录 #1 已保存（牛客网 · 软件测试工程师）。",
+        ),
+        (
+            "add_note",
+            "保存复盘",
+            {
+                "company": "牛客网",
+                "position": "软件测试工程师",
+                "round": "技术一面",
+                "date": "2026-07-09",
+                "questions": "测试流程",
+            },
+            "✅ 保存成功：复盘记录 #1 已保存（牛客网 · 软件测试工程师 · 技术一面）。",
+        ),
+        (
+            "create_application_event",
+            "为牛客网投递创建面试日程",
+            {
+                "application_id": 1,
+                "event_type": "interview",
+                "scheduled_at": "2026-07-10T19:00:00+08:00",
+                "duration_minutes": 30,
+            },
+            "✅ 创建成功：日程 #1 已保存。",
+        ),
+    ),
+)
+def test_chat_confirm_special_write_returns_exact_saved_record_summary(
+    tmp_path,
+    endpoint,
+    tool_name,
+    request_message,
+    tool_args,
+    expected_summary,
+):
+    if tool_name == "create_application_event":
+        app_client = TestClient(create_app(data_dir=tmp_path))
+        application = app_client.post(
+            "/api/applications",
+            json={
+                "company_name": "牛客网",
+                "position_name": "软件测试工程师",
+                "status": "interview",
+            },
+        ).json()
+        tool_args = {**tool_args, "application_id": application["id"]}
     model = ScriptedModel(
         [
             Assistant(
                 tool_calls=[
                     ToolCall(
                         id="w1",
-                        name="add_note",
-                        args=json.dumps(
-                            {
-                                "company": "牛客网",
-                                "position": "软件测试工程师",
-                                "round": "技术一面",
-                                "date": "2026-07-09",
-                                "questions": "测试流程",
-                            },
-                            ensure_ascii=False,
-                        ),
+                        name=tool_name,
+                        args=json.dumps(tool_args, ensure_ascii=False),
                     )
                 ],
             ),
@@ -7492,10 +7904,13 @@ def test_chat_confirm_add_note_returns_saved_record_summary(tmp_path):
         ]
     )
     client = TestClient(create_app(data_dir=tmp_path, chat_model=model))
-    pending = client.post("/api/chat", json={"message": "保存复盘", "conversation_id": 0}).json()
+    pending = client.post(
+        "/api/chat", json={"message": request_message, "conversation_id": 0}
+    ).json()
+    assert pending.get("type") == "confirmation_required", pending
 
     response = client.post(
-        "/api/chat/confirm",
+        endpoint,
         json={
             "conversation_id": pending["conversation_id"],
             "approved": True,
@@ -7504,9 +7919,15 @@ def test_chat_confirm_add_note_returns_saved_record_summary(tmp_path):
     )
 
     assert response.status_code == 200
-    assert response.json()["type"] == "message"
-    message = response.json()["message"]
-    assert "保存成功：复盘记录 #1 已保存（牛客网 · 软件测试工程师 · 技术一面）。" in message
+    if endpoint.endswith("/stream"):
+        events = _parse_sse_events(response.text)
+        assert events[-1]["event"] == "completed"
+        body = events[-1]["data"]["data"]["response"]
+    else:
+        body = response.json()
+    assert body["type"] == "message"
+    message = body["message"]
+    assert message.startswith(f"{expected_summary}\n\n")
     assert "后续可以继续补充面试官追问。" in message
 
 
@@ -7877,35 +8298,41 @@ def test_chat_confirm_chained_pending_cas_loss_has_no_partial_history(
     )
     client = TestClient(create_app(data_dir=tmp_path, chat_model=model))
     pending = client.post("/api/chat", json={"message": "update two", "conversation_id": 0}).json()
+    captured_routes = []
 
     def lose_transition(
         self,
         conversation_id,
-        expected_generation,
-        messages,
+        ownership,
+        origin_tool_message,
+        continuation,
+        chained_pending=None,
         *,
-        pending=None,
+        route_handle,
         clarification=None,
-        delivery_ownership=None,
         delivery_failure_code=None,
         **kwargs,
     ):
+        assert type(route_handle) is TypedPendingRouteHandle
+        captured_routes.append(route_handle)
         del (
             self,
             conversation_id,
-            expected_generation,
-            messages,
-            pending,
+            origin_tool_message,
+            continuation,
+            chained_pending,
             clarification,
-            delivery_ownership,
             delivery_failure_code,
             kwargs,
         )
-        return None
+        return PersistenceResult(
+            PersistenceStatus.CAS_LOST,
+            operation_id=ownership.operation_id,
+        )
 
     monkeypatch.setattr(
-        ChatRepository,
-        "persist_confirmation_continuation",
+        ChatPersistenceCoordinator,
+        "persist_confirmation_delivery",
         lose_transition,
     )
 
@@ -7931,6 +8358,9 @@ def test_chat_confirm_chained_pending_cas_loss_has_no_partial_history(
     assert conversation["pending_clarification"] is None
     stored = client.get(f"/api/chat/conversations/{pending['conversation_id']}").json()
     assert all("abandoned-chain" not in str(message.get("tool_calls", "")) for message in stored)
+    assert len(captured_routes) == 1
+    with pytest.raises(ValueError, match="revoked|was not issued"):
+        pending_route_claim_for_cleanup(captured_routes[0])
 
 
 @pytest.mark.parametrize("conversation_id", [None, 0, -1, "1", 1.5, True, {}, []])
@@ -8587,7 +9017,8 @@ def test_chat_does_not_return_confirmation_when_conversation_was_archived_during
         conversation_id,
         messages,
         pending,
-        pending_authority_claim=None,
+        *,
+        route_handle,
     ):
         repo.update_conversation_for_archive(
             conversation_id, {"archived_at": datetime.now(timezone.utc)}
@@ -8597,7 +9028,7 @@ def test_chat_does_not_return_confirmation_when_conversation_was_archived_during
             conversation_id,
             messages,
             pending,
-            pending_authority_claim,
+            route_handle=route_handle,
         )
 
     monkeypatch.setattr(

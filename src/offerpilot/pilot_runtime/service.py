@@ -38,13 +38,14 @@ from offerpilot.ai.agent_loop import (
     ApprovedContinuationSegment,
     ApprovedWriteSeed,
     NewTurnSeed,
+    PendingPresentationSnapshot,
     SegmentSurfaceGate,
 )
-from offerpilot.ai.tool_authority import PendingAuthorityClaim
 from offerpilot.ai.tool_authority.contracts import SegmentExecutionAuthority
-from offerpilot.ai.tool_runtime.catalog import SegmentToolCatalogLease
+from offerpilot.ai.tool_runtime.catalog import SegmentToolCatalogLease, SegmentToolSpecHandle
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import (
+    ToolExecutionRecord,
     ToolFailure,
     ToolSuccess,
     TransientToolRuntimeValue,
@@ -56,16 +57,23 @@ from offerpilot.ai.tool_runtime.metadata import (
     ToolAuthorityMetadataView,
     ToolDiscoveryMetadataView,
     ToolMetadataBundleV1,
+    ToolOperationMetadataPort,
     WriteOperationMetadataV1,
 )
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.ai.pending_replay import PendingReplayArgsDecoderV1, PendingReplayIntegrityError
 from offerpilot.ai.write_operations import (
+    ClarificationPendingRouteHandle,
     LedgerOperationPreheader,
     OperationCommitted,
     OperationFailed,
     OperationReplay,
+    PendingPersistenceRouteHandle,
+    PendingPersistenceRoutePort,
+    PendingRouteIdentityV1,
+    TypedPendingRouteHandle,
     WriteOperationError,
+    pending_action_identity,
 )
 from offerpilot.agent_runtime.events import (
     ContextManifestInput,
@@ -321,7 +329,8 @@ class RuntimePersistence(Protocol):
         conversation_id: int,
         messages: Sequence[Message],
         pending: PendingAction,
-        pending_authority_claim: PendingAuthorityClaim | None = None,
+        *,
+        route_handle: PendingPersistenceRouteHandle,
     ) -> PersistenceResult: ...
 
     def persist_clarification(
@@ -330,6 +339,8 @@ class RuntimePersistence(Protocol):
         messages: Sequence[Message],
         pending: PendingAction,
         question: str,
+        *,
+        route_handle: ClarificationPendingRouteHandle,
     ) -> PersistenceResult: ...
 
     def set_pending_clarification(
@@ -337,6 +348,8 @@ class RuntimePersistence(Protocol):
         conversation_id: int,
         pending: PendingAction,
         question: str,
+        *,
+        route_handle: ClarificationPendingRouteHandle,
     ) -> PersistenceResult: ...
 
     def clear_pending_action(self, conversation_id: int) -> PersistenceResult: ...
@@ -378,9 +391,6 @@ class NormalizedAgentTurn:
     pending: PendingAction | None
     records: tuple[object, ...] = ()
     failures: tuple[object, ...] = ()
-    pending_authority_claim: PendingAuthorityClaim | None = field(
-        default=None, repr=False, compare=False
-    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -680,7 +690,6 @@ class RuntimeDependencies:
         compare=False,
     )
     missing_target_question: Callable[..., str | None] | None = None
-    pending_action_details: Callable[[PendingAction], Mapping[str, object]] | None = None
     conversation_store: ConversationGateway | None = None
     conversation_gateway: ConversationGateway | None = None
     pending_guard: Callable[..., object] | RuntimePersistence | None = None
@@ -1405,45 +1414,27 @@ def _write_outcome(
     return "failed", "写入未完成"
 
 
-def _last_successful_tool_payload(records: Sequence[object]) -> dict[str, Any]:
-    for record in reversed(tuple(records)):
-        outcome = _record_outcome(record)
-        result = _attribute(outcome, "result")
-        if isinstance(outcome, ToolSuccess) and isinstance(result, dict):
-            return cast(dict[str, Any], result)
-    return {}
-
-
-def _prepend_write_success(
+def _apply_exact_success_presentation(
     reply: str,
-    pending: PendingAction,
-    records: Sequence[object],
+    record: object,
 ) -> str:
-    if pending.tool_name not in {"create_application", "add_note", "create_application_event"}:
+    if type(record) is not ToolExecutionRecord:
         return reply
-    payload = _last_successful_tool_payload(records)
-    if not payload:
+    exact_record = record
+    if (
+        not isinstance(exact_record.outcome, ToolSuccess)
+        or exact_record.terminal_persisted is not True
+    ):
         return reply
-    if pending.tool_name == "create_application":
-        record_id = payload.get("application_id") or payload.get("id")
-        company = str(payload.get("company_name") or "").strip()
-        position = str(payload.get("position_name") or "").strip()
-        meta = " · ".join(value for value in (company, position) if value)
-        summary = (
-            f"✅ 创建成功：投递记录 #{record_id} 已保存（{meta}）。" if record_id and meta else ""
-        )
-    elif pending.tool_name == "add_note":
-        record_id = payload.get("note_id") or payload.get("id")
-        company = str(payload.get("company") or "").strip()
-        position = str(payload.get("position") or "").strip()
-        round_name = str(payload.get("round") or "").strip()
-        meta = " · ".join(value for value in (company, position, round_name) if value)
-        summary = (
-            f"✅ 保存成功：复盘记录 #{record_id} 已保存（{meta}）。" if record_id and meta else ""
-        )
+    summary = exact_record.persisted_visible_result
+    if type(summary) is not str:
+        return reply
+    try:
+        json.loads(summary)
+    except json.JSONDecodeError:
+        pass
     else:
-        record_id = payload.get("application_event_id") or payload.get("id")
-        summary = f"✅ 创建成功：日程 #{record_id} 已保存。" if record_id else ""
+        return reply
     if not summary or summary in reply:
         return reply
     return f"{summary}\n\n{reply}".strip()
@@ -1564,7 +1555,6 @@ def _normalize_agent_result(value: object) -> NormalizedAgentTurn:
         value.pending,
         tuple(value.records),
         tuple(value.failures),
-        value.pending_authority_claim,
     )
 
 
@@ -1716,27 +1706,39 @@ class PilotRuntime:
         _ = bundle.bundle_instance_token
         return bundle
 
+    @property
+    def metadata_components(self) -> TransientToolRuntimeValue:
+        components = self._dependencies.metadata_components
+        if not isinstance(components, TransientToolRuntimeValue):
+            raise RuntimeError("Pilot Runtime has no production Tool Metadata components")
+        if getattr(components, "bundle", None) is not self.metadata_bundle:
+            raise RuntimeError("Pilot Runtime Tool Metadata provenance mismatch")
+        return components
+
     def _open_approval_catalog_lease(
         self,
         tool_context: ToolExecutionContext,
         catalog: object,
+        catalog_lease: SegmentToolCatalogLease | None = None,
     ) -> SegmentToolCatalogLease:
         if catalog is not self._dependencies.catalog:
             raise RuntimeError("approval Catalog drifted from the Runtime Bundle")
         authority_view = self._dependencies.authority_metadata_view
         if type(authority_view) is not ToolAuthorityMetadataView:
             raise RuntimeError("approval authority metadata view is unavailable")
-        catalog_lease = self.metadata_bundle.open_segment_lease()
+        lease = catalog_lease or self.metadata_bundle.open_segment_lease()
+        if type(lease) is not SegmentToolCatalogLease or lease.closed:
+            raise RuntimeError("approval Catalog lease is unavailable")
         try:
             tool_context.authority_factory.bind_segment_tool_catalog(
                 tool_context.authority,
                 authority_metadata_view=authority_view,
-                catalog_lease=catalog_lease,
+                catalog_lease=lease,
             )
         except BaseException:
-            catalog_lease.close()
+            lease.close()
             raise
-        return catalog_lease
+        return lease
 
     def start_turn(
         self,
@@ -2331,6 +2333,9 @@ class PilotRuntime:
                 assembled,
                 conversation,
                 request,
+                persistence,
+                conversation_id,
+                invocation_control,
                 recorder,
                 safe_event_sink,
                 safe_signal_sink,
@@ -2431,15 +2436,21 @@ class PilotRuntime:
         try:
             phase_with_segment("message_persist")
             self._check_cancel(cancel, invocation_control)
-            persisted_turn = self._persist_result(
-                persistence,
-                conversation_id,
-                request,
-                normalized,
-                conversation,
-                catalog=segment.catalog,
-                ensure_active=lambda: self._check_cancel(cancel, invocation_control),
-                control=invocation_control,
+            persisted_turn = (
+                self._pending_persistence_result(invocation, cast(AgentTurnResult, raw_result))
+                if normalized.pending is not None
+                else self._persist_result(
+                    persistence,
+                    conversation_id,
+                    request,
+                    normalized,
+                    conversation,
+                    catalog=segment.catalog,
+                    route_handle=None,
+                    presentation=None,
+                    ensure_active=lambda: self._check_cancel(cancel, invocation_control),
+                    control=invocation_control,
+                )
             )
             self._check_cancel(cancel, invocation_control)
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
@@ -2597,6 +2608,19 @@ class PilotRuntime:
                         retryable=True,
                     )
                 try:
+                    replay = continuation.replay_outcome(
+                        request,
+                        preheader=route_preheader,
+                    )
+                except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                    raise
+                except Exception as exc:
+                    self._mark_completed_if_active(control)
+                    return self._confirmation_failure(exc)
+                if replay is not None:
+                    self._mark_completed_if_active(control)
+                    return replay
+                try:
                     candidate = deterministic.preflight_confirmation(
                         request,
                         preheader=route_preheader,
@@ -2687,7 +2711,7 @@ class PilotRuntime:
                 RuntimeFailureCode.APPLICATION_NOT_FOUND, "conversation not found", 404
             )
         original_pending = None if terminal_replay else adapter.pending_action(conversation)
-        original, journal_holder, on_attempt, on_result = (
+        original, journal_holder, on_attempt, on_bound, on_result = (
             self._deterministic_confirmation_callbacks(
                 adapter,
                 conversation,
@@ -2705,6 +2729,7 @@ class PilotRuntime:
                     "conversation": conversation,
                     "transport": resolved_transport,
                     "on_confirmation_attempt": on_attempt,
+                    "on_confirmation_bound": on_bound,
                     "on_tool_result": on_result,
                     "preflight": legacy_preflight,
                 },
@@ -3620,7 +3645,6 @@ class PilotRuntime:
         try:
             preflight_pending = coordinator.preflight_live(
                 request,
-                catalog=self._dependencies.catalog,
             )
         except ConfirmationReplayError:
             try:
@@ -3642,14 +3666,26 @@ class PilotRuntime:
             return self._confirmation_failure(exc)
 
         catalog = self._dependencies.catalog
+        approval_catalog_lease = self.metadata_bundle.open_segment_lease()
+        approval_spec_handle = approval_catalog_lease.resolve(preflight_pending.tool_name)
+        if type(approval_spec_handle) is not SegmentToolSpecHandle:
+            approval_catalog_lease.close()
+            self._mark_completed_if_active(control)
+            return self._failure(
+                RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                "unsupported runtime route",
+                400,
+            )
         try:
             session_or_replay = coordinator.approve_modify(
                 request,
                 pending=preflight_pending,
                 conversation=None,
-                catalog=catalog,
+                catalog_lease=approval_catalog_lease,
+                spec_handle=approval_spec_handle,
             )
             if isinstance(session_or_replay, OperationReplay):
+                approval_catalog_lease.close()
                 self._mark_completed_if_active(control)
                 try:
                     replayed = coordinator.replay_outcome(request)
@@ -3663,6 +3699,7 @@ class PilotRuntime:
                 )
             session = session_or_replay
         except ConfirmationReplayError:
+            approval_catalog_lease.close()
             self._mark_completed_if_active(control)
             try:
                 replayed = coordinator.replay_outcome(request)
@@ -3675,14 +3712,20 @@ class PilotRuntime:
                 retryable=True,
             )
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+            approval_catalog_lease.close()
             raise
         except Exception as exc:
+            approval_catalog_lease.close()
             self._mark_completed_if_active(control)
             return self._confirmation_failure(exc)
+        except BaseException:
+            approval_catalog_lease.close()
+            raise
 
         driver = self._dependencies.agent_driver
         if driver is None:
             coordinator.cancel_cleanup(session)
+            approval_catalog_lease.close()
             self._mark_completed_if_active(control)
             return self._failure(
                 RuntimeFailureCode.OPERATION_UNAVAILABLE, "unsupported runtime route", 400
@@ -3713,18 +3756,25 @@ class PilotRuntime:
             # fresh Segment is activated; passing a proxy here would make the
             # Driver wrap proxy->gate->proxy recursively.
             tool_context = session.approval_execution_context(recorder)
-            approval_catalog_lease = self._open_approval_catalog_lease(tool_context, catalog)
+            approval_catalog_lease = self._open_approval_catalog_lease(
+                tool_context,
+                catalog,
+                approval_catalog_lease,
+            )
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
             coordinator.cancel_cleanup(session)
+            approval_catalog_lease.close()
             self._abandon(recorder, journal_started)
             raise
         except Exception as exc:
             coordinator.cancel_cleanup(session)
+            approval_catalog_lease.close()
             self._abandon(recorder, journal_started)
             self._mark_completed_if_active(control)
             return self._confirmation_failure(exc)
         except BaseException:
             coordinator.cancel_cleanup(session)
+            approval_catalog_lease.close()
             self._abandon(recorder, journal_started)
             raise
         deferred_origin_events: list[RuntimeEvent] = []
@@ -3752,6 +3802,20 @@ class PilotRuntime:
                     runtime_signal_sink=signal_sink,
                     cancel_check=self._confirmation_cancel_check(control, cancel_check),
                 )
+                self._bind_invocation_pending_persistence(
+                    invocation,
+                    lambda turn, route_handle, presentation: (
+                        self._persist_chained_pending_before_release(
+                            coordinator,
+                            session,
+                            request,
+                            control,
+                            turn,
+                            route_handle,
+                            presentation,
+                        )
+                    ),
+                )
             except Exception:
                 invocation_construction_failed = True
                 raise
@@ -3763,13 +3827,19 @@ class PilotRuntime:
             )
             self._check_cancel(cancel_check, control)
             normalized = _normalize_agent_result(raw_result)
-            outcome: RuntimeOutcome = self._finish_ledger_confirmation(
-                coordinator,
-                session,
-                normalized,
-                request,
-                control,
-                catalog=catalog,
+            outcome: RuntimeOutcome = (
+                cast(
+                    RuntimeOutcome,
+                    invocation._pending_persistence_result(cast(AgentTurnResult, raw_result)),
+                )
+                if normalized.pending is not None
+                else self._finish_ledger_confirmation(
+                    coordinator,
+                    session,
+                    normalized,
+                    request,
+                    control,
+                )
             )
             self._finalize_confirmation_result(
                 recorder,
@@ -3782,6 +3852,7 @@ class PilotRuntime:
                 event_sink=event_sink,
                 deferred_origin_events=deferred_origin_events,
             )
+            self._mark_completed_if_active(control)
             self._stop_confirmation_heartbeat(coordinator, session)
             return outcome
         except RuntimeAgentTimedOut:
@@ -3946,6 +4017,31 @@ class PilotRuntime:
             else:
                 invocation._release_catalog_lease_from_runtime()
 
+    def _persist_chained_pending_before_release(
+        self,
+        coordinator: ConfirmationCoordinator,
+        session: object,
+        request: ConfirmationRequest,
+        control: RuntimeInvocationControl,
+        turn: AgentTurnResult,
+        route_handle: PendingPersistenceRouteHandle,
+        presentation: PendingPresentationSnapshot,
+    ) -> RuntimeOutcome:
+        normalized = _normalize_agent_result(turn)
+        pending = normalized.pending
+        if pending is None:
+            raise TypeError("chained Pending persistence requires a Pending result")
+        return self._finish_ledger_confirmation(
+            coordinator,
+            session,
+            normalized,
+            request,
+            control,
+            route_handle=route_handle,
+            presentation=presentation,
+            complete_control=False,
+        )
+
     def _finish_ledger_confirmation(
         self,
         coordinator: ConfirmationCoordinator,
@@ -3954,8 +4050,14 @@ class PilotRuntime:
         request: ConfirmationRequest,
         control: RuntimeInvocationControl,
         *,
-        catalog: object | None = None,
+        route_handle: PendingPersistenceRouteHandle | None = None,
+        presentation: PendingPresentationSnapshot | None = None,
+        complete_control: bool = True,
     ) -> RuntimeOutcome:
+        def complete_control_once() -> None:
+            if complete_control:
+                self._mark_completed_if_active(control)
+
         typed_session = cast(Any, session)
         state = typed_session.state
         origin = state.origin_tool_message
@@ -3963,7 +4065,7 @@ class PilotRuntime:
             # A driver that does not use the unchanged callback boundary is
             # not allowed to make an unowned write appear durable.
             coordinator.cancel_cleanup(typed_session)
-            self._mark_completed_if_active(control)
+            complete_control_once()
             return self._failure(
                 RuntimeFailureCode.OPERATION_FAILED, "写入结果暂时无法保存。", 503, retryable=True
             )
@@ -3987,12 +4089,12 @@ class PilotRuntime:
             DeliveryBundle(
                 tuple(continuation),
                 pending=pending,
-                pending_authority_claim=normalized.pending_authority_claim,
+                route_handle=route_handle,
             ),
         )
         delivery_status = _failure_status(delivery)
         if delivery is None or delivery_status in {"cas_lost", "closed", "not_found"}:
-            self._mark_completed_if_active(control)
+            complete_control_once()
             if delivery_status == "cas_lost":
                 return self._failure(
                     RuntimeFailureCode.STALE_PENDING_ACTION,
@@ -4010,10 +4112,17 @@ class PilotRuntime:
                 409 if delivery is None else 503,
                 retryable=True,
             )
-        self._mark_completed_if_active(control)
+        complete_control_once()
         if pending is not None:
+            if route_handle is None or type(presentation) is not PendingPresentationSnapshot:
+                raise WriteOperationError("operation_unavailable")
             args, token = _safe_pending_payload(pending)
             from .contracts import PendingActionPayload
+
+            editable = tuple(
+                freeze_json_mapping(dict(value)) for value in presentation.editable_fields
+            )
+            details = freeze_json_mapping(dict(presentation.details))
 
             return ConfirmationRequiredOutcome(
                 confirmation_token=token,
@@ -4026,10 +4135,8 @@ class PilotRuntime:
                     human=pending.human,
                     args=args,
                     confirmation_token=token,
-                    editable_fields=self._pending_editable_fields(
-                        pending, catalog or self._dependencies.catalog
-                    ),
-                    details=self._pending_action_details(pending),
+                    editable_fields=editable,
+                    details=details,
                 ),
             )
         payload = _attribute(_attribute(state.terminal_execution, "payload"), "failure_code")
@@ -4048,10 +4155,9 @@ class PilotRuntime:
         visible_reply = _user_facing_assistant_content(
             normalized.reply or continuation[-1].content if continuation else ""
         )
-        visible_reply = _prepend_write_success(
+        visible_reply = _apply_exact_success_presentation(
             visible_reply,
-            state.pending,
-            normalized.records,
+            state.execution_record,
         )
         return MessageOutcome(
             message=visible_reply,
@@ -4122,30 +4228,79 @@ class PilotRuntime:
             value["parent_operation_id"] = operation_id
         return freeze_json_mapping(value)
 
-    def _pending_action_details(self, pending: PendingAction) -> ImmutablePayload:
-        function = _callable(self._dependencies.pending_action_details, ("resolve", "details"))
-        if function is None:
-            return freeze_json_mapping({})
-        value = _invoke(function, {"pending": pending}, (pending,))
-        return freeze_json_mapping(value) if isinstance(value, Mapping) else freeze_json_mapping({})
+    def _metadata_operation_ports(
+        self,
+    ) -> tuple[ToolOperationMetadataPort, PendingPersistenceRoutePort]:
+        components = self._dependencies.metadata_components
+        operation_port = getattr(components, "operation_port", None)
+        pending_port = getattr(components, "pending_persistence_route_port", None)
+        if type(operation_port) is not ToolOperationMetadataPort:
+            raise RuntimeError("Runtime Tool Operation Metadata Port is unavailable")
+        if type(pending_port) is not PendingPersistenceRoutePort:
+            raise RuntimeError("Runtime Pending Persistence Route Port is unavailable")
+        return operation_port, pending_port
+
+    def _bind_invocation_pending_persistence(
+        self,
+        invocation: AgentLoopInvocation,
+        consumer: Callable[..., object],
+    ) -> None:
+        if self._dependencies.metadata_components is None:
+            # Narrow non-production Runtime tests may never produce Pending.
+            # The private handoff remains unissued, so any attempted Pending
+            # persistence still fails closed before a repository side effect.
+            invocation._bind_pending_persistence(consumer)
+            return
+        operation_port, pending_port = self._metadata_operation_ports()
+        invocation._bind_pending_persistence(consumer, operation_port, pending_port)
+
+    def _clarification_pending_route(
+        self,
+        pending: PendingAction,
+        conversation_id: int,
+    ) -> tuple[PendingPersistenceRoutePort, ClarificationPendingRouteHandle]:
+        digest, revision = pending_action_identity(
+            pending.tool_call_id,
+            pending.tool_name,
+            pending.args,
+        )
+        identity = PendingRouteIdentityV1(
+            conversation_id=conversation_id,
+            operation_id="",
+            tool_call_id=pending.tool_call_id,
+            tool_name="",
+            pending_action_revision=revision,
+            pending_confirmation_claim_id="",
+            arguments_digest=digest,
+        )
+        _, pending_port = self._metadata_operation_ports()
+        return pending_port, pending_port.bind_clarification_pending(identity)
 
     @staticmethod
-    def _pending_editable_fields(
+    def _project_pending_presentation(
         pending: PendingAction,
-        catalog: object | None,
-    ) -> tuple[ImmutablePayload, ...]:
-        resolve = _callable(catalog, ("resolve",))
-        spec = (
-            _invoke(resolve, {"name": pending.tool_name}, (pending.tool_name,)) if resolve else None
+        lease: SegmentToolCatalogLease,
+        spec_handle: SegmentToolSpecHandle,
+        context: ToolExecutionContext,
+    ) -> tuple[tuple[ImmutablePayload, ...], ImmutablePayload]:
+        spec = lease.require_spec(spec_handle)
+        if spec.name != pending.tool_name:
+            raise ValueError("Pending presentation Spec identity mismatch")
+        editable = tuple(
+            freeze_json_mapping(cast(Mapping[str, object], value.to_compat_descriptor()))
+            for value in spec.metadata.editable_fields
         )
-        metadata = _attribute(spec, "metadata")
-        editable_fields = _attribute(metadata, "editable_fields", ())
-        if type(editable_fields) is not tuple:
-            return ()
-        return tuple(
-            freeze_json_mapping(cast(Mapping[str, object], descriptor.to_compat_descriptor()))
-            for descriptor in editable_fields
+        try:
+            decoded = spec.decoder(json.loads(pending.args))
+            raw_details = spec.presentation.pending_details_projector(decoded, context)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raw_details = {}
+        details = (
+            freeze_json_mapping(raw_details)
+            if isinstance(raw_details, Mapping)
+            else freeze_json_mapping({})
         )
+        return editable, details
 
     @staticmethod
     def _confirmation_failure(error: BaseException) -> RuntimeFailureOutcome:
@@ -4346,6 +4501,31 @@ class PilotRuntime:
                         invocation_control,
                     )
                 try:
+                    stream_replay = confirmation_coordinator.replay_outcome(
+                        request,
+                        preheader=route_preheader,
+                    )
+                except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                    raise
+                except Exception as exc:
+                    return self._stream_immediate(
+                        self._confirmation_failure(exc),
+                        invocation_control,
+                        direct=True,
+                    )
+                if stream_replay is not None:
+                    return self._prepare_deterministic_stream(
+                        DeterministicExecution(
+                            stream_replay,
+                            preparation_kind=PreparationKind.REPLAY,
+                        ),
+                        request=request,
+                        conversation=None,
+                        conversation_id=request.conversation_id,
+                        transport=transport,
+                        invocation_control=invocation_control,
+                    )
+                try:
                     candidate = deterministic.preflight_confirmation(
                         request,
                         preheader=route_preheader,
@@ -4430,7 +4610,6 @@ class PilotRuntime:
             try:
                 preflight_pending = confirmation_coordinator.preflight_live(
                     request,
-                    catalog=self._dependencies.catalog,
                 )
             except ConfirmationReplayError:
                 try:
@@ -4623,7 +4802,7 @@ class PilotRuntime:
                     invocation_control,
                 )
             original_pending = None if terminal_replay else adapter.pending_action(conversation)
-            original, journal_holder, on_attempt, on_result = (
+            original, journal_holder, on_attempt, on_bound, on_result = (
                 self._deterministic_confirmation_callbacks(
                     adapter,
                     conversation,
@@ -4641,6 +4820,7 @@ class PilotRuntime:
                         "conversation": conversation,
                         "transport": transport,
                         "on_confirmation_attempt": on_attempt,
+                        "on_confirmation_bound": on_bound,
                         "on_tool_result": on_result,
                         "preflight": legacy_preflight,
                     },
@@ -5643,6 +5823,9 @@ class PilotRuntime:
                     tuple(_materialize_stream_value(item) for item in state.assembled),
                     state.conversation,
                     cast(StartTurnRequest, state.request),
+                    self._require_dependency("persistence"),
+                    cast(int, state.conversation_id),
+                    state.control,
                     state.recorder,
                     agent_events,
                     safe_signal_sink,
@@ -5804,15 +5987,24 @@ class PilotRuntime:
             # ``normalized`` is already the sealed result; the phase is kept
             # for parity with sync diagnostics and golden ordering.
             self._phase("message_persist")
-            persisted_turn = self._persist_result(
-                persistence,
-                state.conversation_id,
-                cast(StartTurnRequest, state.request),
-                normalized,
-                state.conversation,
-                catalog=segment.catalog,
-                ensure_active=lambda: self._check_cancel(cancel_check, state.control),
-                control=state.control,
+            persisted_turn = (
+                self._pending_persistence_result(
+                    invocation_holder["value"],
+                    cast(AgentTurnResult, raw_result),
+                )
+                if normalized.pending is not None
+                else self._persist_result(
+                    persistence,
+                    state.conversation_id,
+                    cast(StartTurnRequest, state.request),
+                    normalized,
+                    state.conversation,
+                    catalog=segment.catalog,
+                    route_handle=None,
+                    presentation=None,
+                    ensure_active=lambda: self._check_cancel(cancel_check, state.control),
+                    control=state.control,
+                )
             )
             self._record_journal_persisted(
                 state.recorder,
@@ -5833,22 +6025,7 @@ class PilotRuntime:
                 )
                 close_terminal_owner()
                 self._mark_completed_if_active(state.control)
-                if normalized.pending is not None:
-                    args, token = _safe_pending_payload(normalized.pending)
-                    from .contracts import PendingActionPayload
-
-                    payload = PendingActionPayload(
-                        tool_name=normalized.pending.tool_name,
-                        operation_id=normalized.pending.operation_id
-                        or normalized.pending.tool_call_id,
-                        human=normalized.pending.human,
-                        args=args,
-                        confirmation_token=token,
-                        editable_fields=self._pending_editable_fields(
-                            normalized.pending, segment.catalog
-                        ),
-                        details=self._pending_action_details(normalized.pending),
-                    )
+                if outcome.pending_action is not None:
                     emit_runtime_event(
                         safe_event_sink,
                         StatusEvent(phase="waiting_confirmation", label="需要确认"),
@@ -5856,9 +6033,9 @@ class PilotRuntime:
                     emit_runtime_event(
                         safe_event_sink,
                         ConfirmationRequiredEvent(
-                            confirmation_token=token,
-                            operation_id=normalized.pending.operation_id or None,
-                            pending_action=payload,
+                            confirmation_token=outcome.confirmation_token,
+                            operation_id=outcome.operation_id,
+                            pending_action=outcome.pending_action,
                         ),
                     )
             elif isinstance(outcome, RuntimeFailureOutcome):
@@ -6473,16 +6650,39 @@ class PilotRuntime:
             return outcome
 
         session = cast(Any, state.confirmation_session or state.confirmation_cell.session)
+        approval_catalog_lease: SegmentToolCatalogLease | None = None
         if session is None:
             request = cast(ConfirmationRequest, state.request)
+            pending = state.confirmation_pending
+            if pending is None:
+                return finish_pre_agent(
+                    self._failure(
+                        RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                        "unsupported runtime route",
+                        400,
+                    )
+                )
+            approval_catalog_lease = self.metadata_bundle.open_segment_lease()
+            approval_spec_handle = approval_catalog_lease.resolve(pending.tool_name)
+            if type(approval_spec_handle) is not SegmentToolSpecHandle:
+                approval_catalog_lease.close()
+                return finish_pre_agent(
+                    self._failure(
+                        RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                        "unsupported runtime route",
+                        400,
+                    )
+                )
             try:
                 session_or_replay = coordinator.approve_modify(
                     request,
-                    pending=state.confirmation_pending,
+                    pending=pending,
                     conversation=None,
-                    catalog=self._dependencies.catalog,
+                    catalog_lease=approval_catalog_lease,
+                    spec_handle=approval_spec_handle,
                 )
                 if isinstance(session_or_replay, OperationReplay):
+                    approval_catalog_lease.close()
                     replay = coordinator.replay_outcome(request)
                     if replay is None:
                         return finish_pre_agent(
@@ -6498,6 +6698,7 @@ class PilotRuntime:
                 state.confirmation_cell.session = session
                 object.__setattr__(state, "confirmation_session", session)
             except ConfirmationReplayError:
+                approval_catalog_lease.close()
                 replay = coordinator.replay_outcome(request)
                 if replay is not None:
                     return finish_pre_agent(replay)
@@ -6510,13 +6711,30 @@ class PilotRuntime:
                     )
                 )
             except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
+                approval_catalog_lease.close()
                 raise
             except Exception as exc:
+                approval_catalog_lease.close()
                 return finish_pre_agent(self._confirmation_failure(exc))
+            except BaseException:
+                approval_catalog_lease.close()
+                raise
+        else:
+            approval_catalog_lease = getattr(session.state, "approval_catalog_lease", None)
         assert session is not None
+        if type(approval_catalog_lease) is not SegmentToolCatalogLease:
+            coordinator.cancel_cleanup(session)
+            return finish_pre_agent(
+                self._failure(
+                    RuntimeFailureCode.OPERATION_UNAVAILABLE,
+                    "unsupported runtime route",
+                    400,
+                )
+            )
         driver = self._dependencies.agent_driver
         if driver is None:
             coordinator.cancel_cleanup(session)
+            approval_catalog_lease.close()
             return finish_pre_agent(
                 self._failure(
                     RuntimeFailureCode.OPERATION_UNAVAILABLE,
@@ -6541,21 +6759,28 @@ class PilotRuntime:
             # journal recorder.  The post-terminal Segment owns the gated
             # proxy used for any chained Pending.
             tool_context = session.approval_execution_context(recorder)
-            approval_catalog_lease = self._open_approval_catalog_lease(tool_context, catalog)
+            approval_catalog_lease = self._open_approval_catalog_lease(
+                tool_context,
+                catalog,
+                approval_catalog_lease,
+            )
         except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut):
             coordinator = cast(ConfirmationCoordinator, self._confirmation_coordinator())
             coordinator.cancel_cleanup(session)
+            approval_catalog_lease.close()
             self._abandon(recorder, journal_started)
             raise
         except Exception as exc:
             coordinator = cast(ConfirmationCoordinator, self._confirmation_coordinator())
             coordinator.cancel_cleanup(session)
+            approval_catalog_lease.close()
             self._abandon(recorder, journal_started)
             bind_outcome = self._confirmation_failure(exc)
             return finish_pre_agent(bind_outcome)
         except BaseException:
             coordinator = cast(ConfirmationCoordinator, self._confirmation_coordinator())
             coordinator.cancel_cleanup(session)
+            approval_catalog_lease.close()
             self._abandon(recorder, journal_started)
             raise
         auto_approve = False
@@ -6605,6 +6830,20 @@ class PilotRuntime:
                         runtime_signal_sink=signal_sink,
                         cancel_check=self._confirmation_cancel_check(state.control, cancel_check),
                     )
+                    self._bind_invocation_pending_persistence(
+                        invocation,
+                        lambda turn, route_handle, presentation: (
+                            self._persist_chained_pending_before_release(
+                                coordinator,
+                                session,
+                                request,
+                                state.control,
+                                turn,
+                                route_handle,
+                                presentation,
+                            )
+                        ),
+                    )
                     invocation_holder["value"] = invocation
                 except Exception:
                     invocation_construction_failed = True
@@ -6648,12 +6887,20 @@ class PilotRuntime:
             else:
                 raw_result = execution_host.run(lambda: invoke_driver(event_sink), state.control)
             normalized = _normalize_agent_result(raw_result)
-            outcome: RuntimeOutcome = self._finish_ledger_confirmation(
-                coordinator,
-                session,
-                normalized,
-                request,
-                state.control,
+            invocation = invocation_holder.get("value")
+            outcome: RuntimeOutcome = (
+                cast(
+                    RuntimeOutcome,
+                    invocation._pending_persistence_result(cast(AgentTurnResult, raw_result)),
+                )
+                if normalized.pending is not None and invocation is not None
+                else self._finish_ledger_confirmation(
+                    coordinator,
+                    session,
+                    normalized,
+                    request,
+                    state.control,
+                )
             )
             self._finalize_confirmation_result(
                 recorder,
@@ -6666,6 +6913,7 @@ class PilotRuntime:
                 event_sink=event_sink,
                 deferred_origin_events=deferred_origin_events,
             )
+            self._mark_completed_if_active(state.control)
             if isinstance(outcome, (MessageOutcome, OperationReplayOutcome)):
                 emit_runtime_event(event_sink, AssistantMessageEvent(message=outcome.message))
             return outcome
@@ -7596,14 +7844,13 @@ class PilotRuntime:
         PendingAction | None,
         dict[str, object],
         Callable[[PendingAction, bool], object],
+        Callable[[object], object],
         Callable[[PendingAction, str, bool], object],
     ]:
         holder: dict[str, object] = {}
         attempt_id = str(uuid4())
 
-        def attempt(effective: PendingAction, approved: bool) -> None:
-            if original is None:
-                return
+        if original is not None:
             recorder, started = self._resume_journal_confirmation(
                 _conversation_id(conversation) or 0,
                 original,
@@ -7611,32 +7858,160 @@ class PilotRuntime:
             )
             holder["recorder"] = recorder
             holder["started"] = started
-            self._capture_confirmation_journal_context(
+            if started:
+                self._capture_confirmation_journal_context(
+                    recorder,
+                    started,
+                    conversation,
+                    _conversation_id(conversation) or 0,
+                    self._require_dependency("persistence"),
+                    control,
+                    tool_names=(original.tool_name,),
+                )
+
+        def attempt(effective: PendingAction, approved: bool) -> None:
+            holder["attempted"] = True
+            holder["approved"] = approved
+            holder["effective"] = effective
+            if original is None:
+                return
+            recorder = holder.get("recorder")
+            started = holder.get("started") is True
+            if recorder is None:
+                return
+            if not approved:
+                self._record_journal_approval(
+                    recorder,
+                    started,
+                    attempt_id,
+                    original,
+                    effective,
+                    False,
+                    edited=edited,
+                    control=control,
+                )
+                holder["approval_recorded"] = started
+                return
+            if not started:
+                return
+            original_fingerprint = self._journal_call(
                 recorder,
-                started,
-                conversation,
-                _conversation_id(conversation) or 0,
-                self._require_dependency("persistence"),
-                control,
-                tool_names=(original.tool_name,),
-            )
-            self._record_journal_approval(
-                recorder,
-                started,
-                attempt_id,
-                original,
-                effective,
-                approved,
-                edited=edited,
+                "fingerprint_pending_identity",
+                {
+                    "tool_call_id": original.tool_call_id,
+                    "tool_name": original.tool_name,
+                    "args": original.args,
+                },
                 control=control,
             )
-            if approved:
-                self._record_journal_tool_start(recorder, started, effective, control)
+            decided_fingerprint = self._journal_call(
+                recorder,
+                "fingerprint_pending_identity",
+                {
+                    "tool_call_id": effective.tool_call_id,
+                    "tool_name": effective.tool_name,
+                    "args": effective.args,
+                },
+                control=control,
+            )
+            if not isinstance(original_fingerprint, str) or not isinstance(
+                decided_fingerprint, str
+            ):
+                holder["bound_recording_failed"] = True
+                return
+            approval_event = EventInput(
+                event_type="approval.decided",
+                facts={
+                    "confirmation_attempt_id": attempt_id,
+                    "decision": "edited" if edited else "approved",
+                    "tool_call_id": original.tool_call_id,
+                    "original_input_fingerprint": original_fingerprint,
+                    "decided_input_fingerprint": decided_fingerprint,
+                },
+                source_ref_type="tool_call",
+                source_ref_id=original.tool_call_id,
+            )
+            tool_started_event = EventInput(
+                event_type="tool.started",
+                facts={
+                    "tool_call_id": effective.tool_call_id,
+                    "tool_name": effective.tool_name,
+                    "result_contract": "legacy_string_v1",
+                },
+                source_ref_type="tool_call",
+                source_ref_id=effective.tool_call_id,
+            )
+            holder["approval_draft"] = self._journal_call(
+                recorder,
+                "prepare_event_draft",
+                approval_event,
+                control=control,
+            )
+            holder["tool_started_draft"] = self._journal_call(
+                recorder,
+                "prepare_event_draft",
+                tool_started_event,
+                control=control,
+            )
+
+        def bound(session: object) -> None:
+            holder["bound_attempted"] = True
+            recorder = holder.get("recorder")
+            if recorder is None or holder.get("started") is not True:
+                return
+            approval_draft = holder.get("approval_draft")
+            tool_started_draft = holder.get("tool_started_draft")
+            if approval_draft is None or tool_started_draft is None:
+                holder["bound_recording_failed"] = True
+                return
+            recorded = self._journal_call(
+                recorder,
+                "record_approval_and_resume_bound",
+                session,
+                approval_draft,
+                ResumedDisposition(
+                    confirmation_attempt_id=attempt_id,
+                    tool_call_id=(original.tool_call_id if original is not None else ""),
+                ),
+                control=control,
+            )
+            if recorded is not True:
+                holder["bound_recording_failed"] = True
+                return
+            holder["approval_recorded"] = True
+            started_recorded = self._journal_call(
+                recorder,
+                "append_prepared_event_bound",
+                session,
+                tool_started_draft,
+                control=control,
+            )
+            holder["tool_started_recorded"] = started_recorded is True
+            if started_recorded is not True:
+                holder["bound_recording_failed"] = True
 
         def result(effective: PendingAction, value: str, succeeded: bool) -> None:
             recorder = holder.get("recorder")
             started = holder.get("started") is True
-            if recorder is not None:
+            if (
+                recorder is not None
+                and holder.get("bound_recording_failed") is True
+                and holder.get("approval_recorded") is not True
+            ):
+                approval_draft = holder.get("approval_draft")
+                if approval_draft is not None:
+                    recovered = self._journal_call(
+                        recorder,
+                        "recover_approval_and_resume",
+                        approval_draft,
+                        ResumedDisposition(
+                            confirmation_attempt_id=attempt_id,
+                            tool_call_id=(original.tool_call_id if original is not None else ""),
+                        ),
+                        control=control,
+                    )
+                    holder["approval_recorded"] = recovered is True
+            if recorder is not None and holder.get("tool_started_recorded") is True:
                 self._record_journal_tool_result(
                     recorder,
                     started,
@@ -7646,7 +8021,7 @@ class PilotRuntime:
                     control,
                 )
 
-        return original, holder, attempt, result
+        return original, holder, attempt, bound, result
 
     def _finish_deterministic_confirmation_journal(
         self,
@@ -7658,6 +8033,11 @@ class PilotRuntime:
     ) -> None:
         recorder = holder.get("recorder")
         if recorder is None or holder.get("started") is not True:
+            return
+        if holder.get("attempted") is not True or (
+            holder.get("approved") is True and holder.get("bound_attempted") is not True
+        ):
+            self._finish_journal_replay(recorder, control)
             return
         persistence = self._require_dependency("persistence")
         getter = _callable(persistence, ("get_pending_action",))
@@ -8315,6 +8695,9 @@ class PilotRuntime:
         assembled: object,
         conversation: object,
         request: StartTurnRequest,
+        persistence: object,
+        conversation_id: int,
+        control: RuntimeInvocationControl,
         recorder: object,
         event_sink: RuntimeEventSink,
         signal_sink: RuntimeSignalSink[str] | None,
@@ -8329,8 +8712,7 @@ class PilotRuntime:
                 if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes))
                 else (_message(assembled),)
             )
-        del conversation, request
-        return AgentLoopInvocation(
+        invocation = AgentLoopInvocation(
             seed=NewTurnSeed(messages),
             model=resolved.model,
             catalog=cast(Any, segment.catalog),
@@ -8347,12 +8729,38 @@ class PilotRuntime:
             runtime_signal_sink=signal_sink,
             cancel_check=cancel_check,
         )
+        self._bind_invocation_pending_persistence(
+            invocation,
+            lambda turn, route_handle, presentation: self._persist_result(
+                persistence,
+                conversation_id,
+                request,
+                _normalize_agent_result(turn),
+                conversation,
+                catalog=invocation.catalog,
+                route_handle=route_handle,
+                presentation=presentation,
+                ensure_active=lambda: self._check_cancel(cancel_check, control),
+                control=control,
+            ),
+        )
+        return invocation
 
     def _run_driver(self, driver: AgentDriver, invocation: AgentLoopInvocation) -> AgentTurnResult:
         result = driver.execute(invocation)
         if not isinstance(result, AgentTurnResult):
             raise TypeError("Agent Driver must return AgentTurnResult")
         return result
+
+    @staticmethod
+    def _pending_persistence_result(
+        invocation: AgentLoopInvocation,
+        turn: AgentTurnResult,
+    ) -> _PersistedTurn:
+        value = invocation._pending_persistence_result(turn)
+        if type(value) is not _PersistedTurn:
+            raise TypeError("Pending persistence consumer returned an invalid result")
+        return value
 
     def _persist_timeout(
         self,
@@ -8424,12 +8832,17 @@ class PilotRuntime:
         conversation: object,
         *,
         catalog: object | None,
+        route_handle: PendingPersistenceRouteHandle | None,
+        presentation: PendingPresentationSnapshot | None,
         ensure_active: Callable[[], None],
         control: RuntimeInvocationControl,
     ) -> _PersistedTurn:
         del request
         pending = result.pending
-        if pending is not None and not _valid_pending_action(pending, catalog):
+        if pending is not None and (
+            type(route_handle) is not TypedPendingRouteHandle
+            or type(presentation) is not PendingPresentationSnapshot
+        ):
             return _PersistedTurn(
                 self._failure(
                     RuntimeFailureCode.OPERATION_FAILED,
@@ -8469,35 +8882,41 @@ class PilotRuntime:
             for message in effective_messages
         ]
         if pending is not None:
+            typed_route_handle = cast(TypedPendingRouteHandle, route_handle)
+            typed_presentation = cast(PendingPresentationSnapshot, presentation)
             question = self._missing_question(pending, conversation_id)
             if question:
-                return self._persist_clarification(
-                    persistence,
-                    conversation_id,
-                    messages,
+                clarification_port, clarification_handle = self._clarification_pending_route(
                     pending,
-                    question,
-                    catalog=catalog,
-                    ensure_active=ensure_active,
-                    control=control,
+                    conversation_id,
                 )
-            function = _callable(persistence, ("persist_initial_pending", "persist_pending"))
+                try:
+                    return self._persist_clarification(
+                        persistence,
+                        conversation_id,
+                        messages,
+                        pending,
+                        question,
+                        route_handle=clarification_handle,
+                        catalog=catalog,
+                        ensure_active=ensure_active,
+                        control=control,
+                    )
+                finally:
+                    clarification_port.revoke_pending(clarification_handle)
+            function = _callable(persistence, ("persist_initial_pending",))
             if function is None:
                 raise TypeError("persistence does not provide atomic pending persistence")
-            commit_function = function
+            persist_initial_pending = function
             before_ids = self._snapshot_message_ids(persistence, conversation_id)
             ensure_active()
             persisted = self._commit_fence(
                 control,
-                lambda: _invoke(
-                    commit_function,
-                    {
-                        "conversation_id": conversation_id,
-                        "messages": messages,
-                        "pending": pending,
-                        "pending_authority_claim": result.pending_authority_claim,
-                    },
-                    (conversation_id, messages, pending),
+                lambda: persist_initial_pending(
+                    conversation_id,
+                    messages,
+                    pending,
+                    route_handle=typed_route_handle,
                 ),
             )
             if not _result_persisted(persisted):
@@ -8524,7 +8943,11 @@ class PilotRuntime:
                     message_ids,
                 )
             args, token = _safe_pending_payload(pending)
-            from .contracts import PendingActionPayload  # local import keeps module exports compact
+            editable = tuple(
+                freeze_json_mapping(dict(value)) for value in typed_presentation.editable_fields
+            )
+            details = freeze_json_mapping(dict(typed_presentation.details))
+            from .contracts import PendingActionPayload
 
             payload = PendingActionPayload(
                 tool_name=pending.tool_name,
@@ -8532,8 +8955,8 @@ class PilotRuntime:
                 human=pending.human,
                 args=args,
                 confirmation_token=token,
-                editable_fields=self._pending_editable_fields(pending, catalog),
-                details=self._pending_action_details(pending),
+                editable_fields=editable,
+                details=details,
             )
             return _PersistedTurn(
                 ConfirmationRequiredOutcome(
@@ -8602,19 +9025,13 @@ class PilotRuntime:
                         ),
                         message_ids,
                     )
-                commit_setter = setter
-                ensure_active()
-                set_result = self._commit_fence(
-                    control,
-                    lambda: _invoke(
-                        commit_setter,
-                        {
-                            "conversation_id": conversation_id,
-                            "pending": forced_pending,
-                            "question": forced_reply,
-                        },
-                        (conversation_id, forced_pending, forced_reply),
-                    ),
+                set_result = self._set_clarification_with_route(
+                    setter,
+                    conversation_id=conversation_id,
+                    pending=forced_pending,
+                    question=forced_reply,
+                    ensure_active=ensure_active,
+                    control=control,
                 )
                 if not _result_persisted(set_result):
                     return _PersistedTurn(
@@ -8663,18 +9080,13 @@ class PilotRuntime:
                     ),
                     message_ids,
                 )
-            ensure_active()
-            set_result = self._commit_fence(
-                control,
-                lambda: _invoke(
-                    setter,
-                    {
-                        "conversation_id": conversation_id,
-                        "pending": clarification[0],
-                        "question": reply,
-                    },
-                    (conversation_id, clarification[0], reply),
-                ),
+            set_result = self._set_clarification_with_route(
+                setter,
+                conversation_id=conversation_id,
+                pending=clarification[0],
+                question=reply,
+                ensure_active=ensure_active,
+                control=control,
             )
             if not _result_persisted(set_result):
                 return _PersistedTurn(
@@ -8747,6 +9159,38 @@ class PilotRuntime:
             ),
             message_ids,
         )
+
+    def _set_clarification_with_route(
+        self,
+        setter: Callable[..., object],
+        *,
+        conversation_id: int,
+        pending: PendingAction,
+        question: str,
+        ensure_active: Callable[[], None],
+        control: RuntimeInvocationControl,
+    ) -> object:
+        route_port, route_handle = self._clarification_pending_route(
+            pending,
+            conversation_id,
+        )
+        try:
+            ensure_active()
+            return self._commit_fence(
+                control,
+                lambda: _invoke(
+                    setter,
+                    {
+                        "conversation_id": conversation_id,
+                        "pending": pending,
+                        "question": question,
+                        "route_handle": route_handle,
+                    },
+                    (conversation_id, pending, question),
+                ),
+            )
+        finally:
+            route_port.revoke_pending(route_handle)
 
     @staticmethod
     def _verify_pending_snapshot(
@@ -8893,6 +9337,7 @@ class PilotRuntime:
         pending: PendingAction,
         question: str,
         *,
+        route_handle: ClarificationPendingRouteHandle,
         catalog: object | None,
         ensure_active: Callable[[], None],
         control: RuntimeInvocationControl,
@@ -8919,6 +9364,7 @@ class PilotRuntime:
                         "messages": messages,
                         "pending": pending,
                         "question": question,
+                        "route_handle": route_handle,
                     },
                     (conversation_id, messages, pending, question),
                 ),
@@ -9011,6 +9457,7 @@ class PilotRuntime:
                             "conversation_id": conversation_id,
                             "pending": pending,
                             "question": question,
+                            "route_handle": route_handle,
                         },
                         (conversation_id, pending, question),
                     ),

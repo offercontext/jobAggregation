@@ -6,9 +6,7 @@ from typing import Any, TYPE_CHECKING, cast
 
 from offerpilot.ai.tool_runtime.contracts import JSONValue
 from offerpilot.ai.tool_runtime.legacy import (
-    LegacyDeterministicAdapter,
     LegacyDeterministicAdapterSpec,
-    LegacyDeterministicCatalog,
     LegacyExecutionContextPort,
     LegacyPresentationBindingV1,
     LegacyReadContextPort,
@@ -339,7 +337,7 @@ def _execute_static_outcome(
     return _execute_outcome(exact_context.outcomes_repository, encoded_args)
 
 
-def build_static_legacy_adapter_catalog() -> LegacyStaticAdapterCatalogV1:
+def build_static_adapter_catalog() -> LegacyStaticAdapterCatalogV1:
     """Build the unpublished static three-Adapter catalog as one sealed unit."""
 
     catalog = LegacyStaticAdapterCatalogV1(
@@ -431,60 +429,3 @@ def build_static_legacy_adapter_catalog() -> LegacyStaticAdapterCatalogV1:
         "legacy_deterministic",
     )
     return catalog
-
-
-def build_legacy_deterministic_catalog(
-    jd_service: ApplicationJDService,
-    outcomes: ApplicationOutcomesRepository,
-) -> LegacyDeterministicCatalog:
-    return LegacyDeterministicCatalog(
-        (
-            LegacyDeterministicAdapter(
-                name="save_application_jd_version",
-                editable_fields=(
-                    {"field": "jd_text", "type": "long_text"},
-                    {
-                        "field": "source_url",
-                        "type": "string",
-                        "clearable": True,
-                        "clear_value": None,
-                    },
-                ),
-                describe=_describe_jd,
-                validate=_validate_jd,
-                execute=lambda args: _execute_jd(jd_service, args),
-            ),
-            LegacyDeterministicAdapter(
-                name="create_application_submission_snapshot",
-                editable_fields=(
-                    {"field": "submitted_at", "type": "datetime"},
-                    {"field": "note", "type": "long_text"},
-                ),
-                describe=lambda args: (
-                    f"冻结投递 #{_payload(args).get('application_id')} 的实际简历、JD 和材料。"
-                ),
-                validate=_validate_snapshot,
-                execute=lambda args: _execute_snapshot(outcomes, args),
-            ),
-            LegacyDeterministicAdapter(
-                name="record_application_outcome",
-                editable_fields=(
-                    {"field": "stage", "type": "enum", "options": cast(JSONValue, sorted(STAGES))},
-                    {
-                        "field": "result",
-                        "type": "enum",
-                        "options": cast(JSONValue, sorted(RESULTS)),
-                    },
-                    {"field": "feedback_text", "type": "long_text"},
-                    {"field": "reflection_text", "type": "long_text"},
-                    {"field": "next_action_text", "type": "long_text"},
-                    {"field": "occurred_at", "type": "datetime"},
-                ),
-                describe=lambda args: (
-                    f"记录投递 #{_payload(args).get('application_id')} 的 {_payload(args).get('stage')} / {_payload(args).get('result')} 结果。"
-                ),
-                validate=_validate_outcome,
-                execute=lambda args: _execute_outcome(outcomes, args),
-            ),
-        )
-    )

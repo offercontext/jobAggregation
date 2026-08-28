@@ -12,7 +12,6 @@ import offerpilot.pilot_runtime.service as service_module
 from offerpilot.pilot_runtime.contracts import (
     AssistantMessageEvent,
     CancelReason,
-    ConfirmationRequiredOutcome,
     InvocationState,
     MessageOutcome,
     RuntimeFailureOutcome,
@@ -47,12 +46,11 @@ from offerpilot.ai.tool_authority.contracts import SegmentExecutionAuthority
 from offerpilot.ai.tool_authority.policy import validate_startup_policy
 from offerpilot.ai.tool_runtime.catalog import (
     SegmentToolCatalogLease,
-    compile_tool_metadata_manifest,
 )
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
-from offerpilot.ai.tool_runtime.contracts import ToolFailure, TransientToolRuntimeValue
+from offerpilot.ai.tool_runtime.contracts import ToolFailure
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.api import _confirmation_token as baseline_confirmation_token
 from offerpilot.pilot_runtime.service import _confirmation_token
@@ -65,7 +63,6 @@ from offerpilot.pilot_runtime.persistence import (
     PersistenceResult,
     PersistenceStatus,
 )
-from offerpilot.pilot_runtime.compensation import prepare_compensation_handler_components
 from offerpilot.repositories.agent_runs import AgentRunRepository
 from offerpilot.repositories.chat import ChatRepository
 from offerpilot.repositories.agent_runs import StartRunCommand
@@ -75,6 +72,7 @@ from offerpilot.repositories.jd import JDAnalysesRepository
 from offerpilot.repositories.notes import NotesRepository
 from offerpilot.repositories.offers import OffersRepository
 from offerpilot.repositories.resumes import ResumesRepository
+from tests.tool_metadata.test_production_bundle import _production_components
 
 
 _AUTHORITY_SESSIONS = init_database(
@@ -83,25 +81,8 @@ _AUTHORITY_SESSIONS = init_database(
 _AUTHORITY_POLICY = validate_startup_policy(MODEL_TOOL_CATALOG.authority_manifest)
 
 
-def _metadata_bundle() -> ToolMetadataBundleV1:
-    manifest = compile_tool_metadata_manifest(MODEL_TOOL_CATALOG.specs)
-    return ToolMetadataBundleV1(
-        typed_catalog=MODEL_TOOL_CATALOG,
-        manifest=manifest,
-        legacy_boundary=manifest.to_dict()["legacy_boundary"],  # type: ignore[arg-type]
-        compensation=prepare_compensation_handler_components().metadata_projection(),
-    )
-
-
-_METADATA_BUNDLE = _metadata_bundle()
-
-
-class _MetadataComponents(TransientToolRuntimeValue):
-    def __init__(self, bundle: ToolMetadataBundleV1) -> None:
-        self.bundle = bundle
-
-
-_METADATA_COMPONENTS = _MetadataComponents(_METADATA_BUNDLE)
+_METADATA_COMPONENTS = _production_components()
+_METADATA_BUNDLE = _METADATA_COMPONENTS.bundle
 
 
 class _Phases:
@@ -241,8 +222,14 @@ class _Persistence:
         return PersistenceResult(PersistenceStatus.PERSISTED, message_ids=message_ids)
 
     def persist_initial_pending(
-        self, conversation_id: int, messages: object, pending: object
+        self,
+        conversation_id: int,
+        messages: object,
+        pending: object,
+        *,
+        route_handle: object,
     ) -> object:
+        assert route_handle is not None
         del conversation_id
         self.pending = pending
         self.pending_count += 1
@@ -275,7 +262,10 @@ class _Persistence:
         messages: object,
         pending: object,
         question: str,
+        *,
+        route_handle: object,
     ) -> object:
+        assert route_handle is not None
         del conversation_id
         self.clarification_count += 1
         values = tuple(messages) if isinstance(messages, (tuple, list)) else ()
@@ -288,8 +278,14 @@ class _Persistence:
         return PersistenceResult(PersistenceStatus.PERSISTED, message_ids=message_ids)
 
     def set_pending_clarification(
-        self, conversation_id: int, pending: object, question: str
+        self,
+        conversation_id: int,
+        pending: object,
+        question: str,
+        *,
+        route_handle: object,
     ) -> object:
+        assert route_handle is not None
         del conversation_id
         self.clarification = SimpleNamespace(pending=pending, question=question)
         self.clarification_count += 1
@@ -893,7 +889,7 @@ def test_confirmation_token_matches_closed_baseline_helper() -> None:
     )
 
 
-def test_pending_outcome_uses_confirmation_token_from_persisted_pending() -> None:
+def test_fabricated_pending_without_live_route_fails_closed_before_persistence() -> None:
     phases = _Phases()
     control = InMemoryRuntimeInvocationControl()
     pending = PendingAction(
@@ -912,11 +908,11 @@ def test_pending_outcome_uses_confirmation_token_from_persisted_pending() -> Non
 
     result = _start(runtime, _Host(phases), control=control)
 
-    assert isinstance(result, ConfirmationRequiredOutcome)
+    assert isinstance(result, RuntimeFailureOutcome)
+    assert result.code is RuntimeFailureCode.OPERATION_FAILED
     assert control.state is InvocationState.COMPLETED
-    assert result.confirmation_token == baseline_confirmation_token(pending)
-    assert result.pending_action is not None
-    assert result.pending_action.confirmation_token == result.confirmation_token
+    assert persistence.pending is None
+    assert persistence.pending_count == 0
 
 
 def test_journal_factory_receives_exact_start_run_builder_and_baseline_events() -> None:
@@ -1642,7 +1638,7 @@ def test_same_named_ordinary_exception_is_not_runtime_cancellation() -> None:
     assert journal.recorder.dispositions == [("failed", "provider_error")]
 
 
-def test_pending_result_is_atomically_persisted_and_suspended() -> None:
+def test_fabricated_pending_result_cannot_reach_atomic_persistence() -> None:
     phases = _Phases()
     pending = PendingAction(
         "call-1", "update_application_status", '{"id": 1}', "update_application_status", "op-1"
@@ -1656,10 +1652,10 @@ def test_pending_result_is_atomically_persisted_and_suspended() -> None:
 
     result = _start(runtime, _Host(phases))
 
-    assert isinstance(result, ConfirmationRequiredOutcome)
-    assert persistence.pending_count == 1
-    assert journal.recorder.dispositions == []
-    assert phases.items[-1] == "run_suspend"
+    assert isinstance(result, RuntimeFailureOutcome)
+    assert result.code is RuntimeFailureCode.OPERATION_FAILED
+    assert persistence.pending_count == 0
+    assert journal.recorder.dispositions == [("failed", "unknown")]
 
 
 @pytest.mark.parametrize(
@@ -1747,7 +1743,7 @@ def test_pending_readback_identity_mismatch_is_safe_after_persistence() -> None:
 
     assert isinstance(result, RuntimeFailureOutcome)
     assert result.code is RuntimeFailureCode.OPERATION_FAILED
-    assert persistence.pending_count == 1
+    assert persistence.pending_count == 0
     assert journal.recorder.dispositions == [("failed", "unknown")]
 
 
@@ -1774,8 +1770,11 @@ def test_persistence_failure_finishes_failed_not_completed(
             conversation_id: int,
             messages: object,
             pending_value: object,
+            *,
+            route_handle: object,
         ) -> object:
             del conversation_id, messages, pending_value
+            assert route_handle is not None
             return PersistenceResult(PersistenceStatus(status))
 
         def persist_initial_messages(self, conversation_id: int, messages: object) -> object:
@@ -1800,7 +1799,7 @@ def test_persistence_failure_finishes_failed_not_completed(
     assert "run_finish" in phases.items
 
 
-def test_missing_target_uses_clarification_without_pending_outcome() -> None:
+def test_missing_target_cannot_turn_a_fabricated_pending_into_clarification() -> None:
     phases = _Phases()
     pending = PendingAction(
         "call-1", "update_application_status", "{}", "update_application_status", "op-1"
@@ -1815,10 +1814,10 @@ def test_missing_target_uses_clarification_without_pending_outcome() -> None:
 
     result = _start(runtime, _Host(phases))
 
-    assert isinstance(result, MessageOutcome)
-    assert result.message == "请先选择投递目标。"
-    assert persistence.clarification_count == 1
-    assert journal.recorder.dispositions == [("completed", None)]
+    assert isinstance(result, RuntimeFailureOutcome)
+    assert result.code is RuntimeFailureCode.OPERATION_FAILED
+    assert persistence.clarification_count == 0
+    assert journal.recorder.dispositions == [("failed", "unknown")]
 
 
 @pytest.mark.parametrize("failure_mode", ["exception", "none", "failed"])
@@ -1842,8 +1841,11 @@ def test_non_atomic_clarification_set_failure_stops_before_assistant_and_complet
             conversation_id: int,
             pending_value: object,
             question: str,
+            *,
+            route_handle: object,
         ) -> object:
             del conversation_id, pending_value, question
+            assert route_handle is not None
             self.setter_calls += 1
             if failure_mode == "exception":
                 raise OSError("clarification CAS unavailable")

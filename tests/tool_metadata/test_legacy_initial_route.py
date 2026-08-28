@@ -105,7 +105,7 @@ class _ForbiddenSessionFactory:
 def _component_graph() -> tuple[Any, ToolMetadataBundleV1, object]:
     catalog_factory = getattr(
         legacy_specs,
-        "build_static_legacy_adapter_catalog",
+        "build_static_adapter_catalog",
         None,
     )
     assert callable(catalog_factory), "Task 7 must expose the exact static Adapter factory"
@@ -223,7 +223,7 @@ def test_static_catalog_has_exact_ordered_specs_and_approved_protocol_seal() -> 
             for marker in ("repository", "service", "session")
         )
 
-    mutated_catalog = legacy_specs.build_static_legacy_adapter_catalog()
+    mutated_catalog = legacy_specs.build_static_adapter_catalog()
     mutated = mutated_catalog.ordered_adapters[0]
     object.__setattr__(mutated, "name", "mutated_legacy_adapter")
     with pytest.raises((TypeError, ValueError), match="integrity|seal|mutation|drift"):
@@ -231,7 +231,7 @@ def test_static_catalog_has_exact_ordered_specs_and_approved_protocol_seal() -> 
 
 
 def test_static_adapter_and_catalog_identity_replacement_fail_closed() -> None:
-    catalog = legacy_specs.build_static_legacy_adapter_catalog()
+    catalog = legacy_specs.build_static_adapter_catalog()
     replacement_order = tuple(list(catalog.ordered_adapters))
     assert replacement_order == catalog.ordered_adapters
     assert replacement_order is not catalog.ordered_adapters
@@ -239,7 +239,7 @@ def test_static_adapter_and_catalog_identity_replacement_fail_closed() -> None:
     with pytest.raises((TypeError, ValueError), match="integrity|seal|mutation|drift"):
         catalog.require_integrity()
 
-    catalog = legacy_specs.build_static_legacy_adapter_catalog()
+    catalog = legacy_specs.build_static_adapter_catalog()
     adapter = catalog.ordered_adapters[0]
     replacement_fields = tuple(
         MappingProxyType(dict(descriptor)) for descriptor in adapter.editable_fields
@@ -252,7 +252,7 @@ def test_static_adapter_and_catalog_identity_replacement_fail_closed() -> None:
 
 
 def test_static_adapter_rejects_bound_method_that_captures_runtime_state() -> None:
-    template = legacy_specs.build_static_legacy_adapter_catalog().ordered_adapters[0]
+    template = legacy_specs.build_static_adapter_catalog().ordered_adapters[0]
     captured = _CapturedLegacyExecutor()
     with pytest.raises(TypeError, match="module-level|named function|callable"):
         legacy_runtime.LegacyDeterministicAdapterSpec(
@@ -269,7 +269,7 @@ def test_static_adapter_rejects_bound_method_that_captures_runtime_state() -> No
 
 
 def test_static_catalog_declares_complete_legacy_presentation_bindings() -> None:
-    adapters = legacy_specs.build_static_legacy_adapter_catalog().ordered_adapters
+    adapters = legacy_specs.build_static_adapter_catalog().ordered_adapters
     for adapter in adapters:
         presentation = adapter.presentation
         assert type(presentation).__name__ == "LegacyPresentationBindingV1"
@@ -320,7 +320,7 @@ def test_legacy_presentation_uses_exact_read_context_and_matches_baseline(
             "idempotency_key": "legacy-present-0002",
         }
     )
-    adapters = legacy_specs.build_static_legacy_adapter_catalog().ordered_adapters
+    adapters = legacy_specs.build_static_adapter_catalog().ordered_adapters
     with session_factory() as session:
         transaction = session.begin()
         context = read_context_type(session, applications, jd_service)
@@ -440,6 +440,112 @@ def test_legacy_presentation_uses_exact_read_context_and_matches_baseline(
         )
 
 
+def test_initial_route_projects_exact_pending_presentation_without_adapter_access(
+    tmp_path: Path,
+) -> None:
+    from offerpilot.db import init_database
+    from offerpilot.repositories.application_jd_versions import ApplicationJDService
+    from offerpilot.repositories.applications import ApplicationCreate, ApplicationsRepository
+
+    session_factory = init_database(tmp_path / "legacy-route-presentation.sqlite3")
+    applications = ApplicationsRepository(session_factory)
+    jd_service = ApplicationJDService(session_factory)
+    application = applications.create(
+        ApplicationCreate(company_name="Acme", position_name="Engineer")
+    )
+    version = jd_service.create_version(
+        application.id,
+        jd_text="baseline JD",
+        source_url=None,
+        source_kind="pilot",
+        expected_current_version_id=None,
+        idempotency_key="legacy-route-present-0001",
+    ).version
+    encoded_by_source = {
+        "jd_deterministic_action": json.dumps(
+            {
+                "application_id": application.id,
+                "jd_text": "updated JD",
+                "source_url": None,
+                "expected_current_version_id": version.id,
+                "idempotency_key": "legacy-route-present-0002",
+            }
+        ),
+        "submission_snapshot_action": json.dumps(
+            {
+                "application_id": application.id,
+                "resume_id": 1,
+                "jd_version_id": version.id,
+                "material_kit_id": None,
+                "submitted_at": "2026-08-25T12:00:00+08:00",
+                "note": "submitted",
+                "idempotency_key": "legacy-route-present-0003",
+            }
+        ),
+        "outcome_recording_action": json.dumps(
+            {
+                "application_id": application.id,
+                "submission_snapshot_id": 1,
+                "application_event_id": None,
+                "stage": "interview",
+                "result": "advanced",
+                "feedback_text": "clear",
+                "reflection_text": "prepare",
+                "next_action_text": "follow up",
+                "feedback_tags": [],
+                "occurred_at": "2026-08-25T13:00:00+08:00",
+                "idempotency_key": "legacy-route-present-0004",
+            }
+        ),
+    }
+    components = _components()
+    adapters = components.catalog.ordered_adapters
+    adapter_by_source = {
+        "jd_deterministic_action": adapters[0],
+        "submission_snapshot_action": adapters[1],
+        "outcome_recording_action": adapters[2],
+    }
+
+    with session_factory() as session, session.begin():
+        context = runtime_contracts.LegacyReadContext(session, applications, jd_service)
+        for source, encoded_args in encoded_by_source.items():
+            owner, lease, _token, handle = _issue_route(components, source)
+            try:
+                presentation = components.initial_route_port.project_pending(
+                    handle,
+                    encoded_args=encoded_args,
+                    context=context,
+                )
+                adapter = adapter_by_source[source]
+                assert presentation.human == adapter.presentation.confirmation_description(
+                    encoded_args
+                )
+                assert materialize_json(presentation.editable_fields) == materialize_json(
+                    adapter.editable_fields
+                )
+                assert materialize_json(presentation.details) == materialize_json(
+                    adapter.presentation.pending_details_projector(encoded_args, context)
+                )
+                for forbidden in (
+                    "adapter",
+                    "catalog",
+                    "execute",
+                    "presentation",
+                    "confirmation_description",
+                    "pending_details_projector",
+                ):
+                    assert not hasattr(presentation, forbidden)
+            finally:
+                lease.close()
+                owner.close()
+            with pytest.raises((TypeError, ValueError), match="closed|revoked|route|lease"):
+                components.initial_route_port.project_pending(
+                    handle,
+                    encoded_args=encoded_args,
+                    context=context,
+                )
+
+
 def test_legacy_route_source_enum_is_closed_and_complete() -> None:
     source_type = getattr(legacy_runtime, "LegacyRouteSourceV1", None)
     assert source_type is not None
@@ -532,7 +638,7 @@ def test_legacy_execution_context_rejects_spoofed_session_and_adapter_types() ->
 
 
 def test_static_legacy_executor_requires_exact_integrity_checked_context() -> None:
-    adapter = legacy_specs.build_static_legacy_adapter_catalog().ordered_adapters[0]
+    adapter = legacy_specs.build_static_adapter_catalog().ordered_adapters[0]
     encoded_args = json.dumps(
         {
             "application_id": 1,
@@ -910,7 +1016,7 @@ def test_owner_close_clears_strong_references_after_metadata_integrity_drift() -
     object.__setattr__(
         registry,
         "_catalog",
-        legacy_specs.build_static_legacy_adapter_catalog(),
+        legacy_specs.build_static_adapter_catalog(),
     )
     assert owner.close() is None
     assert object.__getattribute__(registry, "_owners") == {}
@@ -1071,7 +1177,7 @@ def test_transient_capabilities_and_routes_cannot_be_copied_or_serialized() -> N
 
 
 def test_static_legacy_adapters_cannot_be_copied_or_generically_serialized() -> None:
-    catalog = legacy_specs.build_static_legacy_adapter_catalog()
+    catalog = legacy_specs.build_static_adapter_catalog()
     for adapter in catalog.ordered_adapters:
         assert repr(adapter) == "<LegacyDeterministicAdapterSpec>"
         with pytest.raises(TypeError, match="transient|serializ"):
@@ -1185,16 +1291,22 @@ def test_initial_component_factory_has_only_final_composition_caller() -> None:
     ]
 
 
-def test_existing_legacy_factory_and_server_loaded_resolver_remain_unchanged() -> None:
-    assert tuple(inspect.signature(legacy_specs.build_legacy_deterministic_catalog).parameters) == (
-        "jd_service",
-        "outcomes",
-    )
+def test_legacy_runtime_exposes_only_final_proof_catalog() -> None:
+    assert not hasattr(legacy_specs, "build_legacy_deterministic_catalog")
+    assert not hasattr(legacy_runtime, "ServerLoadedPending")
+    assert not hasattr(legacy_runtime, "LegacyDeterministicAdapter")
+    assert not hasattr(legacy_runtime, "LegacyProofDeterministicCatalog")
     assert tuple(
         inspect.signature(
             legacy_runtime.LegacyDeterministicCatalog.resolve_server_loaded
         ).parameters
-    ) == ("self", "pending")
+    ) == ("self", "proof")
+    proof_annotation = (
+        inspect.signature(legacy_runtime.LegacyDeterministicCatalog.resolve_server_loaded)
+        .parameters["proof"]
+        .annotation
+    )
+    assert getattr(proof_annotation, "__name__", proof_annotation) == "LegacyRouteProof"
     assert legacy_runtime.LEGACY_DETERMINISTIC_NAMES == frozenset(ORDERED_ADAPTERS)
     assert type(MappingProxyType({})) is MappingProxyType
 
@@ -1326,7 +1438,7 @@ def _legacy_model_and_record_type(adapter_name: str) -> tuple[type[Any], str]:
 
 
 def _static_legacy_adapter(adapter_name: str) -> Any:
-    catalog = legacy_specs.build_static_legacy_adapter_catalog()
+    catalog = legacy_specs.build_static_adapter_catalog()
     return next(adapter for adapter in catalog.ordered_adapters if adapter.name == adapter_name)
 
 

@@ -83,7 +83,7 @@ def _verifier() -> Any:
 def _components() -> Any:
     factory = _factory()
     return factory(
-        catalog=legacy_specs.build_static_legacy_adapter_catalog(),
+        catalog=legacy_specs.build_static_adapter_catalog(),
         legacy_boundary=_boundary(),
         runtime_container_token=object(),
         pending_identity_verifier_port=_verifier(),
@@ -102,7 +102,7 @@ def test_unpublished_factory_builds_one_identity_bound_complete_confirmation_gra
         type(components.pending_identity_verifier_port).__name__
         == "LegacyPendingIdentityVerifierPort"
     )
-    assert type(components.catalog).__name__ == "LegacyProofDeterministicCatalog"
+    assert type(components.catalog).__name__ == "LegacyDeterministicCatalog"
     assert components.proof_issuer.preparation_registry is components.preparation_registry
     assert components.proof_issuer.proof_registry is components.proof_registry
     assert components.proof_consumer_port.proof_registry is components.proof_registry
@@ -135,7 +135,7 @@ def test_confirmation_components_are_sealed_and_do_not_publish_partial_topology(
         components.proof_registry = object()  # type: ignore[misc]
 
     factory = _factory()
-    malformed = legacy_specs.build_static_legacy_adapter_catalog()
+    malformed = legacy_specs.build_static_adapter_catalog()
     object.__setattr__(malformed.ordered_adapters[0], "name", "corrupted")
     returned: list[object] = []
     with pytest.raises((TypeError, ValueError), match="integrity|Catalog|boundary|drift"):
@@ -159,7 +159,7 @@ def test_factory_signature_requires_exact_catalog_boundary_container_and_verifie
         "pending_identity_verifier_port",
     )
     valid = {
-        "catalog": legacy_specs.build_static_legacy_adapter_catalog(),
+        "catalog": legacy_specs.build_static_adapter_catalog(),
         "legacy_boundary": _boundary(),
         "runtime_container_token": object(),
         "pending_identity_verifier_port": _verifier(),
@@ -299,34 +299,25 @@ def test_proof_ports_do_not_accept_name_args_session_repository_or_ledger_key() 
         assert not hasattr(preparation_binding_type, forbidden_name)
 
 
-def test_existing_server_loaded_catalog_signature_and_behavior_are_unchanged() -> None:
-    calls: list[str] = []
-
-    def execute(encoded_args: str) -> str:
-        calls.append(encoded_args)
-        return encoded_args
-
-    adapters = tuple(
-        legacy_runtime.LegacyDeterministicAdapter(
-            name=name,
-            editable_fields=(),
-            describe=lambda encoded: encoded,
-            validate=lambda _encoded: "",
-            execute=execute,
-        )
-        for name in ORDERED_ADAPTERS
-    )
-    catalog = legacy_runtime.LegacyDeterministicCatalog(adapters)
-
+def test_legacy_catalog_has_one_final_proof_only_identity() -> None:
+    assert not hasattr(legacy_runtime, "ServerLoadedPending")
+    assert not hasattr(legacy_runtime, "LegacyDeterministicAdapter")
+    assert not hasattr(legacy_runtime, "LegacyProofDeterministicCatalog")
     assert tuple(
         inspect.signature(
             legacy_runtime.LegacyDeterministicCatalog.resolve_server_loaded
         ).parameters
-    ) == ("self", "pending")
-    for adapter in adapters:
-        pending = SimpleNamespace(tool_name=adapter.name)
-        assert catalog.resolve_server_loaded(pending) is adapter
-    assert catalog.resolve_server_loaded(SimpleNamespace(tool_name="unknown")) is None
-    assert calls == []
+    ) == ("self", "proof")
+    annotation = (
+        inspect.signature(legacy_runtime.LegacyDeterministicCatalog.resolve_server_loaded)
+        .parameters["proof"]
+        .annotation
+    )
+    assert getattr(annotation, "__name__", annotation) == "LegacyRouteProof"
+    adapters = legacy_specs.build_static_adapter_catalog().ordered_adapters
+    assert tuple(adapter.name for adapter in adapters) == ORDERED_ADAPTERS
+    assert all(
+        isinstance(adapter, legacy_runtime.LegacyDeterministicAdapterSpec) for adapter in adapters
+    )
     assert legacy_runtime.LEGACY_DETERMINISTIC_NAMES == frozenset(ORDERED_ADAPTERS)
     assert type(MappingProxyType({})) is MappingProxyType

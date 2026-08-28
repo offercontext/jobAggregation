@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from asyncio import CancelledError
+from contextlib import contextmanager
 import hashlib
 import json
 from dataclasses import dataclass, replace
@@ -9,7 +10,7 @@ from typing import Any, Callable
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import select
 
 from offerpilot.ai.agent_contracts import PendingAction
 from offerpilot.ai.types import Message
@@ -27,9 +28,11 @@ from offerpilot.ai.tool_runtime.contracts import (
 )
 from offerpilot.ai.tool_runtime.catalog import SegmentToolCatalogLease, ToolCatalog
 from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
+from offerpilot.ai.tool_runtime.metadata import CommittedPrimaryOperationIdentityV1
 from offerpilot.ai.write_operations import (
     WriteOperationRepository,
     load_or_create_ledger_key,
+    pending_action_identity,
 )
 from offerpilot.db import init_database
 from offerpilot.models import ChatMessage, Conversation, WriteOperation
@@ -43,6 +46,226 @@ from tests.tool_metadata.factories import (
     synthetic_tool_spec,
     write_metadata,
 )
+from tests.tool_metadata.test_pending_routes import (
+    _api as _pending_api,
+    _initial_legacy_route,
+    _operation_identity,
+    _pending_port,
+    _production_components,
+)
+
+
+@contextmanager
+def typed_pending_route(
+    pending: PendingAction,
+    conversation_id: int,
+    *,
+    claim_token: object | None = None,
+    close_origin_before_yield: bool = False,
+):
+    """Issue one exact production Typed route for a repository test call."""
+
+    components = _production_components()
+    port = _pending_port(components)
+    lease = components.bundle.open_segment_lease()
+    spec = lease.resolve(pending.tool_name)
+    assert spec is not None
+    if pending.arguments_digest is None or pending.pending_action_revision is None:
+        computed_digest, computed_revision = pending_action_identity(
+            pending.tool_call_id,
+            pending.tool_name,
+            pending.args,
+        )
+        arguments_digest = pending.arguments_digest or computed_digest
+        revision = pending.pending_action_revision or computed_revision
+    else:
+        arguments_digest = pending.arguments_digest
+        revision = pending.pending_action_revision
+    claim_id = pending.pending_confirmation_claim_id or pending.operation_id
+    if pending.conversation_id is None:
+        pending.bind_typed_proposal_identity(
+            conversation_id=conversation_id,
+            pending_action_revision=revision,
+            pending_confirmation_claim_id=claim_id,
+            arguments_digest=arguments_digest,
+        )
+    identity = _pending_api("PendingRouteIdentityV1")(
+        conversation_id=conversation_id,
+        operation_id=pending.operation_id,
+        tool_call_id=pending.tool_call_id,
+        tool_name=pending.tool_name,
+        pending_action_revision=revision,
+        pending_confirmation_claim_id=claim_id,
+        arguments_digest=arguments_digest,
+    )
+    exact_claim = claim_token if claim_token is not None else object()
+    operation = components.operation_port.bind_typed_write(
+        lease,
+        spec,
+        _operation_identity(identity),
+        exact_claim,
+    )
+    handle = port.bind_typed_pending(operation, identity, exact_claim)
+    try:
+        if close_origin_before_yield:
+            lease.close()
+        yield handle
+    finally:
+        port.revoke_pending(handle)
+        lease.close()
+
+
+@contextmanager
+def legacy_pending_route(
+    pending: PendingAction,
+    conversation_id: int,
+    *,
+    source: str,
+):
+    """Issue one exact initial Legacy route for a repository test call."""
+
+    components = _production_components()
+    port = _pending_port(components)
+    owner, legacy_route = _initial_legacy_route(components, source)
+    arguments_digest, revision = pending_action_identity(
+        pending.tool_call_id,
+        pending.tool_name,
+        pending.args,
+    )
+    identity = _pending_api("PendingRouteIdentityV1")(
+        conversation_id=conversation_id,
+        operation_id=pending.operation_id,
+        tool_call_id=pending.tool_call_id,
+        tool_name=pending.tool_name,
+        pending_action_revision=revision,
+        pending_confirmation_claim_id=pending.operation_id,
+        arguments_digest=arguments_digest,
+    )
+    operation = components.operation_port.bind_legacy(
+        legacy_route,
+        _operation_identity(identity),
+    )
+    handle = port.bind_legacy_pending(operation, identity)
+    try:
+        yield handle
+    finally:
+        port.revoke_pending(handle)
+        owner.close()
+
+
+@contextmanager
+def clarification_pending_route(pending: PendingAction, conversation_id: int):
+    """Issue one exact operationless clarification route."""
+
+    components = _production_components()
+    port = _pending_port(components)
+    arguments_digest, revision = pending_action_identity(
+        pending.tool_call_id,
+        pending.tool_name,
+        pending.args,
+    )
+    identity = _pending_api("PendingRouteIdentityV1")(
+        conversation_id=conversation_id,
+        operation_id="",
+        tool_call_id=pending.tool_call_id,
+        tool_name="",
+        pending_action_revision=revision,
+        pending_confirmation_claim_id="",
+        arguments_digest=arguments_digest,
+    )
+    handle = port.bind_clarification_pending(identity)
+    try:
+        yield handle
+    finally:
+        port.revoke_pending(handle)
+
+
+def create_primary_with_typed_route(
+    repository: WriteOperationRepository,
+    session: Any,
+    *,
+    operation_id: str,
+    conversation_id: int,
+    tool_call_id: str,
+    tool_name: str,
+    raw_args: str,
+    pending_action_revision: int | None = None,
+    arguments_digest: str | None = None,
+    proposal_fingerprint: str,
+    confirmation_token_fingerprint: str,
+    authorization_scope_fingerprint: str | None = None,
+    agent_run_id: str | None = None,
+):
+    """Create a primary row through a fresh exact Typed Pending route."""
+
+    pending = PendingAction(
+        tool_call_id,
+        tool_name,
+        raw_args,
+        tool_name,
+        operation_id,
+    )
+    if pending_action_revision is not None or arguments_digest is not None:
+        assert pending_action_revision is not None and arguments_digest is not None
+        pending.bind_typed_proposal_identity(
+            conversation_id=conversation_id,
+            pending_action_revision=pending_action_revision,
+            pending_confirmation_claim_id=operation_id,
+            arguments_digest=arguments_digest,
+        )
+    with typed_pending_route(pending, conversation_id) as route_handle:
+        assert pending.pending_action_revision is not None
+        assert pending.pending_confirmation_claim_id is not None
+        assert pending.arguments_digest is not None
+        return repository.create_primary(
+            session,
+            route_handle=route_handle,
+            operation_id=operation_id,
+            conversation_id=conversation_id,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            pending_action_revision=pending.pending_action_revision,
+            pending_confirmation_claim_id=pending.pending_confirmation_claim_id,
+            arguments_digest=pending.arguments_digest,
+            proposal_fingerprint=proposal_fingerprint,
+            confirmation_token_fingerprint=confirmation_token_fingerprint,
+            authorization_scope_fingerprint=authorization_scope_fingerprint,
+            agent_run_id=agent_run_id,
+        )
+
+
+@contextmanager
+def compensation_route(
+    repository: WriteOperationRepository,
+    parent_operation_id: str,
+    compensation_kind: str,
+):
+    """Bind the exact Bundle handler to one durable committed parent."""
+
+    stored = repository.get(parent_operation_id)
+    assert stored is not None
+    assert stored.status == "committed"
+    assert stored.terminal_payload_sha256
+    components = _production_components()
+    binding = next(
+        item
+        for item in components.bundle.compensation_view().ordered_handler_bindings
+        if item.compensation_kind == compensation_kind
+    )
+    handler_handle = components.compensation_registry.bind_handler(binding)
+    parent = CommittedPrimaryOperationIdentityV1(
+        operation_id=stored.id,
+        primary_tool=stored.tool_name,
+        operation_role="primary",
+        adapter_kind=stored.adapter_kind,
+        status="committed",
+        terminal_payload_digest=stored.terminal_payload_sha256,
+    )
+    route_handle = components.operation_port.bind_compensation(parent, handler_handle)
+    try:
+        yield parent, components.operation_port, route_handle, handler_handle
+    finally:
+        components.operation_port.revoke_compensation(route_handle)
 
 
 def _digest(value: object) -> str:
@@ -117,6 +340,94 @@ class PendingHarness:
     def close(self) -> None:
         self.lease.close()
         self.factory.close()
+
+
+def _claim_token(claim: PendingAuthorityClaim) -> object:
+    return claim
+
+
+def _persist_typed(
+    harness: PendingHarness,
+    pending: PendingAction,
+    claim: PendingAuthorityClaim,
+    messages: list[dict[str, str]],
+) -> bool:
+    with typed_pending_route(
+        pending,
+        harness.conversation_id,
+        claim_token=_claim_token(claim),
+    ) as route_handle:
+        return harness.chat.persist_pending_action(
+            harness.conversation_id,
+            pending,
+            messages,
+            route_handle=route_handle,
+        )
+
+
+def _set_typed(
+    harness: PendingHarness,
+    pending: PendingAction,
+    claim: PendingAuthorityClaim,
+) -> bool:
+    with typed_pending_route(
+        pending,
+        harness.conversation_id,
+        claim_token=_claim_token(claim),
+    ) as route_handle:
+        return harness.chat.set_pending_action(
+            harness.conversation_id,
+            pending,
+            route_handle=route_handle,
+        )
+
+
+def _replace_typed(
+    harness: PendingHarness,
+    expected: PendingAction,
+    replacement: PendingAction,
+    claim: PendingAuthorityClaim,
+) -> datetime | None:
+    with typed_pending_route(
+        replacement,
+        harness.conversation_id,
+        claim_token=_claim_token(claim),
+    ) as route_handle:
+        return harness.chat.replace_pending_confirmation(
+            harness.conversation_id,
+            expected,
+            replacement,
+            tool_message=Message(
+                role="tool",
+                content="replace",
+                tool_call_id=expected.tool_call_id,
+            ),
+            undo=None,
+            route_handle=route_handle,
+        )
+
+
+def _continue_typed(
+    harness: PendingHarness,
+    generation: datetime | None,
+    pending: PendingAction,
+    claim: PendingAuthorityClaim,
+    *,
+    expected_pending: PendingAction | None = None,
+) -> datetime | None:
+    with typed_pending_route(
+        pending,
+        harness.conversation_id,
+        claim_token=_claim_token(claim),
+    ) as route_handle:
+        return harness.chat.persist_confirmation_continuation(
+            harness.conversation_id,
+            generation,
+            [],
+            pending=pending,
+            expected_pending=expected_pending,
+            route_handle=route_handle,
+        )
 
 
 def _harness(tmp_path: Any, *, segment_id: str = "segment-pending") -> PendingHarness:
@@ -330,35 +641,16 @@ def _sibling_pending_claim(
     return pending, claim
 
 
-def test_initial_typed_pending_delegates_and_commits_scope_hmac_atomically(
-    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+def test_initial_typed_pending_route_commits_scope_hmac_atomically(
+    tmp_path: Any,
 ) -> None:
     harness = _harness(tmp_path)
-    calls: list[tuple[object, int, PendingAction, PendingAuthorityClaim]] = []
-    original = harness.chat.persist_typed_pending
-
-    def spy(
-        session: object,
-        conversation_id: int,
-        pending: PendingAction,
-        claim: PendingAuthorityClaim,
-    ) -> None:
-        calls.append((session, conversation_id, pending, claim))
-        original(session, conversation_id, pending, claim)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(harness.chat, "persist_typed_pending", spy)
     try:
-        assert harness.chat.persist_pending_action(
-            harness.conversation_id,
-            harness.pending,
-            [{"role": "assistant", "tool_calls": '[{"id":"call"}]'}],
-            pending_authority_claim=harness.claim,
-        )
-        assert len(calls) == 1
-        assert calls[0][1:] == (
-            harness.conversation_id,
+        assert _persist_typed(
+            harness,
             harness.pending,
             harness.claim,
+            [{"role": "assistant", "tool_calls": '[{"id":"call"}]'}],
         )
         assert harness.factory.claim_state(harness.claim) is None
         with harness.sessions() as session:
@@ -394,52 +686,40 @@ def test_initial_typed_pending_delegates_and_commits_scope_hmac_atomically(
         harness.close()
 
 
-def test_initial_typed_pending_survives_origin_segment_lease_close(tmp_path: Any) -> None:
+def test_initial_typed_pending_rejects_revoked_origin_segment_route(tmp_path: Any) -> None:
     harness = _harness(tmp_path, segment_id="segment-closed-before-persist")
     try:
         harness.lease.close()
 
-        assert harness.chat.persist_pending_action(
-            harness.conversation_id,
-            harness.pending,
-            [{"role": "assistant", "tool_calls": '[{"id":"call"}]'}],
-            pending_authority_claim=harness.claim,
-        )
+        with pytest.raises((AuthorityPhaseError, TypeError, ValueError)):
+            with typed_pending_route(
+                harness.pending,
+                harness.conversation_id,
+                claim_token=harness.claim,
+                close_origin_before_yield=True,
+            ) as route_handle:
+                harness.chat.persist_pending_action(
+                    harness.conversation_id,
+                    harness.pending,
+                    [{"role": "assistant", "tool_calls": '[{"id":"call"}]'}],
+                    route_handle=route_handle,
+                )
         assert harness.factory.claim_state(harness.claim) is None
-        operation = harness.operations.get(harness.pending.operation_id)
-        assert operation is not None
-        assert operation.adapter_kind == "typed"
+        assert harness.chat.get_pending_action(harness.conversation_id) is None
+        assert harness.operations.get(harness.pending.operation_id) is None
     finally:
         harness.close()
 
 
 @pytest.mark.parametrize("route", ("set", "replace", "continuation"))
-def test_every_typed_pending_route_delegates_the_exact_claim(
+def test_every_typed_pending_route_consumes_the_exact_claim_handle(
     tmp_path: Any,
-    monkeypatch: pytest.MonkeyPatch,
     route: str,
 ) -> None:
     harness = _harness(tmp_path, segment_id=f"segment-{route}")
-    calls: list[tuple[int, PendingAction, PendingAuthorityClaim]] = []
-    original = harness.chat.persist_typed_pending
-
-    def spy(
-        session: object,
-        conversation_id: int,
-        pending: PendingAction,
-        claim: PendingAuthorityClaim,
-    ) -> None:
-        calls.append((conversation_id, pending, claim))
-        original(session, conversation_id, pending, claim)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(harness.chat, "persist_typed_pending", spy)
     try:
         if route == "set":
-            persisted = harness.chat.set_pending_action(
-                harness.conversation_id,
-                harness.pending,
-                pending_authority_claim=harness.claim,
-            )
+            persisted = _set_typed(harness, harness.pending, harness.claim)
             assert persisted is True
         elif route == "replace":
             expected = PendingAction(
@@ -454,15 +734,8 @@ def test_every_typed_pending_route_delegates_the_exact_claim(
                 conversation.pending_args = expected.args
                 conversation.pending_human = expected.human
                 session.commit()
-            persisted = harness.chat.replace_pending_confirmation(
-                harness.conversation_id,
-                expected,
-                harness.pending,
-                tool_message=Message(role="tool", content="replace", tool_call_id="old-call"),
-                undo=None,
-                pending_authority_claim=harness.claim,
-            )
-            assert persisted is not None
+            with pytest.raises(TypeError, match="parent ownership"):
+                _replace_typed(harness, expected, harness.pending, harness.claim)
         else:
             expected = PendingAction(
                 "old-call", "save_application_jd_version", "{}", "old", str(uuid4())
@@ -478,19 +751,20 @@ def test_every_typed_pending_route_delegates_the_exact_claim(
                 session.commit()
                 generation = conversation.updated_at
             assert generation is not None
-            persisted = harness.chat.persist_confirmation_continuation(
-                harness.conversation_id,
-                generation,
-                [{"role": "assistant", "content": "continue"}],
-                pending=harness.pending,
-                expected_pending=expected,
-                pending_authority_claim=harness.claim,
-            )
-            assert persisted is not None
-        assert calls == [(harness.conversation_id, harness.pending, harness.claim)]
+            with pytest.raises(TypeError, match="parent ownership"):
+                _continue_typed(
+                    harness,
+                    generation,
+                    harness.pending,
+                    harness.claim,
+                    expected_pending=expected,
+                )
         assert harness.factory.claim_state(harness.claim) is None
         operation = harness.operations.get(harness.pending.operation_id)
-        assert operation is not None and operation.authorization_scope_fingerprint is not None
+        if route == "set":
+            assert operation is not None and operation.authorization_scope_fingerprint is not None
+        else:
+            assert operation is None
     finally:
         harness.close()
 
@@ -513,11 +787,11 @@ def test_typed_pending_identity_mismatch_revokes_before_any_durable_write(
     mutate(harness)
     try:
         with pytest.raises(AuthorityPhaseError):
-            harness.chat.persist_pending_action(
-                harness.conversation_id,
+            _persist_typed(
+                harness,
                 harness.pending,
+                harness.claim,
                 [{"role": "assistant", "content": "must rollback"}],
-                pending_authority_claim=harness.claim,
             )
         assert harness.factory.claim_state(harness.claim) is None
         with harness.sessions() as session:
@@ -538,12 +812,18 @@ def test_cross_conversation_claim_is_revoked_before_any_write(tmp_path: Any) -> 
     other = harness.chat.create_conversation("other")
     try:
         with pytest.raises(AuthorityPhaseError):
-            harness.chat.persist_pending_action(
-                other.id,
-                harness.pending,
-                [],
-                pending_authority_claim=harness.claim,
-            )
+            with harness.factory.claim_lifecycle(harness.claim):
+                with typed_pending_route(
+                    harness.pending,
+                    other.id,
+                    claim_token=_claim_token(harness.claim),
+                ) as route_handle:
+                    harness.chat.persist_pending_action(
+                        other.id,
+                        harness.pending,
+                        [],
+                        route_handle=route_handle,
+                    )
         assert harness.factory.claim_state(harness.claim) is None
         assert harness.chat.get_pending_action(other.id) is None
         assert harness.operations.get(harness.pending.operation_id) is None
@@ -562,12 +842,7 @@ def test_scope_revision_change_revokes_claim_and_rolls_back(tmp_path: Any) -> No
     assert changed is not None and changed.scope_revision == 1
     try:
         with pytest.raises(AuthorityPhaseError):
-            harness.chat.persist_pending_action(
-                harness.conversation_id,
-                harness.pending,
-                [],
-                pending_authority_claim=harness.claim,
-            )
+            _persist_typed(harness, harness.pending, harness.claim, [])
         assert harness.factory.claim_state(harness.claim) is None
         assert harness.chat.get_pending_action(harness.conversation_id) is None
         assert harness.operations.get(harness.pending.operation_id) is None
@@ -582,22 +857,14 @@ def test_cas_loser_revokes_claim_and_does_not_leave_operation(tmp_path: Any) -> 
         {"archived_at": datetime.now(timezone.utc)},
     )
     try:
-        assert (
-            harness.chat.persist_pending_action(
-                harness.conversation_id,
-                harness.pending,
-                [],
-                pending_authority_claim=harness.claim,
-            )
-            is False
-        )
+        assert _persist_typed(harness, harness.pending, harness.claim, []) is False
         assert harness.factory.claim_state(harness.claim) is None
         assert harness.operations.get(harness.pending.operation_id) is None
     finally:
         harness.close()
 
 
-def test_typed_pending_without_claim_fails_closed_but_exact_legacy_remains_unbound(
+def test_operation_pending_without_exact_route_handle_fails_closed_for_typed_and_legacy(
     tmp_path: Any,
 ) -> None:
     sessions = init_database(tmp_path / "legacy.db")
@@ -612,7 +879,7 @@ def test_typed_pending_without_claim_fails_closed_but_exact_legacy_remains_unbou
         "typed",
         str(uuid4()),
     )
-    with pytest.raises(AuthorityPhaseError):
+    with pytest.raises(TypeError):
         chat.persist_pending_action(conversation.id, typed, [])
     assert chat.get_pending_action(conversation.id) is None
     assert operations.get(typed.operation_id) is None
@@ -624,11 +891,10 @@ def test_typed_pending_without_claim_fails_closed_but_exact_legacy_remains_unbou
         "legacy",
         str(uuid4()),
     )
-    assert chat.persist_pending_action(conversation.id, legacy, [])
-    operation = operations.get(legacy.operation_id)
-    assert operation is not None
-    assert operation.adapter_kind == "legacy_deterministic"
-    assert operation.authorization_scope_fingerprint is None
+    with pytest.raises((AuthorityPhaseError, TypeError, ValueError)):
+        chat.persist_pending_action(conversation.id, legacy, [])
+    assert chat.get_pending_action(conversation.id) is None
+    assert operations.get(legacy.operation_id) is None
 
 
 @pytest.mark.parametrize("route", ("set", "initial", "replace", "continuation"))
@@ -668,11 +934,20 @@ def test_typed_name_without_operation_id_fails_closed_on_every_pending_route(
             session.commit()
             generation = row.updated_at
 
-    with pytest.raises(AuthorityPhaseError):
+    with pytest.raises(TypeError, match="exact route handle"):
         if route == "set":
-            chat.set_pending_action(conversation.id, replacement)
+            chat.set_pending_action(
+                conversation.id,
+                replacement,
+                route_handle=object(),
+            )
         elif route == "initial":
-            chat.persist_pending_action(conversation.id, replacement, [])
+            chat.persist_pending_action(
+                conversation.id,
+                replacement,
+                [],
+                route_handle=object(),
+            )
         elif route == "replace":
             assert expected is not None
             chat.replace_pending_confirmation(
@@ -681,6 +956,7 @@ def test_typed_name_without_operation_id_fails_closed_on_every_pending_route(
                 replacement,
                 Message(role="tool", content="replace", tool_call_id=expected.tool_call_id),
                 None,
+                route_handle=object(),
             )
         else:
             assert expected is not None and generation is not None
@@ -690,6 +966,7 @@ def test_typed_name_without_operation_id_fails_closed_on_every_pending_route(
                 [],
                 pending=replacement,
                 expected_pending=expected,
+                route_handle=object(),
             )
 
     persisted = chat.get_pending_action(conversation.id)
@@ -701,21 +978,24 @@ def test_typed_name_without_operation_id_fails_closed_on_every_pending_route(
         assert list(session.scalars(select(WriteOperation))) == []
 
 
-def test_direct_typed_operation_helper_revokes_claim_without_creating_orphan(
+def test_direct_typed_pending_route_rejects_without_creating_orphan(
     tmp_path: Any,
 ) -> None:
     harness = _harness(tmp_path)
     try:
-        with harness.sessions() as session:
-            session.execute(text("BEGIN IMMEDIATE"))
-            with pytest.raises(AuthorityPhaseError):
-                harness.chat.persist_typed_pending(
-                    session,
-                    harness.conversation_id,
+        with pytest.raises(AuthorityPhaseError):
+            with harness.factory.claim_lifecycle(harness.claim):
+                with typed_pending_route(
                     harness.pending,
-                    harness.claim,
-                )
-            session.rollback()
+                    harness.conversation_id,
+                    claim_token=_claim_token(harness.claim),
+                ) as route_handle:
+                    harness.chat.persist_pending_action(
+                        harness.conversation_id,
+                        harness.pending,
+                        [],
+                        route_handle=route_handle,
+                    )
         assert harness.factory.claim_state(harness.claim) is None
         assert harness.chat.get_pending_action(harness.conversation_id) is None
         assert harness.operations.get(harness.pending.operation_id) is None
@@ -728,12 +1008,18 @@ def test_missing_operation_repository_revokes_claim_before_return(tmp_path: Any)
     unconfigured = ChatRepository(harness.sessions)
     try:
         with pytest.raises(AuthorityPhaseError):
-            unconfigured.persist_pending_action(
-                harness.conversation_id,
-                harness.pending,
-                [],
-                pending_authority_claim=harness.claim,
-            )
+            with harness.factory.claim_lifecycle(harness.claim):
+                with typed_pending_route(
+                    harness.pending,
+                    harness.conversation_id,
+                    claim_token=_claim_token(harness.claim),
+                ) as route_handle:
+                    unconfigured.persist_pending_action(
+                        harness.conversation_id,
+                        harness.pending,
+                        [],
+                        route_handle=route_handle,
+                    )
         assert harness.factory.claim_state(harness.claim) is None
         assert harness.chat.get_pending_action(harness.conversation_id) is None
         assert harness.operations.get(harness.pending.operation_id) is None
@@ -744,24 +1030,11 @@ def test_missing_operation_repository_revokes_claim_before_return(tmp_path: Any)
 def test_missing_generation_revokes_claim_and_prevents_reuse(tmp_path: Any) -> None:
     harness = _harness(tmp_path)
     try:
-        assert (
-            harness.chat.persist_confirmation_continuation(
-                harness.conversation_id,
-                None,
-                [],
-                pending=harness.pending,
-                pending_authority_claim=harness.claim,
-            )
-            is None
-        )
+        with pytest.raises(TypeError, match="parent ownership"):
+            _continue_typed(harness, None, harness.pending, harness.claim)
         assert harness.factory.claim_state(harness.claim) is None
         with pytest.raises(AuthorityPhaseError):
-            harness.chat.persist_pending_action(
-                harness.conversation_id,
-                harness.pending,
-                [],
-                pending_authority_claim=harness.claim,
-            )
+            _persist_typed(harness, harness.pending, harness.claim, [])
         assert harness.chat.get_pending_action(harness.conversation_id) is None
         assert harness.operations.get(harness.pending.operation_id) is None
     finally:
@@ -774,16 +1047,8 @@ def test_second_valid_claim_cannot_overwrite_first_pending_or_orphan_its_operati
     harness = _harness(tmp_path)
     second, second_claim = _sibling_pending_claim(harness)
     try:
-        assert harness.chat.set_pending_action(
-            harness.conversation_id,
-            harness.pending,
-            pending_authority_claim=harness.claim,
-        )
-        assert not harness.chat.set_pending_action(
-            harness.conversation_id,
-            second,
-            pending_authority_claim=second_claim,
-        )
+        assert _set_typed(harness, harness.pending, harness.claim)
+        assert not _set_typed(harness, second, second_claim)
         assert harness.factory.claim_state(second_claim) is None
         assert harness.chat.get_pending_action(harness.conversation_id) == harness.pending
         assert harness.operations.get(harness.pending.operation_id) is not None
@@ -807,26 +1072,19 @@ def test_typed_replacement_cas_loser_reports_failure_and_revokes_claim(
     )
     try:
         if route == "replace":
-            persisted = harness.chat.replace_pending_confirmation(
-                harness.conversation_id,
-                expected,
-                harness.pending,
-                Message(role="tool", content="replace", tool_call_id=expected.tool_call_id),
-                None,
-                pending_authority_claim=harness.claim,
-            )
+            with pytest.raises(TypeError, match="parent ownership"):
+                _replace_typed(harness, expected, harness.pending, harness.claim)
         else:
             conversation = harness.chat.get_conversation(harness.conversation_id)
             assert conversation is not None and conversation.updated_at is not None
-            persisted = harness.chat.persist_confirmation_continuation(
-                harness.conversation_id,
-                conversation.updated_at,
-                [],
-                pending=harness.pending,
-                expected_pending=expected,
-                pending_authority_claim=harness.claim,
-            )
-        assert persisted is None
+            with pytest.raises(TypeError, match="parent ownership"):
+                _continue_typed(
+                    harness,
+                    conversation.updated_at,
+                    harness.pending,
+                    harness.claim,
+                    expected_pending=expected,
+                )
         assert harness.factory.claim_state(harness.claim) is None
         assert harness.chat.get_pending_action(harness.conversation_id) is None
         assert harness.operations.get(harness.pending.operation_id) is None
@@ -842,12 +1100,17 @@ def test_coordinator_closed_short_circuit_revokes_claim(tmp_path: Any) -> None:
         {"archived_at": datetime.now(timezone.utc)},
     )
     try:
-        result = coordinator.persist_initial_pending(
-            harness.conversation_id,
-            [],
+        with typed_pending_route(
             harness.pending,
-            harness.claim,
-        )
+            harness.conversation_id,
+            claim_token=harness.claim,
+        ) as route_handle:
+            result = coordinator.persist_initial_pending(
+                harness.conversation_id,
+                [],
+                harness.pending,
+                route_handle=route_handle,
+            )
         assert result.status is PersistenceStatus.CLOSED
         assert harness.factory.claim_state(harness.claim) is None
         assert harness.operations.get(harness.pending.operation_id) is None
@@ -864,14 +1127,14 @@ def test_cancellation_revokes_claim_and_rolls_back_every_write(
     def cancel(*_args: object, **_kwargs: object) -> None:
         raise CancelledError
 
-    monkeypatch.setattr(harness.chat, "persist_typed_pending", cancel)
+    monkeypatch.setattr(harness.operations, "create_primary", cancel)
     try:
         with pytest.raises(CancelledError):
-            harness.chat.persist_pending_action(
-                harness.conversation_id,
+            _persist_typed(
+                harness,
                 harness.pending,
+                harness.claim,
                 [{"role": "assistant", "content": "must rollback"}],
-                pending_authority_claim=harness.claim,
             )
         assert harness.factory.claim_state(harness.claim) is None
         assert harness.chat.get_pending_action(harness.conversation_id) is None
@@ -915,12 +1178,17 @@ def test_post_commit_cancellation_keeps_atom_and_consumes_claim(
     monkeypatch.setattr(harness.factory, "revoke", revoke)
     try:
         with pytest.raises(CancelledError):
-            coordinator.persist_initial_pending(
-                harness.conversation_id,
-                [],
+            with typed_pending_route(
                 harness.pending,
-                harness.claim,
-            )
+                harness.conversation_id,
+                claim_token=harness.claim,
+            ) as route_handle:
+                coordinator.persist_initial_pending(
+                    harness.conversation_id,
+                    [],
+                    harness.pending,
+                    route_handle=route_handle,
+                )
         assert consumes == [harness.claim]
         assert revokes == []
         assert harness.factory.claim_state(harness.claim) is None

@@ -20,12 +20,7 @@ from offerpilot.ai.tool_authority.fingerprint import authorization_scope_fingerp
 from offerpilot.ai.tool_authority.visibility import AuthorityApplicationVisibilityQuery
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.policy_types import ToolCapability
-from offerpilot.ai.tool_runtime.catalog import compile_tool_metadata_manifest
-from offerpilot.ai.tool_runtime.contracts import (
-    ConfirmationRequired,
-    TransientToolRuntimeValue,
-)
-from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
+from offerpilot.ai.tool_runtime.contracts import ConfirmationRequired
 from offerpilot.ai.tool_runtime.pipeline import execute_prepared, prepare_call
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 from offerpilot.ai.types import Message, ToolCall
@@ -47,7 +42,6 @@ from offerpilot.pilot_runtime.continuation import (
     ConfirmationReplayError,
 )
 from offerpilot.pilot_runtime.composition import _AgentDriver
-from offerpilot.pilot_runtime.compensation import prepare_compensation_handler_components
 from offerpilot.pilot_runtime.contracts import (
     ConfirmationRequest,
     PreparedStreamExecution,
@@ -65,27 +59,12 @@ from offerpilot.repositories.jd import JDAnalysesRepository
 from offerpilot.repositories.notes import NoteCreate, NotesRepository
 from offerpilot.repositories.offers import OffersRepository
 from offerpilot.repositories.resumes import ResumesRepository
+from tests.tool_authority.test_pending_claim import create_primary_with_typed_route
+from tests.tool_metadata.test_production_bundle import _production_components
 
 
-def _production_metadata_bundle() -> ToolMetadataBundleV1:
-    manifest = compile_tool_metadata_manifest(MODEL_TOOL_CATALOG.specs)
-    return ToolMetadataBundleV1(
-        typed_catalog=MODEL_TOOL_CATALOG,
-        manifest=manifest,
-        legacy_boundary=manifest.to_dict()["legacy_boundary"],  # type: ignore[arg-type]
-        compensation=prepare_compensation_handler_components().metadata_projection(),
-    )
-
-
-_METADATA_BUNDLE = _production_metadata_bundle()
-
-
-class _MetadataComponents(TransientToolRuntimeValue):
-    def __init__(self, bundle: ToolMetadataBundleV1) -> None:
-        self.bundle = bundle
-
-
-_METADATA_COMPONENTS = _MetadataComponents(_METADATA_BUNDLE)
+_METADATA_COMPONENTS = _production_components()
+_METADATA_BUNDLE = _METADATA_COMPONENTS.bundle
 
 
 def _revision(tool_call_id: str, tool_name: str, raw_args: str) -> int:
@@ -130,13 +109,14 @@ def _approval_harness(tmp_path) -> SimpleNamespace:
         owner.pending_tool_name = pending.tool_name
         owner.pending_args = raw_args
         owner.pending_human = pending.human
-        repository.create_primary(
+        create_primary_with_typed_route(
+            repository,
             session,
             operation_id=operation_id,
             conversation_id=conversation.id,
             tool_call_id=pending.tool_call_id,
             tool_name=pending.tool_name,
-            adapter_kind="typed",
+            raw_args=raw_args,
             proposal_fingerprint=proposal_fingerprint,
             confirmation_token_fingerprint=token_fingerprint,
             authorization_scope_fingerprint=authorization_scope_fingerprint(
@@ -211,6 +191,28 @@ def _approval_context_resolver(harness: SimpleNamespace):
     return resolve_context
 
 
+def _confirmation_dependencies(
+    harness: SimpleNamespace,
+    approval_context_resolver,
+) -> ConfirmationDependencies:
+    return ConfirmationDependencies(
+        persistence=ChatPersistenceCoordinator(harness.chat),
+        write_operations=harness.repository,
+        write_coordinator=harness.coordinator,
+        catalog=MODEL_TOOL_CATALOG,
+        operation_port=_METADATA_COMPONENTS.operation_port,
+        pending_persistence_route_port=(_METADATA_COMPONENTS.pending_persistence_route_port),
+        approval_context_resolver=approval_context_resolver,
+    )
+
+
+def _approval_route(harness: SimpleNamespace):
+    lease = _METADATA_BUNDLE.open_segment_lease()
+    spec_handle = lease.resolve(harness.pending.tool_name)
+    assert spec_handle is not None
+    return lease, spec_handle
+
+
 def test_production_approve_modify_invokes_minimal_resolver_before_source(
     tmp_path, monkeypatch
 ) -> None:
@@ -234,14 +236,9 @@ def test_production_approve_modify_invokes_minimal_resolver_before_source(
 
     monkeypatch.setattr(ApprovalAuthorityResolver, "resolve", tracked_resolve)
     coordinator = ConfirmationCoordinator(
-        ConfirmationDependencies(
-            persistence=ChatPersistenceCoordinator(harness.chat),
-            write_operations=harness.repository,
-            write_coordinator=harness.coordinator,
-            catalog=MODEL_TOOL_CATALOG,
-            approval_context_resolver=_approval_context_resolver(harness),
-        )
+        _confirmation_dependencies(harness, _approval_context_resolver(harness))
     )
+    catalog_lease, spec_handle = _approval_route(harness)
 
     session = coordinator.approve_modify(
         ConfirmationRequest(
@@ -252,7 +249,8 @@ def test_production_approve_modify_invokes_minimal_resolver_before_source(
         ),
         pending=harness.pending,
         conversation=conversation,
-        catalog=MODEL_TOOL_CATALOG,
+        catalog_lease=catalog_lease,
+        spec_handle=spec_handle,
     )
 
     try:
@@ -262,6 +260,7 @@ def test_production_approve_modify_invokes_minimal_resolver_before_source(
         assert source_calls == 0
     finally:
         session.approval_context.authority_factory.close()
+        catalog_lease.close()
 
 
 def test_real_typed_approval_uses_canonical_visibility_in_both_snapshots(
@@ -345,6 +344,7 @@ def test_real_typed_approval_uses_canonical_visibility_in_both_snapshots(
             context=context,
             prepare_identity=prepare_identity,
             request_fingerprint=harness.request_fingerprint,
+            parent_route_binder=None,
         )
 
         assert isinstance(execution, OperationCommitted)
@@ -387,13 +387,7 @@ def test_runtime_real_typed_origin_is_provider_and_source_free(tmp_path) -> None
         return context
 
     coordinator = ConfirmationCoordinator(
-        ConfirmationDependencies(
-            persistence=ChatPersistenceCoordinator(harness.chat),
-            write_operations=harness.repository,
-            write_coordinator=harness.coordinator,
-            catalog=MODEL_TOOL_CATALOG,
-            approval_context_resolver=tracked_approval_context,
-        )
+        _confirmation_dependencies(harness, tracked_approval_context)
     )
 
     class Conversations:
@@ -487,14 +481,9 @@ def test_production_agent_driver_retains_approval_context_seals(tmp_path) -> Non
     conversation = harness.chat.get_conversation(harness.conversation.id)
     assert conversation is not None
     coordinator = ConfirmationCoordinator(
-        ConfirmationDependencies(
-            persistence=ChatPersistenceCoordinator(harness.chat),
-            write_operations=harness.repository,
-            write_coordinator=harness.coordinator,
-            catalog=MODEL_TOOL_CATALOG,
-            approval_context_resolver=_approval_context_resolver(harness),
-        )
+        _confirmation_dependencies(harness, _approval_context_resolver(harness))
     )
+    approval_lease, approval_spec_handle = _approval_route(harness)
     session = coordinator.approve_modify(
         ConfirmationRequest(
             conversation_id=conversation.id,
@@ -504,7 +493,8 @@ def test_production_agent_driver_retains_approval_context_seals(tmp_path) -> Non
         ),
         pending=harness.pending,
         conversation=conversation,
-        catalog=MODEL_TOOL_CATALOG,
+        catalog_lease=approval_lease,
+        spec_handle=approval_spec_handle,
     )
     origin = session.approval_context
     context = origin.with_runtime_dependencies(
@@ -557,6 +547,7 @@ def test_production_agent_driver_retains_approval_context_seals(tmp_path) -> Non
         assert rebound.operation_executor is session.execute_operation
     finally:
         catalog_lease.close()
+        approval_lease.close()
         origin.authority_factory.close()
 
 
@@ -565,14 +556,9 @@ def test_unclaimed_timeout_closes_approval_authority(tmp_path) -> None:
     conversation = harness.chat.get_conversation(harness.conversation.id)
     assert conversation is not None
     coordinator = ConfirmationCoordinator(
-        ConfirmationDependencies(
-            persistence=ChatPersistenceCoordinator(harness.chat),
-            write_operations=harness.repository,
-            write_coordinator=harness.coordinator,
-            catalog=MODEL_TOOL_CATALOG,
-            approval_context_resolver=_approval_context_resolver(harness),
-        )
+        _confirmation_dependencies(harness, _approval_context_resolver(harness))
     )
+    catalog_lease, spec_handle = _approval_route(harness)
     session = coordinator.approve_modify(
         ConfirmationRequest(
             conversation_id=conversation.id,
@@ -582,7 +568,8 @@ def test_unclaimed_timeout_closes_approval_authority(tmp_path) -> None:
         ),
         pending=harness.pending,
         conversation=conversation,
-        catalog=MODEL_TOOL_CATALOG,
+        catalog_lease=catalog_lease,
+        spec_handle=spec_handle,
     )
     context = session.approval_context
 
@@ -590,6 +577,7 @@ def test_unclaimed_timeout_closes_approval_authority(tmp_path) -> None:
     assert session.state.active is False
     with pytest.raises(AuthorityPhaseError, match="closed"):
         _ = context.scope_constraint
+    catalog_lease.close()
 
 
 @pytest.mark.parametrize("transport_mode", ("sync", "stream"))
@@ -607,13 +595,7 @@ def test_replay_exit_closes_approval_authority(
         return context
 
     coordinator = ConfirmationCoordinator(
-        ConfirmationDependencies(
-            persistence=ChatPersistenceCoordinator(harness.chat),
-            write_operations=harness.repository,
-            write_coordinator=harness.coordinator,
-            catalog=MODEL_TOOL_CATALOG,
-            approval_context_resolver=tracked_approval_context,
-        )
+        _confirmation_dependencies(harness, tracked_approval_context)
     )
 
     class Conversations:

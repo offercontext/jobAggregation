@@ -67,13 +67,14 @@ from offerpilot.ai.tool_runtime.metadata import (
 from offerpilot.ai.tool_runtime.protocol_seals import verify_legacy_boundary
 from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 from offerpilot.ai.tool_specs.legacy import (
-    build_legacy_deterministic_catalog,
-    build_static_legacy_adapter_catalog,
+    build_static_adapter_catalog,
 )
 from offerpilot.ai.write_operations import (
+    PendingPersistenceRoutePort,
     WriteOperationCoordinator,
     WriteOperationError,
     WriteOperationRepository,
+    build_pending_persistence_route_port,
 )
 from offerpilot.agent_runtime.journal import NullRunRecorder, RunRecorderFactory
 from offerpilot.ai.types import Message
@@ -1156,6 +1157,7 @@ class ProductionToolMetadataComponents(TransientToolRuntimeValue):
     __slots__ = (
         "_bundle",
         "_operation_port",
+        "_pending_persistence_route_port",
         "_compensation_registry",
         "_initial_routes",
         "_confirmation_routes",
@@ -1164,6 +1166,7 @@ class ProductionToolMetadataComponents(TransientToolRuntimeValue):
     )
     _bundle: ToolMetadataBundleV1
     _operation_port: ToolOperationMetadataPort
+    _pending_persistence_route_port: PendingPersistenceRoutePort
     _compensation_registry: CompensationHandlerRegistry
     _initial_routes: LegacyInitialRouteComponents
     _confirmation_routes: LegacyConfirmationRouteComponents
@@ -1185,6 +1188,7 @@ class ProductionToolMetadataComponents(TransientToolRuntimeValue):
         *,
         bundle: ToolMetadataBundleV1,
         operation_port: ToolOperationMetadataPort,
+        pending_persistence_route_port: PendingPersistenceRoutePort,
         compensation_registry: CompensationHandlerRegistry,
         initial_routes: LegacyInitialRouteComponents,
         confirmation_routes: LegacyConfirmationRouteComponents,
@@ -1195,6 +1199,7 @@ class ProductionToolMetadataComponents(TransientToolRuntimeValue):
         values = (
             bundle,
             operation_port,
+            pending_persistence_route_port,
             compensation_registry,
             initial_routes,
             confirmation_routes,
@@ -1214,6 +1219,7 @@ class ProductionToolMetadataComponents(TransientToolRuntimeValue):
             current = (
                 self._bundle,
                 self._operation_port,
+                self._pending_persistence_route_port,
                 self._compensation_registry,
                 self._initial_routes,
                 self._confirmation_routes,
@@ -1231,6 +1237,7 @@ class ProductionToolMetadataComponents(TransientToolRuntimeValue):
             token = self._bundle.bundle_instance_token
             if (
                 self._operation_port.bundle_instance_token is not token
+                or self._pending_persistence_route_port.bundle_instance_token is not token
                 or self._compensation_registry.bundle_instance_token is not token
                 or self._initial_routes.initial_route_port.bundle_instance_token is not token
                 or self._confirmation_routes.bundle_instance_token is not token
@@ -1252,6 +1259,11 @@ class ProductionToolMetadataComponents(TransientToolRuntimeValue):
     def operation_port(self) -> ToolOperationMetadataPort:
         self._ensure_integrity()
         return self._operation_port
+
+    @property
+    def pending_persistence_route_port(self) -> PendingPersistenceRoutePort:
+        self._ensure_integrity()
+        return self._pending_persistence_route_port
 
     @property
     def compensation_registry(self) -> CompensationHandlerRegistry:
@@ -1280,10 +1292,10 @@ def build_production_tool_metadata_components(
     manifest = compile_tool_metadata_manifest(MODEL_TOOL_CATALOG.specs)
     manifest_projection = manifest.to_dict()
     expected_legacy = manifest_projection["legacy_boundary"]
-    legacy_catalog = build_static_legacy_adapter_catalog()
-    actual_legacy = _legacy_manifest_from_adapters(legacy_catalog)
+    adapter_catalog = build_static_adapter_catalog()
+    actual_legacy = _legacy_manifest_from_adapters(adapter_catalog)
     verify_legacy_boundary(
-        tuple(adapter.name for adapter in legacy_catalog.ordered_adapters),
+        tuple(adapter.name for adapter in adapter_catalog.ordered_adapters),
         "forbidden",
         "legacy_deterministic",
     )
@@ -1298,7 +1310,7 @@ def build_production_tool_metadata_components(
     )
     runtime_container_token = object()
     initial_routes = build_unpublished_legacy_initial_route_components(
-        catalog=legacy_catalog,
+        catalog=adapter_catalog,
         legacy_boundary=bundle.legacy_boundary(),
         runtime_container_token=runtime_container_token,
     )
@@ -1306,7 +1318,7 @@ def build_production_tool_metadata_components(
     if not _same_canonical_projection(actual_initial, expected_legacy):
         raise ValueError("actual Legacy initial-route policy does not match the exact Manifest")
     confirmation_routes = build_unpublished_legacy_confirmation_components(
-        catalog=legacy_catalog,
+        catalog=adapter_catalog,
         legacy_boundary=bundle.legacy_boundary(),
         runtime_container_token=runtime_container_token,
         pending_identity_verifier_port=pending_identity_verifier_port,
@@ -1324,10 +1336,14 @@ def build_production_tool_metadata_components(
         compensation_registry=compensation_registry,
         legacy_route_issuer_port=legacy_route_verifier,
     )
+    pending_persistence_route_port = build_pending_persistence_route_port(
+        operation_port=operation_port
+    )
     return ProductionToolMetadataComponents(
         _PRODUCTION_METADATA_COMPONENT_SEAL,
         bundle=bundle,
         operation_port=operation_port,
+        pending_persistence_route_port=pending_persistence_route_port,
         compensation_registry=compensation_registry,
         initial_routes=initial_routes,
         confirmation_routes=confirmation_routes,
@@ -1517,7 +1533,6 @@ def build_pilot_runtime(
     clarification_message: Callable[[tuple[PendingAction, str] | None, str], object | None],
     page_context_messages: Callable[[Mapping[str, object] | None], Sequence[object]],
     missing_target_question: Callable[..., str | None] | None = None,
-    pending_action_details: Callable[[PendingAction], Mapping[str, object]] | None = None,
     title_from_message: Callable[[str], str] | None = None,
     catalog: object = MODEL_TOOL_CATALOG,
     application_visible: Callable[[int], bool] | None = None,
@@ -1582,8 +1597,9 @@ def build_pilot_runtime(
             application_outcomes=application_outcomes,
             write_operations=write_operations,
             write_coordinator=write_coordinator,
-            chat=chat,
-            legacy_catalog_factory=cast(Any, build_legacy_deterministic_catalog),
+            legacy_confirmation_routes=metadata_components.confirmation_routes,
+            operation_port=metadata_components.operation_port,
+            pending_persistence_route_port=metadata_components.pending_persistence_route_port,
             legacy_request_owner_lease_factory=initial_routes.owner_lease_factory,
             legacy_initial_route_port=initial_routes.initial_route_port,
             legacy_jd_clarification_issuer=initial_routes.initial_issuer_for(
@@ -1653,6 +1669,8 @@ def build_pilot_runtime(
             persistence=cast(Any, persistence),
             write_operations=cast(Any, write_operations),
             write_coordinator=cast(Any, write_coordinator),
+            operation_port=metadata_components.operation_port,
+            pending_persistence_route_port=metadata_components.pending_persistence_route_port,
             catalog=catalog,
             approval_context_resolver=resolve_approval_context,
             transactional_delivery=transactional_delivery,
@@ -1680,7 +1698,6 @@ def build_pilot_runtime(
         discovery_metadata_view=metadata_bundle.discovery_view(),
         authority_metadata_view=metadata_bundle.authority_view(),
         missing_target_question=missing_target_question,
-        pending_action_details=pending_action_details,
         application_visible=visible,
         deterministic=deterministic,
         confirmation_coordinator=confirmation,

@@ -17,11 +17,12 @@ from __future__ import annotations
 
 import inspect
 import json
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from hashlib import sha256
 from secrets import compare_digest
-from typing import Any, Protocol, cast
+from typing import Any, Protocol, TypeVar, cast
 from uuid import UUID, uuid4
 
 from offerpilot.ai.agent_contracts import PendingAction
@@ -40,15 +41,27 @@ from offerpilot.ai.tool_runtime.contracts import JSONValue
 from offerpilot.ai.tool_runtime.legacy import (
     LegacyInitialRouteIssuer,
     LegacyInitialRoutePort,
-    LegacyDeterministicAdapter,
-    LegacyDeterministicCatalog,
     LEGACY_DETERMINISTIC_NAMES,
+    LegacyPendingPresentationV1,
     RuntimeRequestOwnerLeaseFactory,
-    prepare_legacy_arguments,
 )
-from offerpilot.ai.tool_specs.legacy import build_legacy_deterministic_catalog
+from offerpilot.ai.tool_runtime.legacy_proof import (
+    LegacyApprovedConfirmationInput,
+    LegacyConfirmationLookupIdentity,
+    LegacyPreparedInputPort,
+    LegacyRouteIssuanceLease,
+    PreparedLegacyCall,
+    PreparedLegacyInputV1,
+)
+from offerpilot.ai.tool_runtime.metadata import OperationRouteIdentityV1, ToolOperationMetadataPort
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.ai.write_operations import (
+    DeliveryOwnership,
+    LegacyApprovedBoundRoute,
+    LegacyApprovedRouteBinder,
+    PendingPersistenceRouteHandle,
+    PendingPersistenceRoutePort,
+    PendingRouteIdentityV1,
     LedgerOperationPreheader,
     OperationCommitted,
     OperationFailed,
@@ -57,7 +70,11 @@ from offerpilot.ai.write_operations import (
     WriteOperationError,
     ledger_fingerprint,
     operation_request_fingerprint,
+    pending_action_identity,
 )
+from sqlalchemy.orm import Session
+from offerpilot.repositories.application_jd_versions import ApplicationJDService
+from offerpilot.repositories.applications import ApplicationsRepository
 
 from .contracts import (
     AssistantMessageEvent,
@@ -78,10 +95,16 @@ from .contracts import (
     StatusEvent,
     StreamExecutionMode,
     UserMessageSavedEvent,
+    LegacyExecutionContext,
+    LegacyReadContext,
     WriteStatus,
     freeze_json_mapping,
 )
 from .errors import RuntimeFailureCode
+from .legacy_route import (
+    LegacyConfirmationRouteComponents,
+    LegacyPersistedPresentationPort,
+)
 from .persistence import PersistenceResult, PersistenceStatus
 
 
@@ -97,49 +120,7 @@ _CANCELLED_TOOL_RESULT = json.dumps(
     {"status": "cancelled", "message": "用户取消了该操作，未执行。"},
     ensure_ascii=False,
 )
-
-# Task8 closed compatibility source: ``build_legacy_deterministic_catalog``
-# currently keeps these schemas inside its builder and exposes no public,
-# immutable editable-fields constant.  Keep this bridge-local projection
-# closed and lock it against that legacy source in the focused test suite.
-_LEGACY_EDITABLE_FIELDS: dict[str, tuple[dict[str, JSONValue], ...]] = {
-    "save_application_jd_version": (
-        {"field": "jd_text", "type": "long_text"},
-        {
-            "field": "source_url",
-            "type": "string",
-            "clearable": True,
-            "clear_value": None,
-        },
-    ),
-    "create_application_submission_snapshot": (
-        {"field": "submitted_at", "type": "datetime"},
-        {"field": "note", "type": "long_text"},
-    ),
-    "record_application_outcome": (
-        {
-            "field": "stage",
-            "type": "enum",
-            "options": ["applied", "closed", "interview", "offer", "screening", "written_test"],
-        },
-        {
-            "field": "result",
-            "type": "enum",
-            "options": [
-                "advanced",
-                "no_response",
-                "offer_received",
-                "other",
-                "rejected",
-                "withdrawn",
-            ],
-        },
-        {"field": "feedback_text", "type": "long_text"},
-        {"field": "reflection_text", "type": "long_text"},
-        {"field": "next_action_text", "type": "long_text"},
-        {"field": "occurred_at", "type": "datetime"},
-    ),
-}
+_InitialRouteResult = TypeVar("_InitialRouteResult")
 
 
 class _Persistence(Protocol):
@@ -150,7 +131,12 @@ class _Persistence(Protocol):
     def persist_initial_user_message(self, conversation_id: int, content: str) -> object: ...
 
     def persist_initial_pending(
-        self, conversation_id: int, messages: Sequence[object], pending: PendingAction
+        self,
+        conversation_id: int,
+        messages: Sequence[object],
+        pending: PendingAction,
+        *,
+        route_handle: object,
     ) -> object: ...
 
     def persist_clarification(
@@ -159,20 +145,32 @@ class _Persistence(Protocol):
         messages: Sequence[object],
         pending: PendingAction,
         question: str,
+        *,
+        route_handle: object,
     ) -> object: ...
 
     def clear_pending_clarification(self, conversation_id: int) -> object: ...
 
     def persist_assistant_message(self, conversation_id: int, content: str) -> object: ...
 
+    def persist_confirmation_delivery(
+        self,
+        conversation_id: int,
+        ownership: object | None,
+        origin_tool_message: Message,
+        continuation: Sequence[Message],
+        chained_pending: PendingAction | None,
+        *,
+        route_handle: PendingPersistenceRouteHandle | None,
+        expected_pending: PendingAction,
+        claim_id: str,
+        undo: dict[str, Any] | None,
+    ) -> object: ...
+
 
 @dataclass(frozen=True, slots=True)
 class DeterministicDependencies:
-    """Server-owned dependencies for :class:`DeterministicPilotAdapter`.
-
-    ``legacy_catalog_factory`` is a factory rather than a general ToolCatalog:
-    this keeps the three closed Legacy names out of the model Tool Surface.
-    """
+    """Server-owned dependencies for :class:`DeterministicPilotAdapter`."""
 
     persistence: _Persistence
     applications: object
@@ -180,7 +178,6 @@ class DeterministicDependencies:
     application_outcomes: object
     write_operations: object | None = None
     write_coordinator: object | None = None
-    chat: object | None = None
     legacy_request_owner_lease_factory: RuntimeRequestOwnerLeaseFactory | None = field(
         default=None, repr=False, compare=False
     )
@@ -199,7 +196,15 @@ class DeterministicDependencies:
     legacy_outcome_recording_issuer: LegacyInitialRouteIssuer | None = field(
         default=None, repr=False, compare=False
     )
-    legacy_catalog_factory: Callable[[object, object], LegacyDeterministicCatalog] | None = None
+    legacy_confirmation_routes: LegacyConfirmationRouteComponents | None = field(
+        default=None, repr=False, compare=False
+    )
+    operation_port: ToolOperationMetadataPort | None = field(
+        default=None, repr=False, compare=False
+    )
+    pending_persistence_route_port: PendingPersistenceRoutePort | None = field(
+        default=None, repr=False, compare=False
+    )
     id_factory: Callable[[], str] = field(default=lambda: uuid4().hex, repr=False, compare=False)
     key_factory: Callable[[], str] = field(default=lambda: uuid4().hex, repr=False, compare=False)
 
@@ -262,6 +267,242 @@ class _DeterministicConfirmationPreflight:
     @property
     def operation(self) -> object | None:
         return self.preheader.operation if self.preheader is not None else None
+
+
+class _ApprovedLegacyBoundRoute:
+    __slots__ = (
+        "_routes",
+        "_session",
+        "_lease",
+        "_prepared",
+        "_operation_port",
+        "_pending_port",
+        "_pending_identity",
+        "_parent_route_handle",
+        "_on_prepared",
+        "_on_bound",
+        "_projected",
+        "_executed",
+        "_jd_service",
+        "_outcomes_repository",
+    )
+
+    def __init__(
+        self,
+        *,
+        routes: LegacyConfirmationRouteComponents,
+        session: Session,
+        lease: LegacyRouteIssuanceLease,
+        prepared: PreparedLegacyCall,
+        operation_port: ToolOperationMetadataPort,
+        pending_port: PendingPersistenceRoutePort,
+        pending_identity: PendingRouteIdentityV1,
+        on_prepared: Callable[[PreparedLegacyInputV1], object],
+        on_bound: Callable[[object], object] | None,
+        jd_service: object,
+        outcomes_repository: object,
+    ) -> None:
+        self._routes = routes
+        self._session = session
+        self._lease = lease
+        self._prepared = prepared
+        self._operation_port = operation_port
+        self._pending_port = pending_port
+        self._pending_identity = pending_identity
+        self._parent_route_handle: object | None = None
+        self._on_prepared = on_prepared
+        self._on_bound = on_bound
+        self._projected = False
+        self._executed = False
+        self._jd_service = jd_service
+        self._outcomes_repository = outcomes_repository
+
+    def prepared_call(self) -> PreparedLegacyCall:
+        return self._prepared
+
+    def prepared_input_port(self) -> LegacyPreparedInputPort:
+        return self._routes.prepared_input_port
+
+    def accept_prepared_input(
+        self,
+        prepared: PreparedLegacyCall,
+        projected: PreparedLegacyInputV1,
+    ) -> None:
+        if (
+            self._projected
+            or prepared is not self._prepared
+            or type(projected) is not PreparedLegacyInputV1
+        ):
+            raise WriteOperationError("operation_not_committed", retryable=True)
+        self._projected = True
+        self._on_prepared(projected)
+
+    def execute(self, prepared: PreparedLegacyCall) -> str:
+        if self._executed or not self._projected:
+            raise WriteOperationError("operation_not_committed", retryable=True)
+        if prepared is not self._prepared:
+            raise WriteOperationError("operation_not_committed", retryable=True)
+        self._executed = True
+        verifier = self._routes.pending_identity_verifier_port
+        locked = verifier.locked_recheck(
+            self._session,
+            self._lease,
+            self._prepared,
+        )
+        claim = verifier.bind_claim(
+            self._session,
+            self._lease,
+            locked,
+        )
+        proof = self._routes.proof_issuer.issue_after_claim(
+            self._session,
+            self._lease,
+            claim,
+            self._prepared,
+        )
+        handle = self._routes.catalog.resolve_server_loaded(proof)
+        identity = self._pending_identity
+        operation_handle = self._operation_port.bind_legacy(
+            handle,
+            OperationRouteIdentityV1(
+                operation_id=identity.operation_id,
+                tool_call_id=identity.tool_call_id,
+                revision=identity.pending_action_revision,
+                arguments_digest=identity.arguments_digest,
+            ),
+        )
+        try:
+            self._parent_route_handle = self._pending_port.bind_primary_parent(
+                operation_handle,
+                identity,
+            )
+            context = LegacyExecutionContext(
+                self._session,
+                cast(Any, self._jd_service),
+                cast(Any, self._outcomes_repository),
+            )
+            return self._routes.proof_consumer_port.execute(
+                handle,
+                context,
+                before_execute=self._record_bound_journal,
+            )
+        finally:
+            self._operation_port.revoke_legacy(operation_handle)
+
+    def _record_bound_journal(self) -> None:
+        if self._on_bound is not None:
+            self._on_bound(self._session)
+
+    def primary_parent_route_handle(self) -> object:
+        handle = self._parent_route_handle
+        if handle is None:
+            raise WriteOperationError("operation_not_committed", retryable=True)
+        self._parent_route_handle = None
+        return handle
+
+    def _revoke_unclaimed_parent(self) -> None:
+        handle = self._parent_route_handle
+        self._parent_route_handle = None
+        if handle is not None:
+            self._pending_port.revoke_pending(handle)
+
+
+class _ApprovedLegacyRouteContext(AbstractContextManager[LegacyApprovedBoundRoute]):
+    __slots__ = (
+        "_routes",
+        "_write_session",
+        "_session_factory",
+        "_lookup",
+        "_confirmation_input",
+        "_operation_port",
+        "_pending_port",
+        "_pending_identity",
+        "_on_prepared",
+        "_on_bound",
+        "_jd_service",
+        "_outcomes_repository",
+        "_lease",
+        "_bound_route",
+    )
+
+    def __init__(
+        self,
+        *,
+        routes: LegacyConfirmationRouteComponents,
+        write_session: Session,
+        session_factory: Callable[[], AbstractContextManager[Session]],
+        lookup: LegacyConfirmationLookupIdentity,
+        confirmation_input: LegacyApprovedConfirmationInput,
+        operation_port: ToolOperationMetadataPort,
+        pending_port: PendingPersistenceRoutePort,
+        pending_identity: PendingRouteIdentityV1,
+        on_prepared: Callable[[PreparedLegacyInputV1], object],
+        on_bound: Callable[[object], object] | None,
+        jd_service: object,
+        outcomes_repository: object,
+    ) -> None:
+        self._routes = routes
+        self._write_session = write_session
+        self._session_factory = session_factory
+        self._lookup = lookup
+        self._confirmation_input = confirmation_input
+        self._operation_port = operation_port
+        self._pending_port = pending_port
+        self._pending_identity = pending_identity
+        self._on_prepared = on_prepared
+        self._on_bound = on_bound
+        self._jd_service = jd_service
+        self._outcomes_repository = outcomes_repository
+        self._lease: LegacyRouteIssuanceLease | None = None
+        self._bound_route: _ApprovedLegacyBoundRoute | None = None
+
+    def __enter__(self) -> LegacyApprovedBoundRoute:
+        with self._session_factory() as read_session:
+            with read_session.begin():
+                prepared = self._routes.proof_issuer.prepare_server_loaded(
+                    read_session,
+                    self._lookup,
+                    self._confirmation_input,
+                )
+        lease = self._routes.pending_identity_verifier_port.open_issuance_lease(
+            self._write_session,
+            prepared,
+        )
+        try:
+            bound_route = _ApprovedLegacyBoundRoute(
+                routes=self._routes,
+                session=self._write_session,
+                lease=lease,
+                prepared=prepared,
+                operation_port=self._operation_port,
+                pending_port=self._pending_port,
+                pending_identity=self._pending_identity,
+                on_prepared=self._on_prepared,
+                on_bound=self._on_bound,
+                jd_service=self._jd_service,
+                outcomes_repository=self._outcomes_repository,
+            )
+        except BaseException:
+            self._lease = None
+            self._bound_route = None
+            lease.close()
+            raise
+        self._lease = lease
+        self._bound_route = bound_route
+        return bound_route
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        del exc_type, exc, traceback
+        bound_route = self._bound_route
+        self._bound_route = None
+        lease = self._lease
+        self._lease = None
+        try:
+            if bound_route is not None:
+                bound_route._revoke_unclaimed_parent()
+        finally:
+            if lease is not None:
+                lease.close()
 
 
 def _attribute(value: object, name: str, default: object = None) -> object:
@@ -493,18 +734,16 @@ def _pending_messages(pending: PendingAction, user_message: str | None = None) -
 def _confirmation_payload(
     pending: PendingAction,
     *,
-    details: Mapping[str, object] | None = None,
+    presentation: LegacyPendingPresentationV1,
 ) -> PendingActionPayload:
     return PendingActionPayload(
         tool_name=pending.tool_name,
         operation_id=pending.operation_id or pending.tool_call_id,
-        human=pending.human,
+        human=presentation.human,
         args=freeze_json_mapping(_safe_args(pending.args)),
         confirmation_token=_confirmation_token(pending),
-        editable_fields=tuple(
-            freeze_json_mapping(item) for item in _LEGACY_EDITABLE_FIELDS.get(pending.tool_name, ())
-        ),
-        details=freeze_json_mapping(details or {}),
+        editable_fields=tuple(freeze_json_mapping(item) for item in presentation.editable_fields),
+        details=freeze_json_mapping(presentation.details),
     )
 
 
@@ -586,9 +825,14 @@ class DeterministicPilotAdapter:
         self,
         issuer: LegacyInitialRouteIssuer | None,
         *,
-        expected_adapter_name: str,
-        body: Callable[[], DeterministicExecution],
-    ) -> DeterministicExecution:
+        conversation_id: int,
+        pending: PendingAction,
+        clarification: bool = False,
+        body: Callable[
+            [PendingPersistenceRouteHandle, LegacyPendingPresentationV1 | None],
+            _InitialRouteResult,
+        ],
+    ) -> _InitialRouteResult:
         owner_factory = self.dependencies.legacy_request_owner_lease_factory
         port = self.dependencies.legacy_initial_route_port
         if type(owner_factory) is not RuntimeRequestOwnerLeaseFactory:
@@ -602,9 +846,81 @@ class DeterministicPilotAdapter:
                 token = issuer.issue(request_lease)
                 handle = port.resolve_initial(token)
                 binding = port.require_route(handle)
-                if binding.name != expected_adapter_name:
+                if binding.name != pending.tool_name:
                     raise ValueError("Legacy initial route resolved the wrong Adapter")
-                return body()
+                presentation = None
+                if not clarification:
+                    with self._legacy_read_context() as (_read_session, read_context):
+                        presentation = port.project_pending(
+                            handle,
+                            encoded_args=pending.args,
+                            context=read_context,
+                        )
+                operation_port = self.dependencies.operation_port
+                pending_port = self.dependencies.pending_persistence_route_port
+                if type(operation_port) is not ToolOperationMetadataPort:
+                    raise TypeError("deterministic entry requires the exact operation Port")
+                if type(pending_port) is not PendingPersistenceRoutePort:
+                    raise TypeError("deterministic entry requires the exact Pending route Port")
+                digest, revision = pending_action_identity(
+                    pending.tool_call_id,
+                    pending.tool_name,
+                    pending.args,
+                )
+                pending_identity = PendingRouteIdentityV1(
+                    conversation_id=conversation_id,
+                    operation_id="" if clarification else pending.operation_id,
+                    tool_call_id=pending.tool_call_id,
+                    tool_name="" if clarification else pending.tool_name,
+                    pending_action_revision=revision,
+                    pending_confirmation_claim_id=("" if clarification else pending.operation_id),
+                    arguments_digest=digest,
+                )
+                persistence_handle: PendingPersistenceRouteHandle | None = None
+                operation_handle = None
+                try:
+                    if clarification:
+                        persistence_handle = pending_port.bind_clarification_pending(
+                            pending_identity
+                        )
+                    else:
+                        operation_handle = operation_port.bind_legacy(
+                            handle,
+                            OperationRouteIdentityV1(
+                                operation_id=pending.operation_id,
+                                tool_call_id=pending.tool_call_id,
+                                revision=revision,
+                                arguments_digest=digest,
+                            ),
+                        )
+                        persistence_handle = pending_port.bind_legacy_pending(
+                            operation_handle,
+                            pending_identity,
+                        )
+                    return body(persistence_handle, presentation)
+                finally:
+                    if persistence_handle is not None:
+                        pending_port.revoke_pending(persistence_handle)
+                    if operation_handle is not None:
+                        operation_port.revoke_legacy(operation_handle)
+
+    @contextmanager
+    def _legacy_read_context(self) -> Iterator[tuple[Session, LegacyReadContext]]:
+        coordinator = self.dependencies.write_coordinator
+        repository = getattr(coordinator, "repository", None)
+        session_factory = getattr(repository, "session_factory", None)
+        if not callable(session_factory):
+            raise TypeError("Legacy presentation requires the exact write Session factory")
+        with session_factory() as session:
+            with session.begin():
+                yield (
+                    session,
+                    LegacyReadContext(
+                        session,
+                        ApplicationsRepository(session_factory),
+                        ApplicationJDService(session_factory),
+                    ),
+                )
 
     def matches(self, request: StartTurnRequest, conversation: object) -> bool:
         if request.pilot_action is not None:
@@ -796,6 +1112,10 @@ class DeterministicPilotAdapter:
             execution = self._confirmation_required(
                 existing,
                 conversation_id,
+                presentation=self._persisted_legacy_presentation(
+                    existing,
+                    conversation_id,
+                ),
                 pending_replay=True,
             )
             return self._with_transport_initial(execution, transport)
@@ -814,6 +1134,7 @@ class DeterministicPilotAdapter:
                 return self._confirmation_required(
                     existing,
                     conversation_id,
+                    presentation=self._historical_pending_presentation(existing),
                     pending_replay=True,
                 )
             pending = (
@@ -838,11 +1159,14 @@ class DeterministicPilotAdapter:
             )
             return self._run_initial_route(
                 issuer,
-                expected_adapter_name=pending.tool_name,
-                body=lambda: self._persist_pending(
+                conversation_id=conversation_id,
+                pending=pending,
+                body=lambda route_handle, presentation: self._persist_pending(
                     conversation_id,
                     request.message,
                     pending,
+                    route_handle=route_handle,
+                    presentation=presentation,
                     on_user_message_persisted=on_user_message_persisted,
                 ),
             )
@@ -871,6 +1195,7 @@ class DeterministicPilotAdapter:
                 return self._confirmation_required(
                     existing,
                     conversation_id,
+                    presentation=self._historical_pending_presentation(existing),
                     pending_replay=True,
                 )
             return DeterministicExecution(
@@ -902,12 +1227,15 @@ class DeterministicPilotAdapter:
             )
             return self._run_initial_route(
                 self.dependencies.legacy_jd_clarification_issuer,
-                expected_adapter_name=pending.tool_name,
-                body=lambda: self._persist_clarification(
+                conversation_id=conversation_id,
+                pending=pending,
+                clarification=True,
+                body=lambda route_handle, _presentation: self._persist_clarification(
                     conversation_id,
                     request.message,
                     pending,
                     decision.question,
+                    route_handle=route_handle,
                     on_user_message_persisted=on_user_message_persisted,
                 ),
             )
@@ -960,11 +1288,14 @@ class DeterministicPilotAdapter:
         )
         return self._run_initial_route(
             issuer,
-            expected_adapter_name=pending.tool_name,
-            body=lambda: self._persist_pending(
+            conversation_id=conversation_id,
+            pending=pending,
+            body=lambda route_handle, presentation: self._persist_pending(
                 conversation_id,
                 request.message,
                 pending,
+                route_handle=route_handle,
+                presentation=presentation,
                 on_user_message_persisted=on_user_message_persisted,
             ),
         )
@@ -996,6 +1327,7 @@ class DeterministicPilotAdapter:
         *,
         transport: RuntimeTransportContext | None = None,
         on_confirmation_attempt: Callable[[PendingAction, bool], object] | None = None,
+        on_confirmation_bound: Callable[[object], object] | None = None,
         on_tool_result: Callable[[PendingAction, str, bool], object] | None = None,
         preflight: _DeterministicConfirmationPreflight | None = None,
     ) -> DeterministicExecution:
@@ -1110,63 +1442,37 @@ class DeterministicPilotAdapter:
                 preparation_kind=PreparationKind.DETERMINISTIC_CONFIRMATION,
             )
 
-        adapter = self._legacy_adapter(pending)
-        if adapter is None:
-            return DeterministicExecution(
-                _error(
-                    RuntimeFailureCode.OPERATION_IDENTITY_CONFLICT,
-                    "pending action is no longer available",
-                    409,
-                ),
-                preparation_kind=PreparationKind.DETERMINISTIC_CONFIRMATION,
-            )
-        edited = (
-            None
-            if request.edited_args.is_missing()
-            else cast(Mapping[str, JSONValue], dict(request.edited_args.as_mapping))
-        )
         if request.approved:
-            try:
-                effective_args, human = prepare_legacy_arguments(adapter, pending.args, edited)
-            except ValueError as exc:
-                return DeterministicExecution(
-                    _error(
-                        RuntimeFailureCode.INVALID_CONFIRMATION,
-                        f"invalid confirmation edits: {exc}",
-                        422,
-                    ),
-                    preparation_kind=PreparationKind.DETERMINISTIC_CONFIRMATION,
+            projected_pending: list[PendingAction] = []
+
+            def accept_prepared_input(projected: PreparedLegacyInputV1) -> None:
+                if projected_pending:
+                    raise WriteOperationError("operation_not_committed", retryable=True)
+                effective_pending = PendingAction(
+                    pending.tool_call_id,
+                    pending.tool_name,
+                    projected.encoded_args,
+                    projected.confirmation_human,
+                    pending.operation_id,
                 )
-            effective_pending = PendingAction(
-                pending.tool_call_id,
-                pending.tool_name,
-                effective_args,
-                human,
-                pending.operation_id,
-            )
-            validation_error = adapter.validate(effective_args)
-            if validation_error:
-                return DeterministicExecution(
-                    _error(
-                        RuntimeFailureCode.APPLICATION_JD_INVALID_REQUEST, validation_error, 422
-                    ),
-                    preparation_kind=PreparationKind.DETERMINISTIC_CONFIRMATION,
-                )
-            if on_confirmation_attempt is not None:
-                on_confirmation_attempt(effective_pending, True)
-            input_fingerprint = ledger_fingerprint(
-                cast(Any, operations).key,
-                "write-operation-legacy-input-v1",
-                cast(Any, json.loads(effective_args)),
-            )
+                projected_pending.append(effective_pending)
+                if on_confirmation_attempt is not None:
+                    on_confirmation_attempt(effective_pending, True)
+
             execution = cast(Any, coordinator).execute_legacy(
                 operation_id=pending.operation_id,
                 conversation_id=conversation_id,
                 tool_call_id=pending.tool_call_id,
                 tool_name=pending.tool_name,
-                input_fingerprint=input_fingerprint,
                 request_fingerprint=fingerprint,
-                executor=self._executor(adapter, effective_pending),
+                route_binder=self._approved_route_binder(
+                    conversation_id=conversation_id,
+                    pending=pending,
+                    request=request,
+                    confirmation_token=token,
+                    on_prepared=accept_prepared_input,
+                    on_bound=on_confirmation_bound,
+                ),
             )
             if isinstance(execution, OperationUnknown):
                 return DeterministicExecution(
@@ -1187,6 +1493,17 @@ class DeterministicPilotAdapter:
                     ),
                     preparation_kind=PreparationKind.DETERMINISTIC_CONFIRMATION,
                 )
+            if len(projected_pending) != 1:
+                return DeterministicExecution(
+                    _error(
+                        RuntimeFailureCode.OPERATION_RESULT_UNKNOWN,
+                        "写入结果暂时无法确认，请保留确认卡后重试。",
+                        503,
+                        retryable=True,
+                    ),
+                    preparation_kind=PreparationKind.DETERMINISTIC_CONFIRMATION,
+                )
+            effective_pending = projected_pending[0]
             result = execution.payload.visible_result
             succeeded = execution.payload.status == "committed"
             if on_tool_result is not None:
@@ -1457,8 +1774,19 @@ class DeterministicPilotAdapter:
         user_message: str,
         pending: PendingAction,
         *,
+        route_handle: object,
+        presentation: LegacyPendingPresentationV1 | None,
         on_user_message_persisted: Callable[[int], object] | None,
     ) -> DeterministicExecution:
+        if type(presentation) is not LegacyPendingPresentationV1:
+            raise TypeError("Legacy Pending persistence requires exact presentation")
+        pending = PendingAction(
+            pending.tool_call_id,
+            pending.tool_name,
+            pending.args,
+            presentation.human,
+            pending.operation_id,
+        )
         user_result = self.dependencies.persistence.persist_initial_user_message(
             conversation_id,
             user_message,
@@ -1472,10 +1800,15 @@ class DeterministicPilotAdapter:
             conversation_id,
             _pending_messages(pending),
             pending,
+            route_handle=route_handle,
         )
         if not _result_ok(result):
             return DeterministicExecution(self._persistence_error(result))
-        return self._confirmation_required(pending, conversation_id)
+        return self._confirmation_required(
+            pending,
+            conversation_id,
+            presentation=presentation,
+        )
 
     def _persist_clarification(
         self,
@@ -1484,6 +1817,7 @@ class DeterministicPilotAdapter:
         pending: PendingAction,
         question: str,
         *,
+        route_handle: object,
         on_user_message_persisted: Callable[[int], object] | None,
     ) -> DeterministicExecution:
         result = self.dependencies.persistence.persist_clarification(
@@ -1491,6 +1825,7 @@ class DeterministicPilotAdapter:
             [Message(role="user", content=user_message)],
             pending,
             question,
+            route_handle=route_handle,
         )
         if not _result_ok(result):
             return DeterministicExecution(self._persistence_error(result))
@@ -1557,11 +1892,12 @@ class DeterministicPilotAdapter:
         pending: PendingAction,
         conversation_id: int,
         *,
+        presentation: LegacyPendingPresentationV1,
         operation_id: str | None = None,
         replayed: bool = False,
         pending_replay: bool | None = None,
     ) -> DeterministicExecution:
-        payload = _confirmation_payload(pending, details=self._pending_details(pending))
+        payload = _confirmation_payload(pending, presentation=presentation)
         outcome = ConfirmationRequiredOutcome(
             confirmation_token=payload.confirmation_token,
             conversation_id=conversation_id,
@@ -1583,52 +1919,56 @@ class DeterministicPilotAdapter:
             pending_replay=replayed if pending_replay is None else pending_replay,
         )
 
-    def _pending_details(self, pending: PendingAction) -> dict[str, object]:
-        """Build the small deterministic card metadata without model tools."""
+    @staticmethod
+    def _historical_pending_presentation(
+        pending: PendingAction,
+    ) -> LegacyPendingPresentationV1:
+        """Render immutable historical delivery data without live metadata lookup."""
 
-        if pending.tool_name != "save_application_jd_version":
-            return {}
-        args = _safe_args(pending.args)
-        application_id = args.get("application_id")
-        if type(application_id) is not int:
-            return {}
-        getter = _callable(self.dependencies.applications, ("get", "find"))
-        application = (
-            _invoke(
-                getter, {"application_id": application_id, "id": application_id}, (application_id,)
-            )
-            if getter is not None
-            else None
+        return LegacyPendingPresentationV1(
+            human=pending.human,
+            editable_fields=(),
+            details={},
         )
-        if application is None:
-            return {}
-        target = {
-            "id": f"application-{application_id}",
-            "kind": "application",
-            "title": str(_attribute(application, "company_name", "")),
-            "meta": str(_attribute(application, "position_name", "")),
-            "source": "pending_action",
-        }
-        details: dict[str, object] = {"target": target, "evidence": [target]}
-        expected = args.get("expected_current_version_id")
-        version = None
-        if type(expected) is int:
-            getter = _callable(self.dependencies.application_jd_versions, ("get_version",))
-            if getter is not None:
-                version = _invoke(
-                    getter,
-                    {"application_id": application_id, "version_id": expected},
-                    (application_id, expected),
-                )
-        raw_current_number = (
-            _attribute(version, "version_number", None) if version is not None else None
+
+    def _persisted_legacy_presentation(
+        self,
+        pending: PendingAction,
+        conversation_id: int,
+    ) -> LegacyPendingPresentationV1:
+        routes = self.dependencies.legacy_confirmation_routes
+        if type(routes) is not LegacyConfirmationRouteComponents:
+            raise TypeError("Legacy Pending replay requires exact confirmation routes")
+        port = routes.persisted_presentation_port
+        if type(port) is not LegacyPersistedPresentationPort:
+            raise TypeError("Legacy Pending replay requires exact presentation Port")
+        lookup = LegacyConfirmationLookupIdentity(conversation_id=conversation_id)
+        confirmation_input = LegacyApprovedConfirmationInput(
+            decision="approved",
+            operation_id=pending.operation_id,
+            confirmation_token=_confirmation_token(pending),
+            edited_args_present=False,
+            edited_args=None,
+            rejection_feedback_present=False,
+            rejection_feedback="",
         )
-        current_number = raw_current_number if type(raw_current_number) is int else None
-        details["application_jd"] = {
-            "current_version_number": current_number,
-            "proposed_version_number": (current_number or 0) + 1,
-        }
-        return details
+        coordinator = self.dependencies.write_coordinator
+        session_factory = getattr(
+            getattr(coordinator, "repository", None),
+            "session_factory",
+            None,
+        )
+        if not callable(session_factory):
+            raise TypeError("Legacy Pending replay requires the exact write Session factory")
+        with session_factory() as identity_session:
+            with identity_session.begin():
+                with self._legacy_read_context() as (_read_session, read_context):
+                    return port.project_pending(
+                        identity_session,
+                        lookup,
+                        confirmation_input,
+                        read_context,
+                    )
 
     def _with_transport_initial(
         self,
@@ -1650,53 +1990,78 @@ class DeterministicPilotAdapter:
 
     # ---- Legacy write/ledger ---------------------------------------------
 
-    def _legacy_catalog(self) -> LegacyDeterministicCatalog:
-        factory = self.dependencies.legacy_catalog_factory
-        if factory is not None:
-            return factory(
-                self.dependencies.application_jd_versions, self.dependencies.application_outcomes
-            )
-        return cast(
-            LegacyDeterministicCatalog,
-            cast(Any, build_legacy_deterministic_catalog)(
-                self.dependencies.application_jd_versions,
-                self.dependencies.application_outcomes,
+    def _approved_route_binder(
+        self,
+        *,
+        conversation_id: int,
+        pending: PendingAction,
+        request: ConfirmationRequest,
+        confirmation_token: str,
+        on_prepared: Callable[[PreparedLegacyInputV1], object],
+        on_bound: Callable[[object], object] | None,
+    ) -> LegacyApprovedRouteBinder:
+        routes = self.dependencies.legacy_confirmation_routes
+        coordinator = self.dependencies.write_coordinator
+        if type(routes) is not LegacyConfirmationRouteComponents or coordinator is None:
+            raise WriteOperationError("operation_unavailable")
+        operation_port = self.dependencies.operation_port
+        pending_port = self.dependencies.pending_persistence_route_port
+        if (
+            type(operation_port) is not ToolOperationMetadataPort
+            or type(pending_port) is not PendingPersistenceRoutePort
+        ):
+            raise WriteOperationError("operation_unavailable")
+        arguments_digest, revision = pending_action_identity(
+            pending.tool_call_id,
+            pending.tool_name,
+            pending.args,
+        )
+        pending_identity = PendingRouteIdentityV1(
+            conversation_id=conversation_id,
+            operation_id=pending.operation_id,
+            tool_call_id=pending.tool_call_id,
+            tool_name=pending.tool_name,
+            pending_action_revision=revision,
+            pending_confirmation_claim_id=pending.operation_id,
+            arguments_digest=arguments_digest,
+        )
+        lookup = LegacyConfirmationLookupIdentity(conversation_id=conversation_id)
+        confirmation_input = LegacyApprovedConfirmationInput(
+            decision="approved",
+            operation_id=pending.operation_id,
+            confirmation_token=confirmation_token,
+            edited_args_present=not request.edited_args.is_missing(),
+            edited_args=(
+                None if request.edited_args.is_missing() else dict(request.edited_args.as_mapping)
             ),
+            rejection_feedback_present=False,
+            rejection_feedback="",
         )
 
-    def _legacy_adapter(self, pending: PendingAction) -> LegacyDeterministicAdapter | None:
-        if pending.tool_name not in LEGACY_DETERMINISTIC_NAMES:
-            return None
-        return self._legacy_catalog().resolve_server_loaded(pending)
-
-    def _executor(
-        self,
-        adapter: LegacyDeterministicAdapter,
-        pending: PendingAction,
-    ) -> Callable[[object], str]:
-        def execute(session: object) -> str:
-            jd_service = self._bind(self.dependencies.application_jd_versions, session)
-            outcome_repo = self._bind(self.dependencies.application_outcomes, session)
-            factory = self.dependencies.legacy_catalog_factory
-            catalog = (
-                cast(Any, factory)
-                if factory is not None
-                else cast(Any, build_legacy_deterministic_catalog)
-            )(
-                jd_service,
-                outcome_repo,
+        def bind(write_session: Session) -> AbstractContextManager[LegacyApprovedBoundRoute]:
+            session_factory = getattr(
+                getattr(coordinator, "repository", None),
+                "session_factory",
+                None,
             )
-            loaded = catalog.resolve_server_loaded(pending)
-            if loaded is None:
-                raise ValueError("operation_identity_conflict")
-            return cast(str, loaded.execute(pending.args))
+            if not callable(session_factory):
+                raise WriteOperationError("operation_unavailable")
+            return _ApprovedLegacyRouteContext(
+                routes=routes,
+                write_session=write_session,
+                session_factory=cast(Any, session_factory),
+                lookup=lookup,
+                confirmation_input=confirmation_input,
+                operation_port=operation_port,
+                pending_port=pending_port,
+                pending_identity=pending_identity,
+                on_prepared=on_prepared,
+                on_bound=on_bound,
+                jd_service=self.dependencies.application_jd_versions,
+                outcomes_repository=self.dependencies.application_outcomes,
+            )
 
-        return execute
-
-    @staticmethod
-    def _bind(value: object, session: object) -> object:
-        binder = _callable(value, ("bind",))
-        return binder(session) if binder is not None else value
+        return bind
 
     def _request_fingerprint(
         self, pending: PendingAction, request: ConfirmationRequest, token: str
@@ -1769,9 +2134,12 @@ class DeterministicPilotAdapter:
             "operation_input_conflict": RuntimeFailureCode.OPERATION_INPUT_CONFLICT,
             "operation_identity_conflict": RuntimeFailureCode.OPERATION_IDENTITY_CONFLICT,
             "operation_unavailable": RuntimeFailureCode.OPERATION_UNAVAILABLE,
+            "invalid_confirmation": RuntimeFailureCode.INVALID_CONFIRMATION,
         }
         code = code_map.get(exc.code, RuntimeFailureCode.OPERATION_FAILED)
-        if code in {
+        if code is RuntimeFailureCode.INVALID_CONFIRMATION:
+            status = 422
+        elif code in {
             RuntimeFailureCode.OPERATION_DELIVERY_PENDING,
             RuntimeFailureCode.OPERATION_INPUT_CONFLICT,
             RuntimeFailureCode.OPERATION_IDENTITY_CONFLICT,
@@ -1819,7 +2187,7 @@ class DeterministicPilotAdapter:
         message: str,
         write_status: WriteStatus,
         *,
-        undo: object = {},
+        undo: dict[str, Any] | None = None,
     ) -> DeterministicExecution:
         result = self._resolve_pending(
             conversation_id,
@@ -1875,43 +2243,41 @@ class DeterministicPilotAdapter:
         message: str,
         ownership: object | None,
         *,
-        undo: object = {},
+        undo: dict[str, Any] | None = None,
     ) -> bool | None:
-        target = self.dependencies.chat or self.dependencies.persistence
-        function = _callable(target, ("resolve_pending_confirmation", "resolve_pending"))
-        if function is not None:
-            value = _invoke(
-                function,
-                {
-                    "conversation_id": conversation_id,
-                    "expected": pending,
-                    "pending": pending,
-                    "tool_message": origin,
-                    "undo": undo,
-                    "claim_id": pending.operation_id,
-                    "terminal_assistant_content": message,
-                    "delivery_ownership": ownership,
-                },
-                (conversation_id, pending, origin, {}),
+        try:
+            return self._resolve_pending_delivery(
+                conversation_id,
+                pending,
+                origin,
+                message,
+                ownership,
+                undo=undo,
             )
-            return None if value is None else True
-        # A Runtime persistence coordinator can expose the atomic delivery
-        # facade without exposing a ChatRepository.
-        function = _callable(target, ("persist_confirmation_delivery",))
-        if function is None:
-            return False
-        value = _invoke(
-            function,
-            {
-                "conversation_id": conversation_id,
-                "ownership": ownership,
-                "origin_tool_message": origin,
-                "continuation": [Message(role="assistant", content=message)],
-                "expected_pending": pending,
-                "claim_id": pending.operation_id,
-                "undo": undo,
-            },
-            (conversation_id, ownership, origin, [Message(role="assistant", content=message)]),
+        finally:
+            if type(ownership) is DeliveryOwnership:
+                ownership.revoke_parent_route()
+
+    def _resolve_pending_delivery(
+        self,
+        conversation_id: int,
+        pending: PendingAction,
+        origin: Message,
+        message: str,
+        ownership: object | None,
+        *,
+        undo: dict[str, Any] | None,
+    ) -> bool | None:
+        value = self.dependencies.persistence.persist_confirmation_delivery(
+            conversation_id,
+            ownership,
+            origin,
+            (Message(role="assistant", content=message),),
+            None,
+            route_handle=None,
+            expected_pending=pending,
+            claim_id=pending.operation_id,
+            undo=undo,
         )
         if _result_ok(value):
             return True
@@ -1947,7 +2313,7 @@ class DeterministicPilotAdapter:
                         id_factory=self.dependencies.id_factory,
                         key_factory=self.dependencies.key_factory,
                     )
-                    replaced = self._replace_pending(
+                    replaced, replacement_presentation = self._replace_pending(
                         conversation_id,
                         pending,
                         replacement,
@@ -1966,6 +2332,8 @@ class DeterministicPilotAdapter:
                             preparation_kind=PreparationKind.DETERMINISTIC_CONFIRMATION,
                         )
                     if replaced is True:
+                        if type(replacement_presentation) is not LegacyPendingPresentationV1:
+                            raise ValueError("replacement Pending presentation is unavailable")
                         return DeterministicExecution(
                             _error(
                                 RuntimeFailureCode(code),
@@ -1973,7 +2341,7 @@ class DeterministicPilotAdapter:
                                 409,
                                 pending_action=_confirmation_payload(
                                     replacement,
-                                    details=self._pending_details(replacement),
+                                    presentation=replacement_presentation,
                                 ),
                             ),
                             preparation_kind=PreparationKind.DETERMINISTIC_CONFIRMATION,
@@ -2069,49 +2437,54 @@ class DeterministicPilotAdapter:
         origin: Message,
         message: str,
         ownership: object | None,
-    ) -> bool | None:
-        target = self.dependencies.chat or self.dependencies.persistence
-        function = _callable(target, ("replace_pending_confirmation", "replace_pending"))
-        if function is not None:
-            value = _invoke(
-                function,
-                {
-                    "conversation_id": conversation_id,
-                    "expected": pending,
-                    "pending": pending,
-                    "replacement": replacement,
-                    "tool_message": origin,
-                    "undo": {},
-                    "terminal_assistant_content": message,
-                    "claim_id": pending.operation_id,
-                    "delivery_ownership": ownership,
-                    "pending_authority_claim": None,
-                },
-                (conversation_id, pending, replacement, origin, {}),
+    ) -> tuple[bool | None, LegacyPendingPresentationV1 | None]:
+        persistence = self.dependencies.persistence
+        issuer = self.dependencies.legacy_jd_deterministic_action_issuer
+        projected: LegacyPendingPresentationV1 | None = None
+
+        def persist(
+            route_handle: PendingPersistenceRouteHandle,
+            presentation: LegacyPendingPresentationV1 | None,
+        ) -> object:
+            nonlocal projected
+            if type(presentation) is not LegacyPendingPresentationV1:
+                raise TypeError("replacement Pending requires exact presentation")
+            projected = presentation
+            replacement_with_human = PendingAction(
+                replacement.tool_call_id,
+                replacement.tool_name,
+                replacement.args,
+                presentation.human,
+                replacement.operation_id,
             )
-            return None if value is None else True
-        function = _callable(target, ("persist_confirmation_delivery",))
-        if function is None:
-            return False
-        value = _invoke(
-            function,
-            {
-                "conversation_id": conversation_id,
-                "ownership": ownership,
-                "origin_tool_message": origin,
-                "continuation": [Message(role="assistant", content=message)],
-                "chained_pending": replacement,
-                "expected_pending": pending,
-                "claim_id": pending.operation_id,
-                "undo": {},
-                "pending_authority_claim": None,
-            },
-            (conversation_id, ownership, origin, [Message(role="assistant", content=message)]),
-        )
+            return persistence.persist_confirmation_delivery(
+                conversation_id,
+                ownership,
+                origin,
+                (Message(role="assistant", content=message),),
+                replacement_with_human,
+                route_handle=route_handle,
+                expected_pending=pending,
+                claim_id=pending.operation_id,
+                undo={},
+            )
+
+        try:
+            value = self._run_initial_route(
+                issuer,
+                conversation_id=conversation_id,
+                pending=replacement,
+                body=persist,
+            )
+        finally:
+            if type(ownership) is DeliveryOwnership:
+                ownership.revoke_parent_route()
         if _result_ok(value):
-            return True
+            return True, projected
         status = _result_status(value)
-        return None if str(status) in {"cas_lost", "not_found", "closed"} else False
+        if str(status) in {"cas_lost", "not_found", "closed"}:
+            return None, None
+        return False, None
 
     def _current_jd_by_id(self, application_id: int) -> object | None:
         getter = _callable(self.dependencies.application_jd_versions, ("get_current", "current"))
@@ -2183,6 +2556,7 @@ class DeterministicPilotAdapter:
                 confirmation = self._confirmation_required(
                     pending,
                     conversation_id,
+                    presentation=self._historical_pending_presentation(pending),
                     operation_id=replay.operation_id,
                     replayed=True,
                 )

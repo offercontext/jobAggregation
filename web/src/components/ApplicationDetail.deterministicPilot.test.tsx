@@ -401,7 +401,14 @@ describe('ApplicationDetail deterministic Pilot JD entry', () => {
   });
 
   it('keeps a completed interview in the completed stage when its review exists', () => {
-    state.events = [{ id: 31, event_type: 'interview', scheduled_at: '2026-01-01T00:00:00Z' }];
+    state.events = [{
+      id: 31,
+      application_id: application.id,
+      event_type: 'interview',
+      scheduled_at: '2026-01-01T00:00:00Z',
+      duration_minutes: 45,
+      status: 'done',
+    }];
     state.notes = [{ id: 51, application_event_id: 31 }];
     const interviewApplication = { ...application, status: 'interview' } as never;
     act(() => root?.render(<ApplicationDetail application={interviewApplication} open onClose={vi.fn()} />));

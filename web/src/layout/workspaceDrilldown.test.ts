@@ -65,10 +65,11 @@ describe('workspace drill-down layout contract', () => {
     expect(calendarView).toContain('返回日历');
   });
 
-  it('opens application subflows as replacement workspace layers', () => {
-    expect(applicationDetail).toContain('if (eventFormOpen) {');
-    expect(applicationDetail).toContain('if (editingNote) {');
-    expect(applicationDetail).toContain('if (materialKitOpen && materialKitApplicationId === application.id) {');
+  it('opens application subflows through the shared task owner and keeps record forms local', () => {
+    expect(applicationDetail).toContain('<CoreTaskSurfaceHost');
+    expect(applicationDetail).toContain('resolveApplicationTasks');
+    expect(applicationDetail).toContain('<ScheduleEventForm');
+    expect(applicationDetail).not.toContain('if (materialKitOpen && materialKitApplicationId === application.id) {');
     expect(materialKit).toContain('返回投递详情');
     expect(reviewForm).toContain('返回上一层');
   });

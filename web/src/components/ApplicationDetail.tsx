@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type KeyboardEvent, type ReactNode } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   Typography,
@@ -52,6 +52,7 @@ import type { Resume } from '@/types/resume';
 import MaterialKitDrawer from './MaterialKitDrawer';
 import OpportunityFitReviewDrawer from './OpportunityFitReviewDrawer';
 import ApplicationOutcomeDrawer from './ApplicationOutcomeDrawer';
+import OfferNegotiationDrawer, { type OfferNegotiationDraft } from './OfferNegotiationDrawer';
 import {
   createOpportunityFitV2Draft,
   type OpportunityFitReview,
@@ -59,7 +60,7 @@ import {
 } from '@/types/opportunityFitReview';
 import { SourceStateTag } from './ui/SourceStateTag';
 import { createPilotAttachmentDragBinding } from './PilotAttachmentHandle';
-import { consumeMaterialKitHandoff } from '@/features/pilot/materialKitHandoff';
+import { consumeMaterialKitHandoff, materialKitHandoffStore } from '@/features/pilot/materialKitHandoff';
 import {
   getCurrentApplicationJd,
   getApplicationJdVersion,
@@ -76,6 +77,20 @@ import type {
 } from '@/lib/nextStepSuggestions';
 import styles from './ApplicationDetail.module.css';
 import { getApplicationWorkspaceStage } from './applicationWorkspaceModel';
+import { normalizeInterviewIndexItem } from '@/features/interviewEvents/interviewIndexContract';
+import { projectInterviewEventCard } from '@/features/interviewEvents/interviewEventCard';
+import { createCoreTaskSurfaceController, type ActiveCoreTask, type CoreTaskLaunchResult, type CoreTaskSurfaceController } from '@/features/coreTaskSurface/controller';
+import { CoreTaskSurfaceHost } from '@/features/coreTaskSurface/CoreTaskSurfaceHost';
+import type { TaskLaunchRequest } from '@/features/coreTaskSurface/contracts';
+import {
+  resolveApplicationTasks,
+  type ApplicationTaskEvent,
+  type ApplicationTaskFit,
+  type ApplicationTaskMaterialKit,
+  type ApplicationTaskResolution,
+  type FrozenApplicationTaskSnapshot,
+  type TaskSource,
+} from '@/features/applicationTasks/applicationTaskResolver';
 
 const { Title, Paragraph, Text } = Typography;
 
@@ -124,12 +139,6 @@ const EVENT_STATUS_LABELS: Readonly<Record<string, string>> = {
   soft_deleted: '已取消',
 };
 
-const TERMINAL_EVENT_STATUSES = new Set(['cancelled', 'deleted', 'soft_deleted']);
-
-function isTerminalScheduleEvent(event: ScheduleEvent): boolean {
-  return TERMINAL_EVENT_STATUSES.has(event.status);
-}
-
 function eventSubtypeLabel(value: string): string {
   if (!value) return '';
   return EVENT_SUBTYPE_LABELS[value] ?? (/\p{Script=Han}/u.test(value) ? value : '其他环节');
@@ -151,12 +160,99 @@ function workspaceTimestamp(value?: string | null) {
   return Number.isFinite(timestamp) ? timestamp : 0;
 }
 
+// ApplicationDetail is also exercised as a standalone record view in tests and
+// in a few embedded callers. The AppShell always supplies its application-wide
+// controller; this fallback only keeps those callers on the same host contract
+// without reviving a local owner state machine.
+const STANDALONE_TASK_CONTROLLER = createCoreTaskSurfaceController();
+
+const TASK_COPY: Readonly<Record<string, { title: string; description: string; action: string }>> = Object.freeze({
+  'application.opportunity_fit': { title: '岗位匹配与风险', description: '确认是否值得继续，以及需要补充的事实。', action: '开始判断' },
+  'application.material_kit': { title: '投递准备', description: '选择简历、查看调整建议并完成提交前检查。', action: '打开准备' },
+  'application.interview_prepare': { title: '面试准备', description: '围绕这场面试整理准备信息。', action: '开始准备' },
+  'application.interview_review': { title: '面试复盘', description: '记录或查看这场面试的复盘。', action: '打开复盘' },
+  'application.general_review': { title: '投递复盘', description: '查看不绑定具体事件的投递复盘。', action: '打开复盘' },
+  'application.offer_review': { title: 'Offer 准备', description: '查看归属本次投递的 Offer 与准备信息。', action: '查看准备' },
+  'application.record_outcome': { title: '投递结果', description: '记录本次投递的事实与结果。', action: '打开记录' },
+});
+
+function taskSource<T = never>(status: 'loading' | 'error' | 'ready' | 'absent', value?: T): TaskSource<T> {
+  const immutableValue = value && typeof value === 'object' ? Object.freeze(value) : value;
+  if (status === 'ready') return Object.freeze({ status: 'ready' as const, value: immutableValue as T });
+  if (status === 'loading') return Object.freeze({ status: 'loading' as const });
+  if (status === 'absent') return Object.freeze({ status: 'absent' as const });
+  return Object.freeze({ status: 'error' as const });
+}
+
+function taskLaunchAccepted(result: CoreTaskLaunchResult): boolean {
+  return result.kind === 'launched' || result.kind === 'focused_existing';
+}
+
+function emptyTaskSnapshot(): FrozenApplicationTaskSnapshot {
+  return Object.freeze({
+    application: taskSource('absent'),
+    jd: taskSource('absent'),
+    events: taskSource('absent'),
+    offers: taskSource('absent'),
+    materialKit: taskSource('absent'),
+    reviews: taskSource('absent'),
+    fit: taskSource('absent'),
+    resume: taskSource('absent'),
+    pending: taskSource('absent'),
+    resultUnknown: taskSource('absent'),
+  });
+}
+
+function projectApplicationEvent(
+  event: ScheduleEvent,
+  note: InterviewNote | undefined,
+  now: number,
+): ApplicationTaskEvent {
+  // Missing ownership is intentionally represented as 0 so the resolver marks
+  // the row unavailable instead of silently rebinding a legacy payload.
+  const applicationId = event.application_id ?? 0;
+  const schedule = event.scheduled_at;
+  const scheduledAtState = typeof schedule === 'string' && schedule.length > 0 ? 'present' : 'absent';
+  const normalized = normalizeInterviewIndexItem({
+    application_id: applicationId,
+    event_id: event.id,
+    company_name: '',
+    position_name: '',
+    scheduled_at: schedule ?? '',
+    scheduled_at_state: scheduledAtState,
+    event_status: event.status,
+    duration_minutes: event.duration_minutes,
+    note_id: note?.id ?? null,
+    note_source_status: null,
+    has_review_proposal: false,
+    review_summary: null,
+    has_confirmed_knowledge: false,
+    preparation_available: true,
+  });
+  const card = projectInterviewEventCard(normalized, now);
+  return Object.freeze({
+    applicationId,
+    eventId: event.id,
+    lifecycle: card.lifecycle,
+    bucket: card.bucket,
+    primaryAction: card.primaryAction,
+    scheduledAtTimestamp: normalized.scheduleTimestamp,
+    durationMinutes: normalized.duration_minutes,
+    scheduledAtState,
+  });
+}
+
 interface ApplicationDetailProps {
   application: Application | null;
   open: boolean;
   onClose: () => void;
+  /** Injected by AppShell; all task entrypoints share this controller. */
+  taskController?: CoreTaskSurfaceController;
+  onLaunchTask?: (request: TaskLaunchRequest) => CoreTaskLaunchResult;
+  onTaskSurfaceGuardChange?: (guard: { pending: boolean; unsaved: boolean }) => void;
   onOpenOffers?: () => void;
   offers?: Offer[];
+  offersLoading?: boolean;
   offersError?: boolean;
   onRetryOffers?: () => void;
   onMockInterview?: (app: Application) => void;
@@ -183,6 +279,11 @@ interface ApplicationDetailProps {
   interviewPreparationDrafts?: Record<string, InterviewPreparationDraft>;
   onInterviewPreparationDraftChange?: (key: string, draft: InterviewPreparationDraft | null) => void;
   interviewPreparationKnowledgeOptions?: InterviewPreparationKnowledgeOption[];
+  offerNegotiationDrafts?: Record<number, OfferNegotiationDraft>;
+  onOfferNegotiationDraftChange?: (offerId: number, draft: OfferNegotiationDraft | null) => void;
+  offerNegotiationEntryPoint?: 'ui' | 'pilot';
+  resumesLoading?: boolean;
+  taskNow?: number;
   nextStepSuggestions?: NextStepSuggestionsModel;
   nextStepSessionState?: SuggestionSessionState | null;
   onSetDisposition?: (applicationId: number, suggestionId: string, state: SuggestionSessionState | null) => void;
@@ -196,32 +297,56 @@ interface ApplicationDetailProps {
   onOpportunityFitDraftChange?: (applicationId: number, patch: Partial<OpportunityFitV2Draft> | null) => void;
 }
 
-export default function ApplicationDetail({ application, open, onClose, onOpenOffers, offers = [], offersError = false, onRetryOffers, onMockInterview, onAskPilot, onOpenPilotOpportunityFit, pilotInterviewReviewApplicationId, onPilotInterviewReviewFocusConsumed, pilotInterviewPreparationApplicationId, pilotInterviewPreparationEventId, onPilotInterviewPreparationFocusConsumed, onAttachToPilot, interviewReviewProposalAttempts, onInterviewReviewProposalAttemptChange, onInterviewNoteChanged, interviewKnowledgeCaptureDrafts, onInterviewKnowledgeCaptureDraftChange, onInterviewKnowledgeCaptureNoteChanged, resumes = [], interviewPreparationAttempts, onInterviewPreparationAttemptChange, interviewPreparationDrafts, onInterviewPreparationDraftChange, interviewPreparationKnowledgeOptions = [], nextStepSuggestions, nextStepSessionState = null, onSetDisposition, onNextStepNavigate, isNavigationAvailable, onNextStepReadonlyNavigate, isReadonlyNavigationAvailable, applicationJdDraft, onApplicationJdDraftChange, opportunityFitDraft, onOpportunityFitDraftChange }: ApplicationDetailProps) {
+export default function ApplicationDetail({ application, open, onClose, taskController, onLaunchTask, onTaskSurfaceGuardChange, onOpenOffers, offers, offersLoading = false, offersError = false, onRetryOffers, onMockInterview: _onMockInterview, onAskPilot, onOpenPilotOpportunityFit: _onOpenPilotOpportunityFit, pilotInterviewReviewApplicationId, onPilotInterviewReviewFocusConsumed, pilotInterviewPreparationApplicationId, pilotInterviewPreparationEventId, onPilotInterviewPreparationFocusConsumed, onAttachToPilot, interviewReviewProposalAttempts, onInterviewReviewProposalAttemptChange, onInterviewNoteChanged, interviewKnowledgeCaptureDrafts, onInterviewKnowledgeCaptureDraftChange, onInterviewKnowledgeCaptureNoteChanged, resumes, resumesLoading = false, taskNow, interviewPreparationAttempts, onInterviewPreparationAttemptChange, interviewPreparationDrafts, onInterviewPreparationDraftChange, interviewPreparationKnowledgeOptions = [], offerNegotiationDrafts = {}, onOfferNegotiationDraftChange, offerNegotiationEntryPoint = 'ui', nextStepSuggestions, nextStepSessionState = null, onSetDisposition, onNextStepNavigate, isNavigationAvailable, onNextStepReadonlyNavigate, isReadonlyNavigationAvailable, applicationJdDraft, onApplicationJdDraftChange, opportunityFitDraft, onOpportunityFitDraftChange }: ApplicationDetailProps) {
   const queryClient = useQueryClient();
   const [form] = Form.useForm();
   const [eventFormOpen, setEventFormOpen] = useState(false);
-  const [materialKitOpen, setMaterialKitOpen] = useState(false);
-  const [opportunityFitOpen, setOpportunityFitOpen] = useState(false);
-  const [applicationOutcomeOpen, setApplicationOutcomeOpen] = useState(false);
   const [materialKitPrefill, setMaterialKitPrefill] = useState<{
     resumeID?: number;
     jdSnapshot?: string;
     jdVersionID?: number;
   }>({});
-  const [materialKitApplicationId, setMaterialKitApplicationId] = useState<number | null>(null);
   const [editingNote, setEditingNote] = useState<InterviewNote | null>(null);
-  const [reviewFormOpen, setReviewFormOpen] = useState(false);
-  const [reviewProposalOpen, setReviewProposalOpen] = useState(false);
   const [knowledgeCaptureOpen, setKnowledgeCaptureOpen] = useState(false);
-  const [reviewEventID, setReviewEventID] = useState<number | null>(null);
-  const [preparationOpen, setPreparationOpen] = useState(false);
-  const [preparationEventID, setPreparationEventID] = useState<number | null>(null);
   const [pilotPreparationChoices, setPilotPreparationChoices] = useState<ScheduleEvent[]>([]);
+  const [pilotPreparationChooserOpen, setPilotPreparationChooserOpen] = useState(false);
   const [jdEditorOpen, setJdEditorOpen] = useState(false);
   const [jdHistoryOpen, setJdHistoryOpen] = useState(false);
   const [selectedJdVersion, setSelectedJdVersion] = useState<number | null>(null);
   const [activeTab, setActiveTab] = useState<ApplicationDetailTab>('overview');
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const handledPilotReviewIntentRef = useRef<string | null>(null);
+  const handledPilotPreparationIntentRef = useRef<string | null>(null);
+  const effectiveTaskController = taskController ?? STANDALONE_TASK_CONTROLLER;
+  const taskSurfaceState = useSyncExternalStore(
+    effectiveTaskController.subscribe,
+    effectiveTaskController.getState,
+    effectiveTaskController.getState,
+  );
+  const activeTask = taskSurfaceState.active?.ref.applicationId === application?.id
+    ? taskSurfaceState.active
+    : null;
+  // AppShell supplies the shared clock snapshot; the standalone fallback is
+  // deterministic and never lets the adapter read wall-clock state.
+  const resolverNow = taskNow ?? 0;
+  const offerRecords = offers ?? [];
+  const resumeRecords = resumes ?? [];
+
+  const launchTask = (request: TaskLaunchRequest): CoreTaskLaunchResult => {
+    const result = onLaunchTask?.(request) ?? effectiveTaskController.launch(request);
+    if (result.kind === 'launched' || result.kind === 'focused_existing') setActiveTab('preparation');
+    return result;
+  };
+
+  const isTaskGenerationCurrent = (generation: number): boolean => (
+    effectiveTaskController.getState().active?.generation === generation
+  );
+
+  const closeTask = (generation: number): boolean => {
+    if (!isTaskGenerationCurrent(generation)) return false;
+    effectiveTaskController.close(generation);
+    return true;
+  };
 
   const applicationJdQuery = useQuery({
     queryKey: ['application-jd-current', application?.id],
@@ -300,24 +425,54 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
 
   useEffect(() => {
     setMaterialKitPrefill({});
-    setMaterialKitOpen(false);
-    setMaterialKitApplicationId(null);
-    setApplicationOutcomeOpen(false);
     setActiveTab('overview');
+    setPilotPreparationChooserOpen(false);
+    setPilotPreparationChoices([]);
+    handledPilotReviewIntentRef.current = null;
+    handledPilotPreparationIntentRef.current = null;
   }, [application?.id, open]);
+
+  useEffect(() => {
+    const active = effectiveTaskController.getState().active;
+    if (active && application?.id && active.ref.applicationId !== application.id) {
+      // A remounted detail must never display another application's owner.
+      effectiveTaskController.close(active.generation);
+      effectiveTaskController.markClosed(active.generation);
+    }
+    return () => {
+      const current = effectiveTaskController.getState().active;
+      if (current && current.ref.applicationId === application?.id) {
+        effectiveTaskController.close(current.generation);
+        effectiveTaskController.markClosed(current.generation);
+      }
+    };
+  }, [application?.id, effectiveTaskController, open, taskController]);
 
   useEffect(() => {
     if (!application || !open) return;
     const handoff = consumeMaterialKitHandoff(application.id);
     if (!handoff || !handoff.jdVersionId) return;
-    setMaterialKitPrefill({
+    const alreadyActive = activeTask?.ref.taskId === 'application.material_kit'
+      && activeTask.ref.applicationId === application.id;
+    if (!alreadyActive) {
+      const result = launchTask({
+        ref: { taskId: 'application.material_kit', applicationId: application.id },
+        source: 'deep_link',
+        hints: handoff.resumeId ? { suggestedResumeId: handoff.resumeId } : undefined,
+      });
+      if (result.kind !== 'launched' && result.kind !== 'focused_existing') {
+        // Preserve a denied handoff for the eventual guarded retry. This is a
+        // local navigation token, not a domain write.
+        materialKitHandoffStore.write(handoff);
+        return;
+      }
+    }
+    setMaterialKitPrefill((current) => Object.keys(current).length > 0 ? current : {
       resumeID: handoff.resumeId,
       jdSnapshot: handoff.jdText,
       jdVersionID: handoff.jdVersionId,
     });
-    setMaterialKitApplicationId(application.id);
-    setMaterialKitOpen(true);
-  }, [application?.id, open]);
+  }, [activeTask, application?.id, open]);
 
   const notesQuery = useQuery({
     queryKey: ['notes', application?.id],
@@ -331,10 +486,7 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
     enabled: !!application && open,
   });
 
-  const activeEvents = useMemo(
-    () => (eventsQuery.data ?? []).filter((event) => !isTerminalScheduleEvent(event)),
-    [eventsQuery.data],
-  );
+  const allEvents = eventsQuery.data ?? [];
   const interviewStageDataReady = application?.status !== 'interview'
     || (
       !eventsQuery.isLoading
@@ -346,43 +498,65 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
     );
 
   useEffect(() => {
-    if (!application || !open || pilotInterviewReviewApplicationId !== application.id || !interviewStageDataReady) return;
-    const completedInterview = activeEvents
-      .filter((event) => event.event_type === 'interview' && dayjs(event.scheduled_at).isBefore(dayjs()))
-      .sort((left, right) => dayjs(right.scheduled_at).valueOf() - dayjs(left.scheduled_at).valueOf())[0];
-    const linkedNote = completedInterview
-      ? notesQuery.data?.find((note) => note.application_event_id === completedInterview.id)
-      : undefined;
-    setEditingNote(linkedNote ?? null);
-    setReviewEventID(linkedNote?.application_event_id ?? completedInterview?.id ?? null);
-    setPreparationOpen(false);
-    setPreparationEventID(null);
-    setReviewFormOpen(!linkedNote);
-    setReviewProposalOpen(Boolean(linkedNote));
-    onPilotInterviewReviewFocusConsumed?.();
-  }, [activeEvents, application, interviewStageDataReady, notesQuery.data, open, onPilotInterviewReviewFocusConsumed, pilotInterviewReviewApplicationId]);
-
-  useEffect(() => {
-    if (!application || !open || pilotInterviewPreparationApplicationId !== application.id || eventsQuery.isLoading || eventsQuery.isError || !eventsQuery.data) return;
-    const interviewEvents = activeEvents.filter((event) => event.event_type === 'interview');
-    if (interviewEvents.length === 0) return;
-    const requestedEvent = pilotInterviewPreparationEventId == null
-      ? null
-      : interviewEvents.find((event) => event.id === pilotInterviewPreparationEventId) ?? null;
-    if (requestedEvent) {
-      setPreparationEventID(requestedEvent.id);
-      setPreparationOpen(true);
-      onPilotInterviewPreparationFocusConsumed?.();
+    if (pilotInterviewReviewApplicationId == null) {
+      handledPilotReviewIntentRef.current = null;
       return;
     }
-    if (interviewEvents.length === 1) {
-      setPreparationEventID(interviewEvents[0].id);
-      setPreparationOpen(true);
-    } else {
+    if (!application || !open || pilotInterviewReviewApplicationId !== application.id || !interviewStageDataReady) return;
+    const intentKey = `${application.id}:review`;
+    if (handledPilotReviewIntentRef.current === intentKey) return;
+    handledPilotReviewIntentRef.current = intentKey;
+    // Pilot's application-only intent is an application-level review. It must
+    // not guess the nearest or only interview event.
+    const result = launchTask({
+      ref: { taskId: 'application.general_review', applicationId: application.id },
+      source: 'pilot',
+      focus: 'current',
+    });
+    if (result.kind !== 'launched' && result.kind !== 'focused_existing') {
+      handledPilotReviewIntentRef.current = null;
+      return;
+    }
+    setEditingNote(notesQuery.data?.find((note) => note.application_event_id === null) ?? null);
+    onPilotInterviewReviewFocusConsumed?.();
+  }, [allEvents, application, interviewStageDataReady, notesQuery.data, open, onPilotInterviewReviewFocusConsumed, pilotInterviewReviewApplicationId]);
+
+  useEffect(() => {
+    if (pilotInterviewPreparationApplicationId == null) {
+      handledPilotPreparationIntentRef.current = null;
+      return;
+    }
+    if (!application || !open || pilotInterviewPreparationApplicationId !== application.id || eventsQuery.isLoading || eventsQuery.isError || !eventsQuery.data) return;
+    const intentKey = `${application.id}:${pilotInterviewPreparationEventId ?? 'choose'}`;
+    if (handledPilotPreparationIntentRef.current === intentKey) return;
+    handledPilotPreparationIntentRef.current = intentKey;
+    const interviewEvents = allEvents.filter((event) => event.event_type === 'interview');
+    if (pilotInterviewPreparationEventId == null) {
+      // An application-only intent enters an explicit chooser even when there
+      // happens to be one event; event identity is never inferred here.
       setPilotPreparationChoices(interviewEvents);
+      setPilotPreparationChooserOpen(true);
+    } else if (interviewEvents.some((event) => event.id === pilotInterviewPreparationEventId)) {
+      const result = launchTask({
+        ref: {
+          taskId: 'application.interview_prepare',
+          applicationId: application.id,
+          eventId: pilotInterviewPreparationEventId,
+        },
+        source: 'pilot',
+        focus: 'current',
+      });
+      if (result.kind !== 'launched' && result.kind !== 'focused_existing') {
+        handledPilotPreparationIntentRef.current = null;
+        return;
+      }
+      setPilotPreparationChooserOpen(false);
+    } else {
+      setPilotPreparationChoices([]);
+      setPilotPreparationChooserOpen(true);
     }
     onPilotInterviewPreparationFocusConsumed?.();
-  }, [activeEvents, application, eventsQuery.data, eventsQuery.isError, eventsQuery.isLoading, open, pilotInterviewPreparationEventId, onPilotInterviewPreparationFocusConsumed, pilotInterviewPreparationApplicationId]);
+  }, [allEvents, application, eventsQuery.data, eventsQuery.isError, eventsQuery.isLoading, open, pilotInterviewPreparationEventId, onPilotInterviewPreparationFocusConsumed, pilotInterviewPreparationApplicationId]);
 
   const invalidateNotes = () => {
     if (application) queryClient.invalidateQueries({ queryKey: ['notes', application.id] });
@@ -415,8 +589,6 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
       onInterviewKnowledgeCaptureNoteChanged?.(variables.id);
       message.success('已更新面试复盘');
       setEditingNote(null);
-      setReviewFormOpen(false);
-      setReviewEventID(null);
       invalidateNotes();
     },
     onError: () => message.error('更新失败'),
@@ -426,8 +598,6 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
     mutationFn: (input: CreateNoteInput) => createNote(application!.id, input),
     onSuccess: () => {
       message.success('已保存面试复盘');
-      setReviewFormOpen(false);
-      setReviewEventID(null);
       invalidateNotes();
     },
     onError: () => message.error('保存复盘失败'),
@@ -435,18 +605,13 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
 
   const closeDetail = () => {
     setEventFormOpen(false);
-    setMaterialKitOpen(false);
-    setMaterialKitApplicationId(null);
-    setOpportunityFitOpen(false);
     setMaterialKitPrefill({});
     setEditingNote(null);
-    setReviewFormOpen(false);
-    setReviewProposalOpen(false);
     setKnowledgeCaptureOpen(false);
-    setReviewEventID(null);
     setPilotPreparationChoices([]);
-    setPreparationOpen(false);
-    setPreparationEventID(null);
+    setPilotPreparationChooserOpen(false);
+    const active = effectiveTaskController.getState().active;
+    if (active && active.ref.applicationId === application?.id) effectiveTaskController.close(active.generation);
     onClose();
   };
 
@@ -457,161 +622,294 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
     setKnowledgeCaptureOpen(true);
   };
 
+  const taskSnapshot = useMemo<FrozenApplicationTaskSnapshot>(() => {
+    if (!application) return emptyTaskSnapshot();
+    const currentJd = applicationJdQuery.data?.current;
+    const eventSource: FrozenApplicationTaskSnapshot['events'] = eventsQuery.isLoading
+      ? taskSource('loading')
+      : eventsQuery.isError
+        ? taskSource('error')
+        : eventsQuery.data === undefined
+          ? taskSource('absent')
+          : taskSource('ready', Object.freeze(allEvents
+            .filter((event) => event.event_type === 'interview')
+            .map((event) => projectApplicationEvent(
+              event,
+              notesQuery.data?.find((note) => note.application_event_id === event.id),
+              resolverNow,
+            ))));
+    const reviewRows = Object.freeze((notesQuery.data ?? []).map((note) => Object.freeze({
+      applicationId: application.id,
+      eventId: note.application_event_id ?? null,
+      reviewId: note.id,
+    })));
+    const reviewSource: FrozenApplicationTaskSnapshot['reviews'] = notesQuery.isLoading
+      ? taskSource('loading')
+      : notesQuery.isError
+        ? taskSource('error')
+        : notesQuery.data === undefined
+          ? taskSource('absent')
+          : taskSource('ready', reviewRows);
+    const jdSource: FrozenApplicationTaskSnapshot['jd'] = applicationJdQuery.isLoading
+      ? taskSource('loading')
+      : applicationJdQuery.isError
+        ? taskSource('error')
+        : applicationJdQuery.data === undefined
+          ? taskSource('absent')
+          : taskSource('ready', currentJd ? { id: currentJd.id, versionId: currentJd.id } : null);
+    const offerSource: FrozenApplicationTaskSnapshot['offers'] = offersLoading
+      ? taskSource('loading')
+      : offersError
+        ? taskSource('error')
+        : offers === undefined
+          ? taskSource('absent')
+          : taskSource('ready', Object.freeze(offerRecords.map((offer) => Object.freeze({
+              id: offer.id,
+              applicationId: offer.application_id ?? 0,
+              status: offer.status,
+              deadline: offer.deadline,
+            }))));
+    const resumeSource: FrozenApplicationTaskSnapshot['resume'] = resumesLoading
+      ? taskSource('loading')
+      : resumes === undefined
+        ? taskSource('absent')
+        : taskSource('ready', resumeRecords.length === 1
+          ? { id: resumeRecords[0].id, selected: true }
+          : null);
+    return Object.freeze({
+      application: taskSource('ready', { id: application.id, status: application.status }),
+      jd: jdSource,
+      events: eventSource,
+      offers: offerSource,
+      // Material Kit and Fit are still backed by their existing drawers in
+      // this cutover. Their data owner remains unchanged until Tasks 7/8.
+      materialKit: taskSource<ApplicationTaskMaterialKit | null>('absent'),
+      reviews: reviewSource,
+      fit: taskSource<ApplicationTaskFit | null>('absent'),
+      resume: resumeSource,
+      pending: taskSource('ready', null),
+      resultUnknown: taskSource('ready', null),
+    });
+  }, [allEvents, application?.id, application?.status, applicationJdQuery.data, applicationJdQuery.data?.current, applicationJdQuery.isError, applicationJdQuery.isLoading, eventsQuery.data, eventsQuery.isError, eventsQuery.isLoading, offers, offersError, offersLoading, notesQuery.data, notesQuery.isError, notesQuery.isLoading, resolverNow, resumes, resumesLoading]);
+  const applicationTaskResolution: ApplicationTaskResolution = useMemo(
+    () => resolveApplicationTasks(taskSnapshot, resolverNow),
+    [resolverNow, taskSnapshot],
+  );
+  const taskOwnerOpen = taskSurfaceState.phase !== 'closing';
+  const launchMaterialKit = (prefill: { resumeID?: number; jdSnapshot?: string; jdVersionID?: number } = {}) => {
+    if (!application) return;
+    const result = launchTask({
+      ref: { taskId: 'application.material_kit', applicationId: application.id },
+      source: 'application_task_card',
+      hints: prefill.resumeID ? { suggestedResumeId: prefill.resumeID } : undefined,
+    });
+    if (result.kind === 'launched') setMaterialKitPrefill(prefill);
+    return result;
+  };
+
+  const renderTaskOwner = (active: ActiveCoreTask): ReactNode => {
+    if (!application) return null;
+    if (active.ref.applicationId !== application.id) return null;
+    const isCurrent = () => isTaskGenerationCurrent(active.generation);
+    const close = () => closeTask(active.generation);
+    switch (active.ref.taskId) {
+      case 'application.opportunity_fit':
+        return (
+          <OpportunityFitReviewDrawer
+            application={application}
+            open={taskOwnerOpen}
+            currentJdText={applicationJdQuery.data?.current?.jd_text ?? ''}
+            jdVersionId={applicationJdQuery.data?.current?.id ?? null}
+            draft={opportunityFitDraft ?? createOpportunityFitV2Draft(application.id)}
+            onDraftChange={(patch) => {
+              if (isCurrent()) onOpportunityFitDraftChange?.(application.id, patch);
+            }}
+            onApplicationMissing={() => {
+              if (isCurrent()) onClose();
+            }}
+            onClose={close}
+            onPrepareMaterials={(reviewOrResumeId: OpportunityFitReview | number, jdText: string, jdVersionId?: number) => {
+              if (!isCurrent() || !jdVersionId) return;
+              const resumeID = typeof reviewOrResumeId === 'number'
+                ? reviewOrResumeId
+                : reviewOrResumeId.source.resume.id;
+              launchMaterialKit({ resumeID, jdSnapshot: jdText, jdVersionID: jdVersionId });
+            }}
+          />
+        );
+      case 'application.material_kit':
+        return (
+          <MaterialKitDrawer
+            application={application}
+            open={taskOwnerOpen}
+            onClose={() => {
+              if (!closeTask(active.generation)) return;
+              setMaterialKitPrefill({});
+            }}
+            initialResumeID={materialKitPrefill.resumeID}
+            initialJdSnapshot={materialKitPrefill.jdSnapshot}
+            initialJdVersionID={materialKitPrefill.jdSnapshot && !materialKitPrefill.jdVersionID
+              ? undefined
+              : materialKitPrefill.jdVersionID ?? applicationJdQuery.data?.current?.id}
+          />
+        );
+      case 'application.interview_prepare': {
+        const eventId = active.ref.eventId;
+        if (eventId === undefined) return <div role="alert">请先选择要准备的面试。</div>;
+        const preparationTask = applicationTaskResolution.tasks.find(
+          (task) => task.taskId === 'application.interview_prepare' && task.ref.eventId === eventId,
+        );
+        if (!preparationTask?.executable) return <div role="status">该面试当前不可准备，请先确认日程状态。</div>;
+        const preparationKey = `${application.id}:${eventId}`;
+        return (
+          <InterviewPreparationProposalDrawer
+            key={`${application.id}:${eventId}`}
+            open={taskOwnerOpen}
+            context={{
+              applicationId: application.id,
+              eventId,
+              resumeId: 0,
+              jdText: applicationJdQuery.data?.current?.jd_text ?? '',
+              jdVersionId: applicationJdQuery.data?.current?.id ?? null,
+              knowledgeSelections: [],
+              userAssertions: [],
+            }}
+            resumeOptions={resumeRecords}
+            knowledgeOptions={interviewPreparationKnowledgeOptions}
+            attemptState={interviewPreparationAttempts?.[preparationKey]}
+            draft={interviewPreparationDrafts?.[preparationKey]}
+              onAttemptStateChange={(state) => {
+                if (isCurrent()) onInterviewPreparationAttemptChange?.(preparationKey, state);
+              }}
+              onDraftChange={(draft) => {
+                if (isCurrent()) onInterviewPreparationDraftChange?.(preparationKey, draft);
+              }}
+              onClose={close}
+          />
+        );
+      }
+      case 'application.interview_review':
+      case 'application.general_review': {
+        const eventId = active.ref.eventId;
+        if (eventId !== undefined) {
+          const reviewTask = applicationTaskResolution.tasks.find(
+            (task) => task.taskId === 'application.interview_review' && task.ref.eventId === eventId,
+          );
+          if (!reviewTask?.executable) return <div role="status">该面试当前不可复盘，请先确认日程状态。</div>;
+        }
+        const note = eventId === undefined
+          ? notesQuery.data?.find((item) => item.application_event_id === null)
+          : notesQuery.data?.find((item) => item.application_event_id === eventId);
+        const compatibleEditingNote = editingNote && (
+          eventId === undefined
+            ? editingNote.application_event_id === null
+            : editingNote.application_event_id === eventId
+        ) ? editingNote : undefined;
+        const ownerNote = note ?? compatibleEditingNote;
+        if (eventId !== undefined && note) {
+          return (
+            <InterviewReviewProposalDrawer
+              open={taskOwnerOpen}
+              note={note}
+              eventID={eventId}
+              attemptState={interviewReviewProposalAttempts?.[note.id]}
+              onAttemptStateChange={(state) => {
+                if (isCurrent()) onInterviewReviewProposalAttemptChange?.(note.id, state);
+              }}
+              onClose={() => {
+                if (!isTaskGenerationCurrent(active.generation)) return;
+                setEditingNote(null);
+                close();
+              }}
+            />
+          );
+        }
+        return (
+          <ReviewFormDrawer
+            open={taskOwnerOpen}
+            applications={[application]}
+            initialApplication={application}
+            note={ownerNote}
+            initialEventID={eventId ?? null}
+            saving={updateNoteMut.isPending || createEventNoteMut.isPending}
+            onSubmit={(input) => {
+              if (!isCurrent()) return;
+              const currentNote = ownerNote;
+              if (currentNote) updateNoteMut.mutate({ id: currentNote.id, input });
+              else createEventNoteMut.mutate(input);
+            }}
+            onClose={() => {
+              if (!isTaskGenerationCurrent(active.generation)) return;
+              setEditingNote(null);
+              close();
+            }}
+          />
+        );
+      }
+      case 'application.offer_review': {
+        if (offersLoading) return <div role="status">Offer 信息正在读取。</div>;
+        if (offersError) return <div role="alert">Offer 信息暂时无法读取。</div>;
+        if (offers === undefined) return <div role="status">Offer 信息尚未加载。</div>;
+        const linkedOffers = offerRecords.filter((offer) => offer.application_id === application.id);
+        const suggestedOfferId = active.request.hints?.suggestedOfferId;
+        const offer = linkedOffers.find((item) => item.id === suggestedOfferId)
+          ?? (linkedOffers.length === 1 ? linkedOffers[0] : undefined);
+        if (!offer) return <div role="status">暂无可聚焦的 Offer，请先确认本次投递的 Offer。</div>;
+        return (
+          <OfferNegotiationDrawer
+            open={taskOwnerOpen}
+            offer={offer}
+            entrypoint={offerNegotiationEntryPoint}
+            draft={offerNegotiationDrafts[offer.id]}
+            onDraftChange={(draft) => {
+              if (isCurrent()) onOfferNegotiationDraftChange?.(offer.id, draft);
+            }}
+            onClose={close}
+          />
+        );
+      }
+      case 'application.record_outcome':
+        return (
+          <ApplicationOutcomeDrawer
+            application={application}
+            open={taskOwnerOpen}
+            onClose={close}
+            resumes={resumeRecords}
+            currentJd={applicationJdQuery.data?.current ?? null}
+            events={allEvents}
+            onAskPilot={isCurrent() ? onAskPilot : undefined}
+          />
+        );
+      default:
+        return <div role="alert">当前任务暂不可用，请稍后重试。</div>;
+    }
+  };
+
+  useEffect(() => {
+    const active = activeTask;
+    const reviewNote = active?.ref.taskId === 'application.interview_review' && active.ref.eventId !== undefined
+      ? notesQuery.data?.find((note) => note.application_event_id === active.ref.eventId)
+      : undefined;
+    const pending = active && application
+      ? Boolean(
+      (active.ref.taskId === 'application.interview_prepare' && active.ref.eventId !== undefined
+        && interviewPreparationAttempts?.[`${application.id}:${active.ref.eventId}`])
+      || (active.ref.taskId === 'application.interview_review' && active.ref.eventId !== undefined
+        && reviewNote && interviewReviewProposalAttempts?.[reviewNote.id])
+      )
+      : false;
+    const unsaved = active
+      ? Boolean(
+      active.ref.taskId === 'application.opportunity_fit' && opportunityFitDraft
+      || active.ref.taskId === 'application.material_kit' && (materialKitPrefill.jdSnapshot || materialKitPrefill.resumeID)
+      || active.ref.taskId === 'application.offer_review'
+        && offerRecords.some((offer) => offer.application_id === application?.id && offerNegotiationDrafts?.[offer.id])
+      )
+      : false;
+    onTaskSurfaceGuardChange?.({ pending, unsaved });
+  }, [activeTask, application?.id, interviewPreparationAttempts, interviewReviewProposalAttempts, materialKitPrefill, notesQuery.data, offerNegotiationDrafts, offers, onTaskSurfaceGuardChange, opportunityFitDraft]);
+
   if (!application || !open) return null;
-
-  if (eventFormOpen) {
-    return (
-      <ScheduleEventForm
-        open={eventFormOpen}
-        applications={[application]}
-        initialApplication={application}
-        onClose={() => setEventFormOpen(false)}
-      />
-    );
-  }
-
-  if (reviewFormOpen) {
-    return (
-      <ReviewFormDrawer
-        open={reviewFormOpen}
-        applications={[application]}
-        initialApplication={application}
-        note={editingNote}
-        initialEventID={reviewEventID}
-         saving={updateNoteMut.isPending || createEventNoteMut.isPending}
-         onSubmit={(input) => {
-           if (editingNote) {
-             updateNoteMut.mutate({ id: editingNote.id, input });
-           } else {
-             createEventNoteMut.mutate(input);
-           }
-         }}
-        onClose={() => {
-          setReviewFormOpen(false);
-          setEditingNote(null);
-          setReviewEventID(null);
-        }}
-      />
-    );
-  }
-
-  if (materialKitOpen && materialKitApplicationId === application.id) {
-    return (
-      <MaterialKitDrawer
-        application={application}
-        open={materialKitOpen}
-        onClose={() => {
-          setMaterialKitOpen(false);
-          setMaterialKitApplicationId(null);
-          setMaterialKitPrefill({});
-        }}
-        initialResumeID={materialKitPrefill.resumeID}
-        initialJdSnapshot={materialKitPrefill.jdSnapshot}
-        initialJdVersionID={materialKitPrefill.jdSnapshot && !materialKitPrefill.jdVersionID
-          ? undefined
-          : materialKitPrefill.jdVersionID ?? applicationJdQuery.data?.current?.id}
-      />
-    );
-  }
-
-  if (applicationOutcomeOpen) {
-    return (
-      <ApplicationOutcomeDrawer
-        application={application}
-        open
-        onClose={() => setApplicationOutcomeOpen(false)}
-        resumes={resumes}
-        currentJd={applicationJdQuery.data?.current ?? null}
-        events={eventsQuery.data ?? []}
-        onAskPilot={onAskPilot}
-      />
-    );
-  }
-
-  if (reviewProposalOpen && editingNote) {
-    return (
-      <InterviewReviewProposalDrawer
-        open={reviewProposalOpen}
-        note={editingNote}
-        eventID={editingNote.application_event_id}
-        attemptState={interviewReviewProposalAttempts?.[editingNote.id]}
-        onAttemptStateChange={(state) => onInterviewReviewProposalAttemptChange?.(editingNote.id, state)}
-        onClose={() => {
-          setReviewProposalOpen(false);
-          setEditingNote(null);
-        }}
-      />
-    );
-  }
-
-  if (preparationOpen && preparationEventID !== null) {
-    const preparationKey = `${application.id}:${preparationEventID}`;
-    return (
-      <InterviewPreparationProposalDrawer
-        key={`${application.id}:${preparationEventID}`}
-        open
-        context={{
-          applicationId: application.id,
-          eventId: preparationEventID,
-          resumeId: 0,
-          jdText: applicationJdQuery.data?.current?.jd_text ?? '',
-          jdVersionId: applicationJdQuery.data?.current?.id ?? null,
-          knowledgeSelections: [],
-          userAssertions: [],
-        }}
-        resumeOptions={resumes}
-        knowledgeOptions={interviewPreparationKnowledgeOptions}
-        attemptState={interviewPreparationAttempts?.[preparationKey]}
-        draft={interviewPreparationDrafts?.[preparationKey]}
-        onAttemptStateChange={(state) => onInterviewPreparationAttemptChange?.(preparationKey, state)}
-        onDraftChange={(draft) => onInterviewPreparationDraftChange?.(preparationKey, draft)}
-        onClose={() => {
-          setPreparationOpen(false);
-          setPreparationEventID(null);
-        }}
-      />
-    );
-  }
-
-  if (knowledgeCaptureOpen && editingNote) {
-    return (
-      <InterviewKnowledgeCaptureDrawer
-        open
-        note={editingNote}
-        draft={interviewKnowledgeCaptureDrafts?.[editingNote.id] ?? createInterviewKnowledgeCaptureDraft()}
-        onDraftChange={(draft) => onInterviewKnowledgeCaptureDraftChange?.(editingNote.id, draft)}
-        onClose={() => {
-          setKnowledgeCaptureOpen(false);
-          setEditingNote(null);
-        }}
-      />
-    );
-  }
-
-  if (opportunityFitOpen) {
-    return (
-      <OpportunityFitReviewDrawer
-        application={application}
-        open={opportunityFitOpen}
-        currentJdText={applicationJdQuery.data?.current?.jd_text ?? ''}
-        jdVersionId={applicationJdQuery.data?.current?.id ?? null}
-        draft={opportunityFitDraft ?? createOpportunityFitV2Draft(application.id)}
-        onDraftChange={(patch) => onOpportunityFitDraftChange?.(application.id, patch)}
-        onApplicationMissing={onClose}
-        onClose={() => setOpportunityFitOpen(false)}
-        onPrepareMaterials={(reviewOrResumeId: OpportunityFitReview | number, jdText: string, jdVersionId?: number) => {
-          if (!jdVersionId) return;
-          const resumeID = typeof reviewOrResumeId === 'number'
-            ? reviewOrResumeId
-            : reviewOrResumeId.source.resume.id;
-          setMaterialKitPrefill({ resumeID, jdSnapshot: jdText, jdVersionID: jdVersionId });
-          setMaterialKitApplicationId(application.id);
-          setOpportunityFitOpen(false);
-          setMaterialKitOpen(true);
-        }}
-      />
-    );
-  }
 
   const applicationDragBinding = onAttachToPilot
     ? createPilotAttachmentDragBinding({
@@ -621,16 +919,21 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
       })
     : undefined;
 
-  const interviewEvents = activeEvents.filter((event) => event.event_type === 'interview');
-  const completedInterview = interviewEvents
-    .filter((event) => dayjs(event.scheduled_at).isBefore(dayjs()))
-    .sort((left, right) => dayjs(right.scheduled_at).valueOf() - dayjs(left.scheduled_at).valueOf())[0];
-  const upcomingEvent = activeEvents
-    .filter((event) => dayjs(event.scheduled_at).isAfter(dayjs()))
-    .sort((left, right) => dayjs(left.scheduled_at).valueOf() - dayjs(right.scheduled_at).valueOf())[0];
+  const interviewEvents = allEvents.filter((event) => event.event_type === 'interview');
+  const hasCompletedInterview = taskSnapshot.events.status === 'ready'
+    && taskSnapshot.events.value.some((event) => event.lifecycle === 'completed');
+  const completedReviewTask = applicationTaskResolution.tasks.find(
+    (task) => task.taskId === 'application.interview_review' && task.ref.eventId !== undefined,
+  );
+  const upcomingPrepareTask = applicationTaskResolution.tasks.find(
+    (task) => task.taskId === 'application.interview_prepare' && task.ref.eventId !== undefined && task.executable,
+  );
+  const upcomingEvent = upcomingPrepareTask?.ref.eventId === undefined
+    ? undefined
+    : allEvents.find((event) => event.id === upcomingPrepareTask.ref.eventId);
   const stage = getApplicationWorkspaceStage(application.status, {
-    hasCompletedInterview: Boolean(completedInterview),
-    hasInterviewReview: Boolean(completedInterview && notesQuery.data?.some((note) => note.application_event_id === completedInterview.id)),
+    hasCompletedInterview,
+    hasInterviewReview: Boolean(completedReviewTask?.reason === 'interview_review_available'),
   });
   const stageDataBlocked = application.status === 'interview' && !interviewStageDataReady;
   const stageDataHasError = eventsQuery.isError || notesQuery.isError;
@@ -648,9 +951,7 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
 
   const openMaterials = () => {
     const currentJd = applicationJdQuery.data?.current;
-    setMaterialKitPrefill(currentJd ? { jdSnapshot: currentJd.jd_text, jdVersionID: currentJd.id } : {});
-    setMaterialKitApplicationId(application.id);
-    setMaterialKitOpen(true);
+    return launchMaterialKit(currentJd ? { jdSnapshot: currentJd.jd_text, jdVersionID: currentJd.id } : {});
   };
 
   const runStageAction = () => {
@@ -664,57 +965,63 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
         setEventFormOpen(true);
         break;
       case 'interview-prepare': {
-        const nextInterview = interviewEvents
-          .filter((event) => dayjs(event.scheduled_at).isAfter(dayjs()))
-          .sort((left, right) => dayjs(left.scheduled_at).valueOf() - dayjs(right.scheduled_at).valueOf())[0] ?? interviewEvents[0];
-        if (nextInterview) {
-          setPreparationEventID(nextInterview.id);
-          setPreparationOpen(true);
+        const task = applicationTaskResolution.tasks.find(
+          (item) => item.taskId === 'application.interview_prepare' && item.ref.eventId !== undefined && item.executable,
+        );
+        if (task?.ref.eventId !== undefined) {
+          launchTask({ ref: task.ref, source: 'application_header', focus: 'current' });
         } else {
-          setEventFormOpen(true);
+          setPilotPreparationChoices(interviewEvents);
+          setPilotPreparationChooserOpen(true);
         }
         break;
       }
       case 'interview-review': {
-        const linkedNote = completedInterview
-          ? notesQuery.data?.find((note) => note.application_event_id === completedInterview.id)
-          : undefined;
-        if (linkedNote) {
-          setEditingNote(linkedNote);
-          setReviewEventID(linkedNote.application_event_id ?? completedInterview?.id ?? null);
-          setReviewFormOpen(false);
-          setReviewProposalOpen(true);
-          break;
+        if (completedReviewTask) {
+          const eventId = completedReviewTask.ref.eventId;
+          const linkedNote = eventId === undefined
+            ? notesQuery.data?.find((note) => note.application_event_id === null)
+            : notesQuery.data?.find((note) => note.application_event_id === eventId);
+          const result = launchTask({ ref: completedReviewTask.ref, source: 'application_header', focus: 'current' });
+          if (taskLaunchAccepted(result)) setEditingNote(linkedNote ?? null);
+        } else {
+          launchTask({
+            ref: { taskId: 'application.general_review', applicationId: application.id },
+            source: 'application_header',
+            focus: 'current',
+          });
         }
-        setReviewEventID(completedInterview?.id ?? null);
-        setEditingNote(null);
-        setReviewFormOpen(true);
-        setReviewProposalOpen(false);
         break;
       }
-      case 'offer':
-        if (onOpenOffers) {
-          onOpenOffers();
-          break;
-        }
-        setApplicationOutcomeOpen(true);
+      case 'offer': {
+        const result = launchTask({
+          ref: { taskId: 'application.offer_review', applicationId: application.id },
+          source: 'application_header',
+          focus: 'current',
+        });
+        // Standalone embedded callers historically used this callback to
+        // navigate to the Offer collection. The composed AppShell keeps the
+        // application-level owner mounted and therefore does not navigate.
+        if (!taskController && result.kind === 'launched') onOpenOffers?.();
         break;
+      }
       case 'outcome':
-        setApplicationOutcomeOpen(true);
+        launchTask({
+          ref: { taskId: 'application.record_outcome', applicationId: application.id },
+          source: 'application_header',
+          focus: 'current',
+        });
         break;
     }
   };
 
   const moreActionItems = [
     ...(onAskPilot ? [{ key: 'haru', label: '让 Haru 帮我', onClick: () => onAskPilot(application, { type: 'application_jd_save' }) }] : []),
-    ...(onOpenPilotOpportunityFit ? [{ key: 'fit', label: '评估岗位匹配', onClick: () => onOpenPilotOpportunityFit(application) }] : []),
-    { key: 'materials', label: '打开投递材料', onClick: openMaterials },
-    { key: 'decision', label: '岗位决策漏斗', onClick: () => setOpportunityFitOpen(true) },
-    { key: 'facts', label: '投递事实与结果', onClick: () => setApplicationOutcomeOpen(true) },
-    ...(onMockInterview ? [{ key: 'mock', label: '开始模拟面试', onClick: () => onMockInterview(application) }] : []),
+    { key: 'jd', label: applicationJdQuery.data?.current ? '编辑岗位资料' : '添加岗位资料', onClick: startJdEditor },
+    { key: 'schedule', label: '安排日程', onClick: () => setEventFormOpen(true) },
   ];
 
-  const linkedOffers = offers.filter((offer) => offer.application_id === application.id);
+  const linkedOffers = offerRecords.filter((offer) => offer.application_id === application.id);
   const progressItems: ApplicationProgressItem[] = [
     {
       id: `application-created-${application.id}`,
@@ -760,13 +1067,13 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
     })),
   ].sort((left, right) => workspaceTimestamp(right.timestamp) - workspaceTimestamp(left.timestamp));
 
-  const openOpportunityFit = () => {
-    setActiveTab('preparation');
-    if (onOpenPilotOpportunityFit) {
-      onOpenPilotOpportunityFit(application);
-      return;
-    }
-    setOpportunityFitOpen(true);
+  const launchResolvedTask = (task: ApplicationTaskResolution['tasks'][number]) => {
+    if (!task.executable) return;
+    launchTask({
+      ref: task.ref,
+      source: 'application_task_card',
+      focus: task.taskId === 'application.offer_review' ? 'current' : 'overview',
+    });
   };
 
   const handleTabKeyDown = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
@@ -794,26 +1101,41 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
   return (
     <>
       <Modal
-        open={pilotPreparationChoices.length > 1}
+        open={pilotPreparationChooserOpen}
         title="选择要准备的面试"
         footer={null}
-        onCancel={() => setPilotPreparationChoices([])}
+        onCancel={() => {
+          setPilotPreparationChooserOpen(false);
+          setPilotPreparationChoices([]);
+        }}
       >
-        <Space direction="vertical" style={{ width: '100%' }}>
-          {pilotPreparationChoices.map((event) => (
-            <Button
-              key={event.id}
-              block
-              onClick={() => {
-                setPreparationEventID(event.id);
-                setPreparationOpen(true);
-                setPilotPreparationChoices([]);
-              }}
-            >
-              {event.subtype || '面试'} · {event.scheduled_at}
-            </Button>
-          ))}
-        </Space>
+        {pilotPreparationChoices.length > 0 ? (
+          <Space direction="vertical" style={{ width: '100%' }}>
+            {pilotPreparationChoices.map((event) => (
+              <Button
+                key={event.id}
+                block
+                onClick={() => {
+                  const result = launchTask({
+                    ref: {
+                      taskId: 'application.interview_prepare',
+                      applicationId: application.id,
+                      eventId: event.id,
+                    },
+                    source: 'interview_event_card',
+                    focus: 'current',
+                  });
+                  if (result.kind === 'launched' || result.kind === 'focused_existing') {
+                    setPilotPreparationChooserOpen(false);
+                    setPilotPreparationChoices([]);
+                  }
+                }}
+              >
+                {event.subtype || '面试'} · {event.scheduled_at}
+              </Button>
+            ))}
+          </Space>
+        ) : <div role="status">当前没有可选择的面试，请先安排面试后再开始准备。</div>}
       </Modal>
       <Modal
         open={jdEditorOpen}
@@ -1017,28 +1339,40 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
             <Title id="application-preparation-heading" level={4} className={styles.workspaceSectionTitle}>准备</Title>
             <Text type="secondary">按下一步任务整理岗位判断、材料、沟通与复盘入口。</Text>
             <div className={styles.taskList}>
-              <div className={styles.taskCard}>
-                <div>
-                  <Text strong>岗位匹配与风险</Text>
-                  <Paragraph type="secondary">先确认是否值得继续，以及需要补充的事实。</Paragraph>
-                </div>
-                <Button size="small" onClick={openOpportunityFit}>开始判断</Button>
-              </div>
-              <div className={styles.taskCard}>
-                <div>
-                  <Text strong>投递准备</Text>
-                  <Paragraph type="secondary">选择简历、查看调整建议并完成提交前检查。</Paragraph>
-                </div>
-                <Button size="small" onClick={openMaterials}>打开准备</Button>
-              </div>
-              <div className={styles.taskCard}>
-                <div>
-                  <Text strong>本次投递记录</Text>
-                  <Paragraph type="secondary">冻结实际使用的简历、JD 与材料，并记录外部结果。</Paragraph>
-                </div>
-                <Button size="small" onClick={() => setApplicationOutcomeOpen(true)}>打开记录</Button>
-              </div>
+              {applicationTaskResolution.tasks.length > 0 ? applicationTaskResolution.tasks.map((task) => {
+                const copy = TASK_COPY[task.taskId] ?? { title: '当前任务', description: '当前任务状态已更新。', action: '查看任务' };
+                const unavailable = task.availability === 'loading' || task.availability === 'blocked' || task.availability === 'unavailable';
+                return (
+                  <div className={styles.taskCard} key={`${task.taskId}:${task.ref.eventId ?? task.ref.applicationId}`} data-task-id={task.taskId}>
+                    <div>
+                      <Text strong>{copy.title}</Text>
+                      <Paragraph type="secondary">{copy.description}</Paragraph>
+                      <Text type="secondary">
+                        {task.availability === 'loading' ? '正在读取状态'
+                          : task.availability === 'unavailable' ? '当前资料暂不可用'
+                            : task.availability === 'blocked' ? '还缺少必要资料'
+                               : task.availability === 'waiting_confirmation' ? '等待确认'
+                                : task.reason === 'result_unknown' ? '结果待确认' : ''}
+                      </Text>
+                    </div>
+                    <Button
+                      size="small"
+                      type={task.primary ? 'primary' : 'default'}
+                      disabled={unavailable}
+                      onClick={() => launchResolvedTask(task)}
+                    >
+                      {copy.action}
+                    </Button>
+                  </div>
+                );
+              }) : (
+                <Text type="secondary">暂无可执行任务，必要资料加载完成后会显示在这里。</Text>
+              )}
             </div>
+            {applicationTaskResolution.hasLoading && <div role="status">任务状态正在读取</div>}
+            {applicationTaskResolution.hasUnavailable && !applicationTaskResolution.hasLoading && (
+              <div role="alert">部分任务暂不可用，请先检查相关资料</div>
+            )}
           </section>
 
         <section className={styles.workspaceSection} aria-labelledby="application-materials-heading">
@@ -1103,12 +1437,23 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
           </div>
         ) : eventsQuery.isError ? (
           <Alert style={{ marginBottom: 16 }} type="warning" showIcon message="日程暂时无法读取" action={<Button size="small" onClick={() => void eventsQuery.refetch()}>重试</Button>} />
-        ) : eventsQuery.data && eventsQuery.data.length > 0 ? (
+        ) : allEvents.length > 0 ? (
           <Space direction="vertical" style={{ width: '100%', marginBottom: 16 }}>
-            {eventsQuery.data.map((event) => {
+            {allEvents.map((event) => {
               const notesReady = !notesQuery.isLoading && !notesQuery.isError && Array.isArray(notesQuery.data);
               const linkedNote = notesReady ? notesQuery.data?.find((note) => note.application_event_id === event.id) : undefined;
-              const terminalEvent = isTerminalScheduleEvent(event);
+              const projected = taskSnapshot.events.status === 'ready'
+                ? taskSnapshot.events.value.find((item) => item.eventId === event.id)
+                : undefined;
+              const terminalEvent = projected?.lifecycle === 'cancelled';
+              const unavailableEvent = !projected
+                || projected.lifecycle === 'unknown'
+                || projected.bucket === 'unavailable';
+              const needsStatusUpdate = projected?.bucket === 'needs_status_update';
+              const completedEvent = projected?.lifecycle === 'completed';
+              const preparationTask = applicationTaskResolution.tasks.find(
+                (task) => task.taskId === 'application.interview_prepare' && task.ref.eventId === event.id,
+              );
               return (
               <div key={event.id} style={{ border: '1px solid #e2e8f0', borderRadius: 8, padding: 12 }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
@@ -1120,37 +1465,54 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
                 </div>
                 {event.event_type === 'interview' && terminalEvent ? (
                   <Text type="secondary">该面试已结束或取消，暂不提供准备与复盘操作。</Text>
+                ) : event.event_type === 'interview' && unavailableEvent ? (
+                  <Text type="secondary">该面试状态暂不可用，请先刷新日程后再操作。</Text>
+                ) : event.event_type === 'interview' && needsStatusUpdate ? (
+                  <Text type="secondary">该面试状态需要先更新，暂不提供准备与复盘操作。</Text>
                 ) : event.event_type === 'interview' && !notesReady ? (
                   <Text type="secondary">面试复盘暂不可用，请先完成读取或重试。</Text>
                 ) : event.event_type === 'interview' && (
                   <Space size={4}>
-                    <Button
+                    {completedEvent && <Button
                       size="small"
                       type="link"
                       onClick={() => {
-                        setReviewEventID(event.id);
-                        setEditingNote(linkedNote ?? null);
-                        if (linkedNote) setReviewProposalOpen(true);
-                        else setReviewFormOpen(true);
+                        const result = launchTask({
+                          ref: {
+                            taskId: 'application.interview_review',
+                            applicationId: application.id,
+                            eventId: event.id,
+                          },
+                          source: 'interview_event_card',
+                          focus: 'current',
+                        });
+                        if (taskLaunchAccepted(result)) setEditingNote(linkedNote ?? null);
                       }}
                     >
                       {linkedNote ? '查看复盘' : '记录复盘'}
-                    </Button>
-                    {linkedNote && (
+                    </Button>}
+                    {completedEvent && linkedNote && (
                       <Button size="small" type="link" onClick={() => openKnowledgeCapture(linkedNote)}>
                         保存为复盘沉淀
                       </Button>
                     )}
-                    <Button
-                      size="small"
-                      type="link"
-                      onClick={() => {
-                        setPreparationEventID(event.id);
-                        setPreparationOpen(true);
-                      }}
-                    >
-                      面试准备建议
-                    </Button>
+                    {!completedEvent && preparationTask?.executable && (
+                      <Button
+                        size="small"
+                        type="link"
+                        onClick={() => launchTask({
+                          ref: {
+                            taskId: 'application.interview_prepare',
+                            applicationId: application.id,
+                            eventId: event.id,
+                          },
+                          source: 'interview_event_card',
+                          focus: 'current',
+                        })}
+                      >
+                        面试准备建议
+                      </Button>
+                    )}
                   </Space>
                 )}
               </div>
@@ -1226,9 +1588,14 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
                         type="text"
                         size="small"
                         onClick={() => {
-                          setEditingNote(n);
-                          setReviewEventID(n.application_event_id ?? null);
-                          setReviewFormOpen(true);
+                          const result = launchTask({
+                            ref: n.application_event_id === null
+                              ? { taskId: 'application.general_review', applicationId: application.id }
+                              : { taskId: 'application.interview_review', applicationId: application.id, eventId: n.application_event_id },
+                            source: 'application_task_card',
+                            focus: 'current',
+                          });
+                          if (taskLaunchAccepted(result)) setEditingNote(n);
                         }}
                       >
                         编辑
@@ -1237,8 +1604,14 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
                         type="text"
                         size="small"
                         onClick={() => {
-                          setEditingNote(n);
-                          setReviewProposalOpen(true);
+                          const result = launchTask({
+                            ref: n.application_event_id === null
+                              ? { taskId: 'application.general_review', applicationId: application.id }
+                              : { taskId: 'application.interview_review', applicationId: application.id, eventId: n.application_event_id },
+                            source: 'application_task_card',
+                            focus: 'current',
+                          });
+                          if (taskLaunchAccepted(result)) setEditingNote(n);
                         }}
                       >
                         复盘建议
@@ -1293,6 +1666,18 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
                 ? '该投递已结束，结果与经验记录保留在投递事实中。'
                 : '尚未进入结果阶段，后续状态会继续在这里汇总。'}
           </Text>
+          <div style={{ marginTop: 12 }}>
+            <Button
+              size="small"
+              onClick={() => launchTask({
+                ref: { taskId: 'application.record_outcome', applicationId: application.id },
+                source: 'application_task_card',
+                focus: 'current',
+              })}
+            >
+              投递事实与结果
+            </Button>
+          </div>
         </section>
         </div>
 
@@ -1339,6 +1724,34 @@ export default function ApplicationDetail({ application, open, onClose, onOpenOf
           </section>
         </div>
       </section>
+
+      {activeTask ? (
+        <CoreTaskSurfaceHost
+          controller={effectiveTaskController}
+          renderOwner={renderTaskOwner}
+          heading="当前任务"
+        />
+      ) : null}
+
+      <ScheduleEventForm
+        open={eventFormOpen}
+        applications={[application]}
+        initialApplication={application}
+        onClose={() => setEventFormOpen(false)}
+      />
+
+      {knowledgeCaptureOpen && editingNote ? (
+        <InterviewKnowledgeCaptureDrawer
+          open
+          note={editingNote}
+          draft={interviewKnowledgeCaptureDrafts?.[editingNote.id] ?? createInterviewKnowledgeCaptureDraft()}
+          onDraftChange={(draft) => onInterviewKnowledgeCaptureDraftChange?.(editingNote.id, draft)}
+          onClose={() => {
+            setKnowledgeCaptureOpen(false);
+            setEditingNote(null);
+          }}
+        />
+      ) : null}
 
     </>
   );

@@ -44,7 +44,7 @@ import InterviewStudio, { type InterviewStudioContext as RealInterviewStudioCont
 import type { VoiceCoachingRecommendation } from '@/types/voiceCoaching';
 import InterviewStoryLibraryView, { type InterviewStoryOpenDraft } from '@/components/InterviewStoryLibraryView';
 import InterviewStoryDrawer, { createInterviewStoryDraft, type InterviewStoryDraft } from '@/components/InterviewStoryDrawer';
-import OfferNegotiationDrawer, { type OfferNegotiationDraft } from '@/components/OfferNegotiationDrawer';
+import { type OfferNegotiationDraft } from '@/components/OfferNegotiationDrawer';
 import { listOfferBindingState } from '@/components/offerWorkspaceModel';
 import { discardMockInterviewAttempt } from '@/services/mockInterviews';
 import type { EvidenceTarget } from '@/components/ChatPanel/model';
@@ -106,6 +106,12 @@ import {
   DEFAULT_APPLICATION_VIEW_STATE,
   type ApplicationViewState,
 } from '@/components/KanbanBoard/applicationLifecycle';
+import {
+  createCoreTaskSurfaceController,
+  type CoreTaskLaunchResult,
+  type CoreTaskSurfaceController,
+} from '@/features/coreTaskSurface/controller';
+import type { TaskLaunchRequest } from '@/features/coreTaskSurface/contracts';
 
 const { Content } = Layout;
 
@@ -193,6 +199,32 @@ export default function AppShell() {
 function AppShellContent() {
   const assistantSurface = useAssistantSurface();
   const pilotController = usePilotConversationController();
+  const [offerNegotiationEntryPoint, setOfferNegotiationEntryPoint] = useState<'ui' | 'pilot'>('ui');
+  const taskSurfaceGuardRef = useRef({ pending: false, unsaved: false });
+  // Composition-root authority: every application task opener delegates to
+  // this one generation-safe controller and no child creates another owner.
+  const coreTaskControllerRef = useRef(createCoreTaskSurfaceController({
+    hasPending: () => taskSurfaceGuardRef.current.pending,
+    hasUnsavedChanges: () => taskSurfaceGuardRef.current.unsaved,
+  }));
+  const coreTaskController: CoreTaskSurfaceController = coreTaskControllerRef.current;
+  const launchCoreTask = useCallback((request: TaskLaunchRequest): CoreTaskLaunchResult => {
+    const result = coreTaskController.launch(request);
+    // Entrypoint affects only the renderer's draft bucket. A duplicate focus
+    // must retain the existing bucket and never reset an active owner.
+    if (result.kind === 'launched' && request.ref.taskId === 'application.offer_review') {
+      setOfferNegotiationEntryPoint(request.source === 'pilot' ? 'pilot' : 'ui');
+    }
+    return result;
+  }, [coreTaskController]);
+  const closeCoreTaskSurface = useCallback(() => {
+    const active = coreTaskController.getState().active;
+    if (active) {
+      coreTaskController.close(active.generation);
+      coreTaskController.markClosed(active.generation);
+    }
+    taskSurfaceGuardRef.current = { pending: false, unsaved: false };
+  }, [coreTaskController]);
   const [view, setView] = useState<ViewMode>(readInitialWorkspaceView);
   const [applicationViewState, setApplicationViewState] = useState<ApplicationViewState>(
     DEFAULT_APPLICATION_VIEW_STATE,
@@ -227,14 +259,10 @@ function AppShellContent() {
   const [interviewStudioContext, setInterviewStudioContext] = useState<(RealInterviewStudioContext | QuickPracticeStudioContext) | null>(null);
   const [interviewStudioHaruVisible, setInterviewStudioHaruVisible] = useState(false);
   const [interviewStudioEvidenceOpen, setInterviewStudioEvidenceOpen] = useState(true);
-  const [offerNegotiationOffer, setOfferNegotiationOffer] = useState<Offer | null>(null);
-  const [offerNegotiationEntryPoint, setOfferNegotiationEntryPoint] = useState<'ui' | 'pilot'>('ui');
   const offerNegotiationDraftsRef = useRef(new Map<number, OfferNegotiationDraft>());
   const [offerNegotiationDrafts, setOfferNegotiationDrafts] = useState<Record<number, OfferNegotiationDraft>>({});
   const offerNegotiationPilotDraftsRef = useRef(new Map<number, OfferNegotiationDraft>());
   const [offerNegotiationPilotDrafts, setOfferNegotiationPilotDrafts] = useState<Record<number, OfferNegotiationDraft>>({});
-  const offerNegotiationOverlayRef = useRef<HTMLDivElement | null>(null);
-  const offerNegotiationPreviousFocusRef = useRef<HTMLElement | null>(null);
   const pilotApplicationContextRef = useRef(pilotApplicationContext);
   pilotApplicationContextRef.current = pilotApplicationContext;
   const invalidatePilotV2History = () => {
@@ -330,7 +358,7 @@ function AppShellContent() {
     queryFn: () => getPracticeStats(),
     retry: false,
   });
-  const { data: resumesData } = useQuery({
+  const { data: resumesData, isLoading: resumesLoading } = useQuery({
     queryKey: ['resumes'],
     queryFn: listResumes,
     enabled: true,
@@ -546,10 +574,11 @@ function AppShellContent() {
   useEffect(() => subscribeToWorkspaceView((nextView) => {
     if (nextView === currentViewRef.current) return;
     skipNextHistorySyncRef.current = true;
+    closeCoreTaskSurface();
     setSelected(null);
     setEvidenceFocus(null);
     setView(nextView);
-  }), []);
+  }), [closeCoreTaskSurface]);
 
   useEffect(() => {
     if (!hasMountedRouteRef.current) {
@@ -629,9 +658,10 @@ function AppShellContent() {
 
   useEffect(() => {
     if (selected && !apps.some((app) => app.id === selected.id)) {
+      closeCoreTaskSurface();
       setSelected(null);
     }
-  }, [apps, selected]);
+  }, [apps, closeCoreTaskSurface, selected]);
 
   const shouldShowContextualPilot = view !== 'pilot';
   const contextualPilotRailMode = shouldShowContextualPilot
@@ -706,6 +736,17 @@ function AppShellContent() {
   };
 
   const startApplicationChat = (application: Application, action?: PilotActionRequest) => {
+    if (action?.type === 'application_submission_snapshot' || action?.type === 'application_outcome_record') {
+      const task = launchCoreTask({
+        ref: { taskId: 'application.record_outcome', applicationId: application.id },
+        source: 'haru',
+        focus: 'current',
+      });
+      if (task.kind === 'invalid' || task.kind === 'unavailable' || task.kind === 'replacement_denied') return;
+      setSelected(application);
+      setView('board');
+      if (task.kind === 'focused_existing') return;
+    }
     const initialMessage = action?.type === 'application_submission_snapshot'
       ? '确认本次实际投递材料'
       : action?.type === 'application_outcome_record'
@@ -733,6 +774,7 @@ function AppShellContent() {
   };
 
   const navigateToView = (nextView: ViewMode, { preserveEvidenceFocus = false }: { preserveEvidenceFocus?: boolean } = {}) => {
+    closeCoreTaskSurface();
     setSelected(null);
     if (!preserveEvidenceFocus) setEvidenceFocus(null);
     if (nextView === 'pilot') {
@@ -776,6 +818,16 @@ function AppShellContent() {
   };
 
   const openApplicationDetail = (app: Application) => {
+    const active = coreTaskController.getState().active;
+    if (active && active.ref.applicationId !== app.id) {
+      if (taskSurfaceGuardRef.current.pending || taskSurfaceGuardRef.current.unsaved) {
+        message.warning('当前任务还有未完成内容，请先处理后再切换投递');
+        return;
+      }
+      coreTaskController.close(active.generation);
+      coreTaskController.markClosed(active.generation);
+      taskSurfaceGuardRef.current = { pending: false, unsaved: false };
+    }
     exitPilotContext();
     setSelected(app);
   };
@@ -855,7 +907,15 @@ function AppShellContent() {
   };
 
   const startPilotOpportunityFit = (app: Application) => {
-    setSelected(null);
+    const launchResult = launchCoreTask({
+      ref: { taskId: 'application.opportunity_fit', applicationId: app.id },
+      source: 'pilot',
+      focus: 'current',
+    });
+    if (launchResult.kind === 'invalid' || launchResult.kind === 'unavailable' || launchResult.kind === 'replacement_denied') return;
+    setSelected(app);
+    setView('board');
+    if (launchResult.kind === 'focused_existing') return;
     const currentPilot = pilotApplicationContextRef.current;
     if (currentPilot && currentPilot.applicationId !== app.id) {
       exitPilotContext();
@@ -870,13 +930,22 @@ function AppShellContent() {
         applicationId: app.id,
         pilotDraftKey: crypto.randomUUID(),
       });
-    assistantSurface.openPilot();
-    setView('pilot');
   };
 
   const openPilotInterviewReview = (applicationId: number) => {
     const app = apps.find((item) => item.id === applicationId);
     if (!app) return;
+    const launchResult = launchCoreTask({
+      ref: { taskId: 'application.general_review', applicationId },
+      source: 'pilot',
+      focus: 'current',
+    });
+    if (launchResult.kind === 'invalid' || launchResult.kind === 'unavailable' || launchResult.kind === 'replacement_denied') return;
+    if (launchResult.kind === 'focused_existing') {
+      setSelected(app);
+      setView('board');
+      return;
+    }
     exitPilotContext();
     setPilotInterviewReviewApplicationId(applicationId);
     setView('board');
@@ -886,11 +955,33 @@ function AppShellContent() {
   const openPilotInterviewPreparation = (applicationId: number, eventId?: number) => {
     const app = apps.find((item) => item.id === applicationId);
     if (!app) return;
+    if (eventId == null) {
+      // Keep application-only intent in the explicit event chooser. No event
+      // identity is inferred from ordering, time, or a singleton collection.
+      const active = coreTaskController.getState().active;
+      if (active && active.ref.applicationId !== applicationId
+        && (taskSurfaceGuardRef.current.pending || taskSurfaceGuardRef.current.unsaved)) {
+        message.warning('当前任务还有未完成内容，请先处理后再切换投递');
+        return;
+      }
+    } else {
+      const launchResult = launchCoreTask({
+        ref: { taskId: 'application.interview_prepare', applicationId, eventId },
+        source: 'pilot',
+        focus: 'current',
+      });
+      if (launchResult.kind === 'invalid' || launchResult.kind === 'unavailable' || launchResult.kind === 'replacement_denied') return;
+      if (launchResult.kind === 'focused_existing') {
+        setSelected(app);
+        setView('board');
+        return;
+      }
+    }
     exitPilotContext();
     setPilotInterviewPreparationApplicationId(applicationId);
     setPilotInterviewPreparationEventId(eventId ?? null);
     setView('board');
-    setSelected(app);
+    openApplicationDetail(app);
   };
 
   const openMockInterview = async (
@@ -952,8 +1043,26 @@ function AppShellContent() {
       message.warning('历史未绑定 Offer 仅支持只读查看');
       return;
     }
-    setOfferNegotiationOffer(offer);
+    const application = apps.find((item) => item.id === offer.application_id);
+    if (!application) {
+      message.warning('所属投递当前不可见');
+      return;
+    }
+    const launchResult = launchCoreTask({
+      ref: { taskId: 'application.offer_review', applicationId: application.id },
+      source: entrypoint === 'pilot' ? 'pilot' : 'application_header',
+      focus: 'current',
+      hints: { suggestedOfferId: offer.id },
+    });
+    if (launchResult.kind === 'invalid' || launchResult.kind === 'unavailable' || launchResult.kind === 'replacement_denied') return;
+    if (launchResult.kind === 'focused_existing') {
+      setSelected(application);
+      setView('board');
+      return;
+    }
     setOfferNegotiationEntryPoint(entrypoint);
+    setSelected(application);
+    setView('board');
   };
 
   const updateOfferNegotiationDraft = useCallback((offerId: number, draft: OfferNegotiationDraft | null) => {
@@ -974,68 +1083,19 @@ function AppShellContent() {
     updateOfferNegotiationDraft(offerId, draft);
   }, [updateOfferNegotiationDraft]);
 
-  const handleOfferNegotiationDrawerDraftChange = useCallback((draft: OfferNegotiationDraft | null) => {
-    if (offerNegotiationOffer) {
-      if (draft) {
-        offerNegotiationPilotDraftsRef.current.set(offerNegotiationOffer.id, draft);
-        setOfferNegotiationPilotDrafts((current) => ({ ...current, [offerNegotiationOffer.id]: draft }));
-      } else {
-        offerNegotiationPilotDraftsRef.current.delete(offerNegotiationOffer.id);
-        setOfferNegotiationPilotDrafts((current) => {
-          const next = { ...current };
-          delete next[offerNegotiationOffer.id];
-          return next;
-        });
-      }
+  const handleOfferNegotiationDrawerDraftChange = useCallback((offerId: number, draft: OfferNegotiationDraft | null) => {
+    if (draft) {
+      offerNegotiationPilotDraftsRef.current.set(offerId, draft);
+      setOfferNegotiationPilotDrafts((current) => ({ ...current, [offerId]: draft }));
+    } else {
+      offerNegotiationPilotDraftsRef.current.delete(offerId);
+      setOfferNegotiationPilotDrafts((current) => {
+        const next = { ...current };
+        delete next[offerId];
+        return next;
+      });
     }
-  }, [offerNegotiationOffer]);
-
-  useEffect(() => {
-    if (!offerNegotiationOffer) return;
-
-    offerNegotiationPreviousFocusRef.current = document.activeElement instanceof HTMLElement
-      ? document.activeElement
-      : null;
-    const overlay = offerNegotiationOverlayRef.current;
-    const selector = 'button, [href], input, textarea, select, [tabindex]:not([tabindex="-1"])';
-    const getFocusable = () => Array.from(overlay?.querySelectorAll<HTMLElement>(selector) ?? [])
-      .filter((element) => !element.hasAttribute('disabled') && element.getAttribute('aria-hidden') !== 'true');
-
-    const firstFocusable = getFocusable()[0];
-    (firstFocusable ?? overlay)?.focus();
-
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        event.preventDefault();
-        setOfferNegotiationOffer(null);
-        return;
-      }
-      if (event.key !== 'Tab') return;
-
-      const focusable = getFocusable();
-      if (focusable.length === 0) {
-        event.preventDefault();
-        overlay?.focus();
-        return;
-      }
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-
-    document.addEventListener('keydown', onKeyDown);
-    return () => {
-      document.removeEventListener('keydown', onKeyDown);
-      offerNegotiationPreviousFocusRef.current?.focus();
-      offerNegotiationPreviousFocusRef.current = null;
-    };
-  }, [offerNegotiationOffer]);
+  }, []);
 
   const updateMockInterviewDraft = (patch: Partial<MockInterviewDrawerDraft>) => {
     if (!mockInterviewContext || !mockInterviewDraft) return;
@@ -1413,16 +1473,32 @@ function AppShellContent() {
 
   const preparePilotMaterials = (handoff: PilotOpportunityFitMaterialHandoff) => {
     if (!handoff.jdVersionId) return;
+    const app = apps.find((item) => item.id === handoff.applicationId);
+    if (!app) {
+      message.warning('所属投递当前不可见');
+      return;
+    }
+    const launchResult = launchCoreTask({
+      ref: { taskId: 'application.material_kit', applicationId: handoff.applicationId },
+      source: 'pilot',
+      focus: 'current',
+      hints: handoff.resumeId ? { suggestedResumeId: handoff.resumeId } : undefined,
+    });
+    if (launchResult.kind === 'invalid' || launchResult.kind === 'unavailable' || launchResult.kind === 'replacement_denied') return;
+    if (launchResult.kind === 'focused_existing') {
+      setSelected(app);
+      setView('board');
+      return;
+    }
     writeMaterialKitHandoff({
       applicationId: handoff.applicationId,
       resumeId: handoff.resumeId,
       jdText: handoff.jdText,
       jdVersionId: handoff.jdVersionId,
     });
-    const app = apps.find((item) => item.id === handoff.applicationId);
     exitPilotContext();
     setView('board');
-    if (app) setSelected(app);
+    setSelected(app);
   };
 
   const clearEvidenceFocus = (target: EvidenceTarget) => {
@@ -1469,8 +1545,13 @@ function AppShellContent() {
       message.warning('所属投递当前不可见');
       return;
     }
+    const active = coreTaskController.getState().active;
+    if (active && (taskSurfaceGuardRef.current.pending || taskSurfaceGuardRef.current.unsaved)) {
+      message.warning('当前任务还有未完成内容，请先处理后再切换投递');
+      return;
+    }
     navigateToView('board');
-    setSelected(app);
+    openApplicationDetail(app);
   };
 
   const runPipelineAction = (item: PipelineInsight) => {
@@ -1485,9 +1566,20 @@ function AppShellContent() {
   const handleNextStepNavigate = (destination: NextStepDestination | ReadonlyDestination) => {
     switch (destination.kind) {
       case 'application_detail':
-      case 'material_kit_entry':
         goDetailById(destination.applicationId);
         return;
+      case 'material_kit_entry': {
+        const app = apps.find((item) => item.id === destination.applicationId);
+        if (!app) return;
+        const launchResult = launchCoreTask({
+          ref: { taskId: 'application.material_kit', applicationId: destination.applicationId },
+          source: 'deep_link',
+          focus: 'current',
+        });
+        if (launchResult.kind === 'invalid' || launchResult.kind === 'unavailable' || launchResult.kind === 'replacement_denied') return;
+        openApplicationDetail(app);
+        return;
+      }
       case 'pilot_opportunity_fit':
         {
           const app = apps.find((item) => item.id === destination.applicationId);
@@ -1501,20 +1593,43 @@ function AppShellContent() {
         goDetailById(destination.applicationId);
         return;
       case 'interview_review':
-      case 'interview_review_history':
+      case 'interview_review_history': {
+        const app = apps.find((item) => item.id === destination.applicationId);
+        if (!app) return;
+        const launchResult = launchCoreTask({
+          ref: {
+            taskId: 'application.interview_review',
+            applicationId: destination.applicationId,
+            eventId: destination.eventId,
+          },
+          source: 'deep_link',
+          focus: 'current',
+        });
+        if (launchResult.kind === 'invalid' || launchResult.kind === 'unavailable' || launchResult.kind === 'replacement_denied') return;
+        openApplicationDetail(app);
+        return;
+      }
       case 'interview_review_selection':
+        goDetailById(destination.applicationId);
         return;
       case 'opportunity_fit_history':
         {
           const app = apps.find((item) => item.id === destination.applicationId);
-          if (app) startPilotOpportunityFit(app);
+          if (!app) return;
+          const launchResult = launchCoreTask({
+            ref: { taskId: 'application.opportunity_fit', applicationId: destination.applicationId },
+            source: 'deep_link',
+            focus: 'history',
+          });
+          if (launchResult.kind === 'invalid' || launchResult.kind === 'unavailable' || launchResult.kind === 'replacement_denied') return;
+          openApplicationDetail(app);
         }
         return;
     }
   };
 
   const handleNextStepReadonlyNavigate = (destination: ReadonlyDestination) => {
-    if (destination.kind === 'application_detail') goDetailById(destination.applicationId);
+    handleNextStepNavigate(destination);
   };
 
   const isNextStepReadonlyNavigationAvailable = (destination: ReadonlyDestination) => (
@@ -1586,14 +1701,18 @@ function AppShellContent() {
   const workspaceContent = selectedApp ? (
     <ApplicationDetail
       application={selectedApp}
+      taskController={coreTaskController}
+      onLaunchTask={launchCoreTask}
+      onTaskSurfaceGuardChange={(guard) => { taskSurfaceGuardRef.current = guard; }}
+      taskNow={now.valueOf()}
       offers={ofrs}
+      offersLoading={offersLoading}
       offersError={offersError}
       onRetryOffers={() => void qc.invalidateQueries({ queryKey: ['offers'] })}
       open
-      onClose={() => setSelected(null)}
-      onOpenOffers={() => {
+      onClose={() => {
+        closeCoreTaskSurface();
         setSelected(null);
-        navigateToView('offers');
       }}
       onAskPilot={startApplicationChat}
       onOpenPilotOpportunityFit={startPilotOpportunityFit}
@@ -1606,6 +1725,10 @@ function AppShellContent() {
         setPilotInterviewPreparationEventId(null);
       }}
       onAttachToPilot={attachToPilot}
+      resumesLoading={resumesLoading}
+      offerNegotiationEntryPoint={offerNegotiationEntryPoint}
+      offerNegotiationDrafts={offerNegotiationEntryPoint === 'pilot' ? offerNegotiationPilotDrafts : offerNegotiationDrafts}
+      onOfferNegotiationDraftChange={offerNegotiationEntryPoint === 'pilot' ? handleOfferNegotiationDrawerDraftChange : updateOfferNegotiationDraft}
       applicationJdDraft={selectedApp ? applicationJdDrafts[selectedApp.id] : undefined}
       onApplicationJdDraftChange={updateApplicationJdDraft}
       opportunityFitDraft={selectedApp ? opportunityFitDrafts[selectedApp.id] : undefined}
@@ -2058,32 +2181,6 @@ function AppShellContent() {
           onDraftChange={updateInterviewStoryDraft}
           onClose={() => setInterviewStoryDrawerOpen(false)}
         />
-      ) : null}
-      {offerNegotiationOffer ? (
-        <div
-          className="op-offer-negotiation-overlay"
-          data-testid="offer-negotiation-overlay"
-          role="dialog"
-          aria-modal="true"
-          aria-label={`为 ${offerNegotiationOffer.company_name} 准备谈薪`}
-          ref={offerNegotiationOverlayRef}
-          tabIndex={-1}
-          style={{ position: 'fixed', inset: 0, zIndex: 1100 }}
-        >
-          <div className="op-offer-negotiation-surface">
-            <OfferNegotiationDrawer
-              key={`${offerNegotiationEntryPoint}-${offerNegotiationOffer.id}`}
-              open
-              offer={offerNegotiationOffer}
-              entrypoint={offerNegotiationEntryPoint}
-              draft={offerNegotiationEntryPoint === 'pilot'
-                ? offerNegotiationPilotDrafts[offerNegotiationOffer.id]
-                : offerNegotiationDrafts[offerNegotiationOffer.id]}
-              onDraftChange={handleOfferNegotiationDrawerDraftChange}
-              onClose={() => setOfferNegotiationOffer(null)}
-            />
-          </div>
-        </div>
       ) : null}
       </Layout>
     </DndContext>

@@ -69,14 +69,14 @@ describe('ResumeCard v0.1', () => {
     expect(markup).toContain('创建于');
     expect(markup).toContain('编辑');
     expect(markup).toContain('复制');
-    expect(markup).toContain('主简历不可删除');
+    expect(markup).toContain('基础简历不可删除');
     expect(markup).not.toContain('匹配');
     expect(markup).not.toContain('下载');
     expect(markup).not.toContain('导出');
   });
 
   it('shows set-as-master only for non-master resumes', () => {
-    const markup = renderCard({
+    const resume = {
       id: 8,
       name: '',
       file_path: '',
@@ -93,10 +93,70 @@ describe('ResumeCard v0.1', () => {
       completion_percent: 33,
       missing_sections: ['education'],
       is_complete: false,
+    } as Resume;
+
+    const markup = renderToStaticMarkup(
+      <AntApp>
+        <Card
+          resume={resume}
+          resumes={[resume, {
+            id: 7,
+            name: '',
+            file_path: '',
+            parsed_data: '',
+            parse_status: 'text-ready',
+            title: '基础版本',
+            is_master: true,
+            parent_resume_id: null,
+            source: 'manual',
+            source_file_path: '',
+            content_json: {},
+            deleted_at: null,
+            created_at: '2026-07-08T00:00:00Z',
+            completion_percent: 100,
+            missing_sections: [],
+            is_complete: true,
+          } as Resume]}
+          onEdit={vi.fn()}
+          onSetMaster={vi.fn()}
+          onCopy={vi.fn()}
+          onDelete={vi.fn()}
+        />
+      </AntApp>,
+    );
+
+    expect(markup).toContain('岗位版本');
+    expect(markup).toContain('基于 基础版本');
+    expect(markup).toContain('设为基础简历');
+    expect(markup).not.toContain('设为主简历');
+    expect(markup).not.toContain('主简历不可删除');
+  });
+
+  it('shows an unconfirmed relationship and blocks lineage-creating copy actions', () => {
+    const markup = renderCard({
+      id: 12,
+      name: '',
+      file_path: '',
+      parsed_data: '',
+      parse_status: 'text-ready',
+      title: '',
+      is_master: false,
+      parent_resume_id: 99,
+      source: 'manual',
+      source_file_path: '',
+      content_json: {},
+      deleted_at: null,
+      created_at: '2026-08-06T04:00:00Z',
+      completion_percent: 0,
+      missing_sections: [],
+      is_complete: false,
     } as Resume);
 
-    expect(markup).toContain('设为主简历');
-    expect(markup).not.toContain('主简历不可删除');
+    expect(markup).toContain('关系待确认');
+    expect(markup).toContain('关系待确认，暂不能复制');
+    expect(markup).toContain('关系待确认，暂不能设为基础简历');
+    expect(markup).toContain('未命名简历');
+    expect(markup).not.toContain('#12');
   });
 
   it('renders a compare action and sends only the resume id to its callback', async () => {

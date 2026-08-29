@@ -62,7 +62,7 @@ let onContinueInCopy: ReturnType<typeof vi.fn>;
 let onExitToLibrary: ReturnType<typeof vi.fn>;
 let onCopyResultUnknown: ReturnType<typeof vi.fn>;
 
-function renderWorkspace() {
+function renderWorkspace(options: { source?: Resume; finding?: ResumeAuditFinding } = {}) {
   container = document.createElement('div');
   document.body.appendChild(container);
   root = createRoot(container);
@@ -77,8 +77,8 @@ function renderWorkspace() {
       <AntApp>
         <ResumeFactSupplementWorkspace
           open
-          source={source}
-          finding={finding}
+          source={options.source ?? source}
+          finding={options.finding ?? finding}
           onClose={onClose}
           onCompleted={onCompleted}
           onCopyCreated={onCopyCreated}
@@ -164,6 +164,9 @@ describe('ResumeFactSupplementWorkspace', () => {
 
     expect(document.body.textContent).toContain('负责订单服务');
     expect(document.body.textContent).toContain('系统不会替你估算数字');
+    expect(document.body.textContent).toContain('基础简历');
+    expect(document.body.textContent).not.toContain('#7');
+    expect(document.body.textContent).not.toContain('/experience/0/highlights/0');
     expect(button('创建新版本并查看差异').disabled).toBe(true);
 
     await fillFinalText('将订单接口平均响应时间从 320ms 降至 180ms');
@@ -295,5 +298,15 @@ describe('ResumeFactSupplementWorkspace', () => {
 
     expect(state.updateResume).toHaveBeenCalledTimes(1);
     expect(onCompleted).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not create another lineage while the source relationship is unconfirmed', async () => {
+    renderWorkspace({ source: { ...source, is_master: false, parent_resume_id: 99 } });
+
+    expect(document.body.textContent).toContain('关系待确认');
+    await fillFinalText('完成真实事实补充');
+    await confirmTruth();
+    expect(button('创建新版本并查看差异').disabled).toBe(true);
+    expect(state.copyResume).not.toHaveBeenCalled();
   });
 });

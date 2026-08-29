@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { createServer } from 'vite';
 import source from './ResumeLibraryView.tsx?raw';
+import cardSource from './ResumeCard.tsx?raw';
+import editorSource from './ResumeEditorDrawer.tsx?raw';
+import compareSource from './ResumeVersionCompareDrawer.tsx?raw';
+import factSource from './ResumeFactSupplementWorkspace.tsx?raw';
 
 async function onboardingStyles() {
   const server = await createServer({
@@ -43,5 +47,20 @@ describe('ResumeLibraryView onboarding source contract', () => {
     expect(styles).toContain('outline: 2px solid var(--op-primary);');
     expect(styles).toContain('box-shadow:');
     expect(styles).not.toContain('outline-color: transparent;');
+  });
+
+  it('shares one resume lineage vocabulary across every resume surface', () => {
+    const surfaces = [cardSource, editorSource, compareSource, factSource];
+
+    for (const surface of surfaces) {
+      expect(surface).toContain('formatResumeLineage');
+      expect(surface).not.toContain('主简历');
+      expect(surface).not.toContain('父版本');
+      expect(surface).not.toContain('简历 #');
+    }
+    expect(source).toContain('resumes={resumes}');
+    expect(editorSource).toContain('resolveResumeLineage');
+    expect(compareSource).toContain('resolveResumeLineage');
+    expect(factSource).toContain('resolveResumeLineage');
   });
 });

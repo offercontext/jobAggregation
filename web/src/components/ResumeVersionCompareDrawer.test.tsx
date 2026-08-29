@@ -109,9 +109,9 @@ describe('ResumeVersionCompareDrawer', () => {
     expect(select.value).toBe('2');
     expect(Array.from(select.options).map((option) => option.value)).toEqual(['', '2', '9', '1']);
     expect(select.options[1].textContent).toContain('中文版本 2');
-    expect(select.options[1].textContent).toContain('#2');
-    expect(select.options[1].textContent).toContain('主简历');
-    expect(select.options[1].textContent).toContain('父版本');
+    expect(select.options[1].textContent).toContain('基础简历');
+    expect(select.options[1].textContent).not.toContain('#2');
+    expect(select.options[1].textContent).not.toContain('父版本');
     expect(select.textContent).not.toContain('v1');
     expect(select.textContent).not.toContain('v2');
   });
@@ -128,6 +128,18 @@ describe('ResumeVersionCompareDrawer', () => {
     root = null;
     renderDrawer(makeResume(4), [makeResume(4), makeResume(1)]);
     expect(compareSelect().value).toBe('');
+  });
+
+  it('does not offer a deleted parent as a baseline or expose relationship internals', () => {
+    const target = makeResume(3, { parent_resume_id: 2 });
+    const deletedParent = makeResume(2, { is_master: true, deleted_at: '2026-08-30T00:00:00Z' });
+
+    renderDrawer(target, [target, deletedParent, makeResume(1)]);
+
+    expect(compareSelect().value).toBe('');
+    expect(Array.from(compareSelect().options).map((option) => option.textContent).join(' ')).not.toContain('中文版本 2');
+    expect(drawerRoot().textContent).not.toContain('parent_resume_id');
+    expect(drawerRoot().textContent).not.toContain('is_master');
   });
 
   it('keeps a manual baseline across candidate refresh and reapplies only a new target parent', async () => {
@@ -197,7 +209,8 @@ describe('ResumeVersionCompareDrawer', () => {
     expect(drawerRoot().textContent).toContain('仅比较当前已保存的简历内容');
     expect(drawerRoot().textContent).toContain('数组按位置比较，不推断经历、公司或项目是否为同一项');
     expect(drawerRoot().textContent).toContain('修改 1');
-    expect(drawerRoot().textContent).toContain('/raw_text');
+    expect(drawerRoot().textContent).toContain('其他结构化字段');
+    expect(drawerRoot().textContent).not.toContain('/raw_text');
     expect(drawerRoot().querySelectorAll('details')).toHaveLength(1);
 
     const details = drawerRoot().querySelector('details');
@@ -239,8 +252,10 @@ describe('ResumeVersionCompareDrawer', () => {
 
     renderDrawer(target, [target, base]);
 
-    const added = drawerRoot().querySelector<HTMLElement>('[data-diff-path="/added"]');
-    const removed = drawerRoot().querySelector<HTMLElement>('[data-diff-path="/removed"]');
+    const added = Array.from(drawerRoot().querySelectorAll<HTMLElement>('[data-diff-module="other"]'))
+      .find((item) => item.textContent?.includes('new'));
+    const removed = Array.from(drawerRoot().querySelectorAll<HTMLElement>('[data-diff-module="other"]'))
+      .find((item) => item.textContent?.includes('gone'));
     expect(added?.querySelectorAll('pre')).toHaveLength(1);
     expect(added?.textContent).toContain('new');
     expect(added?.textContent).not.toContain('不存在');

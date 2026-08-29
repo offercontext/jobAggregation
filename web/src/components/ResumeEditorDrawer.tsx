@@ -3,6 +3,8 @@ import { Alert, Button, Input, Modal, Progress, Space, Tag, message } from 'antd
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { updateResume } from '@/services/resumes';
 import type { Resume, ResumeContent, UpdateResumeInput } from '@/types/resume';
+import { formatResumeLineage } from '@/features/materialSurfaces/materialLabels';
+import { resolveResumeLineage } from '@/features/materialSurfaces/resumeLineage';
 import { buildAdvancedResumeJson, parseStructuredResume, serializeStructuredResume, type StructuredResumeDraft } from '@/lib/structuredResume';
 import dayjs from 'dayjs';
 import styles from './ResumeLibraryView.module.css';
@@ -20,6 +22,7 @@ interface Props {
   onFactContinueInCopy?: (resume: Resume) => void;
   onFactExitToLibrary?: () => void;
   onFactCopyResultUnknown?: () => void;
+  resumes?: readonly Resume[];
 }
 
 type SectionKey = 'intent' | 'contact' | 'education' | 'experience' | 'projects' | 'skills' | 'other';
@@ -50,6 +53,7 @@ const EMPTY_DRAFT: StructuredResumeDraft = {
 export default function ResumeEditorDrawer({
   resume, open, onClose, onSaved, onFactVersionCreated, onFactCopyCreated,
   onFactContinueInCopy, onFactExitToLibrary, onFactCopyResultUnknown,
+  resumes,
 }: Props) {
   const qc = useQueryClient();
   const parsed = useMemo(() => parseStructuredResume(resume?.content_json), [resume?.content_json]);
@@ -62,6 +66,15 @@ export default function ResumeEditorDrawer({
   const [advancedJson, setAdvancedJson] = useState('');
   const [auditOpen, setAuditOpen] = useState(false);
   const [supplementFinding, setSupplementFinding] = useState<ResumeAuditFinding | null>(null);
+  const lineageResumes = useMemo(() => {
+    if (!resume) return resumes ?? [];
+    if (resumes?.some((candidate) => candidate.id === resume.id)) return resumes;
+    return [resume, ...(resumes ?? [])];
+  }, [resume, resumes]);
+  const lineage = useMemo(
+    () => resume ? resolveResumeLineage(lineageResumes, resume.id) : null,
+    [lineageResumes, resume],
+  );
 
   useEffect(() => {
     if (!resume) return;
@@ -181,8 +194,10 @@ export default function ResumeEditorDrawer({
       <div className={styles.editorHeader}>
         <Input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="简历标题" className={styles.editorTitleInput} />
         <div className={styles.editorMeta}>
-          <Tag color={resume.is_master ? 'blue' : 'default'}>{resume.is_master ? '主简历' : '非主简历'}</Tag>
-          <Tag>{SOURCE_LABELS[resume.source] ?? resume.source}</Tag>
+          <Tag color={lineage?.kind === 'base' ? 'blue' : lineage?.kind === 'relationship_unknown' ? 'warning' : 'default'}>
+            {lineage ? formatResumeLineage(lineage) : '关系待确认'}
+          </Tag>
+          <Tag>{SOURCE_LABELS[resume.source] ?? '来源待确认'}</Tag>
           <span>{dayjs(resume.created_at).format('YYYY-MM-DD HH:mm')}</span>
         </div>
         <div className={styles.editorCompletion}>
@@ -228,7 +243,7 @@ export default function ResumeEditorDrawer({
 
       {supplementFinding ? (
         <ResumeFactSupplementWorkspace
-          open source={resume} finding={supplementFinding} onClose={() => setSupplementFinding(null)}
+          open source={resume} resumes={lineageResumes} finding={supplementFinding} onClose={() => setSupplementFinding(null)}
           onCompleted={(created) => { setSupplementFinding(null); onFactVersionCreated?.(created); }}
           onCopyCreated={onFactCopyCreated}
           onContinueInCopy={(copy) => { setSupplementFinding(null); onFactContinueInCopy?.(copy); }}

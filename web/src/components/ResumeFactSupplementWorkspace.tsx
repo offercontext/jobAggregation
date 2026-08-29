@@ -4,12 +4,15 @@ import { CheckCircleFilled, SafetyCertificateOutlined } from '@ant-design/icons'
 import { copyResume, updateResume } from '@/services/resumes';
 import type { Resume } from '@/types/resume';
 import type { ResumeAuditFinding } from '@/lib/resumeEvidenceAudit';
+import { formatResumeLineage } from '@/features/materialSurfaces/materialLabels';
+import { resolveResumeLineage } from '@/features/materialSurfaces/resumeLineage';
 import { applyResumeFactSupplement, validateSupplementText } from '@/lib/resumeFactSupplement';
 import styles from './ResumeLibraryView.module.css';
 
 export interface ResumeFactSupplementWorkspaceProps {
   open: boolean;
   source: Resume;
+  resumes?: readonly Resume[];
   finding: ResumeAuditFinding;
   onClose: () => void;
   onCompleted: (resume: Resume) => void;
@@ -24,6 +27,7 @@ type OperationState = 'idle' | 'saving' | 'source_changed' | 'unknown';
 export default function ResumeFactSupplementWorkspace({
   open,
   source,
+  resumes,
   finding,
   onClose,
   onCompleted,
@@ -43,6 +47,15 @@ export default function ResumeFactSupplementWorkspace({
   const versionTitleRef = useRef('');
   const onCloseRef = useRef(onClose);
   const operationStateRef = useRef<OperationState>('idle');
+  const lineageResumes = useMemo(() => {
+    if (resumes?.some((candidate) => candidate.id === source.id)) return resumes;
+    return [source, ...(resumes ?? [])];
+  }, [resumes, source]);
+  const lineage = useMemo(
+    () => resolveResumeLineage(lineageResumes, source.id),
+    [lineageResumes, source.id],
+  );
+  const lineageLabel = formatResumeLineage(lineage);
 
   useEffect(() => {
     onCloseRef.current = onClose;
@@ -104,10 +117,12 @@ export default function ResumeFactSupplementWorkspace({
     }
   }, [finalText]);
   const frozen = operationState === 'unknown' || operationState === 'source_changed';
+  const lineageKnown = lineage.kind !== 'relationship_unknown';
   const canSubmit = confirmed
     && normalizedText.length > 0
     && normalizedText !== expectedText.trim()
     && operationState !== 'saving'
+    && lineageKnown
     && !frozen;
 
   if (!open) return null;
@@ -156,7 +171,7 @@ export default function ResumeFactSupplementWorkspace({
     } catch {
       operationStateRef.current = 'source_changed';
       setOperationState('source_changed');
-      setStatusText(`来源已变化。新版本已创建（#${copy.id}），但没有写入旧表述，请返回简历库重新体检。`);
+      setStatusText('来源已变化。新版本已创建，但没有写入旧表述，请返回简历库重新体检。');
       return;
     }
 
@@ -168,7 +183,7 @@ export default function ResumeFactSupplementWorkspace({
     } catch {
       operationStateRef.current = 'unknown';
       setOperationState('unknown');
-      setStatusText(`新版本已创建（#${copy.id}），但保存结果待确认。为避免覆盖已写入内容，请返回简历库核对。`);
+      setStatusText('新版本已创建，但保存结果待确认。为避免覆盖已写入内容，请返回简历库核对。');
       onCopyResultUnknown?.();
     }
   };
@@ -210,8 +225,8 @@ export default function ResumeFactSupplementWorkspace({
               </div>
             </div>
             <div className={styles.factSourceCard}>
-              <Tag color="blue">当前版本 #{source.id}</Tag>
-              <code>{finding.source?.path}</code>
+              <Tag color={lineage.kind === 'base' ? 'blue' : lineage.kind === 'relationship_unknown' ? 'warning' : 'default'}>{lineageLabel}</Tag>
+              <span>来自已保存简历的当前内容</span>
               <blockquote>{excerpt || '（空白经历要点）'}</blockquote>
             </div>
             <div className={styles.factGuardrail}>
@@ -257,6 +272,12 @@ export default function ResumeFactSupplementWorkspace({
             >
               以上内容是本人确认的真实事实
             </Checkbox>
+
+            {!lineageKnown && (
+              <div className={styles.factOperationStatus} role="status">
+                <span>关系待确认，暂不能创建新版本。</span>
+              </div>
+            )}
 
             {statusText && (
               <div

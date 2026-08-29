@@ -3,6 +3,8 @@ import { CopyOutlined, DeleteOutlined, EditOutlined, FileTextOutlined, StarOutli
 import dayjs from 'dayjs';
 import type { ReactNode } from 'react';
 import type { Resume } from '@/types/resume';
+import { formatResumeLineage, resumeDisplayTitle } from '@/features/materialSurfaces/materialLabels';
+import { resolveResumeLineage } from '@/features/materialSurfaces/resumeLineage';
 import { createPilotAttachmentDragBinding } from './PilotAttachmentHandle';
 
 interface Props {
@@ -13,6 +15,7 @@ interface Props {
   onDelete: (id: number) => void;
   onCompare?: (id: number) => void;
   onAttachToPilot?: (attachment: import('@/types/chat').PilotContextAttachment) => void;
+  resumes?: readonly Resume[];
 }
 
 const SOURCE_LABELS: Record<string, string> = {
@@ -32,9 +35,13 @@ const SECTION_LABELS: Record<string, string> = {
   skills: '技能清单',
 };
 
-export default function ResumeCard({ resume, onEdit, onSetMaster, onCopy, onDelete, onCompare, onAttachToPilot }: Props) {
-  const title = resume.title || resume.name || `简历 #${resume.id}`;
-  const sourceLabel = SOURCE_LABELS[resume.source] ?? resume.source;
+export default function ResumeCard({ resume, onEdit, onSetMaster, onCopy, onDelete, onCompare, onAttachToPilot, resumes }: Props) {
+  const title = resumeDisplayTitle(resume);
+  const sourceLabel = SOURCE_LABELS[resume.source] ?? '来源待确认';
+  const lineage = resolveResumeLineage(resumes ?? [resume], resume.id);
+  const lineageLabel = formatResumeLineage(lineage);
+  const isBase = lineage.kind === 'base';
+  const canCreateLineage = lineage.kind !== 'relationship_unknown';
   const completion = Math.max(0, Math.min(100, resume.completion_percent ?? 0));
   const missing = (resume.missing_sections ?? []).map((item) => SECTION_LABELS[item] ?? item);
   const preview = sectionPreview(resume);
@@ -46,7 +53,7 @@ export default function ResumeCard({ resume, onEdit, onSetMaster, onCopy, onDele
     <Card hoverable styles={{ body: { padding: 14 } }} {...resumeDragBinding}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 }}>
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-          {resume.is_master && <Tag color="blue" style={{ borderRadius: 8 }}>主简历</Tag>}
+          <Tag color={isBase ? 'blue' : lineage.kind === 'relationship_unknown' ? 'warning' : 'default'} style={{ borderRadius: 8 }}>{lineageLabel}</Tag>
           <Tag color={sourceColor(resume.source)} style={{ borderRadius: 8 }}>{sourceLabel}</Tag>
         </div>
         <span style={{ fontSize: 11, color: 'var(--op-muted)', whiteSpace: 'nowrap' }}>
@@ -80,14 +87,26 @@ export default function ResumeCard({ resume, onEdit, onSetMaster, onCopy, onDele
 
       <div style={{ display: 'flex', marginTop: 12, borderTop: '1px solid var(--op-border)', paddingTop: 10 }}>
         <CardAction label="编辑" icon={<EditOutlined />} onClick={() => onEdit(resume.id)} primary />
-        {!resume.is_master && (
+        {!isBase && (
           <>
             <VDivider />
-            <CardAction label="设为主简历" icon={<StarOutlined />} onClick={() => onSetMaster(resume.id)} />
+            <CardAction
+              label="设为基础简历"
+              icon={<StarOutlined />}
+              onClick={() => onSetMaster(resume.id)}
+              disabled={!canCreateLineage}
+              disabledReason={!canCreateLineage ? '关系待确认，暂不能设为基础简历' : undefined}
+            />
           </>
         )}
         <VDivider />
-        <CardAction label="复制" icon={<CopyOutlined />} onClick={() => onCopy(resume.id)} />
+        <CardAction
+          label="复制"
+          icon={<CopyOutlined />}
+          onClick={() => onCopy(resume.id)}
+          disabled={!canCreateLineage}
+          disabledReason={!canCreateLineage ? '关系待确认，暂不能复制' : undefined}
+        />
         {onCompare && (
           <>
             <VDivider />
@@ -99,8 +118,8 @@ export default function ResumeCard({ resume, onEdit, onSetMaster, onCopy, onDele
           label="删除"
           icon={<DeleteOutlined />}
           onClick={() => onDelete(resume.id)}
-          disabled={resume.is_master}
-          disabledReason={resume.is_master ? '主简历不可删除' : undefined}
+          disabled={isBase}
+          disabledReason={isBase ? '基础简历不可删除' : undefined}
         />
       </div>
     </Card>

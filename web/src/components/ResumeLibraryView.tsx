@@ -113,12 +113,12 @@ export default function ResumeLibraryView({
   const setMasterMut = useMutation({
     mutationFn: (id: number) => updateResume(id, { is_master: true }),
     onSuccess: (res) => {
-      message.success('已设为主简历');
+      message.success('已设为基础简历');
       qc.invalidateQueries({ queryKey: ['resumes'] });
       qc.invalidateQueries({ queryKey: ONBOARDING_QUERY_KEY });
       setEditing(res);
     },
-    onError: () => message.error('设置主简历失败'),
+    onError: () => message.error('设置基础简历失败'),
   });
 
   const copyMut = useMutation({
@@ -140,7 +140,7 @@ export default function ResumeLibraryView({
     },
     onError: (error: any) => {
       const detail = error?.response?.data?.error;
-      message.error(detail === 'master resume cannot be deleted' ? '主简历不可删除' : '删除失败');
+      message.error(detail === 'master resume cannot be deleted' ? '基础简历不可删除' : '删除失败');
     },
   });
 
@@ -258,6 +258,7 @@ export default function ResumeLibraryView({
     return (
       <ResumeEditorDrawer
         resume={editing}
+        resumes={resumes}
         open={!!editing}
         onClose={() => setEditing(null)}
         onSaved={(next) => setEditing(next)}
@@ -310,7 +311,7 @@ export default function ResumeLibraryView({
           className={`${styles.headerActions} ${onboardingFocusActive ? styles.onboardingFocus : ''}`}
           tabIndex={-1}
           data-onboarding-target="resume-create"
-          aria-label="创建主简历入口"
+          aria-label="创建基础简历入口"
         >
           <Input.Search
             placeholder="搜索简历"
@@ -360,6 +361,7 @@ export default function ResumeLibraryView({
             <div key={r.id} className={styles.card} style={{ animationDelay: `${Math.min(i, 6) * 60}ms` }}>
               <ResumeCard
                 resume={r}
+                resumes={resumes}
                 onEdit={() => setEditing(r)}
                 onSetMaster={() => setMasterMut.mutate(r.id)}
                 onCopy={() => copyMut.mutate(r.id)}

@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Resume } from '@/types/resume';
 import { diffResumeContent, type DiffModule, type DiffText, type ResumeDiffItem } from '@/lib/resumeVersionDiff';
+import { formatResumeLineage, resumeDisplayTitle } from '@/features/materialSurfaces/materialLabels';
+import { resolveResumeLineage } from '@/features/materialSurfaces/resumeLineage';
 import styles from './ResumeLibraryView.module.css';
 
 export type ResumeVersionCompareDrawerProps = {
@@ -53,15 +55,13 @@ export default function ResumeVersionCompareDrawer({
     const openedNow = open && !previousOpen.current;
     const targetChanged = open && previousTargetId.current !== target.id;
     if (open && (openedNow || targetChanged)) {
-      const parent = candidates.find(
-        (candidate) => candidate.id === target.parent_resume_id && candidate.id !== target.id,
-      );
-      setBaselineId(parent?.id ?? null);
+      const lineage = resolveResumeLineage(candidates, target.id);
+      setBaselineId(lineage.kind === 'job_variant' ? lineage.parent?.id ?? null : null);
       setExpandedKeys(new Set());
     }
     previousOpen.current = open;
     if (open) previousTargetId.current = target.id;
-  }, [candidates, open, target.id, target.parent_resume_id]);
+  }, [candidates, open, target]);
 
   useEffect(() => {
     if (baselineId !== null && !candidates.some((candidate) => candidate.id === baselineId && candidate.id !== target.id)) {
@@ -130,7 +130,7 @@ export default function ResumeVersionCompareDrawer({
             <div className={styles.compareEyebrow}>已保存内容审阅</div>
             <h2 className={styles.compareTitle}>对比版本</h2>
             <p className={styles.compareSubtitle}>
-              当前目标：{resumeTitle(target)} #{target.id}
+              当前目标：{resumeDisplayTitle(target)}
             </p>
           </div>
           <button type="button" className={styles.compareClose} aria-label="关闭版本对比" onClick={onClose}>×</button>
@@ -155,7 +155,7 @@ export default function ResumeVersionCompareDrawer({
               </option>
               {sortedCandidates.map((candidate) => (
                 <option key={candidate.id} value={candidate.id}>
-                  {candidateLabel(candidate, target)}
+                  {candidateLabel(candidate, candidates)}
                 </option>
               ))}
             </select>
@@ -163,7 +163,7 @@ export default function ResumeVersionCompareDrawer({
 
           {baseline && (
             <div className={styles.compareBaselineSummary}>
-              基准：{resumeTitle(baseline)} #{baseline.id}
+              基准：{resumeDisplayTitle(baseline)}
             </div>
           )}
 
@@ -224,10 +224,10 @@ function DiffItemView({
   onToggle: (key: string, expanded: boolean) => void;
 }) {
   return (
-    <article className={styles.compareItem} data-diff-path={item.path}>
+    <article className={styles.compareItem} data-diff-module={item.module}>
       <div className={styles.compareItemMeta}>
         <span className={styles.compareKind}>{KIND_LABELS[item.kind]}</span>
-        <code>{item.path || '(根路径)'}</code>
+        <span>{MODULE_LABELS[item.module]}</span>
       </div>
       <div className={styles.compareValues}>
         {item.kind !== 'added' && (
@@ -263,7 +263,7 @@ function ValueView({
   const isExpanded = expandedKeys.has(keyPrefix);
   return (
     <div className={styles.compareValue}>
-      <span className={styles.compareValueLabel}>{label} · {value.valueType}</span>
+      <span className={styles.compareValueLabel}>{label}</span>
       {text.truncated ? (
         <>
           {!isExpanded && <pre>{text.preview}</pre>}
@@ -280,8 +280,12 @@ function ValueView({
 }
 
 function sortCandidates(target: Resume, candidates: Resume[]) {
-  const available = candidates.filter((candidate) => candidate.id !== target.id);
-  const parentId = target.parent_resume_id;
+  const available = candidates.filter((candidate) => (
+    candidate.id !== target.id
+    && candidate.deleted_at == null
+  ));
+  const lineage = resolveResumeLineage(candidates, target.id);
+  const parentId = lineage.kind === 'job_variant' ? lineage.parent?.id ?? null : null;
   return available.sort((left, right) => {
     const leftIsParent = left.id === parentId;
     const rightIsParent = right.id === parentId;
@@ -290,16 +294,9 @@ function sortCandidates(target: Resume, candidates: Resume[]) {
   });
 }
 
-function candidateLabel(candidate: Resume, target: Resume) {
-  const relationships = [
-    candidate.is_master ? '主简历' : '',
-    candidate.id === target.parent_resume_id ? '父版本' : '',
-  ].filter(Boolean);
-  return `${resumeTitle(candidate)} #${candidate.id}（${relationships.join('、') || '其他简历'}）`;
-}
-
-function resumeTitle(resume: Resume) {
-  return resume.title || resume.name || `简历`;
+function candidateLabel(candidate: Resume, candidates: Resume[]) {
+  const lineage = resolveResumeLineage(candidates, candidate.id);
+  return `${resumeDisplayTitle(candidate)}（${formatResumeLineage(lineage)}）`;
 }
 
 function groupItems(items: ResumeDiffItem[]) {

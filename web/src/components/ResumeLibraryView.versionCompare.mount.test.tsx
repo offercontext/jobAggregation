@@ -156,7 +156,8 @@ describe('ResumeLibraryView version compare mounted audit', () => {
       select!.value = '1';
       select!.dispatchEvent(new Event('change', { bubbles: true }));
     });
-    expect(host?.textContent).toContain('/experience/0/highlights/0');
+    expect(host?.textContent).toContain('工作经历');
+    expect(host?.textContent).not.toContain('/experience/0/highlights/0');
 
     const details = host?.querySelector('details');
     const summary = details?.querySelector('summary');

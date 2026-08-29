@@ -176,6 +176,9 @@ describe('ResumeEditorDrawer mounted audit flow', () => {
   it('opens, expands, collapses, and closes the audit without write, AI, HTTP, or navigation calls', async () => {
     renderEditor();
 
+    expect(container?.textContent).toContain('基础简历');
+    expect(container?.textContent).not.toContain('主简历');
+
     const openButton = findButton('简历事实体检');
     expect(openButton.getAttribute('aria-expanded')).toBe('false');
     expect(container?.textContent).not.toContain('只检查当前简历中可观察的信息');

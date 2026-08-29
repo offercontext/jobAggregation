@@ -25,7 +25,8 @@ export type CoreTaskLaunchResult =
   | { readonly kind: 'focused_existing'; readonly generation: number; readonly key: string; readonly ownerId: string }
   | { readonly kind: 'invalid'; readonly reason: 'unknown_task' | 'invalid_task_identity' }
   | { readonly kind: 'unavailable'; readonly reason: 'task_owner_unavailable' }
-  | { readonly kind: 'replacement_denied'; readonly reason: 'replacement_guard_denied'; readonly generation: number };
+  | { readonly kind: 'replacement_denied'; readonly reason: 'replacement_guard_denied'; readonly generation: number }
+  | { readonly kind: 'superseded'; readonly generation: number; readonly key: string };
 
 export interface CoreTaskControllerOptions {
   readonly registry?: Partial<Readonly<Record<CoreTaskId, CoreTaskOwner>>> | Readonly<Record<string, CoreTaskOwner | undefined>>;
@@ -53,8 +54,10 @@ export interface CoreTaskSurfaceController {
 const CLOSED_STATE: CoreTaskSurfaceState = Object.freeze({ phase: 'closed', generation: 0, active: null });
 
 function frozenRequest(request: TaskLaunchRequest, ref: CoreTaskRef): TaskLaunchRequest {
+  const source = request.source;
+  const focus = request.focus;
   const hints = request.hints ? Object.freeze({ ...request.hints }) : undefined;
-  return Object.freeze({ ...request, ref, ...(hints ? { hints } : {}) });
+  return Object.freeze({ ref, source, ...(focus ? { focus } : {}), ...(hints ? { hints } : {}) });
 }
 
 function ownerFor(
@@ -80,7 +83,13 @@ export function createCoreTaskSurfaceController(options: CoreTaskControllerOptio
   const focusListeners = new Set<(active: ActiveCoreTask) => void>();
 
   const notify = () => {
-    for (const listener of [...listeners]) listener();
+    for (const listener of [...listeners]) {
+      try {
+        listener();
+      } catch {
+        // Observers are not allowed to break the controller's mutation boundary.
+      }
+    }
   };
 
   const setState = (next: CoreTaskSurfaceState) => {
@@ -89,7 +98,13 @@ export function createCoreTaskSurfaceController(options: CoreTaskControllerOptio
   };
 
   const launch = (request: TaskLaunchRequest): CoreTaskLaunchResult => {
-    const parsed = parseCoreTaskRef(request?.ref);
+    let rawRef: unknown;
+    try {
+      rawRef = request?.ref;
+    } catch {
+      return { kind: 'invalid', reason: 'invalid_task_identity' };
+    }
+    const parsed = parseCoreTaskRef(rawRef);
     if (!parsed.ok) return { kind: 'invalid', reason: parsed.reason };
 
     const ownerId = ownerFor(options.registry, parsed.ref.taskId);
@@ -97,8 +112,10 @@ export function createCoreTaskSurfaceController(options: CoreTaskControllerOptio
 
     const active = state.active;
     if (active && active.key === parsed.key) {
-      options.onFocus?.(active);
-      for (const listener of [...focusListeners]) listener(active);
+      try { options.onFocus?.(active); } catch { /* observer isolation */ }
+      for (const listener of [...focusListeners]) {
+        try { listener(active); } catch { /* observer isolation */ }
+      }
       return { kind: 'focused_existing', generation: active.generation, key: active.key, ownerId: active.ownerId };
     }
 
@@ -107,10 +124,23 @@ export function createCoreTaskSurfaceController(options: CoreTaskControllerOptio
         ?? (typeof options.replacementGuard === 'function' ? options.replacementGuard : options.replacementGuard?.canReplace);
       let allowed = true;
       try {
-        if (options.hasPending?.(active) || options.hasUnsavedChanges?.(active)) allowed = false;
-        if (configuredGuard && !configuredGuard(active, parsed.ref, request)) allowed = false;
+        if (options.hasPending?.(active)) allowed = false;
       } catch {
         allowed = false;
+      }
+      if (allowed) {
+        try {
+          if (options.hasUnsavedChanges?.(active)) allowed = false;
+        } catch {
+          allowed = false;
+        }
+      }
+      if (allowed && configuredGuard) {
+        try {
+          if (!configuredGuard(active, parsed.ref, request)) allowed = false;
+        } catch {
+          allowed = false;
+        }
       }
       if (!allowed) {
         return { kind: 'replacement_denied', reason: 'replacement_guard_denied', generation: active.generation };
@@ -119,15 +149,24 @@ export function createCoreTaskSurfaceController(options: CoreTaskControllerOptio
 
     const generation = state.generation + 1;
     const canonicalRef = Object.freeze({ ...parsed.ref });
+    let normalizedRequest: TaskLaunchRequest;
+    try {
+      normalizedRequest = frozenRequest(request, canonicalRef);
+    } catch {
+      return { kind: 'invalid', reason: 'invalid_task_identity' };
+    }
     const activeTask: ActiveCoreTask = Object.freeze({
       ref: canonicalRef,
       key: parsed.key,
       owner: ownerId,
       ownerId,
       generation,
-      request: frozenRequest(request, canonicalRef),
+      request: normalizedRequest,
     });
     setState({ phase: 'opening', generation, active: activeTask });
+    if (state.generation !== generation || state.active?.generation !== generation) {
+      return { kind: 'superseded', generation: state.generation, key: parsed.key };
+    }
     return { kind: 'launched', generation, key: parsed.key, ownerId };
   };
 
@@ -141,8 +180,10 @@ export function createCoreTaskSurfaceController(options: CoreTaskControllerOptio
     focus: (generation) => {
       const active = state.active;
       if (active?.generation === generation) {
-        options.onFocus?.(active);
-        for (const listener of [...focusListeners]) listener(active);
+        try { options.onFocus?.(active); } catch { /* observer isolation */ }
+        for (const listener of [...focusListeners]) {
+          try { listener(active); } catch { /* observer isolation */ }
+        }
       }
     },
     subscribeFocus: (listener) => {

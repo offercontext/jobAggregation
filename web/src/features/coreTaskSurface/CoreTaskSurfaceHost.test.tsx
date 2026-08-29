@@ -93,6 +93,78 @@ describe('CoreTaskSurfaceHost', () => {
     expect(host.querySelector('[data-core-task-owner]')).toBeNull();
   });
 
+  it('reacts to a runtime reduced-motion change and cleans the media listener', () => {
+    let matches = false;
+    let change: ((event: MediaQueryListEvent) => void) | undefined;
+    const remove = vi.fn();
+    const media = {
+      get matches() { return matches; },
+      media: '(prefers-reduced-motion: reduce)',
+      onchange: null,
+      addEventListener: vi.fn((_type: string, listener: (event: MediaQueryListEvent) => void) => { change = listener; }),
+      removeEventListener: remove,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    } as unknown as MediaQueryList;
+    vi.stubGlobal('matchMedia', vi.fn(() => media));
+    const controller = createCoreTaskSurfaceController();
+    const host = document.createElement('div');
+    document.body.append(host);
+    const root = createRoot(host);
+    roots.push(root);
+    act(() => root.render(<CoreTaskSurfaceHost controller={controller} />));
+    const opened = requireLaunch(launch(controller, 5));
+    act(() => root.render(<CoreTaskSurfaceHost controller={controller} />));
+    expect(controller.getState().phase).toBe('opening');
+    matches = true;
+    act(() => change?.({ matches: true } as MediaQueryListEvent));
+    expect(controller.getState().phase).toBe('open');
+    matches = false;
+    act(() => change?.({ matches: false } as MediaQueryListEvent));
+    act(() => controller.close(opened.generation));
+    expect(controller.getState().phase).toBe('closing');
+    matches = true;
+    act(() => change?.({ matches: true } as MediaQueryListEvent));
+    expect(controller.getState().phase).toBe('closed');
+    act(() => root.unmount());
+    expect(remove).toHaveBeenCalled();
+  });
+
+  it('captures focus and focuses an already-open owner when mounted, then restores it', () => {
+    const controller = createCoreTaskSurfaceController();
+    const source = document.createElement('button');
+    const host = document.createElement('div');
+    document.body.append(source, host);
+    source.focus();
+    const opened = requireLaunch(launch(controller, 6));
+    act(() => controller.markOpen(opened.generation));
+    const root = createRoot(host);
+    roots.push(root);
+    act(() => root.render(<StrictMode><CoreTaskSurfaceHost controller={controller} sourceElement={source} /></StrictMode>));
+    const owner = host.querySelector('[data-core-task-owner]') as HTMLElement;
+    expect(document.activeElement).toBe(owner);
+    act(() => controller.close(opened.generation));
+    act(() => controller.markClosed(opened.generation));
+    expect(document.activeElement).toBe(source);
+  });
+
+  it('restores focus after active unmount without StrictMode probe cleanup stealing focus', async () => {
+    const controller = createCoreTaskSurfaceController();
+    const source = document.createElement('button');
+    const host = document.createElement('div');
+    document.body.append(source, host);
+    source.focus();
+    launch(controller, 9);
+    const root = createRoot(host);
+    roots.push(root);
+    act(() => root.render(<StrictMode><CoreTaskSurfaceHost controller={controller} sourceElement={source} /></StrictMode>));
+    expect(document.activeElement).toBe(host.querySelector('[data-core-task-owner]'));
+    act(() => root.unmount());
+    await act(async () => { await Promise.resolve(); });
+    expect(document.activeElement).toBe(source);
+  });
+
   it('fails safely when matchMedia throws', () => {
     vi.stubGlobal('matchMedia', vi.fn(() => { throw new Error('unsupported'); }));
     const controller = createCoreTaskSurfaceController();

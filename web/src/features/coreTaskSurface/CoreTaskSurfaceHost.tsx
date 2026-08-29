@@ -1,6 +1,7 @@
 import {
   useEffect,
   useRef,
+  useState,
   useSyncExternalStore,
   type ReactNode,
   type RefObject,
@@ -33,6 +34,16 @@ function resolveElement(
   }
 }
 
+function readReducedMotion(): boolean {
+  try {
+    return typeof window !== 'undefined'
+      && typeof window.matchMedia === 'function'
+      && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  } catch {
+    return false;
+  }
+}
+
 /** The one display host for a controller-owned task surface. */
 export function CoreTaskSurfaceHost({
   controller,
@@ -47,7 +58,11 @@ export function CoreTaskSurfaceHost({
   const state = useSyncExternalStore(controller.subscribe, controller.getState, controller.getState);
   const ownerRef = useRef<HTMLDivElement | null>(null);
   const returnFocusRef = useRef<HTMLElement | null>(null);
-  const previousPhaseRef = useRef(state.phase);
+  const activeRef = useRef(state.active);
+  activeRef.current = state.active;
+  const mountedRef = useRef(false);
+  const observedGenerationRef = useRef<number | null>(null);
+  const [reducedMotion, setReducedMotion] = useState(readReducedMotion);
 
   useEffect(() => controller.subscribeFocus((active) => {
     if (active.generation !== controller.getState().generation) return;
@@ -55,17 +70,33 @@ export function CoreTaskSurfaceHost({
   }), [controller]);
 
   useEffect(() => {
-    if (state.phase === 'opening' && !returnFocusRef.current) {
+    if (state.active && observedGenerationRef.current !== state.active.generation) {
+      observedGenerationRef.current = state.active.generation;
       returnFocusRef.current = resolveElement(sourceElement, focusReturnRef) ?? (
         typeof document === 'undefined' ? null : document.activeElement instanceof HTMLElement ? document.activeElement : null
       );
+      ownerRef.current?.focus({ preventScroll: true });
     }
-    if (state.phase === 'closed' && previousPhaseRef.current !== 'closed') {
+    if (state.phase === 'closed' && !state.active) {
       returnFocusRef.current?.focus({ preventScroll: true });
       returnFocusRef.current = null;
+      observedGenerationRef.current = null;
     }
-    previousPhaseRef.current = state.phase;
-  }, [focusReturnRef, sourceElement, state.phase]);
+  }, [focusReturnRef, sourceElement, state.active, state.phase]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      queueMicrotask(() => {
+        if (mountedRef.current || !activeRef.current) return;
+        const current = controller.getState().active;
+        if (current?.generation === activeRef.current.generation) {
+          returnFocusRef.current?.focus({ preventScroll: true });
+        }
+      });
+    };
+  }, [controller]);
 
   useEffect(() => {
     if (state.phase !== 'opening' && state.phase !== 'open' && state.phase !== 'closing') return undefined;
@@ -80,18 +111,34 @@ export function CoreTaskSurfaceHost({
   }, [controller, state.active, state.phase]);
 
   useEffect(() => {
-    if (typeof window === 'undefined') return;
-    let reduced = false;
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return undefined;
+    let media: MediaQueryList;
     try {
-      reduced = typeof window.matchMedia === 'function'
-        && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      media = window.matchMedia('(prefers-reduced-motion: reduce)');
     } catch {
-      // A host without matchMedia keeps the normal event-driven lifecycle.
+      return undefined;
     }
-    if (!reduced || !state.active) return;
+    const onChange = (event?: MediaQueryListEvent) => setReducedMotion(event?.matches ?? media.matches);
+    try {
+      media.addEventListener?.('change', onChange);
+    } catch {
+      // Older embedded browsers may only expose addListener.
+      try { media.addListener?.(onChange); } catch { /* unavailable */ }
+    }
+    if (!media.addEventListener && media.addListener) {
+      try { media.addListener(onChange); } catch { /* unavailable */ }
+    }
+    return () => {
+      try { media.removeEventListener?.('change', onChange); } catch { /* unavailable */ }
+      try { media.removeListener?.(onChange); } catch { /* unavailable */ }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!reducedMotion || !state.active) return;
     if (state.phase === 'opening') controller.markOpen(state.active.generation);
     else if (state.phase === 'closing') controller.markClosed(state.active.generation);
-  }, [controller, state.active, state.phase]);
+  }, [controller, reducedMotion, state.active, state.phase]);
 
   if (!state.active || state.phase === 'closed') return null;
   const active = state.active;

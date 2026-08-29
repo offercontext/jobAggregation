@@ -169,6 +169,52 @@ describe('resolveApplicationTasks', () => {
     expect(result.primaryTask?.availability).toBe('result_unknown');
   });
 
+  it.each(['loading', 'error', 'absent'] as const)('does not let result unknown win when Pending is %s', (status) => {
+    const result = resolveApplicationTasks(base({
+      pending: status === 'loading' ? { status } : status === 'error' ? { status } : { status },
+      resultUnknown: ready({ ref: { taskId: 'application.interview_review', applicationId: 7, eventId: 3 } }),
+    }), NOW);
+    expect(result.primaryTask).toBeNull();
+    expect(result.tasks.some((task) => task.reason === 'result_unknown')).toBe(false);
+    expect(result.issues.some((issue) => issue.reason === `source_${status === 'absent' ? 'absent' : status}`)).toBe(true);
+    expect(status === 'loading' ? result.hasLoading : result.hasUnavailable).toBe(true);
+  });
+
+  it('does not let Pending win while result unknown source is unresolved', () => {
+    const result = resolveApplicationTasks(base({
+      pending: ready({ ref: { taskId: 'application.material_kit', applicationId: 7 } }),
+      resultUnknown: { status: 'loading' },
+    }), NOW);
+    expect(result.primaryTask).toBeNull();
+    expect(result.issues.some((issue) => issue.reason === 'source_loading')).toBe(true);
+    expect(result.hasLoading).toBe(true);
+  });
+
+  it('fails closed when ready Pending and result unknown refs disagree', () => {
+    const result = resolveApplicationTasks(base({
+      pending: ready({ ref: { taskId: 'application.material_kit', applicationId: 7 } }),
+      resultUnknown: ready({ ref: { taskId: 'application.interview_review', applicationId: 7, eventId: 3 } }),
+    }), NOW);
+    expect(result.primaryTask).toBeNull();
+    expect(result.tasks.filter((task) => task.availability === 'waiting_confirmation' || task.availability === 'result_unknown')).toHaveLength(0);
+    expect(result.issues.some((issue) => issue.reason === 'pending_identity_invalid' && issue.priority === 1)).toBe(true);
+    expect(result.hasUnavailable).toBe(true);
+  });
+
+  it('rejects outer Pending identity that conflicts with its nested ref', () => {
+    const result = resolveApplicationTasks(base({
+      pending: ready({
+        ref: { taskId: 'application.material_kit', applicationId: 7 },
+        taskId: 'application.offer_review',
+        applicationId: 7,
+      }),
+    }), NOW);
+    expect(result.primaryTask).toBeNull();
+    expect(result.tasks.some((task) => task.reason === 'pending_confirmation')).toBe(false);
+    expect(result.issues.some((issue) => issue.reason === 'pending_identity_invalid')).toBe(true);
+    expect(result.hasUnavailable).toBe(true);
+  });
+
   it.each(['loading', 'error', 'absent'] as const)('blocks lower work when Pending is %s', (status) => {
     const result = resolveApplicationTasks(base({ pending: status === 'loading' ? { status } : status === 'error' ? { status } : { status } }), NOW);
     expect(result.primaryTask).toBeNull();
@@ -212,6 +258,17 @@ describe('resolveApplicationTasks', () => {
     ]) }), NOW);
     expect(invalid.tasks.some((task) => task.primary)).toBe(false);
     expect(invalid.issues.length).toBeGreaterThan(0);
+  });
+
+  it('validates active event schedule before classifying needs-status-update', () => {
+    const result = resolveApplicationTasks(base({ events: ready([event({
+      lifecycle: 'in_progress',
+      bucket: 'needs_status_update',
+      primaryAction: 'update_status',
+      scheduledAtState: 'absent',
+    })]) }), NOW);
+    expect(result.issues.some((issue) => issue.reason === 'event_contract_invalid')).toBe(true);
+    expect(result.issues.some((issue) => issue.reason === 'event_status_needs_update')).toBe(false);
   });
 
   it('fails closed for lifecycle/card bucket conflicts and deleted cancelled cards', () => {

@@ -164,12 +164,24 @@ function compareTask(left: InternalTask, right: InternalTask): number {
 }
 function parseRef(value: unknown): CoreTaskRef | null { const parsed = parseCoreTaskRef(value); return parsed.ok ? parsed.ref : null; }
 function pendingRef(value: ApplicationTaskPending | null): CoreTaskRef | null {
-  if (!value) return null;
-  const direct = parseRef(value.ref); if (direct) return direct;
+  if (!value || !isRecord(value)) return null;
+  const hasOwn = (key: string): boolean => Object.prototype.hasOwnProperty.call(value, key);
+  if (hasOwn('ref')) {
+    const direct = parseRef(value.ref);
+    if (!direct) return null;
+    if (hasOwn('taskId') && (typeof value.taskId !== 'string' || value.taskId !== direct.taskId)) return null;
+    if (hasOwn('applicationId') && safeId(value.applicationId) !== direct.applicationId) return null;
+    if (hasOwn('eventId') && safeId(value.eventId) !== direct.eventId) return null;
+    return direct;
+  }
   const candidate: Record<string, unknown> = { taskId: value.taskId };
   if (value.applicationId !== undefined) candidate.applicationId = value.applicationId;
   if (value.eventId !== undefined) candidate.eventId = value.eventId;
   return parseRef(candidate);
+}
+function sameRef(left: CoreTaskRef, right: CoreTaskRef): boolean {
+  return left.taskId === right.taskId && left.applicationId === right.applicationId && left.eventId === right.eventId
+    && left.resumeId === right.resumeId && left.storyId === right.storyId && left.sourceId === right.sourceId;
 }
 function dependencyAvailability(required: readonly RuntimeSource[]): TaskAvailability {
   if (required.some((source) => source.state === 'loading')) return 'loading';
@@ -214,19 +226,27 @@ export function resolveApplicationTasks(snapshot: FrozenApplicationTaskSnapshot,
     const unknown = sources.resultUnknown.state === 'ready' && isRecord(sources.resultUnknown.value) ? sources.resultUnknown.value as ApplicationTaskPending : null;
     const pendingSourceReady = sources.pending.state === 'ready' && (pending !== null || sources.pending.value === null);
     const resultSourceReady = sources.resultUnknown.state === 'ready' && (unknown !== null || sources.resultUnknown.value === null);
-    let trustedPending = false;
-    for (const [value, availability] of [[pending, 'waiting_confirmation'], [unknown, 'result_unknown']] as const) {
-      if (!value) continue;
-      const ref = pendingRef(value);
-      const valid = ref !== null && ref.applicationId === appId && ref.taskId.startsWith('application.');
-      if (valid && !trustedPending) {
+    const sourceIssue = (source: RuntimeSource): InternalIssue => makeIssue(
+      source.state === 'loading' ? 'loading' : 'unavailable',
+      source.state === 'loading' ? 'source_loading' : source.state === 'absent' ? 'source_absent' : 'source_error', 1,
+    );
+    const pendingCandidate = pendingSourceReady && pending ? pendingRef(pending) : null;
+    const unknownCandidate = resultSourceReady && unknown ? pendingRef(unknown) : null;
+    const pendingValid = pending === null || (pendingCandidate !== null && pendingCandidate.applicationId === appId);
+    const unknownValid = unknown === null || (unknownCandidate !== null && unknownCandidate.applicationId === appId);
+    if (!pendingSourceReady || !resultSourceReady) {
+      if (!pendingSourceReady) addIssue(sourceIssue(sources.pending));
+      if (!resultSourceReady) addIssue(sourceIssue(sources.resultUnknown));
+    } else if (!pendingValid || !unknownValid) {
+      addIssue(makeIssue('unavailable', 'pending_identity_invalid', 1, (pendingCandidate ?? unknownCandidate)?.eventId ?? (pendingCandidate ?? unknownCandidate)?.applicationId));
+    } else if (pendingCandidate && unknownCandidate && !sameRef(pendingCandidate, unknownCandidate)) {
+      addIssue(makeIssue('unavailable', 'pending_identity_invalid', 1, pendingCandidate.eventId ?? pendingCandidate.applicationId));
+    } else if (pendingCandidate || unknownCandidate) {
+      const ref = pendingCandidate ?? unknownCandidate;
+      if (ref) {
+        const availability: TaskAvailability = pendingCandidate ? 'waiting_confirmation' : 'result_unknown';
         addTask(makeTask(ref.taskId, ref, availability, availability === 'waiting_confirmation' ? 'pending_confirmation' : 'result_unknown', 1, null, ref.eventId ?? ref.applicationId));
-        trustedPending = true;
-      } else if (!valid) addIssue(makeIssue('unavailable', 'pending_identity_invalid', 1, ref?.eventId ?? ref?.applicationId));
-    }
-    if (!trustedPending && (!pendingSourceReady || !resultSourceReady)) {
-      const pendingIssue = !pendingSourceReady ? sources.pending : sources.resultUnknown;
-      addIssue(makeIssue(pendingIssue.state === 'loading' ? 'loading' : 'unavailable', pendingIssue.state === 'loading' ? 'source_loading' : pendingIssue.state === 'absent' ? 'source_absent' : 'source_error', 1));
+      }
     }
 
     const reviews = sources.reviews.state === 'ready' && Array.isArray(sources.reviews.value) ? sources.reviews.value : [];
@@ -284,6 +304,11 @@ export function resolveApplicationTasks(snapshot: FrozenApplicationTaskSnapshot,
         if (availability !== 'ready') addIssue(makeIssue(availability, reason, 3, event.eventId));
       } else if (lifecycle === 'scheduled' || lifecycle === 'in_progress') {
         const actionAllowed = event.primaryAction === 'prepare' || event.primaryAction === 'enter_preparation';
+        if (!durationValid || !timeValid) {
+          addTask(makeTask('application.interview_prepare', { taskId: 'application.interview_prepare', applicationId: appId, eventId: event.eventId }, 'unavailable', 'event_contract_invalid', 99, null, event.eventId));
+          addIssue(makeIssue('unavailable', 'event_contract_invalid', 2, event.eventId));
+          continue;
+        }
         if (event.bucket === 'needs_status_update') { addIssue(makeIssue('unavailable', 'event_status_needs_update', 2, event.eventId)); continue; }
         const end = durationValid && timeValid ? event.scheduledAtTimestamp + event.durationMinutes * 60_000 : null;
         const inWindow = lifecycle === 'in_progress' ? end !== null && now <= end : timeValid && event.scheduledAtTimestamp > now && event.scheduledAtTimestamp - now <= 24 * 60 * 60_000;

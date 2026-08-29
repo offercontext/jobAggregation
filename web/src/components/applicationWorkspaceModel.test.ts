@@ -21,4 +21,15 @@ describe('application stage workspace model', () => {
       action: 'interview-review',
     });
   });
+
+  it('uses the canonical lifecycle when it is present, even if the compatibility boolean disagrees', () => {
+    expect(getApplicationWorkspaceStage('interview', { lifecycle: 'completed', hasCompletedInterview: false })).toMatchObject({
+      label: '面试结束',
+      action: 'interview-review',
+    });
+    expect(getApplicationWorkspaceStage('interview', { lifecycle: 'scheduled', hasCompletedInterview: true })).toMatchObject({
+      label: '已约面试',
+      action: 'interview-prepare',
+    });
+  });
 });

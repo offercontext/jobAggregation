@@ -227,7 +227,7 @@ describe('deriveNextStepSuggestions', () => {
   });
 
   it('uses review history only when exactly one ended review is known', () => {
-    const event = makeInterviewEvent(7, '2026-07-29T10:00:00+08:00');
+    const event = makeInterviewEvent(7, '2026-07-29T10:00:00+08:00', 60, { status: 'done' });
     const result = deriveNextStepSuggestions(makeFacts({
       events: { status: 'known', value: [event] },
       interviewPreparationHistory: { status: 'known', value: [] },
@@ -241,6 +241,21 @@ describe('deriveNextStepSuggestions', () => {
       eventId: 7,
       reviewId: 19,
     });
+  });
+
+  it('uses lifecycle completion for a future done event and never ends a past todo event', () => {
+    const futureDone = deriveNextStepSuggestions(makeFacts({
+      events: { status: 'known', value: [makeInterviewEvent(7, '2026-08-30T10:00:00+08:00', 60, { status: 'done' })] },
+      interviewPreparationHistory: { status: 'known', value: [] },
+      mockInterviewHistory: { status: 'known', value: [] },
+      fitReview: { status: 'known', value: null },
+    }), 'detail', now);
+    expect(futureDone.candidates.some((candidate) => candidate.id === 'review_interview')).toBe(true);
+
+    const pastTodo = deriveNextStepSuggestions(makeFacts({
+      events: { status: 'known', value: [makeInterviewEvent(8, '2026-07-29T10:00:00+08:00', 60, { status: 'todo' })] },
+    }), 'detail', now);
+    expect(pastTodo.candidates.some((candidate) => candidate.id === 'review_interview')).toBe(false);
   });
 
   it('excludes events with invalid date or duration from interview destinations', () => {
@@ -301,11 +316,11 @@ describe('deriveNextStepSuggestions', () => {
 
   it('changes the stateKey when the unique historical review changes', () => {
     const before = deriveNextStepSuggestions(makeFacts({
-      events: { status: 'known', value: [makeInterviewEvent(7, '2026-07-29T10:00:00+08:00')] },
+      events: { status: 'known', value: [makeInterviewEvent(7, '2026-07-29T10:00:00+08:00', 60, { status: 'done' })] },
       fitReview: { status: 'known', value: { reviewCountByEvent: { 7: 1 }, reviewIdByEvent: { 7: 19 } } },
     }), 'detail', now);
     const after = deriveNextStepSuggestions(makeFacts({
-      events: { status: 'known', value: [makeInterviewEvent(7, '2026-07-29T10:00:00+08:00')] },
+      events: { status: 'known', value: [makeInterviewEvent(7, '2026-07-29T10:00:00+08:00', 60, { status: 'done' })] },
       fitReview: { status: 'known', value: { reviewCountByEvent: { 7: 1 }, reviewIdByEvent: { 7: 20 } } },
     }), 'detail', now);
 

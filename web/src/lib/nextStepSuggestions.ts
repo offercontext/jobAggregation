@@ -3,6 +3,7 @@ import type { ScheduleEvent } from '@/types/event';
 import type { Offer } from '@/types/offer';
 import type { PracticeStats } from '@/types/question';
 import type { Resume } from '@/types/resume';
+import { classifyEventLifecycleV1 } from '@/features/interviewEvents/eventLifecycle';
 
 export type FactState<T> =
   | { status: 'known'; value: T; version?: string }
@@ -136,6 +137,14 @@ export type SuggestionContext = 'workbench' | 'detail';
 
 type InterviewEventWithDeletedAt = ScheduleEvent & { deleted_at?: string | null };
 
+function lifecycleForEvent(event: ScheduleEvent): ReturnType<typeof classifyEventLifecycleV1> {
+  const projected = (event as ScheduleEvent & { lifecycle?: unknown }).lifecycle;
+  if (projected === 'scheduled' || projected === 'in_progress' || projected === 'completed' || projected === 'cancelled' || projected === 'unknown') {
+    return projected;
+  }
+  return classifyEventLifecycleV1(event.status);
+}
+
 function stableStringify(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) return '[' + value.map(stableStringify).join(',') + ']';
@@ -236,13 +245,18 @@ function classifyInterviewEvents(facts: NextStepFacts, now: Date) {
   const valid = facts.events.value.filter((event): event is InterviewEventWithDeletedAt => {
     if (event.application_id !== applicationId || event.event_type !== 'interview') return false;
     if ('deleted_at' in event && event.deleted_at) return false;
-    if (['cancelled', 'deleted', 'soft_deleted'].includes(event.status)) return false;
+    const lifecycle = lifecycleForEvent(event);
+    if (lifecycle === 'cancelled' || lifecycle === 'unknown') return false;
+    if (lifecycle === 'completed') return true;
+    const scheduleState = (event as ScheduleEvent & { scheduled_at_state?: unknown }).scheduled_at_state;
+    if (scheduleState !== undefined && scheduleState !== 'present') return false;
     if (!isValidDuration(event.duration_minutes)) return false;
     return parseScheduledAt(event.scheduled_at) !== null;
   }).map((event) => {
-    const start = parseScheduledAt(event.scheduled_at) as number;
-    const end = start + event.duration_minutes * 60_000;
-    return { event, start, end };
+    const parsedStart = parseScheduledAt(event.scheduled_at);
+    const start = parsedStart ?? Number.POSITIVE_INFINITY;
+    const end = parsedStart === null ? Number.POSITIVE_INFINITY : start + event.duration_minutes * 60_000;
+    return { event, start, end, lifecycle: lifecycleForEvent(event) };
   });
 
   const timestamp = now.getTime();
@@ -258,8 +272,11 @@ function classifyInterviewEvents(facts: NextStepFacts, now: Date) {
   );
 
   return {
-    currentOrFuture: valid.filter(({ end }) => timestamp < end).sort(sortAscending).map(({ event }) => event),
-    ended: valid.filter(({ end }) => timestamp >= end).sort(sortDescending).map(({ event }) => event),
+    currentOrFuture: valid
+      .filter(({ lifecycle, start, end }) => (lifecycle === 'scheduled' && start > timestamp) || (lifecycle === 'in_progress' && timestamp < end))
+      .sort(sortAscending)
+      .map(({ event }) => event),
+    ended: valid.filter(({ lifecycle }) => lifecycle === 'completed').sort(sortDescending).map(({ event }) => event),
   };
 }
 

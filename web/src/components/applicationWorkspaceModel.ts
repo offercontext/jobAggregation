@@ -1,4 +1,5 @@
 import type { ApplicationStatus } from '@/types/application';
+import type { EventLifecycleV1 } from '@/features/interviewEvents/eventLifecycle';
 
 export interface ApplicationWorkspaceStage {
   label: '准备投递' | '已投递' | '笔试' | '已约面试' | '面试结束' | '已获 Offer' | '已结束';
@@ -8,7 +9,7 @@ export interface ApplicationWorkspaceStage {
 
 export function getApplicationWorkspaceStage(
   status: ApplicationStatus,
-  options: { hasCompletedInterview?: boolean; hasInterviewReview?: boolean } = {},
+  options: { lifecycle?: EventLifecycleV1; hasCompletedInterview?: boolean; hasInterviewReview?: boolean } = {},
 ): ApplicationWorkspaceStage {
   switch (status) {
     case 'pending':
@@ -18,7 +19,7 @@ export function getApplicationWorkspaceStage(
     case 'written_test':
       return { label: '笔试', primaryActionLabel: '准备笔试', action: 'written-test' };
     case 'interview':
-      return options.hasCompletedInterview
+      return (options.lifecycle === 'completed' || (options.lifecycle === undefined && options.hasCompletedInterview === true))
         ? {
             label: '面试结束',
             primaryActionLabel: options.hasInterviewReview ? '查看本轮复盘' : '完成面试复盘',

@@ -29,6 +29,7 @@ from offerpilot.agent_runtime.events import (
     prepare_event,
 )
 from offerpilot.agent_runtime.keyring import JournalKeyDomain
+from offerpilot.ai.tool_runtime.metadata import ProviderToolMetadataView
 from offerpilot.repositories.agent_runs import (
     AgentRunRepository,
     CaptureContextCommand,
@@ -124,6 +125,7 @@ class RunRecorder(Protocol):
         audit: RuntimeSurfaceAudit,
         provider_identities: tuple[str, ...],
         *,
+        provider_view: ProviderToolMetadataView,
         model_step: int,
         model_call_id: str,
     ) -> str | None: ...
@@ -203,10 +205,11 @@ class NullRunRecorder:
         _audit: RuntimeSurfaceAudit,
         _provider_identities: tuple[str, ...],
         *,
+        provider_view: ProviderToolMetadataView,
         model_step: int,
         model_call_id: str,
     ) -> None:
-        del model_step, model_call_id
+        del provider_view, model_step, model_call_id
         return None
 
     def resume(self, _command: ResumedDisposition) -> None:
@@ -289,9 +292,9 @@ class SafeRunRecorder:
         )
         self._resume_bound_transaction: Any | None = None
         self._degraded_bound_resume_recovered = False
-        self._disposition_state: Literal[
-            "not_attempted", "claimed", "completed", "failed"
-        ] = "not_attempted"
+        self._disposition_state: Literal["not_attempted", "claimed", "completed", "failed"] = (
+            "not_attempted"
+        )
         self._waits_for_resume = False
         self._wait_flag = False
         self._current_lease: OperationLease | None = None
@@ -395,6 +398,7 @@ class SafeRunRecorder:
         audit: RuntimeSurfaceAudit,
         provider_identities: tuple[str, ...],
         *,
+        provider_view: ProviderToolMetadataView,
         model_step: int,
         model_call_id: str,
     ) -> str | None:
@@ -414,6 +418,7 @@ class SafeRunRecorder:
                 key_id=self.key.key_id,
                 secret=self.key.secret,
                 provider_identities=provider_identities,
+                provider_view=provider_view,
                 budget_check=lease.checkpoint,
             )
             prepared = PreparedSnapshot(
@@ -654,10 +659,7 @@ class SafeRunRecorder:
         with self._state_lock:
             if self._resume_state == "completed":
                 return True
-            if (
-                self._resume_state != "failed"
-                or self._disposition_state != "not_attempted"
-            ):
+            if self._resume_state != "failed" or self._disposition_state != "not_attempted":
                 return False
             self._resume_state = "claimed"
             self._state_condition.notify_all()
@@ -716,10 +718,7 @@ class SafeRunRecorder:
 
     def resume(self, command: ResumedDisposition) -> None:
         with self._state_lock:
-            if (
-                self._resume_state != "not_attempted"
-                or self._disposition_state != "not_attempted"
-            ):
+            if self._resume_state != "not_attempted" or self._disposition_state != "not_attempted":
                 return
             self._resume_state = "claimed"
             self._state_condition.notify_all()
@@ -1030,15 +1029,12 @@ class SafeRunRecorder:
                     exhausted = True
                 if self.active_budget.clock_invalid_latched and not clock_invalid_before:
                     self._degrade("journal_clock_invalid")
-                elif (
-                    self.recording_status != "degraded"
-                    and (
-                        exhausted
-                        or (
-                            used_before is not None
-                            and self.active_budget.used_seconds - used_before
-                            >= JOURNAL_OPERATION_HARD_CAP_SECONDS
-                        )
+                elif self.recording_status != "degraded" and (
+                    exhausted
+                    or (
+                        used_before is not None
+                        and self.active_budget.used_seconds - used_before
+                        >= JOURNAL_OPERATION_HARD_CAP_SECONDS
                     )
                 ):
                     self._degrade("journal_budget_exhausted")
@@ -1068,10 +1064,7 @@ class SafeRunRecorder:
     def _resume_operation_allowed_locked(self) -> bool:
         return self._resume_state == "claimed" and (
             self._disposition_state == "not_attempted"
-            or (
-                self._disposition_state == "claimed"
-                and self._waits_for_resume
-            )
+            or (self._disposition_state == "claimed" and self._waits_for_resume)
         )
 
     def _acquire_operation(self, lease: OperationLease) -> bool:
@@ -1118,10 +1111,16 @@ class SafeRunRecorder:
     ) -> None:
         diagnostic = self._diagnostic_for(error, failure_diagnostic, lease)
         first_transition = self._degrade(diagnostic)
-        if first_transition and allow_sync and lease is not None and diagnostic not in {
-            "journal_budget_exhausted",
-            "journal_clock_invalid",
-        }:
+        if (
+            first_transition
+            and allow_sync
+            and lease is not None
+            and diagnostic
+            not in {
+                "journal_budget_exhausted",
+                "journal_clock_invalid",
+            }
+        ):
             self._sync_degraded(lease)
 
     def _diagnostic_for(
@@ -1166,7 +1165,11 @@ class SafeRunRecorder:
         try:
             lease.checkpoint()
         except JournalDeadlineExceeded as error:
-            return "journal_clock_invalid" if error.reason == "clock_invalid" else "journal_budget_exhausted"
+            return (
+                "journal_clock_invalid"
+                if error.reason == "clock_invalid"
+                else "journal_budget_exhausted"
+            )
         except JournalBudgetExhausted:
             return "journal_budget_exhausted"
         return None
@@ -1362,10 +1365,15 @@ class SafeRunRecorder:
     ) -> None:
         diagnostic = self._diagnostic_for_final(error, failure_diagnostic, lease)
         first_transition = self._degrade(diagnostic)
-        if first_transition and lease is not None and diagnostic not in {
-            "journal_disposition_budget_exhausted",
-            "journal_clock_invalid",
-        }:
+        if (
+            first_transition
+            and lease is not None
+            and diagnostic
+            not in {
+                "journal_disposition_budget_exhausted",
+                "journal_clock_invalid",
+            }
+        ):
             self._sync_degraded(lease)
 
     def _diagnostic_for_final(
@@ -1527,10 +1535,7 @@ class RunRecorderFactory:
                     else "journal_run_create_failed"
                 )
             except Exception:
-                diagnostic = (
-                    _factory_lease_exhaustion(lease)
-                    or "journal_run_create_failed"
-                )
+                diagnostic = _factory_lease_exhaustion(lease) or "journal_run_create_failed"
             except BaseException as error:
                 primary_base = error
         finally:
@@ -1541,13 +1546,8 @@ class RunRecorderFactory:
                 exhausted = True
             if budget.clock_invalid_latched:
                 diagnostic = "journal_clock_invalid"
-            elif (
-                diagnostic is None
-                and (
-                    exhausted
-                    or budget.used_seconds - used_before
-                    >= JOURNAL_OPERATION_HARD_CAP_SECONDS
-                )
+            elif diagnostic is None and (
+                exhausted or budget.used_seconds - used_before >= JOURNAL_OPERATION_HARD_CAP_SECONDS
             ):
                 diagnostic = "journal_budget_exhausted"
 
@@ -1560,7 +1560,10 @@ class RunRecorderFactory:
             result_command.segment_started.execution_segment_id,
             budget,
         )
-        if diagnostic in {"journal_budget_exhausted", "journal_clock_invalid"} or budget.used_seconds >= budget.total_seconds:
+        if (
+            diagnostic in {"journal_budget_exhausted", "journal_clock_invalid"}
+            or budget.used_seconds >= budget.total_seconds
+        ):
             recorder.mark_degraded(
                 "journal_clock_invalid"
                 if budget.clock_invalid_latched or diagnostic == "journal_clock_invalid"
@@ -1651,13 +1654,8 @@ class RunRecorderFactory:
                 exhausted = True
             if budget.clock_invalid_latched:
                 diagnostic = "journal_clock_invalid"
-            elif (
-                diagnostic is None
-                and (
-                    exhausted
-                    or budget.used_seconds - used_before
-                    >= JOURNAL_OPERATION_HARD_CAP_SECONDS
-                )
+            elif diagnostic is None and (
+                exhausted or budget.used_seconds - used_before >= JOURNAL_OPERATION_HARD_CAP_SECONDS
             ):
                 diagnostic = "journal_budget_exhausted"
 
@@ -1670,7 +1668,10 @@ class RunRecorderFactory:
             result_command.segment_started.execution_segment_id,
             budget,
         )
-        if diagnostic in {"journal_budget_exhausted", "journal_clock_invalid"} or budget.used_seconds >= budget.total_seconds:
+        if (
+            diagnostic in {"journal_budget_exhausted", "journal_clock_invalid"}
+            or budget.used_seconds >= budget.total_seconds
+        ):
             recorder.mark_degraded(
                 "journal_clock_invalid"
                 if budget.clock_invalid_latched or diagnostic == "journal_clock_invalid"
@@ -1740,7 +1741,11 @@ def _factory_lease_exhaustion(lease: OperationLease | None) -> str | None:
     try:
         lease.checkpoint()
     except JournalDeadlineExceeded as error:
-        return "journal_clock_invalid" if error.reason == "clock_invalid" else "journal_budget_exhausted"
+        return (
+            "journal_clock_invalid"
+            if error.reason == "clock_invalid"
+            else "journal_budget_exhausted"
+        )
     except JournalBudgetExhausted:
         return "journal_budget_exhausted"
     return None

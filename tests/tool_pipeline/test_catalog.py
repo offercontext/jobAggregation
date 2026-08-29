@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import inspect
 import pickle
 from dataclasses import replace
 from pathlib import Path
@@ -11,24 +12,58 @@ import pytest
 
 from offerpilot.ai import client as ai_client
 from offerpilot.ai.client import ConfiguredAIClient
-from offerpilot.ai.tool_runtime.catalog import ToolCatalog
+from offerpilot.ai.tool_runtime.catalog import SegmentToolSpecHandle, ToolCatalog
 from offerpilot.ai.tool_runtime.contracts import (
     BindingContract,
-    BindingResolverSpec,
     BindingAudit,
     PreparedToolCall,
     ProviderToolContract,
     ToolExecutionRecord,
     ToolFailure,
     ToolSpec,
-    WriteContract,
+    materialize_provider_payloads,
 )
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG, MODEL_TOOL_NAMES
-from offerpilot.ai.tool_runtime.legacy import LEGACY_DETERMINISTIC_NAMES
+from offerpilot.ai.tool_runtime.metadata import (
+    BindingResolverDescriptorV1,
+    ToolMetadataBundleV1,
+)
+from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
+from offerpilot.ai.tool_specs.legacy import build_static_adapter_catalog
 from offerpilot.ai.types import Message
 from offerpilot.config import Config
 
 from golden import canonical_json, load_golden
+from tests.tool_metadata.factories import (
+    compose_synthetic_bundle,
+    read_metadata,
+    synthetic_tool_spec,
+    write_metadata,
+)
+
+
+_TEST_TOOL_CATALOG = build_model_tool_catalog()
+_TEST_TOOL_NAMES = tuple(spec.name for spec in _TEST_TOOL_CATALOG.specs)
+_TEST_LEGACY_NAMES = frozenset(
+    adapter.name for adapter in build_static_adapter_catalog().ordered_adapters
+)
+
+
+def _test_spec_handle(spec: ToolSpec[Any, Any]) -> SegmentToolSpecHandle:
+    catalog = ToolCatalog((spec,), expected_names=(spec.name,))
+    source = compose_synthetic_bundle()
+    manifest = dict(cast(dict[str, object], source["manifest"]))
+    manifest["typed_tools"] = (spec.name,)
+    bundle = ToolMetadataBundleV1(
+        typed_catalog=catalog,
+        manifest=manifest,
+        legacy_boundary=cast(dict[str, object], source["legacy_boundary"]),
+        compensation=cast(dict[str, object], source["compensation"]),
+    )
+    lease = bundle.open_segment_lease()
+    handle = lease.resolve(spec.name)
+    assert handle is not None
+    assert lease.require_spec(handle) is spec
+    return handle
 
 
 def _contract(name: str, schema: dict[str, Any] | None = None) -> ProviderToolContract:
@@ -56,13 +91,11 @@ def _spec(
     kind: str = "read",
     schema: dict[str, Any] | None = None,
 ) -> ToolSpec[dict[str, Any], dict[str, Any]]:
-    return ToolSpec(
+    metadata = write_metadata() if kind == "write" else read_metadata()
+    metadata = replace(metadata, editable_fields=())
+    return replace(
+        synthetic_tool_spec(name, metadata=metadata),
         contract=_contract(name, schema),
-        confirmation_policy="required" if kind == "write" else "none",
-        decoder=lambda values: dict(values),
-        executor=lambda args, context: args,
-        kind=cast(Any, kind),
-        write_contract=WriteContract() if kind == "write" else None,
     )
 
 
@@ -96,7 +129,7 @@ def test_catalog_rejects_missing_duplicate_or_reordered_names(
 
 
 def test_catalog_rejects_invalid_schema_during_construction() -> None:
-    spec = _spec("broken", schema={"type": "not-a-type"})
+    spec = _spec("broken", schema={"type": "not-a-type", "properties": {}})
 
     with pytest.raises(ValueError, match="invalid_tool_schema"):
         ToolCatalog([spec], expected_names=("broken",))
@@ -133,6 +166,7 @@ def test_transient_runtime_values_reject_pickle_and_hide_sensitive_fields() -> N
         binding=BindingAudit(status="unavailable", target_count=0),
         contract_fingerprint="sha256:" + "b" * 64,
         spec=spec,
+        spec_handle=_test_spec_handle(spec),
         tool_call_id="call-1",
         typed_args={"private": "sensitive-argument-value"},
     )
@@ -153,20 +187,29 @@ def test_transient_runtime_values_reject_pickle_and_hide_sensitive_fields() -> N
     assert "sensitive-argument-value" not in rendered
 
 
+def test_prepared_tool_call_requires_a_typed_segment_spec_handle() -> None:
+    parameter = inspect.signature(PreparedToolCall).parameters["spec_handle"]
+
+    assert parameter.default is inspect.Parameter.empty
+    assert parameter.annotation == "SegmentToolSpecHandleLike"
+    assert PreparedToolCall.__dataclass_params__.frozen is True
+
+
 def test_model_catalog_is_exact_provider_golden_in_exact_order() -> None:
     manifest = load_golden("provider_manifest_30c944f.json")
-    contracts = MODEL_TOOL_CATALOG.provider_contracts()
+    contracts = _TEST_TOOL_CATALOG.provider_contracts()
 
-    assert len(MODEL_TOOL_NAMES) == 25
-    assert len(set(MODEL_TOOL_NAMES)) == 25
-    assert tuple(contract.name for contract in contracts) == MODEL_TOOL_NAMES
-    assert canonical_json([contract.payload for contract in contracts]) == canonical_json(
-        manifest["tools"]
-    )
+    assert len(_TEST_TOOL_NAMES) == 25
+    assert len(set(_TEST_TOOL_NAMES)) == 25
+    assert tuple(contract.name for contract in contracts) == _TEST_TOOL_NAMES
+    payloads = materialize_provider_payloads(contracts)
+    assert canonical_json(payloads) == canonical_json(manifest["tools"])
     actual_fingerprints = {
         contract.name: "sha256:"
-        + hashlib.sha256(canonical_json(contract.parameters).encode("utf-8")).hexdigest()
-        for contract in contracts
+        + hashlib.sha256(
+            canonical_json(payload["function"]["parameters"]).encode("utf-8")
+        ).hexdigest()
+        for contract, payload in zip(contracts, payloads, strict=True)
     }
     assert actual_fingerprints == manifest["schema_fingerprints"]
 
@@ -182,43 +225,44 @@ def test_final_provider_adapter_receives_exact_golden_envelopes(monkeypatch) -> 
     monkeypatch.setattr(ai_client, "completion", fake_completion)
     ConfiguredAIClient(Config(api_key="synthetic-key")).complete(
         [Message(role="user", content="synthetic")],
-        list(MODEL_TOOL_CATALOG.provider_contracts()),
+        list(_TEST_TOOL_CATALOG.provider_contracts()),
     )
 
     assert canonical_json(captured["tools"]) == canonical_json(manifest["tools"])
 
 
 def test_complete_tool_classification_is_exactly_twenty_five_typed_plus_three_legacy() -> None:
-    typed = frozenset(MODEL_TOOL_NAMES)
+    typed = frozenset(_TEST_TOOL_NAMES)
 
     assert len(typed) == 25
-    assert len(LEGACY_DETERMINISTIC_NAMES) == 3
-    assert typed.isdisjoint(LEGACY_DETERMINISTIC_NAMES)
-    assert len(typed | LEGACY_DETERMINISTIC_NAMES) == 28
+    assert len(_TEST_LEGACY_NAMES) == 3
+    assert typed.isdisjoint(_TEST_LEGACY_NAMES)
+    assert len(typed | _TEST_LEGACY_NAMES) == 28
 
 
 def test_catalog_rejects_unknown_capability_and_resolver_metadata() -> None:
     spec = _spec("read_one")
-    with pytest.raises(ValueError, match="unknown capability"):
-        ToolCatalog(
-            [replace(spec, required_capabilities=frozenset({"future.read"}))],
-            expected_names=("read_one",),
-            authority_manifest={
-                "schema_version": 1,
-                "tools": [],
-            },
-        )
+    original = spec.metadata.required_capabilities
+    object.__setattr__(spec.metadata, "required_capabilities", (cast(Any, "future.read"),))
+    try:
+        with pytest.raises((TypeError, ValueError), match="capabilit|metadata"):
+            ToolCatalog(
+                [spec],
+                expected_names=("read_one",),
+                authority_manifest={"schema_version": 1, "tools": []},
+            )
+    finally:
+        object.__setattr__(spec.metadata, "required_capabilities", original)
 
 
 def test_binding_contract_and_resolver_descriptor_have_closed_fields() -> None:
     contract = BindingContract(kind="enforce_if_bound", entity_kind="application")
-    resolver = BindingResolverSpec(
+    resolver = BindingResolverDescriptorV1(
         resolver_id="application_identity_arg",
         entity_kind="application",
         arg_path="id",
         presence="required",
         identity_type="positive_int64",
-        resolve=lambda args, context: None,
     )
     assert contract.entity_kind == "application"
     assert resolver.arg_path == "id"

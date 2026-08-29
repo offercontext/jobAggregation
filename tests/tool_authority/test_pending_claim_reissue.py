@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from asyncio import CancelledError
 from concurrent.futures import ThreadPoolExecutor
+import inspect
 from pathlib import Path
 from typing import Any
 
@@ -13,8 +14,65 @@ from offerpilot.ai.tool_authority import (
     AuthorityPhaseError,
     PendingAuthorityClaim,
 )
+from tests.tool_authority import test_hardening as hardening_helpers
 from tests.tool_authority.test_hardening import SHA, SHA_B, _prepared, _scope, _segment
-from tests.tool_authority.test_pending_claim import _harness, _sibling_pending_claim
+from tests.tool_authority.test_pending_claim import (
+    _harness,
+    _persist_typed,
+    _set_typed,
+    _sibling_pending_claim,
+    clarification_pending_route,
+)
+
+
+def _clear_hardening_helper_state() -> None:
+    hardening_helpers._ROUTES.clear()
+    while hardening_helpers._LEASES:
+        hardening_helpers._LEASES.pop().close()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_hardening_helper_state():
+    _clear_hardening_helper_state()
+    try:
+        yield
+    finally:
+        _clear_hardening_helper_state()
+
+
+def test_operation_pending_repository_ports_require_one_exact_route_handle() -> None:
+    from offerpilot.repositories.chat import ChatRepository
+
+    required_routes = (
+        "set_pending_action",
+        "persist_pending_action",
+        "replace_pending_confirmation",
+        "persist_confirmation_continuation",
+    )
+    failures: list[str] = []
+    for method_name in required_routes:
+        signature = inspect.signature(getattr(ChatRepository, method_name))
+        parameters = tuple(signature.parameters.values())
+        route_parameters = tuple(
+            parameter
+            for parameter in parameters
+            if "route" in parameter.name and "handle" in parameter.name
+        )
+        if len(route_parameters) != 1:
+            failures.append(f"{method_name}: expected one route-handle parameter")
+            continue
+        route_parameter = route_parameters[0]
+        if route_parameter.kind is not inspect.Parameter.KEYWORD_ONLY:
+            failures.append(f"{method_name}: route handle must be keyword-only")
+        annotation = str(route_parameter.annotation)
+        if "PendingPersistenceRouteHandle" not in annotation:
+            failures.append(f"{method_name}: route handle has the wrong sealed union")
+        if route_parameter.default is not inspect.Parameter.empty:
+            failures.append(f"{method_name}: route handle is optional")
+        if "pending_authority_claim" in signature.parameters:
+            failures.append(f"{method_name}: raw PendingAuthorityClaim overload remains")
+
+    assert failures == []
 
 
 def _captured_sources(harness: Any) -> tuple[object, object]:
@@ -119,9 +177,7 @@ def _issue_cross_scope_claim(
 
 
 def _finalized_source_count(harness: Any, authority: object) -> int:
-    return len(
-        harness.factory._finalized_pending_claim_keys.get(id(authority), set())
-    )
+    return len(harness.factory._finalized_pending_claim_keys.get(id(authority), set()))
 
 
 def test_active_pending_proposal_cannot_issue_from_a_cloned_pending(tmp_path: Path) -> None:
@@ -140,9 +196,7 @@ def test_active_pending_proposal_cannot_issue_from_a_cloned_pending(tmp_path: Pa
         harness.close()
 
 
-@pytest.mark.parametrize(
-    "finalization", ("consumed", "cas_loser", "revoked", "cancelled")
-)
+@pytest.mark.parametrize("finalization", ("consumed", "cas_loser", "revoked", "cancelled"))
 def test_finalized_pending_proposal_sources_cannot_issue_another_claim(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -162,26 +216,23 @@ def test_finalized_pending_proposal_sources_cannot_issue_another_claim(
                 "{}",
                 "blocker",
             )
-            assert harness.chat.set_pending_action(harness.conversation_id, blocker)
-            assert not harness.chat.set_pending_action(
-                harness.conversation_id,
-                harness.pending,
-                pending_authority_claim=harness.claim,
-            )
+            with clarification_pending_route(blocker, harness.conversation_id) as route_handle:
+                assert harness.chat.set_pending_action(
+                    harness.conversation_id,
+                    blocker,
+                    route_handle=route_handle,
+                )
+            assert not _set_typed(harness, harness.pending, harness.claim)
         elif finalization == "revoked":
             harness.factory.revoke(harness.claim)
         else:
+
             def cancel(*_args: object, **_kwargs: object) -> None:
                 raise CancelledError
 
-            monkeypatch.setattr(harness.chat, "persist_typed_pending", cancel)
+            monkeypatch.setattr(harness.operations, "create_primary", cancel)
             with pytest.raises(CancelledError):
-                harness.chat.persist_pending_action(
-                    harness.conversation_id,
-                    harness.pending,
-                    [],
-                    pending_authority_claim=harness.claim,
-                )
+                _persist_typed(harness, harness.pending, harness.claim, [])
 
         assert harness.factory.claim_state(harness.claim) is None
         assert _finalized_source_count(harness, authority) == 1
@@ -254,9 +305,7 @@ def test_equivalent_proposal_cannot_cross_segment_authorities(first_state: str) 
 
         first_pending = _registered_cross_scope_pending(factory)
         second_pending = _registered_cross_scope_pending(factory)
-        first_claim = _issue_cross_scope_claim(
-            factory, first, prepared_first, first_pending
-        )
+        first_claim = _issue_cross_scope_claim(factory, first, prepared_first, first_pending)
         if first_state == "finalized":
             factory.revoke(first_claim)
 

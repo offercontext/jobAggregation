@@ -14,13 +14,14 @@ from offerpilot.ai.tool_authority import (
     ApprovalExecutionAuthority,
     AuthorityFactory,
     AuthorityPhaseError,
+    AuthorityUse,
 )
 from offerpilot.ai.tool_authority.fingerprint import authorization_scope_fingerprint
 from offerpilot.ai.tool_authority.visibility import AuthorityApplicationVisibilityQuery
-from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
+from offerpilot.ai.tool_runtime.context import ToolExecutionContext
+from offerpilot.ai.tool_runtime.policy_types import ToolCapability
 from offerpilot.ai.tool_runtime.contracts import ConfirmationRequired
 from offerpilot.ai.tool_runtime.pipeline import execute_prepared, prepare_call
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.ai.write_operations import (
     OperationCommitted,
@@ -57,6 +58,13 @@ from offerpilot.repositories.jd import JDAnalysesRepository
 from offerpilot.repositories.notes import NoteCreate, NotesRepository
 from offerpilot.repositories.offers import OffersRepository
 from offerpilot.repositories.resumes import ResumesRepository
+from tests.tool_authority.test_pending_claim import create_primary_with_typed_route
+from tests.tool_metadata.test_production_bundle import _production_components
+
+
+_METADATA_COMPONENTS = _production_components()
+_METADATA_BUNDLE = _METADATA_COMPONENTS.bundle
+_TEST_TOOL_CATALOG = _METADATA_BUNDLE._typed_catalog
 
 
 def _revision(tool_call_id: str, tool_name: str, raw_args: str) -> int:
@@ -66,9 +74,7 @@ def _revision(tool_call_id: str, tool_name: str, raw_args: str) -> int:
         sort_keys=True,
         separators=(",", ":"),
     ).encode()
-    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & (
-        (1 << 63) - 1
-    )
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & ((1 << 63) - 1)
 
 
 def _approval_harness(tmp_path) -> SimpleNamespace:
@@ -85,17 +91,13 @@ def _approval_harness(tmp_path) -> SimpleNamespace:
     operation_id = str(uuid4())
     proposal = {"id": note.id, "questions": "approved"}
     raw_args = json.dumps(proposal, sort_keys=True, separators=(",", ":"))
-    pending = PendingAction(
-        "scoped-call", "update_note", raw_args, "update_note", operation_id
-    )
+    pending = PendingAction("scoped-call", "update_note", raw_args, "update_note", operation_id)
     revision = _revision(pending.tool_call_id, pending.tool_name, raw_args)
     digest = "sha256:" + hashlib.sha256(raw_args.encode()).hexdigest()
     token_fingerprint = ledger_fingerprint(
         key, "write-operation-confirmation-token-v1", b"scoped-token"
     )
-    proposal_fingerprint = ledger_fingerprint(
-        key, "write-operation-proposal-v1", proposal
-    )
+    proposal_fingerprint = ledger_fingerprint(key, "write-operation-proposal-v1", proposal)
     with sessions() as session:
         owner = session.get(Conversation, conversation.id)
         assert owner is not None
@@ -107,13 +109,14 @@ def _approval_harness(tmp_path) -> SimpleNamespace:
         owner.pending_tool_name = pending.tool_name
         owner.pending_args = raw_args
         owner.pending_human = pending.human
-        repository.create_primary(
+        create_primary_with_typed_route(
+            repository,
             session,
             operation_id=operation_id,
             conversation_id=conversation.id,
             tool_call_id=pending.tool_call_id,
             tool_name=pending.tool_name,
-            adapter_kind="typed",
+            raw_args=raw_args,
             proposal_fingerprint=proposal_fingerprint,
             confirmation_token_fingerprint=token_fingerprint,
             authorization_scope_fingerprint=authorization_scope_fingerprint(
@@ -188,6 +191,28 @@ def _approval_context_resolver(harness: SimpleNamespace):
     return resolve_context
 
 
+def _confirmation_dependencies(
+    harness: SimpleNamespace,
+    approval_context_resolver,
+) -> ConfirmationDependencies:
+    return ConfirmationDependencies(
+        persistence=ChatPersistenceCoordinator(harness.chat),
+        write_operations=harness.repository,
+        write_coordinator=harness.coordinator,
+        catalog=_TEST_TOOL_CATALOG,
+        operation_port=_METADATA_COMPONENTS.operation_port,
+        pending_persistence_route_port=(_METADATA_COMPONENTS.pending_persistence_route_port),
+        approval_context_resolver=approval_context_resolver,
+    )
+
+
+def _approval_route(harness: SimpleNamespace):
+    lease = _METADATA_BUNDLE.open_segment_lease()
+    spec_handle = lease.resolve(harness.pending.tool_name)
+    assert spec_handle is not None
+    return lease, spec_handle
+
+
 def test_production_approve_modify_invokes_minimal_resolver_before_source(
     tmp_path, monkeypatch
 ) -> None:
@@ -211,14 +236,9 @@ def test_production_approve_modify_invokes_minimal_resolver_before_source(
 
     monkeypatch.setattr(ApprovalAuthorityResolver, "resolve", tracked_resolve)
     coordinator = ConfirmationCoordinator(
-        ConfirmationDependencies(
-            persistence=ChatPersistenceCoordinator(harness.chat),
-            write_operations=harness.repository,
-            write_coordinator=harness.coordinator,
-            catalog=MODEL_TOOL_CATALOG,
-            approval_context_resolver=_approval_context_resolver(harness),
-        )
+        _confirmation_dependencies(harness, _approval_context_resolver(harness))
     )
+    catalog_lease, spec_handle = _approval_route(harness)
 
     session = coordinator.approve_modify(
         ConfirmationRequest(
@@ -229,7 +249,8 @@ def test_production_approve_modify_invokes_minimal_resolver_before_source(
         ),
         pending=harness.pending,
         conversation=conversation,
-        catalog=MODEL_TOOL_CATALOG,
+        catalog_lease=catalog_lease,
+        spec_handle=spec_handle,
     )
 
     try:
@@ -239,6 +260,7 @@ def test_production_approve_modify_invokes_minimal_resolver_before_source(
         assert source_calls == 0
     finally:
         session.approval_context.authority_factory.close()
+        catalog_lease.close()
 
 
 def test_real_typed_approval_uses_canonical_visibility_in_both_snapshots(
@@ -260,6 +282,7 @@ def test_real_typed_approval_uses_canonical_visibility_in_both_snapshots(
         tracked_visibility,
     )
     factory = AuthorityFactory()
+    catalog_lease = None
     try:
         authority = ApprovalAuthorityResolver(
             harness.repository,
@@ -288,8 +311,14 @@ def test_real_typed_approval_uses_canonical_visibility_in_both_snapshots(
             approval_context=context,
             request_identity=object(),
         )
+        catalog_lease = _METADATA_BUNDLE.open_segment_lease()
+        factory.bind_segment_tool_catalog(
+            authority,
+            authority_metadata_view=_METADATA_BUNDLE.authority_view(),
+            catalog_lease=catalog_lease,
+        )
         prepared_result = prepare_call(
-            MODEL_TOOL_CATALOG,
+            catalog_lease,
             context,
             ToolCall(
                 harness.pending.tool_call_id,
@@ -302,6 +331,11 @@ def test_real_typed_approval_uses_canonical_visibility_in_both_snapshots(
             record_proposal=False,
         )
         assert isinstance(prepared_result, ConfirmationRequired)
+        factory.begin_prepared_execution(
+            prepared_result.prepared,
+            authority=authority,
+            use=AuthorityUse.APPROVED_WRITE_PREPARE,
+        )
 
         execution, record = harness.coordinator.execute_primary(
             operation_id=harness.operation_id,
@@ -310,6 +344,7 @@ def test_real_typed_approval_uses_canonical_visibility_in_both_snapshots(
             context=context,
             prepare_identity=prepare_identity,
             request_fingerprint=harness.request_fingerprint,
+            parent_route_binder=None,
         )
 
         assert isinstance(execution, OperationCommitted)
@@ -323,6 +358,8 @@ def test_real_typed_approval_uses_canonical_visibility_in_both_snapshots(
         assert updated is not None
         assert updated.questions == "approved"
     finally:
+        if catalog_lease is not None:
+            catalog_lease.close()
         factory.close()
 
 
@@ -350,13 +387,7 @@ def test_runtime_real_typed_origin_is_provider_and_source_free(tmp_path) -> None
         return context
 
     coordinator = ConfirmationCoordinator(
-        ConfirmationDependencies(
-            persistence=ChatPersistenceCoordinator(harness.chat),
-            write_operations=harness.repository,
-            write_coordinator=harness.coordinator,
-            catalog=MODEL_TOOL_CATALOG,
-            approval_context_resolver=tracked_approval_context,
-        )
+        _confirmation_dependencies(harness, tracked_approval_context)
     )
 
     class Conversations:
@@ -377,7 +408,7 @@ def test_runtime_real_typed_origin_is_provider_and_source_free(tmp_path) -> None
                 request_identity=seed,
             )
             prepared = prepare_call(
-                invocation.catalog,
+                invocation.catalog_lease,
                 context,
                 ToolCall(pending.tool_call_id, pending.tool_name, pending.args),
                 call_identity=prepare_identity,
@@ -395,9 +426,7 @@ def test_runtime_real_typed_origin_is_provider_and_source_free(tmp_path) -> None
             assert record.terminal_persisted
             visible = record.persisted_visible_result
             assert isinstance(visible, str)
-            origin = Message(
-                role="tool", content=visible, tool_call_id=pending.tool_call_id
-            )
+            origin = Message(role="tool", content=visible, tool_call_id=pending.tool_call_id)
             continuation.record_result(pending, origin, record)
             return AgentTurnResult(
                 added=[origin, Message(role="assistant", content="done")],
@@ -414,7 +443,12 @@ def test_runtime_real_typed_origin_is_provider_and_source_free(tmp_path) -> None
             confirmation_coordinator=coordinator,
             continuation_model_resolver=forbidden_model,
             agent_driver=OriginDriver(),
-            catalog=MODEL_TOOL_CATALOG,
+            catalog=_TEST_TOOL_CATALOG,
+            metadata_bundle=_METADATA_BUNDLE,
+            metadata_components=_METADATA_COMPONENTS,
+            provider_metadata_view=_METADATA_BUNDLE.provider_view(),
+            discovery_metadata_view=_METADATA_BUNDLE.discovery_view(),
+            authority_metadata_view=_METADATA_BUNDLE.authority_view(),
         )
     )
 
@@ -447,14 +481,9 @@ def test_production_agent_driver_retains_approval_context_seals(tmp_path) -> Non
     conversation = harness.chat.get_conversation(harness.conversation.id)
     assert conversation is not None
     coordinator = ConfirmationCoordinator(
-        ConfirmationDependencies(
-            persistence=ChatPersistenceCoordinator(harness.chat),
-            write_operations=harness.repository,
-            write_coordinator=harness.coordinator,
-            catalog=MODEL_TOOL_CATALOG,
-            approval_context_resolver=_approval_context_resolver(harness),
-        )
+        _confirmation_dependencies(harness, _approval_context_resolver(harness))
     )
+    approval_lease, approval_spec_handle = _approval_route(harness)
     session = coordinator.approve_modify(
         ConfirmationRequest(
             conversation_id=conversation.id,
@@ -464,17 +493,25 @@ def test_production_agent_driver_retains_approval_context_seals(tmp_path) -> Non
         ),
         pending=harness.pending,
         conversation=conversation,
-        catalog=MODEL_TOOL_CATALOG,
+        catalog_lease=approval_lease,
+        spec_handle=approval_spec_handle,
     )
     origin = session.approval_context
     context = origin.with_runtime_dependencies(
         run_recorder=NullRunRecorder(),
         operation_executor=session.execute_operation,
     )
+    catalog_lease = _METADATA_BUNDLE.open_segment_lease()
+    origin.authority_factory.bind_segment_tool_catalog(
+        origin.authority,
+        authority_metadata_view=_METADATA_BUNDLE.authority_view(),
+        catalog_lease=catalog_lease,
+    )
     invocation = AgentLoopInvocation(
         seed=ApprovedWriteSeed(ConfirmationApprovedWritePort(session)),
         model=None,
-        catalog=MODEL_TOOL_CATALOG,
+        catalog=_TEST_TOOL_CATALOG,
+        catalog_lease=catalog_lease,
         tool_context=context,
         auto_approve=False,
         max_iterations=1,
@@ -509,6 +546,8 @@ def test_production_agent_driver_retains_approval_context_seals(tmp_path) -> Non
         assert rebound.scope_constraint is origin.scope_constraint
         assert rebound.operation_executor is session.execute_operation
     finally:
+        catalog_lease.close()
+        approval_lease.close()
         origin.authority_factory.close()
 
 
@@ -517,14 +556,9 @@ def test_unclaimed_timeout_closes_approval_authority(tmp_path) -> None:
     conversation = harness.chat.get_conversation(harness.conversation.id)
     assert conversation is not None
     coordinator = ConfirmationCoordinator(
-        ConfirmationDependencies(
-            persistence=ChatPersistenceCoordinator(harness.chat),
-            write_operations=harness.repository,
-            write_coordinator=harness.coordinator,
-            catalog=MODEL_TOOL_CATALOG,
-            approval_context_resolver=_approval_context_resolver(harness),
-        )
+        _confirmation_dependencies(harness, _approval_context_resolver(harness))
     )
+    catalog_lease, spec_handle = _approval_route(harness)
     session = coordinator.approve_modify(
         ConfirmationRequest(
             conversation_id=conversation.id,
@@ -534,7 +568,8 @@ def test_unclaimed_timeout_closes_approval_authority(tmp_path) -> None:
         ),
         pending=harness.pending,
         conversation=conversation,
-        catalog=MODEL_TOOL_CATALOG,
+        catalog_lease=catalog_lease,
+        spec_handle=spec_handle,
     )
     context = session.approval_context
 
@@ -542,6 +577,7 @@ def test_unclaimed_timeout_closes_approval_authority(tmp_path) -> None:
     assert session.state.active is False
     with pytest.raises(AuthorityPhaseError, match="closed"):
         _ = context.scope_constraint
+    catalog_lease.close()
 
 
 @pytest.mark.parametrize("transport_mode", ("sync", "stream"))
@@ -559,13 +595,7 @@ def test_replay_exit_closes_approval_authority(
         return context
 
     coordinator = ConfirmationCoordinator(
-        ConfirmationDependencies(
-            persistence=ChatPersistenceCoordinator(harness.chat),
-            write_operations=harness.repository,
-            write_coordinator=harness.coordinator,
-            catalog=MODEL_TOOL_CATALOG,
-            approval_context_resolver=tracked_approval_context,
-        )
+        _confirmation_dependencies(harness, tracked_approval_context)
     )
 
     class Conversations:
@@ -600,7 +630,12 @@ def test_replay_exit_closes_approval_authority(
             persistence=ChatPersistenceCoordinator(harness.chat),
             confirmation_coordinator=coordinator,
             agent_driver=ReplayDriver(),
-            catalog=MODEL_TOOL_CATALOG,
+            catalog=_TEST_TOOL_CATALOG,
+            metadata_bundle=_METADATA_BUNDLE,
+            metadata_components=_METADATA_COMPONENTS,
+            provider_metadata_view=_METADATA_BUNDLE.provider_view(),
+            discovery_metadata_view=_METADATA_BUNDLE.discovery_view(),
+            authority_metadata_view=_METADATA_BUNDLE.authority_view(),
         )
     )
     request = ConfirmationRequest(

@@ -1,19 +1,16 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, cast
 
 import pytest
 
 from offerpilot.ai.agent_contracts import PendingAction
+from offerpilot.ai.agent_loop import _pending_presentation_snapshot
 from offerpilot.ai.confirmation import prepare_pending_action
-from offerpilot.ai.tool_runtime.catalog import ToolCatalog
-from offerpilot.ai.tool_runtime.contracts import (
-    ProviderToolContract,
-    ToolExceptionMapping,
-    ToolSpec,
-    WriteContract,
-)
+from offerpilot.ai.tool_runtime.context import ToolExecutionContext
+from offerpilot.ai.tool_runtime.metadata import canonical_json_bytes, freeze_json
 from offerpilot.ai.write_operations import (
     OperationReplay,
     TerminalPayload,
@@ -21,52 +18,29 @@ from offerpilot.ai.write_operations import (
 )
 from offerpilot.pilot_runtime.continuation import _runtime_replay
 from offerpilot.pilot_runtime.contracts import ConfirmationRequiredOutcome
+from tests.tool_metadata.test_production_bundle import _production_components
 
 
-_EDITABLE_FIELDS = (
-    {"field": "status", "type": "enum", "options": ["offer", "rejected"]},
-    {"field": "title", "type": "string"},
-    {"field": "score", "type": "number"},
-    {"field": "active", "type": "boolean"},
-    {"field": "remind_at", "type": "datetime", "clearable": True, "clear_value": ""},
-)
+@contextmanager
+def editable_route(tool_name: str = "update_application_status"):
+    bundle = _production_components().bundle
+    lease = bundle.open_segment_lease()
+    handle = lease.resolve(tool_name)
+    assert handle is not None
+    try:
+        yield lease, handle
+    finally:
+        lease.close()
 
 
-def editable_catalog(
+def pending(
+    args: object | None = None,
     *,
-    editable_fields: tuple[dict[str, Any], ...] = _EDITABLE_FIELDS,
-) -> ToolCatalog:
-    name = "update_application_status"
-    schema = {"type": "object", "properties": {"id": {"type": "integer"}}}
-    contract = ProviderToolContract(
-        payload={
-            "type": "function",
-            "function": {"name": name, "description": name, "parameters": schema},
-        },
-        name=name,
-        description=name,
-        parameters=schema,
-    )
-    spec = ToolSpec(
-        contract=contract,
-        kind="write",
-        decoder=lambda values: dict(values),
-        executor=lambda args, _context: args,
-        confirmation_policy="required",
-        editable_fields=editable_fields,
-        declared_failure_categories=frozenset({"internal_error"}),
-        exception_map=(ToolExceptionMapping(Exception, "internal_error", "test_error"),),
-        success_renderer=str,
-        confirmation_description=lambda _args: "change status",
-        write_contract=WriteContract(),
-    )
-    return ToolCatalog((spec,), expected_names=(name,))
-
-
-def pending(args: object | None = None) -> PendingAction:
+    tool_name: str = "update_application_status",
+) -> PendingAction:
     return PendingAction(
         tool_call_id="w1",
-        tool_name="update_application_status",
+        tool_name=tool_name,
         args=json.dumps(args if args is not None else {"id": 7, "status": "offer"}),
         human="change status",
         operation_id="operation-1",
@@ -74,68 +48,112 @@ def pending(args: object | None = None) -> PendingAction:
 
 
 def test_prepare_pending_action_merges_editable_fields_and_preserves_identity() -> None:
-    original = pending({"id": 7, "status": "offer", "title": "old"})
+    original = pending({"id": 7, "status": "offer", "closed_reason": "old"})
 
-    prepared = prepare_pending_action(
-        original,
-        editable_catalog(),
-        {"status": "rejected", "title": "new"},
-    )
+    with editable_route() as (lease, handle):
+        prepared = prepare_pending_action(
+            original,
+            lease,
+            handle,
+            {"status": "closed", "closed_reason": "new"},
+        )
 
     assert prepared is not original
     assert prepared.tool_call_id == original.tool_call_id
     assert prepared.tool_name == original.tool_name
     assert prepared.operation_id == original.operation_id
-    assert prepared.human == "change status"
-    assert json.loads(prepared.args) == {"id": 7, "status": "rejected", "title": "new"}
-    assert json.loads(original.args) == {"id": 7, "status": "offer", "title": "old"}
+    assert prepared.human
+    assert json.loads(prepared.args) == {
+        "id": 7,
+        "status": "closed",
+        "closed_reason": "new",
+    }
+    assert json.loads(original.args) == {"id": 7, "status": "offer", "closed_reason": "old"}
 
 
 def test_prepare_pending_action_none_edits_return_same_pending() -> None:
     original = pending()
 
-    assert prepare_pending_action(original, editable_catalog(), None) is original
+    with editable_route() as (lease, handle):
+        assert prepare_pending_action(original, lease, handle, None) is original
+
+
+def test_production_pending_presentation_snapshot_is_immutable_and_canonicalizable() -> None:
+    action = pending(
+        {"company_name": "Acme", "position_name": "Engineer", "status": "applied"},
+        tool_name="create_application",
+    )
+
+    with editable_route("create_application") as (lease, handle):
+        spec = lease.require_spec(handle)
+        snapshot = _pending_presentation_snapshot(
+            action,
+            spec,
+            cast(ToolExecutionContext, cast(Any, object())),
+        )
+
+    frozen = freeze_json({"editable_fields": snapshot.editable_fields, "details": snapshot.details})
+    assert canonical_json_bytes(frozen)
+    with pytest.raises(TypeError):
+        snapshot.details["mutated"] = True  # type: ignore[index]
 
 
 @pytest.mark.parametrize("edited", [["status"], "status", 1, True])
 def test_prepare_pending_action_rejects_non_object_edits(edited: object) -> None:
     with pytest.raises(ValueError, match="object"):
-        prepare_pending_action(pending(), editable_catalog(), edited)  # type: ignore[arg-type]
+        with editable_route() as (lease, handle):
+            prepare_pending_action(pending(), lease, handle, edited)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("field", ["id", "unknown"])
 def test_prepare_pending_action_rejects_non_editable_fields(field: str) -> None:
     with pytest.raises(ValueError, match=field):
-        prepare_pending_action(pending(), editable_catalog(), {field: 1})
+        with editable_route() as (lease, handle):
+            prepare_pending_action(pending(), lease, handle, {field: 1})
 
 
 @pytest.mark.parametrize(
-    ("field", "value"),
+    ("tool_name", "field", "value"),
     [
-        ("status", "waiting"),
-        ("status", 1),
-        ("title", 3),
-        ("score", "3"),
-        ("score", True),
-        ("active", 1),
-        ("remind_at", "not-a-date"),
+        ("update_application_status", "status", "waiting"),
+        ("update_application_status", "status", 1),
+        ("update_application_status", "closed_reason", 3),
+        ("create_application_event", "duration_minutes", "3"),
+        ("create_application_event", "duration_minutes", True),
+        ("add_note", "allow_placeholder_date", 1),
+        ("create_application_event", "remind_at", "not-a-date"),
     ],
 )
-def test_prepare_pending_action_rejects_invalid_edit_values(field: str, value: object) -> None:
+def test_prepare_pending_action_rejects_invalid_edit_values(
+    tool_name: str,
+    field: str,
+    value: object,
+) -> None:
     with pytest.raises(ValueError, match=field):
-        prepare_pending_action(pending(), editable_catalog(), {field: value})
+        with editable_route(tool_name) as (lease, handle):
+            prepare_pending_action(
+                pending(tool_name=tool_name),
+                lease,
+                handle,
+                {field: value},
+            )
 
 
 def test_prepare_pending_action_accepts_declared_clear_sentinel() -> None:
-    prepared = prepare_pending_action(
-        pending({"id": 7, "status": "offer", "remind_at": "2026-07-10T12:30:00Z"}),
-        editable_catalog(),
-        {"remind_at": ""},
-    )
+    tool_name = "create_application_event"
+    with editable_route(tool_name) as (lease, handle):
+        prepared = prepare_pending_action(
+            pending(
+                {"id": 7, "remind_at": "2026-07-10T12:30:00Z"},
+                tool_name=tool_name,
+            ),
+            lease,
+            handle,
+            {"remind_at": ""},
+        )
 
     assert json.loads(prepared.args) == {
         "id": 7,
-        "status": "offer",
         "remind_at": "",
     }
 
@@ -144,17 +162,20 @@ def test_prepare_pending_action_rejects_unknown_pending_tool() -> None:
     missing = PendingAction("w1", "missing", "{}", "missing", "operation-1")
 
     with pytest.raises(ValueError, match="missing"):
-        prepare_pending_action(missing, editable_catalog(), {})
+        with editable_route() as (lease, handle):
+            prepare_pending_action(missing, lease, handle, {})
 
 
 @pytest.mark.parametrize("raw_args", ["{", "[]", '"text"', "null"])
 def test_prepare_pending_action_rejects_non_object_original_args(raw_args: str) -> None:
     with pytest.raises(ValueError, match="JSON object"):
-        prepare_pending_action(
-            pending(raw_args),  # type: ignore[arg-type]
-            editable_catalog(),
-            {},
-        )
+        with editable_route() as (lease, handle):
+            prepare_pending_action(
+                pending(raw_args),  # type: ignore[arg-type]
+                lease,
+                handle,
+                {},
+            )
 
 
 @pytest.mark.parametrize(

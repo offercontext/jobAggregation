@@ -14,6 +14,7 @@ from offerpilot.ai.write_operations import (
 from offerpilot.db import init_database
 from offerpilot.models import Conversation
 from offerpilot.repositories.chat import ChatRepository
+from tests.tool_authority.test_pending_claim import create_primary_with_typed_route
 
 
 def _ledger(tmp_path):
@@ -31,16 +32,17 @@ def _ledger(tmp_path):
         owner.pending_tool_name = "create_application"
         owner.pending_args = '{"malformed":'
         owner.pending_human = "private human text"
-        repository.create_primary(
+        create_primary_with_typed_route(
+            repository,
             session,
             operation_id=operation_id,
             conversation_id=conversation.id,
             tool_call_id="call-1",
             tool_name="create_application",
-            adapter_kind="typed",
-            proposal_fingerprint=ledger_fingerprint(
-                key, "write-operation-proposal-v1", {}
-            ),
+            raw_args='{"malformed":',
+            pending_action_revision=1,
+            arguments_digest="sha256:" + "0" * 64,
+            proposal_fingerprint=ledger_fingerprint(key, "write-operation-proposal-v1", {}),
             confirmation_token_fingerprint=ledger_fingerprint(
                 key, "write-operation-confirmation-token-v1", b"token"
             ),

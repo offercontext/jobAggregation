@@ -16,21 +16,27 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, cast
 
 from offerpilot.ai.agent_contracts import PendingAction
-from offerpilot.ai.tool_authority import PendingAuthorityClaim
 from offerpilot.ai.types import Message, ToolCall
-from offerpilot.ai.write_operations import DeliveryOwnership
-from offerpilot.repositories.chat import ChatRepository, _pending_claim_lifecycle
+from offerpilot.ai.write_operations import (
+    ClarificationPendingRouteHandle,
+    DeliveryOwnership,
+    PendingPersistenceRouteHandle,
+    abandon_pending_persistence_route,
+)
+from offerpilot.repositories.chat import ChatRepository
 
 from .contracts import ImmutablePayload, freeze_json_mapping
 
 
 if TYPE_CHECKING:
+
     class StrEnum(str, Enum):
         pass
 else:
     try:
         from enum import StrEnum
     except ImportError:  # pragma: no cover - Python 3.10 compatibility
+
         class StrEnum(str, Enum):
             def __str__(self) -> str:
                 return self.value
@@ -84,13 +90,19 @@ class PersistenceResult:
             raise TypeError("delivery_outcome must be a DeliveryOutcome")
         if type(self.message_count) is not int or self.message_count < 0:
             raise ValueError("message_count must be a non-negative integer")
-        if self.message_id is not None and (type(self.message_id) is not int or self.message_id <= 0):
+        if self.message_id is not None and (
+            type(self.message_id) is not int or self.message_id <= 0
+        ):
             raise ValueError("message_id must be a positive integer or None")
         if type(self.message_ids) is not tuple:
             raise TypeError("message_ids must be a tuple")
         if any(type(value) is not int or value <= 0 for value in self.message_ids):
             raise ValueError("message_ids must contain positive integers")
-        if self.message_id is not None and self.message_ids and self.message_id not in self.message_ids:
+        if (
+            self.message_id is not None
+            and self.message_ids
+            and self.message_id not in self.message_ids
+        ):
             raise ValueError("message_id must be present in message_ids")
         if self.message_id is None and self.message_ids:
             object.__setattr__(self, "message_id", self.message_ids[-1])
@@ -502,8 +514,7 @@ class ChatPersistenceCoordinator:
         """Read detached immutable messages without exposing ORM rows."""
 
         return tuple(
-            _snapshot_message(message)
-            for message in self._chat.list_messages(conversation_id)
+            _snapshot_message(message) for message in self._chat.list_messages(conversation_id)
         )
 
     def get_pending_action(self, conversation_id: int) -> PendingActionView | None:
@@ -527,17 +538,11 @@ class ChatPersistenceCoordinator:
             value["parent_operation_id"] = operation_id
         return freeze_json_mapping(value)
 
-    def get_pending_clarification(
-        self, conversation_id: int
-    ) -> PendingClarificationView | None:
+    def get_pending_clarification(self, conversation_id: int) -> PendingClarificationView | None:
         """Read a detached immutable clarification through the coordinator boundary."""
 
         clarification = self._chat.get_pending_clarification(conversation_id)
-        return (
-            None
-            if clarification is None
-            else _snapshot_pending_clarification(clarification)
-        )
+        return None if clarification is None else _snapshot_pending_clarification(clarification)
 
     def _failure_status(
         self,
@@ -668,7 +673,8 @@ class ChatPersistenceCoordinator:
         conversation_id: int,
         messages: Sequence[MessageInput],
         pending: PendingAction,
-        pending_authority_claim: PendingAuthorityClaim | None = None,
+        *,
+        route_handle: PendingPersistenceRouteHandle,
     ) -> PersistenceResult:
         """Atomically persist a Runtime-authorized initial Pending proposal.
 
@@ -678,29 +684,29 @@ class ChatPersistenceCoordinator:
         the existing repository atom and never fabricates cross-layer checks.
         """
 
-        with _pending_claim_lifecycle(pending_authority_claim):
-            status = self._writable_status(conversation_id)
-            if status is not None:
-                return PersistenceResult(status, operation_id=pending.operation_id or None)
-            before = self.list_messages(conversation_id)
-            persisted = self._chat.persist_pending_action(
-                conversation_id,
-                pending,
-                [_message_values(message) for message in messages],
-                pending_authority_claim=pending_authority_claim,
-            )
-            if persisted:
-                message_ids = _new_message_ids(before, self.list_messages(conversation_id))
-                return PersistenceResult(
-                    PersistenceStatus.PERSISTED,
-                    message_count=len(messages),
-                    message_ids=message_ids,
-                    operation_id=pending.operation_id or None,
-                )
+        status = self._writable_status(conversation_id)
+        if status is not None:
+            abandon_pending_persistence_route(route_handle)
+            return PersistenceResult(status, operation_id=pending.operation_id or None)
+        before = self.list_messages(conversation_id)
+        persisted = self._chat.persist_pending_action(
+            conversation_id,
+            pending,
+            [_message_values(message) for message in messages],
+            route_handle=route_handle,
+        )
+        if persisted:
+            message_ids = _new_message_ids(before, self.list_messages(conversation_id))
             return PersistenceResult(
-                self._failure_status(conversation_id, operation_id=pending.operation_id or None),
+                PersistenceStatus.PERSISTED,
+                message_count=len(messages),
+                message_ids=message_ids,
                 operation_id=pending.operation_id or None,
             )
+        return PersistenceResult(
+            self._failure_status(conversation_id, operation_id=pending.operation_id or None),
+            operation_id=pending.operation_id or None,
+        )
 
     def clear_pending_action(self, conversation_id: int) -> PersistenceResult:
         """Clear a live Pending card through the existing repository atom."""
@@ -719,6 +725,8 @@ class ChatPersistenceCoordinator:
         messages: Sequence[MessageInput],
         pending: PendingAction,
         question: str,
+        *,
+        route_handle: ClarificationPendingRouteHandle,
     ) -> PersistenceResult:
         """Persist a missing-target clarification using current Chat atoms."""
 
@@ -726,19 +734,24 @@ class ChatPersistenceCoordinator:
             raise TypeError("question must be a string")
         initial = self.persist_initial_messages(conversation_id, messages)
         if not initial.persisted:
+            abandon_pending_persistence_route(route_handle)
             return initial
         cleared = self.clear_pending_action(conversation_id)
         if not cleared.persisted:
+            abandon_pending_persistence_route(route_handle)
             return cleared
-        clarification = self.set_pending_clarification(conversation_id, pending, question)
+        clarification = self.set_pending_clarification(
+            conversation_id,
+            pending,
+            question,
+            route_handle=route_handle,
+        )
         if not clarification.persisted:
             return clarification
         assistant = self.persist_assistant_message(conversation_id, question)
         if not assistant.persisted:
             return assistant
-        message_ids = tuple(
-            dict.fromkeys((*initial.message_ids, *assistant.message_ids))
-        )
+        message_ids = tuple(dict.fromkeys((*initial.message_ids, *assistant.message_ids)))
         return PersistenceResult(
             PersistenceStatus.PERSISTED,
             message_count=initial.message_count + assistant.message_count,
@@ -750,11 +763,19 @@ class ChatPersistenceCoordinator:
         conversation_id: int,
         pending: PendingAction,
         question: str,
+        *,
+        route_handle: ClarificationPendingRouteHandle,
     ) -> PersistenceResult:
         status = self._writable_status(conversation_id)
         if status is not None:
+            abandon_pending_persistence_route(route_handle)
             return PersistenceResult(status)
-        self._chat.set_pending_clarification(conversation_id, pending, question)
+        self._chat.set_pending_clarification(
+            conversation_id,
+            pending,
+            question,
+            route_handle=route_handle,
+        )
         stored = self._chat.get_pending_clarification(conversation_id)
         if stored is not None:
             stored_pending, stored_question = stored
@@ -822,6 +843,7 @@ class ChatPersistenceCoordinator:
         continuation: Sequence[MessageInput] | None = None,
         chained_pending: PendingAction | None = None,
         *,
+        route_handle: PendingPersistenceRouteHandle | None,
         messages: Sequence[MessageInput] | None = None,
         pending: PendingAction | None = None,
         clarification: tuple[PendingAction, str] | None = None,
@@ -830,27 +852,23 @@ class ChatPersistenceCoordinator:
         claim_id: str | None = None,
         undo: dict[str, Any] | None = None,
         delivery_failure_code: str | None = None,
-        pending_authority_claim: PendingAuthorityClaim | None = None,
     ) -> PersistenceResult:
-        """Own a chained Pending claim across every delivery short-circuit."""
-
-        with _pending_claim_lifecycle(pending_authority_claim):
-            return self._persist_confirmation_delivery(
-                conversation_id,
-                ownership,
-                origin_tool_message,
-                continuation,
-                chained_pending,
-                messages=messages,
-                pending=pending,
-                clarification=clarification,
-                expected_generation=expected_generation,
-                expected_pending=expected_pending,
-                claim_id=claim_id,
-                undo=undo,
-                delivery_failure_code=delivery_failure_code,
-                pending_authority_claim=pending_authority_claim,
-            )
+        return self._persist_confirmation_delivery(
+            conversation_id,
+            ownership,
+            origin_tool_message,
+            continuation,
+            chained_pending,
+            route_handle=route_handle,
+            messages=messages,
+            pending=pending,
+            clarification=clarification,
+            expected_generation=expected_generation,
+            expected_pending=expected_pending,
+            claim_id=claim_id,
+            undo=undo,
+            delivery_failure_code=delivery_failure_code,
+        )
 
     def _persist_confirmation_delivery(
         self,
@@ -860,6 +878,7 @@ class ChatPersistenceCoordinator:
         continuation: Sequence[MessageInput] | None = None,
         chained_pending: PendingAction | None = None,
         *,
+        route_handle: PendingPersistenceRouteHandle | None,
         messages: Sequence[MessageInput] | None = None,
         pending: PendingAction | None = None,
         clarification: tuple[PendingAction, str] | None = None,
@@ -868,7 +887,6 @@ class ChatPersistenceCoordinator:
         claim_id: str | None = None,
         undo: dict[str, Any] | None = None,
         delivery_failure_code: str | None = None,
-        pending_authority_claim: PendingAuthorityClaim | None = None,
     ) -> PersistenceResult:
         """Atomically deliver an origin tool result and continuation.
 
@@ -882,9 +900,7 @@ class ChatPersistenceCoordinator:
             raise ValueError("pass continuation or messages, not both")
         if chained_pending is not None and pending is not None:
             raise ValueError("pass chained_pending or pending, not both")
-        if clarification is not None and (
-            chained_pending is not None or pending is not None
-        ):
+        if clarification is not None and (chained_pending is not None or pending is not None):
             raise ValueError("clarification cannot be combined with pending")
         if clarification is not None:
             clarification_action, clarification_question = clarification
@@ -894,14 +910,20 @@ class ChatPersistenceCoordinator:
                 raise ValueError("clarification question must be a string")
         if chained_pending is None:
             chained_pending = pending
+        if chained_pending is not None and ownership is None:
+            raise TypeError("chained Pending persistence requires exact parent delivery ownership")
         continuation_values = continuation if continuation is not None else messages or ()
         status = self._writable_status(conversation_id)
         if status is not None:
+            if route_handle is not None:
+                abandon_pending_persistence_route(route_handle)
             operation_id = ownership.operation_id if ownership is not None else None
             return PersistenceResult(status, operation_id=operation_id)
 
         current = self._chat.get_conversation(conversation_id)
         if current is None:
+            if route_handle is not None:
+                abandon_pending_persistence_route(route_handle)
             return PersistenceResult(PersistenceStatus.NOT_FOUND)
         active_pending = self._chat.get_pending_action(conversation_id)
         expected = expected_pending if expected_pending is not None else active_pending
@@ -911,7 +933,9 @@ class ChatPersistenceCoordinator:
         operation_id = (
             ownership.operation_id
             if ownership is not None
-            else expected.operation_id if expected is not None and expected.operation_id else None
+            else expected.operation_id
+            if expected is not None and expected.operation_id
+            else None
         )
         if claim_id is None and expected is not None and expected.operation_id:
             claim_id = expected.operation_id
@@ -924,6 +948,8 @@ class ChatPersistenceCoordinator:
                 message.operation_id == operation_id
                 for message in self._chat.list_messages(conversation_id)
             ):
+                if route_handle is not None:
+                    abandon_pending_persistence_route(route_handle)
                 return PersistenceResult(
                     PersistenceStatus.DUPLICATE,
                     operation_id=operation_id,
@@ -942,6 +968,7 @@ class ChatPersistenceCoordinator:
                 conversation_id,
                 generation,
                 values,
+                route_handle=route_handle,
                 pending=chained_pending,
                 clarification=clarification,
                 delivery_ownership=ownership,
@@ -950,38 +977,24 @@ class ChatPersistenceCoordinator:
                 claim_id=claim_id,
                 origin_message=origin,
                 undo=undo,
-                pending_authority_claim=pending_authority_claim,
             )
         elif ownership is None and expected is not None:
-            # The non-Ledger compatibility atom writes one terminal assistant
-            # message together with the origin.  Existing callers only use a
-            # single continuation in this mode; reject an unrepresentable
-            # multi-message bundle rather than silently dropping identity.
+            # A non-Ledger terminal delivery may resolve the current Pending,
+            # but it cannot publish a child without an exact parent authority.
             if len(values) > 1:
+                if route_handle is not None:
+                    abandon_pending_persistence_route(route_handle)
                 return PersistenceResult(PersistenceStatus.CAS_LOST, operation_id=operation_id)
             terminal = values[0]["content"] if values else ""
-            if chained_pending is not None:
-                origin_persisted = True
-                persisted_generation = self._chat.replace_pending_confirmation(
-                    conversation_id,
-                    expected,
-                    chained_pending,
-                    origin,
-                    undo,
-                    terminal_assistant_content=terminal,
-                    claim_id=claim_id,
-                    pending_authority_claim=pending_authority_claim,
-                )
-            else:
-                origin_persisted = True
-                persisted_generation = self._chat.resolve_pending_confirmation(
-                    conversation_id,
-                    expected,
-                    origin,
-                    undo,
-                    claim_id=claim_id,
-                    terminal_assistant_content=terminal,
-                )
+            origin_persisted = True
+            persisted_generation = self._chat.resolve_pending_confirmation(
+                conversation_id,
+                expected,
+                origin,
+                undo,
+                claim_id=claim_id,
+                terminal_assistant_content=terminal,
+            )
         else:
             # This is the post-resolve continuation path: the origin result is
             # already durable and only the generation CAS plus continuation is
@@ -990,6 +1003,7 @@ class ChatPersistenceCoordinator:
                 conversation_id,
                 generation,
                 values,
+                route_handle=route_handle,
                 pending=chained_pending,
                 clarification=clarification,
                 delivery_ownership=ownership,
@@ -997,7 +1011,6 @@ class ChatPersistenceCoordinator:
                 expected_pending=None,
                 origin_message=None,
                 undo=undo,
-                pending_authority_claim=pending_authority_claim,
             )
 
         if persisted_generation is None:
@@ -1024,6 +1037,7 @@ class ChatPersistenceCoordinator:
         origin_tool_message: MessageInput,
         message: str,
         *,
+        route_handle: PendingPersistenceRouteHandle | None,
         expected_generation: datetime | None = None,
         expected_pending: PendingAction | None = None,
         claim_id: str | None = None,
@@ -1035,6 +1049,7 @@ class ChatPersistenceCoordinator:
             ownership,
             origin_tool_message,
             [Message(role="assistant", content=message)],
+            route_handle=route_handle,
             expected_generation=expected_generation,
             expected_pending=expected_pending,
             claim_id=claim_id,
@@ -1049,6 +1064,7 @@ class ChatPersistenceCoordinator:
         origin_tool_message: MessageInput,
         continuation: Sequence[MessageInput] | None = None,
         *,
+        route_handle: PendingPersistenceRouteHandle | None,
         messages: Sequence[MessageInput] | None = None,
         expected_generation: datetime | None = None,
         expected_pending: PendingAction | None = None,
@@ -1058,7 +1074,6 @@ class ChatPersistenceCoordinator:
         claim_id: str | None = None,
         undo: dict[str, Any] | None = None,
         clarification: tuple[PendingAction, str] | None = None,
-        pending_authority_claim: PendingAuthorityClaim | None = None,
     ) -> PersistenceResult:
         """Typed replay delivery facade; replay never executes a provider/tool."""
 
@@ -1068,6 +1083,7 @@ class ChatPersistenceCoordinator:
             origin_tool_message,
             continuation,
             chained_pending,
+            route_handle=route_handle,
             messages=messages,
             pending=pending,
             clarification=clarification,
@@ -1076,7 +1092,6 @@ class ChatPersistenceCoordinator:
             claim_id=claim_id,
             undo=undo,
             delivery_failure_code=failure_code,
-            pending_authority_claim=pending_authority_claim,
         )
 
     def persist_confirmation_continuation(
@@ -1085,6 +1100,7 @@ class ChatPersistenceCoordinator:
         expected_generation: datetime | None,
         messages: Sequence[MessageInput],
         *,
+        route_handle: PendingPersistenceRouteHandle | None,
         pending: PendingAction | None = None,
         clarification: tuple[PendingAction, str] | None = None,
         delivery_ownership: DeliveryOwnership | None = None,
@@ -1093,7 +1109,6 @@ class ChatPersistenceCoordinator:
         claim_id: str | None = None,
         origin_message: MessageInput | None = None,
         undo: dict[str, Any] | None = None,
-        pending_authority_claim: PendingAuthorityClaim | None = None,
     ) -> PersistenceResult:
         """Compatibility-shaped continuation facade for Runtime callers."""
 
@@ -1105,13 +1120,13 @@ class ChatPersistenceCoordinator:
             origin_message,
             messages,
             pending,
+            route_handle=route_handle,
             clarification=clarification,
             expected_generation=expected_generation,
             expected_pending=expected_pending,
             claim_id=claim_id,
             undo=undo,
             delivery_failure_code=delivery_failure_code,
-            pending_authority_claim=pending_authority_claim,
         )
 
     @staticmethod

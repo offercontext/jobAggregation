@@ -9,24 +9,38 @@ from offerpilot.ai.tool_runtime.contracts import (
     PreparedToolCall,
     ToolExecutionRecord,
     ToolFailure,
-    ToolSpec,
 )
+from offerpilot.ai.tool_runtime.metadata import ToolAuthorityEntryV1
+from offerpilot.ai.tool_runtime.policy_types import OperationKind
 from offerpilot.ai.types import ToolCall
 
 
-def project_tool_proposed(recorder: RunRecorder, spec: ToolSpec[Any, Any], call: ToolCall) -> bool:
+def project_tool_proposed(
+    recorder: RunRecorder,
+    authority_entry: ToolAuthorityEntryV1,
+    call: ToolCall,
+) -> bool:
+    if type(authority_entry) is not ToolAuthorityEntryV1:
+        raise TypeError("tool proposal requires an exact ToolAuthorityEntryV1")
+    authority_entry.__post_init__()
+    if call.name != authority_entry.provider_name:
+        raise ValueError("tool call does not match its Authority entry")
     return _append(
         recorder,
         EventInput(
             event_type="tool.proposed",
             facts={
                 "tool_call_id": call.id,
-                "tool_name": spec.name,
-                "tool_kind": spec.kind,
+                "tool_name": authority_entry.provider_name,
+                "tool_kind": (
+                    "write"
+                    if authority_entry.operation_kind is OperationKind.TRANSACTIONAL_WRITE
+                    else "read"
+                ),
                 "args_shape_digest": _journal_shape_digest(call.args),
                 "proposal_outcome": (
                     "confirmation_required"
-                    if spec.confirmation_policy == "required"
+                    if authority_entry.confirmation_policy == "required"
                     else "execution_allowed"
                 ),
             },

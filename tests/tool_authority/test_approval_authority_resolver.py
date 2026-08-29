@@ -19,6 +19,7 @@ from offerpilot.db import init_database
 from offerpilot.models import Conversation
 from offerpilot.pilot_runtime.continuation import ApprovalAuthorityResolver
 from offerpilot.repositories.chat import ChatRepository
+from tests.tool_authority.test_pending_claim import create_primary_with_typed_route
 
 
 def _revision(tool_call_id: str, tool_name: str, raw_args: str) -> int:
@@ -45,16 +46,15 @@ def _setup(tmp_path):
         owner.pending_tool_call_id = "call-resolver"
         owner.pending_tool_name = "create_application"
         owner.pending_args = args
-        operation = repository.create_primary(
+        operation = create_primary_with_typed_route(
+            repository,
             session,
             operation_id=operation_id,
             conversation_id=conversation.id,
             tool_call_id="call-resolver",
             tool_name="create_application",
-            adapter_kind="typed",
-            proposal_fingerprint=ledger_fingerprint(
-                key, "write-operation-proposal-v1", {}
-            ),
+            raw_args=args,
+            proposal_fingerprint=ledger_fingerprint(key, "write-operation-proposal-v1", {}),
             confirmation_token_fingerprint=ledger_fingerprint(
                 key, "write-operation-confirmation-token-v1", b"token"
             ),

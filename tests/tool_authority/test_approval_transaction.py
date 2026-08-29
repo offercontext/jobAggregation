@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import replace
 from threading import Event
 from types import SimpleNamespace
@@ -12,18 +14,27 @@ import pytest
 from sqlalchemy import delete, update
 
 import test_write_operations as support
+import tests.test_write_operation_acceptance_matrix as legacy_support
 
 from offerpilot.agent_runtime.journal import NullRunRecorder
 from offerpilot.ai.agent_contracts import PendingAction
-from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
+from offerpilot.ai.tool_authority import AuthorityFactory, AuthorityUse, TrustedContextScope
 from offerpilot.ai.tool_authority.fingerprint import authorization_scope_fingerprint
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
-from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
+from offerpilot.ai.tool_runtime.context import ToolExecutionContext
+from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
+from offerpilot.ai.tool_runtime.policy_types import ToolCapability
 from offerpilot.ai.tool_runtime.contracts import ConfirmationRequired
 from offerpilot.ai.tool_runtime.pipeline import Rejected, prepare_call
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.ai.tool_runtime.legacy_proof import (
+    LegacyApprovedConfirmationInput,
+    LegacyConfirmationLookupIdentity,
+)
+from offerpilot.ai.tool_specs import legacy as legacy_specs
+from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
 from offerpilot.ai.types import ToolCall
 from offerpilot.ai.write_operations import (
+    OperationCommitted,
     OperationUnknown,
     WriteOperationCoordinator,
     WriteOperationRepository,
@@ -40,6 +51,32 @@ from offerpilot.repositories.jd import JDAnalysesRepository
 from offerpilot.repositories.notes import NoteCreate, NotesRepository
 from offerpilot.repositories.offers import OffersRepository
 from offerpilot.repositories.resumes import ResumesRepository
+from tests.tool_metadata.factories import compose_synthetic_bundle
+from tests.tool_authority.test_pending_claim import create_primary_with_typed_route
+
+
+_TEST_TOOL_CATALOG = build_model_tool_catalog()
+
+
+_PREPARED_LEGACY_EXECUTION_ARGS: list[str] = []
+
+
+def _capture_prepared_legacy_execute(encoded_args: str, _context: object) -> str:
+    _PREPARED_LEGACY_EXECUTION_ARGS.append(encoded_args)
+    return '{"ok":true}'
+
+
+class _PreparedAcceptanceLegacyBoundRoute(legacy_support._AcceptanceLegacyBoundRoute):
+    def prepared_call(self):
+        self.identity_events.append(("projection", self.prepared))
+        return self.prepared
+
+    def execute(self, prepared=None):
+        execution_input = self.prepared if prepared is None else prepared
+        self.identity_events.append(("execution", execution_input))
+        if execution_input is not self.prepared:
+            raise ValueError("Legacy prepared projection and execution identity mismatch")
+        return super().execute()
 
 
 def _scoped_approval_harness(
@@ -62,17 +99,13 @@ def _scoped_approval_harness(
     raw_proposal = json.dumps(proposal, sort_keys=True, separators=(",", ":"))
     decided = proposal if effective is None else effective
     raw_effective = json.dumps(decided, sort_keys=True, separators=(",", ":"))
-    pending = PendingAction(
-        "scoped-call", tool_name, raw_proposal, tool_name, operation_id
-    )
+    pending = PendingAction("scoped-call", tool_name, raw_proposal, tool_name, operation_id)
     revision = support._pending_revision(pending.tool_call_id, tool_name, raw_effective)
     digest = "sha256:" + hashlib.sha256(raw_effective.encode()).hexdigest()
     token_fingerprint = ledger_fingerprint(
         key, "write-operation-confirmation-token-v1", b"scoped-token"
     )
-    proposal_fingerprint = ledger_fingerprint(
-        key, "write-operation-proposal-v1", proposal
-    )
+    proposal_fingerprint = ledger_fingerprint(key, "write-operation-proposal-v1", proposal)
     with sessions() as session:
         owner = session.get(Conversation, conversation.id)
         assert owner is not None
@@ -84,13 +117,14 @@ def _scoped_approval_harness(
         owner.pending_tool_name = tool_name
         owner.pending_args = raw_proposal
         owner.pending_human = tool_name
-        repository.create_primary(
+        create_primary_with_typed_route(
+            repository,
             session,
             operation_id=operation_id,
             conversation_id=conversation.id,
             tool_call_id=pending.tool_call_id,
             tool_name=tool_name,
-            adapter_kind="typed",
+            raw_args=raw_proposal,
             proposal_fingerprint=proposal_fingerprint,
             confirmation_token_fingerprint=token_fingerprint,
             authorization_scope_fingerprint=authorization_scope_fingerprint(
@@ -141,7 +175,7 @@ def _scoped_approval_harness(
         jd_analyses=JDAnalysesRepository(sessions),
         run_recorder=NullRunRecorder(),
     )
-    original_spec = MODEL_TOOL_CATALOG.resolve(tool_name)
+    original_spec = _TEST_TOOL_CATALOG.resolve(tool_name)
     assert original_spec is not None
     executor_calls: list[object] = []
 
@@ -149,15 +183,32 @@ def _scoped_approval_harness(
         executor_calls.append(dict(args))
         return {"ok": True}
 
-    spec = replace(original_spec, executor=executor)
+    spec = replace(
+        original_spec,
+        metadata=replace(original_spec.metadata, dependencies=()),
+        executor=executor,
+    )
     catalog = ToolCatalog((spec,), expected_names=(tool_name,))
+    source = compose_synthetic_bundle()
+    bundle = ToolMetadataBundleV1(
+        typed_catalog=catalog,
+        manifest={**source["manifest"], "typed_tools": (tool_name,)},
+        legacy_boundary=source["legacy_boundary"],
+        compensation=source["compensation"],
+    )
+    lease = bundle.open_segment_lease()
+    factory.bind_segment_tool_catalog(
+        authority,
+        authority_metadata_view=bundle.authority_view(),
+        catalog_lease=lease,
+    )
     prepare_identity = factory.create_approved_write_prepare_identity(
         authority,
         approval_context=context,
         request_identity=object(),
     )
     prepared_result = prepare_call(
-        catalog,
+        lease,
         context,
         ToolCall(pending.tool_call_id, tool_name, raw_effective),
         call_identity=prepare_identity,
@@ -182,6 +233,7 @@ def _scoped_approval_harness(
         repository=repository,
         coordinator=WriteOperationCoordinator(repository),
         factory=factory,
+        lease=lease,
         conversation=conversation,
         operation_id=operation_id,
         first_id=first.id,
@@ -204,7 +256,130 @@ def _execute_scoped(harness):
         context=harness.context,
         prepare_identity=harness.prepare_identity,
         request_fingerprint=harness.request_fingerprint,
+        parent_route_binder=None,
     )
+
+
+def test_execute_legacy_has_no_caller_supplied_input_fingerprint() -> None:
+    parameters = inspect.signature(WriteOperationCoordinator.execute_legacy).parameters
+
+    assert "input_fingerprint" not in parameters
+    assert {
+        "operation_id",
+        "conversation_id",
+        "tool_call_id",
+        "tool_name",
+        "request_fingerprint",
+        "route_binder",
+    } <= parameters.keys()
+
+
+def test_execute_legacy_fingerprints_the_same_exact_edited_prepared_call_it_executes(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _PREPARED_LEGACY_EXECUTION_ARGS.clear()
+    monkeypatch.setattr(
+        legacy_specs,
+        "_execute_static_jd",
+        _capture_prepared_legacy_execute,
+    )
+    sessions, repository, chat, coordinator, components = legacy_support._legacy_harness(tmp_path)
+    conversation, pending = legacy_support._propose(
+        chat,
+        "save_application_jd_version",
+        "jd_deterministic_action",
+    )
+    operation = repository.get(pending.operation_id)
+    assert operation is not None
+    edited_args = {"jd_text": "proof-prepared edited JD"}
+    expected_canonical_args = {**json.loads(pending.args), **edited_args}
+    expected_encoded_args = json.dumps(
+        expected_canonical_args,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    confirmation_token = legacy_support._legacy_confirmation_token(pending)
+    identity_events: list[tuple[str, object]] = []
+
+    @contextmanager
+    def bind(write_session):
+        routes = components.confirmation_routes
+        with sessions() as read_session:
+            with read_session.begin():
+                prepared = routes.proof_issuer.prepare_server_loaded(
+                    read_session,
+                    LegacyConfirmationLookupIdentity(conversation_id=conversation.id),
+                    LegacyApprovedConfirmationInput(
+                        decision="approved",
+                        operation_id=pending.operation_id,
+                        confirmation_token=confirmation_token,
+                        edited_args_present=True,
+                        edited_args=edited_args,
+                        rejection_feedback_present=False,
+                        rejection_feedback="",
+                    ),
+                )
+        lease = routes.pending_identity_verifier_port.open_issuance_lease(
+            write_session,
+            prepared,
+        )
+        route = _PreparedAcceptanceLegacyBoundRoute(
+            components=components,
+            sessions=sessions,
+            write_session=write_session,
+            lease=lease,
+            prepared=prepared,
+            pending=pending,
+            parent_route_probe=None,
+        )
+        route.identity_events = identity_events
+        try:
+            yield route
+        finally:
+            lease.close()
+
+    request_fingerprint = operation_request_fingerprint(
+        repository.key,
+        operation_id=pending.operation_id,
+        tool_call_id=pending.tool_call_id,
+        approved=True,
+        edited_args_present=True,
+        edited_args=edited_args,
+        rejection_feedback_present=False,
+        rejection_feedback="",
+        confirmation_token_fingerprint=ledger_fingerprint(
+            repository.key,
+            "write-operation-confirmation-token-v1",
+            confirmation_token.encode("ascii"),
+        ),
+        proposal_fingerprint=operation.proposal_fingerprint,
+    )
+
+    execution = coordinator.execute_legacy(
+        operation_id=pending.operation_id,
+        conversation_id=conversation.id,
+        tool_call_id=pending.tool_call_id,
+        tool_name=pending.tool_name,
+        request_fingerprint=request_fingerprint,
+        route_binder=bind,
+    )
+
+    assert isinstance(execution, OperationCommitted), execution
+    assert _PREPARED_LEGACY_EXECUTION_ARGS == [expected_encoded_args]
+    assert [event for event, _prepared in identity_events] == ["projection", "execution"]
+    assert identity_events[0][1] is identity_events[1][1]
+    persisted = repository.get(pending.operation_id)
+    assert persisted is not None
+    assert persisted.input_fingerprint == ledger_fingerprint(
+        repository.key,
+        "write-operation-legacy-input-v1",
+        expected_canonical_args,
+    )
+    assert execution.ownership is not None
+    execution.ownership.revoke_parent_route()
 
 
 def test_locked_scope_revision_change_rolls_back_before_executor(tmp_path) -> None:
@@ -231,6 +406,7 @@ def test_locked_scope_revision_change_rolls_back_before_executor(tmp_path) -> No
             context=harness.context,
             prepare_identity=harness.prepare_identity,
             request_fingerprint=harness.request_fingerprint,
+            parent_route_binder=None,
             approval_decided_callback=lambda _session: decisions.append("approval.decided"),
         )
         assert isinstance(execution, OperationUnknown)
@@ -246,6 +422,7 @@ def test_locked_scope_revision_change_rolls_back_before_executor(tmp_path) -> No
             assert conversation.pending_operation_id == harness.operation_id
             assert conversation.pending_confirmation_claim_id == ""
     finally:
+        harness.lease.close()
         harness.factory.close()
 
 
@@ -278,12 +455,14 @@ def test_locked_scope_aba_is_rejected_by_revision(tmp_path) -> None:
             context=harness.context,
             prepare_identity=harness.prepare_identity,
             request_fingerprint=harness.request_fingerprint,
+            parent_route_binder=None,
         )
         assert isinstance(execution, OperationUnknown)
         assert execution.code == "authorization_scope_changed"
         assert record is None
         assert calls == 0
     finally:
+        harness.lease.close()
         harness.factory.close()
 
 
@@ -310,6 +489,7 @@ def test_locked_claim_cas_does_not_overwrite_another_attempt(tmp_path) -> None:
             context=harness.context,
             prepare_identity=harness.prepare_identity,
             request_fingerprint=harness.request_fingerprint,
+            parent_route_binder=None,
             approval_decided_callback=lambda _session: decisions.append("approval.decided"),
         )
         assert isinstance(execution, OperationUnknown)
@@ -318,6 +498,7 @@ def test_locked_claim_cas_does_not_overwrite_another_attempt(tmp_path) -> None:
         assert calls == 0
         assert decisions == []
     finally:
+        harness.lease.close()
         harness.factory.close()
 
 
@@ -339,9 +520,7 @@ def test_second_connection_target_change_is_denied_before_claim_and_executor(
                 .values(application_id=harness.second_id)
             )
         else:
-            session.execute(
-                delete(InterviewNote).where(InterviewNote.id == harness.note_id)
-            )
+            session.execute(delete(InterviewNote).where(InterviewNote.id == harness.note_id))
         session.commit()
     try:
         execution, record = _execute_scoped(harness)
@@ -356,6 +535,7 @@ def test_second_connection_target_change_is_denied_before_claim_and_executor(
             assert conversation is not None
             assert conversation.pending_confirmation_claim_id == ""
     finally:
+        harness.lease.close()
         harness.factory.close()
 
 
@@ -373,6 +553,7 @@ def test_second_connection_parent_delete_denies_standalone_add_note(tmp_path) ->
         assert record is None
         assert harness.executor_calls == []
     finally:
+        harness.lease.close()
         harness.factory.close()
 
 
@@ -394,6 +575,7 @@ def test_modify_to_cross_application_is_rejected_during_prepare(tmp_path) -> Non
             assert conversation is not None
             assert conversation.pending_confirmation_claim_id == ""
     finally:
+        harness.lease.close()
         harness.factory.close()
 
 
@@ -413,6 +595,11 @@ def test_approve_reject_race_has_one_terminal_winner_and_one_executor(tmp_path) 
         tmp_path,
         executor,
         tool_name="save_offer_assessment",
+    )
+    harness.factory.begin_prepared_execution(
+        harness.prepared,
+        authority=harness.context.authority,
+        use=AuthorityUse.APPROVED_WRITE_PREPARE,
     )
     reject_fingerprint = operation_request_fingerprint(
         harness.repository.key,
@@ -443,6 +630,7 @@ def test_approve_reject_race_has_one_terminal_winner_and_one_executor(tmp_path) 
             context=harness.context,
             prepare_identity=harness.prepare_identity,
             request_fingerprint=harness.request_fingerprint,
+            parent_route_binder=None,
         )
 
     def reject():
@@ -471,6 +659,7 @@ def test_approve_reject_race_has_one_terminal_winner_and_one_executor(tmp_path) 
         assert calls == 1
     finally:
         release.set()
+        harness.lease.close()
         harness.factory.close()
 
 
@@ -486,6 +675,11 @@ def test_decision_callback_is_after_claim_and_before_executor(tmp_path) -> None:
         executor,
         tool_name="save_offer_assessment",
     )
+    harness.factory.begin_prepared_execution(
+        harness.prepared,
+        authority=harness.context.authority,
+        use=AuthorityUse.APPROVED_WRITE_PREPARE,
+    )
     try:
         execution, record = harness.coordinator.execute_primary(
             operation_id=harness.operation_id,
@@ -494,10 +688,12 @@ def test_decision_callback_is_after_claim_and_before_executor(tmp_path) -> None:
             context=harness.context,
             prepare_identity=harness.prepare_identity,
             request_fingerprint=harness.request_fingerprint,
+            parent_route_binder=None,
             approval_decided_callback=lambda _session: events.append("approval.decided"),
         )
         assert record is not None
         assert execution.operation_id == harness.operation_id
         assert events == ["approval.decided", "executor"]
     finally:
+        harness.lease.close()
         harness.factory.close()

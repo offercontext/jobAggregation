@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import inspect
 import json
+from functools import cache
 from types import SimpleNamespace
 from typing import Any, cast
 from uuid import uuid4
@@ -8,6 +10,7 @@ from uuid import uuid4
 import pytest
 
 from offerpilot.ai.agent_contracts import PendingAction
+from offerpilot.ai.tool_runtime.legacy import LegacyRouteSourceV1
 from offerpilot.ai.write_operations import (
     LedgerOperationPreheader,
     LedgerPendingPointer,
@@ -40,6 +43,7 @@ from offerpilot.pilot_runtime.deterministic import (
     DeterministicDependencies,
     DeterministicPilotAdapter,
 )
+from tests.pilot_runtime.test_deterministic import _initial_route_components
 
 
 class _LegacyTerminalOperations:
@@ -155,6 +159,17 @@ class _ConversationBodyReadSpy:
         raise AssertionError("terminal Legacy replay must not read Conversation body")
 
 
+@cache
+def _legacy_route_authority() -> dict[str, object]:
+    components = _initial_route_components()
+    return {
+        "operation_port": components.operation_port,
+        "legacy_jd_clarification_issuer": components.initial_issuer_for(
+            LegacyRouteSourceV1("jd_clarification")
+        ),
+    }
+
+
 def _deterministic_adapter(operations: _LegacyTerminalOperations) -> DeterministicPilotAdapter:
     return DeterministicPilotAdapter(
         DeterministicDependencies(
@@ -163,8 +178,111 @@ def _deterministic_adapter(operations: _LegacyTerminalOperations) -> Determinist
             application_jd_versions=SimpleNamespace(),
             application_outcomes=SimpleNamespace(),
             write_operations=operations,
+            **_legacy_route_authority(),
         )
     )
+
+
+def test_confirmation_catalog_exposes_only_the_one_shot_legacy_route_proof() -> None:
+    from offerpilot.ai.tool_runtime import legacy as legacy_runtime
+
+    assert not hasattr(legacy_runtime, "ServerLoadedPending")
+    signature = inspect.signature(legacy_runtime.LegacyDeterministicCatalog.resolve_server_loaded)
+    parameters = tuple(signature.parameters.values())
+    assert tuple(parameter.name for parameter in parameters) == ("self", "proof")
+    assert "LegacyRouteProof" in str(parameters[1].annotation)
+
+
+def test_terminal_legacy_replay_bypasses_all_live_route_surfaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from offerpilot.ai.tool_runtime.legacy import LegacyDeterministicCatalog
+    from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
+    from offerpilot.pilot_runtime.legacy_route import LegacyRouteProofIssuer
+
+    operations = _LegacyTerminalOperations(chained=False)
+    counters = {
+        "provider": 0,
+        "projector": 0,
+        "bundle": 0,
+        "resolver": 0,
+        "preflight": 0,
+        "proof": 0,
+        "catalog": 0,
+        "executor": 0,
+    }
+
+    def forbidden(name: str):
+        def call(*_args: object, **_kwargs: object) -> object:
+            counters[name] += 1
+            raise AssertionError(f"terminal replay must not initialize {name}")
+
+        return call
+
+    monkeypatch.setattr(
+        ToolMetadataBundleV1,
+        "open_segment_lease",
+        forbidden("bundle"),
+    )
+    monkeypatch.setattr(
+        LegacyRouteProofIssuer,
+        "prepare_server_loaded",
+        forbidden("proof"),
+    )
+    monkeypatch.setattr(
+        LegacyRouteProofIssuer,
+        "issue_after_claim",
+        forbidden("proof"),
+    )
+    monkeypatch.setattr(
+        LegacyDeterministicCatalog,
+        "resolve_server_loaded",
+        forbidden("catalog"),
+    )
+    if hasattr(DeterministicPilotAdapter, "preflight_confirmation"):
+        monkeypatch.setattr(
+            DeterministicPilotAdapter,
+            "preflight_confirmation",
+            forbidden("preflight"),
+        )
+    if hasattr(DeterministicPilotAdapter, "confirm"):
+        monkeypatch.setattr(
+            DeterministicPilotAdapter,
+            "confirm",
+            forbidden("executor"),
+        )
+
+    outcome = PilotRuntime(
+        RuntimeDependencies(
+            conversations=cast(Any, _ConversationBodyReadSpy()),
+            deterministic=_deterministic_adapter(operations),
+            continuation_model_resolver=cast(Any, forbidden("resolver")),
+            agent_driver=cast(Any, forbidden("provider")),
+            confirmation_coordinator=ConfirmationCoordinator(
+                ConfirmationDependencies(write_operations=cast(Any, operations))
+            ),
+        )
+    ).continue_confirmation(
+        ConfirmationRequest(
+            conversation_id=7,
+            approved=True,
+            operation_id=operations.operation_id,
+            confirmation_token=operations.token,
+        ),
+        invocation_control=InMemoryRuntimeInvocationControl(),
+    )
+
+    assert counters == {
+        "provider": 0,
+        "projector": 0,
+        "bundle": 0,
+        "resolver": 0,
+        "preflight": 0,
+        "proof": 0,
+        "catalog": 0,
+        "executor": 0,
+    }
+    assert isinstance(outcome, OperationReplayOutcome)
 
 
 @pytest.mark.parametrize("mode", ("sync", "stream"))
@@ -356,6 +474,7 @@ def test_live_legacy_preflight_falls_through_to_old_deterministic_confirmation()
             application_jd_versions=SimpleNamespace(),
             application_outcomes=SimpleNamespace(),
             write_operations=operations,
+            **_legacy_route_authority(),
         )
     )
 
@@ -580,6 +699,7 @@ def test_real_adapter_live_preflight_and_confirm_rechecks_operation_once() -> No
             application_jd_versions=SimpleNamespace(),
             application_outcomes=SimpleNamespace(),
             write_operations=operations,
+            **_legacy_route_authority(),
         )
     )
     request = ConfirmationRequest(
@@ -632,6 +752,7 @@ def test_proposed_legacy_route_terminalizes_before_conversation_and_replays_spec
             application_jd_versions=SimpleNamespace(),
             application_outcomes=SimpleNamespace(),
             write_operations=operations,
+            **_legacy_route_authority(),
         )
     )
 
@@ -834,6 +955,7 @@ def test_proposed_legacy_fresh_route_identity_mismatch_fails_closed() -> None:
             application_jd_versions=SimpleNamespace(),
             application_outcomes=SimpleNamespace(),
             write_operations=operations,
+            **_legacy_route_authority(),
         )
     )
 
@@ -942,6 +1064,7 @@ def test_omitted_operation_id_rejects_pending_replacement_after_legacy_preheader
             application_outcomes=SimpleNamespace(),
             write_operations=operations,
             write_coordinator=PoisonCoordinator(),
+            **_legacy_route_authority(),
         )
     )
 

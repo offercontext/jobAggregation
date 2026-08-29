@@ -6,7 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 from conftest import wait_for_extraction
 
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
 from offerpilot.api import create_app
 from offerpilot.db import init_database
 
@@ -86,7 +86,7 @@ def test_model_tool_catalog_has_no_knowledge_tools():
         "update_knowledge_document",
         "delete_knowledge_document",
     }
-    names = {contract.name for contract in MODEL_TOOL_CATALOG.provider_contracts()}
+    names = {contract.name for contract in build_model_tool_catalog().provider_contracts()}
     assert not (forbidden & names)
 
 
@@ -152,8 +152,7 @@ def test_knowledge_reset_is_idempotent(tmp_path):
 
     with sqlite3.connect(db_path) as conn:
         versions = [
-            row[0]
-            for row in conn.execute("SELECT version FROM schema_migrations").fetchall()
+            row[0] for row in conn.execute("SELECT version FROM schema_migrations").fetchall()
         ]
 
     assert versions.count("knowledge_rewrite_reset") == 1
@@ -168,8 +167,7 @@ def test_knowledge_reset_preserves_non_knowledge_data(tmp_path):
             "applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)"
         )
         conn.execute(
-            "CREATE TABLE applications ("
-            "id INTEGER PRIMARY KEY, company_name TEXT NOT NULL)"
+            "CREATE TABLE applications (id INTEGER PRIMARY KEY, company_name TEXT NOT NULL)"
         )
         conn.execute("INSERT INTO applications (company_name) VALUES ('OfferPilot')")
         conn.execute("CREATE TABLE knowledge_documents (id INTEGER PRIMARY KEY)")
@@ -221,8 +219,7 @@ def test_knowledge_reset_marks_migrated_even_without_legacy(tmp_path):
 
     with sqlite3.connect(db_path) as conn:
         versions = {
-            row[0]
-            for row in conn.execute("SELECT version FROM schema_migrations").fetchall()
+            row[0] for row in conn.execute("SELECT version FROM schema_migrations").fetchall()
         }
 
     assert "knowledge_rewrite_reset" in versions
@@ -276,7 +273,6 @@ def _legacy_knowledge_tables() -> tuple[str, ...]:
 # ---------------------------------------------------------------------------
 
 
-
 def _upload(client: TestClient, filename: str, content: bytes, title_hint: str = ""):
     files = {"file": (filename, content, "text/markdown")}
     data = {"title_hint": title_hint} if title_hint else None
@@ -284,6 +280,7 @@ def _upload(client: TestClient, filename: str, content: bytes, title_hint: str =
     if response.status_code in (200, 202):
         wait_for_extraction(client, response.json()["source"]["id"])
     return response
+
 
 def test_ki02_upload_returns_202_with_source_and_extraction_job(app_client):
     content = "# Redis Notes\n\nRedis 是一个内存数据库。\n".encode("utf-8")
@@ -424,9 +421,7 @@ def test_ki02_extraction_idempotent_for_same_source(app_client, tmp_path):
 
 
 def test_ki02_evidence_records_carry_structure_and_adjacency(app_client, tmp_path):
-    content = (
-        "# Heading A\n\n第一段内容。\n\n## Heading B\n\n第二段内容。\n".encode("utf-8")
-    )
+    content = "# Heading A\n\n第一段内容。\n\n## Heading B\n\n第二段内容。\n".encode("utf-8")
     response = _upload(app_client, "structured.md", content)
     source_id = response.json()["source"]["id"]
 
@@ -458,15 +453,9 @@ def test_ki02_preflight_failure_rejects_before_commit(app_client, tmp_path):
     import sqlite3
 
     with sqlite3.connect(tmp_path / "data.db") as conn:
-        source_count = conn.execute(
-            "SELECT COUNT(*) FROM knowledge_sources"
-        ).fetchone()[0]
-        evidence_count = conn.execute(
-            "SELECT COUNT(*) FROM knowledge_evidence"
-        ).fetchone()[0]
-        fts_count = conn.execute(
-            "SELECT COUNT(*) FROM knowledge_evidence_fts"
-        ).fetchone()[0]
+        source_count = conn.execute("SELECT COUNT(*) FROM knowledge_sources").fetchone()[0]
+        evidence_count = conn.execute("SELECT COUNT(*) FROM knowledge_evidence").fetchone()[0]
+        fts_count = conn.execute("SELECT COUNT(*) FROM knowledge_evidence_fts").fetchone()[0]
 
     assert source_count == 0
     assert evidence_count == 0

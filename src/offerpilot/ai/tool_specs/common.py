@@ -3,11 +3,10 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from datetime import datetime, timezone
-from typing import Any, Literal, cast
+from typing import Any, Literal, Protocol, cast
 
 from offerpilot.ai.tool_authority.contracts import require_positive_int64
 from offerpilot.ai.tool_runtime.contracts import (
-    BindingTarget,
     JSONValue,
     ProviderToolContract,
     ToolExceptionMapping,
@@ -39,6 +38,22 @@ class ToolStateConflict(Exception):
 BindingResolutionState = Literal["resolved", "omitted", "detached", "unavailable"]
 
 
+class _AuthorityBoundResolverContext(Protocol):
+    def binding_target_resolution(
+        self,
+        *,
+        entity_kind: Literal["application", "resume"],
+        state: BindingResolutionState,
+        identity: int | None,
+    ) -> object: ...
+
+    def resolve_parent_identity(
+        self,
+        entity_kind: str,
+        identity: int,
+    ) -> tuple[str, int | None]: ...
+
+
 def _authority_binding_resolution(
     context: object,
     *,
@@ -46,37 +61,18 @@ def _authority_binding_resolution(
     state: BindingResolutionState,
     identity: int | None,
 ) -> object:
-    """Return an authority-bound resolution when the context exposes the port.
-
-    Task4 deliberately does not open a repository session or read an ORM row.
-    Task7/Task9 provide the authority-aware context port.  The legacy fallback
-    keeps old unit-level Pipeline fixtures callable until that cut-over and
-    never exposes a parent body.
-    """
+    """Return a resolution through the exact authority-bound context port."""
 
     if state == "resolved":
         require_positive_int64(identity, "binding identity")
     elif identity is not None:
         raise ValueError("only resolved binding targets may carry identity")
 
-    for method_name in ("binding_target_resolution", "create_binding_target_resolution"):
-        method = getattr(context, method_name, None)
-        if callable(method):
-            return method(entity_kind=entity_kind, state=state, identity=identity)
-    factory = getattr(context, "authority_factory", None)
-    authority = getattr(context, "authority", None)
-    method = getattr(factory, "create_binding_target_resolution", None)
-    if callable(method) and authority is not None:
-        return method(
-            authority,
-            entity_kind=entity_kind,
-            state=state,
-            identity=identity,
-        )
-    return BindingTarget(
+    resolver_context = cast(_AuthorityBoundResolverContext, context)
+    return resolver_context.binding_target_resolution(
         entity_kind=entity_kind,
-        identity=identity if state == "resolved" else None,
-        available=state == "resolved",
+        state=state,
+        identity=identity,
     )
 
 
@@ -124,15 +120,8 @@ def resolve_parent_application(
         return _authority_binding_resolution(
             context, entity_kind=entity_kind, state="unavailable", identity=None
         )
-    port = getattr(context, "binding_resolver_port", None)
-    resolver = getattr(port, "resolve_parent_identity", None)
-    if not callable(resolver):
-        resolver = getattr(context, "resolve_parent_identity", None)
-    if not callable(resolver):
-        return _authority_binding_resolution(
-            context, entity_kind=entity_kind, state="unavailable", identity=None
-        )
-    result = resolver(entity_kind, identity)
+    resolver_context = cast(_AuthorityBoundResolverContext, context)
+    result = resolver_context.resolve_parent_identity(entity_kind, identity)
     if isinstance(result, Mapping):
         state = result.get("state")
         parent_id = result.get("identity")
@@ -151,7 +140,7 @@ def resolve_parent_application(
         context,
         entity_kind=entity_kind,
         state=cast(BindingResolutionState, state),
-        identity=cast(int | None, parent_id),
+        identity=parent_id,
     )
 
 

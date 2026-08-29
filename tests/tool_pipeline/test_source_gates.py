@@ -50,9 +50,7 @@ def _imported_modules(tree: ast.AST) -> set[str]:
         if isinstance(node, ast.Import)
         for alias in node.names
     }
-    modules.update(
-        node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
-    )
+    modules.update(node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom))
     return modules
 
 
@@ -110,7 +108,10 @@ def test_agent_tests_use_typed_tool_factory_not_legacy_dict_protocol() -> None:
                 findings.append(f"{path.relative_to(ROOT)}:{getattr(node, 'lineno', 0)}:{key}")
             if isinstance(node, ast.Dict):
                 for key_node in node.keys:
-                    if isinstance(key_node, ast.Constant) and key_node.value in BANNED_DICT_PROTOCOL_KEYS:
+                    if (
+                        isinstance(key_node, ast.Constant)
+                        and key_node.value in BANNED_DICT_PROTOCOL_KEYS
+                    ):
                         findings.append(
                             f"{path.relative_to(ROOT)}:{getattr(key_node, 'lineno', 0)}:{key_node.value}"
                         )
@@ -154,9 +155,7 @@ def test_no_shadow_dual_run_or_hidden_pipeline_switch_exists() -> None:
     findings: list[str] = []
     for path in _pipeline_production_files():
         tree = _tree(path)
-        identifiers = {
-            node.id.lower() for node in ast.walk(tree) if isinstance(node, ast.Name)
-        }
+        identifiers = {node.id.lower() for node in ast.walk(tree) if isinstance(node, ast.Name)}
         identifiers.update(
             node.attr.lower() for node in ast.walk(tree) if isinstance(node, ast.Attribute)
         )

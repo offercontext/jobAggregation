@@ -28,12 +28,16 @@ from offerpilot.ai.tool_authority import (
 from offerpilot.ai.tool_authority.fingerprint import authorization_scope_fingerprint
 from offerpilot.ai.tool_runtime.contracts import JSONValue
 from offerpilot.ai.write_operations import (
+    ClarificationPendingRouteHandle,
     DeliveryOwnership,
-    LEGACY_WRITE_OPERATION_NAMES,
-    TYPED_WRITE_OPERATION_NAMES,
-    WriteOperationError,
+    PendingPersistenceRouteHandle,
+    _PendingRouteResolution,
     WriteOperationRepository,
+    abandon_pending_persistence_route,
     ledger_fingerprint,
+    pending_action_identity,
+    pending_route_claim_for_cleanup,
+    require_pending_persistence_route,
 )
 from offerpilot.ai.types import Message
 from offerpilot.models import ChatMessage, Conversation, WriteOperation
@@ -224,36 +228,53 @@ class ChatRepository:
     def _pending_route_transaction(
         self,
         pending: PendingAction,
-        claim: PendingAuthorityClaim | None,
+        route_handle: PendingPersistenceRouteHandle,
+        conversation_id: int,
     ) -> Any:
-        with _pending_claim_lifecycle(claim):
-            adapter_kind = self._pending_adapter_kind(pending, claim)
-            if adapter_kind == "typed":
-                typed_claim = cast(PendingAuthorityClaim, claim)
-                with self._typed_pending_transaction(typed_claim) as session:
-                    yield session, False, adapter_kind, typed_claim
-                return
-            with self._operation_session() as (session, owned):
-                yield session, owned, adapter_kind, None
+        try:
+            route = self._require_pending_route(pending, route_handle, conversation_id)
+        except BaseException:
+            claim = pending_route_claim_for_cleanup(route_handle)
+            if type(claim) is PendingAuthorityClaim:
+                _pending_claim_factory(claim)._revoke_lifecycle_after_entry_failure(
+                    claim,
+                    owns_in_flight=False,
+                )
+            raise
+        if route.adapter_kind == "typed":
+            if type(route.claim) is not PendingAuthorityClaim:
+                raise AuthorityPhaseError("Typed Pending requires its exact authority claim")
+            typed_claim = route.claim
+            with self._typed_pending_transaction(typed_claim) as session:
+                yield session, False, route, typed_claim
+            return
+        with self._operation_session() as (session, owned):
+            yield session, owned, route, None
 
     @contextmanager
     def _optional_pending_route_transaction(
         self,
         pending: PendingAction | None,
-        claim: PendingAuthorityClaim | None,
+        route_handle: PendingPersistenceRouteHandle | None,
+        conversation_id: int,
     ) -> Any:
         if pending is not None:
+            if route_handle is None:
+                raise TypeError("Pending persistence requires an exact route handle")
             try:
-                with self._pending_route_transaction(pending, claim) as route:
+                with self._pending_route_transaction(
+                    pending,
+                    route_handle,
+                    conversation_id,
+                ) as route:
                     yield route
             except _PendingClaimCASLost:
                 return
             return
-        with _pending_claim_lifecycle(claim):
-            if claim is not None:
-                raise AuthorityPhaseError("Pending claim requires a chained Pending")
-            with self._operation_session() as (session, owned):
-                yield session, owned, "none", None
+        if route_handle is not None:
+            raise TypeError("Terminal persistence cannot consume a Pending route")
+        with self._operation_session() as (session, owned):
+            yield session, owned, None, None
 
     def create_conversation(
         self,
@@ -367,9 +388,7 @@ class ChatRepository:
             0 <= expected_scope_revision <= _MAX_SCOPE_REVISION
         ):
             raise ValueError("expected_scope_revision must be a valid integer")
-        if mutation is not None and not isinstance(
-            mutation, ConversationScopeMutationSnapshot
-        ):
+        if mutation is not None and not isinstance(mutation, ConversationScopeMutationSnapshot):
             raise TypeError("mutation must be ConversationScopeMutationSnapshot or None")
 
         with self._session_factory() as session:
@@ -518,16 +537,17 @@ class ChatRepository:
         conversation_id: int,
         pending: PendingAction,
         *,
-        pending_authority_claim: PendingAuthorityClaim | None = None,
+        route_handle: PendingPersistenceRouteHandle,
     ) -> bool:
         try:
-            with self._pending_route_transaction(
-                pending, pending_authority_claim
-            ) as (session, owned, adapter_kind, typed_claim):
+            with self._pending_route_transaction(pending, route_handle, conversation_id) as (
+                session,
+                owned,
+                route,
+                typed_claim,
+            ):
                 if typed_claim is not None:
-                    self._validate_typed_pending(
-                        session, conversation_id, pending, typed_claim
-                    )
+                    self._validate_typed_pending(session, conversation_id, pending, typed_claim)
                 result = session.execute(
                     update(Conversation)
                     .where(Conversation.id == conversation_id)
@@ -553,15 +573,7 @@ class ChatRepository:
                     if owned:
                         session.rollback()
                     return False
-                if adapter_kind == "typed":
-                    self.persist_typed_pending(
-                        session,
-                        conversation_id,
-                        pending,
-                        cast(PendingAuthorityClaim, typed_claim),
-                    )
-                elif adapter_kind == "legacy":
-                    self.persist_legacy_pending(session, conversation_id, pending)
+                self._persist_routed_pending(session, conversation_id, pending, route_handle, route)
                 if owned:
                     session.commit()
                 return True
@@ -574,17 +586,18 @@ class ChatRepository:
         pending: PendingAction,
         messages: list[dict[str, str]],
         *,
-        pending_authority_claim: PendingAuthorityClaim | None = None,
+        route_handle: PendingPersistenceRouteHandle,
     ) -> bool:
         """Atomically persist a write proposal and make it the pending action."""
         try:
-            with self._pending_route_transaction(
-                pending, pending_authority_claim
-            ) as (session, owned, adapter_kind, typed_claim):
+            with self._pending_route_transaction(pending, route_handle, conversation_id) as (
+                session,
+                owned,
+                route,
+                typed_claim,
+            ):
                 if typed_claim is not None:
-                    self._validate_typed_pending(
-                        session, conversation_id, pending, typed_claim
-                    )
+                    self._validate_typed_pending(session, conversation_id, pending, typed_claim)
                 result = session.execute(
                     update(Conversation)
                     .where(Conversation.id == conversation_id)
@@ -615,15 +628,7 @@ class ChatRepository:
                     if owned:
                         session.rollback()
                     return False
-                if adapter_kind == "typed":
-                    self.persist_typed_pending(
-                        session,
-                        conversation_id,
-                        pending,
-                        cast(PendingAuthorityClaim, typed_claim),
-                    )
-                elif adapter_kind == "legacy":
-                    self.persist_legacy_pending(session, conversation_id, pending)
+                self._persist_routed_pending(session, conversation_id, pending, route_handle, route)
                 self._add_pending_messages(session, conversation_id, messages)
                 if owned:
                     session.commit()
@@ -798,9 +803,12 @@ class ChatRepository:
         terminal_assistant_content: str = "",
         claim_id: str | None = None,
         delivery_ownership: DeliveryOwnership | None = None,
-        pending_authority_claim: PendingAuthorityClaim | None = None,
+        route_handle: PendingPersistenceRouteHandle,
     ) -> datetime | None:
         """Atomically replace a stale pending card only when the original still owns it."""
+        if delivery_ownership is None:
+            abandon_pending_persistence_route(route_handle)
+            raise TypeError("chained Pending replacement requires exact parent ownership")
         values: dict[str, Any] = {
             "pending_tool_call_id": replacement.tool_call_id,
             "pending_operation_id": replacement.operation_id,
@@ -819,13 +827,15 @@ class ChatRepository:
             values["last_write_undo_json"] = json.dumps(undo, ensure_ascii=False) if undo else ""
             values["last_write_operation_id"] = expected.operation_id if undo else ""
         try:
-            with self._pending_route_transaction(
-                replacement, pending_authority_claim
-            ) as (session, owned, adapter_kind, typed_claim):
+            with self._pending_route_transaction(replacement, route_handle, conversation_id) as (
+                session,
+                owned,
+                route,
+                typed_claim,
+            ):
+                delivery_ownership.bind_chained_transition(route_handle)
                 if typed_claim is not None:
-                    self._validate_typed_pending(
-                        session, conversation_id, replacement, typed_claim
-                    )
+                    self._validate_typed_pending(session, conversation_id, replacement, typed_claim)
                 now = _next_conversation_timestamp(session, conversation_id)
                 values["updated_at"] = now
                 statement = (
@@ -850,15 +860,13 @@ class ChatRepository:
                     if owned:
                         session.rollback()
                     return None
-                if adapter_kind == "typed":
-                    self.persist_typed_pending(
-                        session,
-                        conversation_id,
-                        replacement,
-                        cast(PendingAuthorityClaim, typed_claim),
-                    )
-                elif adapter_kind == "legacy":
-                    self.persist_legacy_pending(session, conversation_id, replacement)
+                self._persist_routed_pending(
+                    session,
+                    conversation_id,
+                    replacement,
+                    route_handle,
+                    route,
+                )
                 session.add(
                     ChatMessage(
                         conversation_id=conversation_id,
@@ -881,9 +889,7 @@ class ChatRepository:
                             operation_id=(
                                 delivery_ownership.operation_id if delivery_ownership else None
                             ),
-                            delivery_kind=(
-                                "continuation_message" if delivery_ownership else None
-                            ),
+                            delivery_kind=("continuation_message" if delivery_ownership else None),
                             delivery_ordinal=(1 if delivery_ownership else None),
                         )
                     )
@@ -926,11 +932,12 @@ class ChatRepository:
         claim_id: str | None = None,
         origin_message: Message | None = None,
         undo: dict[str, Any] | None = None,
-        pending_authority_claim: PendingAuthorityClaim | None = None,
+        route_handle: PendingPersistenceRouteHandle | None,
     ) -> datetime | None:
-        if expected_generation is None:
-            with _pending_claim_lifecycle(pending_authority_claim):
-                return None
+        if pending is not None and delivery_ownership is None:
+            if route_handle is not None:
+                abandon_pending_persistence_route(route_handle)
+            raise TypeError("chained Pending continuation requires exact parent ownership")
         values: dict[str, Any] = {}
         if expected_pending is not None:
             values.update(
@@ -987,13 +994,24 @@ class ChatRepository:
         if expected_pending is not None and undo is not None:
             values["last_write_undo_json"] = json.dumps(undo, ensure_ascii=False) if undo else ""
             values["last_write_operation_id"] = expected_pending.operation_id if undo else ""
+        routed_pending = (
+            pending if pending is not None else clarification[0] if clarification else None
+        )
         with self._optional_pending_route_transaction(
-            pending, pending_authority_claim
-        ) as (session, owned, adapter_kind, typed_claim):
+            routed_pending, route_handle, conversation_id
+        ) as (session, owned, route, typed_claim):
+            if expected_generation is None:
+                if typed_claim is not None:
+                    raise _PendingClaimCASLost
+                if owned:
+                    session.rollback()
+                return None
+            if pending is not None:
+                assert route_handle is not None
+                assert delivery_ownership is not None
+                delivery_ownership.bind_chained_transition(route_handle)
             if typed_claim is not None and pending is not None:
-                self._validate_typed_pending(
-                    session, conversation_id, pending, typed_claim
-                )
+                self._validate_typed_pending(session, conversation_id, pending, typed_claim)
             now = _next_conversation_timestamp(session, conversation_id, expected_generation)
             values["updated_at"] = now
             statement = update(Conversation).where(Conversation.id == conversation_id)
@@ -1023,15 +1041,15 @@ class ChatRepository:
                 if owned:
                     session.rollback()
                 return None
-            if pending is not None and adapter_kind == "typed":
-                self.persist_typed_pending(
+            if pending is not None:
+                assert route_handle is not None and route is not None
+                self._persist_routed_pending(
                     session,
                     conversation_id,
                     pending,
-                    cast(PendingAuthorityClaim, typed_claim),
+                    route_handle,
+                    route,
                 )
-            elif pending is not None and adapter_kind == "legacy":
-                self.persist_legacy_pending(session, conversation_id, pending)
             if delivery_ownership is not None:
                 if origin_message is None or expected_pending is None:
                     if typed_claim is not None:
@@ -1122,7 +1140,17 @@ class ChatRepository:
         conversation_id: int,
         pending: PendingAction,
         question: str,
+        *,
+        route_handle: ClarificationPendingRouteHandle,
     ) -> None:
+        route = self._require_pending_route(
+            pending,
+            route_handle,
+            conversation_id,
+            clarification=True,
+        )
+        if route.adapter_kind != "clarification":
+            raise TypeError("Clarification persistence requires a clarification route")
         with self._session_factory() as session:
             session.execute(
                 update(Conversation)
@@ -1224,28 +1252,40 @@ class ChatRepository:
             )
             return str(value or "")
 
-    def _pending_adapter_kind(
+    def _require_pending_route(
         self,
         pending: PendingAction,
-        claim: PendingAuthorityClaim | None,
-    ) -> Literal["typed", "legacy", "none"]:
-        if pending.tool_name in TYPED_WRITE_OPERATION_NAMES:
-            if not pending.operation_id:
-                raise AuthorityPhaseError("Typed Pending requires an operation identity")
-            if type(claim) is not PendingAuthorityClaim:
-                raise AuthorityPhaseError("Typed Pending requires its exact authority claim")
-            if self._write_operations is None:
-                raise AuthorityPhaseError("Typed Pending operation repository is unavailable")
-            return "typed"
-        if not pending.operation_id:
-            if claim is not None:
-                raise AuthorityPhaseError("Pending claim requires an operation identity")
-            return "none"
-        if pending.tool_name in LEGACY_WRITE_OPERATION_NAMES:
-            if claim is not None:
-                raise AuthorityPhaseError("Legacy Pending cannot consume a Typed claim")
-            return "legacy"
-        raise WriteOperationError("operation_not_transactional")
+        route_handle: PendingPersistenceRouteHandle,
+        conversation_id: int,
+        *,
+        clarification: bool = False,
+    ) -> _PendingRouteResolution:
+        arguments_digest, revision = pending_action_identity(
+            pending.tool_call_id,
+            pending.tool_name,
+            pending.args,
+        )
+        if not clarification:
+            arguments_digest = pending.arguments_digest or arguments_digest
+            revision = pending.pending_action_revision or revision
+        operationless = clarification or type(route_handle) is ClarificationPendingRouteHandle
+        operation_id = "" if operationless else pending.operation_id
+        claim_id = (
+            ""
+            if operationless
+            else str(pending.pending_confirmation_claim_id or pending.operation_id)
+        )
+        route_tool_name = "" if operationless else pending.tool_name
+        return require_pending_persistence_route(
+            route_handle,
+            conversation_id=conversation_id,
+            operation_id=operation_id,
+            tool_call_id=pending.tool_call_id,
+            tool_name=route_tool_name,
+            pending_action_revision=revision,
+            pending_confirmation_claim_id=claim_id,
+            arguments_digest=arguments_digest,
+        )
 
     @staticmethod
     def _add_pending_messages(
@@ -1265,16 +1305,26 @@ class ChatRepository:
                 )
             )
 
-    def persist_typed_pending(
+    def _persist_routed_pending(
         self,
         session: Session,
         conversation_id: int,
         pending: PendingAction,
-        pending_authority_claim: PendingAuthorityClaim,
+        route_handle: PendingPersistenceRouteHandle,
+        route: _PendingRouteResolution,
     ) -> None:
-        """Persist the Typed Operation side of an already locked Pending atom."""
-
-        with _pending_claim_lifecycle(pending_authority_claim) as lease:
+        if route.adapter_kind == "clarification":
+            return
+        if self._write_operations is None:
+            raise AuthorityPhaseError("Pending operation repository is unavailable")
+        if session.get(WriteOperation, pending.operation_id) is not None:
+            raise AuthorityPhaseError("Pending operation identity already exists")
+        scope_fingerprint: str | None = None
+        if route.adapter_kind == "typed":
+            pending_authority_claim = route.claim
+            if type(pending_authority_claim) is not PendingAuthorityClaim:
+                raise AuthorityPhaseError("Typed Pending claim has an invalid type")
+            lease = _ACTIVE_PENDING_CLAIM_LEASE.get()
             if lease is None:  # pragma: no cover - exact claim required by the signature
                 raise AuthorityPhaseError("Typed Pending claim lifecycle is unavailable")
             lease.require_transaction(self, session)
@@ -1284,31 +1334,36 @@ class ChatRepository:
                 pending,
                 pending_authority_claim,
             )
-            if self._write_operations is None:
-                raise AuthorityPhaseError("Typed Pending operation repository is unavailable")
-            if session.get(WriteOperation, pending.operation_id) is not None:
-                raise AuthorityPhaseError("Typed Pending operation identity already exists")
-            proposal = ledger_fingerprint(
-                self._write_operations.key,
-                "write-operation-proposal-v1",
-                cast(JSONValue, dict(arguments)),
-            )
-            token_fingerprint = ledger_fingerprint(
-                self._write_operations.key,
-                "write-operation-confirmation-token-v1",
-                _pending_confirmation_token(pending).encode("ascii"),
-            )
-            self._write_operations.create_primary(
-                session,
-                operation_id=pending.operation_id,
-                conversation_id=conversation_id,
-                tool_call_id=pending.tool_call_id,
-                tool_name=pending.tool_name,
-                adapter_kind="typed",
-                proposal_fingerprint=proposal,
-                confirmation_token_fingerprint=token_fingerprint,
-                authorization_scope_fingerprint=scope_fingerprint,
-            )
+            proposal_value: JSONValue = cast(JSONValue, dict(arguments))
+        else:
+            try:
+                proposal_value = cast(JSONValue, json.loads(pending.args))
+            except json.JSONDecodeError:
+                proposal_value = pending.args
+        proposal = ledger_fingerprint(
+            self._write_operations.key,
+            "write-operation-proposal-v1",
+            proposal_value,
+        )
+        token_fingerprint = ledger_fingerprint(
+            self._write_operations.key,
+            "write-operation-confirmation-token-v1",
+            _pending_confirmation_token(pending).encode("ascii"),
+        )
+        self._write_operations.create_primary(
+            session,
+            route_handle=route_handle,
+            operation_id=pending.operation_id,
+            conversation_id=conversation_id,
+            tool_call_id=pending.tool_call_id,
+            tool_name=pending.tool_name,
+            pending_action_revision=route.identity.pending_action_revision,
+            pending_confirmation_claim_id=route.identity.pending_confirmation_claim_id,
+            arguments_digest=route.identity.arguments_digest,
+            proposal_fingerprint=proposal,
+            confirmation_token_fingerprint=token_fingerprint,
+            authorization_scope_fingerprint=scope_fingerprint,
+        )
 
     def _validate_typed_pending(
         self,
@@ -1365,14 +1420,10 @@ class ChatRepository:
         if type(trusted_scope) is not TrustedContextScope:
             raise AuthorityPhaseError("Typed Pending trusted scope has an invalid type")
         trusted_context_ref = (
-            trusted_scope.context_ref
-            if trusted_scope.context_type == "application"
-            else None
+            trusted_scope.context_ref if trusted_scope.context_type == "application" else None
         )
         locked_context_ref = (
-            int(cast(str, mutation.context_ref))
-            if mutation.context_type == "application"
-            else None
+            int(cast(str, mutation.context_ref)) if mutation.context_type == "application" else None
         )
         if (
             conversation.scope_revision != claim.conversation_scope_revision
@@ -1399,44 +1450,6 @@ class ChatRepository:
                 binding_policy_fingerprint=claim.binding_policy_fingerprint,
             ),
             arguments,
-        )
-
-    def persist_legacy_pending(
-        self,
-        session: Session,
-        conversation_id: int,
-        pending: PendingAction,
-    ) -> None:
-        if self._write_operations is None or not pending.operation_id:
-            return
-        if pending.tool_name not in LEGACY_WRITE_OPERATION_NAMES:
-            raise WriteOperationError("operation_not_transactional")
-        if session.get(WriteOperation, pending.operation_id) is not None:
-            return
-        try:
-            parsed = json.loads(pending.args)
-        except json.JSONDecodeError:
-            parsed = pending.args
-        proposal = ledger_fingerprint(
-            self._write_operations.key,
-            "write-operation-proposal-v1",
-            parsed,
-        )
-        token = _pending_confirmation_token(pending)
-        token_fingerprint = ledger_fingerprint(
-            self._write_operations.key,
-            "write-operation-confirmation-token-v1",
-            token.encode("ascii"),
-        )
-        self._write_operations.create_primary(
-            session,
-            operation_id=pending.operation_id,
-            conversation_id=conversation_id,
-            tool_call_id=pending.tool_call_id,
-            tool_name=pending.tool_name,
-            adapter_kind="legacy_deterministic",
-            proposal_fingerprint=proposal,
-            confirmation_token_fingerprint=token_fingerprint,
         )
 
     def delete_conversation(self, conversation_id: int) -> None:
@@ -1469,7 +1482,9 @@ def _canonical_context_ref(context_type: str, value: object) -> str:
         try:
             encoded = value.encode("utf-8")
         except UnicodeEncodeError as exc:
-            raise ConversationScopeError("context_ref must not contain surrogate characters") from exc
+            raise ConversationScopeError(
+                "context_ref must not contain surrogate characters"
+            ) from exc
         if len(encoded) > 256:
             raise ConversationScopeError("context_ref must be at most 256 bytes")
         if any(ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F for char in value):
@@ -1604,10 +1619,6 @@ def _pending_claim_factory(claim: PendingAuthorityClaim) -> AuthorityFactory:
 
     with composition._ACTIVE_AUTHORITIES_LOCK:
         found = composition._ACTIVE_OBJECTS.get(id(claim))
-    if (
-        found is None
-        or found[0] is not claim
-        or type(found[1]) is not AuthorityFactory
-    ):
+    if found is None or found[0] is not claim or type(found[1]) is not AuthorityFactory:
         raise AuthorityPhaseError("Typed Pending claim is not active")
     return found[1]

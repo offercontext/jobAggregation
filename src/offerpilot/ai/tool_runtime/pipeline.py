@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from secrets import compare_digest
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, TypeAlias, cast
 
@@ -14,6 +14,7 @@ from offerpilot.ai.tool_authority import (
     AuthorityCallIdentity,
     AuthorityPhaseError,
     AuthorityUse,
+    BindingTargetResolution,
     ExecutionClaim,
     NewTurnPrepareCallIdentity,
     ReadExecutionCallIdentity,
@@ -21,15 +22,17 @@ from offerpilot.ai.tool_authority import (
     require_authority_phase,
     require_authority_spec,
 )
-from offerpilot.ai.tool_runtime.catalog import ToolCatalog
+from offerpilot.ai.tool_authority.policy import decide_binding
+from offerpilot.ai.tool_runtime.catalog import (
+    SegmentToolCatalogLease,
+    SegmentToolSpecHandle,
+)
 from offerpilot.ai.tool_runtime.context import (
     ToolExecutionContext,
-    audit_bindings,
-    pre_resolver_scope_policy,
-    require_capabilities,
     scope_access_denied,
 )
 from offerpilot.ai.tool_runtime.contracts import (
+    BindingAudit,
     ConfirmationRequired,
     JSONValue,
     PreparedToolCall,
@@ -40,7 +43,11 @@ from offerpilot.ai.tool_runtime.contracts import (
     ToolSpec,
     ToolSuccess,
     TransientToolRuntimeValue,
+    ProviderToolContract,
+    materialize_provider_payloads,
 )
+from offerpilot.ai.tool_runtime.metadata import ToolAuthorityEntryV1
+from offerpilot.ai.tool_runtime.policy_types import OperationKind
 from offerpilot.ai.tool_runtime.journal import (
     prepare_tool_started_draft,
     project_tool_proposed,
@@ -62,17 +69,21 @@ from offerpilot.repositories.session_binding import ScopeAccessDenied
 @dataclass(frozen=True)
 class Rejected(TransientToolRuntimeValue):
     failure: ToolFailure = field(repr=False)
+    spec: ToolSpec[Any, Any] | None = field(default=None, repr=False, compare=False)
+    spec_handle: SegmentToolSpecHandle | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 PrepareResult: TypeAlias = ConfirmationRequired[Any, Any] | ReadyToExecute[Any, Any] | Rejected
 StageSink: TypeAlias = Callable[[str], None]
-ConfirmationClaimer: TypeAlias = Callable[
-    [PreparedToolCall[Any, Any]], ToolFailure | None
-]
+ConfirmationClaimer: TypeAlias = Callable[[PreparedToolCall[Any, Any]], ToolFailure | None]
 
 
 def prepare_call(
-    catalog: ToolCatalog,
+    catalog_lease: SegmentToolCatalogLease,
     context: ToolExecutionContext,
     call: ToolCall,
     *,
@@ -83,15 +94,17 @@ def prepare_call(
     record_proposal: bool = True,
 ) -> PrepareResult:
     use = _prepare_use(context, call_identity)
-    _stage(stage_sink, "authority.prelookup")
+    if type(catalog_lease) is not SegmentToolCatalogLease:
+        raise TypeError("prepare_call requires an exact Segment Catalog lease")
     if call_identity is None:
         raise AuthorityPhaseError("prepare_call requires a registered call identity")
     require_authority_phase(context.authority, use, call_identity)
     _require_context_identity(context, call_identity)
 
-    _stage(stage_sink, "catalog.lookup")
-    spec = catalog.resolve(call.name)
-    if spec is None:
+    spec_handle = catalog_lease.resolve(call.name)
+    if spec_handle is None:
+        _stage(stage_sink, "authority.prelookup")
+        _stage(stage_sink, "catalog.lookup")
         return Rejected(
             ToolFailure(
                 category="validation_error",
@@ -99,64 +112,79 @@ def prepare_call(
                 compatibility_detail=f'未知工具 "{call.name}"',
             )
         )
+    spec = catalog_lease.require_spec(spec_handle)
+    _stage(stage_sink, "authority.prelookup")
+    _stage(stage_sink, "catalog.lookup")
 
     _stage(stage_sink, "authority.postlookup")
     factory = context.authority_factory
-    factory.register_tool_spec(
-        spec,
+    registered_spec = factory.register_tool_spec(
+        spec_handle,
+        catalog_lease=catalog_lease,
         authority=context.authority,
         prepare_identity=cast(
             NewTurnPrepareCallIdentity | ApprovedWritePrepareCallIdentity,
             call_identity,
         ),
     )
-    require_authority_spec(context.authority, use, spec)
+    if registered_spec is not spec:
+        raise AuthorityPhaseError("Authority registered a different Segment route")
+    authority_entry = require_authority_spec(context.authority, use, spec_handle)
     if record_proposal:
-        project_tool_proposed(context.run_recorder, spec, call)
+        project_tool_proposed(context.run_recorder, authority_entry, call)
 
     _stage(stage_sink, "parse")
     try:
         parsed = parse_arguments(call.args)
     except ArgumentValidationError as exc:
-        return Rejected(_validation_failure(exc.code))
+        return Rejected(_validation_failure(exc.code), spec, spec_handle)
 
     _stage(stage_sink, "schema")
     try:
-        validated = validate_arguments(catalog.validator_for(spec.name), parsed)
+        validated = validate_arguments(catalog_lease.validator_for(spec_handle), parsed)
     except ArgumentValidationError as exc:
-        return Rejected(_schema_validation_failure(spec, parsed, exc.code))
+        return Rejected(_schema_validation_failure(spec, parsed, exc.code), spec, spec_handle)
 
     _stage(stage_sink, "decode")
     try:
         copied = lossless_typed_copy(validated)
         typed_args = spec.decoder(cast(Mapping[str, JSONValue], copied))
     except ArgumentValidationError as exc:
-        return Rejected(_validation_failure(exc.code))
+        return Rejected(_validation_failure(exc.code), spec, spec_handle)
     except AgentLoopControlError:
         raise
     except Exception:
-        return Rejected(ToolFailure("internal_error", "argument_decode_failed"))
+        return Rejected(ToolFailure("internal_error", "argument_decode_failed"), spec, spec_handle)
 
     _stage(stage_sink, "capability")
-    permission = require_capabilities(spec, context)
+    permission = _require_entry_capabilities(authority_entry, context)
     if permission is not None:
-        return Rejected(permission)
+        return Rejected(permission, spec, spec_handle)
 
     _stage(stage_sink, "scope_policy")
-    scope_failure = pre_resolver_scope_policy(spec, context)
+    scope_failure = _pre_resolver_entry_scope_policy(authority_entry, context)
     if scope_failure is not None:
-        return Rejected(scope_failure)
+        return Rejected(scope_failure, spec, spec_handle)
 
     _stage(stage_sink, "binding.resolve")
     try:
-        binding, binding_allowed = audit_bindings(spec, typed_args, context)
+        binding, binding_allowed = _audit_entry_bindings(
+            authority_entry,
+            spec,
+            typed_args,
+            context,
+        )
     except AgentLoopControlError:
         raise
     except Exception:
-        return Rejected(ToolFailure("internal_error", "binding_resolution_failed"))
+        return Rejected(
+            ToolFailure("internal_error", "binding_resolution_failed"),
+            spec,
+            spec_handle,
+        )
     _stage(stage_sink, "binding.policy")
     if not binding_allowed:
-        return Rejected(scope_access_denied())
+        return Rejected(scope_access_denied(), spec, spec_handle)
 
     _stage(stage_sink, "preflight")
     if spec.preflight is not None:
@@ -165,9 +193,9 @@ def prepare_call(
         except AgentLoopControlError:
             raise
         except Exception as exc:
-            return Rejected(_map_exception(spec, exc))
+            return Rejected(_map_exception(spec, exc), spec, spec_handle)
         if preflight_failure is not None:
-            return Rejected(preflight_failure)
+            return Rejected(preflight_failure, spec, spec_handle)
 
     arguments = cast(dict[str, JSONValue], lossless_typed_copy(validated))
     prepared = factory.prepare_tool_call(
@@ -177,11 +205,12 @@ def prepare_call(
             call_identity,
         ),
         tool_call_id=call.id,
-        spec=spec,
+        catalog_lease=catalog_lease,
+        spec_handle=spec_handle,
         arguments=arguments,
         typed_args=typed_args,
         arguments_digest=_arguments_digest(arguments),
-        contract_fingerprint=_contract_fingerprint(spec.contract.payload),
+        contract_fingerprint=_contract_fingerprint(spec.contract),
         binding=binding,
     )
     object.__setattr__(
@@ -189,7 +218,7 @@ def prepare_call(
         "prepared_instance_token",
         factory.prepared_token(prepared),
     )
-    if spec.kind == "write":
+    if authority_entry.operation_kind is OperationKind.TRANSACTIONAL_WRITE:
         # The draft is transport compatibility data, not authorization.  It is
         # attached to the exact factory-created Prepared object and never used
         # to reconstruct authority or constraint state.
@@ -199,11 +228,9 @@ def prepare_call(
             prepare_tool_started_draft(context.run_recorder, prepared),
         )
         object.__setattr__(prepared, "pending_identity", pending_identity)
-        object.__setattr__(
-            prepared, "pending_action_revision", pending_action_revision
-        )
+        object.__setattr__(prepared, "pending_action_revision", pending_action_revision)
     _stage(stage_sink, "prepared")
-    if spec.confirmation_policy == "required":
+    if authority_entry.confirmation_policy == "required":
         return ConfirmationRequired(prepared)
     return ReadyToExecute(prepared)
 
@@ -218,12 +245,61 @@ def execute_prepared(
     locked_effective_args_digest: str | None = None,
     stage_sink: StageSink | None = None,
 ) -> ToolExecutionRecord[Any, Any]:
-    if prepared.spec.kind == "read":
+    if (
+        type(prepared) is not PreparedToolCall
+        or type(prepared.spec_handle) is not SegmentToolSpecHandle
+    ):
+        raise AuthorityPhaseError("execute_prepared requires an exact Prepared Segment route")
+    if type(call_identity) is ReadExecutionCallIdentity:
         if execution_claim is not None or locked_effective_args_digest is not None:
             raise AuthorityPhaseError("read execution cannot consume an ExecutionClaim")
+        use = AuthorityUse.READ_EXECUTE
+    elif type(call_identity) is ApprovedWriteExecuteCallIdentity:
+        if type(execution_claim) is not ExecutionClaim:
+            raise AuthorityPhaseError("approved execute requires an exact ExecutionClaim")
+        if not isinstance(locked_effective_args_digest, str):
+            raise AuthorityPhaseError("locked effective arguments digest is required")
+        use = AuthorityUse.APPROVED_WRITE_EXECUTE
+    elif type(call_identity) is ApprovedWritePrepareCallIdentity:
+        if execution_claim is not None or locked_effective_args_digest is not None:
+            raise AuthorityPhaseError("approved prepare cannot consume an ExecutionClaim")
+        use = AuthorityUse.APPROVED_WRITE_PREPARE
+    else:
+        raise AuthorityPhaseError("execution requires an exact phase call identity")
+    factory = context.authority_factory
+    authority_entry = factory.require_prepared_route(
+        prepared,
+        authority=context.authority,
+        use=use,
+    )
+    require_authority_phase(context.authority, use, call_identity)
+    _require_context_identity(context, call_identity)
+    if type(call_identity) is ReadExecutionCallIdentity:
+        if call_identity.prepared is not prepared:
+            raise AuthorityPhaseError("read identity belongs to another PreparedToolCall")
+        if prepared.prepared_instance_token is not call_identity.prepared_instance_token:
+            raise AuthorityPhaseError("PreparedToolCall registry token mismatch")
+    elif type(call_identity) is ApprovedWriteExecuteCallIdentity:
+        assert type(execution_claim) is ExecutionClaim
+        if call_identity.prepared is not prepared:
+            raise AuthorityPhaseError("execute identity belongs to another PreparedToolCall")
+        if call_identity.execution_claim is not execution_claim:
+            raise AuthorityPhaseError("execute identity belongs to another ExecutionClaim")
+        if context.bound_session is not execution_claim.session:
+            raise AuthorityPhaseError("ExecutionClaim belongs to another Session")
+        factory.require_execution_claim_transaction(execution_claim, context.bound_session)
+    elif type(call_identity) is ApprovedWritePrepareCallIdentity:
+        factory.require_prepared_origin(prepared, call_identity)
+    factory.begin_prepared_execution(
+        prepared,
+        authority=context.authority,
+        use=use,
+    )
+    if authority_entry.operation_kind is OperationKind.READ:
         return _execute_read(
             prepared,
             context,
+            authority_entry=authority_entry,
             call_identity=call_identity,
             stage_sink=stage_sink,
         )
@@ -253,34 +329,21 @@ def _execute_operation_write(
     confirmation_claimer: ConfirmationClaimer | None,
     stage_sink: StageSink | None,
 ) -> ToolExecutionRecord[Any, Any]:
-    if type(call_identity) is not ApprovedWritePrepareCallIdentity:
-        raise AuthorityPhaseError("write execution requires its approved prepare identity")
-    require_authority_phase(
-        context.authority,
-        AuthorityUse.APPROVED_WRITE_PREPARE,
-        call_identity,
-    )
-    _require_context_identity(context, call_identity)
+    assert type(call_identity) is ApprovedWritePrepareCallIdentity
     if confirmation_claimer is None:
-        return _failed_record(
-            prepared, ToolFailure("conflict", "confirmation_claim_required")
-        )
+        return _failed_record(prepared, ToolFailure("conflict", "confirmation_claim_required"))
     try:
         failure = confirmation_claimer(prepared)
     except AgentLoopControlError:
         raise
     except Exception:
-        return _failed_record(
-            prepared, ToolFailure("conflict", "confirmation_claim_failed")
-        )
+        return _failed_record(prepared, ToolFailure("conflict", "confirmation_claim_failed"))
     if isinstance(failure, ToolFailure):
         return _failed_record(prepared, failure)
     if failure is not None:
         raise TypeError("confirmation claimer returned an invalid result")
     if not callable(context.operation_executor):
-        return _failed_record(
-            prepared, ToolFailure("conflict", "confirmation_claim_required")
-        )
+        return _failed_record(prepared, ToolFailure("conflict", "confirmation_claim_required"))
     record = cast(
         ToolExecutionRecord[Any, Any],
         context.operation_executor(prepared, context, call_identity),
@@ -307,36 +370,12 @@ def _execute_claimed_write(
     locked_effective_args_digest: str | None,
     stage_sink: StageSink | None,
 ) -> ToolExecutionRecord[Any, Any]:
-    if type(context.authority) is not ApprovalExecutionAuthority:
-        raise AuthorityPhaseError("ExecutionClaim requires an Approval authority")
-    if type(call_identity) is not ApprovedWriteExecuteCallIdentity:
-        raise AuthorityPhaseError("ExecutionClaim requires its approved execute identity")
-    if type(execution_claim) is not ExecutionClaim:
-        raise AuthorityPhaseError("execution claim has an invalid type")
-    if not isinstance(locked_effective_args_digest, str):
-        raise AuthorityPhaseError("locked effective arguments digest is required")
+    assert type(context.authority) is ApprovalExecutionAuthority
+    assert type(call_identity) is ApprovedWriteExecuteCallIdentity
+    assert type(execution_claim) is ExecutionClaim
+    assert isinstance(locked_effective_args_digest, str)
     factory = context.authority_factory
     with factory.claim_lifecycle(execution_claim):
-        require_authority_phase(
-            context.authority,
-            AuthorityUse.APPROVED_WRITE_EXECUTE,
-            call_identity,
-        )
-        _require_context_identity(context, call_identity)
-        require_authority_spec(
-            context.authority,
-            AuthorityUse.APPROVED_WRITE_EXECUTE,
-            prepared.spec,
-        )
-        if call_identity.prepared is not prepared:
-            raise AuthorityPhaseError("execute identity belongs to another PreparedToolCall")
-        if call_identity.execution_claim is not execution_claim:
-            raise AuthorityPhaseError("execute identity belongs to another ExecutionClaim")
-        if context.bound_session is not execution_claim.session:
-            raise AuthorityPhaseError("ExecutionClaim belongs to another Session")
-        factory.require_execution_claim_transaction(
-            execution_claim, context.bound_session
-        )
         typed_args_digest = _typed_args_digest(prepared.typed_args)
         digests = (
             prepared.arguments_digest,
@@ -369,36 +408,31 @@ def _execute_read(
     prepared: PreparedToolCall[Any, Any],
     context: ToolExecutionContext,
     *,
+    authority_entry: ToolAuthorityEntryV1,
     call_identity: AuthorityCallIdentity | None,
     stage_sink: StageSink | None,
 ) -> ToolExecutionRecord[Any, Any]:
     _stage(stage_sink, "authority.prelookup")
-    if call_identity is None or type(call_identity) is not ReadExecutionCallIdentity:
-        raise AuthorityPhaseError("read execution requires a registered read call identity")
-    require_authority_phase(context.authority, AuthorityUse.READ_EXECUTE, call_identity)
-    _require_context_identity(context, call_identity)
-    if call_identity.prepared is not prepared:
-        raise AuthorityPhaseError("read identity belongs to another PreparedToolCall")
-    if prepared.prepared_instance_token is not call_identity.prepared_instance_token:
-        raise AuthorityPhaseError("PreparedToolCall registry token mismatch")
-    context.authority_factory.require_prepared_call(prepared, context.authority)
+    assert type(call_identity) is ReadExecutionCallIdentity
 
     spec = prepared.spec
     _stage(stage_sink, "authority.postlookup")
-    require_authority_spec(context.authority, AuthorityUse.READ_EXECUTE, spec)
 
     with context.session_factory() as session:
         bound_context = context.bind(session)
         _stage(stage_sink, "capability")
-        permission = require_capabilities(spec, bound_context)
+        permission = _require_entry_capabilities(authority_entry, bound_context)
         if permission is not None:
             session.rollback()
             return _failed_record(prepared, permission)
 
         _stage(stage_sink, "binding.resolve")
         try:
-            binding, binding_allowed = audit_bindings(
-                spec, prepared.typed_args, bound_context
+            binding, binding_allowed = _audit_entry_bindings(
+                authority_entry,
+                spec,
+                prepared.typed_args,
+                bound_context,
             )
         except AgentLoopControlError:
             session.rollback()
@@ -429,33 +463,143 @@ def _execute_read(
         except AgentLoopControlError:
             raise
         except Exception as exc:
+            _require_current_read_route(prepared, context, authority_entry)
+            failure = _map_exception(spec, exc)
+            _require_current_read_route(prepared, context, authority_entry)
             record = ToolExecutionRecord(
                 execution_started=True,
-                outcome=_map_exception(spec, exc),
+                outcome=failure,
                 prepared=prepared,
             )
             _stage(stage_sink, "tool.failed")
+            _require_current_read_route(prepared, context, authority_entry)
+            visible_result = render_compatibility(spec, record.outcome)
+            _require_current_read_route(prepared, context, authority_entry)
             project_tool_terminal(
                 context.run_recorder,
                 record,
                 started_recorded=started_recorded,
-                visible_result=render_compatibility(spec, record.outcome),
+                visible_result=visible_result,
             )
+            _require_current_read_route(prepared, context, authority_entry)
             return record
 
+        _require_current_read_route(prepared, context, authority_entry)
         record = ToolExecutionRecord(
             execution_started=True,
             outcome=ToolSuccess(result),
             prepared=prepared,
         )
         _stage(stage_sink, "tool.completed")
+        _require_current_read_route(prepared, context, authority_entry)
+        visible_result = render_compatibility(spec, record.outcome)
+        _require_current_read_route(prepared, context, authority_entry)
         project_tool_terminal(
             context.run_recorder,
             record,
             started_recorded=started_recorded,
-            visible_result=render_compatibility(spec, record.outcome),
+            visible_result=visible_result,
         )
+        _require_current_read_route(prepared, context, authority_entry)
         return record
+
+
+def _require_current_read_route(
+    prepared: PreparedToolCall[Any, Any],
+    context: ToolExecutionContext,
+    expected_entry: ToolAuthorityEntryV1,
+) -> None:
+    current_entry = context.authority_factory.require_prepared_route(
+        prepared,
+        authority=context.authority,
+        use=AuthorityUse.READ_EXECUTE,
+    )
+    if current_entry is not expected_entry:
+        raise AuthorityPhaseError("read execution Authority entry identity changed")
+
+
+def _require_entry_capabilities(
+    entry: ToolAuthorityEntryV1,
+    context: ToolExecutionContext,
+) -> ToolFailure | None:
+    available = {
+        capability.value if hasattr(capability, "value") else capability
+        for capability in cast(Any, context.authority).capabilities
+    }
+    required = {capability.value for capability in entry.required_capabilities}
+    if required.issubset(available):
+        return None
+    return ToolFailure(
+        category="permission_denied",
+        code="missing_capability",
+        compatibility_detail="permission denied",
+    )
+
+
+def _pre_resolver_entry_scope_policy(
+    entry: ToolAuthorityEntryV1,
+    context: ToolExecutionContext,
+) -> ToolFailure | None:
+    if (
+        entry.binding.contract.kind == "non_application_only"
+        and cast(Any, context.authority).trusted_scope.context_type == "application"
+    ):
+        return scope_access_denied()
+    return None
+
+
+def _audit_entry_bindings(
+    entry: ToolAuthorityEntryV1,
+    spec: ToolSpec[Any, Any],
+    typed_args: Any,
+    context: ToolExecutionContext,
+) -> tuple[BindingAudit, bool]:
+    resolutions: list[dict[str, object]] = []
+    entity_kinds: set[str] = set()
+    expected_descriptors = entry.binding.resolver_descriptors
+    actual_descriptors = tuple(binding.descriptor for binding in spec.resolver_bindings)
+    if actual_descriptors != expected_descriptors:
+        raise AuthorityPhaseError("resolver bindings do not match Authority metadata")
+    for resolver in spec.resolver_bindings:
+        descriptor = resolver.descriptor
+        resolver_context = context.resolver_context(descriptor.resolver_id)
+        resolution = resolver.resolve(typed_args, cast(Any, resolver_context))
+        if type(resolution) is not BindingTargetResolution:
+            raise TypeError("binding resolver returned an unsealed resolution")
+        context.authority_factory.require_binding_target_resolution(
+            resolution,
+            context.authority,
+        )
+        entity_kinds.add(resolution.entity_kind)
+        resolutions.append(
+            {
+                "entity_kind": resolution.entity_kind,
+                "state": resolution.state,
+                "identity": resolution.identity,
+                "presence": descriptor.presence,
+            }
+        )
+
+    contract = entry.binding.contract
+    scope = cast(Any, context.authority).trusted_scope
+    scope_bound = contract.entity_kind == "application" and scope.context_type == "application"
+    bound_identities = (cast(int, scope.context_ref),) if scope_bound else ()
+    decision = decide_binding(
+        contract.kind,
+        scope_bound=scope_bound,
+        bound_identities=bound_identities,
+        resolutions=resolutions,
+    )
+    if contract.entity_kind is not None:
+        entity_kinds.add(contract.entity_kind)
+    return (
+        BindingAudit(
+            status=decision.status,
+            target_count=len(resolutions),
+            entity_kinds=tuple(sorted(entity_kinds)),
+        ),
+        decision.allowed,
+    )
 
 
 def _prepare_use(
@@ -468,7 +612,10 @@ def _prepare_use(
             raise AuthorityPhaseError("Segment prepare requires NewTurnPrepareCallIdentity")
         return AuthorityUse.NEW_TURN_PREPARE
     if isinstance(authority, ApprovalExecutionAuthority):
-        if call_identity is not None and type(call_identity) is not ApprovedWritePrepareCallIdentity:
+        if (
+            call_identity is not None
+            and type(call_identity) is not ApprovedWritePrepareCallIdentity
+        ):
             raise AuthorityPhaseError("approval prepare requires ApprovedWritePrepareCallIdentity")
         return AuthorityUse.APPROVED_WRITE_PREPARE
     raise AuthorityPhaseError("unknown ToolExecutionAuthority")
@@ -508,13 +655,16 @@ def _schema_validation_failure(
         if detail:
             return ToolFailure("validation_error", code, detail)
     required = spec.contract.parameters.get("required")
-    if isinstance(required, list):
-        missing = [key for key in required if isinstance(key, str) and key not in arguments]
-        if missing:
+    if isinstance(required, Sequence) and not isinstance(required, (str, bytes, bytearray)):
+        missing = next(
+            (key for key in required if isinstance(key, str) and key not in arguments),
+            None,
+        )
+        if missing is not None:
             return ToolFailure(
                 category="validation_error",
                 code=code,
-                compatibility_detail=f"{spec.name} requires {missing[0]}",
+                compatibility_detail=f"{spec.name} requires {missing}",
             )
     return _validation_failure(code)
 
@@ -537,8 +687,9 @@ def _typed_args_digest(typed_args: object) -> str:
         raise AuthorityPhaseError("typed arguments are not canonical JSON") from exc
 
 
-def _contract_fingerprint(payload: Mapping[str, JSONValue]) -> str:
-    encoded = canonical_json(dict(payload)).encode("utf-8")
+def _contract_fingerprint(contract: ProviderToolContract) -> str:
+    payload = materialize_provider_payloads((contract,))[0]
+    encoded = canonical_json(payload).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 

@@ -8,10 +8,10 @@ from types import SimpleNamespace
 
 import pytest
 
+import offerpilot.pilot_runtime.service as service_module
 from offerpilot.pilot_runtime.contracts import (
     AssistantMessageEvent,
     CancelReason,
-    ConfirmationRequiredOutcome,
     InvocationState,
     MessageOutcome,
     RuntimeFailureOutcome,
@@ -44,10 +44,17 @@ from offerpilot.ai.agent_loop import NewTurnSeed, SegmentSurfaceGate, build_segm
 from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
 from offerpilot.ai.tool_authority.contracts import SegmentExecutionAuthority
 from offerpilot.ai.tool_authority.policy import validate_startup_policy
+from offerpilot.ai.tool_runtime.catalog import (
+    SegmentToolCatalogLease,
+)
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
-from offerpilot.context_projector.selector import DEPENDENCY_POLICY_V1
-from offerpilot.ai.tool_runtime.contracts import ToolFailure
+from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
+from offerpilot.ai.tool_runtime.contracts import (
+    BindingAudit,
+    PreparedToolCall,
+    ToolExecutionRecord,
+    ToolFailure,
+)
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.api import _confirmation_token as baseline_confirmation_token
 from offerpilot.pilot_runtime.service import _confirmation_token
@@ -69,12 +76,16 @@ from offerpilot.repositories.jd import JDAnalysesRepository
 from offerpilot.repositories.notes import NotesRepository
 from offerpilot.repositories.offers import OffersRepository
 from offerpilot.repositories.resumes import ResumesRepository
+from tests.tool_metadata.test_production_bundle import _production_components
 
 
+_METADATA_COMPONENTS = _production_components()
+_METADATA_BUNDLE = _METADATA_COMPONENTS.bundle
+_TEST_TOOL_CATALOG = _METADATA_COMPONENTS.typed_catalog
 _AUTHORITY_SESSIONS = init_database(
     Path(tempfile.mkdtemp(prefix="offerpilot-pilot-authority-")) / "authority.db"
 )
-_AUTHORITY_POLICY = validate_startup_policy(MODEL_TOOL_CATALOG.authority_manifest)
+_AUTHORITY_POLICY = validate_startup_policy(_TEST_TOOL_CATALOG.authority_manifest)
 
 
 class _Phases:
@@ -108,24 +119,6 @@ class _ConversationStore:
     def load(self, conversation_id: int) -> _Conversation | None:
         del conversation_id
         return self.conversation
-
-
-class _Catalog:
-    def __init__(self, *, write_names: tuple[str, ...] = ("write", "create_application")) -> None:
-        self._write_names = frozenset(write_names)
-
-    def resolve(self, name: str) -> object | None:
-        if name in self._write_names:
-            return SimpleNamespace(name=name, kind="write")
-        if name == "read_tool":
-            return SimpleNamespace(name=name, kind="read")
-        return None
-
-    def write_names(self) -> frozenset[str]:
-        return self._write_names
-
-    def provider_contracts(self) -> tuple[object, ...]:
-        return tuple(SimpleNamespace(name=name) for name in sorted(self._write_names))
 
 
 def _real_segment(
@@ -232,8 +225,14 @@ class _Persistence:
         return PersistenceResult(PersistenceStatus.PERSISTED, message_ids=message_ids)
 
     def persist_initial_pending(
-        self, conversation_id: int, messages: object, pending: object
+        self,
+        conversation_id: int,
+        messages: object,
+        pending: object,
+        *,
+        route_handle: object,
     ) -> object:
+        assert route_handle is not None
         del conversation_id
         self.pending = pending
         self.pending_count += 1
@@ -266,7 +265,10 @@ class _Persistence:
         messages: object,
         pending: object,
         question: str,
+        *,
+        route_handle: object,
     ) -> object:
+        assert route_handle is not None
         del conversation_id
         self.clarification_count += 1
         values = tuple(messages) if isinstance(messages, (tuple, list)) else ()
@@ -279,8 +281,14 @@ class _Persistence:
         return PersistenceResult(PersistenceStatus.PERSISTED, message_ids=message_ids)
 
     def set_pending_clarification(
-        self, conversation_id: int, pending: object, question: str
+        self,
+        conversation_id: int,
+        pending: object,
+        question: str,
+        *,
+        route_handle: object,
     ) -> object:
+        assert route_handle is not None
         del conversation_id
         self.clarification = SimpleNamespace(pending=pending, question=question)
         self.clarification_count += 1
@@ -458,8 +466,6 @@ def _runtime(
     model: object = "model",
     route: object = "model",
     missing_target_question: object | None = None,
-    catalog: object | None = None,
-    dependency_catalog: object | None = None,
     model_resolver: object | None = None,
     surface_resolver: object | None = None,
     policy_resolver: object | None = None,
@@ -470,7 +476,7 @@ def _runtime(
     resolved_journal = journal or _Journal(phases)
     # Segment visibility is issued only against the reviewed typed catalog;
     # pending/readback tests use unknown names when they need a rejection.
-    resolved_catalog = MODEL_TOOL_CATALOG
+    resolved_catalog = _TEST_TOOL_CATALOG
 
     def resolve_model(request: object, conversation: object) -> object:
         del request, conversation
@@ -483,7 +489,10 @@ def _runtime(
         return ResolvedPolicyCatalog(
             catalog=resolved_catalog,
             policy=_AUTHORITY_POLICY,
-            dependency_policy=DEPENDENCY_POLICY_V1,
+            dependency_policy=_METADATA_BUNDLE.discovery_view().policy,
+            provider_metadata_view=_METADATA_BUNDLE.provider_view(),
+            discovery_metadata_view=_METADATA_BUNDLE.discovery_view(),
+            authority_metadata_view=_METADATA_BUNDLE.authority_view(),
         )
 
     def resolve_segment(
@@ -514,14 +523,22 @@ def _runtime(
             value if isinstance(value, Message) else Message(role="user", content=str(value))
             for value in assembled
         )
-        return build_segment_surface_gate(
-            messages,
-            catalog=getattr(policy, "catalog"),
-            context=getattr(segment, "context"),
-            authority=getattr(segment, "authority"),
-            dependency_policy=getattr(policy, "dependency_policy"),
-            policy=getattr(policy, "policy"),
-        )
+        catalog_lease = _METADATA_BUNDLE.open_segment_lease()
+        try:
+            return build_segment_surface_gate(
+                messages,
+                catalog=getattr(policy, "catalog"),
+                catalog_lease=catalog_lease,
+                context=getattr(segment, "context"),
+                authority=getattr(segment, "authority"),
+                provider_view=getattr(policy, "provider_metadata_view"),
+                discovery_view=getattr(policy, "discovery_metadata_view"),
+                authority_metadata_view=getattr(policy, "authority_metadata_view"),
+                policy=getattr(policy, "policy"),
+            )
+        except BaseException:
+            catalog_lease.close()
+            raise
 
     runtime = PilotRuntime(
         RuntimeDependencies(
@@ -538,7 +555,12 @@ def _runtime(
             agent_driver=driver or _Driver(phases),
             phase_sink=phases,
             missing_target_question=missing_target_question,
-            catalog=dependency_catalog,
+            catalog=resolved_catalog,
+            metadata_bundle=_METADATA_BUNDLE,
+            metadata_components=_METADATA_COMPONENTS,
+            provider_metadata_view=_METADATA_BUNDLE.provider_view(),
+            discovery_metadata_view=_METADATA_BUNDLE.discovery_view(),
+            authority_metadata_view=_METADATA_BUNDLE.authority_view(),
         )
     )
     return runtime, resolved_persistence, resolved_journal
@@ -607,9 +629,12 @@ def test_sync_segment_failure_stops_before_policy_catalog_and_side_effects() -> 
     def policy_spy(*args: object, **kwargs: object) -> object:
         policy_calls.append((args, kwargs))
         return ResolvedPolicyCatalog(
-            catalog=MODEL_TOOL_CATALOG,
+            catalog=_TEST_TOOL_CATALOG,
             policy=_AUTHORITY_POLICY,
-            dependency_policy=DEPENDENCY_POLICY_V1,
+            dependency_policy=_METADATA_BUNDLE.discovery_view().policy,
+            provider_metadata_view=_METADATA_BUNDLE.provider_view(),
+            discovery_metadata_view=_METADATA_BUNDLE.discovery_view(),
+            authority_metadata_view=_METADATA_BUNDLE.authority_view(),
         )
 
     runtime, persistence, journal = _runtime(
@@ -654,10 +679,14 @@ def test_sync_live_policy_drift_closes_segment_before_provider_or_user() -> None
         assert segment.catalog is None
         assert segment.policy is None
         assert segment.surface_gate is None
+        assert getattr(segment, "catalog_lease", None) is None
         return ResolvedPolicyCatalog(
-            catalog=MODEL_TOOL_CATALOG,
+            catalog=_TEST_TOOL_CATALOG,
             policy=drifted,
-            dependency_policy=DEPENDENCY_POLICY_V1,
+            dependency_policy=_METADATA_BUNDLE.discovery_view().policy,
+            provider_metadata_view=_METADATA_BUNDLE.provider_view(),
+            discovery_metadata_view=_METADATA_BUNDLE.discovery_view(),
+            authority_metadata_view=_METADATA_BUNDLE.authority_view(),
         )
 
     runtime, persistence, journal = _runtime(
@@ -695,10 +724,14 @@ def test_sync_policy_spy_sees_exact_unbound_segment_after_segment_phase() -> Non
         assert segment.catalog is None
         assert segment.policy is None
         assert segment.surface_gate is None
+        assert getattr(segment, "catalog_lease", None) is None
         return ResolvedPolicyCatalog(
-            catalog=MODEL_TOOL_CATALOG,
+            catalog=_TEST_TOOL_CATALOG,
             policy=_AUTHORITY_POLICY,
-            dependency_policy=DEPENDENCY_POLICY_V1,
+            dependency_policy=_METADATA_BUNDLE.discovery_view().policy,
+            provider_metadata_view=_METADATA_BUNDLE.provider_view(),
+            discovery_metadata_view=_METADATA_BUNDLE.discovery_view(),
+            authority_metadata_view=_METADATA_BUNDLE.authority_view(),
         )
 
     runtime, _persistence, _journal = _runtime(phases, policy_resolver=policy_spy)
@@ -859,7 +892,7 @@ def test_confirmation_token_matches_closed_baseline_helper() -> None:
     )
 
 
-def test_pending_outcome_uses_confirmation_token_from_persisted_pending() -> None:
+def test_fabricated_pending_without_live_route_fails_closed_before_persistence() -> None:
     phases = _Phases()
     control = InMemoryRuntimeInvocationControl()
     pending = PendingAction(
@@ -878,11 +911,11 @@ def test_pending_outcome_uses_confirmation_token_from_persisted_pending() -> Non
 
     result = _start(runtime, _Host(phases), control=control)
 
-    assert isinstance(result, ConfirmationRequiredOutcome)
+    assert isinstance(result, RuntimeFailureOutcome)
+    assert result.code is RuntimeFailureCode.OPERATION_FAILED
     assert control.state is InvocationState.COMPLETED
-    assert result.confirmation_token == baseline_confirmation_token(pending)
-    assert result.pending_action is not None
-    assert result.pending_action.confirmation_token == result.confirmation_token
+    assert persistence.pending is None
+    assert persistence.pending_count == 0
 
 
 def test_journal_factory_receives_exact_start_run_builder_and_baseline_events() -> None:
@@ -982,26 +1015,37 @@ def test_real_run_recorder_factory_accepts_runtime_builder_and_records_terminal_
             value if isinstance(value, Message) else Message(role="user", content=str(value))
             for value in assembled
         )
-        return build_segment_surface_gate(
-            messages,
-            catalog=getattr(policy, "catalog"),
-            context=getattr(segment, "context"),
-            authority=getattr(segment, "authority"),
-            dependency_policy=getattr(policy, "dependency_policy"),
-            policy=getattr(policy, "policy"),
-        )
+        catalog_lease = _METADATA_BUNDLE.open_segment_lease()
+        try:
+            return build_segment_surface_gate(
+                messages,
+                catalog=getattr(policy, "catalog"),
+                catalog_lease=catalog_lease,
+                context=getattr(segment, "context"),
+                authority=getattr(segment, "authority"),
+                provider_view=getattr(policy, "provider_metadata_view"),
+                discovery_view=getattr(policy, "discovery_metadata_view"),
+                authority_metadata_view=getattr(policy, "authority_metadata_view"),
+                policy=getattr(policy, "policy"),
+            )
+        except BaseException:
+            catalog_lease.close()
+            raise
 
     runtime = PilotRuntime(
         RuntimeDependencies(
             conversations=Gateway(),
             persistence=coordinator,
             policy_catalog_resolver=lambda request, conversation, source: ResolvedPolicyCatalog(
-                catalog=MODEL_TOOL_CATALOG,
+                catalog=_TEST_TOOL_CATALOG,
                 policy=_AUTHORITY_POLICY,
-                dependency_policy=DEPENDENCY_POLICY_V1,
+                dependency_policy=_METADATA_BUNDLE.discovery_view().policy,
+                provider_metadata_view=_METADATA_BUNDLE.provider_view(),
+                discovery_metadata_view=_METADATA_BUNDLE.discovery_view(),
+                authority_metadata_view=_METADATA_BUNDLE.authority_view(),
             ),
             segment_context_resolver=lambda request, conversation, source, recorder: _real_segment(
-                conversation, recorder, MODEL_TOOL_CATALOG
+                conversation, recorder, _TEST_TOOL_CATALOG
             )[0],
             surface_gate_resolver=resolve_surface,
             continuation_model_resolver=lambda request, conversation, policy: ResolvedModel(
@@ -1010,6 +1054,12 @@ def test_real_run_recorder_factory_accepts_runtime_builder_and_records_terminal_
             source_loader=_Source(phases),
             context_assembler=_Assembler(phases),
             agent_driver=_Driver(phases),
+            catalog=_TEST_TOOL_CATALOG,
+            metadata_bundle=_METADATA_BUNDLE,
+            metadata_components=_METADATA_COMPONENTS,
+            provider_metadata_view=_METADATA_BUNDLE.provider_view(),
+            discovery_metadata_view=_METADATA_BUNDLE.discovery_view(),
+            authority_metadata_view=_METADATA_BUNDLE.authority_view(),
             journal=journal,
             phase_sink=phases,
         )
@@ -1107,6 +1157,58 @@ def test_source_failure_stops_before_user_and_journal() -> None:
     assert persistence.message_count == 0
     assert journal.recorder.dispositions == []
     assert control.state is InvocationState.COMPLETED
+
+
+def test_sync_invocation_candidate_failure_closes_unpublished_bundle_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    phases = _Phases()
+    opened: list[SegmentToolCatalogLease] = []
+    original_open = ToolMetadataBundleV1.open_segment_lease
+
+    def observe_open(bundle: ToolMetadataBundleV1) -> SegmentToolCatalogLease:
+        lease = original_open(bundle)
+        opened.append(lease)
+        return lease
+
+    def reject_invocation(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("invocation construction failed")
+
+    monkeypatch.setattr(ToolMetadataBundleV1, "open_segment_lease", observe_open)
+    monkeypatch.setattr(service_module, "AgentLoopInvocation", reject_invocation)
+    runtime, persistence, journal = _runtime(phases)
+
+    with pytest.raises(RuntimeError, match="invocation construction failed"):
+        _start(runtime, _Host(phases))
+
+    assert len(opened) == 1
+    assert opened[0].closed is True
+    assert persistence.user_count == 1
+    assert journal.recorder.abandoned == 1
+
+
+def test_sync_runtime_backstop_closes_published_invocation_before_driver_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    phases = _Phases()
+    opened: list[SegmentToolCatalogLease] = []
+    original_open = ToolMetadataBundleV1.open_segment_lease
+
+    def observe_open(bundle: ToolMetadataBundleV1) -> SegmentToolCatalogLease:
+        lease = original_open(bundle)
+        opened.append(lease)
+        return lease
+
+    monkeypatch.setattr(ToolMetadataBundleV1, "open_segment_lease", observe_open)
+    driver = _Driver(phases)
+    runtime, _persistence, _journal = _runtime(phases, driver=driver)
+
+    outcome = _start(runtime, _Host(phases, error=RuntimeError("host failed")))
+
+    assert isinstance(outcome, RuntimeFailureOutcome)
+    assert len(opened) == 1
+    assert opened[0].closed is True
+    assert driver.provider_calls == 0
 
 
 @pytest.mark.parametrize("failure_mode", ["exception", "none", "failed"])
@@ -1539,7 +1641,7 @@ def test_same_named_ordinary_exception_is_not_runtime_cancellation() -> None:
     assert journal.recorder.dispositions == [("failed", "provider_error")]
 
 
-def test_pending_result_is_atomically_persisted_and_suspended() -> None:
+def test_fabricated_pending_result_cannot_reach_atomic_persistence() -> None:
     phases = _Phases()
     pending = PendingAction(
         "call-1", "update_application_status", '{"id": 1}', "update_application_status", "op-1"
@@ -1553,10 +1655,10 @@ def test_pending_result_is_atomically_persisted_and_suspended() -> None:
 
     result = _start(runtime, _Host(phases))
 
-    assert isinstance(result, ConfirmationRequiredOutcome)
-    assert persistence.pending_count == 1
-    assert journal.recorder.dispositions == []
-    assert phases.items[-1] == "run_suspend"
+    assert isinstance(result, RuntimeFailureOutcome)
+    assert result.code is RuntimeFailureCode.OPERATION_FAILED
+    assert persistence.pending_count == 0
+    assert journal.recorder.dispositions == [("failed", "unknown")]
 
 
 @pytest.mark.parametrize(
@@ -1589,17 +1691,17 @@ def test_invalid_pending_is_rejected_before_any_pending_persistence(pending: obj
     assert journal.recorder.dispositions == [("failed", "unknown")]
 
 
-def test_pending_uses_resolved_catalog_not_global_dependency_catalog() -> None:
+def test_pending_uses_exact_bundle_catalog() -> None:
     phases = _Phases()
     pending = PendingAction("call-1", "write", "{}", "write", "op-1")
     persistence = _Persistence(phases)
     runtime, _, journal = _runtime(
         phases,
         persistence=persistence,
-        catalog=MODEL_TOOL_CATALOG,
-        dependency_catalog=_Catalog(write_names=("write",)),
         driver=_Driver(phases, result=AgentTurnResult([], "", pending)),
     )
+
+    assert runtime._dependencies.catalog is _METADATA_BUNDLE._typed_catalog
 
     result = _start(runtime, _Host(phases))
 
@@ -1644,7 +1746,7 @@ def test_pending_readback_identity_mismatch_is_safe_after_persistence() -> None:
 
     assert isinstance(result, RuntimeFailureOutcome)
     assert result.code is RuntimeFailureCode.OPERATION_FAILED
-    assert persistence.pending_count == 1
+    assert persistence.pending_count == 0
     assert journal.recorder.dispositions == [("failed", "unknown")]
 
 
@@ -1671,8 +1773,11 @@ def test_persistence_failure_finishes_failed_not_completed(
             conversation_id: int,
             messages: object,
             pending_value: object,
+            *,
+            route_handle: object,
         ) -> object:
             del conversation_id, messages, pending_value
+            assert route_handle is not None
             return PersistenceResult(PersistenceStatus(status))
 
         def persist_initial_messages(self, conversation_id: int, messages: object) -> object:
@@ -1697,7 +1802,7 @@ def test_persistence_failure_finishes_failed_not_completed(
     assert "run_finish" in phases.items
 
 
-def test_missing_target_uses_clarification_without_pending_outcome() -> None:
+def test_missing_target_cannot_turn_a_fabricated_pending_into_clarification() -> None:
     phases = _Phases()
     pending = PendingAction(
         "call-1", "update_application_status", "{}", "update_application_status", "op-1"
@@ -1712,10 +1817,10 @@ def test_missing_target_uses_clarification_without_pending_outcome() -> None:
 
     result = _start(runtime, _Host(phases))
 
-    assert isinstance(result, MessageOutcome)
-    assert result.message == "请先选择投递目标。"
-    assert persistence.clarification_count == 1
-    assert journal.recorder.dispositions == [("completed", None)]
+    assert isinstance(result, RuntimeFailureOutcome)
+    assert result.code is RuntimeFailureCode.OPERATION_FAILED
+    assert persistence.clarification_count == 0
+    assert journal.recorder.dispositions == [("failed", "unknown")]
 
 
 @pytest.mark.parametrize("failure_mode", ["exception", "none", "failed"])
@@ -1739,8 +1844,11 @@ def test_non_atomic_clarification_set_failure_stops_before_assistant_and_complet
             conversation_id: int,
             pending_value: object,
             question: str,
+            *,
+            route_handle: object,
         ) -> object:
             del conversation_id, pending_value, question
+            assert route_handle is not None
             self.setter_calls += 1
             if failure_mode == "exception":
                 raise OSError("clarification CAS unavailable")
@@ -1784,16 +1892,33 @@ def test_final_projection_redacts_internal_tool_names_and_uses_safe_write_error(
             return PersistenceResult(PersistenceStatus.PERSISTED, message_id=12)
 
     persistence = CapturingPersistence(phases)
-    write_record = SimpleNamespace(
-        prepared=SimpleNamespace(spec=SimpleNamespace(kind="write")),
-        outcome=SimpleNamespace(code="company_required", compatibility_detail="company_required"),
+    write_spec = _TEST_TOOL_CATALOG.resolve("update_application_status")
+    assert write_spec is not None
+    lease = _METADATA_BUNDLE.open_segment_lease()
+    spec_handle = lease.resolve("update_application_status")
+    assert spec_handle is not None
+    prepared = PreparedToolCall(
+        tool_call_id="call-1",
+        spec=write_spec,
+        arguments={},
+        typed_args={},
+        arguments_digest="sha256:" + "0" * 64,
+        contract_fingerprint="sha256:" + "0" * 64,
+        binding=BindingAudit(status="unbound", target_count=0),
+        spec_handle=spec_handle,
+    )
+    failure = ToolFailure("validation_error", "company_required", "company_required")
+    write_record = ToolExecutionRecord(
+        prepared=prepared,
+        outcome=failure,
+        execution_started=True,
     )
     result_value = AgentTurnResult(
         added=[],
         reply="请继续调用 update_application_status。",
         pending=None,
         records=(write_record,),
-        failures=(ToolFailure("validation_error", "company_required", "company_required"),),
+        failures=(failure,),
     )
     runtime, _, _journal = _runtime(
         phases,
@@ -1801,7 +1926,10 @@ def test_final_projection_redacts_internal_tool_names_and_uses_safe_write_error(
         driver=_Driver(phases, result=result_value),
     )
 
-    result = _start(runtime, _Host(phases))
+    try:
+        result = _start(runtime, _Host(phases))
+    finally:
+        lease.close()
 
     assert isinstance(result, MessageOutcome)
     assert result.message == "这次复盘还缺少公司信息。请告诉我公司名称，或先说明不关联具体公司。"

@@ -25,16 +25,25 @@ from typing import (
 )
 from uuid import UUID
 
+from offerpilot.ai.tool_runtime.contracts import TransientToolRuntimeValue
+
 from .errors import RuntimeFailureCode
 
 
 if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
+
+    from offerpilot.repositories.application_jd_versions import ApplicationJDService
+    from offerpilot.repositories.application_outcomes import ApplicationOutcomesRepository
+    from offerpilot.repositories.applications import ApplicationsRepository
+
     class StrEnum(str, Enum):
         pass
 else:
     try:
         from enum import StrEnum
     except ImportError:  # pragma: no cover - Python 3.10 compatibility
+
         class StrEnum(str, Enum):
             def __str__(self) -> str:
                 return self.value
@@ -55,9 +64,326 @@ _WRITE_STATUSES = frozenset({"none", "success", "failed", "cancelled"})
 _OPERATION_STATUSES = frozenset({"committed", "rejected", "failed"})
 
 
+_MISSING_SESSION_BINDING = object()
+
+
+class LegacyExecutionContext(TransientToolRuntimeValue):
+    """Exact caller-transaction adapters for one Legacy deterministic execution."""
+
+    __slots__ = (
+        "__identity_seal",
+        "__jd_service",
+        "__outcomes_repository",
+        "__session",
+        "__transaction",
+    )
+
+    def __init__(
+        self,
+        session: Session,
+        jd_service: ApplicationJDService,
+        outcomes_repository: ApplicationOutcomesRepository,
+    ) -> None:
+        from offerpilot.repositories.application_jd_versions import (
+            ApplicationJDService as ExactApplicationJDService,
+        )
+        from offerpilot.repositories.application_outcomes import (
+            ApplicationOutcomesRepository as ExactApplicationOutcomesRepository,
+        )
+
+        transaction = self._require_active_outer_transaction(session)
+        bound_jd = self._bind_exact_adapter(
+            jd_service,
+            session,
+            exact_type=ExactApplicationJDService,
+            field_name="jd_service",
+        )
+        bound_outcomes = self._bind_exact_adapter(
+            outcomes_repository,
+            session,
+            exact_type=ExactApplicationOutcomesRepository,
+            field_name="outcomes_repository",
+        )
+        object.__setattr__(self, "_LegacyExecutionContext__session", session)
+        object.__setattr__(self, "_LegacyExecutionContext__transaction", transaction)
+        object.__setattr__(self, "_LegacyExecutionContext__jd_service", bound_jd)
+        object.__setattr__(
+            self,
+            "_LegacyExecutionContext__outcomes_repository",
+            bound_outcomes,
+        )
+        object.__setattr__(
+            self,
+            "_LegacyExecutionContext__identity_seal",
+            (
+                session,
+                transaction,
+                type(jd_service),
+                type(outcomes_repository),
+                bound_jd,
+                bound_outcomes,
+                id(bound_jd),
+                id(bound_outcomes),
+            ),
+        )
+
+    def __setattr__(self, name: str, value: object) -> NoReturn:
+        del name, value
+        raise TypeError("Legacy execution context is immutable")
+
+    @staticmethod
+    def _require_active_outer_transaction(session: object) -> object:
+        from sqlalchemy.orm import Session as ExactSession
+
+        if not isinstance(session, ExactSession):
+            raise TypeError("Legacy execution context requires an exact SQLAlchemy Session")
+        try:
+            is_active = session.is_active
+            in_transaction = session.in_transaction()
+            transaction = session.get_transaction()
+        except (AttributeError, TypeError) as exc:
+            raise TypeError(
+                "Legacy execution context requires an exact SQLAlchemy Session"
+            ) from exc
+        if (
+            is_active is not True
+            or in_transaction is not True
+            or transaction is None
+            or getattr(transaction, "session", None) is not session
+            or getattr(transaction, "parent", _MISSING_SESSION_BINDING) is not None
+            or getattr(transaction, "nested", _MISSING_SESSION_BINDING) is not False
+            or getattr(transaction, "is_active", None) is not True
+        ):
+            raise ValueError(
+                "Legacy execution context requires the caller's exact active outer transaction"
+            )
+        return transaction
+
+    @staticmethod
+    def _bind_exact_adapter(
+        adapter: object,
+        session: object,
+        *,
+        exact_type: type[object],
+        field_name: str,
+    ) -> object:
+        if type(adapter) is not exact_type:
+            raise TypeError(f"{field_name} must be an exact {exact_type.__name__}")
+        bind = getattr(exact_type, "bind", None)
+        if not callable(bind):
+            raise TypeError(f"{field_name} must provide a session binding adapter")
+        source_session_factory = getattr(
+            adapter,
+            "_session_factory",
+            _MISSING_SESSION_BINDING,
+        )
+        bound = bind(adapter, session)
+        if (
+            type(bound) is not exact_type
+            or bound is adapter
+            or getattr(bound, "_session", _MISSING_SESSION_BINDING) is not session
+            or source_session_factory is _MISSING_SESSION_BINDING
+            or getattr(bound, "_session_factory", _MISSING_SESSION_BINDING)
+            is not source_session_factory
+        ):
+            raise TypeError(f"{field_name} did not bind the exact caller Session")
+        return bound
+
+    def _ensure_integrity(self) -> None:
+        try:
+            seal = object.__getattribute__(self, "_LegacyExecutionContext__identity_seal")
+            session = object.__getattribute__(self, "_LegacyExecutionContext__session")
+            transaction = object.__getattribute__(self, "_LegacyExecutionContext__transaction")
+            jd_service = object.__getattribute__(self, "_LegacyExecutionContext__jd_service")
+            outcomes = object.__getattribute__(
+                self,
+                "_LegacyExecutionContext__outcomes_repository",
+            )
+        except AttributeError as exc:
+            raise ValueError("Legacy execution context integrity drift") from exc
+        if (
+            type(seal) is not tuple
+            or len(seal) != 8
+            or seal[0] is not session
+            or seal[1] is not transaction
+            or seal[4] is not jd_service
+            or seal[5] is not outcomes
+            or type(jd_service) is not seal[2]
+            or type(outcomes) is not seal[3]
+            or seal[6] != id(jd_service)
+            or seal[7] != id(outcomes)
+            or getattr(jd_service, "_session", _MISSING_SESSION_BINDING) is not session
+            or getattr(outcomes, "_session", _MISSING_SESSION_BINDING) is not session
+            or self._require_active_outer_transaction(session) is not transaction
+        ):
+            raise ValueError("Legacy execution context integrity drift")
+
+    def require_integrity(self) -> None:
+        self._ensure_integrity()
+
+    @property
+    def session(self) -> Session:
+        self._ensure_integrity()
+        return object.__getattribute__(self, "_LegacyExecutionContext__session")  # type: ignore[no-any-return]
+
+    @property
+    def jd_service(self) -> ApplicationJDService:
+        self._ensure_integrity()
+        return cast(
+            "ApplicationJDService",
+            object.__getattribute__(self, "_LegacyExecutionContext__jd_service"),
+        )
+
+    @property
+    def outcomes_repository(self) -> ApplicationOutcomesRepository:
+        self._ensure_integrity()
+        return cast(
+            "ApplicationOutcomesRepository",
+            object.__getattribute__(
+                self,
+                "_LegacyExecutionContext__outcomes_repository",
+            ),
+        )
+
+
+class LegacyReadContext(TransientToolRuntimeValue):
+    """Exact caller-transaction read adapters for Legacy presentation."""
+
+    __slots__ = (
+        "__applications",
+        "__identity_seal",
+        "__jd_service",
+        "__session",
+        "__transaction",
+    )
+
+    def __init__(
+        self,
+        session: Session,
+        applications: ApplicationsRepository,
+        jd_service: ApplicationJDService,
+    ) -> None:
+        from offerpilot.repositories.application_jd_versions import (
+            ApplicationJDService as ExactApplicationJDService,
+        )
+        from offerpilot.repositories.applications import (
+            ApplicationsRepository as ExactApplicationsRepository,
+        )
+
+        transaction = LegacyExecutionContext._require_active_outer_transaction(session)
+        bound_applications = LegacyExecutionContext._bind_exact_adapter(
+            applications,
+            session,
+            exact_type=ExactApplicationsRepository,
+            field_name="applications",
+        )
+        bound_jd = LegacyExecutionContext._bind_exact_adapter(
+            jd_service,
+            session,
+            exact_type=ExactApplicationJDService,
+            field_name="jd_service",
+        )
+        object.__setattr__(self, "_LegacyReadContext__session", session)
+        object.__setattr__(self, "_LegacyReadContext__transaction", transaction)
+        object.__setattr__(
+            self,
+            "_LegacyReadContext__applications",
+            bound_applications,
+        )
+        object.__setattr__(self, "_LegacyReadContext__jd_service", bound_jd)
+        object.__setattr__(
+            self,
+            "_LegacyReadContext__identity_seal",
+            (
+                session,
+                transaction,
+                bound_applications,
+                bound_jd,
+                type(bound_applications),
+                type(bound_jd),
+            ),
+        )
+
+    def __setattr__(self, name: str, value: object) -> NoReturn:
+        del name, value
+        raise TypeError("Legacy read context is immutable")
+
+    def _ensure_integrity(self) -> None:
+        try:
+            seal = object.__getattribute__(self, "_LegacyReadContext__identity_seal")
+            session = object.__getattribute__(self, "_LegacyReadContext__session")
+            transaction = object.__getattribute__(self, "_LegacyReadContext__transaction")
+            applications = object.__getattribute__(self, "_LegacyReadContext__applications")
+            jd_service = object.__getattribute__(self, "_LegacyReadContext__jd_service")
+        except AttributeError as exc:
+            raise ValueError("Legacy read context integrity drift") from exc
+        if (
+            type(seal) is not tuple
+            or len(seal) != 6
+            or seal[0] is not session
+            or seal[1] is not transaction
+            or seal[2] is not applications
+            or seal[3] is not jd_service
+            or type(applications) is not seal[4]
+            or type(jd_service) is not seal[5]
+            or getattr(applications, "_session", _MISSING_SESSION_BINDING) is not session
+            or getattr(jd_service, "_session", _MISSING_SESSION_BINDING) is not session
+            or LegacyExecutionContext._require_active_outer_transaction(session) is not transaction
+        ):
+            raise ValueError("Legacy read context integrity drift")
+
+    def require_integrity(self) -> None:
+        self._ensure_integrity()
+
+    def application_summary(self, application_id: int) -> ImmutablePayload | None:
+        from offerpilot.models import Application
+
+        self._ensure_integrity()
+        if type(application_id) is not int or application_id <= 0:
+            return None
+        session = cast(
+            "Session",
+            object.__getattribute__(self, "_LegacyReadContext__session"),
+        )
+        with session.no_autoflush:
+            application = session.get(Application, application_id)
+        if application is None or application.deleted_at is not None:
+            return None
+        return MappingProxyType(
+            {
+                "id": application.id,
+                "company_name": application.company_name,
+                "position_name": application.position_name,
+            }
+        )
+
+    def jd_version_number(self, application_id: int, version_id: int) -> int | None:
+        from offerpilot.models import ApplicationJDVersion
+
+        self._ensure_integrity()
+        if (
+            type(application_id) is not int
+            or application_id <= 0
+            or type(version_id) is not int
+            or version_id <= 0
+        ):
+            return None
+        session = cast(
+            "Session",
+            object.__getattribute__(self, "_LegacyReadContext__session"),
+        )
+        with session.no_autoflush:
+            version = session.get(ApplicationJDVersion, version_id)
+        if version is None or version.application_id != application_id:
+            return None
+        return version.version_number
+
+
 def _reject_framework_value(value: object, *, field_name: str) -> None:
     """Reject framework/ORM objects without importing those optional modules."""
 
+    if isinstance(value, TransientToolRuntimeValue):
+        raise TypeError(f"{field_name} cannot contain transient runtime values")
     module = getattr(type(value), "__module__", "")
     if module == "fastapi" or module.startswith("fastapi."):
         raise TypeError(f"{field_name} cannot contain FastAPI objects")
@@ -474,7 +800,9 @@ class StartTurnRequest:
             raise TypeError("attachments must be a tuple")
         if any(not isinstance(item, AttachmentReference) for item in self.attachments):
             raise TypeError("attachments must contain AttachmentReference values")
-        if self.pilot_action is not None and not isinstance(self.pilot_action, PilotActionDescriptor):
+        if self.pilot_action is not None and not isinstance(
+            self.pilot_action, PilotActionDescriptor
+        ):
             raise TypeError("pilot_action must be a PilotActionDescriptor")
 
 
@@ -776,17 +1104,13 @@ class PreparedStreamExecution:
             raise TypeError("opaque_state is required")
         if lifecycle is not None and not isinstance(lifecycle, PreparedLifecycle):
             raise TypeError("lifecycle must be a PreparedLifecycle")
-        if lifecycle_state is not None and not isinstance(
-            lifecycle_state, PreparedLifecycleState
-        ):
+        if lifecycle_state is not None and not isinstance(lifecycle_state, PreparedLifecycleState):
             raise TypeError("lifecycle_state must be a PreparedLifecycleState")
         if completion_reason is not None and not isinstance(completion_reason, CompletionReason):
             raise TypeError("completion_reason must be a CompletionReason")
         if lifecycle is None:
             lifecycle = PreparedLifecycle(
-                lifecycle_state
-                if lifecycle_state is not None
-                else PreparedLifecycleState.PREPARED,
+                lifecycle_state if lifecycle_state is not None else PreparedLifecycleState.PREPARED,
                 completion_reason,
             )
         elif lifecycle_state is not None and lifecycle.state is not lifecycle_state:
@@ -1149,6 +1473,8 @@ __all__ = [
     "InvocationState",
     "JsonScalar",
     "JsonValue",
+    "LegacyExecutionContext",
+    "LegacyReadContext",
     "MISSING_EDITED_ARGS",
     "MessageOutcome",
     "MetaEvent",

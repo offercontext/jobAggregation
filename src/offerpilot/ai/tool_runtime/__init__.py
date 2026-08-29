@@ -1,11 +1,10 @@
 from importlib import import_module
 
+from offerpilot.ai.tool_runtime.policy_types import ToolCapability
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_runtime.contracts import (
     BindingAudit,
     BindingContract,
-    BindingResolverSpec,
-    BindingTarget,
     ConfirmationRequired,
     PreparedToolCall,
     ProviderToolContract,
@@ -16,13 +15,7 @@ from offerpilot.ai.tool_runtime.contracts import (
     ToolSpec,
     ToolSuccess,
 )
-from offerpilot.ai.tool_runtime.context import (
-    UNAVAILABLE,
-    ToolCapability,
-    ToolExecutionContext,
-    aggregate_binding,
-    evaluate_context,
-)
+from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.validation import (
     ArgumentValidationError,
     SchemaContractError,
@@ -38,8 +31,6 @@ __all__ = [
     "ArgumentValidationError",
     "BindingAudit",
     "BindingContract",
-    "BindingResolverSpec",
-    "BindingTarget",
     "ConfirmationRequired",
     "PreparedToolCall",
     "ProviderToolContract",
@@ -54,12 +45,9 @@ __all__ = [
     "ToolResultMetadata",
     "ToolSpec",
     "ToolSuccess",
-    "UNAVAILABLE",
-    "aggregate_binding",
     "canonical_json",
     "compile_tool_schema",
     "execute_prepared",
-    "evaluate_context",
     "parse_arguments",
     "prepare_call",
     "project_transport_event",

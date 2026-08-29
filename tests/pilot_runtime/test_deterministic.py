@@ -1,19 +1,31 @@
 from __future__ import annotations
 
+import asyncio
 import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from typing import Any, NoReturn, cast
 from uuid import uuid4
 
 import pytest
 
-from offerpilot.ai.tool_runtime.legacy import LegacyDeterministicAdapter, LegacyDeterministicCatalog
+from offerpilot.ai.tool_runtime import legacy as legacy_runtime
+from offerpilot.ai.tool_runtime.legacy import LegacyArgumentPreparationError
+from offerpilot.ai.tool_runtime.legacy_proof import (
+    LegacyApprovedConfirmationInput,
+    LegacyConfirmationLookupIdentity,
+)
 from offerpilot.ai.write_operations import (
     OperationCommitted,
     OperationFailed,
     OperationReplay,
+    OperationUnknown,
     TerminalPayload,
     VerifiedPendingReplay,
+    PendingRouteIdentityV1,
     ledger_fingerprint,
+    pending_action_identity,
 )
 from offerpilot.pilot_runtime import (
     CompletedEvent,
@@ -37,19 +49,30 @@ from offerpilot.pilot_runtime import (
     StreamExecutionMode,
     freeze_json_mapping,
 )
-from offerpilot.ai.tool_specs.legacy import build_legacy_deterministic_catalog
 from offerpilot.chat_transport import (
     PreparedStreamGuard,
     event_sse_payload,
     outcome_http_payload,
 )
 from offerpilot.pilot_runtime.deterministic import (
-    _LEGACY_EDITABLE_FIELDS,
     _confirmation_token,
     _invoke as deterministic_invoke,
 )
+from offerpilot.pilot_runtime import deterministic as deterministic_module
 from offerpilot.pilot_runtime.event_sink import InMemoryRuntimeInvocationControl
+from offerpilot.pilot_runtime.persistence import PersistenceResult, PersistenceStatus
 from offerpilot.pilot_runtime.service import PilotRuntime, RuntimeDependencies, _invoke
+from offerpilot.pilot_runtime.composition import (
+    _SqlAlchemyLegacyPendingIdentityBackend,
+    build_production_tool_metadata_components,
+)
+from offerpilot.pilot_runtime.legacy_route import build_legacy_pending_identity_verifier_port
+from offerpilot.db import init_database
+from offerpilot.repositories.chat import ChatRepository
+from offerpilot.ai.write_operations import WriteOperationRepository, load_or_create_ledger_key
+from offerpilot.repositories.application_jd_versions import ApplicationJDService
+from offerpilot.repositories.application_outcomes import ApplicationOutcomesRepository
+from offerpilot.repositories.applications import ApplicationCreate, ApplicationsRepository
 
 
 class _Conversation:
@@ -91,6 +114,7 @@ class _Persistence:
         self.message_ids = 0
         self.resolve_calls = 0
         self.resolve_result: object | None = object()
+        self.backing_chat: ChatRepository | None = None
 
     def get_pending_action(self, _conversation_id: int) -> object | None:
         return self.pending
@@ -98,12 +122,36 @@ class _Persistence:
     def get_pending_clarification(self, _conversation_id: int) -> object | None:
         return self.clarification
 
-    def persist_initial_pending(self, _conversation_id: int, messages: object, pending: object) -> object:
+    def persist_initial_pending(
+        self,
+        _conversation_id: int,
+        messages: object,
+        pending: object,
+        *,
+        route_handle: object,
+    ) -> object:
+        assert route_handle is not None
+        if self.backing_chat is not None:
+            assert self.backing_chat.persist_pending_action(
+                _conversation_id,
+                cast(Any, pending),
+                [],
+                route_handle=cast(Any, route_handle),
+            )
         self.pending = pending
         self.message_ids += len(tuple(messages))
         return SimpleNamespace(persisted=True, message_ids=(self.message_ids - 1, self.message_ids))
 
-    def persist_clarification(self, _conversation_id: int, messages: object, pending: object, question: str) -> object:
+    def persist_clarification(
+        self,
+        _conversation_id: int,
+        messages: object,
+        pending: object,
+        question: str,
+        *,
+        route_handle: object,
+    ) -> object:
+        assert route_handle is not None
         self.clarification = SimpleNamespace(pending=pending, question=question)
         self.message_ids += len(tuple(messages)) + 1
         return SimpleNamespace(persisted=True, message_ids=(self.message_ids - 1, self.message_ids))
@@ -120,12 +168,24 @@ class _Persistence:
         self.message_ids += 1
         return SimpleNamespace(persisted=True, message_id=self.message_ids)
 
-    def resolve_pending_confirmation(self, _conversation_id: int, *_args: object, **_kwargs: object) -> object | None:
+    def persist_confirmation_delivery(
+        self,
+        _conversation_id: int,
+        _ownership: object,
+        _origin: object,
+        _messages: object,
+        chained_pending: object,
+        *,
+        route_handle: object,
+        **_kwargs: object,
+    ) -> PersistenceResult:
+        assert chained_pending is None
+        assert route_handle is None
         self.resolve_calls += 1
         if self.resolve_result is None:
-            return None
+            return PersistenceResult(PersistenceStatus.CAS_LOST)
         self.pending = None
-        return self.resolve_result
+        return PersistenceResult(PersistenceStatus.PERSISTED)
 
 
 class _Operations:
@@ -138,14 +198,49 @@ class _Operations:
 
 
 class _Coordinator:
-    def __init__(self, operations: _Operations) -> None:
+    def __init__(
+        self,
+        operations: _Operations,
+        execute_counter: list[int] | None = None,
+        *,
+        repository: WriteOperationRepository | None = None,
+    ) -> None:
         self.operations = operations
+        self.repository = repository
+        self.execute_counter = execute_counter
         self.execute_calls = 0
         self.reject_calls = 0
 
-    def execute_legacy(self, **kwargs: object) -> OperationCommitted:
+    def _project_legacy(self, kwargs: dict[str, object]) -> OperationUnknown | None:
+        repository = self.repository
+        if repository is None:
+            raise AssertionError("Legacy test coordinator requires an exact backing repository")
+        route_binder = kwargs["route_binder"]
+        assert callable(route_binder)
+        try:
+            with repository.session_factory() as session:
+                with route_binder(session) as bound_route:
+                    prepared = bound_route.prepared_call()
+                    projected = bound_route.prepared_input_port().require(
+                        prepared,
+                        operation_id=str(kwargs["operation_id"]),
+                        tool_call_id=str(kwargs["tool_call_id"]),
+                        tool_name=str(kwargs["tool_name"]),
+                    )
+                    bound_route.accept_prepared_input(prepared, projected)
+        except LegacyArgumentPreparationError:
+            return OperationUnknown(str(kwargs["operation_id"]), "invalid_confirmation", False)
+        return None
+
+    def execute_legacy(self, **kwargs: object) -> OperationCommitted | OperationUnknown:
         self.execute_calls += 1
-        value = kwargs["executor"](object())
+        assert callable(kwargs["route_binder"])
+        invalid = self._project_legacy(kwargs)
+        if invalid is not None:
+            return invalid
+        if self.execute_counter is not None:
+            self.execute_counter[0] += 1
+        value = '{"ok":true}'
         payload = TerminalPayload(
             status="committed",
             result_contract="legacy_string_v1",
@@ -182,6 +277,9 @@ class _ConflictCoordinator(_Coordinator):
 
     def execute_legacy(self, **kwargs: object) -> OperationFailed:
         self.execute_calls += 1
+        invalid = self._project_legacy(kwargs)
+        if invalid is not None:
+            raise AssertionError("conflict test input unexpectedly failed preparation")
         payload = TerminalPayload(
             status="failed",
             result_contract="legacy_string_v1",
@@ -201,12 +299,25 @@ class _ReplacePersistence(_Persistence):
         super().__init__()
         self.replacement_result = replacement_result
         self.replace_calls = 0
+        self.route_handles: list[object] = []
 
-    def replace_pending_confirmation(self, _conversation_id: int, _pending: object, replacement: object, *_args: object, **_kwargs: object) -> object | None:
+    def persist_confirmation_delivery(
+        self,
+        _conversation_id: int,
+        _ownership: object,
+        _origin: object,
+        _messages: object,
+        replacement: object,
+        *,
+        route_handle: object,
+        **_kwargs: object,
+    ) -> PersistenceResult:
         self.replace_calls += 1
+        self.route_handles.append(route_handle)
         if self.replacement_result is not None:
             self.pending = replacement
-        return self.replacement_result
+            return PersistenceResult(PersistenceStatus.PERSISTED)
+        return PersistenceResult(PersistenceStatus.CAS_LOST)
 
 
 def _operation_for_pending(operations: _Operations, pending: object, token: str) -> None:
@@ -221,46 +332,28 @@ def _operation_for_pending(operations: _Operations, pending: object, token: str)
     )
 
 
-def _catalog_factory(counter: list[int]) -> object:
-    def factory(_jd: object, _outcomes: object) -> LegacyDeterministicCatalog:
-        def execute(_args: str) -> str:
-            counter[0] += 1
-            return '{"ok":true}'
-
-        adapters = tuple(
-            LegacyDeterministicAdapter(
-                name=name,
-                editable_fields=(
-                    ({"field": "jd_text", "type": "long_text"}, {"field": "source_url", "type": "string"})
-                    if name == "save_application_jd_version"
-                    else ()
-                ),
-                validate=lambda _args: "",
-                describe=lambda _args: "确认 deterministic write",
-                execute=execute,
-            )
-            for name in (
-                "save_application_jd_version",
-                "create_application_submission_snapshot",
-                "record_application_outcome",
-            )
-        )
-        return LegacyDeterministicCatalog(adapters)
-
-    return factory
-
-
-def _adapter(persistence: _Persistence, *, execute_counter: list[int] | None = None) -> tuple[DeterministicPilotAdapter, _Operations, _Coordinator]:
+def _adapter(
+    persistence: _Persistence,
+    *,
+    execute_counter: list[int] | None = None,
+    components: object | None = None,
+) -> tuple[DeterministicPilotAdapter, _Operations, _Coordinator]:
     operations = _Operations()
-    coordinator = _Coordinator(operations)
+    components = components or _initial_route_components()
+    persistence.backing_chat = components.chat
+    coordinator = _Coordinator(
+        operations,
+        execute_counter,
+        repository=components.repository,
+    )
     adapter = DeterministicPilotAdapter(
         persistence=persistence,
-        applications=_Applications(),
-        application_jd_versions=_JD(),
+        applications=components.applications,
+        application_jd_versions=components.jd_service,
         application_outcomes=object(),
         write_operations=operations,
         write_coordinator=coordinator,
-        legacy_catalog_factory=_catalog_factory(execute_counter or [0]),
+        **_initial_route_dependencies(components),
         id_factory=lambda: "call-deterministic-jd-1",
         key_factory=lambda: "key-deterministic-jd-1",
     )
@@ -269,7 +362,9 @@ def _adapter(persistence: _Persistence, *, execute_counter: list[int] | None = N
 
 class _JournalPersistence(_Persistence):
     def list_messages(self, _conversation_id: int) -> tuple[object, ...]:
-        return tuple(SimpleNamespace(id=index + 1, role="assistant") for index in range(self.message_ids))
+        return tuple(
+            SimpleNamespace(id=index + 1, role="assistant") for index in range(self.message_ids)
+        )
 
 
 class _StrictRecorder:
@@ -322,7 +417,8 @@ class _StrictJournal:
 
 def test_deterministic_initial_journal_suspends_closed_legacy_pending() -> None:
     persistence = _JournalPersistence()
-    adapter, _operations, coordinator = _adapter(persistence)
+    components = _initial_route_components()
+    adapter, _operations, coordinator = _adapter(persistence, components=components)
     journal = _StrictJournal()
     runtime = PilotRuntime(
         RuntimeDependencies(
@@ -330,6 +426,7 @@ def test_deterministic_initial_journal_suspends_closed_legacy_pending() -> None:
             persistence=persistence,
             deterministic=adapter,
             journal=journal,
+            **_runtime_metadata_dependencies(components),
         )
     )
 
@@ -352,7 +449,8 @@ def test_deterministic_initial_journal_suspends_closed_legacy_pending() -> None:
 
 def test_deterministic_chained_journal_suspends_replacement_on_same_run() -> None:
     persistence = _JournalPersistence()
-    adapter, _operations, _coordinator = _adapter(persistence)
+    components = _initial_route_components()
+    adapter, _operations, _coordinator = _adapter(persistence, components=components)
     old_pending = SimpleNamespace(
         tool_call_id="old-call",
         tool_name="save_application_jd_version",
@@ -371,12 +469,24 @@ def test_deterministic_chained_journal_suspends_replacement_on_same_run() -> Non
     original = adapter.pending_action(_Conversation())
     assert original is not None
     journal = _StrictJournal()
-    runtime = PilotRuntime(RuntimeDependencies(persistence=persistence, deterministic=adapter))
+    runtime = PilotRuntime(
+        RuntimeDependencies(
+            persistence=persistence,
+            deterministic=adapter,
+            **_runtime_metadata_dependencies(components),
+        )
+    )
     control = InMemoryRuntimeInvocationControl()
 
     persistence.pending = new_pending
     runtime._finish_deterministic_confirmation_journal(  # type: ignore[attr-defined]
-        {"recorder": journal.recorder, "started": True},
+        {
+            "recorder": journal.recorder,
+            "started": True,
+            "attempted": True,
+            "approved": True,
+            "bound_attempted": True,
+        },
         original,
         _Conversation(),
         MessageOutcome("继续确认", conversation_id=7),
@@ -568,14 +678,6 @@ def test_confirmation_feedback_is_not_in_repr_but_presence_is_retained() -> None
 
     assert request.rejection_feedback_present is True
     assert "secret feedback" not in repr(request)
-
-
-def test_legacy_editable_projection_matches_closed_source_catalog() -> None:
-    catalog = build_legacy_deterministic_catalog(object(), object())
-    for name, expected in _LEGACY_EDITABLE_FIELDS.items():
-        adapter = catalog.resolve_server_loaded(SimpleNamespace(tool_name=name))
-        assert adapter is not None
-        assert tuple(dict(item) for item in adapter.editable_fields) == expected
 
 
 def test_invoke_does_not_retry_a_body_type_error() -> None:
@@ -862,15 +964,17 @@ def test_chained_pending_replay_keeps_only_baseline_replay_metadata() -> None:
 
     persistence = _Persistence()
     operations = _ChainedOperations()
-    coordinator = _Coordinator(operations)
+    components = _initial_route_components()
+    persistence.backing_chat = components.chat
+    coordinator = _Coordinator(operations, repository=components.repository)
     adapter = DeterministicPilotAdapter(
         persistence=persistence,
-        applications=_Applications(),
-        application_jd_versions=_JD(),
+        applications=components.applications,
+        application_jd_versions=components.jd_service,
         application_outcomes=object(),
         write_operations=operations,
         write_coordinator=coordinator,
-        legacy_catalog_factory=_catalog_factory([0]),
+        **_initial_route_dependencies(components),
     )
     adapter.start_turn(StartTurnRequest(message="保存 JD：岗位"), _Conversation())
     child = persistence.pending
@@ -921,18 +1025,24 @@ def test_stream_initial_is_direct_and_pending_replay_does_not_reexecute() -> Non
     execution = adapter.prepare_stream(
         StartTurnRequest(message="保存 JD：职位：后端工程师"),
         _Conversation(),
-        transport=RuntimeTransportContext(mode="stream", transport_run_id=uuid4(), stream_version="pilot-sse-v1"),
+        transport=RuntimeTransportContext(
+            mode="stream", transport_run_id=uuid4(), stream_version="pilot-sse-v1"
+        ),
     )
     assert execution.execution_mode is StreamExecutionMode.DIRECT
     assert [type(event).__name__ for event in execution.events[:3]] == [
-        "MetaEvent", "UserMessageSavedEvent", "StatusEvent"
+        "MetaEvent",
+        "UserMessageSavedEvent",
+        "StatusEvent",
     ]
     assert coordinator.execute_calls == 0
 
     replay = adapter.prepare_stream(
         StartTurnRequest(message="替换文本"),
         _Conversation(),
-        transport=RuntimeTransportContext(mode="stream", transport_run_id=uuid4(), stream_version="pilot-sse-v1"),
+        transport=RuntimeTransportContext(
+            mode="stream", transport_run_id=uuid4(), stream_version="pilot-sse-v1"
+        ),
     )
     assert replay.pending_replay is True
     replay_payload = outcome_http_payload(replay.outcome)
@@ -996,15 +1106,18 @@ def test_stale_cas_uses_typed_pending_projection_and_never_resolves_twice(
 ) -> None:
     persistence = _ReplacePersistence(replacement_result)
     operations = _Operations()
+    components = _initial_route_components()
+    persistence.backing_chat = components.chat
     coordinator = _ConflictCoordinator(operations, "application_jd_stale_current_version")
+    coordinator.repository = components.repository
     adapter = DeterministicPilotAdapter(
         persistence=persistence,
-        applications=_Applications(),
-        application_jd_versions=_JD(),
+        applications=components.applications,
+        application_jd_versions=components.jd_service,
         application_outcomes=object(),
         write_operations=operations,
         write_coordinator=coordinator,
-        legacy_catalog_factory=_catalog_factory([0]),
+        **_initial_route_dependencies(components),
         id_factory=lambda: "call-stale-cas-1",
         key_factory=lambda: "key-stale-cas-0001",
     )
@@ -1029,6 +1142,8 @@ def test_stale_cas_uses_typed_pending_projection_and_never_resolves_twice(
         else RuntimeFailureCode.STALE_PENDING_ACTION
     )
     assert persistence.replace_calls == 1
+    assert len(persistence.route_handles) == 1
+    assert type(persistence.route_handles[0]).__name__ == "LegacyPendingRouteHandle"
     assert persistence.resolve_calls == 0
 
     if replacement_result is not None:
@@ -1372,7 +1487,7 @@ def test_terminal_replay_is_ledger_first_and_does_not_read_pending_or_execute() 
         application_outcomes=object(),
         write_operations=operations,
         write_coordinator=coordinator,
-        legacy_catalog_factory=_catalog_factory([0]),
+        **_initial_route_dependencies(_initial_route_components()),
     )
 
     execution = adapter.confirm(
@@ -1482,3 +1597,479 @@ def test_runtime_confirmation_stream_is_precomputed_and_never_enters_agent_host(
     assert host.calls == 0
     assert seen[-1] == "CompletedEvent"
     assert guard.complete(CompletionReason.NORMAL) is True
+
+
+class _InitialEntryAbort(BaseException):
+    pass
+
+
+def test_approved_legacy_context_revokes_issuance_when_bound_route_entry_aborts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.test_write_operation_acceptance_matrix import (
+        _legacy_confirmation_token,
+        _legacy_harness,
+        _propose,
+    )
+
+    sessions, _repository, chat, _coordinator, components = _legacy_harness(tmp_path)
+    conversation, pending = _propose(
+        chat,
+        "save_application_jd_version",
+        "jd_clarification",
+    )
+    arguments_digest, revision = pending_action_identity(
+        pending.tool_call_id,
+        pending.tool_name,
+        pending.args,
+    )
+
+    def abort_bound_route(**_kwargs: object) -> NoReturn:
+        raise _InitialEntryAbort
+
+    monkeypatch.setattr(
+        deterministic_module,
+        "_ApprovedLegacyBoundRoute",
+        abort_bound_route,
+    )
+    routes = components.confirmation_routes
+    with sessions() as write_session:
+        context = deterministic_module._ApprovedLegacyRouteContext(
+            routes=routes,
+            write_session=write_session,
+            session_factory=sessions,
+            lookup=LegacyConfirmationLookupIdentity(conversation_id=conversation.id),
+            confirmation_input=LegacyApprovedConfirmationInput(
+                decision="approved",
+                operation_id=pending.operation_id,
+                confirmation_token=_legacy_confirmation_token(pending),
+                edited_args_present=False,
+                edited_args=None,
+                rejection_feedback_present=False,
+                rejection_feedback="",
+            ),
+            operation_port=components.operation_port,
+            pending_port=components.pending_persistence_route_port,
+            pending_identity=PendingRouteIdentityV1(
+                conversation_id=conversation.id,
+                operation_id=pending.operation_id,
+                tool_call_id=pending.tool_call_id,
+                tool_name=pending.tool_name,
+                pending_action_revision=revision,
+                pending_confirmation_claim_id=pending.operation_id,
+                arguments_digest=arguments_digest,
+            ),
+            on_prepared=lambda _prepared: None,
+            on_bound=None,
+            jd_service=ApplicationJDService(sessions),
+            outcomes_repository=ApplicationOutcomesRepository(sessions),
+        )
+
+        with pytest.raises(_InitialEntryAbort):
+            context.__enter__()
+
+        assert context._lease is None
+        assert context._bound_route is None
+        assert routes.preparation_registry._entries == {}
+        assert routes.preparation_registry._prepared == {}
+        assert routes.pending_identity_verifier_port._issuance == {}
+
+
+class _InitialEntryPersistence(_Persistence):
+    def __init__(self, failure: str | None = None) -> None:
+        super().__init__()
+        self.failure = failure
+
+    def _raise_after_persist(self) -> None:
+        if self.failure == "exception":
+            raise RuntimeError("deterministic entry failed")
+        if self.failure == "cancelled":
+            raise asyncio.CancelledError
+        if self.failure == "base_exception":
+            raise _InitialEntryAbort
+
+    def persist_initial_pending(
+        self,
+        conversation_id: int,
+        messages: object,
+        pending: object,
+        *,
+        route_handle: object,
+    ) -> object:
+        result = super().persist_initial_pending(
+            conversation_id,
+            messages,
+            pending,
+            route_handle=route_handle,
+        )
+        self._raise_after_persist()
+        return result
+
+    def persist_clarification(
+        self,
+        conversation_id: int,
+        messages: object,
+        pending: object,
+        question: str,
+        *,
+        route_handle: object,
+    ) -> object:
+        result = super().persist_clarification(
+            conversation_id,
+            messages,
+            pending,
+            question,
+            route_handle=route_handle,
+        )
+        self._raise_after_persist()
+        return result
+
+
+_TEST_LEGACY_DATABASES: list[TemporaryDirectory[str]] = []
+
+
+def _initial_route_components() -> object:
+    database = TemporaryDirectory(
+        prefix="offerpilot-task11-deterministic-",
+        ignore_cleanup_errors=True,
+    )
+    _TEST_LEGACY_DATABASES.append(database)
+    root = Path(database.name)
+    sessions = init_database(root / "offerpilot.db")
+    repository = WriteOperationRepository(
+        sessions,
+        load_or_create_ledger_key(root, sessions),
+    )
+    chat = ChatRepository(sessions, repository)
+    conversations = tuple(chat.create_conversation(f"test-{index}") for index in range(7))
+    assert conversations[-1].id == 7
+    applications = ApplicationsRepository(sessions)
+    seeded = tuple(
+        applications.create(ApplicationCreate(f"Example {index}", "Backend"))
+        for index in range(1, 12)
+    )
+    assert seeded[-1].id == 11
+    jd_service = ApplicationJDService(sessions)
+    verifier = build_legacy_pending_identity_verifier_port(
+        backend=_SqlAlchemyLegacyPendingIdentityBackend(),
+        ledger_key=repository.key,
+    )
+    components = build_production_tool_metadata_components(
+        pending_identity_verifier_port=verifier,
+    )
+    initial = components.initial_routes
+    return SimpleNamespace(
+        metadata_components=components,
+        bundle=components.bundle,
+        typed_catalog=components.typed_catalog,
+        owner_lease_factory=initial.owner_lease_factory,
+        initial_route_port=initial.initial_route_port,
+        initial_issuer_for=initial.initial_issuer_for,
+        confirmation_routes=components.confirmation_routes,
+        operation_port=components.operation_port,
+        pending_persistence_route_port=components.pending_persistence_route_port,
+        repository=repository,
+        applications=applications,
+        jd_service=jd_service,
+        chat=chat,
+    )
+
+
+def _runtime_metadata_dependencies(components: object) -> dict[str, object]:
+    bundle = components.bundle
+    return {
+        "catalog": components.typed_catalog,
+        "metadata_bundle": bundle,
+        "metadata_components": components.metadata_components,
+        "provider_metadata_view": bundle.provider_view(),
+        "discovery_metadata_view": bundle.discovery_view(),
+        "authority_metadata_view": bundle.authority_view(),
+    }
+
+
+def _initial_entry_request(source: str) -> StartTurnRequest:
+    if source == "jd_clarification":
+        return StartTurnRequest(message="保存 JD")
+    if source == "jd_deterministic_action":
+        return StartTurnRequest(message="保存 JD：后端工程师")
+    if source == "submission_snapshot_action":
+        payload = {
+            "type": "application_submission_snapshot",
+            "resumeId": 1,
+            "jdVersionId": 1,
+            "materialKitId": None,
+            "submittedAt": "2026-08-26T00:00:00+00:00",
+            "note": "submitted",
+        }
+        return StartTurnRequest(
+            message="冻结本次投递材料",
+            pilot_action=PilotActionDescriptor(
+                kind="application_submission_snapshot",
+                value=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            ),
+        )
+    if source == "outcome_recording_action":
+        payload = {
+            "type": "application_outcome_record",
+            "snapshotId": 1,
+            "eventId": None,
+            "stage": "interview",
+            "result": "advanced",
+            "feedbackText": "clear communication",
+            "reflectionText": "prepare system design",
+            "nextActionText": "schedule next round",
+            "feedbackTags": ["communication"],
+            "occurredAt": "2026-08-26T00:00:00+00:00",
+        }
+        return StartTurnRequest(
+            message="记录本次投递结果",
+            pilot_action=PilotActionDescriptor(
+                kind="application_outcome_record",
+                value=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            ),
+        )
+    raise AssertionError(f"unsupported test source: {source}")
+
+
+def _initial_route_dependencies(components: object) -> dict[str, object]:
+    source_type = legacy_runtime.LegacyRouteSourceV1
+    return {
+        "legacy_request_owner_lease_factory": components.owner_lease_factory,
+        "legacy_initial_route_port": components.initial_route_port,
+        "legacy_jd_clarification_issuer": components.initial_issuer_for(
+            source_type("jd_clarification")
+        ),
+        "legacy_jd_deterministic_action_issuer": components.initial_issuer_for(
+            source_type("jd_deterministic_action")
+        ),
+        "legacy_submission_snapshot_issuer": components.initial_issuer_for(
+            source_type("submission_snapshot_action")
+        ),
+        "legacy_outcome_recording_issuer": components.initial_issuer_for(
+            source_type("outcome_recording_action")
+        ),
+        "legacy_confirmation_routes": components.confirmation_routes,
+        "operation_port": components.operation_port,
+        "pending_persistence_route_port": components.pending_persistence_route_port,
+    }
+
+
+def _adapter_with_initial_routes(
+    persistence: _Persistence,
+    components: object,
+) -> DeterministicPilotAdapter:
+    operations = _Operations()
+    persistence.backing_chat = components.chat
+    call_counter = 0
+
+    def next_call_id() -> str:
+        nonlocal call_counter
+        call_counter += 1
+        return f"call-deterministic-route-{call_counter}"
+
+    return DeterministicPilotAdapter(
+        persistence=persistence,
+        applications=components.applications,
+        application_jd_versions=components.jd_service,
+        application_outcomes=object(),
+        write_operations=operations,
+        write_coordinator=_Coordinator(operations, repository=components.repository),
+        **_initial_route_dependencies(components),
+        id_factory=next_call_id,
+        key_factory=lambda: "key-deterministic-route-1",
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "jd_clarification",
+        "jd_deterministic_action",
+        "submission_snapshot_action",
+        "outcome_recording_action",
+    ),
+)
+@pytest.mark.parametrize(
+    "exit_mode",
+    ("success", "pending_created", "exception", "cancelled", "base_exception"),
+)
+def test_real_deterministic_entries_use_only_the_matching_source_issuer_and_revoke(
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+    exit_mode: str,
+) -> None:
+    components = _initial_route_components()
+    owner_factory = components.owner_lease_factory
+    port = components.initial_route_port
+    source_type = legacy_runtime.LegacyRouteSourceV1
+    issuers = {
+        value: components.initial_issuer_for(source_type(value))
+        for value in (
+            "jd_clarification",
+            "jd_deterministic_action",
+            "submission_snapshot_action",
+            "outcome_recording_action",
+        )
+    }
+    issuer_type = type(next(iter(issuers.values())))
+    owner_factory_type = type(owner_factory)
+    port_type = type(port)
+    operation_port = components.operation_port
+    operation_port_type = type(operation_port)
+    selected_issuers: list[object] = []
+    owners: list[object] = []
+    child_leases: list[object] = []
+    tokens: list[object] = []
+    handles: list[object] = []
+    revoked_operation_handles: list[object] = []
+
+    original_open = owner_factory_type.open
+    original_open_child = issuer_type.open_request_lease
+    original_issue = issuer_type.issue
+    original_resolve = port_type.resolve_initial
+    original_revoke_legacy = operation_port_type.revoke_legacy
+
+    def open_owner(self: object) -> object:
+        owner = original_open(self)
+        owners.append(owner)
+        return owner
+
+    def open_child(self: object, owner: object) -> object:
+        selected_issuers.append(self)
+        child = original_open_child(self, owner)
+        child_leases.append(child)
+        return child
+
+    def issue(self: object, lease: object) -> object:
+        token = original_issue(self, lease)
+        tokens.append(token)
+        return token
+
+    def resolve(self: object, token: object) -> object:
+        handle = original_resolve(self, token)
+        handles.append(handle)
+        return handle
+
+    def revoke_legacy(self: object, handle: object) -> None:
+        revoked_operation_handles.append(handle)
+        original_revoke_legacy(self, handle)
+
+    monkeypatch.setattr(owner_factory_type, "open", open_owner)
+    monkeypatch.setattr(issuer_type, "open_request_lease", open_child)
+    monkeypatch.setattr(issuer_type, "issue", issue)
+    monkeypatch.setattr(port_type, "resolve_initial", resolve)
+    monkeypatch.setattr(operation_port_type, "revoke_legacy", revoke_legacy)
+
+    failure = exit_mode if exit_mode in {"exception", "cancelled", "base_exception"} else None
+    persistence = _InitialEntryPersistence(failure)
+    adapter = _adapter_with_initial_routes(persistence, components)
+    expected_error: type[BaseException] | None = {
+        "exception": RuntimeError,
+        "cancelled": asyncio.CancelledError,
+        "base_exception": _InitialEntryAbort,
+    }.get(exit_mode)
+    if expected_error is None:
+        execution = adapter.start_turn(_initial_entry_request(source), _Conversation())
+        assert isinstance(execution.outcome, (MessageOutcome, ConfirmationRequiredOutcome))
+        if exit_mode == "pending_created":
+            assert persistence.pending is not None or persistence.clarification is not None
+    else:
+        with pytest.raises(expected_error):
+            adapter.start_turn(_initial_entry_request(source), _Conversation())
+
+    assert selected_issuers == [issuers[source]]
+    assert len(owners) == len(child_leases) == len(tokens) == len(handles) == 1
+    expected_issuer = issuers[source]
+    assert object.__getattribute__(child_leases[0], "_registry") is object.__getattribute__(
+        expected_issuer,
+        "_registry",
+    )
+    with pytest.raises((TypeError, ValueError), match="closed|revoked|lease|handle"):
+        port.require_route(handles[0])
+    assert len(revoked_operation_handles) == (0 if source == "jd_clarification" else 1)
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "jd_clarification",
+        "jd_deterministic_action",
+        "submission_snapshot_action",
+        "outcome_recording_action",
+    ),
+)
+def test_consecutive_real_deterministic_requests_open_fresh_owner_and_child_leases(
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+) -> None:
+    components = _initial_route_components()
+    owner_factory_type = type(components.owner_lease_factory)
+    issuer_type = type(components.initial_issuer_for(legacy_runtime.LegacyRouteSourceV1(source)))
+    original_open = owner_factory_type.open
+    original_open_child = issuer_type.open_request_lease
+    owners: list[object] = []
+    children: list[object] = []
+
+    def open_owner(self: object) -> object:
+        owner = original_open(self)
+        owners.append(owner)
+        return owner
+
+    def open_child(self: object, owner: object) -> object:
+        child = original_open_child(self, owner)
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(owner_factory_type, "open", open_owner)
+    monkeypatch.setattr(issuer_type, "open_request_lease", open_child)
+    persistence = _InitialEntryPersistence()
+    adapter = _adapter_with_initial_routes(persistence, components)
+    for index in range(2):
+        if index:
+            components.chat.clear_pending_action(7)
+        persistence.pending = None
+        persistence.clarification = None
+        adapter.start_turn(_initial_entry_request(source), _Conversation())
+
+    assert len(owners) == len(children) == 2
+    assert owners[0] is not owners[1]
+    assert children[0] is not children[1]
+
+
+def test_confirmation_resume_never_requests_an_initial_source_issuer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    components = _initial_route_components()
+    owner_factory_type = type(components.owner_lease_factory)
+    issuer_type = type(
+        components.initial_issuer_for(legacy_runtime.LegacyRouteSourceV1("jd_clarification"))
+    )
+    initial_calls: list[str] = []
+
+    def forbidden_owner(_self: object) -> NoReturn:
+        initial_calls.append("owner")
+        raise AssertionError("confirmation resume cannot open an initial owner lease")
+
+    def forbidden_child(_self: object, _owner: object) -> NoReturn:
+        initial_calls.append("child")
+        raise AssertionError("confirmation resume cannot open an initial child lease")
+
+    persistence = _InitialEntryPersistence()
+    adapter = _adapter_with_initial_routes(persistence, components)
+    adapter.start_turn(_initial_entry_request("jd_deterministic_action"), _Conversation())
+    pending = persistence.pending
+    assert pending is not None
+    token = _confirmation_token(pending)
+    monkeypatch.setattr(owner_factory_type, "open", forbidden_owner)
+    monkeypatch.setattr(issuer_type, "open_request_lease", forbidden_child)
+
+    adapter.confirm(
+        ConfirmationRequest(
+            conversation_id=7,
+            approved=False,
+            confirmation_token=token,
+        ),
+        _Conversation(),
+    )
+    assert initial_calls == []

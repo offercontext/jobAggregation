@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, cast
 
 import pytest
@@ -7,37 +8,43 @@ import pytest
 from offerpilot.ai.tool_runtime.contracts import (
     BindingAudit,
     PreparedToolCall,
-    ProviderToolContract,
     ToolExecutionRecord,
     ToolFailure,
     ToolResultMetadata,
     ToolSpec,
     ToolSuccess,
 )
+from offerpilot.ai.tool_runtime.catalog import SegmentToolSpecHandle, ToolCatalog
+from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.ai.tool_runtime.rendering import render_compatibility
 from offerpilot.ai.tool_runtime.transport import project_transport_event
+from tests.tool_metadata.factories import compose_synthetic_bundle, synthetic_tool_spec
 
 
-def _spec(*, renderer: Any | None = None, metadata: Any | None = None) -> ToolSpec[dict[str, Any], dict[str, Any]]:
-    parameters = {"properties": {}, "type": "object"}
-    return ToolSpec(
-        contract=ProviderToolContract(
-            payload={
-                "type": "function",
-                "function": {
-                    "description": "read",
-                    "name": "read_one",
-                    "parameters": parameters,
-                },
-            },
-            name="read_one",
-            description="read",
-            parameters=parameters,
-        ),
-        decoder=lambda values: dict(values),
-        executor=lambda args, context: args,
-        kind="read",
-        result_metadata=metadata,
+def _test_spec_handle(spec: ToolSpec[Any, Any]) -> SegmentToolSpecHandle:
+    catalog = ToolCatalog((spec,), expected_names=(spec.name,))
+    source = compose_synthetic_bundle()
+    manifest = dict(cast(dict[str, object], source["manifest"]))
+    manifest["typed_tools"] = (spec.name,)
+    bundle = ToolMetadataBundleV1(
+        typed_catalog=catalog,
+        manifest=manifest,
+        legacy_boundary=cast(dict[str, object], source["legacy_boundary"]),
+        compensation=cast(dict[str, object], source["compensation"]),
+    )
+    lease = bundle.open_segment_lease()
+    handle = lease.resolve(spec.name)
+    assert handle is not None
+    assert lease.require_spec(handle) is spec
+    return handle
+
+
+def _spec(
+    *, renderer: Any | None = None, metadata: Any | None = None
+) -> ToolSpec[dict[str, Any], dict[str, Any]]:
+    return replace(
+        synthetic_tool_spec("read_one"),
+        result_metadata_projector=metadata,
         success_renderer=renderer or (lambda result: "visible success"),
     )
 
@@ -49,6 +56,7 @@ def _record(spec: ToolSpec[Any, Any], outcome: Any) -> ToolExecutionRecord[Any, 
         binding=BindingAudit("unavailable", 0),
         contract_fingerprint="sha256:" + "b" * 64,
         spec=spec,
+        spec_handle=_test_spec_handle(spec),
         tool_call_id="read-1",
         typed_args={},
     )

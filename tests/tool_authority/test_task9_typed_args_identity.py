@@ -8,6 +8,7 @@ import pytest
 
 from offerpilot.ai.tool_authority import AuthorityPhaseError
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
+from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.ai.tool_runtime.pipeline import execute_prepared, prepare_call
 from offerpilot.ai.types import ToolCall
 from tests.tool_authority.test_execution_claim import (
@@ -16,6 +17,7 @@ from tests.tool_authority.test_execution_claim import (
     _setup,
 )
 from tests.tool_pipeline.test_pipeline import Recorder, _runtime, _spec
+from tests.tool_metadata.factories import compose_synthetic_bundle
 
 
 class _SemanticOverrideDict(dict[str, Any]):
@@ -52,11 +54,26 @@ def test_read_rejects_replaced_typed_args_before_executor(
         return {"id": args["id"]}
 
     runtime = _runtime(tmp_path, Recorder())
+    lease = None
     try:
         spec = _spec(executor=executor)
         call = ToolCall(id="read-replaced", name=spec.name, args='{"id":1}')
+        catalog = ToolCatalog([spec], expected_names=(spec.name,))
+        source = compose_synthetic_bundle()
+        bundle = ToolMetadataBundleV1(
+            typed_catalog=catalog,
+            manifest={**source["manifest"], "typed_tools": (spec.name,)},
+            legacy_boundary=source["legacy_boundary"],
+            compensation=source["compensation"],
+        )
+        lease = bundle.open_segment_lease()
+        runtime.factory.bind_segment_tool_catalog(
+            runtime.authority,
+            authority_metadata_view=bundle.authority_view(),
+            catalog_lease=lease,
+        )
         result = prepare_call(
-            ToolCatalog([spec], expected_names=(spec.name,)),
+            lease,
             runtime.context,
             call,
             call_identity=runtime.prepare_identity(call),
@@ -74,6 +91,8 @@ def test_read_rejects_replaced_typed_args_before_executor(
             )
         assert calls == 0
     finally:
+        if lease is not None:
+            lease.close()
         runtime.close()
 
 

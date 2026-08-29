@@ -5,143 +5,122 @@ from pathlib import Path
 
 import pytest
 
-from offerpilot.ai.tool_authority.policy import DEPENDENCY_POLICY_VERSION
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_NAMES
-from offerpilot.context_projector.contracts import ProjectionError
-from offerpilot.context_projector.selector import (
-    DEPENDENCY_POLICY_V1,
-    DEPENDENCY_POLICY_V1_FINGERPRINT,
-    DependencyPolicyV1,
-    select_tools,
-    ToolSelectionSignals,
+from offerpilot.ai.tool_authority.policy import (
+    AGENT_TYPED_V1_PROFILE,
+    CAPABILITY_POLICY_VERSION,
+    DEPENDENCY_POLICY_VERSION,
 )
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.ai.tool_runtime.catalog import compile_tool_metadata_manifest
+from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
+from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
 from offerpilot.context_projector.authority_surface import (
     AuthoritySurfaceView,
     intersect_authority_surface,
 )
-from offerpilot.ai.tool_authority.policy import (
-    AGENT_TYPED_V1_PROFILE,
-    CAPABILITY_POLICY_VERSION,
-)
+from offerpilot.context_projector.contracts import ProjectionError, canonical_json, sha256_hex
+from offerpilot.context_projector.selector import ToolSelectionSignals, select_tools
+from offerpilot.pilot_runtime.compensation import prepare_compensation_handler_components
 
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "tool_authority" / "dependency_policy_v1.json"
+_TEST_TOOL_CATALOG = build_model_tool_catalog()
+_TEST_TOOL_NAMES = tuple(spec.name for spec in _TEST_TOOL_CATALOG.specs)
 
 
 def _fixture() -> dict[str, object]:
     return json.loads(FIXTURE.read_text(encoding="utf-8"))
 
 
+def _bundle() -> ToolMetadataBundleV1:
+    manifest = compile_tool_metadata_manifest(_TEST_TOOL_CATALOG.specs)
+    return ToolMetadataBundleV1(
+        typed_catalog=_TEST_TOOL_CATALOG,
+        manifest=manifest,
+        legacy_boundary=manifest.to_dict()["legacy_boundary"],
+        compensation=prepare_compensation_handler_components().metadata_projection(),
+    )
+
+
 def test_dependency_policy_v1_matches_read_only_canonical_golden() -> None:
     expected = _fixture()
-    assert DEPENDENCY_POLICY_V1.version == DEPENDENCY_POLICY_VERSION
-    assert DEPENDENCY_POLICY_V1.catalog_names == MODEL_TOOL_NAMES
-    assert DEPENDENCY_POLICY_V1.coverage == 25
-    assert DEPENDENCY_POLICY_V1.canonical_manifest() == {
+    discovery = _bundle().discovery_view()
+    actual = {
         "dependency_policy_version": expected["dependency_policy_version"],
-        "catalog_names": expected["catalog_names"],
-        "dependencies": expected["dependencies"],
+        "catalog_names": [entry.provider_name for entry in discovery.ordered_entries],
+        "dependencies": {
+            entry.provider_name: list(entry.dependencies) for entry in discovery.ordered_entries
+        },
     }
-    assert DEPENDENCY_POLICY_V1.canonical_fingerprint == expected["canonical_sha256"]
-    assert DEPENDENCY_POLICY_V1_FINGERPRINT == expected["canonical_sha256"]
+    assert actual["dependency_policy_version"] == DEPENDENCY_POLICY_VERSION
+    assert actual["catalog_names"] == list(_TEST_TOOL_NAMES)
+    assert actual["dependencies"] == expected["dependencies"]
+    assert "sha256:" + sha256_hex(canonical_json(actual)) == expected["canonical_sha256"]
 
 
-def test_runtime_rejects_semantically_weakened_dependency_policy_clone() -> None:
-    weakened = DependencyPolicyV1(
-        version=DEPENDENCY_POLICY_VERSION,
-        catalog_names=MODEL_TOOL_NAMES,
-        dependencies={name: () for name in MODEL_TOOL_NAMES},
-    )
-    weakened.validate_closed(MODEL_TOOL_NAMES, MODEL_TOOL_NAMES)
-
-    with pytest.raises(ProjectionError, match="dependency_policy_instance_mismatch"):
+def test_runtime_has_no_injected_dependency_policy_compatibility_path() -> None:
+    bundle = _bundle()
+    with pytest.raises(TypeError):
         select_tools(
-            MODEL_TOOL_CATALOG.provider_contracts(),
+            bundle.discovery_view(),
+            bundle.authority_view(),
             ToolSelectionSignals(page_kind="offers"),
-            dependency_policy=weakened,
+            dependency_policy=object(),  # type: ignore[call-arg]
         )
 
 
 def test_production_source_has_no_catalog_drift_or_injected_surface_fallback() -> None:
     source_root = Path(__file__).parents[2] / "src"
-    production = "\n".join(
-        path.read_text(encoding="utf-8") for path in source_root.rglob("*.py")
-    )
+    production = "\n".join(path.read_text(encoding="utf-8") for path in source_root.rglob("*.py"))
     assert "typed_catalog_drift" not in production
     assert "_project_injected_surface" not in production
     assert "injected-surface-v1" not in production
 
 
-def test_dependency_policy_rejects_unknown_missing_cycle_and_version_drift() -> None:
-    dependencies = {
-        name: tuple(DEPENDENCY_POLICY_V1.dependencies[name]) for name in MODEL_TOOL_NAMES
-    }
-    cases = []
-    unknown_node = dict(dependencies)
-    unknown_node["unknown"] = ()
-    cases.append(unknown_node)
-    missing_node = dict(dependencies)
-    del missing_node[MODEL_TOOL_NAMES[-1]]
-    cases.append(missing_node)
-    unknown_dependency = dict(dependencies)
-    unknown_dependency[MODEL_TOOL_NAMES[0]] = ("unknown",)
-    cases.append(unknown_dependency)
-    cycle = dict(dependencies)
-    cycle["list_applications"] = ("get_application",)
-    cases.append(cycle)
-    for invalid in cases:
-        with pytest.raises(ProjectionError):
-            DependencyPolicyV1(
-                version=DEPENDENCY_POLICY_VERSION,
-                catalog_names=MODEL_TOOL_NAMES,
-                dependencies=invalid,
-            ).validate_closed(MODEL_TOOL_NAMES, MODEL_TOOL_NAMES)
-    with pytest.raises(ProjectionError, match="unsupported_dependency_policy_version"):
-        DependencyPolicyV1(
-            version="dependency-policy-v2",
-            catalog_names=MODEL_TOOL_NAMES,
-            dependencies=dependencies,
-        ).validate_closed(MODEL_TOOL_NAMES, MODEL_TOOL_NAMES)
-
-
-def test_dependency_policy_rejects_open_or_unknown_selection() -> None:
-    with pytest.raises(ProjectionError, match="tool_dependency_not_closed"):
-        DEPENDENCY_POLICY_V1.validate_closed(("get_offer",), MODEL_TOOL_NAMES)
-    with pytest.raises(ProjectionError, match="unknown_selected_tool"):
-        DEPENDENCY_POLICY_V1.validate_closed(("unknown",), MODEL_TOOL_NAMES)
-
-
-def test_selector_and_authority_surface_share_exact_policy_instance(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    seen: list[object] = []
-    original = DependencyPolicyV1.validate_closed
-
-    def validate(
-        self: DependencyPolicyV1,
-        selected_names: tuple[str, ...],
-        catalog_names: tuple[str, ...],
-    ) -> None:
-        seen.append(self)
-        original(self, selected_names, catalog_names)
-
-    monkeypatch.setattr(DependencyPolicyV1, "validate_closed", validate)
+def test_authority_filter_rejects_a_dependency_open_capability_surface() -> None:
+    bundle = _bundle()
     selection = select_tools(
-        MODEL_TOOL_CATALOG.provider_contracts(),
-        ToolSelectionSignals(page_kind="offers"),
-        dependency_policy=DEPENDENCY_POLICY_V1,
+        bundle.discovery_view(),
+        bundle.authority_view(),
+        ToolSelectionSignals(page_kind="workspace", trusted_domains=("offers",)),
     )
-    intersect_authority_surface(
-        MODEL_TOOL_CATALOG,
-        selection,
-        AuthoritySurfaceView(
-            capability_profile_id="agent_typed_v1",
-            capability_policy_version=CAPABILITY_POLICY_VERSION,
-            dependency_policy_version=DEPENDENCY_POLICY_VERSION,
-            capabilities=frozenset(AGENT_TYPED_V1_PROFILE.capabilities),
-            context_type="workspace",
-        ),
-        dependency_policy=DEPENDENCY_POLICY_V1,
+    offers_write = next(
+        capability
+        for capability in AGENT_TYPED_V1_PROFILE.capabilities
+        if str(capability) == "offers.write"
     )
-    assert seen == [DEPENDENCY_POLICY_V1, DEPENDENCY_POLICY_V1]
+    with pytest.raises(ProjectionError, match="tool_dependency_not_closed"):
+        intersect_authority_surface(
+            bundle.discovery_view(),
+            bundle.authority_view(),
+            selection,
+            AuthoritySurfaceView(
+                capability_profile_id="agent_typed_v1",
+                capability_policy_version=CAPABILITY_POLICY_VERSION,
+                dependency_policy_version=DEPENDENCY_POLICY_VERSION,
+                capabilities=frozenset({offers_write}),
+                context_type="workspace",
+            ),
+        )
+
+
+def test_selector_and_authority_surface_require_views_from_the_same_bundle() -> None:
+    first = _bundle()
+    second = _bundle()
+    selection = select_tools(
+        first.discovery_view(),
+        first.authority_view(),
+        ToolSelectionSignals(page_kind="workspace"),
+    )
+    with pytest.raises(ProjectionError, match="Bundle"):
+        intersect_authority_surface(
+            first.discovery_view(),
+            second.authority_view(),
+            selection,
+            AuthoritySurfaceView(
+                capability_profile_id="agent_typed_v1",
+                capability_policy_version=CAPABILITY_POLICY_VERSION,
+                dependency_policy_version=DEPENDENCY_POLICY_VERSION,
+                capabilities=frozenset(AGENT_TYPED_V1_PROFILE.capabilities),
+                context_type="workspace",
+            ),
+        )

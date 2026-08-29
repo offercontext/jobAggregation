@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -14,7 +15,8 @@ from golden import load_golden
 
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
 from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
-from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
+from offerpilot.ai.tool_runtime.context import ToolExecutionContext
+from offerpilot.ai.tool_runtime.policy_types import ToolCapability
 from offerpilot.ai.tool_runtime.contracts import (
     ConfirmationRequired,
     ProviderToolContract,
@@ -22,6 +24,8 @@ from offerpilot.ai.tool_runtime.contracts import (
     ToolFailure,
     ToolSpec,
 )
+from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
+from offerpilot.ai.tool_runtime.journal import project_tool_proposed
 from offerpilot.ai.tool_runtime.pipeline import execute_prepared, prepare_call
 from offerpilot.ai.types import ToolCall
 from offerpilot.agent_runtime.journal import EventInput
@@ -31,6 +35,12 @@ from offerpilot.repositories.jd import JDAnalysesRepository
 from offerpilot.repositories.notes import NotesRepository
 from offerpilot.repositories.offers import OffersRepository
 from offerpilot.repositories.resumes import ResumesRepository
+from tests.tool_metadata.factories import (
+    compose_synthetic_bundle,
+    presentation_binding,
+    read_metadata,
+    write_metadata,
+)
 
 
 class FailingStartedRecorder:
@@ -131,6 +141,29 @@ def _digest(raw: str) -> str:
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
+def _bundle(catalog: ToolCatalog) -> ToolMetadataBundleV1:
+    source = compose_synthetic_bundle()
+    manifest = dict(cast(dict[str, object], source["manifest"]))
+    manifest["typed_tools"] = tuple(spec.name for spec in catalog.specs)
+    return ToolMetadataBundleV1(
+        typed_catalog=catalog,
+        manifest=manifest,
+        legacy_boundary=cast(dict[str, object], source["legacy_boundary"]),
+        compensation=cast(dict[str, object], source["compensation"]),
+    )
+
+
+def _lease(catalog: ToolCatalog, context: ToolExecutionContext) -> Any:
+    bundle = _bundle(catalog)
+    lease = bundle.open_segment_lease()
+    context.authority_factory.bind_segment_tool_catalog(
+        context.authority,
+        authority_metadata_view=bundle.authority_view(),
+        catalog_lease=lease,
+    )
+    return lease
+
+
 def _prepare(
     catalog: ToolCatalog,
     context: ToolExecutionContext,
@@ -148,7 +181,13 @@ def _prepare(
         tool_name=call.name,
         arguments_digest=_digest(call.args),
     )
-    return prepare_call(catalog, context, call, call_identity=identity, **kwargs)
+    return prepare_call(
+        _lease(catalog, context),
+        context,
+        call,
+        call_identity=identity,
+        **kwargs,
+    )
 
 
 def _execute_read(prepared: Any, context: ToolExecutionContext, invocation: Any) -> Any:
@@ -162,7 +201,18 @@ def _execute_read(prepared: Any, context: ToolExecutionContext, invocation: Any)
     return execute_prepared(prepared, context, call_identity=identity)
 
 
-def _runtime(recorder: FailingStartedRecorder, executor: Any) -> tuple[ToolCatalog, ToolExecutionContext, ToolSpec[Any, Any], AuthorityFactory, Any]:
+def _decode_mapping(values: Any) -> dict[str, Any]:
+    return dict(values)
+
+
+def _render_empty_items(result: Any) -> str:
+    del result
+    return '{"items":[]}'
+
+
+def _runtime(
+    recorder: FailingStartedRecorder, executor: Any
+) -> tuple[ToolCatalog, ToolExecutionContext, ToolSpec[Any, Any], AuthorityFactory, Any]:
     parameters = {"properties": {"id": {"type": "integer"}}, "type": "object"}
     spec = ToolSpec(
         contract=ProviderToolContract(
@@ -178,11 +228,16 @@ def _runtime(recorder: FailingStartedRecorder, executor: Any) -> tuple[ToolCatal
             description="read",
             parameters=parameters,
         ),
-        decoder=lambda values: dict(values),
+        metadata=replace(
+            read_metadata(),
+            required_capabilities=(ToolCapability.APPLICATIONS_READ,),
+        ),
+        resolver_bindings=(),
+        undo_builder_binding=None,
+        decoder=_decode_mapping,
         executor=executor,
-        kind="read",
-        required_capabilities=frozenset({ToolCapability.APPLICATIONS_READ}),
-        success_renderer=lambda result: '{"items":[]}',
+        presentation=presentation_binding(),
+        success_renderer=_render_empty_items,
     )
     context, factory, invocation = _authority_context(
         recorder,
@@ -193,7 +248,9 @@ def _runtime(recorder: FailingStartedRecorder, executor: Any) -> tuple[ToolCatal
 
 def test_pipeline_journal_sequence_matches_first_phase_golden() -> None:
     recorder = FailingStartedRecorder()
-    catalog, context, spec, factory, invocation = _runtime(recorder, lambda args, runtime: {"items": []})
+    catalog, context, spec, factory, invocation = _runtime(
+        recorder, lambda args, runtime: {"items": []}
+    )
     prepared = _prepare(
         catalog,
         context,
@@ -210,6 +267,58 @@ def test_pipeline_journal_sequence_matches_first_phase_golden() -> None:
     ]
     started = recorder.events[1]
     assert started.facts["result_contract"] == "legacy_string_v1"
+    factory.close()
+
+
+def test_proposal_projection_uses_authority_entry_when_raw_spec_metadata_drifts() -> None:
+    recorder = FailingStartedRecorder()
+    catalog, _context, spec, factory, _invocation = _runtime(
+        recorder, lambda args, runtime: {"items": []}
+    )
+    authority_entry = _bundle(catalog).authority_view().entries[spec.name]
+
+    object.__setattr__(spec.metadata, "operation", write_metadata().operation)
+    object.__setattr__(spec.metadata, "confirmation_policy", "required")
+
+    assert project_tool_proposed(
+        cast(Any, recorder),
+        authority_entry,
+        ToolCall(id="read-1", name=spec.name, args="{}"),
+    )
+    assert recorder.events[0].facts["tool_kind"] == "read"
+    assert recorder.events[0].facts["proposal_outcome"] == "execution_allowed"
+    factory.close()
+
+
+def test_proposal_projection_rejects_cross_or_fake_authority_entries() -> None:
+    recorder = FailingStartedRecorder()
+    catalog, _context, spec, factory, _invocation = _runtime(
+        recorder, lambda args, runtime: {"items": []}
+    )
+    authority_entry = _bundle(catalog).authority_view().entries[spec.name]
+    call = ToolCall(id="read-1", name=spec.name, args="{}")
+
+    with pytest.raises(ValueError, match="does not match"):
+        project_tool_proposed(
+            cast(Any, recorder),
+            replace(authority_entry, provider_name="get_application"),
+            call,
+        )
+    with pytest.raises(TypeError, match="exact ToolAuthorityEntryV1"):
+        project_tool_proposed(
+            cast(Any, recorder),
+            cast(
+                Any,
+                SimpleNamespace(
+                    provider_name=spec.name,
+                    operation_kind=authority_entry.operation_kind,
+                    confirmation_policy=authority_entry.confirmation_policy,
+                ),
+            ),
+            call,
+        )
+
+    assert recorder.events == []
     factory.close()
 
 
@@ -246,11 +355,15 @@ def _write_runtime(
             description="write",
             parameters=parameters,
         ),
-        decoder=lambda values: dict(values),
+        metadata=replace(
+            write_metadata(),
+            required_capabilities=(ToolCapability.APPLICATIONS_WRITE,),
+        ),
+        resolver_bindings=(),
+        undo_builder_binding=None,
+        decoder=_decode_mapping,
         executor=executor,
-        kind="write",
-        required_capabilities=frozenset({ToolCapability.APPLICATIONS_WRITE}),
-        confirmation_policy="required",
+        presentation=presentation_binding(),
     )
     context, factory, invocation = _authority_context(
         recorder,
@@ -311,7 +424,9 @@ def test_executor_exception_journal_sequence_matches_first_phase_golden() -> Non
 
 def test_write_waiting_and_rejection_sequences_match_first_phase_golden() -> None:
     recorder = FailingStartedRecorder()
-    catalog, context, spec, factory, invocation = _write_runtime(recorder, lambda args, runtime: args)
+    catalog, context, spec, factory, invocation = _write_runtime(
+        recorder, lambda args, runtime: args
+    )
     prepared = _prepare(
         catalog,
         context,
@@ -340,7 +455,9 @@ def test_write_waiting_and_rejection_sequences_match_first_phase_golden() -> Non
 
 def test_pre_execution_stale_claim_sequence_matches_first_phase_golden() -> None:
     recorder = FailingStartedRecorder()
-    catalog, context, spec, factory, invocation = _write_runtime(recorder, lambda args, runtime: args)
+    catalog, context, spec, factory, invocation = _write_runtime(
+        recorder, lambda args, runtime: args
+    )
     prepared = _prepare(
         catalog,
         context,
@@ -390,16 +507,14 @@ def test_pre_execution_stale_claim_sequence_matches_first_phase_golden() -> None
         run_recorder=cast(Any, recorder),
         operation_executor=lambda *_args: pytest.fail("stale claim reached operation executor"),
     )
-    approval_factory.register_tool_execution_context(
-        approval_context, authority=approval_authority
-    )
+    approval_factory.register_tool_execution_context(approval_context, authority=approval_authority)
     prepare_identity = approval_factory.create_approved_write_prepare_identity(
         approval_authority,
         approval_context=approval_context,
         request_identity=object(),
     )
     approved = prepare_call(
-        catalog,
+        _lease(catalog, approval_context),
         approval_context,
         ToolCall(
             id="write-1",
@@ -450,10 +565,15 @@ def test_pre_execution_validation_sequence_matches_first_phase_golden() -> None:
             description="read",
             parameters=parameters,
         ),
-        decoder=lambda values: dict(values),
+        metadata=replace(
+            read_metadata(),
+            required_capabilities=(ToolCapability.APPLICATIONS_READ,),
+        ),
+        resolver_bindings=(),
+        undo_builder_binding=None,
+        decoder=_decode_mapping,
         executor=lambda args, runtime: args,
-        kind="read",
-        required_capabilities=frozenset({ToolCapability.APPLICATIONS_READ}),
+        presentation=presentation_binding(),
     )
     context, factory, invocation = _authority_context(
         recorder,

@@ -35,13 +35,13 @@ from offerpilot.ai.confirmation import prepare_pending_action
 from offerpilot.ai.tool_authority import (
     ApprovalExecutionAuthority,
     AuthorityFactory,
-    PendingAuthorityClaim,
     TrustedContextScope,
 )
 from offerpilot.ai.tool_authority.visibility import (
     AuthorityApplicationVisibilityError,
     AuthorityApplicationVisibilityQuery,
 )
+from offerpilot.ai.tool_runtime.catalog import SegmentToolCatalogLease, SegmentToolSpecHandle
 from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_runtime.contracts import (
     JSONValue,
@@ -56,17 +56,20 @@ from offerpilot.ai.write_operations import (
     DeliveryHeartbeat,
     DeliveryOwnership,
     LedgerOperationPreheader,
-    LedgerPendingPointer,
     OperationCommitted,
     OperationExecution,
     OperationFailed,
     OperationReplay,
     OperationUnknown,
+    PendingPersistenceRouteHandle,
+    PendingPersistenceRoutePort,
+    PendingRouteIdentityV1,
     WriteOperationError,
     ledger_fingerprint,
     operation_request_fingerprint,
     pending_action_identity,
 )
+from offerpilot.ai.tool_runtime.metadata import OperationRouteIdentityV1, ToolOperationMetadataPort
 from offerpilot.models import Conversation, WriteOperation
 
 from .contracts import (
@@ -93,6 +96,8 @@ LedgerExecutor = Callable[
     [PreparedToolCall[Any, Any], object, object],
     ToolExecutionRecord[Any, Any],
 ]
+
+
 class ConfirmationPendingReader(Protocol):
     """The only persistence read needed before a confirmation claim."""
 
@@ -120,7 +125,9 @@ class ConfirmationOperationRepository(Protocol):
 
     def replay(self, operation: object, request_fingerprint: str) -> OperationReplay: ...
 
-    def converge_expired_delivery(self, operation_id: str) -> OperationReplay | OperationUnknown: ...
+    def converge_expired_delivery(
+        self, operation_id: str
+    ) -> OperationReplay | OperationUnknown: ...
 
     def heartbeat(self, ownership: DeliveryOwnership) -> bool: ...
 
@@ -130,7 +137,9 @@ class ConfirmationWriteCoordinator(Protocol):
 
     def reject_primary(self, **kwargs: object) -> OperationExecution: ...
 
-    def execute_primary(self, **kwargs: object) -> tuple[OperationExecution, ToolExecutionRecord[Any, Any] | None]: ...
+    def execute_primary(
+        self, **kwargs: object
+    ) -> tuple[OperationExecution, ToolExecutionRecord[Any, Any] | None]: ...
 
 
 _STALE_APPROVAL_CODES = frozenset(
@@ -257,9 +266,7 @@ class ApprovalAuthorityResolver:
                         session, context_ref
                     )
                 except AuthorityApplicationVisibilityError as exc:
-                    raise WriteOperationError(
-                        "operation_not_committed", retryable=True
-                    ) from exc
+                    raise WriteOperationError("operation_not_committed", retryable=True) from exc
                 if active is None:
                     raise WriteOperationError("authorization_scope_unavailable")
         self._bind_pending_identity(
@@ -422,10 +429,14 @@ def _invoke(
             if parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
                 if parameter.name in values:
                     named_args.append(values[parameter.name])
-            elif parameter.kind in {
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                inspect.Parameter.KEYWORD_ONLY,
-            } and parameter.name in values:
+            elif (
+                parameter.kind
+                in {
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                }
+                and parameter.name in values
+            ):
                 named_kwargs[parameter.name] = values[parameter.name]
         if has_var_keyword:
             keyword_values = dict(values)
@@ -562,10 +573,10 @@ class ConfirmationDependencies:
     write_operations: ConfirmationOperationRepository | None = None
     write_coordinator: ConfirmationWriteCoordinator | None = None
     catalog: object | None = None
-    undo_seed_builder: Callable[..., Mapping[str, Any]] | None = field(
+    operation_port: ToolOperationMetadataPort | None = field(
         default=None, repr=False, compare=False
     )
-    undo_builder: Callable[..., Mapping[str, Any] | None] | None = field(
+    pending_persistence_route_port: PendingPersistenceRoutePort | None = field(
         default=None, repr=False, compare=False
     )
     approval_context_resolver: Callable[..., ToolExecutionContext] | None = field(
@@ -623,7 +634,11 @@ class ConfirmationState:
     undo_update: Mapping[str, Any] | None = field(default=None, repr=False)
     undo_operation_id: str = field(default="", repr=False)
     prepared_call: object | None = field(default=None, repr=False, compare=False)
-    approval_context: ToolExecutionContext | None = field(
+    approval_context: ToolExecutionContext | None = field(default=None, repr=False, compare=False)
+    approval_catalog_lease: SegmentToolCatalogLease | None = field(
+        default=None, repr=False, compare=False
+    )
+    approval_spec_handle: SegmentToolSpecHandle | None = field(
         default=None, repr=False, compare=False
     )
     delivery_ownership: DeliveryOwnership | None = field(default=None, repr=False)
@@ -652,7 +667,7 @@ class DeliveryBundle:
     messages: tuple[Message, ...]
     pending: PendingAction | None = None
     clarification: tuple[PendingAction, str] | None = None
-    pending_authority_claim: PendingAuthorityClaim | None = field(
+    route_handle: PendingPersistenceRouteHandle | None = field(
         default=None, repr=False, compare=False
     )
 
@@ -663,11 +678,9 @@ class DeliveryBundle:
             raise TypeError("messages must contain Message values")
         if self.pending is not None and self.clarification is not None:
             raise ValueError("pending and clarification cannot both be delivered")
-        if self.pending_authority_claim is not None:
-            if type(self.pending_authority_claim) is not PendingAuthorityClaim:
-                raise TypeError("pending_authority_claim must be an exact PendingAuthorityClaim")
+        if self.route_handle is not None:
             if self.pending is None:
-                raise ValueError("pending_authority_claim requires a chained Pending")
+                raise ValueError("route_handle requires a chained Pending")
 
 
 @dataclass(slots=True, repr=False)
@@ -810,14 +823,28 @@ class ConfirmationReplayError(RuntimeError):
         self.replay = replay
 
 
-def _replayed_pending_payload(replay: OperationReplay) -> PendingActionPayload:
+def _replayed_pending_payload(
+    replay: OperationReplay,
+    operation: object | None,
+) -> PendingActionPayload:
     pending = replay.chained_pending
-    if (
-        pending is None
-        or pending.adapter_kind != "typed"
-        or pending.decoded_args is None
-    ):
+    if pending is None or pending.decoded_args is None:
         raise WriteOperationError("operation_delivery_unknown", retryable=True)
+    if operation is None:
+        if pending.adapter_kind != "typed":
+            raise WriteOperationError("operation_delivery_unknown", retryable=True)
+    else:
+        parent_adapter_kind = str(cast(Any, operation).adapter_kind or "")
+        parent_tool_name = str(_attribute(operation, "tool_name", "") or "")
+        if (
+            pending.adapter_kind != parent_adapter_kind
+            or parent_adapter_kind not in {"typed", "legacy_deterministic"}
+            or (
+                parent_adapter_kind == "legacy_deterministic"
+                and pending.tool_name != parent_tool_name
+            )
+        ):
+            raise WriteOperationError("operation_delivery_unknown", retryable=True)
     canonical_args = json.dumps(
         pending.decoded_args,
         ensure_ascii=False,
@@ -852,7 +879,7 @@ def _runtime_replay(
     if replay.delivery_status not in {"pending", "completed", "failed"}:
         raise WriteOperationError("operation_integrity_error")
     if replay.delivery_outcome == "chained_pending":
-        pending_payload = _replayed_pending_payload(replay)
+        pending_payload = _replayed_pending_payload(replay, operation)
         return ConfirmationRequiredOutcome(
             confirmation_token=pending_payload.confirmation_token,
             conversation_id=conversation_id,
@@ -870,15 +897,9 @@ def _runtime_replay(
     if not isinstance(transport, Mapping):
         raise WriteOperationError("operation_integrity_error")
     tool_call_id = str(
-        transport.get("tool_call_id")
-        or _attribute(operation, "tool_call_id", "")
-        or ""
+        transport.get("tool_call_id") or _attribute(operation, "tool_call_id", "") or ""
     )
-    tool_name = str(
-        transport.get("tool_name")
-        or _attribute(operation, "tool_name", "")
-        or ""
-    )
+    tool_name = str(transport.get("tool_name") or _attribute(operation, "tool_name", "") or "")
     if not tool_call_id or not tool_name:
         raise WriteOperationError("operation_integrity_error")
 
@@ -917,7 +938,10 @@ def _runtime_replay(
             raise WriteOperationError("operation_integrity_error") from exc
         if not isinstance(decoded, Mapping):
             raise WriteOperationError("operation_integrity_error")
-        undo = cast(Mapping[str, JSONValue], dict(decoded))
+        undo = {
+            **cast(dict[str, JSONValue], dict(decoded)),
+            "parent_operation_id": replay.operation_id,
+        }
     return OperationReplayOutcome(
         operation_id=replay.operation_id,
         conversation_id=conversation_id,
@@ -973,46 +997,16 @@ class ConfirmationCoordinator:
 
     def _preheader(self, request: ConfirmationRequest) -> LedgerOperationPreheader:
         repository = self.dependencies.write_operations
-        loader = _callable(repository, ("operation_preheader", "load_operation_preheader"))
-        if loader is not None:
-            value = _invoke(
-                loader,
-                {
-                    "conversation_id": request.conversation_id,
-                    "operation_id": request.operation_id,
-                },
-                (),
-            )
-            if not isinstance(value, LedgerOperationPreheader):
-                operation = _attribute(value, "operation")
-                pointer = _attribute(value, "pending_pointer")
-                if operation is None or not isinstance(pointer, LedgerPendingPointer):
-                    raise WriteOperationError("operation_unavailable")
-                value = LedgerOperationPreheader(cast(Any, operation), pointer)
-            return value
-        # Compatibility for narrow test doubles with an explicit Ledger id.
-        # Production repositories always expose the bounded projection above;
-        # an omitted id never falls back to reading a full Pending object.
-        if not request.operation_id:
-            raise WriteOperationError("operation_unavailable")
-        operation = self._operation(request.operation_id)
-        if operation is None:
-            raise WriteOperationError("operation_result_unknown", retryable=True)
-        operation_conversation_id = _attribute(operation, "conversation_id")
-        if operation_conversation_id is None:
-            raise WriteOperationError("operation_unavailable")
-        if operation_conversation_id != request.conversation_id:
-            raise WriteOperationError("operation_identity_conflict")
-        return LedgerOperationPreheader(
-            cast(Any, operation),
-            LedgerPendingPointer(
+        try:
+            value = cast(Any, repository).operation_preheader(
                 conversation_id=request.conversation_id,
-                operation_id=str(_attribute(operation, "id", "") or ""),
-                tool_call_id=str(_attribute(operation, "tool_call_id", "") or ""),
-                tool_name=str(_attribute(operation, "tool_name", "") or ""),
-                pending_confirmation_claim_id="",
-            ),
-        )
+                operation_id=request.operation_id,
+            )
+        except AttributeError as exc:
+            raise WriteOperationError("operation_unavailable") from exc
+        if type(value) is not LedgerOperationPreheader:
+            raise WriteOperationError("operation_unavailable")
+        return value
 
     def operation_preheader(self, request: ConfirmationRequest) -> LedgerOperationPreheader:
         """Load the bounded Ledger route identity exactly once for Runtime dispatch."""
@@ -1277,7 +1271,7 @@ class ConfirmationCoordinator:
             transport = json.loads(replay.payload.transport_json or "{}")
         except (TypeError, ValueError, json.JSONDecodeError):
             transport = None
-        if (
+        if operation is None and (
             not isinstance(transport, Mapping)
             or not transport.get("tool_call_id")
             or not transport.get("tool_name")
@@ -1292,8 +1286,6 @@ class ConfirmationCoordinator:
     def preflight_live(
         self,
         request: ConfirmationRequest,
-        *,
-        catalog: object | None = None,
     ) -> PendingAction:
         """Validate a live approval before any Conversation/model work.
 
@@ -1329,7 +1321,7 @@ class ConfirmationCoordinator:
                 raise ConfirmationReplayError(changed)
             raise WriteOperationError("operation_result_unknown", retryable=True)
         if (
-            _attribute(operation, "adapter_kind") == "typed"
+            cast(Any, operation).adapter_kind == "typed"
             and _attribute(operation, "authorization_scope_fingerprint") is None
         ):
             raise WriteOperationError("authorization_scope_unbound")
@@ -1337,12 +1329,6 @@ class ConfirmationCoordinator:
         if request.confirmation_token and not compare_digest(token, request.confirmation_token):
             raise WriteOperationError("operation_input_conflict")
         self._fingerprint(live, request, token, operation)
-        if catalog is not None:
-            edited = None if request.edited_args.is_missing() else dict(request.edited_args.as_mapping)
-            try:
-                prepare_pending_action(live, cast(Any, catalog), cast(Any, edited))
-            except ValueError as exc:
-                raise WriteOperationError("invalid_confirmation") from exc
         return live
 
     # ---- Live Pending/session construction ------------------------------
@@ -1355,7 +1341,8 @@ class ConfirmationCoordinator:
         approved: bool,
         conversation: object | None = None,
         undo_seed: Mapping[str, Any] | None = None,
-        catalog: object | None = None,
+        catalog_lease: SegmentToolCatalogLease | None = None,
+        spec_handle: SegmentToolSpecHandle | None = None,
     ) -> ConfirmationSession:
         replay = self.terminal_replay(request)
         if replay is not None:
@@ -1377,10 +1364,12 @@ class ConfirmationCoordinator:
         if _status(operation) != "proposed":
             # The row changed after the first Ledger-first read.  Re-run the
             # terminal branch with a fresh row; never inspect stale Pending.
-            raise ConfirmationReplayError(cast(OperationReplay, self.terminal_replay(request, operation=operation)))
+            raise ConfirmationReplayError(
+                cast(OperationReplay, self.terminal_replay(request, operation=operation))
+            )
         if (
             approved
-            and _attribute(operation, "adapter_kind") == "typed"
+            and cast(Any, operation).adapter_kind == "typed"
             and _attribute(operation, "authorization_scope_fingerprint") is None
         ):
             raise WriteOperationError("authorization_scope_unbound")
@@ -1402,15 +1391,20 @@ class ConfirmationCoordinator:
             edited_mapping = (
                 None if edited.is_missing() else cast(dict[str, JSONValue], dict(edited.as_mapping))
             )
-            selected_catalog = catalog if catalog is not None else self.dependencies.catalog
-            if selected_catalog is not None:
-                # This is the schema/edit boundary.  Reject never enters it.
-                try:
-                    effective = prepare_pending_action(
-                        live, cast(Any, selected_catalog), edited_mapping
-                    )
-                except ValueError as exc:
-                    raise WriteOperationError("invalid_confirmation") from exc
+            if (
+                type(catalog_lease) is not SegmentToolCatalogLease
+                or type(spec_handle) is not SegmentToolSpecHandle
+            ):
+                raise WriteOperationError("operation_unavailable")
+            try:
+                effective = prepare_pending_action(
+                    live,
+                    catalog_lease,
+                    spec_handle,
+                    edited_mapping,
+                )
+            except ValueError as exc:
+                raise WriteOperationError("invalid_confirmation") from exc
         approval_context: ToolExecutionContext | None = None
         context_resolver = self.dependencies.approval_context_resolver
         if approved and context_resolver is not None:
@@ -1434,9 +1428,7 @@ class ConfirmationCoordinator:
             except WriteOperationError:
                 raise
             except Exception as exc:
-                raise WriteOperationError(
-                    "operation_not_committed", retryable=True
-                ) from exc
+                raise WriteOperationError("operation_not_committed", retryable=True) from exc
             if not isinstance(resolved_context, ToolExecutionContext):
                 raise WriteOperationError("operation_not_committed", retryable=True)
             approval_context = resolved_context
@@ -1463,7 +1455,9 @@ class ConfirmationCoordinator:
             generation = None
         else:
             candidate_generation = _attribute(conversation, "updated_at")
-            generation = candidate_generation if isinstance(candidate_generation, datetime) else None
+            generation = (
+                candidate_generation if isinstance(candidate_generation, datetime) else None
+            )
         state = ConfirmationState(
             identity=identity,
             pending=live,
@@ -1474,6 +1468,8 @@ class ConfirmationCoordinator:
             undo_seed=dict(undo_seed or {}),
             prepared_call=preflight_result,
             approval_context=approval_context,
+            approval_catalog_lease=catalog_lease if approved else None,
+            approval_spec_handle=spec_handle if approved else None,
             continuation_generation=generation,
         )
         live_session: ConfirmationSession | None = None
@@ -1596,7 +1592,8 @@ class ConfirmationCoordinator:
         pending: PendingAction | None = None,
         conversation: object | None = None,
         undo_seed: Mapping[str, Any] | None = None,
-        catalog: object | None = None,
+        catalog_lease: SegmentToolCatalogLease,
+        spec_handle: SegmentToolSpecHandle,
     ) -> ConfirmationSession:
         if not request.approved:
             raise ValueError("approve_modify requires approved=true")
@@ -1606,7 +1603,8 @@ class ConfirmationCoordinator:
             approved=True,
             conversation=conversation,
             undo_seed=undo_seed,
-            catalog=catalog,
+            catalog_lease=catalog_lease,
+            spec_handle=spec_handle,
         )
 
     def reject(
@@ -1659,9 +1657,7 @@ class ConfirmationCoordinator:
                 tool_name=pointer.tool_name,
                 request_fingerprint=fingerprint,
                 confirmation_token=request.confirmation_token or "",
-                proposal_fingerprint=str(
-                    _attribute(operation, "proposal_fingerprint", "") or ""
-                ),
+                proposal_fingerprint=str(_attribute(operation, "proposal_fingerprint", "") or ""),
             ),
             pending=rejected_pending,
             effective_pending=rejected_pending,
@@ -1748,7 +1744,9 @@ class ConfirmationCoordinator:
             },
             (),
         )
-        if not isinstance(execution, (OperationCommitted, OperationFailed, OperationReplay, OperationUnknown)) and not (
+        if not isinstance(
+            execution, (OperationCommitted, OperationFailed, OperationReplay, OperationUnknown)
+        ) and not (
             _attribute(execution, "operation_id") is not None
             and _attribute(execution, "payload") is not None
         ):
@@ -1773,46 +1771,6 @@ class ConfirmationCoordinator:
         coordinator = _callable(self.dependencies.write_coordinator, ("execute_primary",))
         if coordinator is None:
             raise WriteOperationError("operation_unavailable")
-        undo_seed_builder = self.dependencies.undo_seed_builder
-        if undo_seed_builder is None:
-            def undo_seed_builder(_prepared: object, _context: object) -> Mapping[str, Any]:
-                return dict(state.undo_seed)
-        else:
-            supplied_seed_builder = undo_seed_builder
-
-            def undo_seed_builder(prepared_call: object, context: object) -> Mapping[str, Any]:
-                value = _invoke(
-                    supplied_seed_builder,
-                    {
-                        "prepared": prepared_call,
-                        "context": context,
-                        "state": state,
-                    },
-                    (prepared_call, context),
-                )
-                return dict(value) if isinstance(value, Mapping) else {}
-
-        undo_builder = self.dependencies.undo_builder
-        if undo_builder is not None:
-            supplied_undo_builder = undo_builder
-
-            def undo_builder(
-                prepared_call: object,
-                record: object,
-                seed: object,
-            ) -> Mapping[str, Any] | None:
-                value = _invoke(
-                    supplied_undo_builder,
-                    {
-                        "prepared": prepared_call,
-                        "record": record,
-                        "seed": seed,
-                        "state": state,
-                    },
-                    (prepared_call, record, seed),
-                )
-                return dict(value) if isinstance(value, Mapping) else None
-
         transactional_delivery = self.dependencies.transactional_delivery
         register_delivery = _callable(transactional_delivery, ("register",))
         unregister_delivery = _callable(transactional_delivery, ("unregister",))
@@ -1821,6 +1779,41 @@ class ConfirmationCoordinator:
         if register_delivery is not None:
             registered_delivery_handle = _invoke(register_delivery, {"state": state}, (state,))
             registered_delivery = True
+
+        def bind_parent_route(
+            identity: PendingRouteIdentityV1,
+            execution_claim: object,
+        ) -> object:
+            operation_port = self.dependencies.operation_port
+            pending_port = self.dependencies.pending_persistence_route_port
+            lease = state.approval_catalog_lease
+            if type(operation_port) is not ToolOperationMetadataPort:
+                raise WriteOperationError("operation_unavailable")
+            if type(pending_port) is not PendingPersistenceRoutePort:
+                raise WriteOperationError("operation_unavailable")
+            if type(lease) is not SegmentToolCatalogLease:
+                raise WriteOperationError("operation_unavailable")
+            if type(identity) is not PendingRouteIdentityV1:
+                raise WriteOperationError("operation_identity_conflict")
+            spec_handle = prepared.spec_handle
+            if type(spec_handle) is not SegmentToolSpecHandle:
+                raise WriteOperationError("operation_unavailable")
+            operation_handle = operation_port.bind_typed_write(
+                lease,
+                spec_handle,
+                OperationRouteIdentityV1(
+                    operation_id=identity.operation_id,
+                    tool_call_id=identity.tool_call_id,
+                    revision=identity.pending_action_revision,
+                    arguments_digest=identity.arguments_digest,
+                ),
+                execution_claim,
+            )
+            try:
+                return pending_port.bind_primary_parent(operation_handle, identity)
+            finally:
+                operation_port.revoke_typed_write(operation_handle)
+
         values: dict[str, object] = {
             "operation_id": state.identity.operation_id,
             "conversation_id": state.identity.conversation_id,
@@ -1832,11 +1825,9 @@ class ConfirmationCoordinator:
             "edited_args": (
                 None if state.edited_args.is_missing() else state.edited_args.as_mapping
             ),
-            "undo_seed_builder": undo_seed_builder,
             "approval_decided_callback": state.approval_decided_callback,
+            "parent_route_binder": bind_parent_route,
         }
-        if undo_builder is not None:
-            values["undo_builder"] = undo_builder
         try:
             execution, record = cast(
                 tuple[OperationExecution, ToolExecutionRecord[Any, Any] | None],
@@ -1892,8 +1883,7 @@ class ConfirmationCoordinator:
             state.execution_record = execution_record
             state.approved = approved
             terminal_status = str(
-                _attribute(_attribute(state.terminal_execution, "payload"), "status", "")
-                or ""
+                _attribute(_attribute(state.terminal_execution, "payload"), "status", "") or ""
             )
             state.succeeded = approved and (
                 terminal_status == "committed" or _record_succeeded(execution_record)
@@ -1934,21 +1924,40 @@ class ConfirmationCoordinator:
             # still publishing messages.  Production composition must expose
             # the existing repository atom; test adapters must implement it
             # explicitly rather than receiving an un-fenced fallback.
+            ownership.revoke_parent_route()
             raise WriteOperationError("operation_unavailable")
-        with state.lock:
-            if (
-                state.cancelled
-                or state.delivery_ownership is not None
-            ):
-                return
-            state.delivery_ownership = ownership
-            # Existing DeliveryHeartbeat owns its own retry/stop loop. It is
-            # installed and started while the state lock is held, so a
-            # concurrent timeout/cancel cannot miss it between ownership
-            # assignment and thread creation.
-            state.delivery_heartbeat = DeliveryHeartbeat(
-                cast(Any, self.dependencies.write_operations), ownership
-            ).start()
+        incoming_must_revoke = False
+        heartbeat_instance: DeliveryHeartbeat | None = None
+        try:
+            with state.lock:
+                current = state.delivery_ownership
+                if state.cancelled:
+                    incoming_must_revoke = True
+                elif current is ownership:
+                    return
+                elif current is not None:
+                    incoming_must_revoke = True
+                else:
+                    state.delivery_ownership = ownership
+                    # Install before start while holding the state lock so a
+                    # concurrent cancel either owns both values or neither.
+                    heartbeat_instance = DeliveryHeartbeat(
+                        cast(Any, self.dependencies.write_operations), ownership
+                    )
+                    state.delivery_heartbeat = heartbeat_instance
+                    heartbeat_instance.start()
+        except BaseException:
+            with state.lock:
+                if state.delivery_ownership is ownership:
+                    state.delivery_ownership = None
+                if state.delivery_heartbeat is heartbeat_instance:
+                    state.delivery_heartbeat = None
+            if heartbeat_instance is not None:
+                heartbeat_instance.stop()
+            ownership.revoke_parent_route()
+            raise
+        if incoming_must_revoke:
+            ownership.revoke_parent_route()
 
     def delivery_fence(self, state: ConfirmationState) -> bool:
         with state.lock:
@@ -2015,9 +2024,16 @@ class ConfirmationCoordinator:
             if state.active:
                 state.cancelled = True
                 state.active = False
+            ownership = state.delivery_ownership
+            state.delivery_ownership = None
+            heartbeat = state.delivery_heartbeat
+            state.delivery_heartbeat = None
         self._close_approval_context(state)
         session.close_continuation_segment()
-        self.stop_heartbeat(state)
+        if heartbeat is not None:
+            heartbeat.stop()
+        if isinstance(ownership, DeliveryOwnership):
+            ownership.revoke_parent_route()
 
     @staticmethod
     def _close_approval_context(state: ConfirmationState) -> None:
@@ -2058,7 +2074,7 @@ class ConfirmationCoordinator:
         pending: PendingAction | None = None,
         clarification: tuple[PendingAction, str] | None = None,
         failure_code: str | None = None,
-        pending_authority_claim: PendingAuthorityClaim | None = None,
+        route_handle: PendingPersistenceRouteHandle | None = None,
     ) -> PersistenceResult | object | None:
         """Persist exactly one origin+continuation bundle under the owner fence."""
 
@@ -2069,6 +2085,11 @@ class ConfirmationCoordinator:
             # failure must release it before the caller can retry/replay; the
             # successful atom closes it below.
             session.close_continuation_segment()
+
+        def revoke_parent_route() -> None:
+            ownership_value = state.delivery_ownership
+            if isinstance(ownership_value, DeliveryOwnership):
+                ownership_value.revoke_parent_route()
 
         # Final delivery starts only after the approved origin has returned a
         # terminal result.  Revoke its one-shot authority before any durable
@@ -2081,25 +2102,28 @@ class ConfirmationCoordinator:
                 tuple(_message(item) for item in bundle),
                 pending,
                 clarification,
-                pending_authority_claim,
+                route_handle,
             )
         fence_lost = False
         ownership_missing = False
+        cancelled_ownership: DeliveryOwnership | None = None
+        cancelled_heartbeat: DeliveryHeartbeat | None = None
+        delivery_short_circuit = False
         with state.lock:
-            if (
-                state.delivered
-                or state.cancelled
-                or state.cas_lost
-                or state.delivery_in_progress
-            ):
-                close_segment_on_failure()
-                return None
-            if state.origin_tool_message is None:
+            if state.delivered or state.cancelled or state.cas_lost or state.delivery_in_progress:
+                delivery_short_circuit = True
+                if state.cancelled:
+                    if isinstance(state.delivery_ownership, DeliveryOwnership):
+                        cancelled_ownership = state.delivery_ownership
+                    state.delivery_ownership = None
+                    cancelled_heartbeat = state.delivery_heartbeat
+                    state.delivery_heartbeat = None
+            elif state.origin_tool_message is None:
                 # A terminal replay has no continuation owner and must not
                 # fabricate operation-bound messages.
                 self.stop_heartbeat(state)
                 return None
-            if not isinstance(state.delivery_ownership, DeliveryOwnership):
+            elif not isinstance(state.delivery_ownership, DeliveryOwnership):
                 # Model confirmations are never allowed to use the old
                 # ownership=None persistence atom.  The deterministic legacy
                 # bridge is explicit and does not enter this coordinator.
@@ -2107,7 +2131,13 @@ class ConfirmationCoordinator:
             elif not self.delivery_fence(state):
                 state.cas_lost = True
                 fence_lost = True
-            if ownership_missing or fence_lost:
+            if delivery_short_circuit:
+                generation = None
+                ownership = None
+                expected_pending = None
+                claim_id = None
+                undo = None
+            elif ownership_missing or fence_lost:
                 generation = None
                 ownership = None
                 expected_pending = None
@@ -2120,11 +2150,19 @@ class ConfirmationCoordinator:
                 claim_id = state.claim_id
                 undo = dict(state.undo_update) if state.undo_update is not None else None
                 state.delivery_in_progress = True
+        if delivery_short_circuit:
+            if cancelled_heartbeat is not None:
+                cancelled_heartbeat.stop()
+            if cancelled_ownership is not None:
+                cancelled_ownership.revoke_parent_route()
+            close_segment_on_failure()
+            return None
         if ownership_missing:
             self.stop_heartbeat(state)
             close_segment_on_failure()
             raise WriteOperationError("operation_unavailable")
         if fence_lost:
+            revoke_parent_route()
             self.stop_heartbeat(state)
             close_segment_on_failure()
             return None
@@ -2132,16 +2170,13 @@ class ConfirmationCoordinator:
         if persistence_object is None:
             with state.lock:
                 state.delivery_in_progress = False
+            revoke_parent_route()
             self.stop_heartbeat(state)
             close_segment_on_failure()
             raise WriteOperationError("operation_unavailable")
         values = tuple(delivery.messages)
         chained_pending = pending if pending is not None else delivery.pending
-        chained_pending_claim = (
-            pending_authority_claim
-            if pending is not None
-            else delivery.pending_authority_claim
-        )
+        chained_route_handle = route_handle if pending is not None else delivery.route_handle
         clarification_value = clarification if clarification is not None else delivery.clarification
         try:
             persistence = _attribute(persistence_object, "persist_confirmation_delivery")
@@ -2158,7 +2193,7 @@ class ConfirmationCoordinator:
                     "claim_id": claim_id,
                     "undo": undo,
                     "delivery_failure_code": failure_code,
-                    "pending_authority_claim": chained_pending_claim,
+                    "route_handle": chained_route_handle,
                 }
             else:
                 persistence = _attribute(persistence_object, "persist_confirmation_continuation")
@@ -2180,11 +2215,12 @@ class ConfirmationCoordinator:
                     "claim_id": claim_id,
                     "origin_message": state.origin_tool_message,
                     "undo": undo,
-                    "pending_authority_claim": chained_pending_claim,
+                    "route_handle": chained_route_handle,
                 }
         except BaseException:
             with state.lock:
                 state.delivery_in_progress = False
+            revoke_parent_route()
             self.stop_heartbeat(state)
             close_segment_on_failure()
             raise
@@ -2193,12 +2229,14 @@ class ConfirmationCoordinator:
         except Exception:
             with state.lock:
                 state.delivery_in_progress = False
+            revoke_parent_route()
             self.stop_heartbeat(state)
             close_segment_on_failure()
             raise
         except BaseException:
             with state.lock:
                 state.delivery_in_progress = False
+            revoke_parent_route()
             self.stop_heartbeat(state)
             close_segment_on_failure()
             raise
@@ -2208,12 +2246,14 @@ class ConfirmationCoordinator:
         except BaseException:
             with state.lock:
                 state.delivery_in_progress = False
+            revoke_parent_route()
             self.stop_heartbeat(state)
             close_segment_on_failure()
             raise
         if status_value == "":
             with state.lock:
                 state.delivery_in_progress = False
+            revoke_parent_route()
             self.stop_heartbeat(state)
             close_segment_on_failure()
             raise WriteOperationError("operation_delivery_unknown", retryable=True)
@@ -2221,6 +2261,7 @@ class ConfirmationCoordinator:
             with state.lock:
                 state.cas_lost = True
                 state.delivery_in_progress = False
+            revoke_parent_route()
             self.stop_heartbeat(state)
             close_segment_on_failure()
             return raw
@@ -2230,6 +2271,7 @@ class ConfirmationCoordinator:
         }:
             with state.lock:
                 state.delivery_in_progress = False
+            revoke_parent_route()
             self.stop_heartbeat(state)
             close_segment_on_failure()
             return raw
@@ -2239,6 +2281,7 @@ class ConfirmationCoordinator:
         }:
             with state.lock:
                 state.delivery_in_progress = False
+            revoke_parent_route()
             self.stop_heartbeat(state)
             close_segment_on_failure()
             raise WriteOperationError("operation_delivery_unknown", retryable=True)
@@ -2247,6 +2290,7 @@ class ConfirmationCoordinator:
         except BaseException:
             with state.lock:
                 state.delivery_in_progress = False
+            revoke_parent_route()
             self.stop_heartbeat(state)
             close_segment_on_failure()
             raise
@@ -2257,6 +2301,7 @@ class ConfirmationCoordinator:
             state.delivery_in_progress = False
             state.delivery_result = raw if isinstance(raw, PersistenceResult) else None
             state.active = False
+        revoke_parent_route()
         session.close_continuation_segment()
         self.stop_heartbeat(state)
         return raw
@@ -2273,7 +2318,9 @@ class ConfirmationCoordinator:
         state = session.state
         return self.final_delivery(
             session,
-            DeliveryBundle((Message(role="assistant", content=message or self._fallback_message(state)),)),
+            DeliveryBundle(
+                (Message(role="assistant", content=message or self._fallback_message(state)),)
+            ),
             failure_code="operation_delivery_failed",
         )
 

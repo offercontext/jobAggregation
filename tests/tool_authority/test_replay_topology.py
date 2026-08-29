@@ -1,25 +1,26 @@
 from __future__ import annotations
 
+import hashlib
 import json
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import event
+from sqlalchemy import event, select
 
 import offerpilot.ai.write_operations as write_operations
 from offerpilot.ai.agent_contracts import PendingAction
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
+from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
 from offerpilot.ai.write_operations import (
     OperationReplay,
-    TYPED_WRITE_OPERATION_NAMES,
     WriteOperationError,
     WriteOperationRepository,
-    _typed_pending_confirmation_human,
     build_terminal_payload,
     ledger_fingerprint,
     load_or_create_ledger_key,
     operation_request_fingerprint,
+    require_chained_pending_transition,
 )
 from offerpilot.db import init_database
 from offerpilot.models import ChatMessage, Conversation, WriteOperation
@@ -36,6 +37,13 @@ from offerpilot.pilot_runtime.contracts import (
 from offerpilot.pilot_runtime.errors import RuntimeFailureCode
 from offerpilot.pilot_runtime.service import PilotRuntime, RuntimeDependencies
 from offerpilot.repositories.chat import ChatRepository
+from tests.tool_metadata.test_pending_routes import (
+    _production_components as _pending_route_components,
+    issued_legacy_pending_route,
+    issued_legacy_primary_parent,
+    issued_typed_pending_route,
+    issued_typed_primary_parent,
+)
 
 
 _LEGACY_PENDING_HUMAN = {
@@ -45,18 +53,26 @@ _LEGACY_PENDING_HUMAN = {
     ),
     "record_application_outcome": "请确认记录这次投递进展、原始反馈和下一步行动。",
 }
+_TEST_TOOL_CATALOG = build_model_tool_catalog()
 
 
 def _typed_pending_human(tool_name: str, args: dict[str, object]) -> str:
     """Use the frozen production metadata only as an independent test oracle."""
 
-    spec = MODEL_TOOL_CATALOG.resolve(tool_name)
+    spec = _TEST_TOOL_CATALOG.resolve(tool_name)
     assert spec is not None
-    assert spec.confirmation_description is not None
-    return str(spec.confirmation_description(spec.decoder(args)))
+    return str(spec.presentation.confirmation_description(spec.decoder(args)))
 
 
 _ORIGIN_CONFIRMATION_TOKEN = "origin-replay-token"
+
+
+def _legacy_source(tool_name: str) -> str:
+    return {
+        "save_application_jd_version": "jd_deterministic_action",
+        "create_application_submission_snapshot": "submission_snapshot_action",
+        "record_application_outcome": "outcome_recording_action",
+    }[tool_name]
 
 
 def _scope_fingerprint() -> str:
@@ -75,6 +91,7 @@ def _seed_completed_origin(
     outcome: str = "chained_pending",
     complete_delivery: bool = True,
     delivery_should_fail: bool = False,
+    historical_delivery_manifest_v1: bool = False,
 ):
     sessions = init_database(tmp_path / "offerpilot.db")
     key = load_or_create_ledger_key(tmp_path, sessions)
@@ -95,16 +112,20 @@ def _seed_completed_origin(
     child_pending = PendingAction(
         "child-call", child_name, child_args, expected_child_human, child_id
     )
+    origin_pending = PendingAction(
+        "origin-call",
+        origin_name,
+        json.dumps(origin_args, ensure_ascii=False, separators=(",", ":")),
+        "origin",
+        origin_id,
+    )
     child_token = __import__(
         "offerpilot.pilot_runtime.continuation", fromlist=["_confirmation_token"]
     )._confirmation_token(child_pending)
     now = datetime.now(timezone.utc)
-    owner = repository.prepare_owner(origin_id)
     payload = build_terminal_payload(
         status="committed",
-        result_contract=(
-            "typed_json_v1" if origin_adapter == "typed" else "legacy_string_v1"
-        ),
+        result_contract=("typed_json_v1" if origin_adapter == "typed" else "legacy_string_v1"),
         result={},
         visible_result="saved",
         transport={"tool_call_id": "origin-call", "tool_name": origin_name},
@@ -112,14 +133,72 @@ def _seed_completed_origin(
         failure_category=None,
         failure_code=None,
     )
-    with sessions() as session:
+    route_components = _pending_route_components()
+    with ExitStack() as route_stack:
+        origin_claim = object()
+        child_claim = object()
+        if origin_adapter == "typed":
+            origin_route, origin_identity = route_stack.enter_context(
+                issued_typed_pending_route(
+                    origin_pending,
+                    conversation.id,
+                    claim=origin_claim,
+                    components=route_components,
+                )
+            )
+            parent_route = issued_typed_primary_parent(
+                origin_pending,
+                conversation.id,
+                claim=origin_claim,
+                components=route_components,
+            )
+        else:
+            origin_source = _legacy_source(origin_name)
+            origin_route, origin_identity = route_stack.enter_context(
+                issued_legacy_pending_route(
+                    origin_pending,
+                    conversation.id,
+                    source=origin_source,
+                    components=route_components,
+                )
+            )
+            parent_route = issued_legacy_primary_parent(
+                origin_pending,
+                conversation.id,
+                source=origin_source,
+                components=route_components,
+            )
+        if child_adapter == "typed":
+            child_route, child_identity = route_stack.enter_context(
+                issued_typed_pending_route(
+                    child_pending,
+                    conversation.id,
+                    claim=child_claim,
+                    components=route_components,
+                )
+            )
+        else:
+            child_route, child_identity = route_stack.enter_context(
+                issued_legacy_pending_route(
+                    child_pending,
+                    conversation.id,
+                    source=_legacy_source(child_name),
+                    components=route_components,
+                )
+            )
+        owner = repository.prepare_owner(origin_id)
+        owner.bind_parent_route(parent_route)
+        session = sessions()
         repository.create_primary(
             session,
+            route_handle=origin_route,
             operation_id=origin_id,
             conversation_id=conversation.id,
             tool_call_id="origin-call",
             tool_name=origin_name,
-            adapter_kind=origin_adapter,  # type: ignore[arg-type]
+            pending_action_revision=origin_identity.pending_action_revision,
+            pending_confirmation_claim_id=origin_identity.pending_confirmation_claim_id,
+            arguments_digest=origin_identity.arguments_digest,
             proposal_fingerprint=ledger_fingerprint(
                 key, "write-operation-proposal-v1", origin_args
             ),
@@ -134,11 +213,14 @@ def _seed_completed_origin(
         )
         child = repository.create_primary(
             session,
+            route_handle=child_route,
             operation_id=child_id,
             conversation_id=conversation.id,
             tool_call_id="child-call",
             tool_name=child_name,
-            adapter_kind=child_adapter,  # type: ignore[arg-type]
+            pending_action_revision=child_identity.pending_action_revision,
+            pending_confirmation_claim_id=child_identity.pending_confirmation_claim_id,
+            arguments_digest=child_identity.arguments_digest,
             proposal_fingerprint=ledger_fingerprint(
                 key, "write-operation-proposal-v1", child_value
             ),
@@ -172,9 +254,7 @@ def _seed_completed_origin(
             edited_args=None,
             rejection_feedback_present=False,
             rejection_feedback="",
-            confirmation_token_fingerprint=(
-                origin.confirmation_token_fingerprint or ""
-            ),
+            confirmation_token_fingerprint=(origin.confirmation_token_fingerprint or ""),
             proposal_fingerprint=origin.proposal_fingerprint or "",
         )
         origin.input_fingerprint = ledger_fingerprint(key, "test-origin-input-v1", {})
@@ -214,24 +294,36 @@ def _seed_completed_origin(
             )
             session.flush()
             if delivery_should_fail:
-                with pytest.raises(WriteOperationError, match="operation_delivery_unknown"):
+                with pytest.raises(ValueError, match="Pending chained topology is not permitted"):
+                    require_chained_pending_transition(parent_route, child_route)
+                with pytest.raises(WriteOperationError) as delivery_error:
                     repository.complete_delivery(
                         session,
                         owner,
-                        outcome=outcome,  # type: ignore[arg-type]
-                        next_operation_id=(
-                            child.id if outcome == "chained_pending" else None
-                        ),
+                        outcome="chained_pending",
+                        next_operation_id=child.id,
                     )
+                assert delivery_error.value.code == "operation_delivery_unknown"
                 assert origin.delivery_status == "pending"
                 assert origin.delivery_next_operation_id is None
             else:
-                assert repository.complete_delivery(
-                    session,
-                    owner,
-                    outcome=outcome,  # type: ignore[arg-type]
-                    next_operation_id=(child.id if outcome == "chained_pending" else None),
-                )
+                if outcome == "chained_pending":
+                    owner.bind_chained_transition(child_route)
+                if historical_delivery_manifest_v1:
+                    assert outcome == "chained_pending"
+                    _complete_chained_delivery_as_historical_v1(
+                        session,
+                        operation=origin,
+                        child=child,
+                        ownership=owner,
+                    )
+                else:
+                    assert repository.complete_delivery(
+                        session,
+                        owner,
+                        outcome=outcome,  # type: ignore[arg-type]
+                        next_operation_id=(child.id if outcome == "chained_pending" else None),
+                    )
         else:
             conversation_row.pending_operation_id = origin.id
             conversation_row.pending_tool_call_id = origin.tool_call_id or ""
@@ -239,6 +331,7 @@ def _seed_completed_origin(
             conversation_row.pending_args = '{"private":"must-not-be-selected"}'
             conversation_row.pending_human = "private pending"
         session.commit()
+        session.close()
     return sessions, repository, origin_id, child_id, conversation.id
 
 
@@ -248,15 +341,92 @@ def _replay(repository: WriteOperationRepository, operation_id: str):
     return repository.replay(operation, operation.operation_request_fingerprint or "")
 
 
-def test_typed_chained_replay_returns_one_verified_operation_owned_pending(tmp_path) -> None:
-    _sessions, repository, origin_id, child_id, _conversation_id = _seed_completed_origin(
-        tmp_path
+def _complete_chained_delivery_as_historical_v1(
+    session,
+    *,
+    operation: WriteOperation,
+    child: WriteOperation,
+    ownership,
+) -> None:
+    """Seed the immutable historical v1 shape during its one legal transition."""
+
+    messages = list(
+        session.scalars(
+            select(ChatMessage)
+            .where(ChatMessage.operation_id == operation.id)
+            .order_by(ChatMessage.delivery_ordinal.asc())
+        )
     )
+    manifest = {
+        "operation_id": operation.id,
+        "status": operation.status,
+        "terminal_payload_sha256": operation.terminal_payload_sha256,
+        "delivery_generation": ownership.generation,
+        "messages": [
+            {
+                "role": item.role,
+                "content": item.content,
+                "tool_calls": item.tool_calls,
+                "tool_call_id": item.tool_call_id,
+                "provider_blocks": item.provider_blocks,
+                "delivery_kind": item.delivery_kind,
+                "delivery_ordinal": item.delivery_ordinal,
+            }
+            for item in messages
+        ],
+        "outcome": "chained_pending",
+        "failure_code": None,
+        "next_operation_id": child.id,
+        "old_pending_disposition": "replaced",
+        "validated_undo_digest": write_operations._undo_digest(operation.undo_json),
+        "chained_operation": write_operations._chained_manifest_v1(child),
+    }
+    operation.delivery_status = "completed"
+    operation.delivery_failure_code = None
+    operation.delivery_outcome = "chained_pending"
+    operation.delivery_message_count = len(messages)
+    operation.delivery_manifest_sha256 = (
+        "sha256:"
+        + hashlib.sha256(write_operations.canonical_json(manifest).encode("utf-8")).hexdigest()
+    )
+    operation.delivery_next_operation_id = child.id
+    operation.delivery_owner_token_fingerprint = None
+    operation.delivery_lease_expires_at = None
+    completed_at = datetime.now(timezone.utc)
+    operation.delivered_at = completed_at
+    operation.updated_at = completed_at
+    session.flush()
+    ownership.revoke_parent_route()
+
+
+def test_typed_chained_replay_returns_one_verified_operation_owned_pending(tmp_path) -> None:
+    _sessions, repository, origin_id, child_id, _conversation_id = _seed_completed_origin(tmp_path)
     replay = _replay(repository, origin_id)
     assert replay.chained_pending is not None
     assert replay.chained_pending.adapter_kind == "typed"
     assert replay.chained_pending.operation_id == child_id
     assert replay.chained_pending.decoded_args == {"id": 1, "content": "next"}
+
+
+def test_legacy_chained_replay_returns_verified_decoded_arguments(tmp_path) -> None:
+    _sessions, repository, origin_id, child_id, _conversation_id = _seed_completed_origin(
+        tmp_path,
+        origin_adapter="legacy_deterministic",
+        origin_name="save_application_jd_version",
+        child_adapter="legacy_deterministic",
+        child_name="save_application_jd_version",
+        child_args='{"application_id":1,"jd_text":"next"}',
+    )
+
+    replay = _replay(repository, origin_id)
+
+    assert replay.chained_pending is not None
+    assert replay.chained_pending.adapter_kind == "legacy_deterministic"
+    assert replay.chained_pending.operation_id == child_id
+    assert replay.chained_pending.decoded_args == {
+        "application_id": 1,
+        "jd_text": "next",
+    }
 
 
 def test_mixed_adapter_child_is_rejected_before_delivery_commit(tmp_path) -> None:
@@ -279,6 +449,262 @@ def test_mixed_adapter_child_is_rejected_before_delivery_commit(tmp_path) -> Non
         assert origin.delivery_outcome is None
         assert origin.delivery_next_operation_id is None
         assert conversation.pending_operation_id == child_id
+
+
+@pytest.mark.parametrize(
+    (
+        "origin_adapter",
+        "origin_name",
+        "child_adapter",
+        "child_name",
+        "child_args",
+        "allowed",
+    ),
+    (
+        ("typed", "update_note", "typed", "update_note", '{"id":1}', True),
+        (
+            "typed",
+            "update_note",
+            "legacy_deterministic",
+            "save_application_jd_version",
+            '{"application_id":1,"jd_text":"next"}',
+            False,
+        ),
+        (
+            "legacy_deterministic",
+            "save_application_jd_version",
+            "legacy_deterministic",
+            "save_application_jd_version",
+            '{"application_id":1,"jd_text":"next"}',
+            True,
+        ),
+        (
+            "legacy_deterministic",
+            "save_application_jd_version",
+            "legacy_deterministic",
+            "record_application_outcome",
+            '{"application_id":1}',
+            False,
+        ),
+        (
+            "legacy_deterministic",
+            "record_application_outcome",
+            "legacy_deterministic",
+            "record_application_outcome",
+            '{"application_id":1}',
+            False,
+        ),
+        (
+            "legacy_deterministic",
+            "save_application_jd_version",
+            "typed",
+            "update_note",
+            '{"id":1}',
+            False,
+        ),
+    ),
+    ids=(
+        "typed-to-typed",
+        "typed-to-legacy",
+        "same-chainable-legacy-adapter",
+        "one-legacy-adapter-to-another",
+        "forbidden-legacy-adapter-to-itself",
+        "legacy-to-typed",
+    ),
+)
+def test_trusted_chained_topology_matrix_is_enforced_before_delivery_commit(
+    tmp_path,
+    origin_adapter: str,
+    origin_name: str,
+    child_adapter: str,
+    child_name: str,
+    child_args: str,
+    allowed: bool,
+) -> None:
+    sessions, repository, origin_id, child_id, _conversation_id = _seed_completed_origin(
+        tmp_path,
+        origin_adapter=origin_adapter,
+        origin_name=origin_name,
+        child_adapter=child_adapter,
+        child_name=child_name,
+        child_args=child_args,
+        delivery_should_fail=not allowed,
+    )
+
+    with sessions() as session:
+        origin = session.get(WriteOperation, origin_id)
+        assert origin is not None
+        assert origin.delivery_status == ("completed" if allowed else "pending")
+        assert origin.delivery_next_operation_id == (child_id if allowed else None)
+    if allowed:
+        replay = _replay(repository, origin_id)
+        assert replay.chained_pending is not None
+        assert replay.chained_pending.operation_id == child_id
+
+
+def test_chained_topology_rejects_post_issue_pending_identity_drift() -> None:
+    components = _pending_route_components()
+    parent_pending = PendingAction(
+        "origin-call",
+        "save_application_jd_version",
+        '{"application_id":1,"jd_text":"origin"}',
+        "origin",
+        "origin-operation",
+    )
+    child_pending = PendingAction(
+        "child-call",
+        "save_application_jd_version",
+        '{"application_id":1,"jd_text":"child"}',
+        "child",
+        "child-operation",
+    )
+    parent_route = issued_legacy_primary_parent(
+        parent_pending,
+        41,
+        source="jd_deterministic_action",
+        components=components,
+    )
+    with issued_legacy_pending_route(
+        child_pending,
+        41,
+        source="jd_deterministic_action",
+        components=components,
+    ) as (child_route, _identity):
+        require_chained_pending_transition(parent_route, child_route)
+        parent_record = parent_route._port._require_parent(parent_route)
+        child_record = child_route._port._require_child(child_route)
+        object.__setattr__(parent_record.identity, "tool_name", "record_application_outcome")
+        object.__setattr__(child_record.identity, "tool_name", "record_application_outcome")
+
+        with pytest.raises(ValueError, match="Pending route identity drift"):
+            require_chained_pending_transition(parent_route, child_route)
+
+
+@pytest.mark.parametrize("manifest_version", ("v2", "historical_v1"))
+def test_terminal_chained_replay_uses_only_persisted_ledger_projections(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    manifest_version: str,
+) -> None:
+    from offerpilot.ai.tool_runtime.catalog import ToolCatalog
+    from offerpilot.ai.tool_runtime.legacy import LegacyDeterministicCatalog
+    from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
+    from offerpilot.pilot_runtime.deterministic import DeterministicPilotAdapter
+    from offerpilot.pilot_runtime.legacy_route import LegacyRouteProofIssuer
+
+    _sessions, repository, origin_id, _child_id, conversation_id = _seed_completed_origin(
+        tmp_path,
+        historical_delivery_manifest_v1=manifest_version == "historical_v1",
+    )
+    counters = {
+        "provider": 0,
+        "projector": 0,
+        "bundle": 0,
+        "resolver": 0,
+        "preflight": 0,
+        "proof": 0,
+        "executor": 0,
+    }
+
+    def forbidden(name: str):
+        def call(*_args: object, **_kwargs: object) -> object:
+            counters[name] += 1
+            raise AssertionError(f"terminal replay must not initialize {name}")
+
+        return call
+
+    if hasattr(write_operations, "_verified_pending_confirmation_human"):
+        monkeypatch.setattr(
+            write_operations,
+            "_verified_pending_confirmation_human",
+            forbidden("projector"),
+        )
+    monkeypatch.setattr(ToolCatalog, "resolve", forbidden("resolver"))
+    monkeypatch.setattr(
+        ToolMetadataBundleV1,
+        "open_segment_lease",
+        forbidden("bundle"),
+    )
+    monkeypatch.setattr(
+        LegacyRouteProofIssuer,
+        "prepare_server_loaded",
+        forbidden("proof"),
+    )
+    monkeypatch.setattr(
+        LegacyRouteProofIssuer,
+        "issue_after_claim",
+        forbidden("proof"),
+    )
+    monkeypatch.setattr(
+        LegacyDeterministicCatalog,
+        "resolve_server_loaded",
+        forbidden("resolver"),
+    )
+    if hasattr(DeterministicPilotAdapter, "preflight_confirmation"):
+        monkeypatch.setattr(
+            DeterministicPilotAdapter,
+            "preflight_confirmation",
+            forbidden("preflight"),
+        )
+
+    class ForbiddenWriteCoordinator:
+        def execute_primary(self, *_args: object, **_kwargs: object) -> object:
+            return forbidden("executor")()
+
+        def reject_primary(self, *_args: object, **_kwargs: object) -> object:
+            return forbidden("executor")()
+
+    runtime = PilotRuntime(
+        RuntimeDependencies(
+            confirmation_coordinator=ConfirmationCoordinator(
+                ConfirmationDependencies(
+                    write_operations=repository,
+                    write_coordinator=ForbiddenWriteCoordinator(),  # type: ignore[arg-type]
+                    approval_context_resolver=forbidden("preflight"),
+                )
+            ),
+            continuation_model_resolver=forbidden("provider"),  # type: ignore[arg-type]
+            agent_driver=forbidden("provider"),  # type: ignore[arg-type]
+        )
+    )
+
+    outcome = runtime.continue_confirmation(
+        ConfirmationRequest(
+            conversation_id=conversation_id,
+            approved=True,
+            operation_id=origin_id,
+            confirmation_token=_ORIGIN_CONFIRMATION_TOKEN,
+        ),
+        invocation_control=InMemoryRuntimeInvocationControl(),
+    )
+
+    assert counters == {
+        "provider": 0,
+        "projector": 0,
+        "bundle": 0,
+        "resolver": 0,
+        "preflight": 0,
+        "proof": 0,
+        "executor": 0,
+    }
+    assert isinstance(outcome, ConfirmationRequiredOutcome)
+
+
+def test_historical_v1_replay_does_not_trust_mutable_pending_human(tmp_path) -> None:
+    sessions, repository, origin_id, _child_id, conversation_id = _seed_completed_origin(
+        tmp_path,
+        historical_delivery_manifest_v1=True,
+    )
+    with sessions() as session:
+        conversation = session.get(Conversation, conversation_id)
+        assert conversation is not None
+        conversation.pending_human = "FORGED HISTORICAL V1 TEXT"
+        session.commit()
+
+    replay = _replay(repository, origin_id)
+
+    assert replay.chained_pending is not None
+    assert replay.chained_pending.human == "请确认此待处理操作。"
 
 
 @pytest.mark.parametrize(
@@ -318,22 +744,10 @@ def test_closed_replay_renderer_matches_frozen_typed_confirmation_projection(
     tool_name: str,
     args: dict[str, object],
 ) -> None:
-    assert set(TYPED_WRITE_OPERATION_NAMES) == {
-        "create_application",
-        "update_application_status",
-        "create_application_event",
-        "update_application_event",
-        "delete_application_event",
-        "add_note",
-        "update_note",
-        "delete_note",
-        "update_offer",
-        "save_offer_assessment",
-        "resume_update_career_intent",
-        "resume_rewrite_highlight",
-    }
-    assert _typed_pending_confirmation_human(tool_name, args) == _typed_pending_human(
-        tool_name, args
+    spec = _TEST_TOOL_CATALOG.resolve(tool_name)
+    assert spec is not None
+    assert _typed_pending_human(tool_name, args) == str(
+        spec.presentation.confirmation_description(spec.decoder(args))
     )
 
 
@@ -342,9 +756,7 @@ def test_typed_chained_replay_integrity_and_runtime_side_effect_boundary(
     tmp_path,
     tampered_human: bool,
 ) -> None:
-    sessions, repository, origin_id, child_id, conversation_id = _seed_completed_origin(
-        tmp_path
-    )
+    sessions, repository, origin_id, child_id, conversation_id = _seed_completed_origin(tmp_path)
     if tampered_human:
         with sessions() as session:
             conversation = session.get(Conversation, conversation_id)
@@ -427,34 +839,37 @@ def test_typed_chained_replay_integrity_and_runtime_side_effect_boundary(
     }
 
 
-def test_manifest_failure_wins_before_malformed_pending_decode(
-    tmp_path, monkeypatch
-) -> None:
-    sessions, repository, origin_id, _child_id, conversation_id = _seed_completed_origin(
-        tmp_path
-    )
+def test_manifest_failure_wins_before_malformed_pending_decode(tmp_path, monkeypatch) -> None:
+    sessions, repository, origin_id, _child_id, conversation_id = _seed_completed_origin(tmp_path)
     with sessions() as session:
         conversation = session.get(Conversation, conversation_id)
         assert conversation is not None
         conversation.pending_args = "{"
         session.commit()
-    chained_manifest = write_operations._chained_manifest
+    chained_manifest = write_operations._chained_manifest_v2
 
-    def tampered_manifest(operation: WriteOperation | None):
-        manifest = chained_manifest(operation)
+    def tampered_manifest(
+        operation: WriteOperation | None,
+        *,
+        pending_args: str | None,
+        pending_human: str | None,
+    ):
+        manifest = chained_manifest(
+            operation,
+            pending_args=pending_args,
+            pending_human=pending_human,
+        )
         assert manifest is not None
         return {**manifest, "tool_name": "tampered-after-delivery"}
 
-    monkeypatch.setattr(write_operations, "_chained_manifest", tampered_manifest)
+    monkeypatch.setattr(write_operations, "_chained_manifest_v2", tampered_manifest)
     with pytest.raises(WriteOperationError) as caught:
         _replay(repository, origin_id)
-    assert caught.value.code == "operation_delivery_unknown"
+    assert caught.value.code == "operation_integrity_error"
 
 
 def test_typed_replay_decoder_failure_is_integrity(tmp_path) -> None:
-    sessions, repository, origin_id, _child_id, conversation_id = _seed_completed_origin(
-        tmp_path
-    )
+    sessions, repository, origin_id, _child_id, conversation_id = _seed_completed_origin(tmp_path)
     with sessions() as session:
         conversation = session.get(Conversation, conversation_id)
         assert conversation is not None
@@ -468,9 +883,7 @@ def test_typed_replay_decoder_failure_is_integrity(tmp_path) -> None:
 def test_typed_chained_replay_rejects_tampered_confirmation_projection(
     tmp_path,
 ) -> None:
-    sessions, repository, origin_id, _child_id, conversation_id = _seed_completed_origin(
-        tmp_path
-    )
+    sessions, repository, origin_id, _child_id, conversation_id = _seed_completed_origin(tmp_path)
     with sessions() as session:
         conversation = session.get(Conversation, conversation_id)
         assert conversation is not None
@@ -486,9 +899,7 @@ def test_typed_chained_replay_rejects_tampered_confirmation_projection(
 def test_typed_chained_replay_rejects_valid_json_with_wrong_proposal_hmac(
     tmp_path,
 ) -> None:
-    sessions, repository, origin_id, _child_id, conversation_id = _seed_completed_origin(
-        tmp_path
-    )
+    sessions, repository, origin_id, _child_id, conversation_id = _seed_completed_origin(tmp_path)
     with sessions() as session:
         conversation = session.get(Conversation, conversation_id)
         assert conversation is not None
@@ -528,9 +939,7 @@ def test_legacy_chained_replay_rejects_tampered_confirmation_projection(
 
 
 def test_terminal_child_is_not_a_valid_chained_pending(tmp_path) -> None:
-    sessions, repository, origin_id, child_id, _conversation_id = _seed_completed_origin(
-        tmp_path
-    )
+    sessions, repository, origin_id, child_id, _conversation_id = _seed_completed_origin(tmp_path)
     with sessions() as session:
         child = session.get(WriteOperation, child_id)
         assert child is not None

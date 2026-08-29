@@ -26,6 +26,7 @@ from starlette.requests import ClientDisconnect
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.types import Receive, Scope, Send
 
+from offerpilot.ai.tool_runtime.contracts import TransientToolRuntimeValue
 from offerpilot.pilot_runtime.contracts import (
     AgentThunk,
     AssistantDeltaEvent,
@@ -250,9 +251,7 @@ def _invoke_sse_thunk(
         raise TypeError("SSE thunk signature is unsupported")
 
     required_positional = [
-        parameter
-        for parameter in positional
-        if parameter.default is inspect.Parameter.empty
+        parameter for parameter in positional if parameter.default is inspect.Parameter.empty
     ]
     if len(required_positional) == 0:
         return thunk()
@@ -310,9 +309,7 @@ class _SseInvocationIterator(Generic[_ResultT], Iterator[RuntimeEvent]):
             sink,
             self.cancel_event.is_set,
         )
-        self._deadline = (
-            None if timeout_seconds is None else perf_counter() + timeout_seconds
-        )
+        self._deadline = None if timeout_seconds is None else perf_counter() + timeout_seconds
 
         def on_done(_future: Future[_ResultT]) -> None:
             self.event_queue.put_nowait(self._sentinel)
@@ -439,7 +436,9 @@ class SseAgentExecutionHost(Generic[_ResultT]):
         if not isfinite(poll) or poll <= 0:
             raise ValueError("poll_seconds must be a finite positive number")
         self.poll_seconds = poll
-        self._executor_factory = ThreadPoolExecutor if executor_factory is None else executor_factory
+        self._executor_factory = (
+            ThreadPoolExecutor if executor_factory is None else executor_factory
+        )
         self._started = False
         self._lock = Lock()
 
@@ -506,7 +505,9 @@ class _SseRuntimePump(Generic[_ResultT]):
         if not isfinite(poll) or poll <= 0:
             raise ValueError("poll_seconds must be a finite positive number")
         self.poll_seconds = poll
-        self._executor_factory = ThreadPoolExecutor if executor_factory is None else executor_factory
+        self._executor_factory = (
+            ThreadPoolExecutor if executor_factory is None else executor_factory
+        )
         self._on_cancel = on_cancel
         self._started = False
         self._lock = Lock()
@@ -534,6 +535,8 @@ class _SseRuntimePump(Generic[_ResultT]):
 
 
 def _plain(value: object) -> object:
+    if isinstance(value, TransientToolRuntimeValue):
+        raise TypeError("transient Tool Runtime values cannot cross the transport boundary")
     if isinstance(value, Mapping):
         return {str(key): _plain(child) for key, child in value.items()}
     if isinstance(value, tuple):
@@ -855,9 +858,7 @@ def execute_runtime_sync(
     """Own the synchronous Agent host/control boundary for one Runtime call."""
 
     control = InMemoryRuntimeInvocationControl()
-    host: SyncAgentExecutionHost[object] = SyncAgentExecutionHost(
-        timeout_seconds=timeout_seconds
-    )
+    host: SyncAgentExecutionHost[object] = SyncAgentExecutionHost(timeout_seconds=timeout_seconds)
     if isinstance(request, StartTurnRequest):
         return cast(
             RuntimeOutcome,
@@ -926,9 +927,7 @@ def runtime_stream_response(
             )
         return outcome_http_response(prepared)
 
-    conversation_id, context_type, context_ref, mode = prepared_stream_metadata(
-        prepared, request
-    )
+    conversation_id, context_type, context_ref, mode = prepared_stream_metadata(prepared, request)
     if on_conversation_id is not None:
         on_conversation_id(conversation_id)
     envelope = runtime_sse_envelope(
@@ -984,9 +983,7 @@ def _adapt_cleanup_callback(callback: Callable[..., object] | None) -> CleanupCa
         for parameter in signature.parameters.values()
     )
     required_positional = [
-        parameter
-        for parameter in positional
-        if parameter.default is inspect.Parameter.empty
+        parameter for parameter in positional if parameter.default is inspect.Parameter.empty
     ]
     required_keyword_only = [
         parameter
@@ -999,6 +996,7 @@ def _adapt_cleanup_callback(callback: Callable[..., object] | None) -> CleanupCa
     if accepts_varargs or positional:
         return cast(CleanupCallback, callback)
     if not required_keyword_only:
+
         def no_argument_adapter(_reason: CompletionReason | None) -> object:
             return callback()
 
@@ -1179,7 +1177,9 @@ class PreparedStreamGuard:
             return won
         if self._lifecycle is not None:
             return self._lifecycle.complete(reason)
-        return self._call_runtime(("complete_execution", "complete_prepared_stream", "complete"), reason)
+        return self._call_runtime(
+            ("complete_execution", "complete_prepared_stream", "complete"), reason
+        )
 
     def _run_cleanup(self, reason: CompletionReason | None) -> None:
         with self._lock:
@@ -1372,7 +1372,12 @@ class GuardedStreamingResponse(StreamingResponse):
                 result = original() if callable(original) else original
                 if inspect.isawaitable(result):
                     await cast(Awaitable[object], result)
-        except (RuntimeCancelled, RuntimeAgentTimedOut, asyncio.CancelledError, ClientDisconnect) as exc:
+        except (
+            RuntimeCancelled,
+            RuntimeAgentTimedOut,
+            asyncio.CancelledError,
+            ClientDisconnect,
+        ) as exc:
             background_error = exc
             failure_reason = CompletionReason.CANCELLED
             raise
@@ -1423,7 +1428,10 @@ class GuardedStreamingResponse(StreamingResponse):
         body_error: BaseException | None = None
         try:
             replacement = self.guard.execute_once()
-            if replacement is None and self.guard.lifecycle_state is not PreparedLifecycleState.EXECUTING:
+            if (
+                replacement is None
+                and self.guard.lifecycle_state is not PreparedLifecycleState.EXECUTING
+            ):
                 return
             source = replacement if replacement is not None else content
             self._set_active_source(source)
@@ -1434,7 +1442,12 @@ class GuardedStreamingResponse(StreamingResponse):
                 async for chunk in iterate_in_threadpool(cast(Iterable[bytes | str], source)):
                     yield chunk
             self._body_exhausted = True
-        except (RuntimeCancelled, RuntimeAgentTimedOut, asyncio.CancelledError, ClientDisconnect) as exc:
+        except (
+            RuntimeCancelled,
+            RuntimeAgentTimedOut,
+            asyncio.CancelledError,
+            ClientDisconnect,
+        ) as exc:
             body_error = exc
             self.guard._mark_execution_owner_exit()
             self._complete_preserving(CompletionReason.CANCELLED)
@@ -1549,7 +1562,12 @@ class GuardedStreamingResponse(StreamingResponse):
                 self.guard.mark_response_started()
             try:
                 await send(message)
-            except (RuntimeCancelled, RuntimeTransportAborted, RuntimeAgentTimedOut, ClientDisconnect):
+            except (
+                RuntimeCancelled,
+                RuntimeTransportAborted,
+                RuntimeAgentTimedOut,
+                ClientDisconnect,
+            ):
                 raise
             except OSError:
                 # Starlette owns the ASGI send-disconnect translation.  Keep
@@ -1567,19 +1585,12 @@ class GuardedStreamingResponse(StreamingResponse):
             # request body, replays the first message unchanged.
             asgi_metadata = scope.get("asgi")
             spec_text = (
-                asgi_metadata.get("spec_version")
-                if isinstance(asgi_metadata, Mapping)
-                else None
+                asgi_metadata.get("spec_version") if isinstance(asgi_metadata, Mapping) else None
             )
             spec_version = (
-                tuple(map(int, spec_text.split(".")))
-                if isinstance(spec_text, str)
-                else (2, 0)
+                tuple(map(int, spec_text.split("."))) if isinstance(spec_text, str) else (2, 0)
             )
-            if (
-                spec_version < (2, 4)
-                and scope.get("_offerpilot_request_body_consumed") is not True
-            ):
+            if spec_version < (2, 4) and scope.get("_offerpilot_request_body_consumed") is not True:
                 first_message = await receive()
                 if first_message.get("type") == "http.disconnect":
                     self._finalize_owner(CompletionReason.TRANSPORT_ABORTED)

@@ -30,9 +30,7 @@ JOURNAL_REPOSITORY_API = frozenset(
         "find_waiting_run",
     }
 )
-BOUND_REPOSITORY_API = frozenset(
-    {"append_event_bound", "converge_disposition_bound"}
-)
+BOUND_REPOSITORY_API = frozenset({"append_event_bound", "converge_disposition_bound"})
 BOUND_FORBIDDEN_NAMES = frozenset(
     {
         "_configure_deadline",
@@ -110,9 +108,7 @@ def _parents(tree: ast.AST) -> dict[ast.AST, ast.AST]:
     return result
 
 
-def _is_direct_constructor_method(
-    node: ast.AST, parents: dict[ast.AST, ast.AST]
-) -> bool:
+def _is_direct_constructor_method(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
     current = parents.get(node)
     while current is not None:
         if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -228,9 +224,7 @@ def _top_level_class(tree: ast.AST, name: str) -> ast.ClassDef:
     assert isinstance(tree, ast.Module)
     parents = _parents(tree)
     matches = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ClassDef) and node.name == name
+        node for node in ast.walk(tree) if isinstance(node, ast.ClassDef) and node.name == name
     ]
     assert len(matches) == 1, f"expected exactly one {name} class"
     result = matches[0]
@@ -274,9 +268,7 @@ def _top_level_class(tree: ast.AST, name: str) -> ast.ClassDef:
     return result
 
 
-def _class_method(
-    class_node: ast.ClassDef, name: str
-) -> ast.FunctionDef | ast.AsyncFunctionDef:
+def _class_method(class_node: ast.ClassDef, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
     direct = [
         node
         for node in class_node.body
@@ -330,18 +322,11 @@ def _direct_repository_method(node: ast.AST) -> ast.Attribute | None:
 
 
 def _direct_repository_calls(tree: ast.AST) -> list[ast.Call]:
-    return [
-        node
-        for node in ast.walk(tree)
-        if _direct_repository_method(node) is not None
-    ]
+    return [node for node in ast.walk(tree) if _direct_repository_method(node) is not None]
 
 
 def _contains_none_literal(node: ast.AST) -> bool:
-    return any(
-        isinstance(child, ast.Constant) and child.value is None
-        for child in ast.walk(node)
-    )
+    return any(isinstance(child, ast.Constant) and child.value is None for child in ast.walk(node))
 
 
 def _is_exact_lease_attribute(node: ast.AST, attribute: str) -> bool:
@@ -510,8 +495,7 @@ EXPECTED_DIRECT_DECORATORS = MappingProxyType(
 def _structural_protected_methods(tree: ast.AST) -> dict[str, frozenset[str]]:
     del tree
     return {
-        class_name: frozenset(methods)
-        for class_name, methods in EXPECTED_DIRECT_METHODS.items()
+        class_name: frozenset(methods) for class_name, methods in EXPECTED_DIRECT_METHODS.items()
     }
 
 
@@ -544,13 +528,9 @@ def _validate_class_method_integrity(tree: ast.AST, class_name: str) -> None:
             f"{class_name} class body must not rebind direct methods"
         )
         for method in direct_methods:
-            actual = tuple(
-                decorator_name(decorator) for decorator in method.decorator_list
-            )
+            actual = tuple(decorator_name(decorator) for decorator in method.decorator_list)
             expected = EXPECTED_DIRECT_DECORATORS[class_name].get(method.name, ())
-            assert actual == expected, (
-                f"{class_name}.{method.name} has an unapproved decorator set"
-            )
+            assert actual == expected, f"{class_name}.{method.name} has an unapproved decorator set"
 
 
 def _validate_external_method_rebindings(tree: ast.AST) -> None:
@@ -574,13 +554,10 @@ def _validate_external_method_rebindings(tree: ast.AST) -> None:
             continue
         if node.func.id not in {"setattr", "delattr"} or len(node.args) < 2:
             continue
-        class_name = (
-            node.args[0].id if isinstance(node.args[0], ast.Name) else None
-        )
+        class_name = node.args[0].id if isinstance(node.args[0], ast.Name) else None
         method_name = (
             node.args[1].value
-            if isinstance(node.args[1], ast.Constant)
-            and isinstance(node.args[1].value, str)
+            if isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, str)
             else None
         )
         if class_name in protected_methods and method_name in protected_methods[class_name]:
@@ -663,18 +640,12 @@ def _validate_journal_repository_calls(tree: ast.AST) -> None:
             continue
 
         for required in ("deadline", "safe_clock"):
-            values = [
-                keyword.value
-                for keyword in call.keywords
-                if keyword.arg == required
-            ]
+            values = [keyword.value for keyword in call.keywords if keyword.arg == required]
             assert len(values) == 1, f"{function.attr} must pass exactly one {required}"
             assert not _contains_none_literal(values[0]), (
                 f"{function.attr} must pass a non-None {required}"
             )
-            expected_attribute = (
-                "work_deadline" if required == "deadline" else "safe_clock"
-            )
+            expected_attribute = "work_deadline" if required == "deadline" else "safe_clock"
             assert _is_exact_lease_attribute(values[0], expected_attribute), (
                 f"{function.attr} must pass lease.{expected_attribute} exactly"
             )
@@ -719,9 +690,7 @@ def _validate_bound_call_ownership(tree: ast.Module) -> None:
             )
         }
         assert len(direct_calls) == len(owner_names)
-        assert owners == owner_names, (
-            f"{repository_method} must have only its exact bound owners"
-        )
+        assert owners == owner_names, f"{repository_method} must have only its exact bound owners"
 
 
 def _is_self_name(node: ast.AST) -> bool:
@@ -749,8 +718,7 @@ def _validate_self_clock_access(tree: ast.AST) -> None:
                 and isinstance(parent.func, ast.Name)
                 and parent.func.id == "ActiveWorkBudget"
                 and (
-                    node in parent.args
-                    or any(keyword.value is node for keyword in parent.keywords)
+                    node in parent.args or any(keyword.value is node for keyword in parent.keywords)
                 )
             ), "self.clock is only allowed as a direct ActiveWorkBudget argument"
 
@@ -824,9 +792,7 @@ def _validate_bound_method(method: ast.FunctionDef | ast.AsyncFunctionDef) -> No
         "append_event_bound must receive self.run_id second"
     )
     assert isinstance(append_call.args[2], ast.Name)
-    assert append_call.args[2].id == "draft", (
-        "append_event_bound must receive draft third"
-    )
+    assert append_call.args[2].id == "draft", "append_event_bound must receive draft third"
     assert not append_call.keywords, "append_event_bound must not receive keywords"
     append_statement = parents.get(append_call)
     assert isinstance(append_statement, ast.Expr)
@@ -841,11 +807,7 @@ def _validate_bound_method(method: ast.FunctionDef | ast.AsyncFunctionDef) -> No
         parent = parents.get(node)
         if isinstance(node.ctx, ast.Store):
             raise AssertionError("session aliases and reassignment are forbidden")
-        begin_attr = (
-            parent
-            if isinstance(parent, ast.Attribute) and parent.value is node
-            else None
-        )
+        begin_attr = parent if isinstance(parent, ast.Attribute) and parent.value is node else None
         begin_call = parents.get(begin_attr) if begin_attr is not None else None
         begin_parent = parents.get(begin_call) if begin_call is not None else None
         allowed_begin = (
@@ -900,10 +862,13 @@ def _validate_bound_resume_method(
     assert len(nested) == 1, "bound resume must own exactly one savepoint"
     savepoint = nested[0]
     repository_calls = _direct_repository_calls(method)
-    assert tuple(
-        _direct_repository_method(call).attr  # type: ignore[union-attr]
-        for call in repository_calls
-    ) == expected_repository_calls
+    assert (
+        tuple(
+            _direct_repository_method(call).attr  # type: ignore[union-attr]
+            for call in repository_calls
+        )
+        == expected_repository_calls
+    )
     call_statements: list[ast.Expr] = []
     for call in repository_calls:
         assert len(call.args) == 3 and not call.keywords
@@ -917,9 +882,7 @@ def _validate_bound_resume_method(
         range(len(call_statements))
     ), "approval append must precede resumed disposition in the savepoint"
     forbidden = _node_names(method) & BOUND_FORBIDDEN_NAMES
-    assert not forbidden, (
-        f"bound resume owns no Journal transaction machinery: {sorted(forbidden)}"
-    )
+    assert not forbidden, f"bound resume owns no Journal transaction machinery: {sorted(forbidden)}"
     _validate_journal_repository_calls(method)
 
 
@@ -942,9 +905,7 @@ def _validate_bound_signature(method: ast.FunctionDef | ast.AsyncFunctionDef) ->
 
 def _validate_owned_signature(method: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
     names = _all_argument_names(method)
-    assert {"deadline", "safe_clock"} <= {
-        argument.arg for argument in method.args.kwonlyargs
-    }
+    assert {"deadline", "safe_clock"} <= {argument.arg for argument in method.args.kwonlyargs}
     assert "clock" not in names
     assert method.args.vararg is None and method.args.kwarg is None
 
@@ -991,7 +952,9 @@ def _validate_bound_repository_implementation(
     _validate_bound_signature(method)
     _validate_bound_repository_session(method)
     forbidden = _node_names(method) & BOUND_FORBIDDEN_NAMES
-    assert not forbidden, f"repository bound path owns no transaction machinery: {sorted(forbidden)}"
+    assert not forbidden, (
+        f"repository bound path owns no transaction machinery: {sorted(forbidden)}"
+    )
     for node in ast.walk(method):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             assert node.value not in BOUND_FORBIDDEN_NAMES
@@ -1001,9 +964,7 @@ def _validate_bound_repository_implementation(
 def _validate_repository_module(tree: ast.Module) -> None:
     _validate_external_method_rebindings(tree)
     repository = _top_level_class(tree, "AgentRunRepository")
-    _validate_bound_repository_implementation(
-        _class_method(repository, "append_event_bound")
-    )
+    _validate_bound_repository_implementation(_class_method(repository, "append_event_bound"))
     public_bound = _class_method(repository, "converge_disposition_bound")
     private_bound = _class_method(repository, "_converge_disposition_bound")
     _validate_bound_signature(public_bound)
@@ -1088,7 +1049,8 @@ def _is_budget_module_reference(value: str) -> bool:
     return (
         normalized.endswith(BUDGET_MODULE_SUFFIX)
         or normalized == "budget"
-        or normalized.endswith(".budget") and "agent_runtime" in normalized
+        or normalized.endswith(".budget")
+        and "agent_runtime" in normalized
     )
 
 
@@ -1175,13 +1137,9 @@ def _validate_protected_symbol_scopes(tree: ast.AST) -> None:
     def import_bindings(node: ast.Import | ast.ImportFrom) -> list[tuple[str, str]]:
         if isinstance(node, ast.Import):
             return [
-                (alias.asname or alias.name.split(".", 1)[0], alias.name)
-                for alias in node.names
+                (alias.asname or alias.name.split(".", 1)[0], alias.name) for alias in node.names
             ]
-        return [
-            (alias.asname or alias.name, alias.name)
-            for alias in node.names
-        ]
+        return [(alias.asname or alias.name, alias.name) for alias in node.names]
 
     def approved_protected_import(
         node: ast.Import | ast.ImportFrom, bound_name: str, imported_name: str
@@ -1193,14 +1151,12 @@ def _validate_protected_symbol_scopes(tree: ast.AST) -> None:
             return False
         module = node.module or ""
         if imported_symbol in PUBLIC_BUDGET_API:
-            return (
-                (node.level == 0 and module == "offerpilot.agent_runtime.budget")
-                or (node.level > 0 and module in {"budget", "agent_runtime.budget"})
+            return (node.level == 0 and module == "offerpilot.agent_runtime.budget") or (
+                node.level > 0 and module in {"budget", "agent_runtime.budget"}
             )
         if imported_symbol == "AgentRunRepository":
-            return (
-                (node.level == 0 and module == "offerpilot.repositories.agent_runs")
-                or (node.level > 0 and module in {"repositories.agent_runs", "agent_runs"})
+            return (node.level == 0 and module == "offerpilot.repositories.agent_runs") or (
+                node.level > 0 and module in {"repositories.agent_runs", "agent_runs"}
             )
         return False
 
@@ -1224,9 +1180,7 @@ def _validate_protected_symbol_scopes(tree: ast.AST) -> None:
                     assert not in_disallowed_scope(node), (
                         "protected ownership imports are not allowed in local scopes"
                     )
-                    assert direct_module_import, (
-                        "protected ownership imports are module-level only"
-                    )
+                    assert direct_module_import, "protected ownership imports are module-level only"
                     assert approved_protected_import(node, bound_name, imported_name), (
                         "protected ownership imports must use approved module bindings"
                     )
@@ -1329,12 +1283,23 @@ def test_protected_journal_methods_are_structurally_derived() -> None:
     assert "capture_surface_context" in methods["SafeRunRecorder"]
     assert {"_ordinary", "append_prepared_event_bound"} <= methods["SafeRunRecorder"]
     assert {"start_run", "resume_waiting_run", "_safe"} <= methods["RunRecorderFactory"]
-    assert JOURNAL_REPOSITORY_API | {"append_event_bound"} <= methods[
-        "AgentRunRepository"
-    ]
-    assert {"_insert_event", "_existing_event", "_required_run"} <= methods[
-        "AgentRunRepository"
-    ]
+    assert JOURNAL_REPOSITORY_API | {"append_event_bound"} <= methods["AgentRunRepository"]
+    assert {"_insert_event", "_existing_event", "_required_run"} <= methods["AgentRunRepository"]
+
+
+def test_surface_capture_contract_requires_explicit_exact_provider_view() -> None:
+    tree = _module(JOURNAL_PATH)
+    for class_name in ("RunRecorder", "NullRunRecorder", "SafeRunRecorder"):
+        method = _class_method(_top_level_class(tree, class_name), "capture_surface_context")
+        keyword_only = {
+            argument.arg: (argument, default)
+            for argument, default in zip(method.args.kwonlyargs, method.args.kw_defaults)
+        }
+        assert "provider_view" in keyword_only
+        provider_argument, default = keyword_only["provider_view"]
+        assert default is None
+        assert provider_argument.annotation is not None
+        assert ast.unparse(provider_argument.annotation) == "ProviderToolMetadataView"
 
 
 @pytest.mark.parametrize(
@@ -1361,9 +1326,7 @@ def test_expected_direct_method_manifests_match_canonical_sources(
 def test_journal_owned_repository_signatures_are_explicitly_budget_bound() -> None:
     tree = _module(REPOSITORY_PATH)
     repository = _top_level_class(tree, "AgentRunRepository")
-    methods = {
-        name: _class_method(repository, name) for name in JOURNAL_REPOSITORY_API
-    }
+    methods = {name: _class_method(repository, name) for name in JOURNAL_REPOSITORY_API}
     assert set(methods) == JOURNAL_REPOSITORY_API
     for method in methods.values():
         _validate_owned_signature(method)
@@ -1538,16 +1501,9 @@ def test_mutations_reject_module_level_class_rebinding_and_duplicates(source: st
 @pytest.mark.parametrize(
     "source",
     (
-        "RunRecorderFactory = replacement\n"
-        "class RunRecorderFactory:\n"
-        "    pass\n",
-        "class RunRecorderFactory:\n"
-        "    pass\n"
-        "class RunRecorderFactory:\n"
-        "    pass\n",
-        "@decorator\n"
-        "class RunRecorderFactory:\n"
-        "    pass\n",
+        "RunRecorderFactory = replacement\nclass RunRecorderFactory:\n    pass\n",
+        "class RunRecorderFactory:\n    pass\nclass RunRecorderFactory:\n    pass\n",
+        "@decorator\nclass RunRecorderFactory:\n    pass\n",
     ),
 )
 def test_mutations_reject_factory_class_rebinding_and_duplicates(source: str) -> None:
@@ -1558,22 +1514,16 @@ def test_mutations_reject_factory_class_rebinding_and_duplicates(source: str) ->
     ("source", "class_name"),
     (
         (
-            "class SafeRunRecorder:\n"
-            "    pass\n"
-            "del SafeRunRecorder\n",
+            "class SafeRunRecorder:\n    pass\ndel SafeRunRecorder\n",
             "SafeRunRecorder",
         ),
         (
-            "class AgentRunRepository:\n"
-            "    pass\n"
-            "del AgentRunRepository\n",
+            "class AgentRunRepository:\n    pass\ndel AgentRunRepository\n",
             "AgentRunRepository",
         ),
     ),
 )
-def test_mutations_reject_module_level_class_deletion(
-    source: str, class_name: str
-) -> None:
+def test_mutations_reject_module_level_class_deletion(source: str, class_name: str) -> None:
     _expect_rejected(source, lambda tree: _top_level_class(tree, class_name))
 
 
@@ -1605,8 +1555,7 @@ def test_mutations_reject_module_level_class_deletion(
         "    SafeRunRecorder._ordinary = replacement\n"
         "    RunRecorderFactory._safe = replacement\n"
         "    AgentRunRepository._insert_event = replacement\n",
-        "def patch():\n"
-        "    setattr(AgentRunRepository, 'append_event_bound', replacement)\n",
+        "def patch():\n    setattr(AgentRunRepository, 'append_event_bound', replacement)\n",
     ),
 )
 def test_mutations_reject_external_method_rebinding(source: str) -> None:
@@ -1631,18 +1580,9 @@ def test_mutations_reject_external_method_rebinding(source: str) -> None:
         "            pass\n"
         "    def _ordinary(self):\n"
         "        pass\n",
-        "class SafeRunRecorder:\n"
-        "    del _ordinary\n"
-        "    def _ordinary(self):\n"
-        "        pass\n",
-        "class RunRecorderFactory:\n"
-        "    @decorator\n"
-        "    def _safe(self):\n"
-        "        pass\n",
-        "class AgentRunRepository:\n"
-        "    @decorator\n"
-        "    def _insert_event(self):\n"
-        "        pass\n",
+        "class SafeRunRecorder:\n    del _ordinary\n    def _ordinary(self):\n        pass\n",
+        "class RunRecorderFactory:\n    @decorator\n    def _safe(self):\n        pass\n",
+        "class AgentRunRepository:\n    @decorator\n    def _insert_event(self):\n        pass\n",
     ),
 )
 def test_mutations_reject_class_method_integrity_bypasses(source: str) -> None:
@@ -2056,9 +1996,7 @@ def test_mutations_reject_repository_bound_session_ownership(source: str) -> Non
     _expect_rejected(
         wrapped,
         lambda tree: _validate_bound_repository_implementation(
-            _class_method(
-                _top_level_class(tree, "AgentRunRepository"), "append_event_bound"
-            )
+            _class_method(_top_level_class(tree, "AgentRunRepository"), "append_event_bound")
         ),
     )
 
@@ -2077,9 +2015,7 @@ def test_mutations_reject_missing_or_non_session_bound_helper_arguments(source: 
     _expect_rejected(
         wrapped,
         lambda tree: _validate_bound_repository_implementation(
-            _class_method(
-                _top_level_class(tree, "AgentRunRepository"), "append_event_bound"
-            )
+            _class_method(_top_level_class(tree, "AgentRunRepository"), "append_event_bound")
         ),
     )
 

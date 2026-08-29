@@ -8,7 +8,10 @@ from threading import Lock
 from urllib.parse import urlsplit, urlunsplit
 
 from offerpilot.ai.control import AgentLoopControlError
-from offerpilot.ai.tool_runtime.contracts import ProviderToolContract
+from offerpilot.ai.tool_runtime.contracts import (
+    ProviderToolContract,
+    materialize_provider_payloads,
+)
 from offerpilot.ai.tool_authority.composition import require_authority_phase
 from offerpilot.ai.tool_authority.contracts import (
     AuthorityUse,
@@ -232,11 +235,12 @@ class SingleCandidateAgentTransport:
         normalized = normalize_provider_endpoint(candidate.endpoint)
         if normalized != candidate.endpoint:
             raise ProjectionError("provider_endpoint_changed")
+        tool_payloads = materialize_provider_payloads(surface.tools)
         body = canonical_json(
             {
                 "model": candidate.model,
                 "messages": [message.canonical_value() for message in surface.messages],
-                "tools": [dict(tool.payload) for tool in surface.tools],
+                "tools": tool_payloads,
                 "response_format": response_format,
                 "stream": stream,
             }
@@ -244,7 +248,7 @@ class SingleCandidateAgentTransport:
         if len(body) > ADAPTER_REQUEST_BODY_BYTE_CAP:
             raise ProjectionError("adapter_request_body_byte_cap_exceeded")
         estimated = conservative_units(canonical_messages(surface.messages)) + conservative_units(
-            canonical_json([dict(tool.payload) for tool in surface.tools])
+            canonical_json(tool_payloads)
         )
         if estimated > candidate.budget().input_limit:
             raise ProjectionError("adapter_context_window_exceeded")

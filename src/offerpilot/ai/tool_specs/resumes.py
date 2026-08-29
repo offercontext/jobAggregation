@@ -3,13 +3,22 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, TypedDict, cast
 
-from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
+from offerpilot.ai.tool_runtime.context import ToolExecutionContext
+from offerpilot.ai.tool_runtime.catalog import build_tool_spec
 from offerpilot.ai.tool_runtime.contracts import (
     BindingContract,
-    BindingResolverSpec,
     JSONValue,
     ToolSpec,
 )
+from offerpilot.ai.tool_runtime.metadata import (
+    BindingResolverDescriptorV1,
+    EditableFieldMetadataV1,
+    ReadOperationMetadataV1,
+    ResolverImplementationBinding,
+    ToolPresentationBindingV1,
+    WriteOperationMetadataV1,
+)
+from offerpilot.ai.tool_runtime.policy_types import ToolCapability, ToolDomain
 from offerpilot.ai.tool_specs.common import (
     INPUT_EXCEPTION_MAP,
     NOT_FOUND_EXCEPTION_MAP,
@@ -60,22 +69,23 @@ def _resume_match_binding(args: ResumeArgs, context: ToolExecutionContext) -> ob
     )
 
 
-_RESUME_ID_RESOLVER = BindingResolverSpec(
-    resolver_id="resume_identity_arg",
-    entity_kind="resume",
-    arg_path="id",
-    presence="required",
-    identity_type="positive_int64",
-    resolve=_resume_id_binding,
-)
-_RESUME_MATCH_RESOLVER = BindingResolverSpec(
-    resolver_id="resume_identity_arg",
-    entity_kind="resume",
-    arg_path="resume_id",
-    presence="required",
-    identity_type="positive_int64",
-    resolve=_resume_match_binding,
-)
+def _resume_resolver(
+    implementation_id: str,
+    arg_path: str,
+    resolve: Any,
+) -> ResolverImplementationBinding:
+    descriptor = BindingResolverDescriptorV1(
+        resolver_id="resume_identity_arg",
+        entity_kind="resume",
+        arg_path=arg_path,
+        presence="required",
+        identity_type="positive_int64",
+    )
+    return ResolverImplementationBinding(
+        descriptor=descriptor,
+        implementation_id=implementation_id,
+        resolve=resolve,
+    )
 
 
 def _list(args: ResumeArgs, context: ToolExecutionContext) -> list[dict[str, Any]]:
@@ -153,13 +163,104 @@ def _matches(args: ResumeArgs, context: ToolExecutionContext) -> list[dict[str, 
     return [resume_match_json(match) for match in context.resumes.list_matches(resume_id)]
 
 
+def _empty_confirmation_description(args: object) -> str:
+    del args
+    return ""
+
+
+def _empty_pending_details(args: object, context: object | None = None) -> dict[str, object]:
+    del args, context
+    return {}
+
+
+def _describe_resume_update_career_intent(args: Mapping[str, Any]) -> str:
+    return f"更新简历求职意向 #{args.get('id', '')}"
+
+
+def _describe_resume_rewrite_highlight(args: Mapping[str, Any]) -> str:
+    return f"改写简历亮点 #{args.get('id', '')}"
+
+
 def resume_specs() -> tuple[ToolSpec[Any, Any], ...]:
-    read = frozenset({ToolCapability.RESUMES_READ})
-    write = frozenset({ToolCapability.RESUMES_WRITE})
+    get_resolver = _resume_resolver(
+        "get_resume_resume_identity_arg_v1", "id", _resume_id_binding
+    )
+    career_resolver = _resume_resolver(
+        "resume_update_career_intent_resume_identity_arg_v1", "id", _resume_id_binding
+    )
+    highlight_resolver = _resume_resolver(
+        "resume_rewrite_highlight_resume_identity_arg_v1", "id", _resume_id_binding
+    )
+    match_resolver = _resume_resolver(
+        "list_resume_matches_resume_identity_arg_v1", "resume_id", _resume_match_binding
+    )
     return (
-        ToolSpec(contract=provider_contract("list_resumes", "List resumes and their parse status.", {"type": "object", "properties": {}}), kind="read", decoder=_decode, executor=_list, required_capabilities=read, binding_contract=BindingContract("none"), success_renderer=compact_json),
-        ToolSpec(contract=provider_contract("get_resume", "Get one resume including parsed text by id.", {"type": "object", "properties": {"id": {"type": "integer", "description": "Resume id."}}, "required": ["id"]}), kind="read", decoder=_decode, executor=_get, required_capabilities=read, binding_contract=BindingContract("enforce_if_bound", "resume"), binding_resolvers=(_RESUME_ID_RESOLVER,), declared_failure_categories=frozenset({"not_found"}), exception_map=NOT_FOUND_EXCEPTION_MAP, success_renderer=compact_json),
-        ToolSpec(contract=provider_contract("resume_update_career_intent", "Update a resume's career_intent block. Requires user confirmation.", {"type": "object", "properties": {"id": {"type": "integer"}, "career_intent": {"type": "object"}}, "required": ["id", "career_intent"]}), kind="write", decoder=_decode, executor=_career, required_capabilities=write, binding_contract=BindingContract("enforce_if_bound", "resume"), binding_resolvers=(_RESUME_ID_RESOLVER,), confirmation_policy="required", declared_failure_categories=frozenset({"validation_error", "not_found"}), exception_map=INPUT_EXCEPTION_MAP + NOT_FOUND_EXCEPTION_MAP, success_renderer=compact_json),
-        ToolSpec(contract=provider_contract("resume_rewrite_highlight", "Rewrite one highlight in a structured resume section. Requires user confirmation.", {"type": "object", "properties": {"id": {"type": "integer"}, "section": {"type": "string"}, "item_index": {"type": "integer"}, "highlight_index": {"type": "integer"}, "text": {"type": "string"}}, "required": ["id", "section", "item_index", "highlight_index", "text"]}), kind="write", decoder=_decode, executor=_highlight, required_capabilities=write, binding_contract=BindingContract("enforce_if_bound", "resume"), binding_resolvers=(_RESUME_ID_RESOLVER,), confirmation_policy="required", declared_failure_categories=frozenset({"validation_error", "not_found"}), exception_map=INPUT_EXCEPTION_MAP + NOT_FOUND_EXCEPTION_MAP, success_renderer=compact_json),
-        ToolSpec(contract=provider_contract("list_resume_matches", "List saved JD match results for a resume.", {"type": "object", "properties": {"resume_id": {"type": "integer"}}, "required": ["resume_id"]}), kind="read", decoder=_decode, executor=_matches, required_capabilities=read, binding_contract=BindingContract("enforce_if_bound", "resume"), binding_resolvers=(_RESUME_MATCH_RESOLVER,), declared_failure_categories=frozenset({"not_found"}), exception_map=NOT_FOUND_EXCEPTION_MAP, success_renderer=compact_json),
+        build_tool_spec(
+            contract=provider_contract("list_resumes", "List resumes and their parse status.", {"type": "object", "properties": {}}),
+            domains=(ToolDomain.RESUMES,), dependencies=(), required_capability=ToolCapability.RESUMES_READ,
+            binding_contract=BindingContract("none"), resolver_bindings=(), confirmation_policy="none",
+            editable_fields=(), operation=ReadOperationMetadataV1(), undo_builder_binding=None,
+            presentation=ToolPresentationBindingV1(
+                implementation_id="list_resumes_presentation_v1",
+                confirmation_description=_empty_confirmation_description,
+                pending_details_projector=_empty_pending_details,
+                success_summary_projector=compact_json,
+            ), decoder=_decode, executor=_list, success_renderer=compact_json,
+        ),
+        build_tool_spec(
+            contract=provider_contract("get_resume", "Get one resume including parsed text by id.", {"type": "object", "properties": {"id": {"type": "integer", "description": "Resume id."}}, "required": ["id"]}),
+            domains=(ToolDomain.RESUMES,), dependencies=("list_resumes",), required_capability=ToolCapability.RESUMES_READ,
+            binding_contract=BindingContract("enforce_if_bound", "resume"), resolver_bindings=(get_resolver,),
+            confirmation_policy="none", editable_fields=(), operation=ReadOperationMetadataV1(),
+            undo_builder_binding=None, presentation=ToolPresentationBindingV1(
+                implementation_id="get_resume_presentation_v1",
+                confirmation_description=_empty_confirmation_description,
+                pending_details_projector=_empty_pending_details,
+                success_summary_projector=compact_json,
+            ), decoder=_decode, executor=_get, declared_failure_categories=frozenset({"not_found"}),
+            exception_map=NOT_FOUND_EXCEPTION_MAP, success_renderer=compact_json,
+        ),
+        build_tool_spec(
+            contract=provider_contract("resume_update_career_intent", "Update a resume's career_intent block. Requires user confirmation.", {"type": "object", "properties": {"id": {"type": "integer"}, "career_intent": {"type": "object"}}, "required": ["id", "career_intent"]}),
+            domains=(ToolDomain.RESUMES,), dependencies=("get_resume",), required_capability=ToolCapability.RESUMES_WRITE,
+            binding_contract=BindingContract("enforce_if_bound", "resume"), resolver_bindings=(career_resolver,),
+            confirmation_policy="required", editable_fields=(), operation=WriteOperationMetadataV1(),
+            undo_builder_binding=None, presentation=ToolPresentationBindingV1(
+                implementation_id="resume_update_career_intent_presentation_v1",
+                confirmation_description=_describe_resume_update_career_intent,
+                pending_details_projector=_empty_pending_details,
+                success_summary_projector=compact_json,
+            ), decoder=_decode, executor=_career,
+            declared_failure_categories=frozenset({"validation_error", "not_found"}),
+            exception_map=INPUT_EXCEPTION_MAP + NOT_FOUND_EXCEPTION_MAP, success_renderer=compact_json,
+        ),
+        build_tool_spec(
+            contract=provider_contract("resume_rewrite_highlight", "Rewrite one highlight in a structured resume section. Requires user confirmation.", {"type": "object", "properties": {"id": {"type": "integer"}, "section": {"type": "string"}, "item_index": {"type": "integer"}, "highlight_index": {"type": "integer"}, "text": {"type": "string"}}, "required": ["id", "section", "item_index", "highlight_index", "text"]}),
+            domains=(ToolDomain.RESUMES,), dependencies=("get_resume",), required_capability=ToolCapability.RESUMES_WRITE,
+            binding_contract=BindingContract("enforce_if_bound", "resume"), resolver_bindings=(highlight_resolver,),
+            confirmation_policy="required", editable_fields=(EditableFieldMetadataV1(
+                field="text", value_type="long_text", options=None, clearable=False, clear_value=None
+            ),), operation=WriteOperationMetadataV1(), undo_builder_binding=None,
+            presentation=ToolPresentationBindingV1(
+                implementation_id="resume_rewrite_highlight_presentation_v1",
+                confirmation_description=_describe_resume_rewrite_highlight,
+                pending_details_projector=_empty_pending_details,
+                success_summary_projector=compact_json,
+            ), decoder=_decode, executor=_highlight,
+            declared_failure_categories=frozenset({"validation_error", "not_found"}),
+            exception_map=INPUT_EXCEPTION_MAP + NOT_FOUND_EXCEPTION_MAP, success_renderer=compact_json,
+        ),
+        build_tool_spec(
+            contract=provider_contract("list_resume_matches", "List saved JD match results for a resume.", {"type": "object", "properties": {"resume_id": {"type": "integer"}}, "required": ["resume_id"]}),
+            domains=(ToolDomain.RESUMES,), dependencies=("list_resumes",), required_capability=ToolCapability.RESUMES_READ,
+            binding_contract=BindingContract("enforce_if_bound", "resume"), resolver_bindings=(match_resolver,),
+            confirmation_policy="none", editable_fields=(), operation=ReadOperationMetadataV1(),
+            undo_builder_binding=None, presentation=ToolPresentationBindingV1(
+                implementation_id="list_resume_matches_presentation_v1",
+                confirmation_description=_empty_confirmation_description,
+                pending_details_projector=_empty_pending_details,
+                success_summary_projector=compact_json,
+            ), decoder=_decode, executor=_matches, declared_failure_categories=frozenset({"not_found"}),
+            exception_map=NOT_FOUND_EXCEPTION_MAP, success_renderer=compact_json,
+        ),
     )

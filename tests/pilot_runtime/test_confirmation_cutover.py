@@ -125,6 +125,27 @@ def _confirm(
     return client.post(endpoint, json=payload)
 
 
+@pytest.mark.parametrize("endpoint", ("/api/chat/confirm", "/api/chat/confirm/stream"))
+def test_confirmation_explicit_null_edited_args_remains_422(
+    tmp_path: Any,
+    endpoint: str,
+) -> None:
+    client = TestClient(create_app(data_dir=tmp_path), raise_server_exceptions=False)
+
+    response = client.post(
+        endpoint,
+        json={
+            "conversation_id": 1,
+            "approved": True,
+            "confirmation_token": "0" * 64,
+            "edited_args": None,
+        },
+    )
+
+    assert response.status_code == 422
+    assert "edited_args must be a JSON object" in response.text
+
+
 def _sse_events(raw: str) -> list[tuple[str, dict[str, Any]]]:
     events: list[tuple[str, dict[str, Any]]] = []
     for frame in raw.strip().split("\n\n"):
@@ -168,8 +189,6 @@ def test_streaming_continuation_negotiates_delta_from_fresh_segment_model(
         {"delta": "continuation"},
     ]
     assert len(model.calls) == 2
-
-
 
 
 @pytest.mark.parametrize("endpoint", ("/api/chat/confirm", "/api/chat/confirm/stream"))

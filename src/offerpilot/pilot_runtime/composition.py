@@ -11,16 +11,15 @@ from __future__ import annotations
 
 import json
 import inspect
-from copy import deepcopy
 from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar, Token
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 from uuid import uuid4
 
-from sqlalchemy import event as sqlalchemy_event, select
+from sqlalchemy import event as sqlalchemy_event, select, update
 
 from offerpilot.ai.agent_contracts import (
     AgentAssistantDelta,
@@ -45,14 +44,38 @@ from offerpilot.ai.tool_runtime.context import ToolExecutionContext
 from offerpilot.ai.tool_authority.policy import (
     validate_startup_policy,
 )
-from offerpilot.ai.tool_runtime.catalog import ToolCatalog as RuntimeToolCatalog
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
-from offerpilot.ai.tool_specs.legacy import build_legacy_deterministic_catalog
-from offerpilot.context_projector.selector import DEPENDENCY_POLICY_V1
+from offerpilot.ai.tool_runtime.catalog import (
+    ToolCatalog as RuntimeToolCatalog,
+    compile_tool_metadata_manifest,
+)
+from offerpilot.ai.tool_runtime.contracts import TransientToolRuntimeValue
+from offerpilot.ai.tool_runtime.legacy import (
+    LegacyInitialRouteComponents,
+    LegacyRouteSourceV1,
+    LegacyStaticAdapterCatalogV1,
+    build_unpublished_legacy_initial_route_components,
+)
+from offerpilot.ai.tool_runtime.metadata import (
+    ProviderToolMetadataView,
+    ToolAuthorityMetadataView,
+    ToolDiscoveryMetadataView,
+    ToolMetadataBundleV1,
+    ToolOperationMetadataView,
+    ToolOperationMetadataPort,
+    canonical_json_bytes,
+    freeze_json,
+)
+from offerpilot.ai.tool_runtime.protocol_seals import verify_legacy_boundary
+from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
+from offerpilot.ai.tool_specs.legacy import (
+    build_static_adapter_catalog,
+)
 from offerpilot.ai.write_operations import (
+    PendingPersistenceRoutePort,
     WriteOperationCoordinator,
     WriteOperationError,
     WriteOperationRepository,
+    build_pending_persistence_route_port,
 )
 from offerpilot.agent_runtime.journal import NullRunRecorder, RunRecorderFactory
 from offerpilot.ai.types import Message
@@ -78,6 +101,10 @@ from offerpilot.pilot_runtime.deterministic import (
     DeterministicDependencies,
     DeterministicPilotAdapter,
 )
+from offerpilot.pilot_runtime.compensation import (
+    CompensationHandlerRegistry,
+    prepare_compensation_handler_components,
+)
 from offerpilot.pilot_runtime.errors import (
     ModelUnconfiguredError,
     RuntimeAgentTimedOut,
@@ -98,6 +125,14 @@ from offerpilot.pilot_runtime.service import (
     ResolvedPolicyCatalog,
     SourceLoader,
     SegmentExecution,
+)
+from offerpilot.pilot_runtime.legacy_route import (
+    LegacyConfirmationRouteComponents,
+    LegacyCompositeRouteVerifier,
+    LegacyPendingIdentityVerifierPort,
+    build_legacy_composite_route_verifier,
+    build_legacy_pending_identity_verifier_port,
+    build_unpublished_legacy_confirmation_components,
 )
 
 
@@ -214,34 +249,33 @@ class _ConversationGateway:
 class _PolicyCatalogResolver:
     """Pure startup/policy boundary; it never constructs a Provider."""
 
-    __slots__ = ("_catalog",)
+    __slots__ = (
+        "_catalog",
+        "_provider_view",
+        "_discovery_view",
+        "_authority_view",
+    )
 
-    def __init__(self, catalog: object) -> None:
-        self._catalog = catalog
-
-    @staticmethod
-    def _fresh_segment_catalog(catalog: object) -> RuntimeToolCatalog:
-        """Rebuild a detached catalog for each execution Segment.
-
-        The Approval invocation owns the composition-root catalog.  A
-        continuation Segment must receive a distinct catalog identity so an
-        Approval-bound invocation cannot be reused as the post-terminal
-        Segment.  Rebuilding from the startup-validated specs and manifest
-        also keeps the exact provider schema/order and authority fingerprint,
-        while preventing mutable catalog/spec state from crossing the phase
-        boundary.
-        """
-
+    def __init__(
+        self,
+        catalog: object,
+        *,
+        provider_view: ProviderToolMetadataView,
+        discovery_view: ToolDiscoveryMetadataView,
+        authority_view: ToolAuthorityMetadataView,
+    ) -> None:
         if type(catalog) is not RuntimeToolCatalog:
-            raise ValueError("segment catalog must be a frozen ToolCatalog")
-        specs = tuple(deepcopy(catalog.specs))
-        expected_names = tuple(spec.name for spec in specs)
-        manifest = deepcopy(catalog.authority_manifest)
-        return RuntimeToolCatalog(
-            specs,
-            expected_names=expected_names,
-            authority_manifest=manifest,
-        )
+            raise TypeError("policy resolver requires the exact Typed Catalog")
+        token = provider_view.bundle_instance_token
+        if (
+            discovery_view.bundle_instance_token is not token
+            or authority_view.bundle_instance_token is not token
+        ):
+            raise ValueError("policy resolver metadata views have mixed Bundle provenance")
+        self._catalog = catalog
+        self._provider_view = provider_view
+        self._discovery_view = discovery_view
+        self._authority_view = authority_view
 
     def resolve(
         self,
@@ -258,7 +292,7 @@ class _PolicyCatalogResolver:
             or segment.catalog is not None
         ):
             raise ValueError("policy resolver requires an unbound Segment authority")
-        segment_catalog = self._fresh_segment_catalog(self._catalog)
+        segment_catalog = self._catalog
         manifest = segment_catalog.authority_manifest
         if not isinstance(manifest, Mapping):
             raise ValueError("typed catalog manifest is unavailable")
@@ -277,8 +311,144 @@ class _PolicyCatalogResolver:
         return ResolvedPolicyCatalog(
             catalog=segment_catalog,
             policy=snapshot,
-            dependency_policy=DEPENDENCY_POLICY_V1,
+            dependency_policy=self._discovery_view.policy,
+            provider_metadata_view=self._provider_view,
+            discovery_metadata_view=self._discovery_view,
+            authority_metadata_view=self._authority_view,
         )
+
+
+class _MissingTargetQuestionResolver:
+    """Resolve clarification questions from one exact Bundle projection."""
+
+    __slots__ = ("_applications", "_routes")
+
+    def __init__(
+        self,
+        applications: object,
+        *,
+        operation_view: ToolOperationMetadataView,
+        provider_view: ProviderToolMetadataView,
+    ) -> None:
+        if type(operation_view) is not ToolOperationMetadataView:
+            raise TypeError("missing-target resolver requires the exact Operation view")
+        if type(provider_view) is not ProviderToolMetadataView:
+            raise TypeError("missing-target resolver requires the exact Provider view")
+        if operation_view.bundle_instance_token is not provider_view.bundle_instance_token:
+            raise ValueError("missing-target resolver metadata views have mixed Bundle provenance")
+        operations = tuple(operation_view.entries.values())
+        contracts = provider_view.ordered_contracts
+        if len(operations) != len(contracts) or any(
+            operation.ordinal != ordinal or operation.provider_name != contract.name
+            for ordinal, (operation, contract) in enumerate(
+                zip(operations, contracts, strict=True),
+                start=1,
+            )
+        ):
+            raise ValueError("missing-target resolver metadata views are not aligned")
+        self._applications = applications
+        self._routes = tuple(zip(operations, contracts, strict=True))
+
+    @staticmethod
+    def _arguments(raw: str) -> Mapping[str, object]:
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        return cast(Mapping[str, object], parsed) if isinstance(parsed, Mapping) else {}
+
+    @staticmethod
+    def _positive_int_like(value: object) -> bool:
+        if value in (None, ""):
+            return False
+        try:
+            return int(cast(Any, value)) > 0
+        except (TypeError, ValueError):
+            return False
+
+    def application_visible(self, application_id: int) -> bool:
+        try:
+            return cast(Any, self._applications).get(application_id) is not None
+        except (TypeError, ValueError):
+            return False
+
+    def resolve(self, pending: PendingAction, conversation_id: int) -> str | None:
+        del conversation_id
+        if type(pending) is not PendingAction:
+            raise TypeError("missing-target resolver requires an exact Pending action")
+        route = next(
+            (
+                (operation, contract)
+                for operation, contract in self._routes
+                if contract.name == pending.tool_name
+            ),
+            None,
+        )
+        if route is None:
+            return None
+        operation, contract = route
+        if operation.confirmation_policy != "required":
+            return None
+        properties_value = contract.parameters.get("properties")
+        required_value = contract.parameters.get("required", ())
+        if not isinstance(properties_value, Mapping) or not isinstance(required_value, Sequence):
+            return None
+        properties = frozenset(str(field) for field in properties_value)
+        required = tuple(str(field) for field in required_value)
+        editable = tuple(descriptor.field for descriptor in operation.editable_fields)
+        arguments = self._arguments(pending.args)
+
+        if required == ("company_name", "position_name") and required == editable[:2]:
+            if not str(arguments.get("company_name") or "").strip():
+                return "要新建投递记录的话，还需要公司名称。请告诉我公司是哪一家。"
+            if not str(arguments.get("position_name") or "").strip():
+                return "要新建投递记录的话，还需要岗位名称。请告诉我投递的具体岗位。"
+            return None
+        if required == ("id", "status") and editable[:1] == ("status",):
+            if not self._positive_int_like(arguments.get("id")):
+                return "要更新投递状态的话，还需要明确是哪条投递记录。请告诉我公司/岗位或记录编号。"
+            if not str(arguments.get("status") or "").strip():
+                return "要更新投递状态的话，还需要目标状态。请告诉我是已投递、笔试、面试、Offer 还是已结束。"
+            return None
+        if required == (
+            "application_id",
+            "event_type",
+            "scheduled_at",
+            "duration_minutes",
+        ) and editable[:4] == (
+            "event_type",
+            "subtype",
+            "scheduled_at",
+            "remind_at",
+        ):
+            application_id = arguments.get("application_id")
+            if not self._positive_int_like(application_id) or not self.application_visible(
+                int(cast(Any, application_id))
+            ):
+                return "这条日程要关联哪条投递记录？请告诉我公司/岗位或记录编号。"
+            if not str(arguments.get("event_type") or "").strip():
+                return "这条日程是什么类型？比如笔试、面试、Offer 进展或截止事项。"
+            if not str(arguments.get("scheduled_at") or "").strip():
+                return "这条日程的具体时间是什么？请补充日期和开始时间。"
+            if not self._positive_int_like(arguments.get("duration_minutes")):
+                return "这条日程预计持续多久？请补充时长，例如 30 分钟。"
+            return None
+        if (
+            not required
+            and {"application_id", "company", "date"}.issubset(properties)
+            and editable[:4] == ("company", "position", "round", "date")
+        ):
+            if (
+                not self._positive_int_like(arguments.get("application_id"))
+                and not str(arguments.get("company") or "").strip()
+            ):
+                return "这次复盘还缺少公司信息。请告诉我公司名称，或先说明不关联具体公司。"
+            if not str(arguments.get("date") or "").strip():
+                return "这次复盘还缺少面试日期。请告诉我具体日期，或回复“日期待定”。"
+        return None
+
+    def __call__(self, pending: PendingAction, conversation_id: int) -> str | None:
+        return self.resolve(pending, conversation_id)
 
 
 class _ContinuationModelResolver:
@@ -472,6 +642,29 @@ class _SegmentContextResolver:
 class _SegmentSurfaceGateResolver:
     """Freeze Catalog/Profile/Selector/Authority visibility before Provider."""
 
+    __slots__ = ("_bundle", "_provider_view", "_discovery_view", "_authority_view")
+
+    def __init__(
+        self,
+        *,
+        bundle: ToolMetadataBundleV1,
+    ) -> None:
+        if type(bundle) is not ToolMetadataBundleV1:
+            raise TypeError("surface resolver requires exact Tool Metadata Bundle")
+        provider_view = bundle.provider_view()
+        discovery_view = bundle.discovery_view()
+        authority_view = bundle.authority_view()
+        token = provider_view.bundle_instance_token
+        if (
+            discovery_view.bundle_instance_token is not token
+            or authority_view.bundle_instance_token is not token
+        ):
+            raise ValueError("surface resolver metadata views have mixed Bundle provenance")
+        self._bundle = bundle
+        self._provider_view = provider_view
+        self._discovery_view = discovery_view
+        self._authority_view = authority_view
+
     def resolve(
         self,
         request: StartTurnRequest,
@@ -490,6 +683,12 @@ class _SegmentSurfaceGateResolver:
             raise TypeError("Segment surface gate requires exact ToolExecutionContext")
         if not isinstance(assembled, Sequence) or isinstance(assembled, (str, bytes)):
             raise TypeError("Segment surface gate requires assembled messages")
+        if (
+            _attribute(policy, "provider_metadata_view") is not self._provider_view
+            or _attribute(policy, "discovery_metadata_view") is not self._discovery_view
+            or _attribute(policy, "authority_metadata_view") is not self._authority_view
+        ):
+            raise ValueError("Segment policy metadata views drifted from the Runtime Bundle")
         messages = tuple(
             value
             if isinstance(value, Message)
@@ -506,14 +705,22 @@ class _SegmentSurfaceGateResolver:
             )
             for value in assembled
         )
-        return build_segment_surface_gate(
-            messages,
-            catalog=cast(Any, segment.catalog),
-            context=segment.context,
-            authority=cast(Any, segment.authority),
-            dependency_policy=cast(Any, _attribute(policy, "dependency_policy")),
-            policy=cast(Any, _attribute(policy, "policy")),
-        )
+        catalog_lease = self._bundle.open_segment_lease()
+        try:
+            return build_segment_surface_gate(
+                messages,
+                catalog=cast(Any, segment.catalog),
+                catalog_lease=catalog_lease,
+                context=segment.context,
+                authority=cast(Any, segment.authority),
+                provider_view=self._provider_view,
+                discovery_view=self._discovery_view,
+                authority_metadata_view=self._authority_view,
+                policy=cast(Any, _attribute(policy, "policy")),
+            )
+        except BaseException:
+            catalog_lease.close()
+            raise
 
 
 class _SourceAdapter(SourceLoader):
@@ -795,6 +1002,11 @@ class _AgentDriver:
             # proposal facts available for a later turn.
             recorder.discard_proposals()
             raise
+        finally:
+            # Runner normally owns this close.  Keep the composition driver
+            # as the final boundary when a substituted/failing Runner exits
+            # before taking that ownership.
+            invocation._release_catalog_lease_backstop()
 
 
 class _AtomicTimeoutDelivery:
@@ -1009,6 +1221,425 @@ def _title_from_message(message: str) -> str:
     return title[:36] or "新对话"
 
 
+_PRODUCTION_METADATA_COMPONENT_SEAL = object()
+
+
+def _legacy_manifest_from_adapters(
+    catalog: LegacyStaticAdapterCatalogV1,
+) -> dict[str, object]:
+    catalog.require_integrity()
+    adapters = catalog.ordered_adapters
+    return {
+        "boundary_version": "legacy-deterministic-boundary-v1",
+        "provider_visibility": "forbidden",
+        "adapter_kind": "legacy_deterministic",
+        "ordered_names": [adapter.name for adapter in adapters],
+        "chained_policies": [adapter.chained_policy for adapter in adapters],
+        "initial_route_bindings": [
+            {
+                "route_source": source.value,
+                "adapter_ordinal": adapter.ordinal,
+            }
+            for adapter in adapters
+            for source in adapter.initial_route_sources
+        ],
+    }
+
+
+def _legacy_manifest_from_initial_registry(
+    components: LegacyInitialRouteComponents,
+) -> dict[str, object]:
+    catalog = components.catalog
+    adapters = catalog.ordered_adapters
+    owner = components.owner_lease_factory.open()
+    routes: list[dict[str, object]] = []
+    try:
+        for adapter in adapters:
+            for source in adapter.initial_route_sources:
+                issuer = components.initial_issuer_for(source)
+                lease = issuer.open_request_lease(owner)
+                token = issuer.issue(lease)
+                handle = components.initial_route_port.resolve_initial(token)
+                binding = components.initial_route_port.require_route(handle)
+                routes.append(
+                    {
+                        "route_source": source.value,
+                        "adapter_ordinal": binding.ordinal,
+                    }
+                )
+    finally:
+        owner.close()
+    projection = _legacy_manifest_from_adapters(catalog)
+    projection["initial_route_bindings"] = routes
+    return projection
+
+
+def _same_canonical_projection(
+    left: Mapping[str, object],
+    right: object,
+) -> bool:
+    if not isinstance(right, Mapping):
+        return False
+    return canonical_json_bytes(freeze_json(left)) == canonical_json_bytes(
+        freeze_json(cast(Mapping[str, object], right))
+    )
+
+
+class ProductionToolMetadataComponents(TransientToolRuntimeValue):
+    """One sealed application-level Tool Metadata graph."""
+
+    __slots__ = (
+        "_typed_catalog",
+        "_bundle",
+        "_operation_port",
+        "_pending_persistence_route_port",
+        "_compensation_registry",
+        "_initial_routes",
+        "_confirmation_routes",
+        "_legacy_route_verifier",
+        "_integrity_seal",
+    )
+    _bundle: ToolMetadataBundleV1
+    _typed_catalog: RuntimeToolCatalog
+    _operation_port: ToolOperationMetadataPort
+    _pending_persistence_route_port: PendingPersistenceRoutePort
+    _compensation_registry: CompensationHandlerRegistry
+    _initial_routes: LegacyInitialRouteComponents
+    _confirmation_routes: LegacyConfirmationRouteComponents
+    _legacy_route_verifier: LegacyCompositeRouteVerifier
+    _integrity_seal: tuple[object, ...]
+
+    def __new__(
+        cls,
+        seal: object | None = None,
+        **_kwargs: object,
+    ) -> "ProductionToolMetadataComponents":
+        if seal is not _PRODUCTION_METADATA_COMPONENT_SEAL:
+            raise TypeError("production Tool Metadata components are Composition-created")
+        return object.__new__(cls)
+
+    def __init__(
+        self,
+        seal: object | None = None,
+        *,
+        typed_catalog: RuntimeToolCatalog,
+        bundle: ToolMetadataBundleV1,
+        operation_port: ToolOperationMetadataPort,
+        pending_persistence_route_port: PendingPersistenceRoutePort,
+        compensation_registry: CompensationHandlerRegistry,
+        initial_routes: LegacyInitialRouteComponents,
+        confirmation_routes: LegacyConfirmationRouteComponents,
+        legacy_route_verifier: LegacyCompositeRouteVerifier,
+    ) -> None:
+        if seal is not _PRODUCTION_METADATA_COMPONENT_SEAL:
+            raise TypeError("production Tool Metadata components are Composition-created")
+        if type(typed_catalog) is not RuntimeToolCatalog:
+            raise TypeError("production Tool Metadata components require the exact Typed Catalog")
+        values = (
+            typed_catalog,
+            bundle,
+            operation_port,
+            pending_persistence_route_port,
+            compensation_registry,
+            initial_routes,
+            confirmation_routes,
+            legacy_route_verifier,
+        )
+        for name, value in zip(self.__slots__[:-1], values):
+            object.__setattr__(self, name, value)
+        object.__setattr__(self, "_integrity_seal", values)
+        self._ensure_integrity()
+
+    def __setattr__(self, name: str, value: object) -> NoReturn:
+        del name, value
+        raise AttributeError("production Tool Metadata components are sealed")
+
+    def _ensure_integrity(self) -> None:
+        try:
+            current = (
+                self._typed_catalog,
+                self._bundle,
+                self._operation_port,
+                self._pending_persistence_route_port,
+                self._compensation_registry,
+                self._initial_routes,
+                self._confirmation_routes,
+                self._legacy_route_verifier,
+            )
+            if (
+                type(self._integrity_seal) is not tuple
+                or len(self._integrity_seal) != len(current)
+                or any(
+                    expected is not actual
+                    for expected, actual in zip(self._integrity_seal, current)
+                )
+            ):
+                raise ValueError("production Tool Metadata component identity drift")
+            token = self._bundle.bundle_instance_token
+            if (
+                self._operation_port.bundle_instance_token is not token
+                or self._pending_persistence_route_port.bundle_instance_token is not token
+                or self._compensation_registry.bundle_instance_token is not token
+                or self._initial_routes.initial_route_port.bundle_instance_token is not token
+                or self._confirmation_routes.bundle_instance_token is not token
+                or self._confirmation_routes.catalog.bundle_instance_token is not token
+                or self._legacy_route_verifier.bundle_instance_token is not token
+                or self._operation_port.legacy_route_registry_token
+                is not self._legacy_route_verifier.registry_token
+            ):
+                raise ValueError("production Tool Metadata Bundle provenance drift")
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("production Tool Metadata component integrity drift") from exc
+
+    @property
+    def typed_catalog(self) -> RuntimeToolCatalog:
+        self._ensure_integrity()
+        return self._typed_catalog
+
+    @property
+    def bundle(self) -> ToolMetadataBundleV1:
+        self._ensure_integrity()
+        return self._bundle
+
+    @property
+    def operation_port(self) -> ToolOperationMetadataPort:
+        self._ensure_integrity()
+        return self._operation_port
+
+    @property
+    def pending_persistence_route_port(self) -> PendingPersistenceRoutePort:
+        self._ensure_integrity()
+        return self._pending_persistence_route_port
+
+    @property
+    def compensation_registry(self) -> CompensationHandlerRegistry:
+        self._ensure_integrity()
+        return self._compensation_registry
+
+    @property
+    def initial_routes(self) -> LegacyInitialRouteComponents:
+        self._ensure_integrity()
+        return self._initial_routes
+
+    @property
+    def confirmation_routes(self) -> LegacyConfirmationRouteComponents:
+        self._ensure_integrity()
+        return self._confirmation_routes
+
+
+def build_production_tool_metadata_components(
+    *,
+    pending_identity_verifier_port: LegacyPendingIdentityVerifierPort,
+) -> ProductionToolMetadataComponents:
+    """Assemble and publish the closed 25/3/4 Tool Metadata graph atomically."""
+
+    if type(pending_identity_verifier_port) is not LegacyPendingIdentityVerifierPort:
+        raise TypeError("production metadata requires the exact Legacy verifier Port")
+    typed_catalog = build_model_tool_catalog()
+    manifest = compile_tool_metadata_manifest(typed_catalog.specs)
+    manifest_projection = manifest.to_dict()
+    expected_legacy = manifest_projection["legacy_boundary"]
+    adapter_catalog = build_static_adapter_catalog()
+    actual_legacy = _legacy_manifest_from_adapters(adapter_catalog)
+    verify_legacy_boundary(
+        tuple(adapter.name for adapter in adapter_catalog.ordered_adapters),
+        "forbidden",
+        "legacy_deterministic",
+    )
+    if not _same_canonical_projection(actual_legacy, expected_legacy):
+        raise ValueError("actual Legacy Adapter policy does not match the exact Manifest")
+    compensation_components = prepare_compensation_handler_components()
+    bundle = ToolMetadataBundleV1(
+        typed_catalog=typed_catalog,
+        manifest=manifest,
+        legacy_boundary=actual_legacy,
+        compensation=compensation_components.metadata_projection(),
+    )
+    runtime_container_token = object()
+    initial_routes = build_unpublished_legacy_initial_route_components(
+        catalog=adapter_catalog,
+        legacy_boundary=bundle.legacy_boundary(),
+        runtime_container_token=runtime_container_token,
+    )
+    actual_initial = _legacy_manifest_from_initial_registry(initial_routes)
+    if not _same_canonical_projection(actual_initial, expected_legacy):
+        raise ValueError("actual Legacy initial-route policy does not match the exact Manifest")
+    confirmation_routes = build_unpublished_legacy_confirmation_components(
+        catalog=adapter_catalog,
+        legacy_boundary=bundle.legacy_boundary(),
+        runtime_container_token=runtime_container_token,
+        pending_identity_verifier_port=pending_identity_verifier_port,
+    )
+    legacy_route_verifier = build_legacy_composite_route_verifier(
+        initial_route_port=initial_routes.initial_route_port,
+        proof_consumer_port=confirmation_routes.proof_consumer_port,
+        legacy_boundary=bundle.legacy_boundary(),
+    )
+    compensation_registry = compensation_components.bind(bundle.compensation_view())
+    operation_port = ToolOperationMetadataPort(
+        operation_view=bundle.operation_view(),
+        legacy_boundary=bundle.legacy_boundary(),
+        compensation_view=bundle.compensation_view(),
+        compensation_registry=compensation_registry,
+        legacy_route_issuer_port=legacy_route_verifier,
+    )
+    pending_persistence_route_port = build_pending_persistence_route_port(
+        operation_port=operation_port
+    )
+    return ProductionToolMetadataComponents(
+        _PRODUCTION_METADATA_COMPONENT_SEAL,
+        typed_catalog=typed_catalog,
+        bundle=bundle,
+        operation_port=operation_port,
+        pending_persistence_route_port=pending_persistence_route_port,
+        compensation_registry=compensation_registry,
+        initial_routes=initial_routes,
+        confirmation_routes=confirmation_routes,
+        legacy_route_verifier=legacy_route_verifier,
+    )
+
+
+class _SqlAlchemyLegacyPendingIdentityBackend:
+    """Caller-transaction adapter for the sealed Legacy proof verifier."""
+
+    __slots__ = ()
+
+    @staticmethod
+    def _snapshot(
+        session: object,
+        lookup_identity: object,
+        confirmation_input: object,
+    ) -> dict[str, object]:
+        from offerpilot.models import Conversation, WriteOperation
+
+        conversation_id = getattr(lookup_identity, "conversation_id", None)
+        requested_operation_id = getattr(confirmation_input, "operation_id", None)
+        if type(conversation_id) is not int or conversation_id <= 0:
+            raise WriteOperationError("operation_identity_conflict")
+        getter = getattr(session, "get", None)
+        if not callable(getter):
+            raise WriteOperationError("operation_unavailable")
+        conversation = getter(Conversation, conversation_id)
+        if conversation is None or getattr(conversation, "archived_at", None) is not None:
+            raise WriteOperationError("stale_pending_action")
+        pending_operation_id = str(getattr(conversation, "pending_operation_id", "") or "")
+        operation_id = requested_operation_id or pending_operation_id
+        if type(operation_id) is not str or not operation_id:
+            raise WriteOperationError("stale_pending_action")
+        operation = getter(WriteOperation, operation_id)
+        if operation is None:
+            raise WriteOperationError("operation_result_unknown", retryable=True)
+        raw_args = str(getattr(conversation, "pending_args", "") or "")
+        try:
+            normalized_args = json.loads(raw_args)
+        except (TypeError, ValueError) as exc:
+            raise WriteOperationError("operation_integrity_error") from exc
+        if not isinstance(normalized_args, Mapping):
+            raise WriteOperationError("operation_integrity_error")
+        pending_tool_call_id = str(getattr(conversation, "pending_tool_call_id", "") or "")
+        pending_tool_name = str(getattr(conversation, "pending_tool_name", "") or "")
+        if (
+            pending_operation_id != operation_id
+            or operation.operation_role != "primary"
+            or operation.adapter_kind != "legacy_deterministic"
+            or operation.status != "proposed"
+            or operation.conversation_id != conversation_id
+            or operation.tool_call_id != pending_tool_call_id
+            or operation.tool_name != pending_tool_name
+        ):
+            raise WriteOperationError("operation_identity_conflict")
+        return {
+            "adapter_kind": "legacy_deterministic",
+            "operation_role": "primary",
+            "route_source": "confirmation_resume",
+            "conversation_id": conversation_id,
+            "conversation_scope_revision": getattr(conversation, "scope_revision", None),
+            "pending_operation_id": pending_operation_id,
+            "operation_id": operation_id,
+            "tool_call_id": pending_tool_call_id,
+            "tool_name": pending_tool_name,
+            "fingerprint_key_id": operation.fingerprint_key_id,
+            "raw_args": raw_args,
+            "normalized_args": dict(normalized_args),
+            "proposal_fingerprint": operation.proposal_fingerprint,
+            "confirmation_token_fingerprint": operation.confirmation_token_fingerprint,
+            "authorization_scope_fingerprint": operation.authorization_scope_fingerprint,
+            "input_fingerprint": operation.input_fingerprint,
+            "operation_request_fingerprint": operation.operation_request_fingerprint,
+            "pending_confirmation_claim_id": str(
+                getattr(conversation, "pending_confirmation_claim_id", "") or ""
+            ),
+            "pending_confirmation_claimed_at": getattr(
+                conversation,
+                "pending_confirmation_claimed_at",
+                None,
+            ),
+        }
+
+    def read_snapshot(
+        self,
+        session: object,
+        lookup_identity: object,
+        confirmation_input: object,
+    ) -> dict[str, object]:
+        return self._snapshot(session, lookup_identity, confirmation_input)
+
+    def locked_recheck(
+        self,
+        session: object,
+        lookup_identity: object,
+        confirmation_input: object,
+    ) -> dict[str, object]:
+        return self._snapshot(session, lookup_identity, confirmation_input)
+
+    def claim_cas(
+        self,
+        session: object,
+        lookup_identity: object,
+        confirmation_input: object,
+    ) -> dict[str, object]:
+        from offerpilot.models import Conversation
+
+        snapshot = self._snapshot(session, lookup_identity, confirmation_input)
+        claimed_at = datetime.now(timezone.utc)
+        executor = getattr(session, "execute", None)
+        if not callable(executor):
+            raise WriteOperationError("operation_unavailable")
+        result = executor(
+            update(Conversation)
+            .where(Conversation.id == snapshot["conversation_id"])
+            .where(Conversation.archived_at.is_(None))
+            .where(Conversation.scope_revision == snapshot["conversation_scope_revision"])
+            .where(Conversation.pending_operation_id == snapshot["operation_id"])
+            .where(Conversation.pending_tool_call_id == snapshot["tool_call_id"])
+            .where(Conversation.pending_tool_name == snapshot["tool_name"])
+            .where(Conversation.pending_args == snapshot["raw_args"])
+            .where(Conversation.pending_confirmation_claim_id == "")
+            .where(Conversation.pending_confirmation_claimed_at.is_(None))
+            .values(
+                pending_confirmation_claim_id=snapshot["operation_id"],
+                pending_confirmation_claimed_at=claimed_at,
+            )
+        )
+        if getattr(result, "rowcount", 0) != 1:
+            raise WriteOperationError("confirmation_claim_lost")
+        claim_row = executor(
+            select(
+                Conversation.pending_confirmation_claim_id,
+                Conversation.pending_confirmation_claimed_at,
+            ).where(Conversation.id == snapshot["conversation_id"])
+        ).one_or_none()
+        if claim_row is None:
+            raise WriteOperationError("operation_integrity_error")
+        claim_id, persisted_claimed_at = claim_row
+        if claim_id != snapshot["operation_id"] or persisted_claimed_at is None:
+            raise WriteOperationError("operation_integrity_error")
+        claimed_snapshot = dict(snapshot)
+        claimed_snapshot["pending_confirmation_claim_id"] = claim_id
+        claimed_snapshot["pending_confirmation_claimed_at"] = persisted_claimed_at
+        return claimed_snapshot
+
+
 def _append_log(data_dir: Path, level: str, message: str) -> None:
     # Kept as a late import so composition remains independent from api.py.
     from offerpilot.diagnostics import append_log_entry
@@ -1037,20 +1668,34 @@ def build_pilot_runtime(
     system_message: Callable[[], object],
     clarification_message: Callable[[tuple[PendingAction, str] | None, str], object | None],
     page_context_messages: Callable[[Mapping[str, object] | None], Sequence[object]],
-    missing_target_question: Callable[..., str | None] | None = None,
-    pending_action_details: Callable[[PendingAction], Mapping[str, object]] | None = None,
-    undo_seed_for_pending: Callable[[PendingAction, object], Mapping[str, object]] | None = None,
-    build_write_undo: Callable[
-        [PendingAction, object | None, dict[str, object]], Mapping[str, object] | None
-    ]
-    | None = None,
     title_from_message: Callable[[str], str] | None = None,
-    catalog: object = MODEL_TOOL_CATALOG,
-    application_visible: Callable[[int], bool] | None = None,
     clock: Callable[[], object] | None = None,
 ) -> PilotRuntime:
     """Build one frozen production Runtime graph from app-owned dependencies."""
 
+    if (
+        type(write_operations) is not WriteOperationRepository
+        or type(write_coordinator) is not WriteOperationCoordinator
+        or write_coordinator.repository is not write_operations
+    ):
+        raise WriteOperationError("operation_unavailable")
+    pending_identity_verifier = build_legacy_pending_identity_verifier_port(
+        backend=_SqlAlchemyLegacyPendingIdentityBackend(),
+        ledger_key=write_operations.key,
+    )
+    metadata_components = build_production_tool_metadata_components(
+        pending_identity_verifier_port=pending_identity_verifier,
+    )
+    metadata_bundle = metadata_components.bundle
+    typed_catalog = metadata_components.typed_catalog
+    initial_routes = metadata_components.initial_routes
+    provider_view = metadata_bundle.provider_view()
+    operation_view = metadata_bundle.operation_view()
+    missing_target_question = _MissingTargetQuestionResolver(
+        applications,
+        operation_view=operation_view,
+        provider_view=provider_view,
+    )
     persistence = ChatPersistenceCoordinator(cast(Any, chat))
     gateway = _ConversationGateway(chat, title_from_message)
     source = _SourceAdapter(source_loader)
@@ -1061,12 +1706,17 @@ def build_pilot_runtime(
         page_messages=page_context_messages,
     )
     driver = _AgentDriver()
-    policy_resolver = _PolicyCatalogResolver(catalog)
-    continuation_model_resolver = _ContinuationModelResolver(chat_model, data_dir)
-    surface_gate_resolver = _SegmentSurfaceGateResolver()
-    policy_snapshot = validate_startup_policy(
-        cast(Mapping[str, object], getattr(catalog, "authority_manifest"))
+    policy_resolver = _PolicyCatalogResolver(
+        typed_catalog,
+        provider_view=provider_view,
+        discovery_view=metadata_bundle.discovery_view(),
+        authority_view=metadata_bundle.authority_view(),
     )
+    continuation_model_resolver = _ContinuationModelResolver(chat_model, data_dir)
+    surface_gate_resolver = _SegmentSurfaceGateResolver(
+        bundle=metadata_bundle,
+    )
+    policy_snapshot = validate_startup_policy(typed_catalog.authority_manifest)
     segment_resolver = _SegmentContextResolver(
         applications=applications,
         events=events,
@@ -1084,8 +1734,23 @@ def build_pilot_runtime(
             application_outcomes=application_outcomes,
             write_operations=write_operations,
             write_coordinator=write_coordinator,
-            chat=chat,
-            legacy_catalog_factory=cast(Any, build_legacy_deterministic_catalog),
+            legacy_confirmation_routes=metadata_components.confirmation_routes,
+            operation_port=metadata_components.operation_port,
+            pending_persistence_route_port=metadata_components.pending_persistence_route_port,
+            legacy_request_owner_lease_factory=initial_routes.owner_lease_factory,
+            legacy_initial_route_port=initial_routes.initial_route_port,
+            legacy_jd_clarification_issuer=initial_routes.initial_issuer_for(
+                LegacyRouteSourceV1("jd_clarification")
+            ),
+            legacy_jd_deterministic_action_issuer=initial_routes.initial_issuer_for(
+                LegacyRouteSourceV1("jd_deterministic_action")
+            ),
+            legacy_submission_snapshot_issuer=initial_routes.initial_issuer_for(
+                LegacyRouteSourceV1("submission_snapshot_action")
+            ),
+            legacy_outcome_recording_issuer=initial_routes.initial_issuer_for(
+                LegacyRouteSourceV1("outcome_recording_action")
+            ),
         )
     )
     transactional_delivery = (
@@ -1141,41 +1806,13 @@ def build_pilot_runtime(
             persistence=cast(Any, persistence),
             write_operations=cast(Any, write_operations),
             write_coordinator=cast(Any, write_coordinator),
-            catalog=catalog,
+            operation_port=metadata_components.operation_port,
+            pending_persistence_route_port=metadata_components.pending_persistence_route_port,
+            catalog=typed_catalog,
             approval_context_resolver=resolve_approval_context,
             transactional_delivery=transactional_delivery,
-            undo_seed_builder=(
-                (
-                    lambda _prepared, context, state: undo_seed_for_pending(
-                        cast(
-                            PendingAction,
-                            _attribute(state, "effective_pending", _attribute(state, "pending")),
-                        ),
-                        _attribute(context, "applications", applications),
-                    )
-                )
-                if undo_seed_for_pending is not None
-                else None
-            ),
-            undo_builder=(
-                (
-                    lambda _prepared, record, seed, state: build_write_undo(
-                        cast(
-                            PendingAction,
-                            _attribute(state, "effective_pending", _attribute(state, "pending")),
-                        ),
-                        record,
-                        dict(seed) if isinstance(seed, Mapping) else {},
-                    )
-                )
-                if build_write_undo is not None
-                else None
-            ),
             clock=cast(Any, clock) if clock is not None else lambda: datetime.now(timezone.utc),
         )
-    )
-    visible = application_visible or (
-        lambda application_id: getattr(applications, "get")(application_id) is not None
     )
     dependencies = RuntimeDependencies(
         conversations=gateway,
@@ -1188,14 +1825,22 @@ def build_pilot_runtime(
         context_assembler=assembler,
         agent_driver=cast(Any, driver),
         journal=cast(Any, run_recorder_factory),
-        catalog=cast(Any, catalog),
+        catalog=typed_catalog,
+        metadata_bundle=metadata_bundle,
+        metadata_components=metadata_components,
+        provider_metadata_view=provider_view,
+        discovery_metadata_view=metadata_bundle.discovery_view(),
+        authority_metadata_view=metadata_bundle.authority_view(),
         missing_target_question=missing_target_question,
-        pending_action_details=pending_action_details,
-        application_visible=visible,
+        application_visible=missing_target_question.application_visible,
         deterministic=deterministic,
         confirmation_coordinator=confirmation,
     )
     return PilotRuntime(dependencies)
 
 
-__all__ = ["build_pilot_runtime"]
+__all__ = [
+    "ProductionToolMetadataComponents",
+    "build_pilot_runtime",
+    "build_production_tool_metadata_components",
+]

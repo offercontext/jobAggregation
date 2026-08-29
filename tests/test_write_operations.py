@@ -3,8 +3,9 @@ from __future__ import annotations
 import os
 import hashlib
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from types import SimpleNamespace
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -12,29 +13,36 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from offerpilot.agent_runtime.journal import NullRunRecorder
+from offerpilot.ai import write_operations as write_operations_module
 from offerpilot.ai.agent_contracts import PendingAction
-from offerpilot.ai.tool_authority import AuthorityFactory, TrustedContextScope
+from offerpilot.ai.tool_authority import (
+    AuthorityFactory,
+    AuthorityPhaseError,
+    AuthorityUse,
+    ExecutionClaim,
+    TrustedContextScope,
+)
 from offerpilot.ai.tool_authority.fingerprint import authorization_scope_fingerprint
 from offerpilot.ai.tool_runtime.catalog import ToolCatalog
-from offerpilot.ai.tool_runtime.context import ToolCapability, ToolExecutionContext
+from offerpilot.ai.tool_runtime.context import ToolExecutionContext
+from offerpilot.ai.tool_runtime.policy_types import ToolCapability, UndoPolicy
 from offerpilot.ai.tool_runtime.contracts import (
-    BindingContract,
     ConfirmationRequired,
     ProviderToolContract,
-    REQUIRED_UNDO_TOOL_NAMES,
-    TRANSACTIONAL_TYPED_WRITE_NAMES,
     ToolExceptionMapping,
     ToolSpec,
-    WriteContract,
 )
-from offerpilot.ai.tool_runtime.pipeline import prepare_call
+from offerpilot.ai.tool_runtime.metadata import (
+    EditableFieldMetadataV1,
+    ToolMetadataBundleV1,
+    ToolPresentationBindingV1,
+    UndoBuilderBinding,
+    WriteOperationMetadataV1,
+)
+from offerpilot.ai.tool_runtime.pipeline import execute_prepared, prepare_call
 from offerpilot.ai.types import ToolCall
 from offerpilot.ai.write_operations import (
-    COMPENSATION_OPERATION_NAMES,
     LEDGER_KEY_FILENAME,
-    LEGACY_WRITE_OPERATION_NAMES,
-    REQUIRED_UNDO_OPERATION_NAMES,
-    TYPED_WRITE_OPERATION_NAMES,
     DeliveryHeartbeat,
     DeliveryOwnership,
     OperationCommitted,
@@ -58,6 +66,143 @@ from offerpilot.repositories.notes import NotesRepository
 from offerpilot.repositories.offers import OffersRepository
 from offerpilot.repositories.resumes import ResumesRepository
 from offerpilot.models import Conversation, WriteOperation, WriteOperationTransition
+from tests.tool_metadata.factories import (
+    compose_synthetic_bundle,
+    synthetic_tool_spec,
+    write_metadata,
+)
+from tests.tool_metadata.golden import load_asset
+from tests.tool_metadata.test_production_bundle import _production_components
+from tests.tool_authority.test_pending_claim import (
+    create_primary_with_typed_route,
+    legacy_pending_route,
+)
+
+
+def _persist_legacy_pending(
+    chat: ChatRepository,
+    conversation_id: int,
+    pending: PendingAction,
+    messages: list[dict[str, str]],
+) -> bool:
+    with legacy_pending_route(
+        pending,
+        conversation_id,
+        source="jd_clarification",
+    ) as route_handle:
+        return chat.persist_pending_action(
+            conversation_id,
+            pending,
+            messages,
+            route_handle=route_handle,
+        )
+
+
+def _capture_empty_undo_seed(_context: object, _args: object) -> None:
+    return None
+
+
+def _build_test_undo(_seed: object, _record: object) -> dict[str, object]:
+    return {"kind": "delete_application"}
+
+
+def _raise_undo_projection_failure(_seed: object, _record: object) -> None:
+    raise RuntimeError("undo failed")
+
+
+def _commit_during_undo_seed(context: object, _args: object) -> dict[str, object]:
+    getattr(context, "bound_session").commit()
+    return {}
+
+
+def _rollback_during_undo_seed(context: object, _args: object) -> dict[str, object]:
+    getattr(context, "bound_session").rollback()
+    return {}
+
+
+def _close_during_undo_seed(context: object, _args: object) -> dict[str, object]:
+    getattr(context, "bound_session").close()
+    return {}
+
+
+def _render_test_success(result: object) -> str:
+    return str(result)
+
+
+def _raise_success_projection_failure(_result: object) -> str:
+    raise RuntimeError("presentation failed")
+
+
+_UNDO_SEED_ENDERS = {
+    "commit": _commit_during_undo_seed,
+    "rollback": _rollback_during_undo_seed,
+    "close": _close_during_undo_seed,
+}
+
+
+class _WriteCancelled(BaseException):
+    pass
+
+
+def _test_bundle(spec: ToolSpec[Any, Any]) -> ToolMetadataBundleV1:
+    catalog = ToolCatalog((spec,), expected_names=(spec.name,))
+    source = compose_synthetic_bundle()
+    return ToolMetadataBundleV1(
+        typed_catalog=catalog,
+        manifest={**source["manifest"], "typed_tools": (spec.name,)},
+        legacy_boundary=source["legacy_boundary"],
+        compensation=source["compensation"],
+    )
+
+
+def _test_write_spec(
+    contract: ProviderToolContract,
+    executor: object,
+    *,
+    editable_fields: tuple[EditableFieldMetadataV1, ...] = (),
+    declared_failure_categories: frozenset[str] = frozenset(),
+    exception_map: tuple[ToolExceptionMapping, ...] = (),
+    undo_capture: object | None = None,
+    undo_builder: object | None = None,
+    success_projector: object = _render_test_success,
+    mutable_validator: object | None = None,
+):
+    undo_required = undo_capture is not None or undo_builder is not None
+    metadata = replace(
+        write_metadata(
+            name=contract.name,
+            undo_policy=(UndoPolicy.REQUIRED if undo_required else UndoPolicy.NONE),
+            resolver_descriptors=(),
+        ),
+        editable_fields=editable_fields,
+    )
+    base = synthetic_tool_spec(contract.name, metadata=metadata)
+    binding = None
+    if undo_required:
+        assert undo_capture is not None and undo_builder is not None
+        operation = metadata.operation
+        assert operation.undo_builder_id is not None
+        binding = UndoBuilderBinding(
+            descriptor=operation,
+            implementation_id=operation.undo_builder_id,
+            capture_seed=undo_capture,
+            build_undo=undo_builder,
+        )
+    return replace(
+        base,
+        contract=contract,
+        executor=executor,
+        presentation=ToolPresentationBindingV1(
+            implementation_id="test_write_presentation_v1",
+            confirmation_description=base.presentation.confirmation_description,
+            pending_details_projector=base.presentation.pending_details_projector,
+            success_summary_projector=success_projector,
+        ),
+        undo_builder_binding=binding,
+        declared_failure_categories=declared_failure_categories,
+        exception_map=exception_map,
+        mutable_validator=mutable_validator,
+    )
 
 
 def _approval_request_fingerprint(key, operation_id: str, pending: PendingAction) -> str:
@@ -73,27 +218,28 @@ def _approval_request_fingerprint(key, operation_id: str, pending: PendingAction
         confirmation_token_fingerprint=ledger_fingerprint(
             key, "write-operation-confirmation-token-v1", b"synthetic-token"
         ),
-        proposal_fingerprint=ledger_fingerprint(
-            key, "write-operation-proposal-v1", {}
-        ),
+        proposal_fingerprint=ledger_fingerprint(key, "write-operation-proposal-v1", {}),
     )
 
 
 def test_write_operation_manifests_are_exact() -> None:
-    assert frozenset(TYPED_WRITE_OPERATION_NAMES) == TRANSACTIONAL_TYPED_WRITE_NAMES
-    assert len(TYPED_WRITE_OPERATION_NAMES) == 12
-    assert LEGACY_WRITE_OPERATION_NAMES == (
-        "save_application_jd_version",
-        "create_application_submission_snapshot",
-        "record_application_outcome",
+    components = _production_components()
+    matrix = load_asset("tool_operation_matrix_0c10e05.json")
+    assert tuple(
+        entry.operation_name
+        for entry in components.operation_port.typed_primary_entries
+        if entry.operation_kind == "transactional_write"
+    ) == tuple(
+        item["name"]
+        for item in matrix["typed_operations"]
+        if item["operation_kind"] == "transactional_write"
     )
-    assert COMPENSATION_OPERATION_NAMES == (
-        "undo:update_application_status",
-        "undo:create_application",
-        "undo:create_application_event",
-        "undo:add_note",
-    )
-    assert REQUIRED_UNDO_OPERATION_NAMES == REQUIRED_UNDO_TOOL_NAMES
+    assert tuple(
+        entry.operation_name for entry in components.operation_port.legacy_primary_entries
+    ) == tuple(item["name"] for item in matrix["legacy_operations"])
+    assert tuple(
+        entry.operation_name for entry in components.operation_port.compensation_entries
+    ) == tuple(item["compensation_kind"] for item in matrix["compensation_operations"])
 
 
 @pytest.mark.parametrize(
@@ -123,7 +269,7 @@ def test_ledger_key_is_independent_and_missing_key_fails_closed(tmp_path) -> Non
         human="update",
         operation_id=str(uuid4()),
     )
-    assert chat.persist_pending_action(conversation.id, pending, [])
+    assert _persist_legacy_pending(chat, conversation.id, pending, [])
 
     key_path = tmp_path / LEDGER_KEY_FILENAME
     key_path.unlink()
@@ -210,7 +356,7 @@ def test_bound_chat_operation_uses_caller_transaction(tmp_path) -> None:
     )
 
     with sessions() as session:
-        assert chat.bind(session).persist_pending_action(conversation.id, pending, [])
+        assert _persist_legacy_pending(chat.bind(session), conversation.id, pending, [])
         assert (
             session.get(Conversation, conversation.id).pending_operation_id == pending.operation_id
         )
@@ -226,17 +372,14 @@ def test_transition_trigger_rejects_out_of_order_state(tmp_path) -> None:
     chat = ChatRepository(sessions, repository)
     conversation = chat.create_conversation("workspace")
     operation_id = str(uuid4())
-    assert chat.persist_pending_action(
-        conversation.id,
-        PendingAction(
-            tool_call_id="transition-write",
-                tool_name="save_application_jd_version",
-            args='{"id":1,"status":"offer"}',
-            human="update",
-            operation_id=operation_id,
-        ),
-        [],
+    transition_pending = PendingAction(
+        tool_call_id="transition-write",
+        tool_name="save_application_jd_version",
+        args='{"id":1,"status":"offer"}',
+        human="update",
+        operation_id=operation_id,
     )
+    assert _persist_legacy_pending(chat, conversation.id, transition_pending, [])
 
     with sessions() as session, pytest.raises(IntegrityError):
         session.add(
@@ -254,18 +397,15 @@ def test_primary_operation_rejects_empty_tool_call_id(tmp_path) -> None:
     chat = ChatRepository(sessions, repository)
     conversation = chat.create_conversation("workspace")
 
-    with pytest.raises(IntegrityError):
-        chat.persist_pending_action(
-            conversation.id,
-            PendingAction(
-                tool_call_id="",
-                tool_name="save_application_jd_version",
-                args='{"id":1,"status":"offer"}',
-                human="update",
-                operation_id=str(uuid4()),
-            ),
-            [],
-        )
+    invalid_pending = PendingAction(
+        tool_call_id="",
+        tool_name="save_application_jd_version",
+        args='{"id":1,"status":"offer"}',
+        human="update",
+        operation_id=str(uuid4()),
+    )
+    with pytest.raises((IntegrityError, TypeError, ValueError)):
+        _persist_legacy_pending(chat, conversation.id, invalid_pending, [])
 
 
 def test_mapped_domain_failure_rolls_back_executor_savepoint(tmp_path) -> None:
@@ -290,13 +430,14 @@ def test_mapped_domain_failure_rolls_back_executor_savepoint(tmp_path) -> None:
         setup_conversation.pending_tool_name = pending.tool_name
         setup_conversation.pending_args = pending.args
         setup_conversation.pending_human = pending.human
-        repository.create_primary(
+        create_primary_with_typed_route(
+            repository,
             setup_session,
             operation_id=operation_id,
             conversation_id=conversation.id,
             tool_call_id=pending.tool_call_id,
             tool_name=pending.tool_name,
-            adapter_kind="typed",
+            raw_args=pending.args,
             proposal_fingerprint=ledger_fingerprint(key, "write-operation-proposal-v1", {}),
             confirmation_token_fingerprint=ledger_fingerprint(
                 key, "write-operation-confirmation-token-v1", b"synthetic-token"
@@ -363,7 +504,7 @@ def test_mapped_domain_failure_rolls_back_executor_savepoint(tmp_path) -> None:
         payload={
             "type": "function",
             "function": {
-                    "name": "create_application",
+                "name": "create_application",
                 "description": "create",
                 "parameters": parameters,
             },
@@ -377,25 +518,26 @@ def test_mapped_domain_failure_rolls_back_executor_savepoint(tmp_path) -> None:
         bound_context.applications.create(ApplicationCreate("partial", "write"))
         raise ValueError("conflict")
 
-    spec = ToolSpec(
-        contract=contract,
-        kind="write",
-        decoder=lambda values: values,
-        executor=mutate_then_fail,
-        confirmation_policy="required",
+    spec = _test_write_spec(
+        contract,
+        mutate_then_fail,
         exception_map=(ToolExceptionMapping(ValueError, "conflict", "domain_conflict"),),
         declared_failure_categories=frozenset({"conflict"}),
-        write_contract=WriteContract(),
-        binding_contract=BindingContract("none"),
     )
-    catalog = ToolCatalog((spec,), expected_names=(spec.name,))
+    bundle = _test_bundle(spec)
+    lease = bundle.open_segment_lease()
+    factory.bind_segment_tool_catalog(
+        authority,
+        authority_metadata_view=bundle.authority_view(),
+        catalog_lease=lease,
+    )
     prepare_identity = factory.create_approved_write_prepare_identity(
         authority,
         approval_context=context,
         request_identity=object(),
     )
     prepared_result = prepare_call(
-        catalog,
+        lease,
         context,
         ToolCall(pending.tool_call_id, pending.tool_name, pending.args),
         call_identity=prepare_identity,
@@ -405,6 +547,11 @@ def test_mapped_domain_failure_rolls_back_executor_savepoint(tmp_path) -> None:
     )
     assert isinstance(prepared_result, ConfirmationRequired)
     prepared = prepared_result.prepared
+    factory.begin_prepared_execution(
+        prepared,
+        authority=authority,
+        use=AuthorityUse.APPROVED_WRITE_PREPARE,
+    )
 
     execution, record = WriteOperationCoordinator(repository).execute_primary(
         operation_id=operation_id,
@@ -412,9 +559,8 @@ def test_mapped_domain_failure_rolls_back_executor_savepoint(tmp_path) -> None:
         prepared=prepared,
         context=context,
         prepare_identity=prepare_identity,
-        request_fingerprint=_approval_request_fingerprint(
-            key, operation_id, pending
-        ),
+        request_fingerprint=_approval_request_fingerprint(key, operation_id, pending),
+        parent_route_binder=None,
     )
 
     assert isinstance(execution, OperationFailed)
@@ -432,6 +578,7 @@ def test_mapped_domain_failure_rolls_back_executor_savepoint(tmp_path) -> None:
     assert isinstance(takeover, OperationUnknown)
     assert takeover.code == "operation_delivery_unknown"
     assert takeover.retryable is False
+    lease.close()
     factory.close()
 
 
@@ -460,6 +607,12 @@ def _primary_execution_harness(
     effective_args: str | None = None,
     edited_args: dict[str, object] | None = None,
     tool_name: str = "create_application",
+    undo_capture: object | None = None,
+    undo_builder: object | None = None,
+    success_projector: object = _render_test_success,
+    mutable_validator: object | None = None,
+    editable_field_names: tuple[str, ...] | None = None,
+    schema_field_names: tuple[str, ...] | None = None,
 ):
     sessions = init_database(tmp_path / "offerpilot.db")
     key = load_or_create_ledger_key(tmp_path, sessions)
@@ -484,13 +637,14 @@ def _primary_execution_harness(
         setup_conversation.pending_tool_name = pending.tool_name
         setup_conversation.pending_args = pending.args
         setup_conversation.pending_human = pending.human
-        repository.create_primary(
+        create_primary_with_typed_route(
+            repository,
             setup_session,
             operation_id=operation_id,
             conversation_id=conversation.id,
             tool_call_id=pending.tool_call_id,
             tool_name=pending.tool_name,
-            adapter_kind="typed",
+            raw_args=pending.args,
             proposal_fingerprint=ledger_fingerprint(
                 key,
                 "write-operation-proposal-v1",
@@ -521,13 +675,16 @@ def _primary_execution_harness(
     offers = OffersRepository(sessions)
     resumes = ResumesRepository(sessions)
     factory = AuthorityFactory()
-    arguments_digest = "sha256:" + hashlib.sha256(
-        json.dumps(
-            json.loads(decided_args),
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
+    arguments_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                json.loads(decided_args),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    )
     pending_identity = SimpleNamespace(
         conversation_id=conversation.id,
         operation_id=operation_id,
@@ -559,7 +716,26 @@ def _primary_execution_harness(
         jd_analyses=JDAnalysesRepository(sessions),
         run_recorder=NullRunRecorder(),
     )
-    parameters = {"type": "object", "properties": {}}
+    selected_editable_names = (
+        tuple(edited_args or {}) if editable_field_names is None else editable_field_names
+    )
+    editable_fields = tuple(
+        EditableFieldMetadataV1(
+            field=key,
+            value_type="long_text",
+            options=None,
+            clearable=False,
+            clear_value=None,
+        )
+        for key in selected_editable_names
+    )
+    selected_schema_names = (
+        selected_editable_names if schema_field_names is None else schema_field_names
+    )
+    parameters = {
+        "type": "object",
+        "properties": {field: {"type": "string"} for field in selected_schema_names},
+    }
     contract = ProviderToolContract(
         payload={
             "type": "function",
@@ -573,26 +749,29 @@ def _primary_execution_harness(
         description="create",
         parameters=parameters,
     )
-    spec = ToolSpec(
-        contract=contract,
-        kind="write",
-        decoder=lambda values: values,
-        executor=executor,
-        confirmation_policy="required",
-        write_contract=WriteContract(),
-        binding_contract=BindingContract("none"),
-        editable_fields=tuple(
-            {"field": key, "type": "long_text"} for key in (edited_args or {})
-        ),
+    spec = _test_write_spec(
+        contract,
+        executor,
+        editable_fields=editable_fields,
+        undo_capture=undo_capture,
+        undo_builder=undo_builder,
+        success_projector=success_projector,
+        mutable_validator=mutable_validator,
     )
-    catalog = ToolCatalog((spec,), expected_names=(spec.name,))
+    bundle = _test_bundle(spec)
+    lease = bundle.open_segment_lease()
+    factory.bind_segment_tool_catalog(
+        authority,
+        authority_metadata_view=bundle.authority_view(),
+        catalog_lease=lease,
+    )
     prepare_identity = factory.create_approved_write_prepare_identity(
         authority,
         approval_context=context,
         request_identity=object(),
     )
     prepared_result = prepare_call(
-        catalog,
+        lease,
         context,
         ToolCall(pending.tool_call_id, pending.tool_name, decided_args),
         call_identity=prepare_identity,
@@ -608,6 +787,7 @@ def _primary_execution_harness(
         operation_id=operation_id,
         pending=pending,
         factory=factory,
+        lease=lease,
         context=context,
         prepared=prepared_result.prepared,
         prepare_identity=prepare_identity,
@@ -641,6 +821,100 @@ def _primary_execution_harness(
     )
 
 
+def _consume_outer_approval_transition(harness: SimpleNamespace) -> None:
+    harness.factory.begin_prepared_execution(
+        harness.prepared,
+        authority=harness.context.authority,
+        use=AuthorityUse.APPROVED_WRITE_PREPARE,
+    )
+
+
+def test_raw_spec_editable_field_drift_cannot_authorize_schema_valid_id_edit(tmp_path) -> None:
+    calls = 0
+
+    def executor(_args, _context):
+        nonlocal calls
+        calls += 1
+        return {"ok": True}
+
+    harness = _primary_execution_harness(
+        tmp_path,
+        executor,
+        proposal_args='{"id":"stable","status":"draft"}',
+        effective_args='{"id":"changed","status":"draft"}',
+        edited_args={"id": "changed"},
+        editable_field_names=("status",),
+        schema_field_names=("id", "status"),
+    )
+    injected_id = EditableFieldMetadataV1(
+        field="id",
+        value_type="string",
+        options=None,
+        clearable=False,
+        clear_value=None,
+    )
+    object.__setattr__(
+        harness.prepared.spec.metadata,
+        "editable_fields",
+        (*harness.prepared.spec.metadata.editable_fields, injected_id),
+    )
+    try:
+        with pytest.raises(
+            AuthorityPhaseError,
+            match="ToolSpec metadata or executor identity changed",
+        ):
+            _consume_outer_approval_transition(harness)
+        assert calls == 0
+        with harness.sessions() as session:
+            conversation = session.get(Conversation, harness.conversation.id)
+            operation = session.get(WriteOperation, harness.operation_id)
+            assert conversation is not None
+            assert conversation.pending_confirmation_claim_id == ""
+            assert operation is not None and operation.status == "proposed"
+    finally:
+        harness.lease.close()
+        harness.factory.close()
+
+
+def test_raw_spec_operation_contract_drift_cannot_shrink_approved_result_budget(
+    tmp_path,
+) -> None:
+    calls = 0
+
+    def executor(_args, _context):
+        nonlocal calls
+        calls += 1
+        return {"message": "approved-result"}
+
+    harness = _primary_execution_harness(
+        tmp_path,
+        executor,
+    )
+    original_contract = harness.prepared.spec.metadata.operation
+    assert isinstance(original_contract, WriteOperationMetadataV1)
+    object.__setattr__(
+        harness.prepared.spec.metadata,
+        "operation",
+        replace(original_contract, result_bytes=1),
+    )
+    try:
+        with pytest.raises(
+            AuthorityPhaseError,
+            match="ToolSpec metadata or executor identity changed",
+        ):
+            _consume_outer_approval_transition(harness)
+        assert calls == 0
+        with harness.sessions() as session:
+            conversation = session.get(Conversation, harness.conversation.id)
+            operation = session.get(WriteOperation, harness.operation_id)
+            assert conversation is not None
+            assert conversation.pending_confirmation_claim_id == ""
+            assert operation is not None and operation.status == "proposed"
+    finally:
+        harness.lease.close()
+        harness.factory.close()
+
+
 def test_locked_modify_executes_effective_args_against_original_proposal(tmp_path) -> None:
     seen: list[dict[str, object]] = []
 
@@ -656,6 +930,7 @@ def test_locked_modify_executes_effective_args_against_original_proposal(tmp_pat
         tool_name="save_offer_assessment",
     )
     try:
+        _consume_outer_approval_transition(harness)
         execution, record = harness.coordinator.execute_primary(
             operation_id=harness.operation_id,
             conversation_id=harness.conversation.id,
@@ -663,6 +938,7 @@ def test_locked_modify_executes_effective_args_against_original_proposal(tmp_pat
             context=harness.context,
             prepare_identity=harness.prepare_identity,
             request_fingerprint=harness.request_fingerprint,
+            parent_route_binder=None,
             edited_args_present=harness.edited_args_present,
             edited_args=harness.edited_args,
         )
@@ -670,6 +946,7 @@ def test_locked_modify_executes_effective_args_against_original_proposal(tmp_pat
         assert record is not None
         assert seen == [{"assessment": "changed"}]
     finally:
+        harness.lease.close()
         harness.factory.close()
 
 
@@ -689,6 +966,7 @@ def test_locked_modify_rejects_patch_prepared_mismatch_before_executor(tmp_path)
         tool_name="save_offer_assessment",
     )
     try:
+        _consume_outer_approval_transition(harness)
         execution, record = harness.coordinator.execute_primary(
             operation_id=harness.operation_id,
             conversation_id=harness.conversation.id,
@@ -696,6 +974,7 @@ def test_locked_modify_rejects_patch_prepared_mismatch_before_executor(tmp_path)
             context=harness.context,
             prepare_identity=harness.prepare_identity,
             request_fingerprint=harness.request_fingerprint,
+            parent_route_binder=None,
             edited_args_present=True,
             edited_args=harness.edited_args,
         )
@@ -705,6 +984,7 @@ def test_locked_modify_rejects_patch_prepared_mismatch_before_executor(tmp_path)
         assert record is None
         assert calls == 0
     finally:
+        harness.lease.close()
         harness.factory.close()
 
 
@@ -741,6 +1021,7 @@ def test_locked_modify_preserves_explicit_patch_presence_when_effective_is_uncha
         tool_name="save_offer_assessment",
     )
     try:
+        _consume_outer_approval_transition(harness)
         execution, record = harness.coordinator.execute_primary(
             operation_id=harness.operation_id,
             conversation_id=harness.conversation.id,
@@ -748,6 +1029,7 @@ def test_locked_modify_preserves_explicit_patch_presence_when_effective_is_uncha
             context=harness.context,
             prepare_identity=harness.prepare_identity,
             request_fingerprint=harness.request_fingerprint,
+            parent_route_binder=None,
             edited_args_present=True,
             edited_args=edited_args,
         )
@@ -756,10 +1038,11 @@ def test_locked_modify_preserves_explicit_patch_presence_when_effective_is_uncha
         assert record is not None
         assert calls == 1
     finally:
+        harness.lease.close()
         harness.factory.close()
 
 
-@pytest.mark.parametrize("failure_site", ("renderer", "transport", "undo"))
+@pytest.mark.parametrize("failure_site", ("presentation", "transport", "undo"))
 def test_post_executor_projection_failure_terminalizes_without_rerun(
     tmp_path, monkeypatch, failure_site: str
 ) -> None:
@@ -770,22 +1053,22 @@ def test_post_executor_projection_failure_terminalizes_without_rerun(
         calls += 1
         return {"ok": True}
 
-    harness = _primary_execution_harness(tmp_path, executor)
-    if failure_site == "renderer":
-        monkeypatch.setattr(
-            "offerpilot.ai.write_operations.render_compatibility",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("renderer failed")),
-        )
-    elif failure_site == "transport":
+    harness = _primary_execution_harness(
+        tmp_path,
+        executor,
+        undo_capture=(_capture_empty_undo_seed if failure_site == "undo" else None),
+        undo_builder=(_raise_undo_projection_failure if failure_site == "undo" else None),
+        success_projector=(
+            _raise_success_projection_failure
+            if failure_site == "presentation"
+            else _render_test_success
+        ),
+    )
+    if failure_site == "transport":
         monkeypatch.setattr(
             "offerpilot.ai.write_operations.project_transport_event",
             lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("transport failed")),
         )
-    undo_builder = (
-        (lambda *_args: (_ for _ in ()).throw(RuntimeError("undo failed")))
-        if failure_site == "undo"
-        else None
-    )
     arguments = dict(
         operation_id=harness.operation_id,
         conversation_id=harness.conversation.id,
@@ -793,9 +1076,10 @@ def test_post_executor_projection_failure_terminalizes_without_rerun(
         context=harness.context,
         prepare_identity=harness.prepare_identity,
         request_fingerprint=harness.request_fingerprint,
-        undo_builder=undo_builder,
+        parent_route_binder=None,
     )
     try:
+        _consume_outer_approval_transition(harness)
         first, first_record = harness.coordinator.execute_primary(**arguments)
         replay, replay_record = harness.coordinator.execute_primary(**arguments)
         assert isinstance(first, OperationFailed)
@@ -805,6 +1089,7 @@ def test_post_executor_projection_failure_terminalizes_without_rerun(
         assert replay_record is None
         assert calls == 1
     finally:
+        harness.lease.close()
         harness.factory.close()
 
 
@@ -824,8 +1109,10 @@ def test_ordinary_executor_exception_terminalizes_without_rerun(tmp_path) -> Non
         context=harness.context,
         prepare_identity=harness.prepare_identity,
         request_fingerprint=harness.request_fingerprint,
+        parent_route_binder=None,
     )
     try:
+        _consume_outer_approval_transition(harness)
         first, first_record = harness.coordinator.execute_primary(**arguments)
         replay, replay_record = harness.coordinator.execute_primary(**arguments)
         assert isinstance(first, OperationFailed)
@@ -835,6 +1122,134 @@ def test_ordinary_executor_exception_terminalizes_without_rerun(tmp_path) -> Non
         assert replay_record is None
         assert calls == 1
     finally:
+        harness.lease.close()
+        harness.factory.close()
+
+
+@pytest.mark.parametrize("executor_outcome", ("success", "exception", "base_exception"))
+def test_approved_write_outer_and_inner_transitions_are_each_one_shot(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    executor_outcome: str,
+) -> None:
+    calls = {
+        "confirmation_claimer": 0,
+        "operation_executor": 0,
+        "mutable_recheck": 0,
+        "execution_claim": 0,
+        "inner_execute": 0,
+        "journal_started": 0,
+        "executor": 0,
+    }
+    inner_claims: list[ExecutionClaim] = []
+
+    def mutable_recheck(_args, _context):
+        calls["mutable_recheck"] += 1
+        return None
+
+    def executor(_args, _context):
+        calls["executor"] += 1
+        if executor_outcome == "exception":
+            raise RuntimeError("private executor failure")
+        if executor_outcome == "base_exception":
+            raise _WriteCancelled()
+        return {"ok": True}
+
+    harness = _primary_execution_harness(
+        tmp_path,
+        executor,
+        mutable_validator=mutable_recheck,
+    )
+    original_issue = AuthorityFactory.issue_execution_claim
+    original_inner_execute = write_operations_module.execute_prepared
+    original_started = write_operations_module.project_tool_started_bound
+
+    def counted_issue(self, *args, **kwargs):
+        calls["execution_claim"] += 1
+        return original_issue(self, *args, **kwargs)
+
+    def counted_started(*args, **kwargs):
+        calls["journal_started"] += 1
+        return original_started(*args, **kwargs)
+
+    def counted_inner_execute(*args, **kwargs):
+        claim = kwargs.get("execution_claim")
+        assert isinstance(claim, ExecutionClaim)
+        assert kwargs.get("locked_effective_args_digest") == harness.prepared.arguments_digest
+        inner_claims.append(claim)
+        calls["inner_execute"] += 1
+        return original_inner_execute(*args, **kwargs)
+
+    def confirmation_claimer(prepared):
+        assert prepared is harness.prepared
+        calls["confirmation_claimer"] += 1
+        return None
+
+    def operation_executor(prepared, context, prepare_identity):
+        assert prepared is harness.prepared
+        assert context is harness.context
+        assert prepare_identity is harness.prepare_identity
+        calls["operation_executor"] += 1
+        _execution, record = harness.coordinator.execute_primary(
+            operation_id=harness.operation_id,
+            conversation_id=harness.conversation.id,
+            prepared=prepared,
+            context=context,
+            prepare_identity=prepare_identity,
+            request_fingerprint=harness.request_fingerprint,
+            parent_route_binder=None,
+        )
+        assert record is not None
+        return record
+
+    monkeypatch.setattr(AuthorityFactory, "issue_execution_claim", counted_issue)
+    monkeypatch.setattr(
+        write_operations_module,
+        "execute_prepared",
+        counted_inner_execute,
+    )
+    monkeypatch.setattr(
+        write_operations_module,
+        "project_tool_started_bound",
+        counted_started,
+    )
+    object.__setattr__(harness.context, "operation_executor", operation_executor)
+    stages: list[str] = []
+    arguments = dict(
+        prepared=harness.prepared,
+        context=harness.context,
+        call_identity=harness.prepare_identity,
+        confirmation_claimer=confirmation_claimer,
+        stage_sink=stages.append,
+    )
+    try:
+        if executor_outcome == "base_exception":
+            with pytest.raises(_WriteCancelled):
+                execute_prepared(**arguments)
+        else:
+            record = execute_prepared(**arguments)
+            assert record.execution_started
+
+        first_counts = dict(calls)
+        first_stages = tuple(stages)
+        assert first_counts == {
+            "confirmation_claimer": 1,
+            "operation_executor": 1,
+            "mutable_recheck": 1,
+            "execution_claim": 1,
+            "inner_execute": 1,
+            "journal_started": 1,
+            "executor": 1,
+        }
+        assert len(inner_claims) == 1
+
+        with pytest.raises(AuthorityPhaseError):
+            execute_prepared(**arguments)
+
+        assert calls == first_counts
+        assert tuple(stages) == first_stages
+    finally:
+        harness.lease.close()
         harness.factory.close()
 
 
@@ -860,6 +1275,7 @@ def test_locked_pending_args_change_rejects_before_executor(tmp_path) -> None:
             context=harness.context,
             prepare_identity=harness.prepare_identity,
             request_fingerprint=harness.request_fingerprint,
+            parent_route_binder=None,
         )
         assert isinstance(execution, OperationUnknown)
         assert execution.code == "operation_identity_conflict"
@@ -869,6 +1285,7 @@ def test_locked_pending_args_change_rejects_before_executor(tmp_path) -> None:
             operation = session.get(WriteOperation, harness.operation_id)
             assert operation is not None and operation.status == "proposed"
     finally:
+        harness.lease.close()
         harness.factory.close()
 
 
@@ -883,11 +1300,12 @@ def test_undo_seed_cannot_end_claim_transaction_before_executor(
         calls += 1
         return {"ok": True}
 
-    def end_outer_transaction(_prepared, context):
-        getattr(context.bound_session, end_transaction)()
-        return {}
-
-    harness = _primary_execution_harness(tmp_path, executor)
+    harness = _primary_execution_harness(
+        tmp_path,
+        executor,
+        undo_capture=_UNDO_SEED_ENDERS[end_transaction],
+        undo_builder=_build_test_undo,
+    )
     try:
         execution, record = harness.coordinator.execute_primary(
             operation_id=harness.operation_id,
@@ -896,7 +1314,7 @@ def test_undo_seed_cannot_end_claim_transaction_before_executor(
             context=harness.context,
             prepare_identity=harness.prepare_identity,
             request_fingerprint=harness.request_fingerprint,
-            undo_seed_builder=end_outer_transaction,
+            parent_route_binder=None,
         )
         assert isinstance(execution, OperationUnknown)
         assert execution.code == "operation_not_committed"
@@ -914,8 +1332,7 @@ def test_undo_seed_cannot_end_claim_transaction_before_executor(
             assert conversation is not None
             assert conversation.pending_confirmation_claim_id == ""
             assert conversation.pending_confirmation_claimed_at is None
-            assert [(item.seq, item.state) for item in transitions] == [
-                (1, "proposed")
-            ]
+            assert [(item.seq, item.state) for item in transitions] == [(1, "proposed")]
     finally:
+        harness.lease.close()
         harness.factory.close()

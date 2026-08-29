@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+import inspect
 from threading import Barrier
 from uuid import uuid4
 
@@ -8,9 +9,120 @@ from sqlalchemy import update
 
 from offerpilot.ai.agent_contracts import PendingAction
 from offerpilot.ai.types import Message
+from offerpilot.ai.write_operations import (
+    WriteOperationRepository,
+    load_or_create_ledger_key,
+)
 from offerpilot.db import init_database
 from offerpilot.models import Conversation, WriteOperation
 from offerpilot.repositories.chat import ChatRepository
+from tests.tool_authority.test_pending_claim import (
+    clarification_pending_route,
+    legacy_pending_route,
+)
+
+
+def _set_pending(repo: ChatRepository, conversation_id: int, pending: PendingAction) -> bool:
+    with clarification_pending_route(pending, conversation_id) as route_handle:
+        return repo.set_pending_action(
+            conversation_id,
+            pending,
+            route_handle=route_handle,
+        )
+
+
+def _persist_pending(
+    repo: ChatRepository,
+    conversation_id: int,
+    pending: PendingAction,
+    messages: list[dict[str, str]],
+) -> bool:
+    with clarification_pending_route(pending, conversation_id) as route_handle:
+        return repo.persist_pending_action(
+            conversation_id,
+            pending,
+            messages,
+            route_handle=route_handle,
+        )
+
+
+def _replace_legacy_pending(
+    repo: ChatRepository,
+    conversation_id: int,
+    expected: PendingAction,
+    replacement: PendingAction,
+    tool_message: Message,
+    undo: dict[str, object] | None,
+    **kwargs: object,
+):
+    with legacy_pending_route(
+        replacement,
+        conversation_id,
+        source="jd_clarification",
+    ) as route_handle:
+        return repo.replace_pending_confirmation(
+            conversation_id,
+            expected,
+            replacement,
+            tool_message,
+            undo,
+            route_handle=route_handle,
+            **kwargs,
+        )
+
+
+def _persist_continuation(
+    repo: ChatRepository,
+    conversation_id: int,
+    generation: datetime | None,
+    messages: list[dict[str, str]],
+    *,
+    pending: PendingAction | None = None,
+):
+    if pending is None:
+        return repo.persist_confirmation_continuation(
+            conversation_id,
+            generation,
+            messages,
+            route_handle=None,
+        )
+    with clarification_pending_route(pending, conversation_id) as route_handle:
+        return repo.persist_confirmation_continuation(
+            conversation_id,
+            generation,
+            messages,
+            pending=pending,
+            route_handle=route_handle,
+        )
+
+
+@pytest.mark.parametrize(
+    "method_name",
+    (
+        "set_pending_action",
+        "persist_pending_action",
+        "replace_pending_confirmation",
+        "persist_confirmation_continuation",
+        "set_pending_clarification",
+    ),
+)
+def test_task11_pending_writes_require_an_exact_transient_route_handle(method_name):
+    parameters = inspect.signature(getattr(ChatRepository, method_name)).parameters
+
+    assert "route_handle" in parameters
+    assert parameters["route_handle"].default is inspect.Parameter.empty
+
+
+def test_task11_persists_only_approved_route_identity_primitives():
+    forbidden = {
+        "route_handle",
+        "bundle_instance_token",
+        "segment_catalog_token",
+        "legacy_route_proof",
+    }
+
+    assert forbidden.isdisjoint(PendingAction.__dataclass_fields__)
+    assert forbidden.isdisjoint(WriteOperation.__table__.columns.keys())
 
 
 def test_archive_update_distinguishes_missing_pending_and_success(tmp_path):
@@ -18,9 +130,11 @@ def test_archive_update_distinguishes_missing_pending_and_success(tmp_path):
     pending_conversation = repo.create_conversation("pending")
     active_conversation = repo.create_conversation("active")
     pending = PendingAction("write-1", "display_pending_notice", '{"id":1}', "update")
-    assert repo.set_pending_action(pending_conversation.id, pending) is True
+    assert _set_pending(repo, pending_conversation.id, pending) is True
 
-    missing = repo.update_conversation_for_archive(999_999, {"archived_at": datetime.now(timezone.utc)})
+    missing = repo.update_conversation_for_archive(
+        999_999, {"archived_at": datetime.now(timezone.utc)}
+    )
     blocked = repo.update_conversation_for_archive(
         pending_conversation.id, {"archived_at": datetime.now(timezone.utc)}
     )
@@ -51,7 +165,7 @@ def test_archive_and_pending_creation_are_mutually_exclusive_under_race(tmp_path
 
     def create_pending():
         barrier.wait()
-        return repo.set_pending_action(conversation.id, pending)
+        return _set_pending(repo, conversation.id, pending)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         archive_result = pool.submit(archive)
@@ -72,7 +186,8 @@ def test_pending_action_cannot_be_added_after_archive(tmp_path):
         conversation.id, {"archived_at": datetime.now(timezone.utc)}
     )
 
-    created = repo.set_pending_action(
+    created = _set_pending(
+        repo,
         conversation.id,
         PendingAction("write-1", "display_pending_notice", '{"id":1}', "update"),
     )
@@ -113,7 +228,8 @@ def test_pending_action_and_proposal_messages_are_atomic_when_archived(tmp_path)
     )
     pending = PendingAction("write-1", "display_pending_notice", '{"id":1}', "update")
 
-    persisted = repo.persist_pending_action(
+    persisted = _persist_pending(
+        repo,
         conversation.id,
         pending,
         [
@@ -137,8 +253,14 @@ def test_resolve_pending_confirmation_atomically_persists_result_and_clears_stat
     repo = ChatRepository(init_database(tmp_path / "data.db"))
     conversation = repo.create_conversation("confirm")
     pending = PendingAction("write-1", "display_pending_notice", '{"id":1}', "update")
-    repo.set_pending_action(conversation.id, pending)
-    repo.set_pending_clarification(conversation.id, pending, "clarify")
+    _set_pending(repo, conversation.id, pending)
+    with clarification_pending_route(pending, conversation.id) as route_handle:
+        repo.set_pending_clarification(
+            conversation.id,
+            pending,
+            "clarify",
+            route_handle=route_handle,
+        )
     repo.set_last_write_undo(conversation.id, {"kind": "previous"})
     tool_message = Message(role="tool", content='{"id":1,"status":"offer"}', tool_call_id="write-1")
     undo = {"kind": "update_application_status", "application_id": 1}
@@ -169,7 +291,7 @@ def test_pending_confirmation_claim_is_durable_private_and_single_winner(tmp_pat
     repo = ChatRepository(init_database(tmp_path / "data.db"))
     conversation = repo.create_conversation("confirm")
     pending = PendingAction("write-1", "display_pending_notice", '{"id":1}', "update")
-    repo.set_pending_action(conversation.id, pending)
+    _set_pending(repo, conversation.id, pending)
 
     assert repo.claim_pending_confirmation(conversation.id, pending, "claim-one") is True
     assert repo.claim_pending_confirmation(conversation.id, pending, "claim-two") is False
@@ -206,7 +328,7 @@ def test_pending_confirmation_claim_never_rewrites_provider_tool_call_id(tmp_pat
         '{"id":1}',
         "update",
     )
-    repo.set_pending_action(conversation.id, pending)
+    _set_pending(repo, conversation.id, pending)
 
     assert repo.claim_pending_confirmation(conversation.id, pending, "claim-one") is True
     assert repo.get_pending_action(conversation.id) == pending
@@ -221,12 +343,12 @@ def test_generic_pending_mutations_cannot_clear_or_replace_active_claim(tmp_path
     conversation = repo.create_conversation("confirm")
     pending = PendingAction("write-1", "display_pending_notice", '{"id":1}', "update")
     replacement = PendingAction("write-2", "display_pending_notice", '{"id":2}', "new")
-    repo.set_pending_action(conversation.id, pending)
+    _set_pending(repo, conversation.id, pending)
     assert repo.claim_pending_confirmation(conversation.id, pending, "claim-one") is True
 
     repo.clear_pending_action(conversation.id)
-    assert repo.set_pending_action(conversation.id, replacement) is False
-    assert repo.persist_pending_action(conversation.id, replacement, []) is False
+    assert _set_pending(repo, conversation.id, replacement) is False
+    assert _persist_pending(repo, conversation.id, replacement, []) is False
 
     assert repo.get_pending_action(conversation.id) == pending
     assert (
@@ -247,7 +369,7 @@ def test_pending_confirmation_claim_has_one_winner_across_repository_instances(t
     second = ChatRepository(session_factory)
     conversation = first.create_conversation("confirm")
     pending = PendingAction("write-1", "display_pending_notice", '{"id":1}', "update")
-    first.set_pending_action(conversation.id, pending)
+    _set_pending(first, conversation.id, pending)
     barrier = Barrier(2)
 
     def claim(repo: ChatRepository, claim_id: str) -> bool:
@@ -269,7 +391,7 @@ def test_stale_pending_confirmation_claim_can_be_recovered_after_process_loss(tm
     repo = ChatRepository(session_factory)
     conversation = repo.create_conversation("confirm")
     pending = PendingAction("write-1", "display_pending_notice", '{"id":1}', "update")
-    repo.set_pending_action(conversation.id, pending)
+    _set_pending(repo, conversation.id, pending)
     assert repo.claim_pending_confirmation(conversation.id, pending, "abandoned") is True
 
     with session_factory() as session:
@@ -277,8 +399,7 @@ def test_stale_pending_confirmation_claim_can_be_recovered_after_process_loss(tm
             update(Conversation)
             .where(Conversation.id == conversation.id)
             .values(
-                pending_confirmation_claimed_at=datetime.now(timezone.utc)
-                - timedelta(minutes=16)
+                pending_confirmation_claimed_at=datetime.now(timezone.utc) - timedelta(minutes=16)
             )
         )
         session.commit()
@@ -310,7 +431,7 @@ def test_empty_pending_confirmation_claim_id_is_rejected_without_clearing_pendin
     repo = ChatRepository(init_database(tmp_path / "data.db"))
     conversation = repo.create_conversation("confirm")
     pending = PendingAction("write-1", "display_pending_notice", '{"id":1}', "update")
-    repo.set_pending_action(conversation.id, pending)
+    _set_pending(repo, conversation.id, pending)
 
     with pytest.raises(ValueError, match="non-empty"):
         repo.resolve_pending_confirmation(
@@ -330,7 +451,7 @@ def test_resolve_pending_confirmation_cas_does_not_clear_newer_pending(tmp_path)
     conversation = repo.create_conversation("confirm")
     expected = PendingAction("write-1", "display_pending_notice", '{"id":1}', "first")
     newer = PendingAction("write-2", "display_pending_notice", '{"id":2}', "second")
-    repo.set_pending_action(conversation.id, newer)
+    _set_pending(repo, conversation.id, newer)
 
     resolved = repo.resolve_pending_confirmation(
         conversation.id,
@@ -344,51 +465,85 @@ def test_resolve_pending_confirmation_cas_does_not_clear_newer_pending(tmp_path)
     assert repo.list_messages(conversation.id) == []
 
 
-def test_replace_pending_confirmation_cas_keeps_new_card_and_result_atomic(tmp_path):
-    repo = ChatRepository(init_database(tmp_path / "data.db"))
-    conversation = repo.create_conversation("confirm")
-    expected = PendingAction("write-1", "save_application_jd_version", '{"jd_text":"old"}', "old")
-    replacement = PendingAction(
-        "write-2", "save_application_jd_version", '{"jd_text":"old","retry":true}', "retry"
+def test_replace_pending_confirmation_rejects_missing_parent_ownership(tmp_path):
+    sessions = init_database(tmp_path / "data.db")
+    repo = ChatRepository(
+        sessions,
+        WriteOperationRepository(sessions, load_or_create_ledger_key(tmp_path, sessions)),
     )
-    repo.set_pending_action(conversation.id, expected)
+    conversation = repo.create_conversation("confirm")
+    expected = PendingAction(
+        "write-1",
+        "save_application_jd_version",
+        '{"jd_text":"old"}',
+        "old",
+        str(uuid4()),
+    )
+    replacement = PendingAction(
+        "write-2",
+        "save_application_jd_version",
+        '{"jd_text":"old","retry":true}',
+        "retry",
+        str(uuid4()),
+    )
+    with legacy_pending_route(expected, conversation.id, source="jd_clarification") as route_handle:
+        repo.set_pending_action(conversation.id, expected, route_handle=route_handle)
     repo.set_last_write_undo(conversation.id, {"kind": "old"})
 
-    replaced = repo.replace_pending_confirmation(
-        conversation.id,
-        expected,
-        replacement,
-        Message(role="tool", content="错误：application_jd_stale_current_version", tool_call_id="write-1"),
-        {},
-        terminal_assistant_content="请重新确认岗位资料。",
+    with pytest.raises(TypeError, match="parent ownership"):
+        _replace_legacy_pending(
+            repo,
+            conversation.id,
+            expected,
+            replacement,
+            Message(
+                role="tool",
+                content="错误：application_jd_stale_current_version",
+                tool_call_id="write-1",
+            ),
+            {},
+            terminal_assistant_content="请重新确认岗位资料。",
+        )
+
+    assert repo.get_pending_action(conversation.id) == expected
+    assert repo.get_last_write_undo(conversation.id) == {"kind": "old"}
+    assert repo.list_messages(conversation.id) == []
+
+
+def test_replace_pending_confirmation_missing_parent_does_not_overwrite_newer_card(tmp_path):
+    sessions = init_database(tmp_path / "data.db")
+    repo = ChatRepository(
+        sessions,
+        WriteOperationRepository(sessions, load_or_create_ledger_key(tmp_path, sessions)),
     )
-
-    assert replaced is not None
-    assert repo.get_pending_action(conversation.id) == replacement
-    assert repo.get_last_write_undo(conversation.id) is None
-    assert [(item.role, item.content) for item in repo.list_messages(conversation.id)] == [
-        ("tool", "错误：application_jd_stale_current_version"),
-        ("assistant", "请重新确认岗位资料。"),
-    ]
-
-
-def test_replace_pending_confirmation_cas_does_not_overwrite_newer_card(tmp_path):
-    repo = ChatRepository(init_database(tmp_path / "data.db"))
     conversation = repo.create_conversation("confirm")
-    expected = PendingAction("write-1", "save_application_jd_version", '{"jd_text":"old"}', "old")
-    newer = PendingAction("write-3", "other", '{"value":1}', "newer")
-    replacement = PendingAction("write-2", "save_application_jd_version", '{"jd_text":"retry"}', "retry")
-    repo.set_pending_action(conversation.id, newer)
-
-    replaced = repo.replace_pending_confirmation(
-        conversation.id,
-        expected,
-        replacement,
-        Message(role="tool", content="error", tool_call_id="write-1"),
-        {},
+    expected = PendingAction(
+        "write-1",
+        "save_application_jd_version",
+        '{"jd_text":"old"}',
+        "old",
+        str(uuid4()),
     )
+    newer = PendingAction("write-3", "other", '{"value":1}', "newer")
+    replacement = PendingAction(
+        "write-2",
+        "save_application_jd_version",
+        '{"jd_text":"retry"}',
+        "retry",
+        str(uuid4()),
+    )
+    _set_pending(repo, conversation.id, newer)
 
-    assert replaced is None
+    with pytest.raises(TypeError, match="parent ownership"):
+        _replace_legacy_pending(
+            repo,
+            conversation.id,
+            expected,
+            replacement,
+            Message(role="tool", content="error", tool_call_id="write-1"),
+            {},
+        )
+
     assert repo.get_pending_action(conversation.id) == newer
     assert repo.list_messages(conversation.id) == []
 
@@ -398,7 +553,7 @@ def test_resolve_pending_confirmation_preserves_existing_undo(tmp_path):
     conversation = repo.create_conversation("confirm")
     pending = PendingAction("write-1", "display_pending_notice", '{"id":1}', "update")
     previous = {"kind": "create_application", "application_id": 9}
-    repo.set_pending_action(conversation.id, pending)
+    _set_pending(repo, conversation.id, pending)
     repo.set_last_write_undo(conversation.id, previous)
 
     resolved = repo.resolve_pending_confirmation(
@@ -416,7 +571,7 @@ def test_resolve_pending_confirmation_clears_existing_undo(tmp_path):
     repo = ChatRepository(init_database(tmp_path / "data.db"))
     conversation = repo.create_conversation("confirm")
     pending = PendingAction("write-1", "display_pending_notice", '{"id":1}', "update")
-    repo.set_pending_action(conversation.id, pending)
+    _set_pending(repo, conversation.id, pending)
     repo.set_last_write_undo(conversation.id, {"kind": "old"})
 
     resolved = repo.resolve_pending_confirmation(
@@ -449,7 +604,7 @@ def test_confirmation_continuation_survives_generated_title_update(tmp_path):
     repo = ChatRepository(init_database(tmp_path / "data.db"))
     conversation = repo.create_conversation("confirm")
     pending = PendingAction("write-1", "display_pending_notice", '{"id":1}', "first")
-    repo.set_pending_action(conversation.id, pending)
+    _set_pending(repo, conversation.id, pending)
     generation = repo.resolve_pending_confirmation(
         conversation.id,
         pending,
@@ -458,7 +613,8 @@ def test_confirmation_continuation_survives_generated_title_update(tmp_path):
     )
     repo.apply_generated_title(conversation.id, "Generated title")
 
-    persisted = repo.persist_confirmation_continuation(
+    persisted = _persist_continuation(
+        repo,
         conversation.id,
         generation,
         [
@@ -484,7 +640,7 @@ def test_confirmation_continuation_rejects_stale_conversation_generation(tmp_pat
     repo = ChatRepository(init_database(tmp_path / "data.db"))
     conversation = repo.create_conversation("confirm")
     pending = PendingAction("write-1", "display_pending_notice", '{"id":1}', "first")
-    repo.set_pending_action(conversation.id, pending)
+    _set_pending(repo, conversation.id, pending)
     generation = repo.resolve_pending_confirmation(
         conversation.id,
         pending,
@@ -492,9 +648,8 @@ def test_confirmation_continuation_rejects_stale_conversation_generation(tmp_pat
         {"kind": "undo"},
     )
     repo.append_message(conversation.id, "user", content="newer activity")
-    stale_pending = PendingAction("write-2", "display_pending_notice", '{"id":2}', "old")
-
-    persisted = repo.persist_confirmation_continuation(
+    persisted = _persist_continuation(
+        repo,
         conversation.id,
         generation,
         [
@@ -506,7 +661,6 @@ def test_confirmation_continuation_rejects_stale_conversation_generation(tmp_pat
                 "provider_blocks": "",
             }
         ],
-        pending=stale_pending,
     )
 
     assert persisted is None
@@ -517,12 +671,12 @@ def test_confirmation_continuation_rejects_stale_conversation_generation(tmp_pat
     ]
 
 
-def test_confirmation_continuation_generation_is_consumed_once(tmp_path):
+def test_confirmation_continuation_rejects_chained_pending_without_parent_ownership(tmp_path):
     repo = ChatRepository(init_database(tmp_path / "data.db"))
     conversation = repo.create_conversation("confirm")
     pending = PendingAction("write-1", "display_pending_notice", '{"id":1}', "first")
     chained = PendingAction("write-2", "display_pending_notice", '{"id":2}', "second")
-    repo.set_pending_action(conversation.id, pending)
+    _set_pending(repo, conversation.id, pending)
     generation = repo.resolve_pending_confirmation(
         conversation.id,
         pending,
@@ -539,25 +693,18 @@ def test_confirmation_continuation_generation_is_consumed_once(tmp_path):
         }
     ]
 
-    first = repo.persist_confirmation_continuation(
-        conversation.id,
-        generation,
-        messages,
-        pending=chained,
-    )
-    replay = repo.persist_confirmation_continuation(
-        conversation.id,
-        generation,
-        messages,
-        pending=chained,
-    )
+    with pytest.raises(TypeError, match="parent ownership"):
+        _persist_continuation(
+            repo,
+            conversation.id,
+            generation,
+            messages,
+            pending=chained,
+        )
 
-    assert first is not None
-    assert replay is None
-    assert repo.get_pending_action(conversation.id) == chained
+    assert repo.get_pending_action(conversation.id) is None
     assert [message.content for message in repo.list_messages(conversation.id)] == [
         '{"ok":true}',
-        "next",
     ]
 
 
@@ -566,7 +713,7 @@ def test_confirmation_continuation_cannot_create_pending_after_archive(tmp_path)
     conversation = repo.create_conversation("confirm")
     pending = PendingAction("write-1", "display_pending_notice", '{"id":1}', "first")
     chained = PendingAction("write-2", "display_pending_notice", '{"id":2}', "second")
-    repo.set_pending_action(conversation.id, pending)
+    _set_pending(repo, conversation.id, pending)
     generation = repo.resolve_pending_confirmation(
         conversation.id,
         pending,
@@ -577,13 +724,14 @@ def test_confirmation_continuation_cannot_create_pending_after_archive(tmp_path)
         conversation.id, {"archived_at": datetime.now(timezone.utc)}
     )
 
-    persisted = repo.persist_confirmation_continuation(
-        conversation.id,
-        generation,
-        [{"role": "assistant", "content": "next", "tool_calls": "", "tool_call_id": ""}],
-        pending=chained,
-    )
+    with pytest.raises(TypeError, match="parent ownership"):
+        _persist_continuation(
+            repo,
+            conversation.id,
+            generation,
+            [{"role": "assistant", "content": "next", "tool_calls": "", "tool_call_id": ""}],
+            pending=chained,
+        )
 
     assert archived.status == "updated"
-    assert persisted is None
     assert repo.get_pending_action(conversation.id) is None

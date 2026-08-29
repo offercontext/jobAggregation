@@ -4,14 +4,15 @@ import os
 import re
 import sqlite3
 import zipfile
-from datetime import datetime, timedelta, timezone
-from dataclasses import dataclass
+from datetime import datetime, timezone
+from dataclasses import dataclass, replace
 from hashlib import sha256
 from importlib.metadata import PackageNotFoundError, version as package_version
 from io import BytesIO
 from pathlib import Path
 from secrets import compare_digest
 from time import perf_counter
+from types import SimpleNamespace
 from typing import Any, Callable, Literal, Mapping, Optional, cast
 from uuid import UUID, uuid4
 
@@ -19,7 +20,7 @@ from fastapi import BackgroundTasks, Body, FastAPI, File, Form, Query, Request, 
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pypdf import PdfReader
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from offerpilot.ai.agent_contracts import ChatModel, PendingAction
 from offerpilot.ai.deterministic_actions import (
@@ -56,13 +57,15 @@ from offerpilot.reliability.trace import (
     record_mock_interview_trace,
 )
 from offerpilot.ai.client import ConfiguredAIClient
-from offerpilot.ai.tool_runtime.contracts import (
-    ToolExecutionRecord,
-    ToolSuccess,
+from offerpilot.ai.tool_runtime.metadata import (
+    CommittedPrimaryOperationIdentityV1,
+    FrozenJSONValue,
+    ToolOperationMetadataPort,
+    materialize_json,
 )
-from offerpilot.ai.tool_specs.catalog import (
-    MODEL_TOOL_CATALOG,
-    editable_fields_for_tool,
+from offerpilot.ai.tool_runtime.legacy_proof import (
+    LegacyApprovedConfirmationInput,
+    LegacyConfirmationLookupIdentity,
 )
 from offerpilot.ai.types import Message, ToolCall
 from offerpilot.ai.write_operations import (
@@ -70,10 +73,9 @@ from offerpilot.ai.write_operations import (
     OperationReplay,
     OperationUnknown,
     WriteOperationCoordinator,
-    WriteOperationError,
     WriteOperationRepository,
-    compensation_kind_for_undo,
     load_or_create_ledger_key,
+    payload_from_operation,
 )
 from offerpilot.agent_runtime.journal import (
     NullRunRecorderFactory,
@@ -95,16 +97,23 @@ from offerpilot.pilot_runtime import (
     AttachmentReference,
     ConfirmationRequest,
     EditedArgs,
+    PilotRuntime,
     PilotActionDescriptor,
     RuntimeFailureOutcome,
     StartTurnRequest,
     build_pilot_runtime,
     freeze_json_mapping,
 )
+from offerpilot.pilot_runtime.contracts import LegacyReadContext
+from offerpilot.pilot_runtime.legacy_route import (
+    LegacyConfirmationRouteComponents,
+    LegacyPersistedPresentationPort,
+)
 from offerpilot.pilot_runtime.event_sink import (
     ClosedAgentSignalSink,
     RuntimeSignalLatch,
 )
+from offerpilot.pilot_runtime.compensation import CompensationHandlerRegistry
 from offerpilot.pilot_runtime.errors import (
     RuntimeAgentTimedOut,
     RuntimeCancelled,
@@ -820,10 +829,6 @@ def _resolve_knowledge_download_path(
     return candidate
 
 
-class UndoConflictError(RuntimeError):
-    pass
-
-
 def _mock_interview_proposal_json(record: Any) -> dict[str, Any]:
     return {
         "proposal_id": record.id,
@@ -1152,19 +1157,24 @@ def create_app(
     resolved_data_dir = data_dir or resolve_data_dir()
     resolved_static_dir = static_dir or _find_static_dir()
     session_factory = session_factory_for_data_dir(resolved_data_dir)
-    context_source_loader: ContextSourceLoader[Any, Any] = ContextSourceLoader(
-        resolved_data_dir / "data.db"
-    )
     app_config = load_config(resolved_data_dir)
     applications = ApplicationsRepository(session_factory)
     try:
         ledger_key = load_or_create_ledger_key(resolved_data_dir, session_factory)
-        repository = WriteOperationRepository(session_factory, ledger_key)
-        write_operations: WriteOperationRepository | None = repository
-        write_coordinator: WriteOperationCoordinator | None = WriteOperationCoordinator(repository)
-    except WriteOperationError:
-        write_operations = None
-        write_coordinator = None
+    except BaseException:
+        primary_engine = session_factory.kw.get("bind")
+        if primary_engine is not None:
+            try:
+                primary_engine.dispose()
+            except BaseException:
+                pass
+        raise
+    repository = WriteOperationRepository(session_factory, ledger_key)
+    write_operations = repository
+    write_coordinator = WriteOperationCoordinator(repository)
+    context_source_loader: ContextSourceLoader[Any, Any] = ContextSourceLoader(
+        resolved_data_dir / "data.db"
+    )
     journal_engine = None
     if run_recorder_factory is None:
         try:
@@ -1360,28 +1370,7 @@ def create_app(
         page_context_messages=lambda page: _chat_page_context_messages(
             dict(page) if page is not None else None
         ),
-        missing_target_question=lambda pending, _conversation_id: _pending_action_missing_question(
-            cast(PendingAction, pending),
-            applications,
-        ),
-        pending_action_details=lambda pending: _pending_action_details(
-            pending.tool_name,
-            _safe_tool_args(pending.args),
-            applications,
-            application_jd_versions,
-        ),
-        undo_seed_for_pending=lambda pending, current_applications: _undo_seed_for_pending(
-            pending,
-            cast(Any, current_applications),
-        ),
-        build_write_undo=lambda pending, record, seed: _build_write_undo(
-            pending,
-            cast(Any, record),
-            cast(dict[str, Any], seed),
-        ),
         title_from_message=_title_from_message,
-        catalog=MODEL_TOOL_CATALOG,
-        application_visible=lambda application_id: applications.get(application_id) is not None,
     )
 
     @app.on_event("startup")
@@ -4510,6 +4499,13 @@ def create_app(
         typed_request = _normalize_runtime_confirmation_request(payload)
         if isinstance(typed_request, JSONResponse):
             return typed_request
+        if typed_request.operation_id is None:
+            live_pending = chat.get_pending_action(typed_request.conversation_id)
+            if live_pending is not None and live_pending.operation_id:
+                typed_request = replace(
+                    typed_request,
+                    operation_id=live_pending.operation_id,
+                )
         runtime = http_request.app.state.pilot_runtime
         try:
             outcome = execute_runtime_sync(
@@ -4553,30 +4549,69 @@ def create_app(
             return error_response(
                 409, "operation integrity error", code="operation_integrity_error"
             )
+        runtime = cast(PilotRuntime, app.state.pilot_runtime)
+        components = runtime.metadata_components
+        operation_port = getattr(components, "operation_port", None)
+        compensation_registry = getattr(components, "compensation_registry", None)
+        if (
+            type(operation_port) is not ToolOperationMetadataPort
+            or type(compensation_registry) is not CompensationHandlerRegistry
+        ):
+            return error_response(
+                409, "operation integrity error", code="operation_integrity_error"
+            )
         try:
-            compensation_kind = compensation_kind_for_undo(str(immutable_undo.get("kind") or ""))
-        except ValueError:
+            parent_payload = payload_from_operation(parent)
+            parent_identity = CommittedPrimaryOperationIdentityV1(
+                operation_id=parent.id,
+                primary_tool=parent.tool_name,
+                operation_role=cast(Any, parent.operation_role),
+                adapter_kind=cast(Any, parent.adapter_kind),
+                status=cast(Any, parent.status),
+                terminal_payload_digest=parent_payload.digest,
+            )
+            required_entries = tuple(
+                entry
+                for entry in operation_port.required_undo_entries
+                if entry.primary_tool == parent_identity.primary_tool
+            )
+            if len(required_entries) != 1:
+                raise ValueError("required Undo metadata is not unique")
+            required = required_entries[0]
+            bindings = tuple(
+                binding
+                for binding in runtime.metadata_bundle.compensation_view().ordered_handler_bindings
+                if binding.compensation_kind == required.compensation_kind
+            )
+            if len(bindings) != 1:
+                raise ValueError("compensation binding is not unique")
+            handler_handle = compensation_registry.bind_handler(bindings[0])
+            route_handle = operation_port.bind_compensation(parent_identity, handler_handle)
+            handler = compensation_registry.resolve(route_handle)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
             return error_response(
                 409, "operation integrity error", code="operation_integrity_error"
             )
 
         def execute_undo(session: Session, undo: Mapping[str, Any]) -> str:
             try:
-                return _execute_chat_undo(
-                    dict(undo),
-                    applications.bind(session),
-                    events.bind(session),
-                    notes.bind(session),
-                )
-            except UndoConflictError as exc:
+                frozen_undo = freeze_json_mapping(dict(undo))
+                handler.validate_undo_payload(cast(Any, frozen_undo))
+                return handler.execute(session, cast(Any, frozen_undo))
+            except ValueError as exc:
                 raise ValueError("undo_conflict") from exc
 
-        execution = write_coordinator.execute_compensation(
-            parent_operation_id=parent_operation_id,
-            conversation_id=conversation_id,
-            compensation_kind=compensation_kind,
-            executor=execute_undo,
-        )
+        try:
+            execution = write_coordinator.execute_compensation(
+                parent=parent_identity,
+                conversation_id=conversation_id,
+                operation_port=operation_port,
+                route_handle=route_handle,
+                handler_handle=handler_handle,
+                executor=execute_undo,
+            )
+        finally:
+            operation_port.revoke_compensation(route_handle)
         if isinstance(execution, OperationUnknown):
             return error_response(
                 409 if execution.code.endswith("conflict") else 503,
@@ -4610,6 +4645,13 @@ def create_app(
         typed_request = _normalize_runtime_confirmation_request(payload)
         if isinstance(typed_request, JSONResponse):
             return typed_request
+        if typed_request.operation_id is None:
+            live_pending = chat.get_pending_action(typed_request.conversation_id)
+            if live_pending is not None and live_pending.operation_id:
+                typed_request = replace(
+                    typed_request,
+                    operation_id=live_pending.operation_id,
+                )
         runtime = http_request.app.state.pilot_runtime
         try:
             return runtime_stream_response(
@@ -4623,7 +4665,12 @@ def create_app(
     @app.get("/api/chat/conversations")
     def list_conversations(include_archived: bool = False) -> list[dict[str, Any]]:
         return [
-            _conversation_json(item, applications, application_jd_versions)
+            _conversation_json(
+                item,
+                applications,
+                cast(PilotRuntime, app.state.pilot_runtime),
+                session_factory,
+            )
             for item in chat.list_conversations(include_archived=include_archived)
         ]
 
@@ -4705,7 +4752,14 @@ def create_app(
                 return error_response(409, "该对话有待确认操作，完成或取消后才能归档")
             return error_response(409, "conversation changed; please retry", code="scope_conflict")
         assert conversation is not None
-        return JSONResponse(_conversation_json(conversation, applications, application_jd_versions))
+        return JSONResponse(
+            _conversation_json(
+                conversation,
+                applications,
+                cast(PilotRuntime, app.state.pilot_runtime),
+                session_factory,
+            )
+        )
 
     @app.delete("/api/chat/conversations/{conversation_id}")
     def delete_conversation(conversation_id: int) -> dict[str, str]:
@@ -8408,7 +8462,8 @@ def _snapshot_attachment_messages(rows: tuple[tuple[str, str, Any], ...]) -> lis
 def _conversation_json(
     conversation: Any,
     applications: ApplicationsRepository,
-    application_jd_versions: ApplicationJDService | None = None,
+    runtime: PilotRuntime,
+    session_factory: sessionmaker[Session],
 ) -> dict[str, Any]:
     payload = ConversationOut.model_validate(conversation).model_dump(mode="json")
     payload["context_label"] = _conversation_context_label(conversation, applications)
@@ -8421,8 +8476,10 @@ def _conversation_json(
                 human=conversation.pending_human or conversation.pending_tool_name,
                 operation_id=conversation.pending_operation_id,
             ),
-            applications,
-            application_jd_versions,
+            runtime=runtime,
+            applications=applications,
+            session_factory=session_factory,
+            conversation_id=conversation.id,
         )
     if conversation.clarification_tool_name:
         payload["pending_clarification"] = _pending_action_json(
@@ -8432,8 +8489,10 @@ def _conversation_json(
                 args=conversation.clarification_args,
                 human=conversation.clarification_human or conversation.clarification_tool_name,
             ),
-            applications,
-            application_jd_versions,
+            runtime=runtime,
+            applications=applications,
+            session_factory=session_factory,
+            conversation_id=conversation.id,
         )
         payload["pending_clarification"]["question"] = conversation.clarification_question
     else:
@@ -8469,22 +8528,92 @@ def _conversation_context_label(conversation: Any, applications: ApplicationsRep
 
 def _pending_action_json(
     pending: PendingAction,
-    applications: ApplicationsRepository | None = None,
-    application_jd_versions: ApplicationJDService | None = None,
+    *,
+    runtime: PilotRuntime,
+    applications: ApplicationsRepository,
+    session_factory: sessionmaker[Session],
+    conversation_id: int,
 ) -> dict[str, Any]:
     args = _safe_tool_args(pending.args)
+    human = pending.human
+    details: dict[str, Any] = {}
+    editable_fields: list[dict[str, Any]] = []
+    typed_route_found = False
+    lease = runtime.metadata_bundle.open_segment_lease()
+    try:
+        spec_handle = lease.resolve(pending.tool_name)
+        if spec_handle is not None:
+            typed_route_found = True
+            spec = lease.require_spec(spec_handle)
+            decoded = spec.decoder(args)
+            projected = spec.presentation.pending_details_projector(
+                decoded,
+                SimpleNamespace(applications=applications),
+            )
+            details = dict(projected) if isinstance(projected, Mapping) else {}
+            editable_fields = [
+                descriptor.to_compat_descriptor() for descriptor in spec.metadata.editable_fields
+            ]
+    except (TypeError, ValueError):
+        details = {}
+        editable_fields = []
+    finally:
+        lease.close()
+    if not typed_route_found:
+        try:
+            components = runtime.metadata_components
+            routes = getattr(components, "confirmation_routes", None)
+            if type(routes) is not LegacyConfirmationRouteComponents:
+                raise TypeError("Legacy Pending presentation routes are unavailable")
+            port = routes.persisted_presentation_port
+            if type(port) is not LegacyPersistedPresentationPort:
+                raise TypeError("Legacy Pending presentation Port is unavailable")
+            with session_factory() as identity_session:
+                with identity_session.begin():
+                    with session_factory() as context_session:
+                        with context_session.begin():
+                            projected = port.project_pending(
+                                identity_session,
+                                LegacyConfirmationLookupIdentity(conversation_id=conversation_id),
+                                LegacyApprovedConfirmationInput(
+                                    decision="approved",
+                                    operation_id=pending.operation_id,
+                                    confirmation_token=_confirmation_token(pending),
+                                    edited_args_present=False,
+                                    edited_args=None,
+                                    rejection_feedback_present=False,
+                                    rejection_feedback="",
+                                ),
+                                LegacyReadContext(
+                                    context_session,
+                                    applications,
+                                    ApplicationJDService(session_factory),
+                                ),
+                            )
+            human = projected.human
+            details = cast(
+                dict[str, Any],
+                materialize_json(cast(FrozenJSONValue, projected.details)),
+            )
+            editable_fields = [
+                cast(
+                    dict[str, Any],
+                    materialize_json(cast(FrozenJSONValue, descriptor)),
+                )
+                for descriptor in projected.editable_fields
+            ]
+        except (TypeError, ValueError):
+            details = {}
+            editable_fields = []
     payload: dict[str, Any] = {
         "tool_name": pending.tool_name,
         "operation_id": pending.operation_id,
-        "human": pending.human,
+        "human": human,
         "args": args,
         "confirmation_token": _confirmation_token(pending),
-        "editable_fields": editable_fields_for_tool(pending.tool_name),
+        "editable_fields": editable_fields,
     }
-    if applications is not None:
-        payload.update(
-            _pending_action_details(pending.tool_name, args, applications, application_jd_versions)
-        )
+    payload.update(details)
     return payload
 
 
@@ -8507,595 +8636,11 @@ def _confirmation_token(pending: PendingAction) -> str:
     return sha256(identity.encode("utf-8")).hexdigest()
 
 
-_FIELD_FOLLOWUP_LABELS = {
-    "application_id": "关联投递",
-    "company_name": "公司",
-    "position_name": "岗位",
-    "id": "记录编号",
-    "status": "状态",
-    "event_type": "日程类型",
-    "scheduled_at": "日程时间",
-    "duration_minutes": "时长",
-    "company": "公司",
-    "questions": "问题记录",
-    "self_reflection": "自我复盘",
-    "difficulty_points": "难点短板",
-    "mood": "感受",
-    "notes": "备注",
-}
-
-
-def _pending_action_missing_question(
-    pending: PendingAction,
-    applications: ApplicationsRepository,
-) -> str:
-    args = _safe_tool_args(pending.args)
-    if pending.tool_name == "create_application":
-        if not str(args.get("company_name") or "").strip():
-            return "要新建投递记录的话，还需要公司名称。请告诉我公司是哪一家。"
-        if not str(args.get("position_name") or "").strip():
-            return "要新建投递记录的话，还需要岗位名称。请告诉我投递的具体岗位。"
-    if pending.tool_name == "update_application_status":
-        if not _has_int_like(args.get("id")):
-            return "要更新投递状态的话，还需要明确是哪条投递记录。请告诉我公司/岗位或记录编号。"
-        if not str(args.get("status") or "").strip():
-            return "要更新投递状态的话，还需要目标状态。请告诉我是已投递、笔试、面试、Offer 还是已结束。"
-    if pending.tool_name == "create_application_event":
-        application_id = args.get("application_id")
-        if not _has_existing_application(application_id, applications):
-            return "这条日程要关联哪条投递记录？请告诉我公司/岗位或记录编号。"
-        if not str(args.get("event_type") or "").strip():
-            return "这条日程是什么类型？比如笔试、面试、Offer 进展或截止事项。"
-        if not str(args.get("scheduled_at") or "").strip():
-            return "这条日程的具体时间是什么？请补充日期和开始时间。"
-        if not _has_int_like(args.get("duration_minutes")):
-            return "这条日程预计持续多久？请补充时长，例如 30 分钟。"
-    if pending.tool_name == "add_note":
-        if (
-            not _has_int_like(args.get("application_id"))
-            and not str(args.get("company") or "").strip()
-        ):
-            return "这次复盘还缺少公司信息。请告诉我公司名称，或先说明不关联具体公司。"
-        if not str(args.get("date") or "").strip():
-            return "这次复盘还缺少面试日期。请告诉我具体日期，或回复“日期待定”。"
-    return ""
-
-
-def _has_int_like(value: Any) -> bool:
-    if value in (None, ""):
-        return False
-    try:
-        return int(value) > 0
-    except (TypeError, ValueError):
-        return False
-
-
-def _has_existing_application(value: Any, applications: ApplicationsRepository) -> bool:
-    if not _has_int_like(value):
-        return False
-    try:
-        return applications.get(int(value)) is not None
-    except (TypeError, ValueError):
-        return False
-
-
-def _pending_action_details(
-    tool_name: str,
-    args: dict[str, Any],
-    applications: ApplicationsRepository,
-    application_jd_versions: ApplicationJDService | None = None,
-) -> dict[str, Any]:
-    if tool_name == "save_application_jd_version":
-        app_id = args.get("application_id")
-        if not isinstance(app_id, (int, str)):
-            return {}
-        try:
-            resolved_id = int(app_id)
-        except (TypeError, ValueError):
-            return {}
-        application = applications.get(resolved_id)
-        if application is None:
-            return {}
-        target = {
-            "id": f"application-{application.id}",
-            "kind": "application",
-            "title": application.company_name,
-            "meta": application.position_name,
-            "source": "pending_action",
-        }
-        details: dict[str, Any] = {"target": target, "evidence": [target]}
-        if application_jd_versions is not None:
-            expected_version_id = args.get("expected_current_version_id")
-            expected_version = (
-                application_jd_versions.get_version(application.id, expected_version_id)
-                if type(expected_version_id) is int
-                else None
-            )
-            current_number = (
-                expected_version.version_number if expected_version is not None else None
-            )
-            details["application_jd"] = {
-                "current_version_number": current_number,
-                "proposed_version_number": (current_number or 0) + 1,
-            }
-        return details
-    if tool_name == "create_application":
-        return _pending_create_application_details(args)
-    if tool_name == "create_application_event":
-        return _pending_application_event_details(args, applications)
-    if tool_name == "add_note":
-        return _pending_note_details(args, applications)
-    if tool_name != "update_application_status":
-        return {}
-    app_id = args.get("id")
-    if not isinstance(app_id, (int, str)):
-        return {}
-    try:
-        resolved_id = int(app_id)
-    except ValueError:
-        return {}
-    application = applications.get(resolved_id)
-    if application is None:
-        return {}
-    target = {
-        "id": f"application-{application.id}",
-        "kind": "application",
-        "title": application.company_name,
-        "meta": " · ".join(
-            value for value in [application.position_name, application.status] if value
-        ),
-        "source": "pending_action",
-    }
-    if application.notes:
-        target["snippet"] = _short_preview(application.notes)
-    proposed_status = args.get("status")
-    proposed_changes = []
-    if isinstance(proposed_status, str) and proposed_status:
-        proposed_changes.append(
-            {"field": "status", "before": application.status, "after": proposed_status}
-        )
-    return {
-        "target": target,
-        "proposed_changes": proposed_changes,
-        "evidence": [target],
-    }
-
-
-def _undo_seed_for_pending(
-    pending: PendingAction,
-    applications: ApplicationsRepository,
-) -> dict[str, Any]:
-    if pending.tool_name != "update_application_status":
-        return {}
-    app_id = _safe_tool_args(pending.args).get("id")
-    if not _has_int_like(app_id):
-        return {}
-    application = applications.get(int(str(app_id)))
-    if application is None:
-        return {}
-    return {
-        "application_id": application.id,
-        "status": application.status,
-        "closed_reason": application.closed_reason,
-    }
-
-
-def _build_write_undo(
-    pending: PendingAction,
-    record: ToolExecutionRecord[Any, Any] | None,
-    seed: dict[str, Any],
-) -> dict[str, Any]:
-    payload = _record_payload(record)
-    if pending.tool_name == "update_application_status" and seed:
-        return {
-            "kind": "update_application_status",
-            "label": "撤销更新投递状态",
-            "application_id": seed["application_id"],
-            "before": {
-                "status": seed["status"],
-                "closed_reason": seed["closed_reason"],
-            },
-            "expected_after": {
-                "status": str(payload.get("status") or ""),
-                "closed_reason": str(payload.get("closed_reason") or ""),
-            },
-        }
-    if pending.tool_name == "create_application":
-        application_id = payload.get("application_id") or payload.get("id")
-        if _has_int_like(application_id):
-            return {
-                "kind": "delete_application",
-                "label": "撤销新建投递",
-                "application_id": int(str(application_id)),
-                "expected_after": _created_record_fingerprint("create_application", payload),
-            }
-    if pending.tool_name == "create_application_event":
-        event_id = payload.get("application_event_id") or payload.get("id")
-        if _has_int_like(event_id):
-            return {
-                "kind": "delete_application_event",
-                "label": "撤销新建日程",
-                "application_event_id": int(str(event_id)),
-                "expected_after": _created_record_fingerprint("create_application_event", payload),
-            }
-    if pending.tool_name == "add_note":
-        note_id = payload.get("note_id") or payload.get("id")
-        if _has_int_like(note_id):
-            return {
-                "kind": "delete_note",
-                "label": "撤销保存复盘",
-                "note_id": int(str(note_id)),
-                "expected_after": _created_record_fingerprint("add_note", payload),
-            }
-    return {}
-
-
-def _record_payload(record: ToolExecutionRecord[Any, Any] | None) -> dict[str, Any]:
-    if record is None or not isinstance(record.outcome, ToolSuccess):
-        return {}
-    result = record.outcome.result
-    return cast(dict[str, Any], result) if isinstance(result, dict) else {}
-
-
-_CREATED_RECORD_FINGERPRINT_FIELDS = {
-    "create_application": (
-        "company_name",
-        "position_name",
-        "job_url",
-        "status",
-        "source",
-        "notes",
-        "applied_at",
-        "closed_reason",
-        "updated_at",
-    ),
-    "create_application_event": (
-        "application_id",
-        "event_type",
-        "subtype",
-        "tags",
-        "round",
-        "scheduled_at",
-        "duration_minutes",
-        "location",
-        "notes",
-        "remind_at",
-        "status",
-    ),
-    "add_note": (
-        "application_id",
-        "company",
-        "position",
-        "round",
-        "date",
-        "questions",
-        "self_reflection",
-        "difficulty_points",
-        "mood",
-    ),
-}
-
-
-def _created_record_fingerprint(tool_name: str, payload: dict[str, Any]) -> dict[str, Any]:
-    fields = _CREATED_RECORD_FINGERPRINT_FIELDS.get(tool_name, ())
-    fingerprint = {field: payload.get(field) for field in fields}
-    for field in ("applied_at", "scheduled_at", "remind_at", "updated_at"):
-        if field in fingerprint:
-            fingerprint[field] = _canonical_datetime(fingerprint[field])
-    return fingerprint
-
-
-def _canonical_datetime(value: Any) -> str | None:
-    if value in (None, ""):
-        return None
-    parsed = _parse_optional_datetime(value)
-    if parsed is None:
-        return str(value)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _execute_chat_undo(
-    undo: dict[str, Any],
-    applications: ApplicationsRepository,
-    events: ApplicationEventsRepository,
-    notes: NotesRepository,
-) -> str:
-    kind = str(undo.get("kind") or "")
-    if kind == "update_application_status":
-        before = undo.get("before")
-        expected_after = undo.get("expected_after")
-        if not isinstance(before, dict) or not isinstance(expected_after, dict):
-            raise ValueError("undo payload is invalid")
-        restored = applications.restore_status_if_matches(
-            int(undo["application_id"]),
-            expected_status=str(expected_after.get("status") or ""),
-            expected_closed_reason=str(expected_after.get("closed_reason") or ""),
-            status=str(before.get("status") or "applied"),
-            closed_reason=str(before.get("closed_reason") or ""),
-        )
-        if not restored:
-            raise UndoConflictError("当前投递已被修改，无法安全撤销。")
-        return "已撤销最近一次 AI 写入：投递状态已恢复。"
-    if kind == "delete_application":
-        expected_after = undo.get("expected_after")
-        if not isinstance(expected_after, dict) or not applications.delete_if_matches(
-            int(undo["application_id"]), expected_after
-        ):
-            raise UndoConflictError("新建投递已被修改或不存在，无法安全撤销。")
-        return "已撤销最近一次 AI 写入：新建投递已删除。"
-    if kind == "delete_application_event":
-        expected_after = undo.get("expected_after")
-        if not isinstance(expected_after, dict) or not events.delete_if_matches(
-            int(undo["application_event_id"]), expected_after
-        ):
-            raise UndoConflictError("新建日程已被修改或不存在，无法安全撤销。")
-        return "已撤销最近一次 AI 写入：新建日程已删除。"
-    if kind == "delete_note":
-        expected_after = undo.get("expected_after")
-        if not isinstance(expected_after, dict) or not notes.delete_if_matches(
-            int(undo["note_id"]), expected_after
-        ):
-            raise UndoConflictError("复盘记录已被修改或不存在，无法安全撤销。")
-        return "已撤销最近一次 AI 写入：复盘记录已删除。"
-    raise ValueError("unsupported undo payload")
-
-
-def _parse_optional_datetime(value: Any) -> datetime | None:
-    if not value:
-        return None
-    if isinstance(value, datetime):
-        return value
-    if isinstance(value, str):
-        try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-    return None
-
-
-def _pending_create_application_details(args: dict[str, Any]) -> dict[str, Any]:
-    company = str(args.get("company_name") or "").strip()
-    position = str(args.get("position_name") or "").strip()
-    status = str(args.get("status") or "applied").strip() or "applied"
-    if not company and not position:
-        return {}
-    target = {
-        "id": f"application-draft-{company or 'unknown'}-{position or 'unknown'}",
-        "kind": "application",
-        "title": company or "公司待补充",
-        "meta": " · ".join(value for value in [position, status] if value),
-        "source": "pending_action",
-    }
-    notes = str(args.get("notes") or "").strip()
-    if notes:
-        target["snippet"] = _short_preview(notes)
-    proposed_changes = [
-        {"field": key, "before": "", "after": value}
-        for key, value in [
-            ("company_name", company),
-            ("position_name", position),
-            ("status", status),
-            ("job_url", str(args.get("job_url") or "").strip()),
-            ("notes", notes),
-        ]
-        if value
-    ]
-    details: dict[str, Any] = {
-        "target": target,
-        "proposed_changes": proposed_changes,
-        "evidence": [],
-    }
-    if status == "interview":
-        details["workflow"] = {
-            "current_step": 1,
-            "total_steps": 2,
-            "current_label": "新建投递",
-            "next_label": "保存面试复盘",
-            "description": "确认后我会继续保存这次面试复盘。",
-        }
-    return details
-
-
-_EVENT_TYPE_LABELS = {
-    "written_test": "笔试",
-    "interview": "面试",
-    "offer_step": "Offer 进展",
-    "deadline": "截止",
-    "custom": "自定义",
-}
-
-
-def _pending_application_event_details(
-    args: dict[str, Any],
-    applications: ApplicationsRepository,
-) -> dict[str, Any]:
-    application_id = args.get("application_id")
-    if not isinstance(application_id, (int, str)):
-        return {}
-    try:
-        resolved_id = int(application_id)
-    except ValueError:
-        return {}
-    application = applications.get(resolved_id)
-    if application is None:
-        return {}
-
-    event_type = str(args.get("event_type") or "")
-    event_label = _EVENT_TYPE_LABELS.get(event_type, "日程")
-    scheduled_at = str(args.get("scheduled_at") or "")
-    duration = args.get("duration_minutes")
-    time_label = _format_pending_datetime(scheduled_at)
-    duration_label = _format_pending_duration(duration)
-    target_meta = " · ".join(value for value in [time_label, duration_label] if value)
-    target = {
-        "id": f"application-event-draft-{application.id}",
-        "kind": "application_event",
-        "title": event_label,
-        "meta": target_meta,
-        "source": "pending_action",
-    }
-    notes = str(args.get("notes") or "")
-    if notes:
-        target["snippet"] = _short_preview(notes)
-
-    evidence = {
-        "id": f"application-{application.id}",
-        "kind": "application",
-        "title": application.company_name,
-        "meta": " · ".join(
-            value for value in [application.position_name, application.status] if value
-        ),
-        "source": "pending_action",
-    }
-    proposed_changes = [
-        {"field": key, "before": "", "after": args[key]}
-        for key in [
-            "event_type",
-            "subtype",
-            "scheduled_at",
-            "duration_minutes",
-            "location",
-            "notes",
-            "remind_at",
-        ]
-        if args.get(key) not in (None, "", [])
-    ]
-    return {
-        "target": target,
-        "proposed_changes": proposed_changes,
-        "evidence": [evidence],
-    }
-
-
-def _format_pending_datetime(value: str) -> str:
-    if not value:
-        return ""
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return value
-    if parsed.tzinfo is not None:
-        parsed = parsed.astimezone(timezone(timedelta(hours=8)))
-    return parsed.strftime("%Y-%m-%d %H:%M")
-
-
-def _format_pending_duration(value: Any) -> str:
-    if value in (None, ""):
-        return ""
-    try:
-        minutes = int(value)
-    except (TypeError, ValueError):
-        return str(value)
-    return f"{minutes} 分钟"
-
-
-def _pending_note_details(
-    args: dict[str, Any],
-    applications: ApplicationsRepository,
-) -> dict[str, Any]:
-    company = str(args.get("company") or "").strip()
-    position = str(args.get("position") or "").strip()
-    application_id = args.get("application_id")
-    application = None
-    if isinstance(application_id, (int, str)) and str(application_id).strip():
-        try:
-            application = applications.get(int(application_id))
-        except ValueError:
-            application = None
-    if application is not None:
-        company = company or application.company_name
-        position = position or application.position_name
-
-    round_name = str(args.get("round") or "").strip()
-    date = str(args.get("date") or "").strip()
-    title = company or "公司待补充"
-    meta = " · ".join(value for value in [position, round_name, date] if value)
-    target = {
-        "id": f"note-draft-{title}-{position or 'unknown'}",
-        "kind": "note",
-        "title": title,
-        "meta": meta,
-        "source": "pending_action",
-    }
-    questions = str(args.get("questions") or "").strip()
-    if questions:
-        target["snippet"] = _short_preview(questions)
-
-    proposed_changes = [
-        {"field": key, "before": "", "after": value}
-        for key, value in [
-            ("company", company),
-            ("position", position),
-            ("round", round_name),
-            ("date", date),
-            ("questions", questions),
-            ("self_reflection", str(args.get("self_reflection") or "").strip()),
-            ("difficulty_points", str(args.get("difficulty_points") or "").strip()),
-            ("mood", str(args.get("mood") or "").strip()),
-        ]
-        if value
-    ]
-    evidence = []
-    if application is not None:
-        evidence.append(
-            {
-                "id": f"application-{application.id}",
-                "kind": "application",
-                "title": application.company_name,
-                "meta": " · ".join(
-                    value for value in [application.position_name, application.status] if value
-                ),
-                "source": "pending_action",
-            }
-        )
-    details: dict[str, Any] = {
-        "target": target,
-        "proposed_changes": proposed_changes,
-        "evidence": evidence,
-        "risk_hint": "基于本轮对话整理，请确认结构化内容无误。",
-        "workflow": {
-            "current_step": 2,
-            "total_steps": 2,
-            "current_label": "保存面试复盘",
-            "description": "这是本次连续写入的最后一步。",
-        },
-    }
-    draft_summary = _pending_note_draft_summary(proposed_changes)
-    if draft_summary:
-        details["draft_summary"] = draft_summary
-    return details
-
-
 def _short_preview(value: str, max_length: int = 180) -> str:
     normalized = " ".join(value.split())
     if len(normalized) <= max_length:
         return normalized
     return normalized[: max_length - 3].rstrip() + "..."
-
-
-def _pending_note_draft_summary(changes: list[dict[str, Any]]) -> dict[str, Any]:
-    fields = []
-    for change in changes:
-        field = str(change.get("field") or "")
-        after = change.get("after")
-        if field not in {"questions", "self_reflection", "difficulty_points", "mood", "notes"}:
-            continue
-        if not isinstance(after, str):
-            continue
-        normalized = " ".join(after.split())
-        if len(normalized) < 80:
-            continue
-        fields.append(
-            {
-                "field": field,
-                "label": _FIELD_FOLLOWUP_LABELS.get(field) or field,
-                "summary": _short_preview(after, 96),
-                "characters": len(normalized),
-            }
-        )
-    return {"title": "复盘草稿", "fields": fields} if fields else {}
 
 
 def _safe_tool_args(raw: str) -> dict[str, Any]:

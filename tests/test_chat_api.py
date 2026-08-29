@@ -21,6 +21,7 @@ import offerpilot.agent_runtime.journal as journal_module
 import offerpilot.chat_transport as transport_module
 from offerpilot.ai.types import Assistant, Message, ToolCall
 from offerpilot.ai.agent_contracts import PendingAction, StalePendingActionError
+from offerpilot.ai.tool_runtime.catalog import compile_tool_metadata_manifest
 from offerpilot.ai.tool_runtime.contracts import (
     BindingAudit,
     PreparedToolCall,
@@ -28,8 +29,13 @@ from offerpilot.ai.tool_runtime.contracts import (
     ToolFailure,
     ToolSuccess,
 )
-from offerpilot.ai.tool_specs.catalog import MODEL_TOOL_CATALOG
-from offerpilot.ai.write_operations import WriteOperationError
+from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
+from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
+from offerpilot.ai.write_operations import (
+    TypedPendingRouteHandle,
+    WriteOperationError,
+    pending_route_claim_for_cleanup,
+)
 from offerpilot.agent_runtime.journal import NullRunRecorderFactory, RunRecorderFactory
 from offerpilot.agent_runtime.keyring import load_or_create_journal_key
 from offerpilot.agent_runtime.trace import reconstruct_agent_run
@@ -61,34 +67,93 @@ from offerpilot.pilot_runtime.contracts import (
     PreparationKind,
     StreamExecutionMode,
 )
-from offerpilot.pilot_runtime import InMemoryRuntimeInvocationControl, RuntimeFailureCode
-from offerpilot.pilot_runtime.persistence import ChatPersistenceCoordinator
+from offerpilot.pilot_runtime import (
+    InMemoryRuntimeInvocationControl,
+    RuntimeAgentTimedOut,
+    RuntimeFailureCode,
+)
+from offerpilot.pilot_runtime.persistence import (
+    ChatPersistenceCoordinator,
+    PersistenceResult,
+    PersistenceStatus,
+)
+from offerpilot.pilot_runtime.compensation import prepare_compensation_handler_components
 from offerpilot.repositories.applications import ApplicationsRepository
 from offerpilot.repositories.agent_runs import AgentRunRepository, JournalConflictError
 from offerpilot.repositories.chat import ChatRepository, ConversationScopeMutationSnapshot
 from offerpilot.pilot_runtime.service import PilotRuntime, _has_write_attempt, _write_outcome
+
+_LEGACY_JD_EXECUTION_EVENTS: list[str] | None = None
+_LEGACY_JD_EXECUTION_ORIGINAL: Any = None
+_TEST_TOOL_CATALOG = build_model_tool_catalog()
+
+
+def _timeout_after_agent_signal_host(signal: Event):
+    """Return a deterministic non-joining host that times out after Agent work starts."""
+
+    class TimeoutAfterAgentSignalHost:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def run(self, thunk, invocation_control):
+            executor = transport_module.ThreadPoolExecutor(max_workers=1)
+            executor.submit(thunk)
+            try:
+                assert signal.wait(timeout=5), "Agent work did not reach the timeout probe"
+                assert invocation_control.request_timeout()
+                raise RuntimeAgentTimedOut()
+            finally:
+                executor.shutdown(wait=False, cancel_futures=False)
+
+    return TimeoutAfterAgentSignalHost
+
+
+def _record_legacy_jd_execution(service: Any, encoded_args: str) -> str:
+    assert _LEGACY_JD_EXECUTION_EVENTS is not None
+    assert callable(_LEGACY_JD_EXECUTION_ORIGINAL)
+    _LEGACY_JD_EXECUTION_EVENTS.append("executor")
+    return _LEGACY_JD_EXECUTION_ORIGINAL(service, encoded_args)
 
 
 def _force_replace_claimed_pending_for_cas_test(
     repo: ChatRepository,
     conversation_id: int,
     pending: PendingAction,
+    *,
+    clarification_question: str | None = None,
+    undo: dict[str, Any] | None = None,
 ) -> None:
     """Simulate an out-of-band generation change after a confirmation claim."""
 
+    values: dict[str, Any] = {
+        "pending_tool_call_id": pending.tool_call_id,
+        "pending_confirmation_claim_id": "",
+        "pending_confirmation_claimed_at": None,
+        "pending_tool_name": pending.tool_name,
+        "pending_args": pending.args,
+        "pending_human": pending.human,
+        "updated_at": datetime.now(timezone.utc),
+    }
+    if clarification_question is not None:
+        values.update(
+            {
+                "clarification_tool_call_id": pending.tool_call_id,
+                "clarification_tool_name": pending.tool_name,
+                "clarification_args": pending.args,
+                "clarification_human": pending.human,
+                "clarification_question": clarification_question,
+            }
+        )
+    if undo is not None:
+        values.update(
+            {
+                "last_write_undo_json": json.dumps(undo, ensure_ascii=False),
+                "last_write_operation_id": "",
+            }
+        )
     with repo._session_factory() as session:
         session.execute(
-            update(Conversation)
-            .where(Conversation.id == conversation_id)
-            .values(
-                pending_tool_call_id=pending.tool_call_id,
-                pending_confirmation_claim_id="",
-                pending_confirmation_claimed_at=None,
-                pending_tool_name=pending.tool_name,
-                pending_args=pending.args,
-                pending_human=pending.human,
-                updated_at=datetime.now(timezone.utc),
-            )
+            update(Conversation).where(Conversation.id == conversation_id).values(**values)
         )
         session.commit()
 
@@ -97,7 +162,9 @@ def _journal_rows(tmp_path):
     factory = session_factory_for_data_dir(tmp_path)
     with factory() as session:
         runs = list(session.scalars(select(AgentRun).order_by(AgentRun.started_at, AgentRun.id)))
-        events = list(session.scalars(select(AgentEvent).order_by(AgentEvent.run_id, AgentEvent.seq)))
+        events = list(
+            session.scalars(select(AgentEvent).order_by(AgentEvent.run_id, AgentEvent.seq))
+        )
         snapshots = list(
             session.scalars(
                 select(AgentContextSnapshot).order_by(
@@ -155,8 +222,7 @@ def _journal_confirmation_segment_predicate(*, finished_facts=None):
             event.execution_segment_id
             for event in events
             if event.event_type == "segment.started"
-            and json.loads(event.payload_json)["facts"].get("request_kind")
-            == "confirmation"
+            and json.loads(event.payload_json)["facts"].get("request_kind") == "confirmation"
         }
         if not confirmation_segments:
             return False
@@ -197,8 +263,7 @@ def _journal_terminal_predicate(
             )
             and all(kind in snapshot_counts for kind in required_snapshot_kinds)
             and all(
-                snapshot_counts[kind] >= count
-                for kind, count in minimum_snapshot_counts.items()
+                snapshot_counts[kind] >= count for kind, count in minimum_snapshot_counts.items()
             )
         )
 
@@ -390,6 +455,21 @@ class SlowAfterPendingModel:
         return Assistant(content="late reply")
 
 
+class TimeoutAfterPendingModel:
+    def __init__(self, tool_call: ToolCall):
+        self.tool_call = tool_call
+        self.calls = 0
+
+    def complete(self, messages, tools):
+        del messages, tools
+        self.calls += 1
+        if self.calls == 1:
+            return Assistant(tool_calls=[self.tool_call])
+        if self.calls == 2:
+            raise RuntimeAgentTimedOut()
+        raise AssertionError("unexpected provider call")
+
+
 class StreamingModel:
     def stream_complete(self, messages, tools, on_delta):
         on_delta("第一段")
@@ -444,9 +524,7 @@ class CompleteCausalChainModel:
         self.calls += 1
         if self.calls == 1:
             return Assistant(
-                tool_calls=[
-                    ToolCall(id="journal-read", name="list_applications", args="{}")
-                ]
+                tool_calls=[ToolCall(id="journal-read", name="list_applications", args="{}")]
             )
         if self.calls == 2:
             return Assistant(
@@ -496,9 +574,7 @@ class EquivalenceModel:
         self.tool_results = sum(message.role == "tool" for message in messages)
         if self.provider_calls == 1:
             return Assistant(
-                tool_calls=[
-                    ToolCall(id="equivalence-read", name="list_notes", args="{}")
-                ]
+                tool_calls=[ToolCall(id="equivalence-read", name="list_notes", args="{}")]
             )
         return Assistant(content="equivalent reply")
 
@@ -525,9 +601,7 @@ class WriteEquivalenceModel:
                     ToolCall(
                         id="equivalence-write",
                         name="update_application_status",
-                        args=json.dumps(
-                            {"id": self.application_id, "status": "offer"}
-                        ),
+                        args=json.dumps({"id": self.application_id, "status": "offer"}),
                     )
                 ]
             )
@@ -549,6 +623,7 @@ class FailingAgentRunRepository:
 
     def __getattr__(self, name):
         if name == self.failing_method:
+
             def fail(*args, **kwargs):
                 self.call_counts[name] += 1
                 self.injected_methods.append(name)
@@ -556,6 +631,7 @@ class FailingAgentRunRepository:
 
             return fail
         if name in {"append_event", "append_event_bound"}:
+
             def count_and_delegate(*args, **kwargs):
                 self.call_counts[name] += 1
                 return getattr(self.delegate, name)(*args, **kwargs)
@@ -585,6 +661,44 @@ class ConflictingAgentRunRepository(FailingAgentRunRepository):
         raise JournalConflictError("caller-owned Journal conflict")
 
 
+@pytest.mark.parametrize("dispose_fails", [False, True])
+def test_create_app_does_not_publish_runtime_when_ledger_key_initialization_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dispose_fails: bool,
+) -> None:
+    import offerpilot.api as api_module
+
+    class EngineProbe:
+        dispose_calls = 0
+
+        def dispose(self) -> None:
+            self.dispose_calls += 1
+            if dispose_fails:
+                raise RuntimeError("injected primary engine dispose failure")
+
+    engine = EngineProbe()
+    session_factory = SimpleNamespace(kw={"bind": engine})
+
+    def fail(*_args: object, **_kwargs: object) -> object:
+        raise WriteOperationError("operation_unavailable")
+
+    def forbidden_loader(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("ContextSourceLoader opened before required Ledger initialization")
+
+    monkeypatch.setattr(api_module, "load_or_create_ledger_key", fail)
+    monkeypatch.setattr(api_module, "ContextSourceLoader", forbidden_loader)
+    monkeypatch.setattr(
+        api_module,
+        "session_factory_for_data_dir",
+        lambda _data_dir: session_factory,
+    )
+
+    with pytest.raises(WriteOperationError, match="operation_unavailable"):
+        create_app(tmp_path)
+    assert engine.dispose_calls == 1
+
+
 @pytest.mark.parametrize(
     ("payload", "expected_status"),
     [
@@ -592,9 +706,7 @@ class ConflictingAgentRunRepository(FailingAgentRunRepository):
         ({"message": "hello", "conversation_id": 999999}, 404),
     ],
 )
-def test_chat_ingress_rejection_does_not_create_journal_run(
-    tmp_path, payload, expected_status
-):
+def test_chat_ingress_rejection_does_not_create_journal_run(tmp_path, payload, expected_status):
     client = TestClient(
         create_app(
             data_dir=tmp_path,
@@ -675,9 +787,7 @@ class _RouteSpyRuntime:
         ),
     ],
 )
-def test_chat_routes_delegate_to_pilot_runtime_once(
-    tmp_path, endpoint, payload, expected_calls
-):
+def test_chat_routes_delegate_to_pilot_runtime_once(tmp_path, endpoint, payload, expected_calls):
     app = create_app(data_dir=tmp_path)
     spy = _RouteSpyRuntime()
     app.state.pilot_runtime = spy
@@ -886,9 +996,7 @@ def test_chat_stream_records_journal_without_changing_sse_identity(tmp_path):
     assert [snapshot.snapshot_kind for snapshot in snapshots] == ["initial", "model_input"]
 
 
-def test_repeated_real_chat_stream_shutdown_disposes_primary_engine_once(
-    tmp_path, monkeypatch
-):
+def test_repeated_real_chat_stream_shutdown_disposes_primary_engine_once(tmp_path, monkeypatch):
     app = create_app(
         data_dir=tmp_path,
         chat_model=StreamingModel(),
@@ -921,9 +1029,7 @@ def test_repeated_real_chat_stream_shutdown_disposes_primary_engine_once(
     assert not db_path.exists()
 
 
-def test_shutdown_error_is_not_masked_by_primary_engine_dispose_error(
-    tmp_path, monkeypatch
-):
+def test_shutdown_error_is_not_masked_by_primary_engine_dispose_error(tmp_path, monkeypatch):
     app = create_app(data_dir=tmp_path)
     primary_engine = app.state.db_engine
     journal_engine = app.state.journal_db_engine
@@ -953,9 +1059,7 @@ def test_shutdown_error_is_not_masked_by_primary_engine_dispose_error(
     assert primary_dispose_calls == 1
 
 
-def test_shutdown_cleanup_continues_after_knowledge_stop_failure(
-    tmp_path, monkeypatch
-):
+def test_shutdown_cleanup_continues_after_knowledge_stop_failure(tmp_path, monkeypatch):
     app = create_app(data_dir=tmp_path)
     primary_engine = app.state.db_engine
     journal_engine = app.state.journal_db_engine
@@ -1000,9 +1104,7 @@ def test_shutdown_cleanup_continues_after_knowledge_stop_failure(
 
 
 @pytest.mark.parametrize("endpoint", ["/api/chat", "/api/chat/stream"])
-def test_journal_active_budget_ignores_slow_final_provider_gap(
-    tmp_path, monkeypatch, endpoint
-):
+def test_journal_active_budget_ignores_slow_final_provider_gap(tmp_path, monkeypatch, endpoint):
     # This test isolates the provider wall-time gap from the independently tested
     # 50 ms per-operation default; the 0.5 s cap remains far below the 3.05 s gap.
     monkeypatch.setattr(journal_module, "JOURNAL_OPERATION_HARD_CAP_SECONDS", 0.5)
@@ -1078,9 +1180,7 @@ def test_journal_active_budget_ignores_slow_final_provider_gap(
     assert trace.completion_status == "terminal"
     assert trace.recording_status == "healthy"
     assert trace.integrity_status == "healthy", trace.anomalies
-    assert not any(
-        anomaly.startswith("model_call_incomplete:") for anomaly in trace.anomalies
-    )
+    assert not any(anomaly.startswith("model_call_incomplete:") for anomaly in trace.anomalies)
     client.close()
 
 
@@ -1138,7 +1238,12 @@ def test_journal_active_budget_ignores_slow_provider_before_read_then_final(
             "completed",
         ]
         body = transport_events[-1]["data"]["data"]["response"]
-        assert transport_events.index(next(event for event in transport_events if event["event"] == "tool_result")) < len(transport_events) - 1
+        assert (
+            transport_events.index(
+                next(event for event in transport_events if event["event"] == "tool_result")
+            )
+            < len(transport_events) - 1
+        )
     else:
         body = response.json()
     assert body == {
@@ -1198,9 +1303,7 @@ def test_journal_active_budget_ignores_slow_provider_before_read_then_final(
     assert len(trace.segments[0].model_steps) == 2
     assert len(trace.segments[0].tools) == 1
     assert trace.segments[0].tools[0].completed_seq is not None
-    assert not any(
-        anomaly.startswith("model_call_incomplete:") for anomaly in trace.anomalies
-    )
+    assert not any(anomaly.startswith("model_call_incomplete:") for anomaly in trace.anomalies)
     client.close()
 
 
@@ -1240,8 +1343,7 @@ def test_deterministic_action_records_waiting_run_without_model_events(tmp_path)
         tmp_path,
         "waiting_confirmation",
         predicate=lambda runs, events, snapshots: (
-            waiting_predicate(runs, events, snapshots)
-            and runs[0].recording_status == "healthy"
+            waiting_predicate(runs, events, snapshots) and runs[0].recording_status == "healthy"
         ),
     )
     assert len(runs) == 1
@@ -1256,7 +1358,19 @@ def test_deterministic_action_records_waiting_run_without_model_events(tmp_path)
     assert model.calls == 0
 
 
-def test_deterministic_pending_replay_uses_original_journal_run(tmp_path):
+def test_deterministic_pending_replay_uses_original_journal_run(tmp_path, monkeypatch):
+    import offerpilot.ai.tool_specs.legacy as legacy_specs
+
+    from offerpilot.ai.tool_runtime.legacy import (
+        LegacyDeterministicCatalog,
+        LegacyInitialRouteIssuer,
+    )
+    from offerpilot.pilot_runtime.contracts import LegacyReadContext
+    from offerpilot.pilot_runtime.legacy_route import (
+        LegacyPersistedPresentationPort,
+        LegacyRouteProofIssuer,
+    )
+
     model = CountingFailingModel()
     client = TestClient(
         create_app(
@@ -1282,6 +1396,45 @@ def test_deterministic_pending_replay_uses_original_journal_run(tmp_path):
         },
     )
 
+    observed_read_contexts = []
+    original_project_pending = LegacyPersistedPresentationPort.project_pending
+
+    def record_persisted_projection(
+        self,
+        read_session,
+        lookup_identity,
+        confirmation_input,
+        context,
+    ):
+        assert type(self) is LegacyPersistedPresentationPort
+        assert type(context) is LegacyReadContext
+        context.require_integrity()
+        observed_read_contexts.append(context)
+        return original_project_pending(
+            self,
+            read_session,
+            lookup_identity,
+            confirmation_input,
+            context,
+        )
+
+    def forbid_replay_side_effect(*_args, **_kwargs):
+        raise AssertionError("Legacy Pending presentation replay must remain read-only")
+
+    monkeypatch.setattr(
+        LegacyPersistedPresentationPort,
+        "project_pending",
+        record_persisted_projection,
+    )
+    monkeypatch.setattr(LegacyInitialRouteIssuer, "issue", forbid_replay_side_effect)
+    monkeypatch.setattr(LegacyRouteProofIssuer, "issue_after_claim", forbid_replay_side_effect)
+    monkeypatch.setattr(
+        LegacyDeterministicCatalog,
+        "resolve_server_loaded",
+        forbid_replay_side_effect,
+    )
+    monkeypatch.setattr(legacy_specs, "_execute_jd", forbid_replay_side_effect)
+
     replay = client.post(
         "/api/chat",
         json={
@@ -1291,7 +1444,36 @@ def test_deterministic_pending_replay_uses_original_journal_run(tmp_path):
         },
     )
 
-    assert replay.status_code == 200
+    assert replay.status_code == 200, replay.text
+    replay_pending = replay.json()["pending_action"]
+    assert replay_pending["human"] == (
+        f"Confirm saving the job description to application {application['id']}. "
+        "The source URL will not be opened."
+    )
+    assert replay_pending["editable_fields"] == [
+        {"field": "jd_text", "type": "long_text"},
+        {
+            "field": "source_url",
+            "type": "string",
+            "clearable": True,
+            "clear_value": None,
+        },
+    ]
+    target = {
+        "id": f"application-{application['id']}",
+        "kind": "application",
+        "title": "启明智能",
+        "meta": "后端工程师",
+        "source": "pending_action",
+    }
+    assert replay_pending["target"] == target
+    assert replay_pending["evidence"] == [target]
+    assert replay_pending["application_jd"] == {
+        "current_version_number": None,
+        "proposed_version_number": 1,
+    }
+    assert len(observed_read_contexts) == 1
+    assert model.calls == 0
     replay_predicate = _journal_terminal_predicate(
         required_event_types=("run.waiting_confirmation",)
     )
@@ -1300,15 +1482,10 @@ def test_deterministic_pending_replay_uses_original_journal_run(tmp_path):
         "waiting_confirmation",
         predicate=lambda runs, events, snapshots: (
             replay_predicate(runs, events, snapshots)
-            and len(
-                [event for event in events if event.event_type == "segment.started"]
-            )
-            == 2
+            and len([event for event in events if event.event_type == "segment.started"]) == 2
             and json.loads(
                 next(
-                    event
-                    for event in reversed(events)
-                    if event.event_type == "segment.started"
+                    event for event in reversed(events) if event.event_type == "segment.started"
                 ).payload_json
             )["facts"]["request_kind"]
             == "pending_replay"
@@ -1396,21 +1573,17 @@ def test_journal_disabled_or_create_failure_preserves_chat_behavior(tmp_path, fa
         )
     )
 
-    control_response = control.post(
-        "/api/chat", json={"message": "hello", "conversation_id": 0}
-    )
+    control_response = control.post("/api/chat", json={"message": "hello", "conversation_id": 0})
     candidate_response = candidate.post(
         "/api/chat", json={"message": "hello", "conversation_id": 0}
     )
 
     assert candidate_response.status_code == control_response.status_code
     assert candidate_response.json() == control_response.json()
-    control_messages = ChatRepository(
-        session_factory_for_data_dir(control_dir)
-    ).list_messages(1)
-    candidate_messages = ChatRepository(
-        session_factory_for_data_dir(candidate_dir)
-    ).list_messages(1)
+    control_messages = ChatRepository(session_factory_for_data_dir(control_dir)).list_messages(1)
+    candidate_messages = ChatRepository(session_factory_for_data_dir(candidate_dir)).list_messages(
+        1
+    )
     assert [
         (message.role, message.content, message.tool_calls, message.tool_call_id)
         for message in candidate_messages
@@ -1555,7 +1728,11 @@ def test_deterministic_pilot_conversation_readback_keeps_frozen_version_metadata
     client = TestClient(create_app(data_dir=tmp_path, chat_model=model, title_model=model))
     application = client.post(
         "/api/applications",
-        json={"company_name": "Example Co", "position_name": "Backend Engineer", "status": "interview"},
+        json={
+            "company_name": "Example Co",
+            "position_name": "Backend Engineer",
+            "status": "interview",
+        },
     ).json()
     first = client.post(
         f"/api/applications/{application['id']}/job-description/versions",
@@ -1605,7 +1782,11 @@ def test_invalid_pilot_action_does_not_create_conversation(tmp_path, endpoint):
 
     response = client.post(
         endpoint,
-        json={"message": "save job details", "conversation_id": 0, "pilot_action": {"type": "invalid"}},
+        json={
+            "message": "save job details",
+            "conversation_id": 0,
+            "pilot_action": {"type": "invalid"},
+        },
     )
 
     assert response.status_code == 422
@@ -1638,7 +1819,11 @@ def test_existing_deterministic_conversation_uses_durable_context(tmp_path, endp
     client = TestClient(create_app(data_dir=tmp_path, chat_model=model, title_model=model))
     application = client.post(
         "/api/applications",
-        json={"company_name": "Example Co", "position_name": "Backend Engineer", "status": "interview"},
+        json={
+            "company_name": "Example Co",
+            "position_name": "Backend Engineer",
+            "status": "interview",
+        },
     ).json()
     first = client.post(
         "/api/chat",
@@ -1784,14 +1969,128 @@ def test_deterministic_pilot_confirmation_allows_only_jd_edits_without_ai(tmp_pa
     assert detail["source_url"] is None
     assert model.calls == 0
     _, journal_events, _ = _journal_rows(tmp_path)
-    decisions = [
-        event for event in journal_events if event.event_type == "approval.decided"
-    ]
+    decisions = [event for event in journal_events if event.event_type == "approval.decided"]
     assert len(decisions) == 1
     assert json.loads(decisions[0].payload_json)["facts"]["decision"] == "edited"
 
 
-def test_deterministic_pilot_rejection_does_not_write_without_ai(tmp_path):
+def _legacy_confirmation_stage_spy(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    import offerpilot.ai.tool_specs.legacy as legacy_specs
+
+    from offerpilot.ai.tool_runtime.legacy import LegacyDeterministicCatalog
+    from offerpilot.pilot_runtime.legacy_route import (
+        LegacyPendingIdentityVerifierPort,
+        LegacyRouteProofIssuer,
+    )
+
+    stages: list[str] = []
+
+    def wrap(owner: type[Any], method_name: str, stage: str) -> None:
+        original = getattr(owner, method_name)
+
+        def recorded(*args: Any, **kwargs: Any) -> Any:
+            stages.append(stage)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(owner, method_name, recorded)
+
+    wrap(LegacyRouteProofIssuer, "prepare_server_loaded", "prepare")
+    wrap(LegacyPendingIdentityVerifierPort, "locked_recheck", "locked_recheck")
+    wrap(LegacyPendingIdentityVerifierPort, "bind_claim", "claim")
+    wrap(LegacyRouteProofIssuer, "issue_after_claim", "proof")
+    wrap(LegacyDeterministicCatalog, "resolve_server_loaded", "catalog")
+    global _LEGACY_JD_EXECUTION_EVENTS, _LEGACY_JD_EXECUTION_ORIGINAL
+    _LEGACY_JD_EXECUTION_EVENTS = stages
+    _LEGACY_JD_EXECUTION_ORIGINAL = legacy_specs._execute_jd
+    monkeypatch.setattr(legacy_specs, "_execute_jd", _record_legacy_jd_execution)
+    return stages
+
+
+@pytest.mark.parametrize("endpoint", ["/api/chat/confirm", "/api/chat/confirm/stream"])
+@pytest.mark.parametrize(
+    "edited_args, expected_jd_text",
+    [
+        (None, "职位：后端工程师"),
+        ({"jd_text": "修改后的岗位描述", "source_url": None}, "修改后的岗位描述"),
+    ],
+)
+def test_legacy_approve_and_modify_use_exact_proof_order_with_equivalent_transport(
+    tmp_path,
+    monkeypatch,
+    endpoint,
+    edited_args,
+    expected_jd_text,
+):
+    stages = _legacy_confirmation_stage_spy(monkeypatch)
+
+    model = CountingFailingModel()
+    client = TestClient(create_app(data_dir=tmp_path, chat_model=model, title_model=model))
+    application = client.post(
+        "/api/applications",
+        json={"company_name": "启明智能", "position_name": "后端工程师", "status": "interview"},
+    ).json()
+    pending = client.post(
+        "/api/chat",
+        json={
+            "message": "保存 JD：职位：后端工程师",
+            "conversation_id": 0,
+            "context_type": "application",
+            "context_ref": str(application["id"]),
+        },
+    ).json()
+    request: dict[str, Any] = {
+        "conversation_id": pending["conversation_id"],
+        "approved": True,
+        "confirmation_token": pending["pending_action"]["confirmation_token"],
+    }
+    if edited_args is not None:
+        request["edited_args"] = edited_args
+
+    response = client.post(endpoint, json=request)
+
+    assert response.status_code == 200
+    if endpoint.endswith("/stream"):
+        events = _parse_sse_events(response.text)
+        assert events[-1]["event"] == "completed"
+        public = events[-1]["data"]["data"]["response"]
+    else:
+        public = response.json()
+    assert public["write_status"] == "success"
+    assert public["message"] == "岗位资料已保存。"
+    versions = client.get(f"/api/applications/{application['id']}/job-description/versions").json()
+    detail = client.get(
+        f"/api/applications/{application['id']}/job-description/versions/{versions[0]['id']}"
+    ).json()
+    assert detail["jd_text"] == expected_jd_text
+    assert model.calls == 0
+    assert stages == [
+        "prepare",
+        "locked_recheck",
+        "claim",
+        "proof",
+        "catalog",
+        "executor",
+    ]
+    stages.clear()
+
+    replay = client.post(
+        endpoint,
+        json={**request, "operation_id": public["operation_id"]},
+    )
+
+    assert replay.status_code == 200
+    if endpoint.endswith("/stream"):
+        replay_events = _parse_sse_events(replay.text)
+        replay_public = replay_events[-1]["data"]["data"]["response"]
+    else:
+        replay_public = replay.json()
+    assert replay_public["write_status"] == public["write_status"]
+    assert replay_public["message"] == public["message"]
+    assert stages == []
+
+
+def test_deterministic_pilot_rejection_does_not_write_without_ai(tmp_path, monkeypatch):
+    stages = _legacy_confirmation_stage_spy(monkeypatch)
     model = CountingFailingModel()
     client = TestClient(
         create_app(
@@ -1829,7 +2128,9 @@ def test_deterministic_pilot_rejection_does_not_write_without_ai(tmp_path):
     assert response.status_code == 200
     assert response.json()["write_status"] == "cancelled"
     assert "取消" in response.json()["message"]
-    assert client.get(f"/api/applications/{application['id']}/job-description/versions").json() == []
+    assert (
+        client.get(f"/api/applications/{application['id']}/job-description/versions").json() == []
+    )
     assert model.calls == 0
     runs, journal_events, _ = _wait_for_journal_status(
         tmp_path,
@@ -1841,11 +2142,10 @@ def test_deterministic_pilot_rejection_does_not_write_without_ai(tmp_path):
     )
     assert len(runs) == 1
     assert runs[0].status == "completed"
-    decisions = [
-        event for event in journal_events if event.event_type == "approval.decided"
-    ]
+    decisions = [event for event in journal_events if event.event_type == "approval.decided"]
     assert len(decisions) == 1
     assert json.loads(decisions[0].payload_json)["facts"]["decision"] == "rejected"
+    assert stages == []
     assert not any(
         event.event_type == "tool.started"
         and event.execution_segment_id == decisions[0].execution_segment_id
@@ -1903,7 +2203,10 @@ def test_deterministic_pilot_stale_confirmation_keeps_original_text_in_new_card(
     assert replacement["args"]["jd_text"] == "新版岗位描述"
     assert replacement["args"]["expected_current_version_id"] != first["id"]
     assert replacement["confirmation_token"] != pending["pending_action"]["confirmation_token"]
-    assert len(client.get(f"/api/applications/{application['id']}/job-description/versions").json()) == 2
+    assert (
+        len(client.get(f"/api/applications/{application['id']}/job-description/versions").json())
+        == 2
+    )
     assert model.calls == 0
 
 
@@ -1935,7 +2238,7 @@ def test_deterministic_pilot_retries_same_key_after_chat_cas_failure(
             "context_ref": str(application["id"]),
         },
     ).json()
-    original_resolve = ChatRepository.resolve_pending_confirmation
+    original_persist = ChatRepository.persist_confirmation_continuation
     calls = 0
 
     def fail_once(self, *args, **kwargs):
@@ -1943,9 +2246,9 @@ def test_deterministic_pilot_retries_same_key_after_chat_cas_failure(
         calls += 1
         if calls == 1:
             return None
-        return original_resolve(self, *args, **kwargs)
+        return original_persist(self, *args, **kwargs)
 
-    monkeypatch.setattr(ChatRepository, "resolve_pending_confirmation", fail_once)
+    monkeypatch.setattr(ChatRepository, "persist_confirmation_continuation", fail_once)
     confirmation = {
         "conversation_id": pending["conversation_id"],
         "approved": True,
@@ -2012,14 +2315,34 @@ def test_write_status_uses_registry_metadata_for_all_write_tools():
 
     record = _successful_tool_record("update_offer", {"offer_id": 1})
 
-    assert _has_write_attempt(added, (), MODEL_TOOL_CATALOG) is True
-    assert _write_outcome((record,), attempted=True) == ("success", "")
+    bundle = _test_tool_bundle()
+    assert (
+        _has_write_attempt(
+            added,
+            (),
+            bundle.operation_view(),
+            bundle.provider_view(),
+        )
+        is True
+    )
+    assert _write_outcome(
+        (record,),
+        attempted=True,
+        operation_view=bundle.operation_view(),
+        provider_view=bundle.provider_view(),
+    ) == ("success", "")
 
 
 def test_write_status_does_not_report_missing_delete_as_success():
     record = _successful_tool_record("delete_note", {"deleted": False})
+    bundle = _test_tool_bundle()
 
-    assert _write_outcome((record,), attempted=True) == ("failed", "目标记录不存在")
+    assert _write_outcome(
+        (record,),
+        attempted=True,
+        operation_view=bundle.operation_view(),
+        provider_view=bundle.provider_view(),
+    ) == ("failed", "目标记录不存在")
 
 
 def test_write_status_scans_failed_write_before_later_successful_read():
@@ -2028,10 +2351,13 @@ def test_write_status_scans_failed_write_before_later_successful_read():
         ToolFailure("not_found", "record_not_found", "application not found"),
     )
     successful_read = _tool_record("list_applications", ToolSuccess([]))
+    bundle = _test_tool_bundle()
 
     assert _write_outcome(
         (failed_write, successful_read),
         attempted=True,
+        operation_view=bundle.operation_view(),
+        provider_view=bundle.provider_view(),
     ) == ("failed", "application not found")
 
 
@@ -2039,9 +2365,24 @@ def _successful_tool_record(tool_name: str, result: dict[str, object]) -> ToolEx
     return _tool_record(tool_name, ToolSuccess(result))
 
 
+def _test_tool_bundle() -> ToolMetadataBundleV1:
+    manifest = compile_tool_metadata_manifest(_TEST_TOOL_CATALOG.specs)
+    return ToolMetadataBundleV1(
+        typed_catalog=_TEST_TOOL_CATALOG,
+        manifest=manifest,
+        legacy_boundary=manifest.to_dict()["legacy_boundary"],  # type: ignore[arg-type]
+        compensation=prepare_compensation_handler_components().metadata_projection(),
+    )
+
+
 def _tool_record(tool_name: str, outcome: object) -> ToolExecutionRecord:
-    spec = MODEL_TOOL_CATALOG.resolve(tool_name)
+    spec = _TEST_TOOL_CATALOG.resolve(tool_name)
     assert spec is not None
+    bundle = _test_tool_bundle()
+    lease = bundle.open_segment_lease()
+    spec_handle = lease.resolve(tool_name)
+    assert spec_handle is not None
+    assert lease.require_spec(spec_handle) is spec
     prepared = PreparedToolCall(
         tool_call_id="call-1",
         spec=spec,
@@ -2050,6 +2391,7 @@ def _tool_record(tool_name: str, outcome: object) -> ToolExecutionRecord:
         arguments_digest="sha256:" + "0" * 64,
         binding=BindingAudit(status="unbound", target_count=0),
         contract_fingerprint="sha256:" + "0" * 64,
+        spec_handle=spec_handle,
     )
     return ToolExecutionRecord(prepared=prepared, outcome=outcome, execution_started=True)
 
@@ -2135,9 +2477,7 @@ def _create_journal_hitl_client(tmp_path, model, *, company_name):
     return seed, client, application
 
 
-def _create_status_confirmation(
-    tmp_path, model, *, stable_journal=False, journal_clock=None
-):
+def _create_status_confirmation(tmp_path, model, *, stable_journal=False, journal_clock=None):
     journal_factory = (
         _stable_journal_factory(
             tmp_path,
@@ -2155,11 +2495,7 @@ def _create_status_confirmation(
         create_app(
             data_dir=tmp_path,
             chat_model=model,
-            **(
-                {"run_recorder_factory": journal_factory}
-                if journal_factory is not None
-                else {}
-            ),
+            **({"run_recorder_factory": journal_factory} if journal_factory is not None else {}),
         ),
         raise_server_exceptions=False,
     )
@@ -2224,9 +2560,12 @@ def test_journal_hitl_pending_approve_executes_once_and_finishes_healthy(
         initial_events = _parse_sse_events(initial.text)
         pending_body = initial_events[-1]["data"]["data"]["response"]
         assert initial_events[-1]["event"] == "completed"
-        assert initial_events.index(
-            next(event for event in initial_events if event["event"] == "confirmation_required")
-        ) < len(initial_events) - 1
+        assert (
+            initial_events.index(
+                next(event for event in initial_events if event["event"] == "confirmation_required")
+            )
+            < len(initial_events) - 1
+        )
     else:
         pending_body = initial.json()
     assert pending_body["type"] == "confirmation_required"
@@ -2235,7 +2574,10 @@ def test_journal_hitl_pending_approve_executes_once_and_finishes_healthy(
     operation_id = pending_action["operation_id"]
     token = pending_action["confirmation_token"]
     assert re.fullmatch(r"[0-9a-f]{64}", token)
-    assert client.get("/api/chat/conversations").json()[0]["pending_action"]["confirmation_token"] == token
+    assert (
+        client.get("/api/chat/conversations").json()[0]["pending_action"]["confirmation_token"]
+        == token
+    )
     pending = ChatRepository(session_factory_for_data_dir(tmp_path)).get_pending_action(
         conversation_id
     )
@@ -2247,9 +2589,9 @@ def test_journal_hitl_pending_approve_executes_once_and_finishes_healthy(
     assert proposed.delivery_status == "pending"
     assert proposed.tool_call_id == "journal-hitl-write"
     assert proposed.confirmation_token_fingerprint is not None
-    assert [transition.state for transition in transitions if transition.operation_id == operation_id] == [
-        "proposed"
-    ]
+    assert [
+        transition.state for transition in transitions if transition.operation_id == operation_id
+    ] == ["proposed"]
     runs, initial_events, _ = _wait_for_journal_status(
         tmp_path,
         "waiting_confirmation",
@@ -2309,7 +2651,9 @@ def test_journal_hitl_pending_approve_executes_once_and_finishes_healthy(
     assert committed.delivery_status == "completed"
     assert committed.delivery_outcome == "final_response"
     assert committed.delivery_failure_code is None
-    assert [transition.state for transition in transitions if transition.operation_id == operation_id] == [
+    assert [
+        transition.state for transition in transitions if transition.operation_id == operation_id
+    ] == [
         "proposed",
         "approved",
         "claimed",
@@ -2436,7 +2780,9 @@ def test_journal_hitl_pending_reject_records_ledger_and_no_tool_execution(
     assert operation.status == "rejected"
     assert operation.delivery_status == "completed"
     assert operation.delivery_outcome == "final_response"
-    assert [transition.state for transition in transitions if transition.operation_id == operation_id] == [
+    assert [
+        transition.state for transition in transitions if transition.operation_id == operation_id
+    ] == [
         "proposed",
         "rejected",
     ]
@@ -2547,8 +2893,12 @@ def test_journal_hitl_chained_pending_keeps_ledger_and_run_causal(
     second_token = second_pending["confirmation_token"]
     assert second_token != first_token
     operations, _ = _ledger_rows(tmp_path)
-    first_operation = next(operation for operation in operations if operation.id == first_operation_id)
-    second_operation = next(operation for operation in operations if operation.id == second_operation_id)
+    first_operation = next(
+        operation for operation in operations if operation.id == first_operation_id
+    )
+    second_operation = next(
+        operation for operation in operations if operation.id == second_operation_id
+    )
     assert first_operation.status == "committed"
     assert first_operation.delivery_status == "completed"
     assert first_operation.delivery_outcome == "chained_pending"
@@ -2594,22 +2944,36 @@ def test_journal_hitl_chained_pending_keeps_ledger_and_run_causal(
     assert client.get("/api/chat/conversations").json()[0]["pending_action"] is None
     assert len(model.calls) == (3 if final_approved else 2)
     expected_status = "closed" if final_approved else "offer"
-    assert seed.get(f"/api/applications/{first_application['id']}").json()["status"] == expected_status
+    assert (
+        seed.get(f"/api/applications/{first_application['id']}").json()["status"] == expected_status
+    )
     stored = ChatRepository(session_factory_for_data_dir(tmp_path)).list_messages(
         first_body["conversation_id"]
     )
     assert all(isinstance(message, ChatMessage) for message in stored)
     assert sum(message.role == "tool" for message in stored) == 2
     operations, transitions = _ledger_rows(tmp_path)
-    first_operation = next(operation for operation in operations if operation.id == first_operation_id)
-    second_operation = next(operation for operation in operations if operation.id == second_operation_id)
+    first_operation = next(
+        operation for operation in operations if operation.id == first_operation_id
+    )
+    second_operation = next(
+        operation for operation in operations if operation.id == second_operation_id
+    )
     assert first_operation.status == "committed"
     assert first_operation.delivery_outcome == "chained_pending"
     assert second_operation.status == ("committed" if final_approved else "rejected")
     assert second_operation.delivery_status == "completed"
     assert second_operation.delivery_outcome == "final_response"
-    second_states = [transition.state for transition in transitions if transition.operation_id == second_operation_id]
-    assert second_states == (["proposed", "approved", "claimed", "committed"] if final_approved else ["proposed", "rejected"])
+    second_states = [
+        transition.state
+        for transition in transitions
+        if transition.operation_id == second_operation_id
+    ]
+    assert second_states == (
+        ["proposed", "approved", "claimed", "committed"]
+        if final_approved
+        else ["proposed", "rejected"]
+    )
     runs, journal_events, _ = _wait_for_journal_status(
         tmp_path,
         "completed",
@@ -2646,13 +3010,9 @@ def test_journal_hitl_chained_pending_keeps_ledger_and_run_causal(
 
 
 @pytest.mark.parametrize("endpoint", ["/api/chat/confirm", "/api/chat/confirm/stream"])
-def test_journal_confirmation_resumes_original_run_and_orders_approval(
-    tmp_path, endpoint
-):
+def test_journal_confirmation_resumes_original_run_and_orders_approval(tmp_path, endpoint):
     model = _status_confirmation_model(Assistant(content="status updated"))
-    _, client, _, pending = _create_status_confirmation(
-        tmp_path, model, stable_journal=True
-    )
+    _, client, _, pending = _create_status_confirmation(tmp_path, model, stable_journal=True)
 
     response = client.post(
         endpoint,
@@ -2676,9 +3036,7 @@ def test_journal_confirmation_resumes_original_run_and_orders_approval(
     assert len(runs) == 1
     assert runs[0].status == "completed"
     segment_ids = {
-        event.execution_segment_id
-        for event in events
-        if event.event_type == "segment.started"
+        event.execution_segment_id for event in events if event.event_type == "segment.started"
     }
     assert len(segment_ids) == 2
     event_types = [event.event_type for event in events]
@@ -2697,9 +3055,7 @@ def test_journal_confirmation_resumes_original_run_and_orders_approval(
 
 def test_journal_rejected_confirmation_records_decision_without_tool_start(tmp_path):
     model = _status_confirmation_model(Assistant(content="kept unchanged"))
-    _, client, _, pending = _create_status_confirmation(
-        tmp_path, model, stable_journal=True
-    )
+    _, client, _, pending = _create_status_confirmation(tmp_path, model, stable_journal=True)
 
     response = client.post(
         "/api/chat/confirm",
@@ -2718,8 +3074,7 @@ def test_journal_rejected_confirmation_records_decision_without_tool_start(tmp_p
     assert json.loads(decisions[0].payload_json)["facts"]["decision"] == "rejected"
     confirmation_segment = decisions[0].execution_segment_id
     assert not any(
-        event.event_type == "tool.started"
-        and event.execution_segment_id == confirmation_segment
+        event.event_type == "tool.started" and event.execution_segment_id == confirmation_segment
         for event in events
     )
 
@@ -2731,13 +3086,9 @@ def test_journal_rejected_confirmation_records_decision_without_tool_start(tmp_p
         ("/api/chat/confirm/stream", 200),
     ],
 )
-def test_journal_invalid_confirmation_token_creates_no_segment(
-    tmp_path, endpoint, expected_status
-):
+def test_journal_invalid_confirmation_token_creates_no_segment(tmp_path, endpoint, expected_status):
     model = _status_confirmation_model(Assistant(content="unused"))
-    _, client, _, pending = _create_status_confirmation(
-        tmp_path, model, stable_journal=True
-    )
+    _, client, _, pending = _create_status_confirmation(tmp_path, model, stable_journal=True)
     _, before_events, _ = _journal_rows(tmp_path)
 
     response = client.post(
@@ -2763,18 +3114,14 @@ def test_journal_second_pending_write_stays_on_same_run(tmp_path):
         Assistant(
             tool_calls=[
                 ToolCall(
-                        id="journal-status-2",
-                        name="update_application_status",
-                        args=json.dumps(
-                            {"id": 1, "status": "closed", "closed_reason": "rejected"}
-                        ),
+                    id="journal-status-2",
+                    name="update_application_status",
+                    args=json.dumps({"id": 1, "status": "closed", "closed_reason": "rejected"}),
                 )
             ]
         )
     )
-    _, client, _, pending = _create_status_confirmation(
-        tmp_path, model, stable_journal=True
-    )
+    _, client, _, pending = _create_status_confirmation(tmp_path, model, stable_journal=True)
 
     response = client.post(
         "/api/chat/confirm",
@@ -2995,9 +3342,7 @@ def test_journal_complete_secret_canary_scan(tmp_path):
                                 "application_id": application["id"],
                                 "date": "2026-08-18",
                                 "questions": (
-                                    "tool-args-canary-9da51 "
-                                    "idempotency_canary_1234 "
-                                    + provider_url
+                                    "tool-args-canary-9da51 idempotency_canary_1234 " + provider_url
                                 ),
                             }
                         ),
@@ -3086,10 +3431,7 @@ def test_journal_complete_secret_canary_scan(tmp_path):
         assert canary not in journal_text
 
     run_by_id = {run.id: run for run in runs}
-    assert any(
-        run.initial_context_entity_id or run.initial_context_ref_fingerprint
-        for run in runs
-    )
+    assert any(run.initial_context_entity_id or run.initial_context_ref_fingerprint for run in runs)
     assert snapshots
     assert all(
         snapshot.fingerprint_key_id == run_by_id[snapshot.run_id].fingerprint_key_id
@@ -3112,7 +3454,9 @@ def test_journal_complete_secret_canary_scan(tmp_path):
     settings = client.get("/api/settings")
     settings_backup = client.get("/api/settings/backup")
     archive_response = client.get("/api/backups/export")
-    assert settings.status_code == settings_backup.status_code == archive_response.status_code == 200
+    assert (
+        settings.status_code == settings_backup.status_code == archive_response.status_code == 200
+    )
     external_text = "\n".join([log_text, settings.text, settings_backup.text])
     with ZipFile(BytesIO(archive_response.content)) as archive:
         external_text += "\n" + "\n".join(
@@ -3149,6 +3493,7 @@ def _failure_injected_recorder_factory(
             disposition_budget_seconds=0.006,
         )
     if failure == "invalid-clock":
+
         def invalid_clock():
             raise RuntimeError("invalid Journal clock")
 
@@ -3163,9 +3508,7 @@ def _failure_injected_recorder_factory(
         )
     if failure == "caller-conflict":
         if injected_method not in {"append_event", "append_event_bound"}:
-            raise AssertionError(
-                "caller-conflict failure requires an explicit injection method"
-            )
+            raise AssertionError("caller-conflict failure requires an explicit injection method")
         return RunRecorderFactory(
             ConflictingAgentRunRepository(repository, injected_method),
             key=key,
@@ -3219,9 +3562,7 @@ def _chat_and_business_projection(data_dir):
         (message.role, message.content, message.tool_calls, message.tool_call_id)
         for message in messages
     ]
-    applications = ApplicationsRepository(
-        session_factory_for_data_dir(data_dir)
-    ).list()
+    applications = ApplicationsRepository(session_factory_for_data_dir(data_dir)).list()
     business_rows = [
         (
             application.id,
@@ -3345,9 +3686,7 @@ def test_journal_failure_modes_preserve_business_behavior(tmp_path, endpoint, fa
             if failure in {"locked", "caller-conflict"}
             else time.monotonic
         ),
-        injected_method=(
-            "append_event" if failure in {"locked", "caller-conflict"} else None
-        ),
+        injected_method=("append_event" if failure in {"locked", "caller-conflict"} else None),
     )
     candidate = TestClient(
         create_app(
@@ -3367,17 +3706,17 @@ def test_journal_failure_modes_preserve_business_behavior(tmp_path, endpoint, fa
 
     control_response = control.post(
         endpoint,
-            json={"message": "read notes", "conversation_id": 0},
+        json={"message": "read notes", "conversation_id": 0},
     )
     candidate_response = candidate.post(
         endpoint,
-            json={"message": "read notes", "conversation_id": 0},
+        json={"message": "read notes", "conversation_id": 0},
     )
 
     assert candidate_response.status_code == control_response.status_code
-    assert _normalized_chat_response(
-        candidate_response, endpoint
-    ) == _normalized_chat_response(control_response, endpoint)
+    assert _normalized_chat_response(candidate_response, endpoint) == _normalized_chat_response(
+        control_response, endpoint
+    )
     assert _chat_and_business_projection(candidate_dir) == _chat_and_business_projection(
         control_dir
     )
@@ -3450,9 +3789,7 @@ def test_journal_failure_modes_preserve_hitl_ledger_and_domain_behavior(
         assert initial_body["type"] == "confirmation_required"
         pending_action = initial_body["pending_action"]
         assert re.fullmatch(r"[0-9a-f]{64}", pending_action["confirmation_token"])
-        pending_projection = _write_pending_projection(
-            data_dir, initial_body["conversation_id"]
-        )
+        pending_projection = _write_pending_projection(data_dir, initial_body["conversation_id"])
         confirmation = {
             "conversation_id": initial_body["conversation_id"],
             "approved": approved,
@@ -3677,7 +4014,11 @@ def test_application_chat_context_exposes_current_jd_version_and_analysis_link_s
     )
 
     assert response.status_code == 200
-    context = next(message for message in model.calls[0] if message.role == "system" and "Current conversation context" in message.content)
+    context = next(
+        message
+        for message in model.calls[0]
+        if message.role == "system" and "Current conversation context" in message.content
+    )
     assert f"jd_version_id={version['id']}" in context.content
     assert "jd_source_kind=ui" in context.content
     assert "jd_analysis_id=none" in context.content
@@ -3724,7 +4065,11 @@ def test_application_chat_context_marks_current_jd_analysis_as_linked(tmp_path):
     )
 
     assert response.status_code == 200
-    context = next(message for message in model.calls[0] if message.role == "system" and "Current conversation context" in message.content)
+    context = next(
+        message
+        for message in model.calls[0]
+        if message.role == "system" and "Current conversation context" in message.content
+    )
     assert f"jd_version_id={version['id']}" in context.content
     assert "jd_source_kind=ui" in context.content
     assert "jd_analysis_id=1" in context.content
@@ -3780,7 +4125,11 @@ def test_application_chat_context_ignores_analysis_linked_to_old_jd_version(tmp_
     )
 
     assert response.status_code == 200
-    context = next(message for message in model.calls[0] if message.role == "system" and "Current conversation context" in message.content)
+    context = next(
+        message
+        for message in model.calls[0]
+        if message.role == "system" and "Current conversation context" in message.content
+    )
     assert f"jd_version_id={current_version['id']}" in context.content
     assert "jd_source_kind=ui" in context.content
     assert "jd_analysis_id=none" in context.content
@@ -3935,7 +4284,9 @@ def test_chat_stream_page_context_follows_clarification_and_durable_context_with
         index for index, item in enumerate(history) if item.content == PAGE_CONTEXT_POLICY
     )
     page_data_index = next(
-        index for index, item in enumerate(history) if item.content.startswith(PAGE_CONTEXT_DATA_PREFIX)
+        index
+        for index, item in enumerate(history)
+        if item.content.startswith(PAGE_CONTEXT_DATA_PREFIX)
     )
     assert clarification_message.role == "system"
     assert context_message.role == "system"
@@ -4152,9 +4503,9 @@ def test_chat_page_context_validation_does_not_append_to_existing_conversation(t
         "applications-list",
         "calendar",
         "reminders",
-            "interview",
-            "reviews",
-            "offers",
+        "interview",
+        "reviews",
+        "offers",
         "knowledge",
         "questions",
         "resumes",
@@ -4217,7 +4568,11 @@ def test_chat_attachments_resolve_server_records_after_page_context_and_ignore_c
     app_client = TestClient(create_app(data_dir=tmp_path))
     application = app_client.post(
         "/api/applications",
-        json={"company_name": "Actual Application Co", "position_name": "Platform Engineer", "notes": "official application note"},
+        json={
+            "company_name": "Actual Application Co",
+            "position_name": "Platform Engineer",
+            "notes": "official application note",
+        },
     ).json()
     offer = app_client.post(
         "/api/offers",
@@ -4250,9 +4605,13 @@ def test_chat_attachments_resolve_server_records_after_page_context_and_ignore_c
 
     assert response.status_code == 200
     history = model.calls[0]
-    page_data_index = next(i for i, item in enumerate(history) if item.content.startswith(PAGE_CONTEXT_DATA_PREFIX))
+    page_data_index = next(
+        i for i, item in enumerate(history) if item.content.startswith(PAGE_CONTEXT_DATA_PREFIX)
+    )
     attachment_data_index = next(
-        i for i, item in enumerate(history) if item.content.startswith("Current request attachment reference data: ")
+        i
+        for i, item in enumerate(history)
+        if item.content.startswith("Current request attachment reference data: ")
     )
     attachment_data = history[attachment_data_index].content
     assert attachment_data_index > page_data_index
@@ -4277,7 +4636,9 @@ def test_chat_attachments_resolve_server_records_after_page_context_and_ignore_c
 def test_chat_attachments_reject_invalid_input_without_new_or_existing_conversation_side_effects(
     tmp_path, endpoint, attachments
 ):
-    model = CapturingScriptedModel([Assistant(content="created"), Assistant(content="must not run")])
+    model = CapturingScriptedModel(
+        [Assistant(content="created"), Assistant(content="must not run")]
+    )
     client = TestClient(create_app(data_dir=tmp_path, chat_model=model))
     created = client.post("/api/chat", json={"message": "first", "conversation_id": 0}).json()
     conversation_id = created["conversation_id"]
@@ -4286,7 +4647,11 @@ def test_chat_attachments_reject_invalid_input_without_new_or_existing_conversat
 
     response = client.post(
         endpoint,
-        json={"message": "must not persist", "conversation_id": conversation_id, "attachments": attachments},
+        json={
+            "message": "must not persist",
+            "conversation_id": conversation_id,
+            "attachments": attachments,
+        },
     )
 
     assert response.status_code == 422
@@ -4300,7 +4665,9 @@ def test_chat_attachments_reject_invalid_input_without_new_or_existing_conversat
 def test_chat_attachments_reject_explicit_null_without_conversation_side_effects(
     tmp_path, endpoint, use_existing_conversation
 ):
-    model = CapturingScriptedModel([Assistant(content="created"), Assistant(content="must not run")])
+    model = CapturingScriptedModel(
+        [Assistant(content="created"), Assistant(content="must not run")]
+    )
     client = TestClient(create_app(data_dir=tmp_path, chat_model=model))
     created = client.post("/api/chat", json={"message": "first", "conversation_id": 0}).json()
     conversation_id = created["conversation_id"]
@@ -4338,7 +4705,9 @@ def test_chat_attachments_bound_missing_record_context(tmp_path, endpoint):
 
     assert response.status_code == 200
     attachment_data = next(
-        item.content for item in model.calls[0] if item.content.startswith("Current request attachment reference data: ")
+        item.content
+        for item in model.calls[0]
+        if item.content.startswith("Current request attachment reference data: ")
     )
     assert "not found or is no longer available" in attachment_data
     assert "FORGED LABEL" not in attachment_data
@@ -4498,9 +4867,7 @@ def test_http_and_sse_multi_tool_call_selection_match_baseline(
     )
     assert (body["type"] == "confirmation_required") is expects_pending
     conversation_id = body["conversation_id"]
-    stored = ChatRepository(session_factory_for_data_dir(tmp_path)).list_messages(
-        conversation_id
-    )
+    stored = ChatRepository(session_factory_for_data_dir(tmp_path)).list_messages(conversation_id)
     assistant_with_calls = next(message for message in stored if message.tool_calls)
     assert [item["id"] for item in json.loads(assistant_with_calls.tool_calls)] == expected_ids
     assert sum(message.role == "tool" for message in stored) == expected_tool_messages
@@ -4593,7 +4960,11 @@ def test_chat_confirm_stream_executes_pending_write_and_completes(tmp_path):
 
     response = client.post(
         "/api/chat/confirm/stream",
-        json={"conversation_id": pending["conversation_id"], "approved": True, "confirmation_token": pending["pending_action"]["confirmation_token"]},
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": True,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+        },
     )
 
     assert response.status_code == 200
@@ -4631,11 +5002,19 @@ def test_chat_confirm_stream_recovers_committed_write_when_followup_model_fails(
 
     failed_confirm = client.post(
         "/api/chat/confirm/stream",
-        json={"conversation_id": pending["conversation_id"], "approved": True, "confirmation_token": pending["pending_action"]["confirmation_token"]},
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": True,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+        },
     )
     retry_confirm = client.post(
         "/api/chat/confirm/stream",
-        json={"conversation_id": pending["conversation_id"], "approved": True, "confirmation_token": pending["pending_action"]["confirmation_token"]},
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": True,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+        },
     )
 
     events = _parse_sse_events(failed_confirm.text)
@@ -4701,11 +5080,19 @@ def test_chat_confirm_recovers_committed_write_when_followup_model_fails(tmp_pat
 
     failed_confirm = client.post(
         "/api/chat/confirm",
-        json={"conversation_id": pending["conversation_id"], "approved": True, "confirmation_token": pending["pending_action"]["confirmation_token"]},
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": True,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+        },
     )
     retry_confirm = client.post(
         "/api/chat/confirm",
-        json={"conversation_id": pending["conversation_id"], "approved": True, "confirmation_token": pending["pending_action"]["confirmation_token"]},
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": True,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+        },
     )
 
     assert failed_confirm.status_code == 200
@@ -5062,6 +5449,32 @@ def test_chat_confirmed_status_update_can_be_undone(tmp_path):
     assert replayed_undo.status_code == 200
     assert replayed_undo.json()["replayed"] is True
     assert replayed_undo.json()["operation_id"] == undone.json()["operation_id"]
+    sessions = session_factory_for_data_dir(tmp_path)
+    with sessions() as session:
+        primary = session.get(WriteOperation, parent_operation_id)
+        compensation = session.get(WriteOperation, undone.json()["operation_id"])
+        assert primary is not None
+        assert compensation is not None
+        assert (
+            primary.operation_role,
+            primary.adapter_kind,
+            primary.tool_name,
+            primary.tool_call_id,
+            primary.parent_operation_id,
+        ) == ("primary", "typed", "update_application_status", "w1", None)
+        assert (
+            compensation.operation_role,
+            compensation.adapter_kind,
+            compensation.tool_name,
+            compensation.tool_call_id,
+            compensation.parent_operation_id,
+        ) == (
+            "compensation",
+            "compensation",
+            "undo:update_application_status",
+            None,
+            parent_operation_id,
+        )
     runs, events, _ = _wait_for_journal_status(
         tmp_path,
         "completed",
@@ -5113,7 +5526,11 @@ def test_chat_status_undo_preserves_unrelated_application_edits(tmp_path):
     ).json()
     client.post(
         "/api/chat/confirm",
-        json={"conversation_id": pending["conversation_id"], "approved": True, "confirmation_token": pending["pending_action"]["confirmation_token"]},
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": True,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+        },
     )
     app_client.put(
         f"/api/applications/{application['id']}",
@@ -5159,7 +5576,11 @@ def test_chat_status_undo_rejects_changed_mutated_fields(tmp_path):
     ).json()
     client.post(
         "/api/chat/confirm",
-        json={"conversation_id": pending["conversation_id"], "approved": True, "confirmation_token": pending["pending_action"]["confirmation_token"]},
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": True,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+        },
     )
     app_client.put(
         f"/api/applications/{application['id']}",
@@ -5438,7 +5859,11 @@ def test_chat_created_event_undo_rejects_edited_record(tmp_path):
     pending = client.post("/api/chat", json={"message": "schedule", "conversation_id": 0}).json()
     confirmed = client.post(
         "/api/chat/confirm",
-        json={"conversation_id": pending["conversation_id"], "approved": True, "confirmation_token": pending["pending_action"]["confirmation_token"]},
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": True,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+        },
     ).json()
     event_id = confirmed["undo"]["application_event_id"]
     client.put(
@@ -5479,7 +5904,11 @@ def test_chat_created_note_undo_rejects_edited_record(tmp_path):
     pending = client.post("/api/chat", json={"message": "note", "conversation_id": 0}).json()
     confirmed = client.post(
         "/api/chat/confirm",
-        json={"conversation_id": pending["conversation_id"], "approved": True, "confirmation_token": pending["pending_action"]["confirmation_token"]},
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": True,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+        },
     ).json()
     note_id = confirmed["undo"]["note_id"]
     client.put(f"/api/notes/{note_id}", json={**note_args, "questions": "User changed"})
@@ -5520,7 +5949,9 @@ def test_chat_exposes_module_tools_to_model(tmp_path):
 
     assert response.status_code == 200
     captured_tools = {tool.name for tool in model.tools[0]}
-    assert {"list_applications", "list_notes", "list_application_events", "list_offers"}.issubset(captured_tools)
+    assert {"list_applications", "list_notes", "list_application_events", "list_offers"}.issubset(
+        captured_tools
+    )
     assert {"list_resumes", "list_jd_analyses"}.issubset(captured_tools)
     assert "list_knowledge_documents" not in captured_tools
     assert "search_knowledge" not in captured_tools
@@ -5556,9 +5987,19 @@ def test_chat_allows_wide_read_only_tool_summaries(tmp_path):
             Assistant(tool_calls=[ToolCall(id="r4", name="list_application_events", args="{}")]),
             Assistant(tool_calls=[ToolCall(id="r5", name="list_resumes", args="{}")]),
             Assistant(tool_calls=[ToolCall(id="r6", name="list_jd_analyses", args="{}")]),
-            Assistant(tool_calls=[ToolCall(id="r7", name="compare_offers", args=json.dumps({"ids": []}))]),
-            Assistant(tool_calls=[ToolCall(id="r8", name="list_resume_matches", args=json.dumps({"resume_id": 1}))]),
-            Assistant(tool_calls=[ToolCall(id="r9", name="get_application_event", args=json.dumps({"id": 1}))]),
+            Assistant(
+                tool_calls=[ToolCall(id="r7", name="compare_offers", args=json.dumps({"ids": []}))]
+            ),
+            Assistant(
+                tool_calls=[
+                    ToolCall(id="r8", name="list_resume_matches", args=json.dumps({"resume_id": 1}))
+                ]
+            ),
+            Assistant(
+                tool_calls=[
+                    ToolCall(id="r9", name="get_application_event", args=json.dumps({"id": 1}))
+                ]
+            ),
             Assistant(content="summary complete"),
         ]
     )
@@ -5633,10 +6074,7 @@ def test_chat_rejects_invalid_write_args_before_pending(tmp_path, args):
     assert response.json()["message"] == "参数无效，请重新提供。"
     assert client.get("/api/chat/conversations").json()[0]["pending_action"] is None
     stored = client.get(f"/api/chat/conversations/{response.json()['conversation_id']}").json()
-    assert any(
-        item["role"] == "tool" and "工具参数验证失败" in item["content"]
-        for item in stored
-    )
+    assert any(item["role"] == "tool" and "工具参数验证失败" in item["content"] for item in stored)
 
 
 def test_chat_write_tool_requires_confirmation_before_mutating(tmp_path):
@@ -6025,7 +6463,11 @@ def test_chat_confirm_executes_pending_write(tmp_path):
 
     response = client.post(
         "/api/chat/confirm",
-        json={"conversation_id": pending["conversation_id"], "approved": True, "confirmation_token": pending["pending_action"]["confirmation_token"]},
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": True,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+        },
     )
 
     assert response.status_code == 200
@@ -6231,7 +6673,11 @@ def test_chat_confirm_prehandler_validation_preserves_pending_and_undo(
 
     response = client.post(
         endpoint,
-        json={"conversation_id": pending["conversation_id"], "approved": True, "confirmation_token": pending["pending_action"]["confirmation_token"]},
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": True,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+        },
     )
 
     if endpoint.endswith("/stream"):
@@ -6306,7 +6752,13 @@ def test_chat_confirm_invalid_edits_return_422_and_preserve_pending(
         },
     )
 
-    assert response.status_code == 422
+    if endpoint.endswith("/stream"):
+        assert response.status_code == 200
+        error = _parse_sse_events(response.text)[-1]
+        assert error["event"] == "error"
+        assert error["data"]["data"]["code"] == "invalid_confirmation"
+    else:
+        assert response.status_code == 422
     assert client.get("/api/chat/conversations").json()[0]["pending_action"] is not None
 
 
@@ -6479,7 +6931,11 @@ def test_chat_confirm_stale_resume_preserves_pending(tmp_path, monkeypatch, endp
     )
     response = client.post(
         endpoint,
-        json={"conversation_id": pending["conversation_id"], "approved": True, "confirmation_token": pending["pending_action"]["confirmation_token"]},
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": True,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+        },
     )
 
     if endpoint.endswith("/stream"):
@@ -6517,15 +6973,28 @@ def test_chat_confirm_result_cas_loss_preserves_newer_pending(tmp_path, monkeypa
     )
     _, client, _, pending = _create_status_confirmation(tmp_path, model)
 
-    def lose_cas(self, conversation_id, expected_generation, messages, **kwargs):
+    def lose_cas(
+        self,
+        conversation_id,
+        expected_generation,
+        messages,
+        *,
+        route_handle,
+        **kwargs,
+    ):
         del expected_generation, messages
+        assert route_handle is None
         _force_replace_claimed_pending_for_cas_test(self, conversation_id, newer)
         return None
 
     monkeypatch.setattr(ChatRepository, "persist_confirmation_continuation", lose_cas)
     response = client.post(
         endpoint,
-        json={"conversation_id": pending["conversation_id"], "approved": True, "confirmation_token": pending["pending_action"]["confirmation_token"]},
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": True,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+        },
     )
 
     if endpoint.endswith("/stream"):
@@ -6585,19 +7054,47 @@ def test_chat_confirm_cas_loss_aborts_before_auto_approved_second_write(
         "newer",
     )
     newer_undo = {"kind": "create_application", "application_id": 404}
+    captured_routes = []
 
-    def lose_cas(self, conversation_id, expected_generation, messages, **kwargs):
-        del expected_generation, messages
-        _force_replace_claimed_pending_for_cas_test(self, conversation_id, newer)
-        self.set_pending_clarification(conversation_id, newer, "newer question")
-        self.set_last_write_undo(conversation_id, newer_undo)
-        return None
+    def lose_cas(
+        self,
+        conversation_id,
+        ownership,
+        origin_tool_message,
+        continuation,
+        chained_pending=None,
+        *,
+        route_handle,
+        **kwargs,
+    ):
+        del origin_tool_message, continuation, chained_pending, kwargs
+        assert type(route_handle) is TypedPendingRouteHandle
+        captured_routes.append(route_handle)
+        _force_replace_claimed_pending_for_cas_test(
+            self._chat,
+            conversation_id,
+            newer,
+            clarification_question="newer question",
+            undo=newer_undo,
+        )
+        return PersistenceResult(
+            PersistenceStatus.CAS_LOST,
+            operation_id=ownership.operation_id,
+        )
 
-    monkeypatch.setattr(ChatRepository, "persist_confirmation_continuation", lose_cas)
+    monkeypatch.setattr(
+        ChatPersistenceCoordinator,
+        "persist_confirmation_delivery",
+        lose_cas,
+    )
 
     response = client.post(
         endpoint,
-        json={"conversation_id": pending["conversation_id"], "approved": True, "confirmation_token": pending["pending_action"]["confirmation_token"]},
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": True,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+        },
     )
 
     if endpoint.endswith("/stream"):
@@ -6613,6 +7110,9 @@ def test_chat_confirm_cas_loss_aborts_before_auto_approved_second_write(
     assert conversation["pending_clarification"]["question"] == "newer question"
     assert conversation["last_write_undo"] == newer_undo
     assert len(model.turns) == 0
+    assert len(captured_routes) == 1
+    with pytest.raises(ValueError, match="revoked|was not issued"):
+        pending_route_claim_for_cleanup(captured_routes[0])
 
 
 @pytest.mark.parametrize("endpoint", ["/api/chat/confirm", "/api/chat/confirm/stream"])
@@ -6639,8 +7139,17 @@ def test_chat_confirm_tool_error_uses_expected_pending_cas(tmp_path, monkeypatch
     )
     _, client, _, pending = _create_status_confirmation(tmp_path, model)
 
-    def lose_cas(self, conversation_id, expected_generation, messages, **kwargs):
+    def lose_cas(
+        self,
+        conversation_id,
+        expected_generation,
+        messages,
+        *,
+        route_handle,
+        **kwargs,
+    ):
         del expected_generation, messages
+        assert route_handle is None
         tool_message = kwargs["origin_message"]
         assert tool_message.content.startswith("错误：")
         _force_replace_claimed_pending_for_cas_test(self, conversation_id, newer)
@@ -6650,7 +7159,11 @@ def test_chat_confirm_tool_error_uses_expected_pending_cas(tmp_path, monkeypatch
 
     response = client.post(
         endpoint,
-        json={"conversation_id": pending["conversation_id"], "approved": True, "confirmation_token": pending["pending_action"]["confirmation_token"]},
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": True,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+        },
     )
 
     if endpoint.endswith("/stream"):
@@ -6679,7 +7192,11 @@ def test_chat_confirm_tool_error_provider_failure_is_durable(tmp_path, endpoint)
 
     response = client.post(
         endpoint,
-        json={"conversation_id": pending["conversation_id"], "approved": True, "confirmation_token": pending["pending_action"]["confirmation_token"]},
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": True,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+        },
     )
 
     assert response.status_code == 200
@@ -6758,8 +7275,6 @@ def test_chat_confirm_result_cas_loss_stays_stale_on_followup_failure(
     endpoint,
     failure_kind,
 ):
-    import offerpilot.api as api_module
-
     newer = PendingAction(
         "newer-after-failure",
         "update_application_status",
@@ -6774,26 +7289,41 @@ def test_chat_confirm_result_cas_loss_stays_stale_on_followup_failure(
     model = (
         FailAfterWriteModel(tool_call)
         if failure_kind == "provider"
-        else SlowAfterPendingModel(tool_call)
+        else TimeoutAfterPendingModel(tool_call)
     )
-    _, client, _, pending = _create_status_confirmation(
-        tmp_path, model, stable_journal=True
+    _, client, _, pending = _create_status_confirmation(tmp_path, model, stable_journal=True)
+
+    def lose_cas(
+        self,
+        conversation_id,
+        ownership,
+        origin_tool_message,
+        continuation,
+        chained_pending=None,
+        *,
+        route_handle,
+        **kwargs,
+    ):
+        del origin_tool_message, continuation, chained_pending, kwargs
+        assert route_handle is None
+        _force_replace_claimed_pending_for_cas_test(self._chat, conversation_id, newer)
+        return PersistenceResult(
+            PersistenceStatus.CAS_LOST,
+            operation_id=ownership.operation_id,
+        )
+
+    monkeypatch.setattr(
+        ChatPersistenceCoordinator,
+        "persist_confirmation_delivery",
+        lose_cas,
     )
-    if failure_kind == "timeout":
-        # The follow-up model sleeps for one second, so this still exercises the
-        # timeout path while leaving enough scheduling time for the deliberately
-        # injected CAS loss to be recorded first under a full serial test group.
-        monkeypatch.setattr(api_module, "CHAT_AGENT_TIMEOUT_SECONDS", 0.75)
-
-    def lose_cas(self, conversation_id, expected_generation, messages, **kwargs):
-        del expected_generation, messages
-        _force_replace_claimed_pending_for_cas_test(self, conversation_id, newer)
-        return None
-
-    monkeypatch.setattr(ChatRepository, "persist_confirmation_continuation", lose_cas)
     response = client.post(
         endpoint,
-        json={"conversation_id": pending["conversation_id"], "approved": True, "confirmation_token": pending["pending_action"]["confirmation_token"]},
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": True,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+        },
     )
 
     if endpoint.endswith("/stream"):
@@ -6843,7 +7373,7 @@ def test_chat_confirm_timeout_after_write_returns_completed_fallback(
 ):
     import offerpilot.api as api_module
 
-    model = SlowAfterPendingModel(
+    model = TimeoutAfterPendingModel(
         ToolCall(
             id="slow-confirm",
             name="update_application_status",
@@ -6851,11 +7381,15 @@ def test_chat_confirm_timeout_after_write_returns_completed_fallback(
         )
     )
     _, client, _, pending = _create_status_confirmation(tmp_path, model)
-    monkeypatch.setattr(api_module, "CHAT_AGENT_TIMEOUT_SECONDS", 0.75)
+    monkeypatch.setattr(api_module, "CHAT_AGENT_TIMEOUT_SECONDS", 5.0)
 
     response = client.post(
         endpoint,
-        json={"conversation_id": pending["conversation_id"], "approved": True, "confirmation_token": pending["pending_action"]["confirmation_token"]},
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": True,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+        },
     )
 
     assert response.status_code == 200
@@ -6877,15 +7411,23 @@ def test_chat_confirm_timeout_after_write_returns_completed_fallback(
         endpoint,
         json={
             "conversation_id": pending["conversation_id"],
+            "operation_id": body["operation_id"],
             "approved": True,
             "confirmation_token": pending["pending_action"]["confirmation_token"],
         },
     )
+    assert retry.status_code == 200
     if endpoint.endswith("/stream"):
-        retry_error = _parse_sse_events(retry.text)[-1]
-        assert retry_error["data"]["data"]["code"] == "stale_pending_action"
+        retry_events = _parse_sse_events(retry.text)
+        assert retry_events[-1]["event"] == "completed"
+        retry_body = retry_events[-1]["data"]["data"]["response"]
     else:
-        assert retry.status_code == 409
+        retry_body = retry.json()
+    assert retry_body["replayed"] is True
+    assert retry_body["message"] == body["message"]
+    assert retry_body["undo"] == body["undo"]
+    assert retry_body["operation_id"] == body["operation_id"]
+    assert retry_body["write_status"] == body["write_status"]
 
 
 @pytest.mark.parametrize("endpoint", ["/api/chat/confirm", "/api/chat/confirm/stream"])
@@ -6894,8 +7436,6 @@ def test_chat_confirm_timeout_during_handler_finalizes_durably_later(
     monkeypatch,
     endpoint,
 ):
-    import offerpilot.api as api_module
-
     model = ScriptedModel(
         [
             Assistant(
@@ -6915,27 +7455,34 @@ def test_chat_confirm_timeout_during_handler_finalizes_durably_later(
         model,
         stable_journal=True,
     )
+    handler_started = Event()
+    release_handler = Event()
     original_update = ApplicationsRepository.update_application_status_scoped
 
-    def slow_update(self, constraint, app_id, status, closed_reason=""):
-        time.sleep(1.0)
+    def blocked_update(self, constraint, app_id, status, closed_reason=""):
+        handler_started.set()
+        assert release_handler.wait(timeout=5)
         return original_update(self, constraint, app_id, status, closed_reason)
 
+    monkeypatch.setattr(ApplicationsRepository, "update_application_status_scoped", blocked_update)
     monkeypatch.setattr(
-        ApplicationsRepository, "update_application_status_scoped", slow_update
+        transport_module,
+        "SyncAgentExecutionHost",
+        _timeout_after_agent_signal_host(handler_started),
     )
-    # Leave enough headroom for prepare/claim work under the full serial gate;
-    # the executor itself remains slower than the timeout by construction.
-    monkeypatch.setattr(api_module, "CHAT_AGENT_TIMEOUT_SECONDS", 0.75)
 
-    response = client.post(
-        endpoint,
-        json={
-            "conversation_id": pending["conversation_id"],
-            "approved": True,
-            "confirmation_token": pending["pending_action"]["confirmation_token"],
-        },
-    )
+    try:
+        response = client.post(
+            endpoint,
+            json={
+                "conversation_id": pending["conversation_id"],
+                "approved": True,
+                "confirmation_token": pending["pending_action"]["confirmation_token"],
+            },
+        )
+        assert handler_started.is_set()
+    finally:
+        release_handler.set()
 
     if endpoint.endswith("/stream"):
         error = _parse_sse_events(response.text)[-1]
@@ -6945,9 +7492,14 @@ def test_chat_confirm_timeout_during_handler_finalizes_durably_later(
     else:
         assert response.status_code == 409
         assert "仍在后台执行" in response.json()["error"]
-    time.sleep(0.5)
-    conversation = client.get("/api/chat/conversations").json()[0]
-    assert conversation["pending_action"] is None
+    deadline = time.monotonic() + 5
+    while True:
+        conversation = client.get("/api/chat/conversations").json()[0]
+        if conversation["pending_action"] is None:
+            break
+        if time.monotonic() >= deadline:
+            pytest.fail("background confirmation did not clear the durable Pending action")
+        time.sleep(0.01)
     assert conversation["last_write_undo"] is not None
     assert app_client.get(f"/api/applications/{application['id']}").json()["status"] == "offer"
     stored = client.get(f"/api/chat/conversations/{pending['conversation_id']}").json()
@@ -6968,9 +7520,7 @@ def test_chat_confirm_timeout_during_handler_finalizes_durably_later(
     assert trace.recording_status == "healthy"
     assert trace.integrity_status == "healthy", trace.anomalies
     assert "recording_degraded" not in trace.anomalies
-    assert not any(
-        anomaly.startswith("model_call_incomplete:") for anomaly in trace.anomalies
-    )
+    assert not any(anomaly.startswith("model_call_incomplete:") for anomaly in trace.anomalies)
     assert journal_events[-1].event_type == "segment.finished"
     assert {snapshot.snapshot_kind for snapshot in journal_snapshots} == {
         "initial",
@@ -6985,8 +7535,6 @@ def test_chat_confirm_slow_handler_atomically_finishes_without_chained_continuat
     monkeypatch,
     endpoint,
 ):
-    import offerpilot.api as api_module
-
     handler_started = Event()
     release_handler = Event()
     continuation_started = Event()
@@ -7028,40 +7576,40 @@ def test_chat_confirm_slow_handler_atomically_finishes_without_chained_continuat
         assert release_handler.wait(timeout=5)
         return original_update(self, constraint, app_id, status, closed_reason)
 
+    monkeypatch.setattr(ApplicationsRepository, "update_application_status_scoped", blocked_update)
     monkeypatch.setattr(
-        ApplicationsRepository, "update_application_status_scoped", blocked_update
-    )
-    # The handler intentionally remains blocked for up to five seconds.  Keep
-    # the timeout below that bound, while allowing the worker enough time to
-    # enter the handler under the serial release gate before it expires.
-    monkeypatch.setattr(api_module, "CHAT_AGENT_TIMEOUT_SECONDS", 0.75)
-
-    response = client.post(
-        endpoint,
-        json={
-            "conversation_id": pending["conversation_id"],
-            "approved": True,
-            "confirmation_token": pending["pending_action"]["confirmation_token"],
-        },
-    )
-
-    assert handler_started.is_set()
-    if endpoint.endswith("/stream"):
-        error = _parse_sse_events(response.text)[-1]
-        assert error["data"]["data"]["code"] == "confirmation_in_progress"
-    else:
-        assert response.status_code == 409
-    before_release = client.get("/api/chat/conversations").json()[0]
-    assert before_release["pending_action"] is not None
-    assert all(
-        "写入已完成" not in message["content"]
-        for message in client.get(
-            f"/api/chat/conversations/{pending['conversation_id']}"
-        ).json()
+        transport_module,
+        "SyncAgentExecutionHost",
+        _timeout_after_agent_signal_host(handler_started),
     )
 
     try:
+        response = client.post(
+            endpoint,
+            json={
+                "conversation_id": pending["conversation_id"],
+                "approved": True,
+                "confirmation_token": pending["pending_action"]["confirmation_token"],
+            },
+        )
+        assert handler_started.is_set()
+        if endpoint.endswith("/stream"):
+            error = _parse_sse_events(response.text)[-1]
+            assert error["data"]["data"]["code"] == "confirmation_in_progress"
+        else:
+            assert response.status_code == 409
+        before_release = client.get("/api/chat/conversations").json()[0]
+        assert before_release["pending_action"] is not None
+        assert all(
+            "写入已完成" not in message["content"]
+            for message in client.get(
+                f"/api/chat/conversations/{pending['conversation_id']}"
+            ).json()
+        )
+    finally:
         release_handler.set()
+
+    try:
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             if app_client.get(f"/api/applications/{application['id']}").json()["status"] == "offer":
@@ -7156,7 +7704,11 @@ def test_chat_confirm_rejection_timeout_returns_recorded_fallback(tmp_path, monk
 
     response = client.post(
         endpoint,
-        json={"conversation_id": pending["conversation_id"], "approved": False, "confirmation_token": pending["pending_action"]["confirmation_token"]},
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": False,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+        },
     )
 
     if endpoint.endswith("/stream"):
@@ -7200,7 +7752,11 @@ def test_chat_confirm_timeout_before_result_sink_keeps_pending(tmp_path, monkeyp
     monkeypatch.setattr(composition_module._AgentDriver, "execute", late_execute)
     response = client.post(
         endpoint,
-        json={"conversation_id": pending["conversation_id"], "approved": True, "confirmation_token": pending["pending_action"]["confirmation_token"]},
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": True,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+        },
     )
     time.sleep(0.25)
 
@@ -7220,7 +7776,6 @@ def test_chat_confirm_fallback_timeout_before_handler_keeps_retry_claim(
     endpoint,
 ):
     import offerpilot.ai.agent_loop as agent_module
-    import offerpilot.api as api_module
 
     model = ScriptedModel(
         [
@@ -7255,10 +7810,12 @@ def test_chat_confirm_fallback_timeout_before_handler_keeps_retry_claim(
         return original_update(self, constraint, app_id, status, closed_reason)
 
     monkeypatch.setattr(agent_module, "prepare_call", block_first_prepare)
+    monkeypatch.setattr(ApplicationsRepository, "update_application_status_scoped", record_update)
     monkeypatch.setattr(
-        ApplicationsRepository, "update_application_status_scoped", record_update
+        transport_module,
+        "SyncAgentExecutionHost",
+        _timeout_after_agent_signal_host(validation_started),
     )
-    monkeypatch.setattr(api_module, "CHAT_AGENT_TIMEOUT_SECONDS", 0.05)
 
     first = client.post(
         endpoint,
@@ -7280,7 +7837,9 @@ def test_chat_confirm_fallback_timeout_before_handler_keeps_retry_claim(
     assert client.get("/api/chat/conversations").json()[0]["pending_action"] is not None
 
     release_validation.set()
-    monkeypatch.setattr(api_module, "CHAT_AGENT_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.undo()
+    monkeypatch.setattr(agent_module, "prepare_call", block_first_prepare)
+    monkeypatch.setattr(ApplicationsRepository, "update_application_status_scoped", record_update)
     retry = client.post(
         endpoint,
         json={
@@ -7300,24 +7859,72 @@ def test_chat_confirm_fallback_timeout_before_handler_keeps_retry_claim(
     assert client.get("/api/chat/conversations").json()[0]["pending_action"] is None
 
 
-def test_chat_confirm_add_note_returns_saved_record_summary(tmp_path):
+@pytest.mark.parametrize("endpoint", ["/api/chat/confirm", "/api/chat/confirm/stream"])
+@pytest.mark.parametrize(
+    ("tool_name", "request_message", "tool_args", "expected_summary"),
+    (
+        (
+            "create_application",
+            "先新建牛客网软件测试工程师投递",
+            {
+                "company_name": "牛客网",
+                "position_name": "软件测试工程师",
+                "status": "interview",
+            },
+            "✅ 创建成功：投递记录 #1 已保存（牛客网 · 软件测试工程师）。",
+        ),
+        (
+            "add_note",
+            "保存复盘",
+            {
+                "company": "牛客网",
+                "position": "软件测试工程师",
+                "round": "技术一面",
+                "date": "2026-07-09",
+                "questions": "测试流程",
+            },
+            "✅ 保存成功：复盘记录 #1 已保存（牛客网 · 软件测试工程师 · 技术一面）。",
+        ),
+        (
+            "create_application_event",
+            "为牛客网投递创建面试日程",
+            {
+                "application_id": 1,
+                "event_type": "interview",
+                "scheduled_at": "2026-07-10T19:00:00+08:00",
+                "duration_minutes": 30,
+            },
+            "✅ 创建成功：日程 #1 已保存。",
+        ),
+    ),
+)
+def test_chat_confirm_special_write_returns_exact_saved_record_summary(
+    tmp_path,
+    endpoint,
+    tool_name,
+    request_message,
+    tool_args,
+    expected_summary,
+):
+    if tool_name == "create_application_event":
+        app_client = TestClient(create_app(data_dir=tmp_path))
+        application = app_client.post(
+            "/api/applications",
+            json={
+                "company_name": "牛客网",
+                "position_name": "软件测试工程师",
+                "status": "interview",
+            },
+        ).json()
+        tool_args = {**tool_args, "application_id": application["id"]}
     model = ScriptedModel(
         [
             Assistant(
                 tool_calls=[
                     ToolCall(
                         id="w1",
-                        name="add_note",
-                        args=json.dumps(
-                            {
-                                "company": "牛客网",
-                                "position": "软件测试工程师",
-                                "round": "技术一面",
-                                "date": "2026-07-09",
-                                "questions": "测试流程",
-                            },
-                            ensure_ascii=False,
-                        ),
+                        name=tool_name,
+                        args=json.dumps(tool_args, ensure_ascii=False),
                     )
                 ],
             ),
@@ -7325,17 +7932,30 @@ def test_chat_confirm_add_note_returns_saved_record_summary(tmp_path):
         ]
     )
     client = TestClient(create_app(data_dir=tmp_path, chat_model=model))
-    pending = client.post("/api/chat", json={"message": "保存复盘", "conversation_id": 0}).json()
+    pending = client.post(
+        "/api/chat", json={"message": request_message, "conversation_id": 0}
+    ).json()
+    assert pending.get("type") == "confirmation_required", pending
 
     response = client.post(
-        "/api/chat/confirm",
-        json={"conversation_id": pending["conversation_id"], "approved": True, "confirmation_token": pending["pending_action"]["confirmation_token"]},
+        endpoint,
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": True,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+        },
     )
 
     assert response.status_code == 200
-    assert response.json()["type"] == "message"
-    message = response.json()["message"]
-    assert "保存成功：复盘记录 #1 已保存（牛客网 · 软件测试工程师 · 技术一面）。" in message
+    if endpoint.endswith("/stream"):
+        events = _parse_sse_events(response.text)
+        assert events[-1]["event"] == "completed"
+        body = events[-1]["data"]["data"]["response"]
+    else:
+        body = response.json()
+    assert body["type"] == "message"
+    message = body["message"]
+    assert message.startswith(f"{expected_summary}\n\n")
     assert "后续可以继续补充面试官追问。" in message
 
 
@@ -7386,7 +8006,11 @@ def test_chat_confirm_create_application_continues_to_review_note_card(tmp_path)
 
     response = client.post(
         "/api/chat/confirm",
-        json={"conversation_id": pending["conversation_id"], "approved": True, "confirmation_token": pending["pending_action"]["confirmation_token"]},
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": True,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+        },
     )
 
     assert response.status_code == 200
@@ -7429,7 +8053,11 @@ def test_chat_confirm_replays_reasoning_content_for_pending_tool(tmp_path):
 
     response = client.post(
         "/api/chat/confirm",
-        json={"conversation_id": pending["conversation_id"], "approved": True, "confirmation_token": pending["pending_action"]["confirmation_token"]},
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": True,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+        },
     )
 
     assert response.status_code == 200
@@ -7473,7 +8101,11 @@ def test_chat_confirm_keeps_application_context_for_model(tmp_path):
 
     response = client.post(
         "/api/chat/confirm",
-        json={"conversation_id": pending["conversation_id"], "approved": True, "confirmation_token": pending["pending_action"]["confirmation_token"]},
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": True,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+        },
     )
 
     assert response.status_code == 200
@@ -7512,7 +8144,11 @@ def test_chat_confirm_resumes_pending_write_through_agent_loop(tmp_path):
     reloaded_client = TestClient(create_app(data_dir=tmp_path, chat_model=second_model))
     response = reloaded_client.post(
         "/api/chat/confirm",
-        json={"conversation_id": pending["conversation_id"], "approved": True, "confirmation_token": pending["pending_action"]["confirmation_token"]},
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": True,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+        },
     )
 
     assert response.status_code == 200
@@ -7582,7 +8218,11 @@ def test_chat_confirm_clears_persisted_pending_action(tmp_path):
 
     response = client.post(
         "/api/chat/confirm",
-        json={"conversation_id": pending["conversation_id"], "approved": True, "confirmation_token": pending["pending_action"]["confirmation_token"]},
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": True,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+        },
     )
 
     assert response.status_code == 200
@@ -7631,7 +8271,11 @@ def test_chat_confirm_atomically_replaces_chained_pending_write(tmp_path, monkey
 
     response = client.post(
         "/api/chat/confirm",
-        json={"conversation_id": pending["conversation_id"], "approved": True, "confirmation_token": pending["pending_action"]["confirmation_token"]},
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": True,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+        },
     )
 
     assert response.status_code == 200
@@ -7682,40 +8326,51 @@ def test_chat_confirm_chained_pending_cas_loss_has_no_partial_history(
     )
     client = TestClient(create_app(data_dir=tmp_path, chat_model=model))
     pending = client.post("/api/chat", json={"message": "update two", "conversation_id": 0}).json()
+    captured_routes = []
+
     def lose_transition(
         self,
         conversation_id,
-        expected_generation,
-        messages,
+        ownership,
+        origin_tool_message,
+        continuation,
+        chained_pending=None,
         *,
-        pending=None,
+        route_handle,
         clarification=None,
-        delivery_ownership=None,
         delivery_failure_code=None,
         **kwargs,
     ):
+        assert type(route_handle) is TypedPendingRouteHandle
+        captured_routes.append(route_handle)
         del (
             self,
             conversation_id,
-            expected_generation,
-            messages,
-            pending,
+            origin_tool_message,
+            continuation,
+            chained_pending,
             clarification,
-            delivery_ownership,
             delivery_failure_code,
             kwargs,
         )
-        return None
+        return PersistenceResult(
+            PersistenceStatus.CAS_LOST,
+            operation_id=ownership.operation_id,
+        )
 
     monkeypatch.setattr(
-        ChatRepository,
-        "persist_confirmation_continuation",
+        ChatPersistenceCoordinator,
+        "persist_confirmation_delivery",
         lose_transition,
     )
 
     response = client.post(
         endpoint,
-        json={"conversation_id": pending["conversation_id"], "approved": True, "confirmation_token": pending["pending_action"]["confirmation_token"]},
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": True,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+        },
     )
 
     if endpoint.endswith("/stream"):
@@ -7731,6 +8386,9 @@ def test_chat_confirm_chained_pending_cas_loss_has_no_partial_history(
     assert conversation["pending_clarification"] is None
     stored = client.get(f"/api/chat/conversations/{pending['conversation_id']}").json()
     assert all("abandoned-chain" not in str(message.get("tool_calls", "")) for message in stored)
+    assert len(captured_routes) == 1
+    with pytest.raises(ValueError, match="revoked|was not issued"):
+        pending_route_claim_for_cleanup(captured_routes[0])
 
 
 @pytest.mark.parametrize("conversation_id", [None, 0, -1, "1", 1.5, True, {}, []])
@@ -7825,9 +8483,7 @@ def test_chat_confirm_rejects_review_token_after_pending_replacement(
                     ToolCall(
                         id="replacement-write",
                         name="update_application_status",
-                        args=json.dumps(
-                            {"id": 1, "status": "closed", "closed_reason": "new"}
-                        ),
+                        args=json.dumps({"id": 1, "status": "closed", "closed_reason": "new"}),
                     )
                 ]
             ),
@@ -8000,10 +8656,7 @@ def test_chat_confirm_ledger_delivery_persists_fallback_after_generation_change(
         assert fallback_response["operation_id"] == pending["pending_action"]["operation_id"]
         origin_events = [event for event in fallback_events if event["event"] == "tool_result"]
         assert len(origin_events) == 1
-        assert (
-            origin_events[0]["data"]["data"]["operation_id"]
-            == fallback_response["operation_id"]
-        )
+        assert origin_events[0]["data"]["data"]["operation_id"] == fallback_response["operation_id"]
     else:
         assert response.status_code == 200
         assert response.json()["type"] == "message"
@@ -8124,9 +8777,7 @@ def test_first_model_signal_keeps_title_id_when_later_provider_fails(tmp_path, e
             self.calls += 1
             if self.calls == 1:
                 return Assistant(
-                    tool_calls=[
-                        ToolCall(id="title-read", name="list_applications", args="{}")
-                    ]
+                    tool_calls=[ToolCall(id="title-read", name="list_applications", args="{}")]
                 )
             raise RuntimeError("provider failed after first model")
 
@@ -8309,9 +8960,7 @@ def test_chat_conversation_context_label_resolves_application_and_localized_fall
         ConversationScopeMutationSnapshot(mode="nego_coach", context_type="mode"),
     )
 
-    conversations = {
-        item["id"]: item for item in app_client.get("/api/chat/conversations").json()
-    }
+    conversations = {item["id"]: item for item in app_client.get("/api/chat/conversations").json()}
 
     assert conversations[application_conversation.id]["context_label"] == "字节跳动 · 后端工程师"
     assert conversations[workspace_conversation.id]["context_label"] == "工作区"
@@ -8343,9 +8992,7 @@ def test_chat_conversation_archive_rejects_pending_but_allows_other_updates_and_
         "/api/chat", json={"message": "改成 offer", "conversation_id": 0}
     ).json()["conversation_id"]
 
-    blocked = client.patch(
-        f"/api/chat/conversations/{conversation_id}", json={"archived": True}
-    )
+    blocked = client.patch(f"/api/chat/conversations/{conversation_id}", json={"archived": True})
     renamed = client.patch(
         f"/api/chat/conversations/{conversation_id}",
         json={"title": "待确认状态", "pinned": True},
@@ -8362,12 +9009,8 @@ def test_chat_conversation_archive_rejects_pending_but_allows_other_updates_and_
 
     repo = ChatRepository(session_factory_for_data_dir(tmp_path))
     repo.clear_pending_action(conversation_id)
-    archived = client.patch(
-        f"/api/chat/conversations/{conversation_id}", json={"archived": True}
-    )
-    restored = client.patch(
-        f"/api/chat/conversations/{conversation_id}", json={"archived": False}
-    )
+    archived = client.patch(f"/api/chat/conversations/{conversation_id}", json={"archived": True})
+    restored = client.patch(f"/api/chat/conversations/{conversation_id}", json={"archived": False})
 
     assert archived.status_code == 200
     assert archived.json()["archived_at"] is not None
@@ -8402,7 +9045,8 @@ def test_chat_does_not_return_confirmation_when_conversation_was_archived_during
         conversation_id,
         messages,
         pending,
-        pending_authority_claim=None,
+        *,
+        route_handle,
     ):
         repo.update_conversation_for_archive(
             conversation_id, {"archived_at": datetime.now(timezone.utc)}
@@ -8412,7 +9056,7 @@ def test_chat_does_not_return_confirmation_when_conversation_was_archived_during
             conversation_id,
             messages,
             pending,
-            pending_authority_claim,
+            route_handle=route_handle,
         )
 
     monkeypatch.setattr(
@@ -8434,9 +9078,7 @@ def test_chat_does_not_return_confirmation_when_conversation_was_archived_during
 def test_chat_conversation_update_checks_missing_conversation_before_validating_payload(tmp_path):
     client = TestClient(create_app(data_dir=tmp_path))
 
-    response = client.patch(
-        "/api/chat/conversations/99999", json={"title": "", "pinned": "false"}
-    )
+    response = client.patch("/api/chat/conversations/99999", json={"title": "", "pinned": "false"})
 
     assert response.status_code == 404
     assert response.json()["error"] == "conversation not found"
@@ -8522,6 +9164,7 @@ def test_chat_without_configured_ai_returns_503(tmp_path):
     assert response.status_code == 503
     assert response.json() == {"error": "AI is not configured: run `oc config` to set your API key"}
 
+
 def test_chat_confirm_stream_consumes_pending_before_running_write(tmp_path):
     app_client = TestClient(create_app(data_dir=tmp_path))
     application = app_client.post(
@@ -8551,6 +9194,7 @@ def test_chat_confirm_stream_consumes_pending_before_running_write(tmp_path):
     assert app_client.get(f"/api/applications/{application['id']}").json()["status"] == "offer"
     stored = client.get(f"/api/chat/conversations/{pending['conversation_id']}").json()
     assert len([message for message in stored if message["tool_call_id"] == "write-once"]) == 1
+
 
 def test_chat_confirm_consumes_pending_before_running_write(tmp_path):
     app_client = TestClient(create_app(data_dir=tmp_path))
@@ -8586,6 +9230,7 @@ def test_chat_confirm_consumes_pending_before_running_write(tmp_path):
     assert app_client.get(f"/api/applications/{application['id']}").json()["status"] == "offer"
     stored = client.get(f"/api/chat/conversations/{pending['conversation_id']}").json()
     assert len([message for message in stored if message["tool_call_id"] == "write-once-json"]) == 1
+
 
 def test_chat_cancel_pending_write_records_rejection_when_followup_is_unavailable(tmp_path):
     app_client = TestClient(create_app(data_dir=tmp_path))
@@ -8627,6 +9272,7 @@ def test_chat_cancel_pending_write_records_rejection_when_followup_is_unavailabl
     assert [item["role"] for item in stored[-2:]] == ["tool", "assistant"]
     assert stored[-2]["tool_call_id"] == "w1"
 
+
 def test_chat_cancel_pending_write_keeps_next_turn_provider_compatible(tmp_path):
     app_client = TestClient(create_app(data_dir=tmp_path))
     application = app_client.post(
@@ -8664,6 +9310,7 @@ def test_chat_cancel_pending_write_keeps_next_turn_provider_compatible(tmp_path)
     assert response.json()["message"] == "历史消息已恢复，可以继续了。"
     assert validating_model.calls
 
+
 def test_chat_next_turn_repairs_legacy_orphan_tool_call_history(tmp_path):
     chat = ChatRepository(session_factory_for_data_dir(tmp_path))
     conversation = chat.create_conversation("legacy")
@@ -8684,6 +9331,7 @@ def test_chat_next_turn_repairs_legacy_orphan_tool_call_history(tmp_path):
     assert response.status_code == 200
     assert response.json()["message"] == "历史消息已恢复，可以继续了。"
     assert validating_model.calls
+
 
 def test_chat_confirm_stream_cancel_persists_tool_result(tmp_path):
     app_client = TestClient(create_app(data_dir=tmp_path))
@@ -8718,6 +9366,7 @@ def test_chat_confirm_stream_cancel_persists_tool_result(tmp_path):
     stored = client.get(f"/api/chat/conversations/{pending['conversation_id']}").json()
     assert [item["role"] for item in stored[-2:]] == ["tool", "assistant"]
     assert stored[-2]["tool_call_id"] == "stream-w1"
+
 
 def test_chat_confirm_reports_failed_write_without_success_prefix(tmp_path):
     app_client = TestClient(create_app(data_dir=tmp_path))
@@ -8762,6 +9411,7 @@ def test_chat_confirm_reports_failed_write_without_success_prefix(tmp_path):
     assert "保存成功" not in body["message"]
     assert app_client.get(f"/api/applications/{application['id']}").json()["status"] == "closed"
 
+
 def test_chat_conversation_exposes_pending_action_for_reload(tmp_path):
     app_client = TestClient(create_app(data_dir=tmp_path))
     application = app_client.post(
@@ -8789,6 +9439,7 @@ def test_chat_conversation_exposes_pending_action_for_reload(tmp_path):
     assert conversations[0]["id"] == pending["conversation_id"]
     assert conversations[0]["pending_action"] == pending["pending_action"]
     assert conversations[0]["pending_action"]["target"]["title"] == "字节跳动"
+
 
 def test_chat_confirm_returns_args_for_chained_pending_write(tmp_path):
     app_client = TestClient(create_app(data_dir=tmp_path))
@@ -8866,9 +9517,7 @@ def test_replay_topology_errors_keep_existing_public_contract(
 
 
 @pytest.mark.parametrize("context_ref", ["not-an-id", "999999"])
-def test_chat_fails_closed_before_model_for_invalid_application_scope(
-    tmp_path, context_ref
-):
+def test_chat_fails_closed_before_model_for_invalid_application_scope(tmp_path, context_ref):
     model = CapturingScriptedModel([Assistant(content="不应调用模型")])
     client = TestClient(create_app(data_dir=tmp_path, chat_model=model))
     repository = ChatRepository(session_factory_for_data_dir(tmp_path))
@@ -9016,3 +9665,43 @@ def test_chat_ignores_legacy_non_application_ref_when_loading_source(
 
     assert scope.persisted_context_ref == legacy_ref
     assert scope.application_id is None
+
+
+def test_chat_runtime_injects_one_bundle_provider_discovery_and_authority_views(
+    tmp_path: Path,
+) -> None:
+    app = create_app(
+        data_dir=tmp_path,
+        chat_model=ScriptedModel([Assistant(content="done")]),
+        title_model=ScriptedModel([Assistant(content="title")]),
+    )
+    runtime = app.state.pilot_runtime
+    bundle = runtime.metadata_bundle
+    dependencies = object.__getattribute__(runtime, "_dependencies")
+    provider_view = dependencies.provider_metadata_view
+    discovery_view = dependencies.discovery_metadata_view
+    authority_view = dependencies.authority_metadata_view
+
+    assert provider_view is bundle.provider_view()
+    assert discovery_view is bundle.discovery_view()
+    assert authority_view is bundle.authority_view()
+    assert provider_view.bundle_instance_token is discovery_view.bundle_instance_token
+    assert discovery_view.bundle_instance_token is authority_view.bundle_instance_token
+    assert not hasattr(app.state, "tool_metadata_bundle")
+    assert not hasattr(app.state, "provider_metadata_view")
+
+    confirmation = dependencies.confirmation_coordinator
+    assert confirmation is not None
+    for forbidden in (
+        "legacy_initial_routes",
+        "initial_routes",
+        "owner_lease_factory",
+        "initial_issuer_for",
+        "legacy_request_owner_lease_factory",
+        "legacy_initial_route_port",
+        "legacy_jd_clarification_issuer",
+        "legacy_jd_deterministic_action_issuer",
+        "legacy_submission_snapshot_issuer",
+        "legacy_outcome_recording_issuer",
+    ):
+        assert not hasattr(confirmation, forbidden)

@@ -16,8 +16,11 @@ def project_transport_event(
     record: ToolExecutionRecord[Any, Any],
 ) -> dict[str, object]:
     metadata = ToolResultMetadata()
-    if not isinstance(record.outcome, ToolFailure) and spec.result_metadata is not None:
-        metadata = spec.result_metadata(record.outcome.result)
+    if (
+        not isinstance(record.outcome, ToolFailure)
+        and spec.result_metadata_projector is not None
+    ):
+        metadata = spec.result_metadata_projector(record.outcome.result)
     summary = render_compatibility(spec, record.outcome)[:500]
     return {
         "tool_call_id": record.prepared.tool_call_id,

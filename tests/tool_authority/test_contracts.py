@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -14,6 +15,7 @@ from offerpilot.ai.tool_authority import (
     ApplicationScopeConstraint,
     AuthorityFactory,
     AuthorityPhaseError,
+    AuthorityUse,
     ApprovalExecutionAuthority,
     BindingTargetResolution,
     ExecutionClaim,
@@ -35,12 +37,28 @@ from offerpilot.ai.tool_runtime.contracts import (
     BindingAudit,
     PreparedToolCall,
     ProviderToolContract,
-    ToolSpec,
+    materialize_provider_payloads,
+)
+from offerpilot.ai.tool_runtime.catalog import ToolCatalog
+from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
+from tests.tool_metadata.factories import (
+    compose_synthetic_bundle,
+    read_metadata,
+    synthetic_tool_spec,
+    write_metadata,
 )
 
 
 MAX_INT64 = 2**63 - 1
 ARG_DIGEST = "sha256:" + hashlib.sha256(b"{}").hexdigest()
+_LEASES: list[object] = []
+
+
+@pytest.fixture(autouse=True)
+def _close_segment_leases():
+    yield
+    while _LEASES:
+        getattr(_LEASES.pop(), "close")()
 
 
 def _scope() -> TrustedContextScope:
@@ -66,20 +84,43 @@ def _prepared(
     kind: str = "read",
     invocation: ProviderInvocationIdentity | None = None,
 ) -> PreparedToolCall[Any, Any]:
-    spec = ToolSpec(
-        contract=ProviderToolContract(
-            payload={
-                "type": "function",
-                "function": {"name": tool_name, "description": "", "parameters": {}},
+    parameters: dict[str, object] = {"type": "object", "properties": {}}
+    contract = ProviderToolContract(
+        payload={
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": "",
+                "parameters": parameters,
             },
-            name=tool_name,
-            description="",
-            parameters={},
-        ),
-        kind=kind,  # type: ignore[arg-type]
+        },
+        name=tool_name,
+        description="",
+        parameters=parameters,
+    )
+    metadata = write_metadata(tool_name) if kind == "write" else read_metadata(tool_name)
+    if kind == "write":
+        metadata = replace(metadata, editable_fields=())
+    spec = replace(
+        synthetic_tool_spec(tool_name, metadata=metadata),
+        contract=contract,
         decoder=lambda value: value,
         executor=lambda args, context: args,
-        confirmation_policy="required" if kind == "write" else "none",
+    )
+    catalog = ToolCatalog((spec,), expected_names=(tool_name,))
+    source = compose_synthetic_bundle()
+    bundle = ToolMetadataBundleV1(
+        typed_catalog=catalog,
+        manifest={**source["manifest"], "typed_tools": (tool_name,)},
+        legacy_boundary=source["legacy_boundary"],
+        compensation=source["compensation"],
+    )
+    lease = bundle.open_segment_lease()
+    _LEASES.append(lease)
+    factory.bind_segment_tool_catalog(
+        authority,
+        authority_metadata_view=bundle.authority_view(),
+        catalog_lease=lease,
     )
     if isinstance(authority, ApprovalExecutionAuthority):
         prepare_identity = factory.create_approved_write_prepare_identity(
@@ -139,25 +180,32 @@ def _prepared(
             tool_name=tool_name,
             arguments_digest=ARG_DIGEST,
         )
+    spec_handle = lease.resolve(tool_name)
+    assert spec_handle is not None
     factory.register_tool_spec(
-        spec,
+        spec_handle,
+        catalog_lease=lease,
         authority=authority,
         prepare_identity=prepare_identity,
     )
-    contract_fingerprint = "sha256:" + hashlib.sha256(
-        json.dumps(
-            dict(spec.contract.payload),
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-    ).hexdigest()
+    contract_fingerprint = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                materialize_provider_payloads((spec.contract,))[0],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+    )
     return factory.prepare_tool_call(
         authority,
+        catalog_lease=lease,
+        spec_handle=spec_handle,
         prepare_identity=prepare_identity,
         tool_call_id=tool_call_id,
-        spec=spec,
         arguments={},
         typed_args={},
         arguments_digest=ARG_DIGEST,
@@ -344,26 +392,36 @@ def test_spec_gate_is_fail_closed_for_approval_and_segment_write() -> None:
             effective_args_digest=ARG_DIGEST,
             capabilities=frozenset({"applications.write"}),
         )
-        read_spec = type("Spec", (), {"kind": "read", "confirmation_policy": "none"})()
-        write_spec = type("Spec", (), {"kind": "write", "confirmation_policy": "required"})()
+        prepared = _prepared(
+            factory,
+            approval,
+            tool_name="update_application_status",
+            kind="write",
+        )
+        write_handle = prepared.spec_handle
+        assert write_handle is not None
 
         with pytest.raises(AuthorityPhaseError):
-            require_authority_spec(approval, "approved_write_prepare", read_spec)
-        assert require_authority_spec(approval, "approved_write_prepare", write_spec) is None
+            require_authority_spec(approval, "approved_write_prepare", SimpleNamespace())
+        entry = require_authority_spec(approval, "approved_write_prepare", write_handle)
+        assert entry.provider_name == "update_application_status"
         with pytest.raises(AuthorityPhaseError):
-            require_authority_spec(segment, "read_execute", write_spec)
+            require_authority_spec(segment, "read_execute", write_handle)
 
 
 def test_constraint_and_resolution_invariants_are_closed() -> None:
     with execution_scope() as factory:
         authority = _segment(factory)
         token = authority.authority_instance_token
-        assert ApplicationScopeConstraint(
-            entity_kind="application",
-            mode="unrestricted",
-            allowed_identities=frozenset(),
-            authority_instance_token=token,
-        ).allowed_identities == frozenset()
+        assert (
+            ApplicationScopeConstraint(
+                entity_kind="application",
+                mode="unrestricted",
+                allowed_identities=frozenset(),
+                authority_instance_token=token,
+            ).allowed_identities
+            == frozenset()
+        )
         with pytest.raises(ValueError):
             ApplicationScopeConstraint(
                 entity_kind="application",
@@ -453,6 +511,11 @@ def test_approval_execution_claim_binds_prepared_and_authority_identity() -> Non
             approval,
             tool_name="update_application_status",
             kind="write",
+        )
+        factory.begin_prepared_execution(
+            prepared,
+            authority=approval,
+            use=AuthorityUse.APPROVED_WRITE_PREPARE,
         )
         with Session() as session:
             transaction = session.begin()

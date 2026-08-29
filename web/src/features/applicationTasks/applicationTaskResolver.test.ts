@@ -29,6 +29,7 @@ function event(overrides: Record<string, unknown> = {}) {
     primaryAction: 'prepare' as const,
     scheduledAtTimestamp: NOW + 60 * 60_000,
     durationMinutes: 60,
+    scheduledAtState: 'present' as const,
     sourceMismatch: false,
     deleted: false,
     ...overrides,
@@ -63,6 +64,17 @@ describe('resolveApplicationTasks', () => {
     }), NOW);
     expect(result.primaryTask).toBeNull();
     expect(result.tasks.some((task) => task.taskId === 'application.opportunity_fit')).toBe(true);
+  });
+
+  it.each(['loading', 'error', 'absent'] as const)('applied material stage follows JD/resume dependency %s', (status) => {
+    const result = resolveApplicationTasks(base({
+      application: ready({ id: 7, status: 'applied' }),
+      jd: ready({ id: 11 }),
+      resume: status === 'loading' ? { status } : status === 'error' ? { status } : { status },
+      materialKit: ready(null),
+    }), NOW);
+    expect(result.primaryTask).toBeNull();
+    expect(result.tasks.find((task) => task.taskId === 'application.material_kit')?.availability).toBe(status === 'loading' ? 'loading' : status === 'error' ? 'unavailable' : 'blocked');
   });
 
   it('exports a closed resolver and freezes nested output', () => {
@@ -147,5 +159,104 @@ describe('resolveApplicationTasks', () => {
     expect(a).toEqual(b);
     expect(a.tasks.filter((task) => task.primary)).toHaveLength(1);
     expect(JSON.stringify(input)).toBe(before);
+  });
+
+  it('accepts a valid result-unknown ref without requiring event reads', () => {
+    const result = resolveApplicationTasks(base({
+      events: { status: 'loading' },
+      resultUnknown: ready({ ref: { taskId: 'application.interview_review', applicationId: 7, eventId: 3 } }),
+    }), NOW);
+    expect(result.primaryTask?.availability).toBe('result_unknown');
+  });
+
+  it.each(['loading', 'error', 'absent'] as const)('blocks lower work when Pending is %s', (status) => {
+    const result = resolveApplicationTasks(base({ pending: status === 'loading' ? { status } : status === 'error' ? { status } : { status } }), NOW);
+    expect(result.primaryTask).toBeNull();
+    expect(result.issues.some((issue) => issue.reason.startsWith('source_'))).toBe(true);
+  });
+
+  it('uses an event review only for a safe positive exact event ID', () => {
+    const result = resolveApplicationTasks(base({
+      events: ready([event({ lifecycle: 'completed', bucket: 'completed', primaryAction: 'view_review' })]),
+      reviews: ready([{ applicationId: 7, eventId: 3, reviewId: 20 }]),
+    }), NOW);
+    expect(result.primaryTask?.reason).toBe('interview_review_available');
+    const invalid = resolveApplicationTasks(base({
+      events: ready([event({ lifecycle: 'completed', bucket: 'completed', primaryAction: 'view_review' })]),
+      reviews: ready([{ applicationId: 7, eventId: 0 } as never, { applicationId: 7, eventId: '3' } as never]),
+    }), NOW);
+    expect(invalid.issues.filter((issue) => issue.reason === 'event_contract_invalid')).toHaveLength(1);
+  });
+
+  it.each(['loading', 'error', 'absent'] as const)('does not call a completed event reviewed when reviews are %s', (status) => {
+    const result = resolveApplicationTasks(base({
+      events: ready([event({ lifecycle: 'completed', bucket: 'completed', primaryAction: 'view_review' })]),
+      reviews: status === 'loading' ? { status } : status === 'error' ? { status } : { status },
+    }), NOW);
+    expect(result.primaryTask).toBeNull();
+    expect(result.tasks.find((task) => task.taskId === 'application.interview_review')?.reason).toBe(`source_${status === 'absent' ? 'absent' : status}`);
+  });
+
+  it('keeps application-level null-event review separate', () => {
+    const result = resolveApplicationTasks(base({ reviews: ready([{ applicationId: 7, eventId: null, reviewId: 10 }]) }), NOW);
+    expect(result.tasks.some((task) => task.taskId === 'application.general_review')).toBe(true);
+    expect(result.tasks.some((task) => task.ref.eventId !== undefined && task.taskId === 'application.general_review')).toBe(false);
+  });
+
+  it('requires the canonical upcoming/action contract and 24 hour window', () => {
+    const invalid = resolveApplicationTasks(base({ events: ready([
+      event({ durationMinutes: 0 }), event({ eventId: 4, scheduledAtTimestamp: Number.NaN }),
+      event({ eventId: 5, primaryAction: 'none' }), event({ eventId: 6, bucket: 'unavailable' }),
+      event({ eventId: 7, scheduledAtTimestamp: NOW + 25 * 60 * 60_000 }),
+    ]) }), NOW);
+    expect(invalid.tasks.some((task) => task.primary)).toBe(false);
+    expect(invalid.issues.length).toBeGreaterThan(0);
+  });
+
+  it('fails closed for lifecycle/card bucket conflicts and deleted cancelled cards', () => {
+    const result = resolveApplicationTasks(base({ events: ready([
+      event({ lifecycle: 'scheduled', bucket: 'completed' }),
+      event({ eventId: 4, lifecycle: 'cancelled', bucket: 'cancelled', deleted: true }),
+    ]) }), NOW);
+    expect(result.issues.some((issue) => issue.reason === 'event_contract_invalid')).toBe(true);
+    expect(result.issues.some((issue) => issue.reason === 'entity_deleted')).toBe(true);
+  });
+
+  it('keeps in-progress preparation available at exact end', () => {
+    const result = resolveApplicationTasks(base({ events: ready([event({ lifecycle: 'in_progress', scheduledAtTimestamp: NOW - 60 * 60_000 })]) }), NOW);
+    expect(result.primaryTask?.taskId).toBe('application.interview_prepare');
+  });
+
+  it.each(['draft', 'ready', 'submitted'] as const)('classifies material kit %s explicitly', (status) => {
+    const result = resolveApplicationTasks(base({ application: ready({ id: 7, status: 'applied' }), materialKit: ready({ applicationId: 7, status }) }), NOW);
+    expect(result.tasks.some((task) => task.taskId === 'application.material_kit')).toBe(status !== 'submitted');
+  });
+
+  it('fails closed for deleted or foreign material kits', () => {
+    for (const kit of [{ applicationId: 8, status: 'draft' as const }, { applicationId: 7, status: 'draft' as const, deleted: true }]) {
+      const result = resolveApplicationTasks(base({ application: ready({ id: 7, status: 'applied' }), materialKit: ready(kit) }), NOW);
+      expect(result.tasks.find((task) => task.taskId === 'application.material_kit')?.availability).toBe('unavailable');
+    }
+  });
+
+  it('uses zero, one, and many offers through the same application owner', () => {
+    for (const offers of [[], [{ id: 2, applicationId: 7, status: 'pending' as const }], [{ id: 3, applicationId: 7, status: 'negotiating' as const, deadline: null }, { id: 2, applicationId: 7, status: 'pending' as const, deadline: '2026-09-01T00:00:00Z' }]]) {
+      const result = resolveApplicationTasks(base({ application: ready({ id: 7, status: 'offer' }), offers: ready(offers) }), NOW);
+      expect(result.tasks.some((task) => task.taskId === 'application.offer_review')).toBe(true);
+      expect(result.tasks.find((task) => task.taskId === 'application.offer_review')?.ref).not.toHaveProperty('offerId');
+    }
+  });
+
+  it('fails the whole offer owner for a mixed foreign/malformed source', () => {
+    const result = resolveApplicationTasks(base({ application: ready({ id: 7, status: 'offer' }), offers: ready([
+      { id: 2, applicationId: 7, status: 'pending' }, { id: 3, applicationId: 8, status: 'pending' },
+    ]) }), NOW);
+    expect(result.tasks.find((task) => task.taskId === 'application.offer_review')?.availability).toBe('unavailable');
+  });
+
+  it('keeps every returned task and issue deeply immutable', () => {
+    const result = resolveApplicationTasks(base({ events: ready([event()]) }), NOW);
+    expect(Object.isFrozen(result.issues)).toBe(true);
+    expect(Object.isFrozen(result.tasks[0]?.ref)).toBe(true);
   });
 });

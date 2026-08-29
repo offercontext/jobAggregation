@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Alert, Row, Col, Button, Space, Spin, Empty, Typography, message } from 'antd';
 import { PlusOutlined, SwapOutlined } from '@ant-design/icons';
@@ -9,7 +9,6 @@ import OfferCard from '@/components/OfferCard';
 import AddOfferForm from '@/components/AddOfferForm';
 import OfferCompareDrawer from '@/components/OfferCompareDrawer';
 import OfferComparisonDimensionPanel from '@/components/OfferComparisonDimensionPanel';
-import OfferNegotiationDrawer, { type OfferNegotiationDraft } from '@/components/OfferNegotiationDrawer';
 import { findEvidenceFocusRecord } from '@/lib/pilotEvidenceFocus';
 import { getOfferWorkspaceMode, listMissingOfferFacts, listOfferBindingState } from './offerWorkspaceModel';
 
@@ -27,8 +26,8 @@ interface Props {
   onAttachToPilot?: (attachment: import('@/types/chat').PilotContextAttachment) => void;
   focusOfferId?: number;
   onEvidenceFocusConsumed?: () => void;
-  negotiationDrafts?: Record<number, OfferNegotiationDraft>;
-  onNegotiationDraftChange?: (offerId: number, draft: OfferNegotiationDraft | null) => void;
+  /** The composition root owns the sole negotiation task surface. */
+  onOpenNegotiation?: (offer: Offer) => void;
 }
 
 export default function OfferCenterView({
@@ -40,21 +39,17 @@ export default function OfferCenterView({
   onAttachToPilot,
   focusOfferId,
   onEvidenceFocusConsumed,
-  negotiationDrafts: controlledNegotiationDrafts,
-  onNegotiationDraftChange,
+  onOpenNegotiation,
 }: Props) {
   const [addOpen, setAddOpen] = useState(false);
   const [editing, setEditing] = useState<Offer | null>(null);
   const [compareOpen, setCompareOpen] = useState(false);
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
   const [selectedDimensionIds, setSelectedDimensionIds] = useState<number[]>([]);
-  const [negotiationOffer, setNegotiationOffer] = useState<Offer | null>(null);
   const [entryRequestToken, setEntryRequestToken] = useState<string | null>(null);
   const lastCreateRequestTokenRef = useRef<number | undefined>(
     typeof createRequestToken === 'number' ? createRequestToken : undefined,
   );
-  const [localNegotiationDrafts, setLocalNegotiationDrafts] = useState<Record<number, OfferNegotiationDraft>>({});
-  const negotiationDrafts = controlledNegotiationDrafts ?? localNegotiationDrafts;
   const openCreateOffer = () => {
     if (applications.length === 0) {
       onAddApplication?.();
@@ -85,27 +80,14 @@ export default function OfferCenterView({
       setAddOpen(true);
     }
   }, [applications.length, createRequestToken, onAddApplication]);
-  const openNegotiation = (offer: Offer) => {
+  const handleOpenNegotiation = (offer: Offer) => {
     if (listOfferBindingState(offer) === 'unbound') {
       message.warning('历史未绑定 Offer 仅支持只读查看');
       return;
     }
     setCompareOpen(false);
-    setNegotiationOffer(offer);
+    onOpenNegotiation?.(offer);
   };
-  const updateNegotiationDraft = useCallback((draft: OfferNegotiationDraft | null) => {
-    if (!negotiationOffer) return;
-    if (onNegotiationDraftChange) {
-      onNegotiationDraftChange(negotiationOffer.id, draft);
-      return;
-    }
-    setLocalNegotiationDrafts((current) => {
-      const next = { ...current };
-      if (draft) next[negotiationOffer.id] = draft;
-      else delete next[negotiationOffer.id];
-      return next;
-    });
-  }, [negotiationOffer, onNegotiationDraftChange]);
 
   const { data: offers = [], isLoading, isError, isFetching, refetch } = useQuery({
     queryKey: ['offers'],
@@ -155,7 +137,7 @@ export default function OfferCenterView({
             offers={selectedOffers}
             dimensionIds={selectedDimensionIds}
             onCoach={onCoach}
-            onNegotiation={openNegotiation}
+            onNegotiation={handleOpenNegotiation}
           />
         </div>
       </div>
@@ -208,7 +190,7 @@ export default function OfferCenterView({
                 selected={false}
                 onToggleSelect={toggleSelect}
                 onCoach={onCoach}
-                onNegotiation={listOfferBindingState(offers[0]) === 'bound' ? openNegotiation : undefined}
+                onNegotiation={listOfferBindingState(offers[0]) === 'bound' ? handleOpenNegotiation : undefined}
                 onAttachToPilot={onAttachToPilot}
                 applicationLinkState={applicationLinkState(offers[0])}
                 onOpenApplication={onOpenApplication}
@@ -229,7 +211,7 @@ export default function OfferCenterView({
                 selected={selectedIds.includes(offer.id)}
                 onToggleSelect={toggleSelect}
                 onCoach={onCoach}
-                onNegotiation={listOfferBindingState(offer) === 'bound' ? openNegotiation : undefined}
+                onNegotiation={listOfferBindingState(offer) === 'bound' ? handleOpenNegotiation : undefined}
                 onAttachToPilot={onAttachToPilot}
                 applicationLinkState={applicationLinkState(offer)}
                 onOpenApplication={onOpenApplication}
@@ -246,18 +228,6 @@ export default function OfferCenterView({
         editing={editing}
         requestToken={entryRequestToken}
       />
-      {negotiationOffer && (
-        <OfferNegotiationDrawer
-          key={negotiationOffer.id}
-          open
-          offer={negotiationOffer}
-          entrypoint="ui"
-          dimensionIds={selectedDimensionIds}
-          draft={negotiationDrafts[negotiationOffer.id]}
-          onDraftChange={updateNegotiationDraft}
-          onClose={() => setNegotiationOffer(null)}
-        />
-      )}
     </div>
   );
 }

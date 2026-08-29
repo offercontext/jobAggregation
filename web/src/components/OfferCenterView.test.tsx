@@ -140,17 +140,29 @@ describe('OfferCenterView comparison guardrails', () => {
     expect(host?.querySelector('[data-testid="compare-offers"]')?.textContent).toContain('2,1');
   });
 
-  it('closes comparison before opening the negotiation drawer', async () => {
+  it('closes comparison before handing negotiation to the canonical owner', async () => {
     queryState.offers = [offer(1), offer(2)];
+    const onOpenNegotiation = vi.fn();
     host = document.createElement('div');
     document.body.appendChild(host);
     root = createRoot(host);
-    await act(async () => { root?.render(<OfferCenterView applications={[]} onCoach={vi.fn()} />); });
+    await act(async () => { root?.render(<OfferCenterView applications={[]} onCoach={vi.fn()} onOpenNegotiation={onOpenNegotiation} />); });
     await act(async () => { host?.querySelector<HTMLButtonElement>('[data-testid="select-1"]')?.click(); });
     await act(async () => { host?.querySelector<HTMLButtonElement>('[data-testid="select-2"]')?.click(); });
     await act(async () => { [...(host?.querySelectorAll('button') ?? [])].find((button) => button.textContent?.includes('开始比较'))?.click(); });
     await act(async () => { host?.querySelector<HTMLButtonElement>('[data-testid="compare-negotiate"]')?.click(); });
-    expect(host?.querySelector('[data-testid="offer-negotiation-drawer"]')).not.toBeNull();
+    expect(onOpenNegotiation).toHaveBeenCalledWith(expect.objectContaining({ id: 1 }));
+    expect(host?.querySelector('[data-testid="offer-negotiation-drawer"]')).toBeNull();
+  });
+
+  it('does not create a negotiation owner when the composition root has not supplied one', async () => {
+    queryState.offers = [offer(1)];
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    await act(async () => { root?.render(<OfferCenterView applications={[]} onCoach={vi.fn()} />); });
+    await act(async () => { host?.querySelector<HTMLButtonElement>('[data-testid="prepare-1"]')?.click(); });
+    expect(host?.querySelector('[data-testid="offer-negotiation-drawer"]')).toBeNull();
   });
 
   it('keeps comparison reads and evidence expansion free of negotiation writes', async () => {

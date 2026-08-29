@@ -25,6 +25,26 @@ export const CORE_TASK_REGISTRY: CoreTaskRegistry = Object.freeze({
   'materials.reference': Object.freeze({ ownerId: 'materials-reference' }),
 } as const);
 
+/**
+ * Explicitly records destructive Task 6 entrypoint removals. This is a strict
+ * lexical manifest consumed by the baseline gate; it is not a runtime alias
+ * and cannot make an old owner reachable again.
+ */
+export const CORE_TASK_ENTRYPOINT_CUTOVERS = Object.freeze({
+  'ApplicationDetail.openOpportunityFit': Object.freeze({
+    category: 'core_task',
+    taskId: 'application.opportunity_fit',
+  }),
+  'ApplicationDetail.openMaterials': Object.freeze({
+    category: 'core_task',
+    taskId: 'application.material_kit',
+  }),
+  'OfferCenterView.openNegotiation': Object.freeze({
+    category: 'core_task',
+    taskId: 'application.offer_review',
+  }),
+} as const);
+
 export type CoreTaskOwnerLookupResult =
   | { readonly ok: true; readonly ownerId: string }
   | { readonly ok: false; readonly reason: 'task_owner_unavailable' };

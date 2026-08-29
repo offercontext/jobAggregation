@@ -3,6 +3,8 @@ import { act, type ReactNode } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { writeMaterialKitHandoff } from '@/features/pilot/materialKitHandoff';
+import type { Application } from '@/types/application';
+import type { Resume } from '@/types/resume';
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -10,6 +12,8 @@ const state = vi.hoisted(() => ({
   materialProps: vi.fn(),
   analyzeJD: vi.fn(),
   events: [] as unknown[],
+  materialKit: null as unknown,
+  fitHistory: [] as unknown[],
   jdCurrent: null as unknown,
   jdLoading: false,
   jdHistory: [] as unknown[],
@@ -37,10 +41,14 @@ vi.mock('@tanstack/react-query', () => ({
       ? state.events
       : options.queryKey?.[0] === 'application-jd-current'
         ? state.jdCurrent
-        : options.queryKey?.[0] === 'application-jd-history'
-          ? state.jdHistory
-          : options.queryKey?.[0] === 'application-jd-detail'
-            ? state.jdDetail
+      : options.queryKey?.[0] === 'application-jd-history'
+        ? state.jdHistory
+        : options.queryKey?.[0] === 'application-jd-detail'
+          ? state.jdDetail
+          : options.queryKey?.[0] === 'application-material-kit'
+            ? state.materialKit
+            : options.queryKey?.[0] === 'opportunity-fit-v2-reviews'
+              ? state.fitHistory
             : [],
     isLoading: options.queryKey?.[0] === 'application-jd-current' && state.jdLoading,
   }),
@@ -121,7 +129,7 @@ vi.mock('antd', () => {
 
 const { default: ApplicationDetail } = await import('./ApplicationDetail');
 
-const application = {
+const application: Application = {
   id: 7,
   company_name: 'Example Co.',
   position_name: 'Backend Engineer',
@@ -132,7 +140,26 @@ const application = {
   applied_at: '2026-07-21T00:00:00Z',
   created_at: '2026-07-21T00:00:00Z',
   updated_at: '2026-07-21T00:00:00Z',
-} as never;
+};
+
+const resume: Resume = {
+  id: 11,
+  name: '主简历',
+  file_path: '',
+  parsed_data: '',
+  parse_status: 'parsed',
+  title: '主简历',
+  is_master: true,
+  parent_resume_id: null,
+  source: 'manual',
+  source_file_path: '',
+  content_json: {},
+  deleted_at: null,
+  created_at: '2026-07-01T00:00:00Z',
+  completion_percent: 100,
+  missing_sections: [],
+  is_complete: true,
+};
 
 let root: Root | undefined;
 let container: HTMLDivElement | undefined;
@@ -141,6 +168,8 @@ beforeEach(() => {
   state.materialProps.mockReset();
   state.analyzeJD.mockReset();
   state.events = [];
+  state.materialKit = null;
+  state.fitHistory = [];
   state.jdCurrent = null;
   state.jdLoading = false;
   state.jdHistory = [];
@@ -204,10 +233,19 @@ describe('ApplicationDetail opportunity fit handoff', () => {
       },
     };
 
-    act(() => root?.render(<ApplicationDetail application={application} open onClose={vi.fn()} />));
+    const appliedApplication = { ...application, status: 'applied' } as typeof application;
+    act(() => root?.render(
+      <ApplicationDetail
+        application={appliedApplication}
+        resumes={[resume]}
+        open
+        taskNow={Date.parse('2026-07-24T09:00:00Z')}
+        onClose={vi.fn()}
+      />,
+    ));
     act(() => {
       [...(container?.querySelectorAll('button') || [])]
-        .find((button) => button.textContent === '打开投递材料')
+        .find((button) => button.textContent === '打开准备')
         ?.click();
     });
 
@@ -217,17 +255,44 @@ describe('ApplicationDetail opportunity fit handoff', () => {
   });
 
   it('passes historical frozen Resume and JD into Material Kit without opening a URL', () => {
-    act(() => root?.render(<ApplicationDetail application={application} open onClose={vi.fn()} />));
+    state.jdCurrent = {
+      current: {
+        id: 41,
+        application_id: 7,
+        version_number: 1,
+        jd_text: '当前岗位资料',
+        source_url: null,
+        source_kind: 'ui',
+        content_sha256: 'a'.repeat(64),
+        utf8_byte_length: 10,
+        preview: '当前岗位资料',
+        created_at: '2026-08-05T00:00:00Z',
+      },
+    };
+    const pendingApplication = { ...application, status: 'pending' } as typeof application;
+    act(() => root?.render(
+      <ApplicationDetail
+        application={pendingApplication}
+        resumes={[resume]}
+        open
+        taskNow={Date.parse('2026-07-24T09:00:00Z')}
+        onClose={vi.fn()}
+      />,
+    ));
 
     expect(container?.querySelector('a')).toBeNull();
     expect(state.analyzeJD).not.toHaveBeenCalled();
 
     act(() => {
       [...(container?.querySelectorAll('button') || [])]
-        .find((button) => button.textContent === '岗位决策漏斗')
+        .find((button) => button.textContent === '开始判断')
         ?.click();
     });
-    act(() => container?.querySelector('button')?.click());
+    act(() => {
+      [...(container?.querySelectorAll('button') || [])]
+        .find((button) => button.textContent === 'prepare')
+        ?.click();
+    });
 
     const materialKit = container?.querySelector('[data-testid="material-kit"]');
     expect(materialKit?.getAttribute('data-resume-id')).toBe('11');
@@ -330,34 +395,102 @@ describe('ApplicationDetail opportunity fit handoff', () => {
     act(() => {
       (container?.querySelector('[aria-label="close material kit"]') as HTMLButtonElement)?.click();
     });
+    act(() => {
+      (container?.querySelector('[data-core-task-owner]') as HTMLElement)?.dispatchEvent(new Event('animationend', { bubbles: true }));
+    });
 
     expect(container?.querySelector('[data-testid="material-kit"]')).toBeNull();
-    expect(state.materialProps.mock.calls[state.materialProps.mock.calls.length - 1]?.[0]).toMatchObject({
-      initialResumeID: 12,
-      initialJdSnapshot: 'Frozen Pilot JD',
-    });
+    expect(state.materialProps.mock.calls.some(([props]) => (
+      props.initialResumeID === 12 && props.initialJdSnapshot === 'Frozen Pilot JD'
+    ))).toBe(true);
   });
 
-  it('exposes the Application-scoped Pilot evaluation entry without URL analysis', () => {
+  it('exposes the canonical Application-scoped evaluation task without URL analysis', () => {
     const openPilot = vi.fn();
-    act(() => root?.render(<ApplicationDetail application={application} open onClose={vi.fn()} onOpenPilotOpportunityFit={openPilot} />));
+    state.jdCurrent = {
+      current: {
+        id: 41,
+        application_id: 7,
+        version_number: 1,
+        jd_text: '当前岗位资料',
+        source_url: null,
+        source_kind: 'ui',
+        content_sha256: 'a'.repeat(64),
+        utf8_byte_length: 10,
+        preview: '当前岗位资料',
+        created_at: '2026-08-05T00:00:00Z',
+      },
+    };
+    act(() => root?.render(
+      <ApplicationDetail
+        application={application}
+        resumes={[resume]}
+        open
+        onClose={vi.fn()}
+        onOpenPilotOpportunityFit={openPilot}
+      />,
+    ));
     const button = [...(container?.querySelectorAll('button') || [])]
-      .find((candidate) => candidate.textContent === '评估岗位匹配');
+      .find((candidate) => candidate.textContent === '开始判断');
     act(() => button?.click());
-    expect(openPilot).toHaveBeenCalledWith(application);
+    expect(container?.querySelector('[data-core-task-owner]')).not.toBeNull();
+    expect(openPilot).not.toHaveBeenCalled();
     expect(state.analyzeJD).not.toHaveBeenCalled();
+  });
+
+  it('isolates standalone controller lifecycles across duplicate mounts of one application', () => {
+    state.jdCurrent = { current: { id: 41, jd_text: '岗位资料', source_url: null } };
+    act(() => root?.render(
+      <>
+        <ApplicationDetail application={application} resumes={[resume]} open onClose={vi.fn()} />
+        <ApplicationDetail application={application} resumes={[resume]} open onClose={vi.fn()} />
+      </>,
+    ));
+    const starts = [...(container?.querySelectorAll('button') ?? [])]
+      .filter((button) => button.textContent === '开始判断');
+    expect(starts).toHaveLength(2);
+    act(() => starts[0]?.click());
+    act(() => starts[1]?.click());
+    expect(container?.querySelectorAll('[data-core-task-owner]')).toHaveLength(2);
+
+    act(() => (container?.querySelectorAll('button[aria-label="关闭任务"]')[0] as HTMLButtonElement).click());
+    act(() => (container?.querySelectorAll('[data-core-task-owner]')[0] as HTMLElement).dispatchEvent(new Event('animationend', { bubbles: true })));
+    expect(container?.querySelectorAll('[data-core-task-owner]')).toHaveLength(1);
+  });
+
+  it('keeps standalone task identities separate for different applications', () => {
+    state.jdCurrent = { current: { id: 41, jd_text: '岗位资料', source_url: null } };
+    const otherApplication: Application = { ...application, id: 8, company_name: 'Other Co.' };
+    act(() => root?.render(
+      <>
+        <ApplicationDetail application={application} resumes={[resume]} open onClose={vi.fn()} />
+        <ApplicationDetail application={otherApplication} resumes={[resume]} open onClose={vi.fn()} />
+      </>,
+    ));
+    const starts = [...(container?.querySelectorAll('button') ?? [])]
+      .filter((button) => button.textContent === '开始判断');
+    expect(starts).toHaveLength(2);
+    act(() => starts[0]?.click());
+    act(() => starts[1]?.click());
+    expect([...(container?.querySelectorAll('[data-core-task-key]') ?? [])]
+      .map((owner) => owner.getAttribute('data-core-task-key')))
+      .toEqual(expect.arrayContaining([
+        'application.opportunity_fit:applicationId=7',
+        'application.opportunity_fit:applicationId=8',
+      ]));
   });
 
   it('requires an explicit interview choice when Pilot targets multiple interviews', async () => {
     state.events = [
-      { id: 31, event_type: 'interview', subtype: 'technical', scheduled_at: '2026-07-24T10:00:00Z' },
-      { id: 32, event_type: 'interview', subtype: 'behavioral', scheduled_at: '2026-07-25T10:00:00Z' },
+      { id: 31, application_id: 7, event_type: 'interview', subtype: 'technical', status: 'scheduled', duration_minutes: 45, scheduled_at: '2026-07-24T10:00:00Z' },
+      { id: 32, application_id: 7, event_type: 'interview', subtype: 'behavioral', status: 'scheduled', duration_minutes: 45, scheduled_at: '2026-07-24T11:00:00Z' },
     ];
     act(() => root?.render(
       <ApplicationDetail
         application={application}
         open
         onClose={vi.fn()}
+        taskNow={Date.parse('2026-07-24T09:00:00Z')}
         pilotInterviewPreparationApplicationId={7}
         onPilotInterviewPreparationFocusConsumed={vi.fn()}
       />,
@@ -374,8 +507,8 @@ describe('ApplicationDetail opportunity fit handoff', () => {
   });
   it('opens the explicitly requested interview preparation event without showing a choice dialog', async () => {
     state.events = [
-      { id: 31, event_type: 'interview', subtype: 'technical', scheduled_at: '2026-07-24T10:00:00Z' },
-      { id: 32, event_type: 'interview', subtype: 'behavioral', scheduled_at: '2026-07-25T10:00:00Z' },
+      { id: 31, application_id: 7, event_type: 'interview', subtype: 'technical', status: 'scheduled', duration_minutes: 45, scheduled_at: '2026-07-24T10:00:00Z' },
+      { id: 32, application_id: 7, event_type: 'interview', subtype: 'behavioral', status: 'scheduled', duration_minutes: 45, scheduled_at: '2026-07-24T11:00:00Z' },
     ];
     act(() => root?.render(
       <ApplicationDetail
@@ -384,6 +517,7 @@ describe('ApplicationDetail opportunity fit handoff', () => {
         onClose={vi.fn()}
         pilotInterviewPreparationApplicationId={7}
         pilotInterviewPreparationEventId={32}
+        taskNow={Date.parse('2026-07-24T09:00:00Z')}
         onPilotInterviewPreparationFocusConsumed={vi.fn()}
       />,
     ));

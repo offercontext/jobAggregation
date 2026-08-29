@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import source from './AppShell.tsx?raw';
+import { scopeApplicationOffers } from './AppShell';
 import calendarView from '@/components/CalendarView.tsx?raw';
 import offerCenterView from '@/components/OfferCenterView.tsx?raw';
 import resumeLibraryView from '@/components/ResumeLibraryView.tsx?raw';
@@ -354,7 +355,22 @@ describe('AppShell source contract', () => {
     const detailStart = source.indexOf('<ApplicationDetail');
     const detailEnd = source.indexOf('/>', detailStart);
     expect(detailStart).toBeGreaterThanOrEqual(0);
-    expect(source.slice(detailStart, detailEnd)).toContain('offers={ofrs}');
+    expect(source.slice(detailStart, detailEnd)).toContain('offers={selectedOfferScope.offers}');
+  });
+
+  it('scopes global Offers to the current Application and fails closed on malformed ownership', () => {
+    const current = { id: 71, application_id: 7, status: 'pending' } as never;
+    const foreign = { id: 72, application_id: 8, status: 'pending' } as never;
+    const malformed = { id: 73, status: 'pending' } as never;
+    expect(scopeApplicationOffers([current, foreign], 7)).toEqual({
+      offers: [current],
+      hasInvalidOwner: false,
+    });
+    expect(scopeApplicationOffers([current, malformed], 7)).toEqual({
+      offers: [current],
+      hasInvalidOwner: true,
+    });
+    expect(scopeApplicationOffers(undefined, 7)).toEqual({ offers: undefined, hasInvalidOwner: false });
   });
 
   it('keeps Haru to Pilot expansion as a surface change without a second request owner', () => {

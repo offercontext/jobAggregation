@@ -51,6 +51,18 @@ export interface CoreTaskSurfaceController {
   markClosed(generation: number): void;
 }
 
+/**
+ * Canonical composition helper used by entrypoint adapters. It deliberately
+ * only delegates to the injected lifecycle controller: no second controller,
+ * transport, Provider, or domain side effect is introduced at the boundary.
+ */
+export function launchCoreTask(
+  controller: Pick<CoreTaskSurfaceController, 'launch'>,
+  request: TaskLaunchRequest,
+): CoreTaskLaunchResult {
+  return controller.launch(request);
+}
+
 const CLOSED_STATE: CoreTaskSurfaceState = Object.freeze({ phase: 'closed', generation: 0, active: null });
 
 function frozenRequest(request: TaskLaunchRequest, ref: CoreTaskRef): TaskLaunchRequest {

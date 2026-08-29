@@ -26,7 +26,9 @@ const offerRequest = (
 
 describe('AppShell application task composition', () => {
   it('creates one stable controller and injects one host into ApplicationDetail', () => {
-    expect(appShellSource).toContain('useRef(createCoreTaskSurfaceController(');
+    expect(appShellSource).toContain('const coreTaskControllerRef = useRef<CoreTaskSurfaceController | null>(null);');
+    expect(appShellSource).toContain('if (!coreTaskControllerRef.current) {');
+    expect((appShellSource.match(/createCoreTaskSurfaceController\(/g) ?? []).length).toBe(1);
     expect(appShellSource).toContain('launchCoreTask');
     expect(appShellSource).toContain('taskController={coreTaskController}');
     expect(appShellSource).toContain('onLaunchTask={launchCoreTask}');
@@ -93,6 +95,34 @@ describe('AppShell application task composition', () => {
       source: 'application_task_card',
     })).toMatchObject({ kind: 'replacement_denied' });
     expect(controller.getState().active?.key).toBe('application.material_kit:applicationId=7');
+  });
+
+  it('allows only the narrow confirmed Fit to Material handoff through the unsaved guard', () => {
+    let transition: { applicationId: number; generation: number } | null = null;
+    const controller = createCoreTaskSurfaceController({
+      hasUnsavedChanges: (active) => !(
+        transition
+        && transition.applicationId === active.ref.applicationId
+        && transition.generation === active.generation
+        && active.ref.taskId === 'application.opportunity_fit'
+      ),
+    });
+    const fit = controller.launch({
+      ref: { taskId: 'application.opportunity_fit', applicationId: 7 },
+      source: 'pilot',
+    });
+    expect(fit.kind).toBe('launched');
+    if (fit.kind !== 'launched') return;
+    transition = { applicationId: 7, generation: fit.generation };
+    expect(controller.launch(materialRequest(7, 'pilot'))).toMatchObject({
+      kind: 'launched',
+      generation: fit.generation + 1,
+    });
+    transition = null;
+    expect(controller.launch({
+      ref: { taskId: 'application.opportunity_fit', applicationId: 7 },
+      source: 'application_task_card',
+    })).toMatchObject({ kind: 'replacement_denied' });
   });
 
   it('does not duplicate focus side effects or let stale generation callbacks replace the owner', () => {

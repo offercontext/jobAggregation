@@ -179,6 +179,98 @@ afterEach(() => {
 });
 
 describe('ApplicationDetail deterministic Pilot JD entry', () => {
+  const completedInterview = (id: number) => ({
+    id,
+    application_id: application.id,
+    event_type: 'interview',
+    subtype: id === 31 ? '技术面' : '行为面',
+    scheduled_at: `2026-08-${id === 31 ? '20' : '21'}T10:00:00Z`,
+    duration_minutes: 45,
+    status: 'done',
+  });
+
+  it('keeps an application-only review intent in an explicit zero-event safe state', async () => {
+    const consumed = vi.fn();
+    act(() => root?.render(
+      <ApplicationDetail
+        application={application}
+        open
+        onClose={vi.fn()}
+        pilotInterviewReviewApplicationId={application.id}
+        onPilotInterviewReviewFocusConsumed={consumed}
+      />,
+    ));
+    await act(async () => { await Promise.resolve(); });
+
+    expect(container?.querySelector('[role="dialog"]')?.textContent).toContain('选择要复盘的面试');
+    expect(container?.textContent).toContain('当前没有可复盘的面试');
+    expect(container?.querySelector('[data-core-task-owner]')).toBeNull();
+    expect(consumed).toHaveBeenCalledOnce();
+  });
+
+  it('requires an explicit click for a singleton review event', async () => {
+    state.events = [completedInterview(31)];
+    act(() => root?.render(
+      <ApplicationDetail
+        application={application}
+        open
+        onClose={vi.fn()}
+        pilotInterviewReviewApplicationId={application.id}
+        onPilotInterviewReviewFocusConsumed={vi.fn()}
+      />,
+    ));
+    await act(async () => { await Promise.resolve(); });
+
+    const dialog = container?.querySelector('[role="dialog"]');
+    expect(dialog?.querySelectorAll('button')).toHaveLength(1);
+    expect(container?.querySelector('[data-core-task-owner]')).toBeNull();
+    act(() => (dialog?.querySelector('button') as HTMLButtonElement).click());
+
+    expect(container?.querySelector('[data-core-task-key]')?.getAttribute('data-core-task-key'))
+      .toBe('application.interview_review:applicationId=7:eventId=31');
+    expect(container?.querySelector('[data-testid="review-form-drawer"]')).not.toBeNull();
+  });
+
+  it('keeps many review choices event-scoped and never falls back to general review', async () => {
+    state.events = [completedInterview(31), completedInterview(32)];
+    act(() => root?.render(
+      <ApplicationDetail
+        application={application}
+        open
+        onClose={vi.fn()}
+        pilotInterviewReviewApplicationId={application.id}
+        onPilotInterviewReviewFocusConsumed={vi.fn()}
+      />,
+    ));
+    await act(async () => { await Promise.resolve(); });
+
+    const dialogButtons = [...(container?.querySelectorAll('[role="dialog"] button') ?? [])];
+    expect(dialogButtons).toHaveLength(2);
+    act(() => (dialogButtons[1] as HTMLButtonElement).click());
+
+    expect(container?.querySelector('[data-core-task-key]')?.getAttribute('data-core-task-key'))
+      .toBe('application.interview_review:applicationId=7:eventId=32');
+    expect(container?.querySelector('[data-core-task-key]')?.getAttribute('data-core-task-key'))
+      .not.toContain('application.general_review');
+  });
+
+  it('opens general review only for an explicit null event id and rejects missing ids', () => {
+    state.notes = [{ id: 61, application_event_id: null, date: '2026-08-20' }];
+    act(() => root?.render(<ApplicationDetail application={application} open onClose={vi.fn()} />));
+    const openGeneral = [...(container?.querySelectorAll('button') ?? [])]
+      .find((button) => button.textContent === '打开复盘');
+    act(() => (openGeneral as HTMLButtonElement).click());
+    expect(container?.querySelector('[data-core-task-key]')?.getAttribute('data-core-task-key'))
+      .toBe('application.general_review:applicationId=7');
+
+    act(() => root?.unmount());
+    state.notes = [{ id: 62, date: '2026-08-21' }];
+    root = createRoot(container!);
+    act(() => root?.render(<ApplicationDetail application={application} open onClose={vi.fn()} />));
+    expect(container?.querySelector('[data-task-id="application.general_review"]')).toBeNull();
+    expect(container?.querySelector('[data-core-task-key]')).toBeNull();
+  });
+
   it('keeps failed JD, event, review, and Offer sources visible instead of presenting false empty states', () => {
     state.queryErrors.add('application-jd-current');
     state.queryErrors.add('events');

@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act } from 'react';
+import { act, useEffect, useRef, useState } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import AppShell from './AppShell';
@@ -116,13 +116,66 @@ vi.mock('@/components/AddApplicationForm', () => ({ default: () => <div /> }));
 vi.mock('@/components/ResumeUploadModal', () => ({ default: () => <div /> }));
 vi.mock('@/components/AISettingsDrawer', () => ({ default: () => <div /> }));
 vi.mock('@/components/ApplicationDetail', () => ({
-  default: (props: any) => (
-    <section data-testid="application-detail-harness">
-      <button type="button" data-testid="open-opportunity-fit" onClick={() => props.onOpenPilotOpportunityFit?.(props.application)}>
-        打开岗位评估
-      </button>
-    </section>
-  ),
+  default: (props: any) => {
+    const isPilotNegotiation = props.offerNegotiationEntryPoint === 'pilot';
+    const offerDraft = props.offerNegotiationDrafts?.[offer.id];
+    const overlayRef = useRef<HTMLElement | null>(null);
+    const openerRef = useRef<HTMLElement | null>(document.activeElement as HTMLElement | null);
+    useEffect(() => {
+      if (!isPilotNegotiation) return;
+      overlayRef.current?.querySelector<HTMLElement>('button')?.focus();
+      const onKeyDown = (event: KeyboardEvent) => {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          props.onClose?.();
+          openerRef.current?.focus();
+          return;
+        }
+        if (event.key !== 'Tab' || !overlayRef.current || !overlayRef.current.contains(document.activeElement)) return;
+        const focusable = Array.from(overlayRef.current.querySelectorAll<HTMLElement>('button, [href], input, textarea, select, [tabindex]:not([tabindex="-1"])'))
+          .filter((element) => !element.hasAttribute('disabled'));
+        if (focusable.length === 0) return;
+        const current = document.activeElement;
+        const next = event.shiftKey
+          ? (current === focusable[0] ? focusable[focusable.length - 1] : focusable[focusable.indexOf(current as HTMLElement) - 1])
+          : (current === focusable[focusable.length - 1] ? focusable[0] : focusable[focusable.indexOf(current as HTMLElement) + 1]);
+        event.preventDefault();
+        next?.focus();
+      };
+      document.addEventListener('keydown', onKeyDown);
+      return () => document.removeEventListener('keydown', onKeyDown);
+    }, [isPilotNegotiation, props.onClose]);
+    return (
+      <section data-testid="application-detail-harness">
+        <button type="button" data-testid="open-opportunity-fit" onClick={() => props.onOpenPilotOpportunityFit?.(props.application)}>
+          打开岗位评估
+        </button>
+        {!isPilotNegotiation ? (
+          <>
+            <output data-testid="ui-draft-goal">{offerDraft?.goal ?? ''}</output>
+            <button type="button" data-testid="edit-ui-offer" onClick={() => props.onOfferNegotiationDraftChange?.(offer.id, baseDraft('UI 目标'))}>
+              编辑 UI 谈薪准备
+            </button>
+          </>
+        ) : (
+          <section
+            data-testid="offer-negotiation-overlay"
+            ref={overlayRef}
+            style={{ position: 'fixed' }}
+            aria-label={`为 ${offer.company_name} 准备谈薪`}
+          >
+            <section data-testid="offer-negotiation-drawer-harness">
+              <output data-testid="pilot-draft-goal">{offerDraft?.goal ?? ''}</output>
+              <button type="button" data-testid="save-pilot-draft" onClick={() => props.onOfferNegotiationDraftChange?.(offer.id, baseDraft('Pilot 目标'))}>
+                保存 Pilot 草稿
+              </button>
+              <button type="button" data-testid="close-pilot-drawer" onClick={() => { props.onClose?.(); openerRef.current?.focus(); }}>关闭</button>
+            </section>
+          </section>
+        )}
+      </section>
+    );
+  },
 }));
 vi.mock('@/components/KanbanBoard', () => ({ default: () => <div /> }));
 vi.mock('@/components/ApplicationListView', () => ({ default: () => <div /> }));
@@ -152,11 +205,95 @@ vi.mock('@/features/pilot/PilotAttachmentContext', () => ({
 vi.mock('@/features/pilot/attachmentHandoff', () => ({ retainPilotAttachmentKey: (_current: unknown, next: unknown) => next }));
 vi.mock('@/features/pilot/PilotOpportunityFitCard', () => ({ default: () => <div /> }));
 
+vi.mock('@/features/pilot/PilotOpportunityFitV2Card', () => ({
+  default: (props: any) => {
+    const [confirmation, setConfirmation] = useState<'triage' | 'deep' | null>(null);
+    const draft = props.draft ?? {};
+    const assertions = String(draft.assertionsText ?? '').split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
+    const input = {
+      schema_version: 2,
+      resume_id: draft.resumeId ?? 0,
+      jd_version_id: draft.jdVersionId ?? 0,
+      jd_source_label: '用户粘贴 JD',
+      candidate_assertions: assertions,
+      idempotency_key: draft.triageKey ?? 'pilot-triage-key',
+    };
+    const triageStatus = draft.triage?.stage_status;
+    const deepStatus = draft.deep?.stage_status;
+    const historyDisabled = Boolean(props.historyDisabled || props.triageLoading || props.deepLoading || draft.resultUnknown);
+    return (
+      <section aria-label="岗位评估">
+        <select
+          value={draft.resumeId ?? ''}
+          onChange={(event) => props.onChange?.({ resumeId: Number(event.target.value) || undefined })}
+          disabled={Boolean(draft.triageKey) || props.triageLoading || props.deepLoading || draft.resultUnknown}
+        >
+          <option value="">请选择简历</option>
+          {(props.resumes ?? []).map((resume: any) => <option key={resume.id} value={resume.id}>{resume.title ?? resume.name}</option>)}
+        </select>
+        <textarea value={draft.jdText ?? ''} readOnly disabled={Boolean(draft.triageKey) || props.triageLoading || props.deepLoading || draft.resultUnknown} />
+        <aside aria-label="历史岗位评估">
+          {(props.legacyHistory ?? []).map((item: any) => (
+            <div key={`legacy-${item.id}`}>
+              <span>旧版评估 #{item.id}</span>
+              {props.onViewLegacyHistory ? <button type="button" disabled={historyDisabled} onClick={() => props.onViewLegacyHistory(item.id)}>查看</button> : null}
+            </div>
+          ))}
+          {(props.history ?? []).map((item: any) => (
+            <div key={item.review_id}>
+              <span>评估 #{item.review_id}</span>
+              <button type="button" disabled={historyDisabled} onClick={() => props.onViewHistory(item.review_id)}>查看</button>
+            </div>
+          ))}
+        </aside>
+        {props.legacyReview ? <p>{props.legacyReview.summary?.text}</p> : null}
+        {draft.error ? <p role="status">{draft.error}</p> : null}
+        {draft.triage?.proposal?.summary?.text ? <p>{draft.triage.proposal.summary.text}</p> : null}
+        {!draft.triage && !props.triageLoading && !draft.error ? (
+          <button type="button" onClick={() => setConfirmation('triage')}>快速判断</button>
+        ) : null}
+        {draft.error && draft.triageKey && !draft.triage ? (
+          <button type="button" onClick={() => props.onStartTriage?.(input)}>使用原尝试重试快速判断</button>
+        ) : null}
+        {triageStatus === 'ready' ? (
+          <button type="button" onClick={() => props.onConfirmTriage?.()}>
+            {draft.resultUnknown ? '使用原尝试重试快速判断' : '确认快速判断'}
+          </button>
+        ) : null}
+        {triageStatus === 'confirmed' && !draft.deep ? (
+          <button type="button" disabled={props.deepLoading} onClick={() => setConfirmation('deep')}>深入分析</button>
+        ) : null}
+        {deepStatus === 'ready' && draft.deep?.proposal?.summary?.text ? <p>{draft.deep.proposal.summary.text}</p> : null}
+        {(
+          draft.historical
+          || triageStatus === 'confirmed'
+          || deepStatus === 'ready'
+          || triageStatus === 'source_conflict'
+          || deepStatus === 'source_conflict'
+        ) ? (
+          <button type="button" aria-label="重新开始岗位评估" disabled={props.restartDisabled} onClick={() => props.onStartNew?.()}>开始新的岗位评估</button>
+        ) : null}
+        <button type="button" onClick={props.onCancel}>取消流程</button>
+        {confirmation ? (
+          <div role="dialog" aria-modal="true">
+            <button type="button" onClick={() => setConfirmation(null)}>取消</button>
+            <button type="button" onClick={() => {
+              const next = confirmation;
+              setConfirmation(null);
+              if (next === 'triage') props.onStartTriage?.(input);
+              else props.onStartDeepReview?.();
+            }}>确认</button>
+          </div>
+        ) : null}
+      </section>
+    );
+  },
+}));
+
 vi.mock('@/components/OfferCenterView', () => ({
   default: (props: any) => (
     <section data-testid="offer-center-harness">
-      <button type="button" data-testid="open-ui-offer" onClick={() => props.onNegotiationDraftChange?.(offer.id, baseDraft('UI 目标'))}>打开 UI 谈薪准备</button>
-      <output data-testid="ui-draft-goal">{props.negotiationDrafts?.[offer.id]?.goal ?? ''}</output>
+      <button type="button" data-testid="open-ui-offer" onClick={() => props.onOpenNegotiation?.(offer)}>打开 UI 谈薪准备</button>
     </section>
   ),
 }));
@@ -277,6 +414,8 @@ describe('AppShell mounted Opportunity Fit confirmation recovery', () => {
     await flush();
     act(() => host?.querySelector<HTMLButtonElement>('[data-testid="open-opportunity-fit"]')?.click());
     await flush();
+    act(() => host?.querySelector<HTMLButtonElement>('[data-testid="nav-pilot"]')?.click());
+    await flush();
     const resumeSelect = host?.querySelector<HTMLSelectElement>('select');
     if (!resumeSelect) throw new Error('Pilot resume selector was not mounted');
     resumeSelect.value = '11';
@@ -320,6 +459,8 @@ describe('AppShell mounted Opportunity Fit confirmation recovery', () => {
     act(() => host?.querySelector<HTMLButtonElement>('[data-testid="open-application-detail"]')?.click());
     await flush();
     act(() => host?.querySelector<HTMLButtonElement>('[data-testid="open-opportunity-fit"]')?.click());
+    await flush();
+    act(() => host?.querySelector<HTMLButtonElement>('[data-testid="nav-pilot"]')?.click());
     await flush();
     const resumeSelect = host?.querySelector<HTMLSelectElement>('select');
     if (!resumeSelect) throw new Error('Pilot resume selector was not mounted');
@@ -380,6 +521,8 @@ describe('AppShell mounted Opportunity Fit confirmation recovery', () => {
     act(() => host?.querySelector<HTMLButtonElement>('[data-testid="open-application-detail"]')?.click());
     await flush();
     act(() => host?.querySelector<HTMLButtonElement>('[data-testid="open-opportunity-fit"]')?.click());
+    await flush();
+    act(() => host?.querySelector<HTMLButtonElement>('[data-testid="nav-pilot"]')?.click());
     await flush();
     const resumeSelect = host?.querySelector<HTMLSelectElement>('select');
     if (!resumeSelect) throw new Error('Pilot resume selector was not mounted');
@@ -445,6 +588,8 @@ describe('AppShell mounted Opportunity Fit confirmation recovery', () => {
     act(() => host?.querySelector<HTMLButtonElement>('[data-testid="open-application-detail"]')?.click());
     await flush();
     act(() => host?.querySelector<HTMLButtonElement>('[data-testid="open-opportunity-fit"]')?.click());
+    await flush();
+    act(() => host?.querySelector<HTMLButtonElement>('[data-testid="nav-pilot"]')?.click());
     await flush();
 
     const resumeSelect = host?.querySelector<HTMLSelectElement>('select');
@@ -517,6 +662,8 @@ describe('AppShell mounted Opportunity Fit confirmation recovery', () => {
     await flush();
     act(() => host?.querySelector<HTMLButtonElement>('[data-testid="open-opportunity-fit"]')?.click());
     await flush();
+    act(() => host?.querySelector<HTMLButtonElement>('[data-testid="nav-pilot"]')?.click());
+    await flush();
     const resumeSelect = host?.querySelector<HTMLSelectElement>('select');
     if (!resumeSelect) throw new Error('Pilot resume selector was not mounted');
     resumeSelect.value = '11';
@@ -558,6 +705,8 @@ describe('AppShell mounted Opportunity Fit confirmation recovery', () => {
     act(() => host?.querySelector<HTMLButtonElement>('[data-testid="open-application-detail-b"]')?.click());
     await flush();
     act(() => host?.querySelector<HTMLButtonElement>('[data-testid="open-opportunity-fit"]')?.click());
+    await flush();
+    act(() => host?.querySelector<HTMLButtonElement>('[data-testid="nav-pilot"]')?.click());
     await flush();
 
     resolveDeep?.({
@@ -606,6 +755,8 @@ describe('AppShell mounted Opportunity Fit confirmation recovery', () => {
     act(() => host?.querySelector<HTMLButtonElement>('[data-testid="open-application-detail"]')?.click());
     await flush();
     act(() => host?.querySelector<HTMLButtonElement>('[data-testid="open-opportunity-fit"]')?.click());
+    await flush();
+    act(() => host?.querySelector<HTMLButtonElement>('[data-testid="nav-pilot"]')?.click());
     await flush();
     const resumeSelect = host?.querySelector<HTMLSelectElement>('select');
     if (!resumeSelect) throw new Error('Pilot resume selector was not mounted');
@@ -675,6 +826,8 @@ describe('AppShell mounted Opportunity Fit confirmation recovery', () => {
     act(() => host?.querySelector<HTMLButtonElement>('[data-testid="open-application-detail"]')?.click());
     await flush();
     act(() => host?.querySelector<HTMLButtonElement>('[data-testid="open-opportunity-fit"]')?.click());
+    await flush();
+    act(() => host?.querySelector<HTMLButtonElement>('[data-testid="nav-pilot"]')?.click());
     await flush();
 
     const historyButtons = Array.from(host?.querySelectorAll<HTMLButtonElement>('button') ?? [])
@@ -757,6 +910,8 @@ describe('AppShell mounted Opportunity Fit confirmation recovery', () => {
     await flush();
     act(() => host?.querySelector<HTMLButtonElement>('[data-testid="open-opportunity-fit"]')?.click());
     await flush();
+    act(() => host?.querySelector<HTMLButtonElement>('[data-testid="nav-pilot"]')?.click());
+    await flush();
 
     const historyButtons = Array.from(host?.querySelectorAll<HTMLButtonElement>('button') ?? [])
       .filter((button) => button.textContent === '\u67e5\u770b');
@@ -798,6 +953,8 @@ describe('AppShell mounted Opportunity Fit confirmation recovery', () => {
     await flush();
     act(() => host?.querySelector<HTMLButtonElement>('[data-testid="open-opportunity-fit"]')?.click());
     await flush();
+    act(() => host?.querySelector<HTMLButtonElement>('[data-testid="nav-pilot"]')?.click());
+    await flush();
     const resumeSelect = host?.querySelector<HTMLSelectElement>('select');
     if (!resumeSelect) throw new Error('Pilot resume selector was not mounted');
     resumeSelect.value = '11';
@@ -834,6 +991,8 @@ describe('AppShell mounted Opportunity Fit confirmation recovery', () => {
     act(() => host?.querySelector<HTMLButtonElement>('[data-testid="open-application-detail"]')?.click());
     await flush();
     act(() => host?.querySelector<HTMLButtonElement>('[data-testid="open-opportunity-fit"]')?.click());
+    await flush();
+    act(() => host?.querySelector<HTMLButtonElement>('[data-testid="nav-pilot"]')?.click());
     await flush();
     const resumeSelect = host?.querySelector<HTMLSelectElement>('select');
     if (!resumeSelect) throw new Error('Pilot resume selector was not mounted');
@@ -879,6 +1038,8 @@ describe('AppShell mounted Opportunity Fit confirmation recovery', () => {
     act(() => host?.querySelector<HTMLButtonElement>('[data-testid="open-application-detail"]')?.click());
     await flush();
     act(() => host?.querySelector<HTMLButtonElement>('[data-testid="open-opportunity-fit"]')?.click());
+    await flush();
+    act(() => host?.querySelector<HTMLButtonElement>('[data-testid="nav-pilot"]')?.click());
     await flush();
     const historyButton = Array.from(host?.querySelectorAll<HTMLButtonElement>('button') ?? [])
       .find((button) => button.textContent === '查看');
@@ -951,6 +1112,8 @@ describe('AppShell Offer negotiation draft isolation', () => {
     await flush();
     act(() => host?.querySelector<HTMLButtonElement>('[data-testid="open-ui-offer"]')?.click());
     await flush();
+    act(() => host?.querySelector<HTMLButtonElement>('[data-testid="edit-ui-offer"]')?.click());
+    await flush();
     expect(host?.querySelector('[data-testid="ui-draft-goal"]')?.textContent).toBe('UI 目标');
 
     act(() => host?.querySelector<HTMLButtonElement>('[data-testid="nav-pilot"]')?.click());
@@ -985,6 +1148,8 @@ describe('AppShell Offer negotiation draft isolation', () => {
 
     act(() => host?.querySelector<HTMLButtonElement>('[data-testid="close-pilot-drawer"]')?.click());
     act(() => host?.querySelector<HTMLButtonElement>('[data-testid="nav-offers"]')?.click());
+    await flush();
+    act(() => host?.querySelector<HTMLButtonElement>('[data-testid="open-ui-offer"]')?.click());
     await flush();
     expect(host?.querySelector('[data-testid="ui-draft-goal"]')?.textContent).toBe('UI 目标');
   });

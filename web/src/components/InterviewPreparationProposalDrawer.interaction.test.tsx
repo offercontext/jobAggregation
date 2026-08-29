@@ -2,6 +2,7 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { InterviewPreparationDraft } from './InterviewPreparationProposalDrawer';
 
 const service = vi.hoisted(() => {
   class InterviewPreparationProposalError extends Error {
@@ -18,6 +19,9 @@ vi.mock('@/services/interviewPreparationProposals', () => ({
 }));
 
 const { default: InterviewPreparationProposalDrawer } = await import('./InterviewPreparationProposalDrawer');
+
+declare global { var IS_REACT_ACT_ENVIRONMENT: boolean | undefined; }
+globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
 const context = {
   applicationId: 7,
@@ -50,6 +54,214 @@ afterEach(() => {
 });
 
 describe('InterviewPreparationProposalDrawer interaction', () => {
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+      resolve = resolvePromise;
+      reject = rejectPromise;
+    });
+    return { promise, resolve, reject };
+  }
+
+  function proposalResult() {
+    return {
+      id: 20,
+      application_id: 7,
+      event_id: 11,
+      resume_id: 13,
+      attempt_status: 'ready',
+      proposal_status: 'safe_empty',
+      source_status: 'current',
+      source_states: { jd: 'not_checked' },
+      proposal: {
+        preparation_directions: [],
+        story_prompts: [],
+        review_points: [],
+        interviewer_questions: [],
+        items_to_clarify: [],
+      },
+    };
+  }
+
+  it('records a pending attempt before the generation request settles', async () => {
+    const request = deferred<ReturnType<typeof proposalResult>>();
+    service.create.mockReturnValue(request.promise);
+    const attemptChanges: Array<{ key: string; result_unknown: boolean } | null> = [];
+
+    act(() => root?.render(
+      <InterviewPreparationProposalDrawer
+        open
+        context={context}
+        onClose={() => {}}
+        onAttemptStateChange={(state) => attemptChanges.push(state)}
+      />,
+    ));
+    await act(async () => {
+      container?.querySelector<HTMLButtonElement>('[data-testid="interview-preparation-generate"]')?.click();
+      await Promise.resolve();
+    });
+
+    expect(attemptChanges[0]).toEqual({ key: '00000000-0000-0000-0000-000000000001', result_unknown: false });
+    expect(service.create).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      request.resolve(proposalResult());
+      await request.promise;
+    });
+  });
+
+  it('marks a busy request unknown when the drawer closes and ignores its late success', async () => {
+    const request = deferred<ReturnType<typeof proposalResult>>();
+    service.create.mockReturnValue(request.promise);
+    const attemptChanges: Array<{ key: string; result_unknown: boolean } | null> = [];
+    const draftChanges: Array<InterviewPreparationDraft | null> = [];
+    const onClose = vi.fn();
+
+    act(() => root?.render(
+      <InterviewPreparationProposalDrawer
+        open
+        context={context}
+        onClose={onClose}
+        onAttemptStateChange={(state) => attemptChanges.push(state)}
+        onDraftChange={(draft) => draftChanges.push(draft)}
+      />,
+    ));
+    await act(async () => {
+      container?.querySelector<HTMLButtonElement>('[data-testid="interview-preparation-generate"]')?.click();
+      await Promise.resolve();
+    });
+    const key = attemptChanges[0]?.key;
+    await act(async () => {
+      [...(container?.querySelectorAll<HTMLButtonElement>('button') ?? [])]
+        .find((button) => button.textContent === '关闭')
+        ?.click();
+      await Promise.resolve();
+    });
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(attemptChanges).toEqual([
+      { key, result_unknown: false },
+      { key, result_unknown: true },
+    ]);
+    expect(draftChanges[draftChanges.length - 1]?.attemptState).toEqual({ key, result_unknown: true });
+    request.resolve(proposalResult());
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(attemptChanges).toEqual([
+      { key, result_unknown: false },
+      { key, result_unknown: true },
+    ]);
+  });
+
+  it('keeps generations isolated when an unmounted request resolves after a retry', async () => {
+    const first = deferred<ReturnType<typeof proposalResult>>();
+    const second = deferred<ReturnType<typeof proposalResult>>();
+    service.create.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+    const attemptChanges: Array<{ key: string; result_unknown: boolean } | null> = [];
+    const onClose = vi.fn();
+
+    const props = {
+      open: true,
+      context,
+      onClose,
+      onAttemptStateChange: (state: { key: string; result_unknown: boolean } | null) => attemptChanges.push(state),
+    };
+    act(() => root?.render(<InterviewPreparationProposalDrawer {...props} />));
+    await act(async () => {
+      container?.querySelector<HTMLButtonElement>('[data-testid="interview-preparation-generate"]')?.click();
+      await Promise.resolve();
+    });
+    const firstKey = attemptChanges[0]?.key;
+    act(() => root?.unmount());
+
+    root = createRoot(container!);
+    act(() => root?.render(
+      <InterviewPreparationProposalDrawer
+        {...props}
+        attemptState={{ key: firstKey!, result_unknown: true }}
+        draft={{
+          attemptState: { key: firstKey!, result_unknown: true },
+          resumeId: context.resumeId,
+          jdText: context.jdText,
+          jdVersionId: context.jdVersionId,
+          assertionsText: context.userAssertions.join('\n'),
+          knowledgeSelections: [],
+        }}
+      />,
+    ));
+    await act(async () => {
+      container?.querySelector<HTMLButtonElement>('[data-testid="interview-preparation-generate"]')?.click();
+      await Promise.resolve();
+    });
+    expect(attemptChanges).toEqual([
+      { key: firstKey, result_unknown: false },
+      { key: firstKey, result_unknown: true },
+      { key: firstKey, result_unknown: false },
+    ]);
+
+    second.resolve(proposalResult());
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(attemptChanges[attemptChanges.length - 1]).toBeNull();
+
+    first.resolve(proposalResult());
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(attemptChanges[attemptChanges.length - 1]).toBeNull();
+  });
+
+  it('does not let an unmounted rejection clear a replacement generation', async () => {
+    const first = deferred<ReturnType<typeof proposalResult>>();
+    const second = deferred<ReturnType<typeof proposalResult>>();
+    service.create.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+    const attemptChanges: Array<{ key: string; result_unknown: boolean } | null> = [];
+
+    const props = {
+      open: true,
+      context,
+      onClose: () => {},
+      onAttemptStateChange: (state: { key: string; result_unknown: boolean } | null) => attemptChanges.push(state),
+    };
+    act(() => root?.render(<InterviewPreparationProposalDrawer {...props} />));
+    await act(async () => {
+      container?.querySelector<HTMLButtonElement>('[data-testid="interview-preparation-generate"]')?.click();
+      await Promise.resolve();
+    });
+    const firstKey = attemptChanges[0]?.key;
+    act(() => root?.unmount());
+
+    root = createRoot(container!);
+    act(() => root?.render(
+      <InterviewPreparationProposalDrawer
+        {...props}
+        attemptState={{ key: firstKey!, result_unknown: true }}
+      />,
+    ));
+    await act(async () => {
+      container?.querySelector<HTMLButtonElement>('[data-testid="interview-preparation-generate"]')?.click();
+      await Promise.resolve();
+    });
+    second.resolve(proposalResult());
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(attemptChanges[attemptChanges.length - 1]).toBeNull();
+
+    first.reject(new Error('late rejection'));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(attemptChanges[attemptChanges.length - 1]).toBeNull();
+  });
+
   it('requires explicit confirmation and displays a safe empty result in Chinese', async () => {
     service.create.mockResolvedValue({
       id: 20,
@@ -92,9 +304,13 @@ describe('InterviewPreparationProposalDrawer interaction', () => {
     expect(container?.textContent).toContain('暂无可验证的面试准备建议');
   });
 
-  it('does not claim current sources before JD and resume are selected', () => {
+  it('does not claim current sources before JD and resume are selected', async () => {
     const emptyContext = { ...context, resumeId: 0, jdText: '' };
     act(() => root?.render(<InterviewPreparationProposalDrawer open context={emptyContext} onClose={() => {}} />));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
 
     expect(container?.textContent).not.toContain('当前使用来源');
   });

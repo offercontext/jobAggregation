@@ -135,6 +135,14 @@ export default function InterviewPreparationProposalDrawer({
     ),
   );
   const suppressDraftPersistence = useRef(false);
+  const mountedRef = useRef(false);
+  const activeAttemptKeyRef = useRef<string | null>(null);
+  const activeAttemptGenerationRef = useRef(0);
+  const activeAttemptDraftRef = useRef<InterviewPreparationDraft | null>(null);
+  const onAttemptStateChangeRef = useRef(onAttemptStateChange);
+  const onDraftChangeRef = useRef(onDraftChange);
+  onAttemptStateChangeRef.current = onAttemptStateChange;
+  onDraftChangeRef.current = onDraftChange;
   const hasInput = Boolean(resumeId && jdVersionId);
   const resultUnknown = attemptState?.result_unknown ?? draft?.attemptState.result_unknown ?? false;
   const isSafeEmpty = proposal?.proposal_status === 'safe_empty';
@@ -159,6 +167,46 @@ export default function InterviewPreparationProposalDrawer({
     user_assertions: assertionsText.split('\n').map((value) => value.trim()).filter(Boolean),
     idempotency_key: attemptKey,
   }), [assertionsText, attemptKey, context, jdVersionId, knowledgeOptions, resumeId, selectedEvidenceIds]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      const key = activeAttemptKeyRef.current;
+      if (!key) return;
+      activeAttemptGenerationRef.current += 1;
+      activeAttemptKeyRef.current = null;
+      onAttemptStateChangeRef.current?.({ key, result_unknown: true });
+      const activeDraft = activeAttemptDraftRef.current;
+      if (activeDraft) {
+        onDraftChangeRef.current?.({
+          ...activeDraft,
+          attemptState: { key, result_unknown: true },
+        });
+      }
+    };
+  }, []);
+
+  const previousOpenRef = useRef(open);
+  useEffect(() => {
+    const wasOpen = previousOpenRef.current;
+    previousOpenRef.current = open;
+    if (wasOpen && !open) {
+      const key = activeAttemptKeyRef.current;
+      if (!key) return;
+      activeAttemptGenerationRef.current += 1;
+      activeAttemptKeyRef.current = null;
+      setBusy(false);
+      onAttemptStateChangeRef.current?.({ key, result_unknown: true });
+      const activeDraft = activeAttemptDraftRef.current;
+      if (activeDraft) {
+        onDraftChangeRef.current?.({
+          ...activeDraft,
+          attemptState: { key, result_unknown: true },
+        });
+      }
+    }
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
@@ -187,21 +235,50 @@ export default function InterviewPreparationProposalDrawer({
   const generate = async () => {
     if (!hasInput || busy) return;
     if (!window.confirm('仅 JD、所选简历和已确认 Knowledge Evidence 会发送给 AI；用户断言仅保存于本次快照，不会发送给 AI，也不作为建议依据。是否继续？')) return;
+    const requestKey = attemptKey;
+    const requestGeneration = activeAttemptGenerationRef.current + 1;
+    activeAttemptGenerationRef.current = requestGeneration;
+    activeAttemptKeyRef.current = requestKey;
+    const requestDraft: InterviewPreparationDraft = {
+      attemptState: { key: requestKey, result_unknown: false },
+      resumeId,
+      jdText,
+      jdVersionId,
+      assertionsText,
+      knowledgeSelections: input.knowledge_selections,
+    };
+    activeAttemptDraftRef.current = requestDraft;
+    onAttemptStateChangeRef.current?.({ key: requestKey, result_unknown: false });
+    onDraftChangeRef.current?.(requestDraft);
     setBusy(true);
     setError(null);
     suppressDraftPersistence.current = false;
     try {
       const result = await createInterviewPreparationProposal(input);
+      if (
+        !mountedRef.current
+        || activeAttemptGenerationRef.current !== requestGeneration
+        || activeAttemptKeyRef.current !== requestKey
+      ) return;
       if ('proposal' in result) {
         setProposal(result);
-        onAttemptStateChange?.(null);
+        onAttemptStateChangeRef.current?.(null);
         suppressDraftPersistence.current = true;
-        onDraftChange?.(null);
+        onDraftChangeRef.current?.(null);
+        activeAttemptDraftRef.current = null;
         setAttemptKey(newAttemptKey());
       } else {
-        onAttemptStateChange?.({ key: attemptKey, result_unknown: true });
+        onAttemptStateChangeRef.current?.({ key: requestKey, result_unknown: true });
+        const unknownDraft = { ...requestDraft, attemptState: { key: requestKey, result_unknown: true } };
+        activeAttemptDraftRef.current = unknownDraft;
+        onDraftChangeRef.current?.(unknownDraft);
       }
     } catch (caught) {
+      if (
+        !mountedRef.current
+        || activeAttemptGenerationRef.current !== requestGeneration
+        || activeAttemptKeyRef.current !== requestKey
+      ) return;
       const typedError = caught instanceof InterviewPreparationProposalError ? caught : null;
       const unknown =
         !typedError
@@ -209,17 +286,47 @@ export default function InterviewPreparationProposalDrawer({
         || typedError.code === 'interview_preparation_provider_error'
         || typedError.status >= 500;
       if (unknown) {
-        onAttemptStateChange?.({ key: attemptKey, result_unknown: true });
+        onAttemptStateChangeRef.current?.({ key: requestKey, result_unknown: true });
+        const unknownDraft = { ...requestDraft, attemptState: { key: requestKey, result_unknown: true } };
+        activeAttemptDraftRef.current = unknownDraft;
+        onDraftChangeRef.current?.(unknownDraft);
       } else {
-        onAttemptStateChange?.(null);
+        onAttemptStateChangeRef.current?.(null);
         suppressDraftPersistence.current = true;
-        onDraftChange?.(null);
+        onDraftChangeRef.current?.(null);
+        activeAttemptDraftRef.current = null;
         setAttemptKey(newAttemptKey());
       }
       setError(safeErrorMessage(caught));
     } finally {
-      setBusy(false);
+      if (
+        mountedRef.current
+        && activeAttemptGenerationRef.current === requestGeneration
+        && activeAttemptKeyRef.current === requestKey
+      ) {
+        activeAttemptKeyRef.current = null;
+        setBusy(false);
+      }
     }
+  };
+
+  const handleClose = () => {
+    const key = activeAttemptKeyRef.current;
+    if (key) {
+      activeAttemptGenerationRef.current += 1;
+      activeAttemptKeyRef.current = null;
+      setBusy(false);
+      onAttemptStateChangeRef.current?.({ key, result_unknown: true });
+      const activeDraft = activeAttemptDraftRef.current;
+      if (activeDraft) {
+        onDraftChangeRef.current?.({
+          ...activeDraft,
+          attemptState: { key, result_unknown: true },
+        });
+      }
+      activeAttemptDraftRef.current = null;
+    }
+    onClose();
   };
 
   return (
@@ -331,7 +438,7 @@ export default function InterviewPreparationProposalDrawer({
         <button data-testid="interview-preparation-generate" className={`${workflowStyles.nativeButton} ${workflowStyles.nativeButtonPrimary}`} type="button" disabled={!hasInput || busy} onClick={() => void generate()}>
           {busy ? '正在生成…' : resultUnknown ? '使用原尝试重试' : '生成面试准备建议'}
         </button>
-        <button className={workflowStyles.nativeButton} type="button" onClick={onClose}>关闭</button>
+        <button className={workflowStyles.nativeButton} type="button" onClick={handleClose}>关闭</button>
       </div>
     </section>
   );

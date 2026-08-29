@@ -22,6 +22,32 @@ from offerpilot.repositories.interview_index import _item
 from offerpilot.repositories.notes import NoteCreate, NotesRepository
 
 
+LEGACY_INTERVIEW_INDEX_KEYS = {
+    "application_id",
+    "event_id",
+    "company_name",
+    "position_name",
+    "scheduled_at",
+    "note_id",
+    "note_source_status",
+    "has_review_proposal",
+    "review_summary",
+    "has_confirmed_knowledge",
+    "preparation_available",
+}
+ADDITIVE_INTERVIEW_INDEX_KEYS = {
+    "event_status",
+    "duration_minutes",
+    "scheduled_at_state",
+}
+
+
+def _assert_additive_interview_index_shape(item: dict) -> None:
+    current_keys = set(item)
+    assert LEGACY_INTERVIEW_INDEX_KEYS <= current_keys
+    assert current_keys - LEGACY_INTERVIEW_INDEX_KEYS == ADDITIVE_INTERVIEW_INDEX_KEYS
+
+
 def _ready(tmp_path):
     client = TestClient(create_app(data_dir=tmp_path))
     applications = ApplicationsRepository(session_factory_for_data_dir(tmp_path))
@@ -54,6 +80,12 @@ def test_interview_index_lists_visible_events_and_bound_notes(tmp_path) -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["next_cursor"] is None
+    list_item = body["items"][0]
+    detail_item = client.get(f"/api/interviews/{event.id}").json()
+    _assert_additive_interview_index_shape(list_item)
+    _assert_additive_interview_index_shape(detail_item)
+    assert set(detail_item) == set(list_item)
+    assert detail_item == list_item
     assert body["items"] == [
         {
             "application_id": application.id,
@@ -227,13 +259,15 @@ def test_interview_index_additive_fields_use_raw_event_values_and_preparation_tr
         assert item["scheduled_at_state"] == "present"
         assert item["preparation_available"] is True
 
-    for status in ("done", "completed", "cancelled", "unknown"):
+    for status in ("done", "completed", "cancelled", "deleted", "soft_deleted", "unknown"):
         with session_factory() as session:
             row = session.get(ApplicationEvent, event.id)
             assert row is not None
             row.status = status
             session.commit()
-        assert client.get(f"/api/interviews/{event.id}").json()["preparation_available"] is False
+        item = client.get(f"/api/interviews/{event.id}").json()
+        assert item["event_status"] == status
+        assert item["preparation_available"] is False
 
     for duration in (0, -1, 10081):
         with session_factory() as session:

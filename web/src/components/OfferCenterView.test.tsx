@@ -35,15 +35,18 @@ vi.mock('@/components/OfferCard', () => ({ default: ({
   onToggleSelect,
   onOpenApplication,
   onNegotiation,
+  applicationLinkState,
 }: {
   offer: Offer;
   onToggleSelect: (id: number) => void;
   onOpenApplication?: (id: number) => void;
   onNegotiation?: (offer: Offer) => void;
+  applicationLinkState?: 'unbound' | 'available' | 'unavailable';
 }) => (
   <>
     <button type="button" data-testid={`select-${offer.id}`} onClick={() => onToggleSelect(offer.id)}>{offer.company_name}</button>
-    {offer.application_id ? <button type="button" data-testid={`return-${offer.id}`} onClick={() => onOpenApplication?.(offer.application_id!)}>return</button> : null}
+    {offer.application_id ? <button type="button" data-testid={`return-${offer.id}`} disabled={applicationLinkState === 'unavailable'} onClick={() => onOpenApplication?.(offer.application_id!)}>return</button> : null}
+    {applicationLinkState === 'unavailable' ? <span data-testid={`unavailable-${offer.id}`}>所属投递当前不可见</span> : null}
     {onNegotiation ? <button type="button" data-testid={`prepare-${offer.id}`} onClick={() => onNegotiation(offer)}>prepare</button> : null}
   </>
 ) }));
@@ -58,7 +61,7 @@ vi.mock('@/components/OfferCompareDrawer', () => ({ default: ({ offers, onNegoti
 ) }));
 
 const offer = (id: number): Offer => ({
-  id, company_name: `Company ${id}`, position_name: 'Engineer', status: 'pending',
+  id, application_id: id, company_name: `Company ${id}`, position_name: 'Engineer', status: 'pending',
   base_monthly: 30000, months_per_year: 13, signing_bonus: 10000, equity: '', perks: '',
   deadline: '', notes: '', assessment: '', total_cash: 400000,
   created_at: '2026-07-01T00:00:00Z', updated_at: '2026-07-01T00:00:00Z',
@@ -196,9 +199,24 @@ describe('OfferCenterView comparison guardrails', () => {
     host = document.createElement('div');
     document.body.appendChild(host);
     root = createRoot(host);
-    await act(async () => { root?.render(<OfferCenterView applications={[]} onCoach={vi.fn()} onOpenApplication={onOpenApplication} />); });
+    await act(async () => { root?.render(<OfferCenterView applications={[{ ...applications[0], id: 42 }]} onCoach={vi.fn()} onOpenApplication={onOpenApplication} />); });
     await act(async () => { host?.querySelector<HTMLButtonElement>('[data-testid="return-1"]')?.click(); });
     expect(onOpenApplication).toHaveBeenCalledWith(42);
+  });
+
+  it('marks a bound offer unavailable when its owning application is not visible', async () => {
+    queryState.offers = [{ ...offer(1), application_id: 42 }];
+    const onOpenApplication = vi.fn();
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    await act(async () => { root?.render(<OfferCenterView applications={[]} onCoach={vi.fn()} onOpenApplication={onOpenApplication} />); });
+
+    const back = host?.querySelector<HTMLButtonElement>('[data-testid="return-1"]');
+    expect(back?.disabled).toBe(true);
+    expect(host?.querySelector('[data-testid="unavailable-1"]')?.textContent).toContain('所属投递当前不可见');
+    await act(async () => back?.click());
+    expect(onOpenApplication).not.toHaveBeenCalled();
   });
 });
 

@@ -7,6 +7,7 @@ import OfferCard from './OfferCard';
 
 const offer: Offer = {
   id: 7,
+  application_id: 42,
   company_name: '星云数据',
   position_name: '后端工程师',
   status: 'pending',
@@ -74,8 +75,9 @@ describe('OfferCard', () => {
     expect(onNegotiation).toHaveBeenCalledWith(offer);
     expect(onCoach).not.toHaveBeenCalled();
     const back = host.querySelector<HTMLButtonElement>('[data-action="open-application"]');
-    expect(back).toBeNull();
-    expect(onOpenApplication).not.toHaveBeenCalled();
+    expect(back).not.toBeNull();
+    act(() => back?.click());
+    expect(onOpenApplication).toHaveBeenCalledWith(42);
   });
 
   it('keeps one preparation entry when the host only provides the legacy coach callback', () => {
@@ -134,5 +136,60 @@ describe('OfferCard', () => {
     });
     act(() => host?.querySelector<HTMLButtonElement>('[data-action="open-application"]')?.click());
     expect(onOpenApplication).toHaveBeenCalledWith(42);
+  });
+
+  it('renders a historical unbound offer as read-only', () => {
+    const onNegotiation = vi.fn();
+    const onCoach = vi.fn();
+    const onView = vi.fn();
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    act(() => {
+      root?.render(
+        <OfferCard
+          offer={{ ...offer, application_id: undefined }}
+          selected={false}
+          onToggleSelect={vi.fn()}
+          onCoach={onCoach}
+          onNegotiation={onNegotiation}
+          onView={onView}
+        />,
+      );
+    });
+
+    expect(host.querySelector('[data-action="start-negotiation"]')).toBeNull();
+    expect(host.querySelector('[data-action="view-offer"]')?.textContent).toContain('查看');
+    expect(host.textContent).toContain('历史 Offer 仅支持只读查看');
+    act(() => host?.querySelector<HTMLButtonElement>('[data-action="view-offer"]')?.click());
+    expect(onView).toHaveBeenCalledWith({ ...offer, application_id: undefined });
+    expect(onNegotiation).not.toHaveBeenCalled();
+    expect(onCoach).not.toHaveBeenCalled();
+  });
+
+  it('disables the return action when the owning application is unavailable', () => {
+    const onOpenApplication = vi.fn();
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    act(() => {
+      root?.render(
+        <OfferCard
+          offer={{ ...offer, application_id: 42 }}
+          applicationLinkState="unavailable"
+          selected={false}
+          onToggleSelect={vi.fn()}
+          onCoach={vi.fn()}
+          onView={vi.fn()}
+          onOpenApplication={onOpenApplication}
+        />,
+      );
+    });
+
+    const back = host.querySelector<HTMLButtonElement>('[data-action="open-application"]');
+    expect(back?.disabled).toBe(true);
+    expect(host.textContent).toContain('所属投递当前不可见');
+    act(() => back?.click());
+    expect(onOpenApplication).not.toHaveBeenCalled();
   });
 });

@@ -1,10 +1,11 @@
 import { useEffect } from 'react';
-import { Alert, Modal, Form, Input, InputNumber, Select, App as AntApp } from 'antd';
+import { Alert, Button, Modal, Form, Input, InputNumber, Select, App as AntApp } from 'antd';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import type { Application } from '@/types/application';
 import type { Offer, OfferInput, OfferStatus } from '@/types/offer';
 import { OFFER_STATUS_LABELS } from '@/types/offer';
 import { createOffer, updateOffer } from '@/services/offers';
+import { listOfferBindingState } from './offerWorkspaceModel';
 
 interface Props {
   open: boolean;
@@ -23,6 +24,7 @@ export default function AddOfferForm({ open, onClose, applications, editing, req
   const [form] = Form.useForm();
   const { message: toast } = AntApp.useApp();
   const qc = useQueryClient();
+  const historicalReadOnly = Boolean(editing && listOfferBindingState(editing) === 'unbound');
 
   useEffect(() => {
     if (open) {
@@ -39,14 +41,21 @@ export default function AddOfferForm({ open, onClose, applications, editing, req
     value: application.id,
     label: `#${application.id} ${application.company_name} - ${application.position_name}`,
   }));
-  if (editing?.application_id && !applicationOptions.some((option) => option.value === editing.application_id)) {
+  const editingApplicationId = editing?.application_id;
+  if (
+    editing
+    && listOfferBindingState(editing) === 'bound'
+    && editingApplicationId !== undefined
+    && !applicationOptions.some((option) => option.value === editingApplicationId)
+  ) {
     applicationOptions.unshift({
-      value: editing.application_id,
-      label: `#${editing.application_id}（当前绑定投递不可见）`,
+      value: editingApplicationId,
+      label: `#${editingApplicationId}（当前绑定投递不可见）`,
     });
   }
 
   const submit = (values: OfferInput) => {
+    if (historicalReadOnly) return;
     if (!editing && (!Number.isInteger(values.application_id) || Number(values.application_id) <= 0)) {
       form.setFields([{ name: 'application_id', errors: ['请选择所属投递'] }]);
       return;
@@ -75,24 +84,31 @@ export default function AddOfferForm({ open, onClose, applications, editing, req
 
   return (
     <Modal
-      title={editing ? '编辑 Offer' : '录入 Offer'}
+      title={historicalReadOnly ? '查看 Offer' : editing ? '编辑 Offer' : '录入 Offer'}
       open={open}
       onCancel={onClose}
-      onOk={() => form.submit()}
+      onOk={historicalReadOnly ? undefined : () => form.submit()}
+      footer={historicalReadOnly ? <Button onClick={onClose}>关闭</Button> : undefined}
       confirmLoading={mutation.isPending}
       destroyOnHidden
       data-request-token={requestToken ?? undefined}
     >
-      {!editing?.application_id && editing ? (
+      {historicalReadOnly ? (
         <Alert
           type="warning"
           showIcon
           style={{ marginBottom: 16 }}
-          message="历史 Offer 尚未绑定所属投递"
-          description="本次仅可编辑 Offer 信息，不能在这里补绑定；返回投递入口不可用。"
+          message="历史 Offer 仅支持只读查看"
+          description="该记录没有所属投递，不能编辑、补绑定或进入谈薪准备。"
         />
       ) : null}
-      <Form form={form} layout="vertical" onFinish={(v) => submit(v as OfferInput)}>
+      <Form
+        form={form}
+        layout="vertical"
+        disabled={historicalReadOnly}
+        data-offer-mode={historicalReadOnly ? 'read-only' : 'editable'}
+        onFinish={(v) => submit(v as OfferInput)}
+      >
         <Form.Item name="company_name" label="公司" rules={[{ required: true, message: '请输入公司' }]}>
           <Input />
         </Form.Item>

@@ -4,6 +4,7 @@ import { Button, Empty, Table } from 'antd';
 import type { Offer, OfferComparisonRead } from '@/types/offer';
 import { OFFER_STATUS_LABELS } from '@/types/offer';
 import { readOfferComparison } from '@/services/offers';
+import { listOfferBindingState } from './offerWorkspaceModel';
 import styles from './OfferCompareDrawer.module.css';
 
 interface Props {
@@ -120,7 +121,7 @@ export default function OfferCompareDrawer({
           )}
           {(onNegotiation || onCoach) && (
             <div style={{ display: 'flex', gap: 8, marginTop: 16, flexWrap: 'wrap' }}>
-              {displayedOffers.map((offer) => (
+              {displayedOffers.filter((offer) => listOfferBindingState(offer) === 'bound').map((offer) => (
                 <Button key={offer.id} data-action="start-negotiation" data-offer-id={offer.id} onClick={() => (onNegotiation ?? onCoach)?.(offer)}>
                   为 {offer.company_name} 准备谈薪
                 </Button>

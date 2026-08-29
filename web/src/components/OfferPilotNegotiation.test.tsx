@@ -105,6 +105,26 @@ describe('Pilot offer negotiation entry', () => {
     expect(onPrepare).toHaveBeenCalledWith(offer);
   });
 
+  it('keeps an active historical unbound Offer read-only', () => {
+    const onPrepare = vi.fn();
+    const unbound = { ...offer, application_id: undefined };
+    ({ host, root } = render(unbound, onPrepare, [unbound]));
+
+    expect(host.querySelector('[data-testid="pilot-prepare-offer-negotiation"]')).toBeNull();
+    expect(host.textContent).toContain('历史未绑定 Offer 仅支持只读查看');
+    expect(onPrepare).not.toHaveBeenCalled();
+  });
+
+  it('does not open a selector when only historical unbound Offers exist', () => {
+    const onPrepare = vi.fn();
+    const unbound = { ...offer, application_id: -1 };
+    ({ host, root } = render(null, onPrepare, [unbound]));
+
+    expect(host.querySelector('[data-testid="pilot-choose-offer-negotiation"]')).toBeNull();
+    expect(host.textContent).toContain('暂无可用于谈薪准备的已绑定 Offer');
+    expect(onPrepare).not.toHaveBeenCalled();
+  });
+
   it('clears a selected Offer when the conversation context changes without an explicit Offer', () => {
     const onPrepare = vi.fn();
     ({ host, root } = render(null, onPrepare, [offer], 'conversation:one'));

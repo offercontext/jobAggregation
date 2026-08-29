@@ -17,6 +17,7 @@ interface Props {
   onNegotiation?: (offer: Offer) => void;
   emphasis?: 'primary' | 'secondary';
   onView: (offer: Offer) => void;
+  applicationLinkState?: 'unbound' | 'available' | 'unavailable';
   onOpenApplication?: (applicationId: number) => void;
   onAttachToPilot?: (attachment: import('@/types/chat').PilotContextAttachment) => void;
 }
@@ -25,8 +26,10 @@ function formatWan(n: number): string {
   return (n / 10000).toFixed(1) + '万';
 }
 
-export default function OfferCard({ offer, selectable = true, selected, onToggleSelect, onCoach, onNegotiation, emphasis = 'primary', onView, onOpenApplication, onAttachToPilot }: Props) {
+export default function OfferCard({ offer, selectable = true, selected, onToggleSelect, onCoach, onNegotiation, emphasis = 'primary', onView, applicationLinkState, onOpenApplication, onAttachToPilot }: Props) {
   const bindingState = listOfferBindingState(offer);
+  const resolvedApplicationLinkState = applicationLinkState ?? (bindingState === 'bound' ? 'available' : 'unbound');
+  const historicalReadOnly = resolvedApplicationLinkState === 'unbound';
   const startPreparation = onNegotiation ?? onCoach;
   const offerDragBinding = onAttachToPilot
     ? createPilotAttachmentDragBinding({
@@ -64,23 +67,28 @@ export default function OfferCard({ offer, selectable = true, selected, onToggle
         {offer.application_id ? ` · 关联投递 #${offer.application_id}` : ' · 无关联投递'}
       </div>
       <div className={styles.actions}>
-        {startPreparation && (
+        {startPreparation && !historicalReadOnly && (
           <Button type={emphasis === 'primary' ? 'primary' : 'default'} data-action="start-negotiation" onClick={() => startPreparation(offer)}>
             准备谈薪
           </Button>
         )}
-        {bindingState === 'bound' && offer.application_id && onOpenApplication ? (
+        {resolvedApplicationLinkState === 'available' && offer.application_id && onOpenApplication ? (
           <Button type="link" data-action="open-application" icon={<LinkOutlined />} onClick={() => onOpenApplication(offer.application_id!)}>
             返回所属投递
           </Button>
         ) : null}
+        {resolvedApplicationLinkState === 'unavailable' && offer.application_id ? (
+          <Button type="link" data-action="open-application" icon={<LinkOutlined />} disabled>
+            所属投递当前不可见
+          </Button>
+        ) : null}
         <Button data-action="view-offer" icon={<EyeOutlined />} onClick={() => onView(offer)}>
-          详情
+          {historicalReadOnly ? '查看' : '详情'}
         </Button>
       </div>
-      {bindingState === 'unbound' ? (
+      {historicalReadOnly ? (
         <div role="note" data-binding-warning style={{ marginTop: 10, color: 'var(--op-warning, #b45309)', fontSize: 12, lineHeight: 1.5 }}>
-          历史 Offer 尚未绑定所属投递；可继续查看，但不能返回具体投递。
+          历史 Offer 仅支持只读查看；不能编辑、准备谈薪或返回具体投递。
         </div>
       ) : null}
     </Card>

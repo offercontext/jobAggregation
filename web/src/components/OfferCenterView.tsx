@@ -11,7 +11,7 @@ import OfferCompareDrawer from '@/components/OfferCompareDrawer';
 import OfferComparisonDimensionPanel from '@/components/OfferComparisonDimensionPanel';
 import OfferNegotiationDrawer, { type OfferNegotiationDraft } from '@/components/OfferNegotiationDrawer';
 import { findEvidenceFocusRecord } from '@/lib/pilotEvidenceFocus';
-import { getOfferWorkspaceMode, listMissingOfferFacts } from './offerWorkspaceModel';
+import { getOfferWorkspaceMode, listMissingOfferFacts, listOfferBindingState } from './offerWorkspaceModel';
 
 interface Props {
   applications: Application[];
@@ -86,6 +86,10 @@ export default function OfferCenterView({
     }
   }, [applications.length, createRequestToken, onAddApplication]);
   const openNegotiation = (offer: Offer) => {
+    if (listOfferBindingState(offer) === 'unbound') {
+      message.warning('历史未绑定 Offer 仅支持只读查看');
+      return;
+    }
     setCompareOpen(false);
     setNegotiationOffer(offer);
   };
@@ -128,6 +132,11 @@ export default function OfferCenterView({
     .map((id) => offers.find((offer) => offer.id === id))
     .filter((offer): offer is Offer => Boolean(offer));
   const mode = getOfferWorkspaceMode(offers.length, compareOpen);
+  const visibleApplicationIds = new Set(applications.map((application) => application.id));
+  const applicationLinkState = (offer: Offer): 'unbound' | 'available' | 'unavailable' => {
+    if (listOfferBindingState(offer) === 'unbound') return 'unbound';
+    return visibleApplicationIds.has(Number(offer.application_id)) ? 'available' : 'unavailable';
+  };
 
   if (isLoading) {
     return <div role="status" style={{ textAlign: 'center', padding: 48 }}><Spin size="large" /><div>正在加载 Offer</div></div>;
@@ -199,8 +208,9 @@ export default function OfferCenterView({
                 selected={false}
                 onToggleSelect={toggleSelect}
                 onCoach={onCoach}
-                onNegotiation={openNegotiation}
+                onNegotiation={listOfferBindingState(offers[0]) === 'bound' ? openNegotiation : undefined}
                 onAttachToPilot={onAttachToPilot}
+                applicationLinkState={applicationLinkState(offers[0])}
                 onOpenApplication={onOpenApplication}
                 onView={openEditOffer}
               />
@@ -219,8 +229,9 @@ export default function OfferCenterView({
                 selected={selectedIds.includes(offer.id)}
                 onToggleSelect={toggleSelect}
                 onCoach={onCoach}
-                onNegotiation={openNegotiation}
+                onNegotiation={listOfferBindingState(offer) === 'bound' ? openNegotiation : undefined}
                 onAttachToPilot={onAttachToPilot}
+                applicationLinkState={applicationLinkState(offer)}
                 onOpenApplication={onOpenApplication}
                 onView={openEditOffer}
               />

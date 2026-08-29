@@ -30,14 +30,14 @@ vi.mock('@/services/offers', () => ({
 }));
 
 const offer: Offer = {
-  id: 7, company_name: 'Company', position_name: 'Engineer', status: 'pending',
+  id: 7, application_id: 42, company_name: 'Company', position_name: 'Engineer', status: 'pending',
   base_monthly: 28000, months_per_year: 12, signing_bonus: 0, equity: '', perks: '',
   deadline: '', notes: '', assessment: '', total_cash: 336000,
   created_at: '2026-08-01T00:00:00Z', updated_at: '2026-08-01T00:00:00Z',
 };
 
 const proposal = (): OfferNegotiationProposal => ({
-  id: 3, offer_id: 7, application_id: null, attempt_status: 'ready', proposal_status: 'normal',
+  id: 3, offer_id: 7, application_id: 42, attempt_status: 'ready', proposal_status: 'normal',
   source_fingerprint: 'fingerprint', source_changed: false, source_states: { offer: 'current' }, proposal_hash: 'hash',
   proposal: {
     proposal_status: 'normal',
@@ -76,6 +76,10 @@ describe('OfferNegotiationDrawer', () => {
     service.create.mockReset();
     service.confirm.mockReset();
     service.preview.mockReset();
+    service.list.mockClear();
+    service.dimensions.mockClear();
+    service.values.mockClear();
+    service.get.mockClear();
     service.preview.mockResolvedValue(preview());
     service.list.mockResolvedValue([]);
     vi.stubGlobal('confirm', vi.fn(() => true));
@@ -95,6 +99,21 @@ describe('OfferNegotiationDrawer', () => {
     const button = host?.querySelector<HTMLButtonElement>('[data-testid="offer-negotiation-generate"]');
     expect(button?.disabled).toBe(true);
     expect(service.create).not.toHaveBeenCalled();
+  });
+
+  it('rejects a directly supplied historical unbound Offer before any negotiation read or write', async () => {
+    await act(async () => {
+      root?.render(<OfferNegotiationDrawer open offer={{ ...offer, application_id: undefined }} onClose={vi.fn()} />);
+    });
+
+    expect(host?.textContent).toContain('历史未绑定 Offer 仅支持只读查看');
+    expect(host?.querySelector('[data-testid="offer-negotiation-generate"]')).toBeNull();
+    expect(service.list).not.toHaveBeenCalled();
+    expect(service.dimensions).not.toHaveBeenCalled();
+    expect(service.values).not.toHaveBeenCalled();
+    expect(service.preview).not.toHaveBeenCalled();
+    expect(service.create).not.toHaveBeenCalled();
+    expect(service.confirm).not.toHaveBeenCalled();
   });
 
   it('does not loop when the parent stores each draft update', async () => {

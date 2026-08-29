@@ -45,6 +45,7 @@ import type { VoiceCoachingRecommendation } from '@/types/voiceCoaching';
 import InterviewStoryLibraryView, { type InterviewStoryOpenDraft } from '@/components/InterviewStoryLibraryView';
 import InterviewStoryDrawer, { createInterviewStoryDraft, type InterviewStoryDraft } from '@/components/InterviewStoryDrawer';
 import OfferNegotiationDrawer, { type OfferNegotiationDraft } from '@/components/OfferNegotiationDrawer';
+import { listOfferBindingState } from '@/components/offerWorkspaceModel';
 import { discardMockInterviewAttempt } from '@/services/mockInterviews';
 import type { EvidenceTarget } from '@/components/ChatPanel/model';
 import CommandPalette from './CommandPalette';
@@ -947,6 +948,10 @@ function AppShellContent() {
   };
 
   const openOfferNegotiation = (offer: Offer, entrypoint: 'ui' | 'pilot' = 'ui') => {
+    if (listOfferBindingState(offer) === 'unbound') {
+      message.warning('历史未绑定 Offer 仅支持只读查看');
+      return;
+    }
     setOfferNegotiationOffer(offer);
     setOfferNegotiationEntryPoint(entrypoint);
   };
@@ -1460,7 +1465,10 @@ function AppShellContent() {
 
   const openCanonicalApplication = (appId: number) => {
     const app = apps.find((item) => item.id === appId);
-    if (!app) return;
+    if (!app) {
+      message.warning('所属投递当前不可见');
+      return;
+    }
     navigateToView('board');
     setSelected(app);
   };

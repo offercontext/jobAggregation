@@ -16,7 +16,9 @@ describe('offer progressive disclosure', () => {
   });
 
   it('identifies offers without an owning application for an explicit warning', () => {
-    expect(listOfferBindingState({ application_id: undefined })).toEqual('unbound');
+    for (const applicationId of [undefined, null, 0, -1, Number.NaN, Number.POSITIVE_INFINITY, 1.5]) {
+      expect(listOfferBindingState({ application_id: applicationId })).toEqual('unbound');
+    }
     expect(listOfferBindingState({ application_id: 42 })).toEqual('bound');
   });
 });

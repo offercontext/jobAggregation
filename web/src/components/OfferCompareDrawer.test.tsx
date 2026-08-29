@@ -15,6 +15,7 @@ Object.defineProperty(window, 'matchMedia', {
 
 const offer = (id: number): Offer => ({
   id,
+  application_id: id,
   company_name: `Company ${id}`,
   position_name: 'Engineer',
   status: 'pending',
@@ -83,6 +84,33 @@ it('renders only factual comparison rows and preserves explicit Offer action IDs
     host?.querySelector<HTMLButtonElement>('button[data-action="start-negotiation"][data-offer-id="2"]')?.click();
   });
   expect(onNegotiation).toHaveBeenCalledWith(offers[0]);
+});
+
+it('keeps historical unbound offers read-only while allowing bound preparation', async () => {
+  const offers = [{ ...offer(2), application_id: undefined }, { ...offer(1), application_id: 7 }];
+  readComparison.mockResolvedValue({ offers, dimensions: [], missing: [] } satisfies OfferComparisonRead);
+  const onNegotiation = vi.fn();
+  host = document.createElement('div');
+  document.body.appendChild(host);
+  root = createRoot(host);
+
+  await act(async () => {
+    root?.render(
+      <OfferCompareDrawer
+        open
+        onClose={vi.fn()}
+        offers={offers}
+        dimensionIds={[]}
+        onNegotiation={onNegotiation}
+      />,
+    );
+  });
+
+  expect(host.querySelector('[data-action="start-negotiation"][data-offer-id="2"]')).toBeNull();
+  const boundAction = host.querySelector<HTMLButtonElement>('[data-action="start-negotiation"][data-offer-id="1"]');
+  expect(boundAction).not.toBeNull();
+  await act(async () => boundAction?.click());
+  expect(onNegotiation).toHaveBeenCalledWith(offers[1]);
 });
 
 it('renders a zero signing bonus as a factual comparison value', async () => {

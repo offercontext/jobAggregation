@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 const BASELINE = '0c10e05e256eb757d5f89a8b009dcea193f2fc78';
+const PROJECT_END = '78195000bd94fdfd6fe8508033e0a8687fde3323';
 const ALLOWED_DOCUMENTS = [
   'docs/superpowers/specs/2026-08-25-desktop-task-flow-simplification-design.md',
   'docs/superpowers/plans/2026-08-25-desktop-task-flow-simplification.md',
@@ -35,7 +36,15 @@ function normalize(path: string): string {
 }
 
 function changedPaths(root: string): string[] {
-  const tracked = gitLines(root, ['diff', '--name-only', '--no-renames', BASELINE, '--']);
+  // This is a historical project-scope gate. Validate the exact independently
+  // reviewed desktop range without claiming ownership over later upstream merges.
+  return gitLines(root, ['diff', '--name-only', '--no-renames', `${BASELINE}..${PROJECT_END}`, '--'])
+    .map(normalize)
+    .sort();
+}
+
+function currentWorktreePaths(root: string): string[] {
+  const tracked = gitLines(root, ['diff', '--name-only', '--no-renames', 'HEAD', '--']);
   const untracked = gitLines(root, ['ls-files', '--others', '--exclude-standard']);
   return [...new Set([...tracked, ...untracked].map(normalize))].sort();
 }
@@ -75,11 +84,17 @@ function isChangedProductionSource(path: string): boolean {
 }
 
 describe('Desktop Task Flow independent frontend gate', () => {
-  it('pins the requested baseline and keeps the exact web-plus-three-doc allowlist', () => {
+  it('pins the requested baseline, completed project range, and exact web-plus-three-doc allowlist', () => {
     const root = repoRoot();
     expect(BASELINE).toBe('0c10e05e256eb757d5f89a8b009dcea193f2fc78');
+    expect(PROJECT_END).toBe('78195000bd94fdfd6fe8508033e0a8687fde3323');
     expect(gitLines(root, ['rev-parse', BASELINE])).toEqual([BASELINE]);
+    expect(gitLines(root, ['rev-parse', PROJECT_END])).toEqual([PROJECT_END]);
     expect(() => execFileSync('git', ['merge-base', '--is-ancestor', BASELINE, 'HEAD'], {
+      cwd: root,
+      stdio: 'ignore',
+    })).not.toThrow();
+    expect(() => execFileSync('git', ['merge-base', '--is-ancestor', PROJECT_END, 'HEAD'], {
       cwd: root,
       stdio: 'ignore',
     })).not.toThrow();
@@ -90,14 +105,19 @@ describe('Desktop Task Flow independent frontend gate', () => {
     ]);
   });
 
-  it('rejects changed paths outside web or the three project documents without scanning commit history', () => {
+  it('rejects paths in the completed desktop project range outside web or the three project documents', () => {
     const root = repoRoot();
     const changed = changedPaths(root);
     const disallowed = changed.filter((path) => !isAllowedPath(path));
     const forbidden = changed.filter((path) => FORBIDDEN_PATHS.includes(path as (typeof FORBIDDEN_PATHS)[number]));
 
-    expect(disallowed, 'the current worktree diff must stay inside the project allowlist').toEqual([]);
+    expect(disallowed, 'the completed desktop project range must stay inside the project allowlist').toEqual([]);
     expect(forbidden, 'forbidden frontend ownership boundaries must remain untouched').toEqual([]);
+  });
+
+  it('rejects current worktree and untracked paths outside the desktop project allowlist', () => {
+    const disallowed = currentWorktreePaths(repoRoot()).filter((path) => !isAllowedPath(path));
+    expect(disallowed).toEqual([]);
   });
 
   it('keeps the forbidden frontend ownership boundaries explicit', () => {

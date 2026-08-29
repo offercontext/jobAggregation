@@ -17,6 +17,7 @@ import NegotiationHistoryList from './offer-negotiation/NegotiationHistoryList';
 import NegotiationProposalCard from './offer-negotiation/NegotiationProposalCard';
 import OfferSnapshotSummary from './offer-negotiation/OfferSnapshotSummary';
 import styles from './OfferNegotiationDrawer.module.css';
+import { listOfferBindingState } from './offerWorkspaceModel';
 
 interface Props {
   open: boolean;
@@ -75,7 +76,25 @@ function isPending(value: OfferNegotiationProposal | OfferNegotiationPending): v
   return value.attempt_status === 'generating' || value.attempt_status === 'provider_unknown';
 }
 
-export default function OfferNegotiationDrawer({ open, offer, dimensionIds = [], onClose, draft, onDraftChange, entrypoint = 'ui' }: Props) {
+export default function OfferNegotiationDrawer(props: Props) {
+  if (!props.open) return null;
+  if (listOfferBindingState(props.offer) === 'unbound') {
+    return (
+      <section className={styles.workspace} aria-label="谈薪准备不可用">
+        <header className={styles.header}>
+          <div>
+            <h2>无法为该 Offer 准备谈薪</h2>
+            <p role="alert">历史未绑定 Offer 仅支持只读查看，不能进入谈薪准备。</p>
+          </div>
+          <Button onClick={props.onClose}>关闭</Button>
+        </header>
+      </section>
+    );
+  }
+  return <BoundOfferNegotiationDrawer {...props} />;
+}
+
+function BoundOfferNegotiationDrawer({ open, offer, dimensionIds = [], onClose, draft, onDraftChange, entrypoint = 'ui' }: Props) {
   const [goal, setGoal] = useState(draft?.goal ?? '');
   const [concerns, setConcerns] = useState(draft?.concerns ?? '');
   const [scenario, setScenario] = useState(draft?.scenario ?? '');

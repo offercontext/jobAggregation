@@ -1,6 +1,7 @@
 import { Button, Card, Empty, Radio, Space } from 'antd';
 import { useState } from 'react';
 import type { Offer } from '@/types/offer';
+import { listOfferBindingState } from '../offerWorkspaceModel';
 import styles from './ChatPanel.module.css';
 
 interface Props {
@@ -16,13 +17,14 @@ function offerLabel(offer: Offer): string {
 
 export default function PilotOfferSelectionCard({ offers, disabled = false, onContinue, onCancel }: Props) {
   const [selectedId, setSelectedId] = useState<number | null>(null);
-  const selectedOffer = offers.find((offer) => offer.id === selectedId) ?? null;
+  const eligibleOffers = offers.filter((offer) => listOfferBindingState(offer) === 'bound');
+  const selectedOffer = eligibleOffers.find((offer) => offer.id === selectedId) ?? null;
 
   return (
     <Card size="small" className={styles.pilotOfferSelectionCard}>
       <div className={styles.panelLabel}>选择要准备谈薪的 Offer</div>
-      {offers.length === 0 ? (
-        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无可选择的 Offer" />
+      {eligibleOffers.length === 0 ? (
+        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无可用于谈薪准备的已绑定 Offer" />
       ) : (
         <>
           <Radio.Group
@@ -32,7 +34,7 @@ export default function PilotOfferSelectionCard({ offers, disabled = false, onCo
             disabled={disabled}
           >
             <Space direction="vertical" className={styles.pilotOfferOptions}>
-              {offers.map((offer) => (
+              {eligibleOffers.map((offer) => (
                 <Radio key={offer.id} value={offer.id}>
                   {offerLabel(offer)}
                 </Radio>

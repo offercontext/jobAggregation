@@ -6,7 +6,7 @@ import type { Offer } from '@/types/offer';
 import PilotOfferSelectionCard from './PilotOfferSelectionCard';
 
 const offer1: Offer = {
-  id: 1, company_name: '星云数据', position_name: '后端工程师', status: 'pending',
+  id: 1, application_id: 11, company_name: '星云数据', position_name: '后端工程师', status: 'pending',
   base_monthly: 28000, months_per_year: 12, signing_bonus: 0, equity: '', perks: '',
   deadline: '', notes: '', assessment: '', total_cash: 336000,
   created_at: '2026-08-01T00:00:00Z', updated_at: '2026-08-01T00:00:00Z',
@@ -49,7 +49,37 @@ describe('PilotOfferSelectionCard', () => {
     document.body.appendChild(host);
     root = createRoot(host);
     act(() => root?.render(<PilotOfferSelectionCard offers={[]} onContinue={onContinue} onCancel={vi.fn()} />));
-    expect(host.textContent).toContain('暂无可选择的 Offer');
+    expect(host.textContent).toContain('暂无可用于谈薪准备的已绑定 Offer');
+    expect(host.querySelector('[data-action="continue-offer-negotiation"]')).toBeNull();
+  });
+
+  it('filters historical unbound Offers before selection', () => {
+    const onContinue = vi.fn();
+    const unbound = { ...offer1, id: 3, application_id: undefined, company_name: '历史公司' };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    act(() => root?.render(<PilotOfferSelectionCard offers={[unbound, offer2]} onContinue={onContinue} onCancel={vi.fn()} />));
+
+    expect(host.textContent).not.toContain('历史公司');
+    expect(host.querySelector<HTMLInputElement>('[value="3"]')).toBeNull();
+    act(() => host?.querySelector<HTMLInputElement>('[value="2"]')?.click());
+    act(() => host?.querySelector<HTMLButtonElement>('[data-action="continue-offer-negotiation"]')?.click());
+    expect(onContinue).toHaveBeenCalledWith(offer2);
+  });
+
+  it('shows a safe empty state when every Offer is historical and unbound', () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    act(() => root?.render(
+      <PilotOfferSelectionCard
+        offers={[{ ...offer1, application_id: 0 }, { ...offer2, application_id: -1 }]}
+        onContinue={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    ));
+    expect(host.textContent).toContain('暂无可用于谈薪准备的已绑定 Offer');
     expect(host.querySelector('[data-action="continue-offer-negotiation"]')).toBeNull();
   });
 });

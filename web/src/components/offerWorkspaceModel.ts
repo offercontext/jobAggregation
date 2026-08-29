@@ -8,7 +8,7 @@ export type OfferBindingState = 'bound' | 'unbound';
  * the workspace instead of silently inventing one on the client.
  */
 export function listOfferBindingState(offer: { application_id?: number | null }): OfferBindingState {
-  return typeof offer.application_id === 'number' && offer.application_id > 0 ? 'bound' : 'unbound';
+  return Number.isInteger(offer.application_id) && Number(offer.application_id) > 0 ? 'bound' : 'unbound';
 }
 
 export function getOfferWorkspaceMode(count: number, comparisonOpen: boolean): OfferWorkspaceMode {

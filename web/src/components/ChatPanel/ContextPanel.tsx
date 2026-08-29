@@ -6,6 +6,7 @@ import type { Capability } from './capabilities';
 import { remainingEvidence, selectEvidence, type EvidenceItem, type EvidenceTarget } from './model';
 import EvidenceList from './EvidenceList';
 import PilotOfferSelectionCard from './PilotOfferSelectionCard';
+import { listOfferBindingState } from '../offerWorkspaceModel';
 import styles from './ChatPanel.module.css';
 
 interface Props {
@@ -60,6 +61,8 @@ export default function ContextPanel({
   }, [contextKey, isNego, offer?.id]);
   const evidenceSelection = selectEvidence(evidence, 5);
   const activeOffer = offer ?? selectedOffer;
+  const activeOfferIsBound = activeOffer ? listOfferBindingState(activeOffer) === 'bound' : false;
+  const eligibleOffers = offers.filter((candidate) => listOfferBindingState(candidate) === 'bound');
 
   return (
     <aside className={`${styles.context} ${floating ? styles.contextFloating : ''}`}>
@@ -83,7 +86,7 @@ export default function ContextPanel({
               {OFFER_STATUS_LABELS[activeOffer.status]}
             </span>
           </div>
-          {onPrepareOfferNegotiation && (
+          {onPrepareOfferNegotiation && activeOfferIsBound ? (
             <>
               <button
                 type="button"
@@ -107,10 +110,12 @@ export default function ContextPanel({
                 </button>
               )}
             </>
-          )}
+          ) : activeOffer ? (
+            <div role="note" className={styles.evidenceEmpty}>历史未绑定 Offer 仅支持只读查看，不能进入谈薪准备。</div>
+          ) : null}
         </div>
       )}
-      {!activeOffer && onPrepareOfferNegotiation && offers.length > 0 && (
+      {!activeOffer && onPrepareOfferNegotiation && eligibleOffers.length > 0 && (
         <div>
           <div className={styles.panelLabel}>谈薪准备</div>
           {!offerPickerOpen && (
@@ -125,7 +130,7 @@ export default function ContextPanel({
           )}
           {offerPickerOpen && (
             <PilotOfferSelectionCard
-              offers={offers}
+              offers={eligibleOffers}
               onCancel={() => setOfferPickerOpen(false)}
               onContinue={(selected) => {
                 setSelectedOffer(selected);
@@ -135,6 +140,12 @@ export default function ContextPanel({
           )}
         </div>
       )}
+      {!activeOffer && onPrepareOfferNegotiation && offers.length > 0 && eligibleOffers.length === 0 ? (
+        <div>
+          <div className={styles.panelLabel}>谈薪准备</div>
+          <div role="note" className={styles.evidenceEmpty}>暂无可用于谈薪准备的已绑定 Offer。</div>
+        </div>
+      ) : null}
 
       {onOpenInterviewStoryLibrary ? (
         <div>

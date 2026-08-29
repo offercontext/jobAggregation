@@ -79,6 +79,20 @@ export function CoreTaskSurfaceHost({
     return () => document.removeEventListener('keydown', onKeyDown);
   }, [controller, state.active, state.phase]);
 
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    let reduced = false;
+    try {
+      reduced = typeof window.matchMedia === 'function'
+        && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    } catch {
+      // A host without matchMedia keeps the normal event-driven lifecycle.
+    }
+    if (!reduced || !state.active) return;
+    if (state.phase === 'opening') controller.markOpen(state.active.generation);
+    else if (state.phase === 'closing') controller.markClosed(state.active.generation);
+  }, [controller, state.active, state.phase]);
+
   if (!state.active || state.phase === 'closed') return null;
   const active = state.active;
   const content = renderOwner ? renderOwner(active) : (owner ?? children);
@@ -94,7 +108,7 @@ export function CoreTaskSurfaceHost({
       <div
         key={ownerKey}
         ref={ownerRef}
-        className={styles.owner}
+        className={`${styles.owner} ${state.phase === 'opening' ? styles.opening : ''} ${state.phase === 'closing' ? styles.closing : ''}`.trim()}
         data-core-task-owner={active.ownerId}
         data-core-task-key={active.key}
         data-core-task-generation={active.generation}

@@ -10,7 +10,14 @@
   border-radius: 12px;
   padding: 1rem;
   background: var(--surface-raised, #fff);
+}
+
+.opening {
   animation: task-surface-enter 160ms ease-out;
+}
+
+.closing {
+  animation: task-surface-exit 140ms ease-in;
 }
 
 .heading {
@@ -31,6 +38,11 @@
   to { opacity: 1; transform: translateY(0); }
 }
 
+@keyframes task-surface-exit {
+  from { opacity: 1; transform: translateY(0); }
+  to { opacity: 0; transform: translateY(4px); }
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .owner { animation: none; }
+  .opening, .closing { animation: none; }
 }

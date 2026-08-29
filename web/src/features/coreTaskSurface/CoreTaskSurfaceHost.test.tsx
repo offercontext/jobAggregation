@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { act, StrictMode, useState } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createCoreTaskSurfaceController, type CoreTaskLaunchResult } from './controller';
 import { CoreTaskSurfaceHost } from './CoreTaskSurfaceHost';
@@ -10,10 +10,21 @@ declare global { var IS_REACT_ACT_ENVIRONMENT: boolean | undefined; }
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
 const roots: Root[] = [];
-afterEach(() => { for (const root of roots.splice(0)) act(() => root.unmount()); });
+afterEach(() => {
+  for (const root of roots.splice(0)) act(() => root.unmount());
+  vi.unstubAllGlobals();
+  document.body.replaceChildren();
+});
+
+const launchRequest = (applicationId: number, source: 'application_header' | 'pilot' = 'application_header', hints?: { suggestedResumeId?: number }) => ({
+  ref: { taskId: 'application.material_kit' as const, applicationId },
+  source,
+  focus: source === 'pilot' ? 'current' as const : 'overview' as const,
+  hints,
+});
 
 describe('CoreTaskSurfaceHost', () => {
-  it('renders one accessible owner and preserves its draft through StrictMode', () => {
+  it('completes enter/exit animations, unloads once, and restores source focus', () => {
     const controller = createCoreTaskSurfaceController();
     const host = document.createElement('div');
     const source = document.createElement('button');
@@ -22,49 +33,93 @@ describe('CoreTaskSurfaceHost', () => {
     source.focus();
     const root = createRoot(host);
     roots.push(root);
-    act(() => root.render(<StrictMode><CoreTaskSurfaceHost controller={controller}><Draft /></CoreTaskSurfaceHost></StrictMode>));
-    let launched: ReturnType<typeof controller.launch> | undefined;
-    act(() => { launched = controller.launch({ ref: { taskId: 'application.material_kit', applicationId: 7 }, source: 'application_header' }); });
-    const opened = requireLaunch(launched);
-    act(() => root.render(<StrictMode><CoreTaskSurfaceHost controller={controller}><Draft /></CoreTaskSurfaceHost></StrictMode>));
-    expect(opened.kind).toBe('launched');
-    expect(host.querySelectorAll('[data-core-task-owner]')).toHaveLength(1);
-    expect(host.querySelectorAll('h2')).toHaveLength(1);
-    const input = host.querySelector('input') as HTMLInputElement;
-    expect(input.value).toBe('typed draft');
-    expect(host.querySelector('[data-core-task-owner]')?.getAttribute('data-core-task-generation')).toBe(String(opened.generation));
-    act(() => controller.markOpen(opened.generation));
-    act(() => controller.close(opened.generation));
-    act(() => controller.markClosed(opened.generation));
+    act(() => root.render(<CoreTaskSurfaceHost controller={controller} sourceElement={source}><Draft /></CoreTaskSurfaceHost>));
+    const opened = requireLaunch(launch(controller, 7));
+    expect(controller.getState().phase).toBe('opening');
+    act(() => root.render(<CoreTaskSurfaceHost controller={controller} sourceElement={source}><Draft /></CoreTaskSurfaceHost>));
+    const owner = host.querySelector('[data-core-task-owner]') as HTMLElement;
+    expect(owner.className).toContain('opening');
+    act(() => owner.dispatchEvent(new Event('animationend', { bubbles: true })));
+    expect(controller.getState().phase).toBe('open');
+    expect(host.querySelector('[data-core-task-owner]')).toBe(owner);
+
+    act(() => (host.querySelector('button[aria-label="关闭任务"]') as HTMLButtonElement).click());
+    expect(controller.getState().phase).toBe('closing');
+    expect(host.querySelector('[data-core-task-owner]')).toBe(owner);
+    expect(owner.className).toContain('closing');
+    act(() => owner.dispatchEvent(new Event('animationend', { bubbles: true })));
+    expect(controller.getState()).toMatchObject({ phase: 'closed', generation: opened.generation, active: null });
+    expect(host.querySelector('[data-core-task-owner]')).toBeNull();
     expect(document.activeElement).toBe(source);
-    source.remove();
   });
 
-  it('closes with Escape and ignores stale animation completion', () => {
+  it('uses Escape, and duplicate launch focuses the same owner without resetting a real draft', () => {
     const controller = createCoreTaskSurfaceController();
     const host = document.createElement('div');
+    const source = document.createElement('button');
+    document.body.append(source, host);
+    const root = createRoot(host);
+    roots.push(root);
+    act(() => root.render(<StrictMode><CoreTaskSurfaceHost controller={controller} sourceElement={source}><Draft /></CoreTaskSurfaceHost></StrictMode>));
+    const first = requireLaunch(launch(controller, 7));
+    act(() => root.render(<StrictMode><CoreTaskSurfaceHost controller={controller} sourceElement={source}><Draft /></CoreTaskSurfaceHost></StrictMode>));
+    const owner = host.querySelector('[data-core-task-owner]') as HTMLElement;
+    const input = host.querySelector('input') as HTMLInputElement;
+    input.value = '真实输入';
+    source.focus();
+    const duplicate = launch(controller, 7, 'pilot', { suggestedResumeId: 99 });
+    expect(duplicate).toMatchObject({ kind: 'focused_existing', generation: first.generation });
+    expect(host.querySelector('[data-core-task-owner]')).toBe(owner);
+    expect((host.querySelector('input') as HTMLInputElement).value).toBe('真实输入');
+    expect(document.activeElement).toBe(owner);
+
+    act(() => document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })));
+    expect(controller.getState().phase).toBe('closing');
+  });
+
+  it('finishes opening and closing deterministically when reduced motion is requested', () => {
+    vi.stubGlobal('matchMedia', vi.fn(() => ({ matches: true, media: '', onchange: null, addListener: vi.fn(), removeListener: vi.fn(), addEventListener: vi.fn(), removeEventListener: vi.fn(), dispatchEvent: vi.fn() })));
+    const controller = createCoreTaskSurfaceController();
+    const host = document.createElement('div');
+    document.body.append(host);
     const root = createRoot(host);
     roots.push(root);
     act(() => root.render(<CoreTaskSurfaceHost controller={controller} />));
-    let launched: ReturnType<typeof controller.launch> | undefined;
-    act(() => { launched = controller.launch({ ref: { taskId: 'application.material_kit', applicationId: 1 }, source: 'deep_link' }); });
-    const opened = requireLaunch(launched);
+    const opened = requireLaunch(launch(controller, 3));
     act(() => root.render(<CoreTaskSurfaceHost controller={controller} />));
+    expect(controller.getState().phase).toBe('open');
+    act(() => controller.close(opened.generation));
+    expect(controller.getState().phase).toBe('closed');
+    expect(host.querySelector('[data-core-task-owner]')).toBeNull();
+  });
+
+  it('fails safely when matchMedia throws', () => {
+    vi.stubGlobal('matchMedia', vi.fn(() => { throw new Error('unsupported'); }));
+    const controller = createCoreTaskSurfaceController();
+    const host = document.createElement('div');
+    document.body.append(host);
+    const root = createRoot(host);
+    roots.push(root);
+    act(() => root.render(<CoreTaskSurfaceHost controller={controller} />));
+    const opened = requireLaunch(launch(controller, 4));
+    act(() => root.render(<CoreTaskSurfaceHost controller={controller} />));
+    expect(controller.getState().phase).toBe('opening');
     act(() => controller.markOpen(opened.generation));
-    act(() => root.render(<CoreTaskSurfaceHost controller={controller} />));
-    act(() => document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })));
-    expect(controller.getState().phase).toBe('closing');
-    act(() => controller.markClosed(opened.generation - 1));
-    expect(controller.getState().phase).toBe('closing');
   });
 });
 
-function Draft() {
-  const [value] = useState('typed draft');
-  return <input aria-label="草稿" defaultValue={value} />;
+function launch(controller: ReturnType<typeof createCoreTaskSurfaceController>, applicationId: number, source: 'application_header' | 'pilot' = 'application_header', hints?: { suggestedResumeId?: number }) {
+  let result: ReturnType<typeof controller.launch> | undefined;
+  act(() => { result = controller.launch(launchRequest(applicationId, source, hints)); });
+  return result;
 }
 
 function requireLaunch(result: CoreTaskLaunchResult | undefined) {
   if (!result || result.kind !== 'launched') throw new Error('launch should succeed');
   return result;
+}
+
+function Draft() {
+  const [value] = useState('initial');
+  return <input aria-label="草稿" defaultValue={value} />;
 }

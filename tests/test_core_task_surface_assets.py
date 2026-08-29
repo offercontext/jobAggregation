@@ -26,7 +26,7 @@ ASSET_NAMES = (
 ASSET_SHA256: dict[str, str] = {
     "core_task_entrypoints_93fb006.json": "8ce204c055e8c151eb4e61fa2982bd2702f08d265cfbae357ef349abf34e005a",
     "core_task_request_counts_93fb006.json": "a9878d9aaea402aef2bb86906c06492955c03e045bfc052e8fc5da86d00958eb",
-    "core_task_visible_copy_93fb006.json": "412a9a8f8bd22a0ad3d25b60dfd84dfdf11adc05bbd84a01dc77607cc59c4fb8",
+    "core_task_visible_copy_93fb006.json": "7e3899ede931a88e347b84d3981962a539f5f3b07d5e49aa6cd644de2f28fb61",
     "interview_index_api_93fb006.json": "3c1080a68bd8c9ec135b879ea715341d808e826f7b88c069ee2ddb36b412293d",
 }
 

@@ -234,13 +234,13 @@ export function resolveApplicationTasks(snapshot: FrozenApplicationTaskSnapshot,
     let hasGeneralReview = false;
     for (const raw of reviews) {
       if (!isRecord(raw) || !Object.prototype.hasOwnProperty.call(raw, 'applicationId') || !Object.prototype.hasOwnProperty.call(raw, 'eventId')) {
-        addIssue(makeIssue('unavailable', 'event_contract_invalid', 7)); continue;
+        addIssue(makeIssue('unavailable', 'event_contract_invalid', 3)); continue;
       }
       const owner = safeId(raw.applicationId);
-      if (owner !== appId || raw.deleted || raw.stale || raw.sourceMismatch) { addIssue(makeIssue('unavailable', 'source_mismatch', 7, safeId(raw.eventId))); continue; }
+      if (owner !== appId || raw.deleted || raw.stale || raw.sourceMismatch) { addIssue(makeIssue('unavailable', 'source_mismatch', 3, safeId(raw.eventId))); continue; }
       if (raw.eventId === null) hasGeneralReview = true;
       else if (safeId(raw.eventId) !== null) reviewedEvents.add(safeId(raw.eventId) as number);
-      else addIssue(makeIssue('unavailable', 'event_contract_invalid', 7));
+      else addIssue(makeIssue('unavailable', 'event_contract_invalid', 3));
     }
     const events = sources.events.state === 'ready' && Array.isArray(sources.events.value) ? sources.events.value : [];
     const eventById = new Map<number, ApplicationTaskEvent>();
@@ -258,11 +258,22 @@ export function resolveApplicationTasks(snapshot: FrozenApplicationTaskSnapshot,
       const lifecycle = event.lifecycle;
       if (lifecycle === 'unknown') { addIssue(makeIssue('unavailable', 'event_contract_invalid', 2, event.eventId)); continue; }
       if (event.sourceMismatch || event.deleted || event.stale) { addIssue(makeIssue('unavailable', event.deleted ? 'entity_deleted' : 'source_mismatch', 2, event.eventId)); continue; }
-      if (lifecycle === 'cancelled') continue;
       const bucketConsistent = lifecycle === 'completed'
         ? event.bucket === 'completed'
-        : event.bucket === 'upcoming' || event.bucket === 'needs_status_update' || event.bucket === 'unavailable';
-      if (!bucketConsistent) { addIssue(makeIssue('unavailable', 'event_contract_invalid', 2, event.eventId)); continue; }
+        : lifecycle === 'cancelled'
+          ? event.bucket === 'cancelled' && event.primaryAction === 'none'
+          : event.bucket === 'upcoming' || event.bucket === 'needs_status_update' || event.bucket === 'unavailable';
+      const actionConsistent = lifecycle === 'completed'
+        ? event.primaryAction === 'record_review' || event.primaryAction === 'view_review'
+        : lifecycle === 'cancelled'
+          ? event.primaryAction === 'none'
+          : event.bucket === 'needs_status_update'
+            ? event.primaryAction === 'update_status'
+            : event.bucket === 'unavailable'
+              ? event.primaryAction === 'none'
+              : event.primaryAction === 'prepare' || event.primaryAction === 'enter_preparation';
+      if (!bucketConsistent || !actionConsistent) { addIssue(makeIssue('unavailable', 'event_contract_invalid', 2, event.eventId)); continue; }
+      if (lifecycle === 'cancelled') continue;
       const durationValid = typeof event.durationMinutes === 'number' && Number.isInteger(event.durationMinutes) && event.durationMinutes >= 1 && event.durationMinutes <= 10080;
       const timeValid = typeof event.scheduledAtTimestamp === 'number' && Number.isFinite(event.scheduledAtTimestamp) && event.scheduledAtState === 'present';
       if (lifecycle === 'completed') {

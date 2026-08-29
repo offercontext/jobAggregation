@@ -186,6 +186,7 @@ describe('resolveApplicationTasks', () => {
       reviews: ready([{ applicationId: 7, eventId: 0 } as never, { applicationId: 7, eventId: '3' } as never]),
     }), NOW);
     expect(invalid.issues.filter((issue) => issue.reason === 'event_contract_invalid')).toHaveLength(1);
+    expect(invalid.issues.find((issue) => issue.reason === 'event_contract_invalid')?.priority).toBe(3);
   });
 
   it.each(['loading', 'error', 'absent'] as const)('does not call a completed event reviewed when reviews are %s', (status) => {

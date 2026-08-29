@@ -266,6 +266,18 @@ describe('deriveNextStepSuggestions', () => {
     expect(atEnd.candidates.some((candidate) => candidate.id === 'prepare_interview')).toBe(true);
   });
 
+  it('accepts duration 10080 but rejects 10081 and explicit absent schedules', () => {
+    const result = deriveNextStepSuggestions(makeFacts({
+      events: { status: 'known', value: [
+        makeInterviewEvent(10, '2026-08-01T10:00:00+08:00', 10080),
+        makeInterviewEvent(11, '2026-08-01T10:00:00+08:00', 10081),
+        makeInterviewEvent(12, '2026-08-01T10:00:00+08:00', 60, { scheduled_at_state: 'absent' } as Partial<ScheduleEvent>),
+      ] },
+    }), 'detail', now);
+    expect(result.candidates.some((candidate) => candidate.destination.kind === 'interview_event' && candidate.destination.eventId === 10)).toBe(true);
+    expect(result.candidates.some((candidate) => candidate.destination.kind === 'interview_event' && [11, 12].includes(candidate.destination.eventId))).toBe(false);
+  });
+
   it('excludes events with invalid date or duration from interview destinations', () => {
     const result = deriveNextStepSuggestions(makeFacts({
       events: {

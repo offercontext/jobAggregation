@@ -219,7 +219,7 @@ export function deriveMaterialKitFact(input: MaterialKitQueryFact): FactState<un
 }
 
 function isValidDuration(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value) && value > 0;
+  return typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value) && value >= 1 && value <= 10080;
 }
 
 function parseScheduledAt(value: string): number | null {

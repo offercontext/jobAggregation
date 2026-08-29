@@ -27,6 +27,25 @@ describe('projectInterviewEventCard', () => {
     expect(project({ event_status })).toMatchObject({ bucket, primaryAction, secondaryAction: 'view_application' });
   });
 
+  it.each(['done', 'cancelled'] as const)('keeps terminal status for invalid now: %s', (event_status) => {
+    expect(project({ event_status }, Number.NaN)).toMatchObject({
+      bucket: event_status === 'done' ? 'completed' : 'cancelled',
+      primaryAction: event_status === 'done' ? 'record_review' : 'none',
+    });
+    expect(project({ event_status }, Number.POSITIVE_INFINITY)).toMatchObject({
+      bucket: event_status === 'done' ? 'completed' : 'cancelled',
+    });
+    expect(project({ event_status, scheduled_at_state: 'absent' }, Number.NEGATIVE_INFINITY)).toMatchObject({
+      bucket: event_status === 'done' ? 'completed' : 'cancelled',
+    });
+  });
+
+  it('keeps terminal status with an absent schedule while preserving the contract reason', () => {
+    const item = normalizeInterviewIndexItem(raw({ event_status: 'done', scheduled_at_state: 'absent' }));
+    expect(item.contractReasons).toContain('schedule_absent');
+    expect(projectInterviewEventCard(item, NOW)).toMatchObject({ bucket: 'completed', primaryAction: 'record_review' });
+  });
+
   it('chooses review action when a completed event has a note', () => {
     expect(project({ event_status: 'done', note_id: 20 })).toMatchObject({ bucket: 'completed', primaryAction: 'view_review' });
   });

@@ -191,7 +191,7 @@ export function normalizeInterviewIndexItem(input: unknown, currentEvent?: unkno
   const scheduleTimestamp = state === 'present' ? parseRfc3339(scheduled.value) : null;
   const scheduleValid = state === 'present' && scheduleTimestamp !== null;
   if (state === 'present' && !scheduleValid) appendReason(reasons, 'schedule_invalid');
-  if (state === 'absent' && (lifecycle === 'scheduled' || lifecycle === 'in_progress')) appendReason(reasons, 'schedule_absent');
+  if (state === 'absent') appendReason(reasons, 'schedule_absent');
 
   const durationValue = typeof duration.value === 'number' && Number.isFinite(duration.value) ? duration.value : null;
   const durationValid = durationValue !== null && Number.isInteger(durationValue) && durationValue >= 1 && durationValue <= 10080;

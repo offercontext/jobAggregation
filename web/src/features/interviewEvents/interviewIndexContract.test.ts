@@ -66,6 +66,15 @@ describe('normalizeInterviewIndexItem', () => {
     expect(normalized.contractReasons).not.toContain('schedule_invalid');
   });
 
+  it.each(['done', 'cancelled'] as const)('records schedule_absent for terminal status %s as raw contract truth', (event_status) => {
+    const normalized = normalizeInterviewIndexItem(validRaw({
+      event_status,
+      scheduled_at: '0001-01-01T00:00:00',
+      scheduled_at_state: 'absent',
+    }));
+    expect(normalized.contractReasons).toContain('schedule_absent');
+  });
+
   it.each([
     '',
     '0001-01-01T00:00:00Z',

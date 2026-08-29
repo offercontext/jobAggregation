@@ -72,11 +72,11 @@ function unavailableCard(item: NormalizedInterviewIndexItem, lifecycle: EventLif
 /** Projects one immutable index row. Status is authoritative; time is only for active rows. */
 export function projectInterviewEventCard(item: NormalizedInterviewIndexItem, now: number): InterviewEventCardModel {
   const lifecycle = classifyEventLifecycleV1(item.event_status);
-  if (!Number.isFinite(now)) return unavailableCard(item, lifecycle);
   if (item.application_id === null || item.event_id === null) return unavailableCard(item, lifecycle);
   if (item.sourceMismatch) return unavailableCard(item, lifecycle);
   if (lifecycle === 'completed') return terminalCard(item, lifecycle, 'completed');
   if (lifecycle === 'cancelled') return terminalCard(item, lifecycle, 'cancelled');
+  if (!Number.isFinite(now)) return unavailableCard(item, lifecycle);
   if (lifecycle === 'unknown' || !item.scheduleValid || !item.durationValid || item.scheduled_at_state !== 'present') {
     return unavailableCard(item, lifecycle);
   }

@@ -9921,6 +9921,9 @@ def _interview_index_item_json(item: Any) -> dict[str, Any]:
         "has_review_proposal": item.has_review_proposal,
         "review_summary": item.review_summary,
         "has_confirmed_knowledge": item.has_confirmed_knowledge,
+        "event_status": item.event_status,
+        "duration_minutes": item.duration_minutes,
+        "scheduled_at_state": item.scheduled_at_state,
         "preparation_available": item.preparation_available,
     }
 

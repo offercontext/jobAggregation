@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
-from sqlalchemy import exists, nullslast, select
+from sqlalchemy import and_, exists, func, nullslast, select
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.sql import Select
 
 from offerpilot.ai.interview_review_proposals import build_interview_review_snapshot
 from offerpilot.models import (
@@ -30,6 +32,9 @@ class InterviewIndexItem:
     has_review_proposal: bool
     review_summary: str | None
     has_confirmed_knowledge: bool
+    event_status: str
+    duration_minutes: int | None
+    scheduled_at_state: str
     preparation_available: bool
 
 
@@ -39,39 +44,97 @@ class InterviewIndexRepository:
 
     def list(self, *, limit: int = 50, cursor: str = "") -> tuple[list[InterviewIndexItem], str | None]:
         offset = _parse_cursor(cursor)
-        statement = (
-            select(ApplicationEvent, Application.company_name, Application.position_name, InterviewNote)
-            .join(Application, Application.id == ApplicationEvent.application_id)
-            .outerjoin(InterviewNote, InterviewNote.application_event_id == ApplicationEvent.id)
-            .where(Application.deleted_at.is_(None))
-            .where(ApplicationEvent.event_type == "interview")
-            .order_by(
-                nullslast(ApplicationEvent.scheduled_at.asc()),
-                ApplicationEvent.created_at.desc(),
-                ApplicationEvent.id.desc(),
-            )
-            .offset(offset)
-            .limit(limit + 1)
-        )
+        statement = _event_index_statement()
+        statement = statement.offset(offset).limit(limit + 1)
         with self._session_factory() as session:
             rows = session.execute(statement).all()
             has_more = len(rows) > limit
             rows = rows[:limit]
-            items = [_item(session, row[0], row[1], row[2], row[3]) for row in rows]
+            items = [_item(row) for row in rows]
         return items, str(offset + limit) if has_more else None
 
     def get(self, event_id: int) -> InterviewIndexItem | None:
-        statement = (
-            select(ApplicationEvent, Application.company_name, Application.position_name, InterviewNote)
-            .join(Application, Application.id == ApplicationEvent.application_id)
-            .outerjoin(InterviewNote, InterviewNote.application_event_id == ApplicationEvent.id)
-            .where(Application.deleted_at.is_(None))
-            .where(ApplicationEvent.event_type == "interview")
-            .where(ApplicationEvent.id == event_id)
-        )
+        statement = _event_index_statement().where(ApplicationEvent.id == event_id)
         with self._session_factory() as session:
             row = session.execute(statement).first()
-            return None if row is None else _item(session, row[0], row[1], row[2], row[3])
+            return None if row is None else _item(row)
+
+
+def _event_index_statement() -> Select[Any]:
+    """Build the shared, one-row-per-interview-event read projection."""
+    note_ranked = (
+        select(
+            InterviewNote.id.label("note_id"),
+            InterviewNote.application_event_id,
+            func.row_number()
+            .over(
+                partition_by=InterviewNote.application_event_id,
+                order_by=(InterviewNote.created_at.desc(), InterviewNote.id.desc()),
+            )
+            .label("note_rn"),
+        )
+        .where(InterviewNote.application_event_id.is_not(None))
+        .subquery("latest_event_notes")
+    )
+    review_ranked = (
+        select(
+            InterviewReviewProposal.id.label("review_id"),
+            InterviewReviewProposal.application_event_id,
+            func.row_number()
+            .over(
+                partition_by=InterviewReviewProposal.application_event_id,
+                order_by=(
+                    InterviewReviewProposal.created_at.desc(),
+                    InterviewReviewProposal.id.desc(),
+                ),
+            )
+            .label("review_rn"),
+        )
+        .where(InterviewReviewProposal.application_event_id.is_not(None))
+        .subquery("latest_event_reviews")
+    )
+    has_confirmed_knowledge = exists(
+        select(1).where(
+            KnowledgeCapturedSourceMetadata.application_event_id == ApplicationEvent.id
+        )
+    )
+    return (
+        select(
+            ApplicationEvent,
+            Application.company_name,
+            Application.position_name,
+            InterviewNote,
+            InterviewReviewProposal,
+            has_confirmed_knowledge.label("has_confirmed_knowledge"),
+        )
+        .join(Application, Application.id == ApplicationEvent.application_id)
+        .outerjoin(
+            note_ranked,
+            and_(
+                note_ranked.c.application_event_id == ApplicationEvent.id,
+                note_ranked.c.note_rn == 1,
+            ),
+        )
+        .outerjoin(InterviewNote, InterviewNote.id == note_ranked.c.note_id)
+        .outerjoin(
+            review_ranked,
+            and_(
+                review_ranked.c.application_event_id == ApplicationEvent.id,
+                review_ranked.c.review_rn == 1,
+            ),
+        )
+        .outerjoin(
+            InterviewReviewProposal,
+            InterviewReviewProposal.id == review_ranked.c.review_id,
+        )
+        .where(Application.deleted_at.is_(None))
+        .where(ApplicationEvent.event_type == "interview")
+        .order_by(
+            nullslast(ApplicationEvent.scheduled_at.asc()),
+            ApplicationEvent.created_at.desc(),
+            ApplicationEvent.id.desc(),
+        )
+    )
 
 
 def _parse_cursor(value: str) -> int:
@@ -87,16 +150,20 @@ def _parse_cursor(value: str) -> int:
 
 
 def _item(
-    session: Session,
-    event: ApplicationEvent,
-    company_name: str,
-    position_name: str,
-    note: InterviewNote | None,
+    row: Any,
 ) -> InterviewIndexItem:
+    event, company_name, position_name, note, review, has_confirmed_knowledge = row
     scheduled_at = event.scheduled_at or datetime.min
     if scheduled_at.tzinfo is None or scheduled_at.utcoffset() is None:
         scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
-    review = _latest_event_review(session, event.id)
+    scheduled_at_state = "present" if event.scheduled_at is not None else "absent"
+    duration = event.duration_minutes
+    preparation_available = (
+        event.status in {"todo", "pending", "scheduled", "in_progress"}
+        and event.scheduled_at is not None
+        and type(duration) is int
+        and 1 <= duration <= 10080
+    )
     return InterviewIndexItem(
         application_id=event.application_id,
         event_id=event.id,
@@ -107,30 +174,11 @@ def _item(
         note_source_status=_note_source_status(event, note, review),
         has_review_proposal=review is not None,
         review_summary=_review_summary(review),
-        has_confirmed_knowledge=_has_confirmed_knowledge(session, event.id),
-        preparation_available=True,
-    )
-
-
-def _latest_event_review(session: Session, event_id: int) -> InterviewReviewProposal | None:
-    return session.scalar(
-        select(InterviewReviewProposal)
-        .where(InterviewReviewProposal.application_event_id == event_id)
-        .order_by(InterviewReviewProposal.created_at.desc(), InterviewReviewProposal.id.desc())
-    )
-
-
-def _has_confirmed_knowledge(session: Session, event_id: int) -> bool:
-    return bool(
-        session.scalar(
-            select(
-                exists(
-                    select(1).where(
-                        KnowledgeCapturedSourceMetadata.application_event_id == event_id
-                    )
-                )
-            )
-        )
+        has_confirmed_knowledge=bool(has_confirmed_knowledge),
+        event_status=event.status,
+        duration_minutes=duration,
+        scheduled_at_state=scheduled_at_state,
+        preparation_available=preparation_available,
     )
 
 

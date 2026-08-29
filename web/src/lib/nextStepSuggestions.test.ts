@@ -258,6 +258,14 @@ describe('deriveNextStepSuggestions', () => {
     expect(pastTodo.candidates.some((candidate) => candidate.id === 'review_interview')).toBe(false);
   });
 
+  it('keeps an in-progress event actionable at its exact scheduled end', () => {
+    const eventStart = '2026-07-30T08:00:00+08:00';
+    const atEnd = deriveNextStepSuggestions(makeFacts({
+      events: { status: 'known', value: [makeInterviewEvent(9, eventStart, 60, { status: 'in_progress' })] },
+    }), 'detail', new Date('2026-07-30T09:00:00+08:00'));
+    expect(atEnd.candidates.some((candidate) => candidate.id === 'prepare_interview')).toBe(true);
+  });
+
   it('excludes events with invalid date or duration from interview destinations', () => {
     const result = deriveNextStepSuggestions(makeFacts({
       events: {

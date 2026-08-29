@@ -273,7 +273,7 @@ function classifyInterviewEvents(facts: NextStepFacts, now: Date) {
 
   return {
     currentOrFuture: valid
-      .filter(({ lifecycle, start, end }) => (lifecycle === 'scheduled' && start > timestamp) || (lifecycle === 'in_progress' && timestamp < end))
+      .filter(({ lifecycle, start, end }) => (lifecycle === 'scheduled' && start > timestamp) || (lifecycle === 'in_progress' && timestamp <= end))
       .sort(sortAscending)
       .map(({ event }) => event),
     ended: valid.filter(({ lifecycle }) => lifecycle === 'completed').sort(sortDescending).map(({ event }) => event),

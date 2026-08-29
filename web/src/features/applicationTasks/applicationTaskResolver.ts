@@ -1,53 +1,113 @@
-import { classifyEventLifecycleV1, type EventLifecycleV1 } from '@/features/interviewEvents/eventLifecycle';
+import type { EventLifecycleV1 } from '@/features/interviewEvents/eventLifecycle';
+import { parseCoreTaskRef, type CoreTaskId, type CoreTaskRef } from '@/features/coreTaskSurface/contracts';
 import type { ApplicationStatus } from '@/types/application';
-import type { CoreTaskId, CoreTaskRef } from '@/features/coreTaskSurface/contracts';
 
 export type TaskAvailability = 'ready' | 'loading' | 'blocked' | 'waiting_confirmation' | 'result_unknown' | 'unavailable';
 
-/**
- * Read-only input for the application task projector.  The deliberately
- * structural shape lets API adapters add JSON fields without making this
- * pure module depend on a service or repository contract.
- */
+export type TaskSource<T> =
+  | { readonly status: 'ready'; readonly value: T }
+  | { readonly status: 'loading' }
+  | { readonly status: 'error'; readonly reason?: string }
+  | { readonly status: 'absent' };
+
+export interface ApplicationTaskApplication {
+  readonly id: number;
+  readonly status: ApplicationStatus;
+  readonly deleted?: boolean;
+  readonly deletedAt?: string | null;
+  readonly stale?: boolean;
+  readonly sourceMismatch?: boolean;
+}
+
+export interface ApplicationTaskEvent {
+  readonly applicationId: number;
+  readonly eventId: number;
+  readonly lifecycle: EventLifecycleV1;
+  readonly bucket: 'upcoming' | 'completed' | 'cancelled' | 'needs_status_update' | 'unavailable';
+  readonly primaryAction: 'prepare' | 'enter_preparation' | 'record_review' | 'view_review' | 'update_status' | 'none';
+  readonly scheduledAtTimestamp: number | null;
+  readonly durationMinutes: number | null;
+  readonly scheduledAtState?: 'present' | 'absent';
+  readonly sourceMismatch?: boolean;
+  readonly deleted?: boolean;
+  readonly stale?: boolean;
+}
+
+export interface ApplicationTaskReview {
+  readonly applicationId: number;
+  readonly eventId: number | null;
+  readonly reviewId?: number;
+  readonly deleted?: boolean;
+  readonly stale?: boolean;
+  readonly sourceMismatch?: boolean;
+}
+
+export interface ApplicationTaskMaterialKit {
+  readonly applicationId: number;
+  readonly status: 'draft' | 'ready' | 'submitted' | string;
+  readonly deleted?: boolean;
+  readonly stale?: boolean;
+  readonly sourceMismatch?: boolean;
+  readonly updatedAt?: number | string | null;
+}
+
+export interface ApplicationTaskOffer {
+  readonly id: number;
+  readonly applicationId: number;
+  readonly status: 'pending' | 'negotiating' | 'accepted' | 'declined' | 'expired' | string;
+  readonly deadline?: number | string | null;
+  readonly deleted?: boolean;
+  readonly stale?: boolean;
+  readonly sourceMismatch?: boolean;
+}
+
+export interface ApplicationTaskJd {
+  readonly id?: number;
+  readonly versionId?: number;
+}
+
+export interface ApplicationTaskResume {
+  readonly id?: number;
+  readonly selected?: boolean;
+  readonly deleted?: boolean;
+}
+
+export interface ApplicationTaskFit {
+  readonly reviewId?: number;
+  readonly status?: string;
+}
+
+export interface ApplicationTaskPending {
+  readonly ref?: unknown;
+  readonly taskId?: unknown;
+  readonly applicationId?: unknown;
+  readonly eventId?: unknown;
+}
+
 export interface FrozenApplicationTaskSnapshot {
-  readonly application?: unknown;
-  readonly jd?: unknown;
-  readonly events?: unknown;
-  readonly offers?: unknown;
-  readonly materialKit?: unknown;
-  readonly material_kit?: unknown;
-  readonly reviews?: unknown;
-  readonly fitReview?: unknown;
-  readonly pending?: unknown;
-  readonly resultUnknown?: unknown;
-  readonly resume?: unknown;
-  readonly [key: string]: unknown;
+  readonly application: TaskSource<ApplicationTaskApplication>;
+  readonly jd: TaskSource<ApplicationTaskJd | null>;
+  readonly events: TaskSource<readonly ApplicationTaskEvent[]>;
+  readonly offers: TaskSource<readonly ApplicationTaskOffer[]>;
+  readonly materialKit: TaskSource<ApplicationTaskMaterialKit | null>;
+  readonly reviews: TaskSource<readonly ApplicationTaskReview[]>;
+  readonly fit: TaskSource<ApplicationTaskFit | null>;
+  readonly resume: TaskSource<ApplicationTaskResume | null>;
+  readonly pending: TaskSource<ApplicationTaskPending | null>;
+  readonly resultUnknown: TaskSource<ApplicationTaskPending | null>;
 }
 
 export type ApplicationTaskReason =
-  | 'pending_confirmation'
-  | 'result_unknown'
-  | 'interview_preparation_available'
-  | 'interview_review_missing'
-  | 'interview_review_available'
-  | 'material_kit_incomplete'
-  | 'offer_review_pending'
-  | 'opportunity_fit'
-  | 'material_kit_missing'
-  | 'record_outcome'
-  | 'general_review'
-  | 'source_loading'
-  | 'source_error'
-  | 'source_absent'
-  | 'source_mismatch'
-  | 'application_deleted'
-  | 'entity_deleted'
-  | 'identity_mismatch'
-  | 'foreign_pending';
+  | 'pending_confirmation' | 'result_unknown' | 'pending_identity_invalid'
+  | 'interview_preparation_available' | 'interview_review_missing' | 'interview_review_available'
+  | 'material_kit_incomplete' | 'offer_review_pending' | 'opportunity_fit' | 'material_kit_missing'
+  | 'record_outcome' | 'general_review' | 'source_loading' | 'source_error' | 'source_absent'
+  | 'source_mismatch' | 'application_deleted' | 'entity_deleted' | 'foreign_pending'
+  | 'duplicate_identity_conflict' | 'event_contract_invalid' | 'event_status_needs_update';
 
 export interface ApplicationTaskModel {
-  readonly taskId: CoreTaskId;
-  readonly ref: CoreTaskRef;
+  readonly taskId: CoreTaskId | null;
+  readonly ref: CoreTaskRef | null;
   readonly availability: TaskAvailability;
   readonly reason: ApplicationTaskReason;
   readonly reasonCode: ApplicationTaskReason;
@@ -65,59 +125,19 @@ export interface ApplicationTaskResolution {
   readonly hasUnavailable: boolean;
 }
 
-type SourceState = 'ready' | 'loading' | 'error' | 'absent';
-type SourceView = { state: SourceState; value: unknown; reason: ApplicationTaskReason | null };
+type RuntimeSource = { state: 'ready' | 'loading' | 'error' | 'absent'; value: unknown; malformed?: boolean };
+type InternalTask = ApplicationTaskModel & { readonly priority: number; readonly identity: number | null };
 
-function record(value: unknown): Record<string, unknown> | null {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : null;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function sourceView(value: unknown): SourceView {
-  if (value === undefined) return { state: 'absent', value: undefined, reason: 'source_absent' };
-  const wrapped = record(value);
-  if (!wrapped || !Object.prototype.hasOwnProperty.call(wrapped, 'status') && !Object.prototype.hasOwnProperty.call(wrapped, 'state')) {
-    return { state: 'ready', value, reason: null };
-  }
-  const status = wrapped.status ?? wrapped.state;
-  const hasPayload = Object.prototype.hasOwnProperty.call(wrapped, 'value')
-    || Object.prototype.hasOwnProperty.call(wrapped, 'data')
-    || Object.prototype.hasOwnProperty.call(wrapped, 'items');
-  if (status === 'pending' && !hasPayload) return { state: 'ready', value, reason: null };
-  if (status === 'unknown' && Object.prototype.hasOwnProperty.call(wrapped, 'reason')) {
-    return { state: 'loading', value: undefined, reason: 'source_loading' };
-  }
-  if (status === 'ready' || status === 'success' || status === 'known' || status === 'loaded') {
-    return { state: 'ready', value: wrapped.value ?? wrapped.data ?? wrapped.items ?? null, reason: null };
-  }
-  if (status === 'loading' || status === 'pending') return { state: 'loading', value: undefined, reason: 'source_loading' };
-  if (status === 'error' || status === 'failed') return { state: 'error', value: undefined, reason: 'source_error' };
-  if (status === 'absent' || status === 'missing' || status === 'not_found') return { state: 'absent', value: null, reason: 'source_absent' };
-  if (status === 'unavailable' || status === 'mismatch' || status === 'stale') return { state: 'error', value: undefined, reason: 'source_mismatch' };
-  // Domain rows also commonly have a `status` field (for example a draft
-  // Material Kit or an Application status).  Without a wrapper payload those
-  // are already-loaded records, not failed source envelopes.
-  if (!hasPayload) {
-    return { state: 'ready', value, reason: null };
-  }
-  return { state: 'error', value: undefined, reason: 'source_error' };
-}
-
-function asId(value: unknown): number | null {
+function safeId(value: unknown): number | null {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : null;
 }
 
-function identity(value: Record<string, unknown>, ...keys: string[]): number | null {
-  for (const key of keys) {
-    const id = asId(value[key]);
-    if (id !== null) return id;
-  }
-  return null;
-}
-
-function arrayValue(value: unknown): readonly unknown[] {
-  return Array.isArray(value) ? value : [];
+function isApplicationStatus(value: unknown): value is ApplicationStatus {
+  return value === 'pending' || value === 'applied' || value === 'written_test' || value === 'interview' || value === 'offer' || value === 'closed';
 }
 
 function finiteTime(value: unknown): number | null {
@@ -129,52 +149,46 @@ function finiteTime(value: unknown): number | null {
   return null;
 }
 
-function eventLifecycle(value: Record<string, unknown>): EventLifecycleV1 {
-  // The lifecycle field is accepted from Task 4's card projection. Raw event
-  // rows still go through the one canonical classifier; no local alias set is
-  // maintained here.
-  const projected = value.lifecycle;
-  if (projected === 'scheduled' || projected === 'in_progress' || projected === 'completed' || projected === 'cancelled' || projected === 'unknown') {
-    return projected;
-  }
-  return classifyEventLifecycleV1(value.event_status ?? value.status);
-}
-
-function freezeTask(task: ApplicationTaskModel): ApplicationTaskModel {
-  return Object.freeze({ ...task, ref: Object.freeze({ ...task.ref }) });
-}
-
-function compareTasks(left: ApplicationTaskModel, right: ApplicationTaskModel): number {
-  const time = (left.businessTime === null ? 1 : 0) - (right.businessTime === null ? 1 : 0);
-  if (time !== 0) return time;
-  if (left.businessTime !== null && right.businessTime !== null && left.businessTime !== right.businessTime) {
-    return left.businessTime - right.businessTime;
-  }
-  const leftIdentity = left.ref.eventId ?? left.ref.applicationId ?? left.ref.offerId ?? left.ref.resumeId ?? left.ref.storyId ?? left.ref.sourceId ?? Number.MAX_SAFE_INTEGER;
-  const rightIdentity = right.ref.eventId ?? right.ref.applicationId ?? right.ref.offerId ?? right.ref.resumeId ?? right.ref.storyId ?? right.ref.sourceId ?? Number.MAX_SAFE_INTEGER;
-  return leftIdentity - rightIdentity || left.taskId.localeCompare(right.taskId);
-}
-
-function uniqueTaskKey(task: ApplicationTaskModel): string {
-  const ref = task.ref;
-  return [ref.taskId, ref.applicationId, ref.eventId, ref.resumeId, ref.storyId, ref.sourceId].join(':');
-}
-
-function appStatus(value: Record<string, unknown>): ApplicationStatus | null {
+function readSource(value: unknown): RuntimeSource {
+  if (!isRecord(value)) return { state: 'error', value: undefined, malformed: true };
   const status = value.status;
-  return status === 'pending' || status === 'applied' || status === 'written_test' || status === 'interview' || status === 'offer' || status === 'closed'
-    ? status
-    : null;
+  const hasValue = Object.prototype.hasOwnProperty.call(value, 'value');
+  if (status === 'ready') return hasValue
+    ? { state: 'ready', value: value.value }
+    : { state: 'error', value: undefined, malformed: true };
+  if (status === 'loading') return hasValue ? { state: 'error', value: undefined, malformed: true } : { state: 'loading', value: undefined };
+  if (status === 'error') return hasValue ? { state: 'error', value: undefined, malformed: true } : { state: 'error', value: undefined };
+  if (status === 'absent') return hasValue ? { state: 'error', value: undefined, malformed: true } : { state: 'absent', value: undefined };
+  return { state: 'error', value: undefined, malformed: true };
 }
 
-function taskFor(
-  taskId: CoreTaskId,
-  ref: CoreTaskRef,
-  availability: TaskAvailability,
-  reason: ApplicationTaskReason,
-  priority: number,
-  businessTime: number | null = null,
-): ApplicationTaskModel & { readonly _priority: number } {
+function sourceAvailability(source: RuntimeSource, absent: TaskAvailability = 'blocked'): TaskAvailability {
+  if (source.state === 'loading') return 'loading';
+  if (source.state === 'error') return 'unavailable';
+  if (source.state === 'absent') return absent;
+  return 'ready';
+}
+
+function eventLifecycle(event: ApplicationTaskEvent): EventLifecycleV1 {
+  switch (event.lifecycle) {
+    case 'scheduled':
+    case 'in_progress':
+    case 'completed':
+    case 'cancelled':
+    case 'unknown':
+      return event.lifecycle;
+    default:
+      return 'unknown';
+  }
+}
+
+function stableJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return '[' + value.map(stableJson).sort().join(',') + ']';
+  return '{' + Object.keys(value as object).sort().map((key) => JSON.stringify(key) + ':' + stableJson((value as Record<string, unknown>)[key])).join(',') + '}';
+}
+
+function makeTask(taskId: CoreTaskId | null, ref: CoreTaskRef | null, availability: TaskAvailability, reason: ApplicationTaskReason, priority: number, businessTime: number | null = null, identity: number | null = null): InternalTask {
   return {
     taskId,
     ref,
@@ -182,179 +196,244 @@ function taskFor(
     reason,
     reasonCode: reason,
     primary: false,
-    executable: availability === 'ready' || availability === 'waiting_confirmation' || availability === 'result_unknown',
+    executable: taskId !== null && ref !== null && (availability === 'ready' || availability === 'waiting_confirmation' || availability === 'result_unknown'),
     businessTime,
-    _priority: priority,
+    priority,
+    identity,
   };
 }
 
-/** Pure, deterministic application task resolution. */
+function taskKey(task: InternalTask): string {
+  return task.ref === null ? `blocker:${task.reason}` : [task.ref.taskId, task.ref.applicationId, task.ref.eventId, task.ref.resumeId, task.ref.storyId, task.ref.sourceId].join(':');
+}
+
+function compareTask(left: InternalTask, right: InternalTask): number {
+  const leftMissing = left.businessTime === null ? 1 : 0;
+  const rightMissing = right.businessTime === null ? 1 : 0;
+  if (leftMissing !== rightMissing) return leftMissing - rightMissing;
+  if (left.businessTime !== null && right.businessTime !== null && left.businessTime !== right.businessTime) return left.businessTime - right.businessTime;
+  const leftId = left.identity ?? Number.MAX_SAFE_INTEGER;
+  const rightId = right.identity ?? Number.MAX_SAFE_INTEGER;
+  return leftId - rightId || (left.taskId ?? '').localeCompare(right.taskId ?? '');
+}
+
+function parseRef(value: unknown): CoreTaskRef | null {
+  if (!isRecord(value)) return null;
+  const parsed = parseCoreTaskRef(value);
+  return parsed.ok ? parsed.ref : null;
+}
+
+function pendingRef(value: ApplicationTaskPending | null): CoreTaskRef | null {
+  if (!value) return null;
+  const direct = parseRef(value.ref);
+  if (direct) return direct;
+  const candidate: Record<string, unknown> = { taskId: value.taskId };
+  if (value.applicationId !== undefined) candidate.applicationId = value.applicationId;
+  if (value.eventId !== undefined) candidate.eventId = value.eventId;
+  return parseRef(candidate);
+}
+
+/** Resolves immutable, already-loaded facts into one canonical Application task surface. */
 export function resolveApplicationTasks(snapshot: FrozenApplicationTaskSnapshot, now: number): ApplicationTaskResolution {
   if (!Number.isFinite(now)) throw new RangeError('now must be finite');
-  const appSource = sourceView(snapshot.application);
-  const app = record(appSource.value);
-  const appId = app ? identity(app, 'id', 'applicationId', 'application_id') : null;
-  const appDeleted = Boolean(app?.deleted_at ?? app?.deleted ?? app?.is_deleted);
-  const appStale = Boolean(app?.stale ?? app?.source_mismatch ?? app?.identity_mismatch);
-  const tasks: Array<ApplicationTaskModel & { readonly _priority: number }> = [];
-  const add = (task: ApplicationTaskModel & { readonly _priority: number }) => {
-    if (appId === null) return;
-    if (tasks.some((item) => uniqueTaskKey(item) === uniqueTaskKey(task))) return;
+  const sources = {
+    application: readSource(snapshot?.application),
+    jd: readSource(snapshot?.jd),
+    events: readSource(snapshot?.events),
+    offers: readSource(snapshot?.offers),
+    materialKit: readSource(snapshot?.materialKit),
+    reviews: readSource(snapshot?.reviews),
+    fit: readSource(snapshot?.fit),
+    resume: readSource(snapshot?.resume),
+    pending: readSource(snapshot?.pending),
+    resultUnknown: readSource(snapshot?.resultUnknown),
+  };
+  const eventsMalformed = sources.events.state === 'ready' && !Array.isArray(sources.events.value);
+  const offersMalformed = sources.offers.state === 'ready' && !Array.isArray(sources.offers.value);
+  const reviewsMalformed = sources.reviews.state === 'ready' && !Array.isArray(sources.reviews.value);
+  const materialMalformed = sources.materialKit.state === 'ready' && sources.materialKit.value !== null && !isRecord(sources.materialKit.value);
+  const hasLoading = Object.values(sources).some((source) => source.state === 'loading');
+  const hasUnavailableSource = Object.values(sources).some((source) => source.state === 'error' || source.state === 'absent' || source.malformed)
+    || eventsMalformed || offersMalformed || reviewsMalformed || materialMalformed;
+  const application = isRecord(sources.application.value) ? sources.application.value : null;
+  const appId = safeId(application?.id);
+  const tasks: InternalTask[] = [];
+  const add = (task: InternalTask): void => {
+    if (tasks.some((item) => taskKey(item) === taskKey(task))) return;
     tasks.push(task);
   };
-
-  if (appId === null || appDeleted || appStale) {
-    if (appId !== null) add(taskFor('application.general_review', { taskId: 'application.general_review', applicationId: appId }, 'unavailable', appDeleted ? 'application_deleted' : 'source_mismatch', 99));
+  if (sources.application.state !== 'ready' || appId === null || application === null) {
+    const blockerReason: ApplicationTaskReason = sources.application.state === 'loading' ? 'source_loading' : sources.application.state === 'absent' ? 'source_absent' : 'source_error';
+    add(makeTask(null, null, sources.application.state === 'loading' ? 'loading' : 'unavailable', blockerReason, 1));
+  } else if (!isApplicationStatus(application.status)) {
+    add(makeTask(null, null, 'unavailable', 'source_error', 1));
+  } else if (application.deleted || application.deletedAt || application.stale || application.sourceMismatch) {
+    add(makeTask(null, null, 'unavailable', application.deleted || application.deletedAt ? 'application_deleted' : 'source_mismatch', 1));
   } else {
-    const jdSource = sourceView(snapshot.jd);
-    const resumeSource = sourceView(snapshot.resume);
-    const pendingSource = sourceView(snapshot.pending ?? snapshot.pendingAction);
-    const pending = record(pendingSource.value);
-    const pendingAppId = pending ? identity(pending, 'applicationId', 'application_id') : null;
-    const pendingStatus = pending?.status ?? pending?.attempt_status;
-    const resultUnknownSource = sourceView(snapshot.resultUnknown ?? snapshot.result_unknown);
-    const resultUnknown = record(resultUnknownSource.value);
-    const resultAppId = resultUnknown ? identity(resultUnknown, 'applicationId', 'application_id') : null;
-    const pendingTaskId = pending?.taskId ?? pending?.task_id;
-    const isTaskId = (value: unknown): value is CoreTaskId => typeof value === 'string' && value.startsWith('application.') && value !== 'application.interview_prepare' || value === 'application.interview_prepare';
-    if (pendingSource.state === 'ready' && pending && pendingAppId === appId && pendingStatus !== 'result_unknown' && pendingStatus !== 'unknown' && pendingStatus !== 'provider_unknown') {
-      const taskId = isTaskId(pendingTaskId) ? pendingTaskId : 'application.general_review';
-      add(taskFor(taskId, { taskId, applicationId: appId }, 'waiting_confirmation', 'pending_confirmation', 1));
-    } else if (pendingSource.state === 'ready' && pending && pendingAppId === appId && (pendingStatus === 'result_unknown' || pendingStatus === 'provider_unknown' || pendingStatus === 'unknown')) {
-      const taskId = isTaskId(pendingTaskId) ? pendingTaskId : 'application.general_review';
-      add(taskFor(taskId, { taskId, applicationId: appId }, 'result_unknown', 'result_unknown', 1));
-    } else if (resultUnknownSource.state === 'ready' && resultUnknown && resultAppId === appId) {
-      const taskId = isTaskId(resultUnknown.taskId) ? resultUnknown.taskId : 'application.general_review';
-      add(taskFor(taskId, { taskId, applicationId: appId }, 'result_unknown', 'result_unknown', 1));
-    } else if (pendingSource.state === 'ready' && pending && pendingAppId !== null && pendingAppId !== appId) {
-      add(taskFor('application.general_review', { taskId: 'application.general_review', applicationId: appId }, 'unavailable', 'foreign_pending', 99));
+    const appStatus = application.status;
+    const pending = sources.pending.state === 'ready' && isRecord(sources.pending.value) ? sources.pending.value as ApplicationTaskPending : null;
+    const unknown = sources.resultUnknown.state === 'ready' && isRecord(sources.resultUnknown.value) ? sources.resultUnknown.value as ApplicationTaskPending : null;
+    const pendingValue = pending ?? unknown;
+    const pendingKind = pending ? 'waiting_confirmation' : 'result_unknown';
+    const pendingSourceBlock = sources.pending.state !== 'ready' || sources.resultUnknown.state !== 'ready';
+    if (pendingValue) {
+      const ref = pendingRef(pendingValue);
+      const refApp = ref?.applicationId ?? null;
+      const eventValues = sources.events.state === 'ready' && Array.isArray(sources.events.value) ? sources.events.value : [];
+      const eventOwned = ref?.eventId === undefined || eventValues.some((item) => isRecord(item) && safeId(item.eventId) === ref.eventId && safeId(item.applicationId) === appId);
+      if (ref && refApp === appId && ref.taskId.startsWith('application.') && eventOwned) {
+        add(makeTask(ref.taskId, ref, pendingKind, pendingKind === 'waiting_confirmation' ? 'pending_confirmation' : 'result_unknown', 1, null, ref.eventId ?? ref.applicationId ?? null));
+      } else {
+        add(makeTask(null, null, 'unavailable', 'pending_identity_invalid', 1));
+      }
+    } else if (pendingSourceBlock) {
+      const sourceState = sources.pending.state !== 'ready' ? sources.pending : sources.resultUnknown;
+      add(makeTask(null, null, sourceState.state === 'loading' ? 'loading' : 'unavailable', sourceState.state === 'loading' ? 'source_loading' : sourceState.state === 'absent' ? 'source_absent' : 'source_error', 1));
     }
 
-    const eventsSource = sourceView(snapshot.events);
-    const events = eventsSource.state === 'ready' ? arrayValue(eventsSource.value) : [];
-    const reviewsSource = sourceView(snapshot.reviews ?? snapshot.fitReview);
-    const reviews = reviewsSource.state === 'ready' ? arrayValue(reviewsSource.value) : [];
-    const reviewedEventIds = new Set<number>();
-    let hasGeneralReview = false;
-    for (const item of reviews) {
-      const review = record(item);
-      if (!review) continue;
-      const reviewAppId = identity(review, 'applicationId', 'application_id');
-      if (reviewAppId !== appId) continue;
-      const eventId = identity(review, 'eventId', 'event_id', 'application_event_id');
-      if (eventId === null) hasGeneralReview = true;
-      else reviewedEventIds.add(eventId);
+    const reviews = sources.reviews.state === 'ready' && Array.isArray(sources.reviews.value) ? sources.reviews.value : [];
+    const reviewedEvents = new Set<number>();
+    let generalReview = false;
+    for (const raw of reviews) {
+      if (!isRecord(raw) || safeId(raw.applicationId) !== appId || raw.deleted || raw.stale || raw.sourceMismatch) continue;
+      const reviewEventId = raw.eventId === null ? null : safeId(raw.eventId);
+      if (reviewEventId === null) generalReview = true;
+      else reviewedEvents.add(reviewEventId);
     }
-    const validEvents: Array<{ item: Record<string, unknown>; id: number; lifecycle: EventLifecycleV1; start: number | null; end: number | null }> = [];
+    const events = sources.events.state === 'ready' && Array.isArray(sources.events.value) ? sources.events.value : [];
+    const eventById = new Map<number, ApplicationTaskEvent>();
+    const conflictIds = new Set<number>();
     for (const raw of events) {
-      const event = record(raw);
-      if (!event) continue;
-      const id = identity(event, 'eventId', 'event_id', 'id');
-      const owner = identity(event, 'applicationId', 'application_id');
-      if (id === null || owner !== appId) continue;
-      if (event.deleted_at || event.deleted || event.source_mismatch || event.sourceMismatch || event.identity_mismatch) {
-        const taskId: CoreTaskId = eventLifecycle(event) === 'completed' ? 'application.interview_review' : 'application.interview_prepare';
-        add(taskFor(taskId, { taskId, applicationId: appId, eventId: id }, 'unavailable', event.source_mismatch || event.sourceMismatch || event.identity_mismatch ? 'source_mismatch' : 'entity_deleted', 99));
+      if (!isRecord(raw)) continue;
+      const id = safeId(raw.eventId);
+      if (id === null || safeId(raw.applicationId) !== appId) continue;
+      const current = eventById.get(id);
+      if (current && stableJson(current) !== stableJson(raw)) {
+        add(makeTask(null, null, 'unavailable', 'duplicate_identity_conflict', 2, null, id));
+        conflictIds.add(id);
+        eventById.delete(id);
+      } else if (!current && !conflictIds.has(id)) {
+        eventById.set(id, raw as unknown as ApplicationTaskEvent);
+      }
+    }
+    for (const event of eventById.values()) {
+      const lifecycle = eventLifecycle(event);
+      if (lifecycle === 'unknown') {
+        add(makeTask(null, null, 'unavailable', 'event_contract_invalid', 2, null, event.eventId));
         continue;
       }
-      const lifecycle = eventLifecycle(event);
-      if (lifecycle === 'cancelled' || lifecycle === 'unknown') continue;
-      const start = event.scheduled_at_state === 'absent'
-        ? null
-        : finiteTime(event.scheduledAtTimestamp ?? event.scheduled_at ?? event.scheduledAt);
-      const duration = typeof event.duration_minutes === 'number' && Number.isInteger(event.duration_minutes) && event.duration_minutes > 0 && event.duration_minutes <= 10080 ? event.duration_minutes : null;
-      validEvents.push({ item: event, id, lifecycle, start, end: start !== null && duration !== null ? start + duration * 60_000 : null });
-    }
-    for (const event of validEvents) {
-      const preparationAvailable = event.item.preparation_available === true || event.item.preparationAvailable === true || event.item.primaryAction === 'prepare' || event.item.primaryAction === 'enter_preparation';
-      const within24h = event.start !== null
-        && ((event.start >= now && event.start - now <= 24 * 60 * 60_000)
-          || (event.lifecycle === 'in_progress' && event.end !== null && event.end >= now && now - event.start <= 24 * 60 * 60_000));
-      if ((event.lifecycle === 'scheduled' || event.lifecycle === 'in_progress') && preparationAvailable && within24h) {
-        const availability: TaskAvailability = jdSource.state === 'loading' || resumeSource.state === 'loading'
-          ? 'loading'
-          : jdSource.state === 'error' || resumeSource.state === 'error'
-            ? 'unavailable'
-            : jdSource.state === 'absent' ? 'blocked' : 'ready';
-        add(taskFor('application.interview_prepare', { taskId: 'application.interview_prepare', applicationId: appId, eventId: event.id }, availability, availability === 'loading' ? 'source_loading' : availability === 'unavailable' ? 'source_error' : 'interview_preparation_available', 2, event.start));
-      } else if (event.lifecycle === 'completed') {
-        add(taskFor('application.interview_review', { taskId: 'application.interview_review', applicationId: appId, eventId: event.id }, 'ready', reviewedEventIds.has(event.id) ? 'interview_review_available' : 'interview_review_missing', reviewedEventIds.has(event.id) ? 7 : 3, event.start));
+      if (lifecycle === 'cancelled') continue;
+      if (event.sourceMismatch || event.deleted || event.stale) {
+        add(makeTask(lifecycle === 'completed' ? 'application.interview_review' : 'application.interview_prepare', { taskId: lifecycle === 'completed' ? 'application.interview_review' : 'application.interview_prepare', applicationId: appId, eventId: event.eventId }, 'unavailable', event.deleted ? 'entity_deleted' : 'source_mismatch', 99, null, event.eventId));
+        continue;
+      }
+      const durationValid = typeof event.durationMinutes === 'number' && Number.isInteger(event.durationMinutes) && event.durationMinutes >= 1 && event.durationMinutes <= 10080;
+      const timeValid = typeof event.scheduledAtTimestamp === 'number' && Number.isFinite(event.scheduledAtTimestamp) && event.scheduledAtState !== 'absent';
+      const end = timeValid && durationValid ? event.scheduledAtTimestamp + event.durationMinutes * 60_000 : null;
+      if (lifecycle === 'completed') {
+        const availability = reviewsMalformed ? 'unavailable' : sources.reviews.state === 'ready' ? 'ready' : sources.reviews.state === 'loading' ? 'loading' : 'unavailable';
+        const reason = availability === 'ready' && reviewedEvents.has(event.eventId) ? 'interview_review_available' : 'interview_review_missing';
+        add(makeTask('application.interview_review', { taskId: 'application.interview_review', applicationId: appId, eventId: event.eventId }, availability, reason, reason === 'interview_review_missing' ? 3 : 7, timeValid ? event.scheduledAtTimestamp : null, event.eventId));
+      } else if (lifecycle === 'scheduled' || lifecycle === 'in_progress') {
+        if (event.scheduledAtState !== undefined && event.scheduledAtState !== 'present' && event.scheduledAtState !== 'absent') {
+          add(makeTask('application.interview_prepare', { taskId: 'application.interview_prepare', applicationId: appId, eventId: event.eventId }, 'unavailable', 'event_contract_invalid', 99, null, event.eventId));
+          continue;
+        }
+        if (event.bucket === 'needs_status_update') {
+          add(makeTask(null, null, 'unavailable', 'event_status_needs_update', 2, null, event.eventId));
+          continue;
+        }
+        const actionAllowed = event.primaryAction === 'prepare' || event.primaryAction === 'enter_preparation';
+        const inWindow = lifecycle === 'in_progress'
+          ? end !== null && now <= end
+          : timeValid && event.scheduledAtTimestamp > now && event.scheduledAtTimestamp - now <= 24 * 60 * 60_000;
+        if (event.bucket !== 'upcoming' && event.bucket !== 'unavailable') {
+          add(makeTask('application.interview_prepare', { taskId: 'application.interview_prepare', applicationId: appId, eventId: event.eventId }, 'unavailable', 'event_contract_invalid', 99, null, event.eventId));
+        } else if (event.bucket === 'upcoming' && actionAllowed && durationValid && timeValid && inWindow) {
+          add(makeTask('application.interview_prepare', { taskId: 'application.interview_prepare', applicationId: appId, eventId: event.eventId }, 'ready', 'interview_preparation_available', 2, event.scheduledAtTimestamp, event.eventId));
+        } else if (!durationValid || !timeValid || !actionAllowed || event.bucket === 'unavailable') {
+          add(makeTask('application.interview_prepare', { taskId: 'application.interview_prepare', applicationId: appId, eventId: event.eventId }, 'unavailable', 'event_contract_invalid', 99, null, event.eventId));
+        }
       }
     }
-    const materialSource = sourceView(snapshot.materialKit ?? snapshot.material_kit);
-    const material = record(materialSource.value);
-    const materialComplete = material?.complete === true || material?.is_complete === true || material?.status === 'complete' || material?.status === 'submitted' || material?.status === 'ready';
-    if (materialSource.state === 'ready' && material && !materialComplete) {
-      add(taskFor('application.material_kit', { taskId: 'application.material_kit', applicationId: appId }, 'ready', 'material_kit_incomplete', 4, finiteTime(material.updated_at)));
-    }
-    const offersSource = sourceView(snapshot.offers);
-    let hasOfferMismatch = false;
-    if (offersSource.state === 'ready') {
-      const offers = arrayValue(offersSource.value).map(record).filter((value): value is Record<string, unknown> => value !== null).filter((offer) => {
-        const owner = identity(offer, 'applicationId', 'application_id');
-        const unresolved = ['pending', 'negotiating'].includes(String(offer.status));
-        if (unresolved && owner !== null && owner !== appId) hasOfferMismatch = true;
-        return (owner === null || owner === appId) && unresolved;
-      });
-      if (offers.length > 0) {
-        const deadlines = offers.map((offer) => finiteTime(offer.deadline)).filter((value): value is number => value !== null);
-        add(taskFor('application.offer_review', { taskId: 'application.offer_review', applicationId: appId }, 'ready', 'offer_review_pending', 5, deadlines.length > 0 ? Math.min(...deadlines) : null));
-      }
-      else if (hasOfferMismatch) add(taskFor('application.offer_review', { taskId: 'application.offer_review', applicationId: appId }, 'unavailable', 'source_mismatch', 5));
-    }
-    const status = appStatus(app as Record<string, unknown>);
-    const stageEvent = validEvents.find((event) => {
-      const preparationAvailable = event.item.preparation_available === true || event.item.preparationAvailable === true || event.item.primaryAction === 'prepare' || event.item.primaryAction === 'enter_preparation';
-      const within24h = event.start !== null
-        && ((event.start >= now && event.start - now <= 24 * 60 * 60_000)
-          || (event.lifecycle === 'in_progress' && event.end !== null && event.end >= now && now - event.start <= 24 * 60 * 60_000));
-      return preparationAvailable && within24h;
-    });
-    const hasEventForStage = stageEvent !== undefined;
-    const stageTask: { id: CoreTaskId; reason: ApplicationTaskReason } | null = status === 'pending'
-      ? { id: 'application.opportunity_fit', reason: 'opportunity_fit' }
-      : status === 'applied' || status === 'written_test'
-        ? { id: 'application.material_kit', reason: 'material_kit_missing' }
-        : status === 'interview'
-        ? (hasEventForStage ? { id: 'application.interview_prepare', reason: 'interview_preparation_available' } : null)
-          : status === 'offer'
-            ? { id: 'application.offer_review', reason: 'offer_review_pending' }
-            : status === 'closed'
-              ? { id: 'application.record_outcome', reason: 'record_outcome' }
-              : null;
-    if (stageTask) {
-      const stageSourceLoading = (stageTask.id === 'application.interview_prepare' && eventsSource.state === 'loading')
-        || (stageTask.id === 'application.offer_review' && offersSource.state === 'loading')
-        || (stageTask.id === 'application.material_kit' && (materialSource.state === 'loading' || resumeSource.state === 'loading'));
-      const stageSourceError = (stageTask.id === 'application.interview_prepare' && eventsSource.state === 'error')
-        || (stageTask.id === 'application.offer_review' && (offersSource.state === 'error' || hasOfferMismatch))
-        || (stageTask.id === 'application.material_kit' && (materialSource.state === 'error' || resumeSource.state === 'error'));
-      const availability: TaskAvailability = stageSourceLoading || jdSource.state === 'loading' ? 'loading' : stageSourceError || jdSource.state === 'error' ? 'unavailable' : jdSource.state === 'absent' ? 'blocked' : 'ready';
-      const stageRef: CoreTaskRef = stageTask.id === 'application.interview_prepare' && stageEvent
-        ? { taskId: stageTask.id, applicationId: appId, eventId: stageEvent.id }
-        : { taskId: stageTask.id, applicationId: appId };
-      const materialAlreadyComplete = materialSource.state === 'ready' && material !== null && materialComplete;
-      if (!(stageTask.id === 'application.material_kit' && materialAlreadyComplete)) {
-        add(taskFor(stageTask.id, stageRef, availability, availability === 'loading' ? 'source_loading' : availability === 'unavailable' ? (jdSource.reason ?? 'source_error') : stageTask.reason, 6));
-      }
-    }
-    if (hasGeneralReview) add(taskFor('application.general_review', { taskId: 'application.general_review', applicationId: appId }, 'ready', 'general_review', 7));
-  }
 
-  const unique = new Map<string, ApplicationTaskModel & { readonly _priority: number }>();
-  for (const task of tasks) {
-    const existing = unique.get(uniqueTaskKey(task));
-    if (!existing || task._priority < existing._priority) unique.set(uniqueTaskKey(task), task);
+    const material = sources.materialKit.state === 'ready' && isRecord(sources.materialKit.value) ? sources.materialKit.value : null;
+    if (material) {
+      const materialOwner = safeId(material.applicationId);
+      if (materialOwner !== appId || material.deleted || material.stale || material.sourceMismatch) {
+        add(makeTask('application.material_kit', { taskId: 'application.material_kit', applicationId: appId }, 'unavailable', material.sourceMismatch || materialOwner !== appId ? 'source_mismatch' : 'entity_deleted', 99));
+      } else if (material.status !== 'draft' && material.status !== 'ready' && material.status !== 'submitted') {
+        add(makeTask('application.material_kit', { taskId: 'application.material_kit', applicationId: appId }, 'unavailable', 'source_mismatch', 99));
+      } else if (material.status !== 'submitted') {
+        add(makeTask('application.material_kit', { taskId: 'application.material_kit', applicationId: appId }, 'ready', 'material_kit_incomplete', 4, finiteTime(material.updatedAt), appId));
+      }
+    } else if (materialMalformed) {
+      add(makeTask('application.material_kit', { taskId: 'application.material_kit', applicationId: appId }, 'unavailable', 'source_error', 99));
+    }
+
+    let offerOwnerMismatch = false;
+    const offers = sources.offers.state === 'ready' && Array.isArray(sources.offers.value) ? sources.offers.value : [];
+    const unresolved: Array<{ offer: ApplicationTaskOffer; deadline: number | null }> = [];
+    for (const raw of offers) {
+      if (!isRecord(raw)) { offerOwnerMismatch = true; continue; }
+      const id = safeId(raw.id);
+      const owner = safeId(raw.applicationId);
+      const invalid = id === null || owner !== appId || raw.deleted || raw.stale || raw.sourceMismatch;
+      if (invalid) { offerOwnerMismatch = true; continue; }
+      if (raw.status !== 'pending' && raw.status !== 'negotiating' && raw.status !== 'accepted' && raw.status !== 'declined' && raw.status !== 'expired') { offerOwnerMismatch = true; continue; }
+      if (raw.status === 'pending' || raw.status === 'negotiating') unresolved.push({ offer: raw as unknown as ApplicationTaskOffer, deadline: finiteTime(raw.deadline) });
+    }
+    if (unresolved.length > 0) {
+      const ordered = [...unresolved].sort((a, b) => (a.deadline === null ? 1 : b.deadline === null ? -1 : a.deadline - b.deadline) || a.offer.id - b.offer.id);
+      add(makeTask('application.offer_review', { taskId: 'application.offer_review', applicationId: appId }, 'ready', 'offer_review_pending', 5, ordered[0].deadline, ordered[0].offer.id));
+    } else if (offerOwnerMismatch) {
+      add(makeTask('application.offer_review', { taskId: 'application.offer_review', applicationId: appId }, 'unavailable', 'source_mismatch', 5));
+    }
+
+    const jd = sources.jd;
+    const resume = sources.resume;
+    const dependencyAvailability = (required: readonly RuntimeSource[]): TaskAvailability => {
+      if (required.some((source) => source.state === 'loading')) return 'loading';
+      if (required.some((source) => source.state === 'error')) return 'unavailable';
+      if (required.some((source) => source.state === 'absent' || (source.state === 'ready' && source.value === null))) return 'blocked';
+      return 'ready';
+    };
+    if (appStatus === 'pending' && sources.fit.state !== 'ready') {
+      add(makeTask('application.opportunity_fit', { taskId: 'application.opportunity_fit', applicationId: appId }, sourceAvailability(sources.fit), sources.fit.state === 'loading' ? 'source_loading' : sources.fit.state === 'error' ? 'source_error' : 'source_absent', 6));
+    } else if (appStatus === 'pending' && sources.fit.state === 'ready' && sources.fit.value === null) {
+      add(makeTask('application.opportunity_fit', { taskId: 'application.opportunity_fit', applicationId: appId }, dependencyAvailability([jd, resume]), 'opportunity_fit', 6));
+    }
+    const materialExists = material !== null;
+    if ((appStatus === 'applied' || appStatus === 'written_test') && !materialExists && sources.materialKit.state === 'ready' && !materialMalformed) {
+      add(makeTask('application.material_kit', { taskId: 'application.material_kit', applicationId: appId }, dependencyAvailability([jd, resume]), 'material_kit_missing', 6));
+    }
+    if (appStatus === 'offer' && (sources.offers.state !== 'ready' || offersMalformed)) {
+      add(makeTask('application.offer_review', { taskId: 'application.offer_review', applicationId: appId }, offersMalformed ? 'unavailable' : sourceAvailability(sources.offers, 'unavailable'), offersMalformed ? 'source_error' : sources.offers.state === 'loading' ? 'source_loading' : sources.offers.state === 'error' ? 'source_error' : 'source_absent', 6));
+    } else if (appStatus === 'offer' && sources.offers.state === 'ready' && !offersMalformed && !offerOwnerMismatch && unresolved.length === 0) {
+      add(makeTask('application.offer_review', { taskId: 'application.offer_review', applicationId: appId }, 'ready', 'offer_review_pending', 6));
+    }
+    if (appStatus === 'closed') add(makeTask('application.record_outcome', { taskId: 'application.record_outcome', applicationId: appId }, 'ready', 'record_outcome', 6, null, appId));
+    if (generalReview && sources.reviews.state === 'ready') add(makeTask('application.general_review', { taskId: 'application.general_review', applicationId: appId }, 'ready', 'general_review', 7, null, appId));
+    if ((sources.events.state !== 'ready' || eventsMalformed) && appStatus === 'interview') add(makeTask(null, null, sources.events.state === 'loading' ? 'loading' : 'unavailable', sources.events.state === 'loading' ? 'source_loading' : sources.events.state === 'absent' ? 'source_absent' : 'source_error', 2));
+    if ((sources.reviews.state !== 'ready' || reviewsMalformed) && events.some((item) => isRecord(item) && item.lifecycle === 'completed')) add(makeTask(null, null, sources.reviews.state === 'loading' ? 'loading' : 'unavailable', sources.reviews.state === 'loading' ? 'source_loading' : sources.reviews.state === 'absent' ? 'source_absent' : 'source_error', 3));
   }
-  const ordered = [...unique.values()].sort((a, b) => a._priority - b._priority || compareTasks(a, b));
-  const firstExecutable = ordered.find((task) => task.executable && task.availability !== 'loading' && task.availability !== 'unavailable' && task.availability !== 'blocked') ?? null;
-  const frozenTasks = ordered.map((task) => freezeTask({
+  const deduped = new Map<string, InternalTask>();
+  for (const task of tasks) {
+    const key = taskKey(task);
+    const existing = deduped.get(key);
+    if (!existing || task.priority < existing.priority) deduped.set(key, task);
+  }
+  const ordered = [...deduped.values()].sort((a, b) => a.priority - b.priority || compareTask(a, b));
+  const first = ordered.find((task) => task.executable);
+  const blocking = ordered.find((task) => !task.executable);
+  const primaryInternal = first && (!blocking || blocking.priority > first.priority) ? first : null;
+  const frozenTasks = ordered.map((task) => Object.freeze({
     taskId: task.taskId,
-    ref: task.ref,
+    ref: task.ref === null ? null : Object.freeze({ ...task.ref }),
     availability: task.availability,
     reason: task.reason,
     reasonCode: task.reasonCode,
-    primary: task === firstExecutable,
+    primary: task === primaryInternal,
     executable: task.executable,
     businessTime: task.businessTime,
   }));
@@ -363,8 +442,8 @@ export function resolveApplicationTasks(snapshot: FrozenApplicationTaskSnapshot,
     tasks: Object.freeze(frozenTasks),
     primaryTask,
     primary: primaryTask,
-    hasExecutableTask: firstExecutable !== null,
-    hasLoading: frozenTasks.some((task) => task.availability === 'loading'),
-    hasUnavailable: frozenTasks.some((task) => task.availability === 'unavailable'),
+    hasExecutableTask: primaryTask !== null,
+    hasLoading,
+    hasUnavailable: hasUnavailableSource || frozenTasks.some((task) => task.availability === 'unavailable' || task.availability === 'blocked'),
   });
 }

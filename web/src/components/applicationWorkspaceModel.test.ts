@@ -32,4 +32,8 @@ describe('application stage workspace model', () => {
       action: 'interview-prepare',
     });
   });
+
+  it.each(['cancelled', 'unknown'] as const)('does not expose preparation for a %s event', (lifecycle) => {
+    expect(getApplicationWorkspaceStage('interview', { lifecycle })).toMatchObject({ action: 'none' });
+  });
 });

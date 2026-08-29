@@ -4,7 +4,7 @@ import type { EventLifecycleV1 } from '@/features/interviewEvents/eventLifecycle
 export interface ApplicationWorkspaceStage {
   label: '准备投递' | '已投递' | '笔试' | '已约面试' | '面试结束' | '已获 Offer' | '已结束';
   primaryActionLabel: string;
-  action: 'materials' | 'followup' | 'written-test' | 'interview-prepare' | 'interview-review' | 'offer' | 'outcome';
+  action: 'materials' | 'followup' | 'written-test' | 'interview-prepare' | 'interview-review' | 'offer' | 'outcome' | 'none';
 }
 
 export function getApplicationWorkspaceStage(
@@ -19,6 +19,9 @@ export function getApplicationWorkspaceStage(
     case 'written_test':
       return { label: '笔试', primaryActionLabel: '准备笔试', action: 'written-test' };
     case 'interview':
+      if (options.lifecycle === 'cancelled' || options.lifecycle === 'unknown') {
+        return { label: '已约面试', primaryActionLabel: '暂无可用操作', action: 'none' };
+      }
       return (options.lifecycle === 'completed' || (options.lifecycle === undefined && options.hasCompletedInterview === true))
         ? {
             label: '面试结束',

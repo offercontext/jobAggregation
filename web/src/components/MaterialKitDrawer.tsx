@@ -53,6 +53,7 @@ import { ConfirmationPanel } from './ui/ConfirmationPanel';
 import { SourceStateTag } from './ui/SourceStateTag';
 import styles from './MaterialKitDrawer.module.css';
 import { getMaterialKitStatusForSave } from './materialKitStatus';
+import { projectMaterialKitSurface } from '@/features/materialSurfaces/materialKitSurface';
 import {
   isMaterialFlowSourceConflict,
   MATERIAL_FLOW_COPY,
@@ -69,6 +70,10 @@ interface Props {
   initialResumeID?: number;
   initialJdSnapshot?: string;
   initialJdVersionID?: number;
+  /** Owner/controller state may outlive this view while a write is pending. */
+  pendingState?: 'none' | 'pending' | 'unknown' | 'result_unknown';
+  resultUnknown?: boolean;
+  sourceConflict?: boolean;
 }
 
 interface GenerateVariables {
@@ -201,7 +206,17 @@ function validateProposalAssertions(raw: string): ProposalAssertionsValidation {
   return { values, error: null };
 }
 
-export default function MaterialKitDrawer({ application, open, onClose, initialResumeID, initialJdSnapshot, initialJdVersionID }: Props) {
+export default function MaterialKitDrawer({
+  application,
+  open,
+  onClose,
+  initialResumeID,
+  initialJdSnapshot,
+  initialJdVersionID,
+  pendingState: externalPendingState,
+  resultUnknown: externalResultUnknown = false,
+  sourceConflict: externalSourceConflict = false,
+}: Props) {
   const { message } = AntApp.useApp();
   const queryClient = useQueryClient();
   const applicationID = application?.id;
@@ -219,6 +234,7 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
   };
   const [status, setStatus] = useState<EditableMaterialKitStatus>('draft');
   const [content, setContent] = useState<MaterialKitContent>(() => createDefaultContent());
+  const [draftDirty, setDraftDirty] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [confirmationOpen, setConfirmationOpen] = useState(false);
   const [confirmationKey, setConfirmationKey] = useState<string | null>(null);
@@ -226,6 +242,8 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
   const [confirmationError, setConfirmationError] = useState<string | null>(null);
   const [confirmationRefreshing, setConfirmationRefreshing] = useState(false);
   const [confirmationPreviewValid, setConfirmationPreviewValid] = useState(true);
+  const [confirmationResultUnknown, setConfirmationResultUnknown] = useState(false);
+  const [confirmationSourceConflict, setConfirmationSourceConflict] = useState(false);
   const [evidenceDetailOpen, setEvidenceDetailOpen] = useState(false);
   const [evidenceDetail, setEvidenceDetail] = useState<EvidenceBundleDetail | null>(null);
   const [evidenceDetailError, setEvidenceDetailError] = useState<string | null>(null);
@@ -248,6 +266,7 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
     setJdVersionID(initialJdVersionID);
     setStatus('draft');
     setContent(createDefaultContent());
+    setDraftDirty(false);
     setActionError(null);
     setConfirmationOpen(false);
     setConfirmationKey(null);
@@ -255,6 +274,8 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
     setConfirmationError(null);
     setConfirmationRefreshing(false);
     setConfirmationPreviewValid(true);
+    setConfirmationResultUnknown(false);
+    setConfirmationSourceConflict(false);
     setEvidenceDetailOpen(false);
     setEvidenceDetail(null);
     setEvidenceDetailError(null);
@@ -273,6 +294,7 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
     setJdVersionID(kit.jd_version_id);
     setStatus(kit.status === 'submitted' ? 'draft' : kit.status);
     setContent(cloneContent(kit.content));
+    setDraftDirty(false);
     setActionError(null);
   };
 
@@ -361,6 +383,7 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
     setJdVersionID(undefined);
     setStatus('draft');
     setContent(createDefaultContent());
+    setDraftDirty(false);
     setActionError(getErrorMessage(kitQuery.error));
   }, [application?.notes, kitQuery.error, kitQuery.isError]);
 
@@ -443,6 +466,8 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
 
       if (result.isSuccess && result.data.ready) {
         setConfirmationPreviewValid(true);
+        setConfirmationResultUnknown(false);
+        setConfirmationSourceConflict(false);
         blockedPreviewUpdatedAtRef.current = null;
         return;
       }
@@ -475,6 +500,8 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
       setConfirmationError(null);
       setConfirmationRefreshing(false);
       setConfirmationPreviewValid(true);
+      setConfirmationResultUnknown(false);
+      setConfirmationSourceConflict(false);
       confirmationSessionRef.current = null;
       blockedPreviewUpdatedAtRef.current = null;
       message.success('本次投递记录已保存');
@@ -485,11 +512,14 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
       if (isMaterialFlowSourceConflict(error)) {
         setConfirmationError(getErrorMessage(error, 'confirmation'));
         setConfirmationPreviewValid(false);
+        setConfirmationResultUnknown(false);
+        setConfirmationSourceConflict(true);
         blockedPreviewUpdatedAtRef.current = evidencePreviewQuery.dataUpdatedAt;
         void refreshEvidencePreview(variables.applicationID, variables.sessionID);
         return;
       }
 
+      setConfirmationResultUnknown(true);
       setConfirmationError(getErrorMessage(error, 'confirmation'));
     },
   });
@@ -501,14 +531,60 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
 
   const canSave = Boolean(existingKit && applicationID && existingKit.application_id === applicationID);
   const legacySubmitted = existingKit?.status === 'submitted';
-  const canConfirm = Boolean(canSave);
+  const canConfirm = Boolean(canSave && !legacySubmitted);
   const displayedStatus: MaterialKitStatus = legacySubmitted ? 'submitted' : status;
-  const generateDisabled = !applicationID || !resumeID || !jdVersionID || !jdSnapshot.trim();
-  const proposalDisabled = !applicationID || !existingKit || existingKit.application_id !== applicationID || !resumeID || !jdVersionID || !jdSnapshot.trim();
+  const generateDisabled = legacySubmitted || !applicationID || !resumeID || !jdVersionID || !jdSnapshot.trim();
+  const proposalDisabled = legacySubmitted || !applicationID || !existingKit || existingKit.application_id !== applicationID || !resumeID || !jdVersionID || !jdSnapshot.trim();
   const busy = kitQuery.isFetching || generateMutation.isPending || saveMutation.isPending || proposalMutation.isPending || confirmMutation.isPending || confirmationRefreshing;
 
+  const materialSurface = projectMaterialKitSurface({
+    applicationId: applicationID ?? 0,
+    jd: applicationID && jdVersionID && jdSnapshot.trim()
+      ? { status: 'ready', value: { id: jdVersionID, text: jdSnapshot } }
+      : { status: 'absent', value: null },
+    resumes: resumesQuery.isFetching && !resumesQuery.data
+      ? { status: 'loading', value: null }
+      : resumesQuery.isError
+        ? { status: 'error', value: null }
+        : { status: 'ready', value: resumesQuery.data || [] },
+    materialKit: kitQuery.isFetching && !kitQuery.data
+      ? { status: 'loading', value: null }
+      : kitQuery.isError
+        ? { status: 'error', value: null }
+        : { status: 'ready', value: kitQuery.data || null },
+    selectedResumeId: resumeID,
+    draftDirty,
+    pendingState: externalPendingState
+      ?? (confirmMutation.isPending || confirmationOpen
+        ? 'pending'
+        : confirmationResultUnknown
+          ? 'result_unknown'
+          : 'none'),
+    resultUnknown: externalResultUnknown,
+    sourceConflict: externalSourceConflict || confirmationSourceConflict,
+  });
+
+  const fallbackSurfaceAction = materialSurface.primaryAction.id === 'open_jd'
+    || materialSurface.primaryAction.id === 'select_resume'
+    || materialSurface.primaryAction.id === 'resolve';
+  const handleSurfaceFallbackAction = () => {
+    switch (materialSurface.primaryAction.id) {
+      case 'open_jd':
+        onClose();
+        break;
+      case 'select_resume':
+        document.getElementById('material-kit-resume-select')?.focus();
+        break;
+      case 'resolve':
+        setActionError('请根据当前提示确认材料状态后再继续');
+        break;
+      default:
+        break;
+    }
+  };
+
   const handleGenerate = () => {
-    if (!applicationID || !resumeID || !jdVersionID || !jdSnapshot.trim()) return;
+    if (legacySubmitted || !applicationID || !resumeID || !jdVersionID || !jdSnapshot.trim()) return;
 
     generateMutation.mutate({
       applicationID,
@@ -519,7 +595,7 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
   };
 
   const handleSave = () => {
-    if (!existingKit || !applicationID || existingKit.application_id !== applicationID) return;
+    if (legacySubmitted || !existingKit || !applicationID || existingKit.application_id !== applicationID) return;
 
     saveMutation.mutate({
       applicationID,
@@ -634,6 +710,7 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
     key: K,
     value: MaterialKitContent['resume_advice'][K],
   ) => {
+    setDraftDirty(true);
     setContent((prev) => ({
       ...prev,
       resume_advice: {
@@ -644,6 +721,7 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
   };
 
   const updateMessage = (index: number, patch: Partial<MaterialKitMessage>) => {
+    setDraftDirty(true);
     setContent((prev) => ({
       ...prev,
       messages: prev.messages.map((item, itemIndex) => (itemIndex === index ? { ...item, ...patch } : item)),
@@ -651,6 +729,7 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
   };
 
   const updateChecklist = (id: string, patch: Partial<MaterialKitChecklistItem>) => {
+    setDraftDirty(true);
     setContent((prev) => ({
       ...prev,
       checklist: prev.checklist.map((item) => (item.id === id ? { ...item, ...patch } : item)),
@@ -688,6 +767,7 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
 
   return (
     <section className={styles.workspace} aria-label={MATERIAL_FLOW_COPY.drawer.materialKitTitle}>
+      <div data-testid="material-kit-surface-state" data-state={materialSurface.state} hidden />
       <div className={styles.workspaceHeader}>
         <Button type="link" icon={<ArrowLeftOutlined />} className={styles.backButton} onClick={onClose}>
           返回投递详情
@@ -713,12 +793,16 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
             <Form layout="vertical" className={styles.contextForm}>
               <Form.Item label="简历版本" required>
                 <Select
+                  id="material-kit-resume-select"
                   placeholder="选择本次实际使用的简历版本"
                   value={resumeID}
-                  onChange={setResumeID}
+                  onChange={(value: number | undefined) => {
+                    setResumeID(value);
+                    setDraftDirty(true);
+                  }}
                   options={resumeOptions}
                   loading={resumesQuery.isFetching}
-                  disabled={!open || resumesQuery.isFetching}
+                  disabled={!open || resumesQuery.isFetching || legacySubmitted}
                   showSearch
                   optionFilterProp="label"
                 />
@@ -732,7 +816,7 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
                   onChange={(event) => setJdSnapshot(event.target.value)}
                   placeholder="粘贴岗位 JD，或使用投递备注作为默认内容"
                   rows={8}
-                  disabled={!application}
+                  disabled={!application || legacySubmitted}
                 />
               </Form.Item>
 
@@ -742,7 +826,7 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
                   onChange={(event) => setProposalAssertions(event.target.value)}
                   placeholder={MATERIAL_FLOW_COPY.drawer.candidateFactsPlaceholder}
                   rows={4}
-                  disabled={!application}
+                  disabled={!application || legacySubmitted}
                 />
                 {proposalAssertionsValidation.error ? (
                   <Typography.Text type="danger">{proposalAssertionsValidation.error}</Typography.Text>
@@ -752,9 +836,12 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
               <Form.Item label="材料状态">
                 <Select
                   value={legacySubmitted ? undefined : status}
-                  onChange={(nextStatus: EditableMaterialKitStatus) => setStatus(nextStatus)}
+                  onChange={(nextStatus: EditableMaterialKitStatus) => {
+                    setStatus(nextStatus);
+                    setDraftDirty(true);
+                  }}
                   options={EDITABLE_STATUS_OPTIONS}
-                  disabled={!canSave || legacySubmitted}
+                disabled={!canSave || legacySubmitted}
                 />
               </Form.Item>
             </Form>
@@ -782,19 +869,24 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
 
             <Space className={styles.actionBar}>
               <Button
-                type="primary"
+                type={fallbackSurfaceAction || materialSurface.primaryAction.id === 'generate' ? 'primary' : 'default'}
+                data-material-primary={fallbackSurfaceAction || materialSurface.primaryAction.id === 'generate' ? 'true' : undefined}
                 icon={<ReloadOutlined />}
-                onClick={handleGenerate}
+                onClick={fallbackSurfaceAction ? handleSurfaceFallbackAction : handleGenerate}
                 loading={generateMutation.isPending}
-                disabled={generateDisabled || busy}
+                disabled={materialSurface.primaryAction.id === 'none' || (!fallbackSurfaceAction && (generateDisabled || busy))}
               >
-                生成材料包
+                {materialSurface.primaryAction.id === 'generate' || !fallbackSurfaceAction
+                  ? '生成材料包'
+                  : materialSurface.primaryAction.label}
               </Button>
               <Button
+                type={materialSurface.primaryAction.id === 'save' ? 'primary' : 'default'}
+                data-material-primary={materialSurface.primaryAction.id === 'save' ? 'true' : undefined}
                 icon={<SaveOutlined />}
                 onClick={handleSave}
                 loading={saveMutation.isPending}
-                disabled={!canSave || busy}
+                disabled={!canSave || legacySubmitted || busy}
               >
                 保存
               </Button>
@@ -806,8 +898,22 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
                 {MATERIAL_FLOW_COPY.drawer.generateProposal}
               </Button>
               {canConfirm ? (
-                <Button type="primary" onClick={openConfirmation} disabled={busy}>
+                <Button
+                  type={materialSurface.primaryAction.id === 'record_submission' || materialSurface.primaryAction.id === 'confirm' ? 'primary' : 'default'}
+                  data-material-primary={materialSurface.primaryAction.id === 'record_submission' || materialSurface.primaryAction.id === 'confirm' ? 'true' : undefined}
+                  onClick={openConfirmation}
+                  disabled={busy}
+                >
                   确认已投递
+                </Button>
+              ) : null}
+              {materialSurface.primaryAction.id === 'view_submission' ? (
+                <Button
+                  type="primary"
+                  data-material-primary="true"
+                  onClick={() => document.querySelector('[data-testid="evidence-history"]')?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
+                >
+                  查看本次投递记录
                 </Button>
               ) : null}
             </Space>
@@ -842,10 +948,6 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
                         <Typography.Text className={styles.evidenceTime}>投递（本地）：{formatEvidenceTimestamp(entry.submitted_at)}</Typography.Text>
                         <Typography.Text className={styles.evidenceTime}>确认（本地）：{formatEvidenceTimestamp(entry.confirmed_at)}</Typography.Text>
                         <Typography.Text className={styles.evidenceTime}>确认方式：{formatConfirmationKind(entry.confirmation_kind)}</Typography.Text>
-                        <details>
-                          <summary>高级信息</summary>
-                          <Typography.Text className={styles.evidenceHash}>{entry.bundle_sha256}</Typography.Text>
-                        </details>
                         <Button
                           className={styles.evidenceDetailButton}
                           size="small"
@@ -889,6 +991,7 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
                         value={content.resume_advice.summary}
                         onChange={(event) => updateAdvice('summary', event.target.value)}
                         rows={3}
+                        disabled={legacySubmitted}
                       />
                     </Form.Item>
                     <Form.Item label="匹配亮点">
@@ -897,6 +1000,7 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
                         onChange={(event) => updateAdvice('highlights', textToLines(event.target.value))}
                         rows={4}
                         placeholder="每行一条亮点"
+                        disabled={legacySubmitted}
                       />
                     </Form.Item>
                     <Form.Item label="建议改写的要点">
@@ -905,6 +1009,7 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
                         onChange={(event) => updateAdvice('rewrite_bullets', textToLines(event.target.value))}
                         rows={4}
                         placeholder="每行一条改写建议"
+                        disabled={legacySubmitted}
                       />
                     </Form.Item>
                     <Form.Item label="风险缺口">
@@ -913,6 +1018,7 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
                         onChange={(event) => updateAdvice('gaps', textToLines(event.target.value))}
                         rows={3}
                         placeholder="每行一个待补强点"
+                        disabled={legacySubmitted}
                       />
                     </Form.Item>
                     <Form.Item label="备注">
@@ -920,6 +1026,7 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
                         value={content.resume_advice.notes}
                         onChange={(event) => updateAdvice('notes', event.target.value)}
                         rows={3}
+                        disabled={legacySubmitted}
                       />
                     </Form.Item>
                   </Form>
@@ -937,11 +1044,12 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
                             value={item.title}
                             onChange={(event) => updateMessage(index, { title: event.target.value })}
                             className={styles.messageTitleInput}
+                            disabled={legacySubmitted}
                           />
                           <Button
                             icon={<CopyOutlined />}
-                            onClick={() => copyMessageBody(item.body)}
-                            disabled={!item.body.trim()}
+                          onClick={() => copyMessageBody(item.body)}
+                            disabled={legacySubmitted || !item.body.trim()}
                           >
                             复制
                           </Button>
@@ -951,12 +1059,14 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
                           onChange={(event) => updateMessage(index, { body: event.target.value })}
                           rows={5}
                           placeholder="填写可直接发送的正文"
+                          disabled={legacySubmitted}
                         />
                         <Input.TextArea
                           value={item.notes}
                           onChange={(event) => updateMessage(index, { notes: event.target.value })}
                           rows={2}
                           placeholder="内部备注"
+                          disabled={legacySubmitted}
                         />
                       </div>
                     ))}
@@ -974,11 +1084,13 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
                           checked={item.done}
                           aria-label={`${item.done ? '取消完成' : '标记完成'}：${item.label}`}
                           onChange={(event) => updateChecklist(item.id, { done: event.target.checked })}
+                          disabled={legacySubmitted}
                         />
                         <Input
                           value={item.label}
                           onChange={(event) => updateChecklist(item.id, { label: event.target.value })}
                           bordered={false}
+                          disabled={legacySubmitted}
                         />
                       </div>
                     ))}
@@ -1050,23 +1162,7 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
               </div>
               <Typography.Text>简历：{confirmationPreview.sources.resume.title}</Typography.Text>
               <Typography.Text>JD：{confirmationPreview.sources.jd.characters} 字符</Typography.Text>
-              <details>
-                <summary>高级信息</summary>
-                <div className={styles.sourceRow}>
-                  <Typography.Text>简历版本摘要：{confirmationPreview.sources.resume.sha256}</Typography.Text>
-                </div>
-                <div className={styles.sourceRow}>
-                  <Typography.Text>JD 摘要：{confirmationPreview.sources.jd.sha256}</Typography.Text>
-                </div>
-                <div className={styles.sourceRow}>
-                  <Typography.Text>投递准备编号：#{confirmationPreview.sources.material_kit.id}</Typography.Text>
-                  <Typography.Text className={styles.evidenceHash}>{confirmationPreview.sources.material_kit.sha256}</Typography.Text>
-                </div>
-                <div className={styles.bundleHash}>
-                  <Typography.Text>本次记录摘要</Typography.Text>
-                  <Typography.Text className={styles.evidenceHash}>{confirmationPreview.bundle_sha256}</Typography.Text>
-                </div>
-              </details>
+              <Typography.Text>来源已通过当前材料校验。</Typography.Text>
             </div>
           ) : (
             <div className={styles.previewIssues}>
@@ -1125,11 +1221,6 @@ export default function MaterialKitDrawer({ application, open, onClose, initialR
                 <Typography.Text className={styles.evidenceTime}>确认（本地）：{formatEvidenceTimestamp(evidenceDetail.confirmed_at)}</Typography.Text>
                 <Typography.Text className={styles.evidenceTime}>确认方式：{formatConfirmationKind(evidenceDetail.confirmation_kind)}</Typography.Text>
               </div>
-              <details>
-                <summary>高级信息</summary>
-                <Typography.Text className={styles.evidenceHash}>{evidenceDetail.bundle_sha256}</Typography.Text>
-                <pre className={styles.evidenceSnapshot}>{JSON.stringify(evidenceDetail.snapshot, null, 2)}</pre>
-              </details>
             </>
           ) : null}
         </div>

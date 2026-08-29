@@ -10,6 +10,8 @@ describe('material flow error copy', () => {
     expect(MATERIAL_FLOW_COPY.drawer.materialKitTitle).toBe('投递准备');
     expect(MATERIAL_FLOW_COPY.drawer.evidenceHistoryTitle).toBe('本次投递记录');
     expect(materialEvidenceSourceLabel('evidence_bundle')).toBe('本次投递记录');
+    expect(MATERIAL_FLOW_COPY.surface.readyUnsubmitted).toBe('记录已投递');
+    expect(MATERIAL_FLOW_COPY.surface.submitted).toBe('查看本次投递记录');
   });
 
   it('uses a neutral message for a general HTTP 409', () => {

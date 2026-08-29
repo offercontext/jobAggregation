@@ -1,32 +1,60 @@
+export type MaterialKitHandoffSource =
+  | 'interview_event_card'
+  | 'application_task'
+  | 'pilot'
+  | 'deep_link';
+
+export interface MaterialKitHandoffHints {
+  readonly suggestedResumeId?: number;
+  readonly suggestedJdVersionId?: number;
+}
+
 export interface MaterialKitHandoff {
   readonly applicationId: number;
-  readonly resumeId: number;
-  readonly jdText: string;
-  readonly jdVersionId: number;
+  readonly hints?: MaterialKitHandoffHints;
+  readonly source: MaterialKitHandoffSource;
 }
 
-function cloneAndFreeze<T>(value: T): T {
-  if (value && typeof value === 'object') {
-    Object.freeze(value);
-    for (const child of Object.values(value as Record<string, unknown>)) {
-      cloneAndFreeze(child);
-    }
-  }
-  return value;
+/** Input is intentionally opaque so legacy callers cannot make raw source data part of the contract. */
+export type MaterialKitHandoffInput = unknown;
+
+function validId(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
 }
 
-function freezeHandoff(value: MaterialKitHandoff): MaterialKitHandoff {
-  const copy: MaterialKitHandoff = {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function readHint(record: Record<string, unknown>, key: string): number | undefined {
+  const value = record[key];
+  return validId(value) ? value : undefined;
+}
+
+function normalizeHandoff(value: MaterialKitHandoffInput): MaterialKitHandoff | null {
+  if (!isRecord(value) || !validId(value.applicationId)) return null;
+
+  if (value.source !== 'interview_event_card'
+    && value.source !== 'application_task'
+    && value.source !== 'pilot'
+    && value.source !== 'deep_link') return null;
+
+  const rawHints = isRecord(value.hints) ? value.hints : {};
+  const suggestedResumeId = readHint(rawHints, 'suggestedResumeId');
+  const suggestedJdVersionId = readHint(rawHints, 'suggestedJdVersionId');
+  const normalizedHints: { suggestedResumeId?: number; suggestedJdVersionId?: number } = {};
+  if (suggestedResumeId !== undefined) normalizedHints.suggestedResumeId = suggestedResumeId;
+  if (suggestedJdVersionId !== undefined) normalizedHints.suggestedJdVersionId = suggestedJdVersionId;
+  const hints = Object.keys(normalizedHints).length === 0 ? undefined : Object.freeze(normalizedHints);
+  return Object.freeze({
     applicationId: value.applicationId,
-    resumeId: value.resumeId,
-    jdText: value.jdText,
-    jdVersionId: value.jdVersionId,
-  };
-  return cloneAndFreeze(copy);
+    ...(hints ? { hints } : {}),
+    source: value.source,
+  });
 }
 
 export interface MaterialKitHandoffStore {
-  write: (handoff: MaterialKitHandoff) => void;
+  write: (handoff: MaterialKitHandoffInput) => void;
   consumeMaterialKitHandoff: (applicationId: number) => MaterialKitHandoff | null;
   discardMaterialKitHandoff: (applicationId: number) => boolean;
   clear: () => void;
@@ -35,8 +63,16 @@ export interface MaterialKitHandoffStore {
 export function createMaterialKitHandoffStore(): MaterialKitHandoffStore {
   let pending: MaterialKitHandoff | null = null;
   return {
-    write: (handoff) => {
-      pending = freezeHandoff(handoff);
+    write: (value) => {
+      let normalized: MaterialKitHandoff | null = null;
+      try {
+        normalized = normalizeHandoff(value);
+      } catch {
+        normalized = null;
+      }
+      // An invalid handoff must not leave a stale launch target armed. This is
+      // especially important when a caller switches application context.
+      pending = normalized;
     },
     consumeMaterialKitHandoff: (applicationId) => {
       if (!pending || pending.applicationId !== applicationId) return null;

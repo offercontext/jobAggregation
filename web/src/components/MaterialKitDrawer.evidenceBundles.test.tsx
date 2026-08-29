@@ -207,7 +207,13 @@ function materialKit(status: MaterialKitViewModel['status'] = 'ready'): Material
 let container: HTMLDivElement | undefined;
 let root: Root | undefined;
 
-function render(nextApplication: Application = application) {
+type SurfaceProps = {
+  pendingState?: 'none' | 'pending' | 'unknown' | 'result_unknown';
+  resultUnknown?: boolean;
+  sourceConflict?: boolean;
+};
+
+function render(nextApplication: Application = application, surfaceProps: SurfaceProps = {}) {
   container = document.createElement('div');
   document.body.appendChild(container);
   root = createRoot(container);
@@ -218,12 +224,13 @@ function render(nextApplication: Application = application) {
       onClose={vi.fn()}
       initialJdSnapshot="Build services"
       initialJdVersionID={1}
+      {...surfaceProps}
     />,
   ));
   return container;
 }
 
-function rerender(nextApplication: Application) {
+function rerender(nextApplication: Application, surfaceProps: SurfaceProps = {}) {
   act(() => root?.render(
     <MaterialKitDrawer
       application={nextApplication}
@@ -231,6 +238,7 @@ function rerender(nextApplication: Application) {
       onClose={vi.fn()}
       initialJdSnapshot="Build services"
       initialJdVersionID={1}
+      {...surfaceProps}
     />,
   ));
 }
@@ -307,12 +315,14 @@ afterEach(() => {
 });
 
 describe('MaterialKitDrawer evidence confirmation', () => {
-  it('keeps hashes and internal identifiers behind the advanced information disclosure', () => {
-    expect(drawerSource).toContain('<summary>高级信息</summary>');
+  it('keeps hashes and internal identifiers out of the user-facing material surface', () => {
     expect(drawerSource).toContain('本次投递记录');
     expect(drawerSource).toContain('选择本次实际使用的简历版本');
     expect(drawerSource).not.toContain('选择最匹配的简历版本');
     expect(drawerSource).not.toContain('投递材料包</Typography.Title>');
+    expect(drawerSource).not.toContain('{entry.bundle_sha256}');
+    expect(drawerSource).not.toContain('{evidenceDetail.bundle_sha256}');
+    expect(drawerSource).not.toContain('JSON.stringify(evidenceDetail.snapshot');
   });
 
   it('uses a neutral error when material kit generation returns a general 409', async () => {
@@ -420,6 +430,21 @@ describe('MaterialKitDrawer evidence confirmation', () => {
     expect(confirmButton?.disabled).toBe(true);
   });
 
+  it('projects owner pending, result-unknown, and source-conflict states into the drawer', async () => {
+    const view = render(application, { pendingState: 'pending' });
+    await flush();
+    expect(view.querySelector('[data-testid="material-kit-surface-state"]')?.getAttribute('data-state')).toBe('waiting_confirmation');
+
+    rerender(application, { resultUnknown: true });
+    await flush();
+    expect(view.querySelector('[data-testid="material-kit-surface-state"]')?.getAttribute('data-state')).toBe('result_unknown');
+
+    rerender(application, { sourceConflict: true });
+    await flush();
+    expect(view.querySelector('[data-testid="material-kit-surface-state"]')?.getAttribute('data-state')).toBe('source_conflict');
+    expect(view.querySelector('[data-material-primary="true"]')?.textContent).toContain('确认处理结果');
+  });
+
   it('labels a ready evidence preview as pending until confirmation', async () => {
     const view = render();
     await flush();
@@ -431,34 +456,17 @@ describe('MaterialKitDrawer evidence confirmation', () => {
     expect(modal?.textContent).not.toContain('已确认投递证据快照');
   });
 
-  it('keeps a legacy submitted kit readable, warned, and eligible for historical re-confirmation', async () => {
+  it('keeps a legacy submitted kit readable and strictly read-only', async () => {
     queryState.kit = materialKit('submitted');
-    evidenceService.confirmEvidenceBundle.mockResolvedValue({ id: 2 });
     const view = render();
     await flush();
 
     expect(view.textContent).toContain('旧投递标记，缺少证据快照');
     expect(view.textContent).not.toContain('状态：已投递');
     expect(view.querySelector('option[value="submitted"]')).toBeNull();
-    clickByText(view, '确认已投递');
-
-    const submittedAt = view.querySelector<HTMLInputElement>('input[type="datetime-local"]');
-    expect(submittedAt).toBeInstanceOf(HTMLInputElement);
-    const historicalLocalTime = '2024-06-03T09:15';
-    act(() => {
-      const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-      setValue?.call(submittedAt, historicalLocalTime);
-      submittedAt?.dispatchEvent(new Event('input', { bubbles: true }));
-      submittedAt?.dispatchEvent(new Event('change', { bubbles: true }));
-    });
-    clickByText(view, '确认投递');
-    await flush();
-
-    expect(evidenceService.confirmEvidenceBundle).toHaveBeenCalledWith(7, expect.objectContaining({
-      expected_bundle_sha256: 'a'.repeat(64),
-      idempotency_key: 'e2ddc6c1-2a4d-4bd6-8969-7c0bc29cc771',
-      submitted_at: new Date(historicalLocalTime).toISOString(),
-    }));
+    expect(buttonByText(view, '确认已投递')).toBeUndefined();
+    expect(view.querySelectorAll('input:not([type="hidden"]):not(:disabled), textarea:not(:disabled), select:not(:disabled)')).toHaveLength(0);
+    expect(evidenceService.confirmEvidenceBundle).not.toHaveBeenCalled();
   });
 
   it('defaults to local civil time and confirms its ISO instant with one idempotency key per modal opening', async () => {
@@ -614,7 +622,7 @@ describe('MaterialKitDrawer evidence confirmation', () => {
 
     const modal = view.querySelector<HTMLElement>('[role="dialog"]');
     const confirmButton = [...view.querySelectorAll('button')].find((item) => item.textContent?.includes('确认投递'));
-    expect(modal?.textContent).toContain('f'.repeat(64));
+    expect(modal?.textContent).not.toContain('f'.repeat(64));
     expect(confirmButton?.disabled).toBe(false);
   });
 
@@ -636,7 +644,7 @@ describe('MaterialKitDrawer evidence confirmation', () => {
     const history = view.querySelector<HTMLElement>('[data-testid="evidence-history"]');
     expect(history?.textContent).toContain('第 3 次');
     expect(history?.textContent).toContain('投递（本地）');
-    expect(history?.textContent).toContain('a'.repeat(64));
+    expect(history?.textContent).not.toContain('a'.repeat(64));
     expect(history?.textContent).not.toContain('2026-07-14T09:00:00.000Z');
     expect(history?.querySelector('input, select, textarea')).toBeNull();
 
@@ -687,7 +695,7 @@ describe('MaterialKitDrawer evidence confirmation', () => {
     expect(history?.textContent).toContain(`最近确认（本地）：${dayjs(queryState.history[0].confirmed_at).format('YYYY-MM-DD HH:mm')}`);
     expect(history?.textContent).toContain('第 2 次');
     expect(history?.textContent).toContain('用户确认');
-    expect(history?.textContent).toContain('b'.repeat(64));
+    expect(history?.textContent).not.toContain('b'.repeat(64));
 
     clickByText(view, '查看详情');
     await flush();
@@ -695,7 +703,7 @@ describe('MaterialKitDrawer evidence confirmation', () => {
     expect(evidenceService.getEvidenceBundle).toHaveBeenCalledWith(7, 2);
     const detailModal = view.querySelector<HTMLElement>('[role="dialog"]');
     expect(detailModal?.textContent).toContain('用户确认');
-    expect(detailModal?.textContent).toContain('Immutable job description');
+    expect(detailModal?.textContent).not.toContain('Immutable job description');
     expect(detailModal?.querySelector('input, textarea, select')).toBeNull();
   });
 });

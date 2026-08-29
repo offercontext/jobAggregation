@@ -479,18 +479,19 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
   useEffect(() => {
     if (!application || !open) return;
     const handoff = consumeMaterialKitHandoff(application.id);
-    if (!handoff || !handoff.jdVersionId) return;
+    if (!handoff) return;
+    const suggestedResumeId = handoff.hints?.suggestedResumeId;
     const alreadyActive = activeTask?.ref.taskId === 'application.material_kit'
       && activeTask.ref.applicationId === application.id;
     if (!alreadyActive) {
       const request: TaskLaunchRequest = {
         ref: { taskId: 'application.material_kit', applicationId: application.id },
         source: 'deep_link',
-        hints: handoff.resumeId ? { suggestedResumeId: handoff.resumeId } : undefined,
+        hints: suggestedResumeId ? { suggestedResumeId } : undefined,
       };
       const confirmedFitHandoff = activeTask?.ref.taskId === 'application.opportunity_fit'
         && activeTask.ref.applicationId === application.id
-        && handoff.jdVersionId !== undefined;
+        && handoff.source === 'pilot';
       const result = confirmedFitHandoff
         ? (onConfirmedFitToMaterial?.(request) ?? launchTask(request))
         : launchTask(request);
@@ -502,9 +503,7 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
       }
     }
     setMaterialKitPrefill((current) => Object.keys(current).length > 0 ? current : {
-      resumeID: handoff.resumeId,
-      jdSnapshot: handoff.jdText,
-      jdVersionID: handoff.jdVersionId,
+      resumeID: suggestedResumeId,
     });
   }, [activeTask, application?.id, onConfirmedFitToMaterial, open]);
 

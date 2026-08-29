@@ -69,10 +69,21 @@ vi.mock('./MaterialKitDrawer', () => ({
   },
 }));
 vi.mock('./OpportunityFitReviewDrawer', () => ({
-  default: (props: { onPrepareMaterials: (review: unknown, jdText: string, jdVersionId?: number) => void }) => (
-    <button onClick={() => props.onPrepareMaterials({ source: { resume: { id: 11 } } }, 'Frozen JD text', 1)}>
-      prepare
-    </button>
+  default: (props: {
+    onPrepareMaterials: (review: unknown, jdText: string, jdVersionId?: number) => void;
+    onOwnerStateChange?: (state: { pending: boolean; resultUnknown: boolean; unsaved: boolean }) => void;
+  }) => (
+    <>
+      <button onClick={() => props.onPrepareMaterials({ source: { resume: { id: 11 } } }, 'Frozen JD text', 1)}>
+        prepare
+      </button>
+      <button onClick={() => props.onOwnerStateChange?.({ pending: true, resultUnknown: false, unsaved: true })}>
+        mark fit pending
+      </button>
+      <button onClick={() => props.onOwnerStateChange?.({ pending: false, resultUnknown: true, unsaved: true })}>
+        mark fit unknown
+      </button>
+    </>
   ),
 }));
 vi.mock('@ant-design/icons', () => ({
@@ -302,9 +313,8 @@ describe('ApplicationDetail opportunity fit handoff', () => {
   it('consumes a matching AppShell handoff once and uses frozen values', async () => {
     writeMaterialKitHandoff({
       applicationId: 7,
-      resumeId: 12,
-      jdText: 'Frozen Pilot JD',
-      jdVersionId: 2,
+      source: 'pilot',
+      hints: { suggestedResumeId: 12, suggestedJdVersionId: 2 },
     });
 
     act(() => root?.render(<ApplicationDetail application={application} open onClose={vi.fn()} />));
@@ -313,22 +323,21 @@ describe('ApplicationDetail opportunity fit handoff', () => {
     });
 
     expect(container?.querySelector('[data-testid="material-kit"]')?.getAttribute('data-resume-id')).toBe('12');
-    expect(container?.querySelector('[data-testid="material-kit"]')?.getAttribute('data-jd')).toBe('Frozen Pilot JD');
+    expect(container?.querySelector('[data-testid="material-kit"]')?.getAttribute('data-jd')).toBeNull();
   });
 
   it('keeps a consumed handoff open when the current JD query transitions from loading to loaded', async () => {
     writeMaterialKitHandoff({
       applicationId: 7,
-      resumeId: 12,
-      jdText: 'Frozen Pilot JD',
-      jdVersionId: 2,
+      source: 'pilot',
+      hints: { suggestedResumeId: 12, suggestedJdVersionId: 2 },
     });
     state.jdCurrent = null;
     state.jdLoading = true;
 
     act(() => root?.render(<ApplicationDetail application={application} open onClose={vi.fn()} />));
     await act(async () => { await Promise.resolve(); });
-    expect(container?.querySelector('[data-testid="material-kit"]')?.getAttribute('data-jd')).toBe('Frozen Pilot JD');
+    expect(container?.querySelector('[data-testid="material-kit"]')?.getAttribute('data-jd')).toBeNull();
 
     state.jdLoading = false;
     state.jdCurrent = {
@@ -346,28 +355,27 @@ describe('ApplicationDetail opportunity fit handoff', () => {
       },
     };
     act(() => root?.render(<ApplicationDetail application={application} open onClose={vi.fn()} />));
-    expect(container?.querySelector('[data-testid="material-kit"]')?.getAttribute('data-jd')).toBe('Frozen Pilot JD');
+    expect(container?.querySelector('[data-testid="material-kit"]')?.getAttribute('data-jd')).toBeNull();
   });
 
-  it('does not open Material Kit for a legacy handoff without a JD version', async () => {
+  it('opens Material Kit for an application-only handoff and lets the owner resolve JD', async () => {
     writeMaterialKitHandoff({
       applicationId: 7,
-      resumeId: 12,
-      jdText: 'Legacy JD',
-    } as never);
+      source: 'deep_link',
+      hints: { suggestedResumeId: 12 },
+    });
 
     act(() => root?.render(<ApplicationDetail application={application} open onClose={vi.fn()} />));
     await act(async () => { await Promise.resolve(); });
 
-    expect(container?.querySelector('[data-testid="material-kit"]')).toBeNull();
+    expect(container?.querySelector('[data-testid="material-kit"]')).not.toBeNull();
   });
 
   it('clears consumed material prefill when switching to another Application', async () => {
     writeMaterialKitHandoff({
       applicationId: 7,
-      resumeId: 12,
-      jdText: 'Frozen Pilot JD',
-      jdVersionId: 2,
+      source: 'pilot',
+      hints: { suggestedResumeId: 12, suggestedJdVersionId: 2 },
     });
     const otherApplication = Object.assign({}, application, { id: 8 }) as typeof application;
 
@@ -383,9 +391,8 @@ describe('ApplicationDetail opportunity fit handoff', () => {
   it('clears the consumed material prefill immediately when Material Kit closes', async () => {
     writeMaterialKitHandoff({
       applicationId: 7,
-      resumeId: 12,
-      jdText: 'Frozen Pilot JD',
-      jdVersionId: 2,
+      source: 'pilot',
+      hints: { suggestedResumeId: 12, suggestedJdVersionId: 2 },
     });
 
     act(() => root?.render(<ApplicationDetail application={application} open onClose={vi.fn()} />));
@@ -401,7 +408,7 @@ describe('ApplicationDetail opportunity fit handoff', () => {
 
     expect(container?.querySelector('[data-testid="material-kit"]')).toBeNull();
     expect(state.materialProps.mock.calls.some(([props]) => (
-      props.initialResumeID === 12 && props.initialJdSnapshot === 'Frozen Pilot JD'
+      props.initialResumeID === 12 && props.initialJdSnapshot === undefined
     ))).toBe(true);
   });
 
@@ -436,6 +443,39 @@ describe('ApplicationDetail opportunity fit handoff', () => {
     expect(container?.querySelector('[data-core-task-owner]')).not.toBeNull();
     expect(openPilot).not.toHaveBeenCalled();
     expect(state.analyzeJD).not.toHaveBeenCalled();
+  });
+
+  it('keeps the shared task surface guarded while the Fit owner is pending or unknown', () => {
+    const guards: Array<{ pending: boolean; unsaved: boolean }> = [];
+    state.jdCurrent = { current: { id: 41, application_id: 7, jd_text: '岗位资料', source_url: null } };
+    act(() => root?.render(
+      <ApplicationDetail
+        application={application}
+        resumes={[resume]}
+        open
+        onClose={vi.fn()}
+        onTaskSurfaceGuardChange={(guard) => guards.push(guard)}
+      />,
+    ));
+    act(() => {
+      [...(container?.querySelectorAll('button') || [])]
+        .find((button) => button.textContent === '开始判断')
+        ?.click();
+    });
+
+    act(() => {
+      [...(container?.querySelectorAll('button') || [])]
+        .find((button) => button.textContent === 'mark fit pending')
+        ?.click();
+    });
+    expect(guards[guards.length - 1]).toEqual({ pending: true, unsaved: true });
+
+    act(() => {
+      [...(container?.querySelectorAll('button') || [])]
+        .find((button) => button.textContent === 'mark fit unknown')
+        ?.click();
+    });
+    expect(guards[guards.length - 1]).toEqual({ pending: true, unsaved: true });
   });
 
   it('isolates standalone controller lifecycles across duplicate mounts of one application', () => {

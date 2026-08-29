@@ -32,6 +32,17 @@ export const MATERIAL_FLOW_COPY = {
     confirmationKindUnknown: '其他确认方式',
     evidencePreviewFallback: '材料证据尚未准备完成，请补充必要来源',
   },
+  surface: {
+    loading: '正在加载投递准备，请稍候',
+    missingJd: '补充岗位资料',
+    missingResume: '选择本次简历',
+    notGenerated: '生成投递准备',
+    dirtyDraft: '保存修改',
+    waitingConfirmation: '查看并确认',
+    resultUnknown: '确认处理结果',
+    readyUnsubmitted: '记录已投递',
+    submitted: '查看本次投递记录',
+  },
   errors: {
     proposalUnverifiable: 'AI 输出未通过证据校验，已保护原简历且未创建草稿，请重试',
     proposalSourceConflict: '原始来源已发生变化，请重新生成提案后再审核',

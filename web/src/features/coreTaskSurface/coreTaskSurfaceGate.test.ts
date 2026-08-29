@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
+import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 
 const BASELINE = '93fb0063118761f2c76e71e4209000feee0f755b';
@@ -24,6 +25,13 @@ const CORE_TASK_IDS = [
   'materials.reference',
 ] as const;
 const ENTRYPOINT_CATEGORIES = new Set(['core_task', 'navigation_only', 'record_management']);
+const CANONICAL_LAUNCH_NAMES = new Set([
+  'launchCoreTask',
+  'launchCoreTaskSurface',
+  'openCoreTask',
+  'openCoreTaskSurface',
+  'openTaskSurface',
+]);
 
 type Asset = {
   schema_version: number;
@@ -44,12 +52,21 @@ type VisibleCopy = {
   replacement: string;
 };
 
+type SourceArtifact = {
+  path: string;
+  text: string;
+  sourceFile: ts.SourceFile;
+};
+
 type AuditSources = {
   productionFiles: Map<string, string>;
-  registrySource: string | null;
-  contractsSource: string | null;
-  controllerSource: string | null;
+  registrySource: SourceArtifact | null;
+  contractsSource: SourceArtifact | null;
+  controllerSource: SourceArtifact | null;
+  allowDeletedEntrypointCutover: boolean;
 };
+
+const baselineSourceCache = new Map<string, SourceArtifact | null>();
 
 function repositoryRoot(): string {
   return execFileSync('git', ['rev-parse', '--show-toplevel'], {
@@ -59,6 +76,15 @@ function repositoryRoot(): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function parseSource(path: string, text: string): SourceArtifact {
+  const scriptKind = /\.tsx$/i.test(path) ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
+  return {
+    path,
+    text,
+    sourceFile: ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true, scriptKind),
+  };
 }
 
 function readAssets(root: string): { assets: Map<string, Asset>; violations: string[] } {
@@ -131,62 +157,334 @@ function collectProductionFiles(root: string): Map<string, string> {
   return result;
 }
 
-function readBaselineFile(root: string, file: string): string | null {
+function artifactFromText(path: string, text: string): SourceArtifact {
+  return parseSource(path, text);
+}
+
+function artifactFromProduction(
+  productionFiles: Map<string, string>,
+  path: string,
+): SourceArtifact | null {
+  const text = productionFiles.get(path);
+  return text === undefined ? null : parseSource(path, text);
+}
+
+function readSourceArtifact(root: string, paths: string[]): SourceArtifact | null {
+  for (const relativePath of paths) {
+    const absolutePath = join(root, relativePath);
+    if (!existsSync(absolutePath)) continue;
+    try {
+      return parseSource(relativePath, readFileSync(absolutePath, 'utf8'));
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function readBaselineFile(root: string, file: string): SourceArtifact | null {
+  const cacheKey = `${root}:${file}`;
+  if (baselineSourceCache.has(cacheKey)) return baselineSourceCache.get(cacheKey) ?? null;
+  let artifact: SourceArtifact | null = null;
   try {
-    return execFileSync('git', ['show', `${BASELINE}:${file}`], {
+    const text = execFileSync('git', ['show', `${BASELINE}:${file}`], {
       cwd: root,
       encoding: 'utf8',
     });
+    artifact = parseSource(file, text);
   } catch {
-    return null;
+    artifact = null;
+  }
+  baselineSourceCache.set(cacheKey, artifact);
+  return artifact;
+}
+
+function hasExportModifier(node: ts.Node): boolean {
+  if (!ts.canHaveModifiers(node)) return false;
+  return ts.getModifiers(node)?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword) ?? false;
+}
+
+type FunctionLikeWithBody =
+  | ts.FunctionDeclaration
+  | ts.FunctionExpression
+  | ts.ArrowFunction
+  | ts.MethodDeclaration
+  | ts.GetAccessorDeclaration
+  | ts.SetAccessorDeclaration;
+
+function isFunctionLikeWithBody(node: ts.Node): node is FunctionLikeWithBody {
+  return ts.isFunctionDeclaration(node)
+    || ts.isFunctionExpression(node)
+    || ts.isArrowFunction(node)
+    || ts.isMethodDeclaration(node)
+    || ts.isGetAccessorDeclaration(node)
+    || ts.isSetAccessorDeclaration(node);
+}
+
+function hasImplementedBody(node: FunctionLikeWithBody): boolean {
+  if (!node.body) return false;
+  return !ts.isBlock(node.body) || node.body.statements.length > 0;
+}
+
+function functionLikeName(node: FunctionLikeWithBody): string | null {
+  if (!node.name || !ts.isIdentifier(node.name)) return null;
+  return node.name.text;
+}
+
+function variableFunctionLike(
+  declaration: ts.VariableDeclaration,
+): FunctionLikeWithBody | null {
+  if (!declaration.initializer || !isFunctionLikeWithBody(declaration.initializer)) return null;
+  return declaration.initializer;
+}
+
+function findExportedFunction(
+  sourceFile: ts.SourceFile,
+  name: string,
+): FunctionLikeWithBody | null {
+  for (const statement of sourceFile.statements) {
+    if (
+      isFunctionLikeWithBody(statement)
+      && hasExportModifier(statement)
+      && functionLikeName(statement) === name
+      && hasImplementedBody(statement)
+    ) {
+      return statement;
+    }
+    if (!ts.isVariableStatement(statement) || !hasExportModifier(statement)) continue;
+    for (const declaration of statement.declarationList.declarations) {
+      if (!ts.isIdentifier(declaration.name) || declaration.name.text !== name) continue;
+      const functionLike = variableFunctionLike(declaration);
+      if (functionLike && hasImplementedBody(functionLike)) return functionLike;
+    }
+  }
+  return null;
+}
+
+function findFunctionByLeaf(sourceFile: ts.SourceFile, name: string): FunctionLikeWithBody | null {
+  let found: FunctionLikeWithBody | null = null;
+  const visit = (node: ts.Node): void => {
+    if (found) return;
+    if (
+      isFunctionLikeWithBody(node)
+      && functionLikeName(node) === name
+      && hasImplementedBody(node)
+    ) {
+      found = node;
+      return;
+    }
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === name) {
+      const functionLike = variableFunctionLike(node);
+      if (functionLike && hasImplementedBody(functionLike)) {
+        found = functionLike;
+        return;
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return found;
+}
+
+function calleeName(expression: ts.Expression): string | null {
+  if (ts.isIdentifier(expression)) return expression.text;
+  if (ts.isPropertyAccessExpression(expression)) return expression.name.text;
+  return null;
+}
+
+function callsCanonicalLauncher(functionLike: FunctionLikeWithBody): boolean {
+  if (!functionLike.body) return false;
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    if (found) return;
+    if (ts.isCallExpression(node) && CANONICAL_LAUNCH_NAMES.has(calleeName(node.expression) ?? '')) {
+      found = true;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(functionLike.body, visit);
+  return found;
+}
+
+function findExportedTypeAlias(sourceFile: ts.SourceFile, name: string): ts.TypeAliasDeclaration | null {
+  return sourceFile.statements.find(
+    (statement): statement is ts.TypeAliasDeclaration => (
+      ts.isTypeAliasDeclaration(statement)
+      && statement.name.text === name
+      && hasExportModifier(statement)
+    ),
+  ) ?? null;
+}
+
+function unwrapType(node: ts.TypeNode): ts.TypeNode {
+  let current = node;
+  while (ts.isParenthesizedTypeNode(current)) current = current.type;
+  return current;
+}
+
+function coreTaskIdUnion(sourceFile: ts.SourceFile): string[] | null {
+  const alias = findExportedTypeAlias(sourceFile, 'CoreTaskId');
+  if (!alias) return null;
+  const type = unwrapType(alias.type);
+  if (!ts.isUnionTypeNode(type)) return null;
+  const values: string[] = [];
+  for (const member of type.types) {
+    if (!ts.isLiteralTypeNode(member) || !ts.isStringLiteral(member.literal)) return null;
+    values.push(member.literal.text);
+  }
+  return values;
+}
+
+function exactCoreTaskIdSet(values: string[] | null): boolean {
+  if (!values || values.length !== CORE_TASK_IDS.length) return false;
+  const actual = new Set(values);
+  return actual.size === CORE_TASK_IDS.length
+    && CORE_TASK_IDS.every((taskId) => actual.has(taskId));
+}
+
+function hasCoreTaskContracts(artifact: SourceArtifact | null): boolean {
+  if (!artifact || !exactCoreTaskIdSet(coreTaskIdUnion(artifact.sourceFile))) return false;
+  return Boolean(
+    findExportedFunction(artifact.sourceFile, 'parseCoreTaskRef')
+    && findExportedFunction(artifact.sourceFile, 'coreTaskCanonicalKey'),
+  );
+}
+
+function findExportedConstInitializer(
+  sourceFile: ts.SourceFile,
+  name: string,
+): ts.Expression | null {
+  for (const statement of sourceFile.statements) {
+    if (!ts.isVariableStatement(statement) || !hasExportModifier(statement)) continue;
+    if ((statement.declarationList.flags & ts.NodeFlags.Const) === 0) continue;
+    for (const declaration of statement.declarationList.declarations) {
+      if (ts.isIdentifier(declaration.name) && declaration.name.text === name) {
+        return declaration.initializer ?? null;
+      }
+    }
+  }
+  return null;
+}
+
+function unwrapExpression(expression: ts.Expression): ts.Expression {
+  let current = expression;
+  for (;;) {
+    if (ts.isParenthesizedExpression(current)) {
+      current = current.expression;
+      continue;
+    }
+    if (ts.isAsExpression(current) || ts.isTypeAssertionExpression(current) || ts.isSatisfiesExpression(current)) {
+      current = current.expression;
+      continue;
+    }
+    if (ts.isNonNullExpression(current)) {
+      current = current.expression;
+      continue;
+    }
+    if (
+      ts.isCallExpression(current)
+      && ts.isPropertyAccessExpression(current.expression)
+      && ts.isIdentifier(current.expression.expression)
+      && current.expression.expression.text === 'Object'
+      && current.expression.name.text === 'freeze'
+      && current.arguments.length === 1
+    ) {
+      current = current.arguments[0];
+      continue;
+    }
+    return current;
   }
 }
 
-function symbolLeaf(qualifiedSymbol: string): string {
-  return qualifiedSymbol.split('.').at(-1) ?? '';
-}
-
-function containsSymbol(source: string | null, symbol: string): boolean {
-  if (!source || !symbol) return false;
-  return new RegExp(`\\b${symbol.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}\\b`).test(source);
-}
-
-function registryHasCanonicalOwner(source: string | null, entries: Entrypoint[]): boolean {
-  if (!source || !/(?:CoreTaskRegistryV1|CORE_TASK_REGISTRY|coreTaskRegistry)/.test(source)) {
-    return false;
+function propertyNameText(name: ts.PropertyName): string | null {
+  if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNoSubstitutionTemplateLiteral(name)) {
+    return name.text;
   }
-  return CORE_TASK_IDS.every((taskId) => source.includes(taskId))
-    && entries.some((entry) => entry.category === 'navigation_only' && source.includes(entry.category))
-    && entries.some((entry) => entry.category === 'record_management' && source.includes(entry.category));
+  return null;
 }
 
-function hasCoreTaskContracts(source: string | null): boolean {
-  if (!source) return false;
-  const idDeclaration = source.match(/\b(?:export\s+)?type\s+CoreTaskId\s*=([\s\S]*?);/);
-  const idBody = idDeclaration?.[1] ?? '';
-  const declaredIds = [...idBody.matchAll(/['"]([^'"]+)['"]/g)].map((match) => match[1]);
-  const declaredIdSet = new Set(declaredIds);
-  const hasClosedIdDeclaration = Boolean(idDeclaration)
-    && declaredIds.length === CORE_TASK_IDS.length
-    && declaredIdSet.size === CORE_TASK_IDS.length
-    && declaredIds.every((taskId) => CORE_TASK_IDS.includes(taskId as typeof CORE_TASK_IDS[number]))
-    && CORE_TASK_IDS.every((taskId) => source.includes(taskId));
-  const parserStart = source.search(/\bparseCoreTaskRef\s*(?:=|\(|:)/);
-  const parserBody = parserStart >= 0 ? source.slice(parserStart, parserStart + 900) : '';
-  const hasParser = parserStart >= 0 && /\bCoreTaskRef\b/.test(parserBody);
-  const keyStart = source.search(/\b(?:canonicalTaskKey|canonicalCoreTaskKey|coreTaskRefKey)\s*(?:=|\(|:)/);
-  const keyBody = keyStart >= 0 ? source.slice(keyStart, keyStart + 900) : '';
-  const hasCanonicalKey = keyStart >= 0
-    && /\b(?:taskId|applicationId|eventId|offerId|resumeId|storyId|sourceId)\b/.test(keyBody);
-  return hasClosedIdDeclaration && hasParser && hasCanonicalKey;
+function objectProperties(object: ts.ObjectLiteralExpression): Map<string, ts.PropertyAssignment> | null {
+  const properties = new Map<string, ts.PropertyAssignment>();
+  for (const property of object.properties) {
+    if (!ts.isPropertyAssignment(property)) return null;
+    const name = propertyNameText(property.name);
+    if (!name || properties.has(name)) return null;
+    properties.set(name, property);
+  }
+  return properties;
 }
 
-function hasCoreTaskController(source: string | null): boolean {
-  if (!source) return false;
-  const hasControllerExport = /\bexport\s+(?:function|class|const)\s+(?:CoreTaskSurfaceController|createCoreTaskSurfaceController|useCoreTaskSurfaceController)\b/.test(source);
-  const hasOwnerGenerationState = /\b(?:ownerGeneration|owner_generation|generation)(?:Ref)?\b\s*(?::[^=;]+)?=/.test(source)
-    && /\b(?:useRef|useState|Map|Set|owner)\b/.test(source);
-  return hasControllerExport && hasOwnerGenerationState;
+function objectLiteralFromExpression(expression: ts.Expression): ts.ObjectLiteralExpression | null {
+  const unwrapped = unwrapExpression(expression);
+  return ts.isObjectLiteralExpression(unwrapped) ? unwrapped : null;
+}
+
+function literalOwnerId(value: ts.Expression): string | null {
+  const unwrapped = unwrapExpression(value);
+  if (!ts.isStringLiteral(unwrapped) || !unwrapped.text.trim()) return null;
+  return unwrapped.text;
+}
+
+function hasCanonicalRegistry(artifact: SourceArtifact | null): boolean {
+  if (!artifact) return false;
+  const initializer = findExportedConstInitializer(artifact.sourceFile, 'CORE_TASK_REGISTRY');
+  if (!initializer) return false;
+  const registry = objectLiteralFromExpression(initializer);
+  if (!registry) return false;
+  const properties = objectProperties(registry);
+  if (!properties || properties.size !== CORE_TASK_IDS.length) return false;
+  const keys = [...properties.keys()];
+  const expected = new Set<string>(CORE_TASK_IDS);
+  if (keys.some((key) => !expected.has(key))) return false;
+
+  const ownerIds = new Set<string>();
+  for (const taskId of CORE_TASK_IDS) {
+    const property = properties.get(taskId);
+    if (!property) return false;
+    const ownerRecord = objectLiteralFromExpression(property.initializer);
+    if (!ownerRecord) return false;
+    const ownerProperties = objectProperties(ownerRecord);
+    const ownerProperty = ownerProperties?.get('ownerId');
+    const ownerId = ownerProperty ? literalOwnerId(ownerProperty.initializer) : null;
+    if (!ownerId || ownerIds.has(ownerId)) return false;
+    ownerIds.add(ownerId);
+  }
+  return ownerIds.size === CORE_TASK_IDS.length;
+}
+
+function exportedStateHasFields(sourceFile: ts.SourceFile): boolean {
+  for (const statement of sourceFile.statements) {
+    if (!hasExportModifier(statement)) continue;
+    let members: ts.NodeArray<ts.TypeElement> | undefined;
+    let declarationName: string | null = null;
+    if (ts.isInterfaceDeclaration(statement)) {
+      declarationName = statement.name.text;
+      members = statement.members;
+    } else if (ts.isTypeAliasDeclaration(statement)) {
+      declarationName = statement.name.text;
+      const type = unwrapType(statement.type);
+      if (ts.isTypeLiteralNode(type)) members = type.members;
+    }
+    if (!declarationName || !/^CoreTask.*State$/.test(declarationName) || !members) continue;
+    const names = new Set(
+      members.flatMap((member) => {
+        if (!ts.isPropertySignature(member) || !member.name) return [];
+        const name = propertyNameText(member.name);
+        return name ? [name] : [];
+      }),
+    );
+    if (['phase', 'generation', 'active'].every((name) => names.has(name))) return true;
+  }
+  return false;
+}
+
+function hasCoreTaskController(artifact: SourceArtifact | null): boolean {
+  return Boolean(
+    artifact
+    && findExportedFunction(artifact.sourceFile, 'createCoreTaskSurfaceController')
+    && exportedStateHasFields(artifact.sourceFile),
+  );
 }
 
 function entrypointHasAudit(
@@ -200,27 +498,62 @@ function entrypointHasAudit(
     return false;
   }
   if (entry.category !== 'core_task' && entry.task_id !== null) return false;
-  const leaf = symbolLeaf(entry.qualified_symbol);
-  const baselineSource = readBaselineFile(root, entry.file);
-  if (!containsSymbol(baselineSource, leaf)) return false;
 
-  const currentSource = sources.productionFiles.get(entry.file) ?? null;
-  const migratedSymbol = containsSymbol(currentSource, leaf)
-    || Boolean(sources.registrySource?.includes(entry.qualified_symbol));
-  if (!migratedSymbol || !sources.registrySource) return false;
-  if (entry.category === 'core_task') {
-    return Boolean(entry.task_id && sources.registrySource.includes(entry.task_id));
+  const parts = entry.qualified_symbol.split('.');
+  const leaf = parts[parts.length - 1] ?? '';
+  const baseline = readBaselineFile(root, entry.file);
+  if (!baseline || !findFunctionByLeaf(baseline.sourceFile, leaf)) return false;
+
+  const current = artifactFromProduction(sources.productionFiles, entry.file);
+  if (!current) return sources.allowDeletedEntrypointCutover;
+  const currentFunction = findFunctionByLeaf(current.sourceFile, leaf);
+  if (!currentFunction) return sources.allowDeletedEntrypointCutover;
+  if (entry.category !== 'core_task') return true;
+  return callsCanonicalLauncher(currentFunction);
+}
+
+function hasIdentifier(sourceFile: ts.SourceFile, name: string): boolean {
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    if (found) return;
+    if (ts.isIdentifier(node) && node.text === name) {
+      found = true;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return found;
+}
+
+function hasExportedFunctionMatching(
+  sourceFile: ts.SourceFile,
+  pattern: RegExp,
+): boolean {
+  for (const statement of sourceFile.statements) {
+    if (
+      isFunctionLikeWithBody(statement)
+      && hasExportModifier(statement)
+      && hasImplementedBody(statement)
+      && pattern.test(functionLikeName(statement) ?? '')
+    ) return true;
+    if (!ts.isVariableStatement(statement) || !hasExportModifier(statement)) continue;
+    for (const declaration of statement.declarationList.declarations) {
+      if (!ts.isIdentifier(declaration.name) || !pattern.test(declaration.name.text)) continue;
+      const functionLike = variableFunctionLike(declaration);
+      if (functionLike && hasImplementedBody(functionLike)) return true;
+    }
   }
-  return sources.registrySource.includes(entry.category)
-    && (sources.registrySource.includes(entry.qualified_symbol) || sources.registrySource.includes(entry.file));
+  return false;
 }
 
 function hasCentralEventClassifier(productionFiles: Map<string, string>): boolean {
   for (const [path, source] of productionFiles) {
     if (!path.includes('/features/interviewEvents/')) continue;
     if (!/(?:eventLifecycle|lifecycle|classifier)/i.test(path)) continue;
-    if (!source.includes('EventLifecycleV1')) continue;
-    if (!/\b(?:classify|project|resolve)[A-Za-z]*Event[A-Za-z]*\b/.test(source)) continue;
+    const artifact = parseSource(path, source);
+    if (!hasIdentifier(artifact.sourceFile, 'EventLifecycleV1')) continue;
+    if (!hasExportedFunctionMatching(artifact.sourceFile, /^(?:classify|project|resolve).*Event/i)) continue;
     return true;
   }
   return false;
@@ -240,8 +573,8 @@ function hasLocalEventClassifier(productionFiles: Map<string, string>): boolean 
     'scheduledTimestamp',
   ];
   return localPaths.some((path) => {
-    const source = productionFiles.get(path) ?? '';
-    return localMarkers.some((marker) => source.includes(marker));
+    const artifact = artifactFromProduction(productionFiles, path);
+    return Boolean(artifact && localMarkers.some((marker) => hasIdentifier(artifact.sourceFile, marker)));
   });
 }
 
@@ -249,11 +582,34 @@ function hasCentralMaterialMapper(productionFiles: Map<string, string>): boolean
   for (const [path, source] of productionFiles) {
     if (!path.includes('/features/materialSurfaces/')) continue;
     if (!/(?:mapper|classifier|projector|lineage)/i.test(path)) continue;
-    if (!/(?:classify|project|resolve)[A-Za-z]*(?:Material|Source|Resume)/.test(source)) continue;
-    if (!/(?:origin_kind|source_kind|lineage|MaterialSource)/.test(source)) continue;
+    const artifact = parseSource(path, source);
+    if (!hasExportedFunctionMatching(artifact.sourceFile, /^(?:classify|project|resolve|map).*(?:Material|Source|Resume)/i)) continue;
+    if (!['MaterialSource', 'ResumeLineageV1', 'materialSource', 'origin_kind', 'source_kind']
+      .some((name) => hasIdentifier(artifact.sourceFile, name))) continue;
     return true;
   }
   return false;
+}
+
+function sourceHasVisibleText(sourceFile: ts.SourceFile, needle: string): boolean {
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    if (found) return;
+    if (
+      (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node))
+      && node.text.includes(needle)
+    ) {
+      found = true;
+      return;
+    }
+    if (ts.isJsxText(node) && node.getText(sourceFile).includes(needle)) {
+      found = true;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return found;
 }
 
 function auditManifest(
@@ -263,35 +619,39 @@ function auditManifest(
   sources: AuditSources,
 ): string[] {
   const violations: string[] = [];
-  if (!registryHasCanonicalOwner(sources.registrySource, entries)) {
-    violations.push('registry:missing-owner');
-  }
-  if (!hasCoreTaskContracts(sources.contractsSource)) {
-    violations.push('contracts:missing-core-task-id');
-  }
-  if (!hasCoreTaskController(sources.controllerSource)) {
-    violations.push('controller:missing-owner');
-  }
+  if (!hasCanonicalRegistry(sources.registrySource)) violations.push('registry:missing-owner');
+  if (!hasCoreTaskContracts(sources.contractsSource)) violations.push('contracts:missing-core-task-id');
+  if (!hasCoreTaskController(sources.controllerSource)) violations.push('controller:missing-owner');
+
   const entrypointAuditResults = entries.map((entry) => entrypointHasAudit(root, entry, sources));
-  if (entrypointAuditResults.some((audited) => !audited)) {
-    violations.push('entrypoint:unclassified');
-  }
+  if (entrypointAuditResults.some((audited) => !audited)) violations.push('entrypoint:unclassified');
 
   const centralEventClassifier = hasCentralEventClassifier(sources.productionFiles);
   if (!centralEventClassifier || hasLocalEventClassifier(sources.productionFiles)) {
     violations.push('event:local-classifier');
   }
 
-  const productionText = [...sources.productionFiles.values()].join('\n');
-  const copyAuditResults = visibleCopy.map((item) => !item.lexeme || productionText.includes(item.lexeme));
-  if (copyAuditResults.some((forbidden) => forbidden)) {
-    violations.push('copy:forbidden-lexeme');
-  }
+  const productionArtifacts = [...sources.productionFiles.entries()].map(([path, source]) => parseSource(path, source));
+  const copyAuditResults = visibleCopy.map((item) => (
+    !item.lexeme || productionArtifacts.some((artifact) => sourceHasVisibleText(artifact.sourceFile, item.lexeme))
+  ));
+  if (copyAuditResults.some((forbidden) => forbidden)) violations.push('copy:forbidden-lexeme');
 
-  if (!hasCentralMaterialMapper(sources.productionFiles)) {
-    violations.push('materials:missing-source-mapper');
-  }
+  if (!hasCentralMaterialMapper(sources.productionFiles)) violations.push('materials:missing-source-mapper');
   return [...new Set(violations)];
+}
+
+function realAuditSources(root: string): AuditSources {
+  return {
+    productionFiles: collectProductionFiles(root),
+    registrySource: readSourceArtifact(root, ['web/src/features/coreTaskSurface/registry.ts']),
+    contractsSource: readSourceArtifact(root, ['web/src/features/coreTaskSurface/contracts.ts']),
+    controllerSource: readSourceArtifact(root, [
+      'web/src/features/coreTaskSurface/controller.ts',
+      'web/src/features/coreTaskSurface/controller.tsx',
+    ]),
+    allowDeletedEntrypointCutover: true,
+  };
 }
 
 describe('core task surface baseline gate', () => {
@@ -308,63 +668,62 @@ describe('core task surface baseline gate', () => {
     expect(execFileSync('git', ['cat-file', '-e', BASELINE], { cwd: root })).toBeDefined();
   });
 
-  it('does not let unrelated files satisfy the named manifest violations', () => {
+  it('rejects comment/string pseudo surfaces and unrelated fixture files', () => {
     const root = repositoryRoot();
     const { assets } = readAssets(root);
     const entries = entrypointsFromAsset(assets.get(ASSET_NAMES[0]));
     const visibleCopy = visibleCopyFromAsset(assets.get(ASSET_NAMES[2]));
+    const fakeText = [
+      ...CORE_TASK_IDS,
+      ...entries.map((entry) => entry.qualified_symbol),
+      'core_task',
+      'navigation_only',
+      'record_management',
+      'parseCoreTaskRef',
+      'coreTaskCanonicalKey',
+      'createCoreTaskSurfaceController',
+      'phase generation active',
+    ].join(' ');
     const violations = auditManifest(root, entries, visibleCopy, {
-      registrySource: [
-        'CoreTaskRegistryV1',
-        ...CORE_TASK_IDS,
-        'navigation_only',
-        'record_management',
-      ].join(' '),
-      contractsSource: 'export const unrelatedContracts = true;',
-      controllerSource: 'export const unrelatedController = true;',
+      registrySource: artifactFromText(
+        'web/src/features/coreTaskSurface/registry.ts',
+        `/* ${fakeText} */ export const CORE_TASK_REGISTRY = {};`,
+      ),
+      contractsSource: artifactFromText(
+        'web/src/features/coreTaskSurface/contracts.ts',
+        `/* ${fakeText} */\nexport const fake = '${fakeText}';\ndeclare function parseCoreTaskRef(): unknown;\nexport function parseCoreTaskRef() {}\nexport function coreTaskCanonicalKey() {}`,
+      ),
+      controllerSource: artifactFromText(
+        'web/src/features/coreTaskSurface/controller.ts',
+        `/* ${fakeText} */\nexport interface FakeState { phase: string; generation: number; active: boolean }\nexport declare function createCoreTaskSurfaceController(): unknown;\nexport function createCoreTaskSurfaceController() {}`,
+      ),
       productionFiles: new Map([
-        ['web/src/features/coreTaskSurface/unrelated.ts', 'export const unrelated = true;'],
-        ['web/src/features/interviewEvents/unrelated.ts', 'export const unrelated = true;'],
-        ['web/src/features/materialSurfaces/unrelated.ts', 'export const unrelated = true;'],
+        ['web/src/features/coreTaskSurface/unrelated.ts', `/* ${fakeText} */`],
+        ['web/src/features/interviewEvents/unrelated.ts', `const fake = '${fakeText}';`],
+        ['web/src/features/materialSurfaces/unrelated.ts', `const fake = '${fakeText}';`],
         ['web/src/unrelated.ts', 'const oldCopy = "旧版评估";'],
       ]),
+      allowDeletedEntrypointCutover: false,
     });
-    expect(violations).not.toContain('registry:missing-owner');
     expect(violations).toEqual(expect.arrayContaining([
+      'registry:missing-owner',
+      'contracts:missing-core-task-id',
+      'controller:missing-owner',
       'entrypoint:unclassified',
       'event:local-classifier',
       'copy:forbidden-lexeme',
       'materials:missing-source-mapper',
-      'contracts:missing-core-task-id',
-      'controller:missing-owner',
     ]));
   });
 
-  it('requires the canonical registry, audited entrypoints, classifier, and copy migration', () => {
+  it('requires the canonical AST surfaces, audited entrypoints, classifier, and copy migration', () => {
     const root = repositoryRoot();
     const { assets, violations: assetViolations } = readAssets(root);
     const violations = auditManifest(
       root,
       entrypointsFromAsset(assets.get(ASSET_NAMES[0])),
       visibleCopyFromAsset(assets.get(ASSET_NAMES[2])),
-      {
-        registrySource: (() => {
-          const path = join(root, 'web', 'src', 'features', 'coreTaskSurface', 'registry.ts');
-          return existsSync(path) ? readFileSync(path, 'utf8') : null;
-        })(),
-        contractsSource: (() => {
-          const path = join(root, 'web', 'src', 'features', 'coreTaskSurface', 'contracts.ts');
-          return existsSync(path) ? readFileSync(path, 'utf8') : null;
-        })(),
-        controllerSource: (() => {
-          const candidates = ['controller.ts', 'controller.tsx'];
-          const path = candidates
-            .map((name) => join(root, 'web', 'src', 'features', 'coreTaskSurface', name))
-            .find((candidate) => existsSync(candidate));
-          return path ? readFileSync(path, 'utf8') : null;
-        })(),
-        productionFiles: collectProductionFiles(root),
-      },
+      realAuditSources(root),
     );
     // Intentional RED at the captured baseline.  The implementation batch may
     // turn this into PASS only after every named canonical surface exists.

@@ -709,7 +709,7 @@ function bindingForSourceExpression(
       ? bindings.get(expression.expression.text)
       : undefined;
     const canonicalName = canonicalLauncherName(expression.name.text);
-    if (base && base.kind !== 'shadow' && canonicalName) {
+    if (base && base.kind !== 'shadow' && base.canonicalName && canonicalName) {
       return { kind: 'composition', canonicalName };
     }
     return { kind: 'shadow' };
@@ -736,8 +736,8 @@ function bindingsForPattern(
     const localNames = bindingNames(element.name);
     const sourceBinding = bindingForSourceExpression(initializer, bindings);
     for (const localName of localNames) {
-      if (sourceBinding.kind === 'shadow') {
-        result.push([localName, sourceBinding]);
+      if (sourceBinding.kind === 'shadow' || !sourceBinding.canonicalName) {
+        result.push([localName, { kind: 'shadow' }]);
       } else if (propertyName && canonicalLauncherName(propertyName)) {
         result.push([localName, {
           kind: 'composition',
@@ -759,74 +759,135 @@ function addFunctionParameters(
 ): void {
   for (const parameter of functionLike.parameters) {
     for (const name of bindingNames(parameter.name)) {
-      bindings.set(name, {
-        kind: 'parameter',
-        canonicalName: CANONICAL_LAUNCH_NAMES.has(name) ? name : undefined,
-      });
+      bindings.set(name, { kind: 'parameter' });
     }
   }
 }
 
-function addStatementBindings(
-  statement: ts.Statement,
+function shadowBindingsForPattern(pattern: ts.BindingName): Array<[string, LauncherBinding]> {
+  return bindingNames(pattern).map((name) => [name, { kind: 'shadow' }]);
+}
+
+function isLexicalDeclarationList(declarationList: ts.VariableDeclarationList): boolean {
+  return (declarationList.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) !== 0;
+}
+
+function addFunctionVarBindings(
+  functionLike: FunctionLikeWithBody,
   bindings: Map<string, LauncherBinding>,
-  beforePosition: number,
 ): void {
-  if (statement.getStart() >= beforePosition) return;
-  if (isFunctionLikeWithBody(statement)) {
-    const name = functionLikeName(statement);
-    if (name) bindings.set(name, { kind: 'shadow' });
-    return;
-  }
-  if (ts.isClassDeclaration(statement) && statement.name) {
-    bindings.set(statement.name.text, { kind: 'shadow' });
-    return;
-  }
-  if (!ts.isVariableStatement(statement)) return;
-  for (const declaration of statement.declarationList.declarations) {
-    if (declaration.getStart() >= beforePosition) break;
-    for (const [name, binding] of bindingsForPattern(declaration.name, declaration.initializer, bindings)) {
-      bindings.set(name, binding);
+  if (!functionLike.body || !ts.isBlock(functionLike.body)) return;
+  const parameterNames = new Set(functionLike.parameters.flatMap((parameter) => bindingNames(parameter.name)));
+  const visit = (node: ts.Node): void => {
+    if (isFunctionLikeWithBody(node)) return;
+    if (ts.isVariableDeclarationList(node) && !isLexicalDeclarationList(node)) {
+      for (const declaration of node.declarations) {
+        for (const [name] of shadowBindingsForPattern(declaration.name)) {
+          if (!parameterNames.has(name)) bindings.set(name, { kind: 'shadow' });
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(functionLike.body);
+}
+
+function addBlockLexicalBindings(
+  block: ts.Block,
+  bindings: Map<string, LauncherBinding>,
+  callPosition: number,
+): void {
+  for (const statement of block.statements) {
+    if (isFunctionLikeWithBody(statement)) {
+      const name = functionLikeName(statement);
+      if (name) bindings.set(name, { kind: 'shadow' });
+      continue;
+    }
+    if (ts.isClassDeclaration(statement)) {
+      if (statement.name) bindings.set(statement.name.text, { kind: 'shadow' });
+      continue;
+    }
+    if (!ts.isVariableStatement(statement) || !isLexicalDeclarationList(statement.declarationList)) continue;
+    for (const declaration of statement.declarationList.declarations) {
+      const declarationBindings = declaration.getStart() >= callPosition
+        ? shadowBindingsForPattern(declaration.name)
+        : bindingsForPattern(declaration.name, declaration.initializer, bindings);
+      for (const [name, binding] of declarationBindings) bindings.set(name, binding);
     }
   }
 }
 
-function blockStatementContainingCall(block: ts.Block, call: ts.CallExpression): ts.Statement | null {
-  let node: ts.Node = call;
-  while (node.parent && node.parent !== block) node = node.parent;
-  return node.parent === block && ts.isStatement(node) ? node : null;
+type LauncherScope =
+  | FunctionLikeWithBody
+  | ts.Block
+  | ts.CatchClause
+  | ts.ForStatement
+  | ts.ForInStatement
+  | ts.ForOfStatement;
+
+function isLauncherScope(node: ts.Node): node is LauncherScope {
+  return isFunctionLikeWithBody(node)
+    || ts.isBlock(node)
+    || ts.isCatchClause(node)
+    || ts.isForStatement(node)
+    || ts.isForInStatement(node)
+    || ts.isForOfStatement(node);
+}
+
+function addLoopInitializerBindings(
+  loop: ts.ForStatement | ts.ForInStatement | ts.ForOfStatement,
+  bindings: Map<string, LauncherBinding>,
+): void {
+  const initializer = loop.initializer;
+  if (!initializer || !ts.isVariableDeclarationList(initializer)) return;
+  for (const declaration of initializer.declarations) {
+    for (const [name, binding] of shadowBindingsForPattern(declaration.name)) bindings.set(name, binding);
+  }
+}
+
+function addCatchBindings(
+  clause: ts.CatchClause,
+  bindings: Map<string, LauncherBinding>,
+): void {
+  if (!clause.variableDeclaration) return;
+  for (const [name, binding] of shadowBindingsForPattern(clause.variableDeclaration.name)) {
+    bindings.set(name, binding);
+  }
 }
 
 function launcherBindingsAtCall(
   sourceFile: ts.SourceFile,
-  functionLike: FunctionLikeWithBody,
   call: ts.CallExpression,
 ): Map<string, LauncherBinding> {
   const bindings = importedLauncherBindings(sourceFile);
-  const functions: FunctionLikeWithBody[] = [];
-  let functionParent: ts.Node | undefined = functionLike.parent;
-  while (functionParent) {
-    if (isFunctionLikeWithBody(functionParent)) functions.push(functionParent);
-    functionParent = functionParent.parent;
+  const scopes: LauncherScope[] = [];
+  let parent: ts.Node | undefined = call.parent;
+  while (parent) {
+    if (isLauncherScope(parent)) scopes.push(parent);
+    parent = parent.parent;
   }
-  for (const outer of functions.reverse()) addFunctionParameters(outer, bindings);
-  addFunctionParameters(functionLike, bindings);
-
-  const blocks: ts.Block[] = [];
-  let blockParent: ts.Node | undefined = call.parent;
-  while (blockParent) {
-    if (ts.isBlock(blockParent)) blocks.push(blockParent);
-    blockParent = blockParent.parent;
-  }
-  for (const block of blocks.reverse()) {
-    const containingStatement = blockStatementContainingCall(block, call);
-    if (!containingStatement) continue;
-    for (const statement of block.statements) {
-      addStatementBindings(statement, bindings, call.getStart());
-      if (statement === containingStatement) break;
+  for (const scope of scopes.reverse()) {
+    if (isFunctionLikeWithBody(scope)) {
+      addFunctionParameters(scope, bindings);
+      addFunctionVarBindings(scope, bindings);
+    } else if (ts.isBlock(scope)) {
+      addBlockLexicalBindings(scope, bindings, call.getStart());
+    } else if (ts.isCatchClause(scope)) {
+      addCatchBindings(scope, bindings);
+    } else {
+      addLoopInitializerBindings(scope, bindings);
     }
   }
   return bindings;
+}
+
+function isCanonicalLauncherBinding(binding: LauncherBinding | undefined): boolean {
+  return Boolean(
+    binding
+    && (binding.kind === 'import' || binding.kind === 'composition')
+    && binding.canonicalName
+    && CANONICAL_LAUNCH_NAMES.has(binding.canonicalName),
+  );
 }
 
 function canonicalLauncherCall(
@@ -834,13 +895,7 @@ function canonicalLauncherCall(
   bindings: Map<string, LauncherBinding>,
 ): boolean {
   if (ts.isIdentifier(expression)) {
-    const binding = bindings.get(expression.text);
-    return Boolean(
-      binding
-      && binding.kind !== 'shadow'
-      && binding.canonicalName
-      && CANONICAL_LAUNCH_NAMES.has(binding.canonicalName),
-    );
+    return isCanonicalLauncherBinding(bindings.get(expression.text));
   }
   const propertyName = ts.isPropertyAccessExpression(expression)
     ? canonicalLauncherName(expression.name.text)
@@ -850,7 +905,7 @@ function canonicalLauncherCall(
   }
   if (!ts.isIdentifier(expression.expression)) return false;
   const base = bindings.get(expression.expression.text);
-  return Boolean(base && base.kind !== 'shadow');
+  return isCanonicalLauncherBinding(base);
 }
 
 function callsCanonicalLauncher(
@@ -865,7 +920,7 @@ function callsCanonicalLauncher(
     if (ts.isCallExpression(node)
       && canonicalLauncherCall(
         node.expression,
-        launcherBindingsAtCall(sourceFile, functionLike, node),
+        launcherBindingsAtCall(sourceFile, node),
       )) {
       found = true;
       return;
@@ -1176,7 +1231,6 @@ function hasLocalDeclarationName(sourceFile: ts.SourceFile, name: string): boole
       || ts.isGetAccessorDeclaration(node)
       || ts.isSetAccessorDeclaration(node)
       || ts.isPropertyDeclaration(node)
-      || ts.isPropertySignature(node)
     ) {
       const propertyName = node.name && propertyNameText(node.name);
       if (propertyName === name) {
@@ -1445,6 +1499,109 @@ function AppShellContent() {
 }`;
     expect(entrypointHasAudit(root, entry, sources(factoryLauncher))).toBe(false);
 
+    const loopAndCatchBindings = [
+      `import { launchCoreTask } from './coreTaskSurface';
+function AppShellContent() {
+  const openOfferNegotiation = () => {
+    for (const launchCoreTask of [() => {}]) {
+      launchCoreTask();
+    }
+  };
+  return null;
+}`,
+      `import { launchCoreTask } from './coreTaskSurface';
+function AppShellContent() {
+  const openOfferNegotiation = () => {
+    for (const launchCoreTask in { value: 1 }) {
+      launchCoreTask();
+    }
+  };
+  return null;
+}`,
+      `import { launchCoreTask } from './coreTaskSurface';
+function AppShellContent() {
+  const openOfferNegotiation = () => {
+    for (const launchCoreTask of [1]) {
+      launchCoreTask();
+    }
+  };
+  return null;
+}`,
+      `import { launchCoreTask } from './coreTaskSurface';
+function AppShellContent() {
+  const openOfferNegotiation = () => {
+    try { return null; } catch (launchCoreTask) {
+      launchCoreTask();
+    }
+  };
+  return null;
+}`,
+    ];
+    for (const source of loopAndCatchBindings) {
+      expect(entrypointHasAudit(root, entry, sources(source))).toBe(false);
+    }
+
+    const postLexicalDeclarations = [
+      `import { launchCoreTask } from './coreTaskSurface';
+function AppShellContent() {
+  const openOfferNegotiation = () => {
+    launchCoreTask();
+    let launchCoreTask;
+  };
+  return null;
+}`,
+      `import { launchCoreTask } from './coreTaskSurface';
+function AppShellContent() {
+  const openOfferNegotiation = () => {
+    launchCoreTask();
+    class launchCoreTask {}
+  };
+  return null;
+}`,
+      `import { launchCoreTask } from './coreTaskSurface';
+function AppShellContent() {
+  const openOfferNegotiation = () => {
+    launchCoreTask();
+    function launchCoreTask() { return null; }
+  };
+  return null;
+}`,
+      `import { launchCoreTask } from './coreTaskSurface';
+function AppShellContent() {
+  const openOfferNegotiation = () => {
+    launchCoreTask();
+    if (true) { var launchCoreTask = factory(); }
+  };
+  return null;
+}`,
+    ];
+    for (const source of postLexicalDeclarations) {
+      expect(entrypointHasAudit(root, entry, sources(source))).toBe(false);
+    }
+
+    const parameterLauncher = `import { launchCoreTask } from './coreTaskSurface';
+function AppShellContent() {
+  const openOfferNegotiation = (launchCoreTask = factory()) => launchCoreTask();
+  return null;
+}`;
+    expect(entrypointHasAudit(root, entry, sources(parameterLauncher))).toBe(false);
+    const parameterController = `import { launchCoreTask } from './coreTaskSurface';
+function AppShellContent() {
+  const openOfferNegotiation = (controller: unknown) => controller.launch();
+  return null;
+}`;
+    expect(entrypointHasAudit(root, entry, sources(parameterController))).toBe(false);
+
+    const controlledAlias = `import { launchCoreTask as canonicalLauncher } from './coreTaskSurface';
+function AppShellContent() {
+  const openOfferNegotiation = () => {
+    const open = canonicalLauncher;
+    open();
+  };
+  return null;
+}`;
+    expect(entrypointHasAudit(root, entry, sources(controlledAlias))).toBe(true);
+
     const wrongQualifiedOwner = `import { launchCoreTask } from './coreTaskSurface';
 function OtherContainer() {
   const openOfferNegotiation = () => launchCoreTask();
@@ -1525,6 +1682,14 @@ export function ApplicationDetail() { return TERMINAL_EVENT_STATUSES; }`],
 export function ApplicationDetail() { return isUpcomingInterview(); }`],
     ]);
     expect(hasLocalEventClassifier(localFunction)).toBe(true);
+
+    const interfaceProperty = new Map([
+      ['web/src/components/ApplicationDetail.tsx', `interface InterviewState {
+  isUpcomingInterview: boolean;
+}
+export function ApplicationDetail() { return true; }`],
+    ]);
+    expect(hasLocalEventClassifier(interfaceProperty)).toBe(false);
   });
 
   it('requires the canonical AST surfaces, audited entrypoints, classifier, and copy migration', () => {

@@ -282,7 +282,7 @@ function ValueView({
 function sortCandidates(target: Resume, candidates: Resume[]) {
   const available = candidates.filter((candidate) => (
     candidate.id !== target.id
-    && candidate.deleted_at == null
+    && isVisibleCandidate(candidate)
   ));
   const lineage = resolveResumeLineage(candidates, target.id);
   const parentId = lineage.kind === 'job_variant' ? lineage.parent?.id ?? null : null;
@@ -297,6 +297,22 @@ function sortCandidates(target: Resume, candidates: Resume[]) {
 function candidateLabel(candidate: Resume, candidates: Resume[]) {
   const lineage = resolveResumeLineage(candidates, candidate.id);
   return `${resumeDisplayTitle(candidate)}（${formatResumeLineage(lineage)}）`;
+}
+
+function isVisibleCandidate(candidate: Resume): boolean {
+  const visibility = candidate as Resume & {
+    readonly deleted?: boolean;
+    readonly hidden?: boolean;
+    readonly visible?: boolean;
+  };
+  try {
+    return visibility.deleted_at == null
+      && visibility.deleted !== true
+      && visibility.hidden !== true
+      && visibility.visible !== false;
+  } catch {
+    return false;
+  }
 }
 
 function groupItems(items: ResumeDiffItem[]) {

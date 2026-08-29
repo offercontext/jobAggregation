@@ -142,6 +142,19 @@ describe('ResumeVersionCompareDrawer', () => {
     expect(drawerRoot().textContent).not.toContain('is_master');
   });
 
+  it('does not offer hidden resume rows as comparison candidates', () => {
+    const target = makeResume(4);
+    const hidden = { ...makeResume(3), hidden: true } as Resume;
+    const invisible = { ...makeResume(2), visible: false } as Resume;
+
+    renderDrawer(target, [target, hidden, invisible, makeResume(1)]);
+
+    const labels = Array.from(compareSelect().options).map((option) => option.textContent).join(' ');
+    expect(labels).not.toContain('中文版本 3');
+    expect(labels).not.toContain('中文版本 2');
+    expect(labels).toContain('中文版本 1');
+  });
+
   it('keeps a manual baseline across candidate refresh and reapplies only a new target parent', async () => {
     const target = makeResume(3, { parent_resume_id: 2 });
     const parent = makeResume(2);

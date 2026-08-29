@@ -109,7 +109,11 @@ const INVALID_IDENTITY_RESULT: CoreTaskParseResult = Object.freeze({
 });
 
 function isRecord(value: unknown): value is Record<PropertyKey, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+  try {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+  } catch {
+    return false;
+  }
 }
 
 function hasOwn(value: object, key: PropertyKey): boolean {
@@ -157,15 +161,19 @@ export function parseCoreTaskRef(input: unknown): CoreTaskParseResult {
       return INVALID_IDENTITY_RESULT;
     }
 
+    const identityValues = new Map<CoreTaskIdentityField, number>();
     for (const field of requiredFields) {
-      if (!hasOwn(input, field) || !isSafePositiveInteger(input[field])) {
+      if (!hasOwn(input, field)) {
         return INVALID_IDENTITY_RESULT;
       }
+      const value = input[field];
+      if (!isSafePositiveInteger(value)) return INVALID_IDENTITY_RESULT;
+      identityValues.set(field, value);
     }
 
     const ref = {
       taskId,
-      ...Object.fromEntries(requiredFields.map((field) => [field, input[field]])),
+      ...Object.fromEntries(requiredFields.map((field) => [field, identityValues.get(field)])),
     } as CoreTaskRef;
     const key = canonicalKeyForRef(ref, requiredFields);
     return { ok: true, ref: Object.freeze(ref), key };

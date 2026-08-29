@@ -177,6 +177,38 @@ describe('CoreTask contracts', () => {
     expect(parseCoreTaskRef(hostile)).toEqual({ ok: false, reason: 'unknown_task' });
   });
 
+  it('fails safely for a revoked proxy without throwing', () => {
+    const { proxy, revoke } = Proxy.revocable({}, {});
+    revoke();
+
+    expect(() => parseCoreTaskRef(proxy)).not.toThrow();
+    expect(parseCoreTaskRef(proxy)).toEqual({ ok: false, reason: 'unknown_task' });
+  });
+
+  it('reads every required identity getter once and reuses the validated values', () => {
+    let applicationReads = 0;
+    let eventReads = 0;
+    const input = {
+      taskId: 'application.interview_prepare' as const,
+      get applicationId() {
+        applicationReads += 1;
+        return applicationReads === 1 ? 7 : Number.NaN;
+      },
+      get eventId() {
+        eventReads += 1;
+        return eventReads === 1 ? 9 : Number.NaN;
+      },
+    };
+
+    expect(parseCoreTaskRef(input)).toEqual({
+      ok: true,
+      ref: { taskId: 'application.interview_prepare', applicationId: 7, eventId: 9 },
+      key: 'application.interview_prepare:applicationId=7:eventId=9',
+    });
+    expect(applicationReads).toBe(1);
+    expect(eventReads).toBe(1);
+  });
+
   it('keeps source, focus, and hints out of the canonical identity key', () => {
     const first: TaskLaunchRequest = {
       ref: { taskId: 'application.material_kit', applicationId: 7 },

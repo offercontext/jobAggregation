@@ -16,6 +16,7 @@ const state = vi.hoisted(() => ({
   sourceConflict: vi.fn(),
   listV2: vi.fn(),
   history: [] as Array<{ id: number; recommendation: string; created_at: string }>,
+  drawerClose: null as (() => void) | null,
 }));
 
 vi.mock('@/services/resumes', () => ({
@@ -96,7 +97,10 @@ vi.mock('antd', () => {
     ),
     Card: (props: { title?: ReactNode; children: ReactNode }) => <section><h3>{props.title}</h3>{props.children}</section>,
     Divider: () => <hr />,
-    Drawer: (props: { open: boolean; title: ReactNode; children: ReactNode }) => props.open ? <div role="dialog"><h1>{props.title}</h1>{props.children}</div> : null,
+    Drawer: (props: { open: boolean; title: ReactNode; children: ReactNode; onClose?: () => void }) => {
+      state.drawerClose = props.onClose ?? null;
+      return props.open ? <div role="dialog"><h1>{props.title}</h1>{props.children}</div> : null;
+    },
     Form,
     Input,
     Select: (props: { value?: unknown; disabled?: boolean; onChange?: (value: unknown) => void; options?: Array<{ value: unknown; label: string }> }) => (
@@ -112,9 +116,54 @@ vi.mock('antd', () => {
   };
 });
 
-const { default: OpportunityFitReviewDrawer } = await import('./OpportunityFitReviewDrawer');
+const {
+  default: OpportunityFitReviewDrawer,
+  createOpportunityFitOwnerStore,
+} = await import('./OpportunityFitReviewDrawer');
 
 const application = { id: 7, company_name: 'Example Co.', position_name: 'Backend Engineer' } as never;
+
+function historyV1(id: number, createdAt = '2026-07-21T00:00:00Z') {
+  return {
+    schema_version: 1,
+    id,
+    application_id: 7,
+    resume_id: 11,
+    status: 'triage_complete',
+    summary: { text: `Historical V1 ${id}` },
+    recommendation: 'advance',
+    source_fingerprint_sha256: 'history-source',
+    created_at: createdAt,
+  };
+}
+
+function historyV2(id: number, createdAt = '2026-07-21T00:00:00Z') {
+  return {
+    id,
+    review_id: id,
+    application_id: 7,
+    schema_version: 2,
+    status: 'active',
+    created_at: createdAt,
+    latest_stage: {
+      id: id * 10,
+      stage_id: id * 10,
+      review_id: id,
+      application_id: 7,
+      schema_version: 2,
+      stage: 'triage',
+      stage_status: 'ready',
+      created_at: createdAt,
+      source_fingerprint_sha256: 'history-source',
+      proposal: {
+        schema_version: 2,
+        stage: 'triage',
+        summary: { text: `Historical V2 ${id}` },
+      },
+    },
+  };
+}
+
 let root: Root | undefined;
 let container: HTMLDivElement | undefined;
 
@@ -123,6 +172,13 @@ async function render(
   currentJdText = '',
   draft?: Record<string, unknown>,
   onDraftChange?: (patch: Record<string, unknown>) => void,
+  ownerOptions: {
+    application?: unknown;
+    ownerStore?: ReturnType<typeof createOpportunityFitOwnerStore>;
+    onOwnerStateChange?: (state: { pending: boolean; resultUnknown: boolean; unsaved: boolean }) => void;
+    onOwnerProjectionChange?: (projection: unknown) => void;
+    onClose?: () => void;
+  } = {},
 ) {
   container = document.createElement('div');
   document.body.appendChild(container);
@@ -130,13 +186,16 @@ async function render(
   await act(async () => {
     root?.render(
       <OpportunityFitReviewDrawer
-        application={application}
+        application={(ownerOptions.application ?? application) as never}
         open
         currentJdText={currentJdText}
         jdVersionId={1}
         draft={draft as never}
         onDraftChange={onDraftChange as never}
-        onClose={vi.fn()}
+        ownerStore={ownerOptions.ownerStore}
+        onOwnerStateChange={ownerOptions.onOwnerStateChange}
+        onOwnerProjectionChange={ownerOptions.onOwnerProjectionChange}
+        onClose={ownerOptions.onClose ?? vi.fn()}
         onPrepareMaterials={onPrepareMaterials}
       />,
     );
@@ -155,6 +214,7 @@ beforeEach(() => {
   state.sourceConflict.mockReset();
   state.listV2.mockReset();
   state.history = [];
+  state.drawerClose = null;
   state.list.mockResolvedValue([]);
   state.listV2.mockResolvedValue([]);
   state.create.mockResolvedValue({
@@ -210,6 +270,7 @@ afterEach(async () => {
   });
   container?.remove();
   vi.unstubAllGlobals();
+  state.drawerClose = null;
 });
 
 function setValue(element: HTMLTextAreaElement | HTMLSelectElement, value: string) {
@@ -273,6 +334,111 @@ describe('OpportunityFitReviewDrawer', () => {
     expect(rendered.querySelector('[data-testid="opportunity-fit-source-panel"]')).not.toBeNull();
     expect(rendered.querySelector('[data-testid="opportunity-fit-action-group"]')).not.toBeNull();
     expect(state.create).not.toHaveBeenCalled();
+  });
+
+  it('publishes pending before mutation and keeps an unknown attempt on close', async () => {
+    state.create.mockImplementation(() => new Promise(() => undefined));
+    const ownerStore = createOpportunityFitOwnerStore();
+    const ownerStates: Array<{ pending: boolean; resultUnknown: boolean; unsaved: boolean }> = [];
+    const view = await render(undefined, 'JD text', undefined, undefined, {
+      ownerStore,
+      onOwnerStateChange: (next) => ownerStates.push(next),
+    });
+    const select = getByLabelText(view, '用于审阅的简历') as HTMLSelectElement;
+    await waitFor(() => expect(select.querySelector('option[value="11"]')).toBeTruthy());
+    await act(async () => setValue(select, '11'));
+    await waitFor(() => expect(getByRole(view, 'button', '开始快速判断')).toHaveProperty('disabled', false));
+    await click(getByRole(view, 'button', '开始快速判断'));
+    await waitFor(() => expect(state.create).toHaveBeenCalledTimes(1));
+    expect(ownerStates).toContainEqual({ pending: true, resultUnknown: false, unsaved: true });
+    expect(ownerStore.getDraft(7).triageKey).toBeTruthy();
+
+    await act(async () => state.drawerClose?.());
+    expect(ownerStore.getDraft(7).resultUnknown).toBe(true);
+    expect(ownerStates[ownerStates.length - 1]).toEqual({ pending: false, resultUnknown: true, unsaved: true });
+  });
+
+  it('drops a pending response after switching applications', async () => {
+    let resolveCreate: (() => void) | undefined;
+    state.create.mockImplementation((_applicationID, input: { idempotency_key: string }) => new Promise((resolve) => {
+      resolveCreate = () => resolve({
+        review_id: 31,
+        stage_id: 310,
+        stage: 'triage',
+        stage_status: 'ready',
+        confirmation_token: 'confirm-token',
+        resume_id: 11,
+        jd_version_id: 1,
+        idempotency_key: input.idempotency_key,
+        proposal: { summary: { text: 'Stale App A result', evidence_refs: [] }, conditions: [], risks: [], questions: [], next_steps: [] },
+      });
+    }));
+    const ownerStore = createOpportunityFitOwnerStore();
+    const appB = { id: 8, company_name: 'Other Co.', position_name: 'Platform Engineer' };
+    const view = await render(undefined, 'App A JD', undefined, undefined, { ownerStore });
+    const select = getByLabelText(view, '用于审阅的简历') as HTMLSelectElement;
+    await waitFor(() => expect(select.querySelector('option[value="11"]')).toBeTruthy());
+    await act(async () => setValue(select, '11'));
+    await waitFor(() => expect(getByRole(view, 'button', '快速判断')).toHaveProperty('disabled', false));
+    await click(getByRole(view, 'button', '快速判断'));
+    await waitFor(() => expect(state.create).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      root?.render(
+        <OpportunityFitReviewDrawer
+          application={appB as never}
+          open
+          currentJdText="App B JD"
+          jdVersionId={1}
+          ownerStore={ownerStore}
+          onClose={vi.fn()}
+        />,
+      );
+      await Promise.resolve();
+    });
+    await waitFor(() => expect((getByLabelText(view, '用户粘贴的 JD') as HTMLTextAreaElement).value).toBe('App B JD'));
+
+    resolveCreate?.();
+    await flush();
+
+    expect(view.textContent).not.toContain('Stale App A result');
+    expect(ownerStore.getDraft(7).resultUnknown).toBe(true);
+    expect(ownerStore.getDraft(8).triage).toBeNull();
+  });
+
+  it('isolates composition-scoped drafts across applications and Drawer remounts', async () => {
+    const ownerStore = createOpportunityFitOwnerStore();
+    const appB = { id: 8, company_name: 'Other Co.', position_name: 'Platform Engineer' };
+    ownerStore.setDraft(7, {
+      ...ownerStore.getDraft(7),
+      jdText: 'App A JD',
+      jdVersionId: 1,
+      assertionsText: 'App A fact',
+    });
+    const view = await render(undefined, 'App B JD', undefined, undefined, {
+      application: appB,
+      ownerStore,
+    });
+    expect((getByLabelText(view, '用户粘贴的 JD') as HTMLTextAreaElement).value).toBe('App B JD');
+    expect(ownerStore.getDraft(8).jdText).toBe('App B JD');
+    expect(ownerStore.getDraft(7).jdText).toBe('App A JD');
+
+    await act(async () => {
+      root?.unmount();
+      root = createRoot(container!);
+      root.render(
+        <OpportunityFitReviewDrawer
+          application={application}
+          open
+          currentJdText="App A current JD"
+          jdVersionId={1}
+          ownerStore={ownerStore}
+          onClose={vi.fn()}
+        />,
+      );
+      await Promise.resolve();
+    });
+    expect((getByLabelText(view, '用户粘贴的 JD') as HTMLTextAreaElement).value).toBe('App A JD');
   });
 
   it('reuses the AppShell-owned triage key after a generating response and remount', async () => {
@@ -451,7 +617,7 @@ describe('OpportunityFitReviewDrawer', () => {
     state.create.mockRejectedValue({
       response: { status: 409, data: { error_code: 'application_jd_source_conflict' } },
     });
-    state.listV2.mockResolvedValue([{ review_id: 21, triage_idempotency_key: 'd4b4b5e8-0a3a-4a3e-8e4d-6bc7a04d36b0' }]);
+    state.listV2.mockResolvedValue([{ ...historyV2(21), triage_idempotency_key: 'd4b4b5e8-0a3a-4a3e-8e4d-6bc7a04d36b0' }]);
     state.getV2.mockResolvedValue({
       stages: [{
         review_id: 21,
@@ -533,10 +699,7 @@ describe('OpportunityFitReviewDrawer', () => {
   });
 
   it('keeps the latest Drawer history selection when an earlier response arrives late', async () => {
-    state.listV2.mockResolvedValue([
-      { review_id: 21, stage_count: 1 },
-      { review_id: 22, stage_count: 1 },
-    ]);
+    state.listV2.mockResolvedValue([historyV2(21), historyV2(22)]);
     const resolveHistory = new Map<number, (value: unknown) => void>();
     state.getV2.mockImplementation((_applicationId: number, reviewId: number) => (
       new Promise((resolve) => { resolveHistory.set(reviewId, resolve); })
@@ -554,10 +717,10 @@ describe('OpportunityFitReviewDrawer', () => {
     });
     expect(state.getV2).toHaveBeenCalledTimes(2);
 
-    resolveHistory.get(22)?.({
+    resolveHistory.get(21)?.({
       stages: [{
-        review_id: 22,
-        stage_id: 220,
+        review_id: 21,
+        stage_id: 210,
         stage: 'triage',
         stage_status: 'ready',
         resume_id: 11,
@@ -572,10 +735,10 @@ describe('OpportunityFitReviewDrawer', () => {
     await flush();
     expect(view.textContent).toContain('Drawer history B');
 
-    resolveHistory.get(21)?.({
+    resolveHistory.get(22)?.({
       stages: [{
-        review_id: 21,
-        stage_id: 210,
+        review_id: 22,
+        stage_id: 220,
         stage: 'triage',
         stage_status: 'ready',
         resume_id: 11,
@@ -595,8 +758,8 @@ describe('OpportunityFitReviewDrawer', () => {
 
   it('disables Drawer history while Triage is in flight', async () => {
     let resolveCreate: ((value: unknown) => void) | undefined;
-    state.list.mockResolvedValue([{ id: 8, recommendation: 'advance', created_at: '2026-07-21T00:00:00Z' }]);
-    state.listV2.mockResolvedValue([{ review_id: 21, stage_count: 1 }]);
+    state.list.mockResolvedValue([historyV1(8)]);
+    state.listV2.mockResolvedValue([historyV2(21)]);
     state.create.mockImplementation(() => new Promise((resolve) => { resolveCreate = resolve; }));
     const view = await render(undefined, 'JD text');
     const select = view.querySelector('select');
@@ -634,8 +797,8 @@ describe('OpportunityFitReviewDrawer', () => {
   });
 
   it('keeps Drawer history disabled after remounting an unknown attempt', async () => {
-    state.list.mockResolvedValue([{ id: 8, recommendation: 'advance', created_at: '2026-07-21T00:00:00Z' }]);
-    state.listV2.mockResolvedValue([{ review_id: 21, stage_count: 1 }]);
+    state.list.mockResolvedValue([historyV1(8)]);
+    state.listV2.mockResolvedValue([historyV2(21)]);
     const view = await render(undefined, 'JD text', {
       applicationId: 7,
       resumeId: 11,
@@ -665,8 +828,8 @@ describe('OpportunityFitReviewDrawer', () => {
   });
 
   it('keeps Drawer history disabled while a persisted Deep attempt is unresolved', async () => {
-    state.list.mockResolvedValue([{ id: 8, recommendation: 'advance', created_at: '2026-07-21T00:00:00Z' }]);
-    state.listV2.mockResolvedValue([{ review_id: 21, stage_count: 1 }]);
+    state.list.mockResolvedValue([historyV1(8)]);
+    state.listV2.mockResolvedValue([historyV2(21)]);
     const view = await render(undefined, 'JD text', {
       applicationId: 7,
       resumeId: 11,
@@ -692,9 +855,9 @@ describe('OpportunityFitReviewDrawer', () => {
 
   it('drops a late Drawer history response when a new Triage starts', async () => {
     let resolveHistory: ((value: unknown) => void) | undefined;
-    state.listV2.mockResolvedValue([{ review_id: 21, stage_count: 1 }]);
+    state.listV2.mockResolvedValue([historyV2(21)]);
     state.getV2.mockImplementationOnce(() => new Promise((resolve) => { resolveHistory = resolve; }));
-    state.create.mockResolvedValue({
+    state.create.mockImplementation((_applicationID, input: { idempotency_key: string }) => ({
       review_id: 31,
       stage_id: 310,
       stage: 'triage',
@@ -702,9 +865,9 @@ describe('OpportunityFitReviewDrawer', () => {
       confirmation_token: 'confirm-token',
       resume_id: 11,
       jd_version_id: 1,
-      idempotency_key: 'current-triage-key',
+      idempotency_key: input.idempotency_key,
       proposal: { summary: { text: 'Current Drawer Triage', evidence_refs: [] }, conditions: [], risks: [], questions: [], next_steps: [] },
-    });
+    }));
     const view = await render(undefined, 'JD text');
     await waitFor(() => expect([...view.querySelectorAll<HTMLButtonElement>('button')].find((button) => button.textContent === '查看')).toBeTruthy());
     const historyButton = [...view.querySelectorAll<HTMLButtonElement>('button')]
@@ -909,7 +1072,7 @@ describe('OpportunityFitReviewDrawer', () => {
   });
 
   it('keeps an active v2 review when the current JD query refreshes', async () => {
-    state.create.mockResolvedValue({
+    state.create.mockImplementation((_applicationID, input: { idempotency_key: string }) => ({
       review_id: 21,
       stage_id: 22,
       stage: 'triage',
@@ -917,6 +1080,7 @@ describe('OpportunityFitReviewDrawer', () => {
       confirmation_token: 'confirm-token',
       resume_id: 11,
       jd_version_id: 1,
+      idempotency_key: input.idempotency_key,
       proposal: {
         summary: { text: 'Frozen triage result', evidence_refs: [] },
         conditions: [],
@@ -924,7 +1088,7 @@ describe('OpportunityFitReviewDrawer', () => {
         next_steps: [],
         questions: [],
       },
-    });
+    }));
     const view = await render(undefined, 'JD version one');
     const select = view.querySelector('select');
     if (!(select instanceof HTMLSelectElement)) throw new Error('Expected resume selector');
@@ -1000,7 +1164,7 @@ describe('OpportunityFitReviewDrawer', () => {
   });
 
   it('hands historical review frozen JD and resume to material preparation', async () => {
-    state.history = [{ id: 8, recommendation: 'advance', created_at: '2026-07-21T00:00:00Z' }];
+    state.history = [historyV1(8)];
     state.list.mockResolvedValue(state.history);
     const onPrepareMaterials = vi.fn();
     const view = await render(onPrepareMaterials);
@@ -1053,7 +1217,7 @@ describe('OpportunityFitReviewDrawer', () => {
   });
 
   it('renders Chinese labels for Opportunity Fit enum values', async () => {
-    state.history = [{ id: 9, recommendation: 'advance', created_at: '2026-07-21T00:00:00Z' }];
+    state.history = [historyV1(9)];
     state.list.mockResolvedValue(state.history);
     state.get.mockResolvedValue({
       id: 9,
@@ -1140,6 +1304,7 @@ describe('OpportunityFitReviewDrawer', () => {
     });
     state.getV2.mockResolvedValue({ stages: [confirmed] });
     const onDraftChange = vi.fn();
+    const ownerStates: Array<{ pending: boolean; resultUnknown: boolean; unsaved: boolean }> = [];
     const view = await render(undefined, 'JD text', {
       applicationId: 7,
       resumeId: 11,
@@ -1157,12 +1322,13 @@ describe('OpportunityFitReviewDrawer', () => {
       historical: false,
       resultUnknown: false,
       error: null,
-    }, onDraftChange);
+    }, onDraftChange, { onOwnerStateChange: (state) => ownerStates.push(state) });
 
     await click(getByRole(view, 'button', '快速判断'));
     await waitFor(() => expect(state.getV2).toHaveBeenCalledWith(7, 21));
     expect(onDraftChange).toHaveBeenCalledWith(expect.objectContaining({ triage: confirmed, resultUnknown: false }));
     expect(view.textContent).toContain('Confirmed triage');
+    expect(ownerStates[ownerStates.length - 1]).toEqual({ pending: false, resultUnknown: false, unsaved: true });
   });
 
   it('preserves the Triage confirmation attempt when the response and status lookup are unknown', async () => {

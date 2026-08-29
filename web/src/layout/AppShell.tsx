@@ -7,31 +7,9 @@ import { listEvents } from '@/services/events';
 import { listOffers } from '@/services/offers';
 import { ONBOARDING_QUERY_KEY } from '@/services/onboarding';
 import { listResumes } from '@/services/resumes';
-import {
-  getOpportunityFitReview,
-  listOpportunityFitReviews,
-  createOpportunityFitV2Triage,
-  confirmOpportunityFitV2Triage,
-  createOpportunityFitV2DeepReview,
-  getOpportunityFitV2Review,
-  findOpportunityFitV2SourceConflictStage,
-  listOpportunityFitV2Reviews,
-} from '@/services/opportunityFitReviews';
-import { type PilotOpportunityFitMaterialHandoff } from '@/features/pilot/PilotOpportunityFitCard';
-import PilotOpportunityFitV2Card, { type PilotOpportunityFitV2Draft } from '@/features/pilot/PilotOpportunityFitV2Card';
-import {
-  isOpportunityFitNotFoundError,
-} from '@/features/pilot/pilotOpportunityFitLifecycle';
-import { discardMaterialKitHandoff, writeMaterialKitHandoff } from '@/features/pilot/materialKitHandoff';
 import type { Application } from '@/types/application';
 import type { ScheduleEvent } from '@/types/event';
 import type { Offer } from '@/types/offer';
-import {
-  createOpportunityFitV2Draft,
-  type OpportunityFitReview,
-  type OpportunityFitV2Draft,
-} from '@/types/opportunityFitReview';
-import { getOpportunityFitErrorMessage } from '@/components/opportunityFitCopy';
 import type { ChatStartRequest, PilotActionRequest, PilotContextAttachment } from '@/types/chat';
 import Sidebar from './Sidebar';
 import TopBar, { type TopBarAction } from './TopBar';
@@ -42,6 +20,13 @@ import type { InterviewKnowledgeCaptureDraft } from '@/components/InterviewKnowl
 import type { InterviewPreparationAttemptState, InterviewPreparationDraft, InterviewPreparationKnowledgeOption } from '@/components/InterviewPreparationProposalDrawer';
 import MockInterviewDrawer, { type MockInterviewDrawerDraft } from '@/components/MockInterviewDrawer';
 import InterviewStudio, { type InterviewStudioContext as RealInterviewStudioContext, type QuickPracticeStudioContext } from '@/features/interviewStudio/InterviewStudio';
+import PilotOpportunityFitV2Card from '@/features/pilot/PilotOpportunityFitV2Card';
+import {
+  createOpportunityFitOwnerStore,
+  type OpportunityFitOwnerProjection,
+  type OpportunityFitOwnerStore,
+} from '@/components/OpportunityFitReviewDrawer';
+import { normalizeOpportunityFitHistoryDate } from '@/features/applicationTasks/opportunityFitHistory';
 import type { VoiceCoachingRecommendation } from '@/types/voiceCoaching';
 import InterviewStoryLibraryView, { type InterviewStoryOpenDraft } from '@/components/InterviewStoryLibraryView';
 import InterviewStoryDrawer, { createInterviewStoryDraft, type InterviewStoryDraft } from '@/components/InterviewStoryDrawer';
@@ -113,9 +98,68 @@ import {
   type CoreTaskLaunchResult,
   type CoreTaskSurfaceController,
 } from '@/features/coreTaskSurface/controller';
-import type { CoreTaskRef, TaskLaunchRequest } from '@/features/coreTaskSurface/contracts';
+import type { TaskLaunchRequest } from '@/features/coreTaskSurface/contracts';
 
 const { Content } = Layout;
+
+const PILOT_FIT_PROJECTION_STATUSES = new Set<OpportunityFitOwnerProjection['status']>([
+  'idle',
+  'pending',
+  'result_unknown',
+  'ready',
+  'source_conflict',
+  'unavailable',
+]);
+const PILOT_FIT_HISTORY_STATES = new Set<OpportunityFitOwnerProjection['historyState']>([
+  'ready',
+  'loading',
+  'error',
+  'absent',
+]);
+
+/** Keep the composition-root projection bounded even when a child is
+ * replaced with an untyped implementation. AppShell stores only this frozen
+ * view; the Drawer remains the owner of mutable fit state. */
+function freezePilotFitProjection(value: unknown): OpportunityFitOwnerProjection | null {
+  try {
+    if (!value || typeof value !== 'object') return null;
+    const projection = value as Record<string, unknown>;
+    const applicationId = projection.applicationId;
+    const status = projection.status;
+    const summary = projection.summary;
+    const historyState = projection.historyState;
+    if (!Number.isSafeInteger(applicationId) || (applicationId as number) <= 0) return null;
+    if (typeof status !== 'string' || !PILOT_FIT_PROJECTION_STATUSES.has(status as OpportunityFitOwnerProjection['status'])) return null;
+    if (summary !== null && (typeof summary !== 'string' || summary.trim().length === 0 || summary.length > 8_000)) return null;
+    if (typeof historyState !== 'string' || !PILOT_FIT_HISTORY_STATES.has(historyState as OpportunityFitOwnerProjection['historyState'])) return null;
+    if (!Array.isArray(projection.history)) return null;
+    if (projection.history.length > 100) return null;
+    const history = projection.history.map((value) => {
+      if (!value || typeof value !== 'object') throw new Error('invalid history projection');
+      const item = value as Record<string, unknown>;
+      if (typeof item.internalKey !== 'string' || item.internalKey.length === 0 || item.internalKey.length > 256) throw new Error('invalid history key');
+      const createdAt = normalizeOpportunityFitHistoryDate(item.createdAt);
+      if (!createdAt) throw new Error('invalid history date');
+      if (typeof item.summary !== 'string' || item.summary.trim().length === 0 || item.summary.length > 8_000) throw new Error('invalid history summary');
+      if (item.sourceState !== 'current' && item.sourceState !== 'source_changed' && item.sourceState !== 'unavailable') throw new Error('invalid history source');
+      return Object.freeze({
+        internalKey: item.internalKey,
+        createdAt,
+        summary: item.summary,
+        sourceState: item.sourceState,
+      });
+    });
+    return Object.freeze({
+      applicationId: applicationId as number,
+      status: status as OpportunityFitOwnerProjection['status'],
+      summary: summary as string | null,
+      history: Object.freeze(history),
+      historyState: historyState as OpportunityFitOwnerProjection['historyState'],
+    });
+  } catch {
+    return null;
+  }
+}
 
 const KanbanBoard = lazy(() => import('@/components/KanbanBoard'));
 const ApplicationListView = lazy(() => import('@/components/ApplicationListView'));
@@ -130,7 +174,6 @@ const VoiceCoachingGrowthView = lazy(() => import('@/components/VoiceCoachingGro
 const ResumeLibraryView = lazy(() => import('@/components/ResumeLibraryView'));
 const SettingsView = lazy(() => import('@/components/SettingsView'));
 
-const createPilotOpportunityFitV2Draft = createOpportunityFitV2Draft;
 
 export interface ApplicationOfferScope {
   readonly offers: Offer[] | undefined;
@@ -200,16 +243,6 @@ export function scopeApplicationOffers(
     if (owner === applicationId) scoped.push(candidate);
   }
   return { offers: scoped, hasInvalidOwner };
-}
-
-function sameCoreTaskRef(left: CoreTaskRef | undefined, right: CoreTaskRef | undefined): boolean {
-  if (!left || !right) return false;
-  return left.taskId === right.taskId
-    && left.applicationId === right.applicationId
-    && left.eventId === right.eventId
-    && left.resumeId === right.resumeId
-    && left.storyId === right.storyId
-    && left.sourceId === right.sourceId;
 }
 
 function createMockInterviewDraft(): MockInterviewDrawerDraft {
@@ -284,9 +317,6 @@ function AppShellContent() {
   const [offerNegotiationEntryPoint, setOfferNegotiationEntryPoint] = useState<'ui' | 'pilot'>('ui');
   const taskSurfaceGuardRef = useRef({ pending: false, unsaved: false });
   const pilotControllerRef = useRef(pilotController);
-  const pilotV2OperationPendingRef = useRef(false);
-  const pilotV2HistoryPendingRef = useRef(false);
-  const pilotV2DraftRef = useRef<PilotOpportunityFitV2Draft | null>(null);
   const fitToMaterialTransitionRef = useRef<{ applicationId: number; generation: number } | null>(null);
   pilotControllerRef.current = pilotController;
   // Composition-root authority: every application task opener delegates to
@@ -303,9 +333,7 @@ function AppShellContent() {
             || pilot.activeRequestRef.current
             || pilot.activePendingRef.current
             || pilot.confirmPhase === 'saving'
-            || pilotV2OperationPendingRef.current
-            || pilotV2HistoryPendingRef.current
-            || pilotV2DraftRef.current?.resultUnknown,
+            || taskSurfaceGuardRef.current.pending,
           );
       },
       hasUnsavedChanges: (active) => {
@@ -326,6 +354,10 @@ function AppShellContent() {
     coreTaskController.getState,
     coreTaskController.getState,
   );
+  const opportunityFitOwnerStoreRef = useRef<OpportunityFitOwnerStore | null>(null);
+  if (!opportunityFitOwnerStoreRef.current) {
+    opportunityFitOwnerStoreRef.current = createOpportunityFitOwnerStore();
+  }
   const launchCoreTask = useCallback((request: TaskLaunchRequest): CoreTaskLaunchResult => {
     const result = launchCoreTaskViaController(coreTaskController, request);
     // Entrypoint affects only the renderer's draft bucket. A duplicate focus
@@ -379,14 +411,8 @@ function AppShellContent() {
     typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches
   );
   const [pilotMascotActivity, setPilotMascotActivity] = useState<PilotMascotActivity>('idle');
-  const [pilotApplicationContext, setPilotApplicationContext] = useState<{ applicationId: number; pilotDraftKey: string } | null>(null);
-  const pilotV2DraftsRef = useRef(new Map<number, PilotOpportunityFitV2Draft>());
-  const [pilotV2Draft, setPilotV2Draft] = useState<PilotOpportunityFitV2Draft | null>(null);
-  const pilotV2GenerationRef = useRef(0);
-  const pilotV2HistoryRequestRef = useRef(0);
-  const [pilotV2OperationPending, setPilotV2OperationPending] = useState(false);
-  const [pilotV2HistoryPending, setPilotV2HistoryPending] = useState(false);
-  const [pilotLegacyReview, setPilotLegacyReview] = useState<OpportunityFitReview | null>(null);
+  const [pilotApplicationContext, setPilotApplicationContext] = useState<number | null>(null);
+  const [pilotFitProjections, setPilotFitProjections] = useState<Record<number, OpportunityFitOwnerProjection>>({});
   const [pilotInterviewReviewApplicationId, setPilotInterviewReviewApplicationId] = useState<number | null>(null);
   const [pilotInterviewPreparationApplicationId, setPilotInterviewPreparationApplicationId] = useState<number | null>(null);
   const [pilotInterviewPreparationEventId, setPilotInterviewPreparationEventId] = useState<number | null>(null);
@@ -400,21 +426,10 @@ function AppShellContent() {
   const [offerNegotiationDrafts, setOfferNegotiationDrafts] = useState<Record<number, OfferNegotiationDraft>>({});
   const offerNegotiationPilotDraftsRef = useRef(new Map<number, OfferNegotiationDraft>());
   const [offerNegotiationPilotDrafts, setOfferNegotiationPilotDrafts] = useState<Record<number, OfferNegotiationDraft>>({});
-  const pilotApplicationContextRef = useRef(pilotApplicationContext);
-  pilotApplicationContextRef.current = pilotApplicationContext;
-  pilotV2OperationPendingRef.current = pilotV2OperationPending;
-  pilotV2HistoryPendingRef.current = pilotV2HistoryPending;
-  pilotV2DraftRef.current = pilotV2Draft;
-  const invalidatePilotV2History = () => {
-    pilotV2HistoryRequestRef.current += 1;
-    setPilotV2HistoryPending(false);
-  };
   const [resumeOnboardingFocusToken, setResumeOnboardingFocusToken] = useState(0);
   const [pilotOnboardingFocusToken, setPilotOnboardingFocusToken] = useState(0);
   const nextPilotOnboardingFocusToken = useRef(0);
   const [selected, setSelected] = useState<Application | null>(null);
-  const opportunityFitDraftsRef = useRef(new Map<number, OpportunityFitV2Draft>());
-  const [opportunityFitDrafts, setOpportunityFitDrafts] = useState<Record<number, OpportunityFitV2Draft>>({});
   const applicationJdDraftsRef = useRef(new Map<number, ApplicationJdDraft>());
   const [applicationJdDrafts, setApplicationJdDrafts] = useState<Record<number, ApplicationJdDraft>>({});
   const [interviewReviewProposalAttempts, setInterviewReviewProposalAttempts] = useState<Record<number, InterviewReviewProposalAttemptState>>({});
@@ -447,35 +462,6 @@ function AppShellContent() {
   const [pilotRailAvailable, setPilotRailAvailable] = useState(() =>
     typeof window === 'undefined' ? false : window.matchMedia('(min-width: 1180px)').matches
   );
-  const exitPilotContext = ({ preserveUnknownAttempt = true }: { preserveUnknownAttempt?: boolean } = {}) => {
-    pilotV2GenerationRef.current += 1;
-    invalidatePilotV2History();
-    setPilotV2OperationPending(false);
-    setPilotV2HistoryPending(false);
-    const current = pilotApplicationContextRef.current;
-    if (!current) return;
-    const draft = pilotV2DraftsRef.current.get(current.applicationId);
-    if (draft) {
-      const requestPending = Boolean(
-        (draft.triageKey && (!draft.triage || ['generating', 'provider_unknown'].includes(draft.triage.stage_status)))
-        || (draft.deepKey && (!draft.deep || ['generating', 'provider_unknown'].includes(draft.deep.stage_status))),
-      );
-      const retain = preserveUnknownAttempt && (draft.resultUnknown || requestPending);
-      if (retain) {
-        const retained = {
-          ...draft,
-          resultUnknown: true,
-          error: '结果待确认，请使用原尝试重试。',
-        };
-        pilotV2DraftsRef.current.set(current.applicationId, retained);
-        setPilotV2Draft(retained);
-      } else {
-        pilotV2DraftsRef.current.delete(current.applicationId);
-        setPilotV2Draft(null);
-      }
-    }
-    setPilotApplicationContext(null);
-  };
   const kanbanSensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
   );
@@ -521,60 +507,6 @@ function AppShellContent() {
     [confirmedInterviewKnowledgeNotes],
   );
 
-  const pilotV2HistoryQuery = useQuery({
-    queryKey: ['opportunity-fit-v2-reviews', pilotApplicationContext?.applicationId],
-    queryFn: () => listOpportunityFitV2Reviews(pilotApplicationContext!.applicationId),
-    enabled: Boolean(pilotApplicationContext),
-    retry: false,
-  });
-  const pilotLegacyHistoryQuery = useQuery({
-    queryKey: ['opportunity-fit-v1-reviews', pilotApplicationContext?.applicationId],
-    queryFn: () => listOpportunityFitReviews(pilotApplicationContext!.applicationId),
-    enabled: Boolean(pilotApplicationContext),
-    retry: false,
-  });
-  const pilotApplicationJdQuery = useQuery({
-    queryKey: ['application-jd-current', pilotApplicationContext?.applicationId],
-    queryFn: () => getCurrentApplicationJd(pilotApplicationContext!.applicationId),
-    enabled: Boolean(pilotApplicationContext),
-    retry: false,
-  });
-  useEffect(() => {
-    if (!pilotApplicationContext || !pilotApplicationJdQuery.data?.current) return;
-    const current = pilotV2DraftsRef.current.get(pilotApplicationContext.applicationId);
-    if (!current || current.jdVersionId === pilotApplicationJdQuery.data.current.id) return;
-    const hasFrozenAttempt = Boolean(
-      current.triageKey
-      || current.deepKey
-      || current.triage
-      || current.deep
-      || current.resultUnknown,
-    );
-    if (hasFrozenAttempt) return;
-    const next = {
-      ...current,
-      jdVersionId: pilotApplicationJdQuery.data.current.id,
-      jdText: pilotApplicationJdQuery.data.current.jd_text,
-    };
-    pilotV2DraftsRef.current.set(next.applicationId, next);
-    setPilotV2Draft(next);
-  }, [pilotApplicationContext, pilotApplicationJdQuery.data?.current?.id, pilotApplicationJdQuery.data?.current?.jd_text]);
-  const handlePilotNotFound = () => {
-    const current = pilotApplicationContextRef.current;
-    if (current) discardMaterialKitHandoff(current.applicationId);
-    message.error('当前投递或岗位评估已不存在，请重新打开。');
-    exitPilotContext({ preserveUnknownAttempt: false });
-    setView('dashboard');
-  };
-
-  useEffect(() => {
-    if (
-      isOpportunityFitNotFoundError(pilotV2HistoryQuery.error)
-      || isOpportunityFitNotFoundError(pilotLegacyHistoryQuery.error)
-    ) {
-      handlePilotNotFound();
-    }
-  }, [pilotV2HistoryQuery.error, pilotLegacyHistoryQuery.error]);
 
   // Backend serializes an empty []T slice as JSON `null` (Go encoding/json).
   // React Query's `= []` default only applies when data is `undefined`, so an
@@ -584,6 +516,12 @@ function AppShellContent() {
   const ofrs = Array.isArray(offersData) ? offersData : [];
   const resumes = Array.isArray(resumesData) ? resumesData : [];
   const [suggestionSessionStates, setSuggestionSessionStates] = useState<Record<string, SuggestionSessionState>>({});
+
+  const updatePilotFitProjection = useCallback((projection: OpportunityFitOwnerProjection) => {
+    const safeProjection = freezePilotFitProjection(projection);
+    if (!safeProjection) return;
+    setPilotFitProjections((current) => ({ ...current, [safeProjection.applicationId]: safeProjection }));
+  }, []);
 
   const buildNextStepFacts = (applicationId: number): NextStepFacts => {
     const application = apps.find((item) => item.id === applicationId);
@@ -653,22 +591,6 @@ function AppShellContent() {
     const next = { ...current, ...patch };
     applicationJdDraftsRef.current.set(applicationId, next);
     setApplicationJdDrafts((state) => ({ ...state, [applicationId]: next }));
-  }, []);
-
-  const updateOpportunityFitDraft = useCallback((applicationId: number, patch: Partial<OpportunityFitV2Draft> | null) => {
-    const current = opportunityFitDraftsRef.current.get(applicationId) ?? createOpportunityFitV2Draft(applicationId);
-    if (patch === null) {
-      opportunityFitDraftsRef.current.delete(applicationId);
-      setOpportunityFitDrafts((state) => {
-        const next = { ...state };
-        delete next[applicationId];
-        return next;
-      });
-      return;
-    }
-    const next = { ...current, ...patch };
-    opportunityFitDraftsRef.current.set(applicationId, next);
-    setOpportunityFitDrafts((state) => ({ ...state, [applicationId]: next }));
   }, []);
 
   const qc = useQueryClient();
@@ -760,27 +682,9 @@ function AppShellContent() {
       || pilot.activeRequestRef.current
       || pilot.activePendingRef.current
       || pilot.confirmPhase === 'saving'
-      || pilotV2OperationPendingRef.current
-      || pilotV2HistoryPendingRef.current
-      || pilotV2DraftRef.current?.resultUnknown,
+      || taskSurfaceGuardRef.current.pending,
     );
   };
-
-  const pilotCoreTaskSignal = useMemo<{ ref: CoreTaskRef; pending: boolean; resultUnknown: boolean } | undefined>(() => {
-    if (!pilotApplicationContext || !pilotV2Draft) return undefined;
-    const draft = pilotV2Draft;
-    const draftPending = Boolean(
-      (draft.triageKey && (!draft.triage || ['generating', 'provider_unknown'].includes(draft.triage.stage_status)))
-      || (draft.deepKey && (!draft.deep || ['generating', 'provider_unknown'].includes(draft.deep.stage_status))),
-    );
-    const resultUnknown = Boolean(draft.resultUnknown);
-    if (!pilotV2OperationPending && !pilotV2HistoryPending && !draftPending && !resultUnknown) return undefined;
-    return {
-      ref: { taskId: 'application.opportunity_fit', applicationId: pilotApplicationContext.applicationId },
-      pending: pilotV2OperationPending || pilotV2HistoryPending || draftPending,
-      resultUnknown,
-    };
-  }, [pilotApplicationContext, pilotV2Draft, pilotV2HistoryPending, pilotV2OperationPending]);
 
   useEffect(() => {
     if (!selectedApp || !selectedNextStepCandidate) return;
@@ -808,7 +712,7 @@ function AppShellContent() {
     ? scopeApplicationOffers(offersData, selectedApp.id)
     : { offers: offersData, hasInvalidOwner: false };
   const pilotOfferScope = pilotApplicationContext
-    ? scopeApplicationOffers(offersData, pilotApplicationContext.applicationId)
+    ? scopeApplicationOffers(offersData, pilotApplicationContext)
     : { offers: ofrs, hasInvalidOwner: false };
   const assistantTaskWorkActive = Boolean(
     pilotController.pending
@@ -816,15 +720,12 @@ function AppShellContent() {
     || pilotController.activeRequestRef.current
     || pilotController.activePendingRef.current
     || pilotController.confirmPhase === 'saving'
-    || pilotV2OperationPending
-    || pilotV2HistoryPending
-    || pilotV2Draft?.resultUnknown,
+    || taskSurfaceGuardRef.current.pending,
   );
   const activeCoreTask = coreTaskSurfaceState.active;
-  const pilotSignalOwnsActiveTask = Boolean(
-    pilotCoreTaskSignal
-    && activeCoreTask
-    && sameCoreTaskRef(activeCoreTask.ref, pilotCoreTaskSignal.ref),
+  const externalTaskBlockedForDetail = Boolean(
+    assistantTaskWorkActive
+    && (!selectedApp || !activeCoreTask || activeCoreTask.ref.applicationId !== selectedApp.id),
   );
 
   useEffect(() => {
@@ -1023,7 +924,7 @@ function AppShellContent() {
       coreTaskController.markClosed(active.generation);
       taskSurfaceGuardRef.current = { pending: false, unsaved: false };
     }
-    if (!active || active.ref.applicationId !== app.id) exitPilotContext();
+    if (!active || active.ref.applicationId !== app.id) setPilotApplicationContext(null);
     setSelected(app);
   };
 
@@ -1112,65 +1013,9 @@ function AppShellContent() {
       focus: 'current',
     });
     if (launchResult.kind === 'invalid' || launchResult.kind === 'unavailable' || launchResult.kind === 'replacement_denied') return;
+    setPilotApplicationContext(app.id);
     setSelected(app);
     setView('board');
-    if (launchResult.kind === 'focused_existing') return;
-    const currentPilot = pilotApplicationContextRef.current;
-    if (currentPilot && currentPilot.applicationId !== app.id) {
-      exitPilotContext();
-    }
-    const v2Draft = pilotV2DraftsRef.current.get(app.id) ?? createPilotOpportunityFitV2Draft(app.id);
-    pilotV2DraftsRef.current.set(app.id, v2Draft);
-    setPilotV2Draft(v2Draft);
-    setPilotLegacyReview(null);
-    setPilotApplicationContext((current) => current?.applicationId === app.id
-      ? current
-      : {
-        applicationId: app.id,
-        pilotDraftKey: crypto.randomUUID(),
-      });
-  };
-
-  const openPilotInterviewReview = (applicationId: number, eventId?: number) => {
-    const app = apps.find((item) => item.id === applicationId);
-    if (!app) return;
-    const intent = resolvePilotInterviewReviewIntent(applicationId, eventId, evs);
-    if (intent.kind === 'invalid') return;
-    const active = coreTaskController.getState().active;
-    if (active && active.ref.applicationId !== applicationId
-      && (taskSurfaceGuardRef.current.pending || taskSurfaceGuardRef.current.unsaved || hasLivePilotWork())) {
-      message.warning('当前任务还有未完成内容，请先处理后再切换投递');
-      return;
-    }
-    if (intent.kind === 'event') {
-      const launchResult = launchCoreTaskViaController(coreTaskController, {
-        ref: { taskId: 'application.interview_review', applicationId: intent.applicationId, eventId: intent.eventId },
-        source: 'pilot',
-        focus: 'current',
-      });
-      if (launchResult.kind === 'invalid' || launchResult.kind === 'unavailable' || launchResult.kind === 'replacement_denied') return;
-      if (launchResult.kind === 'focused_existing') {
-        setSelected(app);
-        setView('board');
-        return;
-      }
-      exitPilotContext();
-      setSelected(app);
-      setView('board');
-      return;
-    }
-    // An application-only Pilot review intent has no trusted Event identity.
-    // Hand it to ApplicationDetail's explicit chooser instead of inventing an
-    // application-level review ref.
-    if (active && active.ref.applicationId !== applicationId) {
-      coreTaskController.close(active.generation);
-      coreTaskController.markClosed(active.generation);
-      taskSurfaceGuardRef.current = { pending: false, unsaved: false };
-    }
-    exitPilotContext();
-    setPilotInterviewReviewApplicationId(applicationId);
-    setView('board');
-    openApplicationDetail(app);
   };
 
   const openPilotInterviewPreparation = (applicationId: number, eventId?: number) => {
@@ -1211,7 +1056,7 @@ function AppShellContent() {
         return;
       }
     }
-    exitPilotContext();
+    setPilotApplicationContext(null);
     setPilotInterviewPreparationApplicationId(applicationId);
     setPilotInterviewPreparationEventId(trustedEventId ?? null);
     setView('board');
@@ -1395,353 +1240,6 @@ function AppShellContent() {
       }
       updateMockInterviewDraft({ error: '操作结果待确认，请稍后使用原尝试重试。' });
     }
-  };
-
-  const updatePilotV2Draft = (patch: Partial<PilotOpportunityFitV2Draft>) => {
-    if (!pilotV2Draft) return;
-    const next = { ...pilotV2Draft, ...patch };
-    pilotV2DraftsRef.current.set(next.applicationId, next);
-    setPilotV2Draft(next);
-  };
-
-  const v2ErrorMessage = (error: unknown): string => getOpportunityFitErrorMessage(error);
-
-  const v2ErrorCode = (error: unknown): string | undefined => {
-    if (typeof error !== 'object' || error === null) return undefined;
-    const response = (error as { response?: { data?: { error_code?: unknown } } }).response;
-    return typeof response?.data?.error_code === 'string' ? response.data.error_code : undefined;
-  };
-
-  const v2SourceConflictCopy = '岗位资料版本已变化，当前评估仅供只读查看。';
-
-  const recoverPilotV2SourceConflict = async (
-    stage: 'triage' | 'deep_review',
-    idempotencyKey: string,
-    reviewID?: number,
-  ): Promise<Awaited<ReturnType<typeof findOpportunityFitV2SourceConflictStage>>> => {
-    if (!pilotV2Draft) return { status: 'not_found' };
-    try {
-      return await findOpportunityFitV2SourceConflictStage(
-        pilotV2Draft.applicationId,
-        stage,
-        idempotencyKey,
-        reviewID,
-      );
-    } catch {
-      return { status: 'unknown' };
-    }
-  };
-
-  const pilotV2RecoveryUnknownCopy = '操作结果待确认，请使用原尝试重试。';
-
-  const v2FailureDisposition = (error: unknown): 'unknown' | 'definite' => {
-    if (typeof error !== 'object' || error === null) return 'unknown';
-    const response = (error as { response?: unknown }).response;
-    if (typeof response !== 'object' || response === null) return 'unknown';
-    const record = response as { status?: unknown; data?: unknown };
-    const data = typeof record.data === 'object' && record.data !== null
-      ? record.data as { error_code?: unknown }
-      : undefined;
-    if (data?.error_code === 'opportunity_fit_unverifiable') return 'definite';
-    if (data?.error_code === 'opportunity_fit_provider_error') return 'unknown';
-    return typeof record.status === 'number' && record.status >= 500 ? 'unknown' : 'definite';
-  };
-
-  const startPilotV2Triage = async (input: Parameters<typeof createOpportunityFitV2Triage>[1]) => {
-    if (!pilotV2Draft) return;
-    invalidatePilotV2History();
-    const requestDraft = pilotV2Draft;
-    const generation = pilotV2GenerationRef.current;
-    const key = requestDraft.triageKey ?? input.idempotency_key;
-    setPilotV2OperationPending(true);
-    updatePilotV2Draft({ triageKey: key, error: null });
-    try {
-      const result = await createOpportunityFitV2Triage(requestDraft.applicationId, { ...input, idempotency_key: key });
-      if (generation !== pilotV2GenerationRef.current) return;
-      updatePilotV2Draft({ triage: result, triageKey: key, resultUnknown: false, error: null });
-    } catch (error) {
-      if (generation !== pilotV2GenerationRef.current) return;
-      const errorCode = v2ErrorCode(error);
-      if (errorCode === 'application_jd_source_conflict' || errorCode === 'opportunity_fit_source_conflict') {
-        const conflict = await recoverPilotV2SourceConflict('triage', key);
-        if (generation !== pilotV2GenerationRef.current) return;
-        if (conflict.status === 'found') {
-          updatePilotV2Draft({
-            triage: conflict.stage,
-            triageKey: null,
-            resultUnknown: false,
-            error: v2SourceConflictCopy,
-          });
-          return;
-        }
-        if (conflict.status === 'unknown') {
-          updatePilotV2Draft({ triageKey: key, resultUnknown: true, error: pilotV2RecoveryUnknownCopy });
-          return;
-        }
-        if (conflict.status === 'application_missing') {
-          handlePilotNotFound();
-          return;
-        }
-        if (conflict.status === 'review_missing') {
-          startNewPilotV2Review();
-          return;
-        }
-      }
-      if (
-        typeof error === 'object'
-        && error !== null
-        && typeof (error as { response?: { data?: { error_code?: unknown } } }).response?.data?.error_code === 'string'
-        && (error as { response: { data: { error_code: string } } }).response.data.error_code
-          === 'opportunity_fit_triage_confirmation_expired'
-      ) {
-        startNewPilotV2Review();
-        return;
-      }
-      const disposition = v2FailureDisposition(error);
-      updatePilotV2Draft({
-        triageKey: disposition === 'unknown' ? key : null,
-        resultUnknown: disposition === 'unknown',
-        error: v2ErrorMessage(error),
-      });
-      if (isOpportunityFitNotFoundError(error)) handlePilotNotFound();
-    } finally {
-      if (generation === pilotV2GenerationRef.current) setPilotV2OperationPending(false);
-    }
-  };
-
-  const recoverPilotV2TriageConfirmation = async (
-    requestDraft: PilotOpportunityFitV2Draft,
-  ): Promise<NonNullable<PilotOpportunityFitV2Draft['triage']> | null> => {
-    if (!requestDraft.triage) return null;
-    try {
-      const session = await getOpportunityFitV2Review(
-        requestDraft.applicationId,
-        requestDraft.triage.review_id,
-      );
-      const current = session.stages.find((stage) => (
-        stage.stage === 'triage' && stage.stage_id === requestDraft.triage?.stage_id
-      )) ?? session.stages.find((stage) => stage.stage === 'triage');
-      return current?.stage_status === 'confirmed' ? current : null;
-    } catch {
-      return null;
-    }
-  };
-
-  const confirmPilotV2Triage = async () => {
-    if (!pilotV2Draft?.triage?.confirmation_token) return;
-    invalidatePilotV2History();
-    const requestDraft = pilotV2Draft;
-    const requestTriage = requestDraft.triage;
-    if (!requestTriage?.confirmation_token) return;
-    const generation = pilotV2GenerationRef.current;
-    setPilotV2OperationPending(true);
-    try {
-      const result = await confirmOpportunityFitV2Triage(
-        requestDraft.applicationId,
-        requestTriage.review_id,
-        requestTriage.stage_id,
-        requestTriage.confirmation_token,
-      );
-      if (generation !== pilotV2GenerationRef.current) return;
-      updatePilotV2Draft({ triage: result, resultUnknown: false, error: null });
-    } catch (error) {
-      if (generation !== pilotV2GenerationRef.current) return;
-      const errorCode = v2ErrorCode(error);
-      if (errorCode === 'opportunity_fit_triage_confirmation_expired') {
-        startNewPilotV2Review();
-        return;
-      }
-      if (
-        errorCode === 'opportunity_fit_triage_confirmation_consumed'
-        || v2FailureDisposition(error) === 'unknown'
-      ) {
-        const current = await recoverPilotV2TriageConfirmation(requestDraft);
-        if (generation !== pilotV2GenerationRef.current) return;
-        if (current) {
-          updatePilotV2Draft({ triage: current, resultUnknown: false, error: null });
-          return;
-        }
-        updatePilotV2Draft({ resultUnknown: true, error: pilotV2RecoveryUnknownCopy });
-        return;
-      }
-      if (pilotV2Draft.resultUnknown && v2FailureDisposition(error) === 'definite') {
-        startNewPilotV2Review();
-        return;
-      }
-      updatePilotV2Draft({ error: v2ErrorMessage(error) });
-    } finally {
-      if (generation === pilotV2GenerationRef.current) setPilotV2OperationPending(false);
-    }
-  };
-
-  const startPilotV2DeepReview = async () => {
-    if (!pilotV2Draft?.triage || pilotV2Draft.triage.stage_status !== 'confirmed') return;
-    invalidatePilotV2History();
-    const requestDraft = pilotV2Draft;
-    const requestTriage = requestDraft.triage;
-    if (!requestTriage) return;
-    const generation = pilotV2GenerationRef.current;
-    const key = requestDraft.deepKey ?? crypto.randomUUID();
-    setPilotV2OperationPending(true);
-    updatePilotV2Draft({ deepKey: key, error: null });
-    try {
-      const result = await createOpportunityFitV2DeepReview(
-        requestDraft.applicationId,
-        requestTriage.review_id,
-        {
-          schema_version: 2,
-          resume_id: requestDraft.resumeId ?? 0,
-          jd_source_label: '用户粘贴 JD',
-          candidate_assertions: requestDraft.assertionsText.split(/\r?\n/).map((item) => item.trim()).filter(Boolean),
-          idempotency_key: key,
-          parent_triage_stage_id: requestTriage.stage_id,
-        },
-      );
-      if (generation !== pilotV2GenerationRef.current) return;
-      updatePilotV2Draft({ deep: result, deepKey: key, resultUnknown: false, error: null });
-    } catch (error) {
-      if (generation !== pilotV2GenerationRef.current) return;
-      const errorCode = v2ErrorCode(error);
-      if (errorCode === 'application_jd_source_conflict' || errorCode === 'opportunity_fit_source_conflict') {
-        const conflict = await recoverPilotV2SourceConflict(
-          'deep_review',
-          key,
-          requestTriage.review_id,
-        );
-        if (generation !== pilotV2GenerationRef.current) return;
-        if (conflict.status === 'found') {
-          updatePilotV2Draft({
-            deep: conflict.stage,
-            deepKey: null,
-            resultUnknown: false,
-            error: v2SourceConflictCopy,
-          });
-          return;
-        }
-        if (conflict.status === 'unknown') {
-          updatePilotV2Draft({ deepKey: key, resultUnknown: true, error: pilotV2RecoveryUnknownCopy });
-          return;
-        }
-        if (conflict.status === 'application_missing') {
-          handlePilotNotFound();
-          return;
-        }
-        if (conflict.status === 'review_missing') {
-          startNewPilotV2Review();
-          return;
-        }
-      }
-      const disposition = v2FailureDisposition(error);
-      updatePilotV2Draft({
-        deepKey: disposition === 'unknown' ? key : null,
-        resultUnknown: disposition === 'unknown',
-        error: v2ErrorMessage(error),
-      });
-      if (isOpportunityFitNotFoundError(error)) handlePilotNotFound();
-    } finally {
-      if (generation === pilotV2GenerationRef.current) setPilotV2OperationPending(false);
-    }
-  };
-
-  const viewPilotV2History = async (reviewId: number) => {
-    if (!pilotV2Draft) return;
-    const requestDraft = pilotV2Draft;
-    const generation = pilotV2GenerationRef.current;
-    const requestGeneration = ++pilotV2HistoryRequestRef.current;
-    setPilotV2HistoryPending(true);
-    try {
-      const result = await getOpportunityFitV2Review(requestDraft.applicationId, reviewId);
-      if (generation !== pilotV2GenerationRef.current || requestGeneration !== pilotV2HistoryRequestRef.current) return;
-      const triage = result.stages.find((stage) => stage.stage === 'triage') ?? null;
-      const deep = [...result.stages].reverse().find((stage) => stage.stage === 'deep_review') ?? null;
-      setPilotLegacyReview(null);
-      updatePilotV2Draft({ triage, deep, historical: true, error: null });
-    } catch (error) {
-      if (generation !== pilotV2GenerationRef.current || requestGeneration !== pilotV2HistoryRequestRef.current) return;
-      updatePilotV2Draft({ error: v2ErrorMessage(error) });
-    } finally {
-      if (generation === pilotV2GenerationRef.current && requestGeneration === pilotV2HistoryRequestRef.current) {
-        setPilotV2HistoryPending(false);
-      }
-    }
-  };
-
-  const viewPilotLegacyHistory = async (reviewId: number) => {
-    if (!pilotV2Draft) return;
-    const requestDraft = pilotV2Draft;
-    const generation = pilotV2GenerationRef.current;
-    const requestGeneration = ++pilotV2HistoryRequestRef.current;
-    setPilotV2HistoryPending(true);
-    try {
-      const result = await getOpportunityFitReview(requestDraft.applicationId, reviewId);
-      if (generation !== pilotV2GenerationRef.current || requestGeneration !== pilotV2HistoryRequestRef.current) return;
-      updatePilotV2Draft({ triage: null, deep: null, historical: true, error: null });
-      setPilotLegacyReview(result);
-    } catch (error) {
-      if (generation !== pilotV2GenerationRef.current || requestGeneration !== pilotV2HistoryRequestRef.current) return;
-      if (isOpportunityFitNotFoundError(error)) handlePilotNotFound();
-      else message.error(getOpportunityFitErrorMessage(error));
-    } finally {
-      if (generation === pilotV2GenerationRef.current && requestGeneration === pilotV2HistoryRequestRef.current) {
-        setPilotV2HistoryPending(false);
-      }
-    }
-  };
-
-  const startNewPilotV2Review = () => {
-    if (!pilotV2Draft) return;
-    pilotV2GenerationRef.current += 1;
-    invalidatePilotV2History();
-    setPilotV2OperationPending(false);
-    setPilotV2HistoryPending(false);
-    const next = createPilotOpportunityFitV2Draft(pilotV2Draft.applicationId);
-    const currentJd = pilotApplicationJdQuery.data?.current;
-    if (currentJd) {
-      next.jdVersionId = currentJd.id;
-      next.jdText = currentJd.jd_text;
-    }
-    pilotV2DraftsRef.current.set(next.applicationId, next);
-    setPilotV2Draft(next);
-    setPilotLegacyReview(null);
-  };
-
-  const preparePilotMaterials = (handoff: PilotOpportunityFitMaterialHandoff) => {
-    if (!handoff.jdVersionId) return;
-    const app = apps.find((item) => item.id === handoff.applicationId);
-    if (!app) {
-      message.warning('所属投递当前不可见');
-      return;
-    }
-    const active = coreTaskController.getState().active;
-    const transition = active
-      && active.ref.taskId === 'application.opportunity_fit'
-      && active.ref.applicationId === handoff.applicationId
-      && handoff.jdVersionId
-        ? { applicationId: handoff.applicationId, generation: active.generation }
-        : null;
-    fitToMaterialTransitionRef.current = transition;
-    const launchResult = launchCoreTaskViaController(coreTaskController, {
-      ref: { taskId: 'application.material_kit', applicationId: handoff.applicationId },
-      source: 'pilot',
-      focus: 'current',
-      hints: handoff.resumeId ? { suggestedResumeId: handoff.resumeId } : undefined,
-    });
-    fitToMaterialTransitionRef.current = null;
-    if (launchResult.kind === 'invalid' || launchResult.kind === 'unavailable' || launchResult.kind === 'replacement_denied') return;
-    if (launchResult.kind === 'focused_existing') {
-      setSelected(app);
-      setView('board');
-      return;
-    }
-    writeMaterialKitHandoff({
-      applicationId: handoff.applicationId,
-      resumeId: handoff.resumeId,
-      jdText: handoff.jdText,
-      jdVersionId: handoff.jdVersionId,
-    });
-    exitPilotContext();
-    setView('board');
-    setSelected(app);
   };
 
   const clearEvidenceFocus = (target: EvidenceTarget) => {
@@ -1974,20 +1472,14 @@ function AppShellContent() {
       resumes={resumesData}
       resumesLoading={resumesLoading}
       resumesError={resumesError}
-      pilotTaskSignal={pilotCoreTaskSignal}
-      externalTaskBlocked={assistantTaskWorkActive && (
-        !selectedApp
-        || !pilotCoreTaskSignal
-        || pilotCoreTaskSignal.ref.applicationId !== selectedApp.id
-        || !pilotSignalOwnsActiveTask
-      )}
+      externalTaskBlocked={externalTaskBlockedForDetail}
+      onOpportunityFitProjectionChange={updatePilotFitProjection}
+      opportunityFitOwnerStore={opportunityFitOwnerStoreRef.current ?? undefined}
       offerNegotiationEntryPoint={offerNegotiationEntryPoint}
       offerNegotiationDrafts={offerNegotiationEntryPoint === 'pilot' ? offerNegotiationPilotDrafts : offerNegotiationDrafts}
       onOfferNegotiationDraftChange={offerNegotiationEntryPoint === 'pilot' ? handleOfferNegotiationDrawerDraftChange : updateOfferNegotiationDraft}
       applicationJdDraft={selectedApp ? applicationJdDrafts[selectedApp.id] : undefined}
       onApplicationJdDraftChange={updateApplicationJdDraft}
-      opportunityFitDraft={selectedApp ? opportunityFitDrafts[selectedApp.id] : undefined}
-      onOpportunityFitDraftChange={updateOpportunityFitDraft}
       interviewReviewProposalAttempts={interviewReviewProposalAttempts}
       onInterviewReviewProposalAttemptChange={updateInterviewReviewProposalAttempt}
       onInterviewNoteChanged={clearInterviewReviewProposalAttempt}
@@ -2154,37 +1646,13 @@ function AppShellContent() {
             >
               {pilotApplicationContext ? (
                 <PilotOpportunityFitV2Card
-                  draft={pilotV2Draft ?? createPilotOpportunityFitV2Draft(pilotApplicationContext.applicationId)}
-                  resumes={resumes}
-                  history={pilotV2HistoryQuery.data ?? []}
-                  legacyHistory={pilotLegacyHistoryQuery.data ?? []}
-                  legacyReview={pilotLegacyReview}
-                  historyLoading={pilotV2HistoryPending || pilotV2HistoryQuery.isLoading || pilotV2HistoryQuery.isFetching}
-                  legacyHistoryLoading={pilotLegacyHistoryQuery.isLoading || pilotLegacyHistoryQuery.isFetching}
-                  triageLoading={Boolean(pilotV2Draft?.triageKey && !pilotV2Draft?.triage && !pilotV2Draft?.error)}
-                  deepLoading={Boolean(pilotV2Draft?.deepKey && !pilotV2Draft?.deep && !pilotV2Draft?.error)}
-                  onChange={updatePilotV2Draft}
-                  onStartTriage={startPilotV2Triage}
-                  onConfirmTriage={() => void confirmPilotV2Triage()}
-                  onStartDeepReview={() => void startPilotV2DeepReview()}
-                  onViewHistory={(reviewId) => void viewPilotV2History(reviewId)}
-                  onViewLegacyHistory={(reviewId) => void viewPilotLegacyHistory(reviewId)}
-                  onStartNew={startNewPilotV2Review}
-                  restartDisabled={pilotV2OperationPending}
-                  historyDisabled={pilotV2OperationPending}
-                  onPrepareMaterials={(resumeId, jdText, jdVersionId) => preparePilotMaterials({
-                    applicationId: pilotApplicationContext.applicationId,
-                    resumeId,
-                    jdText,
-                    jdVersionId,
-                  })}
-                  onOpenInterviewReview={openPilotInterviewReview}
-                  onOpenInterviewPreparation={openPilotInterviewPreparation}
-                  interviewEvents={evs.filter((event) => event.application_id === pilotApplicationContext.applicationId && event.event_type === 'interview' && Boolean(event.scheduled_at))}
-                  onOpenMockInterview={openMockInterview}
-                  onCancel={() => {
-                    exitPilotContext();
-                    setView('dashboard');
+                  status={pilotFitProjections[pilotApplicationContext]?.status ?? 'idle'}
+                  summary={pilotFitProjections[pilotApplicationContext]?.summary}
+                  history={pilotFitProjections[pilotApplicationContext]?.history}
+                  historyState={pilotFitProjections[pilotApplicationContext]?.historyState ?? 'loading'}
+                  onOpenTask={() => {
+                    const app = apps.find((item) => item.id === pilotApplicationContext);
+                    if (app) startPilotOpportunityFit(app);
                   }}
                 />
               ) : null}

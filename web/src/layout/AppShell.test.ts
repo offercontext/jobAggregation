@@ -51,32 +51,28 @@ describe('AppShell source contract', () => {
     expect(consumeMaterialKitHandoff(7)).toBeNull();
   });
 
-  it('restores historical Pilot reviews through the frozen review APIs', () => {
-    expect(source).toContain('listOpportunityFitV2Reviews');
-    expect(source).toContain('getOpportunityFitV2Review');
-    expect(source).toContain('listOpportunityFitReviews');
-    expect(source).toContain('getOpportunityFitReview');
-    expect(source).toContain("['opportunity-fit-v2-reviews'");
-    expect(source).toContain('viewPilotV2History');
-    expect(source).toContain('viewPilotLegacyHistory');
-    expect(source).toContain('setPilotLegacyReview');
-    expect(source).not.toContain('const latest = summaries[0]');
-    expect(source).toContain('legacyHistory={pilotLegacyHistoryQuery.data ?? []}');
-    expect(source).toContain('history={pilotV2HistoryQuery.data ?? []}');
-    expect(source).toContain('handlePilotNotFound');
+  it('keeps history and mutation state inside the Drawer owner', () => {
+    expect(source).toContain('createOpportunityFitOwnerStore');
+    expect(source).toContain('opportunityFitOwnerStore={opportunityFitOwnerStoreRef.current');
+    expect(source).toContain('onOpportunityFitProjectionChange={updatePilotFitProjection}');
+    expect(source).not.toContain('listOpportunityFitV2Reviews');
+    expect(source).not.toContain('listOpportunityFitReviews');
+    expect(source).not.toContain('pilotV2DraftsRef');
+    expect(source).not.toContain('pilotV2OperationPendingRef');
   });
 
-  it('clears the Pilot context when the historical list is no longer visible', () => {
-    expect(source).toContain('isOpportunityFitNotFoundError(pilotV2HistoryQuery.error)');
-    expect(source).toContain('isOpportunityFitNotFoundError(pilotLegacyHistoryQuery.error)');
-    expect(source).toContain('handlePilotNotFound();');
-    expect(source).toContain('discardMaterialKitHandoff(current.applicationId);');
+  it('clears only the read-only Pilot presentation when the owner closes', () => {
     expect(source).toContain('setPilotApplicationContext(null);');
+    expect(source).toContain('onOpenTask={() => {');
+    expect(source).toContain("ref: { taskId: 'application.opportunity_fit', applicationId: app.id }");
   });
 
-  it('clears the Pilot context when a historical detail is no longer visible', () => {
-    expect(source).toContain('if (isOpportunityFitNotFoundError(error)) handlePilotNotFound();');
-    expect(source).toContain('exitPilotContext({ preserveUnknownAttempt: false });');
+  it('does not keep a second Pilot recovery or mutation path in AppShell', () => {
+    expect(source).not.toContain('startPilotV2Triage');
+    expect(source).not.toContain('confirmPilotV2Triage');
+    expect(source).not.toContain('startPilotV2DeepReview');
+    expect(source).not.toContain('viewPilotV2History');
+    expect(source).not.toContain('exitPilotContext');
   });
 
   it('deletes ordinary mock attempts but retains unknown results across drawer unmounts', () => {
@@ -92,34 +88,10 @@ describe('AppShell source contract', () => {
     expect(source).toContain('const next = { ...currentDraft, ...patch };');
   });
 
-  it('routes a missing Triage application through the shared Pilot cleanup', () => {
-    const triageStart = source.indexOf('const startPilotV2Triage =');
-    const triageEnd = source.indexOf('const confirmPilotV2Triage =', triageStart);
-    expect(source.slice(triageStart, triageEnd)).toContain('isOpportunityFitNotFoundError(error)');
-  });
-
-  it('recovers Pilot Triage confirmation uncertainty from the server stage', () => {
-    const confirmStart = source.indexOf('const recoverPilotV2TriageConfirmation =');
-    const confirmEnd = source.indexOf('const startPilotV2DeepReview =', confirmStart);
-    const confirmSource = source.slice(confirmStart, confirmEnd);
-    expect(confirmSource).toContain('getOpportunityFitV2Review');
-    expect(confirmSource).toContain("current?.stage_status === 'confirmed'");
-    expect(confirmSource).toContain('opportunity_fit_triage_confirmation_consumed');
-    expect(confirmSource).toContain('resultUnknown: true');
-  });
-
-  it('routes a missing Deep Review application through the shared Pilot cleanup', () => {
-    const deepReviewStart = source.indexOf('const startPilotV2DeepReview =');
-    const deepReviewEnd = source.indexOf('const viewPilotV2History =', deepReviewStart);
-    expect(source.slice(deepReviewStart, deepReviewEnd)).toContain('isOpportunityFitNotFoundError(error)');
-  });
-
-  it('retains an unknown Pilot attempt when the flow is canceled', () => {
-    expect(source).toContain('const exitPilotContext = ({ preserveUnknownAttempt = true }');
-    expect(source).toContain('exitPilotContext();');
-    expect(source).toContain('draft.resultUnknown || requestPending');
-    expect(source).toContain("error: '结果待确认，请使用原尝试重试。'");
-    expect(source).toContain('pilotV2DraftsRef.current.delete(current.applicationId);');
+  it('leaves Pending/result-unknown recovery to the canonical Drawer owner', () => {
+    expect(source).toContain('opportunityFitOwnerStoreRef');
+    expect(source).not.toContain('draft.resultUnknown || requestPending');
+    expect(source).not.toContain('pilotV2DraftsRef.current.delete');
   });
 
   it('keeps the old Pilot view as the expanded assistant workspace', () => {

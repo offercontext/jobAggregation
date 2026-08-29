@@ -31,6 +31,10 @@ export const CORE_TASK_REGISTRY: CoreTaskRegistry = Object.freeze({
  * and cannot make an old owner reachable again.
  */
 export const CORE_TASK_ENTRYPOINT_CUTOVERS = Object.freeze({
+  'AppShellContent.preparePilotMaterials': Object.freeze({
+    category: 'core_task',
+    taskId: 'application.material_kit',
+  }),
   'ApplicationDetail.openOpportunityFit': Object.freeze({
     category: 'core_task',
     taskId: 'application.opportunity_fit',
@@ -39,9 +43,17 @@ export const CORE_TASK_ENTRYPOINT_CUTOVERS = Object.freeze({
     category: 'core_task',
     taskId: 'application.material_kit',
   }),
+  'AppShellContent.openPilotInterviewReview': Object.freeze({
+    category: 'core_task',
+    taskId: 'application.interview_review',
+  }),
   'OfferCenterView.openNegotiation': Object.freeze({
     category: 'core_task',
     taskId: 'application.offer_review',
+  }),
+  'PilotOpportunityFitV2Card': Object.freeze({
+    category: 'core_task',
+    taskId: 'application.opportunity_fit',
   }),
 } as const);
 

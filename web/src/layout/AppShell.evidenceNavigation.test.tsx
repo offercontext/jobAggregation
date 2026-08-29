@@ -21,7 +21,7 @@ vi.mock('@tanstack/react-query', () => ({
     const key = options.queryKey?.[0];
     const dataByKey: Record<string, unknown> = {
       applications: [app],
-      events: [],
+      events: [{ id: 11, application_id: 7, event_type: 'interview' }],
       offers: [],
       questions: undefined,
     };
@@ -101,7 +101,15 @@ vi.mock('@/features/pilot/PilotOpportunityFitCard', () => ({
   default: (props: any) => <section data-testid="pilot-opportunity-fit-card" data-draft-key={props.draft.pilotDraftKey} data-application-id={props.draft.applicationId} />,
 }));
 vi.mock('@/features/pilot/PilotOpportunityFitV2Card', () => ({
-  default: (props: any) => <section data-testid="pilot-opportunity-fit-v2-card" data-draft-key={props.draft.triageKey ?? 'new'} data-application-id={props.draft.applicationId} />,
+  default: (props: any) => (
+    <section
+      data-testid="pilot-opportunity-fit-v2-card"
+      data-status={props.status}
+      data-summary={props.summary ?? ''}
+    >
+      <button type="button" data-testid="open-pilot-owner" onClick={props.onOpenTask}>打开岗位判断</button>
+    </section>
+  ),
 }));
 vi.mock('@/components/ChatPanel', () => ({
   default: (props: any) => (
@@ -218,26 +226,26 @@ afterEach(() => {
 });
 
 describe('AppShell evidence navigation', () => {
-  it('opens one Application-scoped Pilot draft and keeps its key across view changes', async () => {
+  it('opens one Application-scoped Pilot owner and keeps the bounded projection across view changes', async () => {
     const view = render(<AppShell />);
     await flush();
 
-    act(() => view.querySelector<HTMLButtonElement>('[data-testid="nav-pilot"]')?.click());
-    await flush();
-    act(() => view.querySelector<HTMLButtonElement>('[data-testid="open-application-page"]')?.click());
+    act(() => view.querySelector<HTMLButtonElement>('[data-testid="open-dashboard-application"]')?.click());
     await flush();
     act(() => view.querySelector<HTMLButtonElement>('[data-testid="open-pilot-opportunity-fit"]')?.click());
     await flush();
+    act(() => view.querySelector<HTMLButtonElement>('[data-testid="nav-pilot"]')?.click());
+    await flush();
 
     const card = view.querySelector('[data-testid="pilot-opportunity-fit-v2-card"]');
-    expect(card?.getAttribute('data-application-id')).toBe('7');
-    const draftKey = card?.getAttribute('data-draft-key');
-    expect(draftKey).toBeTruthy();
+    expect(card).not.toBeNull();
+    expect(card?.getAttribute('data-status')).toBe('idle');
+    expect(card?.getAttribute('data-summary')).toBe('');
 
     act(() => view.querySelector<HTMLButtonElement>('[data-testid="nav-board"]')?.click());
     act(() => view.querySelector<HTMLButtonElement>('[data-testid="nav-pilot"]')?.click());
     await flush();
-    expect(view.querySelector('[data-testid="pilot-opportunity-fit-v2-card"]')?.getAttribute('data-draft-key')).toBe(draftKey);
+    expect(view.querySelector('[data-testid="pilot-opportunity-fit-v2-card"]')?.getAttribute('data-status')).toBe('idle');
   });
 
   it('invalidates the same-month calendar query after Pilot data changes', async () => {

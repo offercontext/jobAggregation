@@ -48,15 +48,16 @@ import InterviewPreparationProposalDrawer, {
 } from './InterviewPreparationProposalDrawer';
 import type { Resume } from '@/types/resume';
 import MaterialKitDrawer from './MaterialKitDrawer';
-import OpportunityFitReviewDrawer from './OpportunityFitReviewDrawer';
+import OpportunityFitReviewDrawer, {
+  type OpportunityFitOwnerProjection,
+  type OpportunityFitOwnerStore,
+} from './OpportunityFitReviewDrawer';
 import ApplicationOutcomeDrawer from './ApplicationOutcomeDrawer';
 import OfferNegotiationDrawer, { type OfferNegotiationDraft } from './OfferNegotiationDrawer';
 import { getApplicationMaterialKit } from '@/services/materialKits';
 import { listOpportunityFitV2Reviews } from '@/services/opportunityFitReviews';
 import {
-  createOpportunityFitV2Draft,
   type OpportunityFitReview,
-  type OpportunityFitV2Draft,
 } from '@/types/opportunityFitReview';
 import { SourceStateTag } from './ui/SourceStateTag';
 import { createPilotAttachmentDragBinding } from './PilotAttachmentHandle';
@@ -257,14 +258,12 @@ interface ApplicationDetailProps {
   pilotInterviewPreparationEventId?: number | null;
   onPilotInterviewPreparationFocusConsumed?: () => void;
   onAttachToPilot?: (attachment: import('@/types/chat').PilotContextAttachment) => void;
-  /** Runtime signal for a currently attributable Pilot CoreTask attempt. */
-  pilotTaskSignal?: {
-    readonly ref: import('@/features/coreTaskSurface/contracts').CoreTaskRef;
-    readonly pending: boolean;
-    readonly resultUnknown: boolean;
-  };
   /** A global/foreign Assistant attempt that cannot be safely attributed here. */
   externalTaskBlocked?: boolean;
+  /** Owner-local Fit state used to guard the canonical task and bounded projection. */
+  onOpportunityFitOwnerStateChange?: (state: { pending: boolean; resultUnknown: boolean; unsaved: boolean }) => void;
+  onOpportunityFitProjectionChange?: (projection: OpportunityFitOwnerProjection) => void;
+  opportunityFitOwnerStore?: OpportunityFitOwnerStore;
   interviewReviewProposalAttempts?: Record<number, InterviewReviewProposalAttemptState>;
   onInterviewReviewProposalAttemptChange?: (
     noteID: number,
@@ -295,11 +294,9 @@ interface ApplicationDetailProps {
   isReadonlyNavigationAvailable?: (destination: ReadonlyDestination) => boolean;
   applicationJdDraft?: ApplicationJdDraft;
   onApplicationJdDraftChange?: (applicationId: number, patch: Partial<ApplicationJdDraft> | null) => void;
-  opportunityFitDraft?: OpportunityFitV2Draft;
-  onOpportunityFitDraftChange?: (applicationId: number, patch: Partial<OpportunityFitV2Draft> | null) => void;
 }
 
-export default function ApplicationDetail({ application, open, onClose, taskController, onLaunchTask, onConfirmedFitToMaterial, onTaskSurfaceGuardChange, onOpenOffers, offers, offersLoading = false, offersError = false, onRetryOffers, onMockInterview: _onMockInterview, onAskPilot, onOpenPilotOpportunityFit: _onOpenPilotOpportunityFit, pilotTaskSignal, externalTaskBlocked = false, pilotInterviewReviewApplicationId, onPilotInterviewReviewFocusConsumed, pilotInterviewPreparationApplicationId, pilotInterviewPreparationEventId, onPilotInterviewPreparationFocusConsumed, onAttachToPilot, interviewReviewProposalAttempts, onInterviewReviewProposalAttemptChange, onInterviewNoteChanged, interviewKnowledgeCaptureDrafts, onInterviewKnowledgeCaptureDraftChange, onInterviewKnowledgeCaptureNoteChanged, resumes, resumesLoading = false, resumesError = false, taskNow, interviewPreparationAttempts, onInterviewPreparationAttemptChange, interviewPreparationDrafts, onInterviewPreparationDraftChange, interviewPreparationKnowledgeOptions = [], offerNegotiationDrafts = {}, onOfferNegotiationDraftChange, offerNegotiationEntryPoint = 'ui', nextStepSuggestions, nextStepSessionState = null, onSetDisposition, onNextStepNavigate, isNavigationAvailable, onNextStepReadonlyNavigate, isReadonlyNavigationAvailable, applicationJdDraft, onApplicationJdDraftChange, opportunityFitDraft, onOpportunityFitDraftChange }: ApplicationDetailProps) {
+export default function ApplicationDetail({ application, open, onClose, taskController, onLaunchTask, onConfirmedFitToMaterial, onTaskSurfaceGuardChange, onOpenOffers, offers, offersLoading = false, offersError = false, onRetryOffers, onMockInterview: _onMockInterview, onAskPilot, onOpenPilotOpportunityFit: _onOpenPilotOpportunityFit, externalTaskBlocked = false, onOpportunityFitOwnerStateChange, onOpportunityFitProjectionChange, opportunityFitOwnerStore, pilotInterviewReviewApplicationId, onPilotInterviewReviewFocusConsumed, pilotInterviewPreparationApplicationId, pilotInterviewPreparationEventId, onPilotInterviewPreparationFocusConsumed, onAttachToPilot, interviewReviewProposalAttempts, onInterviewReviewProposalAttemptChange, onInterviewNoteChanged, interviewKnowledgeCaptureDrafts, onInterviewKnowledgeCaptureDraftChange, onInterviewKnowledgeCaptureNoteChanged, resumes, resumesLoading = false, resumesError = false, taskNow, interviewPreparationAttempts, onInterviewPreparationAttemptChange, interviewPreparationDrafts, onInterviewPreparationDraftChange, interviewPreparationKnowledgeOptions = [], offerNegotiationDrafts = {}, onOfferNegotiationDraftChange, offerNegotiationEntryPoint = 'ui', nextStepSuggestions, nextStepSessionState = null, onSetDisposition, onNextStepNavigate, isNavigationAvailable, onNextStepReadonlyNavigate, isReadonlyNavigationAvailable, applicationJdDraft, onApplicationJdDraftChange }: ApplicationDetailProps) {
   const queryClient = useQueryClient();
   const [eventFormOpen, setEventFormOpen] = useState(false);
   const [materialKitPrefill, setMaterialKitPrefill] = useState<{
@@ -317,6 +314,11 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
   const [jdHistoryOpen, setJdHistoryOpen] = useState(false);
   const [selectedJdVersion, setSelectedJdVersion] = useState<number | null>(null);
   const [activeTab, setActiveTab] = useState<ApplicationDetailTab>('overview');
+  const [opportunityFitOwnerState, setOpportunityFitOwnerState] = useState({
+    pending: false,
+    resultUnknown: false,
+    unsaved: false,
+  });
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const handledPilotReviewIntentRef = useRef<string | null>(null);
   const handledPilotPreparationIntentRef = useRef<string | null>(null);
@@ -333,6 +335,9 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
   const activeTask = taskSurfaceState.active?.ref.applicationId === application?.id
     ? taskSurfaceState.active
     : null;
+  useEffect(() => {
+    setOpportunityFitOwnerState({ pending: false, resultUnknown: false, unsaved: false });
+  }, [application?.id]);
   // AppShell supplies the shared clock snapshot; the standalone fallback is
   // deterministic and never lets the adapter read wall-clock state.
   const resolverNow = taskNow ?? 0;
@@ -651,17 +656,8 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
 
   const activeTaskRuntimeState = useMemo(() => {
     if (!activeTask) return { pending: false, resultUnknown: false };
-    const sameRef = (left: typeof activeTask.ref, right: typeof activeTask.ref) => (
-      left.taskId === right.taskId
-      && left.applicationId === right.applicationId
-      && left.eventId === right.eventId
-    );
-    const fitDraftPending = activeTask.ref.taskId === 'application.opportunity_fit'
-      && Boolean(
-        opportunityFitDraft?.resultUnknown
-        || (opportunityFitDraft?.triageKey && (!opportunityFitDraft.triage || ['generating', 'provider_unknown'].includes(opportunityFitDraft.triage.stage_status)))
-        || (opportunityFitDraft?.deepKey && (!opportunityFitDraft.deep || ['generating', 'provider_unknown'].includes(opportunityFitDraft.deep.stage_status))),
-      );
+    const fitOwnerPending = activeTask.ref.taskId === 'application.opportunity_fit'
+      && opportunityFitOwnerState.pending;
     const reviewNote = activeTask.ref.taskId === 'application.interview_review' && activeTask.ref.eventId !== undefined
       ? noteRecords.find((note) => note.application_event_id === activeTask.ref.eventId)
       : undefined;
@@ -673,14 +669,13 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
     const localResultUnknown = Boolean(
       (preparationAttempt?.result_unknown)
       || (reviewAttempt?.result_unknown)
-      || (activeTask.ref.taskId === 'application.opportunity_fit' && opportunityFitDraft?.resultUnknown),
+      || (activeTask.ref.taskId === 'application.opportunity_fit' && opportunityFitOwnerState.resultUnknown),
     );
-    const pilotSignalMatches = Boolean(pilotTaskSignal && sameRef(activeTask.ref, pilotTaskSignal.ref));
     return {
-      pending: fitDraftPending || localPending || Boolean(pilotSignalMatches && pilotTaskSignal?.pending),
-      resultUnknown: localResultUnknown || Boolean(pilotSignalMatches && pilotTaskSignal?.resultUnknown),
+      pending: fitOwnerPending || localPending,
+      resultUnknown: localResultUnknown,
     };
-  }, [activeTask, application?.id, interviewPreparationAttempts, interviewReviewProposalAttempts, noteRecords, notesQuery.data, opportunityFitDraft, pilotTaskSignal]);
+  }, [activeTask, application?.id, interviewPreparationAttempts, interviewReviewProposalAttempts, noteRecords, notesQuery.data, opportunityFitOwnerState.pending, opportunityFitOwnerState.resultUnknown]);
 
   const taskSnapshot = useMemo<FrozenApplicationTaskSnapshot>(() => {
     if (!application) return emptyTaskSnapshot();
@@ -832,10 +827,15 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
             open={taskOwnerOpen}
             currentJdText={applicationJdQuery.data?.current?.jd_text ?? ''}
             jdVersionId={applicationJdQuery.data?.current?.id ?? null}
-            draft={opportunityFitDraft ?? createOpportunityFitV2Draft(application.id)}
-            onDraftChange={(patch) => {
-              if (isCurrent()) onOpportunityFitDraftChange?.(application.id, patch);
+            onOwnerStateChange={(state) => {
+              if (!isCurrent()) return;
+              setOpportunityFitOwnerState(state);
+              onOpportunityFitOwnerStateChange?.(state);
             }}
+            onOwnerProjectionChange={(projection) => {
+              if (isCurrent()) onOpportunityFitProjectionChange?.(projection);
+            }}
+            ownerStore={opportunityFitOwnerStore}
             onApplicationMissing={() => {
               if (isCurrent()) onClose();
             }}
@@ -1012,7 +1012,7 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
       : false;
     const unsaved = active
       ? Boolean(
-      active.ref.taskId === 'application.opportunity_fit' && opportunityFitDraft
+      active.ref.taskId === 'application.opportunity_fit' && opportunityFitOwnerState.unsaved
       || active.ref.taskId === 'application.material_kit' && (materialKitPrefill.jdSnapshot || materialKitPrefill.resumeID)
       || active.ref.taskId === 'application.interview_prepare'
         && active.ref.eventId !== undefined
@@ -1022,7 +1022,7 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
       )
       : false;
     onTaskSurfaceGuardChange?.({ pending, unsaved });
-  }, [activeTask, application?.id, interviewPreparationAttempts, interviewPreparationDrafts, interviewReviewProposalAttempts, materialKitPrefill, noteRecords, notesQuery.data, offerNegotiationDrafts, offers, onTaskSurfaceGuardChange, opportunityFitDraft]);
+  }, [activeTask, application?.id, interviewPreparationAttempts, interviewPreparationDrafts, interviewReviewProposalAttempts, materialKitPrefill, noteRecords, notesQuery.data, offerNegotiationDrafts, offers, onTaskSurfaceGuardChange, opportunityFitOwnerState.unsaved]);
 
   if (!application || !open) return null;
 

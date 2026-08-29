@@ -47,6 +47,8 @@ type VisibleCopy = {
 type AuditSources = {
   productionFiles: Map<string, string>;
   registrySource: string | null;
+  contractsSource: string | null;
+  controllerSource: string | null;
 };
 
 function repositoryRoot(): string {
@@ -158,6 +160,35 @@ function registryHasCanonicalOwner(source: string | null, entries: Entrypoint[])
     && entries.some((entry) => entry.category === 'record_management' && source.includes(entry.category));
 }
 
+function hasCoreTaskContracts(source: string | null): boolean {
+  if (!source) return false;
+  const idDeclaration = source.match(/\b(?:export\s+)?type\s+CoreTaskId\s*=([\s\S]*?);/);
+  const idBody = idDeclaration?.[1] ?? '';
+  const declaredIds = [...idBody.matchAll(/['"]([^'"]+)['"]/g)].map((match) => match[1]);
+  const declaredIdSet = new Set(declaredIds);
+  const hasClosedIdDeclaration = Boolean(idDeclaration)
+    && declaredIds.length === CORE_TASK_IDS.length
+    && declaredIdSet.size === CORE_TASK_IDS.length
+    && declaredIds.every((taskId) => CORE_TASK_IDS.includes(taskId as typeof CORE_TASK_IDS[number]))
+    && CORE_TASK_IDS.every((taskId) => source.includes(taskId));
+  const parserStart = source.search(/\bparseCoreTaskRef\s*(?:=|\(|:)/);
+  const parserBody = parserStart >= 0 ? source.slice(parserStart, parserStart + 900) : '';
+  const hasParser = parserStart >= 0 && /\bCoreTaskRef\b/.test(parserBody);
+  const keyStart = source.search(/\b(?:canonicalTaskKey|canonicalCoreTaskKey|coreTaskRefKey)\s*(?:=|\(|:)/);
+  const keyBody = keyStart >= 0 ? source.slice(keyStart, keyStart + 900) : '';
+  const hasCanonicalKey = keyStart >= 0
+    && /\b(?:taskId|applicationId|eventId|offerId|resumeId|storyId|sourceId)\b/.test(keyBody);
+  return hasClosedIdDeclaration && hasParser && hasCanonicalKey;
+}
+
+function hasCoreTaskController(source: string | null): boolean {
+  if (!source) return false;
+  const hasControllerExport = /\bexport\s+(?:function|class|const)\s+(?:CoreTaskSurfaceController|createCoreTaskSurfaceController|useCoreTaskSurfaceController)\b/.test(source);
+  const hasOwnerGenerationState = /\b(?:ownerGeneration|owner_generation|generation)(?:Ref)?\b\s*(?::[^=;]+)?=/.test(source)
+    && /\b(?:useRef|useState|Map|Set|owner)\b/.test(source);
+  return hasControllerExport && hasOwnerGenerationState;
+}
+
 function entrypointHasAudit(
   root: string,
   entry: Entrypoint,
@@ -235,6 +266,12 @@ function auditManifest(
   if (!registryHasCanonicalOwner(sources.registrySource, entries)) {
     violations.push('registry:missing-owner');
   }
+  if (!hasCoreTaskContracts(sources.contractsSource)) {
+    violations.push('contracts:missing-core-task-id');
+  }
+  if (!hasCoreTaskController(sources.controllerSource)) {
+    violations.push('controller:missing-owner');
+  }
   const entrypointAuditResults = entries.map((entry) => entrypointHasAudit(root, entry, sources));
   if (entrypointAuditResults.some((audited) => !audited)) {
     violations.push('entrypoint:unclassified');
@@ -277,7 +314,14 @@ describe('core task surface baseline gate', () => {
     const entries = entrypointsFromAsset(assets.get(ASSET_NAMES[0]));
     const visibleCopy = visibleCopyFromAsset(assets.get(ASSET_NAMES[2]));
     const violations = auditManifest(root, entries, visibleCopy, {
-      registrySource: 'export const unrelated = true;',
+      registrySource: [
+        'CoreTaskRegistryV1',
+        ...CORE_TASK_IDS,
+        'navigation_only',
+        'record_management',
+      ].join(' '),
+      contractsSource: 'export const unrelatedContracts = true;',
+      controllerSource: 'export const unrelatedController = true;',
       productionFiles: new Map([
         ['web/src/features/coreTaskSurface/unrelated.ts', 'export const unrelated = true;'],
         ['web/src/features/interviewEvents/unrelated.ts', 'export const unrelated = true;'],
@@ -285,11 +329,14 @@ describe('core task surface baseline gate', () => {
         ['web/src/unrelated.ts', 'const oldCopy = "旧版评估";'],
       ]),
     });
+    expect(violations).not.toContain('registry:missing-owner');
     expect(violations).toEqual(expect.arrayContaining([
-      'registry:missing-owner',
       'entrypoint:unclassified',
       'event:local-classifier',
       'copy:forbidden-lexeme',
+      'materials:missing-source-mapper',
+      'contracts:missing-core-task-id',
+      'controller:missing-owner',
     ]));
   });
 
@@ -304,6 +351,17 @@ describe('core task surface baseline gate', () => {
         registrySource: (() => {
           const path = join(root, 'web', 'src', 'features', 'coreTaskSurface', 'registry.ts');
           return existsSync(path) ? readFileSync(path, 'utf8') : null;
+        })(),
+        contractsSource: (() => {
+          const path = join(root, 'web', 'src', 'features', 'coreTaskSurface', 'contracts.ts');
+          return existsSync(path) ? readFileSync(path, 'utf8') : null;
+        })(),
+        controllerSource: (() => {
+          const candidates = ['controller.ts', 'controller.tsx'];
+          const path = candidates
+            .map((name) => join(root, 'web', 'src', 'features', 'coreTaskSurface', name))
+            .find((candidate) => existsSync(candidate));
+          return path ? readFileSync(path, 'utf8') : null;
         })(),
         productionFiles: collectProductionFiles(root),
       },

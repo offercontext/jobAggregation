@@ -1004,7 +1004,9 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
       : undefined;
     const pending = active && application
       ? Boolean(
-      (active.ref.taskId === 'application.interview_prepare' && active.ref.eventId !== undefined
+      (active.ref.taskId === 'application.opportunity_fit'
+        && (opportunityFitOwnerState.pending || opportunityFitOwnerState.resultUnknown))
+      || (active.ref.taskId === 'application.interview_prepare' && active.ref.eventId !== undefined
         && interviewPreparationAttempts?.[`${application.id}:${active.ref.eventId}`])
       || (active.ref.taskId === 'application.interview_review' && active.ref.eventId !== undefined
         && reviewNote && interviewReviewProposalAttempts?.[reviewNote.id])
@@ -1022,7 +1024,7 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
       )
       : false;
     onTaskSurfaceGuardChange?.({ pending, unsaved });
-  }, [activeTask, application?.id, interviewPreparationAttempts, interviewPreparationDrafts, interviewReviewProposalAttempts, materialKitPrefill, noteRecords, notesQuery.data, offerNegotiationDrafts, offers, onTaskSurfaceGuardChange, opportunityFitOwnerState.unsaved]);
+  }, [activeTask, application?.id, interviewPreparationAttempts, interviewPreparationDrafts, interviewReviewProposalAttempts, materialKitPrefill, noteRecords, notesQuery.data, offerNegotiationDrafts, offers, onTaskSurfaceGuardChange, opportunityFitOwnerState.pending, opportunityFitOwnerState.resultUnknown, opportunityFitOwnerState.unsaved]);
 
   if (!application || !open) return null;
 

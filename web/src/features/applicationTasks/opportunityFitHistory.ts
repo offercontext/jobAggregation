@@ -337,6 +337,7 @@ export function adaptOpportunityFitHistory(sources: OpportunityFitHistorySources
   const candidates: OpportunityFitHistoryItem[] = [];
   const append = (rows: readonly unknown[], source: 'v1' | 'v2'): boolean => {
     let index = 0;
+    const invalidBefore = invalidRecordCount;
     const sourceCandidates: OpportunityFitHistoryItem[] = [];
     try {
       for (const row of rows) {
@@ -357,7 +358,10 @@ export function adaptOpportunityFitHistory(sources: OpportunityFitHistorySources
         }
       }
       candidates.push(...sourceCandidates);
-      return true;
+      // A ready route containing malformed/foreign rows is only partially
+      // trustworthy. Keep valid rows, but surface the route as partial so the
+      // UI cannot present a filtered/empty result as complete history.
+      return invalidRecordCount === invalidBefore;
     } catch {
       // A revoked proxy/iterator is a malformed source, not an empty route.
       // Discard rows collected before the failure and surface the route as
@@ -401,7 +405,7 @@ export function adaptOpportunityFitHistory(sources: OpportunityFitHistorySources
   ];
   return Object.freeze({
     items: Object.freeze(items),
-    partial: unavailableSources.length > 0,
+    partial: unavailableSources.length > 0 || invalidRecordCount > 0,
     unavailableSources: Object.freeze(unavailableSources),
     invalidRecordCount,
   });

@@ -123,6 +123,8 @@ describe('adaptOpportunityFitHistory', () => {
       v1(4, '2026-08-30T09:00:00Z', { id: 0 }),
     ]));
     expect(result.items).toEqual([]);
+    expect(result.partial).toBe(true);
+    expect(result.unavailableSources).toEqual(['v1']);
     expect(result.invalidRecordCount).toBe(4);
   });
 
@@ -134,6 +136,8 @@ describe('adaptOpportunityFitHistory', () => {
     const reverse = adaptOpportunityFitHistory(readySources([conflict, equivalent, same]));
     expect(forward.items).toEqual([]);
     expect(reverse.items).toEqual([]);
+    expect(forward.partial).toBe(true);
+    expect(reverse.partial).toBe(true);
     expect(forward.invalidRecordCount).toBe(3);
     expect(reverse.invalidRecordCount).toBe(3);
 

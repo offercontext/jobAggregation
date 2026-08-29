@@ -158,7 +158,12 @@ function historyV2(id: number, createdAt = '2026-07-21T00:00:00Z') {
       proposal: {
         schema_version: 2,
         stage: 'triage',
-        summary: { text: `Historical V2 ${id}` },
+        source: { kind: 'opportunity_fit', contract_version: 'opportunity_fit.v2', snapshot_version: '1' },
+        summary: { text: `Historical V2 ${id}`, rationale: 'safe rationale', evidence_refs: [] },
+        conditions: [],
+        risks: [],
+        questions: [],
+        next_steps: [],
       },
     },
   };
@@ -358,6 +363,28 @@ describe('OpportunityFitReviewDrawer', () => {
     expect(ownerStates[ownerStates.length - 1]).toEqual({ pending: false, resultUnknown: true, unsaved: true });
   });
 
+  it('emits a guard immediately when a persisted pending draft is restored', async () => {
+    const ownerStore = createOpportunityFitOwnerStore();
+    ownerStore.setDraft(7, {
+      ...ownerStore.getDraft(7),
+      resumeId: 11,
+      jdText: 'JD text',
+      jdVersionId: 1,
+      triageKey: 'restored-triage-key',
+      triage: {
+        stage_status: 'generating',
+      },
+    } as never);
+    const ownerStates: Array<{ pending: boolean; resultUnknown: boolean; unsaved: boolean }> = [];
+
+    await render(undefined, '', undefined, undefined, {
+      ownerStore,
+      onOwnerStateChange: (next) => ownerStates.push(next),
+    });
+
+    await waitFor(() => expect(ownerStates).toContainEqual({ pending: true, resultUnknown: false, unsaved: true }));
+  });
+
   it('drops a pending response after switching applications', async () => {
     let resolveCreate: (() => void) | undefined;
     state.create.mockImplementation((_applicationID, input: { idempotency_key: string }) => new Promise((resolve) => {
@@ -439,6 +466,75 @@ describe('OpportunityFitReviewDrawer', () => {
       await Promise.resolve();
     });
     expect((getByLabelText(view, '用户粘贴的 JD') as HTMLTextAreaElement).value).toBe('App A JD');
+  });
+
+  it('rejects an initial draft belonging to another Application', async () => {
+    const ownerStore = createOpportunityFitOwnerStore();
+    const foreignDraft = {
+      ...ownerStore.getDraft(8),
+      applicationId: 8,
+      jdText: 'App B JD',
+      jdVersionId: 1,
+    };
+    const view = await render(undefined, '', foreignDraft, undefined, { ownerStore });
+
+    expect((getByLabelText(view, '用户粘贴的 JD') as HTMLTextAreaElement).value).toBe('');
+    expect(ownerStore.getDraft(7).jdText).toBe('');
+    expect(ownerStore.getDraft(7).applicationId).toBe(7);
+  });
+
+  it('does not let a changing initial draft prop overwrite the owner store', async () => {
+    const ownerStore = createOpportunityFitOwnerStore();
+    const initialDraft = {
+      ...ownerStore.getDraft(7),
+      jdText: 'Owner JD',
+      jdVersionId: 1,
+    };
+    const view = await render(undefined, '', initialDraft, undefined, { ownerStore });
+    expect((getByLabelText(view, '用户粘贴的 JD') as HTMLTextAreaElement).value).toBe('Owner JD');
+
+    const changedProp = { ...initialDraft, jdText: 'Changed prop JD' };
+    await act(async () => {
+      root?.render(
+        <OpportunityFitReviewDrawer
+          application={application}
+          open
+          currentJdText=""
+          jdVersionId={1}
+          draft={changedProp as never}
+          ownerStore={ownerStore}
+          onClose={vi.fn()}
+        />,
+      );
+      await Promise.resolve();
+    });
+
+    expect((getByLabelText(view, '用户粘贴的 JD') as HTMLTextAreaElement).value).toBe('Owner JD');
+    expect(ownerStore.getDraft(7).jdText).toBe('Owner JD');
+  });
+
+  it('deep-clones and freezes nested owner draft state', () => {
+    const ownerStore = createOpportunityFitOwnerStore();
+    const draft = {
+      ...ownerStore.getDraft(7),
+      triage: {
+        proposal: {
+          summary: { text: 'Original nested result' },
+        },
+      },
+    } as unknown as {
+      triage: { proposal: { summary: { text: string } } };
+    };
+
+    ownerStore.setDraft(7, draft as never);
+    draft.triage.proposal.summary.text = 'Mutated input';
+
+    const stored = ownerStore.getDraft(7);
+    expect(stored.triage?.proposal?.summary.text).toBe('Original nested result');
+    expect(Object.isFrozen(stored)).toBe(true);
+    expect(Object.isFrozen(stored.triage)).toBe(true);
+    expect(Object.isFrozen(stored.triage?.proposal)).toBe(true);
+    expect(Object.isFrozen(stored.triage?.proposal?.summary)).toBe(true);
   });
 
   it('reuses the AppShell-owned triage key after a generating response and remount', async () => {
@@ -754,6 +850,37 @@ describe('OpportunityFitReviewDrawer', () => {
 
     expect(view.textContent).toContain('Drawer history B');
     expect(view.textContent).not.toContain('Drawer history A late');
+  });
+
+  it('keeps historical V2 detail strictly read-only', async () => {
+    state.listV2.mockResolvedValue([historyV2(21)]);
+    state.getV2.mockResolvedValue({
+      stages: [{
+        ...historyV2(21).latest_stage,
+        stage_status: 'ready',
+        confirmation_token: 'historical-token',
+      }],
+    });
+    const view = await render();
+    await waitFor(() => expect(getByRole(view, 'button', '查看')).toBeTruthy());
+    await click(getByRole(view, 'button', '查看'));
+
+    await waitFor(() => expect(view.textContent).toContain('Historical V2 21'));
+    expect([...view.querySelectorAll('button')].some((button) => button.textContent?.includes('确认快速判断'))).toBe(false);
+    expect([...view.querySelectorAll('button')].some((button) => button.textContent?.includes('重新开始岗位评估'))).toBe(false);
+    expect(state.confirm).not.toHaveBeenCalled();
+    expect(state.deepV2).not.toHaveBeenCalled();
+  });
+
+  it('uses fixed safe copy when a historical detail read fails', async () => {
+    state.listV2.mockResolvedValue([historyV2(21)]);
+    state.getV2.mockRejectedValue(new Error('raw historical provider detail'));
+    const view = await render();
+    await waitFor(() => expect(getByRole(view, 'button', '查看')).toBeTruthy());
+    await click(getByRole(view, 'button', '查看'));
+
+    await waitFor(() => expect(view.textContent).toContain('部分历史暂时不可用'));
+    expect(view.textContent).not.toContain('raw historical provider detail');
   });
 
   it('disables Drawer history while Triage is in flight', async () => {

@@ -99,7 +99,7 @@ export function createOpportunityFitOwnerStore(): OpportunityFitOwnerStore {
   return Object.freeze({
     getDraft(applicationId: number) {
       const existing = drafts.get(applicationId);
-      return existing ? cloneDraft(existing) : createOpportunityFitV2Draft(applicationId);
+      return existing ? cloneDraft(existing) : cloneDraft(createOpportunityFitV2Draft(applicationId));
     },
     setDraft(applicationId: number, draft: OpportunityFitV2Draft) {
       drafts.set(applicationId, cloneDraft(draft));
@@ -110,8 +110,73 @@ export function createOpportunityFitOwnerStore(): OpportunityFitOwnerStore {
   });
 }
 
+function cloneAndFreeze<T>(value: T, seen = new WeakMap<object, unknown>()): T {
+  if (value === null || typeof value !== 'object') return value;
+  const source = value as object;
+  if (seen.has(source)) return seen.get(source) as T;
+
+  const clone = (Array.isArray(value) ? [] : {}) as Record<string, unknown>;
+  seen.set(source, clone);
+  for (const key of Reflect.ownKeys(source)) {
+    if (typeof key !== 'string') continue;
+    const descriptor = Object.getOwnPropertyDescriptor(source, key);
+    if (descriptor && 'value' in descriptor) {
+      clone[key] = cloneAndFreeze(descriptor.value, seen);
+    }
+  }
+  return Object.freeze(clone) as T;
+}
+
 function cloneDraft(draft: OpportunityFitV2Draft): OpportunityFitV2Draft {
-  return { ...draft };
+  return cloneAndFreeze(draft);
+}
+
+function isDraftForApplication(
+  draft: OpportunityFitV2Draft | undefined,
+  applicationId: number,
+): draft is OpportunityFitV2Draft {
+  try {
+    return Boolean(draft && draft.applicationId === applicationId);
+  } catch {
+    return false;
+  }
+}
+
+function hasDraftContent(draft: OpportunityFitV2Draft): boolean {
+  return Boolean(
+    draft.resumeId !== undefined
+      || draft.jdText
+      || draft.jdVersionId !== undefined
+      || draft.assertionsText
+      || draft.triageKey
+      || draft.deepKey
+      || draft.triage
+      || draft.deep
+      || draft.historical
+      || draft.resultUnknown
+      || draft.error,
+  );
+}
+
+function resolveInitialDraft(
+  ownerStore: OpportunityFitOwnerStore,
+  application: Application | null,
+  initialDraftProp: OpportunityFitV2Draft | undefined,
+  allowInitialProp: boolean,
+): OpportunityFitV2Draft {
+  if (!application) return cloneDraft(createOpportunityFitV2Draft(0));
+  const stored = ownerStore.getDraft(application.id);
+  if (!isDraftForApplication(stored, application.id)) {
+    const fresh = cloneDraft(createOpportunityFitV2Draft(application.id));
+    ownerStore.setDraft(application.id, fresh);
+    return fresh;
+  }
+  if (allowInitialProp && isDraftForApplication(initialDraftProp, application.id) && !hasDraftContent(stored)) {
+    const seeded = cloneDraft(initialDraftProp);
+    ownerStore.setDraft(application.id, seeded);
+    return seeded;
+  }
+  return cloneDraft(stored);
 }
 
 function isCurrentAttempt(
@@ -221,17 +286,10 @@ export default function OpportunityFitReviewDrawer({
   const localOwnerStoreRef = useRef<OpportunityFitOwnerStore | null>(null);
   if (!localOwnerStoreRef.current) localOwnerStoreRef.current = createOpportunityFitOwnerStore();
   const ownerStore = ownerStoreProp ?? localOwnerStoreRef.current;
-  const initialDraft = application
-    ? (initialDraftProp ? cloneDraft(initialDraftProp) : ownerStore.getDraft(application.id))
-    : createOpportunityFitV2Draft(0);
-  const seededInitialPropRef = useRef<{ applicationId: number; draft: OpportunityFitV2Draft } | null>(null);
-  if (application && initialDraftProp && (
-    seededInitialPropRef.current?.applicationId !== application.id
-    || seededInitialPropRef.current.draft !== initialDraftProp
-  )) {
-    ownerStore.setDraft(application.id, initialDraftProp);
-    seededInitialPropRef.current = { applicationId: application.id, draft: initialDraftProp };
-  }
+  const seededApplicationRef = useRef<number | null>(null);
+  const allowInitialProp = Boolean(application && seededApplicationRef.current !== application.id);
+  if (application && seededApplicationRef.current !== application.id) seededApplicationRef.current = application.id;
+  const initialDraft = resolveInitialDraft(ownerStore, application, initialDraftProp, allowInitialProp);
   const [ownedDraft, setOwnedDraft] = useState<OpportunityFitV2Draft>(initialDraft);
   const ownedDraftRef = useRef(ownedDraft);
   ownedDraftRef.current = ownedDraft;
@@ -276,17 +334,20 @@ export default function OpportunityFitReviewDrawer({
     if (!application) return;
     if (patch === null) {
       ownerStore.deleteDraft(application.id);
-      const fresh = createOpportunityFitV2Draft(application.id);
+      const fresh = cloneDraft(createOpportunityFitV2Draft(application.id));
       setOwnedDraft(fresh);
       onDraftChange?.(null);
       emitOwnerState(fresh, false);
       return;
     }
-    const next = { ...ownedDraftRef.current, ...patch };
+    const next = cloneDraft({
+      ...ownedDraftRef.current,
+      ...cloneAndFreeze(patch),
+    });
     ownedDraftRef.current = next;
     ownerStore.setDraft(application.id, next);
     setOwnedDraft(next);
-    onDraftChange?.(patch);
+    onDraftChange?.(cloneAndFreeze(patch));
     emitOwnerState(next);
   };
 
@@ -339,9 +400,7 @@ export default function OpportunityFitReviewDrawer({
   useEffect(() => {
     reviewGenerationRef.current += 1;
     if (!open) return;
-    const nextDraft = application
-      ? (initialDraftProp ? cloneDraft(initialDraftProp) : ownerStore.getDraft(application.id))
-      : createOpportunityFitV2Draft(0);
+    const nextDraft = resolveInitialDraft(ownerStore, application, undefined, false);
     setOwnedDraft(nextDraft);
     setStage(nextDraft.triage || nextDraft.deep ? 'review' : 'input');
     setResumeID(nextDraft.resumeId);
@@ -399,6 +458,7 @@ export default function OpportunityFitReviewDrawer({
   };
 
   const unknownResultCopy = '操作结果待确认，请使用原尝试重试。';
+  const historyUnavailableCopy = '部分历史暂时不可用';
 
   const recoverConfirmedTriage = async (generation: number, attemptKey: string): Promise<boolean> => {
     if (!application || !v2Triage) return false;
@@ -824,7 +884,7 @@ export default function OpportunityFitReviewDrawer({
   };
 
   const submit = () => {
-    if (!canSubmit || assertionError) return;
+    if (v2Historical || !canSubmit || assertionError) return;
     const input = buildTriageInput();
     if (!input) return;
     invalidateHistoryRead();
@@ -843,7 +903,7 @@ export default function OpportunityFitReviewDrawer({
   };
 
   const submitDeepReview = () => {
-    if (!v2Triage || v2Triage.stage_status !== 'confirmed' || !v2Triage.jd_version_id || !resumeID) return;
+    if (v2Historical || !v2Triage || v2Triage.stage_status !== 'confirmed' || !v2Triage.jd_version_id || !resumeID) return;
     invalidateHistoryRead();
     const input = {
       schema_version: 2 as const,
@@ -887,9 +947,9 @@ export default function OpportunityFitReviewDrawer({
       setV2Deep(null);
       setV2Historical(false);
       setStage('review');
-    } catch (error) {
+    } catch {
       if (generation !== reviewGenerationRef.current || requestGeneration !== historyRequestGenerationRef.current) return;
-      setActionError(getOpportunityFitErrorMessage(error));
+      setActionError(historyUnavailableCopy);
     } finally {
       if (generation === reviewGenerationRef.current && requestGeneration === historyRequestGenerationRef.current) {
         setHistoryReadPending(false);
@@ -913,9 +973,9 @@ export default function OpportunityFitReviewDrawer({
       setV2Historical(true);
       setStage('review');
       setActionError(null);
-    } catch (error) {
+    } catch {
       if (generation !== reviewGenerationRef.current || requestGeneration !== historyRequestGenerationRef.current) return;
-      setActionError(getOpportunityFitErrorMessage(error));
+      setActionError(historyUnavailableCopy);
     } finally {
       if (generation === reviewGenerationRef.current && requestGeneration === historyRequestGenerationRef.current) {
         setHistoryReadPending(false);
@@ -924,6 +984,7 @@ export default function OpportunityFitReviewDrawer({
   };
 
   const resetV2Review = (message?: string) => {
+    if (v2Historical) return;
     reviewGenerationRef.current += 1;
     historyRequestGenerationRef.current += 1;
     setHistoryReadPending(false);
@@ -941,8 +1002,7 @@ export default function OpportunityFitReviewDrawer({
   };
 
   const canStartNewV2Review = Boolean(
-    v2Historical
-      || ['ready', 'confirmed', 'source_conflict'].includes(v2Triage?.stage_status ?? '')
+    ['ready', 'confirmed', 'source_conflict'].includes(v2Triage?.stage_status ?? '')
       || ['ready', 'confirmed', 'source_conflict'].includes(v2Deep?.stage_status ?? ''),
   );
   const historyErrorMessage = reviewHistoryQuery.error
@@ -1096,15 +1156,16 @@ export default function OpportunityFitReviewDrawer({
           {v2Triage.stage_status === 'source_conflict' ? (
             <Alert type="warning" showIcon message={OPPORTUNITY_FIT_COPY.drawer.sourceChanged} />
           ) : v2Triage.proposal ? <V2ProposalView proposal={v2Triage.proposal} /> : <Spin />}
-          {['generating', 'provider_unknown'].includes(v2Triage.stage_status) ? (
+          {!v2Historical && ['generating', 'provider_unknown'].includes(v2Triage.stage_status) ? (
             <Button type="primary" onClick={submit} loading={createMutation.isPending} disabled={!canSubmit}>
               使用原尝试重试
             </Button>
           ) : null}
-          {v2Triage.stage_status === 'ready' && v2Triage.confirmation_token ? (
+          {!v2Historical && v2Triage.stage_status === 'ready' && v2Triage.confirmation_token ? (
             <Button
               type="primary"
               onClick={() => {
+                if (v2Historical) return;
                 invalidateHistoryRead();
                 activeAttemptRef.current = {
                   kind: 'triage',
@@ -1136,7 +1197,7 @@ export default function OpportunityFitReviewDrawer({
               {v2Deep.stage_status === 'source_conflict' ? (
                 <Alert type="warning" showIcon message={OPPORTUNITY_FIT_COPY.drawer.sourceChanged} />
               ) : v2Deep.proposal ? <V2ProposalView proposal={v2Deep.proposal} /> : <Spin />}
-              {['generating', 'provider_unknown'].includes(v2Deep.stage_status) ? (
+              {!v2Historical && ['generating', 'provider_unknown'].includes(v2Deep.stage_status) ? (
                 <Button type="primary" onClick={submitDeepReview} loading={deepReviewMutation.isPending}>
                   使用原尝试重试
                 </Button>
@@ -1164,7 +1225,7 @@ export default function OpportunityFitReviewDrawer({
               </Button>
             </>
           ) : null}
-          {canStartNewV2Review && !draft?.resultUnknown ? (
+          {!v2Historical && canStartNewV2Review && !draft?.resultUnknown ? (
             <Button
               disabled={historyReadPending || createMutation.isPending || confirmV2Mutation.isPending || deepReviewMutation.isPending}
               onClick={() => resetV2Review()}

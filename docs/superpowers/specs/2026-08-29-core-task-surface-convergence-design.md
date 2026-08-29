@@ -1,6 +1,6 @@
 # Core Task Surface Convergence 设计
 
-> 状态：待复审
+> 状态：已复审通过
 > 固定 baseline：`93fb0063118761f2c76e71e4209000feee0f755b`
 > 设计分支：`refactor/20260829-core-task-surface-convergence`
 > 本文只定义设计；复审通过前不编写实施计划，不修改生产代码。

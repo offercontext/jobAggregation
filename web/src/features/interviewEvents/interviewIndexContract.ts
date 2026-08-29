@@ -57,7 +57,9 @@ function readField(input: Record<PropertyKey, unknown>, key: PropertyKey): ReadF
     if (!present) return { present: false, value: undefined };
     return { present: true, value: input[key] };
   } catch {
-    return { present: false, value: undefined };
+    // A throwing proxy/getter is an observed-but-unreadable field, not a
+    // missing field. Keeping `present` true makes source preflight fail closed.
+    return { present: true, value: undefined };
   }
 }
 
@@ -89,7 +91,11 @@ function maxDayOfMonth(year: number, month: number): number {
   return [4, 6, 9, 11].includes(month) ? 30 : 31;
 }
 
-/** Strict RFC3339 parser; Date.parse alone accepts non-RFC strings and normalizes invalid dates. */
+/**
+ * Strict RFC3339 parser; Date.parse alone accepts non-RFC strings and
+ * normalizes invalid dates. The canonical business subset intentionally
+ * rejects the year-0001 sentinel and leap-second value 60.
+ */
 function parseRfc3339(value: unknown): number | null {
   if (typeof value !== 'string') return null;
   const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/.exec(value);
@@ -118,7 +124,18 @@ function sourceValues(source: unknown): { id: number | null; applicationId: numb
   const eventIdField = readField(source, 'event_id');
   const applicationField = readField(source, 'application_id');
   const statusField = readField(source, 'status');
-  const id = isSafePositiveInteger(idField.value) ? idField.value : isSafePositiveInteger(eventIdField.value) ? eventIdField.value : null;
+  // `id` is canonical whenever it is present. A malformed canonical id must
+  // not be hidden by falling back to the legacy event_id alias. When both are
+  // present, they must describe the same source event.
+  let id: number | null = null;
+  if (idField.present) {
+    if (isSafePositiveInteger(idField.value)
+      && (!eventIdField.present || (isSafePositiveInteger(eventIdField.value) && idField.value === eventIdField.value))) {
+      id = idField.value;
+    }
+  } else if (isSafePositiveInteger(eventIdField.value)) {
+    id = eventIdField.value;
+  }
   return {
     id,
     applicationId: isSafePositiveInteger(applicationField.value) ? applicationField.value : null,

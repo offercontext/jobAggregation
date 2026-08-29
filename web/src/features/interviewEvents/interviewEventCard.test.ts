@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { normalizeInterviewIndexItem } from './interviewIndexContract';
-import { projectInterviewEventCard, type InterviewEventCardModel } from './interviewEventCard';
+import { compareInterviewEventCards, projectInterviewEventCard, type InterviewEventCardModel } from './interviewEventCard';
 
 const NOW = Date.parse('2026-08-29T10:00:00Z');
 const raw = (overrides: Record<string, unknown> = {}) => ({
@@ -86,6 +86,25 @@ describe('projectInterviewEventCard', () => {
     expect(JSON.stringify(item)).toBe(before);
   });
 
+  it('freezes the complete projector output and nested secondary actions', () => {
+    const card = project();
+    expect(Object.isFrozen(card)).toBe(true);
+    expect(Object.isFrozen(card.secondaryActions)).toBe(true);
+    const before = [...card.secondaryActions];
+    try {
+      (card.secondaryActions as unknown as string[]).push('retry');
+    } catch {
+      // Frozen mutation is allowed to throw in strict mode; either way it must not stick.
+    }
+    expect(card.secondaryActions).toEqual(before);
+  });
+
+  it('fails closed when an active row contradicts its preparation hint', () => {
+    expect(project({ preparation_available: false })).toMatchObject({ bucket: 'unavailable', primaryAction: 'none' });
+    expect(project({ event_status: 'in_progress', preparation_available: false })).toMatchObject({ bucket: 'unavailable', primaryAction: 'none' });
+    expect(project({ event_status: 'done', preparation_available: false })).toMatchObject({ bucket: 'completed', primaryAction: 'record_review' });
+  });
+
   it('has a stable comparator for same-time events independent of API order', () => {
     const first = normalizeInterviewIndexItem(raw({ event_id: 2 }));
     const second = normalizeInterviewIndexItem(raw({ event_id: 1 }));
@@ -95,5 +114,39 @@ describe('projectInterviewEventCard', () => {
     const orderB = [projectInterviewEventCard(second, NOW), projectInterviewEventCard(first, NOW)].sort(comparator).map((item) => item.eventId);
     expect(orderA).toEqual([1, 2]);
     expect(orderB).toEqual(orderA);
+  });
+
+  it('exports a total comparator with explicit infinity/NaN ordering and safe identity tie breaks', () => {
+    const card = (scheduledAtTimestamp: number, eventId: number, applicationId = 1, lifecycle: InterviewEventCardModel['lifecycle'] = 'scheduled') => ({
+      ...project(), scheduledAtTimestamp, eventId, applicationId, lifecycle,
+    });
+    const negativeInfinity = card(Number.NEGATIVE_INFINITY, 99);
+    const finite = card(0, 99);
+    const positiveInfinity = card(Number.POSITIVE_INFINITY, 99);
+    const nan = card(Number.NaN, 99);
+    expect([nan, positiveInfinity, finite, negativeInfinity].sort(compareInterviewEventCards).map((item) => item.scheduledAtTimestamp)).toEqual([
+      Number.NEGATIVE_INFINITY, 0, Number.POSITIVE_INFINITY, Number.NaN,
+    ]);
+
+    const sameTimeHigherEvent = card(0, 2, 1);
+    const sameTimeLowerEvent = card(0, 1, 99);
+    expect(compareInterviewEventCards(sameTimeLowerEvent, sameTimeHigherEvent)).toBeLessThan(0);
+    const sameEventLowerApplication = card(0, 1, 1);
+    const sameEventHigherApplication = card(0, 1, 2);
+    expect(compareInterviewEventCards(sameEventLowerApplication, sameEventHigherApplication)).toBeLessThan(0);
+
+    const invalidId = card(0, Number.NaN, Number.POSITIVE_INFINITY);
+    expect(() => compareInterviewEventCards(invalidId, sameEventLowerApplication)).not.toThrow();
+    expect(Number.isNaN(compareInterviewEventCards(invalidId, sameEventLowerApplication))).toBe(false);
+  });
+
+  it('keeps the exported comparator transitive for a three-card chain', () => {
+    const card = (scheduledAtTimestamp: number, eventId: number) => ({ ...project(), scheduledAtTimestamp, eventId });
+    const a = card(Number.NEGATIVE_INFINITY, 100);
+    const b = card(0, Number.NaN);
+    const c = card(Number.POSITIVE_INFINITY, 1);
+    expect(compareInterviewEventCards(a, b)).toBeLessThan(0);
+    expect(compareInterviewEventCards(b, c)).toBeLessThan(0);
+    expect(compareInterviewEventCards(a, c)).toBeLessThan(0);
   });
 });

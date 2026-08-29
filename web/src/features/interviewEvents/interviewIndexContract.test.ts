@@ -79,6 +79,7 @@ describe('normalizeInterviewIndexItem', () => {
     '',
     '0001-01-01T00:00:00Z',
     '2026-02-30T10:00:00Z',
+    '2026-08-29T10:00:60Z',
     '2026-08-29 10:00:00Z',
     'not-a-date',
   ])('rejects an invalid present schedule: %s', (scheduled_at) => {
@@ -122,6 +123,15 @@ describe('normalizeInterviewIndexItem', () => {
     expect(validateInterviewIndexSource(item, { id: 9, application_id: 8, status: 'todo' })).toEqual({ ok: false, reason: 'source_mismatch' });
     expect(validateInterviewIndexSource(item, { id: 9, application_id: 7, status: 'done' })).toEqual({ ok: false, reason: 'source_mismatch' });
     expect(normalizeInterviewIndexItem(item, { id: 9, application_id: 7, status: 'done' }).contractReasons).toContain('source_mismatch');
+  });
+
+  it('does not hide conflicting or invalid canonical source ids behind the event_id alias', () => {
+    expect(validateInterviewIndexSource(validRaw(), { id: 9, event_id: 10, application_id: 7, status: 'todo' })).toEqual({ ok: false, reason: 'source_mismatch' });
+    expect(validateInterviewIndexSource(validRaw(), { id: 'bad', event_id: 9, application_id: 7, status: 'todo' })).toEqual({ ok: false, reason: 'source_mismatch' });
+    const hostile = Object.defineProperty({ event_id: 9, application_id: 7, status: 'todo' }, 'id', {
+      get: () => { throw new Error('id unavailable'); },
+    });
+    expect(validateInterviewIndexSource(validRaw(), hostile)).toEqual({ ok: false, reason: 'source_mismatch' });
   });
 
   it('reads relevant getters once and never throws for hostile input', () => {

@@ -30,9 +30,14 @@ export interface InterviewEventCardModel {
   readonly contractReasons: NormalizedInterviewIndexItem['contractReasons'];
 }
 
+function freezeCard(card: InterviewEventCardModel): InterviewEventCardModel {
+  Object.freeze(card.secondaryActions);
+  return Object.freeze(card);
+}
+
 function terminalCard(item: NormalizedInterviewIndexItem, lifecycle: EventLifecycleV1, bucket: 'completed' | 'cancelled'): InterviewEventCardModel {
   const hasReview = item.note_id !== null;
-  return {
+  return freezeCard({
     applicationId: item.application_id ?? 0,
     eventId: item.event_id ?? 0,
     companyName: item.company_name,
@@ -47,11 +52,11 @@ function terminalCard(item: NormalizedInterviewIndexItem, lifecycle: EventLifecy
     secondaryActions: ['view_application'],
     noteId: item.note_id,
     contractReasons: item.contractReasons,
-  };
+  });
 }
 
 function unavailableCard(item: NormalizedInterviewIndexItem, lifecycle: EventLifecycleV1): InterviewEventCardModel {
-  return {
+  return freezeCard({
     applicationId: item.application_id ?? 0,
     eventId: item.event_id ?? 0,
     companyName: item.company_name,
@@ -66,7 +71,7 @@ function unavailableCard(item: NormalizedInterviewIndexItem, lifecycle: EventLif
     secondaryActions: ['retry', 'view_application'],
     noteId: item.note_id,
     contractReasons: item.contractReasons,
-  };
+  });
 }
 
 /** Projects one immutable index row. Status is authoritative; time is only for active rows. */
@@ -77,6 +82,7 @@ export function projectInterviewEventCard(item: NormalizedInterviewIndexItem, no
   if (lifecycle === 'completed') return terminalCard(item, lifecycle, 'completed');
   if (lifecycle === 'cancelled') return terminalCard(item, lifecycle, 'cancelled');
   if (!Number.isFinite(now)) return unavailableCard(item, lifecycle);
+  if (!item.preparation_available) return unavailableCard(item, lifecycle);
   if (lifecycle === 'unknown' || !item.scheduleValid || !item.durationValid || item.scheduled_at_state !== 'present') {
     return unavailableCard(item, lifecycle);
   }
@@ -89,7 +95,7 @@ export function projectInterviewEventCard(item: NormalizedInterviewIndexItem, no
   const primaryAction: InterviewEventPrimaryAction = bucket === 'upcoming'
     ? lifecycle === 'in_progress' ? 'enter_preparation' : 'prepare'
     : 'update_status';
-  return {
+  return freezeCard({
     applicationId: item.application_id,
     eventId: item.event_id,
     companyName: item.company_name,
@@ -104,10 +110,62 @@ export function projectInterviewEventCard(item: NormalizedInterviewIndexItem, no
     secondaryActions: ['view_application'],
     noteId: item.note_id,
     contractReasons: item.contractReasons,
-  };
+  });
 }
 
 /** Stable order for card lists; equal business times are ordered by numeric event identity. */
 export function compareInterviewEventCards(left: InterviewEventCardModel, right: InterviewEventCardModel): number {
-  return left.scheduledAtTimestamp - right.scheduledAtTimestamp || left.eventId - right.eventId;
+  const timestampRank = (value: unknown): number => {
+    if (typeof value !== 'number') return 3;
+    if (Number.isNaN(value)) return 3;
+    if (value === Number.NEGATIVE_INFINITY) return 0;
+    if (Number.isFinite(value)) return 1;
+    return 2;
+  };
+  const compareNumber = (a: unknown, b: unknown): number => {
+    const leftValue = typeof a === 'number' && Number.isFinite(a) ? a : 0;
+    const rightValue = typeof b === 'number' && Number.isFinite(b) ? b : 0;
+    return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0;
+  };
+  const leftRank = timestampRank(left.scheduledAtTimestamp);
+  const rightRank = timestampRank(right.scheduledAtTimestamp);
+  if (leftRank !== rightRank) return leftRank < rightRank ? -1 : 1;
+  if (leftRank === 1) {
+    const time = compareNumber(left.scheduledAtTimestamp, right.scheduledAtTimestamp);
+    if (time !== 0) return time;
+  }
+  const eventId = compareNumber(left.eventId, right.eventId);
+  if (eventId !== 0) return eventId;
+  const applicationId = compareNumber(left.applicationId, right.applicationId);
+  if (applicationId !== 0) return applicationId;
+  const lifecycleOrder: Record<EventLifecycleV1, number> = {
+    scheduled: 0,
+    in_progress: 1,
+    completed: 2,
+    cancelled: 3,
+    unknown: 4,
+  };
+  const leftLifecycleOrder = lifecycleOrder[left.lifecycle] ?? lifecycleOrder.unknown;
+  const rightLifecycleOrder = lifecycleOrder[right.lifecycle] ?? lifecycleOrder.unknown;
+  const lifecycle = leftLifecycleOrder - rightLifecycleOrder;
+  if (lifecycle !== 0) return lifecycle < 0 ? -1 : 1;
+  const stableString = (a: unknown, b: unknown): number => {
+    const leftString = typeof a === 'string' ? a : '';
+    const rightString = typeof b === 'string' ? b : '';
+    return leftString < rightString ? -1 : leftString > rightString ? 1 : 0;
+  };
+  for (const [a, b] of [
+    [left.bucket, right.bucket],
+    [left.companyName, right.companyName],
+    [left.positionName, right.positionName],
+    [left.scheduledAt, right.scheduledAt],
+    [left.primaryAction, right.primaryAction],
+    [left.secondaryAction, right.secondaryAction],
+  ] as const) {
+    const result = stableString(a, b);
+    if (result !== 0) return result;
+  }
+  const duration = compareNumber(left.durationMinutes, right.durationMinutes);
+  if (duration !== 0) return duration;
+  return 0;
 }

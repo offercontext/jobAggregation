@@ -44,7 +44,7 @@ describe('InterviewV01View', () => {
       application_id: 1, event_id: 2, company_name: '示例', position_name: '工程师',
       scheduled_at: '2099-01-01T00:00:00Z', note_id: null, note_source_status: null,
       has_review_proposal: false, review_summary: null, has_confirmed_knowledge: false,
-      preparation_available: true,
+      preparation_available: true, event_status: 'todo', duration_minutes: 60, scheduled_at_state: 'present' as const,
     };
     expect(isUpcomingInterview(item, Date.now(), 'cancelled')).toBe(false);
     expect(source).toContain('window.setInterval(() => setCurrentTime(Date.now()), 60_000)');

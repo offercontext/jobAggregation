@@ -24,6 +24,36 @@ const CORE_TASK_IDS = [
   'materials.story',
   'materials.reference',
 ] as const;
+const ENVELOPE_KEYS = new Set(['schema_version', 'source_baseline', 'items']);
+const ENTRYPOINT_KEYS = new Set(['file', 'qualified_symbol', 'category', 'task_id']);
+const REQUEST_KEYS = new Set([
+  'flow',
+  'http_reads',
+  'http_mutations',
+  'provider_calls',
+  'tool_executor_calls',
+  'sse_subscriptions',
+  'domain_writes',
+]);
+const VISIBLE_COPY_KEYS = new Set(['file', 'lexeme', 'replacement']);
+const INTERVIEW_SCENARIO_KEYS = new Set(['scenario', 'list', 'get']);
+const INTERVIEW_LIST_KEYS = new Set(['items', 'next_cursor']);
+const INTERVIEW_ITEM_KEYS = new Set([
+  'application_id',
+  'event_id',
+  'company_name',
+  'position_name',
+  'scheduled_at',
+  'note_id',
+  'note_source_status',
+  'has_review_proposal',
+  'review_summary',
+  'has_confirmed_knowledge',
+  'preparation_available',
+]);
+const INTERVIEW_NOTE_SOURCE_STATUSES = new Set(['current', 'source_changed']);
+const SENTINEL_SCHEDULED_AT = '0001-01-01T00:00:00+00:00';
+const RFC3339 = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
 const ENTRYPOINT_CATEGORIES = new Set(['core_task', 'navigation_only', 'record_management']);
 const CANONICAL_LAUNCH_NAMES = new Set([
   'launchCoreTask',
@@ -46,6 +76,11 @@ type Entrypoint = {
   task_id: string | null;
 };
 
+type EntrypointCutover = {
+  category: string;
+  taskId: string | null;
+};
+
 type VisibleCopy = {
   file: string;
   lexeme: string;
@@ -56,6 +91,7 @@ type SourceArtifact = {
   path: string;
   text: string;
   sourceFile: ts.SourceFile;
+  parseDiagnostics: readonly ts.Diagnostic[];
 };
 
 type AuditSources = {
@@ -63,7 +99,7 @@ type AuditSources = {
   registrySource: SourceArtifact | null;
   contractsSource: SourceArtifact | null;
   controllerSource: SourceArtifact | null;
-  allowDeletedEntrypointCutover: boolean;
+  entrypointCutovers: Map<string, EntrypointCutover>;
 };
 
 const baselineSourceCache = new Map<string, SourceArtifact | null>();
@@ -78,13 +114,27 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+function hasExactKeys(value: Record<string, unknown>, expected: Set<string>): boolean {
+  const keys = Object.keys(value);
+  return keys.length === expected.size && keys.every((key) => expected.has(key));
+}
+
 function parseSource(path: string, text: string): SourceArtifact {
   const scriptKind = /\.tsx$/i.test(path) ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
+  const sourceFile = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true, scriptKind);
+  const parseDiagnostics = (sourceFile as ts.SourceFile & {
+    parseDiagnostics?: readonly ts.Diagnostic[];
+  }).parseDiagnostics ?? [];
   return {
     path,
     text,
-    sourceFile: ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true, scriptKind),
+    sourceFile,
+    parseDiagnostics,
   };
+}
+
+function sourceIsUsable(artifact: SourceArtifact | null): artifact is SourceArtifact {
+  return artifact !== null && artifact.parseDiagnostics.length === 0;
 }
 
 function readAssets(root: string): { assets: Map<string, Asset>; violations: string[] } {
@@ -96,9 +146,14 @@ function readAssets(root: string): { assets: Map<string, Asset>; violations: str
       const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
       if (
         !isRecord(parsed)
-        || !Array.isArray(parsed.items)
+        || !hasExactKeys(parsed, ENVELOPE_KEYS)
+        || typeof parsed.schema_version !== 'number'
+        || !Number.isInteger(parsed.schema_version)
         || parsed.schema_version !== 1
         || parsed.source_baseline !== BASELINE
+        || typeof parsed.source_baseline !== 'string'
+        || !Array.isArray(parsed.items)
+        || parsed.items.length === 0
       ) {
         violations.push(`assets:invalid-envelope:${name}`);
         continue;
@@ -108,30 +163,259 @@ function readAssets(root: string): { assets: Map<string, Asset>; violations: str
       violations.push(`assets:unreadable:${name}`);
     }
   }
+  violations.push(...assetShapeViolations(assets));
   return { assets, violations };
 }
 
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0;
+}
+
+function parseEntrypoints(asset: Asset | undefined, name = ASSET_NAMES[0]): {
+  values: Entrypoint[];
+  violations: string[];
+} {
+  const values: Entrypoint[] = [];
+  const violations: string[] = [];
+  const seen = new Set<string>();
+  const coreTasks = new Set<string>();
+  for (const [index, value] of (asset?.items ?? []).entries()) {
+    if (!isRecord(value) || !hasExactKeys(value, ENTRYPOINT_KEYS)) {
+      violations.push(`assets:invalid-entrypoint:${name}:${index}`);
+      continue;
+    }
+    const file = value.file;
+    const qualifiedSymbol = value.qualified_symbol;
+    const category = value.category;
+    const taskId = value.task_id;
+    if (!isNonEmptyString(file) || !file.startsWith('web/src/')) {
+      violations.push(`assets:invalid-entrypoint:${name}:${index}`);
+      continue;
+    }
+    if (!isNonEmptyString(qualifiedSymbol) || typeof category !== 'string') {
+      violations.push(`assets:invalid-entrypoint:${name}:${index}`);
+      continue;
+    }
+    if (!ENTRYPOINT_CATEGORIES.has(category)) {
+      violations.push(`assets:invalid-entrypoint:${name}:${index}`);
+      continue;
+    }
+    if (category === 'core_task') {
+      if (typeof taskId !== 'string' || !new Set<string>(CORE_TASK_IDS).has(taskId)) {
+        violations.push(`assets:invalid-entrypoint:${name}:${index}`);
+        continue;
+      }
+      coreTasks.add(taskId);
+    } else if (taskId !== null) {
+      violations.push(`assets:invalid-entrypoint:${name}:${index}`);
+      continue;
+    }
+    const key = `${file}\u0000${qualifiedSymbol}`;
+    if (seen.has(key)) {
+      violations.push(`assets:duplicate-entrypoint:${name}:${index}`);
+      continue;
+    }
+    seen.add(key);
+    values.push({
+      file,
+      qualified_symbol: qualifiedSymbol,
+      category,
+      task_id: taskId,
+    });
+  }
+  if (coreTasks.size !== CORE_TASK_IDS.length || CORE_TASK_IDS.some((taskId) => !coreTasks.has(taskId))) {
+    violations.push(`assets:incomplete-core-task-entrypoints:${name}`);
+  }
+  return { values, violations };
+}
+
+function parseRequestCounts(asset: Asset | undefined, name = ASSET_NAMES[1]): string[] {
+  const violations: string[] = [];
+  const seen = new Set<string>();
+  for (const [index, value] of (asset?.items ?? []).entries()) {
+    if (!isRecord(value) || !hasExactKeys(value, REQUEST_KEYS)) {
+      violations.push(`assets:invalid-request-count:${name}:${index}`);
+      continue;
+    }
+    if (!isNonEmptyString(value.flow)) {
+      violations.push(`assets:invalid-request-count:${name}:${index}`);
+      continue;
+    }
+    if (seen.has(value.flow)) {
+      violations.push(`assets:duplicate-request-flow:${name}:${index}`);
+      continue;
+    }
+    seen.add(value.flow);
+    const countKeys = [...REQUEST_KEYS].filter((key) => key !== 'flow');
+    if (countKeys.some((key) => !isNonNegativeInteger(value[key]))) {
+      violations.push(`assets:invalid-request-count:${name}:${index}`);
+    }
+  }
+  return violations;
+}
+
+function parseVisibleCopy(asset: Asset | undefined, name = ASSET_NAMES[2]): {
+  values: VisibleCopy[];
+  violations: string[];
+} {
+  const values: VisibleCopy[] = [];
+  const violations: string[] = [];
+  const seen = new Set<string>();
+  for (const [index, value] of (asset?.items ?? []).entries()) {
+    if (!isRecord(value) || !hasExactKeys(value, VISIBLE_COPY_KEYS)) {
+      violations.push(`assets:invalid-visible-copy:${name}:${index}`);
+      continue;
+    }
+    const file = value.file;
+    const lexeme = value.lexeme;
+    const replacement = value.replacement;
+    if (!isNonEmptyString(file) || !file.startsWith('web/src/')
+      || !isNonEmptyString(lexeme) || !isNonEmptyString(replacement)
+      || replacement.includes(lexeme)) {
+      violations.push(`assets:invalid-visible-copy:${name}:${index}`);
+      continue;
+    }
+    const key = `${file}\u0000${lexeme}`;
+    if (seen.has(key)) {
+      violations.push(`assets:duplicate-visible-copy:${name}:${index}`);
+      continue;
+    }
+    seen.add(key);
+    values.push({ file, lexeme, replacement });
+  }
+  return { values, violations };
+}
+
+type InterviewItem = {
+  application_id: number;
+  event_id: number;
+  company_name: string;
+  position_name: string;
+  scheduled_at: string;
+  note_id: number | null;
+  note_source_status: string | null;
+  has_review_proposal: boolean;
+  review_summary: string | null;
+  has_confirmed_knowledge: boolean;
+  preparation_available: boolean;
+};
+
+function isRfc3339OrSentinel(value: unknown): value is string {
+  if (value === SENTINEL_SCHEDULED_AT) return true;
+  if (typeof value !== 'string') return false;
+  const match = RFC3339.exec(value);
+  if (!match) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  if (month < 1 || month > 12 || day < 1 || hour > 23 || minute > 59 || second > 59) return false;
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (day > daysInMonth[month - 1]!) return false;
+  if (match[7] !== 'Z') {
+    const offsetHour = Number(match[7]?.slice(1, 3));
+    const offsetMinute = Number(match[7]?.slice(4, 6));
+    if (offsetHour > 23 || offsetMinute > 59) return false;
+  }
+  return Number.isFinite(Date.parse(value));
+}
+
+function parseInterviewItem(value: unknown): value is InterviewItem {
+  if (!isRecord(value) || !hasExactKeys(value, INTERVIEW_ITEM_KEYS)) return false;
+  const applicationId = value.application_id;
+  const eventId = value.event_id;
+  const noteId = value.note_id;
+  const noteSourceStatus = value.note_source_status;
+  return typeof applicationId === 'number' && Number.isInteger(applicationId) && applicationId > 0
+    && typeof eventId === 'number' && Number.isInteger(eventId) && eventId > 0
+    && typeof value.company_name === 'string'
+    && typeof value.position_name === 'string'
+    && isRfc3339OrSentinel(value.scheduled_at)
+    && (noteId === null || (typeof noteId === 'number' && Number.isInteger(noteId) && noteId > 0))
+    && (noteSourceStatus === null
+      || (typeof noteSourceStatus === 'string' && INTERVIEW_NOTE_SOURCE_STATUSES.has(noteSourceStatus)))
+    && typeof value.has_review_proposal === 'boolean'
+    && (value.review_summary === null || typeof value.review_summary === 'string')
+    && typeof value.has_confirmed_knowledge === 'boolean'
+    && typeof value.preparation_available === 'boolean';
+}
+
+function structurallyEqual(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+  if (Array.isArray(left) && Array.isArray(right)) {
+    return left.length === right.length && left.every((value, index) => structurallyEqual(value, right[index]));
+  }
+  if (!isRecord(left) || !isRecord(right) || !hasExactKeys(left, new Set(Object.keys(right)))) return false;
+  return Object.keys(left).every((key) => structurallyEqual(left[key], right[key]));
+}
+
+function parseInterviewAsset(asset: Asset | undefined, name = ASSET_NAMES[3]): string[] {
+  const violations: string[] = [];
+  const scenarios = new Set<string>();
+  const eventIds = new Set<number>();
+  const applicationIds = new Set<number>();
+  const noteIds = new Set<number>();
+  for (const [index, value] of (asset?.items ?? []).entries()) {
+    if (!isRecord(value) || !hasExactKeys(value, INTERVIEW_SCENARIO_KEYS)) {
+      violations.push(`assets:invalid-interview-scenario:${name}:${index}`);
+      continue;
+    }
+    if (!isNonEmptyString(value.scenario) || scenarios.has(value.scenario)) {
+      violations.push(`assets:invalid-interview-scenario:${name}:${index}`);
+      continue;
+    }
+    scenarios.add(value.scenario);
+    const listing = value.list;
+    const get = value.get;
+    if (!isRecord(listing) || !hasExactKeys(listing, INTERVIEW_LIST_KEYS)
+      || !Array.isArray(listing.items) || listing.items.length === 0
+      || (listing.next_cursor !== null && typeof listing.next_cursor !== 'string')) {
+      violations.push(`assets:invalid-interview-list:${name}:${index}`);
+      continue;
+    }
+    const validListItems = listing.items.every((item) => parseInterviewItem(item));
+    if (!validListItems || !parseInterviewItem(get) || listing.items.length !== 1
+      || !structurallyEqual(listing.items[0], get)) {
+      violations.push(`assets:invalid-interview-payload:${name}:${index}`);
+      continue;
+    }
+    const item = get;
+    if (eventIds.has(item.event_id) || applicationIds.has(item.application_id)
+      || (item.note_id !== null && noteIds.has(item.note_id))) {
+      violations.push(`assets:duplicate-interview-id:${name}:${index}`);
+      continue;
+    }
+    eventIds.add(item.event_id);
+    applicationIds.add(item.application_id);
+    if (item.note_id !== null) noteIds.add(item.note_id);
+  }
+  return violations;
+}
+
+function assetShapeViolations(assets: Map<string, Asset>): string[] {
+  const violations: string[] = [];
+  const entries = parseEntrypoints(assets.get(ASSET_NAMES[0]));
+  violations.push(...entries.violations);
+  violations.push(...parseRequestCounts(assets.get(ASSET_NAMES[1])));
+  const visibleCopy = parseVisibleCopy(assets.get(ASSET_NAMES[2]));
+  violations.push(...visibleCopy.violations);
+  violations.push(...parseInterviewAsset(assets.get(ASSET_NAMES[3])));
+  return violations;
+}
+
 function entrypointsFromAsset(asset: Asset | undefined): Entrypoint[] {
-  return (asset?.items ?? []).flatMap((value) => {
-    if (!isRecord(value)) return [];
-    return [{
-      file: typeof value.file === 'string' ? value.file : '',
-      qualified_symbol: typeof value.qualified_symbol === 'string' ? value.qualified_symbol : '',
-      category: typeof value.category === 'string' ? value.category : '',
-      task_id: typeof value.task_id === 'string' || value.task_id === null ? value.task_id : null,
-    }];
-  });
+  return parseEntrypoints(asset).values;
 }
 
 function visibleCopyFromAsset(asset: Asset | undefined): VisibleCopy[] {
-  return (asset?.items ?? []).flatMap((value) => {
-    if (!isRecord(value)) return [];
-    return [{
-      file: typeof value.file === 'string' ? value.file : '',
-      lexeme: typeof value.lexeme === 'string' ? value.lexeme : '',
-      replacement: typeof value.replacement === 'string' ? value.replacement : '',
-    }];
-  });
+  return parseVisibleCopy(asset).values;
 }
 
 function collectProductionFiles(root: string): Map<string, string> {
@@ -141,10 +425,13 @@ function collectProductionFiles(root: string): Map<string, string> {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
       const path = join(directory, entry.name);
       if (entry.isDirectory()) {
+        if (entry.name.toLowerCase() === '__tests__') continue;
         visit(path);
         continue;
       }
-      if (!/\.tsx?$/.test(entry.name) || /\.test\.tsx?$/.test(entry.name)) continue;
+      if (!/\.tsx?$/.test(entry.name)
+        || /\.(?:test|spec)\.tsx?$/i.test(entry.name)
+        || /\.d\.ts$/i.test(entry.name)) continue;
       try {
         const relativePath = relative(root, path).replace(/\\/g, '/');
         result.set(relativePath, readFileSync(path, 'utf8'));
@@ -223,7 +510,13 @@ function isFunctionLikeWithBody(node: ts.Node): node is FunctionLikeWithBody {
 
 function hasImplementedBody(node: FunctionLikeWithBody): boolean {
   if (!node.body) return false;
-  return !ts.isBlock(node.body) || node.body.statements.length > 0;
+  if (!ts.isBlock(node.body)) return true;
+  return node.body.statements.some((statement) => {
+    if (!ts.isExpressionStatement(statement)) return true;
+    let expression = statement.expression;
+    while (ts.isParenthesizedExpression(expression)) expression = expression.expression;
+    return !ts.isStringLiteral(expression) && !ts.isNoSubstitutionTemplateLiteral(expression);
+  });
 }
 
 function functionLikeName(node: FunctionLikeWithBody): string | null {
@@ -261,16 +554,40 @@ function findExportedFunction(
   return null;
 }
 
-function findFunctionByLeaf(sourceFile: ts.SourceFile, name: string): FunctionLikeWithBody | null {
+function findFunctionInStatements(
+  statements: readonly ts.Statement[],
+  name: string,
+): FunctionLikeWithBody | null {
+  for (const statement of statements) {
+    if (
+      isFunctionLikeWithBody(statement)
+      && functionLikeName(statement) === name
+      && hasImplementedBody(statement)
+    ) return statement;
+    if (!ts.isVariableStatement(statement)) continue;
+    for (const declaration of statement.declarationList.declarations) {
+      if (!ts.isIdentifier(declaration.name) || declaration.name.text !== name) continue;
+      const functionLike = variableFunctionLike(declaration);
+      if (functionLike && hasImplementedBody(functionLike)) return functionLike;
+    }
+  }
+  return null;
+}
+
+function findDirectFunctionByName(sourceFile: ts.SourceFile, name: string): FunctionLikeWithBody | null {
+  return findFunctionInStatements(sourceFile.statements, name);
+}
+
+function findLexicallyNestedFunction(
+  parent: FunctionLikeWithBody,
+  name: string,
+): FunctionLikeWithBody | null {
+  if (!parent.body || !ts.isBlock(parent.body)) return null;
   let found: FunctionLikeWithBody | null = null;
   const visit = (node: ts.Node): void => {
     if (found) return;
-    if (
-      isFunctionLikeWithBody(node)
-      && functionLikeName(node) === name
-      && hasImplementedBody(node)
-    ) {
-      found = node;
+    if (isFunctionLikeWithBody(node)) {
+      if (functionLikeName(node) === name && hasImplementedBody(node)) found = node;
       return;
     }
     if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === name) {
@@ -282,22 +599,232 @@ function findFunctionByLeaf(sourceFile: ts.SourceFile, name: string): FunctionLi
     }
     ts.forEachChild(node, visit);
   };
-  visit(sourceFile);
+  for (const statement of parent.body.statements) visit(statement);
   return found;
 }
 
-function calleeName(expression: ts.Expression): string | null {
-  if (ts.isIdentifier(expression)) return expression.text;
-  if (ts.isPropertyAccessExpression(expression)) return expression.name.text;
-  return null;
-}
-
-function callsCanonicalLauncher(functionLike: FunctionLikeWithBody): boolean {
-  if (!functionLike.body) return false;
+function containsComponentBinding(parent: FunctionLikeWithBody, name: string): boolean {
+  if (!parent.body) return false;
   let found = false;
   const visit = (node: ts.Node): void => {
     if (found) return;
-    if (ts.isCallExpression(node) && CANONICAL_LAUNCH_NAMES.has(calleeName(node.expression) ?? '')) {
+    if (isFunctionLikeWithBody(node)) return;
+    if (ts.isJsxOpeningLikeElement(node)) {
+      const tagName = node.tagName;
+      if (ts.isIdentifier(tagName) && tagName.text === name) {
+        found = true;
+        return;
+      }
+    }
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === name) {
+      found = true;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(parent.body, visit);
+  return found;
+}
+
+function findFunctionByQualifiedPath(
+  sourceFile: ts.SourceFile,
+  qualifiedSymbol: string,
+): FunctionLikeWithBody | null {
+  const parts = qualifiedSymbol.split('.');
+  if (parts.some((part) => !part)) return null;
+  let current = findDirectFunctionByName(sourceFile, parts[0] ?? '');
+  if (!current) return null;
+  for (const part of parts.slice(1)) {
+    const nested = findLexicallyNestedFunction(current, part);
+    if (nested) {
+      current = nested;
+      continue;
+    }
+    const composed = findDirectFunctionByName(sourceFile, part);
+    if (!composed || !containsComponentBinding(current, part)) return null;
+    current = composed;
+  }
+  return current;
+}
+
+type LauncherBinding = {
+  kind: 'import' | 'parameter' | 'composition' | 'shadow';
+  canonicalName?: string;
+};
+
+function bindingNames(pattern: ts.BindingName): string[] {
+  if (ts.isIdentifier(pattern)) return [pattern.text];
+  const names: string[] = [];
+  for (const element of pattern.elements) {
+    if (ts.isOmittedExpression(element)) continue;
+    names.push(...bindingNames(element.name));
+  }
+  return names;
+}
+
+function importedLauncherBindings(sourceFile: ts.SourceFile): Map<string, LauncherBinding> {
+  const bindings = new Map<string, LauncherBinding>();
+  for (const statement of sourceFile.statements) {
+    if (!ts.isImportDeclaration(statement) || !statement.importClause) continue;
+    const clause = statement.importClause;
+    if (clause.name) {
+      const canonicalName = CANONICAL_LAUNCH_NAMES.has(clause.name.text) ? clause.name.text : undefined;
+      bindings.set(clause.name.text, { kind: 'import', canonicalName });
+    }
+    if (!clause.namedBindings) continue;
+    if (ts.isNamespaceImport(clause.namedBindings)) {
+      bindings.set(clause.namedBindings.name.text, { kind: 'import' });
+      continue;
+    }
+    for (const element of clause.namedBindings.elements) {
+      const importedName = element.propertyName?.text ?? element.name.text;
+      if (!CANONICAL_LAUNCH_NAMES.has(importedName)) continue;
+      bindings.set(element.name.text, { kind: 'import', canonicalName: importedName });
+    }
+  }
+  return bindings;
+}
+
+function bindingForSourceExpression(
+  expression: ts.Expression | undefined,
+  bindings: Map<string, LauncherBinding>,
+): LauncherBinding {
+  if (!expression) return { kind: 'shadow' };
+  if (ts.isIdentifier(expression)) return bindings.get(expression.text) ?? { kind: 'shadow' };
+  if (ts.isPropertyAccessExpression(expression)) {
+    const base = ts.isIdentifier(expression.expression)
+      ? bindings.get(expression.expression.text)
+      : undefined;
+    if (base && base.kind !== 'shadow' && CANONICAL_LAUNCH_NAMES.has(expression.name.text)) {
+      return { kind: 'composition', canonicalName: expression.name.text };
+    }
+    if (base && base.kind !== 'shadow') return { kind: 'composition' };
+    if (ts.isCallExpression(expression.expression)) return { kind: 'composition' };
+    return { kind: 'shadow' };
+  }
+  if (ts.isCallExpression(expression)) return { kind: 'composition' };
+  return { kind: 'shadow' };
+}
+
+function bindingsForPattern(
+  pattern: ts.BindingName,
+  initializer: ts.Expression | undefined,
+  bindings: Map<string, LauncherBinding>,
+): Array<[string, LauncherBinding]> {
+  if (ts.isIdentifier(pattern)) {
+    const binding = bindingForSourceExpression(initializer, bindings);
+    if (CANONICAL_LAUNCH_NAMES.has(pattern.text) && binding.kind !== 'shadow') {
+      return [[pattern.text, { kind: 'composition', canonicalName: pattern.text }]];
+    }
+    return [[pattern.text, binding]];
+  }
+  const result: Array<[string, LauncherBinding]> = [];
+  for (const element of pattern.elements) {
+    if (ts.isOmittedExpression(element)) continue;
+    const propertyName = element.propertyName && propertyNameText(element.propertyName);
+    const localNames = bindingNames(element.name);
+    const sourceBinding = bindingForSourceExpression(initializer, bindings);
+    for (const localName of localNames) {
+      if (sourceBinding.kind === 'shadow') {
+        result.push([localName, sourceBinding]);
+      } else if (propertyName && CANONICAL_LAUNCH_NAMES.has(propertyName)) {
+        result.push([localName, { kind: 'composition', canonicalName: propertyName }]);
+      } else if (CANONICAL_LAUNCH_NAMES.has(localName)) {
+        result.push([localName, { kind: 'composition', canonicalName: localName }]);
+      } else {
+        result.push([localName, { kind: 'composition' }]);
+      }
+    }
+  }
+  return result;
+}
+
+function addFunctionParameters(
+  functionLike: FunctionLikeWithBody,
+  bindings: Map<string, LauncherBinding>,
+): void {
+  for (const parameter of functionLike.parameters) {
+    for (const name of bindingNames(parameter.name)) {
+      bindings.set(name, {
+        kind: 'parameter',
+        canonicalName: CANONICAL_LAUNCH_NAMES.has(name) ? name : undefined,
+      });
+    }
+  }
+}
+
+function addFunctionBodyBindings(
+  functionLike: FunctionLikeWithBody,
+  bindings: Map<string, LauncherBinding>,
+): void {
+  if (!functionLike.body || !ts.isBlock(functionLike.body)) return;
+  const visit = (node: ts.Node): void => {
+    if (isFunctionLikeWithBody(node)) {
+      const name = functionLikeName(node);
+      if (name) bindings.set(name, { kind: 'shadow' });
+      return;
+    }
+    if (ts.isVariableDeclaration(node)) {
+      for (const [name, binding] of bindingsForPattern(node.name, node.initializer, bindings)) {
+        bindings.set(name, binding);
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  for (const statement of functionLike.body.statements) visit(statement);
+}
+
+function enclosingFunctions(functionLike: FunctionLikeWithBody): FunctionLikeWithBody[] {
+  const result: FunctionLikeWithBody[] = [];
+  let parent: ts.Node | undefined = functionLike.parent;
+  while (parent) {
+    if (isFunctionLikeWithBody(parent)) result.push(parent);
+    parent = parent.parent;
+  }
+  return result.reverse();
+}
+
+function launcherBindings(sourceFile: ts.SourceFile, functionLike: FunctionLikeWithBody): Map<string, LauncherBinding> {
+  const bindings = importedLauncherBindings(sourceFile);
+  for (const outer of [...enclosingFunctions(functionLike), functionLike]) {
+    addFunctionParameters(outer, bindings);
+    addFunctionBodyBindings(outer, bindings);
+  }
+  return bindings;
+}
+
+function canonicalLauncherCall(
+  expression: ts.Expression,
+  bindings: Map<string, LauncherBinding>,
+): boolean {
+  if (ts.isIdentifier(expression)) {
+    const binding = bindings.get(expression.text);
+    return Boolean(
+      binding
+      && binding.kind !== 'shadow'
+      && binding.canonicalName
+      && CANONICAL_LAUNCH_NAMES.has(binding.canonicalName),
+    );
+  }
+  if (!ts.isPropertyAccessExpression(expression) || !CANONICAL_LAUNCH_NAMES.has(expression.name.text)) {
+    return false;
+  }
+  if (!ts.isIdentifier(expression.expression)) return false;
+  const base = bindings.get(expression.expression.text);
+  return Boolean(base && base.kind !== 'shadow');
+}
+
+function callsCanonicalLauncher(
+  sourceFile: ts.SourceFile,
+  functionLike: FunctionLikeWithBody,
+): boolean {
+  if (!functionLike.body) return false;
+  const bindings = launcherBindings(sourceFile, functionLike);
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    if (found) return;
+    if (isFunctionLikeWithBody(node)) return;
+    if (ts.isCallExpression(node) && canonicalLauncherCall(node.expression, bindings)) {
       found = true;
       return;
     }
@@ -344,7 +871,7 @@ function exactCoreTaskIdSet(values: string[] | null): boolean {
 }
 
 function hasCoreTaskContracts(artifact: SourceArtifact | null): boolean {
-  if (!artifact || !exactCoreTaskIdSet(coreTaskIdUnion(artifact.sourceFile))) return false;
+  if (!sourceIsUsable(artifact) || !exactCoreTaskIdSet(coreTaskIdUnion(artifact.sourceFile))) return false;
   return Boolean(
     findExportedFunction(artifact.sourceFile, 'parseCoreTaskRef')
     && findExportedFunction(artifact.sourceFile, 'coreTaskCanonicalKey'),
@@ -420,6 +947,42 @@ function objectLiteralFromExpression(expression: ts.Expression): ts.ObjectLitera
   return ts.isObjectLiteralExpression(unwrapped) ? unwrapped : null;
 }
 
+function literalString(value: ts.Expression | undefined): string | null {
+  const unwrapped = value ? unwrapExpression(value) : null;
+  return unwrapped && ts.isStringLiteral(unwrapped) && unwrapped.text.length > 0
+    ? unwrapped.text
+    : null;
+}
+
+function entrypointCutoversFromSource(
+  artifact: SourceArtifact | null,
+): Map<string, EntrypointCutover> {
+  const cutovers = new Map<string, EntrypointCutover>();
+  if (!sourceIsUsable(artifact)) return cutovers;
+  const initializer = findExportedConstInitializer(artifact.sourceFile, 'CORE_TASK_ENTRYPOINT_CUTOVERS');
+  const object = initializer ? objectLiteralFromExpression(initializer) : null;
+  const properties = object ? objectProperties(object) : null;
+  if (!properties) return cutovers;
+  for (const [qualifiedSymbol, property] of properties) {
+    const metadata = objectLiteralFromExpression(property.initializer);
+    const metadataProperties = metadata ? objectProperties(metadata) : null;
+    if (!metadataProperties || metadataProperties.size !== 2) return new Map();
+    const category = literalString(metadataProperties.get('category')?.initializer);
+    const taskIdExpression = metadataProperties.get('taskId')?.initializer;
+    const taskId = taskIdExpression && unwrapExpression(taskIdExpression).kind === ts.SyntaxKind.NullKeyword
+      ? null
+      : literalString(taskIdExpression);
+    if (!category || !ENTRYPOINT_CATEGORIES.has(category)
+      || (category === 'core_task'
+        ? !taskId || !new Set<string>(CORE_TASK_IDS).has(taskId)
+        : taskId !== null)) {
+      return new Map();
+    }
+    cutovers.set(qualifiedSymbol, { category, taskId });
+  }
+  return cutovers;
+}
+
 function literalOwnerId(value: ts.Expression): string | null {
   const unwrapped = unwrapExpression(value);
   if (!ts.isStringLiteral(unwrapped) || !unwrapped.text.trim()) return null;
@@ -427,7 +990,7 @@ function literalOwnerId(value: ts.Expression): string | null {
 }
 
 function hasCanonicalRegistry(artifact: SourceArtifact | null): boolean {
-  if (!artifact) return false;
+  if (!sourceIsUsable(artifact)) return false;
   const initializer = findExportedConstInitializer(artifact.sourceFile, 'CORE_TASK_REGISTRY');
   if (!initializer) return false;
   const registry = objectLiteralFromExpression(initializer);
@@ -467,13 +1030,12 @@ function exportedStateHasFields(sourceFile: ts.SourceFile): boolean {
       if (ts.isTypeLiteralNode(type)) members = type.members;
     }
     if (!declarationName || !/^CoreTask.*State$/.test(declarationName) || !members) continue;
-    const names = new Set(
-      members.flatMap((member) => {
-        if (!ts.isPropertySignature(member) || !member.name) return [];
-        const name = propertyNameText(member.name);
-        return name ? [name] : [];
-      }),
-    );
+    const names = new Set<string>();
+    for (const member of members) {
+      if (!ts.isPropertySignature(member) || !member.name) continue;
+      const name = propertyNameText(member.name);
+      if (name) names.add(name);
+    }
     if (['phase', 'generation', 'active'].every((name) => names.has(name))) return true;
   }
   return false;
@@ -481,7 +1043,7 @@ function exportedStateHasFields(sourceFile: ts.SourceFile): boolean {
 
 function hasCoreTaskController(artifact: SourceArtifact | null): boolean {
   return Boolean(
-    artifact
+    sourceIsUsable(artifact)
     && findExportedFunction(artifact.sourceFile, 'createCoreTaskSurfaceController')
     && exportedStateHasFields(artifact.sourceFile),
   );
@@ -499,64 +1061,48 @@ function entrypointHasAudit(
   }
   if (entry.category !== 'core_task' && entry.task_id !== null) return false;
 
-  const parts = entry.qualified_symbol.split('.');
-  const leaf = parts[parts.length - 1] ?? '';
   const baseline = readBaselineFile(root, entry.file);
-  if (!baseline || !findFunctionByLeaf(baseline.sourceFile, leaf)) return false;
+  if (!sourceIsUsable(baseline) || !findFunctionByQualifiedPath(baseline.sourceFile, entry.qualified_symbol)) {
+    return false;
+  }
 
   const current = artifactFromProduction(sources.productionFiles, entry.file);
-  if (!current) return sources.allowDeletedEntrypointCutover;
-  const currentFunction = findFunctionByLeaf(current.sourceFile, leaf);
-  if (!currentFunction) return sources.allowDeletedEntrypointCutover;
+  const cutover = sources.entrypointCutovers.get(entry.qualified_symbol);
+  const isExplicitCutover = Boolean(
+    cutover
+    && cutover.category === entry.category
+    && cutover.taskId === entry.task_id,
+  );
+  if (!current) return isExplicitCutover;
+  if (!sourceIsUsable(current)) return false;
+  const currentFunction = findFunctionByQualifiedPath(current.sourceFile, entry.qualified_symbol);
+  if (!currentFunction) return isExplicitCutover;
   if (entry.category !== 'core_task') return true;
-  return callsCanonicalLauncher(currentFunction);
+  return callsCanonicalLauncher(current.sourceFile, currentFunction);
 }
 
-function hasIdentifier(sourceFile: ts.SourceFile, name: string): boolean {
-  let found = false;
-  const visit = (node: ts.Node): void => {
-    if (found) return;
-    if (ts.isIdentifier(node) && node.text === name) {
-      found = true;
-      return;
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(sourceFile);
-  return found;
+function hasExportedTypeNamed(sourceFile: ts.SourceFile, name: string): boolean {
+  return sourceFile.statements.some((statement) => (
+    hasExportModifier(statement)
+    && ((ts.isTypeAliasDeclaration(statement) && statement.name.text === name)
+      || (ts.isInterfaceDeclaration(statement) && statement.name.text === name))
+  ));
 }
 
-function hasExportedFunctionMatching(
-  sourceFile: ts.SourceFile,
-  pattern: RegExp,
-): boolean {
-  for (const statement of sourceFile.statements) {
-    if (
-      isFunctionLikeWithBody(statement)
-      && hasExportModifier(statement)
-      && hasImplementedBody(statement)
-      && pattern.test(functionLikeName(statement) ?? '')
-    ) return true;
-    if (!ts.isVariableStatement(statement) || !hasExportModifier(statement)) continue;
-    for (const declaration of statement.declarationList.declarations) {
-      if (!ts.isIdentifier(declaration.name) || !pattern.test(declaration.name.text)) continue;
-      const functionLike = variableFunctionLike(declaration);
-      if (functionLike && hasImplementedBody(functionLike)) return true;
-    }
-  }
-  return false;
+function hasExportedFunctionNamed(sourceFile: ts.SourceFile, names: Set<string>): boolean {
+  return [...names].some((name) => Boolean(findExportedFunction(sourceFile, name)));
 }
+
+const EVENT_LIFECYCLE_PATH = 'web/src/features/interviewEvents/eventLifecycle.ts';
+const EVENT_LIFECYCLE_EXPORTS = new Set(['classifyEventLifecycleV1', 'resolveEventLifecycleV1']);
 
 function hasCentralEventClassifier(productionFiles: Map<string, string>): boolean {
-  for (const [path, source] of productionFiles) {
-    if (!path.includes('/features/interviewEvents/')) continue;
-    if (!/(?:eventLifecycle|lifecycle|classifier)/i.test(path)) continue;
-    const artifact = parseSource(path, source);
-    if (!hasIdentifier(artifact.sourceFile, 'EventLifecycleV1')) continue;
-    if (!hasExportedFunctionMatching(artifact.sourceFile, /^(?:classify|project|resolve).*Event/i)) continue;
-    return true;
-  }
-  return false;
+  const source = productionFiles.get(EVENT_LIFECYCLE_PATH);
+  if (source === undefined) return false;
+  const artifact = parseSource(EVENT_LIFECYCLE_PATH, source);
+  if (!sourceIsUsable(artifact)) return false;
+  return hasExportedTypeNamed(artifact.sourceFile, 'EventLifecycleV1')
+    && hasExportedFunctionNamed(artifact.sourceFile, EVENT_LIFECYCLE_EXPORTS);
 }
 
 function hasLocalEventClassifier(productionFiles: Map<string, string>): boolean {
@@ -574,21 +1120,49 @@ function hasLocalEventClassifier(productionFiles: Map<string, string>): boolean 
   ];
   return localPaths.some((path) => {
     const artifact = artifactFromProduction(productionFiles, path);
-    return Boolean(artifact && localMarkers.some((marker) => hasIdentifier(artifact.sourceFile, marker)));
+    if (!sourceIsUsable(artifact)) return false;
+    return localMarkers.some((marker) => artifact.sourceFile.statements.some((statement) => {
+      let found = false;
+      const visit = (node: ts.Node): void => {
+        if (found) return;
+        if (ts.isIdentifier(node) && node.text === marker) {
+          found = true;
+          return;
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(statement);
+      return found;
+    }));
   });
 }
 
+const MATERIAL_CLASSIFICATION_PATH = 'web/src/features/materialSurfaces/materialClassification.ts';
+const MATERIAL_CLASSIFICATION_EXPORTS = new Set([
+  'classifyMaterialRecord',
+  'projectExperienceMaterials',
+  'projectExternalReferences',
+]);
+const RESUME_LINEAGE_PATH = 'web/src/features/materialSurfaces/resumeLineage.ts';
+const MATERIAL_LABELS_PATH = 'web/src/features/materialSurfaces/materialLabels.ts';
+const MATERIAL_LABEL_MAPPER_EXPORTS = new Set(['mapMaterialLabel']);
+
 function hasCentralMaterialMapper(productionFiles: Map<string, string>): boolean {
-  for (const [path, source] of productionFiles) {
-    if (!path.includes('/features/materialSurfaces/')) continue;
-    if (!/(?:mapper|classifier|projector|lineage)/i.test(path)) continue;
-    const artifact = parseSource(path, source);
-    if (!hasExportedFunctionMatching(artifact.sourceFile, /^(?:classify|project|resolve|map).*(?:Material|Source|Resume)/i)) continue;
-    if (!['MaterialSource', 'ResumeLineageV1', 'materialSource', 'origin_kind', 'source_kind']
-      .some((name) => hasIdentifier(artifact.sourceFile, name))) continue;
-    return true;
-  }
-  return false;
+  const classification = productionFiles.get(MATERIAL_CLASSIFICATION_PATH);
+  const lineage = productionFiles.get(RESUME_LINEAGE_PATH);
+  const labels = productionFiles.get(MATERIAL_LABELS_PATH);
+  if (classification === undefined || lineage === undefined || labels === undefined) return false;
+  const classificationArtifact = parseSource(MATERIAL_CLASSIFICATION_PATH, classification);
+  const lineageArtifact = parseSource(RESUME_LINEAGE_PATH, lineage);
+  const labelsArtifact = parseSource(MATERIAL_LABELS_PATH, labels);
+  if (!sourceIsUsable(classificationArtifact)
+    || !sourceIsUsable(lineageArtifact)
+    || !sourceIsUsable(labelsArtifact)) return false;
+  return [...MATERIAL_CLASSIFICATION_EXPORTS].every((name) => (
+    Boolean(findExportedFunction(classificationArtifact.sourceFile, name))
+  ))
+    && Boolean(findExportedFunction(lineageArtifact.sourceFile, 'resolveResumeLineage'))
+    && hasExportedFunctionNamed(labelsArtifact.sourceFile, MATERIAL_LABEL_MAPPER_EXPORTS);
 }
 
 function sourceHasVisibleText(sourceFile: ts.SourceFile, needle: string): boolean {
@@ -598,6 +1172,14 @@ function sourceHasVisibleText(sourceFile: ts.SourceFile, needle: string): boolea
     if (
       (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node))
       && node.text.includes(needle)
+    ) {
+      found = true;
+      return;
+    }
+    if (
+      ts.isTemplateExpression(node)
+      && (node.head.text.includes(needle)
+        || node.templateSpans.some((span) => span.literal.text.includes(needle)))
     ) {
       found = true;
       return;
@@ -631,9 +1213,19 @@ function auditManifest(
     violations.push('event:local-classifier');
   }
 
-  const productionArtifacts = [...sources.productionFiles.entries()].map(([path, source]) => parseSource(path, source));
+  const productionArtifacts = [...sources.productionFiles.entries()]
+    .map(([path, source]) => parseSource(path, source));
+  if (productionArtifacts.some((artifact) => artifact.parseDiagnostics.length > 0)) {
+    violations.push('source:parse-diagnostics');
+  }
   const copyAuditResults = visibleCopy.map((item) => (
-    !item.lexeme || productionArtifacts.some((artifact) => sourceHasVisibleText(artifact.sourceFile, item.lexeme))
+    !item.lexeme
+    || productionArtifacts.some((artifact) => (
+      artifact.path === item.file && artifact.parseDiagnostics.length > 0
+    ))
+    || productionArtifacts.some((artifact) => (
+      sourceIsUsable(artifact) && sourceHasVisibleText(artifact.sourceFile, item.lexeme)
+    ))
   ));
   if (copyAuditResults.some((forbidden) => forbidden)) violations.push('copy:forbidden-lexeme');
 
@@ -642,15 +1234,16 @@ function auditManifest(
 }
 
 function realAuditSources(root: string): AuditSources {
+  const registrySource = readSourceArtifact(root, ['web/src/features/coreTaskSurface/registry.ts']);
   return {
     productionFiles: collectProductionFiles(root),
-    registrySource: readSourceArtifact(root, ['web/src/features/coreTaskSurface/registry.ts']),
+    registrySource,
     contractsSource: readSourceArtifact(root, ['web/src/features/coreTaskSurface/contracts.ts']),
     controllerSource: readSourceArtifact(root, [
       'web/src/features/coreTaskSurface/controller.ts',
       'web/src/features/coreTaskSurface/controller.tsx',
     ]),
-    allowDeletedEntrypointCutover: true,
+    entrypointCutovers: entrypointCutoversFromSource(registrySource),
   };
 }
 
@@ -699,11 +1292,13 @@ describe('core task surface baseline gate', () => {
       ),
       productionFiles: new Map([
         ['web/src/features/coreTaskSurface/unrelated.ts', `/* ${fakeText} */`],
-        ['web/src/features/interviewEvents/unrelated.ts', `const fake = '${fakeText}';`],
-        ['web/src/features/materialSurfaces/unrelated.ts', `const fake = '${fakeText}';`],
+        ['web/src/features/interviewEvents/eventLifecycle.ts', `const fake = '${fakeText}';`],
+        ['web/src/features/materialSurfaces/materialClassification.ts', `const fake = '${fakeText}';`],
+        ['web/src/features/materialSurfaces/resumeLineage.ts', `const fake = '${fakeText}';`],
+        ['web/src/features/materialSurfaces/materialLabels.ts', `const fake = '${fakeText}';`],
         ['web/src/unrelated.ts', 'const oldCopy = "旧版评估";'],
       ]),
-      allowDeletedEntrypointCutover: false,
+      entrypointCutovers: new Map(),
     });
     expect(violations).toEqual(expect.arrayContaining([
       'registry:missing-owner',
@@ -714,6 +1309,109 @@ describe('core task surface baseline gate', () => {
       'copy:forbidden-lexeme',
       'materials:missing-source-mapper',
     ]));
+    const malformedContracts = artifactFromText(
+      'web/src/features/coreTaskSurface/contracts.ts',
+      'export type CoreTaskId = {',
+    );
+    expect(malformedContracts.parseDiagnostics.length).toBeGreaterThan(0);
+    expect(hasCoreTaskContracts(malformedContracts)).toBe(false);
+  });
+
+  it('requires qualified lexical entrypoints, bound launchers, and explicit cutover mappings', () => {
+    const root = repositoryRoot();
+    const entries = entrypointsFromAsset(readAssets(root).assets.get(ASSET_NAMES[0]));
+    const entry = entries.find((candidate) => (
+      candidate.qualified_symbol === 'AppShellContent.openOfferNegotiation'
+    ));
+    expect(entry).toBeDefined();
+    if (!entry) return;
+
+    const sources = (body: string): AuditSources => ({
+      productionFiles: new Map([['web/src/layout/AppShell.tsx', body]]),
+      registrySource: null,
+      contractsSource: null,
+      controllerSource: null,
+      entrypointCutovers: new Map(),
+    });
+    const nestedLauncher = `import { launchCoreTask } from './surface';
+function AppShellContent() {
+  const openOfferNegotiation = () => {
+    function unreachable() { launchCoreTask(); }
+  };
+  return null;
+}`;
+    expect(entrypointHasAudit(root, entry, sources(nestedLauncher))).toBe(false);
+
+    const shadowedLauncher = `import { launchCoreTask } from './surface';
+function AppShellContent() {
+  const openOfferNegotiation = () => {
+    const launchCoreTask = () => {};
+    launchCoreTask();
+  };
+  return null;
+}`;
+    expect(entrypointHasAudit(root, entry, sources(shadowedLauncher))).toBe(false);
+
+    const wrongQualifiedOwner = `import { launchCoreTask } from './surface';
+function OtherContainer() {
+  const openOfferNegotiation = () => launchCoreTask();
+  return null;
+}`;
+    expect(entrypointHasAudit(root, entry, sources(wrongQualifiedOwner))).toBe(false);
+    expect(entrypointHasAudit(root, entry, sources(''))).toBe(false);
+
+    const cutover = new Map<string, EntrypointCutover>([
+      [entry.qualified_symbol, { category: entry.category, taskId: entry.task_id }],
+    ]);
+    expect(entrypointHasAudit(root, entry, { ...sources(''), entrypointCutovers: cutover })).toBe(true);
+    expect(entrypointHasAudit(root, entry, {
+      ...sources(''),
+      entrypointCutovers: new Map([[entry.qualified_symbol, {
+        category: 'core_task',
+        taskId: 'materials.story',
+      }]]),
+    })).toBe(false);
+  });
+
+  it('accepts only complete canonical AST fixture surfaces', () => {
+    const contracts = artifactFromText(
+      'web/src/features/coreTaskSurface/contracts.ts',
+      `export type CoreTaskId = ${CORE_TASK_IDS.map((taskId) => `'${taskId}'`).join(' | ')};
+export function parseCoreTaskRef(ref: string) { return ref; }
+export const coreTaskCanonicalKey = (ref: string) => ref;`,
+    );
+    const registry = artifactFromText(
+      'web/src/features/coreTaskSurface/registry.ts',
+      `export const CORE_TASK_REGISTRY = Object.freeze({
+${CORE_TASK_IDS.map((taskId, index) => `  '${taskId}': { ownerId: 'owner-${index}' },`).join('\n')}
+} as const);`,
+    );
+    const controller = artifactFromText(
+      'web/src/features/coreTaskSurface/controller.ts',
+      `export interface CoreTaskSurfaceState {
+  phase: string;
+  generation: number;
+  active: boolean;
+}
+export function createCoreTaskSurfaceController() {
+  return { phase: 'idle', generation: 0, active: false };
+}`,
+    );
+    expect(hasCoreTaskContracts(contracts)).toBe(true);
+    expect(hasCanonicalRegistry(registry)).toBe(true);
+    expect(hasCoreTaskController(controller)).toBe(true);
+
+    const productionFiles = new Map([
+      [EVENT_LIFECYCLE_PATH, `export type EventLifecycleV1 = { eventId: number };
+export function classifyEventLifecycleV1() { return { eventId: 1 }; }`],
+      [MATERIAL_CLASSIFICATION_PATH, `export function classifyMaterialRecord() { return null; }
+export function projectExperienceMaterials() { return []; }
+export function projectExternalReferences() { return []; }`],
+      [RESUME_LINEAGE_PATH, `export function resolveResumeLineage() { return null; }`],
+      [MATERIAL_LABELS_PATH, `export function mapMaterialLabel() { return ''; }`],
+    ]);
+    expect(hasCentralEventClassifier(productionFiles)).toBe(true);
+    expect(hasCentralMaterialMapper(productionFiles)).toBe(true);
   });
 
   it('requires the canonical AST surfaces, audited entrypoints, classifier, and copy migration', () => {

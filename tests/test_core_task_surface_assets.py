@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import ast
+from datetime import datetime
 import hashlib
 import json
 import re
 import subprocess
 from pathlib import Path
 from typing import Any
-
-import pytest
-
 
 BASELINE = "93fb0063118761f2c76e71e4209000feee0f755b"
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "core_task_surface"
@@ -76,6 +74,13 @@ INTERVIEW_ITEM_KEYS = frozenset(
         "preparation_available",
     }
 )
+INTERVIEW_SERIALIZER_PATH = "src/offerpilot/api.py"
+INTERVIEW_SERIALIZER_NAME = "_interview_index_item_json"
+INTERVIEW_NOTE_SOURCE_STATUSES = frozenset({"current", "source_changed"})
+RFC3339 = re.compile(
+    r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})\Z"
+)
+SENTINEL_SCHEDULED_AT = "0001-01-01T00:00:00+00:00"
 HEX_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -114,6 +119,66 @@ def _baseline_has_file(relative_path: str) -> bool:
         stderr=subprocess.DEVNULL,
         check=False,
     ).returncode == 0
+
+
+def _assert_interview_item(item: Any) -> None:
+    assert isinstance(item, dict)
+    assert set(item) == INTERVIEW_ITEM_KEYS
+    assert type(item["application_id"]) is int and item["application_id"] > 0
+    assert type(item["event_id"]) is int and item["event_id"] > 0
+    assert isinstance(item["company_name"], str)
+    assert isinstance(item["position_name"], str)
+    scheduled_at = item["scheduled_at"]
+    assert isinstance(scheduled_at, str)
+    if scheduled_at == SENTINEL_SCHEDULED_AT:
+        pass
+    else:
+        assert RFC3339.fullmatch(scheduled_at)
+        parsed = datetime.fromisoformat(scheduled_at.replace("Z", "+00:00"))
+        assert parsed.tzinfo is not None
+    assert item["note_id"] is None or (
+        type(item["note_id"]) is int and item["note_id"] > 0
+    )
+    assert item["note_source_status"] is None or (
+        isinstance(item["note_source_status"], str)
+        and item["note_source_status"] in INTERVIEW_NOTE_SOURCE_STATUSES
+    )
+    assert type(item["has_review_proposal"]) is bool
+    assert item["review_summary"] is None or isinstance(item["review_summary"], str)
+    assert type(item["has_confirmed_knowledge"]) is bool
+    assert type(item["preparation_available"]) is bool
+
+
+def _baseline_serializer_keys() -> set[str]:
+    # The fixed JSON was manually captured from the baseline serializer; this
+    # immutable git-show audit protects its legacy key set without inventing a
+    # test-time generator or depending on a live database/API runtime.
+    source = subprocess.run(
+        ["git", "show", f"{BASELINE}:{INTERVIEW_SERIALIZER_PATH}"],
+        cwd=REPOSITORY_ROOT,
+        check=True,
+        stdout=subprocess.PIPE,
+        encoding="utf-8",
+        text=True,
+    ).stdout
+    module = ast.parse(source, filename=INTERVIEW_SERIALIZER_PATH)
+    functions = [
+        node
+        for node in module.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == INTERVIEW_SERIALIZER_NAME
+    ]
+    assert len(functions) == 1
+    returns = [node for node in ast.walk(functions[0]) if isinstance(node, ast.Return)]
+    assert len(returns) == 1
+    payload = returns[0].value
+    assert isinstance(payload, ast.Dict)
+    keys: list[str] = []
+    for key in payload.keys:
+        assert isinstance(key, ast.Constant) and isinstance(key.value, str)
+        keys.append(key.value)
+    assert len(keys) == len(set(keys))
+    return set(keys)
 
 
 def test_core_task_assets_are_fixed_read_only_envelopes() -> None:
@@ -202,6 +267,9 @@ def test_interview_index_golden_preserves_the_baseline_list_and_get_payload_shap
     items = _assert_envelope(_load(ASSET_NAMES[3])[0], ASSET_NAMES[3])
     assert items
     scenarios: set[str] = set()
+    application_ids: set[int] = set()
+    event_ids: set[int] = set()
+    note_ids: set[int] = set()
     for scenario in items:
         assert isinstance(scenario, dict)
         assert set(scenario) == INTERVIEW_SCENARIO_KEYS
@@ -210,13 +278,29 @@ def test_interview_index_golden_preserves_the_baseline_list_and_get_payload_shap
         scenarios.add(scenario["scenario"])
         listing = scenario["list"]
         assert isinstance(listing, dict) and set(listing) == INTERVIEW_LIST_KEYS
-        assert isinstance(listing["items"], list)
+        assert isinstance(listing["items"], list) and listing["items"]
         assert listing["next_cursor"] is None or isinstance(listing["next_cursor"], str)
-        assert isinstance(scenario["get"], dict)
-        assert set(scenario["get"]) == INTERVIEW_ITEM_KEYS
+        _assert_interview_item(scenario["get"])
+        assert len(listing["items"]) == 1
+        assert listing["items"][0] == scenario["get"]
         for item in listing["items"]:
-            assert isinstance(item, dict)
-            assert set(item) == INTERVIEW_ITEM_KEYS
+            _assert_interview_item(item)
+        item = scenario["get"]
+        assert item["application_id"] not in application_ids
+        assert item["event_id"] not in event_ids
+        application_ids.add(item["application_id"])
+        event_ids.add(item["event_id"])
+        if item["note_id"] is not None:
+            assert item["note_id"] not in note_ids
+            note_ids.add(item["note_id"])
+
+
+def test_interview_asset_matches_the_immutable_baseline_serializer_keys() -> None:
+    items = _assert_envelope(_load(ASSET_NAMES[3])[0], ASSET_NAMES[3])
+    assert _baseline_serializer_keys() == INTERVIEW_ITEM_KEYS
+    for scenario in items:
+        assert isinstance(scenario, dict)
+        assert scenario["get"].keys() == INTERVIEW_ITEM_KEYS
 
 
 def test_production_python_does_not_read_review_only_core_task_assets() -> None:

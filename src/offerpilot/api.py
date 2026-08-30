@@ -120,6 +120,27 @@ from offerpilot.pilot_runtime.errors import (
     RuntimeFailureCode,
     RuntimeTransportAborted,
 )
+from offerpilot.product_actions.catalog import ProductActionCatalogV1
+from offerpilot.product_actions.contracts import (
+    ProductActionContractError,
+    ProductActionIntegrityError,
+    ProductActionProofRegistryV1,
+    decode_product_action_request_v1,
+)
+from offerpilot.product_actions.coordinator import (
+    ProductActionCoordinator,
+    ProductActionCoordinatorError,
+    ProductActionDecisionResultV1,
+    ProductActionProposalResultV1,
+    ProductActionRecoveryV1,
+    ProductActionStateV1,
+)
+from offerpilot.product_actions.issuer import (
+    LedgerKeyProfileStoreV1,
+    ReviewReadinessActionIssuer,
+)
+from offerpilot.product_actions.repository import ProductActionProposalRepository
+from offerpilot.review_readiness.repository import ReadinessSignalRepository
 from offerpilot.db import journal_session_factory_for_data_dir, session_factory_for_data_dir
 from offerpilot.diagnostics import append_log_entry, read_recent_log_page
 from offerpilot.knowledge import (
@@ -1172,6 +1193,39 @@ def create_app(
     repository = WriteOperationRepository(session_factory, ledger_key)
     write_operations = repository
     write_coordinator = WriteOperationCoordinator(repository)
+    product_action_proofs = ProductActionProofRegistryV1()
+    product_action_catalog = ProductActionCatalogV1(product_action_proofs)
+    product_action_keys = LedgerKeyProfileStoreV1(
+        (ledger_key,),
+        active_key_id=ledger_key.key_id,
+    )
+    review_readiness_issuer = ReviewReadinessActionIssuer(
+        product_action_catalog,
+        product_action_proofs,
+        product_action_keys,
+    )
+    product_action_proposals = ProductActionProposalRepository(
+        session_factory,
+        catalog=product_action_catalog,
+        proof_registry=product_action_proofs,
+        key_profiles=product_action_keys,
+    )
+    readiness_signals = ReadinessSignalRepository(
+        session_factory,
+        proof_registry=product_action_proofs,
+    )
+    product_action_coordinator = ProductActionCoordinator(
+        session_factory,
+        catalog=product_action_catalog,
+        proposal_repository=product_action_proposals,
+        review_issuer=review_readiness_issuer,
+        proof_registry=product_action_proofs,
+        key_profiles=product_action_keys,
+        readiness_repository=readiness_signals,
+        capability_check=lambda capability: (
+            capability == "application.interview_readiness_feedback.write"
+        ),
+    )
     context_source_loader: ContextSourceLoader[Any, Any] = ContextSourceLoader(
         resolved_data_dir / "data.db"
     )
@@ -1253,6 +1307,7 @@ def create_app(
     app.state.journal_db_engine = journal_engine
     app.state.run_recorder_factory = resolved_run_recorder_factory
     app.state.write_operation_coordinator = write_coordinator
+    app.state.product_action_coordinator = product_action_coordinator
     app.state.knowledge_runtime = knowledge_runtime
 
     @app.middleware("http")
@@ -1322,6 +1377,38 @@ def create_app(
         return JSONResponse(
             status_code=422,
             content={"error": "validation_failed", "detail": errors},
+        )
+
+    @app.exception_handler(ProductActionContractError)
+    async def product_action_contract_exception_handler(
+        _request: Request,
+        exc: ProductActionContractError,
+    ) -> JSONResponse:
+        code = (
+            "product_action_input_too_large"
+            if exc.code == "route_payload_too_large"
+            else "product_action_invalid_request"
+        )
+        return JSONResponse(status_code=422, content={"error_code": code})
+
+    @app.exception_handler(ProductActionCoordinatorError)
+    async def product_action_coordinator_exception_handler(
+        _request: Request,
+        exc: ProductActionCoordinatorError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error_code": exc.code, "retryable": exc.retryable},
+        )
+
+    @app.exception_handler(ProductActionIntegrityError)
+    async def product_action_integrity_exception_handler(
+        _request: Request,
+        _exc: ProductActionIntegrityError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            content={"error_code": "operation_result_unknown", "retryable": True},
         )
 
     def _runtime_source_loader(
@@ -3232,6 +3319,141 @@ def create_app(
             return error_response(404, "Interview note not found")
         notes.delete(note_id)
         return JSONResponse({"message": "Deleted"})
+
+    def _product_action_proposal_response(
+        result: ProductActionProposalResultV1,
+    ) -> JSONResponse:
+        content: dict[str, Any] = {
+            "schema_version": 1,
+            "operation_id": result.operation_id,
+            "action_call_id": result.action_call_id,
+            "action_name": result.action_name,
+            "status": result.status,
+            "created": result.created,
+            "replayed": result.replayed,
+        }
+        if result.confirmation_token is not None:
+            content["confirmation_token"] = result.confirmation_token
+        if result.result is not None:
+            content["result"] = dict(result.result)
+        return JSONResponse(content, status_code=201 if result.created else 200)
+
+    def _product_action_decision_response(
+        result: ProductActionDecisionResultV1,
+    ) -> JSONResponse:
+        return JSONResponse(
+            {
+                "schema_version": 1,
+                "operation_id": result.operation_id,
+                "action_name": result.action_name,
+                "status": result.status,
+                "result": dict(result.result),
+                "replayed": result.replayed,
+                "direct_commit": result.direct_commit,
+            }
+        )
+
+    def _product_action_state_response(result: ProductActionStateV1) -> JSONResponse:
+        content: dict[str, Any] = {
+            "schema_version": 1,
+            "operation_id": result.operation_id,
+            "action_name": result.action_name,
+            "status": result.status,
+        }
+        if result.result is not None:
+            content["result"] = dict(result.result)
+        return JSONResponse(content)
+
+    def _product_action_recovery_response(
+        result: ProductActionRecoveryV1,
+    ) -> JSONResponse:
+        return JSONResponse(
+            {
+                "schema_version": 1,
+                "operation_id": result.operation_id,
+                "action_call_id": result.action_call_id,
+                "action_name": result.action_name,
+                "status": result.status,
+                "confirmation_token": result.confirmation_token,
+                "allowed_decisions": list(result.allowed_decisions),
+                "rejection_only": result.rejection_only,
+                "live_source_state": (
+                    "not_observed" if result.rejection_only else "current"
+                ),
+            }
+        )
+
+    def _propose_review_readiness_action(
+        note_id: int,
+        payload: dict[str, Any],
+    ) -> JSONResponse:
+        result = product_action_coordinator.propose_readiness_signal(
+            note_id=note_id,
+            request=payload,
+        )
+        return _product_action_proposal_response(result)
+
+    def _decide_product_action(
+        operation_id: str,
+        payload: dict[str, Any],
+    ) -> JSONResponse:
+        result = product_action_coordinator.decide(
+            operation_id=operation_id,
+            request=payload,
+        )
+        return _product_action_decision_response(result)
+
+    @app.post("/api/interview-notes/{note_id}/readiness-focus-actions")
+    async def propose_review_readiness_action(
+        note_id: int,
+        request: Request,
+    ) -> JSONResponse:
+        payload = decode_product_action_request_v1(await request.body())
+        response = _propose_review_readiness_action(note_id, payload)
+        return response
+
+    @app.get("/api/product-actions/{operation_id}")
+    def get_product_action(operation_id: str) -> JSONResponse:
+        return _product_action_state_response(
+            product_action_coordinator.get_state(operation_id)
+        )
+
+    @app.get(
+        "/api/interview-notes/{note_id}/readiness-focus-actions/{operation_id}"
+    )
+    def recover_review_readiness_action(
+        note_id: int,
+        operation_id: str,
+    ) -> JSONResponse:
+        return _product_action_recovery_response(
+            product_action_coordinator.recover_signal_owner(
+                note_id=note_id,
+                operation_id=operation_id,
+            )
+        )
+
+    @app.get(
+        "/api/applications/{application_id}/product-actions/{operation_id}/rejection-control"
+    )
+    def recover_product_action_rejection_control(
+        application_id: int,
+        operation_id: str,
+    ) -> JSONResponse:
+        return _product_action_recovery_response(
+            product_action_coordinator.recover_rejection_control(
+                application_id=application_id,
+                operation_id=operation_id,
+            )
+        )
+
+    @app.post("/api/product-actions/{operation_id}/decisions")
+    async def decide_product_action(
+        operation_id: str,
+        request: Request,
+    ) -> JSONResponse:
+        payload = decode_product_action_request_v1(await request.body())
+        response = _decide_product_action(operation_id, payload)
+        return response
 
     @app.get("/api/notes/{note_id}/interview-review-proposals")
     def list_interview_review_proposals(note_id: int) -> JSONResponse:

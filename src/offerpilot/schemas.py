@@ -372,6 +372,69 @@ class InterviewReviewProposalOut(BaseModel):
     created_at: datetime | str
 
 
+class ProductActionProposalOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1] = 1
+    operation_id: str | None
+    action_call_id: str | None
+    action_name: Literal["save_review_readiness_signal", "confirm_interview_story"]
+    status: Literal[
+        "proposed",
+        "rejected",
+        "committed",
+        "failed",
+        "already_confirmed",
+    ]
+    created: bool
+    replayed: bool
+    confirmation_token: str | None = None
+    result: dict[str, Any] | None = None
+
+
+class ProductActionDecisionOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1] = 1
+    operation_id: str
+    action_name: Literal["save_review_readiness_signal", "confirm_interview_story"]
+    status: Literal["rejected", "committed", "failed"]
+    result: dict[str, Any]
+    replayed: bool
+    direct_commit: bool
+
+
+class ProductActionStateOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1] = 1
+    operation_id: str
+    action_name: Literal["save_review_readiness_signal", "confirm_interview_story"]
+    status: Literal["proposed", "rejected", "committed", "failed"]
+    result: dict[str, Any] | None = None
+
+
+class ProductActionRecoveryOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1] = 1
+    operation_id: str
+    action_call_id: str
+    action_name: Literal["save_review_readiness_signal", "confirm_interview_story"]
+    status: Literal["proposed"]
+    confirmation_token: str
+    allowed_decisions: list[Literal["approve", "modify", "reject"]]
+    rejection_only: bool
+    live_source_state: Literal["current", "not_observed"]
+
+
+class ProductActionErrorOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    error_code: str
+    retryable: bool = False
+
+
 class AdaptivePracticeStartIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

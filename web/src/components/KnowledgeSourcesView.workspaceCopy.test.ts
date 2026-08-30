@@ -9,11 +9,10 @@ describe('KnowledgeSourcesView user language', () => {
     expect(source).toContain('内容整理');
     expect(source).toContain('处理记录');
     expect(source).not.toContain('技术详情');
-    expect(source).toContain('复盘沉淀');
+    expect(source).not.toContain('复盘沉淀');
     expect(source).toContain('上传图文资料');
     expect(source).toContain('搜索资料内容');
-    expect(source).toContain('高级信息');
-    expect(source).toContain('原资料已更新，本次结果仍使用旧版');
+    expect(source).not.toContain('高级信息');
     expect(source).toContain('资料处理未完成，请稍后重试');
     expect(source).toContain("message.error('取消失败，请稍后重试。')");
     expect(source).not.toContain('error instanceof Error ? error.message');

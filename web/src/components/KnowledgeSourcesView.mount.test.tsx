@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const state = vi.hoisted(() => ({
   confirmed: [] as unknown[],
+  sources: [] as unknown,
 }));
 
 vi.mock('@/services/knowledge', () => ({
@@ -18,7 +19,7 @@ vi.mock('@/services/knowledge', () => ({
   fetchKnowledgeSourceContent: vi.fn(),
   fetchKnowledgeSourceEvidence: vi.fn(),
   fetchKnowledgeSourceJobs: vi.fn(),
-  fetchKnowledgeSources: vi.fn().mockResolvedValue([]),
+  fetchKnowledgeSources: vi.fn(() => Promise.resolve(state.sources)),
   fetchConfirmedInterviewKnowledgeNotes: vi.fn(() => Promise.resolve(state.confirmed)),
   pasteKnowledgeSource: vi.fn(),
   rebuildKnowledgeSourceBrief: vi.fn(),
@@ -60,6 +61,7 @@ async function flush() {
 
 beforeEach(() => {
   state.confirmed = [];
+  state.sources = [];
   Object.defineProperty(window, 'matchMedia', {
     configurable: true,
     value: () => ({ matches: false, addListener: () => undefined, removeListener: () => undefined }),
@@ -78,11 +80,20 @@ describe('KnowledgeSourcesView mounted source states', () => {
     renderView();
     await flush();
 
-    expect(container?.textContent).toContain('暂无复盘沉淀');
-    expect(container?.textContent).not.toContain('已保留当时版本');
+    expect(container?.textContent).toContain('还没有资料来源');
+    expect(container?.textContent).not.toContain('复盘沉淀');
   });
 
-  it('shows frozen and changed state only for loaded confirmed history', async () => {
+  it.each([null, undefined, {}])('shows malformed successful source collections as unavailable (%o)', async (sources) => {
+    state.sources = sources;
+    renderView();
+    await flush();
+
+    expect(container?.textContent).toContain('参考资料暂时无法读取');
+    expect(container?.textContent).not.toContain('还没有资料来源');
+  });
+
+  it('does not render confirmed history even when the legacy query has data', async () => {
     state.confirmed = [{
       id: 1,
       title: '复盘片段',
@@ -93,7 +104,21 @@ describe('KnowledgeSourcesView mounted source states', () => {
     renderView();
     await flush();
 
-    expect(container?.textContent).toContain('原资料已更新，本次结果仍使用旧版');
-    expect(container?.textContent).toContain('已保留当时版本');
+    expect(container?.textContent).not.toContain('复盘片段');
+    expect(container?.textContent).not.toContain('原资料已更新');
+  });
+
+  it('keeps captured source rows out of the external reference list', async () => {
+    state.sources = [{
+      id: 31,
+      source_kind: 'captured_interview_note',
+      title: '内部面试片段',
+      display_title: '内部面试片段',
+    }];
+    renderView();
+    await flush();
+
+    expect(container?.textContent).not.toContain('内部面试片段');
+    expect(container?.textContent).toContain('还没有资料来源');
   });
 });

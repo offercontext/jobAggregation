@@ -28,7 +28,7 @@ import {
 } from '@/components/OpportunityFitReviewDrawer';
 import { normalizeOpportunityFitHistoryDate } from '@/features/applicationTasks/opportunityFitHistory';
 import type { VoiceCoachingRecommendation } from '@/types/voiceCoaching';
-import InterviewStoryLibraryView, { type InterviewStoryOpenDraft } from '@/components/InterviewStoryLibraryView';
+import { type InterviewStoryOpenDraft } from '@/components/InterviewStoryLibraryView';
 import InterviewStoryDrawer, { createInterviewStoryDraft, type InterviewStoryDraft } from '@/components/InterviewStoryDrawer';
 import { type OfferNegotiationDraft } from '@/components/OfferNegotiationDrawer';
 import { listOfferBindingState } from '@/components/offerWorkspaceModel';
@@ -165,6 +165,7 @@ const KanbanBoard = lazy(() => import('@/components/KanbanBoard'));
 const ApplicationListView = lazy(() => import('@/components/ApplicationListView'));
 const CalendarView = lazy(() => import('@/components/CalendarView'));
 const KnowledgeSourcesView = lazy(() => import('@/components/KnowledgeSourcesView'));
+const ExperienceMaterialsView = lazy(() => import('@/components/ExperienceMaterialsView'));
 const QuestionBankView = lazy(() => import('@/components/QuestionBankView'));
 const OfferCenterView = lazy(() => import('@/components/OfferCenterView'));
 const DashboardView = lazy(() => import('@/features/dashboard/DashboardView'));
@@ -489,7 +490,11 @@ function AppShellContent() {
     queryFn: listResumes,
     enabled: true,
   });
-  const { data: confirmedInterviewKnowledgeNotesData } = useQuery({
+  const {
+    data: confirmedInterviewKnowledgeNotesData,
+    isLoading: confirmedInterviewKnowledgeNotesLoading,
+    isError: confirmedInterviewKnowledgeNotesError,
+  } = useQuery({
     queryKey: ['knowledge', 'confirmed-interview-notes'],
     queryFn: fetchConfirmedInterviewKnowledgeNotes,
     staleTime: 30000,
@@ -1575,10 +1580,13 @@ function AppShellContent() {
           )}
           {view === 'knowledge' && <KnowledgeSourcesView />}
           {view === 'reviews' && (
-            <InterviewStoryLibraryView
+            <ExperienceMaterialsView
               key={interviewStoryLibraryRevision}
               onBack={() => setView('resumes')}
               onOpenDraft={openInterviewStoryDraft}
+              confirmedCaptures={confirmedInterviewKnowledgeNotes}
+              confirmedCapturesLoading={confirmedInterviewKnowledgeNotesLoading}
+              confirmedCapturesError={confirmedInterviewKnowledgeNotesError}
             />
           )}
           {view === 'questions' && <QuestionBankView adaptiveFocus={adaptivePracticeFocus} onAdaptiveFocusConsumed={() => setAdaptivePracticeFocus(undefined)} />}
@@ -1595,10 +1603,13 @@ function AppShellContent() {
               }}
             />
           ) : interviewStoryLibraryOpen ? (
-            <InterviewStoryLibraryView
+            <ExperienceMaterialsView
               key={interviewStoryLibraryRevision}
               onBack={() => setInterviewStoryLibraryOpen(false)}
               onOpenDraft={openInterviewStoryDraft}
+              confirmedCaptures={confirmedInterviewKnowledgeNotes}
+              confirmedCapturesLoading={confirmedInterviewKnowledgeNotesLoading}
+              confirmedCapturesError={confirmedInterviewKnowledgeNotesError}
             />
           ) : (
             <InterviewV01View

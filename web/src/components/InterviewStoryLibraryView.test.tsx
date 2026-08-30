@@ -20,7 +20,10 @@ vi.mock('@/services/interviewStories', () => ({
   restoreInterviewStory: service.restore,
 }));
 
-const { default: InterviewStoryLibraryView } = await import('./InterviewStoryLibraryView');
+const {
+  default: InterviewStoryLibraryView,
+  normalizeInterviewStoryList,
+} = await import('./InterviewStoryLibraryView');
 
 let root: Root | undefined;
 let container: HTMLDivElement | undefined;
@@ -48,7 +51,75 @@ afterEach(() => {
   container?.remove();
 });
 
+function makeVersion(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 12,
+    version_number: 2,
+    origin_kind: 'manual',
+    confirmed_at: '2026-08-10T00:00:00+00:00',
+    source_fingerprint: 'frozen-source',
+    content: {
+      title: { id: 'title', text: '订单延迟排查' },
+      blocks: [{ id: 'situation_001', kind: 'situation', text: '线上延迟', fact_mode: 'evidence_backed' }],
+      capability_labels: [],
+      applicable_questions: [],
+      fact_gap_codes: [],
+    },
+    evidence_links: [{
+      target_kind: 'title',
+      target_id: 'title',
+      source_kind: 'user_assertion',
+      source_stable_id: '1',
+      source_version_or_snapshot: 'assertion:1',
+      source_path: '/statement',
+      excerpt: '这是我的陈述',
+    }],
+    assertions: [{ id: 1, statement: '这是我的陈述', frozen: true }],
+    source_states: [{
+      source_kind: 'user_assertion',
+      source_stable_id: '1',
+      source_version_or_snapshot: 'assertion:1',
+      state: 'frozen_user_assertion',
+    }],
+    ...overrides,
+  };
+}
+
+function makeStory(version: unknown = makeVersion()) {
+  return {
+    id: 8,
+    title: '订单延迟排查',
+    status: 'active',
+    current_version_id: 12,
+    story_revision: 2,
+    version_number: 2,
+    source_states: [],
+    version,
+  };
+}
+
+function makeVersionSummary() {
+  return {
+    id: 12,
+    version_number: 2,
+    origin_kind: 'manual',
+    confirmed_at: '2026-08-10T00:00:00+00:00',
+    source_fingerprint: 'frozen-source',
+  };
+}
+
 describe('InterviewStoryLibraryView', () => {
+  it('selects duplicate Story identities deterministically and reports a partial source', () => {
+    const first = { id: 8, title: '甲故事', status: 'active', current_version_id: 12, story_revision: 2, version_number: 2, source_states: [] };
+    const second = { ...first, title: '乙故事', story_revision: 3 };
+    const forward = normalizeInterviewStoryList([first, second]);
+    const reverse = normalizeInterviewStoryList([second, first]);
+
+    expect(forward.state).toBe('partial');
+    expect(reverse.state).toBe('partial');
+    expect(forward.values).toEqual(reverse.values);
+  });
+
   it('shows a Chinese Story entry and opens a user-initiated draft without writing', async () => {
     const open = vi.fn();
     act(() => root?.render(<InterviewStoryLibraryView onOpenDraft={open} />));
@@ -60,6 +131,114 @@ describe('InterviewStoryLibraryView', () => {
     expect(create?.className).not.toContain('ant-btn-primary');
     act(() => create?.dispatchEvent(new MouseEvent('click', { bubbles: true })));
     expect(open).toHaveBeenCalledWith({ entrypoint: 'ui', reviewNoteId: undefined });
+  });
+
+  it('does not project raw review rows as confirmed experience stories', async () => {
+    service.list.mockResolvedValue([
+      { id: 99, title: '原始复盘', status: 'active' },
+      { id: 8, title: '订单延迟排查', status: 'active', current_version_id: 12, story_revision: 2, version_number: 2, source_states: [] },
+    ]);
+    act(() => root?.render(<InterviewStoryLibraryView onOpenDraft={() => {}} />));
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    expect(container?.textContent).toContain('订单延迟排查');
+    expect(container?.textContent).not.toContain('原始复盘');
+  });
+
+  it('shows a safe partial-unavailable state for malformed Story rows', async () => {
+    service.list.mockResolvedValue([
+      { id: 99, kind: 'interview_story', title: '不完整故事', status: 'active' },
+      { id: 8, kind: 'interview_story', title: '订单延迟排查', status: 'active', current_version_id: 12, story_revision: 2, version_number: 2, source_states: [] },
+    ]);
+    act(() => root?.render(<InterviewStoryLibraryView onOpenDraft={() => {}} />));
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    expect(container?.textContent).toContain('订单延迟排查');
+    expect(container?.textContent).not.toContain('不完整故事');
+    expect(container?.textContent).toContain('部分故事暂时不可用');
+  });
+
+  it('does not treat a malformed version list as an empty history or show the current frozen content', async () => {
+    const version = makeVersion();
+    service.get.mockResolvedValue(makeStory(version));
+    service.listVersions.mockResolvedValue([makeVersionSummary(), { id: 'not-an-id' }]);
+    act(() => root?.render(<InterviewStoryLibraryView onOpenDraft={() => {}} />));
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    act(() => [...(container?.querySelectorAll('button') ?? [])].find((button) => button.textContent === '查看版本')?.click());
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    expect(container?.textContent).toContain('部分版本暂时不可用');
+    expect(container?.querySelector('[data-testid="story-version-content"]')).toBeNull();
+    expect(container?.textContent).not.toContain('线上延迟');
+  });
+
+  it('fails closed for a hostile version-list response without throwing', async () => {
+    service.get.mockResolvedValue(makeStory(makeVersion()));
+    const hostileHistory = new Proxy([], {
+      get(_target, property) {
+        if (property === 'length') throw new Error('hostile length');
+        return Reflect.get([], property);
+      },
+    });
+    service.listVersions.mockResolvedValue(hostileHistory);
+    act(() => root?.render(<InterviewStoryLibraryView onOpenDraft={() => {}} />));
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    act(() => [...(container?.querySelectorAll('button') ?? [])].find((button) => button.textContent === '查看版本')?.click());
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    expect(container?.textContent).toContain('版本历史暂时不可用');
+    expect(container?.querySelector('[data-testid="story-version-content"]')).toBeNull();
+  });
+
+  it.each(['changed', 'missing', 'error', 'deleted', 'unknown'] as const)(
+    'does not present frozen content when a version source is %s',
+    async (state) => {
+      service.get.mockResolvedValue(makeStory(makeVersion({
+        source_states: [{
+          source_kind: 'interview_note',
+          source_stable_id: 'note:1',
+          source_version_or_snapshot: 'note:1',
+          state,
+        }],
+      })));
+      service.listVersions.mockResolvedValue([makeVersionSummary()]);
+      act(() => root?.render(<InterviewStoryLibraryView onOpenDraft={() => {}} />));
+      await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+      act(() => [...(container?.querySelectorAll('button') ?? [])].find((button) => button.textContent === '查看版本')?.click());
+      await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+      expect(container?.querySelector('[data-testid="story-version-content"]')).toBeNull();
+      expect(container?.textContent).toContain(state === 'changed'
+        ? '来源已变化'
+        : state === 'missing'
+          ? '部分来源已缺失'
+          : '当前版本无法展示');
+      expect(container?.textContent).not.toContain('线上延迟');
+    },
+  );
+
+  it('fails closed when content, evidence links, or source states are hostile proxies', async () => {
+    const hostileCases = [
+      { content: new Proxy({}, { get() { throw new Error('content getter'); } }) },
+      { evidence_links: new Proxy([], { get() { throw new Error('evidence getter'); } }) },
+      { source_states: new Proxy([], { get() { throw new Error('states getter'); } }) },
+    ];
+    for (const overrides of hostileCases) {
+      service.get.mockResolvedValue(makeStory(makeVersion(overrides)));
+      service.listVersions.mockResolvedValue([makeVersionSummary()]);
+      act(() => root?.render(<InterviewStoryLibraryView onOpenDraft={() => {}} />));
+      await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+      act(() => [...(container?.querySelectorAll('button') ?? [])].find((button) => button.textContent === '查看版本')?.click());
+      await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+      expect(container?.querySelector('[data-testid="story-version-content"]')).toBeNull();
+      expect(container?.textContent).toContain('当前版本暂时不可用');
+      act(() => root?.unmount());
+      container?.remove();
+      container = document.createElement('div');
+      document.body.appendChild(container);
+      root = createRoot(container);
+    }
   });
 
   it('filters archived Stories and reads immutable version history without a write', async () => {

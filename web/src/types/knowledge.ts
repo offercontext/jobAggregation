@@ -65,6 +65,10 @@ export interface KnowledgeEvidencePolicySummary {
 export interface KnowledgeSource {
   id: number;
   source_kind: string;
+  /** Present only for source rows that carry a typed interview-capture relation. */
+  origin_kind?: string | null;
+  capture_metadata?: KnowledgeCapturedSourceMetadata | null;
+  captureMetadata?: KnowledgeCapturedSourceMetadata | null;
   title: string;
   display_title: string;
   title_hint: string;
@@ -88,6 +92,20 @@ export interface KnowledgeSource {
   updated_at: string;
   provenance: KnowledgeSourceProvenance;
   evidence_policy_summary?: KnowledgeEvidencePolicySummary;
+}
+
+/**
+ * Read-only relation metadata for a source captured from an interview note.
+ * The metadata is optional on older source responses; consumers must fail
+ * closed when a capture marker is present without a complete relation.
+ */
+export interface KnowledgeCapturedSourceMetadata {
+  source_id?: number;
+  origin_note_id: number;
+  application_event_id: number | null;
+  note_fingerprint: string;
+  capture_schema_version: string;
+  captured_at?: string;
 }
 
 export interface ConfirmedInterviewKnowledgeBlock {
@@ -117,6 +135,8 @@ export interface ConfirmedInterviewKnowledgeNote {
     blocks: ConfirmedInterviewKnowledgeBlock[];
   };
   source_id: number;
+  capture_metadata?: KnowledgeCapturedSourceMetadata | null;
+  captureMetadata?: KnowledgeCapturedSourceMetadata | null;
   source_status: 'frozen' | 'source_changed';
   captured_at: string;
   evidence?: Array<{

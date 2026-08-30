@@ -639,6 +639,18 @@ class InterviewKnowledgeCaptureRepository:
             "version_number": version.version_number,
             "content": content,
             "source_id": version.source_id,
+            "capture_metadata": (
+                {
+                    "source_id": metadata.source_id,
+                    "origin_note_id": metadata.origin_note_id,
+                    "application_event_id": metadata.application_event_id,
+                    "note_fingerprint": metadata.note_fingerprint,
+                    "capture_schema_version": metadata.capture_schema_version,
+                    "captured_at": metadata.captured_at.isoformat(),
+                }
+                if metadata is not None
+                else None
+            ),
             "source_status": source_status,
             "captured_at": frozen_at,
             "evidence": list(evidence_by_id.values()),

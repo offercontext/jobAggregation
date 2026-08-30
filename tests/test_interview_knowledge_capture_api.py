@@ -102,6 +102,16 @@ def test_confirm_creates_frozen_knowledge_and_is_idempotent(tmp_path) -> None:
     listing = client.get("/api/knowledge/notes")
     assert listing.status_code == 200
     assert listing.json()["items"][0]["origin_kind"] == "confirmed_interview_capture"
+    metadata = listing.json()["items"][0]["capture_metadata"]
+    assert metadata == {
+        "source_id": first.json()["source_id"],
+        "origin_note_id": note["id"],
+        "application_event_id": note["application_event_id"],
+        "note_fingerprint": attempt["note_fingerprint"],
+        "capture_schema_version": "interview-note-capture-v1",
+        "captured_at": metadata["captured_at"],
+    }
+    assert metadata["captured_at"]
 
 
 def test_confirmed_attempt_is_read_only_for_same_key_direct_preview(tmp_path) -> None:

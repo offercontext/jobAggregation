@@ -17,8 +17,34 @@ import { createApiClient } from './http';
 const http = createApiClient({ baseURL: '/api', timeout: 30000 });
 
 export async function fetchConfirmedInterviewKnowledgeNotes(): Promise<ConfirmedInterviewKnowledgeNote[]> {
-  const { data } = await http.get<{ items: ConfirmedInterviewKnowledgeNote[] }>('/knowledge/notes');
-  return data.items;
+  const { data } = await http.get<unknown>('/knowledge/notes');
+  return parseConfirmedInterviewKnowledgeNotesResponse(data);
+}
+
+/**
+ * Keep malformed successful responses distinct from a legitimate empty source.
+ * Row-level eligibility remains owned by the material classifier; this boundary
+ * only proves that the collection envelope itself is present and iterable.
+ */
+export function parseConfirmedInterviewKnowledgeNotesResponse(
+  input: unknown,
+): ConfirmedInterviewKnowledgeNote[] {
+  try {
+    if (typeof input !== 'object' || input === null) {
+      throw new TypeError('invalid envelope');
+    }
+    const items = Reflect.get(input, 'items');
+    if (!Array.isArray(items)) {
+      throw new TypeError('invalid items');
+    }
+    const result: ConfirmedInterviewKnowledgeNote[] = [];
+    for (let index = 0; index < items.length; index += 1) {
+      result.push(items[index] as ConfirmedInterviewKnowledgeNote);
+    }
+    return result;
+  } catch {
+    throw new Error('经历素材来源暂时不可用');
+  }
 }
 
 export async function fetchConfirmedInterviewKnowledgeNote(
@@ -194,7 +220,15 @@ export async function fetchKnowledgeSourceContent(sourceId: number): Promise<str
 }
 
 export function decodeKnowledgeSourceContent(content: ArrayBuffer): string {
-  const bytes = new Uint8Array(content);
+  let bytes: Uint8Array;
+  try {
+    if (!(content instanceof ArrayBuffer)) {
+      throw new TypeError('invalid content envelope');
+    }
+    bytes = new Uint8Array(content);
+  } catch {
+    throw new Error('资料正文来源暂时不可用');
+  }
   if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
     return new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(3));
   }

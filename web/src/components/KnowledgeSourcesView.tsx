@@ -44,7 +44,6 @@ import {
   fetchKnowledgeSourceEvidence,
   fetchKnowledgeSourceJobs,
   fetchKnowledgeSources,
-  fetchConfirmedInterviewKnowledgeNotes,
   pasteKnowledgeSource,
   rebuildKnowledgeSourceBrief,
   searchKnowledgeEvidence,
@@ -64,9 +63,10 @@ import type {
   KnowledgeSourceBrief,
   KnowledgeSourceBriefResponse,
   KnowledgeSourceJobsResponse,
-  ConfirmedInterviewKnowledgeNote,
 } from '@/types/knowledge';
-import { SourceStateTag } from './ui/SourceStateTag';
+import {
+  projectExternalReferences,
+} from '@/features/materialSurfaces/materialClassification';
 
 const { Paragraph, Text, Title } = Typography;
 
@@ -97,7 +97,362 @@ const BRIEF_LABEL: Record<string, string> = {
   outdated: '已过期',
 };
 
+const SOURCE_LIFECYCLES = new Set(['active', 'archived', 'deleting']);
+const EXTRACTION_STATUSES = new Set(['pending', 'processing', 'extracted', 'failed']);
+const BRIEF_STATUSES = new Set([
+  'not_started',
+  'pending',
+  'processing',
+  'ready',
+  'failed',
+  'outdated',
+]);
+
 const SAFE_PROCESSING_FAILURE_COPY = '资料处理未完成，请稍后重试。';
+const MAX_TITLE_LENGTH = 160;
+const MAX_SUMMARY_LENGTH = 1200;
+const MAX_DETAIL_LENGTH = 20_000;
+const MAX_COLLECTION_LENGTH = 200;
+
+type SafeRecord = Record<string, unknown>;
+
+function safeRecord(value: unknown): SafeRecord | null {
+  try {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+    Reflect.ownKeys(value);
+    return value as SafeRecord;
+  } catch {
+    return null;
+  }
+}
+
+function safeRead(value: unknown, key: string): unknown {
+  const record = safeRecord(value);
+  if (!record) return undefined;
+  try {
+    return Reflect.get(record, key);
+  } catch {
+    return undefined;
+  }
+}
+
+function safeArray(value: unknown, limit = MAX_COLLECTION_LENGTH): unknown[] {
+  try {
+    if (!Array.isArray(value)) return [];
+    const length = Math.min(value.length, limit);
+    const result: unknown[] = [];
+    for (let index = 0; index < length; index += 1) result.push(value[index]);
+    return result;
+  } catch {
+    return [];
+  }
+}
+
+function isSafeArray(value: unknown): boolean {
+  try {
+    return Array.isArray(value);
+  } catch {
+    return false;
+  }
+}
+
+function safeArrayProjection(
+  value: unknown,
+  limit = MAX_COLLECTION_LENGTH,
+): { readonly values: readonly unknown[]; readonly unavailable: boolean } {
+  try {
+    if (!Array.isArray(value) || !Number.isSafeInteger(value.length) || value.length > limit) {
+      return { values: Object.freeze([]), unavailable: true };
+    }
+    const values: unknown[] = [];
+    let unavailable = false;
+    for (let index = 0; index < value.length; index += 1) {
+      if (!(index in value)) {
+        unavailable = true;
+        continue;
+      }
+      try {
+        values.push(value[index]);
+      } catch {
+        unavailable = true;
+      }
+    }
+    return { values: Object.freeze(values), unavailable };
+  } catch {
+    return { values: Object.freeze([]), unavailable: true };
+  }
+}
+
+function boundedText(value: unknown, fallback = '', limit = MAX_SUMMARY_LENGTH): string {
+  if (typeof value !== 'string') return fallback;
+  const normalized = value.trim();
+  if (!normalized) return fallback;
+  return normalized.length <= limit ? normalized : `${normalized.slice(0, limit)}…`;
+}
+
+function safePositiveId(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+function safeFiniteNumber(value: unknown, fallback = 0): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+interface ExternalSourceListItem {
+  readonly id: number;
+  readonly title: string;
+  readonly lifecycle: string;
+  readonly extractionStatus: string;
+  readonly briefStatus: string;
+  readonly mainFilename: string;
+  readonly totalBytes: number;
+}
+
+function externalSourceListItem(
+  item: ReturnType<typeof projectExternalReferences>['items'][number],
+): ExternalSourceListItem | null {
+  const id = safePositiveId(safeRead(item.record, 'id'));
+  if (id === null) return null;
+  return Object.freeze({
+    id,
+    title: boundedText(item.title, '参考资料', MAX_TITLE_LENGTH),
+    lifecycle: boundedText(safeRead(item.record, 'lifecycle'), 'unknown', 32),
+    extractionStatus: boundedText(safeRead(item.record, 'extraction_status'), 'unknown', 32),
+    briefStatus: boundedText(safeRead(item.record, 'brief_status'), 'unknown', 32),
+    mainFilename: boundedText(safeRead(item.record, 'main_filename'), '未提供文件名', MAX_TITLE_LENGTH),
+    totalBytes: Math.max(0, safeFiniteNumber(safeRead(item.record, 'total_bytes'))),
+  });
+}
+
+export function normalizeKnowledgeSourceDetail(input: unknown, expectedId: number): KnowledgeSource | null {
+  const record = safeRecord(input);
+  if (!record || safePositiveId(safeRead(record, 'id')) !== expectedId) return null;
+  const sourceKind = boundedText(safeRead(record, 'source_kind'), '', 48);
+  if (!['markdown', 'text', 'bundle'].includes(sourceKind)) return null;
+  const lifecycle = boundedText(safeRead(record, 'lifecycle'), '', 32);
+  const extractionStatus = boundedText(safeRead(record, 'extraction_status'), '', 32);
+  const briefStatus = boundedText(safeRead(record, 'brief_status'), '', 32);
+  if (
+    !SOURCE_LIFECYCLES.has(lifecycle)
+    || !EXTRACTION_STATUSES.has(extractionStatus)
+    || !BRIEF_STATUSES.has(briefStatus)
+  ) {
+    return null;
+  }
+  const provenanceValue = safeRecord(safeRead(record, 'provenance'));
+  const title = boundedText(
+    safeRead(record, 'display_title'),
+    boundedText(safeRead(record, 'title'), '参考资料', MAX_TITLE_LENGTH),
+    MAX_TITLE_LENGTH,
+  );
+  return Object.freeze({
+    id: expectedId,
+    source_kind: sourceKind,
+    title,
+    display_title: title,
+    title_hint: boundedText(safeRead(record, 'title_hint'), '', MAX_TITLE_LENGTH),
+    author: boundedText(safeRead(record, 'author'), '', MAX_TITLE_LENGTH),
+    published_at: boundedText(safeRead(record, 'published_at'), '', 64) || null,
+    main_filename: boundedText(safeRead(record, 'main_filename'), '未提供文件名', MAX_TITLE_LENGTH),
+    main_media_type: boundedText(safeRead(record, 'main_media_type'), '', 80),
+    total_bytes: Math.max(0, safeFiniteNumber(safeRead(record, 'total_bytes'))),
+    token_count: Math.max(0, safeFiniteNumber(safeRead(record, 'token_count'))),
+    lifecycle,
+    extraction_status: extractionStatus,
+    extraction_error_code: '',
+    extraction_error_message: '',
+    brief_status: briefStatus,
+    brief_block_reason: '',
+    brief_error_code: '',
+    brief_error_message: '',
+    active_snapshot_id: null,
+    archived_at: boundedText(safeRead(record, 'archived_at'), '', 64) || null,
+    created_at: boundedText(safeRead(record, 'created_at'), '', 64),
+    updated_at: boundedText(safeRead(record, 'updated_at'), '', 64),
+    provenance: Object.freeze({
+      title: boundedText(safeRead(provenanceValue, 'title'), '', MAX_TITLE_LENGTH) || undefined,
+      author: boundedText(safeRead(provenanceValue, 'author'), '', MAX_TITLE_LENGTH) || undefined,
+      url: boundedText(safeRead(provenanceValue, 'url'), '', 500) || undefined,
+      published_at: boundedText(safeRead(provenanceValue, 'published_at'), '', 64) || undefined,
+      captured_at: boundedText(safeRead(provenanceValue, 'captured_at'), '', 64),
+      metadata_extraction_version: '',
+    }),
+  });
+}
+
+export function knowledgeSourceCanMutate(source: KnowledgeSource | null): boolean {
+  return source?.lifecycle === 'active' || source?.lifecycle === 'archived';
+}
+
+interface SafeEvidenceProjection {
+  readonly items: KnowledgeEvidence[];
+  readonly unavailable: boolean;
+}
+
+export function normalizeEvidencePage(input: unknown, expectedSourceId: number): SafeEvidenceProjection {
+  const rawItems = safeRead(input, 'items');
+  let unavailable = input !== undefined && !isSafeArray(rawItems);
+  const items: KnowledgeEvidence[] = [];
+  for (const candidate of safeArray(rawItems, 100)) {
+    const record = safeRecord(candidate);
+    const id = boundedText(safeRead(record, 'id'), '', 180);
+    const sourceId = safePositiveId(safeRead(record, 'source_id'));
+    const excerpt = boundedText(safeRead(record, 'canonical_excerpt'), '', 2400);
+    if (!record || !id || sourceId !== expectedSourceId || !excerpt) {
+      unavailable = true;
+      continue;
+    }
+    const headings = safeArray(safeRead(record, 'heading_path'), 12)
+      .map((value) => boundedText(value, '', 120))
+      .filter(Boolean);
+    items.push(Object.freeze({
+      id,
+      source_id: sourceId,
+      snapshot_id: 0,
+      kind: safeRead(record, 'kind') === 'asset' ? 'asset' : 'text',
+      block_kind: '资料片段',
+      ordinal: Math.max(0, safeFiniteNumber(safeRead(record, 'ordinal'))),
+      heading_path: Object.freeze(headings) as string[],
+      char_start: 0,
+      char_end: 0,
+      line_start: 0,
+      line_end: 0,
+      canonical_excerpt: excerpt,
+      search_text: boundedText(safeRead(record, 'search_text'), '', 500),
+      content_hash: '',
+      asset_id: safePositiveId(safeRead(record, 'asset_id')),
+      previous_evidence_id: null,
+      next_evidence_id: null,
+    }));
+  }
+  return { items, unavailable };
+}
+
+function normalizeOriginProjection(
+  input: unknown,
+  expectedSourceId: number,
+): { readonly items: KnowledgeSourceJobsResponse['origins']; readonly unavailable: boolean } {
+  const source = safeArrayProjection(input, 100);
+  let unavailable = source.unavailable;
+  const items = source.values.flatMap((candidate) => {
+    const record = safeRecord(candidate);
+    const id = safePositiveId(safeRead(record, 'id'));
+    const sourceId = safePositiveId(safeRead(record, 'source_id'));
+    if (!record || id === null || sourceId !== expectedSourceId) {
+      unavailable = true;
+      return [];
+    }
+    return [Object.freeze({
+      id,
+      source_id: sourceId,
+      import_method: boundedText(safeRead(record, 'import_method'), '导入', 40),
+      original_filename: boundedText(safeRead(record, 'original_filename'), '未提供文件名', MAX_TITLE_LENGTH),
+      origin_url: boundedText(safeRead(record, 'origin_url'), '', 500),
+      imported_at: boundedText(safeRead(record, 'imported_at'), '', 64),
+    })];
+  });
+  return { items, unavailable };
+}
+
+export function normalizeJobProjection(
+  input: unknown,
+  expectedSourceId?: number,
+): { readonly items: readonly KnowledgeJob[]; readonly unavailable: boolean } {
+  const source = safeArrayProjection(input, 100);
+  let unavailable = source.unavailable;
+  const blockedIds = new Set<number>();
+  const byId = new Map<number, KnowledgeJob>();
+  for (const candidate of source.values) {
+    const record = safeRecord(candidate);
+    const id = safePositiveId(safeRead(record, 'id'));
+    const kind = boundedText(safeRead(record, 'kind'), '', 32);
+    const status = boundedText(safeRead(record, 'status'), 'unknown', 32);
+    const owner = safePositiveId(safeRead(record, 'source_id'));
+    if (!record || id === null || !['extract', 'brief', 'delete', 'process'].includes(kind)
+      || !['pending', 'running', 'succeeded', 'failed', 'canceled'].includes(status)
+      || (expectedSourceId !== undefined && owner !== expectedSourceId)) {
+      unavailable = true;
+      continue;
+    }
+    if (blockedIds.has(id) || byId.has(id)) {
+      unavailable = true;
+      blockedIds.add(id);
+      byId.delete(id);
+      continue;
+    }
+    byId.set(id, Object.freeze({
+      id,
+      kind: kind === 'delete' ? 'delete' : 'process',
+      queue: '',
+      source_id: null,
+      snapshot_id: null,
+      stage: '',
+      status,
+      progress: Math.max(0, Math.min(100, safeFiniteNumber(safeRead(record, 'progress')))),
+      retry_count: Math.max(0, safeFiniteNumber(safeRead(record, 'retry_count'))),
+      next_retry_at: boundedText(safeRead(record, 'next_retry_at'), '', 64) || null,
+      error_code: '',
+      error_message: safeRead(record, 'error_message') ? SAFE_PROCESSING_FAILURE_COPY : '',
+      canceled: safeRead(record, 'canceled') === true,
+      lease_owner: '',
+      lease_expires_at: null,
+      heartbeat_at: null,
+      created_at: boundedText(safeRead(record, 'created_at'), '', 64),
+      updated_at: boundedText(safeRead(record, 'updated_at'), '', 64),
+    }));
+  }
+  return { items: Object.freeze([...byId.values()]), unavailable };
+}
+
+export function normalizeSearchHitProjection(input: unknown): {
+  readonly items: readonly import('@/types/knowledge').KnowledgeEvidenceSearchHit[];
+  readonly unavailable: boolean;
+} {
+  const source = safeArrayProjection(input, 50);
+  let unavailable = source.unavailable;
+  const blockedIds = new Set<string>();
+  const byId = new Map<string, import('@/types/knowledge').KnowledgeEvidenceSearchHit>();
+  for (const candidate of source.values) {
+    const record = safeRecord(candidate);
+    const evidenceId = boundedText(safeRead(record, 'evidence_id'), '', 180);
+    const sourceId = safePositiveId(safeRead(record, 'source_id'));
+    const snippet = boundedText(safeRead(record, 'snippet'), '', 800);
+    if (!record || !evidenceId || sourceId === null || !snippet) {
+      unavailable = true;
+      continue;
+    }
+    if (blockedIds.has(evidenceId) || byId.has(evidenceId)) {
+      unavailable = true;
+      blockedIds.add(evidenceId);
+      byId.delete(evidenceId);
+      continue;
+    }
+    const headingPath = safeArray(safeRead(record, 'heading_path'), 12)
+      .map((value) => boundedText(value, '', 120))
+      .filter(Boolean);
+    byId.set(evidenceId, Object.freeze({
+      evidence_id: evidenceId,
+      source_id: sourceId,
+      snapshot_id: 0,
+      block_kind: '资料片段',
+      heading_path: Object.freeze(headingPath) as string[],
+      char_start: 0,
+      char_end: 0,
+      line_start: 0,
+      line_end: 0,
+      canonical_excerpt: '',
+      snippet,
+      score: safeFiniteNumber(safeRead(record, 'score')),
+      previous_evidence_id: null,
+      next_evidence_id: null,
+    }));
+  }
+  return { items: Object.freeze([...byId.values()]), unavailable };
+}
+
+export function normalizeSearchHits(input: unknown): import('@/types/knowledge').KnowledgeEvidenceSearchHit[] {
+  return [...normalizeSearchHitProjection(input).items];
+}
 
 // Status Pill 变体：替换 antd 彩色圆点 Badge，统一精致化状态标识
 type PillVariant = 'indigo' | 'green' | 'amber' | 'rose' | 'gray' | 'violet' | 'cyan';
@@ -184,21 +539,35 @@ export default function KnowledgeSourcesView() {
     // KV1-02：列表轮询只由 Extraction 在途状态触发；V1 不因 Brief 状态刷新
     // （Brief Pill 已隐藏，brief_status 变化不再影响列表展示）。
     refetchInterval: (query) => {
-      const items = query.state.data ?? [];
-      return items.some(
-        (item) =>
-          item.extraction_status === 'pending' ||
-          item.extraction_status === 'processing',
-      )
+      const items = safeArray(query.state.data);
+      return items.some((item) => {
+        const status = safeRead(item, 'extraction_status');
+        return status === 'pending' || status === 'processing';
+      })
         ? 2000
         : false;
     },
   });
-  const confirmedInterviewKnowledgeQuery = useQuery({
-    queryKey: ['knowledge', 'confirmed-interview-notes'],
-    queryFn: fetchConfirmedInterviewKnowledgeNotes,
+  const externalProjection = projectExternalReferences({
+    sources: sourcesQuery.data,
+    sourcesState: sourcesQuery.isLoading
+      ? 'loading'
+      : sourcesQuery.isError
+        ? 'error'
+        : 'ready',
   });
+  const externalSources = externalProjection.items.flatMap((item) => {
+    const projected = externalSourceListItem(item);
+    return projected ? [projected] : [];
+  });
+  const externalSourceUnavailable = externalProjection.unavailable.some(
+    (issue) => issue.kind !== 'captured_unavailable',
+  ) || externalProjection.items.some((item) => item.sourceState === 'unavailable');
+  const externalSourceIds = new Set(externalSources.map((source) => source.id));
   const [selectedSourceId, setSelectedSourceId] = useState<number | null>(null);
+  const activeExternalSourceId = selectedSourceId !== null && externalSourceIds.has(selectedSourceId)
+    ? selectedSourceId
+    : null;
   // KI-08：搜索结果点击后，进入 Source 详情时定位/高亮对应 Evidence。
   // 保留 evidenceId + 命中片段用于详情面板滚动与高亮；定位完成后清空。
   const [highlightEvidenceId, setHighlightEvidenceId] = useState<string | null>(null);
@@ -282,9 +651,14 @@ export default function KnowledgeSourcesView() {
   const searchMutation = useMutation({
     mutationFn: (query: string) => searchKnowledgeEvidence(query, { limit: 20 }),
     onSuccess: (data) => {
-      setActiveSearch(data.query);
+      setActiveSearch(boundedText(safeRead(data, 'query'), searchQuery, 120));
     },
   });
+
+  const searchProjection = normalizeSearchHitProjection(safeRead(searchMutation.data, 'hits'));
+  const searchHits = [...searchProjection.items];
+  const searchResponseUnavailable = searchMutation.isError
+    || (searchMutation.data !== undefined && searchProjection.unavailable);
 
   const handleSearch = () => {
     if (!searchQuery.trim()) {
@@ -296,59 +670,6 @@ export default function KnowledgeSourcesView() {
 
   return (
     <div style={{ padding: 24 }}>
-      <div style={{ marginBottom: 24 }}>
-        <Title level={4}>复盘沉淀</Title>
-        {(confirmedInterviewKnowledgeQuery.data?.length ?? 0) > 0 ? (
-          <SourceStateTag state="frozen" detail="用户确认保存的面试原始片段" />
-        ) : null}
-        <Paragraph type="secondary">
-          仅展示用户确认保存的面试原始片段沉淀；可继续审阅证据链。
-        </Paragraph>
-        {confirmedInterviewKnowledgeQuery.isLoading ? <Spin /> : null}
-        {!confirmedInterviewKnowledgeQuery.isLoading && !(confirmedInterviewKnowledgeQuery.data?.length ?? 0) ? (
-          <Empty description="暂无复盘沉淀" />
-        ) : (
-          <List
-            bordered
-            dataSource={confirmedInterviewKnowledgeQuery.data ?? []}
-            renderItem={(item: ConfirmedInterviewKnowledgeNote) => (
-              <List.Item>
-                <List.Item.Meta
-                    title={(
-                      <Space size={8}>
-                        <SourceStateTag
-                          state={item.source_status === 'source_changed' ? 'changed' : 'frozen'}
-                          detail={item.source_status === 'source_changed' ? '历史快照仍可审阅' : '用户确认保存'}
-                        />
-                        {item.title || '未命名面试知识'}
-                      </Space>
-                    )}
-                  description={`${item.source_status === 'source_changed' ? '原资料已更新，本次结果仍使用旧版' : '已保留当时版本'} · ${item.content.blocks.length} 个内容块 · ${item.content.blocks.reduce((count, block) => count + block.evidence_refs.length, 0)} 条证据`}
-                />
-                <Space direction="vertical" size={4} style={{ width: '100%', marginTop: 8 }}>
-                  {(item.evidence ?? []).map((evidence) => (
-                    <Typography.Text key={evidence.id} type="secondary">
-                      证据 {evidence.path} · 冻结于 {evidence.frozen_at} · {evidence.excerpt}
-                    </Typography.Text>
-                  ))}
-                  {item.content.blocks.map((block) => (
-                    <div key={block.block_id}>
-                      <Typography.Text>{block.text}</Typography.Text>
-                      {(block.evidence ?? []).map((evidence) => (
-                        <div key={`${block.block_id}-${evidence.id}`}>
-                          <Typography.Text type="secondary">
-                            该内容块证据：{evidence.path} · 冻结于 {evidence.frozen_at} · {evidence.excerpt}
-                          </Typography.Text>
-                        </div>
-                      ))}
-                    </div>
-                  ))}
-                </Space>
-              </List.Item>
-            )}
-          />
-        )}
-      </div>
       <div className="knowledge-page-header">
         <div className="knowledge-page-header-row">
           <span className="knowledge-page-mark" />
@@ -356,7 +677,7 @@ export default function KnowledgeSourcesView() {
             素材库
           </Title>
           <span className="knowledge-page-count">
-            共 <b>{sourcesQuery.data?.length ?? 0}</b> 个来源
+            共 <b>{externalSources.length}</b> 个来源
           </span>
         </div>
         <Paragraph type="secondary" className="knowledge-page-subtitle">
@@ -406,7 +727,8 @@ export default function KnowledgeSourcesView() {
         {searchMutation.data ? (
           <SearchResultsPanel
             query={activeSearch}
-            hits={searchMutation.data.hits}
+            hits={searchHits.filter((hit) => externalSourceIds.has(hit.source_id))}
+            unavailable={searchResponseUnavailable}
             onPick={(sourceId, evidenceId) => {
               setSelectedSourceId(sourceId);
               setHighlightEvidenceId(evidenceId);
@@ -424,16 +746,18 @@ export default function KnowledgeSourcesView() {
           }}
         >
           <SourceListPanel
-            sources={sourcesQuery.data ?? []}
-            loading={sourcesQuery.isLoading}
-            selectedId={selectedSourceId}
+            sources={externalSources}
+            loading={externalProjection.state === 'loading'}
+            error={externalProjection.state === 'error'}
+            unavailable={externalSourceUnavailable}
+            selectedId={activeExternalSourceId}
             onSelect={(id) => {
               setSelectedSourceId(id);
               setHighlightEvidenceId(null);
             }}
           />
           <SourceDetailPanel
-            sourceId={selectedSourceId}
+            sourceId={activeExternalSourceId}
             highlightEvidenceId={highlightEvidenceId}
             onHighlightConsumed={() => setHighlightEvidenceId(null)}
             onDeleted={() => setSelectedSourceId(null)}
@@ -470,11 +794,15 @@ export default function KnowledgeSourcesView() {
 function SourceListPanel({
   sources,
   loading,
+  error,
+  unavailable,
   selectedId,
   onSelect,
 }: {
-  sources: KnowledgeSource[];
+  sources: ExternalSourceListItem[];
   loading: boolean;
+  error: boolean;
+  unavailable: boolean;
   selectedId: number | null;
   onSelect: (id: number) => void;
 }) {
@@ -485,7 +813,21 @@ function SourceListPanel({
       </div>
     );
   }
+  if (error) {
+    return (
+      <div role="alert" style={{ border: '1px solid var(--op-border, #eee)', padding: 24, borderRadius: 8 }}>
+        参考资料暂时无法读取，请稍后重试。
+      </div>
+    );
+  }
   if (!sources.length) {
+    if (unavailable) {
+      return (
+        <div role="alert" style={{ border: '1px solid var(--op-border, #eee)', padding: 24, borderRadius: 8 }}>
+          参考资料暂时无法读取，请稍后重试。
+        </div>
+      );
+    }
     return (
       <div style={{ border: '1px solid var(--op-border, #eee)', padding: 24, borderRadius: 8 }}>
         <Empty description="还没有资料来源" />
@@ -494,6 +836,7 @@ function SourceListPanel({
   }
   return (
     <div className="knowledge-source-list">
+      {unavailable ? <p role="status">部分资料来源暂时不可用，已展示可用内容。</p> : null}
       <div className="knowledge-source-list-head">
         <span>资料列表</span>
         <span>{sources.length}</span>
@@ -512,19 +855,19 @@ function SourceListPanel({
                 <Text className="knowledge-source-item-title">{item.title}</Text>
                 <div className="knowledge-pill-row">
                   <Pill variant={lifecycleVariant(item.lifecycle)}>
-                    {STATUS_LABEL[item.lifecycle] ?? item.lifecycle}
+                    {STATUS_LABEL[item.lifecycle] ?? '状态待确认'}
                   </Pill>
-                  <Pill variant={extractionVariant(item.extraction_status)}>
-                    {EXTRACTION_LABEL[item.extraction_status] ?? item.extraction_status}
+                  <Pill variant={extractionVariant(item.extractionStatus)}>
+                    {EXTRACTION_LABEL[item.extractionStatus] ?? '状态待确认'}
                   </Pill>
                   {SHOW_BRIEF_UI ? (
-                    <Pill variant={briefVariant(item.brief_status)}>
-                      {BRIEF_LABEL[item.brief_status] ?? item.brief_status}
+                    <Pill variant={briefVariant(item.briefStatus)}>
+                      {BRIEF_LABEL[item.briefStatus] ?? '状态待确认'}
                     </Pill>
                   ) : null}
                 </div>
                 <Text className="knowledge-source-item-meta">
-                  {item.main_filename} · {formatBytes(item.total_bytes)}
+                  {item.mainFilename} · {formatBytes(item.totalBytes)}
                 </Text>
               </div>
             </div>
@@ -580,10 +923,8 @@ function SourceDetailContent({
     queryFn: () => fetchKnowledgeSource(sourceId),
     // KV1-02：轮询只由 Extraction 在途状态触发；V1 不因 Brief 状态持续刷新。
     refetchInterval: (query) => {
-      const source = query.state.data;
-      if (!source) return false;
-      return source.extraction_status === 'pending' ||
-        source.extraction_status === 'processing'
+      const status = safeRead(query.state.data, 'extraction_status');
+      return status === 'pending' || status === 'processing'
         ? 2000
         : false;
     },
@@ -611,8 +952,8 @@ function SourceDetailContent({
     queryKey: ['knowledge', 'source', sourceId, 'jobs'],
     queryFn: () => fetchKnowledgeSourceJobs(sourceId),
     refetchInterval: (query) => {
-      const jobs = query.state.data?.jobs ?? [];
-      return jobs.some((job) => job.status === 'pending' || job.status === 'running')
+      const jobs = normalizeJobProjection(safeRead(query.state.data, 'jobs'), sourceId);
+      return jobs.items.some((job) => job.status === 'pending' || job.status === 'running')
         ? 2000
         : false;
     },
@@ -752,7 +1093,8 @@ function SourceDetailContent({
       </div>
     );
   }
-  if (sourceQuery.isError || !sourceQuery.data) {
+  const source = normalizeKnowledgeSourceDetail(sourceQuery.data, sourceId);
+  if (sourceQuery.isError || !source) {
     return (
       <div style={{ padding: 24 }}>
         <Alert
@@ -764,8 +1106,20 @@ function SourceDetailContent({
       </div>
     );
   }
-  const source = sourceQuery.data;
+  const evidenceProjection = normalizeEvidencePage(evidenceQuery.data, sourceId);
+  const originProjection = normalizeOriginProjection(safeRead(jobsQuery.data, 'origins'), sourceId);
+  const jobProjection = normalizeJobProjection(safeRead(jobsQuery.data, 'jobs'), sourceId);
+  const safeOrigins = originProjection.items;
+  const safeJobs = jobProjection.items;
+  const jobsUnavailable = jobsQuery.isError
+    || (jobsQuery.data !== undefined && (originProjection.unavailable || jobProjection.unavailable));
+  const contentMalformed = contentQuery.data !== undefined && typeof contentQuery.data !== 'string';
+  const safeContent = typeof contentQuery.data === 'string'
+    ? boundedText(contentQuery.data, '', MAX_DETAIL_LENGTH)
+    : undefined;
+  const canMutate = knowledgeSourceCanMutate(source);
   const openTitleEditor = () => {
+    if (!canMutate) return;
     setEditingTitle(source.display_title || source.title_hint || '');
     setTitleEditorOpen(true);
   };
@@ -779,10 +1133,10 @@ function SourceDetailContent({
           </Title>
           <div className="knowledge-source-detail-statuses">
             <Pill variant={lifecycleVariant(source.lifecycle)}>
-              {STATUS_LABEL[source.lifecycle] ?? source.lifecycle}
+              {STATUS_LABEL[source.lifecycle] ?? '状态待确认'}
             </Pill>
             <Pill variant={extractionVariant(source.extraction_status)}>
-              {EXTRACTION_LABEL[source.extraction_status] ?? source.extraction_status}
+              {EXTRACTION_LABEL[source.extraction_status] ?? '状态待确认'}
             </Pill>
             {SHOW_BRIEF_UI ? (
               <Pill variant={briefVariant(source.brief_status)}>
@@ -792,22 +1146,28 @@ function SourceDetailContent({
           </div>
         </div>
         <Space size={6} wrap className="knowledge-source-actions">
-          <Button size="small" icon={<EditOutlined />} onClick={openTitleEditor}>
+          <Button size="small" icon={<EditOutlined />} onClick={openTitleEditor} disabled={!canMutate}>
             编辑标题
           </Button>
           {isArchived ? (
             <Button
               size="small"
-              onClick={() => unarchiveMutation.mutate(sourceId)}
+              onClick={() => {
+                if (canMutate) unarchiveMutation.mutate(sourceId);
+              }}
               loading={unarchiveMutation.isPending}
+              disabled={!canMutate}
             >
               取消归档
             </Button>
           ) : (
             <Button
               size="small"
-              onClick={() => archiveMutation.mutate(sourceId)}
+              onClick={() => {
+                if (canMutate) archiveMutation.mutate(sourceId);
+              }}
               loading={archiveMutation.isPending}
+              disabled={!canMutate}
             >
               归档
             </Button>
@@ -816,7 +1176,9 @@ function SourceDetailContent({
             size="small"
             danger
             icon={<DeleteOutlined />}
+            disabled={!canMutate}
             onClick={() => {
+              if (!canMutate) return;
               setDeleteConfirmationText('');
               setDeleteConfirmOpen(true);
             }}
@@ -841,18 +1203,20 @@ function SourceDetailContent({
         <SourceMetadataItem label="导入时间" value={formatDateTime(source.created_at)} />
         <SourceMetadataItem
           label="来源依据"
-          value={evidenceQuery.isLoading ? '—' : `${evidenceQuery.data?.items.length ?? 0} 条`}
+          value={evidenceQuery.isLoading ? '—' : `${evidenceProjection.items.length} 条`}
         />
       </div>
 
       {SHOW_BRIEF_UI ? (
         <BriefBlock
-          sourceId={sourceId}
           briefStatus={source.brief_status}
           data={briefQuery.data}
           loading={briefQuery.isLoading}
-          onRebuild={() => briefRebuildMutation.mutate(sourceId)}
+          onRebuild={() => {
+            if (canMutate) briefRebuildMutation.mutate(sourceId);
+          }}
           rebuilding={briefRebuildMutation.isPending}
+          canMutate={canMutate}
           onCitationJump={handleCitationJump}
         />
       ) : null}
@@ -868,19 +1232,20 @@ function SourceDetailContent({
             children: (
               <StatusBlock
                 source={source}
-                origins={jobsQuery.data?.origins ?? []}
-                briefAttempts={briefQuery.data?.attempts ?? []}
+                origins={safeOrigins}
+                briefAttempts={safeArray(safeRead(briefQuery.data, 'attempts')) as KnowledgeBriefAttempt[]}
                 onCitationJump={handleCitationJump}
               />
             ),
           },
           {
             key: 'evidence',
-            label: `来源依据${evidenceQuery.data?.items.length ? ` (${evidenceQuery.data.items.length})` : ''}`,
+            label: `来源依据${evidenceProjection.items.length ? ` (${evidenceProjection.items.length})` : ''}`,
             children: (
               <EvidenceBlock
-                evidence={evidenceQuery.data?.items ?? []}
+                evidence={evidenceProjection.items}
                 loading={evidenceQuery.isLoading}
+                unavailable={evidenceQuery.isError || evidenceProjection.unavailable}
                 sourceId={sourceId}
                 highlightEvidenceId={highlightEvidenceId ?? briefCitationTarget}
                 onHighlightConsumed={() => {
@@ -892,23 +1257,25 @@ function SourceDetailContent({
           },
           {
             key: 'original',
-            label: '原始 Markdown',
+            label: '资料正文',
             children: (
               <OriginalMarkdownBlock
                 sourceId={sourceId}
-                content={contentQuery.data}
+                content={safeContent}
                 loading={contentQuery.isLoading}
-                error={contentQuery.isError}
+                error={contentQuery.isError || contentMalformed}
               />
             ),
           },
           {
             key: 'jobs',
-            label: '高级信息',
+            label: '处理状态',
             children: (
               <JobsBlock
-                data={jobsQuery.data ?? { jobs: [], origins: [] }}
+                data={{ jobs: [...safeJobs], origins: [...safeOrigins] }}
                 loading={jobsQuery.isLoading}
+                unavailable={jobsUnavailable}
+                canMutate={canMutate}
               />
             ),
           },
@@ -919,10 +1286,12 @@ function SourceDetailContent({
         title="编辑展示标题"
         open={titleEditorOpen}
         onCancel={() => setTitleEditorOpen(false)}
-        onOk={() =>
-          titleMutation.mutate({ id: sourceId, title: editingTitle.trim() })
-        }
-        okButtonProps={{ loading: titleMutation.isPending }}
+        onOk={() => {
+          if (canMutate) {
+            titleMutation.mutate({ id: sourceId, title: editingTitle.trim() });
+          }
+        }}
+        okButtonProps={{ loading: titleMutation.isPending, disabled: !canMutate }}
         okText="保存"
         cancelText="取消"
       >
@@ -935,7 +1304,7 @@ function SourceDetailContent({
             showCount
           />
           <Text type="secondary" style={{ fontSize: 12 }}>
-            修改展示标题不会触发重新解析，来源依据的内部标识保持不变。
+            修改展示标题不会触发重新解析，已有来源依据会继续保留。
           </Text>
         </Space>
       </Modal>
@@ -952,9 +1321,11 @@ function SourceDetailContent({
         okButtonProps={{
           danger: true,
           loading: deleteMutation.isPending,
-          disabled: deleteConfirmationText.trim() !== '删除',
+          disabled: !canMutate || deleteConfirmationText.trim() !== '删除',
         }}
-        onOk={() => deleteMutation.mutate(sourceId)}
+        onOk={() => {
+          if (canMutate) deleteMutation.mutate(sourceId);
+        }}
       >
         <Space direction="vertical" style={{ width: '100%' }} size="small">
           <div className="knowledge-delete-warning">
@@ -1011,10 +1382,10 @@ function StatusBlock({
   const filteredTotal = filterSummary?.filtered_block_total ?? 0;
   return (
     <div className="knowledge-status-record">
-      <StatusLine label="生命周期" value={STATUS_LABEL[source.lifecycle] ?? source.lifecycle} />
+      <StatusLine label="资料状态" value={STATUS_LABEL[source.lifecycle] ?? '状态待确认'} />
       <StatusLine
         label="内容整理"
-        value={EXTRACTION_LABEL[source.extraction_status] ?? source.extraction_status}
+        value={EXTRACTION_LABEL[source.extraction_status] ?? '状态待确认'}
       />
       {SHOW_BRIEF_UI ? (
         <>
@@ -1098,10 +1469,10 @@ function StatusLine({ label, value }: { label: string; value: string }) {
 
 const BRIEF_ATTEMPT_PHASE_LABEL: Record<string, string> = {
   generation: '生成候选',
-  attempt_started: 'Attempt 开始',
+  attempt_started: '开始处理',
   model_call: '模型调用',
-  retry: 'Provider 重试',
-  provider_switch: 'Provider 切换',
+  retry: '服务重试',
+  provider_switch: '切换服务',
   model_response_parsed: '模型响应解析',
   program_check: '程序检查',
   validation_report: '校验报告',
@@ -1130,8 +1501,8 @@ const BRIEF_REASON_CODE_LABEL: Record<string, string> = {
   unsupported_claim: '陈述未被证据支持',
   contradicted_by_evidence: '与证据相矛盾',
   evidence_missing: '缺少引用证据',
-  validator_parse_failed: 'Validator 输出无法解析',
-  validator_unknown_reason: 'Validator 未知原因',
+  validator_parse_failed: '校验结果无法解析',
+  validator_unknown_reason: '校验原因待确认',
 };
 
 function briefAttemptStatusVariant(status: string): PillVariant {
@@ -1205,7 +1576,7 @@ function BriefAttemptTimeline({
               <List.Item>
                 <div className="knowledge-brief-attempt">
                   <Space size={7} wrap>
-                    <Text strong>Attempt #{attempt.id}</Text>
+                    <Text strong>处理记录</Text>
                     <Pill variant={briefAttemptStatusVariant(attempt.status)}>
                       {BRIEF_ATTEMPT_STATUS_LABEL[attempt.status] ?? attempt.status}
                     </Pill>
@@ -1216,7 +1587,7 @@ function BriefAttemptTimeline({
                     ) : null}
                   </Space>
                   <Text type="secondary" style={{ fontSize: 12 }}>
-                    Provider：{attempt.actual_provider_id || attempt.provider_id || '—'}
+                    服务：{attempt.actual_provider_id || attempt.provider_id || '—'}
                     {attempt.actual_provider_model || attempt.provider_model
                       ? ` · 模型：${attempt.actual_provider_model || attempt.provider_model}`
                       : ''}
@@ -1270,7 +1641,7 @@ function BriefAttemptStepView({
     <div className="knowledge-brief-step">
       <Space size={6} wrap>
         <Text strong>
-          {BRIEF_ATTEMPT_PHASE_LABEL[step.phase] ?? (step.phase || '未知阶段')}
+          {BRIEF_ATTEMPT_PHASE_LABEL[step.phase] ?? '当前进度待确认'}
         </Text>
         <Pill variant={briefStepStatusVariant(step.status)}>
           {BRIEF_ATTEMPT_STATUS_LABEL[step.status] ?? step.status}
@@ -1329,14 +1700,14 @@ function BriefEvidenceLinks({
       <Text type="secondary" style={{ fontSize: 11 }}>
         来源依据：
       </Text>
-      {evidenceIds.map((evidenceId) => (
+      {evidenceIds.map((evidenceId, index) => (
         <Button
           key={evidenceId}
           size="small"
           type="link"
           onClick={() => onCitationJump(evidenceId)}
         >
-          {evidenceId}
+          来源依据 {index + 1}
         </Button>
       ))}
     </Space>
@@ -1344,20 +1715,20 @@ function BriefEvidenceLinks({
 }
 
 function BriefBlock({
-  sourceId,
   briefStatus,
   data,
   loading,
   onRebuild,
   rebuilding,
+  canMutate,
   onCitationJump,
 }: {
-  sourceId: number;
   briefStatus: string;
   data: KnowledgeSourceBriefResponse | undefined;
   loading: boolean;
   onRebuild: () => void;
   rebuilding: boolean;
+  canMutate: boolean;
   onCitationJump: (evidenceId: string) => void;
 }) {
   if (loading) {
@@ -1392,7 +1763,7 @@ function BriefBlock({
             size="small"
             onClick={onRebuild}
             loading={rebuilding}
-            disabled={briefStatus === 'processing'}
+            disabled={!canMutate || briefStatus === 'processing'}
           >
             {brief ? '重建资料导读' : '生成资料导读'}
           </Button>
@@ -1403,7 +1774,7 @@ function BriefBlock({
           type="warning"
           showIcon
           message={`资料导读暂缓：${blockReason}`}
-          description="请先在设置中配置满足 96K context 的 Provider，然后点击生成资料导读。"
+          description="请先在设置中配置满足要求的服务，然后点击生成资料导读。"
         />
       ) : null}
       {outdated ? (
@@ -1446,10 +1817,6 @@ function BriefBlock({
       {brief ? (
         <BriefPayloadView brief={brief} onCitationJump={onCitationJump} />
       ) : null}
-      <details className="knowledge-brief-footer">
-        <summary>高级信息</summary>
-        <span>资料来源内部编号：{sourceId}</span>
-      </details>
     </div>
   );
 }
@@ -1463,8 +1830,8 @@ const ISSUE_TYPE_LABEL: Record<string, string> = {
   support_partial: '部分支持',
   support_unsupported: '未支持',
   support_contradicted: '相矛盾',
-  validator_parse_failed: 'Validator 输出无法解析',
-  validator_call_failed: 'Validator 调用失败',
+  validator_parse_failed: '校验结果无法解析',
+  validator_call_failed: '校验暂时不可用',
   coverage_missing: '章节未覆盖',
   // KBR-06：repair patch 非法/越权。
   repair_invalid: '修复补丁非法',
@@ -1666,9 +2033,9 @@ function BriefCitationChips({
   }
   return (
     <div className="knowledge-citation-chips">
-      {evidenceIds.map((id) => (
+      {evidenceIds.map((id, index) => (
         <button key={id} type="button" className="knowledge-chip-cite" onClick={() => onJump(id)}>
-          {id}
+          来源依据 {index + 1}
         </button>
       ))}
     </div>
@@ -1678,12 +2045,14 @@ function BriefCitationChips({
 function EvidenceBlock({
   evidence,
   loading,
+  unavailable,
   sourceId,
   highlightEvidenceId,
   onHighlightConsumed,
 }: {
   evidence: KnowledgeEvidence[];
   loading: boolean;
+  unavailable: boolean;
   sourceId: number;
   highlightEvidenceId: string | null;
   onHighlightConsumed: () => void;
@@ -1692,20 +2061,28 @@ function EvidenceBlock({
   useEffect(() => {
     if (!highlightEvidenceId) return;
     if (highlightRef.current) {
-      highlightRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      highlightRef.current.scrollIntoView({ behavior: 'auto', block: 'center' });
     }
     onHighlightConsumed();
   }, [highlightEvidenceId, onHighlightConsumed]);
   if (loading) {
     return <Spin />;
   }
-  if (!evidence.length) {
+  if (!evidence.length && !unavailable) {
     return (
       <Empty description="尚未生成来源依据" />
     );
   }
   return (
     <div>
+      {unavailable ? (
+        <Alert
+          type="warning"
+          showIcon
+          message="部分来源依据暂时不可用"
+          description={evidence.length ? '已展示可安全读取的内容。' : '请稍后重试。'}
+        />
+      ) : null}
       <List
         className="knowledge-evidence-list"
         dataSource={evidence}
@@ -1746,13 +2123,6 @@ function EvidenceBlock({
                   />
                 ) : null}
                 <MarkdownContent content={item.canonical_excerpt} />
-                <details>
-                  <summary>高级信息</summary>
-                  <span className="knowledge-evidence-loc">
-                    行 {item.line_start}-{item.line_end} · 字符 {item.char_start}-{item.char_end}
-                  </span>
-                  <span className="knowledge-evidence-id">{item.id}</span>
-                </details>
               </div>
             </List.Item>
           );
@@ -1781,7 +2151,7 @@ function OriginalMarkdownBlock({
       <Alert
         type="warning"
         showIcon
-        message="无法读取原始 Markdown"
+        message="无法读取资料正文"
         description="可以下载原件后在本地查看。"
       />
     );
@@ -1789,7 +2159,7 @@ function OriginalMarkdownBlock({
   return (
     <div className="knowledge-original-markdown">
       <div className="knowledge-original-markdown-toolbar">
-        <Text type="secondary">以下内容按原始 Markdown 渲染，未经过模型改写。</Text>
+        <Text type="secondary">以下为资料正文预览，过长内容会缩略显示。</Text>
         <Button size="small" href={buildKnowledgeSourceContentUrl(sourceId)} target="_blank">
           下载原件
         </Button>
@@ -1800,13 +2170,14 @@ function OriginalMarkdownBlock({
 }
 
 function MarkdownContent({ content }: { content: string }) {
+  const safeContent = boundedText(content, '内容暂时不可用', MAX_DETAIL_LENGTH);
   return (
     <div className="knowledge-markdown">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
       >
-        {content}
+        {safeContent}
       </ReactMarkdown>
     </div>
   );
@@ -1841,9 +2212,13 @@ function AssetEvidenceView({
 function JobsBlock({
   data,
   loading,
+  unavailable,
+  canMutate,
 }: {
   data: KnowledgeSourceJobsResponse;
   loading: boolean;
+  unavailable: boolean;
+  canMutate: boolean;
 }) {
   const queryClient = useQueryClient();
   const cancelMutation = useMutation({
@@ -1861,6 +2236,15 @@ function JobsBlock({
   }
   return (
     <div>
+      {unavailable ? (
+        <Alert
+          type="warning"
+          showIcon
+          message="部分处理记录暂时不可用"
+          description="已隐藏不完整的处理记录，请稍后重试。"
+        />
+      ) : null}
+      {!unavailable && data.jobs.length === 0 ? <Empty description="暂无处理记录" /> : null}
       <List
         className="knowledge-jobs-list"
         dataSource={data.jobs}
@@ -1871,34 +2255,16 @@ function JobsBlock({
               <Space size={8} wrap>
                 <span className="knowledge-evidence-kind">{item.kind === 'delete' ? '删除任务' : '资料处理任务'}</span>
                 <Pill variant={jobStatusVariant(item.status)}>
-                  {JOB_STATUS_LABEL[item.status] ?? item.status}
+                  {JOB_STATUS_LABEL[item.status] ?? '状态待确认'}
                 </Pill>
                 {item.canceled ? <Pill variant="rose">已取消</Pill> : null}
               </Space>
               {item.progress > 0 ? <Progress percent={item.progress} size="small" /> : null}
-              <details>
-                <summary>高级信息</summary>
-                <Space direction="vertical" size={2}>
-                  <Text type="secondary" style={{ fontSize: 12 }}>
-                    任务编号：{item.id}
-                  </Text>
-                  <Text type="secondary" style={{ fontSize: 12 }}>
-                    任务类型：{item.kind}
-                  </Text>
-                  <Text type="secondary" style={{ fontSize: 12 }}>
-                    队列：{item.queue}
-                  </Text>
-                  <Text type="secondary" style={{ fontSize: 12 }}>
-                    阶段：{item.stage || '—'} · 创建于 {formatDateTime(item.created_at)}
-                  </Text>
-                  {item.lease_owner ? (
-                    <Text type="secondary" style={{ fontSize: 12 }}>
-                      Worker：{item.lease_owner}
-                      {item.heartbeat_at ? ` · 心跳 ${formatDateTime(item.heartbeat_at)}` : ''}
-                    </Text>
-                  ) : null}
-                </Space>
-              </details>
+              {item.created_at ? (
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  开始时间：{formatDateTime(item.created_at)}
+                </Text>
+              ) : null}
               {(item.retry_count ?? 0) > 0 ? (
                 <Text type="secondary" style={{ fontSize: 12 }}>
                   重试次数：{item.retry_count}
@@ -1912,20 +2278,16 @@ function JobsBlock({
                   type="error"
                   showIcon
                   message={SAFE_PROCESSING_FAILURE_COPY}
-                  description={item.error_code ? (
-                    <details>
-                      <summary>高级信息</summary>
-                      <span>错误标识：{item.error_code}</span>
-                    </details>
-                  ) : undefined}
                 />
               ) : null}
-              {isJobCancellable(item) ? (
+              {canMutate && isJobCancellable(item) ? (
                 <Button
                   size="small"
                   danger
                   loading={cancelMutation.isPending}
-                  onClick={() => cancelMutation.mutate(item.id)}
+                  onClick={() => {
+                    if (canMutate) cancelMutation.mutate(item.id);
+                  }}
                 >
                   取消任务
                 </Button>
@@ -1953,12 +2315,24 @@ function isJobCancellable(job: KnowledgeJob): boolean {
 function SearchResultsPanel({
   query,
   hits,
+  unavailable,
   onPick,
 }: {
   query: string;
   hits: import('@/types/knowledge').KnowledgeEvidenceSearchHit[];
+  unavailable: boolean;
   onPick: (sourceId: number, evidenceId: string) => void;
 }) {
+  if (!hits.length && unavailable) {
+    return (
+      <Alert
+        type="warning"
+        showIcon
+        message="搜索结果暂时不可用"
+        description="请稍后重试。"
+      />
+    );
+  }
   if (!hits.length) {
     return (
       <Alert
@@ -1975,10 +2349,12 @@ function SearchResultsPanel({
       showIcon
       message={`命中 ${hits.length} 条资料内容：${query}`}
       description={
-        <List
-          dataSource={hits}
-          rowKey={(item) => item.evidence_id}
-          renderItem={(item) => (
+        <>
+          {unavailable ? <Text type="warning">部分结果暂时不可用，已展示可安全读取的内容。</Text> : null}
+          <List
+            dataSource={hits}
+            rowKey={(item) => item.evidence_id}
+            renderItem={(item) => (
             <List.Item
               actions={[
                 <Button
@@ -1999,18 +2375,12 @@ function SearchResultsPanel({
                     </Text>
                   ) : null}
                 </Space>
-                <Text>{item.snippet}</Text>
-                <details>
-                  <summary>高级信息</summary>
-                  <Text type="secondary" style={{ fontSize: 12 }}>
-                    资料来源编号：#{item.source_id} · 行 {item.line_start}-{item.line_end}
-                  </Text>
-                  <span className="knowledge-evidence-id">{item.evidence_id}</span>
-                </details>
+                <Text>{boundedText(item.snippet, '内容暂时不可用', 800)}</Text>
               </Space>
             </List.Item>
-          )}
-        />
+            )}
+          />
+        </>
       }
     />
   );

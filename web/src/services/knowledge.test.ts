@@ -1,6 +1,35 @@
 import { describe, expect, it } from 'vitest';
 import source from './knowledge.ts?raw';
-import { decodeKnowledgeSourceContent } from './knowledge';
+import {
+  decodeKnowledgeSourceContent,
+  parseConfirmedInterviewKnowledgeNotesResponse,
+} from './knowledge';
+
+describe('confirmed interview knowledge source envelope', () => {
+  it('preserves a legitimate empty collection', () => {
+    expect(parseConfirmedInterviewKnowledgeNotesResponse({ items: [] })).toEqual([]);
+  });
+
+  it.each([
+    null,
+    {},
+    { items: null },
+    { items: undefined },
+    { items: 'not-a-list' },
+  ])('rejects malformed successful responses instead of presenting them as empty', (input) => {
+    expect(() => parseConfirmedInterviewKnowledgeNotesResponse(input)).toThrow(
+      '经历素材来源暂时不可用',
+    );
+  });
+
+  it('fails closed for a revoked collection proxy', () => {
+    const { proxy, revoke } = Proxy.revocable([], {});
+    revoke();
+    expect(() => parseConfirmedInterviewKnowledgeNotesResponse({ items: proxy })).toThrow(
+      '经历素材来源暂时不可用',
+    );
+  });
+});
 
 describe('knowledge service KI-03 contract', () => {
   it('exposes upload/paste/list/detail/evidence/search endpoints without legacy wiki helpers', () => {
@@ -28,6 +57,10 @@ describe('knowledge source content decoding', () => {
     expect(decodeKnowledgeSourceContent(utf8)).toBe('# UTF-8\n中文');
     expect(decodeKnowledgeSourceContent(utf16le)).toBe('中文');
     expect(decodeKnowledgeSourceContent(gb18030)).toBe('中文');
+  });
+
+  it.each([null, undefined, {}, 'text'])('rejects malformed successful content responses (%o)', (input) => {
+    expect(() => decodeKnowledgeSourceContent(input as never)).toThrow('资料正文来源暂时不可用');
   });
 });
 

@@ -2,7 +2,15 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { App as AntApp } from 'antd';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { describe, expect, it } from 'vitest';
-import KnowledgeSourcesView, { BriefValidationIssues } from './KnowledgeSourcesView';
+import KnowledgeSourcesView, {
+  BriefValidationIssues,
+  knowledgeSourceCanMutate,
+  normalizeEvidencePage,
+  normalizeJobProjection,
+  normalizeKnowledgeSourceDetail,
+  normalizeSearchHitProjection,
+  normalizeSearchHits,
+} from './KnowledgeSourcesView';
 import viewSource from './KnowledgeSourcesView.tsx?raw';
 
 function renderWithProviders() {
@@ -19,6 +27,81 @@ function renderWithProviders() {
 }
 
 describe('KnowledgeSourcesView', () => {
+  it('fails closed and bounds hostile detail payloads', () => {
+    expect(normalizeKnowledgeSourceDetail({ id: 3, source_kind: 'captured_interview_note' }, 3)).toBeNull();
+    expect(normalizeKnowledgeSourceDetail({ id: 4, source_kind: 'markdown' }, 3)).toBeNull();
+
+    const hostileProvenance = new Proxy({}, {
+      get() { throw new Error('hostile getter'); },
+      ownKeys() { throw new Error('hostile keys'); },
+    });
+    const projected = normalizeKnowledgeSourceDetail({
+      id: 3,
+      source_kind: 'markdown',
+      title: 'a'.repeat(400),
+      provenance: hostileProvenance,
+      lifecycle: 'active',
+      extraction_status: 'extracted',
+      brief_status: 'ready',
+    }, 3);
+    expect(projected?.title.length).toBeLessThanOrEqual(161);
+    expect(projected?.provenance.url).toBeUndefined();
+
+    const { proxy, revoke } = Proxy.revocable([], {});
+    revoke();
+    expect(() => normalizeEvidencePage({ items: proxy }, 3)).not.toThrow();
+    expect(normalizeEvidencePage({ items: proxy }, 3)).toMatchObject({ items: [], unavailable: true });
+  });
+
+  it('rejects unknown detail states and keeps deleting sources read-only', () => {
+    const valid = {
+      id: 3,
+      source_kind: 'markdown',
+      lifecycle: 'active',
+      extraction_status: 'extracted',
+      brief_status: 'ready',
+    };
+    expect(normalizeKnowledgeSourceDetail(valid, 3)).not.toBeNull();
+    for (const patch of [
+      { lifecycle: 'mystery' },
+      { lifecycle: undefined },
+      { extraction_status: 'mystery' },
+      { extraction_status: undefined },
+      { brief_status: 'mystery' },
+      { brief_status: undefined },
+    ]) {
+      expect(normalizeKnowledgeSourceDetail({ ...valid, ...patch }, 3)).toBeNull();
+    }
+    const deleting = normalizeKnowledgeSourceDetail({ ...valid, lifecycle: 'deleting' }, 3);
+    expect(deleting).not.toBeNull();
+    expect(knowledgeSourceCanMutate(deleting)).toBe(false);
+    expect(knowledgeSourceCanMutate(normalizeKnowledgeSourceDetail(valid, 3))).toBe(true);
+  });
+
+  it('drops malformed search rows and clamps user-visible snippets', () => {
+    const hits = normalizeSearchHits([
+      { evidence_id: 'e1', source_id: 3, snippet: 'x'.repeat(2_000) },
+      { evidence_id: 'e2', source_id: 0, snippet: 'invalid owner' },
+    ]);
+    expect(hits).toHaveLength(1);
+    expect(hits[0]?.snippet.length).toBeLessThanOrEqual(801);
+  });
+
+  it('keeps malformed job and search collections distinct from legitimate empty results', () => {
+    expect(normalizeSearchHitProjection([])).toMatchObject({ items: [], unavailable: false });
+    expect(normalizeSearchHitProjection(null)).toMatchObject({ items: [], unavailable: true });
+    expect(normalizeSearchHitProjection([
+      { evidence_id: 'e1', source_id: 3, snippet: '可用片段' },
+      { evidence_id: '', source_id: 3, snippet: '损坏片段' },
+    ])).toMatchObject({ items: [expect.objectContaining({ evidence_id: 'e1' })], unavailable: true });
+
+    expect(normalizeJobProjection([])).toMatchObject({ items: [], unavailable: false });
+    expect(normalizeJobProjection({})).toMatchObject({ items: [], unavailable: true });
+    expect(normalizeJobProjection([
+      { id: 1, kind: 'process', status: 'running', progress: 20 },
+      { id: 0, kind: 'process', status: 'running' },
+    ])).toMatchObject({ items: [expect.objectContaining({ id: 1 })], unavailable: true });
+  });
   it('renders Source library surface with upload, bundle, paste entries and search box', () => {
     const markup = renderWithProviders();
 
@@ -35,6 +118,12 @@ describe('KnowledgeSourcesView', () => {
 
   it('does not claim frozen interview knowledge when the list is empty', () => {
     expect(renderWithProviders()).not.toContain('已保留当时版本');
+  });
+
+  it('keeps confirmed interview captures out of the external reference surface', () => {
+    const markup = renderWithProviders();
+    expect(markup).not.toContain('复盘沉淀');
+    expect(markup).not.toContain('已确认面试片段');
   });
 
   it('does not expose legacy Page/Review/Index/Lint/Config entries', () => {
@@ -81,8 +170,8 @@ describe('KnowledgeSourcesView', () => {
   it('polls list/detail by Extraction in-flight state only (KV1-02: not Brief)', () => {
     // KV1-02 / ADR-0002：V1 轮询只由 Extraction pending/processing 触发，不因 Brief
     // 状态刷新；Brief Pill 已隐藏，brief_status 不再驱动列表/详情轮询。
-    expect(viewSource).toContain("item.extraction_status === 'pending'");
-    expect(viewSource).toContain("source.extraction_status === 'pending'");
+    expect(viewSource).toContain("status === 'pending' || status === 'processing'");
+    expect(viewSource).toContain("safeRead(query.state.data, 'extraction_status')");
     // briefQuery 由 SHOW_BRIEF_UI 控制 enabled，V1 不发请求、不轮询 brief_status。
     expect(viewSource).toContain('enabled: SHOW_BRIEF_UI');
     // briefRebuildMutation 的乐观刷新逻辑保留，V1.1 恢复 Brief UI 时复用。
@@ -128,7 +217,8 @@ describe('KnowledgeSourcesView', () => {
     expect(structured).toContain('建议改写');
     // 诊断内容按普通文本渲染，不能把模型输出解释为 HTML。
     expect(structured).toContain('&lt;原文&gt;');
-    expect(structured).toContain('ev_1');
+    expect(structured).toContain('来源依据 1');
+    expect(structured).not.toContain('ev_1');
 
     const legacy = renderToStaticMarkup(
       <AntApp>
@@ -149,7 +239,8 @@ describe('KnowledgeSourcesView', () => {
       </AntApp>,
     );
     expect(legacy).toContain('旧版校验摘要');
-    expect(legacy).toContain('ev_legacy');
+    expect(legacy).toContain('来源依据 1');
+    expect(legacy).not.toContain('ev_legacy');
   });
 
   it('does not expose one-time Knowledge reset product entry', () => {

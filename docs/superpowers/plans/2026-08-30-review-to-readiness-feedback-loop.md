@@ -254,11 +254,13 @@ git commit -m "feat: AI 版本化面试复盘来源"
 - Create: `src/offerpilot/product_actions/catalog.py`
 - Create: `src/offerpilot/product_actions/issuer.py`
 - Create: `src/offerpilot/product_actions/repository.py`
+- Create: `src/offerpilot/event_lifecycle.py`
 - Modify: `src/offerpilot/ai/write_operations.py`
 - Create: `tests/product_actions/test_catalog.py`
 - Create: `tests/product_actions/test_identity.py`
 - Create: `tests/product_actions/test_repository.py`
 - Create: `tests/product_actions/test_isolation.py`
+- Create: `tests/test_event_lifecycle_v1.py`
 - Modify: `tests/tool_metadata/test_production_bundle.py`
 - Modify: `tests/tool_metadata/test_published_operation_checks.py`
 
@@ -267,11 +269,13 @@ git commit -m "feat: AI 版本化面试复盘来源"
 Assert exact runtime classification `25 / 3 / 4 + 2 / 2`, Provider schema bytes/order unchanged, Product Action names returned by Provider are `unknown_tool` with executor 0, and Product modules never import ToolCatalog/LegacyCatalog/Agent compensation/Provider. Add cross-process goldens for five HMAC envelopes, tagged null, Chinese `user_note`, generation changes and deterministic UUIDs.
 Add exact boundary tests for 16,384/16,385-byte route JSON, duplicate JSON keys, NaN/Infinity, boolean-as-integer, malformed UUID/HMAC and action/source cross-pairs. The HTTP-safe decoder must operate on raw request bytes with a duplicate-key-aware object hook before Pydantic/default normalization; FastAPI `dict = Body(...)` is not sufficient for these routes.
 For bundle recovery, cover publication `all_absent | exact_proposed | exact_terminal | unreadable`, plus every parent/route/seq1 single-sided, missing, extra, duplicate, wrong-state or wrong-order corruption. Fresh reconciliation must never repair a partial bundle.
+Prove token identity mechanics directly: the issuer derives the server token before `BEGIN`, the proposed insert stores the matching fingerprint, and the post-commit response returns the exact same raw token. A restart must use the Operation's stored key profile even after active-key rotation; a missing historical key fails closed and never substitutes a new token. Add proof-negative tests for ordinary DTOs, copy/serialization, cross-container, cross-owner, cross-source, cross-action, cross-proof-union, repeated consumption and ABA reuse. `SignalOwnerRecoveryProof` has no generation field; `StoryOwnerRecoveryProof` binds both expected generations; action-discriminated `RejectionOnlyRecoveryProof` fixes `live_source_state=not_observed`.
+Load `tests/fixtures/review_readiness/event_lifecycle_v1.json` in a backend RED test and require one `classify_event_lifecycle_v1(status: object)` implementation for every alias and unknown fallback before Candidate work can begin.
 
 - [ ] **Step 2: Verify RED**
 
 ```powershell
-uv run pytest tests/product_actions/test_catalog.py tests/product_actions/test_identity.py tests/product_actions/test_repository.py tests/product_actions/test_isolation.py tests/tool_metadata/test_production_bundle.py tests/tool_metadata/test_published_operation_checks.py -q
+uv run pytest tests/product_actions/test_catalog.py tests/product_actions/test_identity.py tests/product_actions/test_repository.py tests/product_actions/test_isolation.py tests/test_event_lifecycle_v1.py tests/tool_metadata/test_production_bundle.py tests/tool_metadata/test_published_operation_checks.py -q
 ```
 
 - [ ] **Step 3: Implement closed contracts and Catalogs**
@@ -296,6 +300,7 @@ class ProductActionExecutionAuthorization: ...
 ```
 
 Proofs bind issuer/container/registry incarnation, expose no serialization/copy protocol, are single-consume and revoked on every exit path.
+Implement `classify_event_lifecycle_v1(status: object)` from the pinned fixture as the sole backend classifier. Candidate, advisory, Practice and Preparation must import this module; no task may add a temporary local lifecycle classifier.
 
 - [ ] **Step 4: Implement issuer identity and token recovery**
 
@@ -323,11 +328,11 @@ Guard every delivery lease, heartbeat, takeover and fallback query in `ai/write_
 - [ ] **Step 7: Verify GREEN and commit**
 
 ```powershell
-uv run pytest tests/product_actions/test_catalog.py tests/product_actions/test_identity.py tests/product_actions/test_repository.py tests/product_actions/test_isolation.py tests/tool_metadata -q
-uv run ruff check src/offerpilot/product_actions src/offerpilot/ai/write_operations.py tests/product_actions
+uv run pytest tests/product_actions/test_catalog.py tests/product_actions/test_identity.py tests/product_actions/test_repository.py tests/product_actions/test_isolation.py tests/test_event_lifecycle_v1.py tests/tool_metadata -q
+uv run ruff check src/offerpilot/product_actions src/offerpilot/event_lifecycle.py src/offerpilot/ai/write_operations.py tests/product_actions tests/test_event_lifecycle_v1.py
 uv run mypy src
 git diff --check
-git add src/offerpilot/product_actions src/offerpilot/ai/write_operations.py tests/product_actions tests/tool_metadata/test_production_bundle.py tests/tool_metadata/test_published_operation_checks.py
+git add src/offerpilot/product_actions src/offerpilot/event_lifecycle.py src/offerpilot/ai/write_operations.py tests/product_actions tests/test_event_lifecycle_v1.py tests/tool_metadata/test_production_bundle.py tests/tool_metadata/test_published_operation_checks.py
 git commit -m "feat: AI 建立独立产品操作安全核心"
 ```
 
@@ -352,6 +357,7 @@ git commit -m "feat: AI 建立独立产品操作安全核心"
 Cover every candidate closed state, structure cap and evidence path; same key/same input concurrent replay; same key/different input conflict; same semantic focus with different keys produces one active winner and stable non-leaking 409; reject performs zero candidate/source/capability/binding/preflight/executor/Provider calls; approve/modify execute once; terminal replay executes zero; cancellation/BaseException propagates after cleanup.
 
 Add the complete Signal publication/decision matrix. Publication distinguishes all-absent, exact proposed, exact terminal and unreadable; any parent/route/seq1 partial is an integrity error. Decision starts from an already-persisted proposal, so absent/partial must never reuse publication's rebuild rule; exact proposed with the original decision payload may retry, different decision/effective payload conflicts, and terminal replay validates request fingerprint + terminal digest + the complete ordered prefix with executor=0. `rejected` prefix is valid only for primary operations; compensation has only proposed/committed/failed. Exercise the semantic loser key after winner active/rejected/declared-failed/committed, and golden-test every action-local result/visible/transport/undo/aggregate byte boundary plus rejected/failed codecs.
+For Signal proposal authorization, assert the capability check short-circuits before any Application/Note/Proposal/Candidate query. Owner recovery must reject ordinary DTOs, every cross-proof/container/owner/source/action combination, duplicate consumption and ABA proofs; generic GET, terminal responses and cross-owner paths never expose a token. Rejection-only recovery is action-discriminated and can only observe `live_source_state=not_observed`.
 
 - [ ] **Step 2: Verify RED**
 
@@ -470,6 +476,7 @@ git commit -m "refactor: AI 切换经历素材产品确认链路"
 - [ ] **Step 1: Write owner-proof and compensation RED tests**
 
 Cover capability-before-query, exact application/story owner, parent action/result/undo/digest binding, Story source-attempt lineage, owner switch, ordinary/copy/cross-container/cross-owner/cross-action/ABA/reused proof rejection, deterministic compensation UUID, 20-way one executor winner, proposal/execution commit-unknown, response-loss owner route re-signing a new request-local proof before deterministic terminal replay, terminal replay zero executor and `/api/chat/undo-last-write` remaining incapable of Product Action undo.
+Compensation publication must test `absent | proposed | terminal | unreadable`: only compensation parent and seq1 both absent may be reconstructed. Execution begins after parent+seq1 are durable, so either one absent or any partial state is integrity failure and must never rebuild. Exact proposed is only `[(1, proposed)]`; terminal validates full digest, request/input fingerprints and exact seq1/2/3/4. Unreadable returns unknown. Two-connection all-absent races have exactly one proposal/executor winner. Pin cross-process canonical goldens for compensation operation, request and input fingerprints.
 
 - [ ] **Step 2: Write Signal and Story domain undo RED tests**
 
@@ -510,7 +517,8 @@ git commit -m "feat: AI 增加产品操作受限撤销"
 **Files:**
 
 - Create: `src/offerpilot/review_readiness/projection.py`
-- Create: `src/offerpilot/event_lifecycle.py`
+- Modify: `src/offerpilot/event_lifecycle.py`
+- Modify: `src/offerpilot/review_readiness/candidates.py`
 - Modify: `src/offerpilot/review_readiness/repository.py`
 - Modify: `src/offerpilot/api.py`
 - Create: `tests/test_review_readiness_projection.py`
@@ -520,7 +528,7 @@ git commit -m "feat: AI 增加产品操作受限撤销"
 
 - [ ] **Step 1: Write projection RED tests**
 
-Cover source current/changed/missing/unavailable/retracted, deleted and soft-deleted Application, exact same-Application target rules, every EventLifecycle status alias, source==target, no time inference, practiced only for exact completed pair, read exception returning unavailable rather than empty, safe cross-scope 404 and fingerprint ordering with one/five Evidence rows.
+Cover source current/changed/missing/unavailable/retracted, deleted and soft-deleted Application, exact same-Application target rules, every EventLifecycle status alias, source==target, no time inference, practiced only for exact completed pair, read exception returning unavailable rather than empty, safe cross-scope 404 and fingerprint ordering with one/five Evidence rows. Query Evidence in ordinal order even if the DB return is shuffled; missing ordinal 0, any ordinal gap, a sixth row or any changed Evidence hash corrupts the aggregate and makes advisory/detail unavailable.
 `tests/test_event_lifecycle_v1.py` must load `tests/fixtures/review_readiness/event_lifecycle_v1.json`; the existing frontend `eventLifecycle.test.ts` must load the same fixture and prove byte-for-byte agreement of every alias and unknown fallback.
 Add a strict orthogonality assertion: zero, current, stale, retracted or unreadable Signals never change baseline `InterviewReadinessResult.ready`; it remains a function only of Application/Event/JD/Resume.
 
@@ -546,7 +554,7 @@ uv run pytest tests/test_event_lifecycle_v1.py tests/test_review_readiness_proje
 uv run ruff check src/offerpilot/event_lifecycle.py src/offerpilot/review_readiness/projection.py src/offerpilot/review_readiness/repository.py src/offerpilot/api.py
 uv run mypy src
 git diff --check
-git add src/offerpilot/event_lifecycle.py src/offerpilot/review_readiness/projection.py src/offerpilot/review_readiness/repository.py src/offerpilot/api.py tests/fixtures/review_readiness/event_lifecycle_v1.json tests/test_event_lifecycle_v1.py tests/test_review_readiness_projection.py tests/test_interview_index_api.py tests/test_review_readiness_api.py web/src/features/interviewEvents/eventLifecycle.test.ts
+git add src/offerpilot/event_lifecycle.py src/offerpilot/review_readiness/candidates.py src/offerpilot/review_readiness/projection.py src/offerpilot/review_readiness/repository.py src/offerpilot/api.py tests/fixtures/review_readiness/event_lifecycle_v1.json tests/test_event_lifecycle_v1.py tests/test_review_readiness_projection.py tests/test_interview_index_api.py tests/test_review_readiness_api.py web/src/features/interviewEvents/eventLifecycle.test.ts
 git commit -m "feat: AI 投影复盘准备状态"
 ```
 
@@ -562,7 +570,7 @@ git commit -m "feat: AI 投影复盘准备状态"
 
 - [ ] **Step 1: Write V2 RED matrix**
 
-Cover exact Signal Version + target Event, same Application/interview/scheduled-or-in-progress/completed source/source!=target; both canonical fingerprint goldens; ordinal 0 snapshot selection; all Evidence affecting source fingerprint; same key/same stored input live query 0 after changed/missing/retracted/completed; same key/different body conflict; same pair one winner; same Signal/different targets; source/target/both FK delete history; V1 replay/complete and V1 new create 410.
+Cover exact Signal Version + target Event, same Application/interview/scheduled-or-in-progress/completed source/source!=target; both canonical fingerprint goldens; ordinal 0 snapshot selection; all Evidence affecting source fingerprint; same key/same stored input live query 0 after changed/missing/retracted/completed; same key/different body conflict; same pair one winner; same Signal/different targets; source/target/both FK delete history; V1 replay/complete and V1 new create 410. A shuffled Evidence query is re-ordered by ordinal; missing ordinal 0, any ordinal gap, a sixth row or any changed hash fails closed with Plan writes=0.
 
 - [ ] **Step 2: Verify RED**
 
@@ -622,7 +630,7 @@ git commit -m "feat: AI 绑定复盘信号与目标面试练习"
 
 - [ ] **Step 1: Write V1-byte-equivalence and raw-presence RED tests**
 
-Compare the absent-field V1 snapshot bytes/request fingerprint/input fingerprint against the pinned `interview_preparation_v1_c5a020c.json`; explicit `[]` must create V2; absent versus empty with same key conflicts; null/non-array/bool/int confusion/duplicates/9 items return 422. Unknown/replay must restore the frozen presence bit, not current UI defaults.
+Compare the absent-field V1 snapshot bytes/request fingerprint/input fingerprint against the pinned `interview_preparation_v1_c5a020c.json`; explicit `[]` must create V2; absent versus empty with same key conflicts; null/non-array/bool/int confusion/duplicates/9 items return 422. Unknown/replay must restore the frozen presence bit, not current UI defaults. Explicit `[]` performs zero application-wide Signal aggregate queries and freezes an empty `readiness_feedback` provider input.
 
 - [ ] **Step 2: Write selection/lease/budget RED tests**
 
@@ -731,7 +739,7 @@ Review shows one primary “保存为下次准备重点” and secondary Story o
 
 ```powershell
 cd web
-npm test -- --run src/features/reviewReadiness src/services/interviewStories.test.ts src/components/InterviewReviewProposalDrawer.interaction.test.tsx src/components/InterviewStoryDrawer.interaction.test.tsx src/components/InterviewV01View.adaptivePractice.test.tsx src/components/InterviewPreparationProposalDrawer.interaction.test.tsx src/features/coreTaskSurface
+npm test -- --run src/features/reviewReadiness src/services/interviewStories.test.ts src/components/InterviewReviewProposalDrawer.interaction.test.tsx src/components/InterviewStoryDrawer.interaction.test.tsx src/components/AdaptiveInterviewPracticeWorkspace.test.tsx src/components/QuestionBankView.test.tsx src/components/InterviewV01View.adaptivePractice.test.tsx src/components/InterviewPreparationProposalDrawer.interaction.test.tsx src/features/coreTaskSurface
 cd ..
 ```
 
@@ -765,10 +773,6 @@ git commit -m "feat: AI 接通复盘到下次面试准备"
 - Create: `web/src/features/reviewReadiness/reviewReadinessNegativeFixtures.test.ts`
 - Modify: `tests/test_pilot_runtime_extraction_gate.py`
 - Modify: `src/offerpilot/smoke.py`
-- Modify: `src/offerpilot/repositories/interview_stories.py`
-- Modify: `src/offerpilot/repositories/adaptive_interview_practice.py`
-- Modify: `web/src/components/InterviewStoryDrawer.tsx`
-- Modify: `web/src/services/interviewStories.ts`
 
 - [ ] **Step 1: Add negative fixtures for every forbidden path**
 
@@ -785,7 +789,7 @@ cd ..
 
 - [ ] **Step 3: Delete forbidden production paths**
 
-Verify the owning Tasks already removed the production `confirm_attempt()` method/callers, new V1 Practice creation and client token generation. If a gate remains RED, fix the owning production file under a focused failing test before changing the gate. Keep historical V1 read/replay/complete and historical confirmed Story replay, but add no fallback facade, feature flag, shadow write, second registry or alias.
+Verify the owning Tasks already removed the production `confirm_attempt()` method/callers, new V1 Practice creation and client token generation. Task 12 does not patch production cleanup opportunistically: if a gate remains RED, return to the corresponding owning Task, add a focused failing test, fix and commit every actual production file there, then rerun this gate. Keep historical V1 read/replay/complete and historical confirmed Story replay, but add no fallback facade, feature flag, shadow write, second registry or alias.
 
 - [ ] **Step 4: Update smoke to the server-token/Product Action flow**
 
@@ -800,7 +804,7 @@ npm test -- --run src/features/reviewReadiness/reviewReadinessGate.test.ts src/f
 cd ..
 git diff --check
 git status --short
-git add tests/test_review_to_readiness_source_gates.py web/src/features/reviewReadiness/reviewReadinessGate.test.ts web/src/features/reviewReadiness/reviewReadinessNegativeFixtures.test.ts tests/test_pilot_runtime_extraction_gate.py src/offerpilot/smoke.py src/offerpilot/repositories/interview_stories.py src/offerpilot/repositories/adaptive_interview_practice.py web/src/components/InterviewStoryDrawer.tsx web/src/services/interviewStories.ts
+git add tests/test_review_to_readiness_source_gates.py web/src/features/reviewReadiness/reviewReadinessGate.test.ts web/src/features/reviewReadiness/reviewReadinessNegativeFixtures.test.ts tests/test_pilot_runtime_extraction_gate.py src/offerpilot/smoke.py
 git commit -m "test: AI 封闭旧复盘准备执行路径"
 ```
 
@@ -869,7 +873,8 @@ Every changed/untracked file must belong to the approved project and the worktre
 - [ ] **Step 7: Commit the verified report and checked plan**
 
 ```powershell
-git add docs/superpowers/plans/2026-08-30-review-to-readiness-feedback-loop.md docs/superpowers/reports/2026-08-30-review-to-readiness-feedback-loop-verification.md
+git add docs/superpowers/plans/2026-08-30-review-to-readiness-feedback-loop.md
+git add -f docs/superpowers/reports/2026-08-30-review-to-readiness-feedback-loop-verification.md
 git commit -m "docs: AI 记录复盘准备闭环验收"
 ```
 

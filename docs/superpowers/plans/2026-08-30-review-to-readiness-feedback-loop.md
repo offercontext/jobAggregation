@@ -111,7 +111,7 @@ git commit -m "test: AI 固化复盘准备闭环基线"
 
 Cover exact columns/defaults, Note revision=1, Proposal V1/NULL history, Story Attempt generation=0, legacy Practice origin, old unique removal, column-for-column WriteOperation and transition preservation, repeat startup, injected rollback, `integrity_check`, `foreign_key_check`, old 25/3/4 accepted rows and unknown manifest rejection. Add explicit RED cases for:
 
-- Product Action route action/source/origin mapping, semantic/historical fingerprint iff rules, 16 KiB bytes, exact integer storage and active/terminal truth table；用无 affinity storage + `typeof` 在 DB 拒绝 real/text coercion，并把 SQLite wire 层无法区分 raw bool 与整数 1 记录为明确边界；Task 3 raw decoder/Repository 在 SQL 前以 `type(value) is int` 拒绝 bool；
+- Product Action route action/source/origin mapping, semantic/historical fingerprint iff rules, 16 KiB bytes, exact integer storage and active/terminal truth table；空库与真实 0028 升级库都必须以 `PRAGMA table_info/sqlite_master` 证明 `schema_version/source_id/source_revision` 使用 typeless 或等价 BLOB-affinity storage，默认值落库 `typeof='integer'`；raw integer 1 可写，`1.0`/`"1"` 必须被 DB 拒绝。SQLite wire 层无法区分 raw bool 与整数 1 是明确边界；Task 3 raw decoder/Repository 在 SQL 前以 `type(value) is int` 拒绝 bool；
 - route-without-parent rejection; raw parent-only SQL as the declared SQLite boundary; parent terminal clearing the route in the same statement; route identity immutability and no-delete;
 - mutually exclusive Product primary versus Product compensation manifest rows and every cross-pair rejection;
 - Adaptive legacy/V2 origin truth table, target fingerprint required/format/immutable, both partial uniques and source-only/target-only/both locator `SET NULL` history;
@@ -148,6 +148,8 @@ class InterviewReadinessSignal(Base): ...
 class InterviewReadinessSignalVersion(Base): ...
 class InterviewReadinessSignalEvidence(Base): ...
 ```
+
+`ProductActionProposal.schema_version/source_id/source_revision` use an exact-integer SQLAlchemy type that compiles to typeless or BLOB-affinity storage on SQLite and ordinary `INTEGER` elsewhere; `Base.metadata.create_all()` and the 0029 migration must emit the same SQLite affinity. Pair it with `typeof(...)='integer'` checks so lossless real/text coercion cannot occur before validation. Do not use ordinary SQLite `INTEGER` for these three columns.
 
 Use `(parent_version_id, signal_id) -> (id, signal_id) ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED`; add Signal to `APPLICATION_FOREIGN_KEY_MODELS`. Replace the ordinary Practice proposal/focus unique with origin-specific partial uniques. Extend `WriteOperation` with two mutually exclusive branches:
 
@@ -271,6 +273,7 @@ git commit -m "feat: AI 版本化面试复盘来源"
 - Create: `tests/product_actions/test_repository.py`
 - Create: `tests/product_actions/test_isolation.py`
 - Create: `tests/test_event_lifecycle_v1.py`
+- Modify: `tests/test_review_to_readiness_source_gates.py`
 - Modify: `tests/tool_metadata/test_production_bundle.py`
 - Modify: `tests/tool_metadata/test_published_operation_checks.py`
 
@@ -280,6 +283,7 @@ Assert exact runtime classification `25 / 3 / 4 + 2 / 2`, Provider schema bytes/
 Add exact boundary tests for 16,384/16,385-byte route JSON, duplicate JSON keys, NaN/Infinity, boolean-as-integer, malformed UUID/HMAC and action/source cross-pairs. The HTTP-safe decoder must operate on raw request bytes with a duplicate-key-aware object hook before Pydantic/default normalization; FastAPI `dict = Body(...)` is not sufficient for these routes.
 For bundle recovery, cover publication `all_absent | exact_proposed | exact_terminal | unreadable`, plus every parent/route/seq1 single-sided, missing, extra, duplicate, wrong-state or wrong-order corruption. Fresh reconciliation must never repair a partial bundle.
 Prove token identity mechanics directly: the issuer derives the server token before `BEGIN`, the proposed insert stores the matching fingerprint, and the post-commit response returns the exact same raw token. A restart must use the Operation's stored key profile even after active-key rotation; a missing historical key fails closed and never substitutes a new token. Add proof-negative tests for ordinary DTOs, copy/serialization, cross-container, cross-owner, cross-source, cross-action, cross-proof-union, repeated consumption and ABA reuse. `SignalOwnerRecoveryProof` has no generation field; `StoryOwnerRecoveryProof` binds both expected generations; action-discriminated `RejectionOnlyRecoveryProof` fixes `live_source_state=not_observed`.
+Test the raw decoder and every direct Repository/issuer integer entry separately: `True`, `1.0` and `"1"` for each integer position fail before any `session.execute`/flush/BEGIN. Add a source/AST gate that forbids Product Action integer request fields from first entering ordinary `dict = Body(...)`, Pydantic coercion or any normalized mapping before the duplicate-key-aware exact decoder.
 Load `tests/fixtures/review_readiness/event_lifecycle_v1.json` in a backend RED test and require one `classify_event_lifecycle_v1(status: object)` implementation for every alias and unknown fallback before Candidate work can begin.
 
 - [ ] **Step 2: Verify RED**
@@ -339,10 +343,11 @@ Guard every delivery lease, heartbeat, takeover and fallback query in `ai/write_
 
 ```powershell
 uv run pytest tests/product_actions/test_catalog.py tests/product_actions/test_identity.py tests/product_actions/test_repository.py tests/product_actions/test_isolation.py tests/test_event_lifecycle_v1.py tests/tool_metadata -q
+uv run pytest tests/test_review_to_readiness_source_gates.py -k "not production_cutover_gate" -q
 uv run ruff check src/offerpilot/product_actions src/offerpilot/event_lifecycle.py src/offerpilot/ai/write_operations.py tests/product_actions tests/test_event_lifecycle_v1.py
 uv run mypy src
 git diff --check
-git add src/offerpilot/product_actions src/offerpilot/event_lifecycle.py src/offerpilot/ai/write_operations.py tests/product_actions tests/test_event_lifecycle_v1.py tests/tool_metadata/test_production_bundle.py tests/tool_metadata/test_published_operation_checks.py
+git add src/offerpilot/product_actions src/offerpilot/event_lifecycle.py src/offerpilot/ai/write_operations.py tests/product_actions tests/test_event_lifecycle_v1.py tests/test_review_to_readiness_source_gates.py tests/tool_metadata/test_production_bundle.py tests/tool_metadata/test_published_operation_checks.py
 git commit -m "feat: AI 建立独立产品操作安全核心"
 ```
 
@@ -365,6 +370,7 @@ git commit -m "feat: AI 建立独立产品操作安全核心"
 - [ ] **Step 1: Write candidate, concurrency and HITL RED tests**
 
 Cover every candidate closed state, structure cap and evidence path; same key/same input concurrent replay; same key/different input conflict; same semantic focus with different keys produces one active winner and stable non-leaking 409; reject performs zero candidate/source/capability/binding/preflight/executor/Provider calls; approve/modify execute once; terminal replay executes zero; cancellation/BaseException propagates after cleanup.
+Send raw Signal proposal/decision JSON with every integer field replaced in turn by `true`, `1.0` and `"1"`, plus duplicate top-level keys. Each request must return the exact 422 invalid-request codec before Pydantic/default normalization, with ProductAction Repository/SQL/capability/source/Provider/executor calls all zero.
 
 Add the complete Signal publication/decision matrix. Publication distinguishes all-absent, exact proposed, exact terminal and unreadable; any parent/route/seq1 partial is an integrity error. Decision starts from an already-persisted proposal, so absent/partial must never reuse publication's rebuild rule; exact proposed with the original decision payload may retry, different decision/effective payload conflicts, and terminal replay validates request fingerprint + terminal digest + the complete ordered prefix with executor=0. `rejected` prefix is valid only for primary operations; compensation has only proposed/committed/failed. Exercise the semantic loser key after winner active/rejected/declared-failed/committed, and golden-test every action-local result/visible/transport/undo/aggregate byte boundary plus rejected/failed codecs.
 For Signal proposal authorization, assert the capability check short-circuits before any Application/Note/Proposal/Candidate query. Owner recovery must reject ordinary DTOs, every cross-proof/container/owner/source/action combination, duplicate consumption and ABA proofs; generic GET, terminal responses and cross-owner paths never expose a token. Rejection-only recovery is action-discriminated and can only observe `live_source_state=not_observed`. For both Signal and Story, test source existing/changed/missing branches and require source-currentness repository calls=0, capability=0, binding=0 and preflight=0; recovery uses only the validated Operation/route HMAC and returns exactly `allowed_decisions=('reject',)`.
@@ -424,6 +430,7 @@ git commit -m "feat: AI 保存可审计复盘准备重点"
 - [ ] **Step 1: Write Story publication/decision RED matrix**
 
 Cover the four-object ready bundle (Attempt+parent+route+seq1), publication response loss with concurrent approve/reject/declared failure, historical confirmed replay, historical-ready bridge, source-changed rejection-only recovery, bound executor transaction rollback, direct commit 201/created true and every fresh reconciliation/replay 200/created false. Historical-ready same legacy token+same payload converges; different token or payload conflicts; the legacy token is only HMAC-bound request identity and never executor authorization.
+Send raw Story compatibility, decision and N+1 JSON with every integer field replaced in turn by `true`, `1.0` and `"1"`, plus duplicate top-level keys. Each must fail with the exact 422 codec before Pydantic/default normalization and perform zero ProductAction Repository/SQL/source/Provider/executor calls.
 
 - [ ] **Step 2: Write N→N+1 RED matrix**
 

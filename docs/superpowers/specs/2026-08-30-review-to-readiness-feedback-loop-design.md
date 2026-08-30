@@ -404,10 +404,10 @@ operation_id                    UUID PRIMARY KEY FK write_operations ON DELETE R
 action_call_id                  UUID NOT NULL UNIQUE
 action_name                     confirm_interview_story | save_review_readiness_signal
 request_origin                  current | historical_story_bridge
-schema_version                  INTEGER NOT NULL DEFAULT 1
+schema_version                  EXACT_INT NOT NULL DEFAULT 1  # SQLite typeless/BLOB-affinity storage
 source_kind                     story_proposal | review_focus
-source_id                       INTEGER NOT NULL
-source_revision                 INTEGER NOT NULL
+source_id                       EXACT_INT NOT NULL             # SQLite typeless/BLOB-affinity storage
+source_revision                 EXACT_INT NOT NULL             # SQLite typeless/BLOB-affinity storage
 route_payload_json              TEXT NULL, max 16 KiB
 route_payload_fingerprint       hmac-sha256:<64 hex>
 route_binding_fingerprint       hmac-sha256:<64 hex>

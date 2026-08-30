@@ -94,6 +94,12 @@ describe('KnowledgeSourcesView', () => {
       { evidence_id: 'e1', source_id: 3, snippet: '可用片段' },
       { evidence_id: '', source_id: 3, snippet: '损坏片段' },
     ])).toMatchObject({ items: [expect.objectContaining({ evidence_id: 'e1' })], unavailable: true });
+    expect(normalizeSearchHitProjection([
+      { evidence_id: 'e2', source_id: 3, snippet: '路径损坏', heading_path: null },
+    ])).toMatchObject({ items: [], unavailable: true });
+    expect(normalizeEvidencePage({ items: [
+      { id: 'e2', source_id: 3, canonical_excerpt: '路径损坏', heading_path: { invalid: true } },
+    ] }, 3)).toMatchObject({ items: [], unavailable: true });
 
     expect(normalizeJobProjection([])).toMatchObject({ items: [], unavailable: false });
     expect(normalizeJobProjection({})).toMatchObject({ items: [], unavailable: true });

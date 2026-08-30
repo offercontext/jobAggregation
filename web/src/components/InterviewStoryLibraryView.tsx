@@ -358,7 +358,7 @@ export function normalizeInterviewStoryVersion(input: unknown, expectedStoryId?:
   const sourceFingerprint = safeText(fingerprintRead.value, 512);
   if (id === null || (expectedVersionId !== undefined && id !== expectedVersionId)
     || (storyIdRead.value !== undefined && storyId === null)
-    || (expectedStoryId !== undefined && storyId !== null && storyId !== expectedStoryId)
+    || (expectedStoryId !== undefined && (storyId === null || storyId !== expectedStoryId))
     || versionNumber === null || !originKind || !['manual', 'proposal'].includes(originKind)
     || (confirmedRead.value !== null && !confirmedAt) || !sourceFingerprint) {
     return { value: null, sourceIssue: null };
@@ -453,7 +453,7 @@ interface NormalizedStoryResult {
   readonly invalidVersion: boolean;
 }
 
-function normalizeInterviewStory(input: unknown, options: { detail: boolean }): NormalizedStoryResult {
+function normalizeInterviewStory(input: unknown, options: { detail: boolean; expectedStoryId?: number }): NormalizedStoryResult {
   const record = recordOf(input);
   if (!record) return { value: null, invalidVersion: false };
   const idRead = readValue(record, 'id');
@@ -473,7 +473,8 @@ function normalizeInterviewStory(input: unknown, options: { detail: boolean }): 
   const storyRevision = safePositiveId(revisionRead.value);
   const versionNumber = safeNullablePositiveId(numberRead.value);
   const sourceStates = normalizeSourceStates(statesRead.value);
-  if (id === null || !title || !status || !['active', 'archived'].includes(status)
+  if (id === null || (options.expectedStoryId !== undefined && id !== options.expectedStoryId)
+    || !title || !status || !['active', 'archived'].includes(status)
     || currentVersionId === undefined || storyRevision === null || versionNumber === undefined || !sourceStates) {
     return { value: null, invalidVersion: false };
   }
@@ -699,17 +700,20 @@ export default function InterviewStoryLibraryView({ onOpenDraft, onBack }: Props
       : storyProjection.state;
 
   const toggleArchive = async (story: InterviewStory) => {
+    const generation = storyListRequestGeneration.current;
     try {
       const updated = story.status === 'active'
         ? await archiveInterviewStory(story.id, story.story_revision)
         : await restoreInterviewStory(story.id, story.story_revision);
-      const normalized = normalizeInterviewStory(updated, { detail: false }).value;
+      if (generation !== storyListRequestGeneration.current) return;
+      const normalized = normalizeInterviewStory(updated, { detail: false, expectedStoryId: story.id }).value;
       if (!normalized) {
         setStoryListState('partial');
         return;
       }
       setStories((current) => current.map((item) => item.id === normalized.id ? normalized : item));
     } catch {
+      if (generation !== storyListRequestGeneration.current) return;
       setError(true);
     }
   };
@@ -724,7 +728,7 @@ export default function InterviewStoryLibraryView({ onOpenDraft, onBack }: Props
     try {
       const [rawStory, rawHistory] = await Promise.all([getInterviewStory(storyId), listInterviewStoryVersions(storyId)]);
       if (generation !== historyRequestGeneration.current) return;
-      const normalizedStory = normalizeInterviewStory(rawStory, { detail: true });
+      const normalizedStory = normalizeInterviewStory(rawStory, { detail: true, expectedStoryId: storyId });
       const normalizedHistory = normalizeInterviewStoryVersions(rawHistory, storyId);
       if (!normalizedStory.value) {
         setHistoryState('unavailable');

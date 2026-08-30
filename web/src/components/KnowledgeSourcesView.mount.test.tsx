@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const state = vi.hoisted(() => ({
   confirmed: [] as unknown[],
   sources: [] as unknown,
+  search: vi.fn(),
 }));
 
 vi.mock('@/services/knowledge', () => ({
@@ -23,7 +24,7 @@ vi.mock('@/services/knowledge', () => ({
   fetchConfirmedInterviewKnowledgeNotes: vi.fn(() => Promise.resolve(state.confirmed)),
   pasteKnowledgeSource: vi.fn(),
   rebuildKnowledgeSourceBrief: vi.fn(),
-  searchKnowledgeEvidence: vi.fn(),
+  searchKnowledgeEvidence: state.search,
   unarchiveKnowledgeSource: vi.fn(),
   updateKnowledgeSourceTitle: vi.fn(),
   uploadKnowledgeBundle: vi.fn(),
@@ -59,9 +60,24 @@ async function flush() {
   });
 }
 
+function submitSearch(query = '延迟') {
+  const input = container?.querySelector('input[placeholder^="搜索资料内容"]') as HTMLInputElement | null;
+  if (!input) throw new Error('search input not found');
+  act(() => {
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+    setter?.call(input, query);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  });
+  const button = [...(container?.querySelectorAll('button') ?? [])]
+    .find((candidate) => candidate.textContent?.replace(/\s/g, '') === '搜索');
+  act(() => button?.dispatchEvent(new MouseEvent('click', { bubbles: true })));
+}
+
 beforeEach(() => {
   state.confirmed = [];
   state.sources = [];
+  state.search.mockReset();
   Object.defineProperty(window, 'matchMedia', {
     configurable: true,
     value: () => ({ matches: false, addListener: () => undefined, removeListener: () => undefined }),
@@ -120,5 +136,34 @@ describe('KnowledgeSourcesView mounted source states', () => {
 
     expect(container?.textContent).not.toContain('内部面试片段');
     expect(container?.textContent).toContain('还没有资料来源');
+  });
+
+  it.each([
+    ['error', () => state.search.mockRejectedValue(new Error('network'))],
+    ['null', () => state.search.mockResolvedValue(null)],
+  ] as const)('renders an explicit unavailable panel for a search %s response', async (_kind, configure) => {
+    configure();
+    renderView();
+    await flush();
+    submitSearch();
+    await flush();
+
+    expect(container?.textContent).toContain('搜索结果暂时不可用');
+    expect(container?.textContent).not.toContain('未匹配资料内容');
+  });
+
+  it('does not present search hits as unmatched while the source list is still loading', async () => {
+    state.sources = new Promise(() => undefined);
+    state.search.mockResolvedValue({
+      query: '延迟',
+      hits: [{ evidence_id: 'e1', source_id: 3, snippet: '安全片段' }],
+    });
+    renderView();
+    await flush();
+    submitSearch();
+    await flush();
+
+    expect(container?.textContent).toContain('搜索结果暂时不可用');
+    expect(container?.textContent).not.toContain('未匹配资料内容');
   });
 });

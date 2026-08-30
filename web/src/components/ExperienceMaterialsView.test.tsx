@@ -51,4 +51,19 @@ describe('ExperienceMaterialsView', () => {
     expect(renderToStaticMarkup(<ExperienceMaterialsView confirmedCapturesError />)).toContain('面试片段暂时不可用');
     expect(renderToStaticMarkup(<ExperienceMaterialsView confirmedCaptures={[]} />)).toContain('还没有已确认的面试片段');
   });
+
+  it('fails closed for an explicit ready envelope without captures, including revoked proxies', () => {
+    expect(renderToStaticMarkup(
+      <ExperienceMaterialsView confirmedCapturesState="ready" confirmedCaptures={null as never} />,
+    )).toContain('面试片段暂时不可用');
+
+    const { proxy, revoke } = Proxy.revocable([], {});
+    revoke();
+    expect(() => renderToStaticMarkup(
+      <ExperienceMaterialsView confirmedCapturesState="ready" confirmedCaptures={proxy as never} />,
+    )).not.toThrow();
+    expect(renderToStaticMarkup(
+      <ExperienceMaterialsView confirmedCapturesState="ready" confirmedCaptures={proxy as never} />,
+    )).toContain('面试片段暂时不可用');
+  });
 });

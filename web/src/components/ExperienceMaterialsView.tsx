@@ -28,8 +28,17 @@ function stateForProps(props: ExperienceMaterialsViewProps): MaterialSourceEnvel
   if (props.confirmedCapturesState) {
     if (props.confirmedCapturesState === 'ready' || props.confirmedCapturesState === 'empty' || props.confirmedCapturesState === 'partial') {
       const raw = props.confirmedCaptures;
-      if (raw && !Array.isArray(raw)) return raw;
-      return { status: props.confirmedCapturesState, value: raw ?? EMPTY_CAPTURE_RECORDS };
+      if (raw !== null && raw !== undefined) {
+        try {
+          if (!Array.isArray(raw)) return raw;
+          return { status: props.confirmedCapturesState, value: raw };
+        } catch {
+          return { status: props.confirmedCapturesState, value: null };
+        }
+      }
+      // An explicit ready/empty/partial state without its collection is a
+      // malformed source envelope, not an empty successful result.
+      return { status: props.confirmedCapturesState, value: null };
     }
     return { status: props.confirmedCapturesState };
   }

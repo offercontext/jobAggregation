@@ -136,6 +136,17 @@ function safeRead(value: unknown, key: string): unknown {
   }
 }
 
+function safeHasOwn(value: unknown, key: string): boolean {
+  const record = safeRecord(value);
+  if (!record) return false;
+  try {
+    return Object.prototype.hasOwnProperty.call(record, key);
+  } catch {
+    // A hostile own-property trap is itself an invalid source envelope.
+    return true;
+  }
+}
+
 function safeArray(value: unknown, limit = MAX_COLLECTION_LENGTH): unknown[] {
   try {
     if (!Array.isArray(value)) return [];
@@ -181,6 +192,19 @@ function safeArrayProjection(
   } catch {
     return { values: Object.freeze([]), unavailable: true };
   }
+}
+
+function normalizeHeadingPath(record: SafeRecord): { readonly value: readonly string[]; readonly valid: boolean } {
+  if (!safeHasOwn(record, 'heading_path')) return { value: Object.freeze([]), valid: true };
+  const source = safeArrayProjection(safeRead(record, 'heading_path'), 12);
+  if (source.unavailable) return { value: Object.freeze([]), valid: false };
+  const value: string[] = [];
+  for (const candidate of source.values) {
+    const heading = boundedText(candidate, '', 120);
+    if (!heading) return { value: Object.freeze([]), valid: false };
+    value.push(heading);
+  }
+  return { value: Object.freeze(value), valid: true };
 }
 
 function boundedText(value: unknown, fallback = '', limit = MAX_SUMMARY_LENGTH): string {
@@ -302,9 +326,11 @@ export function normalizeEvidencePage(input: unknown, expectedSourceId: number):
       unavailable = true;
       continue;
     }
-    const headings = safeArray(safeRead(record, 'heading_path'), 12)
-      .map((value) => boundedText(value, '', 120))
-      .filter(Boolean);
+    const headingPath = normalizeHeadingPath(record);
+    if (!headingPath.valid) {
+      unavailable = true;
+      continue;
+    }
     items.push(Object.freeze({
       id,
       source_id: sourceId,
@@ -312,7 +338,7 @@ export function normalizeEvidencePage(input: unknown, expectedSourceId: number):
       kind: safeRead(record, 'kind') === 'asset' ? 'asset' : 'text',
       block_kind: '资料片段',
       ordinal: Math.max(0, safeFiniteNumber(safeRead(record, 'ordinal'))),
-      heading_path: Object.freeze(headings) as string[],
+      heading_path: headingPath.value as string[],
       char_start: 0,
       char_end: 0,
       line_start: 0,
@@ -427,15 +453,17 @@ export function normalizeSearchHitProjection(input: unknown): {
       byId.delete(evidenceId);
       continue;
     }
-    const headingPath = safeArray(safeRead(record, 'heading_path'), 12)
-      .map((value) => boundedText(value, '', 120))
-      .filter(Boolean);
+    const headingPath = normalizeHeadingPath(record);
+    if (!headingPath.valid) {
+      unavailable = true;
+      continue;
+    }
     byId.set(evidenceId, Object.freeze({
       evidence_id: evidenceId,
       source_id: sourceId,
       snapshot_id: 0,
       block_kind: '资料片段',
-      heading_path: Object.freeze(headingPath) as string[],
+      heading_path: headingPath.value as string[],
       char_start: 0,
       char_end: 0,
       line_start: 0,
@@ -563,6 +591,10 @@ export default function KnowledgeSourcesView() {
   const externalSourceUnavailable = externalProjection.unavailable.some(
     (issue) => issue.kind !== 'captured_unavailable',
   ) || externalProjection.items.some((item) => item.sourceState === 'unavailable');
+  const externalSourceListNotReady = externalProjection.state === 'loading'
+    || externalProjection.state === 'error'
+    || externalProjection.state === 'partial'
+    || externalProjection.state === 'unavailable';
   const externalSourceIds = new Set(externalSources.map((source) => source.id));
   const [selectedSourceId, setSelectedSourceId] = useState<number | null>(null);
   const activeExternalSourceId = selectedSourceId !== null && externalSourceIds.has(selectedSourceId)
@@ -657,7 +689,8 @@ export default function KnowledgeSourcesView() {
 
   const searchProjection = normalizeSearchHitProjection(safeRead(searchMutation.data, 'hits'));
   const searchHits = [...searchProjection.items];
-  const searchResponseUnavailable = searchMutation.isError
+  const searchResponseUnavailable = externalSourceListNotReady
+    || searchMutation.isError
     || (searchMutation.data !== undefined && searchProjection.unavailable);
 
   const handleSearch = () => {
@@ -724,7 +757,7 @@ export default function KnowledgeSourcesView() {
           </Space>
         </div>
 
-        {searchMutation.data ? (
+        {searchMutation.isError || searchMutation.data !== undefined ? (
           <SearchResultsPanel
             query={activeSearch}
             hits={searchHits.filter((hit) => externalSourceIds.has(hit.source_id))}

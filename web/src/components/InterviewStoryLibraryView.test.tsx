@@ -23,6 +23,7 @@ vi.mock('@/services/interviewStories', () => ({
 const {
   default: InterviewStoryLibraryView,
   normalizeInterviewStoryList,
+  normalizeInterviewStoryVersion,
 } = await import('./InterviewStoryLibraryView');
 
 let root: Root | undefined;
@@ -54,6 +55,7 @@ afterEach(() => {
 function makeVersion(overrides: Record<string, unknown> = {}) {
   return {
     id: 12,
+    story_id: 8,
     version_number: 2,
     origin_kind: 'manual',
     confirmed_at: '2026-08-10T00:00:00+00:00',
@@ -109,6 +111,12 @@ function makeVersionSummary() {
 }
 
 describe('InterviewStoryLibraryView', () => {
+  it('requires a matching Story identity for a version detail', () => {
+    expect(normalizeInterviewStoryVersion(makeVersion(), 8, 12).value).not.toBeNull();
+    expect(normalizeInterviewStoryVersion(makeVersion({ story_id: undefined }), 8, 12).value).toBeNull();
+    expect(normalizeInterviewStoryVersion(makeVersion({ story_id: 9 }), 8, 12).value).toBeNull();
+  });
+
   it('selects duplicate Story identities deterministically and reports a partial source', () => {
     const first = { id: 8, title: '甲故事', status: 'active', current_version_id: 12, story_revision: 2, version_number: 2, source_states: [] };
     const second = { ...first, title: '乙故事', story_revision: 3 };
@@ -168,6 +176,34 @@ describe('InterviewStoryLibraryView', () => {
     await act(async () => { await Promise.resolve(); await Promise.resolve(); });
 
     expect(container?.textContent).toContain('部分版本暂时不可用');
+    expect(container?.querySelector('[data-testid="story-version-content"]')).toBeNull();
+    expect(container?.textContent).not.toContain('线上延迟');
+  });
+
+  it('fails closed when the Story detail response belongs to another Story', async () => {
+    service.get.mockResolvedValue({ ...makeStory(makeVersion()), id: 99, title: '不应展示的故事' });
+    service.listVersions.mockResolvedValue([makeVersionSummary()]);
+    act(() => root?.render(<InterviewStoryLibraryView onOpenDraft={() => {}} />));
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    act(() => [...(container?.querySelectorAll('button') ?? [])].find((button) => button.textContent === '查看版本')?.click());
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    expect(container?.textContent).toContain('故事历史暂时不可用');
+    expect(container?.textContent).not.toContain('不应展示的故事');
+    expect(container?.querySelector('[data-testid="story-version-content"]')).toBeNull();
+  });
+
+  it('fails closed when a Story detail version omits its required Story identity', async () => {
+    service.get.mockResolvedValue(makeStory(makeVersion({ story_id: undefined })));
+    service.listVersions.mockResolvedValue([makeVersionSummary()]);
+    act(() => root?.render(<InterviewStoryLibraryView onOpenDraft={() => {}} />));
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    act(() => [...(container?.querySelectorAll('button') ?? [])].find((button) => button.textContent === '查看版本')?.click());
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    expect(container?.textContent).toContain('当前版本暂时不可用');
     expect(container?.querySelector('[data-testid="story-version-content"]')).toBeNull();
     expect(container?.textContent).not.toContain('线上延迟');
   });
@@ -245,6 +281,7 @@ describe('InterviewStoryLibraryView', () => {
     const open = vi.fn();
     const version = {
       id: 12,
+      story_id: 8,
       version_number: 2,
       origin_kind: 'manual' as const,
       confirmed_at: '2026-08-10T00:00:00+00:00',
@@ -282,11 +319,87 @@ describe('InterviewStoryLibraryView', () => {
     expect(service.restore).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { action: 'archive' as const, status: 'active' as const, responseStatus: 'archived' as const },
+    { action: 'restore' as const, status: 'archived' as const, responseStatus: 'active' as const },
+  ])('does not apply a mismatched $action response to another Story', async ({ action, status, responseStatus }) => {
+    service.list.mockResolvedValue([
+      { id: 8, title: '原始故事', status, current_version_id: null, story_revision: 2, version_number: null, source_states: [] },
+      { id: 9, title: '保留故事', status, current_version_id: null, story_revision: 3, version_number: null, source_states: [] },
+    ]);
+    const response = {
+      id: 9,
+      title: '不应替换的响应',
+      status: responseStatus,
+      current_version_id: null,
+      story_revision: 4,
+      version_number: null,
+      source_states: [],
+    };
+    if (action === 'archive') service.archive.mockResolvedValue(response);
+    else service.restore.mockResolvedValue(response);
+
+    act(() => root?.render(<InterviewStoryLibraryView onOpenDraft={() => {}} />));
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    const actionButton = [...(container?.querySelectorAll('button') ?? [])]
+      .find((button) => button.textContent === (action === 'archive' ? '归档' : '恢复'));
+    act(() => actionButton?.click());
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    expect(container?.textContent).toContain('保留故事');
+    expect(container?.textContent).not.toContain('不应替换的响应');
+    expect(container?.textContent).toContain('部分故事暂时不可用');
+  });
+
+  it('ignores an archive response that arrives after the Story list generation changed', async () => {
+    let resolveArchive: (value: unknown) => void = () => undefined;
+    service.list
+      .mockResolvedValueOnce([{
+        id: 8,
+        title: '当前故事',
+        status: 'active',
+        current_version_id: null,
+        story_revision: 2,
+        version_number: null,
+        source_states: [],
+      }])
+      .mockResolvedValueOnce([{
+        id: 8,
+        title: '刷新后的故事',
+        status: 'archived',
+        current_version_id: null,
+        story_revision: 3,
+        version_number: null,
+        source_states: [],
+      }]);
+    service.archive.mockImplementation(() => new Promise((resolve) => { resolveArchive = resolve; }));
+
+    act(() => root?.render(<InterviewStoryLibraryView onOpenDraft={() => {}} />));
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    act(() => [...(container?.querySelectorAll('button') ?? [])].find((button) => button.textContent === '归档')?.click());
+    act(() => [...(container?.querySelectorAll('button') ?? [])].find((button) => button.textContent === '已归档')?.click());
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    act(() => resolveArchive({
+      id: 8,
+      title: '迟到覆盖的故事',
+      status: 'archived',
+      current_version_id: null,
+      story_revision: 4,
+      version_number: null,
+      source_states: [],
+    }));
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    expect(container?.textContent).toContain('刷新后的故事');
+    expect(container?.textContent).not.toContain('迟到覆盖的故事');
+  });
+
   it('keeps the last selected immutable version when an older history request resolves late', async () => {
     let resolveFirst: (value: unknown) => void = () => undefined;
     let resolveSecond: (value: unknown) => void = () => undefined;
     const version = (id: number, title: string) => ({
-      id, version_number: id, origin_kind: 'manual' as const, confirmed_at: '2026-08-10T00:00:00+00:00', source_fingerprint: `fp-${id}`,
+      id, story_id: 8, version_number: id, origin_kind: 'manual' as const, confirmed_at: '2026-08-10T00:00:00+00:00', source_fingerprint: `fp-${id}`,
       content: { title: { id: 'title' as const, text: title }, blocks: [], capability_labels: [], applicable_questions: [], fact_gap_codes: ['missing_result'] },
       evidence_links: [], assertions: [], source_states: [],
     });
@@ -315,6 +428,7 @@ describe('InterviewStoryLibraryView', () => {
   it('groups immutable STAR content and frozen evidence instead of rendering a wall of tags', async () => {
     const version = {
       id: 18,
+      story_id: 8,
       version_number: 3,
       origin_kind: 'proposal' as const,
       confirmed_at: '2026-08-12T08:00:00+00:00',

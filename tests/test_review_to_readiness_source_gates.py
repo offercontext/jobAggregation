@@ -325,22 +325,6 @@ def _has_note_revision_helper(tree: ast.AST | None) -> bool:
 
 
 def _application_event_delete_violations(path: Path, tree: ast.Module) -> list[str]:
-    model_names = {"ApplicationEvent"}
-    delete_names = {"delete"}
-    for node in tree.body:
-        if isinstance(node, ast.ImportFrom) and node.module == "offerpilot.models":
-            model_names.update(
-                alias.asname or alias.name
-                for alias in node.names
-                if alias.name == "ApplicationEvent"
-            )
-        elif isinstance(node, ast.ImportFrom) and node.module == "sqlalchemy":
-            delete_names.update(
-                alias.asname or alias.name
-                for alias in node.names
-                if alias.name == "delete"
-            )
-
     def assigned_names(target: ast.expr) -> set[str]:
         if isinstance(target, ast.Name):
             return {target.id}
@@ -365,207 +349,281 @@ def _application_event_delete_violations(path: Path, tree: ast.Module) -> list[s
             return (node.target,), node.value
         return (), None
 
-    def is_event_model(node: ast.AST) -> bool:
-        if isinstance(node, ast.Name):
-            return node.id in model_names
-        if isinstance(node, ast.Attribute):
-            return node.attr == "ApplicationEvent"
-        return (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, (ast.Name, ast.Attribute))
-            and (
-                (isinstance(node.func, ast.Name) and node.func.id == "aliased")
-                or (isinstance(node.func, ast.Attribute) and node.func.attr == "aliased")
-            )
-            and bool(node.args)
-            and is_event_model(node.args[0])
-        )
-
-    changed = True
-    while changed:
-        changed = False
-        for candidate in ast.walk(tree):
-            targets, value = assignment_parts(candidate)
-            if value is None or not is_event_model(value):
-                continue
-            aliases = {
-                name
-                for target in targets
-                for name in assigned_names(target)
-            }
-            if not aliases.issubset(model_names):
-                model_names.update(aliases)
-                changed = True
-
-    event_table_names: set[str] = set()
-    event_query_names: set[str] = set()
-    event_row_names = {"event", "application_event"}
-
-    def is_event_table(node: ast.AST) -> bool:
-        if isinstance(node, ast.Name):
-            return node.id in event_table_names
-        if (
-            isinstance(node, ast.Attribute)
-            and node.attr == "__table__"
-            and is_event_model(node.value)
-        ):
-            return True
-        return (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr in {"alias", "table_valued"}
-            and is_event_table(node.func.value)
-        )
-
-    def query_targets_event(node: ast.AST) -> bool:
-        if isinstance(node, ast.Name) and node.id in event_query_names:
-            return True
-        return any(
-            isinstance(child, ast.Call)
-            and isinstance(child.func, ast.Attribute)
-            and child.func.attr == "query"
-            and any(is_event_model(argument) for argument in child.args)
-            for child in ast.walk(node)
-        )
-
-    def select_targets_event(node: ast.AST) -> bool:
-        return any(
-            isinstance(child, ast.Call)
-            and isinstance(child.func, (ast.Name, ast.Attribute))
-            and (
-                (isinstance(child.func, ast.Name) and child.func.id == "select")
-                or (isinstance(child.func, ast.Attribute) and child.func.attr == "select")
-            )
-            and any(is_event_model(argument) for argument in child.args)
-            for child in ast.walk(node)
-        )
-
-    def is_event_row_source(node: ast.AST) -> bool:
-        if isinstance(node, ast.Name):
-            return node.id in event_row_names
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-            return False
-        if node.func.attr == "get":
-            return bool(node.args) and is_event_model(node.args[0])
-        if node.func.attr == "scalar":
-            return bool(node.args) and select_targets_event(node.args[0])
-        if node.func.attr in {"first", "one", "one_or_none"}:
-            return query_targets_event(node.func.value)
-        return False
-
-    def annotation_targets_event(annotation: ast.expr | None) -> bool:
-        return annotation is not None and any(
-            is_event_model(child) for child in ast.walk(annotation)
-        )
-
-    for candidate in ast.walk(tree):
-        if isinstance(candidate, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            arguments = (
-                *candidate.args.posonlyargs,
-                *candidate.args.args,
-                *candidate.args.kwonlyargs,
-            )
-            event_row_names.update(
-                argument.arg
-                for argument in arguments
-                if annotation_targets_event(argument.annotation)
-            )
-        elif (
-            isinstance(candidate, ast.AnnAssign)
-            and annotation_targets_event(candidate.annotation)
-        ):
-            event_row_names.update(assigned_names(candidate.target))
-
-    changed = True
-    while changed:
-        changed = False
-        for candidate in ast.walk(tree):
-            targets, value = assignment_parts(candidate)
-            if value is None:
-                continue
-            names = {
-                name
-                for target in targets
-                for name in assigned_names(target)
-            }
-            target_sets: tuple[tuple[bool, set[str]], ...] = (
-                (is_event_table(value), event_table_names),
-                (query_targets_event(value), event_query_names),
-                (is_event_row_source(value), event_row_names),
-            )
-            for matches, known_names in target_sets:
-                if matches and not names.issubset(known_names):
-                    known_names.update(names)
-                    changed = True
-        for candidate in ast.walk(tree):
-            if not isinstance(candidate, (ast.For, ast.AsyncFor)):
-                continue
-            iterator = candidate.iter
-            is_event_scalar_iter = (
-                isinstance(iterator, ast.Call)
-                and isinstance(iterator.func, ast.Attribute)
-                and iterator.func.attr == "scalars"
-                and bool(iterator.args)
-                and select_targets_event(iterator.args[0])
-            )
-            if not is_event_scalar_iter:
-                continue
-            names = assigned_names(candidate.target)
-            if not names.issubset(event_row_names):
-                event_row_names.update(names)
-                changed = True
-
     violations: list[str] = []
+    scope_types = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
 
-    class DeleteVisitor(ast.NodeVisitor):
-        def __init__(self) -> None:
-            self.functions: list[str] = []
+    class Lineage:
+        def __init__(self, parent: Lineage | None = None) -> None:
+            self.models = set(parent.models) if parent is not None else {"ApplicationEvent"}
+            self.delete_factories = set(parent.delete_factories) if parent is not None else {"delete"}
+            self.tables = set(parent.tables) if parent is not None else set()
+            self.queries = set(parent.queries) if parent is not None else set()
+            self.rows = set(parent.rows) if parent is not None else set()
 
-        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
-            self.functions.append(node.name)
-            self.generic_visit(node)
-            self.functions.pop()
+        def discard(self, names: set[str]) -> None:
+            self.models.difference_update(names)
+            self.delete_factories.difference_update(names)
+            self.tables.difference_update(names)
+            self.queries.difference_update(names)
+            self.rows.difference_update(names)
 
-        visit_AsyncFunctionDef = visit_FunctionDef
+    def local_nodes(scope: ast.AST) -> list[ast.AST]:
+        nodes: list[ast.AST] = []
+        pending = list(ast.iter_child_nodes(scope))
+        while pending:
+            candidate = pending.pop()
+            if isinstance(candidate, scope_types):
+                continue
+            nodes.append(candidate)
+            pending.extend(ast.iter_child_nodes(candidate))
+        return nodes
 
-        def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
-            owner = self.functions[-1] if self.functions else ""
-            direct_sql_delete = (
-                isinstance(node.func, ast.Name)
-                and node.func.id in delete_names
+    def child_scopes(scope: ast.AST) -> list[ast.AST]:
+        children: list[ast.AST] = []
+        pending = list(ast.iter_child_nodes(scope))
+        while pending:
+            candidate = pending.pop()
+            if isinstance(candidate, scope_types):
+                children.append(candidate)
+                continue
+            pending.extend(ast.iter_child_nodes(candidate))
+        return children
+
+    def scope_arguments(scope: ast.AST) -> tuple[ast.arg, ...]:
+        if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            return (
+                *scope.args.posonlyargs,
+                *scope.args.args,
+                *scope.args.kwonlyargs,
+            )
+        return ()
+
+    def local_bindings(scope: ast.AST, nodes: list[ast.AST]) -> set[str]:
+        names = {argument.arg for argument in scope_arguments(scope)}
+        for candidate in nodes:
+            targets, _value = assignment_parts(candidate)
+            names.update(
+                name
+                for target in targets
+                for name in assigned_names(target)
+            )
+            if isinstance(candidate, (ast.For, ast.AsyncFor)):
+                names.update(assigned_names(candidate.target))
+            elif isinstance(candidate, (ast.With, ast.AsyncWith)):
+                for item in candidate.items:
+                    if item.optional_vars is not None:
+                        names.update(assigned_names(item.optional_vars))
+            elif isinstance(candidate, ast.ExceptHandler) and candidate.name is not None:
+                names.add(candidate.name)
+            elif isinstance(candidate, (ast.Import, ast.ImportFrom)):
+                names.update(alias.asname or alias.name.split(".")[0] for alias in candidate.names)
+        names.update(
+            child.name
+            for child in child_scopes(scope)
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        )
+        return names
+
+    def analyze_scope(scope: ast.AST, inherited: Lineage | None) -> None:
+        nodes = local_nodes(scope)
+        lineage = Lineage(inherited)
+        lineage.discard(local_bindings(scope, nodes))
+
+        for candidate in nodes:
+            if not isinstance(candidate, ast.ImportFrom):
+                continue
+            if candidate.module == "offerpilot.models":
+                lineage.models.update(
+                    alias.asname or alias.name
+                    for alias in candidate.names
+                    if alias.name == "ApplicationEvent"
+                )
+            elif candidate.module == "sqlalchemy":
+                lineage.delete_factories.update(
+                    alias.asname or alias.name
+                    for alias in candidate.names
+                    if alias.name == "delete"
+                )
+
+        def is_event_model(node: ast.AST) -> bool:
+            if isinstance(node, ast.Name):
+                return node.id in lineage.models
+            if isinstance(node, ast.Attribute):
+                return node.attr == "ApplicationEvent"
+            return (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, (ast.Name, ast.Attribute))
+                and (
+                    (isinstance(node.func, ast.Name) and node.func.id == "aliased")
+                    or (isinstance(node.func, ast.Attribute) and node.func.attr == "aliased")
+                )
                 and bool(node.args)
                 and is_event_model(node.args[0])
             )
-            table_delete = (
-                isinstance(node.func, ast.Attribute)
-                and node.func.attr == "delete"
+
+        def is_delete_factory(node: ast.AST) -> bool:
+            if isinstance(node, ast.Name):
+                return node.id in lineage.delete_factories
+            return isinstance(node, ast.Attribute) and node.attr == "delete"
+
+        def is_event_table(node: ast.AST) -> bool:
+            if isinstance(node, ast.Name):
+                return node.id in lineage.tables
+            if (
+                isinstance(node, ast.Attribute)
+                and node.attr == "__table__"
+                and is_event_model(node.value)
+            ):
+                return True
+            return (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"alias", "table_valued"}
                 and is_event_table(node.func.value)
             )
+
+        def query_targets_event(node: ast.AST) -> bool:
+            if isinstance(node, ast.Name) and node.id in lineage.queries:
+                return True
+            return any(
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Attribute)
+                and child.func.attr == "query"
+                and any(is_event_model(argument) for argument in child.args)
+                for child in ast.walk(node)
+            )
+
+        def select_targets_event(node: ast.AST) -> bool:
+            return any(
+                isinstance(child, ast.Call)
+                and isinstance(child.func, (ast.Name, ast.Attribute))
+                and (
+                    (isinstance(child.func, ast.Name) and child.func.id == "select")
+                    or (isinstance(child.func, ast.Attribute) and child.func.attr == "select")
+                )
+                and any(is_event_model(argument) for argument in child.args)
+                for child in ast.walk(node)
+            )
+
+        def is_event_row_source(node: ast.AST) -> bool:
+            if isinstance(node, ast.Name):
+                return node.id in lineage.rows
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                return False
+            if node.func.attr == "get":
+                return bool(node.args) and is_event_model(node.args[0])
+            if node.func.attr == "scalar":
+                return bool(node.args) and select_targets_event(node.args[0])
+            if node.func.attr in {"first", "one", "one_or_none"}:
+                return query_targets_event(node.func.value)
+            return False
+
+        def annotation_targets_event(annotation: ast.expr | None) -> bool:
+            return annotation is not None and any(
+                is_event_model(child) for child in ast.walk(annotation)
+            )
+
+        lineage.rows.update(
+            argument.arg
+            for argument in scope_arguments(scope)
+            if annotation_targets_event(argument.annotation)
+        )
+        lineage.rows.update(
+            name
+            for candidate in nodes
+            if isinstance(candidate, ast.AnnAssign)
+            and annotation_targets_event(candidate.annotation)
+            for name in assigned_names(candidate.target)
+        )
+
+        changed = True
+        while changed:
+            changed = False
+            for candidate in nodes:
+                targets, value = assignment_parts(candidate)
+                if value is None:
+                    continue
+                names = {
+                    name
+                    for target in targets
+                    for name in assigned_names(target)
+                }
+                target_sets: tuple[tuple[bool, set[str]], ...] = (
+                    (is_event_model(value), lineage.models),
+                    (is_delete_factory(value), lineage.delete_factories),
+                    (is_event_table(value), lineage.tables),
+                    (query_targets_event(value), lineage.queries),
+                    (is_event_row_source(value), lineage.rows),
+                )
+                for matches, known_names in target_sets:
+                    if matches and not names.issubset(known_names):
+                        known_names.update(names)
+                        changed = True
+            for candidate in nodes:
+                if not isinstance(candidate, (ast.For, ast.AsyncFor)):
+                    continue
+                iterator = candidate.iter
+                is_event_scalar_iter = (
+                    isinstance(iterator, ast.Call)
+                    and isinstance(iterator.func, ast.Attribute)
+                    and iterator.func.attr == "scalars"
+                    and bool(iterator.args)
+                    and select_targets_event(iterator.args[0])
+                )
+                if not is_event_scalar_iter:
+                    continue
+                names = assigned_names(candidate.target)
+                if not names.issubset(lineage.rows):
+                    lineage.rows.update(names)
+                    changed = True
+
+        owner = (
+            scope.name
+            if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef))
+            else ""
+        )
+        approved_owner = (
+            path.as_posix().endswith("repositories/application_events.py")
+            and owner == "_delete_application_event_owned"
+        )
+        for candidate in nodes:
+            if not isinstance(candidate, ast.Call):
+                continue
+            direct_sql_delete = (
+                is_delete_factory(candidate.func)
+                and bool(candidate.args)
+                and is_event_model(candidate.args[0])
+            )
+            table_delete = (
+                isinstance(candidate.func, ast.Attribute)
+                and candidate.func.attr == "delete"
+                and is_event_table(candidate.func.value)
+            )
             query_delete = (
-                isinstance(node.func, ast.Attribute)
-                and node.func.attr == "delete"
-                and query_targets_event(node.func.value)
+                isinstance(candidate.func, ast.Attribute)
+                and candidate.func.attr == "delete"
+                and query_targets_event(candidate.func.value)
             )
             orm_delete = (
-                isinstance(node.func, ast.Attribute)
-                and node.func.attr == "delete"
-                and bool(node.args)
-                and is_event_row_source(node.args[0])
-            )
-            approved = (
-                path.as_posix().endswith("repositories/application_events.py")
-                and owner == "_delete_application_event_owned"
+                isinstance(candidate.func, ast.Attribute)
+                and candidate.func.attr == "delete"
+                and bool(candidate.args)
+                and is_event_row_source(candidate.args[0])
             )
             if (
                 direct_sql_delete
                 or table_delete
                 or query_delete
                 or orm_delete
-            ) and not approved:
-                violations.append(f"{path.relative_to(ROOT).as_posix()}:{node.lineno}")
-            self.generic_visit(node)
+            ) and not approved_owner:
+                violations.append(
+                    f"{path.relative_to(ROOT).as_posix()}:{candidate.lineno}"
+                )
 
-    DeleteVisitor().visit(tree)
+        for child in child_scopes(scope):
+            analyze_scope(child, lineage)
+
+    analyze_scope(tree, None)
     return violations
 
 
@@ -730,7 +788,10 @@ def test_application_event_delete_owner_detector_rejects_direct_sql_and_orm_path
     direct = ast.parse(
         "def delete_event(session):\n    session.execute(delete(ApplicationEvent))\n"
     )
-    orm = ast.parse("def delete_event(session, event):\n    session.delete(event)\n")
+    orm = ast.parse(
+        "def delete_event(session, event: ApplicationEvent):\n"
+        "    session.delete(event)\n"
+    )
     loaded_row = ast.parse(
         "def delete_event(session):\n"
         "    row = session.get(ApplicationEvent, 1)\n"
@@ -763,6 +824,30 @@ def test_application_event_delete_owner_detector_rejects_direct_sql_and_orm_path
     assert _application_event_delete_violations(arbitrary, table_delete)
     assert _application_event_delete_violations(arbitrary, query_delete)
     assert _application_event_delete_violations(approved, owner) == []
+
+
+def test_application_event_delete_owner_detector_keeps_lineage_in_lexical_scope() -> None:
+    cross_function_row = ast.parse(
+        "def load_event(session):\n"
+        "    row = session.get(ApplicationEvent, 1)\n"
+        "    return row\n"
+        "def delete_untyped_row(session, row):\n"
+        "    session.delete(row)\n"
+    )
+    unrelated_event_parameter = ast.parse(
+        "def delete_unrelated(session, event):\n"
+        "    session.delete(event)\n"
+    )
+    interview_note_row = ast.parse(
+        "def delete_note(session):\n"
+        "    row = session.get(InterviewNote, 1)\n"
+        "    session.delete(row)\n"
+    )
+    arbitrary = ROOT / "src" / "offerpilot" / "other.py"
+
+    assert _application_event_delete_violations(arbitrary, cross_function_row) == []
+    assert _application_event_delete_violations(arbitrary, unrelated_event_parameter) == []
+    assert _application_event_delete_violations(arbitrary, interview_note_row) == []
 
 
 def test_application_event_hard_delete_has_one_production_owner() -> None:

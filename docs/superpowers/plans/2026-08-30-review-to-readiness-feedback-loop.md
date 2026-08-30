@@ -357,7 +357,7 @@ git commit -m "feat: AI 建立独立产品操作安全核心"
 Cover every candidate closed state, structure cap and evidence path; same key/same input concurrent replay; same key/different input conflict; same semantic focus with different keys produces one active winner and stable non-leaking 409; reject performs zero candidate/source/capability/binding/preflight/executor/Provider calls; approve/modify execute once; terminal replay executes zero; cancellation/BaseException propagates after cleanup.
 
 Add the complete Signal publication/decision matrix. Publication distinguishes all-absent, exact proposed, exact terminal and unreadable; any parent/route/seq1 partial is an integrity error. Decision starts from an already-persisted proposal, so absent/partial must never reuse publication's rebuild rule; exact proposed with the original decision payload may retry, different decision/effective payload conflicts, and terminal replay validates request fingerprint + terminal digest + the complete ordered prefix with executor=0. `rejected` prefix is valid only for primary operations; compensation has only proposed/committed/failed. Exercise the semantic loser key after winner active/rejected/declared-failed/committed, and golden-test every action-local result/visible/transport/undo/aggregate byte boundary plus rejected/failed codecs.
-For Signal proposal authorization, assert the capability check short-circuits before any Application/Note/Proposal/Candidate query. Owner recovery must reject ordinary DTOs, every cross-proof/container/owner/source/action combination, duplicate consumption and ABA proofs; generic GET, terminal responses and cross-owner paths never expose a token. Rejection-only recovery is action-discriminated and can only observe `live_source_state=not_observed`.
+For Signal proposal authorization, assert the capability check short-circuits before any Application/Note/Proposal/Candidate query. Owner recovery must reject ordinary DTOs, every cross-proof/container/owner/source/action combination, duplicate consumption and ABA proofs; generic GET, terminal responses and cross-owner paths never expose a token. Rejection-only recovery is action-discriminated and can only observe `live_source_state=not_observed`. For both Signal and Story, test source existing/changed/missing branches and require source-currentness repository calls=0, capability=0, binding=0 and preflight=0; recovery uses only the validated Operation/route HMAC and returns exactly `allowed_decisions=('reject',)`.
 
 - [ ] **Step 2: Verify RED**
 
@@ -476,11 +476,11 @@ git commit -m "refactor: AI 切换经历素材产品确认链路"
 - [ ] **Step 1: Write owner-proof and compensation RED tests**
 
 Cover capability-before-query, exact application/story owner, parent action/result/undo/digest binding, Story source-attempt lineage, owner switch, ordinary/copy/cross-container/cross-owner/cross-action/ABA/reused proof rejection, deterministic compensation UUID, 20-way one executor winner, proposal/execution commit-unknown, response-loss owner route re-signing a new request-local proof before deterministic terminal replay, terminal replay zero executor and `/api/chat/undo-last-write` remaining incapable of Product Action undo.
-Compensation publication must test `absent | proposed | terminal | unreadable`: only compensation parent and seq1 both absent may be reconstructed. Execution begins after parent+seq1 are durable, so either one absent or any partial state is integrity failure and must never rebuild. Exact proposed is only `[(1, proposed)]`; terminal validates full digest, request/input fingerprints and exact seq1/2/3/4. Unreadable returns unknown. Two-connection all-absent races have exactly one proposal/executor winner. Pin cross-process canonical goldens for compensation operation, request and input fingerprints.
+Compensation publication must test `absent | proposed | terminal | unreadable`: only compensation parent and seq1 both absent may be reconstructed. Execution begins after parent+seq1 are durable, so either one absent or any partial state is integrity failure and must never rebuild. Exact proposed is only `[(1, proposed)]`; terminal validates full digest, request/input fingerprints and exact seq1/2/3/4. Unreadable returns unknown. Two-connection all-absent races have exactly one proposal/executor winner. Pin cross-process canonical goldens for compensation operation, request and input fingerprints. SQLite, serialization, projector and every unmapped Exception roll back the whole execution transaction and leave the Operation proposed; only a mapped domain-stale outcome may close as failed. The same execution never calls its executor twice, and Provider calls plus Agent Compensation fallback calls remain zero.
 
 - [ ] **Step 2: Write Signal and Story domain undo RED tests**
 
-Signal Undo appends a retracted Version with every immutable field and Evidence byte-copied, works after source deletion, and never deletes history. New Story Undo archives and increments revision; appended Story Undo restores previous pointer/title and leaves the new Version immutable. Any later edit makes undo stale. Golden-test both `compensation_json_v1` results and the 4/1/4/12 KiB result/visible/transport/aggregate caps. Assert no正文 enters those projections and `previous_title` appears only in Story `undo_json`, never visible/transport/log/Journal/error.
+Signal Undo appends a retracted Version with `version_number=parent+1`, `parent_version_id=<active version id>`, `disposition=retracted`, byte-copied statement/user note/source revision/three fingerprints, and every Evidence field byte-copied in ordinal order. It must generate `domain_idempotency_key=uuid5(READINESS_SIGNAL_RETRACTION_VERSION_NAMESPACE, compensation_operation_id + ':signal-retraction')` and set `write_operation_id=<compensation operation id>` rather than copying either UNIQUE identity from the active Version. Version, Evidence, Signal pointer/revision and compensation terminal commit in one transaction; Undo works after source deletion and never deletes history. New Story Undo archives and increments revision; appended Story Undo restores previous pointer/title and leaves the new Version immutable. Any later edit makes undo stale. Golden-test both `compensation_json_v1` results and the 4/1/4/12 KiB result/visible/transport/aggregate caps. Assert no正文 enters those projections and `previous_title` appears only in Story `undo_json`, never visible/transport/log/Journal/error.
 
 - [ ] **Step 3: Verify RED**
 
@@ -522,7 +522,7 @@ git commit -m "feat: AI 增加产品操作受限撤销"
 - Modify: `src/offerpilot/review_readiness/repository.py`
 - Modify: `src/offerpilot/api.py`
 - Create: `tests/test_review_readiness_projection.py`
-- Create: `tests/test_event_lifecycle_v1.py`
+- Modify: `tests/test_event_lifecycle_v1.py`
 - Modify: `tests/test_interview_index_api.py`
 - Modify: `web/src/features/interviewEvents/eventLifecycle.test.ts`
 
@@ -541,7 +541,7 @@ uv run pytest tests/test_event_lifecycle_v1.py tests/test_review_readiness_proje
 - [ ] **Step 3: Implement one canonical aggregate loader and fingerprints**
 
 Compute `practice_source_fingerprint_v1` from Signal/Version plus all Evidence ordered by ordinal; compute `practice_target_fingerprint_v1` from the exact authoritative Event. Expose only bounded statement/user note/evidence/detail labels and safe hashes; never return Note/Proposal snapshots, Operation or token.
-Implement `classify_event_lifecycle_v1(status: object)` as the only backend classifier; Candidate, advisory, Practice and Preparation import it and never infer lifecycle from dates.
+Reuse the Task 3 `classify_event_lifecycle_v1(status: object)` unchanged. Add mechanical import/AST assertions that Candidate, advisory, Practice and Preparation all import it and contain no local status classifier or date-based lifecycle inference.
 
 - [ ] **Step 4: Add the four read APIs**
 

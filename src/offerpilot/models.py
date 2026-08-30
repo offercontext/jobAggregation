@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
@@ -20,12 +21,23 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.engine.interfaces import Dialect
 
 
 class ExactInteger(Integer):
     """Integer semantics with no SQLite integer affinity coercion."""
 
     cache_ok = True
+
+    def bind_processor(self, dialect: Dialect) -> Callable[[Any], Any]:
+        parent_processor = super().bind_processor(dialect)
+
+        def process(value: Any) -> Any:
+            if value is not None and type(value) is not int:
+                raise TypeError("exact integer values require type(value) is int")
+            return parent_processor(value) if parent_processor is not None else value
+
+        return process
 
 
 @compiles(ExactInteger, "sqlite")
@@ -2266,7 +2278,8 @@ class WriteOperation(Base):
             "AND delivery_next_operation_id IS NULL AND delivered_at IS NOT NULL "
             "AND delivery_failure_code IS NOT NULL) OR "
             "(status <> 'proposed' AND operation_role = 'compensation' AND delivery_status = 'not_applicable' "
-            "AND delivery_generation = 0 AND delivery_outcome = 'none' AND delivery_message_count = 0 "
+            "AND delivery_generation = 0 AND delivery_outcome IS NOT NULL "
+            "AND delivery_outcome = 'none' AND delivery_message_count = 0 "
             "AND delivery_owner_token_fingerprint IS NULL AND delivery_lease_expires_at IS NULL "
             "AND delivery_manifest_sha256 IS NULL AND delivery_next_operation_id IS NULL "
             "AND delivery_failure_code IS NULL AND delivered_at IS NOT NULL "
@@ -2275,7 +2288,8 @@ class WriteOperation(Base):
             "(status <> 'proposed' AND operation_role = 'primary' "
             "AND adapter_kind = 'product_action' "
             "AND delivery_status = 'not_applicable' AND delivery_generation = 0 "
-            "AND delivery_outcome IS NULL AND delivery_message_count = 0 "
+            "AND delivery_outcome IS NOT NULL AND delivery_outcome = 'none' "
+            "AND delivery_message_count = 0 "
             "AND delivery_owner_token_fingerprint IS NULL "
             "AND delivery_lease_expires_at IS NULL "
             "AND delivery_manifest_sha256 IS NULL "

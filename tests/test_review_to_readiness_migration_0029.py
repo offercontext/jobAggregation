@@ -7,9 +7,12 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError as SQLAlchemyIntegrityError
+from sqlalchemy.exc import StatementError
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session
 
 import offerpilot.db as database
 from offerpilot.db import init_database
@@ -37,7 +40,7 @@ SHA_B = "sha256:" + "b" * 64
 SHA_C = "sha256:" + "c" * 64
 UUID_KEY = "10000000-0000-4000-8000-000000000001"
 FIXTURE_DIRECTORY = Path(__file__).parent / "fixtures" / "review_readiness"
-PRE_0029_SCHEMA_SHA256 = "ea678cb458fd2f2f1b5aa807617ff06de917e9b451fd3f293625f20b5cbe682c"
+PRE_0029_SCHEMA_SHA256 = "39eb6d1e8a5fc924460f2ac9e36e3e8f6c20e56f72bf77f364b89121c120b72d"
 
 
 def _dispose(factory) -> None:  # type: ignore[no-untyped-def]
@@ -57,6 +60,17 @@ def migrated_db(tmp_path: Path) -> Iterator[tuple[Path, sqlite3.Connection]]:
         connection.close()
 
 
+@pytest.fixture(scope="module")
+def exact_integer_sqlalchemy_engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Engine]:
+    db_path = tmp_path_factory.mktemp("exact-integer-bind") / "bind.db"
+    factory = init_database(db_path)
+    engine = factory.kw["bind"]
+    try:
+        yield engine
+    finally:
+        engine.dispose()
+
+
 def _table_columns(connection: sqlite3.Connection, table: str) -> dict[str, tuple[object, ...]]:
     return {str(row[1]): row for row in connection.execute(f"PRAGMA table_info({table})")}
 
@@ -65,12 +79,31 @@ def _uuid(seed: int) -> str:
     return f"00000000-0000-4000-8000-{seed:012d}"
 
 
+def _product_route_values(seed: int) -> dict[str, object]:
+    return {
+        "operation_id": _uuid(seed),
+        "action_call_id": _uuid(seed + 1),
+        "action_name": "confirm_interview_story",
+        "request_origin": "current",
+        "schema_version": 1,
+        "source_kind": "story_proposal",
+        "source_id": 1,
+        "source_revision": 1,
+        "route_payload_json": "{}",
+        "route_payload_fingerprint": HMAC_A,
+        "route_binding_fingerprint": HMAC_B,
+        "request_idempotency_fingerprint": HMAC_C,
+        "semantic_claim_fingerprint": None,
+        "historical_request_token_fingerprint": None,
+    }
+
+
 def _create_fixed_pre_0029_database(path: Path) -> None:
     fixture_text = (FIXTURE_DIRECTORY / "pre_0029_0028_schema.sql").read_text(
         encoding="utf-8"
     )
-    normalized_fixture_bytes = fixture_text.replace("\r\n", "\n").encode()
-    assert hashlib.sha256(normalized_fixture_bytes).hexdigest() == PRE_0029_SCHEMA_SHA256
+    fixture_bytes = (FIXTURE_DIRECTORY / "pre_0029_0028_schema.sql").read_bytes()
+    assert hashlib.sha256(fixture_bytes).hexdigest() == PRE_0029_SCHEMA_SHA256
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA foreign_keys = ON")
     try:
@@ -248,37 +281,33 @@ def _insert_fixed_terminal_operation(
           delivery_manifest_sha256,delivery_next_operation_id,delivery_generation,
           delivery_owner_token_fingerprint,delivery_lease_expires_at,created_at,approved_at,
           claimed_at,rejected_at,committed_at,failed_at,delivered_at,updated_at
-        ) VALUES (?,?,?,?,NULL,NULL,?,?,?,'committed',?,?,?, ?,?,?,?,'{\"old\":true}',
-          '逐字结果','{\"transport\":true}',?,?,NULL,NULL,?,NULL,?,?,?,NULL,?,NULL,NULL,
-          '2026-08-29 03:00:00.000001','2026-08-29 03:00:01.000002',
-          '2026-08-29 03:00:02.000003',NULL,'2026-08-29 03:00:03.000004',NULL,
-          '2026-08-29 03:00:03.000004','2026-08-29 03:00:04.000005')
+        ) VALUES (
+          :operation_id,:operation_role,:parent_operation_id,:parent_terminal_sha,
+          NULL,NULL,:tool_call_id,:tool_name,:adapter_kind,'proposed',
+          :fingerprint_key_id,:proposal_fingerprint,NULL,
+          :confirmation_token_fingerprint,:authorization_scope_fingerprint,
+          :operation_request_fingerprint,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+          'pending',NULL,NULL,NULL,NULL,NULL,0,NULL,NULL,
+          '2026-08-29 03:00:00.000001',NULL,NULL,NULL,NULL,NULL,NULL,
+          '2026-08-29 03:00:00.000001'
+        )
         """,
-        (
-            operation_id,
-            operation_role,
-            parent_operation_id,
-            parent_terminal_sha,
-            tool_call_id,
-            tool_name,
-            adapter_kind,
-            UUID_KEY,
-            None if is_compensation else HMAC_A,
-            HMAC_B,
-            None if is_compensation else HMAC_C,
-            None if is_compensation else HMAC_D,
-            HMAC_A,
-            result_contract,
-            undo_json,
-            SHA_C,
-            "not_applicable" if is_compensation else "completed",
-            delivery_outcome,
-            0 if is_compensation else 2,
-            None if is_compensation else SHA_A,
-            0 if is_compensation else 1,
-        ),
+        {
+            "operation_id": operation_id,
+            "operation_role": operation_role,
+            "parent_operation_id": parent_operation_id,
+            "parent_terminal_sha": parent_terminal_sha,
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "adapter_kind": adapter_kind,
+            "fingerprint_key_id": UUID_KEY,
+            "proposal_fingerprint": None if is_compensation else HMAC_A,
+            "confirmation_token_fingerprint": None if is_compensation else HMAC_C,
+            "authorization_scope_fingerprint": None if is_compensation else HMAC_D,
+            "operation_request_fingerprint": HMAC_A if is_compensation else None,
+        },
     )
-    for seq, state in enumerate(("proposed", "approved", "claimed", "committed"), start=1):
+    for seq, state in enumerate(("proposed", "approved", "claimed"), start=1):
         connection.execute(
             "INSERT INTO write_operation_transitions(id,operation_id,seq,state,created_at) "
             "VALUES (?,?,?,?,?)",
@@ -290,6 +319,44 @@ def _insert_fixed_terminal_operation(
                 f"2026-08-29 03:00:0{seq}.{seq:06d}",
             ),
         )
+    connection.execute(
+        """
+        UPDATE write_operations SET
+          status='committed',input_fingerprint=:input_fingerprint,
+          operation_request_fingerprint=:operation_request_fingerprint,
+          result_contract=:result_contract,result_json='{\"old\":true}',
+          visible_result='逐字结果',transport_json='{\"transport\":true}',
+          undo_json=:undo_json,terminal_payload_sha256=:terminal_payload_sha256,
+          delivery_status=:delivery_status,delivery_outcome=:delivery_outcome,
+          delivery_message_count=:delivery_message_count,
+          delivery_manifest_sha256=:delivery_manifest_sha256,
+          delivery_generation=:delivery_generation,
+          approved_at='2026-08-29 03:00:01.000002',
+          claimed_at='2026-08-29 03:00:02.000003',
+          committed_at='2026-08-29 03:00:03.000004',
+          delivered_at='2026-08-29 03:00:03.000004',
+          updated_at='2026-08-29 03:00:04.000005'
+        WHERE id=:operation_id
+        """,
+        {
+            "operation_id": operation_id,
+            "input_fingerprint": HMAC_B,
+            "operation_request_fingerprint": HMAC_A,
+            "result_contract": result_contract,
+            "undo_json": undo_json,
+            "terminal_payload_sha256": SHA_C,
+            "delivery_status": "not_applicable" if is_compensation else "completed",
+            "delivery_outcome": delivery_outcome,
+            "delivery_message_count": 0 if is_compensation else 2,
+            "delivery_manifest_sha256": None if is_compensation else SHA_A,
+            "delivery_generation": 0 if is_compensation else 1,
+        },
+    )
+    connection.execute(
+        "INSERT INTO write_operation_transitions(id,operation_id,seq,state,created_at) "
+        "VALUES (?, ?, 4, 'committed', '2026-08-29 03:00:04.000004')",
+        (_uuid(transition_seed + 4), operation_id),
+    )
 
 
 def _insert_application_graph(
@@ -428,7 +495,7 @@ def _commit_product_primary(
           status='committed',input_fingerprint=?,operation_request_fingerprint=?,
           result_contract='product_action_json_v1',result_json='{}',visible_result='saved',
           transport_json='{}',undo_json='{}',terminal_payload_sha256=?,
-          delivery_status='not_applicable',delivery_outcome=NULL,delivery_message_count=0,
+          delivery_status='not_applicable',delivery_outcome='none',delivery_message_count=0,
           approved_at=CURRENT_TIMESTAMP,claimed_at=CURRENT_TIMESTAMP,
           committed_at=CURRENT_TIMESTAMP,delivered_at=CURRENT_TIMESTAMP
         WHERE id=?
@@ -858,14 +925,84 @@ def test_product_action_exact_integer_columns_reject_real_and_text_affinity_inpu
         )
 
 
-def test_sqlite_boolean_wire_alias_is_not_claimed_as_a_database_rejection(
+@pytest.mark.parametrize("surface", ["core", "orm"])
+@pytest.mark.parametrize(
+    ("column_name", "invalid_value"),
+    [
+        (column_name, invalid_value)
+        for column_name in ("schema_version", "source_id", "source_revision")
+        for invalid_value in (True, 1.0, "1")
+    ],
+)
+def test_exact_integer_sqlalchemy_bind_rejects_before_entering_sqlite_driver(
+    exact_integer_sqlalchemy_engine: Engine,
+    surface: str,
+    column_name: str,
+    invalid_value: object,
+) -> None:
+    values = _product_route_values(116)
+    values[column_name] = invalid_value
+    executed_statements: list[str] = []
+
+    def observe_driver_entry(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        executed_statements.append(statement)
+
+    event.listen(
+        exact_integer_sqlalchemy_engine,
+        "before_cursor_execute",
+        observe_driver_entry,
+    )
+    try:
+        with pytest.raises(StatementError) as exc_info:
+            if surface == "core":
+                with exact_integer_sqlalchemy_engine.begin() as connection:
+                    connection.execute(ProductActionProposal.__table__.insert(), values)
+            else:
+                with Session(exact_integer_sqlalchemy_engine) as session:
+                    session.add(ProductActionProposal(**values))
+                    session.flush()
+        assert isinstance(exc_info.value.orig, TypeError)
+        assert executed_statements == []
+    finally:
+        event.remove(
+            exact_integer_sqlalchemy_engine,
+            "before_cursor_execute",
+            observe_driver_entry,
+        )
+
+
+def test_raw_sqlite_boolean_uses_the_documented_integer_wire_alias(
     migrated_db: tuple[Path, sqlite3.Connection],
 ) -> None:
     _path, connection = migrated_db
-    assert connection.execute("SELECT typeof(?), ? = 1", (True, True)).fetchone() == (
-        "integer",
-        1,
+    operation_id = _uuid(118)
+    action_call_id = _uuid(119)
+    _insert_product_primary(
+        connection,
+        operation_id=operation_id,
+        action_call_id=action_call_id,
+        action_name="confirm_interview_story",
     )
+    _insert_product_route(
+        connection,
+        operation_id=operation_id,
+        action_call_id=action_call_id,
+        action_name="confirm_interview_story",
+        source_kind="story_proposal",
+        schema_version=True,
+    )
+    assert connection.execute(
+        "SELECT schema_version,typeof(schema_version) FROM product_action_proposals "
+        "WHERE operation_id=?",
+        (operation_id,),
+    ).fetchone() == (1, "integer")
 
 
 @pytest.mark.parametrize(
@@ -1166,10 +1303,11 @@ def _attempt_product_commit_with_delivery(
         ("completed", 1, "final_response", 2, None, None, SHA_A, None, True),
         ("completed", 1, "chained_pending", 2, None, None, SHA_A, None, True),
         ("failed", 1, "fallback", 2, None, None, SHA_A, "delivery_failed", True),
-        ("not_applicable", 0, "none", 0, None, None, None, None, True),
+        ("not_applicable", 0, None, 0, None, None, None, None, True),
+        ("not_applicable", 0, "final_response", 0, None, None, None, None, True),
     ],
 )
-def test_product_action_terminal_rejects_chat_delivery_and_legacy_outcomes(
+def test_product_action_terminal_rejects_chat_delivery_and_nonexact_outcomes(
     migrated_db: tuple[Path, sqlite3.Connection],
     delivery_status: str,
     delivery_generation: int,
@@ -1240,7 +1378,7 @@ def test_product_action_committed_requires_action_undo_payload(
             operation_id=operation_id,
             delivery_status="not_applicable",
             delivery_generation=0,
-            delivery_outcome=None,
+            delivery_outcome="none",
             delivery_message_count=0,
             delivered=True,
             undo_json=None,
@@ -1554,7 +1692,7 @@ def test_product_action_rejected_and_failed_terminals_clear_the_route(
             UPDATE write_operations SET status='rejected',operation_request_fingerprint=?,
               result_contract='rejection_json_v1',result_json='{}',visible_result='cancelled',
               transport_json='{}',terminal_payload_sha256=?,delivery_status='not_applicable',
-              delivery_outcome=NULL,delivery_message_count=0,
+              delivery_outcome='none',delivery_message_count=0,
               rejected_at=CURRENT_TIMESTAMP,delivered_at=CURRENT_TIMESTAMP
             WHERE id=?
             """,
@@ -1570,7 +1708,7 @@ def test_product_action_rejected_and_failed_terminals_clear_the_route(
               operation_request_fingerprint=?,result_contract='product_action_json_v1',
               result_json='{}',visible_result='failed',transport_json='{}',
               terminal_payload_sha256=?,failure_category='conflict',failure_code='story_conflict',
-              delivery_status='not_applicable',delivery_outcome=NULL,delivery_message_count=0,
+              delivery_status='not_applicable',delivery_outcome='none',delivery_message_count=0,
               approved_at=CURRENT_TIMESTAMP,claimed_at=CURRENT_TIMESTAMP,
               failed_at=CURRENT_TIMESTAMP,delivered_at=CURRENT_TIMESTAMP
             WHERE id=?
@@ -1857,6 +1995,52 @@ def test_normal_init_upgrades_fixed_0028_history_without_changing_ledger_bytes(
     db_path = tmp_path / "fixed-0028.db"
     _create_fixed_pre_0029_database(db_path)
     with sqlite3.connect(db_path) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type='table'"
+        ).fetchone() == (68,)
+        assert connection.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type='index' AND sql IS NOT NULL"
+        ).fetchone() == (95,)
+        assert connection.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type='trigger'"
+        ).fetchone() == (40,)
+        assert connection.execute(
+            "SELECT version FROM schema_migrations "
+            "WHERE version IN ('0026_write_operation_ledger','0028_scoped_tool_authority') "
+            "ORDER BY version"
+        ).fetchall() == [
+            ("0026_write_operation_ledger",),
+            ("0028_scoped_tool_authority",),
+        ]
+        old_ledger_sql = str(
+            connection.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='table' AND name='write_operations'"
+            ).fetchone()[0]
+        )
+        assert "ck_write_operations_manifest" in old_ledger_sql
+        assert "ck_write_operations_typed_primary_scope_bound" in old_ledger_sql
+        assert "product_action" not in old_ledger_sql
+        old_trigger_names = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger'"
+            )
+        }
+        assert {
+            "trg_write_operation_compensation_insert",
+            "trg_write_operation_terminal_immutable",
+            "trg_write_operation_delivery_generation",
+            "trg_write_operation_delivery_immutable",
+            "trg_write_operation_transition_insert",
+            "trg_write_operation_transition_immutable",
+            "trg_write_operation_transition_delete",
+            "trg_write_operation_scope_insert",
+            "trg_write_operation_scope_fingerprint_immutable",
+            "trg_write_operation_scope_identity_immutable",
+            "trg_write_operation_scope_conversation_immutable",
+            "trg_write_operation_scope_status",
+        } <= old_trigger_names
         operation_columns = [
             str(row[1]) for row in connection.execute("PRAGMA table_info(write_operations)")
         ]
@@ -1898,6 +2082,7 @@ def test_normal_init_upgrades_fixed_0028_history_without_changing_ledger_bytes(
             encoding="utf-8"
         )
     )
+    assert baseline["source_baseline"] == "c5a020cbedd8ff64f6188f51c10d8f4daa7c7dff"
     assert (
         baseline["provider_tools"],
         baseline["legacy_deterministic"],

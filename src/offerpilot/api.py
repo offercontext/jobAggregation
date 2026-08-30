@@ -126,6 +126,7 @@ from offerpilot.product_actions.contracts import (
     ProductActionIntegrityError,
     ProductActionProofRegistryV1,
     decode_product_action_request_v1,
+    materialize_frozen_json,
 )
 from offerpilot.product_actions.coordinator import (
     ProductActionCoordinator,
@@ -134,8 +135,10 @@ from offerpilot.product_actions.coordinator import (
     ProductActionProposalResultV1,
     ProductActionRecoveryV1,
     ProductActionStateV1,
+    seal_interview_story_product_action_handler,
 )
 from offerpilot.product_actions.issuer import (
+    InterviewStoryActionIssuer,
     LedgerKeyProfileStoreV1,
     ReviewReadinessActionIssuer,
 )
@@ -262,6 +265,7 @@ from offerpilot.repositories.interview_practice_cases import (
 )
 from offerpilot.repositories.interview_stories import (
     InterviewStoriesRepository,
+    InterviewStoryProductActionHandler,
     StoryCasConflictError,
     StoryConflictError,
     StoryIdempotencyConflictError,
@@ -1219,6 +1223,20 @@ def create_app(
         session_factory,
         proof_registry=product_action_proofs,
     )
+    interview_story_issuer = InterviewStoryActionIssuer(
+        product_action_catalog,
+        product_action_proofs,
+        product_action_keys,
+    )
+    interview_stories = InterviewStoriesRepository(
+        session_factory,
+        action_issuer=interview_story_issuer,
+        proposal_repository=product_action_proposals,
+        proof_registry=product_action_proofs,
+    )
+    story_product_action_handler = seal_interview_story_product_action_handler(
+        InterviewStoryProductActionHandler(interview_stories)
+    )
     product_action_coordinator = ProductActionCoordinator(
         session_factory,
         catalog=product_action_catalog,
@@ -1228,8 +1246,13 @@ def create_app(
         key_profiles=product_action_keys,
         readiness_repository=readiness_signals,
         capability_check=lambda capability: (
-            capability == "application.interview_readiness_feedback.write"
+            capability
+            in {
+                "application.interview_readiness_feedback.write",
+                "stories.write",
+            }
         ),
+        additional_handlers=(story_product_action_handler,),
     )
     context_source_loader: ContextSourceLoader[Any, Any] = ContextSourceLoader(
         resolved_data_dir / "data.db"
@@ -1275,7 +1298,6 @@ def create_app(
     interview_preparation_proposals = InterviewPreparationProposalsRepository(session_factory)
     interview_knowledge_capture = InterviewKnowledgeCaptureRepository(session_factory)
     interview_index = InterviewIndexRepository(session_factory)
-    interview_stories = InterviewStoriesRepository(session_factory)
     mock_interviews = MockInterviewRepository(session_factory)
     interview_practice_cases = InterviewPracticeCaseRepository(session_factory)
     mock_interview_review_drafts = MockInterviewReviewDraftRepository(session_factory)
@@ -1313,6 +1335,8 @@ def create_app(
     app.state.run_recorder_factory = resolved_run_recorder_factory
     app.state.write_operation_coordinator = write_coordinator
     app.state.product_action_coordinator = product_action_coordinator
+    app.state.interview_stories_repository = interview_stories
+    app.state.product_action_proposal_repository = product_action_proposals
     app.state.knowledge_runtime = knowledge_runtime
 
     @app.middleware("http")
@@ -1386,14 +1410,17 @@ def create_app(
 
     @app.exception_handler(ProductActionContractError)
     async def product_action_contract_exception_handler(
-        _request: Request,
+        request: Request,
         exc: ProductActionContractError,
     ) -> JSONResponse:
-        code = (
-            "product_action_input_too_large"
-            if exc.code == "route_payload_too_large"
-            else "product_action_invalid_request"
-        )
+        if request.url.path.startswith("/api/interview-story-proposals/"):
+            code = "interview_story_invalid_request"
+        else:
+            code = (
+                "product_action_input_too_large"
+                if exc.code == "route_payload_too_large"
+                else "product_action_invalid_request"
+            )
         return JSONResponse(status_code=422, content={"error_code": code})
 
     @app.exception_handler(ProductActionCoordinatorError)
@@ -7293,6 +7320,47 @@ def create_app(
         )
 
     def _story_attempt_response(attempt: dict[str, Any], status_code: int = 200) -> JSONResponse:
+        attempt = dict(attempt)
+        operation_id = attempt.pop("product_action_operation_id", None)
+        if attempt.get("attempt_status") in {"ready", "invalidated"} and isinstance(
+            operation_id,
+            str,
+        ):
+            state = product_action_coordinator.get_state(operation_id)
+            if state.status == "proposed":
+                if interview_stories.product_action_source_is_current(
+                    attempt_id=attempt["id"],
+                    operation_id=operation_id,
+                ):
+                    recovery = product_action_coordinator.recover_story_owner(
+                        attempt_id=attempt["id"],
+                        operation_id=operation_id,
+                    )
+                else:
+                    recovery = product_action_coordinator.recover_story_rejection_control(
+                        attempt_id=attempt["id"],
+                        operation_id=operation_id,
+                    )
+                attempt["product_action"] = {
+                    "operation_id": recovery.operation_id,
+                    "action_call_id": recovery.action_call_id,
+                    "confirmation_token": recovery.confirmation_token,
+                    "action_name": recovery.action_name,
+                }
+                if recovery.rejection_only:
+                    attempt["product_action"]["allowed_decisions"] = list(
+                        recovery.allowed_decisions
+                    )
+                    attempt["product_action"]["rejection_only"] = True
+            else:
+                terminal: dict[str, Any] = {
+                    "operation_id": state.operation_id,
+                    "action_name": state.action_name,
+                    "status": state.status,
+                }
+                if state.result is not None:
+                    terminal["terminal_result"] = dict(state.result)
+                attempt["product_action"] = terminal
         if attempt["attempt_status"] in {"generating", "provider_unknown"}:
             retry_after_ms = interview_stories.get_attempt_retry_after_ms(attempt["id"])
             return JSONResponse(
@@ -7312,6 +7380,8 @@ def create_app(
                 code="story_unverifiable",
             )
         if attempt["attempt_status"] == "invalidated":
+            if "product_action" in attempt:
+                return JSONResponse(attempt, status_code=status_code)
             return error_response(
                 409,
                 "故事来源或版本已变化，请重新确认后再试。",
@@ -7468,6 +7538,19 @@ def create_app(
                 "AI 建议未通过证据校验，请重新开始",
                 code="story_unverifiable",
             )
+        except ProductActionCoordinatorError as exc:
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"error_code": exc.code, "retryable": exc.retryable},
+            )
+        except ProductActionIntegrityError:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error_code": "operation_result_unknown",
+                    "retryable": True,
+                },
+            )
         except Exception:
             interview_stories.mark_provider_unknown(
                 attempt_id=claim.attempt_id,
@@ -7606,9 +7689,18 @@ def create_app(
         return _story_attempt_response(attempt)
 
     @app.post("/api/interview-story-proposals/{attempt_id}/confirm")
-    def confirm_interview_story_proposal(
-        attempt_id: int, payload: dict[str, Any] = Body(...)
+    async def confirm_interview_story_proposal(
+        attempt_id: int,
+        request: Request,
     ) -> JSONResponse:
+        try:
+            payload = decode_product_action_request_v1(await request.body())
+        except ProductActionContractError:
+            return error_response(
+                422,
+                "面试故事输入无效",
+                code="interview_story_invalid_request",
+            )
         allowed = {
             "confirmation_token",
             "content",
@@ -7619,19 +7711,163 @@ def create_app(
         if set(payload) != allowed or not _is_story_confirmation_payload(payload):
             return error_response(422, "面试故事输入无效", code="interview_story_invalid_request")
         try:
-            result = interview_stories.confirm_attempt(attempt_id=attempt_id, **payload)
-            return JSONResponse(
-                {
-                    "story_id": result.story_id,
-                    "version_id": result.version_id,
-                    "created": result.created,
-                },
-                status_code=201 if result.created else 200,
+            plan = interview_stories.prepare_confirmation_decision(
+                attempt_id=attempt_id,
+                confirmation_token=cast(str, payload["confirmation_token"]),
+                content=cast(dict[str, Any], payload["content"]),
+                evidence_links=cast(list[dict[str, Any]], payload["evidence_links"]),
+                expected_current_version_id=cast(
+                    int | None,
+                    payload["expected_current_version_id"],
+                ),
+                expected_story_revision=cast(
+                    int | None,
+                    payload["expected_story_revision"],
+                ),
             )
+            if (
+                plan.terminal_failure_code
+                == "product_action_story_write_conflict"
+            ):
+                return error_response(
+                    409,
+                    "经历素材写入发生冲突，请刷新后重试",
+                    code="product_action_story_write_conflict",
+                )
+            if plan.replay is not None:
+                return JSONResponse(
+                    {
+                        "story_id": plan.replay.story_id,
+                        "version_id": plan.replay.version_id,
+                        "created": False,
+                    },
+                    status_code=200,
+                )
+            if not plan.operation_id or plan.decision is None:
+                raise StoryCasConflictError("story proposal cannot be confirmed")
+            result = product_action_coordinator.decide(
+                operation_id=plan.operation_id,
+                request=dict(plan.decision),
+            )
+            if (
+                result.status == "failed"
+                and result.result.get("code")
+                == "product_action_story_write_conflict"
+            ):
+                return error_response(
+                    409,
+                    "经历素材写入发生冲突，请刷新后重试",
+                    code="product_action_story_write_conflict",
+                )
+            projection = (
+                result.transport.get("legacy_reconciliation_or_replay")
+                if plan.force_replay_projection
+                else result.legacy_projection
+            )
+            if projection is None:
+                raise ProductActionIntegrityError("story_legacy_projection")
+            materialized = materialize_frozen_json(projection)
+            if type(materialized) is not dict:
+                raise ProductActionIntegrityError("story_legacy_projection")
+            body = materialized.get("body")
+            status = materialized.get("status_code")
+            if type(body) is not dict or type(status) is not int:
+                raise ProductActionIntegrityError("story_legacy_projection")
+            return JSONResponse(body, status_code=status)
+        except ProductActionCoordinatorError as exc:
+            if exc.code == "operation_result_unknown":
+                return error_response(
+                    503,
+                    "操作结果暂时无法确认，请使用原请求重试",
+                    code="operation_result_unknown",
+                    details={"retryable": True},
+                )
+            legacy_code = {
+                "product_action_story_write_conflict": "story_cas_conflict",
+                "product_action_revision_conflict": "story_cas_conflict",
+                "story_source_conflict": "story_source_conflict",
+                "product_action_request_conflict": "story_idempotency_conflict",
+                "product_action_stale": "story_conflict",
+            }.get(exc.code)
+            if legacy_code == "story_source_conflict":
+                return _story_error_response(StorySourceConflictError(exc.code))
+            if legacy_code == "story_cas_conflict":
+                return _story_error_response(StoryCasConflictError(exc.code))
+            if legacy_code == "story_idempotency_conflict":
+                return _story_error_response(StoryIdempotencyConflictError(exc.code))
+            return _story_error_response(StoryConflictError(exc.code))
+        except ProductActionContractError as exc:
+            if exc.code == "historical_story_bridge_request_conflict":
+                return _story_error_response(StoryIdempotencyConflictError(exc.code))
+            if exc.code in {
+                "historical_story_bridge_source_changed",
+                "historical_story_bridge_attempt_not_exact_ready",
+            }:
+                return _story_error_response(StorySourceConflictError(exc.code))
+            return _story_error_response(StoryValidationError(exc.code))
         except (KeyError, TypeError, ValueError, StoryValidationError) as exc:
             return _story_error_response(
                 exc if isinstance(exc, StoryValidationError) else StoryValidationError("invalid")
             )
+
+    def _create_next_interview_story_product_action(
+        attempt_id: int,
+        payload: dict[str, Any],
+    ) -> JSONResponse:
+        if (
+            set(payload)
+            != {
+                "expected_generation_revision",
+                "expected_product_action_generation",
+            }
+            or type(payload.get("expected_generation_revision")) is not int
+            or cast(int, payload["expected_generation_revision"]) < 1
+            or type(payload.get("expected_product_action_generation")) is not int
+            or cast(int, payload["expected_product_action_generation"]) < 1
+        ):
+            return error_response(
+                422,
+                "面试故事输入无效",
+                code="interview_story_invalid_request",
+            )
+        try:
+            result = interview_stories.create_next_product_action(
+                attempt_id=attempt_id,
+                expected_generation_revision=cast(
+                    int, payload["expected_generation_revision"]
+                ),
+                expected_product_action_generation=cast(
+                    int, payload["expected_product_action_generation"]
+                ),
+            )
+        except StoryValidationError as exc:
+            return _story_error_response(exc)
+        response: dict[str, Any] = {
+            "schema_version": 1,
+            "contract": "story_product_action_proposal_response_v1",
+            "operation_id": result.operation_id,
+            "action_call_id": result.action_call_id,
+            "product_action_generation": result.product_action_generation,
+            "status": result.status,
+            "proposal_created": result.proposal_created,
+        }
+        if result.confirmation_token is not None:
+            response["confirmation_token"] = result.confirmation_token
+        if result.terminal_result is not None:
+            response["terminal_result"] = dict(result.terminal_result)
+        return JSONResponse(
+            response,
+            status_code=201 if result.proposal_created else 200,
+        )
+
+    @app.post("/api/interview-story-proposals/{attempt_id}/product-actions")
+    async def create_next_interview_story_product_action(
+        attempt_id: int,
+        request: Request,
+    ) -> JSONResponse:
+        payload = decode_product_action_request_v1(await request.body())
+        response = _create_next_interview_story_product_action(attempt_id, payload)
+        return response
 
     @app.get("/{full_path:path}", include_in_schema=False)
     def serve_frontend(full_path: str) -> Response:

@@ -707,9 +707,8 @@ def test_target_story_change_during_provider_immediately_invalidates_the_attempt
     factory.kw["bind"].dispose()
 
 
-def test_confirmation_invalidates_ready_attempt_when_frozen_source_changes(tmp_path) -> None:
+def test_ready_attempt_detects_when_frozen_source_changes(tmp_path) -> None:
     from offerpilot.ai.interview_stories import validate_interview_story_proposal
-    from offerpilot.repositories.interview_stories import StorySourceConflictError
 
     factory = init_database(tmp_path / "story-confirm-source-conflict.db")
     repository = InterviewStoriesRepository(factory)
@@ -739,27 +738,16 @@ def test_confirmation_invalidates_ready_attempt_when_frozen_source_changes(tmp_p
         assert note is not None
         note.questions = "The source has changed after proposal generation."
         session.commit()
-    links = [
-        {
-            key: value
-            for key, value in link.items()
-            if key in {
-                "target_kind", "target_id", "source_kind", "source_stable_id",
-                "source_version_or_snapshot", "source_path", "excerpt", "text_location",
-            }
-        }
-        for link in checked["evidence_links"]
-    ]
-    with pytest.raises(StorySourceConflictError, match="source changed"):
-        repository.confirm_attempt(
-            attempt_id=claim.attempt_id,
-            confirmation_token="story-confirm-source-change-token",
-            content=_manual_content_from_proposal(checked),
-            evidence_links=links,
-            expected_current_version_id=None,
-            expected_story_revision=None,
+    assert checked["proposal_status"] == "normal"
+    with factory() as session:
+        current = materialize_selected_sources(
+            session,
+            [{"source_kind": "interview_note", "source_id": note_id, "path": "/questions"}],
+            ["I own this incident response."],
         )
-    assert repository.get_attempt(claim.attempt_id)["attempt_status"] == "invalidated"
+    assert current.source_fingerprint != claim.source_fingerprint
+    assert repository.get_attempt(claim.attempt_id)["attempt_status"] == "ready"
+    assert not hasattr(repository, "confirm_attempt")
     factory.kw["bind"].dispose()
 
 
@@ -786,7 +774,7 @@ def test_story_assertions_and_evidence_links_reject_duplicates_before_persistenc
     factory.kw["bind"].dispose()
 
 
-def test_story_attempt_replay_heartbeat_and_confirmation_are_fenced(tmp_path) -> None:
+def test_story_attempt_replay_heartbeat_and_ready_publication_are_fenced(tmp_path) -> None:
     from offerpilot.ai.interview_stories import validate_interview_story_proposal
 
     factory = init_database(tmp_path / "story.db")
@@ -828,25 +816,9 @@ def test_story_attempt_replay_heartbeat_and_confirmation_are_fenced(tmp_path) ->
     assert replay_after_old_lease.generation_revision == first.generation_revision
 
     provider_payload = _provider_story_proposal(first.source_snapshot)
-    checked = validate_interview_story_proposal(provider_payload, first.source_snapshot)
-    confirmation_links = [
-        {
-            key: value
-            for key, value in link.items()
-            if key
-            in {
-                "target_kind",
-                "target_id",
-                "source_kind",
-                "source_stable_id",
-                "source_version_or_snapshot",
-                "source_path",
-                "excerpt",
-                "text_location",
-            }
-        }
-        for link in checked["evidence_links"]
-    ]
+    assert validate_interview_story_proposal(
+        provider_payload, first.source_snapshot
+    )["proposal_status"] == "normal"
     assert repository.complete_proposal(
         attempt_id=first.attempt_id,
         generation_revision=first.generation_revision,
@@ -861,31 +833,11 @@ def test_story_attempt_replay_heartbeat_and_confirmation_are_fenced(tmp_path) ->
         attempt.provider_lease_until = datetime(2030, 1, 1)
         session.commit()
 
-    confirmation = repository.confirm_attempt(
-        attempt_id=first.attempt_id,
-        confirmation_token="story-confirmation-key-0001",
-        content=_manual_content_from_proposal(checked),
-        evidence_links=confirmation_links,
-        expected_current_version_id=None,
-        expected_story_revision=None,
-    )
-    replayed_confirmation = repository.confirm_attempt(
-        attempt_id=first.attempt_id,
-        confirmation_token="story-confirmation-key-0001",
-        content=_manual_content_from_proposal(checked),
-        evidence_links=confirmation_links,
-        expected_current_version_id=None,
-        expected_story_revision=None,
-    )
-    assert (replayed_confirmation.story_id, replayed_confirmation.version_id, replayed_confirmation.created) == (
-        confirmation.story_id,
-        confirmation.version_id,
-        False,
-    )
     with factory() as session:
-        assert len(list(session.scalars(select(InterviewStoryVersion)))) == 1
+        assert len(list(session.scalars(select(InterviewStoryVersion)))) == 0
         attempt = session.get(InterviewStoryProposalAttempt, first.attempt_id)
-        assert attempt is not None and attempt.provider_lease_until is None
+        assert attempt is not None and attempt.provider_lease_until == datetime(2030, 1, 1)
+        assert attempt.attempt_status == "ready"
     factory.kw["bind"].dispose()
 
 
@@ -952,7 +904,7 @@ def test_proposal_confirmation_must_use_the_cas_values_frozen_at_claim(tmp_path)
         for link in checked["evidence_links"]
     ]
     with pytest.raises(StoryConflictError, match="confirmation CAS"):
-        repository.confirm_attempt(
+        repository.prepare_confirmation_decision(
             attempt_id=claim.attempt_id,
             confirmation_token="story-frozen-confirm-cas-token",
             content=_manual_content_from_proposal(checked),

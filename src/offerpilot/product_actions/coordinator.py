@@ -426,6 +426,14 @@ class ProductActionHandlerV1(Protocol):
         authorization_binding: tuple[object, ...],
     ) -> ProductActionHandlerResultV1: ...
 
+    def stage_terminal_input_in_session(
+        self,
+        session: Session,
+        *,
+        operation_id: str,
+        effective_payload_sha256: str,
+    ) -> None: ...
+
     def project_committed_terminal(
         self,
         operation_id: str,
@@ -759,6 +767,15 @@ class _ReadinessSignalHandlerV1:
             _json_mapping(undo),
         )
 
+    def stage_terminal_input_in_session(
+        self,
+        session: Session,
+        *,
+        operation_id: str,
+        effective_payload_sha256: str,
+    ) -> None:
+        del session, operation_id, effective_payload_sha256
+
     def project_committed_terminal(
         self,
         operation_id: str,
@@ -839,6 +856,7 @@ def _require_closed_handler_contract(handler: ProductActionHandlerV1) -> None:
         "external_preflight",
         "locked_recheck",
         "execute_in_session",
+        "stage_terminal_input_in_session",
         "project_committed_terminal",
         "project_failed_terminal",
         "terminal_replay_effective_payload_sha256",
@@ -871,6 +889,7 @@ class _SealedProductActionHandlerV1:
         ProductActionPreflightV1 | ProductActionPreClaimDispositionV1,
     ]
     _execute_in_session: Callable[..., ProductActionHandlerResultV1]
+    _stage_terminal_input_in_session: Callable[..., None]
     _project_committed_terminal: Callable[..., ProductActionTerminalProjectionV1]
     _project_failed_terminal: Callable[..., ProductActionTerminalProjectionV1]
     _terminal_replay_effective_payload_sha256: Callable[..., str]
@@ -903,6 +922,10 @@ class _SealedProductActionHandlerV1:
             ("_external_preflight", "external_preflight"),
             ("_locked_recheck", "locked_recheck"),
             ("_execute_in_session", "execute_in_session"),
+            (
+                "_stage_terminal_input_in_session",
+                "stage_terminal_input_in_session",
+            ),
             ("_project_committed_terminal", "project_committed_terminal"),
             ("_project_failed_terminal", "project_failed_terminal"),
             (
@@ -967,6 +990,20 @@ class _SealedProductActionHandlerV1:
     ) -> ProductActionTerminalProjectionV1:
         self._ensure_sealed()
         return self._project_committed_terminal(operation_id, result)
+
+    def stage_terminal_input_in_session(
+        self,
+        session: Session,
+        *,
+        operation_id: str,
+        effective_payload_sha256: str,
+    ) -> None:
+        self._ensure_sealed()
+        self._stage_terminal_input_in_session(
+            session,
+            operation_id=operation_id,
+            effective_payload_sha256=effective_payload_sha256,
+        )
 
     def project_failed_terminal(
         self,
@@ -2295,10 +2332,17 @@ class ProductActionCoordinator:
         )
 
     @classmethod
-    def _verified_decision_transport(
+    def verify_terminal_projection(
         cls,
         bundle: ProductActionBundleV1,
-    ) -> MappingProxyType[str, FrozenJSONValue]:
+    ) -> ProductActionTerminalProjectionV1:
+        """Validate and seal an action-local terminal codec for trusted adapters."""
+
+        if (
+            type(bundle) is not ProductActionBundleV1
+            or bundle.classification != "exact_terminal"
+        ):
+            raise ProductActionIntegrityError("product_action_terminal_transport")
         result = dict(_terminal_result(bundle))
         transport = _terminal_json_object(
             bundle.operation.transport_json,
@@ -2334,7 +2378,12 @@ class ProductActionCoordinator:
                 or bundle.operation.undo_json is not None
             ):
                 raise ProductActionIntegrityError("product_action_terminal_transport")
-            return _frozen_json_mapping(transport)
+            return ProductActionTerminalProjectionV1(
+                _json_mapping(result),
+                cast(str, bundle.operation.visible_result),
+                _json_mapping(transport),
+                None,
+            )
         if status not in {"committed", "failed"}:
             raise ProductActionIntegrityError("product_action_terminal_transport")
         undo = (
@@ -2345,7 +2394,7 @@ class ProductActionCoordinator:
             if bundle.operation.undo_json is not None
             else None
         )
-        projection = cls._require_terminal_projection(
+        return cls._require_terminal_projection(
             ProductActionTerminalProjectionV1(
                 result,
                 bundle.operation.visible_result or "",
@@ -2356,6 +2405,13 @@ class ProductActionCoordinator:
             action_name=bundle.operation.tool_name,
             status=cast(Literal["committed", "failed"], status),
         )
+
+    @classmethod
+    def _verified_decision_transport(
+        cls,
+        bundle: ProductActionBundleV1,
+    ) -> MappingProxyType[str, FrozenJSONValue]:
+        projection = cls.verify_terminal_projection(bundle)
         return _frozen_json_mapping(projection.transport)
 
     def decide(
@@ -2403,6 +2459,10 @@ class ProductActionCoordinator:
                 completion_kind="direct_commit",
             )
         if bundle.classification == "exact_terminal":
+            if bundle.operation.status == "rejected":
+                raise ProductActionCoordinatorError(
+                    "product_action_request_conflict"
+                )
             handler = self._handlers.get(bundle.operation.tool_name)
             if handler is None:
                 raise ProductActionCoordinatorError("product_action_stale")
@@ -2620,9 +2680,17 @@ class ProductActionCoordinator:
                         != route_payload.get("generation_revision")
                         or story_attempt.product_action_generation
                         != route_payload.get("product_action_generation")
-                        or story_attempt.proposal_hash
+                        or (
+                            story_attempt.proposal_hash
+                            if story_attempt.proposal_hash.startswith("sha256:")
+                            else "sha256:" + story_attempt.proposal_hash
+                        )
                         != route_payload.get("proposal_hash")
-                        or story_attempt.source_fingerprint
+                        or (
+                            story_attempt.source_fingerprint
+                            if story_attempt.source_fingerprint.startswith("sha256:")
+                            else "sha256:" + story_attempt.source_fingerprint
+                        )
                         != route_payload.get("source_fingerprint")
                         or story_attempt.target_story_id
                         != route_payload.get("target_story_id")
@@ -2693,6 +2761,12 @@ class ProductActionCoordinator:
                     ),
                 )
                 locked._consume(handler=handler, stage="locked")
+                handler.stage_terminal_input_in_session(
+                    session,
+                    operation_id=operation.id,
+                    effective_payload_sha256=locked.effective_payload_sha256,
+                )
+                session.flush()
                 savepoint = session.begin_nested()
                 try:
                     handler_result = handler.execute_in_session(
@@ -3110,8 +3184,18 @@ class ProductActionCoordinator:
                     and attempt.product_action_generation
                     == route["product_action_generation"]
                     and attempt.product_action_operation_id == bundle.operation.id
-                    and attempt.proposal_hash == route["proposal_hash"]
-                    and attempt.source_fingerprint == route["source_fingerprint"]
+                    and (
+                        attempt.proposal_hash
+                        if attempt.proposal_hash.startswith("sha256:")
+                        else "sha256:" + attempt.proposal_hash
+                    )
+                    == route["proposal_hash"]
+                    and (
+                        attempt.source_fingerprint
+                        if attempt.source_fingerprint.startswith("sha256:")
+                        else "sha256:" + attempt.source_fingerprint
+                    )
+                    == route["source_fingerprint"]
                     and attempt.target_story_id == route["target_story_id"]
                     and attempt.failure_category == ""
                     and attempt.confirmation_token_hash == ""

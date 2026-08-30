@@ -599,6 +599,29 @@ class InterviewStoryAttemptPendingOut(BaseModel):
     retry_after_ms: int = 1000
 
 
+class InterviewStoryProductActionOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    operation_id: str
+    action_call_id: str
+    confirmation_token: str
+    action_name: Literal["confirm_interview_story"]
+
+
+class InterviewStoryProductActionProposalOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1]
+    contract: Literal["story_product_action_proposal_response_v1"]
+    operation_id: str
+    action_call_id: str
+    product_action_generation: int
+    status: Literal["proposed", "rejected", "committed", "failed"]
+    proposal_created: bool
+    confirmation_token: str | None = None
+    terminal_result: dict[str, Any] | None = None
+
+
 class OpportunityFitReviewOut(OpportunityFitReviewSummaryOut):
     source: dict[str, Any]
     triage: dict[str, Any]

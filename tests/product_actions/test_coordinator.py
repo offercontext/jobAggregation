@@ -196,6 +196,15 @@ class _FakeStoryHandler:
         }
         return ProductActionHandlerResultV1(result, "已保存到经历素材。", undo)
 
+    def stage_terminal_input_in_session(
+        self,
+        session: Session,
+        *,
+        operation_id: str,
+        effective_payload_sha256: str,
+    ) -> None:
+        del session, operation_id, effective_payload_sha256
+
     def project_committed_terminal(
         self,
         operation_id: str,
@@ -1537,7 +1546,11 @@ def test_fake_story_handler_uses_action_local_transport_budget_and_completion_ki
     def replaced_projector(*_args, **_kwargs):
         raise AssertionError("sealed registration must snapshot handler methods")
 
+    def replaced_stage(*_args, **_kwargs):
+        raise AssertionError("sealed registration must snapshot handler methods")
+
     handler.project_committed_terminal = replaced_projector  # type: ignore[method-assign]
+    handler.stage_terminal_input_in_session = replaced_stage  # type: ignore[method-assign]
     prepared = _publish_fake_story(coordinator, handler)
 
     direct = coordinator.decide(
@@ -1583,6 +1596,16 @@ def test_fake_story_handler_requires_sealed_registration(tmp_path) -> None:
             capability_check=lambda _capability: True,
             additional_handlers=(handler,),
         )
+
+
+def test_fake_story_handler_requires_exact_terminal_input_stager(tmp_path) -> None:
+    session_factory = init_database(tmp_path / "fake-story-stager-contract.sqlite3")
+    bootstrap = _coordinator(session_factory)
+    handler = _FakeStoryHandler(bootstrap._proof_registry)
+    handler.stage_terminal_input_in_session = None  # type: ignore[method-assign]
+
+    with pytest.raises(TypeError, match="handler contract is invalid"):
+        seal_interview_story_product_action_handler(handler)
 
 
 def test_attempt_bound_story_recovery_exposes_full_then_rejection_only_credentials(

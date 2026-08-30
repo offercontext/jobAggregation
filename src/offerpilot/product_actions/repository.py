@@ -350,8 +350,18 @@ class ProductActionProposalRepository:
             and attempt.product_action_generation
             == payload["product_action_generation"]
             and attempt.product_action_operation_id == operation_id
-            and attempt.proposal_hash == payload["proposal_hash"]
-            and attempt.source_fingerprint == payload["source_fingerprint"]
+            and (
+                attempt.proposal_hash
+                if attempt.proposal_hash.startswith("sha256:")
+                else "sha256:" + attempt.proposal_hash
+            )
+            == payload["proposal_hash"]
+            and (
+                attempt.source_fingerprint
+                if attempt.source_fingerprint.startswith("sha256:")
+                else "sha256:" + attempt.source_fingerprint
+            )
+            == payload["source_fingerprint"]
             and attempt.target_story_id == payload["target_story_id"]
             and attempt.failure_category == ""
             and attempt.confirmation_token_hash == ""
@@ -374,8 +384,18 @@ class ProductActionProposalRepository:
             and attempt.generation_revision == payload["generation_revision"]
             and type(attempt.product_action_generation) is int
             and attempt.attempt_status == "ready"
-            and attempt.proposal_hash == payload["proposal_hash"]
-            and attempt.source_fingerprint == payload["source_fingerprint"]
+            and (
+                attempt.proposal_hash
+                if attempt.proposal_hash.startswith("sha256:")
+                else "sha256:" + attempt.proposal_hash
+            )
+            == payload["proposal_hash"]
+            and (
+                attempt.source_fingerprint
+                if attempt.source_fingerprint.startswith("sha256:")
+                else "sha256:" + attempt.source_fingerprint
+            )
+            == payload["source_fingerprint"]
             and attempt.target_story_id == payload["target_story_id"]
             and payload["product_action_generation"] == 1
             and attempt.product_action_generation == 0
@@ -917,8 +937,21 @@ class ProductActionProposalRepository:
         )
         with self.session_factory() as session:
             try:
-                rows = self._load_rows(session, prepared.operation_id)
-            except DBAPIError:
+                publication_uow = self.begin_publication_uow(session)
+                publication = self.reconcile_publication_in_session(
+                    session,
+                    publication_uow,
+                    prepared,
+                )
+                session.rollback()
+                return publication
+            except ProductActionIntegrityError as exc:
+                try:
+                    session.rollback()
+                except BaseException:
+                    pass
+                if exc.code != "product_action_bundle_unreadable":
+                    raise
                 return ProductActionPublicationV1(
                     "unreadable",
                     prepared.operation_id,
@@ -926,17 +959,39 @@ class ProductActionProposalRepository:
                     None,
                     False,
                 )
-            classification = self._classify_rows(rows)
-            if classification == "all_absent":
-                return ProductActionPublicationV1(
-                    "all_absent",
-                    prepared.operation_id,
-                    prepared.action_call_id,
-                    None,
-                    False,
-                )
-            bundle = self._validated_bundle(rows, expected=prepared)
-            return self._publication_from_bundle(prepared, bundle, created=False)
+
+    def reconcile_publication_in_session(
+        self,
+        session: Session,
+        publication_uow: ProductActionPublicationUoWV1,
+        prepared: PreparedProductActionProposalV1,
+    ) -> ProductActionPublicationV1:
+        """Classify a prepared publication inside the caller's stable writer UoW."""
+
+        validate_prepared_product_action(
+            prepared,
+            catalog=self._catalog,
+            key_profiles=self._key_profiles,
+            require_route_proof=False,
+        )
+        self._require_publication_uow(session, publication_uow)
+        try:
+            rows = self._load_rows(session, prepared.operation_id)
+        except DBAPIError as exc:
+            raise ProductActionIntegrityError(
+                "product_action_bundle_unreadable"
+            ) from exc
+        classification = self._classify_rows(rows)
+        if classification == "all_absent":
+            return ProductActionPublicationV1(
+                "all_absent",
+                prepared.operation_id,
+                prepared.action_call_id,
+                None,
+                False,
+            )
+        bundle = self._validated_bundle(rows, expected=prepared)
+        return self._publication_from_bundle(prepared, bundle, created=False)
 
     def load_bundle(self, operation_id: str) -> ProductActionBundleV1:
         normalized = require_product_action_uuid(operation_id, "operation_id")
@@ -970,6 +1025,13 @@ class ProductActionProposalRepository:
     def _load_rows(self, session: Session, operation_id: str) -> _RawBundleRows:
         # Explicit SQL is intentional: publication verification must not trust the
         # identity map that just flushed the three objects.
+        # Pysqlite does not issue BEGIN for a read-only SQLAlchemy transaction.
+        # Start a real driver transaction so all three SELECTs observe one snapshot
+        # instead of straddling a concurrent atomic bundle publication.
+        connection = session.connection()
+        driver_connection = connection.connection.driver_connection
+        if getattr(driver_connection, "in_transaction", False) is not True:
+            connection.exec_driver_sql("BEGIN")
         operation = session.execute(
             text(
                 "SELECT "

@@ -761,6 +761,14 @@ def _loads_any_name(node: ast.AST, names: set[str]) -> bool:
     )
 
 
+def _loaded_names(node: ast.AST) -> set[str]:
+    return {
+        child.id
+        for child in ast.walk(node)
+        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+    }
+
+
 def _controlled_derivation(node: ast.AST, names: set[str]) -> bool:
     forbidden = (
         ast.Await,
@@ -774,8 +782,10 @@ def _controlled_derivation(node: ast.AST, names: set[str]) -> bool:
         ast.YieldFrom,
         ast.DictComp,
     )
-    return _loads_any_name(node, names) and not any(
-        isinstance(child, forbidden) for child in ast.walk(node)
+    return (
+        _loads_any_name(node, names)
+        and _loaded_names(node) <= names
+        and not any(isinstance(child, forbidden) for child in ast.walk(node))
     )
 
 
@@ -800,22 +810,39 @@ def _simple_assignment(
 def _direct_controlled_call(
     node: ast.AST,
     controlled_names: set[str],
+    context_id_names: set[str],
 ) -> ast.Call | None:
     value = node.value if isinstance(node, ast.Await) else node
     if isinstance(value, ast.Call):
-        controlled_arguments = [
-            argument
-            for argument in (*value.args, *(item.value for item in value.keywords))
-            if _loads_any_name(argument, controlled_names)
-        ]
-        if controlled_arguments and all(
-            _controlled_derivation(argument, controlled_names)
-            or (
-                isinstance(argument, ast.Name)
-                and argument.id in controlled_names
+        arguments = (*value.args, *(item.value for item in value.keywords))
+        allowed_names = controlled_names | context_id_names
+        forbidden = (
+            ast.Await,
+            ast.Call,
+            ast.GeneratorExp,
+            ast.Lambda,
+            ast.ListComp,
+            ast.NamedExpr,
+            ast.SetComp,
+            ast.Yield,
+            ast.YieldFrom,
+            ast.DictComp,
+        )
+        has_controlled_argument = any(
+            _loads_any_name(argument, controlled_names) for argument in arguments
+        )
+        all_arguments_are_closed = all(
+            (
+                bool(_loaded_names(argument))
+                and _loaded_names(argument) <= allowed_names
+                and not any(
+                    isinstance(child, forbidden) for child in ast.walk(argument)
+                )
             )
-            for argument in controlled_arguments
-        ):
+            or isinstance(argument, ast.Constant)
+            for argument in arguments
+        )
+        if has_controlled_argument and all_arguments_are_closed:
             return value
     return None
 
@@ -823,10 +850,15 @@ def _direct_controlled_call(
 def _return_route_sink(
     statement: ast.Return,
     controlled_names: set[str],
+    context_id_names: set[str],
 ) -> tuple[bool, ast.Call | None]:
     if statement.value is None:
         return False, None
-    direct_call = _direct_controlled_call(statement.value, controlled_names)
+    direct_call = _direct_controlled_call(
+        statement.value,
+        controlled_names,
+        context_id_names,
+    )
     if direct_call is not None:
         return True, direct_call
     value = statement.value.value if isinstance(statement.value, ast.Await) else statement.value
@@ -842,6 +874,7 @@ def _decoder_flow_reaches_route_sink(
     *,
     decoder_result_name: str,
     raw_body_name: str | None,
+    context_id_names: set[str],
 ) -> bool:
     controlled_names = {decoder_result_name}
     allowed_stores: set[int] = set()
@@ -858,7 +891,11 @@ def _decoder_flow_reaches_route_sink(
 
         assignment = _simple_assignment(statement)
         assigned_sink = (
-            _direct_controlled_call(assignment[1], controlled_names)
+            _direct_controlled_call(
+                assignment[1],
+                controlled_names,
+                context_id_names,
+            )
             if assignment is not None
             else None
         )
@@ -900,7 +937,11 @@ def _decoder_flow_reaches_route_sink(
                     for name in response_names
                     if _loads_any_name(returned.value, {name})
                 )
-            is_sink, sink_call = _return_route_sink(returned, controlled_names)
+            is_sink, sink_call = _return_route_sink(
+                returned,
+                controlled_names,
+                context_id_names,
+            )
             if not is_sink:
                 continue
             route_sink_seen = True
@@ -919,7 +960,7 @@ def _decoder_flow_reaches_route_sink(
             ) and id(call) not in allowed_sink_calls:
                 return False
 
-    guarded_names = controlled_names | response_names
+    guarded_names = controlled_names | response_names | context_id_names
     for statement in statements:
         for child in ast.walk(statement):
             if (
@@ -959,6 +1000,11 @@ def _unsafe_product_action_http_bodies(tree: ast.AST | None) -> list[str]:
         if ".post(" not in decorator_casefold and ".patch(" not in decorator_casefold:
             continue
         arguments = (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
+        context_id_names = {
+            argument.arg
+            for argument in arguments
+            if argument.arg.endswith("_id") and argument.arg != "request"
+        }
         defaults = (
             *node.args.defaults,
             *(item for item in node.args.kw_defaults if item is not None),
@@ -1027,13 +1073,12 @@ def _unsafe_product_action_http_bodies(tree: ast.AST | None) -> list[str]:
             if (binding := _raw_body_binding(statement)) is not None
         }
         decoder_input = decoder_call.args[0] if decoder_call.args else None
-        bound_input_is_unchanged = False
+        bound_input_is_exclusive = False
         if isinstance(decoder_input, ast.Name) and decoder_input.id in raw_body_sources:
             source_index = raw_body_sources[decoder_input.id]
-            bound_input_is_unchanged = not any(
+            bound_input_is_exclusive = not any(
                 isinstance(child, ast.Name)
                 and child.id == decoder_input.id
-                and not isinstance(child.ctx, ast.Load)
                 for statement in node.body[source_index + 1 : decoder_statement_index]
                 for child in ast.walk(statement)
             )
@@ -1043,9 +1088,16 @@ def _unsafe_product_action_http_bodies(tree: ast.AST | None) -> list[str]:
                 _is_awaited_request_body(decoder_input)
                 or (
                     isinstance(decoder_input, ast.Name)
-                    and bound_input_is_unchanged
+                    and bound_input_is_exclusive
                 )
             )
+        )
+        context_ids_are_unchanged = not any(
+            isinstance(child, ast.Name)
+            and child.id in context_id_names
+            and not isinstance(child.ctx, ast.Load)
+            for statement in node.body
+            for child in ast.walk(statement)
         )
         request_body_calls = [
             child
@@ -1085,6 +1137,7 @@ def _unsafe_product_action_http_bodies(tree: ast.AST | None) -> list[str]:
                 raw_body_name=(
                     decoder_input.id if isinstance(decoder_input, ast.Name) else None
                 ),
+                context_id_names=context_id_names,
             )
         )
         if (
@@ -1092,6 +1145,7 @@ def _unsafe_product_action_http_bodies(tree: ast.AST | None) -> list[str]:
             or len(request_body_calls) != 1
             or request_json_calls
             or not calls_before_decoder_are_safe
+            or not context_ids_are_unchanged
             or not decoder_flow_is_safe
         ):
             violations.append(f"ui:unsafe-product-action-body:{node.name}")
@@ -2728,6 +2782,60 @@ async def decide(operation_id: str, request: Request):
     assert _unsafe_product_action_http_bodies(audit_then_secondary_parse) == [
         "ui:unsafe-product-action-body:decide"
     ]
+
+    aliased_raw_then_secondary_parse = ast.parse(
+        '''
+@router.post("/api/product-actions/{operation_id}/decisions")
+async def decide(operation_id: str, request: Request):
+    raw_body = await request.body()
+    raw_alias = raw_body
+    payload = decode_product_action_request_v1(raw_body, contract="decision")
+    normalized = json.loads(raw_alias)
+    return service.decide(operation_id, normalized, decoded=payload)
+'''
+    )
+    assert _unsafe_product_action_http_bodies(aliased_raw_then_secondary_parse) == [
+        "ui:unsafe-product-action-body:decide"
+    ]
+
+    parsed_request_with_decoder_bypass = ast.parse(
+        '''
+@router.post("/api/product-actions/{operation_id}/decisions")
+async def decide(operation_id: str, request: Request):
+    payload = decode_product_action_request_v1(await request.body(), contract="decision")
+    parsed = parse_request(request)
+    return service.decide(operation_id, parsed, decoded=payload)
+'''
+    )
+    assert _unsafe_product_action_http_bodies(parsed_request_with_decoder_bypass) == [
+        "ui:unsafe-product-action-body:decide"
+    ]
+
+    literal_body_with_decoder_bypass = ast.parse(
+        '''
+@router.post("/api/product-actions/{operation_id}/decisions")
+async def decide(operation_id: str, request: Request):
+    payload = decode_product_action_request_v1(await request.body(), contract="decision")
+    return service.decide(operation_id, {"decision": "approve"}, decoded=payload)
+'''
+    )
+    assert _unsafe_product_action_http_bodies(literal_body_with_decoder_bypass) == [
+        "ui:unsafe-product-action-body:decide"
+    ]
+
+    mixed_decoder_and_uncontrolled_derivation = ast.parse(
+        '''
+@router.post("/api/product-actions/{operation_id}/decisions")
+async def decide(operation_id: str, request: Request):
+    payload = decode_product_action_request_v1(await request.body(), contract="decision")
+    parsed = parse_request(request)
+    normalized = payload or parsed
+    return service.decide(operation_id, normalized)
+'''
+    )
+    assert _unsafe_product_action_http_bodies(
+        mixed_decoder_and_uncontrolled_derivation
+    ) == ["ui:unsafe-product-action-body:decide"]
 
     audit_result_is_not_a_business_sink = ast.parse(
         '''

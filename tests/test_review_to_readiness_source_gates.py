@@ -359,6 +359,12 @@ def _application_event_delete_violations(path: Path, tree: ast.Module) -> list[s
             self.tables = set(parent.tables) if parent is not None else set()
             self.queries = set(parent.queries) if parent is not None else set()
             self.rows = set(parent.rows) if parent is not None else set()
+            self.selection_results = (
+                set(parent.selection_results) if parent is not None else set()
+            )
+            self.scalar_collections = (
+                set(parent.scalar_collections) if parent is not None else set()
+            )
 
         def discard(self, names: set[str]) -> None:
             self.models.difference_update(names)
@@ -366,6 +372,8 @@ def _application_event_delete_violations(path: Path, tree: ast.Module) -> list[s
             self.tables.difference_update(names)
             self.queries.difference_update(names)
             self.rows.difference_update(names)
+            self.selection_results.difference_update(names)
+            self.scalar_collections.difference_update(names)
 
     def local_nodes(scope: ast.AST) -> list[ast.AST]:
         nodes: list[ast.AST] = []
@@ -505,6 +513,44 @@ def _application_event_delete_violations(path: Path, tree: ast.Module) -> list[s
                 for child in ast.walk(node)
             )
 
+        def selection_result_targets_event(node: ast.AST) -> bool:
+            if isinstance(node, ast.Name):
+                return node.id in lineage.selection_results
+            return (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and (
+                    (
+                        node.func.attr in {"execute", "scalars"}
+                        and bool(node.args)
+                        and select_targets_event(node.args[0])
+                    )
+                    or (
+                        node.func.attr in {"unique", "yield_per"}
+                        and selection_result_targets_event(node.func.value)
+                    )
+                )
+            )
+
+        def scalar_collection_targets_event(node: ast.AST) -> bool:
+            if isinstance(node, ast.Name):
+                return node.id in lineage.scalar_collections
+            return (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and (
+                    (
+                        node.func.attr == "scalars"
+                        and bool(node.args)
+                        and select_targets_event(node.args[0])
+                    )
+                    or (
+                        node.func.attr in {"unique", "yield_per"}
+                        and scalar_collection_targets_event(node.func.value)
+                    )
+                )
+            )
+
         def is_event_row_source(node: ast.AST) -> bool:
             if isinstance(node, ast.Name):
                 return node.id in lineage.rows
@@ -515,9 +561,11 @@ def _application_event_delete_violations(path: Path, tree: ast.Module) -> list[s
             if node.func.attr == "scalar":
                 return bool(node.args) and select_targets_event(node.args[0])
             if node.func.attr in {"scalar_one", "scalar_one_or_none"}:
-                return select_targets_event(node.func.value)
+                return selection_result_targets_event(node.func.value)
             if node.func.attr in {"first", "one", "one_or_none"}:
-                return query_targets_event(node.func.value)
+                return query_targets_event(
+                    node.func.value
+                ) or scalar_collection_targets_event(node.func.value)
             return False
 
         def contains_raw_event_delete(node: ast.Call) -> bool:
@@ -531,6 +579,10 @@ def _application_event_delete_violations(path: Path, tree: ast.Module) -> list[s
                 and isinstance(child.value, str)
                 and "delete from application_events"
                 in " ".join(child.value.lower().split())
+                .replace('"', "")
+                .replace("`", "")
+                .replace("[", "")
+                .replace("]", "")
                 for child in ast.walk(node)
             )
 
@@ -570,6 +622,14 @@ def _application_event_delete_violations(path: Path, tree: ast.Module) -> list[s
                     (is_event_table(value), lineage.tables),
                     (query_targets_event(value), lineage.queries),
                     (is_event_row_source(value), lineage.rows),
+                    (
+                        selection_result_targets_event(value),
+                        lineage.selection_results,
+                    ),
+                    (
+                        scalar_collection_targets_event(value),
+                        lineage.scalar_collections,
+                    ),
                 )
                 for matches, known_names in target_sets:
                     if matches and not names.issubset(known_names):
@@ -578,15 +638,7 @@ def _application_event_delete_violations(path: Path, tree: ast.Module) -> list[s
             for candidate in nodes:
                 if not isinstance(candidate, (ast.For, ast.AsyncFor)):
                     continue
-                iterator = candidate.iter
-                is_event_scalar_iter = (
-                    isinstance(iterator, ast.Call)
-                    and isinstance(iterator.func, ast.Attribute)
-                    and iterator.func.attr == "scalars"
-                    and bool(iterator.args)
-                    and select_targets_event(iterator.args[0])
-                )
-                if not is_event_scalar_iter:
+                if not scalar_collection_targets_event(candidate.iter):
                     continue
                 names = assigned_names(candidate.target)
                 if not names.issubset(lineage.rows):
@@ -765,6 +817,12 @@ def _interview_note_mutation_violations(path: Path, tree: ast.Module) -> list[st
             self.tables = set(parent.tables) if parent is not None else set()
             self.queries = set(parent.queries) if parent is not None else set()
             self.rows = set(parent.rows) if parent is not None else set()
+            self.selection_results = (
+                set(parent.selection_results) if parent is not None else set()
+            )
+            self.scalar_collections = (
+                set(parent.scalar_collections) if parent is not None else set()
+            )
             self.revision_values = (
                 set(parent.revision_values) if parent is not None else set()
             )
@@ -782,6 +840,8 @@ def _interview_note_mutation_violations(path: Path, tree: ast.Module) -> list[st
             self.tables.difference_update(names)
             self.queries.difference_update(names)
             self.rows.difference_update(names)
+            self.selection_results.difference_update(names)
+            self.scalar_collections.difference_update(names)
             self.revision_values.difference_update(names)
             self.update_statements.difference_update(names)
             self.revisioned_update_statements.difference_update(names)
@@ -904,6 +964,44 @@ def _interview_note_mutation_violations(path: Path, tree: ast.Module) -> list[st
                 for child in ast.walk(node)
             )
 
+        def selection_result_targets_note(node: ast.AST) -> bool:
+            if isinstance(node, ast.Name):
+                return node.id in lineage.selection_results
+            return (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and (
+                    (
+                        node.func.attr in {"execute", "scalars"}
+                        and bool(node.args)
+                        and select_targets_note(node.args[0])
+                    )
+                    or (
+                        node.func.attr in {"unique", "yield_per"}
+                        and selection_result_targets_note(node.func.value)
+                    )
+                )
+            )
+
+        def scalar_collection_targets_note(node: ast.AST) -> bool:
+            if isinstance(node, ast.Name):
+                return node.id in lineage.scalar_collections
+            return (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and (
+                    (
+                        node.func.attr == "scalars"
+                        and bool(node.args)
+                        and select_targets_note(node.args[0])
+                    )
+                    or (
+                        node.func.attr in {"unique", "yield_per"}
+                        and scalar_collection_targets_note(node.func.value)
+                    )
+                )
+            )
+
         def annotation_targets_note(annotation: ast.expr | None) -> bool:
             return annotation is not None and any(
                 is_note_model(child) for child in ast.walk(annotation)
@@ -923,9 +1021,11 @@ def _interview_note_mutation_violations(path: Path, tree: ast.Module) -> list[st
             if node.func.attr == "scalar":
                 return bool(node.args) and select_targets_note(node.args[0])
             if node.func.attr in {"scalar_one", "scalar_one_or_none"}:
-                return select_targets_note(node.func.value)
+                return selection_result_targets_note(node.func.value)
             if node.func.attr in {"first", "one", "one_or_none"}:
-                return query_targets_note(node.func.value)
+                return query_targets_note(
+                    node.func.value
+                ) or scalar_collection_targets_note(node.func.value)
             return False
 
         def is_revision_values(node: ast.AST) -> bool:
@@ -1031,6 +1131,14 @@ def _interview_note_mutation_violations(path: Path, tree: ast.Module) -> list[st
                     (is_note_table(value), lineage.tables),
                     (query_targets_note(value), lineage.queries),
                     (is_note_row_source(value), lineage.rows),
+                    (
+                        selection_result_targets_note(value),
+                        lineage.selection_results,
+                    ),
+                    (
+                        scalar_collection_targets_note(value),
+                        lineage.scalar_collections,
+                    ),
                     (is_revision_values(value), lineage.revision_values),
                     (is_note_update_statement(value), lineage.update_statements),
                     (
@@ -1042,6 +1150,15 @@ def _interview_note_mutation_violations(path: Path, tree: ast.Module) -> list[st
                     if matches and not names.issubset(known_names):
                         known_names.update(names)
                         changed = True
+            for candidate in nodes:
+                if not isinstance(candidate, (ast.For, ast.AsyncFor)):
+                    continue
+                if not scalar_collection_targets_note(candidate.iter):
+                    continue
+                names = assigned_names(candidate.target)
+                if not names.issubset(lineage.rows):
+                    lineage.rows.update(names)
+                    changed = True
 
         owner = (
             scope.name
@@ -1070,6 +1187,10 @@ def _interview_note_mutation_violations(path: Path, tree: ast.Module) -> list[st
                 and isinstance(child.value, str)
                 and "update interview_notes"
                 in " ".join(child.value.lower().split())
+                .replace('"', "")
+                .replace("`", "")
+                .replace("[", "")
+                .replace("]", "")
                 for child in ast.walk(node)
             )
 
@@ -1322,9 +1443,24 @@ def test_application_event_delete_owner_detector_rejects_direct_sql_and_orm_path
         "    row = session.execute(select(ApplicationEvent)).scalar_one()\n"
         "    session.delete(row)\n"
     )
+    scalars_first_delete = ast.parse(
+        "def delete_event(session):\n"
+        "    row = session.scalars(select(ApplicationEvent)).first()\n"
+        "    session.delete(row)\n"
+    )
+    split_result_delete = ast.parse(
+        "def delete_event(session):\n"
+        "    result = session.execute(select(ApplicationEvent))\n"
+        "    row = result.scalar_one()\n"
+        "    session.delete(row)\n"
+    )
     raw_text_delete = ast.parse(
         "def delete_event(connection):\n"
         "    connection.exec_driver_sql('DELETE FROM application_events WHERE id = 1')\n"
+    )
+    quoted_raw_text_delete = ast.parse(
+        "def delete_event(connection):\n"
+        "    connection.exec_driver_sql('DELETE FROM \"application_events\" WHERE id = 1')\n"
     )
     owner = ast.parse(
         "def _delete_application_event_owned(session):\n"
@@ -1340,7 +1476,10 @@ def test_application_event_delete_owner_detector_rejects_direct_sql_and_orm_path
     assert _application_event_delete_violations(arbitrary, table_delete)
     assert _application_event_delete_violations(arbitrary, query_delete)
     assert _application_event_delete_violations(arbitrary, execute_scalar_delete)
+    assert _application_event_delete_violations(arbitrary, scalars_first_delete)
+    assert _application_event_delete_violations(arbitrary, split_result_delete)
     assert _application_event_delete_violations(arbitrary, raw_text_delete)
+    assert _application_event_delete_violations(arbitrary, quoted_raw_text_delete)
     assert _application_event_delete_violations(approved, owner) == []
 
 
@@ -1361,11 +1500,20 @@ def test_application_event_delete_owner_detector_keeps_lineage_in_lexical_scope(
         "    row = session.get(InterviewNote, 1)\n"
         "    session.delete(row)\n"
     )
+    unrelated_scalar_results = ast.parse(
+        "def delete_note(session):\n"
+        "    first = session.scalars(select(InterviewNote)).first()\n"
+        "    session.delete(first)\n"
+        "    result = session.execute(select(InterviewNote))\n"
+        "    second = result.scalar_one()\n"
+        "    session.delete(second)\n"
+    )
     arbitrary = ROOT / "src" / "offerpilot" / "other.py"
 
     assert _application_event_delete_violations(arbitrary, cross_function_row) == []
     assert _application_event_delete_violations(arbitrary, unrelated_event_parameter) == []
     assert _application_event_delete_violations(arbitrary, interview_note_row) == []
+    assert _application_event_delete_violations(arbitrary, unrelated_scalar_results) == []
 
 
 def test_interview_note_mutation_detector_requires_revisioned_owners() -> None:
@@ -1389,6 +1537,21 @@ def test_interview_note_mutation_detector_requires_revisioned_owners() -> None:
     query_update = ast.parse(
         "def mutate(session):\n"
         "    session.query(InterviewNote).update({'questions': 'changed'})\n"
+    )
+    scalars_one_assignment = ast.parse(
+        "def mutate(session):\n"
+        "    row = session.scalars(select(InterviewNote)).one()\n"
+        "    row.questions = 'changed'\n"
+    )
+    scalar_iteration_assignment = ast.parse(
+        "def mutate(session):\n"
+        "    rows = session.scalars(select(InterviewNote))\n"
+        "    for row in rows:\n"
+        "        row.questions = 'changed'\n"
+    )
+    quoted_raw_update = ast.parse(
+        "def mutate(connection):\n"
+        "    connection.exec_driver_sql('UPDATE \"interview_notes\" SET questions = 1')\n"
     )
     approved_owner = ast.parse(
         "def update(session):\n"
@@ -1431,6 +1594,9 @@ def test_interview_note_mutation_detector_requires_revisioned_owners() -> None:
     assert _interview_note_mutation_violations(arbitrary, direct_bulk_update)
     assert _interview_note_mutation_violations(arbitrary, table_update)
     assert _interview_note_mutation_violations(arbitrary, query_update)
+    assert _interview_note_mutation_violations(arbitrary, scalars_one_assignment)
+    assert _interview_note_mutation_violations(arbitrary, scalar_iteration_assignment)
+    assert _interview_note_mutation_violations(arbitrary, quoted_raw_update)
     assert _interview_note_mutation_violations(notes_owner, approved_owner) == []
     assert _interview_note_mutation_violations(notes_owner, approved_scoped_owner) == []
     assert _interview_note_mutation_violations(events_owner, approved_event_owner) == []
@@ -1445,6 +1611,8 @@ def test_interview_note_mutation_detector_avoids_read_and_unrelated_writes() -> 
         "    observed = row.questions\n"
         "    other.questions = 'unrelated'\n"
         "    created = InterviewNote(questions='new')\n"
+        "    for event in session.scalars(select(ApplicationEvent)):\n"
+        "        event.questions = 'unrelated'\n"
         "    return observed, created\n"
     )
     arbitrary = ROOT / "src" / "offerpilot" / "other.py"

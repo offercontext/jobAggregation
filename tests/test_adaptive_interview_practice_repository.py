@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import select, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from offerpilot.db import init_database
@@ -29,7 +29,9 @@ from offerpilot.review_readiness.candidates import (
     project_readiness_candidates,
     resolve_readiness_candidates,
 )
-from offerpilot.review_readiness.projection import project_practice_focus
+from offerpilot.review_readiness.projection import (
+    project_practice_focus,
+)
 from offerpilot.review_readiness.repository import ReadinessSignalRepository
 from offerpilot.repositories.adaptive_interview_practice import (
     AdaptivePracticeConflict,
@@ -349,7 +351,7 @@ def test_legacy_new_creation_is_retired_but_existing_replay_survives(tmp_path) -
         session_factory,
         proposal_id=proposal_id,
     )
-    replay, replay_created = repository.start(
+    replay, replay_created = repository.replay_legacy_start(
         proposal_id=proposal_id,
         focus_id=focus_id,
         expected_source_fingerprint=source_fingerprint,
@@ -363,7 +365,7 @@ def test_legacy_new_creation_is_retired_but_existing_replay_survives(tmp_path) -
     assert replay["interview_note_id"] == note_id
     assert repository.list_recommendations() == []
     with pytest.raises(AdaptivePracticeGone, match="retired"):
-        repository.start(
+        repository.replay_legacy_start(
             proposal_id=proposal_id,
             focus_id="focus-reflection",
             expected_source_fingerprint="sha256:" + "a" * 64,
@@ -380,7 +382,7 @@ def test_legacy_replay_rejects_changed_idempotent_input(tmp_path) -> None:
     )
 
     with pytest.raises(AdaptivePracticeConflict, match="idempotency"):
-        repository.start(
+        repository.replay_legacy_start(
             proposal_id=proposal_id,
             focus_id=focus_id,
             expected_source_fingerprint=source_fingerprint + "-changed",
@@ -458,7 +460,7 @@ def test_deleted_application_hides_recommendations_and_plans(tmp_path) -> None:
     with pytest.raises(AdaptivePracticeNotFound):
         repository.get(plan_id)
     with pytest.raises(AdaptivePracticeNotFound):
-        repository.start(
+        repository.replay_legacy_start(
             proposal_id=proposal_id,
             focus_id=focus_id,
             expected_source_fingerprint=source_fingerprint,
@@ -552,7 +554,7 @@ def test_v2_start_binds_exact_signal_target_and_primary_evidence(tmp_path) -> No
         persisted = session.get(AdaptivePracticePlan, plan["id"])
         assert persisted is not None
         assert persisted.application_event_id != persisted.target_application_event_id
-        assert persisted.start_input_fingerprint == sha256_text(
+        assert persisted.start_input_fingerprint == "sha256:" + sha256_text(
             canonical_json(
                 {
                     "idempotency_key": start_key,
@@ -671,17 +673,12 @@ def test_v2_start_rejects_changed_fingerprints_and_ineligible_targets(tmp_path) 
             idempotency_key=str(uuid4()),
         )
 
-    source_target_fingerprint = _exact_pair(
-        session_factory,
-        version_id,
-        int(seeded["event_id"]),
-    )[1]
     with pytest.raises(AdaptivePracticeConflict, match="not eligible"):
         repository.start_v2(
             readiness_signal_version_id=version_id,
             target_application_event_id=int(seeded["event_id"]),
             expected_source_fingerprint=source_fingerprint,
-            expected_target_fingerprint=source_target_fingerprint,
+            expected_target_fingerprint="sha256:" + "c" * 64,
             idempotency_key=str(uuid4()),
         )
 
@@ -714,17 +711,12 @@ def test_v2_start_rejects_changed_fingerprints_and_ineligible_targets(tmp_path) 
         session.commit()
         other_application_id = other_application.id
     other_target_id = _add_target(session_factory, other_application_id)
-    other_target_fingerprint = _exact_pair(
-        session_factory,
-        version_id,
-        other_target_id,
-    )[1]
-    with pytest.raises(AdaptivePracticeConflict, match="not eligible"):
+    with pytest.raises(AdaptivePracticeNotFound):
         repository.start_v2(
             readiness_signal_version_id=version_id,
             target_application_event_id=other_target_id,
             expected_source_fingerprint=source_fingerprint,
-            expected_target_fingerprint=other_target_fingerprint,
+            expected_target_fingerprint="sha256:" + "d" * 64,
             idempotency_key=str(uuid4()),
         )
     with session_factory() as session:
@@ -970,6 +962,127 @@ def test_v2_integrity_failure_without_persisted_winner_is_unavailable(
             expected_target_fingerprint=target_fingerprint,
             idempotency_key=str(uuid4()),
         )
+
+
+@pytest.mark.parametrize("operation", ["list", "get"])
+def test_plan_read_storage_failures_are_unavailable(tmp_path, monkeypatch, operation: str) -> None:
+    session_factory, _, _, _, proposal_id = _setup(tmp_path)
+    plan_id, _focus_id, _source_fingerprint, _start_key = _seed_legacy_plan(
+        session_factory,
+        proposal_id=proposal_id,
+    )
+    repository = AdaptivePracticeRepository(session_factory)
+
+    def fail_read(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise OperationalError("SELECT", {}, RuntimeError("offline"))
+
+    if operation == "list":
+        monkeypatch.setattr(Session, "scalars", fail_read)
+        with pytest.raises(AdaptivePracticeUnavailable):
+            repository.list_plans()
+    else:
+        monkeypatch.setattr(Session, "get", fail_read)
+        with pytest.raises(AdaptivePracticeUnavailable):
+            repository.get(plan_id)
+
+
+def test_begin_and_idempotency_lookup_storage_failures_are_unavailable(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    (
+        session_factory,
+        _seeded,
+        version_id,
+        target_id,
+        source_fingerprint,
+        target_fingerprint,
+    ) = _seed_v2(tmp_path)
+    repository = AdaptivePracticeRepository(session_factory)
+    request = {
+        "readiness_signal_version_id": version_id,
+        "target_application_event_id": target_id,
+        "expected_source_fingerprint": source_fingerprint,
+        "expected_target_fingerprint": target_fingerprint,
+        "idempotency_key": str(uuid4()),
+    }
+
+    def fail_storage(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise OperationalError("SELECT", {}, RuntimeError("offline"))
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(Session, "execute", fail_storage)
+        with pytest.raises(AdaptivePracticeUnavailable):
+            repository.start_v2(**request)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(Session, "scalar", fail_storage)
+        with pytest.raises(AdaptivePracticeUnavailable):
+            repository.start_v2(**request)
+
+
+def test_non_integrity_commit_failures_are_unavailable(tmp_path, monkeypatch) -> None:
+    (
+        session_factory,
+        _seeded,
+        version_id,
+        target_id,
+        source_fingerprint,
+        target_fingerprint,
+    ) = _seed_v2(tmp_path)
+    repository = AdaptivePracticeRepository(session_factory)
+    request = {
+        "readiness_signal_version_id": version_id,
+        "target_application_event_id": target_id,
+        "expected_source_fingerprint": source_fingerprint,
+        "expected_target_fingerprint": target_fingerprint,
+        "idempotency_key": str(uuid4()),
+    }
+
+    def fail_commit(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise OperationalError("COMMIT", {}, RuntimeError("offline"))
+
+    monkeypatch.setattr(Session, "commit", fail_commit)
+    with pytest.raises(AdaptivePracticeUnavailable):
+        repository.start_v2(**request)
+
+
+def test_completion_storage_failures_are_unavailable(tmp_path, monkeypatch) -> None:
+    (
+        session_factory,
+        _seeded,
+        version_id,
+        target_id,
+        source_fingerprint,
+        target_fingerprint,
+    ) = _seed_v2(tmp_path)
+    repository = AdaptivePracticeRepository(session_factory)
+    plan, _ = repository.start_v2(
+        readiness_signal_version_id=version_id,
+        target_application_event_id=target_id,
+        expected_source_fingerprint=source_fingerprint,
+        expected_target_fingerprint=target_fingerprint,
+        idempotency_key=str(uuid4()),
+    )
+
+    def fail_storage(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise OperationalError("COMMIT", {}, RuntimeError("offline"))
+
+    completion = {
+        "plan_id": plan["id"],
+        "expected_revision": 1,
+        "response_text": "回答",
+        "reflection_text": "",
+        "self_assessment": "clearer",
+        "idempotency_key": str(uuid4()),
+    }
+    with monkeypatch.context() as scoped:
+        scoped.setattr(Session, "execute", fail_storage)
+        with pytest.raises(AdaptivePracticeUnavailable):
+            repository.complete(**completion)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(Session, "commit", fail_storage)
+        with pytest.raises(AdaptivePracticeUnavailable):
+            repository.complete(**completion)
 
 
 def test_v2_commit_unknown_recovers_same_idempotency_winner_without_live_reload(

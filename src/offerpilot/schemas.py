@@ -436,12 +436,18 @@ class ProductActionErrorOut(BaseModel):
 
 
 class AdaptivePracticeStartIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", strict=True)
 
-    proposal_id: int
-    focus_id: str
-    expected_source_fingerprint: str
-    idempotency_key: str
+    readiness_signal_version_id: int = Field(gt=0, le=2**63 - 1)
+    target_application_event_id: int = Field(gt=0, le=2**63 - 1)
+    expected_source_fingerprint: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    expected_target_fingerprint: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    idempotency_key: str = Field(
+        pattern=(
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}$"
+        )
+    )
 
 
 class AdaptivePracticeCompleteIn(BaseModel):
@@ -456,8 +462,13 @@ class AdaptivePracticeCompleteIn(BaseModel):
 
 class AdaptivePracticePlanOut(BaseModel):
     id: int
+    origin_contract: Literal[
+        "legacy_review_focus_v1", "confirmed_readiness_signal_v1"
+    ]
     application_id: int
     application_event_id: int
+    target_application_event_id: int | None
+    readiness_signal_version_id: int | None
     interview_note_id: int
     proposal_id: int
     focus_id: str
@@ -471,7 +482,20 @@ class AdaptivePracticePlanOut(BaseModel):
     source_path: str
     source_excerpt: str
     source_fingerprint: str
-    source_status: Literal["current", "changed", "missing"]
+    target_fingerprint: str | None
+    source_status: Literal["current", "changed", "missing"] | None
+    practice_state: Literal[
+        "ready",
+        "in_progress",
+        "completed",
+        "source_changed",
+        "source_missing",
+        "target_changed",
+        "target_missing",
+        "retracted",
+        "not_eligible",
+        "unavailable",
+    ]
     status: Literal["in_progress", "completed"]
     revision: int
     response_text: str

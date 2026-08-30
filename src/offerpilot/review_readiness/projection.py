@@ -64,6 +64,7 @@ _ABSENT: dict[str, JSONValue] = {"state": "absent", "value": None}
 _EVIDENCE_PATHS = frozenset(
     {"/questions", "/self_reflection", "/difficulty_points", "/mood"}
 )
+_PRACTICE_ASSESSMENTS = frozenset({"needs_work", "clearer", "confident"})
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -662,7 +663,7 @@ def project_practice_target(
         if owner_id is None:
             return PracticeTargetProjectionV1("missing")
         if type(owner_id) is not int or owner_id != application_id:
-            return PracticeTargetProjectionV1("not_eligible")
+            return PracticeTargetProjectionV1("missing")
         event = session.get(ApplicationEvent, target_event_id)
         if event is None:
             return PracticeTargetProjectionV1("unavailable")
@@ -866,6 +867,7 @@ def _validate_v2_plan(
             or plan.revision != 1
             or plan.response_text != ""
             or plan.reflection_text != ""
+            or plan.self_assessment != ""
             or plan.completion_idempotency_key is not None
             or plan.completion_fingerprint != ""
             or plan.completed_at is not None
@@ -874,27 +876,42 @@ def _validate_v2_plan(
         return
     if plan.status != "completed" or type(plan.revision) is not int or plan.revision != 2:
         raise _ProjectionIntegrityError("practice_plan_status_invalid")
-    _bounded_text(
+    response_text = _bounded_text(
         plan.response_text,
         "practice_plan_response",
         max_codepoints=8_000,
         max_bytes=32_768,
     )
-    _bounded_text(
+    reflection_text = _bounded_text(
         plan.reflection_text,
         "practice_plan_reflection",
         max_codepoints=4_000,
         max_bytes=16_384,
         allow_empty=True,
     )
+    if type(plan.self_assessment) is not str or plan.self_assessment not in (
+        _PRACTICE_ASSESSMENTS
+    ):
+        raise _ProjectionIntegrityError("practice_plan_self_assessment_invalid")
     _canonical_uuid(
         plan.completion_idempotency_key,
         "practice_plan_completion_key",
     )
-    _require_sha256(
+    completion_fingerprint = _require_sha256(
         plan.completion_fingerprint,
         "practice_plan_completion_fingerprint",
     )
+    expected_completion_fingerprint = _canonical_fingerprint(
+        {
+            "plan_id": plan.id,
+            "expected_revision": 1,
+            "response_text": response_text,
+            "reflection_text": reflection_text,
+            "self_assessment": plan.self_assessment,
+        }
+    )
+    if completion_fingerprint != expected_completion_fingerprint:
+        raise _ProjectionIntegrityError("practice_plan_completion_input_mismatch")
     if not isinstance(plan.completed_at, datetime):
         raise _ProjectionIntegrityError("practice_plan_completed_at_invalid")
 

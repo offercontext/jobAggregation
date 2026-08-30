@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
 from sqlalchemy import select, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from offerpilot.models import (
@@ -75,6 +77,17 @@ _DRILLS = {
 _ASSESSMENTS = {"needs_work", "clearer", "confident"}
 
 
+@contextmanager
+def _storage_session(
+    session_factory: sessionmaker[Session],
+) -> Iterator[Session]:
+    try:
+        with session_factory() as session:
+            yield session
+    except SQLAlchemyError as exc:
+        raise AdaptivePracticeUnavailable("adaptive practice storage is unavailable") from exc
+
+
 def _require_positive_int(value: object, field: str) -> int:
     if type(value) is not int or value < 1 or value > 2**63 - 1:
         raise AdaptivePracticeValidationError(f"adaptive practice {field} is invalid")
@@ -92,6 +105,20 @@ def _require_sha256(value: object, field: str) -> str:
     return value
 
 
+def _require_uuid(value: object, field: str) -> str:
+    if type(value) is not str:
+        raise AdaptivePracticeValidationError(f"adaptive practice {field} is invalid")
+    try:
+        parsed = UUID(value)
+    except (ValueError, AttributeError) as exc:
+        raise AdaptivePracticeValidationError(
+            f"adaptive practice {field} is invalid"
+        ) from exc
+    if str(parsed) != value:
+        raise AdaptivePracticeValidationError(f"adaptive practice {field} is invalid")
+    return value
+
+
 class AdaptivePracticeRepository:
     def __init__(self, session_factory: sessionmaker[Session]):
         self._session_factory = session_factory
@@ -102,31 +129,38 @@ class AdaptivePracticeRepository:
         return []
 
     def list_plans(self) -> list[dict[str, Any]]:
-        with self._session_factory() as session:
-            plans = list(
-                session.scalars(
-                    select(AdaptivePracticePlan)
-                    .join(Application, Application.id == AdaptivePracticePlan.application_id)
-                    .where(Application.deleted_at.is_(None))
-                    .order_by(
-                        AdaptivePracticePlan.created_at.desc(), AdaptivePracticePlan.id.desc()
+        try:
+            with self._session_factory() as session:
+                plans = list(
+                    session.scalars(
+                        select(AdaptivePracticePlan)
+                        .join(Application, Application.id == AdaptivePracticePlan.application_id)
+                        .where(Application.deleted_at.is_(None))
+                        .order_by(
+                            AdaptivePracticePlan.created_at.desc(),
+                            AdaptivePracticePlan.id.desc(),
+                        )
                     )
                 )
-            )
-            return [
-                _plan_json(session, plan)
-                for plan in plans
-                if _plan_context_is_visible(session, plan)
-            ]
+                return [
+                    _plan_json(session, plan)
+                    for plan in plans
+                    if _plan_context_is_visible(session, plan)
+                ]
+        except SQLAlchemyError as exc:
+            raise AdaptivePracticeUnavailable("adaptive practice storage is unavailable") from exc
 
     def get(self, plan_id: int) -> dict[str, Any]:
-        with self._session_factory() as session:
-            plan = _visible_plan(session, plan_id)
-            if plan is None:
-                raise AdaptivePracticeNotFound()
-            return _plan_json(session, plan)
+        try:
+            with self._session_factory() as session:
+                plan = _visible_plan(session, plan_id)
+                if plan is None:
+                    raise AdaptivePracticeNotFound()
+                return _plan_json(session, plan)
+        except SQLAlchemyError as exc:
+            raise AdaptivePracticeUnavailable("adaptive practice storage is unavailable") from exc
 
-    def start(
+    def replay_legacy_start(
         self,
         *,
         proposal_id: int,
@@ -143,21 +177,26 @@ class AdaptivePracticeRepository:
                 }
             )
         )
-        with self._session_factory() as session:
-            session.execute(text("BEGIN IMMEDIATE"))
-            existing = session.scalar(
-                select(AdaptivePracticePlan).where(
-                    AdaptivePracticePlan.start_idempotency_key == idempotency_key
+        try:
+            with self._session_factory() as session:
+                session.execute(text("BEGIN IMMEDIATE"))
+                existing = session.scalar(
+                    select(AdaptivePracticePlan).where(
+                        AdaptivePracticePlan.start_idempotency_key == idempotency_key
+                    )
                 )
-            )
-            if existing is not None:
-                if existing.start_input_fingerprint != request_fingerprint:
-                    raise AdaptivePracticeConflict("adaptive practice idempotency input changed")
-                visible = _visible_plan(session, existing.id)
-                if visible is None:
-                    raise AdaptivePracticeNotFound()
-                return _plan_json(session, visible), False
-            raise AdaptivePracticeGone("adaptive_practice_v1_retired")
+                if existing is not None:
+                    if existing.start_input_fingerprint != request_fingerprint:
+                        raise AdaptivePracticeConflict(
+                            "adaptive practice idempotency input changed"
+                        )
+                    visible = _visible_plan(session, existing.id)
+                    if visible is None:
+                        raise AdaptivePracticeNotFound()
+                    return _plan_json(session, visible), False
+                raise AdaptivePracticeGone("adaptive_practice_v1_retired")
+        except SQLAlchemyError as exc:
+            raise AdaptivePracticeUnavailable("adaptive practice storage is unavailable") from exc
 
     def start_v2(
         self,
@@ -172,17 +211,8 @@ class AdaptivePracticeRepository:
         _require_positive_int(target_application_event_id, "target application event")
         _require_sha256(expected_source_fingerprint, "source fingerprint")
         _require_sha256(expected_target_fingerprint, "target fingerprint")
-        if not isinstance(idempotency_key, str) or not idempotency_key:
-            raise AdaptivePracticeValidationError("adaptive practice idempotency key is invalid")
-        try:
-            parsed_key = UUID(idempotency_key)
-        except (ValueError, AttributeError) as exc:
-            raise AdaptivePracticeValidationError(
-                "adaptive practice idempotency key is invalid"
-            ) from exc
-        if str(parsed_key) != idempotency_key:
-            raise AdaptivePracticeValidationError("adaptive practice idempotency key is invalid")
-        request_fingerprint = sha256_text(
+        _require_uuid(idempotency_key, "idempotency key")
+        request_fingerprint = "sha256:" + sha256_text(
             canonical_json(
                 {
                     "idempotency_key": idempotency_key,
@@ -193,7 +223,7 @@ class AdaptivePracticeRepository:
                 }
             )
         )
-        with self._session_factory() as session:
+        with _storage_session(self._session_factory) as session:
             session.execute(text("BEGIN IMMEDIATE"))
             replay = _load_v2_start_replay(
                 session,
@@ -212,6 +242,10 @@ class AdaptivePracticeRepository:
                 raise AdaptivePracticeUnavailable("adaptive practice source is unavailable")
             if projection.state in {"source_missing", "target_missing"}:
                 raise AdaptivePracticeNotFound()
+            if projection.state in {"in_progress", "completed"}:
+                raise AdaptivePracticeConflict(
+                    f"adaptive practice already started: {projection.state.replace('_', ' ')}"
+                )
             if projection.state != "ready":
                 raise AdaptivePracticeConflict(
                     f"adaptive practice {projection.state.replace('_', ' ')}"
@@ -224,6 +258,18 @@ class AdaptivePracticeRepository:
                 raise AdaptivePracticeConflict("adaptive practice source changed")
             if target.practice_target_fingerprint != expected_target_fingerprint:
                 raise AdaptivePracticeConflict("adaptive practice target changed")
+            duplicate_pair = session.scalar(
+                select(AdaptivePracticePlan.id).where(
+                    AdaptivePracticePlan.origin_contract
+                    == "confirmed_readiness_signal_v1",
+                    AdaptivePracticePlan.readiness_signal_version_id
+                    == readiness_signal_version_id,
+                    AdaptivePracticePlan.target_application_event_id
+                    == target_application_event_id,
+                )
+            )
+            if duplicate_pair is not None:
+                raise AdaptivePracticeConflict("adaptive practice already started")
             if (
                 source.source_event_id is None
                 or source.source_note_id is None
@@ -304,6 +350,13 @@ class AdaptivePracticeRepository:
         reflection = reflection_text.strip()
         if not response or len(response) > 8000 or len(reflection) > 4000:
             raise AdaptivePracticeValidationError("adaptive practice response is invalid")
+        try:
+            response.encode("utf-8")
+            reflection.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise AdaptivePracticeValidationError(
+                "adaptive practice response is invalid"
+            ) from exc
         if self_assessment not in _ASSESSMENTS:
             raise AdaptivePracticeValidationError("adaptive practice assessment is invalid")
         fingerprint = sha256_text(
@@ -317,11 +370,14 @@ class AdaptivePracticeRepository:
                 }
             )
         )
-        with self._session_factory() as session:
+        with _storage_session(self._session_factory) as session:
             session.execute(text("BEGIN IMMEDIATE"))
             plan = _visible_plan(session, plan_id)
             if plan is None:
                 raise AdaptivePracticeNotFound()
+            if plan.origin_contract == "confirmed_readiness_signal_v1":
+                _require_uuid(idempotency_key, "completion idempotency key")
+                fingerprint = "sha256:" + fingerprint
             if plan.completion_idempotency_key == idempotency_key:
                 if plan.completion_fingerprint != fingerprint:
                     raise AdaptivePracticeConflict(

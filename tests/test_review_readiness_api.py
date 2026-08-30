@@ -597,6 +597,7 @@ def test_event_advisory_maps_exact_pair_states_and_ignores_self_assessment(tmp_p
         primary = source.aggregate.evidence[0]
         target_fingerprint = compute_practice_target_fingerprint_v1(target)
         start_idempotency_key = str(uuid4())
+        completion_idempotency_key = str(uuid4())
         plan = AdaptivePracticePlan(
             application_id=int(seeded["application_id"]),
             application_event_id=int(seeded["event_id"]),
@@ -630,8 +631,8 @@ def test_event_advisory_maps_exact_pair_states_and_ignores_self_assessment(tmp_p
             revision=2,
             response_text="Response",
             reflection_text="Reflection",
-            self_assessment="unrelated-private-rating",
-            completion_idempotency_key=str(uuid4()),
+            self_assessment="clearer",
+            completion_idempotency_key=completion_idempotency_key,
             completion_fingerprint="sha256:" + "c" * 64,
             completed_at=datetime.now(timezone.utc),
             origin_contract="confirmed_readiness_signal_v1",
@@ -640,6 +641,18 @@ def test_event_advisory_maps_exact_pair_states_and_ignores_self_assessment(tmp_p
             target_fingerprint=target_fingerprint,
         )
         session.add(plan)
+        session.flush()
+        plan.completion_fingerprint = "sha256:" + sha256_text(
+            canonical_json(
+                {
+                    "plan_id": plan.id,
+                    "expected_revision": 1,
+                    "response_text": plan.response_text,
+                    "reflection_text": plan.reflection_text,
+                    "self_assessment": plan.self_assessment,
+                }
+            )
+        )
         session.commit()
 
     completed = client.get(
@@ -651,7 +664,7 @@ def test_event_advisory_maps_exact_pair_states_and_ignores_self_assessment(tmp_p
     assert item["practiceState"] == "completed"
     assert item["selected"] is True
     assert "self_assessment" not in json.dumps(completed.json())
-    assert "unrelated-private-rating" not in json.dumps(completed.json())
+    assert "clearer" not in json.dumps(completed.json())
     with session_factory() as session:
         stored = session.scalar(
             select(AdaptivePracticePlan).where(
@@ -660,7 +673,18 @@ def test_event_advisory_maps_exact_pair_states_and_ignores_self_assessment(tmp_p
             )
         )
         assert stored is not None
-        stored.self_assessment = "a-different-private-rating"
+        stored.self_assessment = "confident"
+        stored.completion_fingerprint = "sha256:" + sha256_text(
+            canonical_json(
+                {
+                    "plan_id": stored.id,
+                    "expected_revision": 1,
+                    "response_text": stored.response_text,
+                    "reflection_text": stored.reflection_text,
+                    "self_assessment": stored.self_assessment,
+                }
+            )
+        )
         session.commit()
     assert client.get(
         f"/api/applications/{seeded['application_id']}/events/{target_id}/readiness-feedback"

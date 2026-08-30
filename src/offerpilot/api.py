@@ -192,8 +192,10 @@ from offerpilot.repositories.application_outcomes import (
 )
 from offerpilot.repositories.adaptive_interview_practice import (
     AdaptivePracticeConflict,
+    AdaptivePracticeGone,
     AdaptivePracticeNotFound,
     AdaptivePracticeRepository,
+    AdaptivePracticeUnavailable,
     AdaptivePracticeValidationError,
 )
 from offerpilot.repositories.chat import (
@@ -3735,40 +3737,71 @@ def create_app(
 
     @app.get("/api/interview-practice/plans")
     def list_adaptive_practice_plans() -> JSONResponse:
-        return JSONResponse(adaptive_practice.list_plans())
+        try:
+            return JSONResponse(adaptive_practice.list_plans())
+        except AdaptivePracticeUnavailable:
+            return _adaptive_practice_error(503, "adaptive_practice_unavailable")
+
+    @app.get("/api/interview-practice/plans/{plan_id}")
+    def get_adaptive_practice_plan(plan_id: int) -> JSONResponse:
+        try:
+            return JSONResponse(adaptive_practice.get(plan_id))
+        except AdaptivePracticeNotFound:
+            return _adaptive_practice_error(404, "adaptive_practice_not_found")
+        except AdaptivePracticeUnavailable:
+            return _adaptive_practice_error(503, "adaptive_practice_unavailable")
 
     @app.post("/api/interview-practice/plans")
-    def start_adaptive_practice(payload: Any = Body(None)) -> JSONResponse:
-        required = {
-            "proposal_id",
-            "focus_id",
-            "expected_source_fingerprint",
-            "idempotency_key",
-        }
-        if not isinstance(payload, dict) or set(payload) != required:
-            return _adaptive_practice_error(422, "adaptive_practice_invalid_payload")
-        proposal_id = payload.get("proposal_id")
-        if type(proposal_id) is not int or proposal_id <= 0:
-            return _adaptive_practice_error(422, "adaptive_practice_invalid_payload")
-        values = [payload.get(name) for name in required - {"proposal_id"}]
-        if any(not isinstance(value, str) or not value.strip() for value in values):
+    async def start_adaptive_practice(request: Request) -> JSONResponse:
+        try:
+            contract, payload = _decode_adaptive_practice_start(await request.body())
+        except (ProductActionContractError, ValueError):
             return _adaptive_practice_error(422, "adaptive_practice_invalid_payload")
         try:
-            plan, created = adaptive_practice.start(
-                proposal_id=proposal_id,
-                focus_id=payload["focus_id"].strip(),
-                expected_source_fingerprint=payload["expected_source_fingerprint"].strip(),
-                idempotency_key=payload["idempotency_key"].strip(),
-            )
+            if contract == "confirmed_readiness_signal_v1":
+                plan, created = adaptive_practice.start_v2(
+                    readiness_signal_version_id=cast(
+                        int, payload["readiness_signal_version_id"]
+                    ),
+                    target_application_event_id=cast(
+                        int, payload["target_application_event_id"]
+                    ),
+                    expected_source_fingerprint=cast(
+                        str, payload["expected_source_fingerprint"]
+                    ),
+                    expected_target_fingerprint=cast(
+                        str, payload["expected_target_fingerprint"]
+                    ),
+                    idempotency_key=cast(str, payload["idempotency_key"]),
+                )
+            else:
+                plan, created = adaptive_practice.replay_legacy_start(
+                    proposal_id=cast(int, payload["proposal_id"]),
+                    focus_id=cast(str, payload["focus_id"]),
+                    expected_source_fingerprint=cast(
+                        str, payload["expected_source_fingerprint"]
+                    ),
+                    idempotency_key=cast(str, payload["idempotency_key"]),
+                )
+        except AdaptivePracticeValidationError:
+            return _adaptive_practice_error(422, "adaptive_practice_invalid_payload")
+        except AdaptivePracticeGone:
+            return _adaptive_practice_error(410, "adaptive_practice_v1_retired")
         except AdaptivePracticeNotFound:
             return _adaptive_practice_error(404, "adaptive_practice_not_found")
         except AdaptivePracticeConflict as exc:
-            code = (
-                "adaptive_practice_idempotency_conflict"
-                if "idempotency" in str(exc)
-                else "adaptive_practice_source_conflict"
-            )
+            message = str(exc)
+            if "idempotency" in message:
+                code = "adaptive_practice_idempotency_conflict"
+            elif "already started" in message:
+                code = "adaptive_practice_pair_conflict"
+            elif "target" in message or "not eligible" in message:
+                code = "adaptive_practice_target_conflict"
+            else:
+                code = "adaptive_practice_source_conflict"
             return _adaptive_practice_error(409, code)
+        except AdaptivePracticeUnavailable:
+            return _adaptive_practice_error(503, "adaptive_practice_unavailable")
         return JSONResponse(plan, status_code=201 if created else 200)
 
     @app.post("/api/interview-practice/plans/{plan_id}/complete")
@@ -3794,7 +3827,7 @@ def create_app(
                 response_text=payload["response_text"],
                 reflection_text=payload["reflection_text"],
                 self_assessment=payload["self_assessment"],
-                idempotency_key=payload["idempotency_key"].strip(),
+                idempotency_key=payload["idempotency_key"],
             )
         except AdaptivePracticeNotFound:
             return _adaptive_practice_error(404, "adaptive_practice_not_found")
@@ -3807,6 +3840,8 @@ def create_app(
                 else "adaptive_practice_revision_conflict"
             )
             return _adaptive_practice_error(409, code)
+        except AdaptivePracticeUnavailable:
+            return _adaptive_practice_error(503, "adaptive_practice_unavailable")
         return JSONResponse(plan)
 
     @app.get("/api/offers")
@@ -7903,13 +7938,73 @@ def error_response(
     return JSONResponse(payload, status_code=status_code)
 
 
+_ADAPTIVE_PRACTICE_V2_START_KEYS = {
+    "readiness_signal_version_id",
+    "target_application_event_id",
+    "expected_source_fingerprint",
+    "expected_target_fingerprint",
+    "idempotency_key",
+}
+_ADAPTIVE_PRACTICE_V1_START_KEYS = {
+    "proposal_id",
+    "focus_id",
+    "expected_source_fingerprint",
+    "idempotency_key",
+}
+
+
+def _decode_adaptive_practice_start(
+    raw: bytes,
+) -> tuple[Literal["confirmed_readiness_signal_v1", "legacy_review_focus_v1"], dict[str, Any]]:
+    payload = cast(dict[str, Any], decode_product_action_request_v1(raw))
+    keys = set(payload)
+    if keys == _ADAPTIVE_PRACTICE_V2_START_KEYS:
+        for field in ("readiness_signal_version_id", "target_application_event_id"):
+            value = payload[field]
+            if type(value) is not int or not 1 <= value <= 2**63 - 1:
+                raise ValueError(f"{field} must be an exact positive integer")
+        _require_adaptive_practice_sha256(payload["expected_source_fingerprint"])
+        _require_adaptive_practice_sha256(payload["expected_target_fingerprint"])
+        idempotency_key = payload["idempotency_key"]
+        if type(idempotency_key) is not str:
+            raise ValueError("idempotency_key must be a canonical UUID")
+        parsed = UUID(idempotency_key)
+        if str(parsed) != idempotency_key:
+            raise ValueError("idempotency_key must be a canonical UUID")
+        return "confirmed_readiness_signal_v1", payload
+    if keys == _ADAPTIVE_PRACTICE_V1_START_KEYS:
+        proposal_id = payload["proposal_id"]
+        if type(proposal_id) is not int or not 1 <= proposal_id <= 2**63 - 1:
+            raise ValueError("proposal_id must be an exact positive integer")
+        for field in ("focus_id", "expected_source_fingerprint", "idempotency_key"):
+            value = payload[field]
+            if type(value) is not str or not value or value != value.strip():
+                raise ValueError(f"{field} must be a non-empty exact string")
+        return "legacy_review_focus_v1", payload
+    raise ValueError("adaptive practice start body has an unsupported shape")
+
+
+def _require_adaptive_practice_sha256(value: object) -> None:
+    if (
+        type(value) is not str
+        or len(value) != 71
+        or not value.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in value[7:])
+    ):
+        raise ValueError("adaptive practice fingerprint must be canonical sha256")
+
+
 def _adaptive_practice_error(status_code: int, code: str) -> JSONResponse:
     messages = {
         "adaptive_practice_not_found": "练习或来源已不可见，请重新打开页面。",
         "adaptive_practice_source_conflict": "复盘来源已变化，请重新核对后再开始。",
+        "adaptive_practice_target_conflict": "目标面试已变化，请重新核对后再开始。",
+        "adaptive_practice_pair_conflict": "该准备重点与目标面试已有练习记录。",
         "adaptive_practice_idempotency_conflict": "本次操作内容已变化，请重新开始。",
         "adaptive_practice_revision_conflict": "练习状态已变化，请重新加载。",
         "adaptive_practice_invalid_payload": "练习内容不完整，请检查后重试。",
+        "adaptive_practice_v1_retired": "旧版练习创建已停用，请从复盘准备重点重新开始。",
+        "adaptive_practice_unavailable": "练习来源暂时不可用，请稍后重试。",
     }
     return error_response(status_code, messages[code], code=code)
 

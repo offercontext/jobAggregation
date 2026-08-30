@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import event, select, update
+from sqlalchemy import event, func, select, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
@@ -186,7 +186,7 @@ def _target(session_factory, application_id: int, *, status: str = "todo", **val
         return event.id
 
 
-def _completed_plan(
+def _practice_plan(
     session,
     *,
     seeded: dict[str, object],
@@ -197,7 +197,12 @@ def _completed_plan(
     source_path: str,
     source_excerpt: str,
     source_hash: str,
+    completed: bool = True,
+    self_assessment: str | None = None,
 ) -> AdaptivePracticePlan:  # type: ignore[no-untyped-def]
+    plan_id = int(
+        session.scalar(select(func.coalesce(func.max(AdaptivePracticePlan.id), 0))) or 0
+    ) + 1
     start_idempotency_key = str(uuid4())
     start_input_fingerprint = "sha256:" + sha256_text(
         canonical_json(
@@ -210,7 +215,27 @@ def _completed_plan(
             }
         )
     )
+    response_text = "Response" if completed else ""
+    reflection_text = "Reflection" if completed else ""
+    effective_assessment = self_assessment
+    if effective_assessment is None:
+        effective_assessment = "clearer" if completed else ""
+    completion_key = str(uuid4()) if completed else None
+    completion_fingerprint = ""
+    if completed:
+        completion_fingerprint = "sha256:" + sha256_text(
+            canonical_json(
+                {
+                    "plan_id": plan_id,
+                    "expected_revision": 1,
+                    "response_text": response_text,
+                    "reflection_text": reflection_text,
+                    "self_assessment": effective_assessment,
+                }
+            )
+        )
     plan = AdaptivePracticePlan(
+        id=plan_id,
         application_id=int(seeded["application_id"]),
         application_event_id=int(seeded["event_id"]),
         interview_note_id=int(seeded["note_id"]),
@@ -227,14 +252,14 @@ def _completed_plan(
         observation="Observation",
         reason="Reason",
         prompt="Prompt",
-        status="completed",
-        revision=2,
-        response_text="Response",
-        reflection_text="Reflection",
-        self_assessment="improved",
-        completion_idempotency_key=str(uuid4()),
-        completion_fingerprint="sha256:" + "d" * 64,
-        completed_at=datetime.now(timezone.utc),
+        status="completed" if completed else "in_progress",
+        revision=2 if completed else 1,
+        response_text=response_text,
+        reflection_text=reflection_text,
+        self_assessment=effective_assessment,
+        completion_idempotency_key=completion_key,
+        completion_fingerprint=completion_fingerprint,
+        completed_at=datetime.now(timezone.utc) if completed else None,
         origin_contract="confirmed_readiness_signal_v1",
         readiness_signal_version_id=version_id,
         target_application_event_id=target_id,
@@ -832,7 +857,7 @@ def test_target_must_be_exact_distinct_interview_in_same_application(tmp_path) -
             session,
             signal_version_id=version_id,
             target_event_id=cross_app,
-        ).state == "not_eligible"
+        ).state == "target_missing"
         assert project_practice_focus(
             session,
             signal_version_id=version_id,
@@ -910,7 +935,7 @@ def test_direct_focus_checks_source_and_target_scope_before_target_content_or_pl
     finally:
         event.remove(engine, "before_cursor_execute", observe)
 
-    assert cross_scope.state == "not_eligible"
+    assert cross_scope.state == "target_missing"
     assert any("application_events" in item for item in cross_scope_statements)
     assert not any("adaptive_practice_plans" in item for item in cross_scope_statements)
     assert missing_source.state == "source_missing"
@@ -926,7 +951,7 @@ def test_canonical_focus_rejects_every_corrupt_v2_frozen_field(tmp_path) -> None
         target = session.get(ApplicationEvent, target_id)
         assert source.aggregate is not None and target is not None
         primary = source.aggregate.evidence[0]
-        plan = _completed_plan(
+        plan = _practice_plan(
             session,
             seeded=seeded,
             version_id=version_id,
@@ -965,6 +990,8 @@ def test_canonical_focus_rejects_every_corrupt_v2_frozen_field(tmp_path) -> None
         ("reflection_text", "r" * 4_001),
         ("completion_idempotency_key", "not-a-canonical-uuid"),
         ("completion_fingerprint", "not-a-fingerprint"),
+        ("completion_fingerprint", "sha256:" + "d" * 64),
+        ("self_assessment", "mastered"),
         ("completed_at", None),
     )
     for field, value in corruptions:
@@ -992,7 +1019,7 @@ def test_canonical_focus_rejects_every_corrupt_v2_frozen_field(tmp_path) -> None
             )
             assert source.aggregate is not None
             primary = source.aggregate.evidence[0]
-            _completed_plan(
+            _practice_plan(
                 session,
                 seeded=seeded,
                 version_id=target_id,
@@ -1014,7 +1041,7 @@ def test_canonical_focus_rejects_every_corrupt_v2_frozen_field(tmp_path) -> None
         ).state == "unavailable"
 
 
-def test_canonical_focus_deliberately_ignores_private_self_assessment(tmp_path) -> None:
+def test_canonical_focus_rejects_invalid_completed_self_assessment(tmp_path) -> None:
     session_factory, seeded, _signal_id, version_id = _seed_current_signal(tmp_path)
     target_id = _target(session_factory, int(seeded["application_id"]))
     with session_factory() as session:
@@ -1022,7 +1049,7 @@ def test_canonical_focus_deliberately_ignores_private_self_assessment(tmp_path) 
         target = session.get(ApplicationEvent, target_id)
         assert source.aggregate is not None and target is not None
         primary = source.aggregate.evidence[0]
-        plan = _completed_plan(
+        plan = _practice_plan(
             session,
             seeded=seeded,
             version_id=version_id,
@@ -1033,12 +1060,40 @@ def test_canonical_focus_deliberately_ignores_private_self_assessment(tmp_path) 
             source_excerpt=primary.excerpt,
             source_hash=primary.source_field_sha256,
         )
-        plan.self_assessment = "private-corruption-" + "x" * 20_000
+        plan.self_assessment = "mastered"
         assert project_practice_focus(
             session,
             signal_version_id=version_id,
             target_event_id=target_id,
-        ).state == "completed"
+        ).state == "unavailable"
+
+
+def test_canonical_focus_rejects_nonempty_in_progress_self_assessment(tmp_path) -> None:
+    session_factory, seeded, _signal_id, version_id = _seed_current_signal(tmp_path)
+    target_id = _target(session_factory, int(seeded["application_id"]))
+    with session_factory() as session:
+        source = load_canonical_readiness_signal(session, signal_version_id=version_id)
+        target = session.get(ApplicationEvent, target_id)
+        assert source.aggregate is not None and target is not None
+        primary = source.aggregate.evidence[0]
+        _practice_plan(
+            session,
+            seeded=seeded,
+            version_id=version_id,
+            target_id=target_id,
+            source_fingerprint=source.aggregate.practice_source_fingerprint,
+            target_fingerprint=compute_practice_target_fingerprint_v1(target),
+            source_path=primary.source_path,
+            source_excerpt=primary.excerpt,
+            source_hash=primary.source_field_sha256,
+            completed=False,
+            self_assessment="clearer",
+        )
+        assert project_practice_focus(
+            session,
+            signal_version_id=version_id,
+            target_event_id=target_id,
+        ).state == "unavailable"
 
 
 def test_practiced_requires_the_exact_completed_signal_target_pair(tmp_path) -> None:
@@ -1051,7 +1106,7 @@ def test_practiced_requires_the_exact_completed_signal_target_pair(tmp_path) -> 
         event = session.get(ApplicationEvent, target_id)
         assert event is not None
         target_fingerprint = compute_practice_target_fingerprint_v1(event)
-        _completed_plan(
+        _practice_plan(
             session,
             seeded=seeded,
             version_id=version_id,
@@ -1087,7 +1142,7 @@ def test_deleted_historical_plan_target_does_not_poison_a_different_pair(
         deleted_target = session.get(ApplicationEvent, deleted_target_id)
         assert source.aggregate is not None and deleted_target is not None
         primary = source.aggregate.evidence[0]
-        plan = _completed_plan(
+        plan = _practice_plan(
             session,
             seeded=seeded,
             version_id=version_id,
@@ -1126,7 +1181,7 @@ def test_existing_plan_fingerprints_precede_terminal_status(tmp_path) -> None:
         source = load_canonical_readiness_signal(session, signal_version_id=source_version)
         target = session.get(ApplicationEvent, source_target)
         assert source.aggregate is not None and target is not None
-        _completed_plan(
+        _practice_plan(
             session,
             seeded=source_seeded,
             version_id=source_version,
@@ -1152,7 +1207,7 @@ def test_existing_plan_fingerprints_precede_terminal_status(tmp_path) -> None:
         target = session.get(ApplicationEvent, changed_target)
         assert source.aggregate is not None and target is not None
         target_fingerprint = compute_practice_target_fingerprint_v1(target)
-        _completed_plan(
+        _practice_plan(
             session,
             seeded=target_seeded,
             version_id=target_version,
@@ -1275,7 +1330,7 @@ def test_baseline_interview_readiness_module_has_no_signal_dependency() -> None:
     assert "load_canonical_readiness_signal(" in readiness_source
     assert "_validate_v2_plan(" in projection_source
     assert "_validated_exact_v2_plan" not in readiness_source
-    assert "self_assessment" not in projection_source
+    assert "self_assessment" in projection_source
     assert "self_assessment" not in readiness_source
     assert "classify_event_lifecycle_v1(" in readiness_source
     assert ".scheduled_at" not in readiness_source

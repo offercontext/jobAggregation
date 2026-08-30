@@ -2,3 +2,4 @@ tests/fixtures/knowledge/structures/*.md text eol=lf
 tests/fixtures/tool_authority/*.json text eol=lf
 tests/fixtures/review_readiness/*.json text eol=lf
 tests/fixtures/review_readiness/*.sql text eol=lf
+tests/fixtures/core_task_surface/*.json text eol=lf

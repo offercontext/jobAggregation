@@ -112,6 +112,21 @@ describe('resolveApplicationTasks', () => {
     expect(pastTodo.tasks.some((task) => task.taskId === 'application.interview_review')).toBe(false);
   });
 
+  it('keeps an upcoming preparation ahead of a completed-event review', () => {
+    const result = resolveApplicationTasks(base({
+      events: ready([
+        event({ eventId: 31, lifecycle: 'completed', bucket: 'completed', primaryAction: 'record_review', scheduledAtTimestamp: NOW - 2 * 60 * 60_000 }),
+        event({ eventId: 32, scheduledAtTimestamp: NOW + 60 * 60_000 }),
+      ]),
+    }), NOW);
+
+    expect(result.primaryTask?.ref).toEqual({
+      taskId: 'application.interview_prepare',
+      applicationId: 7,
+      eventId: 32,
+    });
+  });
+
   it('does not treat loading/error/absent sources as empty known data', () => {
     const loading = resolveApplicationTasks(base({ application: { status: 'loading' }, events: { status: 'loading' } }), NOW);
     expect(loading.primaryTask).toBeNull();
@@ -216,9 +231,13 @@ describe('resolveApplicationTasks', () => {
   });
 
   it.each(['loading', 'error', 'absent'] as const)('blocks lower work when Pending is %s', (status) => {
-    const result = resolveApplicationTasks(base({ pending: status === 'loading' ? { status } : status === 'error' ? { status } : { status } }), NOW);
+    const result = resolveApplicationTasks(base({
+      pending: status === 'loading' ? { status } : status === 'error' ? { status } : { status },
+      events: ready([event()]),
+    }), NOW);
     expect(result.primaryTask).toBeNull();
     expect(result.issues.some((issue) => issue.reason.startsWith('source_'))).toBe(true);
+    expect(result.tasks.find((task) => task.taskId === 'application.interview_prepare')?.executable).toBe(false);
   });
 
   it('uses an event review only for a safe positive exact event ID', () => {

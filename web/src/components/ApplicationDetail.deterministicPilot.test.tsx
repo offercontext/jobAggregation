@@ -46,7 +46,9 @@ vi.mock('@tanstack/react-query', () => ({
           ? state.jdHistory
           : options.queryKey?.[0] === 'application-jd-detail'
             ? state.jdDetail
-        : null,
+            : options.queryKey?.[0] === 'opportunity-fit-v2-reviews'
+              ? []
+              : null,
     isLoading: state.queryLoading.has(String(options.queryKey?.[0] ?? '')),
     isError: state.queryErrors.has(String(options.queryKey?.[0] ?? '')),
     refetch: state.refetch,
@@ -508,6 +510,83 @@ describe('ApplicationDetail deterministic Pilot JD entry', () => {
     expect(container?.textContent).toContain('面试结束');
     expect(container?.textContent).toContain('查看本轮复盘');
     expect(container?.textContent).not.toContain('准备本轮面试');
+  });
+
+  it('uses the resolver primary interview task when completed and upcoming events coexist', () => {
+    const now = Date.parse('2026-08-29T10:00:00Z');
+    state.events = [
+      {
+        id: 31,
+        application_id: application.id,
+        event_type: 'interview',
+        scheduled_at: '2026-08-29T08:00:00Z',
+        duration_minutes: 45,
+        status: 'done',
+      },
+      {
+        id: 32,
+        application_id: application.id,
+        event_type: 'interview',
+        scheduled_at: '2026-08-29T11:00:00Z',
+        duration_minutes: 45,
+        status: 'todo',
+      },
+    ];
+    const interviewApplication = { ...application, status: 'interview' } as never;
+
+    act(() => root?.render(
+      <ApplicationDetail application={interviewApplication} open onClose={vi.fn()} taskNow={now} />,
+    ));
+
+    const prepare = [...(container?.querySelectorAll('button') ?? [])]
+      .find((button) => button.textContent === '准备本轮面试') as HTMLButtonElement | undefined;
+    expect(prepare).not.toBeUndefined();
+    expect(container?.textContent).not.toContain('完成面试复盘');
+    expect(container?.querySelectorAll('button[type="primary"]')).toHaveLength(1);
+    act(() => prepare?.click());
+    expect(container?.querySelector('[data-core-task-key]')?.getAttribute('data-core-task-key'))
+      .toBe('application.interview_prepare:applicationId=7:eventId=32');
+  });
+
+  it('disables lower task cards when a higher-priority source issue blocks execution', () => {
+    state.events = [
+      {
+        id: 31,
+        application_id: 99,
+        event_type: 'interview',
+        scheduled_at: '2026-08-29T11:00:00Z',
+        duration_minutes: 45,
+        status: 'todo',
+      },
+      {
+        id: 32,
+        application_id: application.id,
+        event_type: 'interview',
+        scheduled_at: '2026-08-29T08:00:00Z',
+        duration_minutes: 45,
+        status: 'done',
+      },
+    ];
+    state.notes = [{ id: 61, application_event_id: null, date: '2026-08-20' }];
+    const interviewApplication = { ...application, status: 'interview' } as never;
+
+    act(() => root?.render(
+      <ApplicationDetail
+        application={interviewApplication}
+        open
+        onClose={vi.fn()}
+        taskNow={Date.parse('2026-08-29T10:00:00Z')}
+      />,
+    ));
+
+    const card = container?.querySelector('[data-task-id="application.general_review"]');
+    const openReview = card?.querySelector('button') as HTMLButtonElement | null;
+    expect(openReview?.disabled).toBe(true);
+    const eventReview = [...(container?.querySelectorAll('button') ?? [])]
+      .find((button) => button.textContent === '记录复盘') as HTMLButtonElement | undefined;
+    expect(eventReview?.disabled).toBe(true);
+    act(() => openReview?.click());
+    expect(container?.querySelector('[data-core-task-key]')).toBeNull();
   });
 
   it('supports keyboard tabs and keeps the progress projection read-only', () => {

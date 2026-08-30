@@ -938,11 +938,15 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
     [resolverNow, taskSnapshot],
   );
   const taskOwnerOpen = taskSurfaceState.phase !== 'closing';
-  const launchMaterialKit = (prefill: { resumeID?: number; jdSnapshot?: string; jdVersionID?: number } = {}, confirmedFitToMaterial = false) => {
+  const launchMaterialKit = (
+    prefill: { resumeID?: number; jdSnapshot?: string; jdVersionID?: number } = {},
+    confirmedFitToMaterial = false,
+    source: TaskLaunchRequest['source'] = 'application_task_card',
+  ) => {
     if (!application) return;
     const request: TaskLaunchRequest = {
       ref: { taskId: 'application.material_kit', applicationId: application.id },
-      source: 'application_task_card',
+      source,
       hints: prefill.resumeID ? { suggestedResumeId: prefill.resumeID } : undefined,
     };
     const result = confirmedFitToMaterial
@@ -1218,20 +1222,21 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
       })
     : undefined;
 
-  const hasCompletedInterview = taskSnapshot.events.status === 'ready'
-    && taskSnapshot.events.value.some((event) => event.lifecycle === 'completed');
-  const completedReviewTask = applicationTaskResolution.tasks.find(
-    (task) => task.taskId === 'application.interview_review' && task.ref.eventId !== undefined,
-  );
+  const headerPrimaryTask = applicationTaskResolution.primaryTask;
   const upcomingPrepareTask = applicationTaskResolution.tasks.find(
     (task) => task.taskId === 'application.interview_prepare' && task.ref.eventId !== undefined && task.executable,
   );
   const upcomingEvent = upcomingPrepareTask?.ref.eventId === undefined
     ? undefined
     : allEvents.find((event) => event.id === upcomingPrepareTask.ref.eventId);
+  const primaryInterviewLifecycle = headerPrimaryTask?.taskId === 'application.interview_prepare'
+    ? 'scheduled'
+    : headerPrimaryTask?.taskId === 'application.interview_review'
+      ? 'completed'
+      : 'unknown';
   const stage = getApplicationWorkspaceStage(application.status, {
-    hasCompletedInterview,
-    hasInterviewReview: Boolean(completedReviewTask?.reason === 'interview_review_available'),
+    lifecycle: application.status === 'interview' ? primaryInterviewLifecycle : undefined,
+    hasInterviewReview: headerPrimaryTask?.reason === 'interview_review_available',
   });
   const stageDataBlocked = application.status === 'interview' && !interviewStageDataReady;
   const stageDataHasError = eventsQuery.isError || notesQuery.isError;
@@ -1240,6 +1245,14 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
     : stage.label;
   const stagePrimaryActionLabel = stageDataBlocked
     ? stageDataHasError ? '重试日程和复盘' : '等待面试进展加载'
+    : application.status === 'interview'
+      ? headerPrimaryTask?.taskId === 'application.interview_prepare'
+        ? '准备本轮面试'
+        : headerPrimaryTask?.taskId === 'application.interview_review'
+          ? headerPrimaryTask.reason === 'interview_review_available' ? '查看本轮复盘' : '完成面试复盘'
+          : headerPrimaryTask
+            ? TASK_COPY[headerPrimaryTask.taskId]?.action ?? '打开当前任务'
+            : '暂无可用操作'
     : stage.primaryActionLabel;
 
   const retryStageData = () => {
@@ -1249,6 +1262,10 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
 
   const runStageAction = () => {
     if (stageDataBlocked) return;
+    if (application.status === 'interview') {
+      if (headerPrimaryTask) launchResolvedTask(headerPrimaryTask, 'application_header');
+      return;
+    }
     switch (stage.action) {
       case 'materials':
         {
@@ -1260,45 +1277,6 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
       case 'written-test':
         setEventFormOpen(true);
         break;
-      case 'interview-prepare': {
-        const task = applicationTaskResolution.tasks.find(
-          (item) => item.taskId === 'application.interview_prepare' && item.ref.eventId !== undefined && item.executable,
-        );
-        if (task?.ref.eventId !== undefined) {
-          launchTask({ ref: task.ref, source: 'application_header', focus: 'current' });
-        } else {
-          setPilotPreparationChoices(canonicalInterviewChoices.preparation);
-          setPilotPreparationChooserOpen(true);
-        }
-        break;
-      }
-      case 'interview-review': {
-        if (!interviewReviewDataReady) {
-          message.warning('面试进展暂不可用，请先完成读取或重试。');
-          break;
-        }
-        if (completedReviewTask) {
-          const eventId = completedReviewTask.ref.eventId;
-          if (eventId === undefined) {
-            setPilotReviewChoices(canonicalInterviewChoices.review);
-            setPilotReviewChooserOpen(true);
-            break;
-          }
-          if (!completedReviewTask.executable) {
-            message.warning('面试复盘当前不可用，请先检查事件与复盘资料。');
-            break;
-          }
-          const linkedNote = noteRecords.find((note) => note.application_event_id === eventId);
-          const result = launchTask({ ref: completedReviewTask.ref, source: 'application_header', focus: 'current' });
-          if (taskLaunchAccepted(result)) setEditingNote(linkedNote ?? null);
-        } else {
-          // A review without a trusted completed Event is not a general
-          // review. Keep the user in the explicit chooser/safe empty state.
-          setPilotReviewChoices(canonicalInterviewChoices.review);
-          setPilotReviewChooserOpen(true);
-        }
-        break;
-      }
       case 'offer': {
         const result = launchTask({
           ref: { taskId: 'application.offer_review', applicationId: application.id },
@@ -1373,19 +1351,22 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
     })),
   ].sort((left, right) => workspaceTimestamp(right.timestamp) - workspaceTimestamp(left.timestamp));
 
-  const launchResolvedTask = (task: ApplicationTaskResolution['tasks'][number]) => {
+  const launchResolvedTask = (
+    task: ApplicationTaskResolution['tasks'][number],
+    source: TaskLaunchRequest['source'] = 'application_task_card',
+  ) => {
     if (!task.executable || externalTaskBlocked) return;
     if (task.taskId === 'application.material_kit') {
       const currentJd = applicationJdQuery.data?.current;
       launchMaterialKit(currentJd ? {
         jdSnapshot: currentJd.jd_text,
         jdVersionID: currentJd.id,
-      } : {});
+      } : {}, false, source);
       return;
     }
     launchTask({
       ref: task.ref,
-      source: 'application_task_card',
+      source,
       focus: task.taskId === 'application.offer_review' ? 'current' : 'overview',
     });
   };
@@ -1454,14 +1435,19 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
               <Button
                 key={choice.eventId}
                 block
-                disabled={externalTaskBlocked}
+                disabled={externalTaskBlocked || !applicationTaskResolution.tasks.some(
+                  (task) => task.taskId === 'application.interview_prepare'
+                    && task.ref.eventId === choice.eventId
+                    && task.executable,
+                )}
                 onClick={() => {
+                  const task = applicationTaskResolution.tasks.find(
+                    (candidate) => candidate.taskId === 'application.interview_prepare'
+                      && candidate.ref.eventId === choice.eventId,
+                  );
+                  if (!task?.executable) return;
                   const result = launchTask({
-                    ref: {
-                      taskId: 'application.interview_prepare',
-                      applicationId: application.id,
-                      eventId: choice.eventId,
-                    },
+                    ref: task.ref,
                     source: 'interview_event_card',
                     focus: 'current',
                   });
@@ -1492,7 +1478,11 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
               <Button
                 key={choice.eventId}
                 block
-                disabled={externalTaskBlocked}
+                disabled={externalTaskBlocked || !applicationTaskResolution.tasks.some(
+                  (task) => task.taskId === 'application.interview_review'
+                    && task.ref.eventId === choice.eventId
+                    && task.executable,
+                )}
                 onClick={() => {
                   const task = applicationTaskResolution.tasks.find(
                     (candidate) => candidate.taskId === 'application.interview_review'
@@ -1614,7 +1604,9 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
               <Button
                 type="primary"
                 size="large"
-                disabled={externalTaskBlocked || (stageDataBlocked && !stageDataHasError)}
+                disabled={externalTaskBlocked
+                  || (stageDataBlocked && !stageDataHasError)
+                  || (application.status === 'interview' && !stageDataBlocked && headerPrimaryTask === null)}
                 onClick={stageDataBlocked ? retryStageData : runStageAction}
               >
                 {stagePrimaryActionLabel}
@@ -1737,9 +1729,14 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
             <div className={styles.taskList}>
               {applicationTaskResolution.tasks.length > 0 ? applicationTaskResolution.tasks.map((task) => {
                 const copy = TASK_COPY[task.taskId] ?? { title: '当前任务', description: '当前任务状态已更新。', action: '查看任务' };
-                const unavailable = externalTaskBlocked || task.availability === 'loading' || task.availability === 'blocked' || task.availability === 'unavailable';
+                const unavailable = externalTaskBlocked || !task.executable || task.availability === 'loading' || task.availability === 'blocked' || task.availability === 'unavailable';
                 return (
-                  <div className={styles.taskCard} key={`${task.taskId}:${task.ref.eventId ?? task.ref.applicationId}`} data-task-id={task.taskId}>
+                  <div
+                    className={styles.taskCard}
+                    key={`${task.taskId}:${task.ref.eventId ?? task.ref.applicationId}`}
+                    data-task-id={task.taskId}
+                    data-primary={task.primary ? 'true' : undefined}
+                  >
                     <div>
                       <Text strong>{copy.title}</Text>
                       <Paragraph type="secondary">{copy.description}</Paragraph>
@@ -1753,7 +1750,7 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
                     </div>
                     <Button
                       size="small"
-                      type={task.primary ? 'primary' : 'default'}
+                      type="default"
                       disabled={unavailable}
                       onClick={() => launchResolvedTask(task)}
                     >
@@ -1856,6 +1853,9 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
               const preparationTask = applicationTaskResolution.tasks.find(
                 (task) => task.taskId === 'application.interview_prepare' && task.ref.eventId === event.id,
               );
+              const reviewTask = applicationTaskResolution.tasks.find(
+                (task) => task.taskId === 'application.interview_review' && task.ref.eventId === event.id,
+              );
               return (
               <div key={event.id} style={{ border: '1px solid #e2e8f0', borderRadius: 8, padding: 12 }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
@@ -1878,15 +1878,11 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
                     {completedEvent && <Button
                       size="small"
                       type="link"
-                      disabled={externalTaskBlocked}
+                      disabled={externalTaskBlocked || !reviewTask?.executable}
                       onClick={() => {
-                        if (externalTaskBlocked) return;
+                        if (externalTaskBlocked || !reviewTask?.executable) return;
                         const result = launchTask({
-                          ref: {
-                            taskId: 'application.interview_review',
-                            applicationId: application.id,
-                            eventId: event.id,
-                          },
+                          ref: reviewTask.ref,
                           source: 'interview_event_card',
                           focus: 'current',
                         });

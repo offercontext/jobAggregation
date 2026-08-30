@@ -363,10 +363,11 @@ export function resolveApplicationTasks(snapshot: FrozenApplicationTaskSnapshot,
   const deduped = new Map<string, InternalTask>();
   for (const task of tasks) { const existing = deduped.get(taskKey(task)); if (!existing || task.priority < existing.priority) deduped.set(taskKey(task), task); }
   const ordered = [...deduped.values()].sort((a, b) => a.priority - b.priority || compareTask(a, b));
-  const first = ordered.find((task) => task.executable) ?? null;
-  const blockerPriority = [...issues.map((issue) => issue.priority), ...ordered.filter((task) => !task.executable).map((task) => task.priority)].reduce((min, value) => Math.min(min, value), Number.POSITIVE_INFINITY);
-  const primaryInternal = first && blockerPriority > first.priority ? first : null;
-  const frozenTasks = ordered.map((task) => Object.freeze({ taskId: task.taskId, ref: Object.freeze({ ...task.ref }), availability: task.availability, reason: task.reason, reasonCode: task.reasonCode, primary: task === primaryInternal, executable: task.executable, businessTime: task.businessTime }));
+  const issueBlockerPriority = issues.map((issue) => issue.priority).reduce((min, value) => Math.min(min, value), Number.POSITIVE_INFINITY);
+  const primaryBlockerPriority = [...issues.map((issue) => issue.priority), ...ordered.filter((task) => !task.executable).map((task) => task.priority)].reduce((min, value) => Math.min(min, value), Number.POSITIVE_INFINITY);
+  const isExecutable = (task: InternalTask): boolean => task.executable && issueBlockerPriority > task.priority;
+  const primaryInternal = ordered.find((task) => isExecutable(task) && primaryBlockerPriority > task.priority) ?? null;
+  const frozenTasks = ordered.map((task) => Object.freeze({ taskId: task.taskId, ref: Object.freeze({ ...task.ref }), availability: task.availability, reason: task.reason, reasonCode: task.reasonCode, primary: task === primaryInternal, executable: isExecutable(task), businessTime: task.businessTime }));
   const frozenIssues = Object.freeze([...issues].sort((a, b) => a.priority - b.priority || (a.identity ?? Number.MAX_SAFE_INTEGER) - (b.identity ?? Number.MAX_SAFE_INTEGER) || a.reason.localeCompare(b.reason)));
   const primaryTask = frozenTasks.find((task) => task.primary) ?? null;
   return Object.freeze({

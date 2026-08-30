@@ -957,6 +957,8 @@ historical bridge 第一次创建时 product_action_generation 原子从 0 变 1
 
 pre-0029 historical-ready Story bridge 另由 Repository 在 BEGIN IMMEDIATE 内验证 exact ready Attempt、generation_revision、proposal hash、旧 token 的 baseline 格式和该 ready 行尚无 terminal confirmation hash 后，签发一次性的 HistoricalStoryRouteProof。普通 DTO、字段相同的伪造对象和 ProductActionRouteProof 都不能代替它。ready 行第一次请求没有可比较的旧 hash；Repository 用 Ledger key 与域 `historical-story-request-token-v1` 对 `{attempt_id,generation_revision,proposal_hash,legacy_confirmation_token}` 做 HMAC，原 token 不落盘。结果写入 historical_request_token_fingerprint 并进入 proposal/request identity；同 token+同 payload 收敛到同 Operation，不同 token 或 payload 返回 conflict。已经 confirmed 的历史行继续使用既有 confirmation_token_hash/payload_hash 只读 replay，绝不创建 Product Action。该 fingerprint 只证明兼容请求身份，永远不能授权 executor；真正执行仍必须在新 Product Action server token 和锁内 ExecutionAuthorization 下完成。proof 在 claim、异常、取消或事务结束后 revoke。
 
+caller-owned publication 在 COMMIT unknown 后若 fresh reconciliation 为 exact all-absent，不得复用已消费 proof，也不得按当前 active key 重签身份。Repository 在第一次写入返回一个 Repository-bound、不可复制/序列化的一次性 opaque replay grant；只有该 grant 才能在新的 BEGIN IMMEDIATE、exact all-absent 且旧 proof 已退役时，为其中冻结的 Prepared identity（同 persisted key、token、operation/call ID 与全部 HMAC）签发一次 fresh proof；第二次 unknown 不再重放。historical bridge 的 replay grant 还必须在同一事务重验 exact baseline Attempt 并原子推进 product_action_generation/pointer。historical bridge 若已存在 attempt-bound route，则必须先用 Operation 持久化 key 重验 legacy token fingerprint 与完整 route payload：同 token+同 payload 跨 active-key rotation 收敛，不同 token 或 payload返回 conflict。
+
 ### 7.3 API
 
 新增：
@@ -1013,9 +1015,11 @@ decision contract：
 - `StoryOwnerRecoveryProof` 精确绑定 issuer/container、canonical story owner、attempt_id、generation_revision、product_action_generation、proposal_hash、operation_id、action_call_id、route_payload_fingerprint、route_binding_fingerprint、request_origin=current|historical_story_bridge，并固定 `allowed_decisions=('approve','modify','reject')`；
 - `RejectionOnlyRecoveryProof` 是 action-discriminated、route-only 的 union，不声明当前来源是否存在：Signal 分支绑定 canonical application owner、application_id、route 中预期的 Note/Proposal/Event locator、`live_source_state='not_observed'`、semantic_claim_fingerprint、operation/action_call 与两项 route fingerprint，且禁止 generation 字段；Story 分支绑定 canonical attempt owner、route 中预期的 attempt locator、`live_source_state='not_observed'`、可信 route 中的 generation_revision/product_action_generation/proposal_hash、operation/action_call 与两项 route fingerprint。两分支都固定 `allowed_decisions=('reject',)`，不能通过 nullable 通用字段互相模拟；
 - 三类 proof 都绑定 issuer/container/registry incarnation，单次 render 后 revoke；ordinary/dataclass duck type、跨 union、跨 owner/source/action/Operation、replaced generation、重复消费、ABA proof 和 generic GET 都不能换取 token。full owner proof 才能陈述 verified-current source；rejection-only proof 只陈述 HMAC 已验证的 expected locator 与 not_observed，既不制造 present/absent、revision 或 generation，也不把 not_observed 当作 missing 事实；
-- invalidated/source_changed Story 以及来源 missing 的 exact owner recovery 都只能签发 Story 分支 `RejectionOnlyRecoveryProof` 并返回同一 token；safe state 标记 rejection_only，approve/modify 返回 stale 且 executor=0；
+- invalidated/source_changed Story 以及来源 missing 的 exact owner recovery 都只能签发 Story 分支 `RejectionOnlyRecoveryProof`；render 后 response 的 `confirmation_token` 字段承载不同 bytes 的 rejection-scoped opaque credential，不得返回原 server confirmation token；safe state 标记 rejection_only，approve/modify 返回 stale 且 executor=0；
+- rejection-scoped opaque credential 固定使用 HMAC domain `product-action-rejection-decision-v1` 与 Operation 持久化的 key profile，绑定 action、operation_id、action_call_id、原 confirmation token fingerprint、route payload fingerprint、route binding fingerprint、semantic claim 与 `allowed_decisions=('reject',)`。approve/modify 必须在 capability/source/preflight 查询前拒绝；reject 在可信边界内映射回原持久 token identity。该 credential 不能进入 Ledger request/input/terminal fingerprint，decision body 与普通确认请求保持一致；
 - Signal 来源 changed 或 Note/Proposal/Event 任一已删除时，full note-bound recovery 不可用；application-bound rejection-control 只读取 Operation+ProductActionProposal，验证 route HMAC 内的 exact application_id/operation/semantic claim 后签发 Signal 分支 `RejectionOnlyRecoveryProof`，source existence/currentness Repository、capability、binding、preflight=0；
 - Story 来源 changed/missing 时，canonical Attempt route 使用 Story 分支 `RejectionOnlyRecoveryProof`。rejection-only proof 不要求也不探测来源仍存在，数据库读取失败仅指 Operation/route 本身不可读并返回 unknown；terminal、跨 owner 或普通 generic GET 绝不返回 token；
+- Coordinator 向 Story adapter 提供 attempt-bound full-owner 与 rejection-only 两个公共可信恢复接口；full-owner 在 writer lock 内验证 exact active Operation/route 与 ready Attempt 后消费 `StoryOwnerRecoveryProof`，来源不再 current 时只能降级为 route-only rejection credential。adapter 不复制 proof/HMAC/route 验证器；
 - approve 不携带 edited_payload；
 - modify 必须携带 action-specific exact object；
 - Signal modify 只允许 user_note；
@@ -1223,6 +1227,8 @@ Story committed result_json 只能是：
 ~~~
 
 visible_result 固定为“已保存到经历素材。”；transport_json 只保存安全 ID/outcome/revision，并同时冻结可纯函数投影的 `legacy_direct_commit={status_code:201,body:{story_id,version_id,created:true}}` 与 `legacy_reconciliation_or_replay={status_code:200,body:{story_id,version_id,created:false}}`，不保存 Story 正文或 Evidence。HTTP adapter 只依据“本次 commit 调用是否正常返回且本请求完成 transition”选择第一支；任何 fresh read 都选择第二支，不能重算或改写 terminal payload。undo_json 使用 §9.3 两个 exact union。
+
+Coordinator 的 DecisionResult 必须携带已经通过 action-local exact codec、terminal digest 与 persisted-key 校验的递归只读 transport，并按 direct commit 或 reconciliation/replay 暴露其中已冻结的 legacy projection；Story adapter 禁止 fresh-load 后重算 transport、status 或 created。
 
 failed result_json 固定为 `{schema_version, action_name, outcome:'failed', code}`；transport 只复制 operation/action/status/code，undo_json 必须 NULL；visible_result 只能由封闭 code→文本 renderer 产生。
 

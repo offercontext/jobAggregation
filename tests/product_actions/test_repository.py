@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import pickle
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
@@ -210,6 +212,103 @@ def test_session_bound_publication_joins_caller_uow_and_never_commits_or_rolls_b
         assert attempt.failure_category == ""
 
 
+def test_all_absent_replay_refreshes_consumed_proof_without_changing_frozen_identity(
+    product_database: Any,
+    product_core: tuple[object, ...],
+) -> None:
+    repository, issuer = _repository(product_database, product_core)
+    prepared = issuer.prepare(route_payload_raw=raw_json(signal_route()))
+
+    with product_database() as session:
+        publication_uow = repository.begin_publication_uow(session)
+        publication = repository.publish_bundle_in_session(
+            session,
+            publication_uow,
+            prepared,
+        )
+        replay_grant = publication.replay_grant
+        assert replay_grant is not None
+        session.rollback()
+
+    assert repr(replay_grant) == "<ProductActionPublicationReplayV1>"
+    with pytest.raises(TypeError, match="cannot be copied"):
+        copy.copy(replay_grant)
+    with pytest.raises(TypeError, match="cannot be copied"):
+        pickle.dumps(replay_grant)
+
+    product_core[2].activate(KEY_TWO.key_id)  # type: ignore[attr-defined]
+    with product_database() as session:
+        publication_uow = repository.begin_publication_uow(session)
+        refreshed = repository.refresh_all_absent_from_grant_in_session(
+            session,
+            publication_uow,
+            replay_grant,
+        )
+        assert refreshed is not prepared
+        assert refreshed.identity_projection() == prepared.identity_projection()
+        assert refreshed.fingerprint_key_id == prepared.fingerprint_key_id
+        assert refreshed.confirmation_token == prepared.confirmation_token
+        with pytest.raises(ProductActionContractError) as repeated:
+            repository.refresh_all_absent_from_grant_in_session(
+                session,
+                publication_uow,
+                replay_grant,
+            )
+        assert repeated.value.code == "publication_replay_proof_not_consumed"
+        result = repository.publish_bundle_in_session(
+            session,
+            publication_uow,
+            refreshed,
+        )
+        session.commit()
+
+    assert result.created is True
+    assert result.operation_id == prepared.operation_id
+    assert result.confirmation_token == prepared.confirmation_token
+
+
+def test_all_absent_replay_grant_is_repository_bound(
+    product_database: Any,
+    product_core: tuple[object, ...],
+) -> None:
+    repository, issuer = _repository(product_database, product_core)
+    prepared = issuer.prepare(route_payload_raw=raw_json(signal_route()))
+    with product_database() as session:
+        publication_uow = repository.begin_publication_uow(session)
+        publication = repository.publish_bundle_in_session(
+            session,
+            publication_uow,
+            prepared,
+        )
+        replay_grant = publication.replay_grant
+        assert replay_grant is not None
+        session.rollback()
+
+    foreign_registry = ProductActionProofRegistryV1()
+    foreign_catalog = ProductActionCatalogV1(foreign_registry)
+    foreign_profiles = LedgerKeyProfileStoreV1(
+        (KEY_ONE, KEY_TWO),
+        active_key_id=KEY_ONE.key_id,
+    )
+    foreign_repository = ProductActionProposalRepository(
+        product_database,
+        catalog=foreign_catalog,
+        proof_registry=foreign_registry,
+        key_profiles=foreign_profiles,
+    )
+
+    with product_database() as session:
+        publication_uow = foreign_repository.begin_publication_uow(session)
+        with pytest.raises(ProductActionContractError) as error:
+            foreign_repository.refresh_all_absent_from_grant_in_session(
+                session,
+                publication_uow,
+                replay_grant,
+            )
+        session.rollback()
+    assert error.value.code == "publication_replay_grant"
+
+
 def test_session_bound_publication_requires_caller_owned_transaction_before_sql(
     product_database: Any,
     product_core: tuple[object, ...],
@@ -318,6 +417,195 @@ def test_historical_story_bridge_requires_locked_exact_legacy_ready_attempt_and_
         assert result.bundle.route.historical_request_token_fingerprint is not None
         assert registry._records == {}  # type: ignore[attr-defined]
         session.rollback()
+
+
+def test_historical_story_bridge_replay_uses_persisted_key_and_exact_legacy_request(
+    product_database: Any,
+    product_core: tuple[object, ...],
+) -> None:
+    catalog, registry, profiles, _signal_issuer, story_issuer = product_core
+    repository = ProductActionProposalRepository(
+        product_database,
+        catalog=catalog,  # type: ignore[arg-type]
+        proof_registry=registry,  # type: ignore[arg-type]
+        key_profiles=profiles,  # type: ignore[arg-type]
+    )
+    _insert_historical_ready_attempt(product_database)
+    route = raw_json(story_route(product_action_generation=1))
+    with product_database() as session:
+        publication_uow = repository.begin_publication_uow(session)
+        first = repository.publish_historical_story_bridge_in_session(
+            session,
+            publication_uow,
+            issuer=story_issuer,  # type: ignore[arg-type]
+            route_payload_raw=route,
+            legacy_confirmation_token="legacy_token_0001",
+        )
+        session.commit()
+
+    with product_database() as session:
+        attempt = session.get(InterviewStoryProposalAttempt, 51)
+        assert attempt is not None
+        assert attempt.product_action_generation == 1
+        assert attempt.product_action_operation_id == first.operation_id
+
+    profiles.activate(KEY_TWO.key_id)  # type: ignore[attr-defined]
+    with product_database() as session:
+        publication_uow = repository.begin_publication_uow(session)
+        replay = repository.publish_historical_story_bridge_in_session(
+            session,
+            publication_uow,
+            issuer=story_issuer,  # type: ignore[arg-type]
+            route_payload_raw=route,
+            legacy_confirmation_token="legacy_token_0001",
+        )
+        session.rollback()
+
+    assert replay.created is False
+    assert replay.operation_id == first.operation_id
+    assert replay.confirmation_token == first.confirmation_token
+
+    for conflicting_route, conflicting_token in (
+        (route, "legacy_token_0002"),
+        (
+            raw_json(
+                story_route(
+                    product_action_generation=1,
+                    source_fingerprint="sha256:" + "9" * 64,
+                )
+            ),
+            "legacy_token_0001",
+        ),
+    ):
+        with product_database() as session:
+            publication_uow = repository.begin_publication_uow(session)
+            with pytest.raises(ProductActionContractError) as error:
+                repository.publish_historical_story_bridge_in_session(
+                    session,
+                    publication_uow,
+                    issuer=story_issuer,  # type: ignore[arg-type]
+                    route_payload_raw=conflicting_route,
+                    legacy_confirmation_token=conflicting_token,
+                )
+            session.rollback()
+        assert error.value.code == "historical_story_bridge_request_conflict"
+
+
+def test_historical_story_bridge_all_absent_replay_preserves_frozen_identity_and_attempt_cas(
+    product_database: Any,
+    product_core: tuple[object, ...],
+) -> None:
+    catalog, registry, profiles, _signal_issuer, story_issuer = product_core
+    repository = ProductActionProposalRepository(
+        product_database,
+        catalog=catalog,  # type: ignore[arg-type]
+        proof_registry=registry,  # type: ignore[arg-type]
+        key_profiles=profiles,  # type: ignore[arg-type]
+    )
+    _insert_historical_ready_attempt(product_database)
+    route = raw_json(story_route(product_action_generation=1))
+    with product_database() as session:
+        publication_uow = repository.begin_publication_uow(session)
+        first = repository.publish_historical_story_bridge_in_session(
+            session,
+            publication_uow,
+            issuer=story_issuer,  # type: ignore[arg-type]
+            route_payload_raw=route,
+            legacy_confirmation_token="legacy_token_0001",
+        )
+        replay_grant = first.replay_grant
+        assert replay_grant is not None
+        session.rollback()
+
+    profiles.activate(KEY_TWO.key_id)  # type: ignore[attr-defined]
+    with product_database() as session:
+        publication_uow = repository.begin_publication_uow(session)
+        replay = repository.replay_all_absent_historical_story_bridge_in_session(
+            session,
+            publication_uow,
+            replay_grant,
+        )
+        session.commit()
+
+    assert replay.created is True
+    assert replay.replay_grant is None
+    assert replay.operation_id == first.operation_id
+    assert replay.action_call_id == first.action_call_id
+    assert replay.confirmation_token == first.confirmation_token
+    assert replay.bundle is not None
+    assert replay.bundle.operation.fingerprint_key_id == KEY_ONE.key_id
+    with product_database() as session:
+        attempt = session.get(InterviewStoryProposalAttempt, 51)
+        assert attempt is not None
+        assert attempt.product_action_generation == 1
+        assert attempt.product_action_operation_id == first.operation_id
+
+    with product_database() as session:
+        publication_uow = repository.begin_publication_uow(session)
+        with pytest.raises(ProductActionContractError) as repeated:
+            repository.replay_all_absent_historical_story_bridge_in_session(
+                session,
+                publication_uow,
+                replay_grant,
+            )
+        session.rollback()
+    assert repeated.value.code == "publication_replay_not_all_absent"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("attempt_status", "invalidated"),
+        ("source_fingerprint", "sha256:" + "9" * 64),
+        ("product_action_operation_id", None),
+        ("confirmed_story_id", 99),
+    ],
+)
+def test_historical_story_proposed_replay_never_returns_full_token_after_attempt_drift(
+    product_database: Any,
+    product_core: tuple[object, ...],
+    field: str,
+    value: object,
+) -> None:
+    catalog, registry, profiles, _signal_issuer, story_issuer = product_core
+    repository = ProductActionProposalRepository(
+        product_database,
+        catalog=catalog,  # type: ignore[arg-type]
+        proof_registry=registry,  # type: ignore[arg-type]
+        key_profiles=profiles,  # type: ignore[arg-type]
+    )
+    _insert_historical_ready_attempt(product_database)
+    route = raw_json(story_route(product_action_generation=1))
+    with product_database() as session:
+        publication_uow = repository.begin_publication_uow(session)
+        repository.publish_historical_story_bridge_in_session(
+            session,
+            publication_uow,
+            issuer=story_issuer,  # type: ignore[arg-type]
+            route_payload_raw=route,
+            legacy_confirmation_token="legacy_token_0001",
+        )
+        session.commit()
+    with product_database() as session:
+        attempt = session.get(InterviewStoryProposalAttempt, 51)
+        assert attempt is not None
+        setattr(attempt, field, value)
+        if field == "product_action_operation_id":
+            attempt.product_action_generation = 0
+        session.commit()
+
+    with product_database() as session:
+        publication_uow = repository.begin_publication_uow(session)
+        with pytest.raises(ProductActionContractError) as error:
+            repository.publish_historical_story_bridge_in_session(
+                session,
+                publication_uow,
+                issuer=story_issuer,  # type: ignore[arg-type]
+                route_payload_raw=route,
+                legacy_confirmation_token="legacy_token_0001",
+            )
+        session.rollback()
+    assert error.value.code == "historical_story_bridge_source_changed"
 
 
 @pytest.mark.parametrize(

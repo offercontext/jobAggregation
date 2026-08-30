@@ -30,7 +30,7 @@ from offerpilot.product_actions.repository import ProductActionProposalRepositor
 from offerpilot.review_readiness.candidates import project_readiness_candidates
 from offerpilot.review_readiness.repository import ReadinessSignalRepository
 
-from tests.product_actions.conftest import KEY_ONE
+from tests.product_actions.conftest import KEY_ONE, KEY_TWO
 from tests.review_readiness_support import seed_review_candidate
 
 
@@ -39,10 +39,14 @@ def _coordinator(  # type: ignore[no-untyped-def]
     *,
     capability_check=None,
     candidate_projector=project_readiness_candidates,
+    additional_handlers=(),
 ):
     registry = ProductActionProofRegistryV1()
     catalog = ProductActionCatalogV1(registry)
-    keys = LedgerKeyProfileStoreV1((KEY_ONE,), active_key_id=KEY_ONE.key_id)
+    keys = LedgerKeyProfileStoreV1(
+        (KEY_ONE, KEY_TWO),
+        active_key_id=KEY_ONE.key_id,
+    )
     issuer = ReviewReadinessActionIssuer(catalog, registry, keys)
     proposal_repository = ProductActionProposalRepository(
         session_factory,
@@ -66,6 +70,7 @@ def _coordinator(  # type: ignore[no-untyped-def]
             )
         ),
         candidate_projector=candidate_projector,
+        additional_handlers=additional_handlers,
     )
 
 

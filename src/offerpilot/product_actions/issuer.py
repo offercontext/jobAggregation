@@ -655,8 +655,11 @@ def _prepared_from_derived_identity(
 
 
 class _ProductActionBundle(Protocol):
-    operation: Any
-    route: Any
+    @property
+    def operation(self) -> Any: ...
+
+    @property
+    def route(self) -> Any: ...
 
 
 class _BaseActionIssuer:
@@ -779,6 +782,58 @@ class _BaseActionIssuer:
             raise ProductActionIntegrityError("confirmation_token_integrity")
         return token
 
+    def matches_persisted_request(
+        self,
+        bundle: _ProductActionBundle,
+        *,
+        route_payload_raw: bytes,
+    ) -> bool:
+        """Verify an existing identity with its stored key without issuing a proof."""
+
+        self._ensure_integrity()
+        operation = bundle.operation
+        persisted = bundle.route
+        if (
+            operation.tool_name != self._action_name
+            or persisted.action_name != self._action_name
+        ):
+            raise ProductActionIntegrityError("action_identity_mismatch")
+        route = decode_product_action_route_payload(
+            route_payload_raw,
+            action_name=self._action_name,
+            request_origin=cast(ProductActionRequestOrigin, persisted.request_origin),
+        )
+        key = self._key_profiles.resolve(operation.fingerprint_key_id)
+        derived = _derive(
+            route=route,
+            catalog=self._catalog,
+            key=key,
+            historical_request_token_fingerprint=(
+                persisted.historical_request_token_fingerprint
+            ),
+        )
+        comparisons = (
+            (derived["operation_id"], operation.id),
+            (derived["action_call_id"], operation.tool_call_id),
+            (derived["route_payload_fingerprint"], persisted.route_payload_fingerprint),
+            (derived["semantic_claim_fingerprint"], persisted.semantic_claim_fingerprint),
+            (
+                derived["authorization_scope_fingerprint"],
+                operation.authorization_scope_fingerprint,
+            ),
+            (derived["route_binding_fingerprint"], persisted.route_binding_fingerprint),
+            (
+                derived["request_idempotency_fingerprint"],
+                persisted.request_idempotency_fingerprint,
+            ),
+            (derived["proposal_fingerprint"], operation.proposal_fingerprint),
+            (
+                derived["confirmation_token_fingerprint"],
+                operation.confirmation_token_fingerprint,
+            ),
+        )
+        return all(left == right for left, right in comparisons)
+
 
 class ReviewReadinessActionIssuer(_BaseActionIssuer):
     __slots__ = ()
@@ -826,6 +881,83 @@ class InterviewStoryActionIssuer(_BaseActionIssuer):
         if request_origin != "current" or historical_confirmation_token is not None:
             raise ProductActionContractError("historical_story_bridge_repository_only")
         return self._prepare(route_payload_raw=route_payload_raw)
+
+    def matches_persisted_historical_request(
+        self,
+        bundle: _ProductActionBundle,
+        *,
+        route_payload_raw: bytes,
+        legacy_confirmation_token: str,
+    ) -> bool:
+        """Verify a bridge replay with the Operation's persisted key profile."""
+
+        self._ensure_integrity()
+        operation = bundle.operation
+        persisted = bundle.route
+        if (
+            operation.tool_name != "confirm_interview_story"
+            or persisted.action_name != "confirm_interview_story"
+            or persisted.request_origin != "historical_story_bridge"
+            or type(legacy_confirmation_token) is not str
+        ):
+            raise ProductActionIntegrityError("action_identity_mismatch")
+        route = decode_product_action_route_payload(
+            route_payload_raw,
+            action_name="confirm_interview_story",
+            request_origin="historical_story_bridge",
+        )
+        payload = _route_payload(route)
+        attempt_id = payload["attempt_id"]
+        generation_revision = payload["generation_revision"]
+        proposal_hash = payload["proposal_hash"]
+        if (
+            type(attempt_id) is not int
+            or type(generation_revision) is not int
+            or type(proposal_hash) is not str
+        ):
+            raise ProductActionContractError("historical_story_bridge_exact_identity")
+        key = self._key_profiles.resolve(operation.fingerprint_key_id)
+        expected_historical = _derive_historical_request_token_fingerprint(
+            key,
+            attempt_id=attempt_id,
+            generation_revision=generation_revision,
+            proposal_hash=proposal_hash,
+            legacy_confirmation_token=legacy_confirmation_token,
+        )
+        if (
+            persisted.historical_request_token_fingerprint is None
+            or not hmac.compare_digest(
+                expected_historical,
+                persisted.historical_request_token_fingerprint,
+            )
+        ):
+            return False
+        derived = _derive(
+            route=route,
+            catalog=self._catalog,
+            key=key,
+            historical_request_token_fingerprint=expected_historical,
+        )
+        comparisons = (
+            (derived["operation_id"], operation.id),
+            (derived["action_call_id"], operation.tool_call_id),
+            (derived["route_payload_fingerprint"], persisted.route_payload_fingerprint),
+            (
+                derived["authorization_scope_fingerprint"],
+                operation.authorization_scope_fingerprint,
+            ),
+            (derived["route_binding_fingerprint"], persisted.route_binding_fingerprint),
+            (
+                derived["request_idempotency_fingerprint"],
+                persisted.request_idempotency_fingerprint,
+            ),
+            (derived["proposal_fingerprint"], operation.proposal_fingerprint),
+            (
+                derived["confirmation_token_fingerprint"],
+                operation.confirmation_token_fingerprint,
+            ),
+        )
+        return all(left == right for left, right in comparisons)
 
 def validate_prepared_product_action(
     prepared: PreparedProductActionProposalV1,

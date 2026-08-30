@@ -18,7 +18,10 @@ from offerpilot.product_actions.issuer import (
     LedgerKeyProfileStoreV1,
     ReviewReadinessActionIssuer,
 )
-from offerpilot.product_actions.repository import ProductActionPublicationUoWV1
+from offerpilot.product_actions.repository import (
+    ProductActionPublicationReplayV1,
+    ProductActionPublicationUoWV1,
+)
 
 
 __all__ = [
@@ -31,6 +34,7 @@ __all__ = [
     "ProductActionCompensationCatalogV1",
     "ProductActionExecutionAuthorization",
     "ProductActionProofRegistryV1",
+    "ProductActionPublicationReplayV1",
     "ProductActionPublicationUoWV1",
     "ProductActionRouteProof",
     "RejectionOnlyRecoveryProof",

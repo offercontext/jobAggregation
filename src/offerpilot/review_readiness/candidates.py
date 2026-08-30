@@ -247,6 +247,9 @@ def project_readiness_candidates(
             )
             for focus in normalized["practice_focuses"]
         )
+        focus_ids = tuple(candidate.focus_id for candidate in candidates)
+        if len(focus_ids) != len(set(focus_ids)):
+            raise ReviewReadinessContractError("focus_id_duplicated")
     except (
         InterviewReviewModelError,
         ReviewReadinessContractError,

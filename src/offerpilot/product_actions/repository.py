@@ -8,7 +8,7 @@ from dataclasses import dataclass, fields
 from types import SimpleNamespace
 from typing import Any, Literal, NoReturn, SupportsIndex, cast
 
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -127,6 +127,69 @@ class ProductActionBundleV1:
     transition_prefix: tuple[tuple[int, str], ...]
 
 
+_PUBLICATION_REPLAY_CONSTRUCTION_SEAL = object()
+
+
+class ProductActionPublicationReplayV1:
+    """Opaque one-shot carrier for a commit-unknown all-absent replay."""
+
+    __slots__ = ("_repository", "_prepared", "_seal")
+    _repository: object
+    _prepared: PreparedProductActionProposalV1
+    _seal: tuple[object, PreparedProductActionProposalV1]
+
+    def __new__(
+        cls,
+        construction_seal: object | None = None,
+        *_args: object,
+        **_kwargs: object,
+    ) -> ProductActionPublicationReplayV1:
+        if construction_seal is not _PUBLICATION_REPLAY_CONSTRUCTION_SEAL:
+            raise TypeError("Product Action publication replay is Repository-issued")
+        return object.__new__(cls)
+
+    def __init__(
+        self,
+        construction_seal: object | None = None,
+        repository: object | None = None,
+        prepared: PreparedProductActionProposalV1 | None = None,
+    ) -> None:
+        if (
+            construction_seal is not _PUBLICATION_REPLAY_CONSTRUCTION_SEAL
+            or repository is None
+            or type(prepared) is not PreparedProductActionProposalV1
+        ):
+            raise TypeError("Product Action publication replay is Repository-issued")
+        object.__setattr__(self, "_repository", repository)
+        object.__setattr__(self, "_prepared", prepared)
+        object.__setattr__(self, "_seal", (repository, prepared))
+
+    def __setattr__(self, name: str, value: object) -> NoReturn:
+        del name, value
+        raise AttributeError("Product Action publication replay is sealed")
+
+    def __repr__(self) -> str:
+        return "<ProductActionPublicationReplayV1>"
+
+    @staticmethod
+    def _serialization_error() -> NoReturn:
+        raise TypeError("Product Action publication replay cannot be copied or serialized")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> NoReturn:
+        del protocol
+        self._serialization_error()
+
+    def __getstate__(self) -> NoReturn:
+        self._serialization_error()
+
+    def __copy__(self) -> NoReturn:
+        self._serialization_error()
+
+    def __deepcopy__(self, memo: dict[int, object]) -> NoReturn:
+        del memo
+        self._serialization_error()
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class ProductActionPublicationV1:
     classification: PublicationClassification
@@ -135,6 +198,7 @@ class ProductActionPublicationV1:
     confirmation_token: str | None
     created: bool
     bundle: ProductActionBundleV1 | None = None
+    replay_grant: ProductActionPublicationReplayV1 | None = None
 
 
 _PUBLICATION_UOW_CONSTRUCTION_SEAL = object()
@@ -269,6 +333,61 @@ class ProductActionProposalRepository:
             return HistoricalStoryRouteProof
         return ProductActionRouteProof
 
+    @staticmethod
+    def _historical_attempt_is_exact_active(
+        attempt: InterviewStoryProposalAttempt | None,
+        payload: dict[str, Any],
+        operation_id: str,
+    ) -> bool:
+        return bool(
+            attempt is not None
+            and type(attempt.id) is int
+            and attempt.id == payload["attempt_id"]
+            and attempt.attempt_status == "ready"
+            and type(attempt.generation_revision) is int
+            and attempt.generation_revision == payload["generation_revision"]
+            and type(attempt.product_action_generation) is int
+            and attempt.product_action_generation
+            == payload["product_action_generation"]
+            and attempt.product_action_operation_id == operation_id
+            and attempt.proposal_hash == payload["proposal_hash"]
+            and attempt.source_fingerprint == payload["source_fingerprint"]
+            and attempt.target_story_id == payload["target_story_id"]
+            and attempt.failure_category == ""
+            and attempt.confirmation_token_hash == ""
+            and attempt.confirmation_payload_hash == ""
+            and attempt.confirmed_story_id is None
+            and attempt.confirmed_story_version_id is None
+            and attempt.confirmed_at is None
+        )
+
+    @staticmethod
+    def _historical_attempt_is_exact_baseline(
+        attempt: InterviewStoryProposalAttempt | None,
+        payload: dict[str, Any],
+    ) -> bool:
+        return bool(
+            attempt is not None
+            and type(attempt.id) is int
+            and attempt.id == payload["attempt_id"]
+            and type(attempt.generation_revision) is int
+            and attempt.generation_revision == payload["generation_revision"]
+            and type(attempt.product_action_generation) is int
+            and attempt.attempt_status == "ready"
+            and attempt.proposal_hash == payload["proposal_hash"]
+            and attempt.source_fingerprint == payload["source_fingerprint"]
+            and attempt.target_story_id == payload["target_story_id"]
+            and payload["product_action_generation"] == 1
+            and attempt.product_action_generation == 0
+            and attempt.product_action_operation_id is None
+            and attempt.failure_category == ""
+            and attempt.confirmation_token_hash == ""
+            and attempt.confirmation_payload_hash == ""
+            and attempt.confirmed_story_id is None
+            and attempt.confirmed_story_version_id is None
+            and attempt.confirmed_at is None
+        )
+
     def begin_publication_uow(self, session: Session) -> ProductActionPublicationUoWV1:
         """Acquire BEGIN IMMEDIATE while leaving commit/rollback to the caller."""
 
@@ -351,6 +470,156 @@ class ProductActionProposalRepository:
         ):
             return self._publish_bundle_in_session_unclaimed(session, prepared)
 
+    def _refresh_all_absent_prepared_in_session(
+        self,
+        session: Session,
+        publication_uow: ProductActionPublicationUoWV1,
+        prepared: PreparedProductActionProposalV1,
+    ) -> PreparedProductActionProposalV1:
+        """Issue one fresh proof for an exact frozen identity after absent reconciliation."""
+
+        self._require_publication_uow(session, publication_uow)
+        validate_prepared_product_action(
+            prepared,
+            catalog=self._catalog,
+            key_profiles=self._key_profiles,
+            require_route_proof=False,
+        )
+        if self._classify_rows(self._load_rows(session, prepared.operation_id)) != "all_absent":
+            raise ProductActionContractError("publication_replay_not_all_absent")
+        try:
+            self._proof_registry._consume_publication_refresh(
+                prepared.route_proof,
+                proof_type=self._route_proof_type(prepared),
+                action_name=prepared.action_name,
+                expected_binding=prepared.proof_binding,
+            )
+        except ValueError as exc:
+            raise ProductActionContractError(
+                "publication_replay_proof_not_consumed"
+            ) from exc
+        except TypeError as exc:
+            raise ProductActionContractError("publication_replay_proof_identity") from exc
+        proof = self._proof_registry._issue(
+            self._route_proof_type(prepared),
+            action_name=prepared.action_name,
+            binding=prepared.proof_binding,
+            publication_refreshable=False,
+        )
+        values = {
+            name: getattr(prepared, name)
+            for name in PreparedProductActionProposalV1.__slots__
+            if name != "_integrity_seal"
+        }
+        values["route_proof"] = proof
+        try:
+            return PreparedProductActionProposalV1(**values)
+        except BaseException:
+            try:
+                self._proof_registry.revoke(proof)
+            except ValueError:
+                pass
+            raise
+
+    def refresh_all_absent_from_grant_in_session(
+        self,
+        session: Session,
+        publication_uow: ProductActionPublicationUoWV1,
+        replay_grant: ProductActionPublicationReplayV1,
+    ) -> PreparedProductActionProposalV1:
+        """Consume an exact Repository-bound one-shot replay grant."""
+
+        self._require_publication_uow(session, publication_uow)
+        if type(replay_grant) is not ProductActionPublicationReplayV1:
+            raise ProductActionContractError("publication_replay_grant")
+        try:
+            if (
+                replay_grant._seal
+                != (replay_grant._repository, replay_grant._prepared)
+                or replay_grant._repository is not self
+            ):
+                raise ProductActionContractError("publication_replay_grant")
+        except AttributeError as exc:
+            raise ProductActionContractError("publication_replay_grant") from exc
+        return self._refresh_all_absent_prepared_in_session(
+            session,
+            publication_uow,
+            replay_grant._prepared,
+        )
+
+    def replay_all_absent_historical_story_bridge_in_session(
+        self,
+        session: Session,
+        publication_uow: ProductActionPublicationUoWV1,
+        replay_grant: ProductActionPublicationReplayV1,
+    ) -> ProductActionPublicationV1:
+        """Replay one frozen historical publication and its Attempt pointer CAS."""
+
+        prepared = self.refresh_all_absent_from_grant_in_session(
+            session,
+            publication_uow,
+            replay_grant,
+        )
+        try:
+            if (
+                prepared.action_name != "confirm_interview_story"
+                or prepared.request_origin != "historical_story_bridge"
+            ):
+                raise ProductActionContractError("historical_story_bridge_replay_grant")
+            decoded = decode_product_action_route_payload(
+                prepared.route_payload_json.encode("utf-8"),
+                action_name="confirm_interview_story",
+                request_origin="historical_story_bridge",
+            )
+            payload = _route_payload(decoded)
+            attempt_id = payload["attempt_id"]
+            if type(attempt_id) is not int:
+                raise ProductActionIntegrityError(
+                    "historical_story_bridge_replay_identity"
+                )
+            attempt = session.get(InterviewStoryProposalAttempt, attempt_id)
+            if not self._historical_attempt_is_exact_baseline(attempt, payload):
+                raise ProductActionContractError(
+                    "historical_story_bridge_attempt_not_exact_ready"
+                )
+            publication = self.publish_bundle_in_session(
+                session,
+                publication_uow,
+                prepared,
+            )
+            exact_attempt = cast(InterviewStoryProposalAttempt, attempt)
+            exact_attempt.product_action_generation = cast(
+                int,
+                payload["product_action_generation"],
+            )
+            exact_attempt.product_action_operation_id = prepared.operation_id
+            session.flush()
+            session.expire(exact_attempt)
+            refreshed_attempt = session.get(InterviewStoryProposalAttempt, attempt_id)
+            if not self._historical_attempt_is_exact_active(
+                refreshed_attempt,
+                payload,
+                prepared.operation_id,
+            ):
+                raise ProductActionIntegrityError(
+                    "historical_story_bridge_attempt_pointer"
+                )
+            return ProductActionPublicationV1(
+                publication.classification,
+                publication.operation_id,
+                publication.action_call_id,
+                publication.confirmation_token,
+                publication.created,
+                publication.bundle,
+                None,
+            )
+        except BaseException:
+            try:
+                self._proof_registry.revoke(prepared.route_proof)
+            except ValueError:
+                pass
+            raise
+
     def publish_historical_story_bridge_in_session(
         self,
         session: Session,
@@ -390,28 +659,67 @@ class ProductActionProposalRepository:
             or type(requested_generation) is not int
         ):
             raise ProductActionContractError("historical_story_bridge_exact_integer")
+        existing_ids = tuple(
+            session.scalars(
+                select(ProductActionProposal.operation_id).where(
+                    ProductActionProposal.action_name == "confirm_interview_story",
+                    ProductActionProposal.request_origin == "historical_story_bridge",
+                    ProductActionProposal.source_kind == "story_proposal",
+                    ProductActionProposal.source_id == attempt_id,
+                )
+            )
+        )
+        if len(existing_ids) > 1:
+            raise ProductActionIntegrityError("historical_story_bridge_identity")
+        if existing_ids:
+            bundle = self.load_bundle_in_session(
+                session,
+                publication_uow,
+                existing_ids[0],
+            )
+            if not issuer.matches_persisted_historical_request(
+                bundle,
+                route_payload_raw=route_payload_raw,
+                legacy_confirmation_token=legacy_confirmation_token,
+            ):
+                raise ProductActionContractError(
+                    "historical_story_bridge_request_conflict"
+                )
+            if bundle.classification == "exact_terminal":
+                return ProductActionPublicationV1(
+                    bundle.classification,
+                    bundle.operation.id,
+                    cast(str, bundle.operation.tool_call_id),
+                    None,
+                    False,
+                    bundle,
+                )
+            attempt = session.get(InterviewStoryProposalAttempt, attempt_id)
+            if not self._historical_attempt_is_exact_active(
+                attempt,
+                payload,
+                bundle.operation.id,
+            ):
+                raise ProductActionContractError(
+                    "historical_story_bridge_source_changed"
+                )
+            token = (
+                issuer.recover_confirmation_token(cast(Any, bundle))
+                if bundle.classification == "exact_proposed"
+                else None
+            )
+            return ProductActionPublicationV1(
+                bundle.classification,
+                bundle.operation.id,
+                cast(str, bundle.operation.tool_call_id),
+                token,
+                False,
+                bundle,
+            )
         attempt = session.get(InterviewStoryProposalAttempt, attempt_id)
         if attempt is None:
             raise ProductActionContractError("historical_story_bridge_attempt_missing")
-        if (
-            type(attempt.id) is not int
-            or type(attempt.generation_revision) is not int
-            or type(attempt.product_action_generation) is not int
-            or attempt.id != attempt_id
-            or attempt.attempt_status != "ready"
-            or attempt.generation_revision != generation_revision
-            or attempt.proposal_hash != payload["proposal_hash"]
-            or attempt.source_fingerprint != payload["source_fingerprint"]
-            or attempt.target_story_id != payload["target_story_id"]
-            or requested_generation != 1
-            or attempt.product_action_generation != 0
-            or attempt.product_action_operation_id is not None
-            or attempt.confirmation_token_hash != ""
-            or attempt.confirmation_payload_hash != ""
-            or attempt.confirmed_story_id is not None
-            or attempt.confirmed_story_version_id is not None
-            or attempt.confirmed_at is not None
-        ):
+        if not self._historical_attempt_is_exact_baseline(attempt, payload):
             raise ProductActionContractError("historical_story_bridge_attempt_not_exact_ready")
         key = self._key_profiles.active()
         historical_fingerprint = _derive_historical_request_token_fingerprint(
@@ -445,7 +753,25 @@ class ProductActionProposalRepository:
                 proof=proof,
                 binding=binding,
             )
-            return self.publish_bundle_in_session(session, publication_uow, prepared)
+            publication = self.publish_bundle_in_session(
+                session,
+                publication_uow,
+                prepared,
+            )
+            attempt.product_action_generation = requested_generation
+            attempt.product_action_operation_id = prepared.operation_id
+            session.flush()
+            session.expire(attempt)
+            refreshed_attempt = session.get(InterviewStoryProposalAttempt, attempt_id)
+            if not self._historical_attempt_is_exact_active(
+                refreshed_attempt,
+                payload,
+                prepared.operation_id,
+            ):
+                raise ProductActionIntegrityError(
+                    "historical_story_bridge_attempt_pointer"
+                )
+            return publication
         except BaseException:
             try:
                 self._proof_registry.revoke(proof)
@@ -1078,8 +1404,8 @@ class ProductActionProposalRepository:
         ):
             raise ProductActionIntegrityError("product_action_route_payload")
 
-    @staticmethod
     def _publication_from_bundle(
+        self,
         prepared: PreparedProductActionProposalV1,
         bundle: ProductActionBundleV1,
         *,
@@ -1092,6 +1418,15 @@ class ProductActionProposalRepository:
             prepared.confirmation_token if bundle.classification == "exact_proposed" else None,
             created,
             bundle,
+            (
+                ProductActionPublicationReplayV1(
+                    _PUBLICATION_REPLAY_CONSTRUCTION_SEAL,
+                    self,
+                    prepared,
+                )
+                if created
+                else None
+            ),
         )
 
 
@@ -1100,6 +1435,7 @@ __all__ = [
     "ProductActionOperationSnapshotV1",
     "ProductActionProposalRepository",
     "ProductActionPublicationV1",
+    "ProductActionPublicationReplayV1",
     "ProductActionPublicationUoWV1",
     "ProductActionRouteSnapshotV1",
 ]

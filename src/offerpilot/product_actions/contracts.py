@@ -10,6 +10,7 @@ from threading import RLock
 from types import MappingProxyType
 from typing import Any, ClassVar, Literal, NoReturn, SupportsIndex, TypeAlias, cast
 from uuid import UUID
+from weakref import WeakKeyDictionary
 
 
 PRODUCT_ACTION_NAMES = (
@@ -242,6 +243,12 @@ def _freeze_json(value: JSONValue) -> FrozenJSONValue:
     return cast(JSONScalar, value)
 
 
+def freeze_product_action_json(value: JSONValue) -> FrozenJSONValue:
+    """Return an immutable recursive projection of already-validated JSON."""
+
+    return _freeze_json(value)
+
+
 SIGNAL_ROUTE_FIELDS = (
     "application_id",
     "event_id",
@@ -377,7 +384,7 @@ def tagged_optional(value: JSONValue | None) -> dict[str, JSONValue]:
 
 
 class _OpaqueProductActionProof:
-    __slots__ = ("_registry_token", "_incarnation", "_nonce", "_seal")
+    __slots__ = ("_registry_token", "_incarnation", "_nonce", "_seal", "__weakref__")
     binding_fields: ClassVar[tuple[str, ...]] = ()
     _registry_token: object
     _incarnation: object
@@ -567,6 +574,16 @@ class _ProofRecord:
     action_name: ProductActionName
     binding: tuple[object, ...]
     state: Literal["issued", "in_flight", "consumed", "revoked"]
+    publication_refreshable: bool
+
+
+@dataclass(slots=True)
+class _RetiredProofRecord:
+    proof_type: type[ProductActionProof]
+    action_name: ProductActionName
+    binding: tuple[object, ...]
+    state: Literal["consumed", "revoked", "refreshed"]
+    publication_refreshable: bool
 
 
 class _ProofClaim(AbstractContextManager[ProductActionProof]):
@@ -600,28 +617,40 @@ class ProductActionProofRegistryV1:
         "_registry_token",
         "_incarnation",
         "_records",
+        "_retired",
         "_lock",
         "_integrity_seal",
     )
     _registry_token: object
     _incarnation: object
     _records: dict[int, _ProofRecord]
+    _retired: WeakKeyDictionary[ProductActionProof, _RetiredProofRecord]
     _lock: RLock
-    _integrity_seal: tuple[object, object, dict[int, _ProofRecord], RLock]
+    _integrity_seal: tuple[
+        object,
+        object,
+        dict[int, _ProofRecord],
+        WeakKeyDictionary[ProductActionProof, _RetiredProofRecord],
+        RLock,
+    ]
 
     def __init__(self) -> None:
         registry_token = object()
         incarnation = object()
         records: dict[int, _ProofRecord] = {}
+        retired: WeakKeyDictionary[ProductActionProof, _RetiredProofRecord] = (
+            WeakKeyDictionary()
+        )
         lock = RLock()
         object.__setattr__(self, "_registry_token", registry_token)
         object.__setattr__(self, "_incarnation", incarnation)
         object.__setattr__(self, "_records", records)
+        object.__setattr__(self, "_retired", retired)
         object.__setattr__(self, "_lock", lock)
         object.__setattr__(
             self,
             "_integrity_seal",
-            (registry_token, incarnation, records, lock),
+            (registry_token, incarnation, records, retired, lock),
         )
 
     def __setattr__(self, name: str, value: object) -> NoReturn:
@@ -633,6 +662,7 @@ class ProductActionProofRegistryV1:
             self._registry_token,
             self._incarnation,
             self._records,
+            self._retired,
             self._lock,
         ):
             raise ValueError("Product Action proof Registry integrity drift")
@@ -643,6 +673,7 @@ class ProductActionProofRegistryV1:
         *,
         action_name: str,
         binding: tuple[object, ...],
+        publication_refreshable: bool = True,
     ) -> ProductActionProof:
         self._ensure_integrity()
         if proof_type not in _PROOF_TYPES:
@@ -651,6 +682,8 @@ class ProductActionProofRegistryV1:
             raise ValueError("Product Action proof action is invalid")
         if type(binding) is not tuple:
             raise TypeError("Product Action proof binding must be an exact tuple")
+        if type(publication_refreshable) is not bool:
+            raise TypeError("Product Action proof refresh policy must be exact bool")
         nonce = object()
         proof = proof_type(
             _PROOF_CONSTRUCTION_SEAL,
@@ -664,6 +697,7 @@ class ProductActionProofRegistryV1:
             cast(ProductActionName, action_name),
             binding,
             "issued",
+            publication_refreshable,
         )
         with self._lock:
             self._records[id(proof)] = record
@@ -715,6 +749,44 @@ class ProductActionProofRegistryV1:
                 raise ValueError(f"Product Action proof is {record.state}")
             return record.action_name, record.binding
 
+    def _consume_publication_refresh(
+        self,
+        proof: object,
+        *,
+        proof_type: type[Any],
+        action_name: str,
+        expected_binding: tuple[object, ...],
+    ) -> None:
+        """Atomically consume the one refresh allowed after a consumed proof."""
+
+        self._ensure_integrity()
+        if type(proof) not in _PROOF_TYPES:
+            raise TypeError("Product Action proof has the wrong union type")
+        typed = cast(ProductActionProof, proof)
+        try:
+            if (
+                typed._seal
+                != (typed._registry_token, typed._incarnation, typed._nonce)
+                or typed._registry_token is not self._registry_token
+                or typed._incarnation is not self._incarnation
+            ):
+                raise ValueError
+        except (AttributeError, ValueError) as exc:
+            raise ValueError("Product Action proof provenance mismatch") from exc
+        with self._lock:
+            retired = self._retired.get(typed)
+            if (
+                id(typed) in self._records
+                or retired is None
+                or retired.proof_type is not proof_type
+                or retired.action_name != action_name
+                or retired.binding != expected_binding
+                or retired.state != "consumed"
+                or retired.publication_refreshable is not True
+            ):
+                raise ValueError("Product Action proof is not refreshable")
+            retired.state = "refreshed"
+
     def claim(
         self,
         proof: object,
@@ -748,6 +820,13 @@ class ProductActionProofRegistryV1:
             record.state = state
             if self._records.pop(id(proof), None) is not record:
                 raise ValueError("Product Action proof Registry integrity drift")
+            self._retired[proof] = _RetiredProofRecord(
+                record.proof_type,
+                record.action_name,
+                record.binding,
+                state,
+                record.publication_refreshable,
+            )
 
     def revoke(self, proof: object) -> None:
         with self._lock:
@@ -757,6 +836,13 @@ class ProductActionProofRegistryV1:
             record.state = "revoked"
             if self._records.pop(id(proof), None) is not record:
                 raise ValueError("Product Action proof Registry integrity drift")
+            self._retired[record.proof] = _RetiredProofRecord(
+                record.proof_type,
+                record.action_name,
+                record.binding,
+                "revoked",
+                record.publication_refreshable,
+            )
 
 
 __all__ = [
@@ -775,6 +861,7 @@ __all__ = [
     "canonical_product_action_json",
     "decode_product_action_request_v1",
     "decode_product_action_route_payload",
+    "freeze_product_action_json",
     "materialize_frozen_json",
     "require_product_action_hmac",
     "require_product_action_uuid",

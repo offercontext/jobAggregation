@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import gc
 import json
 import os
 import pickle
@@ -652,6 +653,29 @@ def test_terminal_proof_records_are_removed_without_permitting_reuse_or_cross_re
                 action_name="confirm_interview_story",
                 expected_binding=binding,
             )
+
+
+def test_retired_proof_tombstones_do_not_keep_request_local_proofs_alive() -> None:
+    registry = ProductActionProofRegistryV1()
+    binding = ("owner", 1)
+    proof = registry._issue(  # noqa: SLF001 - lifecycle cleanup contract
+        ProductActionRouteProof,
+        action_name="confirm_interview_story",
+        binding=binding,
+    )
+    with registry.claim(
+        proof,
+        proof_type=ProductActionRouteProof,
+        action_name="confirm_interview_story",
+        expected_binding=binding,
+    ):
+        pass
+    assert len(registry._retired) == 1  # type: ignore[attr-defined]
+
+    del proof
+    gc.collect()
+
+    assert len(registry._retired) == 0  # type: ignore[attr-defined]
 
 
 def test_signal_and_story_recovery_proof_field_contracts_are_not_nullable_unions() -> None:

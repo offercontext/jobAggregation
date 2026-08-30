@@ -41,6 +41,15 @@ from offerpilot.pilot_runtime.deterministic import (
     DeterministicPilotAdapter,
 )
 from offerpilot.pilot_runtime.service import RuntimeDependencies
+from offerpilot.product_actions.catalog import (
+    ProductActionCatalogV1,
+    ProductActionCompensationCatalogV1,
+)
+from offerpilot.product_actions.contracts import (
+    PRODUCT_ACTION_COMPENSATION_NAMES,
+    PRODUCT_ACTION_NAMES,
+    ProductActionProofRegistryV1,
+)
 
 
 ROOT = Path(__file__).parents[2]
@@ -246,6 +255,47 @@ def test_production_components_publish_one_complete_25_3_4_bundle_graph() -> Non
     for binding in bundle.compensation_view().ordered_handler_bindings:
         handler = compensation_registry.bind_handler(binding)
         assert compensation_registry.require_handler_handle(handler) is binding
+
+
+def test_agent_bundle_stays_exact_25_3_4_and_product_catalogs_are_independent_2_2() -> None:
+    components = _production_components()
+    registry = ProductActionProofRegistryV1()
+    actions = ProductActionCatalogV1(registry)
+    compensations = ProductActionCompensationCatalogV1()
+
+    provider_names = tuple(
+        contract.name
+        for contract in components.bundle.provider_view().ordered_contracts
+    )
+    legacy_names = tuple(
+        binding.name
+        for binding in components.bundle.legacy_boundary().ordered_adapter_bindings
+    )
+    agent_compensation_names = tuple(
+        binding.compensation_kind
+        for binding in components.bundle.compensation_view().ordered_handler_bindings
+    )
+
+    assert (
+        len(provider_names),
+        len(legacy_names),
+        len(agent_compensation_names),
+        len(actions.ordered_specs),
+        len(compensations.ordered_specs),
+    ) == (25, 3, 4, 2, 2)
+    assert actions.names() == PRODUCT_ACTION_NAMES
+    assert compensations.names() == PRODUCT_ACTION_COMPENSATION_NAMES
+    assert set(PRODUCT_ACTION_NAMES).isdisjoint(provider_names)
+    assert set(PRODUCT_ACTION_NAMES).isdisjoint(legacy_names)
+    assert set(PRODUCT_ACTION_COMPENSATION_NAMES).isdisjoint(agent_compensation_names)
+    provider_fixture = json.loads(
+        (ROOT / "tests" / "fixtures" / "tool_pipeline" / "provider_manifest_30c944f.json")
+        .read_text(encoding="utf-8")
+    )
+    assert [
+        contract.payload
+        for contract in components.bundle.provider_view().ordered_contracts
+    ] == provider_fixture["tools"]
 
 
 def test_build_pilot_runtime_has_no_raw_catalog_injection_surface() -> None:

@@ -26,6 +26,13 @@ PRODUCT_ACTION_MODULES = frozenset(
         "compensation.py",
     }
 )
+RAW_DECODER_NAME = "decode_product_action_request_v1"
+PRODUCT_ACTION_ROUTE_MARKERS = (
+    "readiness-focus-actions",
+    "product-actions",
+    "product-action-undo",
+    "/decisions",
+)
 
 
 def _parse(path: Path) -> ast.Module | None:
@@ -131,9 +138,22 @@ def _has_registered_migration(tree: ast.AST | None) -> bool:
             terminal = node.func.id
         elif isinstance(node.func, ast.Attribute):
             terminal = node.func.attr
-        if terminal != "_record_migration":
+        if terminal == "_record_migration" and any(
+            _literal_string(argument) == MIGRATION for argument in node.args
+        ):
+            return True
+        if terminal != "execute" or not node.args:
             continue
-        if any(_literal_string(argument) == MIGRATION for argument in node.args):
+        statement = _literal_string(node.args[0])
+        if statement is None or "insert into schema_migrations" not in " ".join(
+            statement.casefold().split()
+        ):
+            continue
+        if any(
+            isinstance(item, ast.Constant) and item.value == MIGRATION
+            for argument in node.args[1:]
+            for item in ast.walk(argument)
+        ):
             return True
     return False
 
@@ -362,6 +382,74 @@ def _application_event_delete_violations(path: Path, tree: ast.Module) -> list[s
     return violations
 
 
+def _unsafe_product_action_http_bodies(tree: ast.AST | None) -> list[str]:
+    """Reject normalization/coercion before the duplicate-aware raw decoder."""
+
+    if tree is None:
+        return []
+    violations: list[str] = []
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        decorator_text = " ".join(ast.unparse(item) for item in node.decorator_list)
+        if not any(marker in decorator_text for marker in PRODUCT_ACTION_ROUTE_MARKERS):
+            continue
+        arguments = (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
+        defaults = (
+            *node.args.defaults,
+            *(item for item in node.args.kw_defaults if item is not None),
+        )
+        has_raw_request = any(
+            argument.arg == "request"
+            and argument.annotation is not None
+            and "Request" in ast.unparse(argument.annotation)
+            for argument in arguments
+        )
+        body_or_model_parameter = any(
+            argument.annotation is not None
+            and (
+                "dict" in ast.unparse(argument.annotation).casefold()
+                or "BaseModel" in ast.unparse(argument.annotation)
+            )
+            for argument in arguments
+        ) or any(
+            isinstance(child, ast.Call)
+            and (
+                isinstance(child.func, ast.Name)
+                and child.func.id == "Body"
+                or isinstance(child.func, ast.Attribute)
+                and child.func.attr == "Body"
+            )
+            for argument in arguments
+            if argument.annotation is not None
+            for child in ast.walk(argument.annotation)
+        ) or any(
+            isinstance(child, ast.Call)
+            and (
+                isinstance(child.func, ast.Name)
+                and child.func.id == "Body"
+                or isinstance(child.func, ast.Attribute)
+                and child.func.attr == "Body"
+            )
+            for default in defaults
+            for child in ast.walk(default)
+        )
+        decoder_calls = [
+            child
+            for child in ast.walk(node)
+            if isinstance(child, ast.Call)
+            and (
+                isinstance(child.func, ast.Name)
+                and child.func.id == RAW_DECODER_NAME
+                or isinstance(child.func, ast.Attribute)
+                and child.func.attr == RAW_DECODER_NAME
+            )
+        ]
+        if body_or_model_parameter or not has_raw_request or len(decoder_calls) != 1:
+            violations.append(f"ui:unsafe-product-action-body:{node.name}")
+    return violations
+
+
 def _source_violations() -> list[str]:
     violations: list[str] = []
     db_tree = _parse(SRC / "db.py")
@@ -371,6 +459,7 @@ def _source_violations() -> list[str]:
     }
     notes_tree = _parse(SRC / "repositories" / "notes.py")
     practice_tree = _parse(SRC / "repositories" / "adaptive_interview_practice.py")
+    api_tree = _parse(SRC / "api.py")
 
     if not _has_registered_migration(db_tree):
         violations.append("migration:missing-0029")
@@ -385,6 +474,7 @@ def _source_violations() -> list[str]:
         violations.append("practice:unconfirmed-proposal-source")
     if not _has_note_revision_helper(notes_tree):
         violations.append("note:missing-content-revision")
+    violations.extend(_unsafe_product_action_http_bodies(api_tree))
     return violations
 
 
@@ -416,6 +506,10 @@ PRODUCT_ACTION_COMPENSATION_NAMES = (
     "undo:confirm_interview_story", "undo:save_review_readiness_signal"
 )
 _record_migration(engine, "0029_review_to_readiness_feedback", "approved")
+cursor.execute(
+    "INSERT INTO schema_migrations(version,description) VALUES (?,?)",
+    ("0029_review_to_readiness_feedback", "approved"),
+)
 def route(repo):
     return repo.confirm_attempt()
 class AdaptivePracticeRepository:
@@ -433,6 +527,16 @@ def _revisioned_note_values(values):
     assert _has_self_committing_story_call(exact)
     assert _proposal_drives_practice(exact)
     assert _has_note_revision_helper(exact)
+
+    atomic_raw_migration = ast.parse(
+        '''
+cursor.execute(
+    "INSERT INTO schema_migrations(version,description) VALUES (?,?)",
+    ("0029_review_to_readiness_feedback", "approved"),
+)
+'''
+    )
+    assert _has_registered_migration(atomic_raw_migration)
 
 
 def test_application_event_delete_owner_detector_rejects_direct_sql_and_orm_paths() -> None:
@@ -614,6 +718,52 @@ class AdaptivePracticeRepository:
 '''
     )
     assert not _proposal_drives_practice(unreachable_legacy_helper)
+
+
+def test_product_action_http_gate_requires_raw_request_before_body_normalization() -> None:
+    safe = ast.parse(
+        '''
+@router.post("/api/product-actions/{operation_id}/decisions")
+async def decide(operation_id: str, request: Request):
+    payload = decode_product_action_request_v1(await request.body(), contract="decision")
+    return service.decide(operation_id, payload)
+'''
+    )
+    assert _unsafe_product_action_http_bodies(safe) == []
+
+    coerced_dict = ast.parse(
+        '''
+@router.post("/api/product-actions/{operation_id}/decisions")
+def decide(operation_id: str, payload: dict = Body(...)):
+    return decode_product_action_request_v1(payload, contract="decision")
+'''
+    )
+    assert _unsafe_product_action_http_bodies(coerced_dict) == [
+        "ui:unsafe-product-action-body:decide"
+    ]
+
+    raw_plus_coerced_model = ast.parse(
+        '''
+@router.post("/api/product-actions/{operation_id}/decisions")
+async def decide(operation_id: str, request: Request, payload: DecisionBody = Body(...)):
+    raw = decode_product_action_request_v1(await request.body(), contract="decision")
+    return service.decide(operation_id, raw, payload)
+'''
+    )
+    assert _unsafe_product_action_http_bodies(raw_plus_coerced_model) == [
+        "ui:unsafe-product-action-body:decide"
+    ]
+
+    missing_decoder = ast.parse(
+        '''
+@router.post("/api/interview-notes/{note_id}/readiness-focus-actions")
+async def propose(note_id: int, request: Request):
+    return service.propose(await request.json())
+'''
+    )
+    assert _unsafe_product_action_http_bodies(missing_decoder) == [
+        "ui:unsafe-product-action-body:propose"
+    ]
 
 
 def test_review_to_readiness_production_cutover_gate() -> None:

@@ -17,6 +17,10 @@ from offerpilot.ai.tool_runtime.catalog import compile_tool_metadata_manifest
 from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
 from offerpilot.models import WriteOperation
+from offerpilot.product_actions.contracts import (
+    PRODUCT_ACTION_COMPENSATION_NAMES,
+    PRODUCT_ACTION_NAMES,
+)
 
 
 _TEST_TOOL_CATALOG = build_model_tool_catalog()
@@ -229,6 +233,34 @@ def test_product_routes_are_additive_to_the_fixed_agent_baseline(
 
     assert not _accepted(baseline, route)
     assert _accepted(current, route)
+
+
+def test_current_sqlite_product_allow_set_is_exactly_the_independent_two_by_two() -> None:
+    connection = sqlite3.connect(":memory:")
+    checks = _current_checks()
+    _create_published_schema(
+        connection,
+        manifest_sql=checks[MANIFEST_CONSTRAINT],
+        undo_policy_sql=checks[UNDO_POLICY_CONSTRAINT],
+        undo_bytes_sql=checks[UNDO_BYTES_CONSTRAINT],
+    )
+    try:
+        product_routes = {
+            *(("primary", "product_action", name) for name in PRODUCT_ACTION_NAMES),
+            *(("compensation", "compensation", name) for name in PRODUCT_ACTION_COMPENSATION_NAMES),
+        }
+        assert len(product_routes) == 4
+        assert all(_accepted(connection, route) for route in product_routes)
+        assert not _accepted(
+            connection,
+            ("primary", "product_action", "unknown_product_action"),
+        )
+        assert not _accepted(
+            connection,
+            ("compensation", "compensation", "undo:unknown_product_action"),
+        )
+    finally:
+        connection.close()
 
 
 @pytest.mark.parametrize("route", sorted(_all_published_routes()))

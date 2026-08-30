@@ -1807,6 +1807,7 @@ class WriteOperationRepository:
         sqlite_now = session.scalar(select(func.unixepoch("now")))
         if (
             operation is None
+            or operation.adapter_kind == "product_action"
             or operation.delivery_status != "pending"
             or operation.delivery_generation != ownership.generation
             or not hmac.compare_digest(
@@ -1936,6 +1937,7 @@ class WriteOperationRepository:
                     result = session.execute(
                         update(WriteOperation)
                         .where(WriteOperation.id == ownership.operation_id)
+                        .where(WriteOperation.adapter_kind != "product_action")
                         .where(WriteOperation.delivery_status == "pending")
                         .where(WriteOperation.delivery_generation == ownership.generation)
                         .where(
@@ -1958,7 +1960,11 @@ class WriteOperationRepository:
                 session.execute(text("BEGIN IMMEDIATE"))
                 now_epoch = int(session.scalar(select(func.unixepoch("now"))) or 0)
                 operation = session.get(WriteOperation, operation_id)
-                if operation is None or operation.status not in _TERMINAL_STATUSES:
+                if (
+                    operation is None
+                    or operation.adapter_kind == "product_action"
+                    or operation.status not in _TERMINAL_STATUSES
+                ):
                     session.rollback()
                     return OperationUnknown(operation_id, "operation_result_unknown", True)
                 payload = payload_from_operation(operation)

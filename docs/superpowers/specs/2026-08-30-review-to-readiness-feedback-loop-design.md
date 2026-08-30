@@ -1,6 +1,6 @@
 # Review-to-Readiness Feedback Loop 设计
 
-> 状态：待复审
+> 状态：已复审通过
 > 固定 baseline：c5a020cbedd8ff64f6188f51c10d8f4daa7c7dff
 > 设计分支：feat/20260830-review-readiness-feedback-loop
 > Worktree：D:\Users\yuqi.chen\offerpilot\.worktrees\feat-20260830-review-readiness-feedback-loop
@@ -2095,4 +2095,4 @@ baseline golden + 0029 RED
 → old-path deletion + full release verification
 ~~~
 
-本文批准不等于授权实施；用户完成书面复审前，状态保持“待复审”。
+本文已完成书面复审并获用户批准进入实施；任何偏离已批准边界的重大变更必须先停止并重新复审。

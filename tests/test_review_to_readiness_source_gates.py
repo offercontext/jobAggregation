@@ -1,0 +1,230 @@
+from __future__ import annotations
+
+import ast
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src" / "offerpilot"
+MIGRATION = "0029_review_to_readiness_feedback"
+PRODUCT_ACTIONS = (
+    "confirm_interview_story",
+    "save_review_readiness_signal",
+)
+PRODUCT_ACTION_COMPENSATIONS = (
+    "undo:confirm_interview_story",
+    "undo:save_review_readiness_signal",
+)
+
+
+def _parse(path: Path) -> ast.Module | None:
+    if not path.is_file():
+        return None
+    return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+
+def _literal_string(node: ast.AST) -> str | None:
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+
+def _literal_string_sequence(tree: ast.AST | None, name: str) -> tuple[str, ...] | None:
+    if tree is None:
+        return None
+    for node in tree.body:
+        value: ast.AST | None = None
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == name for target in node.targets
+        ):
+            value = node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            if node.target.id == name:
+                value = node.value
+        if not isinstance(value, (ast.Tuple, ast.List)):
+            continue
+        items = tuple(_literal_string(item) for item in value.elts)
+        if all(item is not None for item in items):
+            return tuple(item for item in items if item is not None)
+    return None
+
+
+def _has_registered_migration(tree: ast.AST | None) -> bool:
+    if tree is None:
+        return False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        terminal = None
+        if isinstance(node.func, ast.Name):
+            terminal = node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            terminal = node.func.attr
+        if terminal != "_record_migration":
+            continue
+        if any(_literal_string(argument) == MIGRATION for argument in node.args):
+            return True
+    return False
+
+
+def _has_self_committing_story_call(tree: ast.AST) -> bool:
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name) and node.func.id == "confirm_attempt":
+            return True
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "confirm_attempt":
+            return True
+    return False
+
+
+def _proposal_drives_practice_start(tree: ast.AST | None) -> bool:
+    if tree is None:
+        return False
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef) or node.name != "AdaptivePracticeRepository":
+            continue
+        for member in node.body:
+            if not isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if member.name != "start":
+                continue
+            parameters = {
+                argument.arg
+                for argument in (*member.args.posonlyargs, *member.args.args, *member.args.kwonlyargs)
+            }
+            if "proposal_id" in parameters:
+                return True
+            if any(
+                isinstance(child, ast.Name) and child.id == "InterviewReviewProposal"
+                for child in ast.walk(member)
+            ):
+                return True
+    return False
+
+
+def _has_note_revision_helper(tree: ast.AST | None) -> bool:
+    if tree is None:
+        return False
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name != "_revisioned_note_values":
+            continue
+        string_literals = {
+            child.value
+            for child in ast.walk(node)
+            if isinstance(child, ast.Constant) and isinstance(child.value, str)
+        }
+        has_revision_source = any(
+            isinstance(child, ast.Attribute)
+            and child.attr == "content_revision"
+            and isinstance(child.value, ast.Name)
+            and child.value.id == "InterviewNote"
+            for child in ast.walk(node)
+        )
+        has_increment = any(
+            isinstance(child, ast.BinOp)
+            and isinstance(child.op, ast.Add)
+            and isinstance(child.right, ast.Constant)
+            and type(child.right.value) is int
+            and child.right.value == 1
+            for child in ast.walk(node)
+        )
+        has_timestamp = any(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and child.func.attr == "current_timestamp"
+            for child in ast.walk(node)
+        )
+        return (
+            {"content_revision", "updated_at"}.issubset(string_literals)
+            and has_revision_source
+            and has_increment
+            and has_timestamp
+        )
+    return False
+
+
+def _source_violations() -> list[str]:
+    violations: list[str] = []
+    db_tree = _parse(SRC / "db.py")
+    contracts_tree = _parse(SRC / "product_actions" / "contracts.py")
+    notes_tree = _parse(SRC / "repositories" / "notes.py")
+    practice_tree = _parse(SRC / "repositories" / "adaptive_interview_practice.py")
+
+    if not _has_registered_migration(db_tree):
+        violations.append("migration:missing-0029")
+    if _literal_string_sequence(contracts_tree, "PRODUCT_ACTION_NAMES") != PRODUCT_ACTIONS:
+        violations.append("ledger:missing-product-action")
+    if (
+        _literal_string_sequence(contracts_tree, "PRODUCT_ACTION_COMPENSATION_NAMES")
+        != PRODUCT_ACTION_COMPENSATIONS
+    ):
+        violations.append("ledger:missing-product-action-compensation")
+    if any(
+        _has_self_committing_story_call(tree)
+        for path in sorted(SRC.rglob("*.py"))
+        if (tree := _parse(path)) is not None
+    ):
+        violations.append("story:self-committing-confirm")
+    if _proposal_drives_practice_start(practice_tree):
+        violations.append("practice:unconfirmed-proposal-source")
+    if not _has_note_revision_helper(notes_tree):
+        violations.append("note:missing-content-revision")
+    return violations
+
+
+def test_detectors_require_exact_ast_surfaces_not_comments_or_strings() -> None:
+    pseudo = ast.parse(
+        '''
+"""0029_review_to_readiness_feedback confirm_attempt InterviewReviewProposal"""
+PRODUCT_ACTION_NAMES = "confirm_interview_story save_review_readiness_signal"
+# _record_migration(engine, "0029_review_to_readiness_feedback", "fake")
+class AdaptivePracticeRepository:
+    def start(self, readiness_signal_version_id):
+        return "proposal_id InterviewReviewProposal"
+def _revisioned_note_values(values):
+    return "content_revision updated_at current_timestamp"
+'''
+    )
+    assert not _has_registered_migration(pseudo)
+    assert _literal_string_sequence(pseudo, "PRODUCT_ACTION_NAMES") is None
+    assert not _has_self_committing_story_call(pseudo)
+    assert not _proposal_drives_practice_start(pseudo)
+    assert not _has_note_revision_helper(pseudo)
+
+
+def test_detectors_accept_only_the_approved_mechanical_shapes() -> None:
+    exact = ast.parse(
+        '''
+PRODUCT_ACTION_NAMES = ("confirm_interview_story", "save_review_readiness_signal")
+PRODUCT_ACTION_COMPENSATION_NAMES = (
+    "undo:confirm_interview_story", "undo:save_review_readiness_signal"
+)
+_record_migration(engine, "0029_review_to_readiness_feedback", "approved")
+def route(repo):
+    return repo.confirm_attempt()
+class AdaptivePracticeRepository:
+    def start(self, proposal_id):
+        return InterviewReviewProposal
+def _revisioned_note_values(values):
+    return {
+        **values,
+        "content_revision": InterviewNote.content_revision + 1,
+        "updated_at": func.current_timestamp(),
+    }
+'''
+    )
+    assert _has_registered_migration(exact)
+    assert _literal_string_sequence(exact, "PRODUCT_ACTION_NAMES") == PRODUCT_ACTIONS
+    assert (
+        _literal_string_sequence(exact, "PRODUCT_ACTION_COMPENSATION_NAMES")
+        == PRODUCT_ACTION_COMPENSATIONS
+    )
+    assert _has_self_committing_story_call(exact)
+    assert _proposal_drives_practice_start(exact)
+    assert _has_note_revision_helper(exact)
+
+
+def test_review_to_readiness_production_cutover_gate() -> None:
+    # Intentional RED until Tasks 1-8 remove every named production gap.
+    assert _source_violations() == []

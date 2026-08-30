@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "source_baseline": "c5a020cbedd8ff64f6188f51c10d8f4daa7c7dff",
+  "provider_tools": 25,
+  "legacy_deterministic": 3,
+  "agent_compensations": 4,
+  "product_actions": [
+    "confirm_interview_story",
+    "save_review_readiness_signal"
+  ],
+  "product_action_compensations": [
+    "undo:confirm_interview_story",
+    "undo:save_review_readiness_signal"
+  ],
+  "production_contributors_disabled": [
+    "confirmed_memory",
+    "knowledge_context",
+    "older_conversation_summary"
+  ]
+}

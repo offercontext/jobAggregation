@@ -582,6 +582,32 @@ class InterviewPreparationProposalOut(BaseModel):
     created_at: datetime | str
 
 
+class InterviewPreparationProposalCreateIn(BaseModel):
+    """Strict normalized shape after the HTTP raw-JSON contract is sealed."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    event_id: int
+    resume_id: int
+    jd_version_id: int
+    knowledge_selections: list[dict[str, Any]]
+    user_assertions: list[str]
+    idempotency_key: str
+    readiness_feedback_version_ids: list[int] = Field(
+        default_factory=list,
+        max_length=8,
+    )
+
+    @field_validator("readiness_feedback_version_ids")
+    @classmethod
+    def validate_readiness_feedback_version_ids(cls, value: list[int]) -> list[int]:
+        if any(type(item) is not int or item < 1 for item in value):
+            raise ValueError("readiness feedback version IDs must be positive integers")
+        if len(set(value)) != len(value):
+            raise ValueError("readiness feedback version IDs must be unique")
+        return value
+
+
 class InterviewPreparationPendingOut(BaseModel):
     attempt_status: Literal["generating", "provider_unknown"]
     application_id: int

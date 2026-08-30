@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from hashlib import sha256
 from importlib.metadata import PackageNotFoundError, version as package_version
 from io import BytesIO
+from math import isfinite
 from pathlib import Path
 from secrets import compare_digest
 from time import perf_counter
@@ -16,7 +17,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Literal, Mapping, Optional, cast
 from uuid import UUID, uuid4
 
-from fastapi import BackgroundTasks, Body, FastAPI, File, Form, Query, Request, UploadFile
+from fastapi import BackgroundTasks, Body, Depends, FastAPI, File, Form, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pypdf import PdfReader
@@ -328,6 +329,7 @@ from offerpilot.schemas import (
     EvidenceBundlePreviewOut,
     ApplicationEventOut,
     InterviewNoteRestOut,
+    InterviewPreparationProposalCreateIn,
     JDAnalysisOut,
     KnowledgeIngestResponse,
     MaterialKitOut,
@@ -3105,9 +3107,20 @@ def create_app(
 
     @app.post("/api/applications/{app_id}/interview-preparation-proposals")
     def create_interview_preparation_proposal(
-        app_id: int, payload: dict[str, Any] = Body(...)
+        app_id: int,
+        decoded: tuple[dict[str, Any], bool] | JSONResponse = Depends(
+            _interview_preparation_raw_request
+        ),
     ) -> JSONResponse:
-        parsed = _interview_preparation_request_payload(payload)
+        if isinstance(decoded, JSONResponse):
+            return decoded
+        payload, readiness_feedback_version_ids_present = decoded
+        parsed = _interview_preparation_request_payload(
+            payload,
+            readiness_feedback_version_ids_present=(
+                readiness_feedback_version_ids_present
+            ),
+        )
         if isinstance(parsed, JSONResponse):
             return parsed
         app_model = applications.get(app_id)
@@ -9908,7 +9921,85 @@ def _interview_review_proposal_json(proposal: Any) -> dict[str, Any]:
     }
 
 
-def _interview_preparation_request_payload(payload: Any) -> dict[str, Any] | JSONResponse:
+def _decode_interview_preparation_request(
+    raw_body: bytes,
+) -> tuple[dict[str, Any], bool] | JSONResponse:
+    def invalid_request() -> JSONResponse:
+        return error_response(
+            422,
+            "面试准备请求字段无效。",
+            code="interview_preparation_invalid_request",
+        )
+
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        decoded: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in decoded:
+                raise ValueError("duplicate JSON object key")
+            decoded[key] = value
+        return decoded
+
+    def reject_non_finite(_value: str) -> None:
+        raise ValueError("non-finite JSON number")
+
+    def parse_finite_float(value: str) -> float:
+        parsed = float(value)
+        if not isfinite(parsed):
+            raise ValueError("non-finite JSON number")
+        return parsed
+
+    try:
+        decoded = json.loads(
+            raw_body.decode("utf-8"),
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_non_finite,
+            parse_float=parse_finite_float,
+        )
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        TypeError,
+        ValueError,
+    ):
+        return invalid_request()
+    if _decoded_json_contains_surrogate(decoded):
+        return invalid_request()
+    if type(decoded) is not dict:
+        return invalid_request()
+    return decoded, "readiness_feedback_version_ids" in decoded
+
+
+def _decoded_json_contains_surrogate(value: Any) -> bool:
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if type(item) is str:
+            if any(0xD800 <= ord(character) <= 0xDFFF for character in item):
+                return True
+        elif type(item) is list:
+            pending.extend(item)
+        elif type(item) is dict:
+            for key, child in item.items():
+                if any(0xD800 <= ord(character) <= 0xDFFF for character in key):
+                    return True
+                pending.append(child)
+    return False
+
+
+async def _interview_preparation_raw_request(
+    request: Request,
+) -> tuple[dict[str, Any], bool] | JSONResponse:
+    """Read raw bytes asynchronously while keeping Provider work in FastAPI's threadpool."""
+
+    return _decode_interview_preparation_request(await request.body())
+
+
+def _interview_preparation_request_payload(
+    payload: Any,
+    *,
+    readiness_feedback_version_ids_present: bool = False,
+) -> dict[str, Any] | JSONResponse:
     allowed = {
         "event_id",
         "resume_id",
@@ -9916,7 +10007,9 @@ def _interview_preparation_request_payload(payload: Any) -> dict[str, Any] | JSO
         "knowledge_selections",
         "user_assertions",
         "idempotency_key",
+        "readiness_feedback_version_ids",
     }
+    required = allowed - {"readiness_feedback_version_ids"}
     if not isinstance(payload, dict):
         return error_response(
             422,
@@ -9927,7 +10020,7 @@ def _interview_preparation_request_payload(payload: Any) -> dict[str, Any] | JSO
         return error_response(
             422, "Application JD version is required.", code="application_jd_version_required"
         )
-    if set(payload) != allowed:
+    if set(payload) - allowed or required - set(payload):
         return error_response(
             422,
             "面试准备请求字段无效。",
@@ -9957,14 +10050,36 @@ def _interview_preparation_request_payload(payload: Any) -> dict[str, Any] | JSO
         return error_response(
             422, "用户断言格式无效。", code="interview_preparation_invalid_request"
         )
-    return {
-        "event_id": payload["event_id"],
-        "resume_id": payload["resume_id"],
-        "jd_version_id": payload["jd_version_id"],
-        "knowledge_selections": payload["knowledge_selections"],
-        "user_assertions": payload["user_assertions"],
-        "idempotency_key": payload["idempotency_key"],
+    if readiness_feedback_version_ids_present != (
+        "readiness_feedback_version_ids" in payload
+    ):
+        return error_response(
+            422,
+            "面试准备请求字段无效。",
+            code="interview_preparation_invalid_request",
+        )
+    try:
+        normalized = InterviewPreparationProposalCreateIn.model_validate(payload)
+    except (TypeError, ValueError):
+        return error_response(
+            422,
+            "面试准备请求字段无效。",
+            code="interview_preparation_invalid_request",
+        )
+    normalized_payload: dict[str, Any] = {
+        "event_id": normalized.event_id,
+        "resume_id": normalized.resume_id,
+        "jd_version_id": normalized.jd_version_id,
+        "knowledge_selections": normalized.knowledge_selections,
+        "user_assertions": normalized.user_assertions,
+        "idempotency_key": normalized.idempotency_key,
     }
+    if readiness_feedback_version_ids_present:
+        normalized_payload["readiness_feedback_version_ids_present"] = True
+        normalized_payload["readiness_feedback_version_ids"] = tuple(
+            normalized.readiness_feedback_version_ids
+        )
+    return normalized_payload
 
 
 def _interview_preparation_generation_response(result: Any) -> JSONResponse:

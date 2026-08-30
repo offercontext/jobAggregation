@@ -27,6 +27,13 @@ export interface QuickPracticeDraft {
   resumeId: number | undefined;
 }
 
+export type QuickPracticeResumeSourceStatus = 'ready' | 'loading' | 'error' | 'absent' | 'unknown';
+
+export interface QuickPracticeReadinessOptions {
+  /** The source state is authoritative; rows carried by an unresolved envelope are not usable. */
+  readonly resumeSourceStatus?: QuickPracticeResumeSourceStatus;
+}
+
 function isValidId(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
 }
@@ -77,8 +84,23 @@ export function buildRealInterviewReadiness(input: RealInterviewReadinessInput):
   });
 }
 
-export function buildQuickPracticeReadiness(draft: QuickPracticeDraft): ReadinessResult {
+export function buildQuickPracticeReadiness(
+  draft: QuickPracticeDraft,
+  options: QuickPracticeReadinessOptions = {},
+): ReadinessResult {
   const draftStatus = validateQuickPracticeDraft(draft);
+  const resumeSourceStatus = options.resumeSourceStatus ?? 'ready';
+  const resumeSourceReady = resumeSourceStatus === 'ready';
+  const resumeStatus: ReadinessStatus = resumeSourceReady
+    ? isValidId(draft.resumeId) ? 'ready' : 'needs_input'
+    : resumeSourceStatus === 'loading' ? 'unknown' : 'unavailable';
+  const resumeDetail = resumeSourceReady
+    ? isValidId(draft.resumeId) ? '将冻结当前已保存版本。' : '需要选择一份当前可见的已保存简历。'
+    : resumeSourceStatus === 'loading'
+      ? '简历列表正在加载，加载完成后才能开始。'
+      : resumeSourceStatus === 'absent'
+        ? '简历列表尚未加载，加载完成后才能开始。'
+        : '简历列表状态暂时无法确认，请重试后再开始。';
   const items: ReadinessItem[] = [
     {
       key: 'application',
@@ -96,9 +118,9 @@ export function buildQuickPracticeReadiness(draft: QuickPracticeDraft): Readines
     {
       key: 'resume',
       label: '简历',
-      status: isValidId(draft.resumeId) ? 'ready' : 'needs_input',
-      detail: isValidId(draft.resumeId) ? '将冻结当前已保存版本。' : '需要选择一份当前可见的已保存简历。',
-      actionLabel: '选择简历',
+      status: resumeStatus,
+      detail: resumeDetail,
+      actionLabel: resumeSourceReady ? '选择简历' : undefined,
     },
     {
       key: 'event',
@@ -114,7 +136,7 @@ export function buildQuickPracticeReadiness(draft: QuickPracticeDraft): Readines
     },
   ];
   return Object.freeze({
-    ready: draftStatus.ok && items.slice(1, 3).every((item) => item.status === 'ready'),
+    ready: draftStatus.ok && resumeSourceReady && items.slice(1, 3).every((item) => item.status === 'ready'),
     items: Object.freeze(items.map((item) => Object.freeze(item))),
   });
 }

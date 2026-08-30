@@ -69,4 +69,21 @@ describe('interview readiness model', () => {
       status: 'needs_input',
     });
   });
+
+  it.each([
+    ['loading', 'unknown'],
+    ['error', 'unavailable'],
+    ['unknown', 'unavailable'],
+    ['absent', 'unavailable'],
+  ] as const)('does not treat a stale numeric resume as ready while the %s source is unresolved', (sourceStatus, expectedStatus) => {
+    const result = buildQuickPracticeReadiness({
+      positionName: '工程师',
+      jdText: 'JD',
+      jdConfirmed: true,
+      resumeId: 11,
+    }, { resumeSourceStatus: sourceStatus });
+
+    expect(result.ready).toBe(false);
+    expect(result.items.find((item) => item.key === 'resume')).toMatchObject({ status: expectedStatus });
+  });
 });

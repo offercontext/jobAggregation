@@ -20,6 +20,8 @@ import type { InterviewKnowledgeCaptureDraft } from '@/components/InterviewKnowl
 import type { InterviewPreparationAttemptState, InterviewPreparationDraft, InterviewPreparationKnowledgeOption } from '@/components/InterviewPreparationProposalDrawer';
 import InterviewStudio, { type InterviewStudioContext as RealInterviewStudioContext, type QuickPracticeStudioContext } from '@/features/interviewStudio/InterviewStudio';
 import PilotOpportunityFitV2Card from '@/features/pilot/PilotOpportunityFitV2Card';
+import { normalizeInterviewIndexItem } from '@/features/interviewEvents/interviewIndexContract';
+import { projectInterviewEventCard, type InterviewEventCardModel } from '@/features/interviewEvents/interviewEventCard';
 import {
   createOpportunityFitOwnerStore,
   type OpportunityFitOwnerProjection,
@@ -187,6 +189,21 @@ type UniqueInterviewEventResult =
   | { readonly ok: true; readonly event: ScheduleEvent }
   | { readonly ok: false };
 
+export type InterviewEventSourceState = 'loading' | 'error' | 'ready' | 'absent' | 'unknown';
+
+export interface ExactInterviewTaskInput {
+  readonly taskId: 'application.interview_prepare' | 'application.interview_review';
+  readonly applicationId: number;
+  readonly eventId: number;
+  readonly events: unknown;
+  readonly sourceState: InterviewEventSourceState;
+  readonly now: number;
+}
+
+export type ExactInterviewTaskResult =
+  | { readonly ok: true; readonly event: ScheduleEvent; readonly card: InterviewEventCardModel }
+  | { readonly ok: false; readonly reason: 'source_unavailable' | 'event_unavailable' | 'event_not_executable' };
+
 function resolveUniqueInterviewEvent(
   applicationId: number,
   eventId: number,
@@ -213,6 +230,70 @@ function resolveUniqueInterviewEvent(
     return { ok: false };
   }
   return matched ? { ok: true, event: matched } : { ok: false };
+}
+
+function projectExactInterviewEventCard(event: ScheduleEvent, now: number): InterviewEventCardModel | null {
+  try {
+    const source = event as unknown as Record<PropertyKey, unknown>;
+    const scheduledAt = source.scheduled_at;
+    const hasScheduleState = Object.prototype.hasOwnProperty.call(source, 'scheduled_at_state');
+    const scheduledAtState = hasScheduleState
+      ? source.scheduled_at_state
+      : typeof scheduledAt === 'string' && scheduledAt.length > 0 ? 'present' : 'absent';
+    const preparationAvailable = Object.prototype.hasOwnProperty.call(source, 'preparation_available')
+      ? source.preparation_available
+      : true;
+    const normalized = normalizeInterviewIndexItem({
+      application_id: source.application_id,
+      event_id: source.id,
+      company_name: source.company_name,
+      position_name: source.position_name,
+      scheduled_at: scheduledAt,
+      scheduled_at_state: scheduledAtState,
+      event_status: source.status,
+      duration_minutes: source.duration_minutes,
+      note_id: source.note_id ?? null,
+      note_source_status: null,
+      has_review_proposal: false,
+      review_summary: null,
+      has_confirmed_knowledge: false,
+      preparation_available: preparationAvailable,
+    });
+    return projectInterviewEventCard(normalized, now);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Validates an exact interview task at the same source/lifecycle/card boundary
+ * used by the interview surfaces. A task cannot be launched from cached,
+ * unresolved, terminal, expired, or otherwise non-executable event data.
+ */
+export function resolveExecutableInterviewTask(input: ExactInterviewTaskInput): ExactInterviewTaskResult {
+  try {
+    if (input.sourceState !== 'ready' || !Array.isArray(input.events)) {
+      return { ok: false, reason: 'source_unavailable' };
+    }
+    const resolved = resolveUniqueInterviewEvent(
+      input.applicationId,
+      input.eventId,
+      input.events as readonly Pick<ScheduleEvent, 'id' | 'application_id' | 'event_type'>[],
+    );
+    if (!resolved.ok) return { ok: false, reason: 'event_unavailable' };
+    const card = projectExactInterviewEventCard(resolved.event, input.now);
+    if (!card) return { ok: false, reason: 'event_not_executable' };
+    const executable = input.taskId === 'application.interview_prepare'
+      ? (card.lifecycle === 'scheduled' || card.lifecycle === 'in_progress')
+        && (card.primaryAction === 'prepare' || card.primaryAction === 'enter_preparation')
+      : card.lifecycle === 'completed'
+        && (card.primaryAction === 'record_review' || card.primaryAction === 'view_review');
+    return executable
+      ? { ok: true, event: resolved.event, card }
+      : { ok: false, reason: 'event_not_executable' };
+  } catch {
+    return { ok: false, reason: 'event_unavailable' };
+  }
 }
 
 export interface InterviewPreparationSelection {
@@ -525,6 +606,13 @@ function AppShellContent() {
   // explicit null-coalesce is needed to keep downstream iterators safe.
   const apps = Array.isArray(applications) ? applications : [];
   const evs = Array.isArray(eventsData) ? eventsData : [];
+  const eventSourceState: InterviewEventSourceState = eventsLoading
+    ? 'loading'
+    : eventsError
+      ? 'error'
+      : Array.isArray(eventsData)
+        ? 'ready'
+        : 'unknown';
   const ofrs = Array.isArray(offersData) ? offersData : [];
   const resumes = Array.isArray(resumesData) ? resumesData : [];
   const [suggestionSessionStates, setSuggestionSessionStates] = useState<Record<string, SuggestionSessionState>>({});
@@ -1092,8 +1180,15 @@ function AppShellContent() {
       return { kind: 'invalid', reason: 'invalid_task_identity' };
     }
     const app = apps.find((item) => item.id === applicationId);
-    const intent = resolvePilotInterviewReviewIntent(applicationId!, eventId, evs);
-    if (!app || intent.kind !== 'event') {
+    const exactEvent = resolveExecutableInterviewTask({
+      taskId: ref.taskId,
+      applicationId: applicationId!,
+      eventId: eventId!,
+      events: eventsData,
+      sourceState: eventSourceState,
+      now: now.valueOf(),
+    });
+    if (!app || !exactEvent.ok) {
       message.warning('指定的面试当前不可用，请刷新面试列表后重试。');
       return { kind: 'unavailable', reason: 'task_owner_unavailable' };
     }

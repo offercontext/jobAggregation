@@ -18,6 +18,7 @@ import {
   buildQuickPracticeReadiness,
   buildRealInterviewReadiness,
   type QuickPracticeDraft,
+  type QuickPracticeResumeSourceStatus,
   type ReadinessItem,
 } from './interviewReadinessModel';
 import styles from './InterviewReadinessCenter.module.css';
@@ -129,6 +130,21 @@ function sourceRows(value: ResumeInput | undefined): ResumeRows | undefined {
     return undefined;
   } catch {
     return undefined;
+  }
+}
+
+function resumeSourceStatus(value: ResumeInput | undefined): QuickPracticeResumeSourceStatus {
+  try {
+    if (Array.isArray(value)) return 'ready';
+    if (value === undefined || value === null) return 'absent';
+    if (typeof value !== 'object') return 'unknown';
+    const status = (value as ResumeSelectionSource<ResumeRows>).status;
+    if (status === 'ready' && !Array.isArray((value as ResumeSelectionSource<ResumeRows>).value)) return 'unknown';
+    return status === 'loading' || status === 'ready' || status === 'error' || status === 'absent' || status === 'unknown'
+      ? status
+      : 'unknown';
+  } catch {
+    return 'unknown';
   }
 }
 
@@ -429,7 +445,8 @@ export default function InterviewReadinessCenter({
   const latestQuickDraftRef = useRef(quickDraft);
   latestQuickDraftRef.current = quickDraft;
 
-  const quickReadiness = buildQuickPracticeReadiness(quickDraft);
+  const quickResumeSourceStatus = resumeSourceStatus(resumes);
+  const quickReadiness = buildQuickPracticeReadiness(quickDraft, { resumeSourceStatus: quickResumeSourceStatus });
   const effectiveLockedEvent: LockedInterviewEvent | null = lockedEvent ?? (
     isValidId(applicationId) && isValidId(eventId) ? { applicationId, eventId } : null
   );
@@ -452,7 +469,12 @@ export default function InterviewReadinessCenter({
   const startQuickPractice = async () => {
     const draft = quickDraft;
     const resumeId = draft.resumeId;
-    if (!quickReadiness.ready || !hasUniqueVisibleResume(quickResumeRows, resumeId)) {
+    const currentResumeSourceStatus = resumeSourceStatus(resumes);
+    const currentResumeRows = visibleResumeRows(resumes);
+    if (currentResumeSourceStatus !== 'ready'
+      || quickResumeSourceStatus !== 'ready'
+      || !quickReadiness.ready
+      || !hasUniqueVisibleResume(currentResumeRows, resumeId)) {
       setQuickError('当前简历已不可用，请重新选择后再开始快速练习。');
       return;
     }
@@ -548,6 +570,9 @@ export default function InterviewReadinessCenter({
               <label>选择简历<Select id="quick-readiness-resume" value={quickDraft.resumeId} placeholder="请选择已保存简历" allowClear onChange={(value) => setQuickDraft((current) => ({ ...current, resumeId: value }))} options={quickResumeRows.map((resume) => ({ value: resume.id, label: resumeLabel(resume, quickResumeRows) }))} /></label>
             </div>
             <Checklist items={quickReadiness.items} onAction={(item) => item.key === 'resume' ? focusControl('quick-readiness-resume') : item.key === 'jd' ? focusControl('quick-readiness-jd') : undefined} />
+            {quickResumeSourceStatus === 'loading' ? <div className={styles.error} role="status">简历列表正在加载，确认完成后才能开始。</div> : null}
+            {quickResumeSourceStatus === 'absent' ? <div className={styles.error} role="status">简历列表尚未加载，确认完成后才能开始。</div> : null}
+            {quickResumeSourceStatus === 'error' || quickResumeSourceStatus === 'unknown' ? <div className={styles.error} role="alert">简历列表状态暂时无法确认，请重试后再开始。</div> : null}
             {quickError ? <div className={styles.error} role="alert">{quickError}</div> : null}
             <button type="button" className={actionEmphasis === 'primary' ? styles.primaryAction : styles.secondaryAction} disabled={!quickReadiness.ready || !quickResumeSelectionValid || creatingCase} onClick={() => void startQuickPractice()}>
               {creatingCase ? '正在冻结练习资料…' : '进入快速练习'}<span aria-hidden="true">↗</span>

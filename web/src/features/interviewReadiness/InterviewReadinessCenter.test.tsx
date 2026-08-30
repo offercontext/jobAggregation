@@ -251,6 +251,25 @@ describe('InterviewReadinessCenter', () => {
     host.remove();
   });
 
+  it.each([
+    ['loading', '简历列表正在加载', '暂时未知'],
+    ['error', '简历列表状态暂时无法确认', '暂时不可用'],
+    ['unknown', '简历列表状态暂时无法确认', '暂时不可用'],
+    ['absent', '简历列表尚未加载', '暂时不可用'],
+  ] as const)('renders an explicit quick-practice resume source state for %s', (status, copy, statusCopy) => {
+    const markup = renderToStaticMarkup(
+      <InterviewReadinessCenter
+        initialMode="quick"
+        fixedMode="quick"
+        resumes={{ status, value: [quickResume] }}
+      />,
+    );
+
+    expect(markup).toContain(copy);
+    expect(markup).toContain(statusCopy);
+    expect(markup).not.toContain('将冻结当前已保存版本');
+  });
+
   it('supports secondary embedding and reduced motion', async () => {
     const markup = renderToStaticMarkup(
       <InterviewReadinessCenter initialMode="quick" fixedMode="quick" actionEmphasis="secondary" resumes={[]} />,

@@ -42,6 +42,7 @@
 - Modify: `docs/superpowers/specs/2026-08-30-review-to-readiness-feedback-loop-design.md`
 - Create: `tests/fixtures/review_readiness/review_to_readiness_baseline_c5a020c.json`
 - Create: `tests/fixtures/review_readiness/event_lifecycle_v1.json`
+- Create: `tests/fixtures/review_readiness/interview_preparation_v1_c5a020c.json`
 - Create: `tests/test_review_to_readiness_baseline.py`
 - Create: `tests/test_review_to_readiness_source_gates.py`
 - Create: `web/src/features/reviewReadiness/reviewReadinessGate.test.ts`
@@ -65,6 +66,7 @@ Write a manually reviewed asset with this closed envelope:
 
 Record SHA-256 constants in the Python test and assert no production module reads this review-only fixture.
 Freeze the cross-language EventLifecycle fixture with the exact status mapping from the design; the later backend and existing frontend classifiers must both consume the fixture only in tests and produce identical results.
+Before any `schemas.py` or `api.py` change, capture from `c5a020c` one deterministic Interview Preparation V1 input snapshot, canonical JSON bytes, request fingerprint and input fingerprint in `interview_preparation_v1_c5a020c.json`; hard-code its fixture SHA in the baseline test. Task 9 must compare against this pinned asset and must not regenerate expected bytes from the then-current implementation.
 
 - [x] **Step 2: Add RED mechanical gates**
 
@@ -77,6 +79,7 @@ uv run pytest tests/test_review_to_readiness_baseline.py -q
 uv run pytest tests/test_review_to_readiness_source_gates.py -q
 cd web
 npm test -- --run src/features/reviewReadiness/reviewReadinessGate.test.ts
+cd ..
 ```
 
 Expected: the immutable asset test passes; both production gates fail only for named missing/cutover requirements.
@@ -86,7 +89,8 @@ Expected: the immutable asset test passes; both production gates fail only for n
 > Task 0 只固化基线与机械门禁；后端与前端 source gate 仍保持预期 RED，待后续任务逐项转绿。
 
 ```powershell
-git add docs/superpowers/specs/2026-08-30-review-to-readiness-feedback-loop-design.md docs/superpowers/plans/2026-08-30-review-to-readiness-feedback-loop.md tests/fixtures/review_readiness tests/test_review_to_readiness_baseline.py tests/test_review_to_readiness_source_gates.py web/src/features/reviewReadiness/reviewReadinessGate.test.ts
+git add docs/superpowers/specs/2026-08-30-review-to-readiness-feedback-loop-design.md tests/fixtures/review_readiness tests/test_review_to_readiness_baseline.py tests/test_review_to_readiness_source_gates.py web/src/features/reviewReadiness/reviewReadinessGate.test.ts
+git add -f docs/superpowers/plans/2026-08-30-review-to-readiness-feedback-loop.md
 git commit -m "test: AI 固化复盘准备闭环基线"
 ```
 
@@ -105,7 +109,14 @@ git commit -m "test: AI 固化复盘准备闭环基线"
 
 - [ ] **Step 1: Write migration RED tests against empty and real 0028 databases**
 
-Cover exact columns/defaults, Note revision=1, Proposal V1/NULL history, Story Attempt generation=0, legacy Practice origin, old unique removal, column-for-column WriteOperation and transition preservation, repeat startup, injected rollback, `integrity_check`, `foreign_key_check`, old 25/3/4 accepted rows and unknown manifest rejection.
+Cover exact columns/defaults, Note revision=1, Proposal V1/NULL history, Story Attempt generation=0, legacy Practice origin, old unique removal, column-for-column WriteOperation and transition preservation, repeat startup, injected rollback, `integrity_check`, `foreign_key_check`, old 25/3/4 accepted rows and unknown manifest rejection. Add explicit RED cases for:
+
+- Product Action route action/source/origin mapping, semantic/historical fingerprint iff rules, 16 KiB bytes, integer-not-bool coercion and active/terminal truth table;
+- route-without-parent rejection; raw parent-only SQL as the declared SQLite boundary; parent terminal clearing the route in the same statement; route identity immutability and no-delete;
+- mutually exclusive Product primary versus Product compensation manifest rows and every cross-pair rejection;
+- Adaptive legacy/V2 origin truth table, target fingerprint required/format/immutable, both partial uniques and source-only/target-only/both locator `SET NULL` history;
+- Signal source ID rebind and NULL→non-NULL rejection;
+- every historical `write_operation_transition` column and ordered row remaining byte-for-byte unchanged.
 
 The Signal self-FK test must execute:
 
@@ -138,7 +149,27 @@ class InterviewReadinessSignalVersion(Base): ...
 class InterviewReadinessSignalEvidence(Base): ...
 ```
 
-Use `(parent_version_id, signal_id) -> (id, signal_id) ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED`; add Signal to `APPLICATION_FOREIGN_KEY_MODELS`. Replace the ordinary Practice proposal/focus unique with origin-specific partial uniques. Extend `WriteOperation` only with the approved product-action shape: `adapter_kind=product_action`, exact 2 primary names, exact 2 compensation names, `product_action_json_v1`, required undo and terminal `not_applicable` delivery.
+Use `(parent_version_id, signal_id) -> (id, signal_id) ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED`; add Signal to `APPLICATION_FOREIGN_KEY_MODELS`. Replace the ordinary Practice proposal/focus unique with origin-specific partial uniques. Extend `WriteOperation` with two mutually exclusive branches:
+
+```text
+Product primary:
+  operation_role=primary
+  adapter_kind=product_action
+  tool_name in the exact 2 Product Action names
+  result_contract=product_action_json_v1 when committed/failed
+  required undo when committed
+  terminal delivery=not_applicable
+
+Product compensation:
+  operation_role=compensation
+  adapter_kind=compensation
+  tool_name in the exact 2 Product Action compensation names
+  result_contract=compensation_json_v1 when committed/failed
+  rejected is forbidden
+  terminal delivery=not_applicable
+```
+
+Do not register either compensation name in the Agent Compensation Registry.
 
 - [ ] **Step 4: Implement `_ensure_review_to_readiness_feedback_schema()`**
 
@@ -235,6 +266,7 @@ git commit -m "feat: AI 版本化面试复盘来源"
 
 Assert exact runtime classification `25 / 3 / 4 + 2 / 2`, Provider schema bytes/order unchanged, Product Action names returned by Provider are `unknown_tool` with executor 0, and Product modules never import ToolCatalog/LegacyCatalog/Agent compensation/Provider. Add cross-process goldens for five HMAC envelopes, tagged null, Chinese `user_note`, generation changes and deterministic UUIDs.
 Add exact boundary tests for 16,384/16,385-byte route JSON, duplicate JSON keys, NaN/Infinity, boolean-as-integer, malformed UUID/HMAC and action/source cross-pairs. The HTTP-safe decoder must operate on raw request bytes with a duplicate-key-aware object hook before Pydantic/default normalization; FastAPI `dict = Body(...)` is not sufficient for these routes.
+For bundle recovery, cover publication `all_absent | exact_proposed | exact_terminal | unreadable`, plus every parent/route/seq1 single-sided, missing, extra, duplicate, wrong-state or wrong-order corruption. Fresh reconciliation must never repair a partial bundle.
 
 - [ ] **Step 2: Verify RED**
 
@@ -319,6 +351,8 @@ git commit -m "feat: AI 建立独立产品操作安全核心"
 
 Cover every candidate closed state, structure cap and evidence path; same key/same input concurrent replay; same key/different input conflict; same semantic focus with different keys produces one active winner and stable non-leaking 409; reject performs zero candidate/source/capability/binding/preflight/executor/Provider calls; approve/modify execute once; terminal replay executes zero; cancellation/BaseException propagates after cleanup.
 
+Add the complete Signal publication/decision matrix. Publication distinguishes all-absent, exact proposed, exact terminal and unreadable; any parent/route/seq1 partial is an integrity error. Decision starts from an already-persisted proposal, so absent/partial must never reuse publication's rebuild rule; exact proposed with the original decision payload may retry, different decision/effective payload conflicts, and terminal replay validates request fingerprint + terminal digest + the complete ordered prefix with executor=0. `rejected` prefix is valid only for primary operations; compensation has only proposed/committed/failed. Exercise the semantic loser key after winner active/rejected/declared-failed/committed, and golden-test every action-local result/visible/transport/undo/aggregate byte boundary plus rejected/failed codecs.
+
 - [ ] **Step 2: Verify RED**
 
 ```powershell
@@ -373,11 +407,11 @@ git commit -m "feat: AI 保存可审计复盘准备重点"
 
 - [ ] **Step 1: Write Story publication/decision RED matrix**
 
-Cover the four-object ready bundle (Attempt+parent+route+seq1), publication response loss with concurrent approve/reject/declared failure, historical confirmed replay, historical-ready bridge, source-changed rejection-only recovery, bound executor transaction rollback, direct commit 201/created true and every fresh reconciliation/replay 200/created false.
+Cover the four-object ready bundle (Attempt+parent+route+seq1), publication response loss with concurrent approve/reject/declared failure, historical confirmed replay, historical-ready bridge, source-changed rejection-only recovery, bound executor transaction rollback, direct commit 201/created true and every fresh reconciliation/replay 200/created false. Historical-ready same legacy token+same payload converges; different token or payload conflicts; the legacy token is only HMAC-bound request identity and never executor authorization.
 
 - [ ] **Step 2: Write N→N+1 RED matrix**
 
-Only ready + rejected current N may create N+1. Cover direct 201, fresh proposed 200 with same token, terminal replay without token, 20-way single winner, old token rejection, failed/stale/invalidated/confirmed refusal, later-pointer historical replay and every partial/unreadable commit-unknown class.
+Only ready + rejected current N may create N+1. The exact body is `{expected_generation_revision, expected_product_action_generation}` and rejects extra fields, old token, content/evidence and a generic `generation` alias. Cover direct 201, fresh proposed 200 with same token, terminal replay without token, 20-way single winner, old token rejection, failed/stale/invalidated/confirmed refusal, later-pointer historical replay and every partial/unreadable commit-unknown class.
 
 - [ ] **Step 3: Verify RED**
 
@@ -403,6 +437,7 @@ def confirm_attempt_bound(
 ```
 
 The legacy `/confirm` endpoint is only a fixed Coordinator adapter. Byte-equivalent content is approve; edited content/evidence is modify; target CAS fields must equal the frozen route. Historical confirmed stays read-only; historical ready first creates an exact bridge with old token HMAC as request identity but executes only using the new server token/proof.
+After the historical bridge tests are GREEN, delete the self-committing `confirm_attempt()` production method and all callers; no compatibility fallback may retain its transaction ownership.
 
 - [ ] **Step 6: Implement explicit next-generation endpoint**
 
@@ -434,11 +469,11 @@ git commit -m "refactor: AI 切换经历素材产品确认链路"
 
 - [ ] **Step 1: Write owner-proof and compensation RED tests**
 
-Cover capability-before-query, exact application/story owner, parent action/result/undo/digest binding, ordinary/copy/cross-container/cross-owner/cross-action/ABA/reused proof rejection, deterministic compensation UUID, 20-way one executor winner, proposal/execution commit-unknown, terminal replay zero executor and `/api/chat/undo-last-write` remaining incapable of Product Action undo.
+Cover capability-before-query, exact application/story owner, parent action/result/undo/digest binding, Story source-attempt lineage, owner switch, ordinary/copy/cross-container/cross-owner/cross-action/ABA/reused proof rejection, deterministic compensation UUID, 20-way one executor winner, proposal/execution commit-unknown, response-loss owner route re-signing a new request-local proof before deterministic terminal replay, terminal replay zero executor and `/api/chat/undo-last-write` remaining incapable of Product Action undo.
 
 - [ ] **Step 2: Write Signal and Story domain undo RED tests**
 
-Signal Undo appends a retracted Version with every immutable field and Evidence byte-copied, works after source deletion, and never deletes history. New Story Undo archives and increments revision; appended Story Undo restores previous pointer/title and leaves the new Version immutable. Any later edit makes undo stale. Assert `previous_title` appears only in `undo_json`, never visible/transport/log/error.
+Signal Undo appends a retracted Version with every immutable field and Evidence byte-copied, works after source deletion, and never deletes history. New Story Undo archives and increments revision; appended Story Undo restores previous pointer/title and leaves the new Version immutable. Any later edit makes undo stale. Golden-test both `compensation_json_v1` results and the 4/1/4/12 KiB result/visible/transport/aggregate caps. Assert no正文 enters those projections and `previous_title` appears only in Story `undo_json`, never visible/transport/log/Journal/error.
 
 - [ ] **Step 3: Verify RED**
 
@@ -448,7 +483,7 @@ uv run pytest tests/product_actions/test_compensation.py tests/test_chat_api.py 
 
 - [ ] **Step 4: Implement independent compensation coordinator**
 
-Do not register these names in Agent Compensation Registry. Build owner-scoped issuers and sealed proof union, deterministic operation identity, proposal+seq1 UoW, exact prefix/digest reload, seq2/3 + one executor + domain mutation + seq4 terminal UoW, and separate proposal/execution commit-unknown rules. Product compensation delivery is `not_applicable` and writes no Conversation/last-write/ProductActionProposal/Journal row.
+Do not register these names in Agent Compensation Registry. Build owner-scoped issuers and sealed proof union, deterministic operation identity, proposal+seq1 UoW, exact prefix/digest reload, seq2/3 + one executor + domain mutation + seq4 terminal UoW, and separate proposal/execution commit-unknown rules. Product compensation keeps `adapter_kind=compensation`, can never be rejected, uses no `ProductActionProposal`, has terminal delivery `not_applicable`, and writes no Conversation/last-write/Journal row.
 
 - [ ] **Step 5: Add only the approved owner-scoped routes**
 
@@ -481,11 +516,13 @@ git commit -m "feat: AI 增加产品操作受限撤销"
 - Create: `tests/test_review_readiness_projection.py`
 - Create: `tests/test_event_lifecycle_v1.py`
 - Modify: `tests/test_interview_index_api.py`
+- Modify: `web/src/features/interviewEvents/eventLifecycle.test.ts`
 
 - [ ] **Step 1: Write projection RED tests**
 
 Cover source current/changed/missing/unavailable/retracted, deleted and soft-deleted Application, exact same-Application target rules, every EventLifecycle status alias, source==target, no time inference, practiced only for exact completed pair, read exception returning unavailable rather than empty, safe cross-scope 404 and fingerprint ordering with one/five Evidence rows.
 `tests/test_event_lifecycle_v1.py` must load `tests/fixtures/review_readiness/event_lifecycle_v1.json`; the existing frontend `eventLifecycle.test.ts` must load the same fixture and prove byte-for-byte agreement of every alias and unknown fallback.
+Add a strict orthogonality assertion: zero, current, stale, retracted or unreadable Signals never change baseline `InterviewReadinessResult.ready`; it remains a function only of Application/Event/JD/Resume.
 
 - [ ] **Step 2: Verify RED**
 
@@ -543,9 +580,21 @@ Decode only:
 
 After `BEGIN IMMEDIATE`, query the idempotency key before any live source/target Repository call. Exact existing input replays the frozen Plan; different input conflicts; absent key invokes the shared canonical loaders and inserts `confirmed_readiness_signal_v1` with both fingerprints and ordinal-0 legacy snapshot.
 
+Persist the identities without overloading the legacy column:
+
+```text
+origin_contract=confirmed_readiness_signal_v1
+application_event_id=signal.source_event_id
+target_application_event_id=request.target_application_event_id
+readiness_signal_version_id=request.readiness_signal_version_id
+```
+
+Copy the legacy source Note/Proposal/focus/snapshot fields from the confirmed Version for immutable display. A source≠target test must prove the two Event columns cannot be swapped; start remains Provider=0.
+
 - [ ] **Step 4: Remove unconfirmed Proposal recommendation creation**
 
 `list_recommendations` may expose compatibility history but cannot create or recommend a new legacy plan. List/get branch by `origin_contract` and retain in-progress/completed V2 rows after locators become null. Completion changes only Plan state and never Signal/Memory/Knowledge.
+Delete the legacy create implementation after its 410/replay/complete tests are GREEN; preserve only historical read/replay/complete branches.
 
 - [ ] **Step 5: Verify GREEN and commit**
 
@@ -573,11 +622,11 @@ git commit -m "feat: AI 绑定复盘信号与目标面试练习"
 
 - [ ] **Step 1: Write V1-byte-equivalence and raw-presence RED tests**
 
-Freeze existing absent-field V1 canonical bytes/fingerprint; explicit `[]` must create V2; absent versus empty with same key conflicts; null/non-array/bool/int confusion/duplicates/9 items return 422. Unknown/replay must restore the frozen presence bit, not current UI defaults.
+Compare the absent-field V1 snapshot bytes/request fingerprint/input fingerprint against the pinned `interview_preparation_v1_c5a020c.json`; explicit `[]` must create V2; absent versus empty with same key conflicts; null/non-array/bool/int confusion/duplicates/9 items return 422. Unknown/replay must restore the frozen presence bit, not current UI defaults.
 
 - [ ] **Step 2: Write selection/lease/budget RED tests**
 
-Cover 0/1/8 items, order, cross-app, stale/retracted/missing, target completed/cancelled/unknown/wrong type, source==target, same read snapshot as Event/JD/Resume, Provider fallback frozen input, lifecycle drift during Provider and late-result discard. Build exact final-wrapper fixtures for 65,536 bytes and 65,537 bytes using escaped quotes, backslashes, Chinese and emoji.
+Cover 0/1/8 items, order, cross-app, stale/retracted/missing, target completed/cancelled/unknown/wrong type, source==target, same read snapshot as Event/JD/Resume, Provider fallback frozen input, lifecycle drift during Provider and late-result discard. Build exact final-wrapper fixtures for 65,536 bytes and 65,537 bytes using escaped quotes, backslashes, Chinese and emoji. Add raw-body tests for duplicate `readiness_feedback_version_ids` including absent/empty ambiguity, duplicate unrelated keys, non-object top level and NaN/Infinity.
 
 - [ ] **Step 3: Verify RED**
 
@@ -587,7 +636,7 @@ uv run pytest tests/test_interview_preparation_repository.py tests/test_intervie
 
 - [ ] **Step 4: Preserve raw presence and V1 builder**
 
-Freeze `readiness_feedback_version_ids_present` before defaults/model dump. When false, call the untouched V1 snapshot builder with no additional envelope key. When true, validate an ordered tuple and include `readiness_feedback_selection={present:true,ordered_version_ids:[...]}` in the V2 request/input fingerprint.
+Decode raw request bytes with a duplicate-key-aware object hook before Pydantic/default handling, then freeze `readiness_feedback_version_ids_present` from own-key presence. When false, call the physically isolated untouched V1 snapshot builder with no import/call into the V2 builder and no additional envelope key. When true, validate an ordered tuple and include `readiness_feedback_selection={present:true,ordered_version_ids:[...]}` in the V2 request/input fingerprint.
 
 - [ ] **Step 5: Implement Session-bound selection loader and V2 input**
 
@@ -653,6 +702,7 @@ git commit -m "test: AI 封闭复盘信号上下文边界"
 - Create: `web/src/features/reviewReadiness/ReadinessFeedbackAdvisory.tsx`
 - Create: `web/src/features/reviewReadiness/reviewReadiness.module.css`
 - Create: `web/src/features/reviewReadiness/*.test.tsx`
+- Create: `web/src/features/reviewReadiness/service.test.ts`
 - Modify: `web/src/types/note.ts`
 - Modify: `web/src/types/interviewReviewProposal.ts`
 - Modify: `web/src/types/interviewStory.ts`
@@ -682,11 +732,13 @@ Review shows one primary “保存为下次准备重点” and secondary Story o
 ```powershell
 cd web
 npm test -- --run src/features/reviewReadiness src/services/interviewStories.test.ts src/components/InterviewReviewProposalDrawer.interaction.test.tsx src/components/InterviewStoryDrawer.interaction.test.tsx src/components/InterviewV01View.adaptivePractice.test.tsx src/components/InterviewPreparationProposalDrawer.interaction.test.tsx src/features/coreTaskSurface
+cd ..
 ```
 
 - [ ] **Step 4: Implement typed services and confirmation reducer**
 
 Keep operation ID, action call ID, server token, original decision payload and result-unknown state in owner-generation scoped drafts. Delete the client-generated Story authorization token fallback. Generic safe GET never upgrades to token; only source-bound owner recovery does. Terminal replay clears token but preserves safe result and undo eligibility.
+Keep the existing `CoreTaskId` union and top-level navigation unchanged; review feedback/question bank/quick practice are modes inside the existing owner, not new tasks or routes.
 
 - [ ] **Step 5: Render accessible owner components**
 
@@ -696,7 +748,7 @@ Use `aria-busy`, `role=alert`, bounded `aria-live`, non-color-only status, 44px 
 
 ```powershell
 cd web
-npm test -- --run src/features/reviewReadiness src/services/interviewStories.test.ts src/components/InterviewReviewProposalDrawer.interaction.test.tsx src/components/InterviewStoryDrawer.interaction.test.tsx src/components/InterviewV01View.adaptivePractice.test.tsx src/components/InterviewPreparationProposalDrawer.interaction.test.tsx src/features/coreTaskSurface
+npm test -- --run src/features/reviewReadiness src/services/interviewStories.test.ts src/components/InterviewReviewProposalDrawer.interaction.test.tsx src/components/InterviewStoryDrawer.interaction.test.tsx src/components/AdaptiveInterviewPracticeWorkspace.test.tsx src/components/QuestionBankView.test.tsx src/components/InterviewV01View.adaptivePractice.test.tsx src/components/InterviewPreparationProposalDrawer.interaction.test.tsx src/features/coreTaskSurface
 npm run build
 cd ..
 git diff --check
@@ -713,10 +765,14 @@ git commit -m "feat: AI 接通复盘到下次面试准备"
 - Create: `web/src/features/reviewReadiness/reviewReadinessNegativeFixtures.test.ts`
 - Modify: `tests/test_pilot_runtime_extraction_gate.py`
 - Modify: `src/offerpilot/smoke.py`
+- Modify: `src/offerpilot/repositories/interview_stories.py`
+- Modify: `src/offerpilot/repositories/adaptive_interview_practice.py`
+- Modify: `web/src/components/InterviewStoryDrawer.tsx`
+- Modify: `web/src/services/interviewStories.ts`
 
 - [ ] **Step 1: Add negative fixtures for every forbidden path**
 
-Detect Product Action imports in Provider/Tool selector/dispatcher/Legacy/Agent Compensation; Chat/Pending/Message/AgentRun/Journal writes; parent-only Product Action inserts; unconfirmed Proposal Practice creation; old self-committing Story confirm; client-generated Story token; generic operation-id undo; `/api/stories` alias; Signal query from Chat/Haru; registered/ready `confirmed_memory`; direct review UI domain CRUD; target inference; and sensitive canary in log/transport/sessionStorage/report.
+Detect Product Action imports in Provider/Tool selector/dispatcher/Legacy/Agent Compensation; Chat/Pending/Message/AgentRun/Journal writes; parent-only Product Action inserts; unconfirmed Proposal Practice creation; old self-committing Story confirm; client-generated Story token; generic operation-id undo; `/api/stories` alias; Signal query from Chat/Haru; registered/ready `confirmed_memory`; direct review UI domain CRUD; target inference; Preparation V1 importing/calling the V2 builder; new `CoreTaskId`/top-level navigation; and sensitive canary in Snapshot, Event, Journal, Manifest, HTTP error, terminal result/visible/transport/undo, sessionStorage and release report. Permit `previous_title` only in Story `undo_json`.
 
 - [ ] **Step 2: Run gates and verify any remaining RED violations**
 
@@ -724,11 +780,12 @@ Detect Product Action imports in Provider/Tool selector/dispatcher/Legacy/Agent 
 uv run pytest tests/test_review_to_readiness_baseline.py tests/test_review_to_readiness_source_gates.py tests/test_pilot_runtime_extraction_gate.py -q
 cd web
 npm test -- --run src/features/reviewReadiness/reviewReadinessGate.test.ts src/features/reviewReadiness/reviewReadinessNegativeFixtures.test.ts
+cd ..
 ```
 
 - [ ] **Step 3: Delete forbidden production paths**
 
-Remove the production `confirm_attempt()` caller and, after historical tests use the bridge, the old self-committing method itself. Retire new V1 Practice creation and client token generation. Keep historical V1 read/replay/complete and historical confirmed Story replay, but add no fallback facade, feature flag, shadow write, second registry or alias.
+Verify the owning Tasks already removed the production `confirm_attempt()` method/callers, new V1 Practice creation and client token generation. If a gate remains RED, fix the owning production file under a focused failing test before changing the gate. Keep historical V1 read/replay/complete and historical confirmed Story replay, but add no fallback facade, feature flag, shadow write, second registry or alias.
 
 - [ ] **Step 4: Update smoke to the server-token/Product Action flow**
 
@@ -743,7 +800,7 @@ npm test -- --run src/features/reviewReadiness/reviewReadinessGate.test.ts src/f
 cd ..
 git diff --check
 git status --short
-git add tests/test_review_to_readiness_source_gates.py web/src/features/reviewReadiness/reviewReadinessGate.test.ts web/src/features/reviewReadiness/reviewReadinessNegativeFixtures.test.ts tests/test_pilot_runtime_extraction_gate.py src/offerpilot/smoke.py
+git add tests/test_review_to_readiness_source_gates.py web/src/features/reviewReadiness/reviewReadinessGate.test.ts web/src/features/reviewReadiness/reviewReadinessNegativeFixtures.test.ts tests/test_pilot_runtime_extraction_gate.py src/offerpilot/smoke.py src/offerpilot/repositories/interview_stories.py src/offerpilot/repositories/adaptive_interview_practice.py web/src/components/InterviewStoryDrawer.tsx web/src/services/interviewStories.ts
 git commit -m "test: AI 封闭旧复盘准备执行路径"
 ```
 
@@ -763,6 +820,7 @@ uv run pytest tests/test_review_to_readiness_migration_0029.py tests/product_act
 ```powershell
 cd web
 npm test -- --run src/features/reviewReadiness src/components/InterviewReviewProposalDrawer.interaction.test.tsx src/components/InterviewStoryDrawer.interaction.test.tsx src/components/InterviewV01View.adaptivePractice.test.tsx src/components/InterviewPreparationProposalDrawer.interaction.test.tsx src/features/coreTaskSurface
+cd ..
 ```
 
 Record exact counts and exit codes.

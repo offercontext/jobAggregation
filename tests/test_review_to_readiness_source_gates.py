@@ -15,6 +15,17 @@ PRODUCT_ACTION_COMPENSATIONS = (
     "undo:confirm_interview_story",
     "undo:save_review_readiness_signal",
 )
+PRODUCT_ACTION_MODULES = frozenset(
+    {
+        "__init__.py",
+        "contracts.py",
+        "catalog.py",
+        "issuer.py",
+        "repository.py",
+        "coordinator.py",
+        "compensation.py",
+    }
+)
 
 
 def _parse(path: Path) -> ast.Module | None:
@@ -45,6 +56,68 @@ def _literal_string_sequence(tree: ast.AST | None, name: str) -> tuple[str, ...]
         if all(item is not None for item in items):
             return tuple(item for item in items if item is not None)
     return None
+
+
+def _catalog_exposes_independent_names(
+    tree: ast.AST | None,
+    *,
+    class_name: str,
+    names_binding: str,
+    forbidden_binding: str,
+) -> bool:
+    if tree is None:
+        return False
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef) or node.name != class_name:
+            continue
+        references = {
+            child.id for child in ast.walk(node) if isinstance(child, ast.Name)
+        }
+        has_behavior = any(
+            isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+            for member in node.body
+        )
+        return (
+            has_behavior
+            and names_binding in references
+            and forbidden_binding not in references
+        )
+    return False
+
+
+def _product_action_violations(
+    module_trees: dict[str, ast.Module | None],
+) -> list[str]:
+    modules_complete = set(module_trees) == PRODUCT_ACTION_MODULES and all(
+        module_trees[name] is not None for name in PRODUCT_ACTION_MODULES
+    )
+    contracts = module_trees.get("contracts.py")
+    catalog = module_trees.get("catalog.py")
+    primary_exact = (
+        _literal_string_sequence(contracts, "PRODUCT_ACTION_NAMES") == PRODUCT_ACTIONS
+        and _catalog_exposes_independent_names(
+            catalog,
+            class_name="ProductActionCatalogV1",
+            names_binding="PRODUCT_ACTION_NAMES",
+            forbidden_binding="PRODUCT_ACTION_COMPENSATION_NAMES",
+        )
+    )
+    compensation_exact = (
+        _literal_string_sequence(contracts, "PRODUCT_ACTION_COMPENSATION_NAMES")
+        == PRODUCT_ACTION_COMPENSATIONS
+        and _catalog_exposes_independent_names(
+            catalog,
+            class_name="ProductActionCompensationCatalogV1",
+            names_binding="PRODUCT_ACTION_COMPENSATION_NAMES",
+            forbidden_binding="PRODUCT_ACTION_NAMES",
+        )
+    )
+    violations: list[str] = []
+    if not modules_complete or not primary_exact:
+        violations.append("ledger:missing-product-action")
+    if not modules_complete or not compensation_exact:
+        violations.append("ledger:missing-product-action-compensation")
+    return violations
 
 
 def _has_registered_migration(tree: ast.AST | None) -> bool:
@@ -101,6 +174,36 @@ def _proposal_drives_practice_start(tree: ast.AST | None) -> bool:
     return False
 
 
+def _proposal_drives_practice_recommendations(tree: ast.AST | None) -> bool:
+    if tree is None:
+        return False
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef) or node.name != "AdaptivePracticeRepository":
+            continue
+        for member in node.body:
+            if not isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if member.name != "list_recommendations":
+                continue
+            scans_proposals = any(
+                isinstance(child, ast.Name) and child.id == "InterviewReviewProposal"
+                for child in ast.walk(member)
+            )
+            projects_focuses = any(
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Name)
+                and child.func.id == "_proposal_focuses"
+                for child in ast.walk(member)
+            )
+            if scans_proposals and projects_focuses:
+                return True
+    return False
+
+
+def _proposal_drives_practice(tree: ast.AST | None) -> bool:
+    return _proposal_drives_practice_start(tree) or _proposal_drives_practice_recommendations(tree)
+
+
 def _has_note_revision_helper(tree: ast.AST | None) -> bool:
     if tree is None:
         return False
@@ -147,26 +250,23 @@ def _has_note_revision_helper(tree: ast.AST | None) -> bool:
 def _source_violations() -> list[str]:
     violations: list[str] = []
     db_tree = _parse(SRC / "db.py")
-    contracts_tree = _parse(SRC / "product_actions" / "contracts.py")
+    product_action_dir = SRC / "product_actions"
+    product_action_modules = {
+        name: _parse(product_action_dir / name) for name in PRODUCT_ACTION_MODULES
+    }
     notes_tree = _parse(SRC / "repositories" / "notes.py")
     practice_tree = _parse(SRC / "repositories" / "adaptive_interview_practice.py")
 
     if not _has_registered_migration(db_tree):
         violations.append("migration:missing-0029")
-    if _literal_string_sequence(contracts_tree, "PRODUCT_ACTION_NAMES") != PRODUCT_ACTIONS:
-        violations.append("ledger:missing-product-action")
-    if (
-        _literal_string_sequence(contracts_tree, "PRODUCT_ACTION_COMPENSATION_NAMES")
-        != PRODUCT_ACTION_COMPENSATIONS
-    ):
-        violations.append("ledger:missing-product-action-compensation")
+    violations.extend(_product_action_violations(product_action_modules))
     if any(
         _has_self_committing_story_call(tree)
         for path in sorted(SRC.rglob("*.py"))
         if (tree := _parse(path)) is not None
     ):
         violations.append("story:self-committing-confirm")
-    if _proposal_drives_practice_start(practice_tree):
+    if _proposal_drives_practice(practice_tree):
         violations.append("practice:unconfirmed-proposal-source")
     if not _has_note_revision_helper(notes_tree):
         violations.append("note:missing-content-revision")
@@ -189,7 +289,7 @@ def _revisioned_note_values(values):
     assert not _has_registered_migration(pseudo)
     assert _literal_string_sequence(pseudo, "PRODUCT_ACTION_NAMES") is None
     assert not _has_self_committing_story_call(pseudo)
-    assert not _proposal_drives_practice_start(pseudo)
+    assert not _proposal_drives_practice(pseudo)
     assert not _has_note_revision_helper(pseudo)
 
 
@@ -215,14 +315,80 @@ def _revisioned_note_values(values):
 '''
     )
     assert _has_registered_migration(exact)
-    assert _literal_string_sequence(exact, "PRODUCT_ACTION_NAMES") == PRODUCT_ACTIONS
-    assert (
-        _literal_string_sequence(exact, "PRODUCT_ACTION_COMPENSATION_NAMES")
-        == PRODUCT_ACTION_COMPENSATIONS
-    )
     assert _has_self_committing_story_call(exact)
-    assert _proposal_drives_practice_start(exact)
+    assert _proposal_drives_practice(exact)
     assert _has_note_revision_helper(exact)
+
+
+def test_product_action_gate_requires_all_modules_and_independent_catalogs() -> None:
+    contracts = ast.parse(
+        '''
+PRODUCT_ACTION_NAMES = ("confirm_interview_story", "save_review_readiness_signal")
+PRODUCT_ACTION_COMPENSATION_NAMES = (
+    "undo:confirm_interview_story", "undo:save_review_readiness_signal"
+)
+'''
+    )
+    catalog = ast.parse(
+        '''
+class ProductActionCatalogV1:
+    def names(self):
+        return PRODUCT_ACTION_NAMES
+class ProductActionCompensationCatalogV1:
+    def names(self):
+        return PRODUCT_ACTION_COMPENSATION_NAMES
+'''
+    )
+    complete = {name: ast.parse("") for name in PRODUCT_ACTION_MODULES}
+    complete["contracts.py"] = contracts
+    complete["catalog.py"] = catalog
+    assert _product_action_violations(complete) == []
+
+    strings_only = dict(complete)
+    strings_only["catalog.py"] = ast.parse(
+        '''
+PRIMARY = "ProductActionCatalogV1 confirm_interview_story save_review_readiness_signal"
+COMPENSATION = "ProductActionCompensationCatalogV1 undo:confirm_interview_story"
+'''
+    )
+    assert _product_action_violations(strings_only) == [
+        "ledger:missing-product-action",
+        "ledger:missing-product-action-compensation",
+    ]
+
+    missing_module = dict(complete)
+    missing_module["coordinator.py"] = None
+    assert _product_action_violations(missing_module) == [
+        "ledger:missing-product-action",
+        "ledger:missing-product-action-compensation",
+    ]
+
+
+def test_practice_gate_stays_red_when_only_start_is_replaced() -> None:
+    legacy_scan = ast.parse(
+        '''
+class AdaptivePracticeRepository:
+    def start(self, readiness_signal_version_id, target_application_event_id):
+        return readiness_signal_version_id, target_application_event_id
+    def list_recommendations(self):
+        proposals = session.scalars(select(InterviewReviewProposal))
+        return [_proposal_focuses(proposal) for proposal in proposals]
+'''
+    )
+    assert not _proposal_drives_practice_start(legacy_scan)
+    assert _proposal_drives_practice_recommendations(legacy_scan)
+    assert _proposal_drives_practice(legacy_scan)
+
+    historical_plans_only = ast.parse(
+        '''
+class AdaptivePracticeRepository:
+    def start(self, readiness_signal_version_id, target_application_event_id):
+        return readiness_signal_version_id, target_application_event_id
+    def list_recommendations(self):
+        return session.scalars(select(AdaptivePracticePlan))
+'''
+    )
+    assert not _proposal_drives_practice(historical_plans_only)
 
 
 def test_review_to_readiness_production_cutover_gate() -> None:

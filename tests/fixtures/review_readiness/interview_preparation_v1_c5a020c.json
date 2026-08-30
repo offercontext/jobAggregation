@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "source_baseline": "c5a020cbedd8ff64f6188f51c10d8f4daa7c7dff",
+  "contract": "interview_preparation_v1_c5a020c",
+  "request_identity": {
+    "application_id": 1,
+    "application_event_id": 1,
+    "idempotency_key": "review-readiness-prep-v1-0001"
+  },
+  "canonical_request_json": "{\"event_id\":1,\"idempotency_key\":\"review-readiness-prep-v1-0001\",\"jd_version_id\":1,\"knowledge_selections\":[],\"resume_id\":1,\"user_assertions\":[\"I led the migration.\"]}",
+  "canonical_request_sha256": "2f0ab78233f0ce43a24411e2c73c36b6c6edbf3564f34e4596ae4cd80a515001",
+  "input_snapshot_json": "{\"event\":{\"application_id\":1,\"duration_minutes\":45,\"event_type\":\"interview\",\"id\":1,\"round\":2,\"scheduled_at\":\"2026-07-20T10:00:00\",\"status\":\"todo\",\"subtype\":\"technical\"},\"jd\":{\"content_sha256\":\"jd-content-sha256\",\"text\":\"Build reliable APIs with Python.\",\"version_id\":1,\"version_number\":3},\"jd_version_id\":1,\"knowledge_evidence\":[],\"resume\":{\"content_json\":{\"experience\":[{\"highlights\":[\"Built reliable API services\"]}]},\"id\":1},\"user_assertions\":[\"I led the migration.\"]}",
+  "source_fingerprint": "97169db7b854d8e5585c5a6db0eb6ac47ecd33a15a3e12ca915db4dd6e1a4944"
+}

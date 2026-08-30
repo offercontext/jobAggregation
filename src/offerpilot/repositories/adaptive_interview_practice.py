@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from typing import Any
+from uuid import UUID
 
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
@@ -13,8 +13,8 @@ from offerpilot.models import (
     Application,
     ApplicationEvent,
     InterviewNote,
-    InterviewReviewProposal,
 )
+from offerpilot.review_readiness.projection import project_practice_focus
 from offerpilot.repositories.json_contract import canonical_json, sha256_text
 
 
@@ -28,6 +28,14 @@ class AdaptivePracticeConflict(ValueError):
 
 class AdaptivePracticeValidationError(ValueError):
     pass
+
+
+class AdaptivePracticeGone(Exception):
+    """The caller attempted to create a retired legacy practice plan."""
+
+
+class AdaptivePracticeUnavailable(Exception):
+    """The canonical readiness projection could not be loaded safely."""
 
 
 _PATH_TO_FIELD = {
@@ -67,61 +75,49 @@ _DRILLS = {
 _ASSESSMENTS = {"needs_work", "clearer", "confident"}
 
 
+def _require_positive_int(value: object, field: str) -> int:
+    if type(value) is not int or value < 1 or value > 2**63 - 1:
+        raise AdaptivePracticeValidationError(f"adaptive practice {field} is invalid")
+    return value
+
+
+def _require_sha256(value: object, field: str) -> str:
+    if (
+        type(value) is not str
+        or len(value) != 71
+        or not value.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in value[7:])
+    ):
+        raise AdaptivePracticeValidationError(f"adaptive practice {field} is invalid")
+    return value
+
+
 class AdaptivePracticeRepository:
     def __init__(self, session_factory: sessionmaker[Session]):
         self._session_factory = session_factory
 
     def list_recommendations(self) -> list[dict[str, Any]]:
-        with self._session_factory() as session:
-            used = {
-                (row.interview_review_proposal_id, row.focus_id)
-                for row in session.scalars(select(AdaptivePracticePlan))
-            }
-            proposals = list(
-                session.scalars(
-                    select(InterviewReviewProposal)
-                    .order_by(
-                        InterviewReviewProposal.created_at.desc(),
-                        InterviewReviewProposal.id.desc(),
-                    )
-                )
-            )
-            result: list[dict[str, Any]] = []
-            for proposal in proposals:
-                context = _visible_context(session, proposal)
-                if context is None:
-                    continue
-                note, event, application = context
-                for item in _proposal_focuses(proposal):
-                    focus_id = item.get("id")
-                    if not isinstance(focus_id, str) or not focus_id or (proposal.id, focus_id) in used:
-                        continue
-                    recommendation = _recommendation(
-                        proposal, item, note, event, application
-                    )
-                    if recommendation is not None:
-                        result.append(recommendation)
-            return result
+        # New practice creation is exact Signal-Version + target only.  Scanning
+        # unconfirmed Review Proposals here would recreate the retired V1 path.
+        return []
 
     def list_plans(self) -> list[dict[str, Any]]:
         with self._session_factory() as session:
             plans = list(
                 session.scalars(
                     select(AdaptivePracticePlan)
-                    .join(InterviewNote, InterviewNote.id == AdaptivePracticePlan.interview_note_id)
-                    .join(ApplicationEvent, ApplicationEvent.id == AdaptivePracticePlan.application_event_id)
                     .join(Application, Application.id == AdaptivePracticePlan.application_id)
-                    .where(
-                        Application.deleted_at.is_(None),
-                        InterviewNote.application_id == AdaptivePracticePlan.application_id,
-                        InterviewNote.application_event_id == AdaptivePracticePlan.application_event_id,
-                        ApplicationEvent.application_id == AdaptivePracticePlan.application_id,
-                        ApplicationEvent.event_type == "interview",
+                    .where(Application.deleted_at.is_(None))
+                    .order_by(
+                        AdaptivePracticePlan.created_at.desc(), AdaptivePracticePlan.id.desc()
                     )
-                    .order_by(AdaptivePracticePlan.created_at.desc(), AdaptivePracticePlan.id.desc())
                 )
             )
-            return [_plan_json(session, plan) for plan in plans]
+            return [
+                _plan_json(session, plan)
+                for plan in plans
+                if _plan_context_is_visible(session, plan)
+            ]
 
     def get(self, plan_id: int) -> dict[str, Any]:
         with self._session_factory() as session:
@@ -161,60 +157,138 @@ class AdaptivePracticeRepository:
                 if visible is None:
                     raise AdaptivePracticeNotFound()
                 return _plan_json(session, visible), False
-            proposal = session.get(InterviewReviewProposal, proposal_id)
-            if proposal is None:
-                raise AdaptivePracticeNotFound()
-            context = _visible_context(session, proposal)
-            if context is None:
-                raise AdaptivePracticeNotFound()
-            note, event, application = context
-            item = next(
-                (candidate for candidate in _proposal_focuses(proposal) if candidate.get("id") == focus_id),
-                None,
+            raise AdaptivePracticeGone("adaptive_practice_v1_retired")
+
+    def start_v2(
+        self,
+        *,
+        readiness_signal_version_id: int,
+        target_application_event_id: int,
+        expected_source_fingerprint: str,
+        expected_target_fingerprint: str,
+        idempotency_key: str,
+    ) -> tuple[dict[str, Any], bool]:
+        _require_positive_int(readiness_signal_version_id, "readiness signal version")
+        _require_positive_int(target_application_event_id, "target application event")
+        _require_sha256(expected_source_fingerprint, "source fingerprint")
+        _require_sha256(expected_target_fingerprint, "target fingerprint")
+        if not isinstance(idempotency_key, str) or not idempotency_key:
+            raise AdaptivePracticeValidationError("adaptive practice idempotency key is invalid")
+        try:
+            parsed_key = UUID(idempotency_key)
+        except (ValueError, AttributeError) as exc:
+            raise AdaptivePracticeValidationError(
+                "adaptive practice idempotency key is invalid"
+            ) from exc
+        if str(parsed_key) != idempotency_key:
+            raise AdaptivePracticeValidationError("adaptive practice idempotency key is invalid")
+        request_fingerprint = sha256_text(
+            canonical_json(
+                {
+                    "idempotency_key": idempotency_key,
+                    "readiness_signal_version_id": readiness_signal_version_id,
+                    "expected_source_fingerprint": expected_source_fingerprint,
+                    "target_application_event_id": target_application_event_id,
+                    "expected_target_fingerprint": expected_target_fingerprint,
+                }
             )
-            if item is None:
+        )
+        with self._session_factory() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            replay = _load_v2_start_replay(
+                session,
+                idempotency_key=idempotency_key,
+                request_fingerprint=request_fingerprint,
+            )
+            if replay is not None:
+                return replay
+
+            projection = project_practice_focus(
+                session,
+                signal_version_id=readiness_signal_version_id,
+                target_event_id=target_application_event_id,
+            )
+            if projection.state == "unavailable":
+                raise AdaptivePracticeUnavailable("adaptive practice source is unavailable")
+            if projection.state in {"source_missing", "target_missing"}:
                 raise AdaptivePracticeNotFound()
-            recommendation = _recommendation(proposal, item, note, event, application)
-            if recommendation is None:
+            if projection.state != "ready":
+                raise AdaptivePracticeConflict(
+                    f"adaptive practice {projection.state.replace('_', ' ')}"
+                )
+            source = projection.source
+            target = projection.target
+            if source is None or target is None:
+                raise AdaptivePracticeUnavailable("adaptive practice projection is incomplete")
+            if source.practice_source_fingerprint != expected_source_fingerprint:
                 raise AdaptivePracticeConflict("adaptive practice source changed")
-            if recommendation["source_fingerprint"] != expected_source_fingerprint:
-                raise AdaptivePracticeConflict("adaptive practice source changed")
+            if target.practice_target_fingerprint != expected_target_fingerprint:
+                raise AdaptivePracticeConflict("adaptive practice target changed")
+            if (
+                source.source_event_id is None
+                or source.source_note_id is None
+                or source.source_proposal_id is None
+                or not source.evidence
+            ):
+                raise AdaptivePracticeUnavailable("adaptive practice source snapshot is incomplete")
+            primary = source.evidence[0]
+            drill = _DRILLS.get(primary.source_path)
+            if drill is None:
+                raise AdaptivePracticeUnavailable("adaptive practice source path is unsupported")
+            drill_kind, title, reason, base_prompt = drill
+            prompt = base_prompt
+            if source.user_note:
+                prompt = f"{base_prompt}\n用户补充：{source.user_note}"
             plan = AdaptivePracticePlan(
-                application_id=application.id,
-                application_event_id=event.id,
-                interview_note_id=note.id,
-                interview_review_proposal_id=proposal.id,
-                focus_id=focus_id,
+                application_id=source.application_id,
+                application_event_id=source.source_event_id,
+                interview_note_id=source.source_note_id,
+                interview_review_proposal_id=source.source_proposal_id,
+                focus_id=source.focus_id,
                 start_idempotency_key=idempotency_key,
                 start_input_fingerprint=request_fingerprint,
-                source_fingerprint=expected_source_fingerprint,
-                source_path=recommendation["source_path"],
-                source_excerpt=recommendation["source_excerpt"],
-                source_hash=sha256_text(
-                    str(getattr(note, _PATH_TO_FIELD[recommendation["source_path"]], ""))
-                ),
-                drill_kind=recommendation["drill_kind"],
-                title=recommendation["title"],
-                observation=recommendation["observation"],
-                reason=recommendation["reason"],
-                prompt=recommendation["prompt"],
+                source_fingerprint=source.practice_source_fingerprint,
+                source_path=primary.source_path,
+                source_excerpt=primary.excerpt,
+                source_hash=primary.source_field_sha256,
+                drill_kind=drill_kind,
+                title=title,
+                observation=source.statement_text,
+                reason=reason,
+                prompt=prompt,
+                origin_contract="confirmed_readiness_signal_v1",
+                readiness_signal_version_id=source.version_id,
+                target_application_event_id=target.event_id,
+                target_fingerprint=target.practice_target_fingerprint,
             )
             session.add(plan)
             try:
                 session.commit()
             except IntegrityError as exc:
                 session.rollback()
+                replay = _load_v2_start_replay(
+                    session,
+                    idempotency_key=idempotency_key,
+                    request_fingerprint=request_fingerprint,
+                )
+                if replay is not None:
+                    return replay
                 duplicate = session.scalar(
                     select(AdaptivePracticePlan).where(
-                        AdaptivePracticePlan.interview_review_proposal_id == proposal_id,
-                        AdaptivePracticePlan.focus_id == focus_id,
+                        AdaptivePracticePlan.origin_contract == "confirmed_readiness_signal_v1",
+                        AdaptivePracticePlan.readiness_signal_version_id
+                        == readiness_signal_version_id,
+                        AdaptivePracticePlan.target_application_event_id
+                        == target_application_event_id,
                     )
                 )
                 if duplicate is not None:
                     raise AdaptivePracticeConflict("adaptive practice already started") from exc
-                raise AdaptivePracticeConflict("adaptive practice could not be started") from exc
+                raise AdaptivePracticeUnavailable(
+                    "adaptive practice could not be persisted"
+                ) from exc
             session.refresh(plan)
-            return _plan_json(session, plan), True
+            return _plan_json(session, plan, project_live=False), True
 
     def complete(
         self,
@@ -250,7 +324,9 @@ class AdaptivePracticeRepository:
                 raise AdaptivePracticeNotFound()
             if plan.completion_idempotency_key == idempotency_key:
                 if plan.completion_fingerprint != fingerprint:
-                    raise AdaptivePracticeConflict("adaptive practice completion idempotency input changed")
+                    raise AdaptivePracticeConflict(
+                        "adaptive practice completion idempotency input changed"
+                    )
                 return _plan_json(session, plan), False
             if plan.status != "in_progress" or plan.revision != expected_revision:
                 raise AdaptivePracticeConflict("adaptive practice revision changed")
@@ -260,7 +336,9 @@ class AdaptivePracticeRepository:
                 )
             )
             if other is not None:
-                raise AdaptivePracticeConflict("adaptive practice completion idempotency input changed")
+                raise AdaptivePracticeConflict(
+                    "adaptive practice completion idempotency input changed"
+                )
             plan.response_text = response
             plan.reflection_text = reflection
             plan.self_assessment = self_assessment
@@ -274,113 +352,55 @@ class AdaptivePracticeRepository:
             return _plan_json(session, plan), True
 
 
-def _proposal_focuses(proposal: InterviewReviewProposal) -> list[dict[str, Any]]:
-    try:
-        payload = json.loads(proposal.proposal_json)
-    except (TypeError, ValueError):
-        return []
-    values = payload.get("practice_focuses") if isinstance(payload, dict) else None
-    return [item for item in values if isinstance(item, dict)] if isinstance(values, list) else []
-
-
-def _visible_context(
-    session: Session, proposal: InterviewReviewProposal
-) -> tuple[InterviewNote, ApplicationEvent, Application] | None:
-    if proposal.note_id is None or proposal.application_event_id is None:
-        return None
-    note = session.get(InterviewNote, proposal.note_id)
-    event = session.get(ApplicationEvent, proposal.application_event_id)
-    if note is None or event is None or note.application_id is None:
-        return None
-    application = session.get(Application, note.application_id)
-    if (
-        application is None
-        or application.deleted_at is not None
-        or note.application_event_id != event.id
-        or event.application_id != application.id
-        or event.event_type != "interview"
-    ):
-        return None
-    return note, event, application
-
-
-def _recommendation(
-    proposal: InterviewReviewProposal,
-    item: dict[str, Any],
-    note: InterviewNote,
-    event: ApplicationEvent,
-    application: Application,
-) -> dict[str, Any] | None:
-    focus_id = item.get("id")
-    observation = item.get("text")
-    refs = item.get("evidence_refs")
-    if not isinstance(focus_id, str) or not isinstance(observation, str) or not observation.strip():
-        return None
-    if not isinstance(refs, list):
-        return None
-    for ref in refs:
-        if not isinstance(ref, dict) or ref.get("source") != "interview_note":
-            continue
-        path = ref.get("path")
-        excerpt = ref.get("excerpt")
-        if path not in _PATH_TO_FIELD or not isinstance(excerpt, str) or not excerpt.strip():
-            continue
-        current = str(getattr(note, _PATH_TO_FIELD[path], ""))
-        if excerpt not in current:
-            continue
-        drill_kind, title, reason, prompt = _DRILLS[path]
-        source_fingerprint = sha256_text(
-            canonical_json(
-                {
-                    "proposal_id": proposal.id,
-                    "proposal_hash": proposal.proposal_hash,
-                    "focus_id": focus_id,
-                    "source_path": path,
-                    "source_excerpt": excerpt,
-                    "source_value_hash": sha256_text(current),
-                    "note_id": note.id,
-                    "event_id": event.id,
-                }
-            )
-        )
-        return {
-            "proposal_id": proposal.id,
-            "focus_id": focus_id,
-            "application_id": application.id,
-            "application_event_id": event.id,
-            "interview_note_id": note.id,
-            "company_name": application.company_name,
-            "position_name": application.position_name,
-            "drill_kind": drill_kind,
-            "title": title,
-            "observation": observation.strip(),
-            "reason": reason,
-            "prompt": prompt,
-            "source_path": path,
-            "source_excerpt": excerpt,
-            "source_fingerprint": source_fingerprint,
-        }
-    return None
-
-
 def _visible_plan(session: Session, plan_id: int) -> AdaptivePracticePlan | None:
-    return session.scalar(
-        select(AdaptivePracticePlan)
-        .join(InterviewNote, InterviewNote.id == AdaptivePracticePlan.interview_note_id)
-        .join(ApplicationEvent, ApplicationEvent.id == AdaptivePracticePlan.application_event_id)
-        .join(Application, Application.id == AdaptivePracticePlan.application_id)
-        .where(
-            AdaptivePracticePlan.id == plan_id,
-            Application.deleted_at.is_(None),
-            InterviewNote.application_id == AdaptivePracticePlan.application_id,
-            InterviewNote.application_event_id == AdaptivePracticePlan.application_event_id,
-            ApplicationEvent.application_id == AdaptivePracticePlan.application_id,
-            ApplicationEvent.event_type == "interview",
+    plan = session.get(AdaptivePracticePlan, plan_id)
+    return plan if plan is not None and _plan_context_is_visible(session, plan) else None
+
+
+def _load_v2_start_replay(
+    session: Session,
+    *,
+    idempotency_key: str,
+    request_fingerprint: str,
+) -> tuple[dict[str, Any], bool] | None:
+    existing = session.scalar(
+        select(AdaptivePracticePlan).where(
+            AdaptivePracticePlan.start_idempotency_key == idempotency_key
         )
+    )
+    if existing is None:
+        return None
+    if existing.start_input_fingerprint != request_fingerprint:
+        raise AdaptivePracticeConflict("adaptive practice idempotency input changed")
+    visible = _visible_plan(session, existing.id)
+    if visible is None:
+        raise AdaptivePracticeNotFound()
+    return _plan_json(session, visible, project_live=False), False
+
+
+def _plan_context_is_visible(session: Session, plan: AdaptivePracticePlan) -> bool:
+    application = session.get(Application, plan.application_id)
+    if application is None or application.deleted_at is not None:
+        return False
+    if plan.origin_contract == "confirmed_readiness_signal_v1":
+        # The non-null snapshot columns are history, not live joins.  V2 remains
+        # readable/completable after either locator is lowered to NULL.
+        return True
+    if plan.origin_contract != "legacy_review_focus_v1":
+        return False
+    note = session.get(InterviewNote, plan.interview_note_id)
+    event = session.get(ApplicationEvent, plan.application_event_id)
+    return bool(
+        note is not None
+        and event is not None
+        and note.application_id == plan.application_id
+        and note.application_event_id == plan.application_event_id
+        and event.application_id == plan.application_id
+        and event.event_type == "interview"
     )
 
 
-def _source_status(session: Session, plan: AdaptivePracticePlan) -> str:
+def _legacy_source_status(session: Session, plan: AdaptivePracticePlan) -> str:
     note = session.get(InterviewNote, plan.interview_note_id)
     event = session.get(ApplicationEvent, plan.application_event_id)
     if note is None or event is None or note.application_id != plan.application_id:
@@ -392,12 +412,39 @@ def _source_status(session: Session, plan: AdaptivePracticePlan) -> str:
     return "current" if sha256_text(current) == plan.source_hash else "changed"
 
 
-def _plan_json(session: Session, plan: AdaptivePracticePlan) -> dict[str, Any]:
+def _practice_state(
+    session: Session,
+    plan: AdaptivePracticePlan,
+    *,
+    project_live: bool,
+) -> str:
+    if plan.origin_contract != "confirmed_readiness_signal_v1" or not project_live:
+        return plan.status
+    if plan.readiness_signal_version_id is None:
+        return "source_missing"
+    projection = project_practice_focus(
+        session,
+        signal_version_id=plan.readiness_signal_version_id,
+        target_event_id=plan.target_application_event_id or 0,
+    )
+    return projection.state
+
+
+def _plan_json(
+    session: Session,
+    plan: AdaptivePracticePlan,
+    *,
+    project_live: bool = True,
+) -> dict[str, Any]:
     application = session.get(Application, plan.application_id)
+    practice_state = _practice_state(session, plan, project_live=project_live)
     return {
         "id": plan.id,
+        "origin_contract": plan.origin_contract,
         "application_id": plan.application_id,
         "application_event_id": plan.application_event_id,
+        "target_application_event_id": plan.target_application_event_id,
+        "readiness_signal_version_id": plan.readiness_signal_version_id,
         "interview_note_id": plan.interview_note_id,
         "proposal_id": plan.interview_review_proposal_id,
         "focus_id": plan.focus_id,
@@ -411,7 +458,13 @@ def _plan_json(session: Session, plan: AdaptivePracticePlan) -> dict[str, Any]:
         "source_path": plan.source_path,
         "source_excerpt": plan.source_excerpt,
         "source_fingerprint": plan.source_fingerprint,
-        "source_status": _source_status(session, plan),
+        "target_fingerprint": plan.target_fingerprint,
+        "source_status": (
+            _legacy_source_status(session, plan)
+            if plan.origin_contract == "legacy_review_focus_v1"
+            else None
+        ),
+        "practice_state": practice_state,
         "status": plan.status,
         "revision": plan.revision,
         "response_text": plan.response_text,

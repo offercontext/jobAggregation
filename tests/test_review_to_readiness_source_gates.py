@@ -750,13 +750,204 @@ def _raw_body_binding(statement: ast.stmt) -> str | None:
     return None
 
 
+def _loads_any_name(node: ast.AST, names: set[str]) -> bool:
+    return any(
+        isinstance(child, ast.Name)
+        and child.id in names
+        and isinstance(child.ctx, ast.Load)
+        for child in ast.walk(node)
+    )
+
+
+def _controlled_derivation(node: ast.AST, names: set[str]) -> bool:
+    forbidden = (
+        ast.Await,
+        ast.Call,
+        ast.GeneratorExp,
+        ast.Lambda,
+        ast.ListComp,
+        ast.NamedExpr,
+        ast.SetComp,
+        ast.Yield,
+        ast.YieldFrom,
+        ast.DictComp,
+    )
+    return _loads_any_name(node, names) and not any(
+        isinstance(child, forbidden) for child in ast.walk(node)
+    )
+
+
+def _simple_assignment(
+    statement: ast.stmt,
+) -> tuple[ast.Name, ast.AST] | None:
+    if (
+        isinstance(statement, ast.Assign)
+        and len(statement.targets) == 1
+        and isinstance(statement.targets[0], ast.Name)
+    ):
+        return statement.targets[0], statement.value
+    if (
+        isinstance(statement, ast.AnnAssign)
+        and isinstance(statement.target, ast.Name)
+        and statement.value is not None
+    ):
+        return statement.target, statement.value
+    return None
+
+
+def _direct_controlled_call(
+    node: ast.AST,
+    controlled_names: set[str],
+) -> ast.Call | None:
+    value = node.value if isinstance(node, ast.Await) else node
+    if isinstance(value, ast.Call):
+        controlled_arguments = [
+            argument
+            for argument in (*value.args, *(item.value for item in value.keywords))
+            if _loads_any_name(argument, controlled_names)
+        ]
+        if controlled_arguments and all(
+            _controlled_derivation(argument, controlled_names)
+            or (
+                isinstance(argument, ast.Name)
+                and argument.id in controlled_names
+            )
+            for argument in controlled_arguments
+        ):
+            return value
+    return None
+
+
+def _return_route_sink(
+    statement: ast.Return,
+    controlled_names: set[str],
+) -> tuple[bool, ast.Call | None]:
+    if statement.value is None:
+        return False, None
+    direct_call = _direct_controlled_call(statement.value, controlled_names)
+    if direct_call is not None:
+        return True, direct_call
+    value = statement.value.value if isinstance(statement.value, ast.Await) else statement.value
+    if _controlled_derivation(value, controlled_names) or (
+        isinstance(value, ast.Name) and value.id in controlled_names
+    ):
+        return True, None
+    return False, None
+
+
+def _decoder_flow_reaches_route_sink(
+    statements: list[ast.stmt],
+    *,
+    decoder_result_name: str,
+    raw_body_name: str | None,
+) -> bool:
+    controlled_names = {decoder_result_name}
+    allowed_stores: set[int] = set()
+    response_names: set[str] = set()
+    returned_response_names: set[str] = set()
+    route_sink_seen = False
+
+    for statement in statements:
+        if raw_body_name is not None and any(
+            isinstance(child, ast.Name) and child.id == raw_body_name
+            for child in ast.walk(statement)
+        ):
+            return False
+
+        assignment = _simple_assignment(statement)
+        assigned_sink = (
+            _direct_controlled_call(assignment[1], controlled_names)
+            if assignment is not None
+            else None
+        )
+        if assignment is not None and assigned_sink is not None:
+            target, _value = assignment
+            if target.id in controlled_names or target.id in response_names:
+                return False
+            response_names.add(target.id)
+            allowed_stores.add(id(target))
+        elif assignment is not None and _loads_any_name(
+            assignment[1],
+            controlled_names,
+        ):
+            target, value = assignment
+            if target.id in controlled_names or not _controlled_derivation(
+                value,
+                controlled_names,
+            ):
+                return False
+            controlled_names.add(target.id)
+            allowed_stores.add(id(target))
+        elif any(
+            isinstance(child, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+            and any(
+                _loads_any_name(value, controlled_names)
+                for value in ast.iter_child_nodes(child)
+            )
+            for child in ast.walk(statement)
+        ):
+            return False
+
+        allowed_sink_calls = {id(assigned_sink)} if assigned_sink is not None else set()
+        for returned in (
+            child for child in ast.walk(statement) if isinstance(child, ast.Return)
+        ):
+            if returned.value is not None:
+                returned_response_names.update(
+                    name
+                    for name in response_names
+                    if _loads_any_name(returned.value, {name})
+                )
+            is_sink, sink_call = _return_route_sink(returned, controlled_names)
+            if not is_sink:
+                continue
+            route_sink_seen = True
+            if sink_call is not None:
+                allowed_sink_calls.add(id(sink_call))
+
+        for call in (child for child in ast.walk(statement) if isinstance(child, ast.Call)):
+            if isinstance(call.func, ast.Attribute) and _loads_any_name(
+                call.func.value,
+                controlled_names,
+            ):
+                return False
+            if any(
+                _loads_any_name(argument, controlled_names)
+                for argument in (*call.args, *(item.value for item in call.keywords))
+            ) and id(call) not in allowed_sink_calls:
+                return False
+
+    guarded_names = controlled_names | response_names
+    for statement in statements:
+        for child in ast.walk(statement):
+            if (
+                isinstance(child, ast.Name)
+                and child.id in guarded_names
+                and not isinstance(child.ctx, ast.Load)
+                and id(child) not in allowed_stores
+            ):
+                return False
+            if (
+                isinstance(child, (ast.Attribute, ast.Subscript))
+                and not isinstance(child.ctx, ast.Load)
+                and _loads_any_name(child, guarded_names)
+            ):
+                return False
+    all_response_sinks_returned = (
+        not response_names or response_names == returned_response_names
+    )
+    return all_response_sinks_returned and (
+        route_sink_seen or bool(response_names)
+    )
+
+
 def _unsafe_product_action_http_bodies(tree: ast.AST | None) -> list[str]:
     """Reject normalization/coercion before the duplicate-aware raw decoder."""
 
     if tree is None:
         return []
     violations: list[str] = []
-    for node in tree.body:
+    for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         decorator_text = " ".join(ast.unparse(item) for item in node.decorator_list)
@@ -885,32 +1076,21 @@ def _unsafe_product_action_http_bodies(tree: ast.AST | None) -> list[str]:
             and decoder_statement.value is decoder_call
         ):
             decoder_result_name = decoder_statement.target.id
-        decoder_result_is_unchanged = decoder_result_name is not None and not any(
-            isinstance(child, ast.Name)
-            and child.id == decoder_result_name
-            and not isinstance(child.ctx, ast.Load)
-            for statement in node.body[decoder_statement_index + 1 :]
-            for child in ast.walk(statement)
-        )
-        result_used_by_business = decoder_result_name is not None and any(
-            isinstance(call, ast.Call)
-            and any(
-                isinstance(child, ast.Name)
-                and child.id == decoder_result_name
-                and isinstance(child.ctx, ast.Load)
-                for argument in (*call.args, *(item.value for item in call.keywords))
-                for child in ast.walk(argument)
+        decoder_flow_is_safe = decoder_result_name is not None and (
+            _decoder_flow_reaches_route_sink(
+                node.body[decoder_statement_index + 1 :],
+                decoder_result_name=decoder_result_name,
+                raw_body_name=(
+                    decoder_input.id if isinstance(decoder_input, ast.Name) else None
+                ),
             )
-            for statement in node.body[decoder_statement_index + 1 :]
-            for call in ast.walk(statement)
         )
         if (
             not decoder_uses_raw_body
             or len(request_body_calls) != 1
             or request_json_calls
             or not calls_before_decoder_are_safe
-            or not decoder_result_is_unchanged
-            or not result_used_by_business
+            or not decoder_flow_is_safe
         ):
             violations.append(f"ui:unsafe-product-action-body:{node.name}")
     return violations
@@ -2251,6 +2431,83 @@ async def decide(operation_id: str, request: Request):
 '''
     )
     assert _unsafe_product_action_http_bodies(overwritten_decoder_result) == [
+        "ui:unsafe-product-action-body:decide"
+    ]
+
+    safe_controlled_derivation = ast.parse(
+        '''
+@router.post("/api/product-actions/{operation_id}/decisions")
+async def decide(operation_id: str, request: Request):
+    payload = decode_product_action_request_v1(await request.body(), contract="decision")
+    decision = payload["decision"]
+    return service.decide(operation_id, decision)
+'''
+    )
+    assert _unsafe_product_action_http_bodies(safe_controlled_derivation) == []
+
+    safe_service_result_then_return = ast.parse(
+        '''
+@router.post("/api/product-actions/{operation_id}/decisions")
+async def decide(operation_id: str, request: Request):
+    payload = decode_product_action_request_v1(await request.body(), contract="decision")
+    response = service.decide(operation_id, payload)
+    return response
+'''
+    )
+    assert _unsafe_product_action_http_bodies(safe_service_result_then_return) == []
+
+    audit_then_secondary_parse = ast.parse(
+        '''
+@router.post("/api/product-actions/{operation_id}/decisions")
+async def decide(operation_id: str, request: Request):
+    raw_body = await request.body()
+    payload = decode_product_action_request_v1(raw_body, contract="decision")
+    audit(payload)
+    normalized = json.loads(raw_body)
+    return service.decide(operation_id, normalized)
+'''
+    )
+    assert _unsafe_product_action_http_bodies(audit_then_secondary_parse) == [
+        "ui:unsafe-product-action-body:decide"
+    ]
+
+    audit_result_is_not_a_business_sink = ast.parse(
+        '''
+@router.post("/api/product-actions/{operation_id}/decisions")
+async def decide(operation_id: str, request: Request):
+    payload = decode_product_action_request_v1(await request.body(), contract="decision")
+    audit_result = audit(payload)
+    return service.decide(operation_id, {})
+'''
+    )
+    assert _unsafe_product_action_http_bodies(audit_result_is_not_a_business_sink) == [
+        "ui:unsafe-product-action-body:decide"
+    ]
+
+    mutated_decoder_result = ast.parse(
+        '''
+@router.post("/api/product-actions/{operation_id}/decisions")
+async def decide(operation_id: str, request: Request):
+    payload = decode_product_action_request_v1(await request.body(), contract="decision")
+    payload.clear()
+    return service.decide(operation_id, payload)
+'''
+    )
+    assert _unsafe_product_action_http_bodies(mutated_decoder_result) == [
+        "ui:unsafe-product-action-body:decide"
+    ]
+
+    mutated_derived_result = ast.parse(
+        '''
+@router.post("/api/product-actions/{operation_id}/decisions")
+async def decide(operation_id: str, request: Request):
+    payload = decode_product_action_request_v1(await request.body(), contract="decision")
+    decision = payload["decision"]
+    decision = normalize_decision(decision)
+    return service.decide(operation_id, decision)
+'''
+    )
+    assert _unsafe_product_action_http_bodies(mutated_derived_result) == [
         "ui:unsafe-product-action-body:decide"
     ]
 

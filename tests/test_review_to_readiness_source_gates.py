@@ -541,8 +541,16 @@ def _application_event_delete_violations(path: Path, tree: ast.Module) -> list[s
                 and (
                     (
                         node.func.attr == "scalars"
-                        and bool(node.args)
-                        and select_targets_event(node.args[0])
+                        and (
+                            (
+                                bool(node.args)
+                                and select_targets_event(node.args[0])
+                            )
+                            or (
+                                not node.args
+                                and selection_result_targets_event(node.func.value)
+                            )
+                        )
                     )
                     or (
                         node.func.attr in {"unique", "yield_per"}
@@ -963,17 +971,6 @@ def _interview_note_mutation_violations(path: Path, tree: ast.Module) -> list[st
             self.scalar_collections = (
                 set(parent.scalar_collections) if parent is not None else set()
             )
-            self.revision_values = (
-                set(parent.revision_values) if parent is not None else set()
-            )
-            self.update_statements = (
-                set(parent.update_statements) if parent is not None else set()
-            )
-            self.revisioned_update_statements = (
-                set(parent.revisioned_update_statements)
-                if parent is not None
-                else set()
-            )
 
         def discard(self, names: set[str]) -> None:
             self.models.difference_update(names)
@@ -982,9 +979,6 @@ def _interview_note_mutation_violations(path: Path, tree: ast.Module) -> list[st
             self.rows.difference_update(names)
             self.selection_results.difference_update(names)
             self.scalar_collections.difference_update(names)
-            self.revision_values.difference_update(names)
-            self.update_statements.difference_update(names)
-            self.revisioned_update_statements.difference_update(names)
 
     def local_nodes(scope: ast.AST) -> list[ast.AST]:
         nodes: list[ast.AST] = []
@@ -1048,6 +1042,58 @@ def _interview_note_mutation_violations(path: Path, tree: ast.Module) -> list[st
                     for alias in candidate.names
                     if alias.name == "InterviewNote"
                 )
+
+        parent_by_id = {
+            id(child): parent
+            for parent in (scope, *nodes)
+            for child in ast.iter_child_nodes(parent)
+        }
+
+        def source_position(node: ast.AST) -> tuple[int, int]:
+            return (
+                getattr(node, "lineno", 0),
+                getattr(node, "col_offset", 0),
+            )
+
+        assignments = [
+            (
+                source_position(candidate),
+                {
+                    name
+                    for target in assignment_parts(candidate)[0]
+                    for name in assigned_names(target)
+                },
+                assignment_parts(candidate)[1],
+            )
+            for candidate in nodes
+            if assignment_parts(candidate)[0]
+        ]
+        assignments.sort(key=lambda assignment: assignment[0])
+
+        def expression_cutoff(
+            node: ast.AST,
+            cutoff: tuple[int, int] | None,
+        ) -> tuple[int, int]:
+            if cutoff is not None:
+                return cutoff
+            current = node
+            while id(current) in parent_by_id:
+                parent = parent_by_id[id(current)]
+                if assignment_parts(parent)[1] is not None:
+                    return source_position(parent)
+                current = parent
+            return source_position(node)
+
+        def latest_assignment(
+            name: str,
+            cutoff: tuple[int, int],
+        ) -> tuple[tuple[int, int], ast.expr | None] | None:
+            matches = [
+                (position, value)
+                for position, names, value in assignments
+                if name in names and position < cutoff
+            ]
+            return matches[-1] if matches else None
 
         def is_note_model(node: ast.AST) -> bool:
             if isinstance(node, ast.Name):
@@ -1132,8 +1178,16 @@ def _interview_note_mutation_violations(path: Path, tree: ast.Module) -> list[st
                 and (
                     (
                         node.func.attr == "scalars"
-                        and bool(node.args)
-                        and select_targets_note(node.args[0])
+                        and (
+                            (
+                                bool(node.args)
+                                and select_targets_note(node.args[0])
+                            )
+                            or (
+                                not node.args
+                                and selection_result_targets_note(node.func.value)
+                            )
+                        )
                     )
                     or (
                         node.func.attr in {"unique", "yield_per"}
@@ -1168,15 +1222,28 @@ def _interview_note_mutation_violations(path: Path, tree: ast.Module) -> list[st
                 ) or scalar_collection_targets_note(node.func.value)
             return False
 
-        def is_revision_values(node: ast.AST) -> bool:
-            return (
-                isinstance(node, ast.Name)
-                and node.id in lineage.revision_values
-            ) or (
+        def is_revision_values(
+            node: ast.AST,
+            cutoff: tuple[int, int] | None = None,
+            seen: frozenset[tuple[str, tuple[int, int]]] = frozenset(),
+        ) -> bool:
+            if (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
                 and node.func.id == "_revisioned_note_values"
-            )
+            ):
+                return True
+            if not isinstance(node, ast.Name):
+                return False
+            resolved_cutoff = expression_cutoff(node, cutoff)
+            key = (node.id, resolved_cutoff)
+            if key in seen:
+                return False
+            assignment = latest_assignment(node.id, resolved_cutoff)
+            if assignment is None or assignment[1] is None:
+                return False
+            position, value = assignment
+            return is_revision_values(value, position, seen | {key})
 
         def is_note_update_factory(node: ast.AST) -> bool:
             return (
@@ -1193,9 +1260,21 @@ def _interview_note_mutation_violations(path: Path, tree: ast.Module) -> list[st
                 and is_note_model(node.args[0])
             )
 
-        def is_note_update_statement(node: ast.AST) -> bool:
+        def is_note_update_statement(
+            node: ast.AST,
+            cutoff: tuple[int, int] | None = None,
+            seen: frozenset[tuple[str, tuple[int, int]]] = frozenset(),
+        ) -> bool:
+            resolved_cutoff = expression_cutoff(node, cutoff)
             if isinstance(node, ast.Name):
-                return node.id in lineage.update_statements
+                key = (node.id, resolved_cutoff)
+                if key in seen:
+                    return False
+                assignment = latest_assignment(node.id, resolved_cutoff)
+                if assignment is None or assignment[1] is None:
+                    return False
+                position, value = assignment
+                return is_note_update_statement(value, position, seen | {key})
             if is_note_update_factory(node):
                 return True
             return (
@@ -1211,24 +1290,45 @@ def _interview_note_mutation_violations(path: Path, tree: ast.Module) -> list[st
                     "where",
                     "with_dialect_options",
                 }
-                and is_note_update_statement(node.func.value)
+                and is_note_update_statement(node.func.value, resolved_cutoff, seen)
             )
 
-        def update_call_uses_revision_values(node: ast.Call) -> bool:
-            return any(is_revision_values(argument) for argument in node.args) or any(
-                is_revision_values(keyword.value) for keyword in node.keywords
+        def update_call_uses_revision_values(
+            node: ast.Call,
+            cutoff: tuple[int, int] | None = None,
+        ) -> bool:
+            resolved_cutoff = expression_cutoff(node, cutoff)
+            return any(
+                is_revision_values(argument, resolved_cutoff)
+                for argument in node.args
+            ) or any(
+                keyword.arg is None
+                and is_revision_values(keyword.value, resolved_cutoff)
+                for keyword in node.keywords
             )
 
-        def is_revisioned_note_update(node: ast.AST) -> bool:
+        def is_revisioned_note_update(
+            node: ast.AST,
+            cutoff: tuple[int, int] | None = None,
+            seen: frozenset[tuple[str, tuple[int, int]]] = frozenset(),
+        ) -> bool:
+            resolved_cutoff = expression_cutoff(node, cutoff)
             if isinstance(node, ast.Name):
-                return node.id in lineage.revisioned_update_statements
+                key = (node.id, resolved_cutoff)
+                if key in seen:
+                    return False
+                assignment = latest_assignment(node.id, resolved_cutoff)
+                if assignment is None or assignment[1] is None:
+                    return False
+                position, value = assignment
+                return is_revisioned_note_update(value, position, seen | {key})
             if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
                 return False
             if (
                 node.func.attr in {"values", "ordered_values"}
-                and is_note_update_statement(node.func.value)
+                and is_note_update_statement(node.func.value, resolved_cutoff)
             ):
-                return update_call_uses_revision_values(node)
+                return update_call_uses_revision_values(node, resolved_cutoff)
             return (
                 node.func.attr
                 in {
@@ -1238,7 +1338,7 @@ def _interview_note_mutation_violations(path: Path, tree: ast.Module) -> list[st
                     "where",
                     "with_dialect_options",
                 }
-                and is_revisioned_note_update(node.func.value)
+                and is_revisioned_note_update(node.func.value, resolved_cutoff, seen)
             )
 
         lineage.rows.update(
@@ -1278,12 +1378,6 @@ def _interview_note_mutation_violations(path: Path, tree: ast.Module) -> list[st
                     (
                         scalar_collection_targets_note(value),
                         lineage.scalar_collections,
-                    ),
-                    (is_revision_values(value), lineage.revision_values),
-                    (is_note_update_statement(value), lineage.update_statements),
-                    (
-                        is_revisioned_note_update(value),
-                        lineage.revisioned_update_statements,
                     ),
                 )
                 for matches, known_names in target_sets:
@@ -1594,6 +1688,18 @@ def test_application_event_delete_owner_detector_rejects_direct_sql_and_orm_path
         "    row = result.scalar_one()\n"
         "    session.delete(row)\n"
     )
+    execute_scalars_delete = ast.parse(
+        "def delete_event(session):\n"
+        "    row = session.execute(select(ApplicationEvent)).scalars().first()\n"
+        "    session.delete(row)\n"
+    )
+    split_execute_scalars_delete = ast.parse(
+        "def delete_event(session):\n"
+        "    result = session.execute(select(ApplicationEvent))\n"
+        "    rows = result.scalars()\n"
+        "    row = rows.first()\n"
+        "    session.delete(row)\n"
+    )
     raw_text_delete = ast.parse(
         "def delete_event(connection):\n"
         "    connection.exec_driver_sql('DELETE FROM application_events WHERE id = 1')\n"
@@ -1618,6 +1724,8 @@ def test_application_event_delete_owner_detector_rejects_direct_sql_and_orm_path
     assert _application_event_delete_violations(arbitrary, execute_scalar_delete)
     assert _application_event_delete_violations(arbitrary, scalars_first_delete)
     assert _application_event_delete_violations(arbitrary, split_result_delete)
+    assert _application_event_delete_violations(arbitrary, execute_scalars_delete)
+    assert _application_event_delete_violations(arbitrary, split_execute_scalars_delete)
     assert _application_event_delete_violations(arbitrary, raw_text_delete)
     assert _application_event_delete_violations(arbitrary, quoted_raw_text_delete)
     assert _application_event_delete_violations(approved, owner) == []
@@ -1647,6 +1755,12 @@ def test_application_event_delete_owner_detector_keeps_lineage_in_lexical_scope(
         "    result = session.execute(select(InterviewNote))\n"
         "    second = result.scalar_one()\n"
         "    session.delete(second)\n"
+        "    third = session.execute(select(InterviewNote)).scalars().first()\n"
+        "    session.delete(third)\n"
+        "    other_result = session.execute(select(InterviewNote))\n"
+        "    rows = other_result.scalars()\n"
+        "    fourth = rows.first()\n"
+        "    session.delete(fourth)\n"
     )
     arbitrary = ROOT / "src" / "offerpilot" / "other.py"
 
@@ -1689,6 +1803,18 @@ def test_interview_note_mutation_detector_requires_revisioned_owners() -> None:
         "    for row in rows:\n"
         "        row.questions = 'changed'\n"
     )
+    execute_scalars_assignment = ast.parse(
+        "def mutate(session):\n"
+        "    row = session.execute(select(InterviewNote)).scalars().one()\n"
+        "    row.questions = 'changed'\n"
+    )
+    split_execute_scalars_assignment = ast.parse(
+        "def mutate(session):\n"
+        "    result = session.execute(select(InterviewNote))\n"
+        "    rows = result.scalars()\n"
+        "    for row in rows:\n"
+        "        row.questions = 'changed'\n"
+    )
     quoted_raw_update = ast.parse(
         "def mutate(connection):\n"
         "    connection.exec_driver_sql('UPDATE \"interview_notes\" SET questions = 1')\n"
@@ -1725,6 +1851,28 @@ def test_interview_note_mutation_detector_requires_revisioned_owners() -> None:
         "    )\n"
         "    session.execute(update(InterviewNote).values(questions='bypass'))\n"
     )
+    reassigned_revision_values = ast.parse(
+        "def update(session):\n"
+        "    values = _revisioned_note_values({'questions': 'initial'})\n"
+        "    values = {'questions': 'bypass'}\n"
+        "    statement = update(InterviewNote).values(**values)\n"
+        "    session.execute(statement)\n"
+    )
+    safely_reassigned_revision_values = ast.parse(
+        "def update(session):\n"
+        "    values = {'questions': 'initial'}\n"
+        "    values = _revisioned_note_values(values)\n"
+        "    statement = update(InterviewNote).values(**values)\n"
+        "    session.execute(statement)\n"
+    )
+    reassigned_revisioned_statement = ast.parse(
+        "def update(session):\n"
+        "    statement = update(InterviewNote).values(\n"
+        "        **_revisioned_note_values({'questions': 'initial'})\n"
+        "    )\n"
+        "    statement = update(InterviewNote).values(questions='bypass')\n"
+        "    session.execute(statement)\n"
+    )
     arbitrary = ROOT / "src" / "offerpilot" / "other.py"
     notes_owner = ROOT / "src" / "offerpilot" / "repositories" / "notes.py"
     events_owner = ROOT / "src" / "offerpilot" / "repositories" / "application_events.py"
@@ -1736,12 +1884,29 @@ def test_interview_note_mutation_detector_requires_revisioned_owners() -> None:
     assert _interview_note_mutation_violations(arbitrary, query_update)
     assert _interview_note_mutation_violations(arbitrary, scalars_one_assignment)
     assert _interview_note_mutation_violations(arbitrary, scalar_iteration_assignment)
+    assert _interview_note_mutation_violations(arbitrary, execute_scalars_assignment)
+    assert _interview_note_mutation_violations(
+        arbitrary,
+        split_execute_scalars_assignment,
+    )
     assert _interview_note_mutation_violations(arbitrary, quoted_raw_update)
     assert _interview_note_mutation_violations(notes_owner, approved_owner) == []
     assert _interview_note_mutation_violations(notes_owner, approved_scoped_owner) == []
     assert _interview_note_mutation_violations(events_owner, approved_event_owner) == []
     assert _interview_note_mutation_violations(notes_owner, unrevisioned_owner)
     assert _interview_note_mutation_violations(notes_owner, mixed_owner)
+    assert _interview_note_mutation_violations(notes_owner, reassigned_revision_values)
+    assert _interview_note_mutation_violations(
+        notes_owner,
+        reassigned_revisioned_statement,
+    )
+    assert (
+        _interview_note_mutation_violations(
+            notes_owner,
+            safely_reassigned_revision_values,
+        )
+        == []
+    )
 
 
 def test_interview_note_mutation_detector_avoids_read_and_unrelated_writes() -> None:
@@ -1752,6 +1917,12 @@ def test_interview_note_mutation_detector_avoids_read_and_unrelated_writes() -> 
         "    other.questions = 'unrelated'\n"
         "    created = InterviewNote(questions='new')\n"
         "    for event in session.scalars(select(ApplicationEvent)):\n"
+        "        event.questions = 'unrelated'\n"
+        "    event = session.execute(select(ApplicationEvent)).scalars().one()\n"
+        "    event.questions = 'unrelated'\n"
+        "    result = session.execute(select(ApplicationEvent))\n"
+        "    rows = result.scalars()\n"
+        "    for event in rows:\n"
         "        event.questions = 'unrelated'\n"
         "    return observed, created\n"
     )

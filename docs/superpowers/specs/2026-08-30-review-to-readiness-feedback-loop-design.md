@@ -1104,6 +1104,20 @@ route binding fingerprint
 
 terminal replay 必须重算并比较；同 Operation 的不同 decision 或 effective payload 返回 conflict。
 
+Product Action primary 在 `committed` / `failed` terminal 写入的
+`input_fingerprint` 使用 Ledger HMAC key 和独立域
+`product-action-input-v1`。canonical envelope 精确为：
+
+~~~text
+operation_request_fingerprint
+authorization_scope_fingerprint
+effective_payload_sha256
+~~~
+
+其中 `effective_payload_sha256` 是 effective payload canonical JSON bytes 的
+`sha256:<lowercase hex>`；不得用 Agent Tool 的 `write-operation-input-v1`，也不得省略
+scope 绑定。`rejected` 仍按 terminal shape 保持 `input_fingerprint=NULL`。
+
 ### 8.2 Approve / modify
 
 统一顺序：

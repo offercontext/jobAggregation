@@ -4,8 +4,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from sqlalchemy import create_engine, event, text
+from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.schema import CreateIndex, CreateTable
 
 from offerpilot.models import Base
 
@@ -320,6 +322,7 @@ def init_database(db_path: Path) -> SessionFactory:
     # acquire those columns above before the scoped-authority migration
     # canonicalizes legacy mode values or installs scope triggers.
     _ensure_scoped_tool_authority_schema(engine)
+    _ensure_review_to_readiness_feedback_schema(engine)
 
     resume_migrations = [
         _ensure_column(engine, "resumes", "name", "TEXT DEFAULT ''"),
@@ -1948,6 +1951,713 @@ def _ensure_scoped_tool_authority_schema(engine) -> None:  # type: ignore[no-unt
         "0028_scoped_tool_authority",
         "Add Conversation scope revision and Write Operation authorization fingerprint",
     )
+
+
+def _review_to_readiness_table_sql(engine, table_name: str, replacement: str) -> str:  # type: ignore[no-untyped-def]
+    compiled = str(CreateTable(Base.metadata.tables[table_name]).compile(dialect=engine.dialect))
+    needle = f"CREATE TABLE {table_name} ("
+    if needle not in compiled:
+        raise RuntimeError(f"cannot compile controlled rebuild for {table_name}")
+    return compiled.replace(needle, f"CREATE TABLE {replacement} (", 1)
+
+
+def _compile_review_to_readiness_indexes(engine, table_name: str) -> list[str]:  # type: ignore[no-untyped-def]
+    return [
+        str(CreateIndex(index).compile(dialect=engine.dialect))
+        for index in sorted(
+            Base.metadata.tables[table_name].indexes,
+            key=lambda item: item.name or "",
+        )
+    ]
+
+
+def _review_to_readiness_migration_checkpoint(_checkpoint: str) -> None:
+    """Named no-op hook used to prove that every 0029 DDL step rolls back."""
+
+
+def _ensure_review_to_readiness_feedback_schema(
+    engine: Engine,
+    *,
+    force_rebuild: bool = False,
+) -> None:
+    """Install the destructive 0029 rebuild and its cross-row SQLite guards."""
+
+    write_table_sql = _review_to_readiness_table_sql(
+        engine,
+        "write_operations",
+        "write_operations_0029",
+    )
+    practice_table_sql = _review_to_readiness_table_sql(
+        engine,
+        "adaptive_practice_plans",
+        "adaptive_practice_plans_0029",
+    )
+    note_table_sql = _review_to_readiness_table_sql(
+        engine,
+        "interview_notes",
+        "interview_notes_0029",
+    )
+    write_index_sql = _compile_review_to_readiness_indexes(engine, "write_operations")
+    practice_index_sql = _compile_review_to_readiness_indexes(
+        engine,
+        "adaptive_practice_plans",
+    )
+
+    raw = engine.raw_connection()
+    cursor = raw.cursor()
+    try:
+        cursor.execute("PRAGMA foreign_keys = OFF")
+        cursor.execute("BEGIN IMMEDIATE")
+        marker_exists = cursor.execute(
+            "SELECT 1 FROM schema_migrations "
+            "WHERE version='0029_review_to_readiness_feedback'"
+        ).fetchone() is not None
+
+        if not marker_exists:
+            additive_columns = (
+                (
+                    "interview_review_proposals",
+                    "proposal_schema_version",
+                    "INTEGER NOT NULL DEFAULT 1",
+                ),
+                (
+                    "interview_review_proposals",
+                    "source_note_revision",
+                    "INTEGER",
+                ),
+                (
+                    "interview_story_proposal_attempts",
+                    "product_action_operation_id",
+                    "VARCHAR(36) REFERENCES write_operations(id) ON DELETE RESTRICT",
+                ),
+                (
+                    "interview_story_proposal_attempts",
+                    "product_action_generation",
+                    "INTEGER NOT NULL DEFAULT 0",
+                ),
+            )
+            for table_name, column_name, definition in additive_columns:
+                columns = {
+                    str(row[1])
+                    for row in cursor.execute(f"PRAGMA table_info({table_name})")
+                }
+                if column_name not in columns:
+                    cursor.execute(
+                        f'ALTER TABLE "{table_name}" ADD COLUMN "{column_name}" {definition}'
+                    )
+            cursor.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "uq_interview_story_attempt_product_action_operation "
+                "ON interview_story_proposal_attempts(product_action_operation_id) "
+                "WHERE product_action_operation_id IS NOT NULL"
+            )
+
+            note_columns = [
+                str(row[1]) for row in cursor.execute("PRAGMA table_info(interview_notes)")
+            ]
+            expected_note_columns = [
+                column.name for column in Base.metadata.tables["interview_notes"].columns
+            ]
+            if note_columns != expected_note_columns:
+                unknown_note_columns = set(note_columns) - set(expected_note_columns)
+                if unknown_note_columns:
+                    raise RuntimeError("unsupported pre-0029 interview_notes columns")
+                note_triggers = [
+                    (str(row[0]), str(row[1]))
+                    for row in cursor.execute(
+                        "SELECT name,sql FROM sqlite_master WHERE type='trigger' "
+                        "AND sql IS NOT NULL AND instr(lower(sql),'interview_notes') > 0 "
+                        "ORDER BY name"
+                    )
+                ]
+                note_indexes = [
+                    str(row[0])
+                    for row in cursor.execute(
+                        "SELECT sql FROM sqlite_master WHERE type='index' "
+                        "AND tbl_name='interview_notes' AND sql IS NOT NULL ORDER BY name"
+                    )
+                ]
+                for trigger_name, _statement in note_triggers:
+                    cursor.execute(f'DROP TRIGGER "{trigger_name}"')
+                cursor.execute("DROP TABLE IF EXISTS interview_notes_0029")
+                cursor.execute(note_table_sql)
+                target_note_columns = ",".join(
+                    f'\"{column}\"' for column in expected_note_columns
+                )
+                note_source_expressions: list[str] = []
+                for column in expected_note_columns:
+                    if column in note_columns:
+                        note_source_expressions.append(f'\"{column}\"')
+                    elif column == "content_revision":
+                        note_source_expressions.append("1")
+                    elif column == "updated_at":
+                        note_source_expressions.append("coalesce(created_at,CURRENT_TIMESTAMP)")
+                    else:
+                        raise RuntimeError("unsupported interview note migration column")
+                cursor.execute(
+                    f"INSERT INTO interview_notes_0029 ({target_note_columns}) "
+                    f"SELECT {','.join(note_source_expressions)} FROM interview_notes"
+                )
+                cursor.execute("DROP TABLE interview_notes")
+                cursor.execute("ALTER TABLE interview_notes_0029 RENAME TO interview_notes")
+                for statement in note_indexes:
+                    cursor.execute(statement)
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_notes_app ON interview_notes(application_id)"
+                )
+                for _trigger_name, statement in note_triggers:
+                    cursor.execute(statement)
+
+            invalid_proposals = cursor.execute(
+                """
+                SELECT count(*) FROM interview_review_proposals
+                WHERE NOT (
+                  (typeof(proposal_schema_version) = 'integer'
+                   AND proposal_schema_version = 1
+                   AND source_note_revision IS NULL)
+                  OR
+                  (typeof(proposal_schema_version) = 'integer'
+                   AND proposal_schema_version = 2
+                   AND typeof(source_note_revision) = 'integer'
+                   AND source_note_revision >= 1)
+                )
+                """
+            ).fetchone()[0]
+            if invalid_proposals:
+                raise RuntimeError("invalid pre-0029 interview review proposal history")
+            invalid_story_attempts = cursor.execute(
+                """
+                SELECT count(*) FROM interview_story_proposal_attempts
+                WHERE NOT (
+                  typeof(product_action_generation) = 'integer'
+                  AND product_action_generation >= 0
+                  AND (
+                    (product_action_generation = 0
+                     AND product_action_operation_id IS NULL)
+                    OR
+                    (product_action_generation >= 1
+                     AND product_action_operation_id IS NOT NULL)
+                  )
+                )
+                """
+            ).fetchone()[0]
+            if invalid_story_attempts:
+                raise RuntimeError("invalid pre-0029 story product action history")
+
+        persisted_write_sql = str(
+            cursor.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='table' AND name='write_operations'"
+            ).fetchone()[0]
+        )
+        persisted_practice_sql = str(
+            cursor.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='table' AND name='adaptive_practice_plans'"
+            ).fetchone()[0]
+        )
+        should_rebuild = force_rebuild or (
+            not marker_exists
+            and (
+                "ck_write_operations_product_action_scope_bound" not in persisted_write_sql
+                or "ck_adaptive_practice_origin_contract" not in persisted_practice_sql
+                or "uq_adaptive_practice_proposal_focus" in persisted_practice_sql
+            )
+        )
+        if should_rebuild:
+            operation_columns = [
+                str(row[1]) for row in cursor.execute("PRAGMA table_info(write_operations)")
+            ]
+            expected_operation_columns = [
+                column.name for column in Base.metadata.tables["write_operations"].columns
+            ]
+            if set(operation_columns) != set(expected_operation_columns):
+                raise RuntimeError("unsupported pre-0029 write_operations columns")
+            operation_before = cursor.execute(
+                "SELECT "
+                + ",".join(f'\"{column}\"' for column in operation_columns)
+                + " FROM write_operations ORDER BY id"
+            ).fetchall()
+            transition_columns = [
+                str(row[1])
+                for row in cursor.execute("PRAGMA table_info(write_operation_transitions)")
+            ]
+            transitions_before = cursor.execute(
+                "SELECT "
+                + ",".join(f'\"{column}\"' for column in transition_columns)
+                + " FROM write_operation_transitions ORDER BY operation_id,seq,id"
+            ).fetchall()
+            operation_triggers = [
+                (str(row[0]), str(row[1]))
+                for row in cursor.execute(
+                    "SELECT name,sql FROM sqlite_master "
+                    "WHERE type='trigger' AND sql IS NOT NULL "
+                    "AND instr(lower(sql),'write_operations') > 0 "
+                    "ORDER BY name"
+                )
+            ]
+            for trigger_name, _statement in operation_triggers:
+                cursor.execute(f'DROP TRIGGER "{trigger_name}"')
+
+            cursor.execute("DROP TABLE IF EXISTS write_operations_0029")
+            cursor.execute(write_table_sql)
+            quoted_operations = ",".join(f'\"{column}\"' for column in operation_columns)
+            cursor.execute(
+                f"INSERT INTO write_operations_0029 ({quoted_operations}) "
+                f"SELECT {quoted_operations} FROM write_operations"
+            )
+            cursor.execute("DROP TABLE write_operations")
+            cursor.execute("ALTER TABLE write_operations_0029 RENAME TO write_operations")
+            for statement in write_index_sql:
+                cursor.execute(statement)
+            for _trigger_name, statement in operation_triggers:
+                cursor.execute(statement)
+
+            operation_after = cursor.execute(
+                "SELECT "
+                + ",".join(f'\"{column}\"' for column in operation_columns)
+                + " FROM write_operations ORDER BY id"
+            ).fetchall()
+            transitions_after = cursor.execute(
+                "SELECT "
+                + ",".join(f'\"{column}\"' for column in transition_columns)
+                + " FROM write_operation_transitions ORDER BY operation_id,seq,id"
+            ).fetchall()
+            if operation_after != operation_before:
+                raise RuntimeError("0029 changed historical write operation bytes")
+            if transitions_after != transitions_before:
+                raise RuntimeError("0029 changed historical transition bytes")
+
+            practice_columns = [
+                str(row[1])
+                for row in cursor.execute("PRAGMA table_info(adaptive_practice_plans)")
+            ]
+            expected_practice_columns = [
+                column.name for column in Base.metadata.tables["adaptive_practice_plans"].columns
+            ]
+            unknown_practice_columns = set(practice_columns) - set(expected_practice_columns)
+            if unknown_practice_columns:
+                raise RuntimeError("unsupported pre-0029 adaptive_practice_plans columns")
+            cursor.execute("DROP TABLE IF EXISTS adaptive_practice_plans_0029")
+            cursor.execute(practice_table_sql)
+            target_columns = ",".join(
+                f'\"{column}\"' for column in expected_practice_columns
+            )
+            source_expressions: list[str] = []
+            for column in expected_practice_columns:
+                if column in practice_columns:
+                    source_expressions.append(f'\"{column}\"')
+                elif column == "origin_contract":
+                    source_expressions.append("'legacy_review_focus_v1'")
+                else:
+                    source_expressions.append("NULL")
+            cursor.execute(
+                f"INSERT INTO adaptive_practice_plans_0029 ({target_columns}) "
+                f"SELECT {','.join(source_expressions)} FROM adaptive_practice_plans"
+            )
+            _review_to_readiness_migration_checkpoint("before_adaptive_swap")
+            cursor.execute("DROP TABLE adaptive_practice_plans")
+            cursor.execute(
+                "ALTER TABLE adaptive_practice_plans_0029 RENAME TO adaptive_practice_plans"
+            )
+            for statement in practice_index_sql:
+                cursor.execute(statement)
+
+        trigger_names = (
+            "trg_product_action_route_insert",
+            "trg_product_action_route_identity_immutable",
+            "trg_product_action_route_terminalize",
+            "trg_product_action_route_delete",
+            "trg_product_action_parent_terminal_guard",
+            "trg_product_action_parent_terminalize_route",
+            "trg_interview_readiness_signal_source_immutable",
+            "trg_interview_readiness_signal_current_insert",
+            "trg_interview_readiness_signal_current_update",
+            "trg_interview_readiness_signal_version_immutable",
+            "trg_interview_readiness_signal_version_delete",
+            "trg_interview_review_proposal_contract_insert",
+            "trg_interview_review_proposal_contract_update",
+            "trg_interview_story_product_action_insert",
+            "trg_interview_story_product_action_update",
+            "trg_adaptive_practice_v2_insert",
+            "trg_adaptive_practice_v2_identity_immutable",
+            "trg_adaptive_practice_v2_locator_monotonic",
+            "trg_write_operation_compensation_insert",
+            "trg_write_operation_compensation_update",
+        )
+        for trigger_name in trigger_names:
+            cursor.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+
+        cursor.execute(
+            """
+            CREATE TRIGGER trg_product_action_route_insert
+            BEFORE INSERT ON product_action_proposals
+            BEGIN
+                SELECT CASE WHEN NEW.route_payload_json IS NULL
+                    OR NEW.terminalized_at IS NOT NULL
+                    OR NOT EXISTS (
+                      SELECT 1 FROM write_operations parent
+                      WHERE parent.id = NEW.operation_id
+                        AND parent.operation_role = 'primary'
+                        AND parent.adapter_kind = 'product_action'
+                        AND parent.status = 'proposed'
+                        AND parent.tool_call_id = NEW.action_call_id
+                        AND parent.tool_name = NEW.action_name
+                    )
+                  THEN RAISE(ABORT, 'invalid product action parent') END;
+            END
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TRIGGER trg_product_action_route_identity_immutable
+            BEFORE UPDATE ON product_action_proposals
+            WHEN NEW.operation_id IS NOT OLD.operation_id
+              OR NEW.action_call_id IS NOT OLD.action_call_id
+              OR NEW.action_name IS NOT OLD.action_name
+              OR NEW.request_origin IS NOT OLD.request_origin
+              OR NEW.schema_version IS NOT OLD.schema_version
+              OR NEW.source_kind IS NOT OLD.source_kind
+              OR NEW.source_id IS NOT OLD.source_id
+              OR NEW.source_revision IS NOT OLD.source_revision
+              OR NEW.route_payload_fingerprint IS NOT OLD.route_payload_fingerprint
+              OR NEW.route_binding_fingerprint IS NOT OLD.route_binding_fingerprint
+              OR NEW.request_idempotency_fingerprint IS NOT OLD.request_idempotency_fingerprint
+              OR NEW.semantic_claim_fingerprint IS NOT OLD.semantic_claim_fingerprint
+              OR NEW.historical_request_token_fingerprint IS NOT OLD.historical_request_token_fingerprint
+              OR NEW.created_at IS NOT OLD.created_at
+            BEGIN
+                SELECT RAISE(ABORT, 'product action route identity is immutable');
+            END
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TRIGGER trg_product_action_route_terminalize
+            BEFORE UPDATE OF route_payload_json, terminalized_at ON product_action_proposals
+            WHEN NEW.route_payload_json IS NOT OLD.route_payload_json
+              OR NEW.terminalized_at IS NOT OLD.terminalized_at
+            BEGIN
+                SELECT CASE WHEN NOT (
+                  OLD.route_payload_json IS NOT NULL AND OLD.terminalized_at IS NULL
+                  AND NEW.route_payload_json IS NULL AND NEW.terminalized_at IS NOT NULL
+                  AND EXISTS (
+                    SELECT 1 FROM write_operations parent
+                    WHERE parent.id = OLD.operation_id
+                      AND parent.operation_role = 'primary'
+                      AND parent.adapter_kind = 'product_action'
+                      AND parent.status IN ('rejected','committed','failed')
+                      AND parent.tool_call_id = OLD.action_call_id
+                      AND parent.tool_name = OLD.action_name
+                  )
+                ) THEN RAISE(ABORT, 'invalid product action route terminalization') END;
+            END
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TRIGGER trg_product_action_route_delete
+            BEFORE DELETE ON product_action_proposals
+            BEGIN
+                SELECT RAISE(ABORT, 'product action route is immutable');
+            END
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TRIGGER trg_product_action_parent_terminal_guard
+            BEFORE UPDATE OF status ON write_operations
+            WHEN OLD.operation_role = 'primary'
+              AND OLD.adapter_kind = 'product_action'
+              AND OLD.status = 'proposed'
+              AND NEW.status IN ('rejected','committed','failed')
+            BEGIN
+                SELECT CASE WHEN NOT EXISTS (
+                  SELECT 1 FROM product_action_proposals route
+                  WHERE route.operation_id = OLD.id
+                    AND route.action_call_id = OLD.tool_call_id
+                    AND route.action_name = OLD.tool_name
+                    AND route.route_payload_json IS NOT NULL
+                    AND route.terminalized_at IS NULL
+                ) THEN RAISE(ABORT, 'product action route missing') END;
+            END
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TRIGGER trg_product_action_parent_terminalize_route
+            AFTER UPDATE OF status ON write_operations
+            WHEN OLD.operation_role = 'primary'
+              AND OLD.adapter_kind = 'product_action'
+              AND OLD.status = 'proposed'
+              AND NEW.status IN ('rejected','committed','failed')
+            BEGIN
+                UPDATE product_action_proposals
+                   SET route_payload_json = NULL,
+                       terminalized_at = CASE NEW.status
+                         WHEN 'rejected' THEN NEW.rejected_at
+                         WHEN 'committed' THEN NEW.committed_at
+                         ELSE NEW.failed_at
+                       END
+                 WHERE operation_id = NEW.id
+                   AND action_call_id = NEW.tool_call_id
+                   AND action_name = NEW.tool_name;
+                SELECT CASE WHEN changes() <> 1
+                  THEN RAISE(ABORT, 'product action route terminalization failed') END;
+            END
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE TRIGGER trg_interview_readiness_signal_source_immutable
+            BEFORE UPDATE ON interview_readiness_signals
+            WHEN NEW.application_id IS NOT OLD.application_id
+              OR (NEW.source_event_id IS NOT OLD.source_event_id
+                  AND (OLD.source_event_id IS NULL OR NEW.source_event_id IS NOT NULL))
+              OR (NEW.source_note_id IS NOT OLD.source_note_id
+                  AND (OLD.source_note_id IS NULL OR NEW.source_note_id IS NOT NULL))
+              OR (NEW.source_proposal_id IS NOT OLD.source_proposal_id
+                  AND (OLD.source_proposal_id IS NULL OR NEW.source_proposal_id IS NOT NULL))
+            BEGIN
+                SELECT RAISE(ABORT, 'readiness signal source identity is immutable');
+            END
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TRIGGER trg_interview_readiness_signal_current_insert
+            BEFORE INSERT ON interview_readiness_signals
+            WHEN NEW.current_version_id IS NOT NULL
+            BEGIN
+                SELECT CASE WHEN NOT EXISTS (
+                  SELECT 1 FROM interview_readiness_signal_versions version
+                  WHERE version.id = NEW.current_version_id AND version.signal_id = NEW.id
+                ) THEN RAISE(ABORT, 'invalid readiness signal current version') END;
+            END
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TRIGGER trg_interview_readiness_signal_current_update
+            BEFORE UPDATE OF current_version_id ON interview_readiness_signals
+            WHEN NEW.current_version_id IS NOT NULL
+            BEGIN
+                SELECT CASE WHEN NOT EXISTS (
+                  SELECT 1 FROM interview_readiness_signal_versions version
+                  WHERE version.id = NEW.current_version_id AND version.signal_id = NEW.id
+                ) THEN RAISE(ABORT, 'invalid readiness signal current version') END;
+            END
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TRIGGER trg_interview_readiness_signal_version_immutable
+            BEFORE UPDATE ON interview_readiness_signal_versions
+            BEGIN
+                SELECT RAISE(ABORT, 'readiness signal version is immutable');
+            END
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TRIGGER trg_interview_readiness_signal_version_delete
+            BEFORE DELETE ON interview_readiness_signal_versions
+            WHEN EXISTS (
+              SELECT 1 FROM interview_readiness_signals signal WHERE signal.id = OLD.signal_id
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'readiness signal version delete requires aggregate owner');
+            END
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TRIGGER trg_interview_review_proposal_contract_insert
+            BEFORE INSERT ON interview_review_proposals
+            WHEN NOT (
+              (typeof(NEW.proposal_schema_version) = 'integer'
+               AND NEW.proposal_schema_version = 1
+               AND NEW.source_note_revision IS NULL)
+              OR
+              (typeof(NEW.proposal_schema_version) = 'integer'
+               AND NEW.proposal_schema_version = 2
+               AND typeof(NEW.source_note_revision) = 'integer'
+               AND NEW.source_note_revision >= 1)
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid interview review proposal source revision');
+            END
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TRIGGER trg_interview_review_proposal_contract_update
+            BEFORE UPDATE OF proposal_schema_version, source_note_revision
+            ON interview_review_proposals
+            WHEN NOT (
+              (typeof(NEW.proposal_schema_version) = 'integer'
+               AND NEW.proposal_schema_version = 1
+               AND NEW.source_note_revision IS NULL)
+              OR
+              (typeof(NEW.proposal_schema_version) = 'integer'
+               AND NEW.proposal_schema_version = 2
+               AND typeof(NEW.source_note_revision) = 'integer'
+               AND NEW.source_note_revision >= 1)
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid interview review proposal source revision');
+            END
+            """
+        )
+        story_product_action_truth = """
+          typeof(NEW.product_action_generation) = 'integer'
+          AND NEW.product_action_generation >= 0
+          AND (
+            (NEW.product_action_generation = 0
+             AND NEW.product_action_operation_id IS NULL)
+            OR
+            (NEW.product_action_generation >= 1
+             AND NEW.product_action_operation_id IS NOT NULL)
+          )
+        """
+        cursor.execute(
+            f"""
+            CREATE TRIGGER trg_interview_story_product_action_insert
+            BEFORE INSERT ON interview_story_proposal_attempts
+            WHEN NOT ({story_product_action_truth})
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid story product action generation');
+            END
+            """
+        )
+        cursor.execute(
+            f"""
+            CREATE TRIGGER trg_interview_story_product_action_update
+            BEFORE UPDATE OF product_action_operation_id, product_action_generation
+            ON interview_story_proposal_attempts
+            WHEN NOT ({story_product_action_truth})
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid story product action generation');
+            END
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE TRIGGER trg_adaptive_practice_v2_insert
+            BEFORE INSERT ON adaptive_practice_plans
+            WHEN NEW.origin_contract = 'confirmed_readiness_signal_v1'
+              AND (NEW.readiness_signal_version_id IS NULL
+                   OR NEW.target_application_event_id IS NULL)
+            BEGIN
+                SELECT RAISE(ABORT, 'new readiness practice requires live source and target');
+            END
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TRIGGER trg_adaptive_practice_v2_identity_immutable
+            BEFORE UPDATE ON adaptive_practice_plans
+            WHEN NEW.origin_contract IS NOT OLD.origin_contract
+              OR NEW.source_fingerprint IS NOT OLD.source_fingerprint
+              OR NEW.target_fingerprint IS NOT OLD.target_fingerprint
+            BEGIN
+                SELECT RAISE(ABORT, 'adaptive practice source identity is immutable');
+            END
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TRIGGER trg_adaptive_practice_v2_locator_monotonic
+            BEFORE UPDATE ON adaptive_practice_plans
+            WHEN (NEW.readiness_signal_version_id IS NOT OLD.readiness_signal_version_id
+                  AND (OLD.readiness_signal_version_id IS NULL
+                       OR NEW.readiness_signal_version_id IS NOT NULL))
+              OR (NEW.target_application_event_id IS NOT OLD.target_application_event_id
+                  AND (OLD.target_application_event_id IS NULL
+                       OR NEW.target_application_event_id IS NOT NULL))
+            BEGIN
+                SELECT RAISE(ABORT, 'adaptive practice locator is monotonic');
+            END
+            """
+        )
+
+        product_compensation_parent = """
+          SELECT 1 FROM write_operations parent
+          WHERE parent.id = NEW.parent_operation_id
+            AND parent.operation_role = 'primary'
+            AND parent.status = 'committed'
+            AND parent.terminal_payload_sha256 = NEW.parent_terminal_payload_sha256
+            AND length(NEW.parent_terminal_payload_sha256) = 71
+            AND substr(NEW.parent_terminal_payload_sha256,1,7) = 'sha256:'
+            AND substr(NEW.parent_terminal_payload_sha256,8) NOT GLOB '*[^0-9a-f]*'
+            AND (
+              (parent.adapter_kind = 'typed' AND (
+                (parent.tool_name = 'update_application_status'
+                 AND NEW.tool_name = 'undo:update_application_status') OR
+                (parent.tool_name = 'create_application'
+                 AND NEW.tool_name = 'undo:create_application') OR
+                (parent.tool_name = 'create_application_event'
+                 AND NEW.tool_name = 'undo:create_application_event') OR
+                (parent.tool_name = 'add_note' AND NEW.tool_name = 'undo:add_note')
+              )) OR
+              (parent.adapter_kind = 'product_action' AND (
+                (parent.tool_name = 'confirm_interview_story'
+                 AND NEW.tool_name = 'undo:confirm_interview_story') OR
+                (parent.tool_name = 'save_review_readiness_signal'
+                 AND NEW.tool_name = 'undo:save_review_readiness_signal')
+              ))
+            )
+        """
+        cursor.execute(
+            f"""
+            CREATE TRIGGER trg_write_operation_compensation_insert
+            BEFORE INSERT ON write_operations
+            WHEN NEW.operation_role = 'compensation'
+            BEGIN
+                SELECT CASE WHEN NOT EXISTS ({product_compensation_parent})
+                  THEN RAISE(ABORT, 'invalid compensation parent') END;
+            END
+            """
+        )
+        cursor.execute(
+            f"""
+            CREATE TRIGGER trg_write_operation_compensation_update
+            BEFORE UPDATE OF parent_operation_id, parent_terminal_payload_sha256,
+                             operation_role, tool_name ON write_operations
+            WHEN NEW.operation_role = 'compensation'
+            BEGIN
+                SELECT CASE WHEN NOT EXISTS ({product_compensation_parent})
+                  THEN RAISE(ABORT, 'invalid compensation parent') END;
+            END
+            """
+        )
+
+        integrity = cursor.execute("PRAGMA integrity_check").fetchall()
+        if integrity != [("ok",)]:
+            raise RuntimeError("0029 integrity check failed")
+        foreign_key_violations = cursor.execute("PRAGMA foreign_key_check").fetchall()
+        if foreign_key_violations:
+            raise RuntimeError("0029 foreign key check failed")
+        if not marker_exists:
+            cursor.execute(
+                "INSERT INTO schema_migrations(version,description) VALUES (?,?)",
+                (
+                    "0029_review_to_readiness_feedback",
+                    "Add review-to-readiness Product Action, Signal, and Practice V2 schema",
+                ),
+            )
+        raw.commit()
+    except Exception:
+        raw.rollback()
+        raise
+    finally:
+        try:
+            cursor.execute("PRAGMA foreign_keys = ON")
+        finally:
+            cursor.close()
+            raw.close()
 
 
 def _rebuild_chat_messages_for_write_operation_integrity(engine) -> None:  # type: ignore[no-untyped-def]

@@ -30,6 +30,7 @@ def test_interview_review_schema_is_created_and_idempotent(tmp_path):
     second.kw["bind"].dispose()
 
     assert "application_event_id" in note_columns
+    assert {"content_revision", "updated_at"} <= note_columns
     assert {
         "id",
         "note_id",
@@ -39,6 +40,8 @@ def test_interview_review_schema_is_created_and_idempotent(tmp_path):
         "source_fingerprint",
         "proposal_json",
         "proposal_hash",
+        "proposal_schema_version",
+        "source_note_revision",
         "created_at",
     } <= proposal_columns
     assert "idx_notes_event" in note_indexes
@@ -78,7 +81,7 @@ def test_interview_review_migration_adds_column_to_existing_legacy_notes_table(t
     with session_factory() as session:
         note = session.execute(
             text(
-                "SELECT company, position, application_event_id "
+                "SELECT company, position, application_event_id, content_revision, updated_at "
                 "FROM interview_notes WHERE id = 1"
             )
         ).one()
@@ -93,7 +96,8 @@ def test_interview_review_migration_adds_column_to_existing_legacy_notes_table(t
         ).scalar_one_or_none()
     session_factory.kw["bind"].dispose()
 
-    assert note == ("旧公司", "旧岗位", None)
+    assert note[:4] == ("旧公司", "旧岗位", None, 1)
+    assert note.updated_at is not None
     assert "idx_notes_event" in note_indexes
     assert "uq_interview_notes_event_main" in note_indexes
     assert migration == "0010_interview_review_proposals"

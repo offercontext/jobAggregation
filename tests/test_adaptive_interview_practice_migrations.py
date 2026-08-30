@@ -16,6 +16,10 @@ def test_adaptive_practice_schema_is_created_and_idempotent(tmp_path) -> None:
         migrations = set(
             session.execute(text("SELECT version FROM schema_migrations")).scalars()
         )
+        indexes = {
+            row[1]
+            for row in session.execute(text("PRAGMA index_list(adaptive_practice_plans)"))
+        }
 
     second.kw["bind"].dispose()
     assert {
@@ -34,5 +38,15 @@ def test_adaptive_practice_schema_is_created_and_idempotent(tmp_path) -> None:
         "completion_idempotency_key",
         "response_text",
         "self_assessment",
+        "origin_contract",
+        "readiness_signal_version_id",
+        "target_application_event_id",
+        "target_fingerprint",
     } <= columns
     assert "0021_adaptive_interview_practice" in migrations
+    assert "0029_review_to_readiness_feedback" in migrations
+    assert "uq_adaptive_practice_proposal_focus" not in indexes
+    assert {
+        "uq_adaptive_practice_legacy_proposal_focus",
+        "uq_adaptive_practice_signal_target",
+    } <= indexes

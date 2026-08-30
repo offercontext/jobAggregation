@@ -51,6 +51,33 @@ BASELINE_UNDO_POLICY_SQL = (
     "AND undo_json IS NULL)"
 )
 BASELINE_UNDO_BYTES_SQL = "undo_json IS NULL OR length(CAST(undo_json AS BLOB)) <= 65536"
+CURRENT_MANIFEST_SQL = (
+    "(operation_role = 'primary' AND adapter_kind = 'typed' AND tool_name IN "
+    "('create_application','update_application_status','create_application_event',"
+    "'update_application_event','delete_application_event','add_note','update_note',"
+    "'delete_note','update_offer','save_offer_assessment','resume_update_career_intent',"
+    "'resume_rewrite_highlight')) OR "
+    "(operation_role = 'primary' AND adapter_kind = 'legacy_deterministic' AND tool_name IN "
+    "('save_application_jd_version','create_application_submission_snapshot',"
+    "'record_application_outcome')) OR "
+    "(operation_role = 'primary' AND adapter_kind = 'product_action' AND tool_name IN "
+    "('confirm_interview_story','save_review_readiness_signal')) OR "
+    "(operation_role = 'compensation' AND adapter_kind = 'compensation' AND tool_name IN "
+    "('undo:update_application_status','undo:create_application',"
+    "'undo:create_application_event','undo:add_note','undo:confirm_interview_story',"
+    "'undo:save_review_readiness_signal'))"
+)
+CURRENT_UNDO_POLICY_SQL = (
+    "status <> 'committed' OR "
+    "(operation_role = 'primary' AND tool_name IN "
+    "('create_application','update_application_status','create_application_event','add_note',"
+    "'confirm_interview_story','save_review_readiness_signal') "
+    "AND undo_json IS NOT NULL) OR "
+    "((operation_role = 'compensation' OR tool_name NOT IN "
+    "('create_application','update_application_status','create_application_event','add_note',"
+    "'confirm_interview_story','save_review_readiness_signal')) "
+    "AND undo_json IS NULL)"
+)
 
 TYPED_WRITE_NAMES = (
     "create_application",
@@ -176,13 +203,32 @@ def published_schemas() -> Iterable[tuple[sqlite3.Connection, sqlite3.Connection
         current.close()
 
 
-def test_published_operation_constraint_names_and_sql_match_fixed_baseline() -> None:
+def test_published_operation_constraints_preserve_agent_routes_and_add_product_routes() -> None:
     checks = _current_checks()
 
     assert BASELINE_COMMIT == "0c10e05e256eb757d5f89a8b009dcea193f2fc78"
-    assert checks[MANIFEST_CONSTRAINT] == _normalized_sql(BASELINE_MANIFEST_SQL)
-    assert checks[UNDO_POLICY_CONSTRAINT] == _normalized_sql(BASELINE_UNDO_POLICY_SQL)
+    assert checks[MANIFEST_CONSTRAINT] == _normalized_sql(CURRENT_MANIFEST_SQL)
+    assert checks[UNDO_POLICY_CONSTRAINT] == _normalized_sql(CURRENT_UNDO_POLICY_SQL)
     assert checks[UNDO_BYTES_CONSTRAINT] == _normalized_sql(BASELINE_UNDO_BYTES_SQL)
+
+
+@pytest.mark.parametrize(
+    "route",
+    [
+        ("primary", "product_action", "confirm_interview_story"),
+        ("primary", "product_action", "save_review_readiness_signal"),
+        ("compensation", "compensation", "undo:confirm_interview_story"),
+        ("compensation", "compensation", "undo:save_review_readiness_signal"),
+    ],
+)
+def test_product_routes_are_additive_to_the_fixed_agent_baseline(
+    published_schemas: tuple[sqlite3.Connection, sqlite3.Connection],
+    route: PublishedRoute,
+) -> None:
+    baseline, current = published_schemas
+
+    assert not _accepted(baseline, route)
+    assert _accepted(current, route)
 
 
 @pytest.mark.parametrize("route", sorted(_all_published_routes()))

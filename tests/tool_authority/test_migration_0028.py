@@ -201,22 +201,34 @@ def _create_real_0027_database(path: Path) -> None:
         "(typeof(scope_revision) = 'integer' AND scope_revision BETWEEN 0 AND 9223372036854775807)",
         "",
     )
+    def drop_check(ddl: str, constraint_name: str) -> str:
+        marker = f", \n\tCONSTRAINT {constraint_name} CHECK ("
+        if marker not in ddl:
+            return ddl
+        start = ddl.index(marker)
+        cursor = start + len(marker)
+        depth = 1
+        while depth:
+            character = ddl[cursor]
+            if character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+            cursor += 1
+        return ddl[:start] + ddl[cursor:]
+
     operation_ddl = str(CreateTable(operations).compile(engine)).replace(
         "\n\tauthorization_scope_fingerprint VARCHAR, ",
         "",
-    ).replace(
-        ", \n\tCONSTRAINT ck_write_operations_authorization_scope_fingerprint CHECK "
-        "(authorization_scope_fingerprint IS NULL OR "
-        "(length(authorization_scope_fingerprint) = 76 AND "
-        "substr(authorization_scope_fingerprint,1,12) = 'hmac-sha256:' AND "
-        "substr(authorization_scope_fingerprint,13) NOT GLOB '*[^0-9a-f]*'))",
-        "",
-    ).replace(
-        ", \n\tCONSTRAINT ck_write_operations_typed_primary_scope_bound CHECK "
-        "(NOT (operation_role = 'primary' AND adapter_kind = 'typed' AND "
-        "status = 'proposed' AND authorization_scope_fingerprint IS NULL))",
-        "",
     )
+    for constraint_name in (
+        "ck_write_operations_authorization_scope_fingerprint",
+        "ck_write_operations_typed_primary_scope_bound",
+        "ck_write_operations_product_action_primary_shape",
+        "ck_write_operations_product_compensation_shape",
+        "ck_write_operations_product_action_scope_bound",
+    ):
+        operation_ddl = drop_check(operation_ddl, constraint_name)
     assert "scope_revision" not in conversation_ddl
     assert "authorization_scope_fingerprint" not in operation_ddl
 

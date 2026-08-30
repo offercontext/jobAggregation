@@ -8,6 +8,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
@@ -21,6 +22,16 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 class Base(DeclarativeBase):
     pass
+
+
+def _sqlite_uuid_check(column: str) -> str:
+    return (
+        f"length({column}) = 36 AND lower({column}) = {column} "
+        f"AND substr({column}, 9, 1) = '-' AND substr({column}, 14, 1) = '-' "
+        f"AND substr({column}, 19, 1) = '-' AND substr({column}, 24, 1) = '-' "
+        f"AND length(replace({column}, '-', '')) = 32 "
+        f"AND {column} NOT GLOB '*[^0-9a-f-]*'"
+    )
 
 
 class Application(Base):
@@ -219,7 +230,13 @@ class ApplicationEvent(Base):
 
 class InterviewNote(Base):
     __tablename__ = "interview_notes"
-    __table_args__ = (Index("idx_notes_app", "application_id"),)
+    __table_args__ = (
+        CheckConstraint(
+            "typeof(content_revision) = 'integer' AND content_revision >= 1",
+            name="ck_interview_notes_content_revision",
+        ),
+        Index("idx_notes_app", "application_id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     application_id: Mapped[int | None] = mapped_column(
@@ -238,10 +255,19 @@ class InterviewNote(Base):
     self_reflection: Mapped[str] = mapped_column(String, default="", server_default="")
     difficulty_points: Mapped[str] = mapped_column(String, default="", server_default="")
     mood: Mapped[str] = mapped_column(String, default="", server_default="")
+    content_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=text("1")
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
         server_default=func.current_timestamp(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+        onupdate=func.current_timestamp(),
     )
 
 
@@ -704,6 +730,15 @@ class InterviewReviewProposal(Base):
             "idempotency_key",
             name="uq_interview_review_proposals_note_key",
         ),
+        CheckConstraint(
+            "(typeof(proposal_schema_version) = 'integer' "
+            "AND proposal_schema_version = 1 AND source_note_revision IS NULL) OR "
+            "(typeof(proposal_schema_version) = 'integer' "
+            "AND proposal_schema_version = 2 "
+            "AND typeof(source_note_revision) = 'integer' "
+            "AND source_note_revision >= 1)",
+            name="ck_interview_review_proposal_source_revision",
+        ),
         Index("idx_interview_review_proposals_note", "note_id"),
     )
 
@@ -721,6 +756,10 @@ class InterviewReviewProposal(Base):
     source_fingerprint: Mapped[str] = mapped_column(String, nullable=False)
     proposal_json: Mapped[str] = mapped_column(String, nullable=False)
     proposal_hash: Mapped[str] = mapped_column(String, nullable=False)
+    proposal_schema_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=text("1")
+    )
+    source_note_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -736,16 +775,40 @@ class AdaptivePracticePlan(Base):
             name="uq_adaptive_practice_start_key",
         ),
         UniqueConstraint(
-            "interview_review_proposal_id",
-            "focus_id",
-            name="uq_adaptive_practice_proposal_focus",
-        ),
-        UniqueConstraint(
             "completion_idempotency_key",
             name="uq_adaptive_practice_completion_key",
         ),
         Index("idx_adaptive_practice_application", "application_id", "created_at"),
         Index("idx_adaptive_practice_status", "status", "created_at"),
+        Index(
+            "uq_adaptive_practice_legacy_proposal_focus",
+            "interview_review_proposal_id",
+            "focus_id",
+            unique=True,
+            sqlite_where=text("origin_contract = 'legacy_review_focus_v1'"),
+        ),
+        Index(
+            "uq_adaptive_practice_signal_target",
+            "readiness_signal_version_id",
+            "target_application_event_id",
+            unique=True,
+            sqlite_where=text("origin_contract = 'confirmed_readiness_signal_v1'"),
+        ),
+        CheckConstraint(
+            "(origin_contract = 'legacy_review_focus_v1' "
+            "AND readiness_signal_version_id IS NULL "
+            "AND target_application_event_id IS NULL "
+            "AND target_fingerprint IS NULL) OR "
+            "(origin_contract = 'confirmed_readiness_signal_v1' "
+            "AND target_fingerprint IS NOT NULL "
+            "AND length(source_fingerprint) = 71 "
+            "AND substr(source_fingerprint,1,7) = 'sha256:' "
+            "AND substr(source_fingerprint,8) NOT GLOB '*[^0-9a-f]*' "
+            "AND length(target_fingerprint) = 71 "
+            "AND substr(target_fingerprint,1,7) = 'sha256:' "
+            "AND substr(target_fingerprint,8) NOT GLOB '*[^0-9a-f]*')",
+            name="ck_adaptive_practice_origin_contract",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -781,6 +844,21 @@ class AdaptivePracticePlan(Base):
         String, nullable=False, default="", server_default=""
     )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    origin_contract: Mapped[str] = mapped_column(
+        String,
+        nullable=False,
+        default="legacy_review_focus_v1",
+        server_default="legacy_review_focus_v1",
+    )
+    readiness_signal_version_id: Mapped[int | None] = mapped_column(
+        ForeignKey("interview_readiness_signal_versions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    target_application_event_id: Mapped[int | None] = mapped_column(
+        ForeignKey("application_events.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    target_fingerprint: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.current_timestamp()
     )
@@ -1362,6 +1440,19 @@ class InterviewStoryProposalAttempt(Base):
     __tablename__ = "interview_story_proposal_attempts"
     __table_args__ = (
         UniqueConstraint("idempotency_key", name="uq_interview_story_attempt_key"),
+        CheckConstraint(
+            "typeof(product_action_generation) = 'integer' "
+            "AND product_action_generation >= 0 "
+            "AND ((product_action_generation = 0 AND product_action_operation_id IS NULL) "
+            "OR (product_action_generation >= 1 AND product_action_operation_id IS NOT NULL))",
+            name="ck_interview_story_product_action_generation",
+        ),
+        Index(
+            "uq_interview_story_attempt_product_action_operation",
+            "product_action_operation_id",
+            unique=True,
+            sqlite_where=text("product_action_operation_id IS NOT NULL"),
+        ),
         Index("idx_interview_story_attempt_target", "target_story_id"),
         Index("idx_interview_story_attempt_status", "attempt_status"),
     )
@@ -1408,6 +1499,16 @@ class InterviewStoryProposalAttempt(Base):
     )
     confirmed_story_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     confirmed_story_version_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    product_action_operation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("write_operations.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    product_action_generation: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+    )
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.current_timestamp()
@@ -1420,6 +1521,307 @@ class InterviewStoryProposalAttempt(Base):
     )
 
 
+class ProductActionProposal(Base):
+    __tablename__ = "product_action_proposals"
+    __table_args__ = (
+        CheckConstraint(_sqlite_uuid_check("operation_id"), name="ck_product_action_operation_uuid"),
+        CheckConstraint(_sqlite_uuid_check("action_call_id"), name="ck_product_action_call_uuid"),
+        CheckConstraint(
+            "action_name IN ('confirm_interview_story','save_review_readiness_signal')",
+            name="ck_product_action_name",
+        ),
+        CheckConstraint(
+            "request_origin IN ('current','historical_story_bridge')",
+            name="ck_product_action_origin",
+        ),
+        CheckConstraint(
+            "typeof(schema_version) = 'integer' AND schema_version = 1",
+            name="ck_product_action_schema_version",
+        ),
+        CheckConstraint(
+            "typeof(source_id) = 'integer' AND source_id > 0 "
+            "AND typeof(source_revision) = 'integer' AND source_revision > 0",
+            name="ck_product_action_source_revision",
+        ),
+        CheckConstraint(
+            "(action_name = 'confirm_interview_story' AND source_kind = 'story_proposal') OR "
+            "(action_name = 'save_review_readiness_signal' AND source_kind = 'review_focus')",
+            name="ck_product_action_source_mapping",
+        ),
+        CheckConstraint(
+            "request_origin = 'current' OR action_name = 'confirm_interview_story'",
+            name="ck_product_action_historical_origin",
+        ),
+        CheckConstraint(
+            "(action_name = 'save_review_readiness_signal' "
+            "AND semantic_claim_fingerprint IS NOT NULL) OR "
+            "(action_name = 'confirm_interview_story' "
+            "AND semantic_claim_fingerprint IS NULL)",
+            name="ck_product_action_semantic_claim",
+        ),
+        CheckConstraint(
+            "(request_origin = 'historical_story_bridge' "
+            "AND historical_request_token_fingerprint IS NOT NULL) OR "
+            "(request_origin = 'current' "
+            "AND historical_request_token_fingerprint IS NULL)",
+            name="ck_product_action_historical_request",
+        ),
+        CheckConstraint(
+            "(route_payload_json IS NOT NULL AND terminalized_at IS NULL "
+            "AND json_valid(route_payload_json) = 1 "
+            "AND json_type(route_payload_json) = 'object' "
+            "AND length(CAST(route_payload_json AS BLOB)) <= 16384) OR "
+            "(route_payload_json IS NULL AND terminalized_at IS NOT NULL)",
+            name="ck_product_action_route_lifecycle",
+        ),
+        CheckConstraint(
+            "length(route_payload_fingerprint) = 76 "
+            "AND substr(route_payload_fingerprint,1,12) = 'hmac-sha256:' "
+            "AND substr(route_payload_fingerprint,13) NOT GLOB '*[^0-9a-f]*' "
+            "AND length(route_binding_fingerprint) = 76 "
+            "AND substr(route_binding_fingerprint,1,12) = 'hmac-sha256:' "
+            "AND substr(route_binding_fingerprint,13) NOT GLOB '*[^0-9a-f]*' "
+            "AND length(request_idempotency_fingerprint) = 76 "
+            "AND substr(request_idempotency_fingerprint,1,12) = 'hmac-sha256:' "
+            "AND substr(request_idempotency_fingerprint,13) NOT GLOB '*[^0-9a-f]*' "
+            "AND (semantic_claim_fingerprint IS NULL OR "
+            "(length(semantic_claim_fingerprint) = 76 "
+            "AND substr(semantic_claim_fingerprint,1,12) = 'hmac-sha256:' "
+            "AND substr(semantic_claim_fingerprint,13) NOT GLOB '*[^0-9a-f]*')) "
+            "AND (historical_request_token_fingerprint IS NULL OR "
+            "(length(historical_request_token_fingerprint) = 76 "
+            "AND substr(historical_request_token_fingerprint,1,12) = 'hmac-sha256:' "
+            "AND substr(historical_request_token_fingerprint,13) NOT GLOB '*[^0-9a-f]*'))",
+            name="ck_product_action_fingerprints",
+        ),
+        Index(
+            "uq_product_action_active_semantic_claim",
+            "semantic_claim_fingerprint",
+            unique=True,
+            sqlite_where=text(
+                "action_name = 'save_review_readiness_signal' AND terminalized_at IS NULL"
+            ),
+        ),
+    )
+
+    operation_id: Mapped[str] = mapped_column(
+        ForeignKey("write_operations.id", ondelete="RESTRICT"),
+        primary_key=True,
+    )
+    action_call_id: Mapped[str] = mapped_column(String(36), nullable=False, unique=True)
+    action_name: Mapped[str] = mapped_column(String, nullable=False)
+    request_origin: Mapped[str] = mapped_column(String, nullable=False)
+    schema_version: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=1,
+        server_default=text("1"),
+    )
+    source_kind: Mapped[str] = mapped_column(String, nullable=False)
+    source_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    route_payload_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    route_payload_fingerprint: Mapped[str] = mapped_column(String(76), nullable=False)
+    route_binding_fingerprint: Mapped[str] = mapped_column(String(76), nullable=False)
+    request_idempotency_fingerprint: Mapped[str] = mapped_column(
+        String(76),
+        nullable=False,
+        unique=True,
+    )
+    semantic_claim_fingerprint: Mapped[str | None] = mapped_column(String(76), nullable=True)
+    historical_request_token_fingerprint: Mapped[str | None] = mapped_column(
+        String(76),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+    )
+    terminalized_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+
+class InterviewReadinessSignal(Base):
+    __tablename__ = "interview_readiness_signals"
+    __table_args__ = (
+        CheckConstraint(
+            "typeof(revision) = 'integer' AND revision >= 1",
+            name="ck_interview_readiness_signal_revision",
+        ),
+        Index(
+            "uq_interview_readiness_signal_source_focus",
+            "source_proposal_id",
+            "focus_id",
+            unique=True,
+            sqlite_where=text("source_proposal_id IS NOT NULL"),
+        ),
+        Index("idx_interview_readiness_signal_application", "application_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey("applications.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    source_event_id: Mapped[int | None] = mapped_column(
+        ForeignKey("application_events.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    source_note_id: Mapped[int | None] = mapped_column(
+        ForeignKey("interview_notes.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    source_proposal_id: Mapped[int | None] = mapped_column(
+        ForeignKey("interview_review_proposals.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    focus_id: Mapped[str] = mapped_column(String, nullable=False)
+    current_version_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    revision: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=1,
+        server_default=text("1"),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+        onupdate=func.current_timestamp(),
+    )
+
+
+class InterviewReadinessSignalVersion(Base):
+    __tablename__ = "interview_readiness_signal_versions"
+    __table_args__ = (
+        CheckConstraint(
+            "typeof(version_number) = 'integer' AND version_number >= 1",
+            name="ck_interview_readiness_signal_version_number",
+        ),
+        CheckConstraint(
+            "disposition IN ('active','retracted')",
+            name="ck_interview_readiness_signal_disposition",
+        ),
+        CheckConstraint(
+            "schema_version = 'readiness-signal-v1'",
+            name="ck_interview_readiness_signal_schema",
+        ),
+        CheckConstraint(
+            "typeof(source_note_revision) = 'integer' AND source_note_revision >= 1",
+            name="ck_interview_readiness_signal_note_revision",
+        ),
+        CheckConstraint(
+            "length(source_note_fingerprint) = 71 "
+            "AND substr(source_note_fingerprint,1,7) = 'sha256:' "
+            "AND substr(source_note_fingerprint,8) NOT GLOB '*[^0-9a-f]*' "
+            "AND length(source_proposal_hash) = 71 "
+            "AND substr(source_proposal_hash,1,7) = 'sha256:' "
+            "AND substr(source_proposal_hash,8) NOT GLOB '*[^0-9a-f]*' "
+            "AND length(candidate_fingerprint) = 71 "
+            "AND substr(candidate_fingerprint,1,7) = 'sha256:' "
+            "AND substr(candidate_fingerprint,8) NOT GLOB '*[^0-9a-f]*'",
+            name="ck_interview_readiness_signal_hashes",
+        ),
+        CheckConstraint(
+            _sqlite_uuid_check("domain_idempotency_key"),
+            name="ck_interview_readiness_signal_domain_key",
+        ),
+        UniqueConstraint(
+            "signal_id",
+            "version_number",
+            name="uq_interview_readiness_signal_version_number",
+        ),
+        UniqueConstraint("id", "signal_id", name="uq_interview_readiness_signal_version_owner"),
+        ForeignKeyConstraint(
+            ["parent_version_id", "signal_id"],
+            [
+                "interview_readiness_signal_versions.id",
+                "interview_readiness_signal_versions.signal_id",
+            ],
+            ondelete="NO ACTION",
+            deferrable=True,
+            initially="DEFERRED",
+            name="fk_interview_readiness_signal_version_parent",
+        ),
+        Index("idx_interview_readiness_signal_version_signal", "signal_id", "version_number"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    signal_id: Mapped[int] = mapped_column(
+        ForeignKey("interview_readiness_signals.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    version_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    parent_version_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    disposition: Mapped[str] = mapped_column(String, nullable=False)
+    schema_version: Mapped[str] = mapped_column(String, nullable=False)
+    statement_text: Mapped[str] = mapped_column(Text, nullable=False)
+    user_note: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    source_note_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_note_fingerprint: Mapped[str] = mapped_column(String(71), nullable=False)
+    source_proposal_hash: Mapped[str] = mapped_column(String(71), nullable=False)
+    candidate_fingerprint: Mapped[str] = mapped_column(String(71), nullable=False)
+    domain_idempotency_key: Mapped[str] = mapped_column(String(36), nullable=False, unique=True)
+    write_operation_id: Mapped[str] = mapped_column(
+        ForeignKey("write_operations.id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+    )
+
+
+class InterviewReadinessSignalEvidence(Base):
+    __tablename__ = "interview_readiness_signal_evidence"
+    __table_args__ = (
+        CheckConstraint(
+            "typeof(ordinal) = 'integer' AND ordinal BETWEEN 0 AND 4",
+            name="ck_interview_readiness_signal_evidence_ordinal",
+        ),
+        CheckConstraint(
+            "source_path IN ('/questions','/self_reflection','/difficulty_points','/mood')",
+            name="ck_interview_readiness_signal_evidence_path",
+        ),
+        CheckConstraint(
+            "length(excerpt_sha256) = 71 "
+            "AND substr(excerpt_sha256,1,7) = 'sha256:' "
+            "AND substr(excerpt_sha256,8) NOT GLOB '*[^0-9a-f]*' "
+            "AND length(source_field_sha256) = 71 "
+            "AND substr(source_field_sha256,1,7) = 'sha256:' "
+            "AND substr(source_field_sha256,8) NOT GLOB '*[^0-9a-f]*'",
+            name="ck_interview_readiness_signal_evidence_hashes",
+        ),
+        UniqueConstraint(
+            "signal_version_id",
+            "ordinal",
+            name="uq_interview_readiness_signal_evidence_ordinal",
+        ),
+        Index("idx_interview_readiness_signal_evidence_version", "signal_version_id", "ordinal"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    signal_version_id: Mapped[int] = mapped_column(
+        ForeignKey("interview_readiness_signal_versions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_path: Mapped[str] = mapped_column(String, nullable=False)
+    excerpt: Mapped[str] = mapped_column(Text, nullable=False)
+    excerpt_sha256: Mapped[str] = mapped_column(String(71), nullable=False)
+    source_field_sha256: Mapped[str] = mapped_column(String(71), nullable=False)
+
+
 # Every model with a direct foreign key to applications.id. Conditional application
 # deletion iterates this explicit inventory; a metadata-backed test keeps it exhaustive.
 APPLICATION_FOREIGN_KEY_MODELS = (
@@ -1428,6 +1830,7 @@ APPLICATION_FOREIGN_KEY_MODELS = (
     ApplicationSubmissionSnapshot,
     ApplicationOutcome,
     InterviewNote,
+    InterviewReadinessSignal,
     Offer,
     ResumeMatch,
     JDAnalysis,
@@ -1614,16 +2017,6 @@ class ChatMessage(Base):
     )
 
 
-def _sqlite_uuid_check(column: str) -> str:
-    return (
-        f"length({column}) = 36 AND lower({column}) = {column} "
-        f"AND substr({column}, 9, 1) = '-' AND substr({column}, 14, 1) = '-' "
-        f"AND substr({column}, 19, 1) = '-' AND substr({column}, 24, 1) = '-' "
-        f"AND length(replace({column}, '-', '')) = 32 "
-        f"AND {column} NOT GLOB '*[^0-9a-f-]*'"
-    )
-
-
 class WriteOperation(Base):
     __tablename__ = "write_operations"
     __table_args__ = (
@@ -1632,7 +2025,7 @@ class WriteOperation(Base):
             "operation_role IN ('primary','compensation')", name="ck_write_operations_role"
         ),
         CheckConstraint(
-            "adapter_kind IN ('typed','legacy_deterministic','compensation')",
+            "adapter_kind IN ('typed','legacy_deterministic','compensation','product_action')",
             name="ck_write_operations_adapter",
         ),
         CheckConstraint(
@@ -1659,10 +2052,30 @@ class WriteOperation(Base):
             "(operation_role = 'primary' AND adapter_kind = 'legacy_deterministic' AND tool_name IN "
             "('save_application_jd_version','create_application_submission_snapshot',"
             "'record_application_outcome')) OR "
+            "(operation_role = 'primary' AND adapter_kind = 'product_action' AND tool_name IN "
+            "('confirm_interview_story','save_review_readiness_signal')) OR "
             "(operation_role = 'compensation' AND adapter_kind = 'compensation' AND tool_name IN "
             "('undo:update_application_status','undo:create_application',"
-            "'undo:create_application_event','undo:add_note'))",
+            "'undo:create_application_event','undo:add_note','undo:confirm_interview_story',"
+            "'undo:save_review_readiness_signal'))",
             name="ck_write_operations_manifest",
+        ),
+        CheckConstraint(
+            "adapter_kind <> 'product_action' OR "
+            "(operation_role = 'primary' AND conversation_id IS NULL AND agent_run_id IS NULL "
+            "AND tool_call_id IS NOT NULL AND proposal_fingerprint IS NOT NULL "
+            "AND confirmation_token_fingerprint IS NOT NULL "
+            "AND authorization_scope_fingerprint IS NOT NULL)",
+            name="ck_write_operations_product_action_primary_shape",
+        ),
+        CheckConstraint(
+            "NOT (operation_role = 'compensation' AND tool_name IN "
+            "('undo:confirm_interview_story','undo:save_review_readiness_signal')) OR "
+            "(adapter_kind = 'compensation' AND conversation_id IS NULL AND agent_run_id IS NULL "
+            "AND tool_call_id IS NULL AND proposal_fingerprint IS NULL "
+            "AND confirmation_token_fingerprint IS NULL "
+            "AND authorization_scope_fingerprint IS NULL)",
+            name="ck_write_operations_product_compensation_shape",
         ),
         CheckConstraint(
             "result_json IS NULL OR length(CAST(result_json AS BLOB)) <= 524288",
@@ -1728,9 +2141,9 @@ class WriteOperation(Base):
             name="ck_write_operations_authorization_scope_fingerprint",
         ),
         CheckConstraint(
-            "NOT (operation_role = 'primary' AND adapter_kind = 'typed' "
+            "NOT (operation_role = 'primary' AND adapter_kind = 'product_action' "
             "AND status = 'proposed' AND authorization_scope_fingerprint IS NULL)",
-            name="ck_write_operations_typed_primary_scope_bound",
+            name="ck_write_operations_product_action_scope_bound",
         ),
         CheckConstraint(
             "(parent_terminal_payload_sha256 IS NULL OR (length(parent_terminal_payload_sha256) = 71 "
@@ -1777,16 +2190,19 @@ class WriteOperation(Base):
             "status NOT IN ('committed','failed') OR "
             "(adapter_kind = 'typed' AND result_contract = 'typed_json_v1') OR "
             "(adapter_kind = 'legacy_deterministic' AND result_contract = 'legacy_string_v1') OR "
+            "(adapter_kind = 'product_action' AND result_contract = 'product_action_json_v1') OR "
             "(adapter_kind = 'compensation' AND result_contract = 'compensation_json_v1')",
             name="ck_write_operations_result_contract",
         ),
         CheckConstraint(
             "status <> 'committed' OR "
             "(operation_role = 'primary' AND tool_name IN "
-            "('create_application','update_application_status','create_application_event','add_note') "
+            "('create_application','update_application_status','create_application_event','add_note',"
+            "'confirm_interview_story','save_review_readiness_signal') "
             "AND undo_json IS NOT NULL) OR "
             "((operation_role = 'compensation' OR tool_name NOT IN "
-            "('create_application','update_application_status','create_application_event','add_note')) "
+            "('create_application','update_application_status','create_application_event','add_note',"
+            "'confirm_interview_story','save_review_readiness_signal')) "
             "AND undo_json IS NULL)",
             name="ck_write_operations_undo_policy",
         ),
@@ -1820,6 +2236,18 @@ class WriteOperation(Base):
             "AND delivery_manifest_sha256 IS NULL AND delivery_next_operation_id IS NULL "
             "AND delivery_failure_code IS NULL AND delivered_at IS NOT NULL "
             "AND ((status = 'committed' AND delivered_at = committed_at) "
+            "OR (status = 'failed' AND delivered_at = failed_at))) OR "
+            "(status <> 'proposed' AND operation_role = 'primary' "
+            "AND adapter_kind = 'product_action' "
+            "AND delivery_status = 'not_applicable' AND delivery_generation = 0 "
+            "AND delivery_outcome = 'none' AND delivery_message_count = 0 "
+            "AND delivery_owner_token_fingerprint IS NULL "
+            "AND delivery_lease_expires_at IS NULL "
+            "AND delivery_manifest_sha256 IS NULL "
+            "AND delivery_next_operation_id IS NULL "
+            "AND delivery_failure_code IS NULL AND delivered_at IS NOT NULL "
+            "AND ((status = 'rejected' AND delivered_at = rejected_at) "
+            "OR (status = 'committed' AND delivered_at = committed_at) "
             "OR (status = 'failed' AND delivered_at = failed_at)))",
             name="ck_write_operations_delivery_shape",
         ),
@@ -1835,6 +2263,12 @@ class WriteOperation(Base):
             "parent_operation_id",
             unique=True,
             sqlite_where=text("operation_role = 'compensation'"),
+        ),
+        Index(
+            "uq_write_operations_product_action_call",
+            "tool_call_id",
+            unique=True,
+            sqlite_where=text("operation_role = 'primary' AND adapter_kind = 'product_action'"),
         ),
         Index("idx_write_operations_status", "status", "delivery_status"),
     )

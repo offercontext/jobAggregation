@@ -17,6 +17,7 @@ from offerpilot.models import (
     OpportunityFitReviewStage,
     Base,
     InterviewNote,
+    InterviewReadinessSignal,
     JDAnalysis,
     Offer,
     Question,
@@ -46,6 +47,8 @@ def _application_dependency(model, application_id):
         return model(application_id=application_id, event_type="interview")
     if model is InterviewNote:
         return model(application_id=application_id, company="A", position="Engineer")
+    if model is InterviewReadinessSignal:
+        return model(application_id=application_id, focus_id="conditional-delete-focus")
     if model is Offer:
         return model(application_id=application_id, company_name="A", position_name="Engineer")
     if model is JDAnalysis:

@@ -65,6 +65,9 @@ def test_story_attempt_schema_persists_the_bounded_provider_repair_count(tmp_pat
     assert "repair_count" in columns
     assert columns["repair_count"][3] == 1
     assert str(columns["repair_count"][4]).strip("'") == "0"
+    assert columns["product_action_operation_id"][3] == 0
+    assert columns["product_action_generation"][3] == 1
+    assert str(columns["product_action_generation"][4]).strip("'") == "0"
 
 
 def test_story_schema_adds_repair_count_to_a_pre_audit_attempt_table(tmp_path: Path) -> None:
@@ -108,13 +111,14 @@ def test_story_schema_adds_repair_count_to_a_pre_audit_attempt_table(tmp_path: P
     with factory() as session:
         row = session.execute(
             text(
-                "SELECT repair_count FROM interview_story_proposal_attempts "
+                "SELECT repair_count,product_action_operation_id,product_action_generation "
+                "FROM interview_story_proposal_attempts "
                 "WHERE idempotency_key = 'pre-audit-story-repair-01'"
             )
         ).one()
     _dispose(factory)
 
-    assert row[0] == 0
+    assert row == (0, None, 0)
 
 
 def test_story_migration_coexists_with_jd_0018_marker_and_schema(tmp_path: Path) -> None:

@@ -2,18 +2,28 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from threading import RLock
+from typing import Iterator, Literal, TypeAlias
 from uuid import UUID
-from sqlalchemy import select
+
+from sqlalchemy import select, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
+from offerpilot.event_lifecycle import classify_event_lifecycle_v1
 from offerpilot.models import (
+    AdaptivePracticePlan,
+    Application,
+    ApplicationEvent,
+    InterviewNote,
     InterviewReadinessSignal,
     InterviewReadinessSignalEvidence,
     InterviewReadinessSignalVersion,
+    InterviewReviewProposal,
     WriteOperation,
     WriteOperationTransition,
 )
@@ -31,11 +41,165 @@ from offerpilot.product_actions.compensation import (
     readiness_signal_retraction_domain_key,
 )
 from offerpilot.review_readiness.contracts import (
+    CandidateProjectionV1,
     ReadinessCandidateV1,
     ReadinessEvidenceV1,
     ReadinessSignalAggregateV1,
     ReadinessSignalWriteResultV1,
 )
+from offerpilot.review_readiness.candidates import project_readiness_candidates
+from offerpilot.review_readiness.projection import (
+    CanonicalReadinessSignalV1,
+    PracticeFocusProjectionV1,
+    ReadinessSourceStateV1,
+    load_canonical_readiness_signal,
+    project_practice_focus,
+    project_practice_target,
+)
+
+
+AdvisoryStateV1: TypeAlias = Literal[
+    "available",
+    "practiced",
+    "stale_source",
+    "retracted",
+    "unavailable",
+]
+AdvisoryPracticeStateV1: TypeAlias = Literal[
+    "not_started",
+    "in_progress",
+    "completed",
+    "legacy_only",
+]
+
+
+class ReviewReadinessReadNotFound(RuntimeError):
+    """The requested exact public identity is absent or outside its owner scope."""
+
+
+class ReviewReadinessReadUnavailable(RuntimeError):
+    """The read could not prove a complete, trustworthy aggregate."""
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ReadinessAdvisoryV1:
+    signal_id: int
+    version_id: int
+    practice_source_fingerprint: str
+    practice_target_fingerprint: str
+    state: AdvisoryStateV1
+    practice_state: AdvisoryPracticeStateV1
+    selected: bool
+    title: str
+    source_label: str
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ReadinessSignalDetailV1:
+    state: ReadinessSourceStateV1
+    aggregate: CanonicalReadinessSignalV1
+    title: str
+    source_label: str
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ReadinessPracticeFocusV1:
+    advisory: ReadinessAdvisoryV1
+    target_event_id: int
+
+
+@contextmanager
+def _read_uow(
+    session_factory: sessionmaker[Session],
+) -> Iterator[Session]:
+    """Own a real SQLite read snapshot and always release it by rollback."""
+
+    with session_factory() as session:
+        session.execute(text("BEGIN"))
+        try:
+            yield session
+        finally:
+            if session.in_transaction():
+                session.rollback()
+
+
+def _source_label(session: Session, aggregate: CanonicalReadinessSignalV1) -> str:
+    if aggregate.source_event_id is None:
+        return "面试复盘来源不可用"
+    event = session.get(ApplicationEvent, aggregate.source_event_id)
+    if event is None or event.application_id != aggregate.application_id:
+        return "面试复盘来源不可用"
+    # Labels never infer lifecycle from timestamps.
+    lifecycle = classify_event_lifecycle_v1(event.status)
+    round_number = event.round
+    if type(round_number) is not int or not 0 <= round_number <= 10_000:
+        return "面试复盘"
+    suffix = "" if lifecycle == "completed" else "（来源状态已变化）"
+    label = f"第 {round_number} 轮面试复盘{suffix}"
+    return label if len(label.encode("utf-8")) <= 128 else "面试复盘"
+
+
+def _legacy_practice_exists(
+    session: Session,
+    aggregate: CanonicalReadinessSignalV1,
+) -> bool:
+    if aggregate.source_proposal_id is None:
+        return False
+    return (
+        session.scalar(
+            select(AdaptivePracticePlan.id).where(
+                AdaptivePracticePlan.origin_contract == "legacy_review_focus_v1",
+                AdaptivePracticePlan.interview_review_proposal_id
+                == aggregate.source_proposal_id,
+                AdaptivePracticePlan.focus_id == aggregate.focus_id,
+            )
+        )
+        is not None
+    )
+
+
+def _advisory_from_focus(
+    session: Session,
+    *,
+    focus: PracticeFocusProjectionV1,
+) -> ReadinessAdvisoryV1:
+    aggregate = focus.source
+    target = focus.target
+    if aggregate is None or target is None:
+        raise ReviewReadinessReadUnavailable("readiness_signal_unavailable")
+    if focus.state == "unavailable":
+        raise ReviewReadinessReadUnavailable("readiness_signal_unavailable")
+    state: AdvisoryStateV1
+    practice_state: AdvisoryPracticeStateV1
+    selected = False
+    if focus.state in {"source_changed", "source_missing"}:
+        state, practice_state = "stale_source", "not_started"
+    elif focus.state == "retracted":
+        state, practice_state = "retracted", "not_started"
+    elif focus.state == "ready":
+        state = "available"
+        practice_state = (
+            "legacy_only"
+            if _legacy_practice_exists(session, aggregate)
+            else "not_started"
+        )
+    elif focus.state == "completed":
+        state, practice_state, selected = "practiced", "completed", True
+    elif focus.state == "in_progress":
+        state, practice_state, selected = "available", "in_progress", True
+    else:
+        raise ReviewReadinessReadUnavailable("readiness_plan_unavailable")
+    return ReadinessAdvisoryV1(
+        signal_id=aggregate.signal_id,
+        version_id=aggregate.version_id,
+        practice_source_fingerprint=aggregate.practice_source_fingerprint,
+        practice_target_fingerprint=target.practice_target_fingerprint,
+        state=state,
+        practice_state=practice_state,
+        selected=selected,
+        title=aggregate.statement_text,
+        source_label=_source_label(session, aggregate),
+    )
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -618,5 +782,203 @@ class ReadinessSignalRepository:
         with self._session_factory() as session:
             return self.load_by_operation_in_session(session, operation_id)
 
+    def project_candidates(
+        self,
+        *,
+        note_id: int,
+        proposal_id: int,
+    ) -> CandidateProjectionV1:
+        """Return the exact bounded candidate projection from one read snapshot."""
 
-__all__ = ["ReadinessSignalRepository", "ReadinessSignalRetractionResultV1"]
+        if type(note_id) is not int or note_id < 1 or type(proposal_id) is not int or proposal_id < 1:
+            raise ReviewReadinessReadNotFound("review_readiness_not_found")
+        try:
+            with _read_uow(self._session_factory) as session:
+                note = session.get(InterviewNote, note_id)
+                proposal = session.get(InterviewReviewProposal, proposal_id)
+                if note is None or proposal is None or proposal.note_id != note.id:
+                    raise ReviewReadinessReadNotFound("review_readiness_not_found")
+                projection = project_readiness_candidates(note_id, proposal_id, session)
+                if projection.state == "source_missing":
+                    raise ReviewReadinessReadNotFound("review_readiness_not_found")
+                if projection.state == "unavailable":
+                    raise ReviewReadinessReadUnavailable("review_readiness_unavailable")
+                return projection
+        except (ReviewReadinessReadNotFound, ReviewReadinessReadUnavailable):
+            raise
+        except SQLAlchemyError as exc:
+            raise ReviewReadinessReadUnavailable("review_readiness_unavailable") from exc
+        except (TypeError, ValueError, UnicodeEncodeError) as exc:
+            raise ReviewReadinessReadUnavailable("review_readiness_unavailable") from exc
+
+    def load_signal_detail(
+        self,
+        *,
+        application_id: int,
+        signal_id: int,
+    ) -> ReadinessSignalDetailV1:
+        """Load one Signal only through its exact owning Application path."""
+
+        if (
+            type(application_id) is not int
+            or application_id < 1
+            or type(signal_id) is not int
+            or signal_id < 1
+        ):
+            raise ReviewReadinessReadNotFound("review_readiness_not_found")
+        try:
+            with _read_uow(self._session_factory) as session:
+                application = session.get(Application, application_id)
+                if application is None or application.deleted_at is not None:
+                    raise ReviewReadinessReadNotFound("review_readiness_not_found")
+                signal = session.get(InterviewReadinessSignal, signal_id)
+                if signal is None or signal.application_id != application.id:
+                    raise ReviewReadinessReadNotFound("review_readiness_not_found")
+                projection = load_canonical_readiness_signal(session, signal_id=signal_id)
+                if projection.state == "unavailable" or projection.aggregate is None:
+                    raise ReviewReadinessReadUnavailable("review_readiness_unavailable")
+                if projection.aggregate.application_id != application.id:
+                    raise ReviewReadinessReadNotFound("review_readiness_not_found")
+                return ReadinessSignalDetailV1(
+                    state=projection.state,
+                    aggregate=projection.aggregate,
+                    title=projection.aggregate.statement_text,
+                    source_label=_source_label(session, projection.aggregate),
+                )
+        except (ReviewReadinessReadNotFound, ReviewReadinessReadUnavailable):
+            raise
+        except SQLAlchemyError as exc:
+            raise ReviewReadinessReadUnavailable("review_readiness_unavailable") from exc
+        except (TypeError, ValueError, UnicodeEncodeError) as exc:
+            raise ReviewReadinessReadUnavailable("review_readiness_unavailable") from exc
+
+    def list_event_advisories(
+        self,
+        *,
+        application_id: int,
+        event_id: int,
+    ) -> tuple[ReadinessAdvisoryV1, ...]:
+        """Project all exact same-Application Signals against one explicit target."""
+
+        if (
+            type(application_id) is not int
+            or application_id < 1
+            or type(event_id) is not int
+            or event_id < 1
+        ):
+            raise ReviewReadinessReadNotFound("review_readiness_not_found")
+        try:
+            with _read_uow(self._session_factory) as session:
+                application = session.get(Application, application_id)
+                if application is None or application.deleted_at is not None:
+                    raise ReviewReadinessReadNotFound("review_readiness_not_found")
+                target_projection = project_practice_target(
+                    session,
+                    application_id=application.id,
+                    target_event_id=event_id,
+                )
+                if target_projection.state in {"missing", "not_eligible"}:
+                    raise ReviewReadinessReadNotFound("review_readiness_not_found")
+                if (
+                    target_projection.state == "unavailable"
+                    or target_projection.target is None
+                ):
+                    raise ReviewReadinessReadUnavailable(
+                        "review_readiness_unavailable"
+                    )
+                target = target_projection.target
+                signal_ids = tuple(
+                    session.scalars(
+                        select(InterviewReadinessSignal.id)
+                        .where(InterviewReadinessSignal.application_id == application.id)
+                        .order_by(InterviewReadinessSignal.id)
+                    )
+                )
+                advisories: list[ReadinessAdvisoryV1] = []
+                for signal_id in signal_ids:
+                    signal = session.get(InterviewReadinessSignal, signal_id)
+                    if signal is None or signal.current_version_id is None:
+                        raise ReviewReadinessReadUnavailable(
+                            "review_readiness_unavailable"
+                        )
+                    focus = project_practice_focus(
+                        session,
+                        signal_version_id=signal.current_version_id,
+                        target_event_id=target.event_id,
+                    )
+                    if focus.state in {"unavailable", "target_missing", "not_eligible"}:
+                        raise ReviewReadinessReadUnavailable(
+                            "review_readiness_unavailable"
+                        )
+                    if focus.source is None or focus.source.application_id != application.id:
+                        raise ReviewReadinessReadUnavailable(
+                            "review_readiness_unavailable"
+                        )
+                    advisories.append(
+                        _advisory_from_focus(
+                            session,
+                            focus=focus,
+                        )
+                    )
+                return tuple(advisories)
+        except (ReviewReadinessReadNotFound, ReviewReadinessReadUnavailable):
+            raise
+        except SQLAlchemyError as exc:
+            raise ReviewReadinessReadUnavailable("review_readiness_unavailable") from exc
+        except (TypeError, ValueError, UnicodeEncodeError) as exc:
+            raise ReviewReadinessReadUnavailable("review_readiness_unavailable") from exc
+
+    def load_practice_focus(
+        self,
+        *,
+        signal_version_id: int,
+        target_event_id: int,
+    ) -> ReadinessPracticeFocusV1:
+        """Load one explicit Version/target pair without any target inference."""
+
+        if (
+            type(signal_version_id) is not int
+            or signal_version_id < 1
+            or type(target_event_id) is not int
+            or target_event_id < 1
+        ):
+            raise ReviewReadinessReadNotFound("review_readiness_not_found")
+        try:
+            with _read_uow(self._session_factory) as session:
+                focus = project_practice_focus(
+                    session,
+                    signal_version_id=signal_version_id,
+                    target_event_id=target_event_id,
+                )
+                if focus.state == "source_missing" and focus.source is None:
+                    raise ReviewReadinessReadNotFound("review_readiness_not_found")
+                if focus.state in {"target_missing", "not_eligible"}:
+                    raise ReviewReadinessReadNotFound("review_readiness_not_found")
+                if focus.state == "unavailable" or focus.source is None:
+                    raise ReviewReadinessReadUnavailable("review_readiness_unavailable")
+                if focus.target is None:
+                    raise ReviewReadinessReadUnavailable(
+                        "review_readiness_unavailable"
+                    )
+                advisory = _advisory_from_focus(
+                    session,
+                    focus=focus,
+                )
+                return ReadinessPracticeFocusV1(advisory, focus.target.event_id)
+        except (ReviewReadinessReadNotFound, ReviewReadinessReadUnavailable):
+            raise
+        except SQLAlchemyError as exc:
+            raise ReviewReadinessReadUnavailable("review_readiness_unavailable") from exc
+        except (TypeError, ValueError, UnicodeEncodeError) as exc:
+            raise ReviewReadinessReadUnavailable("review_readiness_unavailable") from exc
+
+
+__all__ = [
+    "ReadinessAdvisoryV1",
+    "ReadinessPracticeFocusV1",
+    "ReadinessSignalDetailV1",
+    "ReadinessSignalRepository",
+    "ReadinessSignalRetractionResultV1",
+    "ReviewReadinessReadNotFound",
+    "ReviewReadinessReadUnavailable",
+]

@@ -6,8 +6,9 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import event, select, update
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session
 
 from offerpilot.db import init_database
 from offerpilot.models import (
@@ -193,19 +194,34 @@ def _completed_plan(
     target_id: int,
     source_fingerprint: str,
     target_fingerprint: str,
+    source_path: str,
+    source_excerpt: str,
+    source_hash: str,
 ) -> AdaptivePracticePlan:  # type: ignore[no-untyped-def]
+    start_idempotency_key = str(uuid4())
+    start_input_fingerprint = "sha256:" + sha256_text(
+        canonical_json(
+            {
+                "idempotency_key": start_idempotency_key,
+                "readiness_signal_version_id": version_id,
+                "expected_source_fingerprint": source_fingerprint,
+                "target_application_event_id": target_id,
+                "expected_target_fingerprint": target_fingerprint,
+            }
+        )
+    )
     plan = AdaptivePracticePlan(
         application_id=int(seeded["application_id"]),
         application_event_id=int(seeded["event_id"]),
         interview_note_id=int(seeded["note_id"]),
         interview_review_proposal_id=int(seeded["proposal_id"]),
         focus_id=str(seeded["focus_id"]),
-        start_idempotency_key=str(uuid4()),
-        start_input_fingerprint="sha256:" + "a" * 64,
+        start_idempotency_key=start_idempotency_key,
+        start_input_fingerprint=start_input_fingerprint,
         source_fingerprint=source_fingerprint,
-        source_path="/difficulty_points",
-        source_excerpt="safe excerpt",
-        source_hash="sha256:" + "c" * 64,
+        source_path=source_path,
+        source_excerpt=source_excerpt,
+        source_hash=source_hash,
         drill_kind="explain",
         title="Practice",
         observation="Observation",
@@ -824,6 +840,207 @@ def test_target_must_be_exact_distinct_interview_in_same_application(tmp_path) -
         ).state == "target_missing"
 
 
+def test_direct_focus_checks_source_and_target_scope_before_target_content_or_plan(
+    tmp_path,
+) -> None:
+    session_factory, seeded, _signal_id, version_id = _seed_current_signal(tmp_path)
+    with session_factory() as session:
+        other = Application(company_name="Other", position_name="Role", source="web")
+        session.add(other)
+        session.commit()
+        other_id = other.id
+    target_id = _target(session_factory, other_id)
+    with session_factory() as session:
+        target = session.get(ApplicationEvent, target_id)
+        source = load_canonical_readiness_signal(session, signal_version_id=version_id)
+        assert target is not None and source.aggregate is not None
+        primary = source.aggregate.evidence[0]
+        target._tags = "not-json"
+        session.add(
+            AdaptivePracticePlan(
+                application_id=int(seeded["application_id"]),
+                application_event_id=target_id,
+                interview_note_id=int(seeded["note_id"]) + 900_000,
+                interview_review_proposal_id=int(seeded["proposal_id"]) + 900_000,
+                focus_id="malformed-cross-app-plan",
+                start_idempotency_key="not-a-uuid",
+                start_input_fingerprint="not-a-fingerprint",
+                source_fingerprint=source.aggregate.practice_source_fingerprint,
+                source_path=primary.source_path,
+                source_excerpt=primary.excerpt,
+                source_hash=primary.source_field_sha256,
+                drill_kind="",
+                title="",
+                observation="",
+                reason="",
+                prompt="",
+                status="completed",
+                revision=1,
+                origin_contract="confirmed_readiness_signal_v1",
+                readiness_signal_version_id=version_id,
+                target_application_event_id=target_id,
+                target_fingerprint="sha256:" + "a" * 64,
+            )
+        )
+        session.commit()
+
+    statements: list[str] = []
+
+    def observe(_conn, _cursor, statement, _parameters, _context, _many) -> None:
+        statements.append(statement.lower())
+
+    engine = session_factory.kw["bind"]
+    event.listen(engine, "before_cursor_execute", observe)
+    try:
+        with session_factory() as session:
+            cross_scope = project_practice_focus(
+                session,
+                signal_version_id=version_id,
+                target_event_id=target_id,
+            )
+        cross_scope_statements = tuple(statements)
+        statements.clear()
+        with session_factory() as session:
+            missing_source = project_practice_focus(
+                session,
+                signal_version_id=999_999,
+                target_event_id=target_id,
+            )
+        missing_source_statements = tuple(statements)
+    finally:
+        event.remove(engine, "before_cursor_execute", observe)
+
+    assert cross_scope.state == "not_eligible"
+    assert any("application_events" in item for item in cross_scope_statements)
+    assert not any("adaptive_practice_plans" in item for item in cross_scope_statements)
+    assert missing_source.state == "source_missing"
+    assert not any("application_events" in item for item in missing_source_statements)
+    assert not any("adaptive_practice_plans" in item for item in missing_source_statements)
+
+
+def test_canonical_focus_rejects_every_corrupt_v2_frozen_field(tmp_path) -> None:
+    session_factory, seeded, _signal_id, version_id = _seed_current_signal(tmp_path)
+    target_id = _target(session_factory, int(seeded["application_id"]))
+    with session_factory() as session:
+        source = load_canonical_readiness_signal(session, signal_version_id=version_id)
+        target = session.get(ApplicationEvent, target_id)
+        assert source.aggregate is not None and target is not None
+        primary = source.aggregate.evidence[0]
+        plan = _completed_plan(
+            session,
+            seeded=seeded,
+            version_id=version_id,
+            target_id=target_id,
+            source_fingerprint=source.aggregate.practice_source_fingerprint,
+            target_fingerprint=compute_practice_target_fingerprint_v1(target),
+            source_path=primary.source_path,
+            source_excerpt=primary.excerpt,
+            source_hash=primary.source_field_sha256,
+        )
+        session.commit()
+        plan_id = plan.id
+
+    corruptions: tuple[tuple[str, object], ...] = (
+        ("application_id", int(seeded["application_id"]) + 900_000),
+        ("application_event_id", target_id),
+        ("interview_note_id", int(seeded["note_id"]) + 900_000),
+        (
+            "interview_review_proposal_id",
+            int(seeded["proposal_id"]) + 900_000,
+        ),
+        ("focus_id", "another-focus"),
+        ("source_path", "/questions"),
+        ("source_excerpt", primary.excerpt + " changed"),
+        ("source_hash", "sha256:" + "e" * 64),
+        ("drill_kind", "d" * 129),
+        ("title", "t" * 201),
+        ("observation", "o" * 1_001),
+        ("reason", "r" * 1_001),
+        ("prompt", "p" * 2_001),
+        ("start_idempotency_key", "not-a-canonical-uuid"),
+        ("start_input_fingerprint", "sha256:" + "e" * 64),
+        ("status", "finished"),
+        ("revision", 3),
+        ("response_text", ""),
+        ("reflection_text", "r" * 4_001),
+        ("completion_idempotency_key", "not-a-canonical-uuid"),
+        ("completion_fingerprint", "not-a-fingerprint"),
+        ("completed_at", None),
+    )
+    for field, value in corruptions:
+        with session_factory() as session:
+            stored = session.get(AdaptivePracticePlan, plan_id)
+            assert stored is not None
+            setattr(stored, field, value)
+            session.flush()
+            projection = project_practice_focus(
+                session,
+                signal_version_id=version_id,
+                target_event_id=target_id,
+            )
+            assert projection.state == "unavailable", field
+            session.rollback()
+
+    engine = session_factory.kw["bind"]
+    with engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        connection.commit()
+        with Session(connection) as session:
+            source = load_canonical_readiness_signal(
+                session,
+                signal_version_id=version_id,
+            )
+            assert source.aggregate is not None
+            primary = source.aggregate.evidence[0]
+            _completed_plan(
+                session,
+                seeded=seeded,
+                version_id=target_id,
+                target_id=version_id,
+                source_fingerprint=source.aggregate.practice_source_fingerprint,
+                target_fingerprint="sha256:" + "f" * 64,
+                source_path=primary.source_path,
+                source_excerpt=primary.excerpt,
+                source_hash=primary.source_field_sha256,
+            )
+            session.commit()
+        connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+        connection.commit()
+    with session_factory() as session:
+        assert project_practice_focus(
+            session,
+            signal_version_id=version_id,
+            target_event_id=target_id,
+        ).state == "unavailable"
+
+
+def test_canonical_focus_deliberately_ignores_private_self_assessment(tmp_path) -> None:
+    session_factory, seeded, _signal_id, version_id = _seed_current_signal(tmp_path)
+    target_id = _target(session_factory, int(seeded["application_id"]))
+    with session_factory() as session:
+        source = load_canonical_readiness_signal(session, signal_version_id=version_id)
+        target = session.get(ApplicationEvent, target_id)
+        assert source.aggregate is not None and target is not None
+        primary = source.aggregate.evidence[0]
+        plan = _completed_plan(
+            session,
+            seeded=seeded,
+            version_id=version_id,
+            target_id=target_id,
+            source_fingerprint=source.aggregate.practice_source_fingerprint,
+            target_fingerprint=compute_practice_target_fingerprint_v1(target),
+            source_path=primary.source_path,
+            source_excerpt=primary.excerpt,
+            source_hash=primary.source_field_sha256,
+        )
+        plan.self_assessment = "private-corruption-" + "x" * 20_000
+        assert project_practice_focus(
+            session,
+            signal_version_id=version_id,
+            target_event_id=target_id,
+        ).state == "completed"
+
+
 def test_practiced_requires_the_exact_completed_signal_target_pair(tmp_path) -> None:
     session_factory, seeded, _signal_id, version_id = _seed_current_signal(tmp_path)
     target_id = _target(session_factory, int(seeded["application_id"]))
@@ -841,6 +1058,9 @@ def test_practiced_requires_the_exact_completed_signal_target_pair(tmp_path) -> 
             target_id=target_id,
             source_fingerprint=source.aggregate.practice_source_fingerprint,
             target_fingerprint=target_fingerprint,
+            source_path=source.aggregate.evidence[0].source_path,
+            source_excerpt=source.aggregate.evidence[0].excerpt,
+            source_hash=source.aggregate.evidence[0].source_field_sha256,
         )
         session.commit()
     with session_factory() as session:
@@ -853,6 +1073,49 @@ def test_practiced_requires_the_exact_completed_signal_target_pair(tmp_path) -> 
             session,
             signal_version_id=version_id,
             target_event_id=other_target_id,
+        ).state == "ready"
+
+
+def test_deleted_historical_plan_target_does_not_poison_a_different_pair(
+    tmp_path,
+) -> None:
+    session_factory, seeded, _signal_id, version_id = _seed_current_signal(tmp_path)
+    deleted_target_id = _target(session_factory, int(seeded["application_id"]))
+    current_target_id = _target(session_factory, int(seeded["application_id"]))
+    with session_factory() as session:
+        source = load_canonical_readiness_signal(session, signal_version_id=version_id)
+        deleted_target = session.get(ApplicationEvent, deleted_target_id)
+        assert source.aggregate is not None and deleted_target is not None
+        primary = source.aggregate.evidence[0]
+        plan = _completed_plan(
+            session,
+            seeded=seeded,
+            version_id=version_id,
+            target_id=deleted_target_id,
+            source_fingerprint=source.aggregate.practice_source_fingerprint,
+            target_fingerprint=compute_practice_target_fingerprint_v1(deleted_target),
+            source_path=primary.source_path,
+            source_excerpt=primary.excerpt,
+            source_hash=primary.source_field_sha256,
+        )
+        frozen_target_fingerprint = plan.target_fingerprint
+        session.commit()
+        plan_id = plan.id
+    with session_factory() as session:
+        deleted_target = session.get(ApplicationEvent, deleted_target_id)
+        assert deleted_target is not None
+        session.delete(deleted_target)
+        session.commit()
+    with session_factory() as session:
+        stored = session.get(AdaptivePracticePlan, plan_id)
+        assert stored is not None
+        assert stored.target_application_event_id is None
+        assert stored.target_fingerprint == frozen_target_fingerprint
+        assert stored.status == "completed"
+        assert project_practice_focus(
+            session,
+            signal_version_id=version_id,
+            target_event_id=current_target_id,
         ).state == "ready"
 
 
@@ -870,6 +1133,9 @@ def test_existing_plan_fingerprints_precede_terminal_status(tmp_path) -> None:
             target_id=source_target,
             source_fingerprint="sha256:" + "f" * 64,
             target_fingerprint=compute_practice_target_fingerprint_v1(target),
+            source_path=source.aggregate.evidence[0].source_path,
+            source_excerpt=source.aggregate.evidence[0].excerpt,
+            source_hash=source.aggregate.evidence[0].source_field_sha256,
         )
         session.commit()
     with source_factory() as session:
@@ -893,6 +1159,9 @@ def test_existing_plan_fingerprints_precede_terminal_status(tmp_path) -> None:
             target_id=changed_target,
             source_fingerprint=source.aggregate.practice_source_fingerprint,
             target_fingerprint=target_fingerprint,
+            source_path=source.aggregate.evidence[0].source_path,
+            source_excerpt=source.aggregate.evidence[0].excerpt,
+            source_hash=source.aggregate.evidence[0].source_field_sha256,
         )
         target.round += 1
         session.commit()
@@ -990,10 +1259,25 @@ def test_database_read_failure_is_explicitly_unavailable(tmp_path, monkeypatch) 
 
 
 def test_baseline_interview_readiness_module_has_no_signal_dependency() -> None:
-    """The full API orthogonality matrix belongs to the later Task 7 API wiring."""
+    """The baseline projector remains orthogonal to the additive Signal projection."""
 
     from offerpilot.repositories import interview_index
+    from offerpilot.review_readiness import projection as readiness_projection
+    from offerpilot.review_readiness import repository as readiness_repository
 
-    source = __import__("inspect").getsource(interview_index)
-    assert "InterviewReadinessSignal" not in source
-    assert "readiness_signal" not in source
+    inspect = __import__("inspect")
+    baseline_source = inspect.getsource(interview_index)
+    projection_source = inspect.getsource(readiness_projection)
+    readiness_source = inspect.getsource(readiness_repository)
+    assert "InterviewReadinessSignal" not in baseline_source
+    assert "readiness_signal" not in baseline_source
+    assert "project_practice_focus(" in readiness_source
+    assert "load_canonical_readiness_signal(" in readiness_source
+    assert "_validate_v2_plan(" in projection_source
+    assert "_validated_exact_v2_plan" not in readiness_source
+    assert "self_assessment" not in projection_source
+    assert "self_assessment" not in readiness_source
+    assert "classify_event_lifecycle_v1(" in readiness_source
+    assert ".scheduled_at" not in readiness_source
+    assert readiness_source.count("with _read_uow(self._session_factory)") == 4
+    assert 'session.execute(text("BEGIN"))' in readiness_source

@@ -13,8 +13,9 @@ import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Literal, TypeAlias, cast
+from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -48,6 +49,12 @@ PracticeFocusStateV1: TypeAlias = Literal[
     "target_changed",
     "target_missing",
     "retracted",
+    "not_eligible",
+    "unavailable",
+]
+PracticeTargetStateV1: TypeAlias = Literal[
+    "ready",
+    "missing",
     "not_eligible",
     "unavailable",
 ]
@@ -94,6 +101,12 @@ class PracticeTargetV1:
     application_id: int
     lifecycle: EventLifecycleV1
     practice_target_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class PracticeTargetProjectionV1:
+    state: PracticeTargetStateV1
+    target: PracticeTargetV1 | None = None
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -145,6 +158,33 @@ def _require_sha256(value: object, field: str) -> str:
     ):
         raise _ProjectionIntegrityError(f"{field}_invalid")
     return value
+
+
+def _canonical_uuid(value: object, field: str) -> str:
+    if type(value) is not str:
+        raise _ProjectionIntegrityError(f"{field}_invalid")
+    try:
+        parsed = UUID(value)
+    except (ValueError, AttributeError) as exc:
+        raise _ProjectionIntegrityError(f"{field}_invalid") from exc
+    if str(parsed) != value:
+        raise _ProjectionIntegrityError(f"{field}_invalid")
+    return value
+
+
+def _bounded_identifier(value: object, field: str) -> str:
+    text = _bounded_text(
+        value,
+        field,
+        max_codepoints=128,
+        max_bytes=128,
+    )
+    if any(
+        character not in "abcdefghijklmnopqrstuvwxyz0123456789_-"
+        for character in text
+    ):
+        raise _ProjectionIntegrityError(f"{field}_invalid")
+    return text
 
 
 def _require_fingerprint_json(value: object) -> None:
@@ -595,6 +635,270 @@ def compute_practice_target_fingerprint_v1(event: ApplicationEvent) -> str:
     return _canonical_fingerprint(envelope)
 
 
+def project_practice_target(
+    session: Session,
+    *,
+    application_id: int,
+    target_event_id: int,
+    source_event_id: int | None = None,
+) -> PracticeTargetProjectionV1:
+    """Resolve one target with owner scope decided before target content decode."""
+
+    if (
+        type(application_id) is not int
+        or application_id < 1
+        or type(target_event_id) is not int
+        or target_event_id < 1
+    ):
+        return PracticeTargetProjectionV1("missing")
+    if source_event_id is not None and target_event_id == source_event_id:
+        return PracticeTargetProjectionV1("not_eligible")
+    try:
+        owner_id = session.scalar(
+            select(ApplicationEvent.application_id).where(
+                ApplicationEvent.id == target_event_id
+            )
+        )
+        if owner_id is None:
+            return PracticeTargetProjectionV1("missing")
+        if type(owner_id) is not int or owner_id != application_id:
+            return PracticeTargetProjectionV1("not_eligible")
+        event = session.get(ApplicationEvent, target_event_id)
+        if event is None:
+            return PracticeTargetProjectionV1("unavailable")
+        _bounded_text(
+            event.status,
+            "event_status",
+            max_codepoints=128,
+            max_bytes=512,
+        )
+        fingerprint = compute_practice_target_fingerprint_v1(event)
+        lifecycle = classify_event_lifecycle_v1(event.status)
+        target = PracticeTargetV1(
+            _exact_int(event.id, "event_id", minimum=1),
+            _exact_int(event.application_id, "application_id", minimum=1),
+            lifecycle,
+            fingerprint,
+        )
+        if event.event_type != "interview" or lifecycle not in {
+            "scheduled",
+            "in_progress",
+        }:
+            return PracticeTargetProjectionV1("not_eligible", target)
+        return PracticeTargetProjectionV1("ready", target)
+    except SQLAlchemyError:
+        return PracticeTargetProjectionV1("unavailable")
+    except (_ProjectionIntegrityError, UnicodeEncodeError, ValueError, TypeError):
+        return PracticeTargetProjectionV1("unavailable")
+
+
+def _plan_source_identity_matches(
+    plan: AdaptivePracticePlan,
+    aggregate: CanonicalReadinessSignalV1,
+) -> bool:
+    return (
+        type(plan.application_id) is int
+        and plan.application_id == aggregate.application_id
+        and type(plan.application_event_id) is int
+        and plan.application_event_id == aggregate.source_event_id
+        and type(plan.interview_note_id) is int
+        and plan.interview_note_id == aggregate.source_note_id
+        and type(plan.interview_review_proposal_id) is int
+        and plan.interview_review_proposal_id == aggregate.source_proposal_id
+        and type(plan.focus_id) is str
+        and plan.focus_id == aggregate.focus_id
+    )
+
+
+def _exact_v2_plan_for_pair(
+    session: Session,
+    *,
+    aggregate: CanonicalReadinessSignalV1,
+    target: PracticeTargetV1,
+) -> AdaptivePracticePlan | None:
+    """Find the exact pair while detecting damaged locators tied to its owner."""
+
+    owner_match = (
+        (AdaptivePracticePlan.application_id == aggregate.application_id)
+        & (AdaptivePracticePlan.application_event_id == aggregate.source_event_id)
+        & (AdaptivePracticePlan.interview_note_id == aggregate.source_note_id)
+        & (
+            AdaptivePracticePlan.interview_review_proposal_id
+            == aggregate.source_proposal_id
+        )
+        & (AdaptivePracticePlan.focus_id == aggregate.focus_id)
+    )
+    plans = list(
+        session.scalars(
+            select(AdaptivePracticePlan)
+            .where(
+                AdaptivePracticePlan.origin_contract
+                == "confirmed_readiness_signal_v1",
+                or_(
+                    owner_match,
+                    AdaptivePracticePlan.readiness_signal_version_id
+                    == aggregate.version_id,
+                    AdaptivePracticePlan.target_application_event_id
+                    == target.event_id,
+                ),
+            )
+            .order_by(AdaptivePracticePlan.id)
+        )
+    )
+    exact: list[AdaptivePracticePlan] = []
+    for plan in plans:
+        belongs_to_source = _plan_source_identity_matches(plan, aggregate)
+        if belongs_to_source:
+            if plan.readiness_signal_version_id != aggregate.version_id:
+                raise _ProjectionIntegrityError("practice_plan_source_locator_invalid")
+            if plan.target_application_event_id is None:
+                # ON DELETE SET NULL preserves an unrelated historical pair.
+                continue
+            if type(plan.target_application_event_id) is not int:
+                raise _ProjectionIntegrityError("practice_plan_target_locator_invalid")
+            if plan.target_application_event_id == aggregate.source_event_id:
+                raise _ProjectionIntegrityError("practice_plan_target_locator_invalid")
+            if plan.target_application_event_id == target.event_id:
+                exact.append(plan)
+                continue
+            other_target_owner = session.scalar(
+                select(ApplicationEvent.application_id).where(
+                    ApplicationEvent.id == plan.target_application_event_id
+                )
+            )
+            if other_target_owner != aggregate.application_id:
+                raise _ProjectionIntegrityError("practice_plan_target_locator_invalid")
+        elif plan.readiness_signal_version_id == aggregate.version_id:
+            if not belongs_to_source:
+                raise _ProjectionIntegrityError("practice_plan_source_owner_invalid")
+    if len(exact) > 1:
+        raise _ProjectionIntegrityError("practice_plan_pair_ambiguous")
+    return exact[0] if exact else None
+
+
+def _validate_v2_plan(
+    plan: AdaptivePracticePlan,
+    *,
+    aggregate: CanonicalReadinessSignalV1,
+    target: PracticeTargetV1,
+) -> None:
+    """Validate the complete non-private frozen V2 plan envelope."""
+
+    _exact_int(plan.id, "practice_plan_id", minimum=1)
+    if not _plan_source_identity_matches(plan, aggregate):
+        raise _ProjectionIntegrityError("practice_plan_source_owner_invalid")
+    if (
+        plan.origin_contract != "confirmed_readiness_signal_v1"
+        or type(plan.readiness_signal_version_id) is not int
+        or plan.readiness_signal_version_id != aggregate.version_id
+        or type(plan.target_application_event_id) is not int
+        or plan.target_application_event_id != target.event_id
+        or plan.application_event_id == plan.target_application_event_id
+    ):
+        raise _ProjectionIntegrityError("practice_plan_locator_invalid")
+
+    source_fingerprint = _require_sha256(
+        plan.source_fingerprint,
+        "practice_plan_source_fingerprint",
+    )
+    target_fingerprint = _require_sha256(
+        plan.target_fingerprint,
+        "practice_plan_target_fingerprint",
+    )
+    primary = aggregate.evidence[0]
+    if (
+        plan.source_path != primary.source_path
+        or plan.source_excerpt != primary.excerpt
+        or plan.source_hash != primary.source_field_sha256
+    ):
+        raise _ProjectionIntegrityError("practice_plan_source_snapshot_invalid")
+    _require_sha256(plan.source_hash, "practice_plan_source_hash")
+
+    _bounded_identifier(plan.drill_kind, "practice_plan_drill_kind")
+    _bounded_text(
+        plan.title,
+        "practice_plan_title",
+        max_codepoints=200,
+        max_bytes=800,
+    )
+    _bounded_text(
+        plan.observation,
+        "practice_plan_observation",
+        max_codepoints=1_000,
+        max_bytes=4_096,
+    )
+    _bounded_text(
+        plan.reason,
+        "practice_plan_reason",
+        max_codepoints=1_000,
+        max_bytes=4_096,
+    )
+    _bounded_text(
+        plan.prompt,
+        "practice_plan_prompt",
+        max_codepoints=2_000,
+        max_bytes=8_192,
+    )
+
+    start_key = _canonical_uuid(
+        plan.start_idempotency_key,
+        "practice_plan_start_key",
+    )
+    start_fingerprint = _require_sha256(
+        plan.start_input_fingerprint,
+        "practice_plan_start_input_fingerprint",
+    )
+    expected_start_fingerprint = _canonical_fingerprint(
+        {
+            "idempotency_key": start_key,
+            "readiness_signal_version_id": aggregate.version_id,
+            "expected_source_fingerprint": source_fingerprint,
+            "target_application_event_id": target.event_id,
+            "expected_target_fingerprint": target_fingerprint,
+        }
+    )
+    if start_fingerprint != expected_start_fingerprint:
+        raise _ProjectionIntegrityError("practice_plan_start_input_mismatch")
+
+    if plan.status == "in_progress":
+        if (
+            type(plan.revision) is not int
+            or plan.revision != 1
+            or plan.response_text != ""
+            or plan.reflection_text != ""
+            or plan.completion_idempotency_key is not None
+            or plan.completion_fingerprint != ""
+            or plan.completed_at is not None
+        ):
+            raise _ProjectionIntegrityError("practice_plan_in_progress_shape_invalid")
+        return
+    if plan.status != "completed" or type(plan.revision) is not int or plan.revision != 2:
+        raise _ProjectionIntegrityError("practice_plan_status_invalid")
+    _bounded_text(
+        plan.response_text,
+        "practice_plan_response",
+        max_codepoints=8_000,
+        max_bytes=32_768,
+    )
+    _bounded_text(
+        plan.reflection_text,
+        "practice_plan_reflection",
+        max_codepoints=4_000,
+        max_bytes=16_384,
+        allow_empty=True,
+    )
+    _canonical_uuid(
+        plan.completion_idempotency_key,
+        "practice_plan_completion_key",
+    )
+    _require_sha256(
+        plan.completion_fingerprint,
+        "practice_plan_completion_fingerprint",
+    )
+    if not isinstance(plan.completed_at, datetime):
+        raise _ProjectionIntegrityError("practice_plan_completed_at_invalid")
+
+
 def project_practice_focus(
     session: Session,
     *,
@@ -614,45 +918,47 @@ def project_practice_focus(
         "unavailable": "unavailable",
         "retracted": "retracted",
     }
-    if source.state != "current" or source.aggregate is None:
+    if source.state == "unavailable" or source.aggregate is None:
         return PracticeFocusProjectionV1(
             source_state[source.state],
-            source.aggregate,
+            None,
         )
     aggregate = source.aggregate
     if type(target_event_id) is not int or target_event_id < 1:
         return PracticeFocusProjectionV1("target_missing", aggregate)
     try:
-        event = session.get(ApplicationEvent, target_event_id)
-        if event is None:
+        target_projection = project_practice_target(
+            session,
+            application_id=aggregate.application_id,
+            target_event_id=target_event_id,
+            source_event_id=aggregate.source_event_id,
+        )
+        if target_projection.state == "missing":
             return PracticeFocusProjectionV1("target_missing", aggregate)
-        application = session.get(Application, event.application_id)
-        if application is None or application.deleted_at is not None:
+        if target_projection.state == "unavailable":
             return PracticeFocusProjectionV1("unavailable", aggregate)
-        fingerprint = compute_practice_target_fingerprint_v1(event)
-        lifecycle = classify_event_lifecycle_v1(event.status)
-        target = PracticeTargetV1(event.id, event.application_id, lifecycle, fingerprint)
-        plan = session.scalar(
-            select(AdaptivePracticePlan).where(
-                AdaptivePracticePlan.origin_contract
-                == "confirmed_readiness_signal_v1",
-                AdaptivePracticePlan.readiness_signal_version_id
-                == aggregate.version_id,
-                AdaptivePracticePlan.target_application_event_id == event.id,
+        if target_projection.target is None:
+            return PracticeFocusProjectionV1("not_eligible", aggregate)
+        target = target_projection.target
+        if target_projection.state == "not_eligible":
+            return PracticeFocusProjectionV1("not_eligible", aggregate, target)
+        if source.state != "current":
+            return PracticeFocusProjectionV1(
+                source_state[source.state],
+                aggregate,
+                target,
             )
+        plan = _exact_v2_plan_for_pair(
+            session,
+            aggregate=aggregate,
+            target=target,
         )
         if plan is not None:
+            _validate_v2_plan(plan, aggregate=aggregate, target=target)
             if plan.source_fingerprint != aggregate.practice_source_fingerprint:
                 return PracticeFocusProjectionV1("source_changed", aggregate, target)
-            if plan.target_fingerprint != fingerprint:
+            if plan.target_fingerprint != target.practice_target_fingerprint:
                 return PracticeFocusProjectionV1("target_changed", aggregate, target)
-        if (
-            event.application_id != aggregate.application_id
-            or event.event_type != "interview"
-            or event.id == aggregate.source_event_id
-            or lifecycle not in {"scheduled", "in_progress"}
-        ):
-            return PracticeFocusProjectionV1("not_eligible", aggregate, target)
         if plan is None:
             state: PracticeFocusStateV1 = "ready"
         elif plan.status == "completed":
@@ -672,6 +978,8 @@ __all__ = [
     "CanonicalReadinessSignalV1",
     "PracticeFocusProjectionV1",
     "PracticeFocusStateV1",
+    "PracticeTargetProjectionV1",
+    "PracticeTargetStateV1",
     "PracticeTargetV1",
     "ReadinessSignalProjectionV1",
     "ReadinessSourceStateV1",
@@ -679,4 +987,5 @@ __all__ = [
     "compute_practice_target_fingerprint_v1",
     "load_canonical_readiness_signal",
     "project_practice_focus",
+    "project_practice_target",
 ]

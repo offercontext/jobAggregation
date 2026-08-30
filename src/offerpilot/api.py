@@ -140,7 +140,12 @@ from offerpilot.product_actions.issuer import (
     ReviewReadinessActionIssuer,
 )
 from offerpilot.product_actions.repository import ProductActionProposalRepository
-from offerpilot.review_readiness.repository import ReadinessSignalRepository
+from offerpilot.review_readiness.repository import (
+    ReadinessAdvisoryV1,
+    ReadinessSignalRepository,
+    ReviewReadinessReadNotFound,
+    ReviewReadinessReadUnavailable,
+)
 from offerpilot.db import journal_session_factory_for_data_dir, session_factory_for_data_dir
 from offerpilot.diagnostics import append_log_entry, read_recent_log_page
 from offerpilot.knowledge import (
@@ -1409,6 +1414,26 @@ def create_app(
         return JSONResponse(
             status_code=503,
             content={"error_code": "operation_result_unknown", "retryable": True},
+        )
+
+    @app.exception_handler(ReviewReadinessReadNotFound)
+    async def review_readiness_not_found_exception_handler(
+        _request: Request,
+        _exc: ReviewReadinessReadNotFound,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=404,
+            content={"error_code": "review_readiness_not_found", "retryable": False},
+        )
+
+    @app.exception_handler(ReviewReadinessReadUnavailable)
+    async def review_readiness_unavailable_exception_handler(
+        _request: Request,
+        _exc: ReviewReadinessReadUnavailable,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            content={"error_code": "review_readiness_unavailable", "retryable": True},
         )
 
     def _runtime_source_loader(
@@ -3402,6 +3427,142 @@ def create_app(
             request=payload,
         )
         return _product_action_decision_response(result)
+
+    def _readiness_advisory_json(item: ReadinessAdvisoryV1) -> dict[str, Any]:
+        return {
+            "signalId": item.signal_id,
+            "versionId": item.version_id,
+            "practiceSourceFingerprint": item.practice_source_fingerprint,
+            "practiceTargetFingerprint": item.practice_target_fingerprint,
+            "state": item.state,
+            "practiceState": item.practice_state,
+            "selected": item.selected,
+            "title": item.title,
+            "sourceLabel": item.source_label,
+        }
+
+    @app.get(
+        "/api/interview-notes/{note_id}/readiness-feedback-candidates"
+    )
+    def get_review_readiness_candidates(
+        note_id: int,
+        proposal_id: int = Query(..., ge=1),
+    ) -> JSONResponse:
+        projection = readiness_signals.project_candidates(
+            note_id=note_id,
+            proposal_id=proposal_id,
+        )
+        candidates = () if projection.state == "already_confirmed" else projection.candidates
+        return JSONResponse(
+            {
+                "schema_version": 1,
+                "state": projection.state,
+                "note_id": projection.note_id,
+                "proposal_id": projection.proposal_id,
+                "candidates": [
+                    {
+                        "application_id": candidate.application_id,
+                        "event_id": candidate.event_id,
+                        "note_id": candidate.note_id,
+                        "proposal_id": candidate.proposal_id,
+                        "proposal_schema_version": candidate.proposal_schema_version,
+                        "focus_id": candidate.focus_id,
+                        "statement": candidate.statement_text,
+                        "source_note_revision": candidate.source_note_revision,
+                        "source_note_fingerprint": candidate.source_note_fingerprint,
+                        "source_proposal_hash": candidate.source_proposal_hash,
+                        "candidate_fingerprint": candidate.candidate_fingerprint,
+                        "evidence": [
+                            {
+                                "ordinal": evidence.ordinal,
+                                "source_path": evidence.source_path,
+                                "excerpt": evidence.excerpt,
+                                "excerpt_sha256": evidence.excerpt_sha256,
+                                "source_field_sha256": evidence.source_field_sha256,
+                            }
+                            for evidence in candidate.evidence
+                        ],
+                    }
+                    for candidate in candidates
+                ],
+            }
+        )
+
+    @app.get(
+        "/api/applications/{application_id}/events/{event_id}/readiness-feedback"
+    )
+    def get_event_readiness_feedback(
+        application_id: int,
+        event_id: int,
+    ) -> JSONResponse:
+        items = readiness_signals.list_event_advisories(
+            application_id=application_id,
+            event_id=event_id,
+        )
+        return JSONResponse(
+            {
+                "schema_version": 1,
+                "application_id": application_id,
+                "event_id": event_id,
+                "items": [_readiness_advisory_json(item) for item in items],
+            }
+        )
+
+    @app.get(
+        "/api/applications/{application_id}/readiness-signals/{signal_id}"
+    )
+    def get_readiness_signal_detail(
+        application_id: int,
+        signal_id: int,
+    ) -> JSONResponse:
+        detail = readiness_signals.load_signal_detail(
+            application_id=application_id,
+            signal_id=signal_id,
+        )
+        aggregate = detail.aggregate
+        return JSONResponse(
+            {
+                "schema_version": 1,
+                "signal_id": aggregate.signal_id,
+                "version_id": aggregate.version_id,
+                "application_id": aggregate.application_id,
+                "source_event_id": aggregate.source_event_id,
+                "state": detail.state,
+                "focus_id": aggregate.focus_id,
+                "title": detail.title,
+                "source_label": detail.source_label,
+                "statement": aggregate.statement_text,
+                "user_note": aggregate.user_note,
+                "practice_source_fingerprint": aggregate.practice_source_fingerprint,
+                "evidence": [
+                    {
+                        "ordinal": evidence.ordinal,
+                        "source_path": evidence.source_path,
+                        "excerpt": evidence.excerpt,
+                        "excerpt_sha256": evidence.excerpt_sha256,
+                        "source_field_sha256": evidence.source_field_sha256,
+                    }
+                    for evidence in aggregate.evidence
+                ],
+            }
+        )
+
+    @app.get("/api/interview-practice/focus/{signal_version_id}")
+    def get_readiness_practice_focus(
+        signal_version_id: int,
+        target_event_id: int = Query(..., ge=1),
+    ) -> JSONResponse:
+        focus = readiness_signals.load_practice_focus(
+            signal_version_id=signal_version_id,
+            target_event_id=target_event_id,
+        )
+        return JSONResponse(
+            {
+                "schema_version": 1,
+                **_readiness_advisory_json(focus.advisory),
+                "targetEventId": focus.target_event_id,
+            }
+        )
 
     @app.post("/api/interview-notes/{note_id}/readiness-focus-actions")
     async def propose_review_readiness_action(

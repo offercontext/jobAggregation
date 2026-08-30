@@ -149,55 +149,92 @@ def _has_self_committing_story_call(tree: ast.AST) -> bool:
     return False
 
 
-def _proposal_drives_practice_start(tree: ast.AST | None) -> bool:
+def _reachable_practice_functions(
+    tree: ast.AST | None,
+    root_name: str,
+) -> tuple[ast.FunctionDef | ast.AsyncFunctionDef, ...]:
     if tree is None:
-        return False
+        return ()
+    module_functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+    repository_methods: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
     for node in tree.body:
-        if not isinstance(node, ast.ClassDef) or node.name != "AdaptivePracticeRepository":
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            module_functions[node.name] = node
+        elif isinstance(node, ast.ClassDef) and node.name == "AdaptivePracticeRepository":
+            for member in node.body:
+                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    repository_methods[member.name] = member
+
+    root = repository_methods.get(root_name)
+    if root is None:
+        return ()
+    reachable: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+    pending = [root]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
             continue
-        for member in node.body:
-            if not isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        seen.add(id(current))
+        reachable.append(current)
+        for child in ast.walk(current):
+            if not isinstance(child, ast.Call):
                 continue
-            if member.name != "start":
-                continue
-            parameters = {
-                argument.arg
-                for argument in (*member.args.posonlyargs, *member.args.args, *member.args.kwonlyargs)
-            }
-            if "proposal_id" in parameters:
-                return True
-            if any(
-                isinstance(child, ast.Name) and child.id == "InterviewReviewProposal"
-                for child in ast.walk(member)
+            if isinstance(child.func, ast.Name):
+                helper = module_functions.get(child.func.id)
+            elif (
+                isinstance(child.func, ast.Attribute)
+                and isinstance(child.func.value, ast.Name)
+                and child.func.value.id
+                in {"self", "cls", "AdaptivePracticeRepository"}
             ):
-                return True
-    return False
+                helper = repository_methods.get(child.func.attr)
+            else:
+                helper = None
+            if helper is not None and id(helper) not in seen:
+                pending.append(helper)
+    return tuple(reachable)
+
+
+def _proposal_drives_practice_start(tree: ast.AST | None) -> bool:
+    reachable = _reachable_practice_functions(tree, "start")
+    if not reachable:
+        return False
+    root_parameters = {
+        argument.arg
+        for argument in (
+            *reachable[0].args.posonlyargs,
+            *reachable[0].args.args,
+            *reachable[0].args.kwonlyargs,
+        )
+    }
+    return "proposal_id" in root_parameters or any(
+        isinstance(child, ast.Name) and child.id == "InterviewReviewProposal"
+        for member in reachable
+        for child in ast.walk(member)
+    )
 
 
 def _proposal_drives_practice_recommendations(tree: ast.AST | None) -> bool:
-    if tree is None:
-        return False
-    for node in tree.body:
-        if not isinstance(node, ast.ClassDef) or node.name != "AdaptivePracticeRepository":
-            continue
-        for member in node.body:
-            if not isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            if member.name != "list_recommendations":
-                continue
-            scans_proposals = any(
-                isinstance(child, ast.Name) and child.id == "InterviewReviewProposal"
-                for child in ast.walk(member)
+    reachable = _reachable_practice_functions(tree, "list_recommendations")
+    scans_proposals = any(
+        isinstance(child, ast.Name) and child.id == "InterviewReviewProposal"
+        for member in reachable
+        for child in ast.walk(member)
+    )
+    projects_focuses = any(
+        isinstance(child, ast.Call)
+        and (
+            (isinstance(child.func, ast.Name) and child.func.id == "_proposal_focuses")
+            or (
+                isinstance(child.func, ast.Attribute)
+                and child.func.attr == "_proposal_focuses"
             )
-            projects_focuses = any(
-                isinstance(child, ast.Call)
-                and isinstance(child.func, ast.Name)
-                and child.func.id == "_proposal_focuses"
-                for child in ast.walk(member)
-            )
-            if scans_proposals and projects_focuses:
-                return True
-    return False
+        )
+        for member in reachable
+        for child in ast.walk(member)
+    )
+    return scans_proposals and projects_focuses
 
 
 def _proposal_drives_practice(tree: ast.AST | None) -> bool:
@@ -389,6 +426,36 @@ class AdaptivePracticeRepository:
 '''
     )
     assert not _proposal_drives_practice(historical_plans_only)
+
+
+def test_practice_gate_follows_reachable_module_helpers_without_scanning_unrelated_helpers() -> None:
+    extracted_legacy_scan = ast.parse(
+        '''
+def _legacy_recommendations(session):
+    proposals = session.scalars(select(InterviewReviewProposal))
+    return [_proposal_focuses(proposal) for proposal in proposals]
+class AdaptivePracticeRepository:
+    def list_recommendations(self):
+        return _legacy_recommendations(self._session_factory())
+    def start(self, readiness_signal_version_id, target_application_event_id):
+        return readiness_signal_version_id, target_application_event_id
+'''
+    )
+    assert _proposal_drives_practice(extracted_legacy_scan)
+
+    unreachable_legacy_helper = ast.parse(
+        '''
+def _unused_legacy_recommendations(session):
+    proposals = session.scalars(select(InterviewReviewProposal))
+    return [_proposal_focuses(proposal) for proposal in proposals]
+class AdaptivePracticeRepository:
+    def list_recommendations(self):
+        return session.scalars(select(AdaptivePracticePlan))
+    def start(self, readiness_signal_version_id, target_application_event_id):
+        return readiness_signal_version_id, target_application_event_id
+'''
+    )
+    assert not _proposal_drives_practice(unreachable_legacy_helper)
 
 
 def test_review_to_readiness_production_cutover_gate() -> None:

@@ -26,7 +26,7 @@ export const OPPORTUNITY_FIT_COPY = {
     humanConfirmationDescription: 'AI 只生成带证据引用的分析，不会自动接受、投递或访问外部招聘平台。',
     startTriage: '开始快速判断',
     sourceFrozen: '已保留当时版本',
-    sourceChanged: '原资料已更新，本次结果仍使用旧版',
+    sourceChanged: '来源已更新，已有结果仍保留',
     triage: '快速判断',
     hardConstraints: '岗位约束',
     fitSignals: '候选人匹配信号',

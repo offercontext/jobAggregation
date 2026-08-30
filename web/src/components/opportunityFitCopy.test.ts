@@ -17,7 +17,7 @@ describe('opportunity fit copy', () => {
     expect(OPPORTUNITY_FIT_COPY.drawer.startDeepReview).toBe('开始深入分析');
     expect(OPPORTUNITY_FIT_COPY.drawer.deepReview).toBe('深入分析');
     expect(OPPORTUNITY_FIT_COPY.drawer.sourceFrozen).toBe('已保留当时版本');
-    expect(OPPORTUNITY_FIT_COPY.drawer.sourceChanged).toBe('原资料已更新，本次结果仍使用旧版');
+    expect(OPPORTUNITY_FIT_COPY.drawer.sourceChanged).toBe('来源已更新，已有结果仍保留');
   });
 
   it('maps a provider 502 to safe configuration copy', () => {

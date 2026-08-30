@@ -4,8 +4,6 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import AppShell from './AppShell';
 
-const mockServices = vi.hoisted(() => ({ discard: vi.fn() }));
-
 vi.mock('@tanstack/react-query', () => ({
   useMutation: () => ({ isPending: false, mutate: vi.fn() }),
   useQuery: () => ({ data: [], isError: false, isLoading: false, isFetching: false, error: null }),
@@ -30,7 +28,6 @@ vi.mock('antd', () => {
 vi.mock('@/services/applicationJdVersions', () => ({
   getCurrentApplicationJd: vi.fn().mockResolvedValue({ current: { id: 4, jd_text: '后端工程师 JD' } }),
 }));
-vi.mock('@/services/mockInterviews', () => ({ discardMockInterviewAttempt: mockServices.discard }));
 vi.mock('./Sidebar', () => ({
   default: (props: { onChange: (view: string) => void }) => <nav>
     <button type="button" data-testid="nav-interview" onClick={() => props.onChange('interview')}>面试</button>
@@ -54,7 +51,6 @@ vi.mock('@/components/SettingsView', () => ({ default: () => <div /> }));
 vi.mock('@/features/dashboard/DashboardView', () => ({ default: () => <div /> }));
 vi.mock('@/features/reminders/RemindersView', () => ({ default: () => <div /> }));
 vi.mock('@/components/OfferNegotiationDrawer', () => ({ default: () => <div /> }));
-vi.mock('@/components/InterviewStoryLibraryView', () => ({ default: () => <div /> }));
 vi.mock('@/components/InterviewStoryDrawer', () => ({
   createInterviewStoryDraft: () => ({}), default: () => <div />,
 }));
@@ -63,7 +59,6 @@ vi.mock('@/features/pilot/PilotAttachmentContext', () => ({
   usePilotAttachmentStore: () => ({ addAttachment: vi.fn(), createNewDraftWithAttachment: vi.fn() }),
 }));
 vi.mock('@/features/pilot/attachmentHandoff', () => ({ retainPilotAttachmentKey: (_current: unknown, next: unknown) => next }));
-vi.mock('@/features/pilot/PilotOpportunityFitCard', () => ({ default: () => <div /> }));
 vi.mock('@/features/pilot/PilotOpportunityFitV2Card', () => ({ default: () => <div /> }));
 vi.mock('@/features/pilotMascot/PilotMascot', () => ({ default: () => <div /> }));
 vi.mock('@/components/InterviewV01View', () => ({
@@ -72,39 +67,43 @@ vi.mock('@/components/InterviewV01View', () => ({
   ),
 }));
 
-const recommendation = {
-  focus_kind: 'long_pause_control',
-  title: '减少长停顿',
-  reason: '连续长停顿仍较明显',
-  source_snapshot_ids: [17, 16],
-  source_snapshot_id: 17,
-  application_id: 5,
-  event_id: 9,
-  question_text: '请介绍一次线上故障处理经历。',
-  source_available: true,
-};
-
 vi.mock('@/components/VoiceCoachingGrowthView', () => ({
-  default: (props: { onBack: () => void; onPractice: (input: typeof recommendation) => void }) => (
+  default: (props: { onBack: () => void; onPractice: (input: unknown) => void }) => (
     <section data-testid="voice-growth-view">
       <button type="button" data-testid="back-growth" onClick={props.onBack}>返回</button>
-      <button type="button" data-testid="practice-growth" onClick={() => props.onPractice(recommendation)}>再练一次</button>
+      <button type="button" data-testid="practice-growth" onClick={() => props.onPractice({ focus_kind: 'long_pause_control' })}>再练一次</button>
     </section>
   ),
 }));
-vi.mock('@/components/MockInterviewDrawer', () => ({
-  default: (props: {
-    draft: { attemptId?: number | null; voicePracticeFocus?: { title?: string } | null };
-    onDraftChange: (patch: Record<string, unknown>) => void;
-    onClose: () => void;
-  }) => (
-    <section>
-      <output data-testid="mock-focus" data-attempt-id={props.draft.attemptId ?? 'none'}>{props.draft.voicePracticeFocus?.title ?? 'none'}</output>
-      <button type="button" data-testid="mark-voice-saved" onClick={() => props.onDraftChange({ attemptId: 41, hasSavedVoiceCoachingSnapshot: true })}>saved</button>
-      <button type="button" data-testid="mark-voice-confirmed-only" onClick={() => props.onDraftChange({ attemptId: 40, answerSubmitted: false, hasSubmittedVoiceAnswer: false, voiceCoachingReview: { turnNo: 1, saveState: 'idle' } })}>confirmed only</button>
-      <button type="button" data-testid="mark-voice-skipped" onClick={() => props.onDraftChange({ attemptId: 42, answerSubmitted: true, hasSubmittedVoiceAnswer: true, voiceCoachingReview: null })}>skipped</button>
-      <button type="button" data-testid="mark-voice-unknown" onClick={() => props.onDraftChange({ attemptId: 43, answerSubmitted: true, hasSubmittedVoiceAnswer: true, voiceCoachingReview: { turnNo: 1, saveState: 'unknown' } })}>unknown</button>
-      <button type="button" data-testid="close-mock" onClick={props.onClose}>close</button>
+// Free practice now has one canonical owner: AppShell opens the readiness
+// center, which hands a frozen context to InterviewStudio.  Mock both lazy
+// boundaries so this test only verifies that composition-root wiring.
+vi.mock('@/features/interviewReadiness/InterviewReadinessCenter', () => ({
+  default: (props: { fixedMode?: string; onOpenStudio?: (context: unknown) => void }) => (
+    <section data-testid="interview-readiness-center" data-readiness-mode={props.fixedMode ?? 'real'}>
+      <button
+        type="button"
+        data-testid="open-quick-studio"
+        onClick={() => props.onOpenStudio?.({
+          kind: 'quick_practice',
+          caseId: 101,
+          positionName: '后端工程师',
+          jdText: '已确认的岗位资料',
+          resumeId: 11,
+        })}
+      >进入练习工作台</button>
+    </section>
+  ),
+}));
+vi.mock('@/features/interviewStudio/InterviewStudio', () => ({
+  default: (props: { context: { kind: string; caseId?: number; positionName?: string }; onClose: () => void }) => (
+    <section
+      data-testid="interview-studio"
+      data-context-kind={props.context.kind}
+      data-case-id={props.context.caseId ?? 'none'}
+    >
+      <output data-testid="studio-position">{props.context.positionName ?? 'none'}</output>
+      <button type="button" data-testid="close-studio" onClick={props.onClose}>关闭工作台</button>
     </section>
   ),
 }));
@@ -128,7 +127,6 @@ beforeEach(() => {
   host = document.createElement('div');
   document.body.appendChild(host);
   root = createRoot(host);
-  mockServices.discard.mockReset();
 });
 
 afterEach(async () => {
@@ -138,7 +136,7 @@ afterEach(async () => {
 });
 
 describe('AppShell voice coaching navigation', () => {
-  it('opens the same read-only growth view from Interview and Pilot, then hands focus to a new mock draft', async () => {
+  it('opens the same read-only growth view from Interview and Pilot, then hands off through the canonical readiness owner', async () => {
     await act(async () => root.render(<AppShell />));
     await flush();
 
@@ -149,12 +147,14 @@ describe('AppShell voice coaching navigation', () => {
     expect(host.querySelector('[data-testid="voice-growth-view"]')).not.toBeNull();
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="practice-growth"]')?.click());
     await flush();
-    expect(host.querySelector('[data-testid="mock-focus"]')?.textContent).toBe('减少长停顿');
-    act(() => host.querySelector<HTMLButtonElement>('[data-testid="mark-voice-saved"]')?.click());
-    act(() => host.querySelector<HTMLButtonElement>('[data-testid="close-mock"]')?.click());
+    expect(host.querySelector('[data-testid="interview-readiness-center"]')?.getAttribute('data-readiness-mode')).toBe('quick');
+    act(() => host.querySelector<HTMLButtonElement>('[data-testid="open-quick-studio"]')?.click());
     await flush();
-    expect(mockServices.discard).not.toHaveBeenCalled();
-    expect(host.querySelector('[data-testid="mock-focus"]')).toBeNull();
+    expect(host.querySelector('[data-testid="interview-studio"]')?.getAttribute('data-context-kind')).toBe('quick_practice');
+    expect(host.querySelector('[data-testid="interview-studio"]')?.getAttribute('data-case-id')).toBe('101');
+    act(() => host.querySelector<HTMLButtonElement>('[data-testid="close-studio"]')?.click());
+    await flush();
+    expect(host.querySelector('[data-testid="interview-studio"]')).toBeNull();
 
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="nav-pilot"]')?.click());
     await flush();
@@ -163,31 +163,10 @@ describe('AppShell voice coaching navigation', () => {
     expect(host.querySelector('[data-testid="voice-growth-view"]')).not.toBeNull();
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="practice-growth"]')?.click());
     await flush();
-    expect(host.querySelector('[data-testid="mock-focus"]')?.getAttribute('data-attempt-id')).toBe('none');
+    expect(host.querySelector('[data-testid="interview-readiness-center"]')?.getAttribute('data-readiness-mode')).toBe('quick');
   });
 
-  it.each(['mark-voice-skipped', 'mark-voice-unknown'])(
-    'preserves an already submitted voice answer when closing after %s',
-    async (action) => {
-      await act(async () => root.render(<AppShell />));
-      await flush();
-      act(() => host.querySelector<HTMLButtonElement>('[data-testid="nav-interview"]')?.click());
-      await flush();
-      act(() => host.querySelector<HTMLButtonElement>('[data-testid="open-ui-growth"]')?.click());
-      await flush();
-      act(() => host.querySelector<HTMLButtonElement>('[data-testid="practice-growth"]')?.click());
-      await flush();
-      act(() => host.querySelector<HTMLButtonElement>(`[data-testid="${action}"]`)?.click());
-      act(() => host.querySelector<HTMLButtonElement>('[data-testid="close-mock"]')?.click());
-      await flush();
-
-      expect(mockServices.discard).not.toHaveBeenCalled();
-      expect(host.querySelector('[data-testid="mock-focus"]')).toBeNull();
-    },
-  );
-
-  it('discards a voice transcript that was confirmed locally but never submitted', async () => {
-    mockServices.discard.mockResolvedValue(undefined);
+  it('keeps the composition root write-free while the canonical studio owns close', async () => {
     await act(async () => root.render(<AppShell />));
     await flush();
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="nav-interview"]')?.click());
@@ -196,14 +175,16 @@ describe('AppShell voice coaching navigation', () => {
     await flush();
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="practice-growth"]')?.click());
     await flush();
-    act(() => host.querySelector<HTMLButtonElement>('[data-testid="mark-voice-confirmed-only"]')?.click());
-    act(() => host.querySelector<HTMLButtonElement>('[data-testid="close-mock"]')?.click());
+    expect(host.querySelector('[data-testid="interview-readiness-center"]')).not.toBeNull();
+    expect(host.querySelector('[data-testid="interview-studio"]')).toBeNull();
+    act(() => host.querySelector<HTMLButtonElement>('[data-testid="open-quick-studio"]')?.click());
     await flush();
-
-    expect(mockServices.discard).toHaveBeenCalledWith({ applicationId: 5, eventId: 9, attemptId: 40 });
+    act(() => host.querySelector<HTMLButtonElement>('[data-testid="close-studio"]')?.click());
+    await flush();
+    expect(host.querySelector('[data-testid="interview-studio"]')).toBeNull();
   });
 
-  it('keeps an unknown voice-save draft when focused practice is opened again for the same event', async () => {
+  it('reopens the same canonical preparation route after the studio closes', async () => {
     await act(async () => root.render(<AppShell />));
     await flush();
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="nav-interview"]')?.click());
@@ -212,8 +193,10 @@ describe('AppShell voice coaching navigation', () => {
     await flush();
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="practice-growth"]')?.click());
     await flush();
-    act(() => host.querySelector<HTMLButtonElement>('[data-testid="mark-voice-unknown"]')?.click());
-    act(() => host.querySelector<HTMLButtonElement>('[data-testid="close-mock"]')?.click());
+    act(() => host.querySelector<HTMLButtonElement>('[data-testid="open-quick-studio"]')?.click());
+    await flush();
+    expect(host.querySelector('[data-testid="interview-studio"]')?.getAttribute('data-case-id')).toBe('101');
+    act(() => host.querySelector<HTMLButtonElement>('[data-testid="close-studio"]')?.click());
     await flush();
 
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="nav-interview"]')?.click());
@@ -222,8 +205,6 @@ describe('AppShell voice coaching navigation', () => {
     await flush();
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="practice-growth"]')?.click());
     await flush();
-
-    expect(host.querySelector('[data-testid="mock-focus"]')?.getAttribute('data-attempt-id')).toBe('43');
-    expect(mockServices.discard).not.toHaveBeenCalled();
+    expect(host.querySelector('[data-testid="interview-readiness-center"]')?.getAttribute('data-readiness-mode')).toBe('quick');
   });
 });

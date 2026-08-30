@@ -50,16 +50,18 @@ vi.mock('@/features/pilot/PilotAttachmentContext', () => ({
   usePilotAttachmentStore: () => ({ addAttachment: vi.fn(), createNewDraftWithAttachment: vi.fn() }),
 }));
 vi.mock('@/features/pilot/attachmentHandoff', () => ({ retainPilotAttachmentKey: (_current: unknown, next: unknown) => next }));
-vi.mock('@/features/pilot/PilotOpportunityFitCard', () => ({ default: () => <div /> }));
 vi.mock('@/features/pilot/PilotOpportunityFitV2Card', () => ({ default: () => <div /> }));
-vi.mock('@/components/MockInterviewDrawer', () => ({ default: () => <div /> }));
 vi.mock('@/components/OfferNegotiationDrawer', () => ({ default: () => <div /> }));
 vi.mock('@/components/InterviewV01View', () => ({
   default: (props: { onOpenStoryLibrary: (noteId?: number) => void }) => (
     <button type="button" data-testid="open-ui-story" onClick={() => props.onOpenStoryLibrary(7)}>整理为故事</button>
   ),
 }));
-vi.mock('@/components/InterviewStoryLibraryView', () => ({
+// AppShell's reviews/interview-story surface is the canonical
+// ExperienceMaterialsView wrapper.  Keep the test focused on the AppShell
+// handoff while replacing that lazy boundary, rather than mocking the
+// retired library entrypoint directly.
+vi.mock('@/components/ExperienceMaterialsView', () => ({
   default: (props: { onOpenDraft: (input: { entrypoint: 'ui'; reviewNoteId: number }) => void }) => (
     <button type="button" data-testid="library-open-ui-story" onClick={() => props.onOpenDraft({ entrypoint: 'ui', reviewNoteId: 7 })}>新建故事</button>
   ),

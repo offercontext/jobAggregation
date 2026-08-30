@@ -521,7 +521,7 @@ export default function InterviewStudio({ context, onClose, onActivityChange, on
       });
       if (requestId !== startRequestRef.current || !isBusinessRequestCurrent(businessGeneration)) return;
       if (!isTurnResponse(result)) {
-        const message = '第一题结果待确认，输入已冻结。请使用原 key 重试。';
+        const message = '第一题结果待确认，输入已冻结。请使用原尝试恢复。';
         persistStudioStartRecovery(message);
         setStartError(message);
         const retryAfterMs = 'retry_after_ms' in result && typeof result.retry_after_ms === 'number'
@@ -637,7 +637,7 @@ export default function InterviewStudio({ context, onClose, onActivityChange, on
       if (!isBusinessRequestCurrent(businessGeneration)) return false;
       const response = (error as { response?: { status?: number } } | null)?.response;
       if (response?.status === 409) {
-        setVoiceReview((current) => current ? { ...current, saveState: 'conflict', saveError: '表达复盘已存在不同内容，原保存 key 无法覆盖历史快照。' } : current);
+        setVoiceReview((current) => current ? { ...current, saveState: 'conflict', saveError: '表达复盘已存在不同内容，原保存尝试无法覆盖历史快照。' } : current);
       } else if (response?.status === 422) {
         setVoiceReview((current) => current ? { ...current, saveState: 'invalid', saveError: '表达复盘数据未通过校验，回答已提交，可继续文本面试。' } : current);
       } else {
@@ -960,7 +960,7 @@ export default function InterviewStudio({ context, onClose, onActivityChange, on
             </div>
           ) : startError ? (
             <div className={styles.studioStatus} data-interview-studio-status>
-              <Alert className={styles.alert} type="warning" showIcon message={startError} action={<Button size="small" onClick={retry} disabled={working}>使用原 key 重试</Button>} />
+              <Alert className={styles.alert} type="warning" showIcon message={startError} action={<Button size="small" onClick={retry} disabled={working}>使用原尝试恢复</Button>} />
             </div>
           ) : terminalFailure ? (
             <div ref={studioStatusRef} className={styles.studioStatus} data-interview-studio-status tabIndex={-1}>
@@ -980,7 +980,7 @@ export default function InterviewStudio({ context, onClose, onActivityChange, on
             </div>
           ) : state?.phase === 'result_unknown' && state.error ? (
             <div ref={studioStatusRef} className={styles.studioStatus} data-interview-studio-status tabIndex={-1}>
-              <Alert className={styles.alert} type="warning" showIcon message={state.error} action={<Button size="small" onClick={retry} disabled={working}>使用原 key 重试</Button>} />
+              <Alert className={styles.alert} type="warning" showIcon message={state.error} action={<Button size="small" onClick={retry} disabled={working}>使用原尝试恢复</Button>} />
             </div>
           ) : state?.error ? (
             <div className={styles.studioStatus} data-interview-studio-status>
@@ -1026,7 +1026,7 @@ export default function InterviewStudio({ context, onClose, onActivityChange, on
               {!timeline.length ? <div className={styles.loadingTurn}><span className={styles.loader} />正在创建冻结 Attempt…</div> : null}
             </div>
             {state?.phase === 'next_question_generating' ? <div className={styles.generating} role="status" aria-live="polite"><span className={styles.loader} />正在根据已确认回答准备下一题…</div> : null}
-            {voiceReview?.saveState === 'unknown' ? <Alert className={styles.alert} type="warning" showIcon message="表达复盘保存结果待确认，原保存 key 已保留。" action={<Button size="small" onClick={() => void retryVoiceReview()} disabled={working}>使用原 key 重试</Button>} /> : null}
+            {voiceReview?.saveState === 'unknown' ? <Alert className={styles.alert} type="warning" showIcon message="表达复盘保存结果待确认，原保存尝试已保留。" action={<Button size="small" onClick={() => void retryVoiceReview()} disabled={working}>使用原尝试恢复</Button>} /> : null}
             {voiceReview?.saveError ? <Alert className={styles.alert} type="warning" showIcon message={voiceReview.saveError} /> : null}
             {state?.phase === 'completed' && !proposal ? <div className={styles.completeCard}><CheckCircleOutlined /><div><strong>本轮已完成</strong><span>你可以结束并生成复盘，或退出保留已确认的回答。</span></div></div> : null}
             {proposal ? <section ref={feedbackResultRef} tabIndex={-1} data-interview-feedback-result className={styles.feedbackCard} aria-label="复盘建议"><span className={styles.kicker}>复盘建议</span><h2>{feedbackIsSafeEmpty ? '复盘已完成' : '复盘建议已准备好'}</h2><p>{feedbackIsSafeEmpty ? '本轮没有生成可验证的复盘建议；已确认回答仍然保留。' : '建议只来自本次已确认回答与冻结来源。正式投递和快速练习会保持各自的来源边界。'}</p>{feedbackItems.length ? <ul>{feedbackItems.map((item) => <li key={item.id}>{item.text}</li>)}</ul> : null}</section> : null}

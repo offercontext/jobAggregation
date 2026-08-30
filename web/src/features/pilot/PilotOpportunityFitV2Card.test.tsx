@@ -67,7 +67,7 @@ describe('PilotOpportunityFitV2Card', () => {
     });
     expect(container.textContent).toContain('基于冻结资料的摘要');
     expect(container.textContent).toContain('历史摘要');
-    expect(container.textContent).toContain('原资料已更新，本次结果仍使用旧版');
+    expect(container.textContent).toContain('来源已更新，已有结果仍保留');
     expect(container.textContent).not.toContain('v2:7:42');
     expect(onOpenTask).not.toHaveBeenCalled();
   });

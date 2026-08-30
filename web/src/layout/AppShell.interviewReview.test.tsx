@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { resolveExecutableInterviewTask, resolvePilotInterviewReviewIntent } from './AppShell';
 import appShellSource from './AppShell.tsx?raw';
-import pilotCardSource from '@/features/pilot/PilotOpportunityFitCard.tsx?raw';
+import pilotCardSource from '@/features/pilot/PilotOpportunityFitV2Card.tsx?raw';
 
 describe('Pilot interview review navigation', () => {
   it('keeps application-only intents in a chooser and accepts only an exact event', () => {

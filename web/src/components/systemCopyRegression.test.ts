@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { MATERIAL_FLOW_COPY } from './materialFlowCopy';
 import { OPPORTUNITY_FIT_COPY } from './opportunityFitCopy';
 import nextStepSuggestions from './NextStepSuggestions.tsx?raw';
+import interviewStudioSource from '@/features/interviewStudio/InterviewStudio.tsx?raw';
 
 const LEGACY_FIXED_PHRASES = [
   'AI recommendation',
@@ -38,5 +39,12 @@ describe('controlled proposal copy stays localized', () => {
     }
     expect(nextStepSuggestions).not.toMatch(/@\/services\//);
     expect(nextStepSuggestions).not.toContain('localStorage');
+  });
+
+  it('keeps retry recovery copy user-facing rather than exposing internal keys', () => {
+    expect(interviewStudioSource).not.toContain('原 key');
+    expect(interviewStudioSource).not.toContain('原保存 key');
+    expect(interviewStudioSource).toContain('使用原尝试恢复');
+    expect(interviewStudioSource).toContain('原保存尝试');
   });
 });

@@ -321,7 +321,7 @@ describe('InterviewStudio continuous voice integration', () => {
     expect(status?.textContent).toContain('复盘结果待确认，已保留原 feedback key');
     expect(status?.closest('[data-interview-conversation-scroll]')).toBeNull();
     expect(document.activeElement).toBe(status);
-    expect(host!.textContent).toContain('使用原 key 重试');
+    expect(host!.textContent).toContain('使用原尝试恢复');
     expect(serviceSpies.finish).toHaveBeenCalledTimes(1);
   });
 
@@ -348,7 +348,7 @@ describe('InterviewStudio continuous voice integration', () => {
     await act(async () => { await Promise.resolve(); });
 
     expect(host!.textContent).toContain('下一题结果待确认，已保留原 question key');
-    expect(host!.textContent).toContain('使用原 key 重试');
+    expect(host!.textContent).toContain('使用原尝试恢复');
     expect(host!.textContent).not.toContain('重新开始练习');
     expect(serviceSpies.discard).not.toHaveBeenCalled();
   });
@@ -372,7 +372,7 @@ describe('InterviewStudio continuous voice integration', () => {
     await act(async () => { button('确认录音文字').click(); await Promise.resolve(); });
     await act(async () => { await Promise.resolve(); });
 
-    expect(host!.textContent).not.toContain('使用原 key 重试');
+    expect(host!.textContent).not.toContain('使用原尝试恢复');
     expect(host!.textContent).toContain('重新开始练习');
     await act(async () => { button('重新开始练习').click(); await Promise.resolve(); });
     await act(async () => { await Promise.resolve(); });
@@ -406,7 +406,7 @@ describe('InterviewStudio continuous voice integration', () => {
     await act(async () => { await Promise.resolve(); });
 
     expect(host!.textContent).toContain('AI 输出未通过证据验证');
-    expect(host!.textContent).not.toContain('使用原 key 重试');
+    expect(host!.textContent).not.toContain('使用原尝试恢复');
     await act(async () => { button('重新开始练习').click(); await Promise.resolve(); });
     await act(async () => { await Promise.resolve(); });
 
@@ -618,7 +618,7 @@ describe('InterviewStudio continuous voice integration', () => {
       await Promise.resolve();
     });
     expect(serviceSpies.start).not.toHaveBeenCalled();
-    await act(async () => { button('使用原 key 重试').click(); await Promise.resolve(); });
+    await act(async () => { button('使用原尝试恢复').click(); await Promise.resolve(); });
     await act(async () => { await Promise.resolve(); });
     expect(serviceSpies.answer).toHaveBeenCalledWith(expect.objectContaining({
       attemptId: 41,
@@ -662,7 +662,7 @@ describe('InterviewStudio continuous voice integration', () => {
       await Promise.resolve();
     });
     expect(serviceSpies.start).toHaveBeenCalledTimes(1);
-    await act(async () => { button('使用原 key 重试').click(); await Promise.resolve(); });
+    await act(async () => { button('使用原尝试恢复').click(); await Promise.resolve(); });
     await act(async () => { await Promise.resolve(); });
     expect(serviceSpies.start).toHaveBeenCalledWith(expect.objectContaining({ attemptKey: stored.attemptKey, questionKey: stored.questionKey }));
     expect(window.sessionStorage.getItem('offerpilot:interview-studio:start-recovery:real:7:8')).toBeNull();

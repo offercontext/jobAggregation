@@ -21,7 +21,22 @@ vi.mock('@tanstack/react-query', () => ({
     const key = options.queryKey?.[0];
     const dataByKey: Record<string, unknown> = {
       applications: [app],
-      events: [{ id: 11, application_id: 7, event_type: 'interview' }],
+      events: [{
+        id: 11,
+        application_id: 7,
+        event_type: 'interview',
+        subtype: 'technical',
+        tags: [],
+        round: 1,
+        // Keep the fixture executable under the canonical lifecycle/card
+        // gate used by exact task launches.
+        scheduled_at: '2099-01-01T09:00:00Z',
+        duration_minutes: 60,
+        location: '线上',
+        notes: '',
+        status: 'todo',
+        created_at: '2026-01-01T00:00:00Z',
+      }],
       offers: [],
       questions: undefined,
     };
@@ -97,9 +112,6 @@ vi.mock('@/components/InterviewV01View', () => ({
     </section>
   ),
 }));
-vi.mock('@/features/pilot/PilotOpportunityFitCard', () => ({
-  default: (props: any) => <section data-testid="pilot-opportunity-fit-card" data-draft-key={props.draft.pilotDraftKey} data-application-id={props.draft.applicationId} />,
-}));
 vi.mock('@/features/pilot/PilotOpportunityFitV2Card', () => ({
   default: (props: any) => (
     <section
@@ -109,6 +121,15 @@ vi.mock('@/features/pilot/PilotOpportunityFitV2Card', () => ({
     >
       <button type="button" data-testid="open-pilot-owner" onClick={props.onOpenTask}>打开岗位判断</button>
     </section>
+  ),
+}));
+vi.mock('@/features/interviewReadiness/InterviewReadinessCenter', () => ({
+  default: (props: any) => (
+    <section
+      data-testid="interview-readiness-center"
+      data-application-id={props.lockedEvent?.applicationId ?? 'none'}
+      data-event-id={props.lockedEvent?.eventId ?? 'none'}
+    />
   ),
 }));
 vi.mock('@/components/ChatPanel', () => ({
@@ -284,7 +305,7 @@ describe('AppShell evidence navigation', () => {
     expect(view.querySelector('[data-testid="offer-focus"]')?.textContent).toBe('none');
   });
 
-  it('opens the native preparation drawer for the selected interview event from the top-level index', async () => {
+  it('opens the canonical preparation center for the selected interview event from the top-level index', async () => {
     const view = render(<AppShell />);
     await flush();
 
@@ -293,9 +314,9 @@ describe('AppShell evidence navigation', () => {
     act(() => view.querySelector<HTMLButtonElement>('[data-testid="open-interview-preparation"]')?.click());
     await flush();
 
-    const drawer = view.querySelector('[data-testid="interview-preparation-drawer"]');
-    expect(drawer?.getAttribute('data-application-id')).toBe('7');
-    expect(drawer?.getAttribute('data-event-id')).toBe('11');
+    const preparation = view.querySelector('[data-testid="interview-readiness-center"]');
+    expect(preparation?.getAttribute('data-application-id')).toBe('7');
+    expect(preparation?.getAttribute('data-event-id')).toBe('11');
   });
 
   it('clears an errored evidence target when the user leaves its destination', async () => {

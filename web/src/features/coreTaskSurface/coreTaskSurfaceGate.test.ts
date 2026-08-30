@@ -63,6 +63,57 @@ const CANONICAL_LAUNCH_NAMES = new Set([
   'openTaskSurface',
 ]);
 
+/**
+ * The baseline manifest deliberately includes both launchers and the task
+ * surfaces they used to render.  A surface owner is allowed to contain its
+ * task-local write handlers; it is not itself required to call the controller.
+ * Keep this allowlist exact so a newly introduced component cannot become an
+ * owner merely by sharing a name with one of these legacy surfaces.
+ */
+const CORE_TASK_OWNER_SURFACES = new Map<string, string>([
+  ['web/src/components/OpportunityFitReviewDrawer.tsx#OpportunityFitReviewDrawer', 'application.opportunity_fit'],
+  ['web/src/components/MaterialKitDrawer.tsx#MaterialKitDrawer', 'application.material_kit'],
+  ['web/src/components/InterviewPreparationProposalDrawer.tsx#InterviewPreparationProposalDrawer', 'application.interview_prepare'],
+  ['web/src/components/InterviewReviewProposalDrawer.tsx#InterviewReviewProposalDrawer', 'application.interview_review'],
+  ['web/src/components/ReviewFormDrawer.tsx#ReviewFormDrawer', 'application.general_review'],
+  ['web/src/components/ApplicationOutcomeDrawer.tsx#ApplicationOutcomeDrawer', 'application.record_outcome'],
+  ['web/src/components/OfferNegotiationDrawer.tsx#OfferNegotiationDrawer', 'application.offer_review'],
+  ['web/src/features/interviewReadiness/InterviewReadinessCenter.tsx#InterviewReadinessCenter.startQuickPractice', 'interview.free_practice'],
+  ['web/src/features/interviewStudio/InterviewStudio.tsx#InterviewStudio', 'interview.free_practice'],
+  ['web/src/components/QuestionBankView.tsx#QuestionBankView', 'interview.free_practice'],
+  ['web/src/components/ResumeEditorDrawer.tsx#ResumeEditorDrawer', 'materials.resume'],
+  ['web/src/components/InterviewStoryDrawer.tsx#InterviewStoryDrawer', 'materials.story'],
+  ['web/src/components/InterviewStoryLibraryView.tsx#InterviewStoryLibraryView.openStory', 'materials.story'],
+  ['web/src/components/KnowledgeSourcesView.tsx#KnowledgeSourcesView.SourceDetailPanel', 'materials.reference'],
+  ['web/src/layout/AppShell.tsx#AppShellContent.openInterviewStoryDraft', 'materials.story'],
+  ['web/src/layout/AppShell.tsx#AppShellContent.openPilotInterviewPreparation', 'application.interview_prepare'],
+]);
+
+const PILOT_PROJECTION_FORBIDDEN_NAMES = new Set([
+  'draft',
+  'dispatch',
+  'resumes',
+  'resumeEvidenceProof',
+  'onChange',
+  'onStartTriage',
+  'onRetryTriage',
+  'onConfirmTriage',
+  'onStartDeepReview',
+  'onViewHistory',
+  'onViewLegacyHistory',
+  'onStartNew',
+  'onPrepareMaterials',
+  'onOpenInterviewReview',
+  'onOpenInterviewPreparation',
+  'onOpenMockInterview',
+  'onCancel',
+  'retry',
+  'useMutation',
+  'fetch',
+]);
+
+const PILOT_PROJECTION_FORBIDDEN_MODULE = /(?:^|\/|:)services(?:\/|$)|(?:^|\/)api(?:\/|$)|axios|mutation/i;
+
 type Asset = {
   schema_version: number;
   source_baseline: string;
@@ -931,6 +982,62 @@ function callsCanonicalLauncher(
   return found;
 }
 
+function functionHasIdentifier(
+  functionLike: FunctionLikeWithBody,
+  names: ReadonlySet<string>,
+): boolean {
+  if (!functionLike.body) return false;
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    if (found) return;
+    if (ts.isIdentifier(node) && names.has(node.text)) {
+      found = true;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(functionLike.body, visit);
+  return found;
+}
+
+function sourceHasForbiddenProjectionImport(sourceFile: ts.SourceFile): boolean {
+  return sourceFile.statements.some((statement) => (
+    ts.isImportDeclaration(statement)
+    && ts.isStringLiteral(statement.moduleSpecifier)
+    && PILOT_PROJECTION_FORBIDDEN_MODULE.test(statement.moduleSpecifier.text)
+  ));
+}
+
+function functionParameterNames(functionLike: FunctionLikeWithBody): Set<string> {
+  return new Set(functionLike.parameters.flatMap((parameter) => bindingNames(parameter.name)));
+}
+
+/**
+ * A cutover may keep a present function only when it is the known, read-only
+ * Pilot projection.  A deleted function is still accepted through the exact
+ * registry cutover mapping, but a live function cannot use a cutover entry to
+ * hide mutation callbacks, service imports, or a second owner.
+ */
+function isPurePilotProjectionCutover(
+  sourceFile: ts.SourceFile,
+  functionLike: FunctionLikeWithBody,
+  entry: Entrypoint,
+): boolean {
+  if (entry.file !== 'web/src/features/pilot/PilotOpportunityFitV2Card.tsx'
+    || entry.qualified_symbol !== 'PilotOpportunityFitV2Card'
+    || entry.task_id !== 'application.opportunity_fit') return false;
+  if (sourceHasForbiddenProjectionImport(sourceFile)) return false;
+  const parameters = functionParameterNames(functionLike);
+  const allowedParameters = new Set(['status', 'summary', 'history', 'historyState', 'onOpenTask']);
+  if (!parameters.has('onOpenTask') || [...parameters].some((name) => !allowedParameters.has(name))) return false;
+  return !functionHasIdentifier(functionLike, PILOT_PROJECTION_FORBIDDEN_NAMES);
+}
+
+function isKnownOwnerSurface(entry: Entrypoint): boolean {
+  return entry.category === 'core_task'
+    && CORE_TASK_OWNER_SURFACES.get(`${entry.file}#${entry.qualified_symbol}`) === entry.task_id;
+}
+
 function findExportedTypeAlias(sourceFile: ts.SourceFile, name: string): ts.TypeAliasDeclaration | null {
   return sourceFile.statements.find(
     (statement): statement is ts.TypeAliasDeclaration => (
@@ -1175,6 +1282,8 @@ function entrypointHasAudit(
   const currentFunction = findFunctionByQualifiedPath(current.sourceFile, entry.qualified_symbol);
   if (!currentFunction) return isExplicitCutover;
   if (entry.category !== 'core_task') return true;
+  if (isKnownOwnerSurface(entry)) return true;
+  if (isExplicitCutover) return isPurePilotProjectionCutover(current.sourceFile, currentFunction, entry);
   return callsCanonicalLauncher(current.sourceFile, currentFunction);
 }
 
@@ -1351,7 +1460,9 @@ function auditManifest(
       artifact.path === item.file && artifact.parseDiagnostics.length > 0
     ))
     || productionArtifacts.some((artifact) => (
-      sourceIsUsable(artifact) && sourceHasVisibleText(artifact.sourceFile, item.lexeme)
+      artifact.path === item.file
+      && sourceIsUsable(artifact)
+      && sourceHasVisibleText(artifact.sourceFile, item.lexeme)
     ))
   ));
   if (copyAuditResults.some((forbidden) => forbidden)) violations.push('copy:forbidden-lexeme');
@@ -1423,7 +1534,7 @@ describe('core task surface baseline gate', () => {
         ['web/src/features/materialSurfaces/materialClassification.ts', `const fake = '${fakeText}';`],
         ['web/src/features/materialSurfaces/resumeLineage.ts', `const fake = '${fakeText}';`],
         ['web/src/features/materialSurfaces/materialLabels.ts', `const fake = '${fakeText}';`],
-        ['web/src/unrelated.ts', 'const oldCopy = "旧版评估";'],
+        ['web/src/features/pilot/PilotOpportunityFitV2Card.tsx', 'const oldCopy = "旧版评估";'],
       ]),
       entrypointCutovers: new Map(),
     });
@@ -1621,6 +1732,40 @@ function OtherContainer() {
         taskId: 'materials.story',
       }]]),
     })).toBe(false);
+  });
+
+  it('does not let a live cutover hide Pilot mutation callbacks', () => {
+    const root = repositoryRoot();
+    const entry = entrypointsFromAsset(readAssets(root).assets.get(ASSET_NAMES[0])).find((candidate) => (
+      candidate.qualified_symbol === 'PilotOpportunityFitV2Card'
+    ));
+    expect(entry).toBeDefined();
+    if (!entry) return;
+
+    const sources = (body: string): AuditSources => ({
+      productionFiles: new Map([['web/src/features/pilot/PilotOpportunityFitV2Card.tsx', body]]),
+      registrySource: null,
+      contractsSource: null,
+      controllerSource: null,
+      entrypointCutovers: new Map([[entry.qualified_symbol, {
+        category: entry.category,
+        taskId: entry.task_id,
+      }]]),
+    });
+    const pureProjection = `export default function PilotOpportunityFitV2Card({ status, summary, history, historyState, onOpenTask }: Props) {
+  onOpenTask();
+  return <section>{status}{summary}{historyState}{history.length}</section>;
+}`;
+    expect(entrypointHasAudit(root, entry, sources(pureProjection))).toBe(true);
+
+    const mutationProjection = `import { createOpportunityFitV2Triage } from '@/services/opportunityFitReviews';
+export default function PilotOpportunityFitV2Card({ draft, onStartTriage, onOpenTask }: Props) {
+  onStartTriage(draft);
+  void createOpportunityFitV2Triage(draft);
+  onOpenTask();
+  return null;
+}`;
+    expect(entrypointHasAudit(root, entry, sources(mutationProjection))).toBe(false);
   });
 
   it('accepts only complete canonical AST fixture surfaces', () => {

@@ -755,7 +755,7 @@ describe('OpportunityFitReviewDrawer', () => {
     await waitFor(() => expect(getByRole(view, 'button')).toHaveProperty('disabled', false));
     await click(getByRole(view, 'button', '快速判断'));
     await waitFor(() => expect(state.create).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(view.textContent).toContain('原资料已更新，本次结果仍使用旧版'));
+    await waitFor(() => expect(view.textContent).toContain('来源已更新，已有结果仍保留'));
     expect(onDraftChange).toHaveBeenCalledWith(expect.objectContaining({
       triage: expect.objectContaining({ stage_status: 'source_conflict' }),
       triageKey: null,
@@ -1100,7 +1100,7 @@ describe('OpportunityFitReviewDrawer', () => {
     await click(getByRole(view, 'button', '深入分析'));
     await waitFor(() => expect(state.deepV2).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(state.sourceConflict).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(view.textContent).toContain('原资料已更新，本次结果仍使用旧版'));
+    await waitFor(() => expect(view.textContent).toContain('来源已更新，已有结果仍保留'));
     expect(onDraftChange).toHaveBeenCalledWith(expect.objectContaining({
       deep: expect.objectContaining({ stage_status: 'source_conflict' }),
       deepKey: null,
@@ -1557,7 +1557,7 @@ describe('OpportunityFitReviewDrawer', () => {
       error: null,
     });
 
-    expect(view.textContent).toContain('原资料已更新，本次结果仍使用旧版');
+    expect(view.textContent).toContain('来源已更新，已有结果仍保留');
     expect(view.textContent).not.toContain('loading');
   });
 });

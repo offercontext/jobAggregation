@@ -33,7 +33,7 @@ const STATUS_COPY: Readonly<Record<PilotOpportunityFitProjectionStatus, string>>
 });
 
 function sourceStateCopy(state: OpportunityFitHistoryItem['sourceState']): string {
-  if (state === 'source_changed') return '原资料已更新，本次结果仍使用旧版';
+  if (state === 'source_changed') return '来源已更新，已有结果仍保留';
   if (state === 'unavailable') return '历史记录暂时不可用';
   return '当前来源';
 }

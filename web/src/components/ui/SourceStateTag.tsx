@@ -10,7 +10,7 @@ export interface SourceStateTagProps {
 const labels: Record<SourceState, string> = {
   current: '当前使用来源',
   frozen: '已保留当时版本',
-  changed: '原资料已更新，本次结果仍使用旧版',
+  changed: '来源已更新，已有结果仍保留',
   unknown: '来源暂不可确认',
   pending: '待确认的证据预览',
 };

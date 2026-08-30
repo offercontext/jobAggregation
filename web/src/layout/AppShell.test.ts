@@ -74,17 +74,21 @@ describe('AppShell source contract', () => {
     expect(source).not.toContain('exitPilotContext');
   });
 
-  it('deletes ordinary mock attempts but retains unknown results across drawer unmounts', () => {
-    expect(source).toContain('discardMockInterviewAttempt');
-    expect(source).toContain('if (!draft.attemptId && draft.attemptKey)');
-    expect(source).toContain('if (!draft.attemptId || draft.resultUnknown)');
-    expect(source).toContain('setMockInterviewContext(null);');
-    expect(source).toContain('操作结果待确认，请稍后使用原尝试重试。');
+  it('leaves free-practice attempt recovery inside the canonical Studio owner', () => {
+    expect(source).toContain("ref: { taskId: 'interview.free_practice' }");
+    expect(source).toContain('<InterviewReadinessCenter');
+    expect(source).toContain('<InterviewStudio');
+    expect(source).not.toContain('discardMockInterviewAttempt');
+    expect(source).not.toContain('setMockInterviewContext');
+    expect(source).not.toContain('<MockInterviewDrawer');
   });
 
-  it('merges mock interview patches from the keyed current draft', () => {
-    expect(source).toContain('mockInterviewDraftsRef.current.get(draftKey)');
-    expect(source).toContain('const next = { ...currentDraft, ...patch };');
+  it('hands the frozen readiness context to Studio without a second AppShell draft store', () => {
+    expect(source).toContain('setInterviewStudioContext(context);');
+    expect(source).toContain('context={interviewStudioContext}');
+    expect(source).toContain('setInterviewStudioContext(null);');
+    expect(source).not.toContain('mockInterviewDraftsRef');
+    expect(source).not.toContain('mockInterviewDrafts');
   });
 
   it('leaves Pending/result-unknown recovery to the canonical Drawer owner', () => {

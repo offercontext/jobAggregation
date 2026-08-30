@@ -1062,7 +1062,7 @@ export default function OpportunityFitReviewDrawer({
                       <Typography.Text>{item.summary}</Typography.Text>
                       <br />
                       <Typography.Text type="secondary">
-                        {item.sourceState === 'source_changed' ? '原资料已更新，本次结果仍使用旧版' : '当前来源'} · {new Date(item.createdAt).toLocaleString()}
+                        {item.sourceState === 'source_changed' ? '来源已更新，已有结果仍保留' : '当前来源'} · {new Date(item.createdAt).toLocaleString()}
                       </Typography.Text>
                     </div>
                     {reference ? (

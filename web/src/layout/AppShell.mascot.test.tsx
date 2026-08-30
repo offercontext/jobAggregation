@@ -63,7 +63,6 @@ vi.mock('@/features/pilot/PilotAttachmentContext', () => ({
   usePilotAttachmentStore: () => ({ addAttachment: vi.fn(), createNewDraftWithAttachment: vi.fn() }),
 }));
 vi.mock('@/features/pilot/attachmentHandoff', () => ({ retainPilotAttachmentKey: (_current: unknown, next: unknown) => next }));
-vi.mock('@/features/pilot/PilotOpportunityFitCard', () => ({ default: () => <div /> }));
 vi.mock('@/features/pilot/PilotOpportunityFitV2Card', () => ({ default: () => <div /> }));
 vi.mock('@/features/pilotMascot/PilotMascot', () => ({
   default: (props: {

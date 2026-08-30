@@ -16,6 +16,7 @@ from offerpilot.ai.agent_contracts import ChatModel
 from offerpilot.ai.interview_preparation_proposals import (
     InterviewPreparationModelError,
     generate_interview_preparation_proposal,
+    generate_interview_preparation_proposal_v2,
 )
 from offerpilot.knowledge.interview_capture import note_fingerprint
 from offerpilot.models import (
@@ -33,6 +34,11 @@ from offerpilot.models import (
     Resume,
 )
 from offerpilot.repositories.json_contract import canonical_json, parse_json_object, sha256_text
+from offerpilot.review_readiness.preparation_selection import (
+    PreparationReadinessSelectionError,
+    PreparationReadinessSelectionLoader,
+    PreparationReadinessSelectionV2,
+)
 
 
 LEASE_SECONDS = 30
@@ -219,6 +225,60 @@ class InterviewPreparationProposalsRepository:
         self._now_factory = now_factory or (lambda: datetime.now(timezone.utc))
         self._waiter = waiter
 
+    def _try_frozen_existing(
+        self,
+        session: Session,
+        row: InterviewPreparationProposal,
+        *,
+        application_id: int,
+        event_id: int,
+        resume_id: int,
+        jd_text: str,
+        knowledge_selections: list[dict[str, Any]],
+        user_assertions: list[str],
+        jd_version_id: int | None,
+        readiness_feedback_version_ids_present: bool,
+        readiness_feedback_version_ids: tuple[int, ...],
+    ) -> InterviewPreparationGenerationResult | None:
+        if not _frozen_request_matches(
+            row,
+            application_id=application_id,
+            event_id=event_id,
+            resume_id=resume_id,
+            jd_text=jd_text,
+            knowledge_selections=knowledge_selections,
+            user_assertions=user_assertions,
+            jd_version_id=jd_version_id,
+            readiness_feedback_version_ids_present=(
+                readiness_feedback_version_ids_present
+            ),
+            readiness_feedback_version_ids=readiness_feedback_version_ids,
+        ):
+            raise InterviewPreparationConflictError(
+                "interview preparation idempotency key has a different request",
+                "interview_preparation_idempotency_conflict",
+            )
+        if row.attempt_status == "invalidated":
+            raise _attempt_invalidated()
+        if row.attempt_status == "ready":
+            _set_source_status(session, row)
+            session.commit()
+            return InterviewPreparationGenerationResult(row, False, False, "ready")
+        lease_until = _as_aware(row.provider_lease_until)
+        if (
+            row.attempt_status in {"generating", "provider_unknown"}
+            and lease_until is not None
+            and lease_until > self._now_factory()
+        ):
+            session.commit()
+            return InterviewPreparationGenerationResult(
+                row,
+                False,
+                True,
+                row.attempt_status,
+            )
+        return None
+
     def create_generated(
         self,
         *,
@@ -232,17 +292,56 @@ class InterviewPreparationProposalsRepository:
         model: ChatModel | None,
         on_diagnostic: Any | None = None,
         jd_version_id: int | None = None,
+        readiness_feedback_version_ids_present: bool = False,
+        readiness_feedback_version_ids: tuple[int, ...] = (),
     ) -> InterviewPreparationGenerationResult:
         if not isinstance(idempotency_key, str) or not IDEMPOTENCY_KEY_RE.fullmatch(idempotency_key):
             raise InterviewPreparationValidationError(
                 "idempotency_key must be 16-128 ASCII characters",
                 "interview_preparation_invalid_request",
             )
+        _validate_readiness_selection_request(
+            readiness_feedback_version_ids_present,
+            readiness_feedback_version_ids,
+        )
         owner_attempt_id: int
         owner_revision: int
         owner_token: str
         with self._session_factory() as session:
             session.execute(text("BEGIN IMMEDIATE"))
+            frozen_existing = _find_by_key(
+                session,
+                application_id,
+                event_id,
+                idempotency_key,
+            )
+            v2_existing = (
+                frozen_existing
+                if readiness_feedback_version_ids_present
+                or (
+                    frozen_existing is not None
+                    and _is_v2_attempt(frozen_existing)
+                )
+                else None
+            )
+            if v2_existing is not None:
+                frozen_result = self._try_frozen_existing(
+                    session,
+                    v2_existing,
+                    application_id=application_id,
+                    event_id=event_id,
+                    resume_id=resume_id,
+                    jd_text=jd_text,
+                    knowledge_selections=knowledge_selections,
+                    user_assertions=user_assertions,
+                    jd_version_id=jd_version_id,
+                    readiness_feedback_version_ids_present=(
+                        readiness_feedback_version_ids_present
+                    ),
+                    readiness_feedback_version_ids=readiness_feedback_version_ids,
+                )
+                if frozen_result is not None:
+                    return frozen_result
             if jd_version_id is not None:
                 current_version_id = session.scalar(
                     select(ApplicationJDVersion.id)
@@ -255,16 +354,43 @@ class InterviewPreparationProposalsRepository:
                         "interview preparation source changed",
                         "interview_preparation_source_conflict",
                     )
-            snapshot = _build_snapshot(
-                session,
-                application_id=application_id,
-                event_id=event_id,
-                resume_id=resume_id,
-                jd_text=jd_text,
-                knowledge_selections=knowledge_selections,
-                user_assertions=user_assertions,
-                jd_version_id=jd_version_id,
-            )
+            try:
+                snapshot = (
+                    _build_v2_snapshot(
+                        session,
+                        application_id=application_id,
+                        event_id=event_id,
+                        resume_id=resume_id,
+                        jd_text=jd_text,
+                        knowledge_selections=knowledge_selections,
+                        user_assertions=user_assertions,
+                        jd_version_id=jd_version_id,
+                        readiness_feedback_version_ids=readiness_feedback_version_ids,
+                    )
+                    if readiness_feedback_version_ids_present
+                    else _build_v1_snapshot(
+                        session,
+                        application_id=application_id,
+                        event_id=event_id,
+                        resume_id=resume_id,
+                        jd_text=jd_text,
+                        knowledge_selections=knowledge_selections,
+                        user_assertions=user_assertions,
+                        jd_version_id=jd_version_id,
+                    )
+                )
+            except (InterviewPreparationValidationError, InterviewPreparationNotFound) as exc:
+                if v2_existing is None:
+                    raise
+                _invalidate_active_attempt(
+                    session,
+                    v2_existing,
+                    reason="source_conflict",
+                )
+                raise InterviewPreparationConflictError(
+                    "interview preparation source changed",
+                    "interview_preparation_source_conflict",
+                ) from exc
             fingerprint = sha256_text(canonical_json(snapshot))
             existing = _find_by_key(session, application_id, event_id, idempotency_key)
             if existing is not None:
@@ -281,6 +407,10 @@ class InterviewPreparationProposalsRepository:
                     knowledge_selections=knowledge_selections,
                     user_assertions=user_assertions,
                     jd_version_id=jd_version_id,
+                    readiness_feedback_version_ids_present=(
+                        readiness_feedback_version_ids_present
+                    ),
+                    readiness_feedback_version_ids=readiness_feedback_version_ids,
                     idempotency_key=idempotency_key,
                     on_diagnostic=on_diagnostic,
                 )
@@ -328,6 +458,10 @@ class InterviewPreparationProposalsRepository:
             source_fingerprint=fingerprint,
             snapshot=snapshot,
             on_diagnostic=on_diagnostic,
+            readiness_feedback_version_ids_present=(
+                readiness_feedback_version_ids_present
+            ),
+            readiness_feedback_version_ids=readiness_feedback_version_ids,
         )
 
     def preflight(
@@ -341,6 +475,8 @@ class InterviewPreparationProposalsRepository:
         user_assertions: List[str],
         idempotency_key: str,
         jd_version_id: int | None = None,
+        readiness_feedback_version_ids_present: bool = False,
+        readiness_feedback_version_ids: tuple[int, ...] = (),
     ) -> InterviewPreparationGenerationResult | None:
         """Return a replayable attempt without resolving the AI provider.
 
@@ -354,18 +490,82 @@ class InterviewPreparationProposalsRepository:
                 "idempotency_key must be 16-128 ASCII characters",
                 "interview_preparation_invalid_request",
             )
+        _validate_readiness_selection_request(
+            readiness_feedback_version_ids_present,
+            readiness_feedback_version_ids,
+        )
         with self._session_factory() as session:
             session.execute(text("BEGIN IMMEDIATE"))
-            snapshot = _build_snapshot(
+            frozen_existing = _find_by_key(
                 session,
-                application_id=application_id,
-                event_id=event_id,
-                resume_id=resume_id,
-                jd_text=jd_text,
-                knowledge_selections=knowledge_selections,
-                user_assertions=user_assertions,
-                jd_version_id=jd_version_id,
+                application_id,
+                event_id,
+                idempotency_key,
             )
+            v2_existing = (
+                frozen_existing
+                if readiness_feedback_version_ids_present
+                or (
+                    frozen_existing is not None
+                    and _is_v2_attempt(frozen_existing)
+                )
+                else None
+            )
+            if v2_existing is not None:
+                frozen_result = self._try_frozen_existing(
+                    session,
+                    v2_existing,
+                    application_id=application_id,
+                    event_id=event_id,
+                    resume_id=resume_id,
+                    jd_text=jd_text,
+                    knowledge_selections=knowledge_selections,
+                    user_assertions=user_assertions,
+                    jd_version_id=jd_version_id,
+                    readiness_feedback_version_ids_present=(
+                        readiness_feedback_version_ids_present
+                    ),
+                    readiness_feedback_version_ids=readiness_feedback_version_ids,
+                )
+                if frozen_result is not None:
+                    return frozen_result
+            try:
+                snapshot = (
+                    _build_v2_snapshot(
+                        session,
+                        application_id=application_id,
+                        event_id=event_id,
+                        resume_id=resume_id,
+                        jd_text=jd_text,
+                        knowledge_selections=knowledge_selections,
+                        user_assertions=user_assertions,
+                        jd_version_id=jd_version_id,
+                        readiness_feedback_version_ids=readiness_feedback_version_ids,
+                    )
+                    if readiness_feedback_version_ids_present
+                    else _build_v1_snapshot(
+                        session,
+                        application_id=application_id,
+                        event_id=event_id,
+                        resume_id=resume_id,
+                        jd_text=jd_text,
+                        knowledge_selections=knowledge_selections,
+                        user_assertions=user_assertions,
+                        jd_version_id=jd_version_id,
+                    )
+                )
+            except (InterviewPreparationValidationError, InterviewPreparationNotFound) as exc:
+                if v2_existing is None:
+                    raise
+                _invalidate_active_attempt(
+                    session,
+                    v2_existing,
+                    reason="source_conflict",
+                )
+                raise InterviewPreparationConflictError(
+                    "interview preparation source changed",
+                    "interview_preparation_source_conflict",
+                ) from exc
             fingerprint = sha256_text(canonical_json(snapshot))
             existing = _find_by_key(session, application_id, event_id, idempotency_key)
             if existing is None:
@@ -384,6 +584,10 @@ class InterviewPreparationProposalsRepository:
                 knowledge_selections=knowledge_selections,
                 user_assertions=user_assertions,
                 jd_version_id=jd_version_id,
+                readiness_feedback_version_ids_present=(
+                    readiness_feedback_version_ids_present
+                ),
+                readiness_feedback_version_ids=readiness_feedback_version_ids,
                 idempotency_key=idempotency_key,
                 on_diagnostic=None,
             )
@@ -439,6 +643,8 @@ class InterviewPreparationProposalsRepository:
         idempotency_key: str,
         on_diagnostic: Any | None,
         jd_version_id: int | None = None,
+        readiness_feedback_version_ids_present: bool = False,
+        readiness_feedback_version_ids: tuple[int, ...] = (),
     ) -> InterviewPreparationGenerationResult | _InterviewPreparationOwnedGeneration | None:
         if row.attempt_status == "invalidated":
             raise _attempt_invalidated()
@@ -545,6 +751,8 @@ class InterviewPreparationProposalsRepository:
         snapshot: dict[str, Any],
         on_diagnostic: Any | None,
         jd_version_id: int | None = None,
+        readiness_feedback_version_ids_present: bool = False,
+        readiness_feedback_version_ids: tuple[int, ...] = (),
     ) -> InterviewPreparationGenerationResult:
         if model is None:
             raise InterviewPreparationProviderError()
@@ -566,10 +774,18 @@ class InterviewPreparationProposalsRepository:
             heartbeat.start()
         try:
             try:
-                proposal = generate_interview_preparation_proposal(
-                    model,
-                    snapshot,
-                    on_diagnostic=on_diagnostic,
+                proposal = (
+                    generate_interview_preparation_proposal_v2(
+                        model,
+                        snapshot,
+                        on_diagnostic=on_diagnostic,
+                    )
+                    if readiness_feedback_version_ids_present
+                    else generate_interview_preparation_proposal(
+                        model,
+                        snapshot,
+                        on_diagnostic=on_diagnostic,
+                    )
                 )
             except InterviewPreparationModelError as exc:
                 if exc.failure_category != "provider_error":
@@ -605,18 +821,37 @@ class InterviewPreparationProposalsRepository:
                     "interview_preparation_idempotency_conflict",
                 )
             try:
-                current_snapshot = _build_snapshot(
-                    session,
-                    application_id=application_id,
-                    event_id=event_id,
-                    resume_id=resume_id,
-                    jd_text=jd_text,
-                    jd_version_id=jd_version_id,
-                    knowledge_selections=knowledge_selections,
-                    user_assertions=user_assertions,
+                current_snapshot = (
+                    _build_v2_snapshot(
+                        session,
+                        application_id=application_id,
+                        event_id=event_id,
+                        resume_id=resume_id,
+                        jd_text=jd_text,
+                        jd_version_id=jd_version_id,
+                        knowledge_selections=knowledge_selections,
+                        user_assertions=user_assertions,
+                        readiness_feedback_version_ids=(
+                            readiness_feedback_version_ids
+                        ),
+                    )
+                    if readiness_feedback_version_ids_present
+                    else _build_v1_snapshot(
+                        session,
+                        application_id=application_id,
+                        event_id=event_id,
+                        resume_id=resume_id,
+                        jd_text=jd_text,
+                        jd_version_id=jd_version_id,
+                        knowledge_selections=knowledge_selections,
+                        user_assertions=user_assertions,
+                    )
                 )
             except InterviewPreparationNotFound as exc:
-                if exc.code == "interview_preparation_application_not_found":
+                if (
+                    not readiness_feedback_version_ids_present
+                    and exc.code == "interview_preparation_application_not_found"
+                ):
                     session.rollback()
                     raise
                 current_snapshot = None
@@ -743,7 +978,102 @@ class InterviewPreparationProposalsRepository:
                 return
 
 
-def _build_snapshot(
+def _validate_readiness_selection_request(
+    present: object,
+    ordered_version_ids: object,
+) -> None:
+    if type(present) is not bool or type(ordered_version_ids) is not tuple:
+        raise InterviewPreparationValidationError(
+            "readiness feedback selection is invalid",
+            "interview_preparation_invalid_request",
+        )
+    if not present and ordered_version_ids:
+        raise InterviewPreparationValidationError(
+            "an absent readiness feedback selection must be empty",
+            "interview_preparation_invalid_request",
+        )
+    if len(ordered_version_ids) > 8 or any(
+        type(item) is not int or item < 1 or item > 2**63 - 1
+        for item in ordered_version_ids
+    ):
+        raise InterviewPreparationValidationError(
+            "readiness feedback selection is invalid",
+            "interview_preparation_invalid_request",
+        )
+    if len(set(ordered_version_ids)) != len(ordered_version_ids):
+        raise InterviewPreparationValidationError(
+            "readiness feedback selection is invalid",
+            "interview_preparation_invalid_request",
+        )
+
+
+def _build_v2_snapshot(
+    session: Session,
+    *,
+    application_id: int,
+    event_id: int,
+    resume_id: int,
+    jd_text: str,
+    knowledge_selections: list[dict[str, Any]],
+    user_assertions: list[str],
+    readiness_feedback_version_ids: tuple[int, ...],
+    jd_version_id: int | None = None,
+) -> dict[str, Any]:
+    snapshot = _build_v1_snapshot(
+        session,
+        application_id=application_id,
+        event_id=event_id,
+        resume_id=resume_id,
+        jd_text=jd_text,
+        knowledge_selections=knowledge_selections,
+        user_assertions=user_assertions,
+        jd_version_id=jd_version_id,
+    )
+    try:
+        selection = _load_v2_selection(
+            session,
+            application_id=application_id,
+            target_event_id=event_id,
+            resume_id=resume_id,
+            ordered_version_ids=readiness_feedback_version_ids,
+        )
+    except PreparationReadinessSelectionError as exc:
+        raise InterviewPreparationValidationError(
+            "readiness feedback selection is unavailable",
+            "interview_preparation_readiness_selection_invalid",
+        ) from exc
+    snapshot["input_contract"] = "interview-preparation-input-v2"
+    snapshot["readiness_feedback_selection"] = {
+        "present": True,
+        "ordered_version_ids": list(selection.ordered_version_ids),
+    }
+    snapshot["readiness_feedback_selection_fingerprint"] = (
+        selection.selection_fingerprint
+    )
+    snapshot["readiness_feedback"] = [
+        item.to_json() for item in selection.readiness_feedback
+    ]
+    return snapshot
+
+
+def _load_v2_selection(
+    session: Session,
+    *,
+    application_id: int,
+    target_event_id: int,
+    resume_id: int,
+    ordered_version_ids: tuple[int, ...],
+) -> PreparationReadinessSelectionV2:
+    readiness_loader = PreparationReadinessSelectionLoader(session)
+    return readiness_loader.load(
+        application_id=application_id,
+        target_event_id=target_event_id,
+        resume_id=resume_id,
+        ordered_version_ids=ordered_version_ids,
+    )
+
+
+def _build_v1_snapshot(
     session: Session,
     *,
     application_id: int,
@@ -948,6 +1278,163 @@ def _validate_knowledge_selections(
             }
         )
     return result
+
+
+def _snapshot_object(row: InterviewPreparationProposal) -> dict[str, Any] | None:
+    try:
+        value = json.loads(row.input_snapshot_json)
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _is_v2_attempt(row: InterviewPreparationProposal) -> bool:
+    snapshot = _snapshot_object(row)
+    return snapshot is not None and snapshot.get("input_contract") == (
+        "interview-preparation-input-v2"
+    )
+
+
+def _requested_knowledge_identity(
+    selections: object,
+) -> tuple[tuple[int, str], ...] | None:
+    if type(selections) is not list:
+        return None
+    pairs: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    for selection in selections:
+        if type(selection) is not dict or set(selection) != {
+            "note_version_id",
+            "evidence_ids",
+        }:
+            return None
+        version_id = selection.get("note_version_id")
+        evidence_ids = selection.get("evidence_ids")
+        if type(version_id) is not int or type(evidence_ids) is not list:
+            return None
+        for evidence_id in evidence_ids:
+            if (
+                type(evidence_id) is not str
+                or not evidence_id
+                or evidence_id in seen
+            ):
+                return None
+            seen.add(evidence_id)
+            pairs.append((version_id, evidence_id))
+    return tuple(sorted(pairs))
+
+
+def _snapshot_knowledge_identity(
+    snapshot: dict[str, Any],
+) -> tuple[tuple[int, str], ...] | None:
+    values = snapshot.get("knowledge_evidence")
+    if type(values) is not list:
+        return None
+    pairs: list[tuple[int, str]] = []
+    for item in values:
+        if type(item) is not dict:
+            return None
+        version_id = item.get("note_version_id")
+        evidence_id = item.get("id")
+        if type(version_id) is not int or type(evidence_id) is not str:
+            return None
+        pairs.append((version_id, evidence_id))
+    return tuple(sorted(pairs))
+
+
+def _frozen_request_matches(
+    row: InterviewPreparationProposal,
+    *,
+    application_id: int,
+    event_id: int,
+    resume_id: int,
+    jd_text: str,
+    knowledge_selections: list[dict[str, Any]],
+    user_assertions: list[str],
+    jd_version_id: int | None,
+    readiness_feedback_version_ids_present: bool,
+    readiness_feedback_version_ids: tuple[int, ...],
+) -> bool:
+    snapshot = _snapshot_object(row)
+    if snapshot is None:
+        return False
+    is_v2 = snapshot.get("input_contract") == "interview-preparation-input-v2"
+    if is_v2 != readiness_feedback_version_ids_present:
+        return False
+    if (
+        type(application_id) is not int
+        or application_id != row.application_id
+        or type(event_id) is not int
+        or event_id != row.application_event_id
+        or type(resume_id) is not int
+        or resume_id != row.resume_id
+        or type(jd_text) is not str
+        or type(user_assertions) is not list
+        or any(type(item) is not str for item in user_assertions)
+    ):
+        return False
+    event = snapshot.get("event")
+    resume = snapshot.get("resume")
+    jd = snapshot.get("jd")
+    if (
+        type(event) is not dict
+        or event.get("id") != event_id
+        or event.get("application_id") != application_id
+        or type(resume) is not dict
+        or resume.get("id") != resume_id
+        or type(jd) is not dict
+        or jd.get("text") != jd_text
+        or snapshot.get("jd_version_id") != jd_version_id
+    ):
+        return False
+    normalized_assertions = [item for item in user_assertions if item.strip()]
+    if snapshot.get("user_assertions") != normalized_assertions:
+        return False
+    if _requested_knowledge_identity(knowledge_selections) != (
+        _snapshot_knowledge_identity(snapshot)
+    ):
+        return False
+    if not is_v2:
+        return True
+    selection = snapshot.get("readiness_feedback_selection")
+    return (
+        type(selection) is dict
+        and selection.get("present") is True
+        and selection.get("ordered_version_ids")
+        == list(readiness_feedback_version_ids)
+    )
+
+
+def _invalidate_active_attempt(
+    session: Session,
+    row: InterviewPreparationProposal,
+    *,
+    reason: str,
+) -> None:
+    session.execute(
+        update(InterviewPreparationProposal)
+        .where(InterviewPreparationProposal.id == row.id)
+        .where(
+            InterviewPreparationProposal.attempt_status.in_(
+                ["generating", "provider_unknown"]
+            )
+        )
+        .where(
+            InterviewPreparationProposal.generation_revision
+            == row.generation_revision
+        )
+        .where(
+            InterviewPreparationProposal.provider_call_token
+            == row.provider_call_token
+        )
+        .values(
+            attempt_status="invalidated",
+            invalidation_reason=reason,
+            provider_call_token="",
+            provider_lease_until=None,
+        )
+    )
+    session.commit()
 
 
 def _find_by_key(

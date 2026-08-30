@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 
 import pytest
@@ -57,6 +58,39 @@ def _snapshot() -> dict[str, object]:
         ],
         "user_assertions": ["I led the migration personally."],
     }
+
+
+def _v2_snapshot() -> dict[str, object]:
+    snapshot = _snapshot()
+    snapshot.update(
+        {
+            "input_contract": "interview-preparation-input-v2",
+            "readiness_feedback_selection": {
+                "present": True,
+                "ordered_version_ids": [41],
+            },
+            "readiness_feedback_selection_fingerprint": "sha256:" + "a" * 64,
+            "readiness_feedback": [
+                {
+                    "statement": "先澄清可靠性约束，再说明缓存一致性的取舍。",
+                    "user_note": "这是上下文，不是支持证据。",
+                    "source_event": {"round": 2, "subtype": "technical"},
+                    "practice_state": "completed",
+                    "evidence": [
+                        {
+                            "path": "/difficulty_points",
+                            "excerpt": "cache consistency tradeoffs",
+                            "excerpt_sha256": "sha256:"
+                            + hashlib.sha256(
+                                "cache consistency tradeoffs".encode("utf-8")
+                            ).hexdigest(),
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    return snapshot
 
 
 def _ref(source: str, path: str, excerpt: str) -> dict[str, str]:
@@ -139,6 +173,178 @@ class FakeModel:
 
 def test_validator_accepts_five_evidence_gated_preparation_arrays() -> None:
     assert validate_interview_preparation(_proposal(), _snapshot()) == _proposal()
+
+
+def test_v2_validator_accepts_only_frozen_readiness_provider_paths() -> None:
+    from offerpilot.ai.interview_preparation_proposals import (
+        validate_interview_preparation_v2,
+    )
+
+    payload = safe_empty_interview_preparation_proposal()
+    payload["review_points"] = [
+        {
+            "id": "review-feedback-1",
+            "text": "准备解释缓存一致性的取舍。",
+            "evidence_refs": [
+                _ref(
+                    "confirmed_readiness_feedback",
+                    "/readiness_feedback/0/evidence/0/excerpt",
+                    "cache consistency tradeoffs",
+                )
+            ],
+        }
+    ]
+    assert validate_interview_preparation_v2(payload, _v2_snapshot()) == payload
+
+    forged = copy.deepcopy(payload)
+    forged["review_points"][0]["evidence_refs"][0] = _ref(  # type: ignore[index]
+        "confirmed_readiness_feedback",
+        "/readiness_feedback/0/user_note",
+        "这是上下文，不是支持证据。",
+    )
+    with pytest.raises(InterviewPreparationModelError) as exc_info:
+        validate_interview_preparation_v2(forged, _v2_snapshot())
+    assert exc_info.value.validation_category == "unknown_evidence_ref"
+
+
+def test_v2_prompt_uses_bounded_untrusted_feedback_without_internal_ids() -> None:
+    from offerpilot.ai.interview_preparation_proposals import (
+        generate_interview_preparation_proposal_v2,
+    )
+
+    model = FakeModel([safe_empty_interview_preparation_proposal()])
+    result = generate_interview_preparation_proposal_v2(model, _v2_snapshot())
+
+    assert result == safe_empty_interview_preparation_proposal()
+    system = model.messages[0][0].content
+    prompt = model.messages[0][1].content
+    assert "不受信任" in system
+    assert "confirmed_readiness_feedback" in system
+    assert "cache consistency tradeoffs" in prompt
+    assert "这是上下文，不是支持证据。" in prompt
+    assert "ordered_version_ids" not in prompt
+    assert "selection_fingerprint" not in prompt
+
+
+def test_v1_schema_prompt_and_validator_remain_closed_to_readiness_v2() -> None:
+    from offerpilot.ai.interview_preparation_proposals import (
+        INTERVIEW_PREPARATION_JSON_SCHEMA,
+        _initial_prompt,
+    )
+
+    schema_sources = INTERVIEW_PREPARATION_JSON_SCHEMA["properties"][
+        "review_points"
+    ]["items"]["properties"]["evidence_refs"]["items"]["properties"][
+        "source"
+    ]["enum"]
+    assert "confirmed_readiness_feedback" not in schema_sources
+    assert "readiness_feedback" not in _initial_prompt(_v2_snapshot())
+
+    payload = safe_empty_interview_preparation_proposal()
+    payload["review_points"] = [
+        {
+            "id": "legacy-review-1",
+            "text": "must stay rejected by V1",
+            "evidence_refs": [
+                _ref(
+                    "confirmed_readiness_feedback",
+                    "/readiness_feedback/0/statement",
+                    "先澄清可靠性约束",
+                )
+            ],
+        }
+    ]
+    with pytest.raises(InterviewPreparationModelError) as exc_info:
+        validate_interview_preparation(payload, _v2_snapshot())
+    assert exc_info.value.validation_category == "unknown_evidence_ref"
+
+
+def test_readiness_feedback_final_wrapper_exact_utf8_budget() -> None:
+    from offerpilot.review_readiness.preparation_selection import (
+        PreparationReadinessSelectionError,
+        canonical_readiness_feedback_bytes,
+    )
+
+    prefix = '中😀"\\'
+    prefix_bytes = len(prefix.encode("utf-8"))
+    feedback = [
+        {
+            "statement": "s" * 2048,
+            "user_note": "u" * 1024,
+            "source_event": {"round": index + 1, "subtype": "technical"},
+            "practice_state": "completed",
+            "evidence": [
+                {
+                    "path": "/difficulty_points",
+                    "excerpt": prefix + "x" * (4096 - prefix_bytes),
+                    "excerpt_sha256": "sha256:" + f"{index:x}" * 64,
+                }
+            ],
+        }
+        for index in range(8)
+    ]
+    raw = json.dumps(
+        {"readiness_feedback": feedback},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    delta = 65_536 - len(raw)
+    assert 0 < delta < 32_000
+    for item in feedback:
+        excerpt = item["evidence"][0]["excerpt"]  # type: ignore[index]
+        available = excerpt.count("x")
+        used = min(delta, available)
+        item["evidence"][0]["excerpt"] = excerpt.replace("x", '"', used)  # type: ignore[index]
+        delta -= used
+        if delta == 0:
+            break
+    assert delta == 0
+    assert len(canonical_readiness_feedback_bytes(feedback)) == 65_536
+    for item in feedback:
+        excerpt = item["evidence"][0]["excerpt"]  # type: ignore[index]
+        item["evidence"][0]["excerpt_sha256"] = (  # type: ignore[index]
+            "sha256:" + hashlib.sha256(excerpt.encode("utf-8")).hexdigest()
+        )
+    exact_snapshot = _snapshot()
+    exact_snapshot.update(
+        {
+            "input_contract": "interview-preparation-input-v2",
+            "readiness_feedback_selection": {
+                "present": True,
+                "ordered_version_ids": list(range(1, 9)),
+            },
+            "readiness_feedback_selection_fingerprint": "sha256:" + "a" * 64,
+            "readiness_feedback": feedback,
+        }
+    )
+    from offerpilot.ai.interview_preparation_proposals import (
+        validate_interview_preparation_v2,
+    )
+
+    assert validate_interview_preparation_v2(
+        safe_empty_interview_preparation_proposal(), exact_snapshot
+    ) == safe_empty_interview_preparation_proposal()
+
+    oversized = copy.deepcopy(feedback)
+    for item in oversized:
+        excerpt = item["evidence"][0]["excerpt"]  # type: ignore[index]
+        if "x" in excerpt:
+            item["evidence"][0]["excerpt"] = excerpt.replace("x", "\\", 1)  # type: ignore[index]
+            changed = item["evidence"][0]["excerpt"]  # type: ignore[index]
+            item["evidence"][0]["excerpt_sha256"] = (  # type: ignore[index]
+                "sha256:" + hashlib.sha256(changed.encode("utf-8")).hexdigest()
+            )
+            break
+    with pytest.raises(PreparationReadinessSelectionError) as exc_info:
+        canonical_readiness_feedback_bytes(oversized)
+    assert exc_info.value.code == "preparation_readiness_feedback_too_large"
+    oversized_snapshot = {**exact_snapshot, "readiness_feedback": oversized}
+    with pytest.raises(InterviewPreparationModelError) as model_exc:
+        validate_interview_preparation_v2(
+            safe_empty_interview_preparation_proposal(), oversized_snapshot
+        )
+    assert model_exc.value.validation_category == "limit_exceeded"
 
 
 def test_validator_rejects_forged_refs_non_leaf_resume_and_unicode_rewrite() -> None:

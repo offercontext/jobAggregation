@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import importlib.util
+import hashlib
 import json
+from dataclasses import FrozenInstanceError, is_dataclass
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from threading import Event, Lock
+from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
+from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy import select, text
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -18,23 +25,33 @@ from offerpilot.models import (
     ApplicationJDVersion,
     InterviewNote,
     InterviewPreparationProposal,
+    InterviewReadinessSignal,
     KnowledgeEvidence,
     KnowledgeNoteEvidence,
     KnowledgeNoteVersion,
     Resume,
 )
 from offerpilot.repositories.interview_knowledge_capture import InterviewKnowledgeCaptureRepository
-from offerpilot.repositories.json_contract import canonical_json
+from offerpilot.repositories.json_contract import canonical_json, sha256_text
 from offerpilot.repositories.interview_preparation_proposals import (
     InterviewPreparationConflictError,
     InterviewPreparationNotFound,
     InterviewPreparationProviderError,
     InterviewPreparationProposalsRepository,
+    InterviewPreparationValidationError,
     _InterviewPreparationLeaseHeartbeat,
 )
+from tests.review_readiness_support import seed_review_candidate
+from tests.test_review_readiness_projection import _commit_signal
 
 
 JD_TEXT = "Build reliable APIs with Python."
+
+
+def test_preparation_readiness_selection_loader_module_is_owner_local_asset() -> None:
+    assert importlib.util.find_spec(
+        "offerpilot.review_readiness.preparation_selection"
+    ) is not None
 
 
 class ManualClock:
@@ -1271,3 +1288,982 @@ def test_soft_deleted_application_returns_not_found_for_history(tmp_path) -> Non
     with pytest.raises(InterviewPreparationNotFound):
         repository.list(ids[0])
     factory.kw["bind"].dispose()
+
+
+def _setup_selected_signal(tmp_path, *, focus_count: int = 1):  # type: ignore[no-untyped-def]
+    factory = init_database(tmp_path / f"preparation-v2-{uuid4()}.sqlite3")
+    focuses = [
+        {
+            "id": f"focus-{index}",
+            "text": f"准备重点 {index}",
+            "evidence_refs": [
+                {
+                    "source": "interview_note",
+                    "path": "/difficulty_points",
+                    "excerpt": "cache consistency tradeoffs",
+                }
+            ],
+        }
+        for index in range(1, focus_count + 1)
+    ]
+    seeded = seed_review_candidate(
+        factory,
+        focus_id="focus-1",
+        practice_focuses=focuses,
+    )
+    version_ids = []
+    for focus in focuses:
+        _signal_id, version_id = _commit_signal(
+            factory,
+            seeded,
+            focus_id=focus["id"],
+            idempotency_key=str(uuid4()),
+            user_note=f"用户备注 {focus['id']}",
+        )
+        version_ids.append(version_id)
+    with factory() as session:
+        target = ApplicationEvent(
+            application_id=int(seeded["application_id"]),
+            event_type="interview",
+            subtype="system_design",
+            round=3,
+            scheduled_at=datetime(2031, 1, 2, 9, tzinfo=timezone.utc),
+            duration_minutes=60,
+            status="todo",
+        )
+        resume = Resume(
+            title="Preparation Resume",
+            name="Preparation Resume",
+            parse_status="text-ready",
+            content_json=json.dumps(
+                {"experience": [{"highlights": ["Built reliable APIs"]}]}
+            ),
+        )
+        session.add_all((target, resume))
+        session.commit()
+        target_id = target.id
+        resume_id = resume.id
+    return factory, seeded, tuple(version_ids), target_id, resume_id
+
+
+def test_v1_snapshot_remains_byte_equal_to_pinned_c5a020c_fixture(tmp_path) -> None:
+    from offerpilot.repositories.interview_preparation_proposals import (
+        _build_v1_snapshot,
+    )
+
+    fixture = json.loads(
+        (
+            Path(__file__).parent
+            / "fixtures"
+            / "review_readiness"
+            / "interview_preparation_v1_c5a020c.json"
+        ).read_text(encoding="utf-8")
+    )
+    factory, ids = _setup(tmp_path)
+    with factory() as session:
+        version = ApplicationJDVersion(
+            application_id=ids[0],
+            version_number=3,
+            jd_text=JD_TEXT,
+            content_sha256="jd-content-sha256",
+            source_kind="ui",
+            idempotency_key="jd-version-v1-baseline-0001",
+            request_fingerprint_sha256="jd-request-sha256",
+        )
+        session.add(version)
+        session.commit()
+        snapshot = _build_v1_snapshot(
+            session,
+            application_id=ids[0],
+            event_id=ids[1],
+            resume_id=ids[2],
+            jd_text=JD_TEXT,
+            knowledge_selections=[],
+            user_assertions=["I led the migration."],
+            jd_version_id=version.id,
+        )
+    assert canonical_json(snapshot) == fixture["input_snapshot_json"]
+    assert sha256_text(canonical_json(snapshot)) == fixture["source_fingerprint"]
+    request = {
+        "event_id": ids[1],
+        "idempotency_key": "review-readiness-prep-v1-0001",
+        "jd_version_id": version.id,
+        "knowledge_selections": [],
+        "resume_id": ids[2],
+        "user_assertions": ["I led the migration."],
+    }
+    assert canonical_json(request) == fixture["canonical_request_json"]
+    assert sha256_text(canonical_json(request)) == fixture["canonical_request_sha256"]
+
+
+def test_v2_request_input_and_selection_fingerprints_match_ordered_golden(
+    tmp_path,
+) -> None:
+    from offerpilot.repositories.interview_preparation_proposals import (
+        _build_v2_snapshot,
+    )
+
+    factory, seeded, version_ids, target_id, resume_id = _setup_selected_signal(
+        tmp_path, focus_count=2
+    )
+    ordered_ids = tuple(reversed(version_ids))
+    request_identity = {
+        "event_id": target_id,
+        "idempotency_key": "v2-golden-order-0001",
+        "knowledge_selections": [],
+        "readiness_feedback_selection": {
+            "present": True,
+            "ordered_version_ids": list(ordered_ids),
+        },
+        "resume_id": resume_id,
+        "user_assertions": [],
+    }
+    with factory() as session:
+        snapshot = _build_v2_snapshot(
+            session,
+            application_id=int(seeded["application_id"]),
+            event_id=target_id,
+            resume_id=resume_id,
+            jd_text=JD_TEXT,
+            knowledge_selections=[],
+            user_assertions=[],
+            readiness_feedback_version_ids=ordered_ids,
+        )
+        forward_snapshot = _build_v2_snapshot(
+            session,
+            application_id=int(seeded["application_id"]),
+            event_id=target_id,
+            resume_id=resume_id,
+            jd_text=JD_TEXT,
+            knowledge_selections=[],
+            user_assertions=[],
+            readiness_feedback_version_ids=version_ids,
+        )
+    assert canonical_json(request_identity) == (
+        '{"event_id":2,"idempotency_key":"v2-golden-order-0001",'
+        '"knowledge_selections":[],"readiness_feedback_selection":'
+        '{"ordered_version_ids":[2,1],"present":true},"resume_id":1,'
+        '"user_assertions":[]}'
+    )
+    assert sha256_text(canonical_json(snapshot)) == (
+        "f1dfbc72c0d67dfb6ed016c4c6b5e3638fcca82c9c6d6e7649bb2d3e9fe039fc"
+    )
+    assert snapshot["readiness_feedback_selection_fingerprint"] == (
+        "sha256:e01e6b1b7694c479f1f3756373681a6518500b0b9a80c3b0239ea90aaf4f166b"
+    )
+    assert forward_snapshot["readiness_feedback_selection_fingerprint"] == (
+        "sha256:9fc8aa910f3ce983b053d642df340a32eee689d0b60a74add0e2eb62d1202160"
+    )
+    assert sha256_text(canonical_json(forward_snapshot)) == (
+        "17cb4250d9ef470f245fbd93253914290e980718e26daa70f89d22afcea64f01"
+    )
+
+
+def test_selection_loader_preserves_order_and_uses_no_signal_query_for_empty(tmp_path) -> None:
+    from offerpilot.review_readiness.preparation_selection import (
+        PreparationReadinessSelectionLoader,
+    )
+
+    factory, seeded, version_ids, target_id, resume_id = _setup_selected_signal(
+        tmp_path, focus_count=2
+    )
+    statements: list[str] = []
+
+    def capture(_conn, _cursor, statement, _parameters, _context, _many):  # type: ignore[no-untyped-def]
+        statements.append(statement.lower())
+
+    engine = factory.kw["bind"]
+    sqlalchemy_event.listen(engine, "before_cursor_execute", capture)
+    try:
+        with factory() as session:
+            empty = PreparationReadinessSelectionLoader(session).load(
+                application_id=int(seeded["application_id"]),
+                target_event_id=target_id,
+                resume_id=resume_id,
+                ordered_version_ids=(),
+            )
+        assert empty.ordered_version_ids == ()
+        assert empty.readiness_feedback == ()
+        assert not any("interview_readiness_signal" in item for item in statements)
+        statements.clear()
+        with factory() as session:
+            selection = PreparationReadinessSelectionLoader(session).load(
+                application_id=int(seeded["application_id"]),
+                target_event_id=target_id,
+                resume_id=resume_id,
+                ordered_version_ids=tuple(reversed(version_ids)),
+            )
+    finally:
+        sqlalchemy_event.remove(engine, "before_cursor_execute", capture)
+    assert selection.ordered_version_ids == tuple(reversed(version_ids))
+    assert [item.statement for item in selection.readiness_feedback] == [
+        "准备重点 2",
+        "准备重点 1",
+    ]
+    assert selection.selection_fingerprint.startswith("sha256:")
+    assert all(not hasattr(item, "version_id") for item in selection.readiness_feedback)
+
+
+def test_selection_loader_returns_deeply_immutable_copied_dto(tmp_path) -> None:
+    from offerpilot.review_readiness.preparation_selection import (
+        PreparationReadinessSelectionLoader,
+    )
+
+    factory, seeded, version_ids, target_id, resume_id = _setup_selected_signal(tmp_path)
+    with factory() as session:
+        selection = PreparationReadinessSelectionLoader(session).load(
+            application_id=int(seeded["application_id"]),
+            target_event_id=target_id,
+            resume_id=resume_id,
+            ordered_version_ids=version_ids,
+        )
+    item = selection.readiness_feedback[0]
+    assert is_dataclass(item)
+    with pytest.raises(FrozenInstanceError):
+        item.statement = "forged"  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_code"),
+    (
+        ("target_completed", "preparation_readiness_target_not_eligible"),
+        ("target_cancelled", "preparation_readiness_target_not_eligible"),
+        ("target_unknown", "preparation_readiness_target_not_eligible"),
+        ("target_wrong_type", "preparation_readiness_target_not_eligible"),
+        ("source_equals_target", "preparation_readiness_target_not_eligible"),
+        ("source_changed", "preparation_readiness_signal_not_current"),
+        ("retracted", "preparation_readiness_signal_not_current"),
+        ("missing", "preparation_readiness_signal_not_current"),
+    ),
+)
+def test_selection_loader_fails_closed_for_invalid_source_or_target(
+    tmp_path, mutation: str, expected_code: str
+) -> None:
+    from offerpilot.review_readiness.preparation_selection import (
+        PreparationReadinessSelectionError,
+        PreparationReadinessSelectionLoader,
+    )
+
+    factory, seeded, version_ids, target_id, resume_id = _setup_selected_signal(tmp_path)
+    with factory() as session:
+        if mutation == "target_completed":
+            target = session.get(ApplicationEvent, target_id)
+            assert target is not None
+            target.status = "completed"
+        elif mutation == "target_cancelled":
+            target = session.get(ApplicationEvent, target_id)
+            assert target is not None
+            target.status = "cancelled"
+        elif mutation == "target_unknown":
+            target = session.get(ApplicationEvent, target_id)
+            assert target is not None
+            target.status = "future_status"
+        elif mutation == "target_wrong_type":
+            target = session.get(ApplicationEvent, target_id)
+            assert target is not None
+            target.event_type = "written_test"
+        elif mutation == "source_equals_target":
+            target_id = int(seeded["event_id"])
+        elif mutation == "source_changed":
+            note = session.get(InterviewNote, int(seeded["note_id"]))
+            assert note is not None
+            note.content_revision += 1
+        elif mutation == "retracted":
+            signal = session.scalar(select(InterviewReadinessSignal))
+            assert signal is not None
+            signal.current_version_id = None
+        else:
+            version_ids = (2**62,)
+        session.commit()
+    with factory() as session, pytest.raises(PreparationReadinessSelectionError) as exc_info:
+        PreparationReadinessSelectionLoader(session).load(
+            application_id=int(seeded["application_id"]),
+            target_event_id=target_id,
+            resume_id=resume_id,
+            ordered_version_ids=version_ids,
+        )
+    assert exc_info.value.code == expected_code
+
+
+def test_selection_loader_accepts_eight_and_rejects_nine_or_cross_application(
+    tmp_path,
+) -> None:
+    from offerpilot.review_readiness.preparation_selection import (
+        PreparationReadinessSelectionError,
+        PreparationReadinessSelectionLoader,
+    )
+
+    factory, seeded, version_ids, target_id, resume_id = _setup_selected_signal(
+        tmp_path, focus_count=8
+    )
+    with factory() as session:
+        selection = PreparationReadinessSelectionLoader(session).load(
+            application_id=int(seeded["application_id"]),
+            target_event_id=target_id,
+            resume_id=resume_id,
+            ordered_version_ids=version_ids,
+        )
+    assert selection.ordered_version_ids == version_ids
+    assert len(selection.readiness_feedback) == 8
+
+    with factory() as session, pytest.raises(PreparationReadinessSelectionError):
+        PreparationReadinessSelectionLoader(session).load(
+            application_id=int(seeded["application_id"]),
+            target_event_id=target_id,
+            resume_id=resume_id,
+            ordered_version_ids=version_ids + (2**62,),
+        )
+
+    with factory() as session:
+        other = Application(company_name="Other", position_name="Backend", source="test")
+        session.add(other)
+        session.flush()
+        other_target = ApplicationEvent(
+            application_id=other.id,
+            event_type="interview",
+            subtype="system_design",
+            round=4,
+            scheduled_at=datetime(2032, 1, 1, 9, tzinfo=timezone.utc),
+            duration_minutes=60,
+            status="todo",
+        )
+        session.add(other_target)
+        session.commit()
+        other_application_id = other.id
+        other_target_id = other_target.id
+    with factory() as session, pytest.raises(PreparationReadinessSelectionError) as exc_info:
+        PreparationReadinessSelectionLoader(session).load(
+            application_id=other_application_id,
+            target_event_id=other_target_id,
+            resume_id=resume_id,
+            ordered_version_ids=(version_ids[0],),
+        )
+    assert exc_info.value.code == "preparation_readiness_signal_not_current"
+
+
+def _exact_feedback_high_water_fixture(target_bytes: int) -> list[dict[str, object]]:
+    feedback: list[dict[str, object]] = []
+    for _index in range(8):
+        evidence = []
+        for _evidence_index in range(5):
+            excerpt = '中文"\\🙂'
+            evidence.append(
+                {
+                    "path": "/difficulty_points",
+                    "excerpt": excerpt,
+                    "excerpt_sha256": "sha256:"
+                    + hashlib.sha256(excerpt.encode("utf-8")).hexdigest(),
+                }
+            )
+        feedback.append(
+            {
+                "statement": "准备重点",
+                "user_note": "备注",
+                "source_event": {"round": 2, "subtype": "technical"},
+                "practice_state": "completed",
+                "evidence": evidence,
+            }
+        )
+    wrapper = canonical_json({"readiness_feedback": feedback}).encode("utf-8")
+    remaining = target_bytes - len(wrapper)
+    assert remaining >= 0
+    if remaining % 2:
+        feedback[-1]["statement"] = str(feedback[-1]["statement"]) + "x"
+        remaining -= 1
+    slash_counts = [remaining // 2 // 40] * 40
+    for index in range((remaining // 2) % 40):
+        slash_counts[index] += 1
+    for flat_index, slash_count in enumerate(slash_counts):
+        item = feedback[flat_index // 5]
+        evidence = item["evidence"]
+        assert isinstance(evidence, list)
+        evidence_item = evidence[flat_index % 5]
+        assert isinstance(evidence_item, dict)
+        excerpt = str(evidence_item["excerpt"]) + "\\" * slash_count
+        evidence_item["excerpt"] = excerpt
+        evidence_item["excerpt_sha256"] = "sha256:" + hashlib.sha256(
+            excerpt.encode("utf-8")
+        ).hexdigest()
+    assert len(canonical_json({"readiness_feedback": feedback}).encode("utf-8")) == (
+        target_bytes
+    )
+    return feedback
+
+
+@pytest.mark.parametrize(("target_bytes", "accepted"), ((65_536, True), (65_537, False)))
+def test_selection_loader_enforces_exact_wrapper_after_each_of_eight_full_signals(
+    tmp_path, monkeypatch, target_bytes: int, accepted: bool
+) -> None:
+    import offerpilot.review_readiness.preparation_selection as preparation_selection
+
+    factory, seeded, version_ids, target_id, resume_id = _setup_selected_signal(
+        tmp_path, focus_count=8
+    )
+    feedback = _exact_feedback_high_water_fixture(target_bytes)
+    by_version_id = dict(zip(version_ids, feedback, strict=True))
+
+    def project(_session, *, signal_version_id):  # type: ignore[no-untyped-def]
+        item = by_version_id[signal_version_id]
+        source_event = item["source_event"]
+        assert isinstance(source_event, dict)
+        evidence_json = item["evidence"]
+        assert isinstance(evidence_json, list)
+        aggregate = SimpleNamespace(
+            application_id=int(seeded["application_id"]),
+            source_event_id=int(seeded["event_id"]),
+            version_id=signal_version_id,
+            statement_text=item["statement"],
+            user_note=item["user_note"],
+            evidence=tuple(
+                SimpleNamespace(
+                    source_path=evidence_item["path"],
+                    excerpt=evidence_item["excerpt"],
+                    excerpt_sha256=evidence_item["excerpt_sha256"],
+                )
+                for evidence_item in evidence_json
+            ),
+            practice_source_fingerprint=f"sha256:{signal_version_id:064x}",
+        )
+        return SimpleNamespace(state="current", aggregate=aggregate)
+
+    original_canonicalizer = preparation_selection.canonical_readiness_feedback_bytes
+    canonicalizer_calls: list[int] = []
+
+    def record_complete_prefix(items):  # type: ignore[no-untyped-def]
+        canonicalizer_calls.append(len(items))
+        return original_canonicalizer(items)
+
+    monkeypatch.setattr(preparation_selection, "load_canonical_readiness_signal", project)
+    monkeypatch.setattr(
+        preparation_selection,
+        "canonical_readiness_feedback_bytes",
+        record_complete_prefix,
+    )
+    with factory() as session:
+        if accepted:
+            selection = preparation_selection.PreparationReadinessSelectionLoader(
+                session
+            ).load(
+                application_id=int(seeded["application_id"]),
+                target_event_id=target_id,
+                resume_id=resume_id,
+                ordered_version_ids=version_ids,
+            )
+            assert len(selection.canonical_readiness_feedback_json.encode("utf-8")) == (
+                65_536
+            )
+        else:
+            with pytest.raises(
+                preparation_selection.PreparationReadinessSelectionError
+            ) as exc_info:
+                preparation_selection.PreparationReadinessSelectionLoader(session).load(
+                    application_id=int(seeded["application_id"]),
+                    target_event_id=target_id,
+                    resume_id=resume_id,
+                    ordered_version_ids=version_ids,
+                )
+            assert exc_info.value.code == "preparation_readiness_feedback_too_large"
+    assert canonicalizer_calls == list(range(1, 9))
+
+
+def test_repository_freezes_explicit_empty_v2_and_conflicts_with_absent_v1(tmp_path) -> None:
+    factory, seeded, _version_ids, target_id, resume_id = _setup_selected_signal(tmp_path)
+    repository = InterviewPreparationProposalsRepository(factory)
+    created = repository.create_generated(
+        application_id=int(seeded["application_id"]),
+        event_id=target_id,
+        resume_id=resume_id,
+        jd_text=JD_TEXT,
+        knowledge_selections=[],
+        user_assertions=[],
+        idempotency_key="explicit-empty-v2-0001",
+        model=SafeEmptyModel(),
+        readiness_feedback_version_ids_present=True,
+        readiness_feedback_version_ids=(),
+    )
+    assert created.proposal is not None
+    with factory() as session:
+        row = session.get(InterviewPreparationProposal, created.proposal.id)
+        assert row is not None
+        snapshot = json.loads(row.input_snapshot_json)
+    assert snapshot["input_contract"] == "interview-preparation-input-v2"
+    assert snapshot["readiness_feedback"] == []
+    assert snapshot["readiness_feedback_selection"]["present"] is True
+    assert snapshot["readiness_feedback_selection"]["ordered_version_ids"] == []
+    assert snapshot["readiness_feedback_selection_fingerprint"].startswith("sha256:")
+
+    with pytest.raises(InterviewPreparationConflictError) as exc_info:
+        repository.create_generated(
+            application_id=int(seeded["application_id"]),
+            event_id=target_id,
+            resume_id=resume_id,
+            jd_text=JD_TEXT,
+            knowledge_selections=[],
+            user_assertions=[],
+            idempotency_key="explicit-empty-v2-0001",
+            model=SafeEmptyModel(),
+        )
+    assert exc_info.value.code == "interview_preparation_idempotency_conflict"
+
+
+@pytest.mark.parametrize("conflict_kind", ("absent", "different_selection"))
+def test_v2_request_conflict_does_not_mutate_accepted_attempt_and_original_resumes(
+    tmp_path, conflict_kind: str
+) -> None:
+    factory, seeded, version_ids, target_id, resume_id = _setup_selected_signal(
+        tmp_path, focus_count=2
+    )
+    repository = InterviewPreparationProposalsRepository(factory)
+    key = f"v2-nondestructive-conflict-{conflict_kind}"
+    original_selection = (version_ids[0],)
+    with pytest.raises(InterviewPreparationProviderError):
+        repository.create_generated(
+            application_id=int(seeded["application_id"]),
+            event_id=target_id,
+            resume_id=resume_id,
+            jd_text=JD_TEXT,
+            knowledge_selections=[],
+            user_assertions=[],
+            idempotency_key=key,
+            model=FailingModel(),
+            readiness_feedback_version_ids_present=True,
+            readiness_feedback_version_ids=original_selection,
+        )
+    with factory() as session:
+        accepted = session.scalar(select(InterviewPreparationProposal))
+        assert accepted is not None
+        accepted_state = (
+            accepted.attempt_status,
+            accepted.provider_call_token,
+            accepted.generation_revision,
+            accepted.provider_lease_until,
+            accepted.input_snapshot_json,
+            accepted.source_fingerprint,
+        )
+
+    conflict_kwargs = (
+        {}
+        if conflict_kind == "absent"
+        else {
+            "readiness_feedback_version_ids_present": True,
+            "readiness_feedback_version_ids": (version_ids[1],),
+        }
+    )
+    with pytest.raises(InterviewPreparationConflictError) as exc_info:
+        repository.create_generated(
+            application_id=int(seeded["application_id"]),
+            event_id=target_id,
+            resume_id=resume_id,
+            jd_text=JD_TEXT,
+            knowledge_selections=[],
+            user_assertions=[],
+            idempotency_key=key,
+            model=SafeEmptyModel(),
+            **conflict_kwargs,
+        )
+    assert exc_info.value.code == "interview_preparation_idempotency_conflict"
+    with factory() as session:
+        unchanged = session.scalar(select(InterviewPreparationProposal))
+        assert unchanged is not None
+        assert (
+            unchanged.attempt_status,
+            unchanged.provider_call_token,
+            unchanged.generation_revision,
+            unchanged.provider_lease_until,
+            unchanged.input_snapshot_json,
+            unchanged.source_fingerprint,
+        ) == accepted_state
+        unchanged.provider_lease_until = datetime(2000, 1, 1)
+        session.commit()
+
+    resumed = repository.create_generated(
+        application_id=int(seeded["application_id"]),
+        event_id=target_id,
+        resume_id=resume_id,
+        jd_text=JD_TEXT,
+        knowledge_selections=[],
+        user_assertions=[],
+        idempotency_key=key,
+        model=SafeEmptyModel(),
+        readiness_feedback_version_ids_present=True,
+        readiness_feedback_version_ids=original_selection,
+    )
+    assert resumed.proposal is not None
+    assert resumed.proposal.attempt_status == "ready"
+
+
+def test_invalid_explicit_selection_fails_before_provider_call(tmp_path) -> None:
+    factory, seeded, version_ids, target_id, resume_id = _setup_selected_signal(tmp_path)
+    with factory() as session:
+        target = session.get(ApplicationEvent, target_id)
+        assert target is not None
+        target.status = "cancelled"
+        session.commit()
+    model = SafeEmptyModel()
+    with pytest.raises(InterviewPreparationValidationError) as exc_info:
+        InterviewPreparationProposalsRepository(factory).create_generated(
+            application_id=int(seeded["application_id"]),
+            event_id=target_id,
+            resume_id=resume_id,
+            jd_text=JD_TEXT,
+            knowledge_selections=[],
+            user_assertions=[],
+            idempotency_key="invalid-selection-v2-001",
+            model=model,
+            readiness_feedback_version_ids_present=True,
+            readiness_feedback_version_ids=version_ids,
+        )
+    assert getattr(exc_info.value, "code", None) == (
+        "interview_preparation_readiness_selection_invalid"
+    )
+    assert model.calls == 0
+
+
+def test_target_drift_during_v2_provider_discards_late_result(tmp_path) -> None:
+    factory, seeded, version_ids, target_id, resume_id = _setup_selected_signal(tmp_path)
+
+    class DriftModel(SafeEmptyModel):
+        def complete(self, messages, tools):  # type: ignore[no-untyped-def]
+            with factory() as session:
+                target = session.get(ApplicationEvent, target_id)
+                assert target is not None
+                target.status = "completed"
+                session.commit()
+            return super().complete(messages, tools)
+
+    model = DriftModel()
+    repository = InterviewPreparationProposalsRepository(factory)
+    with pytest.raises(InterviewPreparationConflictError) as exc_info:
+        repository.create_generated(
+            application_id=int(seeded["application_id"]),
+            event_id=target_id,
+            resume_id=resume_id,
+            jd_text=JD_TEXT,
+            knowledge_selections=[],
+            user_assertions=[],
+            idempotency_key="target-drift-v2-0001",
+            model=model,
+            readiness_feedback_version_ids_present=True,
+            readiness_feedback_version_ids=version_ids,
+        )
+    assert exc_info.value.code == "interview_preparation_source_conflict"
+    assert model.calls == 1
+    with factory() as session:
+        row = session.scalar(select(InterviewPreparationProposal))
+        assert row is not None
+        assert row.attempt_status == "invalidated"
+        assert row.proposal_json == ""
+
+
+def test_selected_source_drift_during_provider_discards_late_result(tmp_path) -> None:
+    factory, seeded, version_ids, target_id, resume_id = _setup_selected_signal(tmp_path)
+
+    class DriftModel(SafeEmptyModel):
+        def complete(self, messages, tools):  # type: ignore[no-untyped-def]
+            with factory() as session:
+                source = session.get(ApplicationEvent, int(seeded["event_id"]))
+                assert source is not None
+                source.status = "in_progress"
+                session.commit()
+            return super().complete(messages, tools)
+
+    model = DriftModel()
+    with pytest.raises(InterviewPreparationConflictError) as exc_info:
+        InterviewPreparationProposalsRepository(factory).create_generated(
+            application_id=int(seeded["application_id"]),
+            event_id=target_id,
+            resume_id=resume_id,
+            jd_text=JD_TEXT,
+            knowledge_selections=[],
+            user_assertions=[],
+            idempotency_key="source-drift-v2-00001",
+            model=model,
+            readiness_feedback_version_ids_present=True,
+            readiness_feedback_version_ids=version_ids,
+        )
+    assert exc_info.value.code == "interview_preparation_source_conflict"
+    assert model.calls == 1
+
+
+def test_selected_current_pointer_retraction_during_provider_discards_late_result(
+    tmp_path,
+) -> None:
+    factory, seeded, version_ids, target_id, resume_id = _setup_selected_signal(tmp_path)
+
+    class RetractingModel(SafeEmptyModel):
+        def complete(self, messages, tools):  # type: ignore[no-untyped-def]
+            with factory() as session:
+                signal = session.scalar(select(InterviewReadinessSignal))
+                assert signal is not None
+                signal.current_version_id = None
+                session.commit()
+            return super().complete(messages, tools)
+
+    model = RetractingModel()
+    with pytest.raises(InterviewPreparationConflictError) as exc_info:
+        InterviewPreparationProposalsRepository(factory).create_generated(
+            application_id=int(seeded["application_id"]),
+            event_id=target_id,
+            resume_id=resume_id,
+            jd_text=JD_TEXT,
+            knowledge_selections=[],
+            user_assertions=[],
+            idempotency_key="pointer-retract-v2-0001",
+            model=model,
+            readiness_feedback_version_ids_present=True,
+            readiness_feedback_version_ids=version_ids,
+        )
+    assert exc_info.value.code == "interview_preparation_source_conflict"
+    assert model.calls == 1
+    with factory() as session:
+        row = session.scalar(select(InterviewPreparationProposal))
+        assert row is not None
+        assert row.attempt_status == "invalidated"
+        assert row.proposal_json == ""
+
+
+def test_application_visibility_drift_during_v2_provider_invalidates_attempt(tmp_path) -> None:
+    factory, seeded, version_ids, target_id, resume_id = _setup_selected_signal(tmp_path)
+
+    class DriftModel(SafeEmptyModel):
+        def complete(self, messages, tools):  # type: ignore[no-untyped-def]
+            with factory() as session:
+                application = session.get(Application, int(seeded["application_id"]))
+                assert application is not None
+                application.deleted_at = datetime.now(timezone.utc)
+                session.commit()
+            return super().complete(messages, tools)
+
+    with pytest.raises(InterviewPreparationConflictError) as exc_info:
+        InterviewPreparationProposalsRepository(factory).create_generated(
+            application_id=int(seeded["application_id"]),
+            event_id=target_id,
+            resume_id=resume_id,
+            jd_text=JD_TEXT,
+            knowledge_selections=[],
+            user_assertions=[],
+            idempotency_key="application-drift-v2-01",
+            model=DriftModel(),
+            readiness_feedback_version_ids_present=True,
+            readiness_feedback_version_ids=version_ids,
+        )
+    assert exc_info.value.code == "interview_preparation_source_conflict"
+    with factory() as session:
+        row = session.scalar(select(InterviewPreparationProposal))
+        assert row is not None
+        assert row.attempt_status == "invalidated"
+
+
+def test_repository_routes_explicit_selection_through_v2_provider_contract(tmp_path) -> None:
+    factory, seeded, version_ids, target_id, resume_id = _setup_selected_signal(tmp_path)
+
+    class ReadinessModel:
+        supports_json_schema = False
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.messages = []
+
+        def complete(self, messages, tools):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            self.messages.append(messages)
+            return Assistant(
+                content=json.dumps(
+                    {
+                        **safe_empty_interview_preparation_proposal(),
+                        "review_points": [
+                            {
+                                "id": "feedback-review-1",
+                                "text": "准备重点复习",
+                                "evidence_refs": [
+                                    {
+                                        "source": "confirmed_readiness_feedback",
+                                        "path": "/readiness_feedback/0/evidence/0/excerpt",
+                                        "excerpt": "cache consistency tradeoffs",
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+    model = ReadinessModel()
+    result = InterviewPreparationProposalsRepository(factory).create_generated(
+        application_id=int(seeded["application_id"]),
+        event_id=target_id,
+        resume_id=resume_id,
+        jd_text=JD_TEXT,
+        knowledge_selections=[],
+        user_assertions=[],
+        idempotency_key="repository-v2-provider-0001",
+        model=model,
+        readiness_feedback_version_ids_present=True,
+        readiness_feedback_version_ids=version_ids,
+    )
+    assert result.proposal is not None
+    assert result.proposal.proposal_status == "normal"
+    assert model.calls == 1
+    assert "cache consistency tradeoffs" in model.messages[0][1].content
+
+
+def test_ready_v2_replay_uses_frozen_contract_after_source_drift(tmp_path) -> None:
+    factory, seeded, version_ids, target_id, resume_id = _setup_selected_signal(tmp_path)
+    repository = InterviewPreparationProposalsRepository(factory)
+    first = repository.create_generated(
+        application_id=int(seeded["application_id"]),
+        event_id=target_id,
+        resume_id=resume_id,
+        jd_text=JD_TEXT,
+        knowledge_selections=[],
+        user_assertions=[],
+        idempotency_key="ready-v2-frozen-0001",
+        model=SafeEmptyModel(),
+        readiness_feedback_version_ids_present=True,
+        readiness_feedback_version_ids=version_ids,
+    )
+    with factory() as session:
+        source = session.get(ApplicationEvent, int(seeded["event_id"]))
+        assert source is not None
+        source.status = "in_progress"
+        session.commit()
+
+    replay_model = SafeEmptyModel()
+    replay = repository.create_generated(
+        application_id=int(seeded["application_id"]),
+        event_id=target_id,
+        resume_id=resume_id,
+        jd_text=JD_TEXT,
+        knowledge_selections=[],
+        user_assertions=[],
+        idempotency_key="ready-v2-frozen-0001",
+        model=replay_model,
+        readiness_feedback_version_ids_present=True,
+        readiness_feedback_version_ids=version_ids,
+    )
+    assert replay.proposal is not None and first.proposal is not None
+    assert replay.proposal.id == first.proposal.id
+    assert replay.created is False
+    assert replay_model.calls == 0
+
+
+def test_expired_v2_provider_fallback_source_drift_invalidates_without_second_call(
+    tmp_path,
+) -> None:
+    factory, seeded, version_ids, target_id, resume_id = _setup_selected_signal(tmp_path)
+    repository = InterviewPreparationProposalsRepository(factory)
+    with pytest.raises(InterviewPreparationProviderError):
+        repository.create_generated(
+            application_id=int(seeded["application_id"]),
+            event_id=target_id,
+            resume_id=resume_id,
+            jd_text=JD_TEXT,
+            knowledge_selections=[],
+            user_assertions=[],
+            idempotency_key="unknown-v2-frozen-01",
+            model=FailingModel(),
+            readiness_feedback_version_ids_present=True,
+            readiness_feedback_version_ids=version_ids,
+        )
+    with factory() as session:
+        row = session.scalar(select(InterviewPreparationProposal))
+        source = session.get(ApplicationEvent, int(seeded["event_id"]))
+        assert row is not None and source is not None
+        row.provider_lease_until = datetime(2000, 1, 1)
+        source.status = "in_progress"
+        session.commit()
+
+    retry_model = SafeEmptyModel()
+    with pytest.raises(InterviewPreparationConflictError) as exc_info:
+        repository.create_generated(
+            application_id=int(seeded["application_id"]),
+            event_id=target_id,
+            resume_id=resume_id,
+            jd_text=JD_TEXT,
+            knowledge_selections=[],
+            user_assertions=[],
+            idempotency_key="unknown-v2-frozen-01",
+            model=retry_model,
+            readiness_feedback_version_ids_present=True,
+            readiness_feedback_version_ids=version_ids,
+        )
+    assert exc_info.value.code == "interview_preparation_source_conflict"
+    assert retry_model.calls == 0
+    with factory() as session:
+        row = session.scalar(select(InterviewPreparationProposal))
+        assert row is not None
+        assert row.attempt_status == "invalidated"
+
+
+def test_expired_v2_provider_fallback_reuses_byte_identical_frozen_provider_input(
+    tmp_path,
+) -> None:
+    factory, seeded, version_ids, target_id, resume_id = _setup_selected_signal(tmp_path)
+
+    class RecordingFailingModel(FailingModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.messages = []
+
+        def complete(self, messages, tools):  # type: ignore[no-untyped-def]
+            self.messages.append(messages)
+            return super().complete(messages, tools)
+
+    class RecordingSafeEmptyModel(SafeEmptyModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.messages = []
+
+        def complete(self, messages, tools):  # type: ignore[no-untyped-def]
+            self.messages.append(messages)
+            return super().complete(messages, tools)
+
+    repository = InterviewPreparationProposalsRepository(factory)
+    first_model = RecordingFailingModel()
+    with pytest.raises(InterviewPreparationProviderError):
+        repository.create_generated(
+            application_id=int(seeded["application_id"]),
+            event_id=target_id,
+            resume_id=resume_id,
+            jd_text=JD_TEXT,
+            knowledge_selections=[],
+            user_assertions=[],
+            idempotency_key="unknown-v2-unchanged-01",
+            model=first_model,
+            readiness_feedback_version_ids_present=True,
+            readiness_feedback_version_ids=version_ids,
+        )
+    with factory() as session:
+        row = session.scalar(select(InterviewPreparationProposal))
+        assert row is not None
+        frozen_snapshot_json = row.input_snapshot_json
+        frozen_fingerprint = row.source_fingerprint
+        row.provider_lease_until = datetime(2000, 1, 1)
+        session.commit()
+
+    retry_model = RecordingSafeEmptyModel()
+    result = repository.create_generated(
+        application_id=int(seeded["application_id"]),
+        event_id=target_id,
+        resume_id=resume_id,
+        jd_text=JD_TEXT,
+        knowledge_selections=[],
+        user_assertions=[],
+        idempotency_key="unknown-v2-unchanged-01",
+        model=retry_model,
+        readiness_feedback_version_ids_present=True,
+        readiness_feedback_version_ids=version_ids,
+    )
+    assert result.proposal is not None
+    assert result.proposal.attempt_status == "ready"
+    assert first_model.calls == retry_model.calls == 1
+    assert first_model.messages[0][1].content.encode("utf-8") == (
+        retry_model.messages[0][1].content.encode("utf-8")
+    )
+    with factory() as session:
+        row = session.scalar(select(InterviewPreparationProposal))
+        assert row is not None
+        assert row.input_snapshot_json == frozen_snapshot_json
+        assert row.source_fingerprint == frozen_fingerprint
+        assert row.generation_revision == 2

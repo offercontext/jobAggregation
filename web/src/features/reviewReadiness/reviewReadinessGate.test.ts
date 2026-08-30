@@ -12,13 +12,28 @@ const CANONICAL_COMPONENTS = [
 
 type AbstractValue =
   | { kind: 'unknown' }
-  | { kind: 'generated-token' }
+  | { kind: 'server-token' }
+  | { kind: 'server-response' }
+  | { kind: 'server-response-function' }
+  | { kind: 'story-service-namespace' }
   | { kind: 'story-confirm-function' }
   | { kind: 'string'; text: string }
-  | { kind: 'object'; properties: Map<string, AbstractValue> };
+  | {
+    kind: 'object';
+    properties: Map<string, AbstractValue>;
+    unknownProperties: boolean;
+  }
+  | {
+    kind: 'local-function';
+    node: ts.FunctionDeclaration | ts.FunctionExpression | ts.ArrowFunction;
+    closure: LexicalScope;
+  };
 
 const UNKNOWN: AbstractValue = { kind: 'unknown' };
-const GENERATED_TOKEN: AbstractValue = { kind: 'generated-token' };
+const SERVER_TOKEN: AbstractValue = { kind: 'server-token' };
+const SERVER_RESPONSE: AbstractValue = { kind: 'server-response' };
+const SERVER_RESPONSE_FUNCTION: AbstractValue = { kind: 'server-response-function' };
+const STORY_SERVICE_NAMESPACE: AbstractValue = { kind: 'story-service-namespace' };
 const STORY_CONFIRM_FUNCTION: AbstractValue = { kind: 'story-confirm-function' };
 
 class LexicalScope {
@@ -80,27 +95,203 @@ function propertyName(node: ts.PropertyName): string | null {
 function unwrap(expression: ts.Expression): ts.Expression {
   if (ts.isParenthesizedExpression(expression)
     || ts.isAsExpression(expression)
-    || ts.isNonNullExpression(expression)) {
+    || ts.isNonNullExpression(expression)
+    || ts.isSatisfiesExpression(expression)) {
     return unwrap(expression.expression);
   }
   return expression;
 }
 
 function mergeValues(left: AbstractValue, right: AbstractValue): AbstractValue {
-  if (left.kind === 'generated-token' || right.kind === 'generated-token') {
-    return GENERATED_TOKEN;
+  if (left.kind === 'server-token' && right.kind === 'server-token') return SERVER_TOKEN;
+  if (left.kind === 'server-response' && right.kind === 'server-response') {
+    return SERVER_RESPONSE;
   }
-  if (left.kind === 'story-confirm-function' || right.kind === 'story-confirm-function') {
+  if (left.kind === 'server-response-function' && right.kind === 'server-response-function') {
+    return SERVER_RESPONSE_FUNCTION;
+  }
+  if (left.kind === 'story-confirm-function' && right.kind === 'story-confirm-function') {
     return STORY_CONFIRM_FUNCTION;
   }
   if (left.kind === 'string' && right.kind === 'string' && left.text === right.text) {
     return left;
   }
   if (left.kind === 'object' && left === right) return left;
+  if (left.kind === 'local-function'
+    && right.kind === 'local-function'
+    && left.node === right.node) return left;
   return UNKNOWN;
 }
 
-function evaluateExpression(rawExpression: ts.Expression, scope: LexicalScope): AbstractValue {
+function isStoryServiceModule(moduleName: string): boolean {
+  return /(?:^|\/)services\/interviewStories$/.test(moduleName);
+}
+
+function isStoryServerResponseFunction(name: string): boolean {
+  return name === 'createInterviewStoryProposal'
+    || name === 'getInterviewStoryProposal'
+    || /^(?:create|get|load|propose|recover|request|refresh)InterviewStoryProductAction/.test(name);
+}
+
+function objectWithServerToken(): AbstractValue {
+  return {
+    kind: 'object',
+    properties: new Map([['confirmation_token', SERVER_TOKEN]]),
+    unknownProperties: false,
+  };
+}
+
+function propertyValue(owner: AbstractValue, name: string): AbstractValue {
+  if (owner.kind === 'object') return owner.properties.get(name) ?? UNKNOWN;
+  if (owner.kind === 'story-service-namespace') {
+    if (name === 'confirmInterviewStoryProposal') return STORY_CONFIRM_FUNCTION;
+    return isStoryServerResponseFunction(name) ? SERVER_RESPONSE_FUNCTION : UNKNOWN;
+  }
+  if (owner.kind === 'server-response'
+    && (name === 'confirmation_token' || name === 'confirmationToken')) {
+    return SERVER_TOKEN;
+  }
+  if (name === 'serverConfirmationToken' || name === 'server_confirmation_token') {
+    return SERVER_TOKEN;
+  }
+  return UNKNOWN;
+}
+
+function declareBinding(
+  name: ts.BindingName,
+  rawValue: AbstractValue,
+  scope: LexicalScope,
+  activeFunctions = new Set<ts.Node>(),
+): void {
+  if (ts.isIdentifier(name)) {
+    scope.declare(name.text, rawValue);
+    return;
+  }
+  if (!ts.isObjectBindingPattern(name)) return;
+  for (const element of name.elements) {
+    if (element.dotDotDotToken) {
+      declareBinding(element.name, UNKNOWN, scope, activeFunctions);
+      continue;
+    }
+    const key = element.propertyName
+      ? propertyName(element.propertyName)
+      : ts.isIdentifier(element.name) ? element.name.text : null;
+    let value = key === null ? UNKNOWN : propertyValue(rawValue, key);
+    if (element.initializer) {
+      value = mergeValues(
+        value,
+        evaluateExpression(element.initializer, scope, activeFunctions),
+      );
+    }
+    declareBinding(element.name, value, scope, activeFunctions);
+  }
+}
+
+function declareFunctionDeclarations(
+  statements: readonly ts.Statement[],
+  scope: LexicalScope,
+): void {
+  for (const statement of statements) {
+    if (!ts.isFunctionDeclaration(statement) || !statement.name) continue;
+    scope.declare(
+      statement.name.text,
+      statement.name.text === 'confirmInterviewStoryProposal'
+        ? STORY_CONFIRM_FUNCTION
+        : { kind: 'local-function', node: statement, closure: scope },
+    );
+  }
+}
+
+function evaluateStatements(
+  statements: readonly ts.Statement[],
+  scope: LexicalScope,
+  activeFunctions: Set<ts.Node>,
+): AbstractValue | null {
+  declareFunctionDeclarations(statements, scope);
+  for (const statement of statements) {
+    if (ts.isFunctionDeclaration(statement)) continue;
+    if (ts.isVariableStatement(statement)) {
+      for (const declaration of statement.declarationList.declarations) {
+        declareBinding(
+          declaration.name,
+          declaration.initializer
+            ? evaluateExpression(declaration.initializer, scope, activeFunctions)
+            : UNKNOWN,
+          scope,
+          activeFunctions,
+        );
+      }
+      continue;
+    }
+    if (ts.isReturnStatement(statement)) {
+      return statement.expression
+        ? evaluateExpression(statement.expression, scope, activeFunctions)
+        : UNKNOWN;
+    }
+    if (ts.isBlock(statement)) {
+      const returned = evaluateStatements(
+        statement.statements,
+        new LexicalScope(scope),
+        activeFunctions,
+      );
+      if (returned !== null) return returned;
+      continue;
+    }
+    if (ts.isIfStatement(statement)) {
+      const thenValue = ts.isBlock(statement.thenStatement)
+        ? evaluateStatements(
+          statement.thenStatement.statements,
+          new LexicalScope(scope),
+          activeFunctions,
+        )
+        : null;
+      const elseValue = statement.elseStatement && ts.isBlock(statement.elseStatement)
+        ? evaluateStatements(
+          statement.elseStatement.statements,
+          new LexicalScope(scope),
+          activeFunctions,
+        )
+        : null;
+      if (thenValue !== null || elseValue !== null) {
+        return thenValue !== null && elseValue !== null
+          ? mergeValues(thenValue, elseValue)
+          : UNKNOWN;
+      }
+    }
+  }
+  return null;
+}
+
+function evaluateLocalFunction(
+  value: Extract<AbstractValue, { kind: 'local-function' }>,
+  arguments_: readonly ts.Expression[],
+  callerScope: LexicalScope,
+  activeFunctions: Set<ts.Node>,
+): AbstractValue {
+  if (activeFunctions.has(value.node)) return UNKNOWN;
+  const nextActive = new Set(activeFunctions).add(value.node);
+  const functionScope = new LexicalScope(value.closure);
+  value.node.parameters.forEach((parameter, index) => {
+    declareBinding(
+      parameter.name,
+      arguments_[index]
+        ? evaluateExpression(arguments_[index], callerScope, activeFunctions)
+        : UNKNOWN,
+      functionScope,
+      activeFunctions,
+    );
+  });
+  if (!ts.isBlock(value.node.body)) {
+    return evaluateExpression(value.node.body, functionScope, nextActive);
+  }
+  return evaluateStatements(value.node.body.statements, functionScope, nextActive) ?? UNKNOWN;
+}
+
+function evaluateExpression(
+  rawExpression: ts.Expression,
+  scope: LexicalScope,
+  activeFunctions = new Set<ts.Node>(),
+): AbstractValue {
   const expression = unwrap(rawExpression);
   if (ts.isIdentifier(expression)) {
     const binding = scope.lookup(expression.text);
@@ -121,56 +312,88 @@ function evaluateExpression(rawExpression: ts.Expression, scope: LexicalScope): 
       ].join(''),
     };
   }
+  if (ts.isAwaitExpression(expression)) {
+    return evaluateExpression(expression.expression, scope, activeFunctions);
+  }
   if (ts.isPropertyAccessExpression(expression)) {
-    const owner = evaluateExpression(expression.expression, scope);
-    return owner.kind === 'object'
-      ? owner.properties.get(expression.name.text) ?? UNKNOWN
-      : UNKNOWN;
+    return propertyValue(
+      evaluateExpression(expression.expression, scope, activeFunctions),
+      expression.name.text,
+    );
+  }
+  if (ts.isElementAccessExpression(expression)
+    && expression.argumentExpression
+    && (ts.isStringLiteral(expression.argumentExpression)
+      || ts.isNoSubstitutionTemplateLiteral(expression.argumentExpression))) {
+    return propertyValue(
+      evaluateExpression(expression.expression, scope, activeFunctions),
+      expression.argumentExpression.text,
+    );
   }
   if (ts.isBinaryExpression(expression)) {
-    return mergeValues(
-      evaluateExpression(expression.left, scope),
-      evaluateExpression(expression.right, scope),
-    );
+    if (expression.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken
+      || expression.operatorToken.kind === ts.SyntaxKind.BarBarToken) {
+      return mergeValues(
+        evaluateExpression(expression.left, scope, activeFunctions),
+        evaluateExpression(expression.right, scope, activeFunctions),
+      );
+    }
+    return UNKNOWN;
   }
   if (ts.isConditionalExpression(expression)) {
     return mergeValues(
-      evaluateExpression(expression.whenTrue, scope),
-      evaluateExpression(expression.whenFalse, scope),
+      evaluateExpression(expression.whenTrue, scope, activeFunctions),
+      evaluateExpression(expression.whenFalse, scope, activeFunctions),
     );
   }
+  if (ts.isFunctionExpression(expression) || ts.isArrowFunction(expression)) {
+    return { kind: 'local-function', node: expression, closure: scope };
+  }
   if (ts.isObjectLiteralExpression(expression)) {
-    const value: AbstractValue = { kind: 'object', properties: new Map() };
+    const value: AbstractValue = {
+      kind: 'object',
+      properties: new Map(),
+      unknownProperties: false,
+    };
     for (const property of expression.properties) {
       if (ts.isPropertyAssignment(property)) {
         const name = propertyName(property.name);
         if (name !== null) {
-          value.properties.set(name, evaluateExpression(property.initializer, scope));
+          value.properties.set(
+            name,
+            evaluateExpression(property.initializer, scope, activeFunctions),
+          );
         }
       } else if (ts.isShorthandPropertyAssignment(property)) {
-        value.properties.set(property.name.text, evaluateExpression(property.name, scope));
+        value.properties.set(
+          property.name.text,
+          evaluateExpression(property.name, scope, activeFunctions),
+        );
       } else if (ts.isSpreadAssignment(property)) {
-        const spread = evaluateExpression(property.expression, scope);
+        const spread = evaluateExpression(property.expression, scope, activeFunctions);
         if (spread.kind === 'object') {
           for (const [name, nested] of spread.properties) value.properties.set(name, nested);
+          value.unknownProperties ||= spread.unknownProperties;
+        } else if (spread.kind === 'server-response') {
+          value.properties.set('confirmation_token', SERVER_TOKEN);
+        } else {
+          value.properties.delete('confirmation_token');
+          value.unknownProperties = true;
         }
       }
     }
     return value;
   }
   if (ts.isCallExpression(expression)) {
-    if (ts.isIdentifier(expression.expression)
-      && expression.expression.text === 'key'
-      && expression.arguments.some((argument) => (
-        ts.isStringLiteral(argument) && argument.text === 'story-confirm'
-      ))) return GENERATED_TOKEN;
-    if (ts.isPropertyAccessExpression(expression.expression)) {
-      const owner = expression.expression.expression;
-      const member = expression.expression.name.text;
-      if ((member === 'randomUUID' && ts.isIdentifier(owner) && owner.text === 'crypto')
-        || (member === 'random' && ts.isIdentifier(owner) && owner.text === 'Math')) {
-        return GENERATED_TOKEN;
-      }
+    const callee = evaluateExpression(expression.expression, scope, activeFunctions);
+    if (callee.kind === 'server-response-function') return SERVER_RESPONSE;
+    if (callee.kind === 'local-function') {
+      return evaluateLocalFunction(
+        callee,
+        expression.arguments,
+        scope,
+        activeFunctions,
+      );
     }
   }
   return UNKNOWN;
@@ -187,13 +410,18 @@ function assignProperty(
     existing.value.properties.set(property, value);
     return;
   }
-  const replacement: AbstractValue = { kind: 'object', properties: new Map([[property, value]]) };
+  const replacement: AbstractValue = {
+    kind: 'object',
+    properties: new Map([[property, value]]),
+    unknownProperties: false,
+  };
   scope.assign(ownerName, replacement);
 }
 
-function hasGeneratedConfirmationToken(value: AbstractValue): boolean {
-  return value.kind === 'object'
-    && value.properties.get('confirmation_token')?.kind === 'generated-token';
+function hasUnsafeConfirmationToken(value: AbstractValue): boolean {
+  if (value.kind !== 'object') return true;
+  const token = value.properties.get('confirmation_token');
+  return token === undefined ? value.unknownProperties : token.kind !== 'server-token';
 }
 
 function callIsStoryConfirmHttpPost(node: ts.CallExpression, scope: LexicalScope): boolean {
@@ -212,27 +440,34 @@ function hasClientGeneratedStoryAuthorization(sourceFile: ts.SourceFile): boolea
   const visit = (node: ts.Node, scope: LexicalScope): void => {
     if (violation) return;
     if (ts.isSourceFile(node)) {
+      declareFunctionDeclarations(node.statements, scope);
       for (const statement of node.statements) visit(statement, scope);
       return;
     }
     if (ts.isImportDeclaration(node)) {
       const clause = node.importClause;
+      const moduleName = ts.isStringLiteral(node.moduleSpecifier)
+        ? node.moduleSpecifier.text
+        : '';
+      const storyService = isStoryServiceModule(moduleName);
       if (clause?.name) scope.declare(clause.name.text, UNKNOWN);
       if (clause?.namedBindings && ts.isNamedImports(clause.namedBindings)) {
         for (const specifier of clause.namedBindings.elements) {
           const imported = specifier.propertyName?.text ?? specifier.name.text;
           scope.declare(
             specifier.name.text,
-            imported === 'confirmInterviewStoryProposal' ? STORY_CONFIRM_FUNCTION : UNKNOWN,
+            imported === 'confirmInterviewStoryProposal'
+              ? STORY_CONFIRM_FUNCTION
+              : storyService && isStoryServerResponseFunction(imported)
+                ? SERVER_RESPONSE_FUNCTION
+                : UNKNOWN,
           );
         }
       } else if (clause?.namedBindings && ts.isNamespaceImport(clause.namedBindings)) {
-        scope.declare(clause.namedBindings.name.text, {
-          kind: 'object',
-          properties: new Map([
-            ['confirmInterviewStoryProposal', STORY_CONFIRM_FUNCTION],
-          ]),
-        });
+        scope.declare(
+          clause.namedBindings.name.text,
+          storyService ? STORY_SERVICE_NAMESPACE : UNKNOWN,
+        );
       }
       return;
     }
@@ -242,14 +477,20 @@ function hasClientGeneratedStoryAuthorization(sourceFile: ts.SourceFile): boolea
           node.name.text,
           node.name.text === 'confirmInterviewStoryProposal'
             ? STORY_CONFIRM_FUNCTION
-            : UNKNOWN,
+            : { kind: 'local-function', node, closure: scope },
         );
       }
       if (node.body) {
         const child = new LexicalScope(scope);
-        for (const parameter of node.parameters) {
-          if (ts.isIdentifier(parameter.name)) child.declare(parameter.name.text, UNKNOWN);
-        }
+        node.parameters.forEach((parameter, index) => {
+          declareBinding(
+            parameter.name,
+            node.name?.text === 'confirmInterviewStoryProposal' && index === 1
+              ? objectWithServerToken()
+              : UNKNOWN,
+            child,
+          );
+        });
         visit(node.body, child);
       }
       return;
@@ -257,13 +498,14 @@ function hasClientGeneratedStoryAuthorization(sourceFile: ts.SourceFile): boolea
     if (ts.isFunctionExpression(node) || ts.isArrowFunction(node)) {
       const child = new LexicalScope(scope);
       for (const parameter of node.parameters) {
-        if (ts.isIdentifier(parameter.name)) child.declare(parameter.name.text, UNKNOWN);
+        declareBinding(parameter.name, UNKNOWN, child);
       }
       visit(node.body, child);
       return;
     }
     if (ts.isBlock(node)) {
       const child = new LexicalScope(scope);
+      declareFunctionDeclarations(node.statements, child);
       for (const statement of node.statements) visit(statement, child);
       return;
     }
@@ -273,12 +515,11 @@ function hasClientGeneratedStoryAuthorization(sourceFile: ts.SourceFile): boolea
     }
     if (ts.isVariableDeclaration(node)) {
       if (node.initializer) visit(node.initializer, scope);
-      if (ts.isIdentifier(node.name)) {
-        scope.declare(
-          node.name.text,
-          node.initializer ? evaluateExpression(node.initializer, scope) : UNKNOWN,
-        );
-      }
+      declareBinding(
+        node.name,
+        node.initializer ? evaluateExpression(node.initializer, scope) : UNKNOWN,
+        scope,
+      );
       return;
     }
     if (ts.isBinaryExpression(node)
@@ -299,7 +540,7 @@ function hasClientGeneratedStoryAuthorization(sourceFile: ts.SourceFile): boolea
         ? evaluateExpression(node.arguments[1], scope)
         : UNKNOWN;
       if ((callee.kind === 'story-confirm-function' || callIsStoryConfirmHttpPost(node, scope))
-        && hasGeneratedConfirmationToken(request)) {
+        && hasUnsafeConfirmationToken(request)) {
         violation = true;
         return;
       }
@@ -531,6 +772,49 @@ describe('review readiness mechanical gate', () => {
     for (const source of unsafeCases) {
       expect(hasClientGeneratedStoryAuthorization(parse('unsafe.tsx', source))).toBe(true);
     }
+  });
+
+  it('rejects every token without an explicit server-issued source through local helpers', () => {
+    const unsafeCases = [
+      `function makeToken() { return crypto.randomUUID(); }
+       const alias = makeToken;
+       confirmInterviewStoryProposal(id, { confirmation_token: alias() });`,
+      `const token = \`\${Date.now()}-\${Math.random()}\`;
+       confirmInterviewStoryProposal(id, { confirmation_token: token });`,
+      `function first() { return second(); }
+       const second = () => third();
+       function third() { return Date.now(); }
+       const alias = first;
+       confirmInterviewStoryProposal(id, { confirmation_token: alias() });`,
+      `confirmInterviewStoryProposal(id, { confirmation_token: 'client-value' });`,
+      `confirmInterviewStoryProposal(id, { confirmation_token: opaqueToken() });`,
+      `confirmInterviewStoryProposal(id, { ...opaqueRequest() });`,
+    ];
+    for (const source of unsafeCases) {
+      expect(hasClientGeneratedStoryAuthorization(parse('unsafe-source.tsx', source))).toBe(true);
+    }
+  });
+
+  it('allows server response tokens propagated through local helpers and aliases', () => {
+    const safe = parse('server-source.tsx', `
+      import { getInterviewStoryProposal as loadProposal } from '@/services/interviewStories';
+      const takeToken = (response) => response.confirmation_token;
+      function forwardToken(response) {
+        const helper = takeToken;
+        return helper(response);
+      }
+      async function owner() {
+        const response = await loadProposal(id);
+        const confirmation_token = forwardToken(response);
+        const request = { confirmation_token };
+        confirmInterviewStoryProposal(id, request);
+      }
+      async function destructuredOwner() {
+        const { confirmation_token: serverToken } = await loadProposal(id);
+        confirmInterviewStoryProposal(id, { confirmation_token: serverToken });
+      }
+    `);
+    expect(hasClientGeneratedStoryAuthorization(safe)).toBe(false);
   });
 
   it('detects token generation inside the Story service HTTP path', () => {

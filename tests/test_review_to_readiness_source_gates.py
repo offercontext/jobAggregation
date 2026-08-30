@@ -217,24 +217,44 @@ def _proposal_drives_practice_start(tree: ast.AST | None) -> bool:
 
 def _proposal_drives_practice_recommendations(tree: ast.AST | None) -> bool:
     reachable = _reachable_practice_functions(tree, "list_recommendations")
-    scans_proposals = any(
-        isinstance(child, ast.Name) and child.id == "InterviewReviewProposal"
-        for member in reachable
-        for child in ast.walk(member)
-    )
-    projects_focuses = any(
-        isinstance(child, ast.Call)
-        and (
-            (isinstance(child.func, ast.Name) and child.func.id == "_proposal_focuses")
-            or (
-                isinstance(child.func, ast.Attribute)
-                and child.func.attr == "_proposal_focuses"
-            )
-        )
-        for member in reachable
-        for child in ast.walk(member)
-    )
-    return scans_proposals and projects_focuses
+
+    class RuntimeModelAccess(ast.NodeVisitor):
+        found = False
+
+        def visit_Name(self, node: ast.Name) -> None:  # noqa: N802
+            if node.id == "InterviewReviewProposal":
+                self.found = True
+
+        def visit_arg(self, node: ast.arg) -> None:
+            return
+
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:  # noqa: N802
+            self.visit(node.target)
+            if node.value is not None:
+                self.visit(node.value)
+
+        def _visit_function(
+            self,
+            node: ast.FunctionDef | ast.AsyncFunctionDef,
+        ) -> None:
+            for default in (*node.args.defaults, *node.args.kw_defaults):
+                if default is not None:
+                    self.visit(default)
+            for statement in node.body:
+                self.visit(statement)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
+            self._visit_function(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:  # noqa: N802
+            self._visit_function(node)
+
+    for member in reachable:
+        visitor = RuntimeModelAccess()
+        visitor.visit(member)
+        if visitor.found:
+            return True
+    return False
 
 
 def _proposal_drives_practice(tree: ast.AST | None) -> bool:
@@ -416,6 +436,32 @@ class AdaptivePracticeRepository:
     assert _proposal_drives_practice_recommendations(legacy_scan)
     assert _proposal_drives_practice(legacy_scan)
 
+    inline_focus_scan = ast.parse(
+        '''
+class AdaptivePracticeRepository:
+    def start(self, readiness_signal_version_id, target_application_event_id):
+        return readiness_signal_version_id, target_application_event_id
+    def list_recommendations(self):
+        proposals = session.scalars(select(InterviewReviewProposal))
+        return [proposal.practice_focuses for proposal in proposals]
+'''
+    )
+    assert _proposal_drives_practice(inline_focus_scan)
+
+    renamed_focus_helper = ast.parse(
+        '''
+def _review_weaknesses(session):
+    proposals = session.scalars(select(InterviewReviewProposal))
+    return [proposal.practice_focuses for proposal in proposals]
+class AdaptivePracticeRepository:
+    def start(self, readiness_signal_version_id, target_application_event_id):
+        return readiness_signal_version_id, target_application_event_id
+    def list_recommendations(self):
+        return _review_weaknesses(self._session_factory())
+'''
+    )
+    assert _proposal_drives_practice(renamed_focus_helper)
+
     historical_plans_only = ast.parse(
         '''
 class AdaptivePracticeRepository:
@@ -426,6 +472,34 @@ class AdaptivePracticeRepository:
 '''
     )
     assert not _proposal_drives_practice(historical_plans_only)
+
+    safe_plan_helper = ast.parse(
+        '''
+def _plan_focuses(plan):
+    return plan.focuses
+class AdaptivePracticeRepository:
+    def start(self, readiness_signal_version_id, target_application_event_id):
+        return readiness_signal_version_id, target_application_event_id
+    def list_recommendations(self):
+        plans = session.scalars(select(AdaptivePracticePlan))
+        return [_plan_focuses(plan) for plan in plans]
+'''
+    )
+    assert not _proposal_drives_practice(safe_plan_helper)
+
+    annotation_only = ast.parse(
+        '''
+def _format_plan(plan: InterviewReviewProposal):
+    return plan.focuses
+class AdaptivePracticeRepository:
+    def start(self, readiness_signal_version_id, target_application_event_id):
+        return readiness_signal_version_id, target_application_event_id
+    def list_recommendations(self):
+        plans = session.scalars(select(AdaptivePracticePlan))
+        return [_format_plan(plan) for plan in plans]
+'''
+    )
+    assert not _proposal_drives_practice(annotation_only)
 
 
 def test_practice_gate_follows_reachable_module_helpers_without_scanning_unrelated_helpers() -> None:

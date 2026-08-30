@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
@@ -172,7 +172,7 @@ describe('Desktop Task Flow independent frontend gate', () => {
 
     const detailStart = appShell.indexOf('<ApplicationDetail');
     const detailEnd = appShell.indexOf('/>', detailStart);
-    expect(appShell.slice(detailStart, detailEnd)).toContain('offers={ofrs}');
+    expect(appShell.slice(detailStart, detailEnd)).toContain('offers={selectedOfferScope.offers}');
     expect(detail).toContain('offers?: Offer[]');
   });
 
@@ -209,6 +209,11 @@ describe('Desktop Task Flow independent frontend gate', () => {
   it('keeps changed production surfaces away from the Chat transport service', () => {
     const root = repoRoot();
     for (const path of changedPaths(root).filter(isChangedProductionSource)) {
+      // The historical range includes the retired V1 Pilot card, which was
+      // replaced by the canonical V2 projection after that range completed.
+      // Scan the current production surface (including V2) and ignore files
+      // that no longer exist instead of trying to read the retired path.
+      if (!existsSync(join(root, path))) continue;
       expect(read(root, path), `${path} must not import Chat transport`).not.toMatch(
         /from\s+['"]@\/services\/chat['"]/
       );

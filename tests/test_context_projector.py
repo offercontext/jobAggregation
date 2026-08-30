@@ -10,10 +10,11 @@ import time
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from types import SimpleNamespace
+from collections.abc import Callable
 from typing import cast
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import Engine, event, select, text
 from sqlalchemy.exc import IntegrityError
 from fastapi.testclient import TestClient
 
@@ -23,8 +24,8 @@ from offerpilot.agent_runtime.events import (
     validate_context_manifest_json,
 )
 from offerpilot.agent_runtime.budget import JournalBudgetExhausted
-from offerpilot.agent_runtime.journal import RunRecorderFactory
-from offerpilot.agent_runtime.keyring import load_or_create_journal_key
+from offerpilot.agent_runtime.journal import RunRecorderFactory, SafeRunRecorder
+from offerpilot.agent_runtime.keyring import JournalKeyDomain, load_or_create_journal_key
 from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
 from offerpilot.ai.tool_runtime.catalog import compile_tool_metadata_manifest
 from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
@@ -309,6 +310,36 @@ def test_frozen_source_has_distinct_revision_and_full_content_fingerprint() -> N
 def test_contributor_diagnostics_are_closed_and_bounded() -> None:
     with pytest.raises(ProjectionError, match="invalid_diagnostic"):
         ContributorResult("current_scope", "ready", diagnostics={"detail": "secret"})  # type: ignore[dict-item]
+
+
+@pytest.mark.parametrize(
+    "deferred_name",
+    ("confirmed_memory", "knowledge_context", "older_conversation_summary"),
+)
+def test_plain_ready_contributor_cannot_enable_deferred_agent_context(
+    deferred_name: str,
+) -> None:
+    values = list(contributors())
+    index = CONTRIBUTOR_ORDER.index(deferred_name)
+    values[index] = ContributorResult(
+        deferred_name,
+        "ready",
+        (frozen("system", "synthetic future context"),),
+    )
+
+    with pytest.raises(ProjectionError, match="deferred_contributor_not_disabled"):
+        ModelSurfaceProjector().project(
+            ProjectionRequest(
+                model_call_id="deferred-context-must-remain-disabled",
+                contributors=tuple(values),
+                history=(),
+                tool_signals=ToolSelectionSignals(current_request="compare offers"),
+                provider_budgets=(ProviderBudget(),),
+                selection=_selection_for(
+                    ToolSelectionSignals(current_request="compare offers")
+                ),
+            )
+        )
 
 
 @pytest.mark.parametrize(
@@ -992,6 +1023,181 @@ def test_manifest_v2_is_canonical_private_and_validated_by_shared_entrypoint() -
     assert "logical_input_fingerprint" not in prepared.manifest_json
 
 
+def test_future_readiness_asset_does_not_change_persisted_journal_manifest_bytes(
+    tmp_path: Path,
+) -> None:
+    contributor_statuses = (
+        ("static_policy", "not_applicable"),
+        ("current_scope", "not_applicable"),
+        ("active_control", "not_applicable"),
+        ("request_page_context", "not_applicable"),
+        ("request_attachments", "not_applicable"),
+        ("conversation_history", "not_applicable"),
+        ("current_request", "not_applicable"),
+        ("confirmed_memory", "disabled"),
+        ("knowledge_context", "disabled"),
+        ("older_conversation_summary", "disabled"),
+    )
+    audit = RuntimeSurfaceAudit(
+        "model-surface-budget-v1",
+        contributor_statuses,  # type: ignore[arg-type]
+        (),
+        (),
+        (),
+        0,
+        0,
+        0,
+        False,
+    )
+    expected_bytes = (
+        '{"budget_policy_version":"model-surface-budget-v1","contributors":['
+        '{"name":"static_policy","status":"not_applicable"},'
+        '{"name":"current_scope","status":"not_applicable"},'
+        '{"name":"active_control","status":"not_applicable"},'
+        '{"name":"request_page_context","status":"not_applicable"},'
+        '{"name":"request_attachments","status":"not_applicable"},'
+        '{"name":"conversation_history","status":"not_applicable"},'
+        '{"name":"current_request","status":"not_applicable"},'
+        '{"name":"confirmed_memory","status":"disabled"},'
+        '{"name":"knowledge_context","status":"disabled"},'
+        '{"name":"older_conversation_summary","status":"disabled"}],'
+        '"counts":{"canonical_message_bytes":0,"canonical_tool_bytes":0,'
+        '"estimated_input_units":0},'
+        '"fingerprint_key_id":"11111111-1111-4111-8111-111111111111",'
+        '"history_groups":[],"manifest_schema_version":2,'
+        '"providers":["a52e1463df875c508550e3d69427f090f7654642906f2129b587582fb188e65e"],'
+        '"signals":[],"sources":[],"tools":[],"truncated":false}'
+    )
+    expected_digest = "390e144801a3e7b1e1bfbc777f8b3968248964822a8692850a22190a72c70164"
+
+    session_factory = init_database(tmp_path / "future-gate-journal.db")
+    run_id = "22222222-2222-4222-8222-222222222222"
+    segment_id = "33333333-3333-4333-8333-333333333333"
+    snapshot_id = "44444444-4444-4444-8444-444444444444"
+    with session_factory() as session:
+        conversation = Conversation(title="future manifest gate")
+        session.add(conversation)
+        session.flush()
+        session.add(
+            AgentRun(
+                id=run_id,
+                conversation_id=conversation.id,
+                origin_kind="user_message",
+                initial_context_type="workspace",
+                fingerprint_key_id="11111111-1111-4111-8111-111111111111",
+                initial_transport_mode="sync",
+                initial_route_kind="model",
+                status="running",
+            )
+        )
+        session.commit()
+
+    recorder = SafeRunRecorder(
+        AgentRunRepository(session_factory),
+        JournalKeyDomain(
+            "11111111-1111-4111-8111-111111111111",
+            b"future-gate",
+        ),
+        run_id,
+        segment_id,
+        clock=_non_advancing_journal_clock,
+        segment_budget_seconds=10.0,
+        uuid_factory=lambda: snapshot_id,
+    )
+    captured = recorder.capture_surface_context(
+        {"request": "synthetic"},
+        audit,
+        ("provider/model",),
+        provider_view=_selector_bundle().provider_view(),
+        model_step=1,
+        model_call_id="55555555-5555-4555-8555-555555555555",
+    )
+    assert captured == snapshot_id
+    with session_factory() as session:
+        snapshot = session.get(AgentContextSnapshot, snapshot_id)
+        assert snapshot is not None
+        assert snapshot.manifest_json == expected_bytes
+        assert snapshot.manifest_digest == expected_digest
+        assert hashlib.sha256(snapshot.manifest_json.encode()).hexdigest() == expected_digest
+
+
+def test_workspace_application_chat_and_haru_issue_zero_signal_queries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _ChatModel:
+        def complete(
+            self,
+            messages: list[Message],
+            tools: list[object],
+            response_format: dict[str, object] | None = None,
+        ) -> Assistant:
+            del messages, tools, response_format
+            return Assistant(content="ok")
+
+    statements: list[str] = []
+
+    original_load = ContextSourceLoader.load
+
+    def traced_load(
+        loader: ContextSourceLoader[object, object],
+        read: Callable[[sqlite3.Connection], object],
+        freeze: Callable[[object], object],
+    ) -> object:
+        def traced_read(connection: sqlite3.Connection) -> object:
+            connection.set_trace_callback(lambda statement: statements.append(statement.lower()))
+            try:
+                return read(connection)
+            finally:
+                connection.set_trace_callback(None)
+
+        return original_load(loader, traced_read, freeze)
+
+    monkeypatch.setattr(ContextSourceLoader, "load", traced_load)
+
+    with TestClient(create_app(data_dir=tmp_path, chat_model=_ChatModel())) as client:
+        application = client.post(
+            "/api/applications",
+            json={"company_name": "Signal Zero", "position_name": "Engineer"},
+        ).json()
+
+        def capture_engine_sql(
+            _connection: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _executemany: bool,
+        ) -> None:
+            statements.append(statement.lower())
+
+        event.listen(Engine, "before_cursor_execute", capture_engine_sql)
+        try:
+            cases = (
+                ("ordinary chat", {"context_type": "global"}),
+                (
+                    "application chat",
+                    {
+                        "context_type": "application",
+                        "context_ref": str(application["id"]),
+                    },
+                ),
+                ("Haru", {"context_type": "workspace", "mode": "general"}),
+            )
+            for label, scope in cases:
+                statements.clear()
+                response = client.post(
+                    "/api/chat",
+                    json={"message": label, "conversation_id": 0, **scope},
+                )
+                assert response.status_code == 200, response.text
+                assert any("from conversations" in statement for statement in statements), label
+                assert not any(
+                    "interview_readiness_signal" in statement for statement in statements
+                ), label
+        finally:
+            event.remove(Engine, "before_cursor_execute", capture_engine_sql)
+
+
 def test_manifest_v2_rejects_65537_bytes() -> None:
     base = {
         "manifest_schema_version": 2,
@@ -1459,3 +1665,9 @@ def test_real_chat_adapter_uses_projected_surface_and_persists_v2_manifest(
     assert snapshots[0].manifest_schema_version == 2
     manifest = validate_surface_manifest_v2(snapshots[0].manifest_json)
     assert manifest["tools"]
+    contributor_statuses = {
+        item["name"]: item["status"] for item in manifest["contributors"]
+    }
+    assert contributor_statuses["confirmed_memory"] == "disabled"
+    assert contributor_statuses["knowledge_context"] == "disabled"
+    assert contributor_statuses["older_conversation_summary"] == "disabled"

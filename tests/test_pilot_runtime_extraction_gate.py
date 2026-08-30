@@ -17,6 +17,27 @@ TRANSPORT = SRC / "chat_transport.py"
 RUNTIME = SRC / "pilot_runtime"
 
 
+def test_future_readiness_contributor_is_absent_from_agent_runtime_call_graph() -> None:
+    future_symbol = "ConfirmedReadinessContributorPort"
+    future_module = "offerpilot.review_readiness.contributor"
+    paths = (
+        SRC / "ai" / "agent_loop.py",
+        SRC / "context_projector" / "projector.py",
+        SRC / "context_projector" / "selector.py",
+        RUNTIME / "composition.py",
+        RUNTIME / "service.py",
+    )
+
+    findings: list[str] = []
+    for path in paths:
+        tree = _tree(path)
+        imports = _imports(tree)
+        if future_module in imports or future_symbol in _resolved_names(tree):
+            findings.append(str(path.relative_to(ROOT)))
+
+    assert findings == []
+
+
 def _tree(path: Path) -> ast.Module:
     return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 

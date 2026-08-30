@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Optional, cast
 
 from builtins import list as BuiltinList
@@ -9,6 +10,7 @@ from sqlalchemy import (
     and_,
     delete,
     exists,
+    func,
     insert,
     literal,
     or_,
@@ -347,24 +349,27 @@ class NotesRepository:
                 event_id = cast(int | None, data.application_event_id)
             if event_id != note.application_event_id:
                 self._validate_event_binding(session, note.application_id, event_id, note.id)
-            note.company = data.company
-            note.position = data.position
-            note.round = data.round
-            note.date = data.date
-            note.questions = data.questions
-            note.self_reflection = data.self_reflection
-            note.difficulty_points = data.difficulty_points
-            note.mood = data.mood
-            note.application_event_id = event_id
+            values = _note_update_values(data)
+            values["application_event_id"] = event_id
+            statement = (
+                update(InterviewNote)
+                .where(InterviewNote.id == note_id)
+                .values(**_revisioned_note_values(values))
+                .returning(InterviewNote)
+                .execution_options(populate_existing=True, synchronize_session=False)
+            )
             try:
+                updated = session.scalar(statement)
+                if updated is None:
+                    return None
                 finish_repository_write(session, self._session)
             except IntegrityError as exc:
                 rollback_repository_write(session, self._session)
                 if event_id is not None:
                     raise NoteBindingError(409, "Interview event already has a note") from exc
                 raise
-            session.refresh(note)
-            return note
+            session.refresh(updated)
+            return updated
 
     def update_note_scoped(
         self,
@@ -400,7 +405,7 @@ class NotesRepository:
                 or_(InterviewNote.application_id.is_(None), visible_parent)
             )
 
-        values = _note_update_values(data)
+        values = _revisioned_note_values(_note_update_values(data))
         application_change = data.application_id is not UNSET
         application_allowed: ColumnElement[bool]
         if application_change:
@@ -632,6 +637,14 @@ def _note_update_values(data: NoteUpdate) -> dict[str, object]:
     if data.application_event_id is not UNSET:
         values["application_event_id"] = data.application_event_id
     return values
+
+
+def _revisioned_note_values(values: Mapping[str, object]) -> dict[str, object]:
+    return {
+        **values,
+        "content_revision": InterviewNote.content_revision + 1,
+        "updated_at": func.current_timestamp(),
+    }
 
 
 def _valid_interview_event(

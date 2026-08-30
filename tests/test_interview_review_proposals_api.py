@@ -86,6 +86,8 @@ def test_create_is_idempotent_and_returns_source_status(tmp_path) -> None:
     assert second.status_code == 200
     assert first.json()["id"] == second.json()["id"]
     assert first.json()["source_status"] == "current"
+    assert first.json()["proposal_schema_version"] == 2
+    assert first.json()["source_note_revision"] == note["content_revision"]
     assert first.json()["proposal"]["summary"]["evidence_refs"][0]["excerpt"] == (
         "I struggled to explain the tradeoff."
     )

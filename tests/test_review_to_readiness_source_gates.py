@@ -304,6 +304,64 @@ def _has_note_revision_helper(tree: ast.AST | None) -> bool:
     return False
 
 
+def _application_event_delete_violations(path: Path, tree: ast.Module) -> list[str]:
+    model_names = {"ApplicationEvent"}
+    delete_names = {"delete"}
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module == "offerpilot.models":
+            model_names.update(
+                alias.asname or alias.name
+                for alias in node.names
+                if alias.name == "ApplicationEvent"
+            )
+        elif isinstance(node, ast.ImportFrom) and node.module == "sqlalchemy":
+            delete_names.update(
+                alias.asname or alias.name
+                for alias in node.names
+                if alias.name == "delete"
+            )
+
+    violations: list[str] = []
+
+    class DeleteVisitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.functions: list[str] = []
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
+            self.functions.append(node.name)
+            self.generic_visit(node)
+            self.functions.pop()
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
+            owner = self.functions[-1] if self.functions else ""
+            direct_sql_delete = (
+                isinstance(node.func, ast.Name)
+                and node.func.id in delete_names
+                and bool(node.args)
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id in model_names
+            )
+            orm_delete = (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "delete"
+                and bool(node.args)
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id in {"event", "application_event"}
+            )
+            approved = (
+                path.as_posix().endswith("repositories/application_events.py")
+                and owner == "_delete_application_event_owned"
+            )
+            if (direct_sql_delete or orm_delete) and not approved:
+                violations.append(f"{path.relative_to(ROOT).as_posix()}:{node.lineno}")
+            self.generic_visit(node)
+
+    DeleteVisitor().visit(tree)
+    return violations
+
+
 def _source_violations() -> list[str]:
     violations: list[str] = []
     db_tree = _parse(SRC / "db.py")
@@ -375,6 +433,32 @@ def _revisioned_note_values(values):
     assert _has_self_committing_story_call(exact)
     assert _proposal_drives_practice(exact)
     assert _has_note_revision_helper(exact)
+
+
+def test_application_event_delete_owner_detector_rejects_direct_sql_and_orm_paths() -> None:
+    direct = ast.parse(
+        "def delete_event(session):\n    session.execute(delete(ApplicationEvent))\n"
+    )
+    orm = ast.parse("def delete_event(session, event):\n    session.delete(event)\n")
+    owner = ast.parse(
+        "def _delete_application_event_owned(session):\n"
+        "    session.execute(delete(ApplicationEvent))\n"
+    )
+    arbitrary = ROOT / "src" / "offerpilot" / "other.py"
+    approved = ROOT / "src" / "offerpilot" / "repositories" / "application_events.py"
+
+    assert _application_event_delete_violations(arbitrary, direct)
+    assert _application_event_delete_violations(arbitrary, orm)
+    assert _application_event_delete_violations(approved, owner) == []
+
+
+def test_application_event_hard_delete_has_one_production_owner() -> None:
+    violations = []
+    for path in sorted(SRC.rglob("*.py")):
+        tree = _parse(path)
+        if tree is not None:
+            violations.extend(_application_event_delete_violations(path, tree))
+    assert violations == []
 
 
 def test_product_action_gate_requires_all_modules_and_independent_catalogs() -> None:

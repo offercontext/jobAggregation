@@ -295,7 +295,7 @@ from offerpilot.schemas import (
     ConversationOut,
     EvidenceBundlePreviewOut,
     ApplicationEventOut,
-    InterviewNoteOut,
+    InterviewNoteRestOut,
     JDAnalysisOut,
     KnowledgeIngestResponse,
     MaterialKitOut,
@@ -9103,7 +9103,7 @@ def _note_create_from_payload(
 
 
 def _note_json(note: Any) -> dict[str, Any]:
-    return InterviewNoteOut.model_validate(note).model_dump(mode="json")
+    return InterviewNoteRestOut.model_validate(note).model_dump(mode="json")
 
 
 def _interview_knowledge_diagnostic_message(diagnostic: dict[str, Any]) -> str:
@@ -9184,6 +9184,8 @@ def _interview_review_proposal_json(proposal: Any) -> dict[str, Any]:
         "id": proposal.id,
         "note_id": proposal.note_id,
         "application_event_id": event_id,
+        "proposal_schema_version": proposal.proposal_schema_version,
+        "source_note_revision": proposal.source_note_revision,
         "source_fingerprint": proposal.source_fingerprint,
         "source_status": getattr(proposal, "source_status", "source_changed"),
         "proposal": proposal_payload,

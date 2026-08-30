@@ -316,7 +316,7 @@ def test_every_target_and_application_binding_is_exact_positive_int64_before_sql
         event.remove(engine, "before_cursor_execute", capture)
 
 
-def test_all_nine_restricted_mutations_use_one_guarded_returning_statement(seeded) -> None:
+def test_restricted_mutations_are_guarded_and_event_delete_owns_note_unbind(seeded) -> None:
     factory = AuthorityFactory()
     authority, constraint = _scope(factory, seeded["first_id"])
     engine = seeded["session_factory"].kw["bind"]
@@ -365,11 +365,29 @@ def test_all_nine_restricted_mutations_use_one_guarded_returning_statement(seede
                     constraint, seeded["first_offer_id"], "strong"
                 ),
             )
-            for call in calls:
+            for index, call in enumerate(calls):
                 statements.clear()
                 assert call() is not None
-                assert len(statements) == 1
-                assert "RETURNING" in statements[0].upper()
+                if index == 3:
+                    note_updates = [
+                        statement
+                        for statement in statements
+                        if statement.upper().startswith("UPDATE INTERVIEW_NOTES")
+                    ]
+                    event_deletes = [
+                        statement
+                        for statement in statements
+                        if statement.upper().startswith("DELETE FROM APPLICATION_EVENTS")
+                    ]
+                    assert len(note_updates) == 1
+                    assert len(event_deletes) == 1
+                    assert all(
+                        "EXISTS" in statement.upper()
+                        for statement in (*note_updates, *event_deletes)
+                    )
+                else:
+                    assert len(statements) == 1
+                    assert "RETURNING" in statements[0].upper()
     finally:
         event.remove(engine, "before_cursor_execute", capture)
 
@@ -653,6 +671,7 @@ def test_application_scope_standalone_add_note_keeps_null_parent_but_requires_ac
         )
         assert note.application_id is None
         assert note.company == "Standalone"
+        assert note.content_revision == 1
         session.commit()
 
     ApplicationsRepository(seeded["session_factory"]).delete(seeded["first_id"])
@@ -1263,6 +1282,151 @@ def test_workspace_note_update_domain_failure_does_not_fire_update_trigger(
         current = session.get(InterviewNote, seeded["first_note_id"])
         assert current is not None
         assert current.company == "A"
+        assert current.content_revision == 1
+
+
+def test_scoped_note_consecutive_updates_each_increment_revision_in_bound_session(
+    seeded,
+) -> None:
+    factory = AuthorityFactory()
+    authority, constraint = _scope(factory, seeded["first_id"])
+    with seeded["session_factory"]() as session:
+        old_timestamp = datetime(2020, 1, 1)
+        session.execute(
+            text("UPDATE interview_notes SET updated_at=:old WHERE id=:note_id"),
+            {"old": old_timestamp, "note_id": seeded["first_note_id"]},
+        )
+        session.commit()
+        notes = _bind(seeded["notes"], session, factory, authority, constraint)
+
+        first = notes.update_note_scoped(
+            constraint,
+            seeded["first_note_id"],
+            NoteUpdate(application_id=seeded["first_id"], company="first"),
+        )
+        first_revision = first.content_revision if first is not None else None
+        second = notes.update_note_scoped(
+            constraint,
+            seeded["first_note_id"],
+            NoteUpdate(application_id=seeded["first_id"], company="second"),
+        )
+
+        assert first_revision == 2
+        assert second is not None
+        assert second.content_revision == 3
+        assert second.updated_at > old_timestamp
+        assert session.get_transaction() is not None
+
+
+def test_scoped_event_delete_revisions_bound_note_once_and_keeps_outer_transaction(seeded) -> None:
+    factory = AuthorityFactory()
+    authority, constraint = _scope(factory, seeded["first_id"])
+    with seeded["session_factory"]() as session:
+        notes = _bind(seeded["notes"], session, factory, authority, constraint)
+        events = _bind(seeded["events"], session, factory, authority, constraint)
+        updated = notes.update_note_scoped(
+            constraint,
+            seeded["first_note_id"],
+            NoteUpdate(
+                application_id=seeded["first_id"],
+                application_event_id=seeded["first_event_id"],
+                company="A",
+            ),
+        )
+        assert updated is not None
+        session.commit()
+        assert updated.content_revision == 2
+        old_timestamp = datetime(2020, 1, 1)
+        session.execute(
+            text("UPDATE interview_notes SET updated_at=:old WHERE id=:note_id"),
+            {"old": old_timestamp, "note_id": seeded["first_note_id"]},
+        )
+        session.commit()
+
+        assert events.delete_application_event_scoped(
+            constraint, seeded["first_event_id"]
+        ) is True
+        session.expire_all()
+        note = session.get(InterviewNote, seeded["first_note_id"])
+        assert note is not None
+        assert note.application_event_id is None
+        assert note.content_revision == 3
+        assert note.updated_at > old_timestamp
+        assert session.get_transaction() is not None
+        session.rollback()
+
+    with seeded["session_factory"]() as session:
+        note = session.get(InterviewNote, seeded["first_note_id"])
+        assert note is not None
+        assert note.application_event_id == seeded["first_event_id"]
+        assert note.content_revision == 2
+
+
+def test_scoped_event_delete_cross_scope_changes_no_note_revision(seeded) -> None:
+    bound_second = seeded["notes"].update(
+        seeded["second_note_id"],
+        NoteUpdate(
+            application_id=seeded["second_id"],
+            application_event_id=seeded["second_event_id"],
+            company="B",
+        ),
+    )
+    assert bound_second is not None
+    assert bound_second.content_revision == 2
+    factory = AuthorityFactory()
+    authority, constraint = _scope(factory, seeded["first_id"])
+    with seeded["session_factory"]() as session:
+        events = _bind(seeded["events"], session, factory, authority, constraint)
+        before = session.get(InterviewNote, seeded["second_note_id"])
+        assert before is not None
+        before_revision = before.content_revision
+
+        with pytest.raises(ScopeAccessDenied):
+            events.delete_application_event_scoped(
+                constraint, seeded["second_event_id"]
+            )
+
+        session.expire_all()
+        after = session.get(InterviewNote, seeded["second_note_id"])
+        assert after is not None
+        assert after.content_revision == before_revision
+
+
+def test_scoped_event_delete_trigger_abort_rolls_back_owner_primitive_only(seeded) -> None:
+    bound_note = seeded["notes"].update(
+        seeded["first_note_id"],
+        NoteUpdate(
+            application_id=seeded["first_id"],
+            application_event_id=seeded["first_event_id"],
+            company="A",
+        ),
+    )
+    assert bound_note is not None
+    assert bound_note.content_revision == 2
+    factory = AuthorityFactory()
+    authority, constraint = _scope(factory, seeded["first_id"])
+    with seeded["session_factory"]() as session:
+        events = _bind(seeded["events"], session, factory, authority, constraint)
+        session.execute(
+            text(
+                "CREATE TRIGGER reject_scoped_event_delete "
+                "BEFORE DELETE ON application_events "
+                "BEGIN SELECT RAISE(ABORT, 'scoped delete blocked'); END"
+            )
+        )
+        session.commit()
+
+        with pytest.raises(IntegrityError, match="scoped delete blocked"):
+            events.delete_application_event_scoped(
+                constraint, seeded["first_event_id"]
+            )
+
+        session.expire_all()
+        stored = session.get(InterviewNote, seeded["first_note_id"])
+        assert stored is not None
+        assert stored.application_event_id == seeded["first_event_id"]
+        assert stored.content_revision == 2
+        assert session.get(ApplicationEvent, seeded["first_event_id"]) is not None
 
 
 def test_workspace_note_update_classifies_after_guarded_mutation_under_write_lock(

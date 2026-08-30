@@ -137,6 +137,11 @@ class InterviewNoteOut(BaseModel):
     created_at: datetime
 
 
+class InterviewNoteRestOut(InterviewNoteOut):
+    content_revision: int
+    updated_at: datetime
+
+
 class OfferOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -358,6 +363,8 @@ class InterviewReviewProposalOut(BaseModel):
     id: int
     note_id: int | None
     application_event_id: int | None = None
+    proposal_schema_version: Literal[1, 2]
+    source_note_revision: int | None
     source_fingerprint: str
     source_status: Literal["current", "source_changed"]
     proposal: dict[str, Any]

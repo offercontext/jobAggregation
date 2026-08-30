@@ -10,9 +10,11 @@ from builtins import list as BuiltinList
 from sqlalchemy import and_, delete, exists, insert, literal, select, update
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql import Select
+from sqlalchemy.sql.elements import ColumnElement
 
-from offerpilot.models import Application, ApplicationEvent
+from offerpilot.models import Application, ApplicationEvent, InterviewNote
 from offerpilot.repositories.applications import _restricted_scope_id
+from offerpilot.repositories.notes import _revisioned_note_values
 from offerpilot.repositories.session_binding import (
     ScopedRepositoryBinding,
     ScopeAccessDenied,
@@ -344,12 +346,20 @@ class ApplicationEventsRepository:
 
     def delete(self, event_id: int) -> bool:
         with repository_session(self._session_factory, self._session) as session:
-            event = _get_visible_event(session, event_id)
-            if event is None:
-                return False
-            session.delete(event)
-            finish_repository_write(session, self._session)
-            return True
+            active_parent = exists(
+                select(Application.id).where(
+                    Application.id == ApplicationEvent.application_id,
+                    Application.deleted_at.is_(None),
+                )
+            )
+            deleted = _delete_application_event_owned(
+                session,
+                event_id,
+                (active_parent,),
+            )
+            if deleted:
+                finish_repository_write(session, self._session)
+            return deleted
 
     def delete_application_event_scoped(
         self,
@@ -364,19 +374,18 @@ class ApplicationEventsRepository:
                 Application.deleted_at.is_(None),
             )
         )
-        statement = (
-            delete(ApplicationEvent)
-            .where(ApplicationEvent.id == event_id)
-            .where(active_parent)
-        )
+        predicates: list[ColumnElement[bool]] = [active_parent]
         if constraint.mode == "restricted":
             allowed_id = _restricted_scope_id(constraint)
-            statement = statement.where(ApplicationEvent.application_id == allowed_id)
-        returning_statement = statement.returning(ApplicationEvent.id)
+            predicates.append(ApplicationEvent.application_id == allowed_id)
         with binding.session.no_autoflush:
-            rows = list(binding.session.scalars(returning_statement))
-        if len(rows) != 1:
-            if constraint.mode == "restricted" or len(rows) > 1:
+            deleted = _delete_application_event_owned(
+                binding.session,
+                event_id,
+                tuple(predicates),
+            )
+        if not deleted:
+            if constraint.mode == "restricted":
                 raise ScopeAccessDenied("application scope denied")
             return False
         return True
@@ -386,29 +395,62 @@ class ApplicationEventsRepository:
         remind_at = _expected_datetime(expected.get("remind_at"))
         tags = expected.get("tags")
         encoded_tags = json.dumps(tags if isinstance(tags, list) else [], ensure_ascii=False)
-        statement = (
-            delete(ApplicationEvent)
-            .where(ApplicationEvent.id == event_id)
-            .where(ApplicationEvent.application_id == expected.get("application_id"))
-            .where(ApplicationEvent.event_type == expected.get("event_type"))
-            .where(ApplicationEvent.subtype == expected.get("subtype"))
-            .where(ApplicationEvent._tags == encoded_tags)
-            .where(ApplicationEvent.round == expected.get("round"))
-            .where(ApplicationEvent.scheduled_at == scheduled_at)
-            .where(ApplicationEvent.duration_minutes == expected.get("duration_minutes"))
-            .where(ApplicationEvent.location == expected.get("location"))
-            .where(ApplicationEvent.notes == expected.get("notes"))
-            .where(ApplicationEvent.status == expected.get("status"))
-        )
-        statement = (
-            statement.where(ApplicationEvent.remind_at.is_(None))
+        predicates: list[ColumnElement[bool]] = [
+            ApplicationEvent.application_id == expected.get("application_id"),
+            ApplicationEvent.event_type == expected.get("event_type"),
+            ApplicationEvent.subtype == expected.get("subtype"),
+            ApplicationEvent._tags == encoded_tags,
+            ApplicationEvent.round == expected.get("round"),
+            ApplicationEvent.scheduled_at == scheduled_at,
+            ApplicationEvent.duration_minutes == expected.get("duration_minutes"),
+            ApplicationEvent.location == expected.get("location"),
+            ApplicationEvent.notes == expected.get("notes"),
+            ApplicationEvent.status == expected.get("status"),
+        ]
+        predicates.append(
+            ApplicationEvent.remind_at.is_(None)
             if remind_at is None
-            else statement.where(ApplicationEvent.remind_at == remind_at)
+            else ApplicationEvent.remind_at == remind_at
         )
         with repository_session(self._session_factory, self._session) as session:
-            result = session.execute(statement)
-            finish_repository_write(session, self._session)
-            return getattr(result, "rowcount", 0) == 1
+            deleted = _delete_application_event_owned(
+                session,
+                event_id,
+                tuple(predicates),
+            )
+            if deleted:
+                finish_repository_write(session, self._session)
+            return deleted
+
+
+def _delete_application_event_owned(
+    session: Session,
+    event_id: int,
+    predicates: tuple[ColumnElement[bool], ...],
+) -> bool:
+    """Unbind surviving Notes and delete one exact Event under caller ownership."""
+
+    exact_event = and_(ApplicationEvent.id == event_id, *predicates)
+    event_still_matches = exists(select(ApplicationEvent.id).where(exact_event))
+    connection = session.connection()
+    driver_connection = getattr(connection.connection, "driver_connection", None)
+    if (
+        connection.dialect.name == "sqlite"
+        and driver_connection is not None
+        and not driver_connection.in_transaction
+    ):
+        connection.exec_driver_sql("BEGIN IMMEDIATE")
+    with session.begin_nested():
+        session.execute(
+            update(InterviewNote)
+            .where(
+                InterviewNote.application_event_id == event_id,
+                event_still_matches,
+            )
+            .values(**_revisioned_note_values({"application_event_id": None}))
+        )
+        result = session.execute(delete(ApplicationEvent).where(exact_event))
+        return getattr(result, "rowcount", 0) == 1
 
 
 def _get_visible_event(session: Session, event_id: int) -> Optional[ApplicationEvent]:

@@ -249,6 +249,13 @@ def test_event_delete_if_matches_is_conditional(tmp_path):
             location="Room A",
         )
     )
+    note = NotesRepository(session_factory).create(
+        NoteCreate(
+            application_id=app.id,
+            application_event_id=event.id,
+            company="A",
+        )
+    )
     expected = {
         "application_id": app.id,
         "event_type": "interview",
@@ -265,8 +272,13 @@ def test_event_delete_if_matches_is_conditional(tmp_path):
 
     assert events.delete_if_matches(event.id, {**expected, "location": "changed"}) is False
     assert events.get(event.id) is not None
+    assert NotesRepository(session_factory).get(note.id).content_revision == 1
     assert events.delete_if_matches(event.id, expected) is True
     assert events.get(event.id) is None
+    unbound = NotesRepository(session_factory).get(note.id)
+    assert unbound is not None
+    assert unbound.application_event_id is None
+    assert unbound.content_revision == 2
 
 
 def test_note_delete_if_matches_is_conditional(tmp_path):

@@ -1,6 +1,12 @@
+from datetime import datetime, timezone
+
 from fastapi.testclient import TestClient
+from sqlalchemy import text
 
 from offerpilot.api import create_app
+from offerpilot.db import init_database
+from offerpilot.models import InterviewNote
+from offerpilot.repositories.notes import NoteCreate, NoteUpdate, NotesRepository
 
 
 def test_create_note_for_application_backfills_company_and_position(tmp_path):
@@ -19,6 +25,59 @@ def test_create_note_for_application_backfills_company_and_position(tmp_path):
     assert response.json()["application_id"] == app["id"]
     assert response.json()["company"] == "ByteDance"
     assert response.json()["position"] == "Backend"
+
+
+def test_note_rest_output_exposes_server_owned_revision_and_timestamp(tmp_path):
+    client = TestClient(create_app(data_dir=tmp_path))
+
+    created = client.post("/api/notes", json={"company": "Acme"})
+    first_update = client.put(
+        f"/api/notes/{created.json()['id']}",
+        json={"company": "Acme", "questions": "first"},
+    )
+    second_update = client.put(
+        f"/api/notes/{created.json()['id']}",
+        json={"company": "Acme", "questions": "second"},
+    )
+
+    assert created.status_code == 201
+    assert created.json()["content_revision"] == 1
+    assert created.json()["updated_at"]
+    assert first_update.json()["content_revision"] == 2
+    assert second_update.json()["content_revision"] == 3
+    assert client.get("/api/notes").json()[0]["content_revision"] == 3
+
+
+def test_bound_repository_updates_increment_revision_atomically_without_committing(tmp_path):
+    session_factory = init_database(tmp_path / "bound.db")
+    repository = NotesRepository(session_factory)
+    note = repository.create(NoteCreate(company="Acme"))
+    old_timestamp = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    with session_factory() as session:
+        session.execute(
+            text("UPDATE interview_notes SET updated_at=:old WHERE id=:note_id"),
+            {"old": old_timestamp, "note_id": note.id},
+        )
+        session.commit()
+        bound = repository.bind(session)
+
+        first = bound.update(note.id, NoteUpdate(company="Acme", questions="first"))
+        first_revision = first.content_revision if first is not None else None
+        second = bound.update(note.id, NoteUpdate(company="Acme", questions="second"))
+
+        assert first is not None
+        assert second is not None
+        assert first_revision == 2
+        assert second.content_revision == 3
+        assert second.updated_at > old_timestamp.replace(tzinfo=None)
+        assert session.get_transaction() is not None
+        session.rollback()
+
+    with session_factory() as session:
+        stored = session.get(InterviewNote, note.id)
+        assert stored is not None
+        assert stored.content_revision == 1
+        assert stored.questions == ""
 
 
 def test_create_standalone_note_requires_company(tmp_path):
@@ -130,6 +189,10 @@ def test_bound_note_rejects_application_reassignment_or_unbinding(tmp_path):
 
     assert null_response.status_code == 422
     assert other_response.status_code == 422
+    current = next(
+        item for item in client.get("/api/notes").json() if item["id"] == note["id"]
+    )
+    assert current["content_revision"] == 1
 
 
 def test_note_binding_requires_same_application_interview_event(tmp_path):
@@ -174,6 +237,7 @@ def test_deleting_event_unbinds_note_but_deleting_application_hides_bound_notes(
     after_event_delete = client.get("/api/notes").json()
     assert after_event_delete[0]["id"] == note["id"]
     assert after_event_delete[0]["application_event_id"] is None
+    assert after_event_delete[0]["content_revision"] == 2
 
     application_two, event_two = _create_application_and_event(client, company="Tencent")
     note_two = _create_bound_note(client, application_two, event_two)
@@ -183,4 +247,19 @@ def test_deleting_event_unbinds_note_but_deleting_application_hides_bound_notes(
     assert client.get(f"/api/applications/{application_two['id']}/notes").status_code == 404
     assert client.put(f"/api/notes/{note_two['id']}", json={"questions": "x"}).status_code == 404
     assert client.delete(f"/api/notes/{note_two['id']}").status_code == 404
+
+
+def test_deleting_event_does_not_revision_an_already_unbound_note(tmp_path):
+    client = TestClient(create_app(data_dir=tmp_path))
+    application, event = _create_application_and_event(client)
+    note = client.post(
+        f"/api/applications/{application['id']}/notes",
+        json={"questions": "Not bound to the event"},
+    ).json()
+
+    assert client.delete(f"/api/application-events/{event['id']}").status_code == 200
+
+    stored = next(item for item in client.get("/api/notes").json() if item["id"] == note["id"])
+    assert stored["application_event_id"] is None
+    assert stored["content_revision"] == 1
 

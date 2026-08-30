@@ -1,6 +1,19 @@
+from datetime import datetime, timezone
+
+import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from offerpilot.api import create_app
+from offerpilot.db import init_database
+from offerpilot.models import InterviewNote
+from offerpilot.repositories.application_events import (
+    ApplicationEventCreate,
+    ApplicationEventsRepository,
+)
+from offerpilot.repositories.applications import ApplicationCreate, ApplicationsRepository
+from offerpilot.repositories.notes import NoteCreate, NotesRepository
 
 
 def test_create_and_list_application_events_with_application_fields(tmp_path):
@@ -188,6 +201,73 @@ def test_application_event_validation_and_delete(tmp_path):
     assert deleted.status_code == 200
     assert deleted.json() == {"message": "Deleted"}
     assert client.get(f"/api/application-events/{event['id']}").status_code == 404
+
+
+def test_event_delete_trigger_failure_rolls_back_note_unbind_and_revision(tmp_path):
+    session_factory = init_database(tmp_path / "rollback.db")
+    application = ApplicationsRepository(session_factory).create(
+        ApplicationCreate(company_name="Acme", position_name="Backend")
+    )
+    events = ApplicationEventsRepository(session_factory)
+    event = events.create(
+        ApplicationEventCreate(
+            application_id=application.id,
+            event_type="interview",
+            scheduled_at=datetime(2026, 8, 30, 10, tzinfo=timezone.utc),
+            duration_minutes=45,
+        )
+    )
+    note = NotesRepository(session_factory).create(
+        NoteCreate(
+            application_id=application.id,
+            application_event_id=event.id,
+            company="Acme",
+        )
+    )
+    with session_factory() as session:
+        session.execute(
+            text(
+                "CREATE TRIGGER reject_event_delete BEFORE DELETE ON application_events "
+                "BEGIN SELECT RAISE(ABORT, 'blocked event delete'); END"
+            )
+        )
+        session.commit()
+
+    with pytest.raises(IntegrityError, match="blocked event delete"):
+        events.delete(event.id)
+
+    with session_factory() as session:
+        stored = session.get(InterviewNote, note.id)
+        assert stored is not None
+        assert stored.application_event_id == event.id
+        assert stored.content_revision == 1
+
+
+def test_missing_event_delete_changes_no_bound_note_revision(tmp_path):
+    client = TestClient(create_app(data_dir=tmp_path))
+    application = client.post(
+        "/api/applications",
+        json={"company_name": "Acme", "position_name": "Backend"},
+    ).json()
+    event = client.post(
+        "/api/application-events",
+        json={
+            "application_id": application["id"],
+            "event_type": "interview",
+            "scheduled_at": "2026-08-30T10:00:00Z",
+            "duration_minutes": 45,
+        },
+    ).json()
+    note = client.post(
+        f"/api/applications/{application['id']}/notes",
+        json={"application_event_id": event["id"]},
+    ).json()
+
+    assert client.delete("/api/application-events/9223372036854775807").status_code == 404
+
+    stored = next(item for item in client.get("/api/notes").json() if item["id"] == note["id"])
+    assert stored["application_event_id"] == event["id"]
+    assert stored["content_revision"] == 1
 
 
 def test_legacy_events_api_is_not_exposed(tmp_path):

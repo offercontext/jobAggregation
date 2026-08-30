@@ -98,6 +98,14 @@ class InterviewReviewProposalsRepository:
             snapshot = _current_snapshot(session, note)
             snapshot_json = canonical_json(snapshot)
             source_fingerprint = sha256_text(snapshot_json)
+            source_note_revision = note.content_revision
+            source_resource = (
+                note.id,
+                note.application_id,
+                note.application_event_id,
+                snapshot["event"]["id"],
+                snapshot["event"]["application_id"],
+            )
 
         proposal = generate_interview_review_proposal(
             model,
@@ -117,7 +125,18 @@ class InterviewReviewProposalsRepository:
                 return _with_source_status(session, note, existing), False
             current_snapshot = _current_snapshot(session, note)
             current_fingerprint = sha256_text(canonical_json(current_snapshot))
-            if current_fingerprint != source_fingerprint:
+            current_resource = (
+                note.id,
+                note.application_id,
+                note.application_event_id,
+                current_snapshot["event"]["id"],
+                current_snapshot["event"]["application_id"],
+            )
+            if (
+                current_resource != source_resource
+                or note.content_revision != source_note_revision
+                or current_fingerprint != source_fingerprint
+            ):
                 raise InterviewReviewConflictError("interview review source changed")
             event_id = int(current_snapshot["event"]["id"])
             stored = InterviewReviewProposal(
@@ -128,6 +147,8 @@ class InterviewReviewProposalsRepository:
                 source_fingerprint=source_fingerprint,
                 proposal_json=proposal_json,
                 proposal_hash=proposal_hash,
+                proposal_schema_version=2,
+                source_note_revision=source_note_revision,
             )
             session.add(stored)
             try:
@@ -207,7 +228,18 @@ def _with_source_status(
                 and event.application_id == note.application_id
             ):
                 current_snapshot = build_interview_review_snapshot(note, event)
-                if sha256_text(canonical_json(current_snapshot)) == proposal.source_fingerprint:
+                revision_matches = (
+                    proposal.proposal_schema_version == 1
+                    or (
+                        proposal.proposal_schema_version == 2
+                        and proposal.source_note_revision == note.content_revision
+                    )
+                )
+                if (
+                    revision_matches
+                    and sha256_text(canonical_json(current_snapshot))
+                    == proposal.source_fingerprint
+                ):
                     source_status = "current"
     except (TypeError, ValueError, KeyError):
         source_status = "source_changed"

@@ -30,6 +30,7 @@ from offerpilot.models import (
     ApplicationEvent,
     InterviewNote,
 )
+from offerpilot.repositories.application_events import _delete_application_event_owned
 
 
 UndoPayloadValidator: TypeAlias = Callable[[FrozenJSONObject], None]
@@ -428,31 +429,31 @@ def execute_delete_application_event_undo(
     payload = _require_delete_event_payload(undo)
     expected = cast(FrozenJSONObject, payload["expected_after"])
     tags = cast(tuple[str, ...], expected["tags"])
-    statement = (
-        delete(ApplicationEvent)
-        .where(ApplicationEvent.id == cast(int, payload["application_event_id"]))
-        .where(ApplicationEvent.application_id == expected["application_id"])
-        .where(ApplicationEvent.event_type == expected["event_type"])
-        .where(ApplicationEvent.subtype == expected["subtype"])
-        .where(ApplicationEvent._tags == json.dumps(list(tags), ensure_ascii=False))
-        .where(ApplicationEvent.round == expected["round"])
-        .where(
-            ApplicationEvent.scheduled_at
-            == _require_optional_datetime(expected["scheduled_at"], "expected event scheduled_at")
-        )
-        .where(ApplicationEvent.duration_minutes == expected["duration_minutes"])
-        .where(ApplicationEvent.location == expected["location"])
-        .where(ApplicationEvent.notes == expected["notes"])
-        .where(ApplicationEvent.status == expected["status"])
-    )
+    predicates = [
+        ApplicationEvent.application_id == expected["application_id"],
+        ApplicationEvent.event_type == expected["event_type"],
+        ApplicationEvent.subtype == expected["subtype"],
+        ApplicationEvent._tags == json.dumps(list(tags), ensure_ascii=False),
+        ApplicationEvent.round == expected["round"],
+        ApplicationEvent.scheduled_at
+        == _require_optional_datetime(expected["scheduled_at"], "expected event scheduled_at"),
+        ApplicationEvent.duration_minutes == expected["duration_minutes"],
+        ApplicationEvent.location == expected["location"],
+        ApplicationEvent.notes == expected["notes"],
+        ApplicationEvent.status == expected["status"],
+    ]
     remind_at = _require_optional_datetime(expected["remind_at"], "expected event remind_at")
-    statement = (
-        statement.where(ApplicationEvent.remind_at.is_(None))
+    predicates.append(
+        ApplicationEvent.remind_at.is_(None)
         if remind_at is None
-        else statement.where(ApplicationEvent.remind_at == remind_at)
+        else ApplicationEvent.remind_at == remind_at
     )
-    result = session.execute(statement)
-    if getattr(result, "rowcount", 0) != 1:
+    deleted = _delete_application_event_owned(
+        session,
+        cast(int, payload["application_event_id"]),
+        tuple(predicates),
+    )
+    if not deleted:
         raise CompensationConflictError("undo_conflict")
     return "已撤销最近一次 AI 写入：新建日程已删除。"
 

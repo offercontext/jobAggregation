@@ -72,6 +72,7 @@ from offerpilot.models import (
 )
 from offerpilot.repositories.json_contract import canonical_json, sha256_text
 from offerpilot.repositories.interview_stories import InterviewStoriesRepository
+from offerpilot.repositories.application_events import _delete_application_event_owned
 from offerpilot.reliability.policy import get_recovery_policy
 from offerpilot.reliability.trace import read_mock_interview_traces
 
@@ -2745,7 +2746,7 @@ def _cleanup_interview_story_smoke_records(data_dir: Path, seed: dict[str, int])
             session.execute(delete(MockInterviewTurn).where(MockInterviewTurn.attempt_id == seed["mock_attempt_id"]))
             session.execute(delete(MockInterviewAttempt).where(MockInterviewAttempt.id == seed["mock_attempt_id"]))
             session.execute(delete(InterviewNote).where(InterviewNote.id == seed["note_id"]))
-            session.execute(delete(ApplicationEvent).where(ApplicationEvent.id == seed["event_id"]))
+            _delete_application_event_owned(session, seed["event_id"], ())
             session.execute(delete(Resume).where(Resume.id == seed["resume_id"]))
             session.execute(delete(Application).where(Application.id == seed["application_id"]))
             session.commit()
@@ -3204,7 +3205,19 @@ def _cleanup_real_ai_smoke_records(
                 session.execute(
                     delete(MockInterviewAttempt).where(MockInterviewAttempt.id.in_(attempt_ids))
                 )
-            session.execute(delete(ApplicationEvent).where(ApplicationEvent.application_id == application_id))
+            event_ids = list(
+                session.scalars(
+                    select(ApplicationEvent.id).where(
+                        ApplicationEvent.application_id == application_id
+                    )
+                )
+            )
+            for event_id in event_ids:
+                _delete_application_event_owned(
+                    session,
+                    event_id,
+                    (ApplicationEvent.application_id == application_id,),
+                )
             session.execute(delete(Question).where(Question.application_id == application_id))
             session.execute(
                 delete(ApplicationMaterialKit).where(

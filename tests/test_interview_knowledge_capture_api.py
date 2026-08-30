@@ -112,6 +112,10 @@ def test_confirm_creates_frozen_knowledge_and_is_idempotent(tmp_path) -> None:
         "captured_at": metadata["captured_at"],
     }
     assert metadata["captured_at"]
+    stored_note = next(
+        item for item in client.get("/api/notes").json() if item["id"] == note["id"]
+    )
+    assert stored_note["content_revision"] == 1
 
 
 def test_confirmed_attempt_is_read_only_for_same_key_direct_preview(tmp_path) -> None:

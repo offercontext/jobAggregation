@@ -551,8 +551,17 @@ def test_delete_event_handler_exact_datetime_tags_null_mismatch_and_rollback() -
             )
             application_event.tags = ["onsite", "backend"]
             session.add(application_event)
+            session.flush()
+            note = InterviewNote(
+                application_id=application_id,
+                application_event_id=application_event.id,
+                company="Event Co",
+                position="Engineer",
+            )
+            session.add(note)
             session.commit()
             event_id = application_event.id
+            note_id = note.id
             expected_after = {
                 "application_id": application_id,
                 "event_type": application_event.event_type,
@@ -577,6 +586,10 @@ def test_delete_event_handler_exact_datetime_tags_null_mismatch_and_rollback() -
 
             assert handler.execute(session, undo) == "已撤销最近一次 AI 写入：新建日程已删除。"
             assert session.get(ApplicationEvent, event_id) is None
+            changed_note = session.get(InterviewNote, note_id)
+            assert changed_note is not None
+            assert changed_note.application_event_id is None
+            assert changed_note.content_revision == 2
             session.rollback()
 
         with sessions() as session:
@@ -584,6 +597,10 @@ def test_delete_event_handler_exact_datetime_tags_null_mismatch_and_rollback() -
             assert preserved is not None
             assert preserved.tags == ["onsite", "backend"]
             assert preserved.remind_at is None
+            preserved_note = session.get(InterviewNote, note_id)
+            assert preserved_note is not None
+            assert preserved_note.application_event_id == event_id
+            assert preserved_note.content_revision == 1
             mismatch = freeze_json(
                 {
                     "kind": "delete_application_event",
@@ -594,6 +611,8 @@ def test_delete_event_handler_exact_datetime_tags_null_mismatch_and_rollback() -
             )
             with pytest.raises(ValueError, match="^undo_conflict$"):
                 handler.execute(session, mismatch)
+            session.refresh(preserved_note)
+            assert preserved_note.content_revision == 1
             session.rollback()
 
         with sessions() as session:

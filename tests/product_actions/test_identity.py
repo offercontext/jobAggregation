@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+import offerpilot.product_actions.issuer as issuer_module
 from offerpilot.product_actions.contracts import (
     HistoricalStoryRouteProof,
     ProductActionContractError,
@@ -202,6 +203,38 @@ def test_tagged_optional_never_uses_bare_null_or_omission() -> None:
     assert tagged_optional(7) == {"state": "present", "value": 7}
 
 
+def test_story_route_binding_scope_uses_raw_integer_when_present_and_tagged_null_when_absent(
+    product_core: tuple[object, ...],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _catalog, _registry, _profiles, _signal_issuer, story_issuer = product_core
+    original_hmac = issuer_module._hmac  # noqa: SLF001 - canonical-envelope golden
+    route_bindings: list[dict[str, object]] = []
+
+    def capture_hmac(key: object, domain: str, value: dict[str, object]) -> str:
+        if domain == "product-action-route-binding-v1":
+            route_bindings.append(value)
+        return original_hmac(key, domain, value)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(issuer_module, "_hmac", capture_hmac)
+    story_issuer.prepare(route_payload_raw=raw_json(story_route()))
+    story_issuer.prepare(
+        route_payload_raw=raw_json(
+            story_route(
+                target_story_id=None,
+                expected_current_version_id=None,
+                expected_story_revision=None,
+            )
+        )
+    )
+
+    assert route_bindings[0]["application_scope"] == {"kind": "story", "id": 52}
+    assert route_bindings[1]["application_scope"] == {
+        "kind": "story",
+        "id": {"state": "absent", "value": None},
+    }
+
+
 def test_five_identity_hmacs_token_and_deterministic_uuids_match_goldens(
     product_core: tuple[object, ...],
 ) -> None:
@@ -241,7 +274,7 @@ def test_five_identity_hmacs_token_and_deterministic_uuids_match_goldens(
     assert story.operation_id == "7c89ac2e-d8c3-5a9c-9fc1-e7b04a76dd55"
     assert story.action_call_id == "90267b25-082e-551c-80f8-09e5aebbed1a"
     assert story.confirmation_token == (
-        "e7ea5bc7aa7a83a4fc3d9a3446029e4178dca2cf127bfbcd9bd32c5241f6a652"
+        "044bb2bf8ff27e81ce9b7d2c3e2f65cd999f23b7adc91033ebe26ec79e12bd3f"
     )
 
 
@@ -283,6 +316,9 @@ def test_identity_goldens_are_exact_across_fresh_processes_hash_seeds_and_sqlite
 
         values = {
             "signal": signal_issuer.prepare(route_payload_raw=raw_json(signal_route())),
+            "story_present": story_issuer.prepare(
+                route_payload_raw=raw_json(story_route())
+            ),
             "story_null": story_issuer.prepare(route_payload_raw=raw_json(story_route(
                 target_story_id=None,
                 expected_current_version_id=None,
@@ -358,11 +394,12 @@ def test_identity_goldens_are_exact_across_fresh_processes_hash_seeds_and_sqlite
     )
     expected = json.loads(
         r'''{
-          "historical":{"action_call_id":"54d5d001-cdbd-5f54-ac1f-55022d826b52","authorization_scope_fingerprint":"hmac-sha256:b633f2ac8954cdb972a38802ebdae0065674292477e79e310c12e5382b215df6","confirmation_token":"965f4678d9d7a87218492f092e2a44ba04cc23d25db711529167736eb8ec6006","confirmation_token_fingerprint":"hmac-sha256:7529a435680a5c833057c71d56262919eead0433ffeaba5157d22618d271b49f","historical_request_token_fingerprint":"hmac-sha256:39ab15c84619dfd4643587f155f027cd34df131be6da9b67d626676e80397e0a","operation_id":"f75a0ec2-909b-5abb-bae9-5010b7da41e4","proposal_fingerprint":"hmac-sha256:a0e97b0287b92420b47538684bc4cb3ff4401b82178db6883d6e56f0e7796a77","request_idempotency_fingerprint":"hmac-sha256:ddf4bea9000abdbc20fe580cf439f9f98ae61ba0965daaeb069f476f0331d055","route_binding_fingerprint":"hmac-sha256:429fb78e407ed104276c9618c7505b686f261651a4abcfae6a1277b5f7b4b3c8","route_payload_fingerprint":"hmac-sha256:785fce85478a2739f53489ad43d008e05b7049877371f32cf07ef52175138149","semantic_claim_fingerprint":null},
+          "historical":{"action_call_id":"54d5d001-cdbd-5f54-ac1f-55022d826b52","authorization_scope_fingerprint":"hmac-sha256:b633f2ac8954cdb972a38802ebdae0065674292477e79e310c12e5382b215df6","confirmation_token":"1e4259b14a4d95a5ca011ea5827135c34d35d56a7cdf55693f86d8500217c371","confirmation_token_fingerprint":"hmac-sha256:6c011aa5862cd42e606d5a150d544d7f6256b89dda28a51634aae28cf8603906","historical_request_token_fingerprint":"hmac-sha256:39ab15c84619dfd4643587f155f027cd34df131be6da9b67d626676e80397e0a","operation_id":"f75a0ec2-909b-5abb-bae9-5010b7da41e4","proposal_fingerprint":"hmac-sha256:e03327d9e0e10715d2ce7285a72975b0a692c6b5b167b7a2d29e9aafa7e10350","request_idempotency_fingerprint":"hmac-sha256:c80ee692b6cd1ae149d03ae1c4d307dcde53110b5be2532f9a39fb3105968656","route_binding_fingerprint":"hmac-sha256:bbcfb2ca8b1e4ae56b7f4c58508d54820a2427efa17b0d6fc5f2354403158efc","route_payload_fingerprint":"hmac-sha256:785fce85478a2739f53489ad43d008e05b7049877371f32cf07ef52175138149","semantic_claim_fingerprint":null},
           "signal":{"action_call_id":"07e593da-ef9c-580e-b870-c73d7e20e73d","authorization_scope_fingerprint":"hmac-sha256:3f2ec6af4c59bc4e7d0a0b5d09a8d004be3ca9a99c917c15be244a78f2610126","confirmation_token":"f5544100b4d9b53b506333f11a989004e6d52d870022270bde726c7e56655b3e","confirmation_token_fingerprint":"hmac-sha256:3d2847dba9403e67e711254186bb50b891b92b9797bceedffcade9f4944b0bd7","historical_request_token_fingerprint":null,"operation_id":"8da3e238-a39c-5d2b-b646-49e3da5f94a1","proposal_fingerprint":"hmac-sha256:e209dafe9fa2e6a39fa21c0693d12ffbb046cc79a5f06ccbf5ce98f8c33dc1b9","request_idempotency_fingerprint":"hmac-sha256:7e23cfc6de8acd5042e15acd5cbf259e3753e6748951ffa5e387ca781cf4fcf9","route_binding_fingerprint":"hmac-sha256:ecaeeca48b1b735abcc3fd3283d419e58c24d92ce597f811573e3f17d5600646","route_payload_fingerprint":"hmac-sha256:7e80096753bbd320485a1116f1a1e0782a26a8ee334eec108795c126c7c336e0","semantic_claim_fingerprint":"hmac-sha256:2e2c71fa3191dab8bf1c9c09f2394fd4fa9a9bd32c1a53472e81c34267f27921"},
-          "story_gr7":{"action_call_id":"ebff98df-8f85-5647-91c8-918967a47f0a","authorization_scope_fingerprint":"hmac-sha256:c049b799b9a84712c2816c3c3a27aaa26987ce06be5fd21558d4427d9f6485ab","confirmation_token":"c37eb575af0f74a0ebe864d7cfb59b090ad8315d5533ac571b5d530f83539539","confirmation_token_fingerprint":"hmac-sha256:f973a5e5c95b8d12f0dbd663afd7aab1789f9b5592b7f886cbfb90e91e49cae9","historical_request_token_fingerprint":null,"operation_id":"4c9e63c7-955e-5756-89bf-e913e2963658","proposal_fingerprint":"hmac-sha256:19dd497801b287c01257117325a7f45fa9af69fb2c645b56ecef454eb629a38f","request_idempotency_fingerprint":"hmac-sha256:54b5439299659a64ae9ce8f9076e9c8feb50b2d45ea1f44e0997cfac6aeb2c61","route_binding_fingerprint":"hmac-sha256:f42a8a5207d38d7276ba6276038d759bf0bde8ecc94e167daf365dcd7da79a95","route_payload_fingerprint":"hmac-sha256:a603c365b8302c36b38d2410cfa7fbe6d14247f566a22821d0a10c0a123fcc8b","semantic_claim_fingerprint":null},
+          "story_present":{"action_call_id":"90267b25-082e-551c-80f8-09e5aebbed1a","authorization_scope_fingerprint":"hmac-sha256:4be5ea6e528b264178e9f768d53f9827f8afbd52c071ce83e3e16278d49a5860","confirmation_token":"044bb2bf8ff27e81ce9b7d2c3e2f65cd999f23b7adc91033ebe26ec79e12bd3f","confirmation_token_fingerprint":"hmac-sha256:ddf107723491ec069a781b8986fc9680cb21bd2da5e74b517611f6dbe5636f05","historical_request_token_fingerprint":null,"operation_id":"7c89ac2e-d8c3-5a9c-9fc1-e7b04a76dd55","proposal_fingerprint":"hmac-sha256:ffc9497202092204708dca3946218c766984bdddd39d7c64f187ee8e32005b25","request_idempotency_fingerprint":"hmac-sha256:93eb0d782a4b9dd4a9ba2ea446954dbd8eb3587eb0b4d4698553892e7e99a3ab","route_binding_fingerprint":"hmac-sha256:6bdb7466a64c63e8110390b71b8996a49f291ca5c7273ecf0b15a57630ee4a74","route_payload_fingerprint":"hmac-sha256:d11247c9bc968529766a73bdbfde9f4d6fbdf369292f6916d13d5754af58b928","semantic_claim_fingerprint":null},
+          "story_gr7":{"action_call_id":"ebff98df-8f85-5647-91c8-918967a47f0a","authorization_scope_fingerprint":"hmac-sha256:c049b799b9a84712c2816c3c3a27aaa26987ce06be5fd21558d4427d9f6485ab","confirmation_token":"7f3578a472b881f1325685ac34b2da40a985c7f532fcf015960020a9dbc0bb1f","confirmation_token_fingerprint":"hmac-sha256:e5e62ffa33ac32c7b80f517c04d5a312047c56c91afe090c6f6bd73467f20957","historical_request_token_fingerprint":null,"operation_id":"4c9e63c7-955e-5756-89bf-e913e2963658","proposal_fingerprint":"hmac-sha256:3b43dd675bc3e2cbc6d22bc6d92601b01106de73ae3e2db694654abed2449523","request_idempotency_fingerprint":"hmac-sha256:7a54c1f0196bf876b134928ee27abec93b9a4465ffe2fbe95689d6c83b3adbfb","route_binding_fingerprint":"hmac-sha256:a029d382b80601c2812fb5a6fc9cddba8e41b484f9924d95b4ea372736ccc504","route_payload_fingerprint":"hmac-sha256:a603c365b8302c36b38d2410cfa7fbe6d14247f566a22821d0a10c0a123fcc8b","semantic_claim_fingerprint":null},
           "story_null":{"action_call_id":"90267b25-082e-551c-80f8-09e5aebbed1a","authorization_scope_fingerprint":"hmac-sha256:1852f815b79d7425d807dcaa9a5b87e5fadde195372f9e6526119661a1b529e3","confirmation_token":"bb376d6cb51aacdaeac48c5917303d109b9beb613d974b931764df8e0c3bb9e7","confirmation_token_fingerprint":"hmac-sha256:3c838d01520e9a1d709a8b6e5c08b37c4f6c5acd234e3b76ae76dcd1115a6f61","historical_request_token_fingerprint":null,"operation_id":"7c89ac2e-d8c3-5a9c-9fc1-e7b04a76dd55","proposal_fingerprint":"hmac-sha256:b51b656de64f532a7c38ea25860bcd9b0a6ea51afd3c6643f6f5413cc45bfbdf","request_idempotency_fingerprint":"hmac-sha256:d75f203ec547ea16a31a7dc2c3ee4044a3509197bb3110ef7b83bbcd5f05dc3c","route_binding_fingerprint":"hmac-sha256:7bae6f0085dfe6540633e924d9379b355e5d62c4d38d2cd7aff0198e197dc32b","route_payload_fingerprint":"hmac-sha256:18d3608a9dccdb16de56467d99a94641c8ff340c8981163130a357ea9b457faa","semantic_claim_fingerprint":null},
-          "story_pg9":{"action_call_id":"d369a5af-0c96-5375-9095-6f8d5576dc34","authorization_scope_fingerprint":"hmac-sha256:f761299a2ac91563f98ce52d96d1cf88123348a41157b3a619919a1c66643da9","confirmation_token":"0e54e5a7ed365befb87bd42bdb19cd9a2d7cf92491a6e1aeb015cdcf6450359e","confirmation_token_fingerprint":"hmac-sha256:72239f63e6648105f5bb344355a23c472cd9397925cac76906dba7e0245e561f","historical_request_token_fingerprint":null,"operation_id":"cf6917d8-cd46-5277-8ab3-150b0aa8edb7","proposal_fingerprint":"hmac-sha256:71d3e4ffc5740565ab426a9b005031bb2a185312ce4237ca403efa7f40ca22db","request_idempotency_fingerprint":"hmac-sha256:f6529b7cf27d5df2e3d51897e8ebdaee96486906cdc3b7f8b98dca62c0eef02a","route_binding_fingerprint":"hmac-sha256:6ee4b52172e6179a628545634de536531d85f08054d09545aa0416832351743b","route_payload_fingerprint":"hmac-sha256:c4e580e471b03a4b9c5780e4eb7d259e201cf0e5ff7ccc2adfc8a8f192df94fc","semantic_claim_fingerprint":null}
+          "story_pg9":{"action_call_id":"d369a5af-0c96-5375-9095-6f8d5576dc34","authorization_scope_fingerprint":"hmac-sha256:f761299a2ac91563f98ce52d96d1cf88123348a41157b3a619919a1c66643da9","confirmation_token":"04e9fad16ffeaaabc69ca20f4bb26cc3f6c1412c163380b6ddb2e8ee09928f1a","confirmation_token_fingerprint":"hmac-sha256:336117ec4474193334dc02d901e401e5d2b0218b4dbb188ca5b283167fc06413","historical_request_token_fingerprint":null,"operation_id":"cf6917d8-cd46-5277-8ab3-150b0aa8edb7","proposal_fingerprint":"hmac-sha256:1773d70d33673641ccda2cb88d6896ab157622d79eadd2eea80583a79fe76196","request_idempotency_fingerprint":"hmac-sha256:0865580b91174167a4efc7d747c1843e4c7d4dacf1deb5a2b8ad309a95e9322d","route_binding_fingerprint":"hmac-sha256:2f45ad3f626aea71840a1a4c39ebba3b9e9a11d531520f8757520b3c398e5704","route_payload_fingerprint":"hmac-sha256:c4e580e471b03a4b9c5780e4eb7d259e201cf0e5ff7ccc2adfc8a8f192df94fc","semantic_claim_fingerprint":null}
         }'''
     )
     outputs = []

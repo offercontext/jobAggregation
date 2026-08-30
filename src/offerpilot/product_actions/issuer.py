@@ -315,9 +315,17 @@ def _owner_and_scope(
             },
             {"kind": "application", "id": payload["application_id"]},
         )
+    target_story_id = payload["target_story_id"]
     return (
         {"kind": "interview_story_owner", "attempt_id": payload["attempt_id"]},
-        {"kind": "story", "id": tagged_optional(payload["target_story_id"])},
+        {
+            "kind": "story",
+            "id": (
+                target_story_id
+                if target_story_id is not None
+                else tagged_optional(None)
+            ),
+        },
     )
 
 

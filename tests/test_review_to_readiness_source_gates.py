@@ -765,12 +765,26 @@ def _interview_note_mutation_violations(path: Path, tree: ast.Module) -> list[st
             self.tables = set(parent.tables) if parent is not None else set()
             self.queries = set(parent.queries) if parent is not None else set()
             self.rows = set(parent.rows) if parent is not None else set()
+            self.revision_values = (
+                set(parent.revision_values) if parent is not None else set()
+            )
+            self.update_statements = (
+                set(parent.update_statements) if parent is not None else set()
+            )
+            self.revisioned_update_statements = (
+                set(parent.revisioned_update_statements)
+                if parent is not None
+                else set()
+            )
 
         def discard(self, names: set[str]) -> None:
             self.models.difference_update(names)
             self.tables.difference_update(names)
             self.queries.difference_update(names)
             self.rows.difference_update(names)
+            self.revision_values.difference_update(names)
+            self.update_statements.difference_update(names)
+            self.revisioned_update_statements.difference_update(names)
 
     def local_nodes(scope: ast.AST) -> list[ast.AST]:
         nodes: list[ast.AST] = []
@@ -914,6 +928,79 @@ def _interview_note_mutation_violations(path: Path, tree: ast.Module) -> list[st
                 return query_targets_note(node.func.value)
             return False
 
+        def is_revision_values(node: ast.AST) -> bool:
+            return (
+                isinstance(node, ast.Name)
+                and node.id in lineage.revision_values
+            ) or (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_revisioned_note_values"
+            )
+
+        def is_note_update_factory(node: ast.AST) -> bool:
+            return (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, (ast.Name, ast.Attribute))
+                and (
+                    (isinstance(node.func, ast.Name) and node.func.id == "update")
+                    or (
+                        isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "update"
+                    )
+                )
+                and bool(node.args)
+                and is_note_model(node.args[0])
+            )
+
+        def is_note_update_statement(node: ast.AST) -> bool:
+            if isinstance(node, ast.Name):
+                return node.id in lineage.update_statements
+            if is_note_update_factory(node):
+                return True
+            return (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr
+                in {
+                    "execution_options",
+                    "ordered_values",
+                    "prefix_with",
+                    "returning",
+                    "values",
+                    "where",
+                    "with_dialect_options",
+                }
+                and is_note_update_statement(node.func.value)
+            )
+
+        def update_call_uses_revision_values(node: ast.Call) -> bool:
+            return any(is_revision_values(argument) for argument in node.args) or any(
+                is_revision_values(keyword.value) for keyword in node.keywords
+            )
+
+        def is_revisioned_note_update(node: ast.AST) -> bool:
+            if isinstance(node, ast.Name):
+                return node.id in lineage.revisioned_update_statements
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                return False
+            if (
+                node.func.attr in {"values", "ordered_values"}
+                and is_note_update_statement(node.func.value)
+            ):
+                return update_call_uses_revision_values(node)
+            return (
+                node.func.attr
+                in {
+                    "execution_options",
+                    "prefix_with",
+                    "returning",
+                    "where",
+                    "with_dialect_options",
+                }
+                and is_revisioned_note_update(node.func.value)
+            )
+
         lineage.rows.update(
             argument.arg
             for argument in scope_arguments(scope)
@@ -944,6 +1031,12 @@ def _interview_note_mutation_violations(path: Path, tree: ast.Module) -> list[st
                     (is_note_table(value), lineage.tables),
                     (query_targets_note(value), lineage.queries),
                     (is_note_row_source(value), lineage.rows),
+                    (is_revision_values(value), lineage.revision_values),
+                    (is_note_update_statement(value), lineage.update_statements),
+                    (
+                        is_revisioned_note_update(value),
+                        lineage.revisioned_update_statements,
+                    ),
                 )
                 for matches, known_names in target_sets:
                     if matches and not names.issubset(known_names):
@@ -955,13 +1048,7 @@ def _interview_note_mutation_violations(path: Path, tree: ast.Module) -> list[st
             if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef))
             else ""
         )
-        uses_revision_helper = any(
-            isinstance(candidate, ast.Call)
-            and isinstance(candidate.func, ast.Name)
-            and candidate.func.id == "_revisioned_note_values"
-            for candidate in nodes
-        )
-        approved_sql_owner = uses_revision_helper and (
+        approved_sql_owner = (
             (
                 path.as_posix().endswith("repositories/notes.py")
                 and owner in {"update", "update_note_scoped"}
@@ -1002,17 +1089,24 @@ def _interview_note_mutation_violations(path: Path, tree: ast.Module) -> list[st
                     for target in ast.walk(root_target)
                 )
             elif isinstance(candidate, ast.Call):
-                direct_update = (
-                    isinstance(candidate.func, (ast.Name, ast.Attribute))
-                    and (
-                        (isinstance(candidate.func, ast.Name) and candidate.func.id == "update")
-                        or (
-                            isinstance(candidate.func, ast.Attribute)
-                            and candidate.func.attr == "update"
-                        )
-                    )
+                update_values_call = (
+                    isinstance(candidate.func, ast.Attribute)
+                    and candidate.func.attr in {"values", "ordered_values"}
+                    and is_note_update_statement(candidate.func.value)
+                )
+                update_values_violation = update_values_call and (
+                    not approved_sql_owner
+                    or not update_call_uses_revision_values(candidate)
+                )
+                executes_update = (
+                    isinstance(candidate.func, ast.Attribute)
+                    and candidate.func.attr in {"execute", "scalar", "scalars"}
                     and bool(candidate.args)
-                    and is_note_model(candidate.args[0])
+                    and is_note_update_statement(candidate.args[0])
+                )
+                execute_violation = executes_update and (
+                    not approved_sql_owner
+                    or not is_revisioned_note_update(candidate.args[0])
                 )
                 table_update = (
                     isinstance(candidate.func, ast.Attribute)
@@ -1039,7 +1133,8 @@ def _interview_note_mutation_violations(path: Path, tree: ast.Module) -> list[st
                     and candidate.args[1].value in guarded_fields
                 )
                 mutation = (
-                    (direct_update and not approved_sql_owner)
+                    update_values_violation
+                    or execute_violation
                     or table_update
                     or query_update
                     or mapping_update
@@ -1301,12 +1396,35 @@ def test_interview_note_mutation_detector_requires_revisioned_owners() -> None:
         "        update(InterviewNote).values(**_revisioned_note_values({'questions': 'changed'}))\n"
         "    )\n"
     )
+    approved_scoped_owner = ast.parse(
+        "def update_note_scoped(session):\n"
+        "    values = _revisioned_note_values({'questions': 'changed'})\n"
+        "    statement = update(InterviewNote).where(InterviewNote.id == 1)\n"
+        "    statement = statement.values(**values).returning(InterviewNote)\n"
+        "    session.scalars(statement)\n"
+    )
+    approved_event_owner = ast.parse(
+        "def _delete_application_event_owned(session):\n"
+        "    session.execute(\n"
+        "        update(InterviewNote).values(\n"
+        "            **_revisioned_note_values({'application_event_id': None})\n"
+        "        )\n"
+        "    )\n"
+    )
     unrevisioned_owner = ast.parse(
         "def update(session):\n"
         "    session.execute(update(InterviewNote).values(questions='changed'))\n"
     )
+    mixed_owner = ast.parse(
+        "def update(session):\n"
+        "    session.execute(\n"
+        "        update(InterviewNote).values(**_revisioned_note_values({'questions': 'ok'}))\n"
+        "    )\n"
+        "    session.execute(update(InterviewNote).values(questions='bypass'))\n"
+    )
     arbitrary = ROOT / "src" / "offerpilot" / "other.py"
     notes_owner = ROOT / "src" / "offerpilot" / "repositories" / "notes.py"
+    events_owner = ROOT / "src" / "offerpilot" / "repositories" / "application_events.py"
 
     assert _interview_note_mutation_violations(arbitrary, direct_content_assignment)
     assert _interview_note_mutation_violations(arbitrary, direct_binding_assignment)
@@ -1314,7 +1432,10 @@ def test_interview_note_mutation_detector_requires_revisioned_owners() -> None:
     assert _interview_note_mutation_violations(arbitrary, table_update)
     assert _interview_note_mutation_violations(arbitrary, query_update)
     assert _interview_note_mutation_violations(notes_owner, approved_owner) == []
+    assert _interview_note_mutation_violations(notes_owner, approved_scoped_owner) == []
+    assert _interview_note_mutation_violations(events_owner, approved_event_owner) == []
     assert _interview_note_mutation_violations(notes_owner, unrevisioned_owner)
+    assert _interview_note_mutation_violations(notes_owner, mixed_owner)
 
 
 def test_interview_note_mutation_detector_avoids_read_and_unrelated_writes() -> None:

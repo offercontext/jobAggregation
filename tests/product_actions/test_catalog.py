@@ -13,7 +13,9 @@ from offerpilot.product_actions.catalog import (
 from offerpilot.product_actions.contracts import (
     PRODUCT_ACTION_COMPENSATION_NAMES,
     PRODUCT_ACTION_NAMES,
+    HistoricalStoryRouteProof,
     ProductActionProofRegistryV1,
+    ProductActionRouteProof,
 )
 from tests.product_actions.conftest import raw_json, signal_route
 
@@ -90,6 +92,31 @@ def test_catalogs_and_specs_reject_mutation_and_cross_registry_resolution(
             catalog.names()
     finally:
         object.__setattr__(first, "action_name", original)
+
+
+def test_historical_story_catalog_resolution_rejects_an_ordinary_route_proof() -> None:
+    registry = ProductActionProofRegistryV1()
+    catalog = ProductActionCatalogV1(registry)
+    binding = ("confirm_interview_story", "historical_story_bridge")
+    ordinary = registry._issue(  # noqa: SLF001 - adversarial proof type test
+        ProductActionRouteProof,
+        action_name="confirm_interview_story",
+        binding=binding,
+    )
+    with pytest.raises(TypeError, match="proof type mismatch"):
+        catalog.resolve_historical_story(  # type: ignore[arg-type]
+            ordinary,
+            expected_binding=binding,
+        )
+    historical = registry._issue(  # noqa: SLF001 - adversarial proof type test
+        HistoricalStoryRouteProof,
+        action_name="confirm_interview_story",
+        binding=binding,
+    )
+    assert catalog.resolve_historical_story(
+        historical,
+        expected_binding=binding,
+    ).action_name == "confirm_interview_story"
 
 
 def test_agent_provider_bytes_and_order_remain_exactly_the_pinned_25() -> None:

@@ -14,6 +14,7 @@ from offerpilot.product_actions.catalog import ProductActionCatalogV1
 from offerpilot.product_actions.contracts import (
     PRODUCT_ACTION_NAMES,
     DecodedProductActionRouteV1,
+    HistoricalStoryRouteProof,
     ProductActionContractError,
     ProductActionIntegrityError,
     ProductActionName,
@@ -152,7 +153,7 @@ class PreparedProductActionProposalV1:
     confirmation_token_fingerprint: str
     transition_id: str
     created_at: datetime
-    route_proof: ProductActionRouteProof
+    route_proof: ProductActionRouteProof | HistoricalStoryRouteProof
     proof_binding: tuple[object, ...]
     _confirmation_token: str
     _integrity_seal: tuple[object, ...]
@@ -350,6 +351,78 @@ def _confirmation_token(
     ).hexdigest()
 
 
+def _derive_persisted_proposal_identity(
+    key: LedgerKeyDomain,
+    *,
+    catalog_fingerprint: str,
+    action_name: ProductActionName,
+    request_origin: ProductActionRequestOrigin,
+    operation_id: str,
+    action_call_id: str,
+    route_payload_fingerprint: str,
+    route_binding_fingerprint: str,
+    authorization_scope_fingerprint: str,
+    semantic_claim_fingerprint: str | None,
+    historical_request_token_fingerprint: str | None,
+) -> tuple[str, str]:
+    """Rebuild the terminal-safe keyed chain without cleared route plaintext."""
+
+    proposal_fingerprint = _hmac(
+        key,
+        "product-action-proposal-v1",
+        {
+            "operation_id": operation_id,
+            "action_call_id": action_call_id,
+            "catalog_fingerprint": catalog_fingerprint,
+            "action_name": action_name,
+            "request_origin": request_origin,
+            "route_payload_fingerprint": route_payload_fingerprint,
+            "route_binding_fingerprint": route_binding_fingerprint,
+            "authorization_scope_fingerprint": authorization_scope_fingerprint,
+            "semantic_claim_fingerprint": tagged_optional(semantic_claim_fingerprint),
+            "historical_request_token_fingerprint": tagged_optional(
+                historical_request_token_fingerprint
+            ),
+        },
+    )
+    confirmation_token = _confirmation_token(
+        key,
+        catalog_fingerprint=catalog_fingerprint,
+        action_name=action_name,
+        operation_id=operation_id,
+        action_call_id=action_call_id,
+        proposal_fingerprint=proposal_fingerprint,
+        route_binding_fingerprint=route_binding_fingerprint,
+        historical_request_token_fingerprint=historical_request_token_fingerprint,
+    )
+    confirmation_token_fingerprint = ledger_fingerprint(
+        key,
+        "write-operation-confirmation-token-v1",
+        confirmation_token.encode("ascii"),
+    )
+    return proposal_fingerprint, confirmation_token_fingerprint
+
+
+def _derive_historical_request_token_fingerprint(
+    key: LedgerKeyDomain,
+    *,
+    attempt_id: int,
+    generation_revision: int,
+    proposal_hash: str,
+    legacy_confirmation_token: str,
+) -> str:
+    return _hmac(
+        key,
+        "historical-story-request-token-v1",
+        {
+            "attempt_id": attempt_id,
+            "generation_revision": generation_revision,
+            "proposal_hash": proposal_hash,
+            "legacy_confirmation_token": legacy_confirmation_token,
+        },
+    )
+
+
 def _derive(
     *,
     route: DecodedProductActionRouteV1,
@@ -512,6 +585,44 @@ def _proof_binding(values: dict[str, Any], route: DecodedProductActionRouteV1) -
     )
 
 
+def _prepared_from_derived_identity(
+    *,
+    route: DecodedProductActionRouteV1,
+    key: LedgerKeyDomain,
+    values: dict[str, Any],
+    historical_request_token_fingerprint: str | None,
+    proof: ProductActionRouteProof | HistoricalStoryRouteProof,
+    binding: tuple[object, ...],
+) -> PreparedProductActionProposalV1:
+    return PreparedProductActionProposalV1(
+        schema_version=1,
+        action_name=route.action_name,
+        request_origin=route.request_origin,
+        source_kind=route.source_kind,
+        source_id=route.source_id,
+        source_revision=route.source_revision,
+        route_payload_json=route.canonical_json,
+        route_payload_fingerprint=values["route_payload_fingerprint"],
+        semantic_claim_fingerprint=values["semantic_claim_fingerprint"],
+        authorization_scope_fingerprint=values["authorization_scope_fingerprint"],
+        route_binding_fingerprint=values["route_binding_fingerprint"],
+        request_idempotency_fingerprint=values["request_idempotency_fingerprint"],
+        proposal_fingerprint=values["proposal_fingerprint"],
+        historical_request_token_fingerprint=historical_request_token_fingerprint,
+        operation_id=values["operation_id"],
+        action_call_id=values["action_call_id"],
+        fingerprint_key_id=key.key_id,
+        confirmation_token_fingerprint=values["confirmation_token_fingerprint"],
+        transition_id=str(
+            uuid5(PRODUCT_ACTION_CALL_NAMESPACE, values["operation_id"] + ":transition:1")
+        ),
+        created_at=datetime.now(timezone.utc),
+        route_proof=proof,
+        proof_binding=binding,
+        _confirmation_token=values["confirmation_token"],
+    )
+
+
 class _ProductActionBundle(Protocol):
     operation: Any
     route: Any
@@ -573,77 +684,36 @@ class _BaseActionIssuer:
         self,
         *,
         route_payload_raw: bytes,
-        request_origin: ProductActionRequestOrigin,
-        historical_confirmation_token: str | None,
     ) -> PreparedProductActionProposalV1:
         self._ensure_integrity()
         route = decode_product_action_route_payload(
             route_payload_raw,
             action_name=self._action_name,
-            request_origin=request_origin,
+            request_origin="current",
         )
-        key = self._key_profiles.active()
-        historical_fingerprint = None
-        if request_origin == "historical_story_bridge":
-            if type(historical_confirmation_token) is not str or not historical_confirmation_token:
-                raise ProductActionContractError("historical_confirmation_token_required")
-            try:
-                encoded = historical_confirmation_token.encode("utf-8")
-            except UnicodeEncodeError as exc:
-                raise ProductActionContractError("historical_confirmation_token_invalid") from exc
-            if len(encoded) > 4_096:
-                raise ProductActionContractError("historical_confirmation_token_invalid")
-            payload = _route_payload(route)
-            historical_fingerprint = _hmac(
-                key,
-                "historical-story-request-token-v1",
-                {
-                    "attempt_id": payload["attempt_id"],
-                    "generation_revision": payload["generation_revision"],
-                    "proposal_hash": payload["proposal_hash"],
-                    "legacy_confirmation_token": historical_confirmation_token,
-                },
-            )
-        elif historical_confirmation_token is not None:
-            raise ProductActionContractError("historical_confirmation_token_forbidden")
+        selected_key = self._key_profiles.active()
         values = _derive(
             route=route,
             catalog=self._catalog,
-            key=key,
-            historical_request_token_fingerprint=historical_fingerprint,
+            key=selected_key,
+            historical_request_token_fingerprint=None,
         )
         binding = _proof_binding(values, route)
-        proof = self._registry._issue(
+        proof = cast(
             ProductActionRouteProof,
-            action_name=route.action_name,
-            binding=binding,
-        )
-        return PreparedProductActionProposalV1(
-            schema_version=1,
-            action_name=route.action_name,
-            request_origin=route.request_origin,
-            source_kind=route.source_kind,
-            source_id=route.source_id,
-            source_revision=route.source_revision,
-            route_payload_json=route.canonical_json,
-            route_payload_fingerprint=values["route_payload_fingerprint"],
-            semantic_claim_fingerprint=values["semantic_claim_fingerprint"],
-            authorization_scope_fingerprint=values["authorization_scope_fingerprint"],
-            route_binding_fingerprint=values["route_binding_fingerprint"],
-            request_idempotency_fingerprint=values["request_idempotency_fingerprint"],
-            proposal_fingerprint=values["proposal_fingerprint"],
-            historical_request_token_fingerprint=historical_fingerprint,
-            operation_id=values["operation_id"],
-            action_call_id=values["action_call_id"],
-            fingerprint_key_id=key.key_id,
-            confirmation_token_fingerprint=values["confirmation_token_fingerprint"],
-            transition_id=str(
-                uuid5(PRODUCT_ACTION_CALL_NAMESPACE, values["operation_id"] + ":transition:1")
+            self._registry._issue(
+                ProductActionRouteProof,
+                action_name=route.action_name,
+                binding=binding,
             ),
-            created_at=datetime.now(timezone.utc),
-            route_proof=proof,
-            proof_binding=binding,
-            _confirmation_token=values["confirmation_token"],
+        )
+        return _prepared_from_derived_identity(
+            route=route,
+            key=selected_key,
+            values=values,
+            historical_request_token_fingerprint=None,
+            proof=proof,
+            binding=binding,
         )
 
     def recover_confirmation_token(self, bundle: _ProductActionBundle) -> str:
@@ -696,11 +766,7 @@ class ReviewReadinessActionIssuer(_BaseActionIssuer):
         )
 
     def prepare(self, *, route_payload_raw: bytes) -> PreparedProductActionProposalV1:
-        return self._prepare(
-            route_payload_raw=route_payload_raw,
-            request_origin="current",
-            historical_confirmation_token=None,
-        )
+        return self._prepare(route_payload_raw=route_payload_raw)
 
 
 class InterviewStoryActionIssuer(_BaseActionIssuer):
@@ -726,12 +792,9 @@ class InterviewStoryActionIssuer(_BaseActionIssuer):
         request_origin: Literal["current", "historical_story_bridge"] = "current",
         historical_confirmation_token: str | None = None,
     ) -> PreparedProductActionProposalV1:
-        return self._prepare(
-            route_payload_raw=route_payload_raw,
-            request_origin=request_origin,
-            historical_confirmation_token=historical_confirmation_token,
-        )
-
+        if request_origin != "current" or historical_confirmation_token is not None:
+            raise ProductActionContractError("historical_story_bridge_repository_only")
+        return self._prepare(route_payload_raw=route_payload_raw)
 
 def validate_prepared_product_action(
     prepared: PreparedProductActionProposalV1,
@@ -790,7 +853,16 @@ def validate_prepared_product_action(
     if derived["confirmation_token"] != prepared.confirmation_token:
         raise ProductActionIntegrityError("prepared_confirmation_token")
     if require_route_proof:
-        catalog.resolve(prepared.route_proof, expected_binding=prepared.proof_binding)
+        if prepared.request_origin == "historical_story_bridge":
+            catalog.resolve_historical_story(
+                cast(HistoricalStoryRouteProof, prepared.route_proof),
+                expected_binding=prepared.proof_binding,
+            )
+        else:
+            catalog.resolve(
+                cast(ProductActionRouteProof, prepared.route_proof),
+                expected_binding=prepared.proof_binding,
+            )
 
 
 __all__ = [

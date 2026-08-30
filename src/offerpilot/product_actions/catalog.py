@@ -9,6 +9,7 @@ from typing import Literal, NoReturn, cast
 from offerpilot.product_actions.contracts import (
     PRODUCT_ACTION_COMPENSATION_NAMES,
     PRODUCT_ACTION_NAMES,
+    HistoricalStoryRouteProof,
     JSONValue,
     ProductActionProofRegistryV1,
     ProductActionRouteProof,
@@ -298,6 +299,26 @@ class ProductActionCatalogV1:
             if spec.action_name == action_name:
                 return spec
         raise ValueError("Product Action proof action is outside the Catalog")
+
+    def resolve_historical_story(
+        self,
+        proof: HistoricalStoryRouteProof,
+        *,
+        expected_binding: tuple[object, ...],
+    ) -> ProductActionSpecV1:
+        self._ensure_integrity()
+        action_name, binding = self._registry._issued_identity(proof)
+        if binding != expected_binding:
+            raise ValueError("Historical Story proof binding mismatch")
+        self._registry.require_issued(
+            proof,
+            proof_type=HistoricalStoryRouteProof,
+            action_name="confirm_interview_story",
+            expected_binding=expected_binding,
+        )
+        if action_name != "confirm_interview_story":
+            raise ValueError("Historical Story proof action mismatch")
+        return self._ordered_specs[0]
 
 
 class ProductActionCompensationCatalogV1:

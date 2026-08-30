@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+import re
 from dataclasses import dataclass, fields
 from types import SimpleNamespace
 from typing import Any, Literal, cast
@@ -12,11 +13,17 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
 from offerpilot.ai.write_operations import payload_from_operation
-from offerpilot.models import ProductActionProposal, WriteOperation, WriteOperationTransition
+from offerpilot.models import (
+    InterviewStoryProposalAttempt,
+    ProductActionProposal,
+    WriteOperation,
+    WriteOperationTransition,
+)
 from offerpilot.product_actions.catalog import ProductActionCatalogV1
 from offerpilot.product_actions.contracts import (
     EXPECTED_PREFIX,
     PRODUCT_ACTION_NAMES,
+    HistoricalStoryRouteProof,
     ProductActionContractError,
     ProductActionIntegrityError,
     ProductActionProofRegistryV1,
@@ -26,9 +33,15 @@ from offerpilot.product_actions.contracts import (
     require_product_action_uuid,
 )
 from offerpilot.product_actions.issuer import (
+    InterviewStoryActionIssuer,
     LedgerKeyProfileStoreV1,
     PreparedProductActionProposalV1,
     _derive,
+    _derive_historical_request_token_fingerprint,
+    _derive_persisted_proposal_identity,
+    _prepared_from_derived_identity,
+    _proof_binding,
+    _route_payload,
     validate_prepared_product_action,
 )
 
@@ -139,6 +152,7 @@ class _PublicationUnresolved(RuntimeError):
 
 _OPERATION_COLUMNS = tuple(field.name for field in fields(ProductActionOperationSnapshotV1))
 _ROUTE_COLUMNS = tuple(field.name for field in fields(ProductActionRouteSnapshotV1))
+_LEGACY_CONFIRMATION_TOKEN = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 
 
 class ProductActionProposalRepository:
@@ -165,6 +179,144 @@ class ProductActionProposalRepository:
         self._proof_registry = proof_registry
         self._key_profiles = key_profiles
 
+    @staticmethod
+    def _route_proof_type(
+        prepared: PreparedProductActionProposalV1,
+    ) -> type[ProductActionRouteProof] | type[HistoricalStoryRouteProof]:
+        if prepared.request_origin == "historical_story_bridge":
+            return HistoricalStoryRouteProof
+        return ProductActionRouteProof
+
+    @staticmethod
+    def _require_publication_uow(session: Session) -> None:
+        if not session.in_transaction():
+            raise ProductActionContractError("publication_uow_required")
+        driver_connection = session.connection().connection.driver_connection
+        if getattr(driver_connection, "in_transaction", False) is not True:
+            raise ProductActionContractError("publication_uow_required")
+
+    def publish_bundle_in_session(
+        self,
+        session: Session,
+        prepared: PreparedProductActionProposalV1,
+    ) -> ProductActionPublicationV1:
+        """Join a caller-owned BEGIN IMMEDIATE UoW without ending its transaction."""
+
+        validate_prepared_product_action(
+            prepared,
+            catalog=self._catalog,
+            key_profiles=self._key_profiles,
+        )
+        self._require_publication_uow(session)
+        with self._proof_registry.claim(
+            prepared.route_proof,
+            proof_type=self._route_proof_type(prepared),
+            action_name=prepared.action_name,
+            expected_binding=prepared.proof_binding,
+        ):
+            return self._publish_bundle_in_session_unclaimed(session, prepared)
+
+    def publish_historical_story_bridge_in_session(
+        self,
+        session: Session,
+        *,
+        issuer: InterviewStoryActionIssuer,
+        route_payload_raw: bytes,
+        legacy_confirmation_token: str,
+    ) -> ProductActionPublicationV1:
+        """Validate a pre-0029 ready Attempt under the caller's write lock."""
+
+        self._require_publication_uow(session)
+        if (
+            type(issuer) is not InterviewStoryActionIssuer
+            or issuer._catalog is not self._catalog
+            or issuer._registry is not self._proof_registry
+            or issuer._key_profiles is not self._key_profiles
+        ):
+            raise TypeError("Historical Story issuer composition is invalid")
+        if (
+            type(legacy_confirmation_token) is not str
+            or _LEGACY_CONFIRMATION_TOKEN.fullmatch(legacy_confirmation_token) is None
+        ):
+            raise ProductActionContractError("historical_story_bridge_token_invalid")
+        decoded = decode_product_action_route_payload(
+            route_payload_raw,
+            action_name="confirm_interview_story",
+            request_origin="historical_story_bridge",
+        )
+        payload = _route_payload(decoded)
+        attempt_id = payload["attempt_id"]
+        generation_revision = payload["generation_revision"]
+        requested_generation = payload["product_action_generation"]
+        if (
+            type(attempt_id) is not int
+            or type(generation_revision) is not int
+            or type(requested_generation) is not int
+        ):
+            raise ProductActionContractError("historical_story_bridge_exact_integer")
+        attempt = session.get(InterviewStoryProposalAttempt, attempt_id)
+        if attempt is None:
+            raise ProductActionContractError("historical_story_bridge_attempt_missing")
+        if (
+            type(attempt.id) is not int
+            or type(attempt.generation_revision) is not int
+            or type(attempt.product_action_generation) is not int
+            or attempt.id != attempt_id
+            or attempt.attempt_status != "ready"
+            or attempt.generation_revision != generation_revision
+            or attempt.proposal_hash != payload["proposal_hash"]
+            or attempt.source_fingerprint != payload["source_fingerprint"]
+            or attempt.target_story_id != payload["target_story_id"]
+            or requested_generation != 1
+            or attempt.product_action_generation != 0
+            or attempt.product_action_operation_id is not None
+            or attempt.confirmation_token_hash != ""
+            or attempt.confirmation_payload_hash != ""
+            or attempt.confirmed_story_id is not None
+            or attempt.confirmed_story_version_id is not None
+            or attempt.confirmed_at is not None
+        ):
+            raise ProductActionContractError("historical_story_bridge_attempt_not_exact_ready")
+        key = self._key_profiles.active()
+        historical_fingerprint = _derive_historical_request_token_fingerprint(
+            key,
+            attempt_id=attempt_id,
+            generation_revision=generation_revision,
+            proposal_hash=cast(str, payload["proposal_hash"]),
+            legacy_confirmation_token=legacy_confirmation_token,
+        )
+        values = _derive(
+            route=decoded,
+            catalog=self._catalog,
+            key=key,
+            historical_request_token_fingerprint=historical_fingerprint,
+        )
+        binding = _proof_binding(values, decoded)
+        proof = cast(
+            HistoricalStoryRouteProof,
+            self._proof_registry._issue(
+                HistoricalStoryRouteProof,
+                action_name="confirm_interview_story",
+                binding=binding,
+            ),
+        )
+        try:
+            prepared = _prepared_from_derived_identity(
+                route=decoded,
+                key=key,
+                values=values,
+                historical_request_token_fingerprint=historical_fingerprint,
+                proof=proof,
+                binding=binding,
+            )
+            return self.publish_bundle_in_session(session, prepared)
+        except BaseException:
+            try:
+                self._proof_registry.revoke(proof)
+            except ValueError:
+                pass
+            raise
+
     def publish_bundle(
         self,
         prepared: PreparedProductActionProposalV1,
@@ -177,7 +329,7 @@ class ProductActionProposalRepository:
         try:
             with self._proof_registry.claim(
                 prepared.route_proof,
-                proof_type=ProductActionRouteProof,
+                proof_type=self._route_proof_type(prepared),
                 action_name=prepared.action_name,
                 expected_binding=prepared.proof_binding,
             ):
@@ -206,85 +358,84 @@ class ProductActionProposalRepository:
         with self.session_factory() as session:
             try:
                 session.execute(text("BEGIN IMMEDIATE"))
-                rows = self._load_rows(session, prepared.operation_id)
-                classification = self._classify_rows(rows)
-                if classification != "all_absent":
-                    bundle = self._validated_bundle(rows, expected=prepared)
-                    session.rollback()
-                    return self._publication_from_bundle(
-                        prepared,
-                        bundle,
-                        created=False,
-                    )
-                operation = WriteOperation(
-                    id=prepared.operation_id,
-                    operation_role="primary",
-                    parent_operation_id=None,
-                    parent_terminal_payload_sha256=None,
-                    conversation_id=None,
-                    agent_run_id=None,
-                    tool_call_id=prepared.action_call_id,
-                    tool_name=prepared.action_name,
-                    adapter_kind="product_action",
-                    status="proposed",
-                    fingerprint_key_id=prepared.fingerprint_key_id,
-                    proposal_fingerprint=prepared.proposal_fingerprint,
-                    input_fingerprint=None,
-                    confirmation_token_fingerprint=prepared.confirmation_token_fingerprint,
-                    authorization_scope_fingerprint=(
-                        prepared.authorization_scope_fingerprint
-                    ),
-                    operation_request_fingerprint=None,
-                    delivery_status="pending",
-                    delivery_generation=0,
-                    created_at=prepared.created_at,
-                    updated_at=prepared.created_at,
-                )
-                session.add(operation)
-                session.flush()
-                session.add_all(
-                    (
-                        ProductActionProposal(
-                            operation_id=prepared.operation_id,
-                            action_call_id=prepared.action_call_id,
-                            action_name=prepared.action_name,
-                            request_origin=prepared.request_origin,
-                            schema_version=prepared.schema_version,
-                            source_kind=prepared.source_kind,
-                            source_id=prepared.source_id,
-                            source_revision=prepared.source_revision,
-                            route_payload_json=prepared.route_payload_json,
-                            route_payload_fingerprint=(prepared.route_payload_fingerprint),
-                            route_binding_fingerprint=(prepared.route_binding_fingerprint),
-                            request_idempotency_fingerprint=(
-                                prepared.request_idempotency_fingerprint
-                            ),
-                            semantic_claim_fingerprint=(
-                                prepared.semantic_claim_fingerprint
-                            ),
-                            historical_request_token_fingerprint=(
-                                prepared.historical_request_token_fingerprint
-                            ),
-                            created_at=prepared.created_at,
-                            terminalized_at=None,
-                        ),
-                        WriteOperationTransition(
-                            id=prepared.transition_id,
-                            operation_id=prepared.operation_id,
-                            seq=1,
-                            state="proposed",
-                            created_at=prepared.created_at,
-                        ),
-                    )
-                )
-                session.flush()
-                reverse_rows = self._load_rows(session, prepared.operation_id)
-                bundle = self._validated_bundle(reverse_rows, expected=prepared)
+                result = self._publish_bundle_in_session_unclaimed(session, prepared)
                 session.commit()
-                return self._publication_from_bundle(prepared, bundle, created=True)
+                return result
             except BaseException:
                 session.rollback()
                 raise
+
+    def _publish_bundle_in_session_unclaimed(
+        self,
+        session: Session,
+        prepared: PreparedProductActionProposalV1,
+    ) -> ProductActionPublicationV1:
+        rows = self._load_rows(session, prepared.operation_id)
+        classification = self._classify_rows(rows)
+        if classification != "all_absent":
+            bundle = self._validated_bundle(rows, expected=prepared)
+            return self._publication_from_bundle(prepared, bundle, created=False)
+        operation = WriteOperation(
+            id=prepared.operation_id,
+            operation_role="primary",
+            parent_operation_id=None,
+            parent_terminal_payload_sha256=None,
+            conversation_id=None,
+            agent_run_id=None,
+            tool_call_id=prepared.action_call_id,
+            tool_name=prepared.action_name,
+            adapter_kind="product_action",
+            status="proposed",
+            fingerprint_key_id=prepared.fingerprint_key_id,
+            proposal_fingerprint=prepared.proposal_fingerprint,
+            input_fingerprint=None,
+            confirmation_token_fingerprint=prepared.confirmation_token_fingerprint,
+            authorization_scope_fingerprint=prepared.authorization_scope_fingerprint,
+            operation_request_fingerprint=None,
+            delivery_status="pending",
+            delivery_generation=0,
+            created_at=prepared.created_at,
+            updated_at=prepared.created_at,
+        )
+        session.add(operation)
+        session.flush()
+        session.add_all(
+            (
+                ProductActionProposal(
+                    operation_id=prepared.operation_id,
+                    action_call_id=prepared.action_call_id,
+                    action_name=prepared.action_name,
+                    request_origin=prepared.request_origin,
+                    schema_version=prepared.schema_version,
+                    source_kind=prepared.source_kind,
+                    source_id=prepared.source_id,
+                    source_revision=prepared.source_revision,
+                    route_payload_json=prepared.route_payload_json,
+                    route_payload_fingerprint=prepared.route_payload_fingerprint,
+                    route_binding_fingerprint=prepared.route_binding_fingerprint,
+                    request_idempotency_fingerprint=(
+                        prepared.request_idempotency_fingerprint
+                    ),
+                    semantic_claim_fingerprint=prepared.semantic_claim_fingerprint,
+                    historical_request_token_fingerprint=(
+                        prepared.historical_request_token_fingerprint
+                    ),
+                    created_at=prepared.created_at,
+                    terminalized_at=None,
+                ),
+                WriteOperationTransition(
+                    id=prepared.transition_id,
+                    operation_id=prepared.operation_id,
+                    seq=1,
+                    state="proposed",
+                    created_at=prepared.created_at,
+                ),
+            )
+        )
+        session.flush()
+        reverse_rows = self._load_rows(session, prepared.operation_id)
+        bundle = self._validated_bundle(reverse_rows, expected=prepared)
+        return self._publication_from_bundle(prepared, bundle, created=True)
 
     def reconcile_publication(
         self,
@@ -329,6 +480,25 @@ class ProductActionProposalRepository:
                 if self._classify_rows(rows) == "all_absent":
                     raise ProductActionIntegrityError("product_action_bundle_absent")
                 return self._validated_bundle(rows, expected=None)
+        except ProductActionIntegrityError:
+            raise
+        except OperationalError as exc:
+            raise ProductActionIntegrityError("product_action_bundle_unreadable") from exc
+
+    def load_bundle_in_session(
+        self,
+        session: Session,
+        operation_id: str,
+    ) -> ProductActionBundleV1:
+        """Load and validate the exact bundle inside a caller-owned writer UoW."""
+
+        normalized = require_product_action_uuid(operation_id, "operation_id")
+        self._require_publication_uow(session)
+        try:
+            rows = self._load_rows(session, normalized)
+            if self._classify_rows(rows) == "all_absent":
+                raise ProductActionIntegrityError("product_action_bundle_absent")
+            return self._validated_bundle(rows, expected=None)
         except ProductActionIntegrityError:
             raise
         except OperationalError as exc:
@@ -496,6 +666,7 @@ class ProductActionProposalRepository:
             self._validate_active_identity(operation, route)
         else:
             self._validate_terminal_parent_shape(operation)
+            self._validate_terminal_identity(operation, route)
             try:
                 payload_from_operation(SimpleNamespace(**operation_values))  # type: ignore[arg-type]
             except Exception as exc:
@@ -673,6 +844,49 @@ class ProductActionProposalRepository:
             derived_name = "operation_id" if name == "operation_id" else name
             if derived[derived_name] != persisted:
                 raise ProductActionIntegrityError(f"product_action_{name}")
+
+    def _validate_terminal_identity(
+        self,
+        operation: ProductActionOperationSnapshotV1,
+        route: ProductActionRouteSnapshotV1,
+    ) -> None:
+        """Verify the keyed identity chain that survives route payload clearing."""
+
+        if (
+            operation.tool_name not in PRODUCT_ACTION_NAMES
+            or route.request_origin not in {"current", "historical_story_bridge"}
+            or operation.tool_call_id is None
+            or operation.proposal_fingerprint is None
+            or operation.authorization_scope_fingerprint is None
+            or operation.confirmation_token_fingerprint is None
+        ):
+            raise ProductActionIntegrityError("product_action_terminal_identity")
+        key = self._key_profiles.resolve(operation.fingerprint_key_id)
+        proposal_fingerprint, token_fingerprint = _derive_persisted_proposal_identity(
+            key,
+            catalog_fingerprint=self._catalog.fingerprint,
+            action_name=cast(Any, operation.tool_name),
+            request_origin=cast(Any, route.request_origin),
+            operation_id=operation.id,
+            action_call_id=operation.tool_call_id,
+            route_payload_fingerprint=route.route_payload_fingerprint,
+            route_binding_fingerprint=route.route_binding_fingerprint,
+            authorization_scope_fingerprint=operation.authorization_scope_fingerprint,
+            semantic_claim_fingerprint=route.semantic_claim_fingerprint,
+            historical_request_token_fingerprint=(
+                route.historical_request_token_fingerprint
+            ),
+        )
+        if not hmac.compare_digest(
+            proposal_fingerprint,
+            operation.proposal_fingerprint,
+        ):
+            raise ProductActionIntegrityError("product_action_proposal_fingerprint")
+        if not hmac.compare_digest(
+            token_fingerprint,
+            operation.confirmation_token_fingerprint,
+        ):
+            raise ProductActionIntegrityError("product_action_confirmation_token_fingerprint")
 
     @staticmethod
     def _validate_expected(

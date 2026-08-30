@@ -657,6 +657,9 @@ def _unsafe_product_action_http_bodies(tree: ast.AST | None) -> list[str]:
         decorator_text = " ".join(ast.unparse(item) for item in node.decorator_list)
         if not any(marker in decorator_text for marker in PRODUCT_ACTION_ROUTE_MARKERS):
             continue
+        decorator_casefold = decorator_text.casefold()
+        if ".post(" not in decorator_casefold and ".patch(" not in decorator_casefold:
+            continue
         arguments = (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
         defaults = (
             *node.args.defaults,
@@ -1055,6 +1058,47 @@ def _interview_note_mutation_violations(path: Path, tree: ast.Module) -> list[st
     return violations
 
 
+def _writes_raw_product_action_parent(tree: ast.AST | None) -> bool:
+    """Detect construction or SQL insertion of a Product Action Ledger parent."""
+
+    if tree is None:
+        return False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        terminal = None
+        if isinstance(node.func, ast.Name):
+            terminal = node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            terminal = node.func.attr
+        if terminal == "WriteOperation" and any(
+            keyword.arg == "adapter_kind"
+            and _literal_string(keyword.value) == "product_action"
+            for keyword in node.keywords
+        ):
+            return True
+        literals = " ".join(
+            child.value
+            for child in ast.walk(node)
+            if isinstance(child, ast.Constant) and isinstance(child.value, str)
+        ).casefold()
+        normalized = " ".join(literals.split())
+        if "insert into write_operations" in normalized and "product_action" in normalized:
+            return True
+        if terminal in {"insert", "values"} and any(
+            isinstance(child, ast.Name) and child.id == "WriteOperation"
+            for child in ast.walk(node)
+        ) and any(
+            keyword.arg == "adapter_kind"
+            and _literal_string(keyword.value) == "product_action"
+            for candidate in ast.walk(node)
+            if isinstance(candidate, ast.Call)
+            for keyword in candidate.keywords
+        ):
+            return True
+    return False
+
+
 def _source_violations() -> list[str]:
     violations: list[str] = []
     db_tree = _parse(SRC / "db.py")
@@ -1080,6 +1124,14 @@ def _source_violations() -> list[str]:
     if not _has_note_revision_helper(notes_tree):
         violations.append("note:missing-content-revision")
     violations.extend(_unsafe_product_action_http_bodies(api_tree))
+    parent_owner = (SRC / "product_actions" / "repository.py").resolve()
+    for path in sorted(SRC.rglob("*.py")):
+        if path.resolve() == parent_owner:
+            continue
+        if _writes_raw_product_action_parent(_parse(path)):
+            violations.append(
+                "ledger:raw-product-action-parent:" + path.relative_to(SRC).as_posix()
+            )
     return violations
 
 
@@ -1453,6 +1505,23 @@ class AdaptivePracticeRepository:
 
 
 def test_product_action_http_gate_requires_raw_request_before_body_normalization() -> None:
+    safe_get = ast.parse(
+        '''
+@router.get("/api/product-actions/{operation_id}")
+async def get_product_action(operation_id: str):
+    return service.load(operation_id)
+
+@router.get("/api/interview-notes/{note_id}/readiness-focus-actions/{operation_id}")
+async def get_readiness_action(note_id: int, operation_id: str):
+    return service.load_owner(note_id, operation_id)
+
+@router.get("/api/applications/{application_id}/product-actions/{operation_id}/rejection-control")
+async def get_rejection_control(application_id: int, operation_id: str):
+    return service.load_rejection(application_id, operation_id)
+'''
+    )
+    assert _unsafe_product_action_http_bodies(safe_get) == []
+
     safe = ast.parse(
         '''
 @router.post("/api/product-actions/{operation_id}/decisions")
@@ -1496,6 +1565,29 @@ async def propose(note_id: int, request: Request):
     assert _unsafe_product_action_http_bodies(missing_decoder) == [
         "ui:unsafe-product-action-body:propose"
     ]
+
+
+def test_product_action_parent_ast_gate_rejects_orm_core_and_raw_sql_writers() -> None:
+    assert _writes_raw_product_action_parent(
+        ast.parse('WriteOperation(id="x", adapter_kind="product_action")')
+    )
+    assert _writes_raw_product_action_parent(
+        ast.parse(
+            'insert(WriteOperation).values(id="x", adapter_kind="product_action")'
+        )
+    )
+    assert _writes_raw_product_action_parent(
+        ast.parse(
+            '''
+session.execute(
+    text("INSERT INTO write_operations(id,adapter_kind) VALUES (:id,'product_action')")
+)
+'''
+        )
+    )
+    assert not _writes_raw_product_action_parent(
+        ast.parse('WriteOperation(id="x", adapter_kind="typed")')
+    )
 
 
 def test_review_to_readiness_production_cutover_gate() -> None:

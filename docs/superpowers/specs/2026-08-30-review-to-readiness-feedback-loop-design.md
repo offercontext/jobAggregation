@@ -465,7 +465,7 @@ product_action_generation
 
 数据库机械约束固定为：
 
-- operation_id/action_call_id 为规范 UUID；schema_version 必须是 JSON/SQLite integer 1，禁止 bool/real/text coercion；source_id/source_revision 为正整数；
+- operation_id/action_call_id 为规范 UUID；schema_version 必须是 integer 1，source_id/source_revision 必须是正整数。SQLite 列使用无 affinity 的 exact-integer storage 并配合 `typeof(...)='integer'`，机械拒绝可被普通 `INTEGER` affinity 无损吞掉的 real/text 输入；所有 Repository/HTTP route 在绑定 SQL 前还必须以 `type(value) is int` 拒绝 bool。SQLite 驱动会把 Python/JSON bool 与整数 1 绑定为完全相同的 wire value，raw SQL 层无法再区分，因此“直接 raw SQL 传 bool”是明确的 SQLite 边界，而不是 DB 已保证的属性；Product Action 的 duplicate-key-aware raw decoder 负责在归一化前封闭该边界；
 - active route_payload_json 必须 `json_valid=1`、顶层 object，并以 `length(CAST(route_payload_json AS BLOB)) <= 16384` 约束 UTF-8 bytes；三个恒定必填 fingerprint、conditional semantic/historical fingerprint 均使用封闭的 `hmac-sha256:<64 lowercase hex>` 格式；
 - action/source 映射只能是 `confirm_interview_story ↔ story_proposal` 或 `save_review_readiness_signal ↔ review_focus`；request_origin=historical_story_bridge 只允许 confirm_interview_story，其他必须 current；
 - historical_request_token_fingerprint 的 present iff request_origin=historical_story_bridge；current 行必须 NULL；semantic_claim_fingerprint 对 save_review_readiness_signal 必填、Story 必须 NULL；

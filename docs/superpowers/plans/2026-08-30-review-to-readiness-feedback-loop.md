@@ -111,7 +111,7 @@ git commit -m "test: AI 固化复盘准备闭环基线"
 
 Cover exact columns/defaults, Note revision=1, Proposal V1/NULL history, Story Attempt generation=0, legacy Practice origin, old unique removal, column-for-column WriteOperation and transition preservation, repeat startup, injected rollback, `integrity_check`, `foreign_key_check`, old 25/3/4 accepted rows and unknown manifest rejection. Add explicit RED cases for:
 
-- Product Action route action/source/origin mapping, semantic/historical fingerprint iff rules, 16 KiB bytes, integer-not-bool coercion and active/terminal truth table;
+- Product Action route action/source/origin mapping, semantic/historical fingerprint iff rules, 16 KiB bytes, exact integer storage and active/terminal truth table；用无 affinity storage + `typeof` 在 DB 拒绝 real/text coercion，并把 SQLite wire 层无法区分 raw bool 与整数 1 记录为明确边界；Task 3 raw decoder/Repository 在 SQL 前以 `type(value) is int` 拒绝 bool；
 - route-without-parent rejection; raw parent-only SQL as the declared SQLite boundary; parent terminal clearing the route in the same statement; route identity immutability and no-delete;
 - mutually exclusive Product primary versus Product compensation manifest rows and every cross-pair rejection;
 - Adaptive legacy/V2 origin truth table, target fingerprint required/format/immutable, both partial uniques and source-only/target-only/both locator `SET NULL` history;

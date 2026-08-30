@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import (
     Boolean,
@@ -18,6 +19,31 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.ext.compiler import compiles
+
+
+class ExactInteger(Integer):
+    """Integer semantics with no SQLite integer affinity coercion."""
+
+    cache_ok = True
+
+
+@compiles(ExactInteger, "sqlite")
+def _compile_exact_integer_sqlite(
+    _type: ExactInteger,
+    _compiler: Any,
+    **_kwargs: Any,
+) -> str:
+    return "BLOB"
+
+
+@compiles(ExactInteger)
+def _compile_exact_integer_default(
+    type_: ExactInteger,
+    compiler: Any,
+    **kwargs: Any,
+) -> str:
+    return str(compiler.visit_INTEGER(type_, **kwargs))
 
 
 class Base(DeclarativeBase):
@@ -1612,14 +1638,14 @@ class ProductActionProposal(Base):
     action_name: Mapped[str] = mapped_column(String, nullable=False)
     request_origin: Mapped[str] = mapped_column(String, nullable=False)
     schema_version: Mapped[int] = mapped_column(
-        Integer,
+        ExactInteger,
         nullable=False,
         default=1,
         server_default=text("1"),
     )
     source_kind: Mapped[str] = mapped_column(String, nullable=False)
-    source_id: Mapped[int] = mapped_column(Integer, nullable=False)
-    source_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_id: Mapped[int] = mapped_column(ExactInteger, nullable=False)
+    source_revision: Mapped[int] = mapped_column(ExactInteger, nullable=False)
     route_payload_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     route_payload_fingerprint: Mapped[str] = mapped_column(String(76), nullable=False)
     route_binding_fingerprint: Mapped[str] = mapped_column(String(76), nullable=False)
@@ -2141,6 +2167,11 @@ class WriteOperation(Base):
             name="ck_write_operations_authorization_scope_fingerprint",
         ),
         CheckConstraint(
+            "NOT (operation_role = 'primary' AND adapter_kind = 'typed' "
+            "AND status = 'proposed' AND authorization_scope_fingerprint IS NULL)",
+            name="ck_write_operations_typed_primary_scope_bound",
+        ),
+        CheckConstraint(
             "NOT (operation_role = 'primary' AND adapter_kind = 'product_action' "
             "AND status = 'proposed' AND authorization_scope_fingerprint IS NULL)",
             name="ck_write_operations_product_action_scope_bound",
@@ -2212,19 +2243,23 @@ class WriteOperation(Base):
             "AND delivery_outcome IS NULL AND delivery_message_count IS NULL "
             "AND delivery_manifest_sha256 IS NULL AND delivery_next_operation_id IS NULL "
             "AND delivered_at IS NULL AND delivery_failure_code IS NULL) OR "
-            "(status <> 'proposed' AND operation_role = 'primary' AND delivery_status = 'pending' AND delivery_generation >= 1 "
+            "(status <> 'proposed' AND operation_role = 'primary' "
+            "AND adapter_kind <> 'product_action' AND delivery_status = 'pending' "
+            "AND delivery_generation >= 1 "
             "AND delivery_owner_token_fingerprint IS NOT NULL AND delivery_lease_expires_at IS NOT NULL "
             "AND delivery_outcome IS NULL AND delivery_message_count IS NULL "
             "AND delivery_manifest_sha256 IS NULL AND delivery_next_operation_id IS NULL "
             "AND delivered_at IS NULL AND delivery_failure_code IS NULL) OR "
-            "(status <> 'proposed' AND operation_role = 'primary' AND delivery_status = 'completed' "
+            "(status <> 'proposed' AND operation_role = 'primary' "
+            "AND adapter_kind <> 'product_action' AND delivery_status = 'completed' "
             "AND delivery_generation >= 1 AND delivery_owner_token_fingerprint IS NULL AND delivery_lease_expires_at IS NULL "
             "AND delivery_outcome IN ('final_response','chained_pending') "
             "AND delivery_message_count >= 2 AND delivery_manifest_sha256 IS NOT NULL "
             "AND delivered_at IS NOT NULL AND delivery_failure_code IS NULL "
             "AND ((delivery_outcome = 'chained_pending' AND delivery_next_operation_id IS NOT NULL) "
             "OR (delivery_outcome = 'final_response' AND delivery_next_operation_id IS NULL))) OR "
-            "(status <> 'proposed' AND operation_role = 'primary' AND delivery_status = 'failed' "
+            "(status <> 'proposed' AND operation_role = 'primary' "
+            "AND adapter_kind <> 'product_action' AND delivery_status = 'failed' "
             "AND delivery_generation >= 1 AND delivery_owner_token_fingerprint IS NULL "
             "AND delivery_lease_expires_at IS NULL AND delivery_outcome = 'fallback' "
             "AND delivery_message_count = 2 AND delivery_manifest_sha256 IS NOT NULL "
@@ -2240,7 +2275,7 @@ class WriteOperation(Base):
             "(status <> 'proposed' AND operation_role = 'primary' "
             "AND adapter_kind = 'product_action' "
             "AND delivery_status = 'not_applicable' AND delivery_generation = 0 "
-            "AND delivery_outcome = 'none' AND delivery_message_count = 0 "
+            "AND delivery_outcome IS NULL AND delivery_message_count = 0 "
             "AND delivery_owner_token_fingerprint IS NULL "
             "AND delivery_lease_expires_at IS NULL "
             "AND delivery_manifest_sha256 IS NULL "

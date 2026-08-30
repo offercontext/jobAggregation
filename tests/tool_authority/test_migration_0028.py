@@ -676,7 +676,7 @@ def test_mode_trigger_preserves_non_ascii_unicode_including_replacement_characte
         engine.dispose()
 
 
-def test_init_database_upgrades_real_0027_schema_with_0026_triggers_intact(
+def test_init_database_upgrades_real_0027_terminal_history_with_0026_triggers_intact(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "0027.db"
@@ -693,6 +693,28 @@ def test_init_database_upgrades_real_0027_schema_with_0026_triggers_intact(
                 )
             )
             _legacy_operation(conn, operation_id=operation_id)
+            conn.execute(
+                text(
+                    """
+                    UPDATE write_operations SET
+                      status='rejected',operation_request_fingerprint=:request,
+                      result_contract='rejection_json_v1',result_json='{}',
+                      visible_result='rejected',transport_json='{}',
+                      terminal_payload_sha256=:terminal,
+                      delivery_status='completed',delivery_outcome='final_response',
+                      delivery_message_count=2,delivery_manifest_sha256=:manifest,
+                      delivery_generation=1,rejected_at='2026-08-29 01:02:03.000001',
+                      delivered_at='2026-08-29 01:02:04.000002'
+                    WHERE id=:id
+                    """
+                ),
+                {
+                    "id": operation_id,
+                    "request": "hmac-sha256:" + "c" * 64,
+                    "terminal": "sha256:" + "d" * 64,
+                    "manifest": "sha256:" + "e" * 64,
+                },
+            )
             trigger_names = set(
                 conn.execute(
                     text("SELECT name FROM sqlite_master WHERE type='trigger'")
@@ -737,15 +759,30 @@ def test_init_database_upgrades_real_0027_schema_with_0026_triggers_intact(
                 "0028_scoped_tool_authority",
             } <= versions
 
+        bound_operation_id = "00000000-0000-4000-8000-000000000002"
+        with engine.begin() as conn:
+            _legacy_operation(
+                conn,
+                operation_id=bound_operation_id,
+                authorization_scope_fingerprint="hmac-sha256:" + "f" * 64,
+            )
         with pytest.raises(Exception, match="invalid delivery generation"):
             with engine.begin() as conn:
                 conn.execute(
                     text(
                         "UPDATE write_operations SET delivery_generation=2 WHERE id=:id"
                     ),
+                    {"id": bound_operation_id},
+                )
+        with pytest.raises(Exception, match="delivery is immutable"):
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "UPDATE write_operations SET delivery_generation=3 WHERE id=:id"
+                    ),
                     {"id": operation_id},
                 )
-        with pytest.raises(Exception, match="unbound typed operation"):
+        with pytest.raises(Exception, match="terminal is immutable"):
             with engine.begin() as conn:
                 conn.execute(
                     text("UPDATE write_operations SET status='committed' WHERE id=:id"),

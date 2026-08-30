@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import create_engine, text
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import IntegrityError as SQLAlchemyIntegrityError
 
 import offerpilot.db as database
 from offerpilot.db import init_database
 from offerpilot.models import (
     APPLICATION_FOREIGN_KEY_MODELS,
     AdaptivePracticePlan,
+    Base,
     InterviewNote,
     InterviewReadinessSignal,
     InterviewReadinessSignalEvidence,
@@ -31,6 +36,8 @@ SHA_A = "sha256:" + "a" * 64
 SHA_B = "sha256:" + "b" * 64
 SHA_C = "sha256:" + "c" * 64
 UUID_KEY = "10000000-0000-4000-8000-000000000001"
+FIXTURE_DIRECTORY = Path(__file__).parent / "fixtures" / "review_readiness"
+PRE_0029_SCHEMA_SHA256 = "ea678cb458fd2f2f1b5aa807617ff06de917e9b451fd3f293625f20b5cbe682c"
 
 
 def _dispose(factory) -> None:  # type: ignore[no-untyped-def]
@@ -56,6 +63,233 @@ def _table_columns(connection: sqlite3.Connection, table: str) -> dict[str, tupl
 
 def _uuid(seed: int) -> str:
     return f"00000000-0000-4000-8000-{seed:012d}"
+
+
+def _create_fixed_pre_0029_database(path: Path) -> None:
+    fixture_text = (FIXTURE_DIRECTORY / "pre_0029_0028_schema.sql").read_text(
+        encoding="utf-8"
+    )
+    normalized_fixture_bytes = fixture_text.replace("\r\n", "\n").encode()
+    assert hashlib.sha256(normalized_fixture_bytes).hexdigest() == PRE_0029_SCHEMA_SHA256
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA foreign_keys = ON")
+    try:
+        connection.executescript(fixture_text)
+        connection.execute(
+            "INSERT INTO applications(id,company_name,position_name,created_at,updated_at) "
+            "VALUES (1,'历史公司','历史岗位','2026-08-29 01:00:00.000001',"
+            "'2026-08-29 01:00:01.000002')"
+        )
+        connection.execute(
+            "INSERT INTO application_events(id,application_id,event_type,status,created_at) "
+            "VALUES (1,1,'interview','completed','2026-08-29 01:00:02.000003')"
+        )
+        connection.execute(
+            "INSERT INTO interview_notes(id,application_id,application_event_id,company,"
+            "position,questions,created_at) VALUES (1,1,1,'历史公司','历史岗位',"
+            "'逐字正文\\u0000保留','2026-08-29 01:00:03.000004')"
+        )
+        connection.execute(
+            "INSERT INTO interview_review_proposals(id,note_id,application_event_id,"
+            "idempotency_key,input_snapshot_json,source_fingerprint,proposal_json,"
+            "proposal_hash,created_at) VALUES (1,1,1,'legacy-proposal','{\"n\":1}',"
+            "?,?,?,'2026-08-29 01:00:04.000005')",
+            (SHA_A, '{"focuses":["历史"]}', SHA_B),
+        )
+        for story_id, story_status in enumerate(
+            ("generating", "ready", "confirmed"),
+            start=1,
+        ):
+            connection.execute(
+                "INSERT INTO interview_story_proposal_attempts("
+                "id,idempotency_key,entrypoint,attempt_status,input_snapshot_json,"
+                "source_fingerprint,proposal_json,proposal_hash,created_at,updated_at) "
+                "VALUES (?,?, 'ui',?,'{}',?,'{}',?,'2026-08-29 01:00:05.000006',"
+                "'2026-08-29 01:00:06.000007')",
+                (story_id, f"legacy-story-{story_id}", story_status, SHA_A, SHA_B),
+            )
+        for plan_id, status in enumerate(("in_progress", "completed"), start=1):
+            connection.execute(
+                "INSERT INTO adaptive_practice_plans("
+                "id,application_id,application_event_id,interview_note_id,"
+                "interview_review_proposal_id,focus_id,start_idempotency_key,"
+                "start_input_fingerprint,source_fingerprint,source_path,source_excerpt,"
+                "source_hash,drill_kind,title,observation,reason,prompt,status,revision,"
+                "response_text,reflection_text,self_assessment,completion_idempotency_key,"
+                "completion_fingerprint,completed_at,created_at,updated_at) VALUES ("
+                "?,1,1,1,1,?,?,?,?,'/questions','逐字证据',?,'behavioral','标题',"
+                "'观察','原因','提示',?,?,?,?,'ready',?,?,?,"
+                "'2026-08-29 01:00:07.000008','2026-08-29 01:00:08.000009')",
+                (
+                    plan_id,
+                    f"focus-{plan_id}",
+                    f"legacy-start-{plan_id}",
+                    SHA_A,
+                    SHA_B,
+                    SHA_C,
+                    status,
+                    2 if status == "completed" else 1,
+                    "answer" if status == "completed" else "",
+                    "reflection" if status == "completed" else "",
+                    f"legacy-complete-{plan_id}" if status == "completed" else None,
+                    SHA_A if status == "completed" else "",
+                    "2026-08-29 01:00:09.000010" if status == "completed" else None,
+                ),
+            )
+
+        typed_tools = (
+            "create_application",
+            "update_application_status",
+            "create_application_event",
+            "update_application_event",
+            "delete_application_event",
+            "add_note",
+            "update_note",
+            "delete_note",
+            "update_offer",
+            "save_offer_assessment",
+            "resume_update_career_intent",
+            "resume_rewrite_highlight",
+        )
+        legacy_tools = (
+            "save_application_jd_version",
+            "create_application_submission_snapshot",
+            "record_application_outcome",
+        )
+        operation_ids: dict[str, str] = {}
+        for ordinal, (adapter_kind, tool_name) in enumerate(
+            [("typed", tool) for tool in typed_tools]
+            + [("legacy_deterministic", tool) for tool in legacy_tools],
+            start=1,
+        ):
+            operation_id = _uuid(700 + ordinal)
+            operation_ids[tool_name] = operation_id
+            undo_json = (
+                '{"undo":"required"}'
+                if tool_name
+                in {
+                    "create_application",
+                    "update_application_status",
+                    "create_application_event",
+                    "add_note",
+                }
+                else None
+            )
+            _insert_fixed_terminal_operation(
+                connection,
+                operation_id=operation_id,
+                operation_role="primary",
+                parent_operation_id=None,
+                parent_terminal_sha=None,
+                tool_call_id=f"old-call-{ordinal}",
+                tool_name=tool_name,
+                adapter_kind=adapter_kind,
+                result_contract=(
+                    "typed_json_v1"
+                    if adapter_kind == "typed"
+                    else "legacy_string_v1"
+                ),
+                undo_json=undo_json,
+                delivery_outcome="final_response",
+                transition_seed=8000 + ordinal * 10,
+            )
+        compensation_pairs = (
+            ("undo:update_application_status", "update_application_status"),
+            ("undo:create_application", "create_application"),
+            ("undo:create_application_event", "create_application_event"),
+            ("undo:add_note", "add_note"),
+        )
+        for ordinal, (tool_name, parent_tool) in enumerate(compensation_pairs, start=1):
+            _insert_fixed_terminal_operation(
+                connection,
+                operation_id=_uuid(750 + ordinal),
+                operation_role="compensation",
+                parent_operation_id=operation_ids[parent_tool],
+                parent_terminal_sha=SHA_C,
+                tool_call_id=None,
+                tool_name=tool_name,
+                adapter_kind="compensation",
+                result_contract="compensation_json_v1",
+                undo_json=None,
+                delivery_outcome="none",
+                transition_seed=9000 + ordinal * 10,
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _insert_fixed_terminal_operation(
+    connection: sqlite3.Connection,
+    *,
+    operation_id: str,
+    operation_role: str,
+    parent_operation_id: str | None,
+    parent_terminal_sha: str | None,
+    tool_call_id: str | None,
+    tool_name: str,
+    adapter_kind: str,
+    result_contract: str,
+    undo_json: str | None,
+    delivery_outcome: str,
+    transition_seed: int,
+) -> None:
+    is_compensation = operation_role == "compensation"
+    connection.execute(
+        """
+        INSERT INTO write_operations(
+          id,operation_role,parent_operation_id,parent_terminal_payload_sha256,
+          conversation_id,agent_run_id,tool_call_id,tool_name,adapter_kind,status,
+          fingerprint_key_id,proposal_fingerprint,input_fingerprint,
+          confirmation_token_fingerprint,authorization_scope_fingerprint,
+          operation_request_fingerprint,result_contract,result_json,visible_result,
+          transport_json,undo_json,terminal_payload_sha256,failure_category,failure_code,
+          delivery_status,delivery_failure_code,delivery_outcome,delivery_message_count,
+          delivery_manifest_sha256,delivery_next_operation_id,delivery_generation,
+          delivery_owner_token_fingerprint,delivery_lease_expires_at,created_at,approved_at,
+          claimed_at,rejected_at,committed_at,failed_at,delivered_at,updated_at
+        ) VALUES (?,?,?,?,NULL,NULL,?,?,?,'committed',?,?,?, ?,?,?,?,'{\"old\":true}',
+          '逐字结果','{\"transport\":true}',?,?,NULL,NULL,?,NULL,?,?,?,NULL,?,NULL,NULL,
+          '2026-08-29 03:00:00.000001','2026-08-29 03:00:01.000002',
+          '2026-08-29 03:00:02.000003',NULL,'2026-08-29 03:00:03.000004',NULL,
+          '2026-08-29 03:00:03.000004','2026-08-29 03:00:04.000005')
+        """,
+        (
+            operation_id,
+            operation_role,
+            parent_operation_id,
+            parent_terminal_sha,
+            tool_call_id,
+            tool_name,
+            adapter_kind,
+            UUID_KEY,
+            None if is_compensation else HMAC_A,
+            HMAC_B,
+            None if is_compensation else HMAC_C,
+            None if is_compensation else HMAC_D,
+            HMAC_A,
+            result_contract,
+            undo_json,
+            SHA_C,
+            "not_applicable" if is_compensation else "completed",
+            delivery_outcome,
+            0 if is_compensation else 2,
+            None if is_compensation else SHA_A,
+            0 if is_compensation else 1,
+        ),
+    )
+    for seq, state in enumerate(("proposed", "approved", "claimed", "committed"), start=1):
+        connection.execute(
+            "INSERT INTO write_operation_transitions(id,operation_id,seq,state,created_at) "
+            "VALUES (?,?,?,?,?)",
+            (
+                _uuid(transition_seed + seq),
+                operation_id,
+                seq,
+                state,
+                f"2026-08-29 03:00:0{seq}.{seq:06d}",
+            ),
+        )
 
 
 def _insert_application_graph(
@@ -132,8 +366,18 @@ def _insert_product_route(
     historical_request: str | None = None,
     route_payload: str | None = "{}",
     terminalized_at: str | None = None,
+    schema_version: object = 1,
+    source_id: object = 1,
+    source_revision: object = 1,
+    route_payload_fingerprint: str = HMAC_A,
+    route_binding_fingerprint: str = HMAC_B,
+    request_idempotency_fingerprint: str | None = None,
 ) -> None:
-    request_fingerprint = HMAC_C[:-12] + operation_id[-12:]
+    request_fingerprint = (
+        request_idempotency_fingerprint
+        if request_idempotency_fingerprint is not None
+        else HMAC_C[:-12] + operation_id[-12:]
+    )
     connection.execute(
         """
         INSERT INTO product_action_proposals(
@@ -142,17 +386,20 @@ def _insert_product_route(
           route_payload_fingerprint,route_binding_fingerprint,
           request_idempotency_fingerprint,semantic_claim_fingerprint,
           historical_request_token_fingerprint,created_at,terminalized_at
-        ) VALUES (?,?,?,?,1,?,1,1,?,?,?,?,?,?,CURRENT_TIMESTAMP,?)
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,?)
         """,
         (
             operation_id,
             action_call_id,
             action_name,
             request_origin,
+            schema_version,
             source_kind,
+            source_id,
+            source_revision,
             route_payload,
-            HMAC_A,
-            HMAC_B,
+            route_payload_fingerprint,
+            route_binding_fingerprint,
             request_fingerprint,
             semantic_claim,
             historical_request,
@@ -181,7 +428,7 @@ def _commit_product_primary(
           status='committed',input_fingerprint=?,operation_request_fingerprint=?,
           result_contract='product_action_json_v1',result_json='{}',visible_result='saved',
           transport_json='{}',undo_json='{}',terminal_payload_sha256=?,
-          delivery_status='not_applicable',delivery_outcome='none',delivery_message_count=0,
+          delivery_status='not_applicable',delivery_outcome=NULL,delivery_message_count=0,
           approved_at=CURRENT_TIMESTAMP,claimed_at=CURRENT_TIMESTAMP,
           committed_at=CURRENT_TIMESTAMP,delivered_at=CURRENT_TIMESTAMP
         WHERE id=?
@@ -343,6 +590,109 @@ def test_0029_fresh_schema_has_exact_columns_defaults_models_and_marker(
     }
 
 
+def test_product_action_exact_integer_storage_and_default_are_affinity_safe(
+    migrated_db: tuple[Path, sqlite3.Connection],
+) -> None:
+    _path, connection = migrated_db
+    columns = _table_columns(connection, "product_action_proposals")
+    for column_name in ("schema_version", "source_id", "source_revision"):
+        declared_type = str(columns[column_name][2]).upper()
+        assert "INT" not in declared_type
+        assert declared_type in {"", "BLOB"}
+    assert columns["schema_version"][3:5] == (1, "1")
+    assert columns["source_id"][3:5] == (1, None)
+    assert columns["source_revision"][3:5] == (1, None)
+    table_sql = str(
+        connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='product_action_proposals'"
+        ).fetchone()[0]
+    ).upper()
+    for column_name in ("schema_version", "source_id", "source_revision"):
+        declaration = table_sql.split(column_name.upper(), 1)[1].split(",", 1)[0]
+        assert "INT" not in declaration
+
+    operation_id = _uuid(90)
+    action_call_id = _uuid(91)
+    _insert_product_primary(
+        connection,
+        operation_id=operation_id,
+        action_call_id=action_call_id,
+        action_name="confirm_interview_story",
+    )
+    connection.execute(
+        """
+        INSERT INTO product_action_proposals(
+          operation_id,action_call_id,action_name,request_origin,source_kind,
+          source_id,source_revision,route_payload_json,route_payload_fingerprint,
+          route_binding_fingerprint,request_idempotency_fingerprint
+        ) VALUES (?,?,'confirm_interview_story','current','story_proposal',1,1,
+          '{}',?,?,?)
+        """,
+        (operation_id, action_call_id, HMAC_A, HMAC_B, HMAC_C),
+    )
+    assert connection.execute(
+        "SELECT typeof(schema_version),typeof(source_id),typeof(source_revision) "
+        "FROM product_action_proposals WHERE operation_id=?",
+        (operation_id,),
+    ).fetchone() == ("integer", "integer", "integer")
+
+
+def test_base_metadata_create_all_has_both_primary_scope_checks_and_exact_integer_storage(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'create-all.db'}")
+    Base.metadata.create_all(engine)
+    with engine.connect() as sqlalchemy_connection:
+        table_sql = str(
+            sqlalchemy_connection.execute(
+                text(
+                    "SELECT sql FROM sqlite_master WHERE type='table' "
+                    "AND name='write_operations'"
+                )
+            ).scalar_one()
+        )
+        assert "ck_write_operations_typed_primary_scope_bound" in table_sql
+        assert "ck_write_operations_product_action_scope_bound" in table_sql
+        route_columns = list(
+            sqlalchemy_connection.execute(text("PRAGMA table_info(product_action_proposals)"))
+        )
+        route_types = {str(row[1]): str(row[2]).upper() for row in route_columns}
+        assert all(
+            "INT" not in route_types[name]
+            for name in ("schema_version", "source_id", "source_revision")
+        )
+        with pytest.raises(SQLAlchemyIntegrityError):
+            sqlalchemy_connection.execute(
+                text(
+                    """
+                    INSERT INTO write_operations(
+                      id,operation_role,parent_operation_id,parent_terminal_payload_sha256,
+                      conversation_id,agent_run_id,tool_call_id,tool_name,adapter_kind,status,
+                      fingerprint_key_id,proposal_fingerprint,
+                      confirmation_token_fingerprint,authorization_scope_fingerprint,
+                      delivery_status,delivery_generation
+                    ) VALUES (:id,'primary',NULL,NULL,NULL,NULL,'typed-call',
+                      'create_application','typed','proposed',:key,:proposal,:confirmation,
+                      NULL,'pending',0)
+                    """
+                ),
+                {
+                    "id": _uuid(92),
+                    "key": UUID_KEY,
+                    "proposal": HMAC_A,
+                    "confirmation": HMAC_B,
+                },
+            )
+    engine.dispose()
+    product_table = Base.metadata.tables["product_action_proposals"]
+    for column_name in ("schema_version", "source_id", "source_revision"):
+        assert (
+            product_table.columns[column_name].type.compile(dialect=postgresql.dialect())
+            == "INTEGER"
+        )
+
+
 def test_0029_is_repeatable_and_database_integrity_is_clean(tmp_path: Path) -> None:
     db_path = tmp_path / "repeat.db"
     first = init_database(db_path)
@@ -464,9 +814,21 @@ def test_product_action_route_accepts_exact_current_and_historical_shapes(
     ).fetchone() == (origin, action_name, source_kind)
 
 
-@pytest.mark.parametrize("schema_version", [0, 2, 1.5, "not-one"])
-def test_product_action_route_requires_integer_one_not_bool_coercions(
-    migrated_db: tuple[Path, sqlite3.Connection], schema_version: object
+@pytest.mark.parametrize(
+    ("column_name", "invalid_value"),
+    [
+        ("schema_version", 1.0),
+        ("schema_version", "1"),
+        ("source_id", 1.0),
+        ("source_id", "1"),
+        ("source_revision", 1.0),
+        ("source_revision", "1"),
+    ],
+)
+def test_product_action_exact_integer_columns_reject_real_and_text_affinity_inputs(
+    migrated_db: tuple[Path, sqlite3.Connection],
+    column_name: str,
+    invalid_value: object,
 ) -> None:
     _path, connection = migrated_db
     operation_id = _uuid(110)
@@ -477,25 +839,139 @@ def test_product_action_route_requires_integer_one_not_bool_coercions(
         action_call_id=action_call_id,
         action_name="confirm_interview_story",
     )
+    values: dict[str, object] = {
+        "schema_version": 1,
+        "source_id": 1,
+        "source_revision": 1,
+    }
+    values[column_name] = invalid_value
     with pytest.raises(sqlite3.IntegrityError):
-        connection.execute(
-            """
-            INSERT INTO product_action_proposals(
-              operation_id,action_call_id,action_name,request_origin,schema_version,
-              source_kind,source_id,source_revision,route_payload_json,
-              route_payload_fingerprint,route_binding_fingerprint,
-              request_idempotency_fingerprint,created_at
-            ) VALUES (?,?,?,'current',?,'story_proposal',1,1,'{}',?,?,?,CURRENT_TIMESTAMP)
-            """,
-            (
-                operation_id,
-                action_call_id,
-                "confirm_interview_story",
-                schema_version,
-                HMAC_A,
-                HMAC_B,
-                HMAC_C,
-            ),
+        _insert_product_route(
+            connection,
+            operation_id=operation_id,
+            action_call_id=action_call_id,
+            action_name="confirm_interview_story",
+            source_kind="story_proposal",
+            schema_version=values["schema_version"],
+            source_id=values["source_id"],
+            source_revision=values["source_revision"],
+        )
+
+
+def test_sqlite_boolean_wire_alias_is_not_claimed_as_a_database_rejection(
+    migrated_db: tuple[Path, sqlite3.Connection],
+) -> None:
+    _path, connection = migrated_db
+    assert connection.execute("SELECT typeof(?), ? = 1", (True, True)).fetchone() == (
+        "integer",
+        1,
+    )
+
+
+@pytest.mark.parametrize(
+    ("uuid_column", "invalid_uuid"),
+    [
+        ("operation_id", "00000000-0000-4000-8000-00000000000"),
+        ("operation_id", "00000000-0000-4000-8000-0000000000000"),
+        ("operation_id", "00000000-0000-4000-8000-00000000000A"),
+        ("operation_id", "00000000-0000-4000-8000-00000000000z"),
+        ("action_call_id", "00000000-0000-4000-8000-00000000000"),
+        ("action_call_id", "00000000-0000-4000-8000-0000000000000"),
+        ("action_call_id", "00000000-0000-4000-8000-00000000000A"),
+        ("action_call_id", "00000000-0000-4000-8000-00000000000z"),
+    ],
+)
+def test_product_action_uuid_columns_reject_malformed_uppercase_and_wrong_length(
+    migrated_db: tuple[Path, sqlite3.Connection],
+    uuid_column: str,
+    invalid_uuid: str,
+) -> None:
+    _path, connection = migrated_db
+    operation_id = invalid_uuid if uuid_column == "operation_id" else _uuid(112)
+    action_call_id = invalid_uuid if uuid_column == "action_call_id" else _uuid(113)
+    if uuid_column == "operation_id":
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_product_primary(
+                connection,
+                operation_id=operation_id,
+                action_call_id=action_call_id,
+                action_name="confirm_interview_story",
+            )
+        return
+    _insert_product_primary(
+        connection,
+        operation_id=operation_id,
+        action_call_id=action_call_id,
+        action_name="confirm_interview_story",
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_product_route(
+            connection,
+            operation_id=operation_id,
+            action_call_id=action_call_id,
+            action_name="confirm_interview_story",
+            source_kind="story_proposal",
+        )
+
+
+@pytest.mark.parametrize(
+    ("fingerprint_column", "invalid_fingerprint"),
+    [
+        (column_name, invalid_value)
+        for column_name in (
+            "route_payload_fingerprint",
+            "route_binding_fingerprint",
+            "request_idempotency_fingerprint",
+            "semantic_claim_fingerprint",
+            "historical_request_token_fingerprint",
+        )
+        for invalid_value in (
+            "hmac-sha256:" + "a" * 63,
+            "hmac-sha256:" + "a" * 65,
+            "hmac-sha256:" + "A" * 64,
+            "hmac-sha257:" + "a" * 64,
+        )
+    ],
+)
+def test_product_action_hmac_columns_reject_malformed_uppercase_and_wrong_length(
+    migrated_db: tuple[Path, sqlite3.Connection],
+    fingerprint_column: str,
+    invalid_fingerprint: str,
+) -> None:
+    _path, connection = migrated_db
+    operation_id = _uuid(114)
+    action_call_id = _uuid(115)
+    is_semantic = fingerprint_column == "semantic_claim_fingerprint"
+    is_historical = fingerprint_column == "historical_request_token_fingerprint"
+    action_name = "save_review_readiness_signal" if is_semantic else "confirm_interview_story"
+    _insert_product_primary(
+        connection,
+        operation_id=operation_id,
+        action_call_id=action_call_id,
+        action_name=action_name,
+    )
+    kwargs: dict[str, object] = {
+        "route_payload_fingerprint": HMAC_A,
+        "route_binding_fingerprint": HMAC_B,
+        "request_idempotency_fingerprint": HMAC_C,
+        "semantic_claim": HMAC_D if is_semantic else None,
+        "historical_request": HMAC_D if is_historical else None,
+    }
+    if fingerprint_column == "semantic_claim_fingerprint":
+        kwargs["semantic_claim"] = invalid_fingerprint
+    elif fingerprint_column == "historical_request_token_fingerprint":
+        kwargs["historical_request"] = invalid_fingerprint
+    else:
+        kwargs[fingerprint_column] = invalid_fingerprint
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_product_route(
+            connection,
+            operation_id=operation_id,
+            action_call_id=action_call_id,
+            action_name=action_name,
+            source_kind="review_focus" if is_semantic else "story_proposal",
+            request_origin="historical_story_bridge" if is_historical else "current",
+            **kwargs,
         )
 
 
@@ -564,13 +1040,230 @@ def test_product_action_route_bytes_parent_identity_active_terminal_and_no_delet
         )
 
 
+@pytest.mark.parametrize("invalid_json", ["{", "[]", '"text"', "null", "1"])
+def test_product_action_active_route_requires_valid_top_level_json_object(
+    migrated_db: tuple[Path, sqlite3.Connection],
+    invalid_json: str,
+) -> None:
+    _path, connection = migrated_db
+    operation_id = _uuid(126)
+    action_call_id = _uuid(127)
+    _insert_product_primary(
+        connection,
+        operation_id=operation_id,
+        action_call_id=action_call_id,
+        action_name="confirm_interview_story",
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_product_route(
+            connection,
+            operation_id=operation_id,
+            action_call_id=action_call_id,
+            action_name="confirm_interview_story",
+            source_kind="story_proposal",
+            route_payload=invalid_json,
+        )
+
+
+@pytest.mark.parametrize(
+    ("route_payload", "terminalized_at"),
+    [
+        (None, None),
+        ("{}", "2026-08-30 01:02:03.000001"),
+        (None, "2026-08-30 01:02:03.000001"),
+    ],
+)
+def test_product_action_route_insert_rejects_every_non_active_lifecycle_shape(
+    migrated_db: tuple[Path, sqlite3.Connection],
+    route_payload: str | None,
+    terminalized_at: str | None,
+) -> None:
+    _path, connection = migrated_db
+    operation_id = _uuid(128)
+    action_call_id = _uuid(129)
+    _insert_product_primary(
+        connection,
+        operation_id=operation_id,
+        action_call_id=action_call_id,
+        action_name="confirm_interview_story",
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_product_route(
+            connection,
+            operation_id=operation_id,
+            action_call_id=action_call_id,
+            action_name="confirm_interview_story",
+            source_kind="story_proposal",
+            route_payload=route_payload,
+            terminalized_at=terminalized_at,
+        )
+
+
+def _attempt_product_commit_with_delivery(
+    connection: sqlite3.Connection,
+    *,
+    operation_id: str,
+    delivery_status: str,
+    delivery_generation: int,
+    delivery_outcome: str | None,
+    delivery_message_count: int | None,
+    delivery_owner: str | None = None,
+    delivery_lease: str | None = None,
+    delivery_manifest: str | None = None,
+    delivery_failure_code: str | None = None,
+    delivered: bool = False,
+    undo_json: str | None = "{}",
+) -> None:
+    connection.execute(
+        """
+        UPDATE write_operations SET
+          status='committed',input_fingerprint=?,operation_request_fingerprint=?,
+          result_contract='product_action_json_v1',result_json='{}',visible_result='saved',
+          transport_json='{}',undo_json=?,terminal_payload_sha256=?,
+          delivery_status=?,delivery_generation=?,delivery_outcome=?,delivery_message_count=?,
+          delivery_owner_token_fingerprint=?,delivery_lease_expires_at=?,
+          delivery_manifest_sha256=?,delivery_failure_code=?,
+          delivery_next_operation_id=CASE WHEN ?='chained_pending' THEN id ELSE NULL END,
+          approved_at=CURRENT_TIMESTAMP,claimed_at=CURRENT_TIMESTAMP,
+          committed_at=CURRENT_TIMESTAMP,
+          delivered_at=CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END
+        WHERE id=?
+        """,
+        (
+            HMAC_D,
+            HMAC_C,
+            undo_json,
+            SHA_C,
+            delivery_status,
+            delivery_generation,
+            delivery_outcome,
+            delivery_message_count,
+            delivery_owner,
+            delivery_lease,
+            delivery_manifest,
+            delivery_failure_code,
+            delivery_outcome,
+            delivered,
+            operation_id,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "delivery_status",
+        "delivery_generation",
+        "delivery_outcome",
+        "delivery_message_count",
+        "delivery_owner",
+        "delivery_lease",
+        "delivery_manifest",
+        "delivery_failure_code",
+        "delivered",
+    ),
+    [
+        ("pending", 1, None, None, HMAC_A, "2026-08-30 02:00:00", None, None, False),
+        ("completed", 1, "final_response", 2, None, None, SHA_A, None, True),
+        ("completed", 1, "chained_pending", 2, None, None, SHA_A, None, True),
+        ("failed", 1, "fallback", 2, None, None, SHA_A, "delivery_failed", True),
+        ("not_applicable", 0, "none", 0, None, None, None, None, True),
+    ],
+)
+def test_product_action_terminal_rejects_chat_delivery_and_legacy_outcomes(
+    migrated_db: tuple[Path, sqlite3.Connection],
+    delivery_status: str,
+    delivery_generation: int,
+    delivery_outcome: str | None,
+    delivery_message_count: int | None,
+    delivery_owner: str | None,
+    delivery_lease: str | None,
+    delivery_manifest: str | None,
+    delivery_failure_code: str | None,
+    delivered: bool,
+) -> None:
+    _path, connection = migrated_db
+    operation_id = _uuid(130)
+    action_call_id = _uuid(131)
+    _insert_product_primary(
+        connection,
+        operation_id=operation_id,
+        action_call_id=action_call_id,
+        action_name="confirm_interview_story",
+    )
+    _insert_product_route(
+        connection,
+        operation_id=operation_id,
+        action_call_id=action_call_id,
+        action_name="confirm_interview_story",
+        source_kind="story_proposal",
+    )
+    _transition(connection, operation_id, 1, "proposed")
+    with pytest.raises(sqlite3.IntegrityError):
+        _attempt_product_commit_with_delivery(
+            connection,
+            operation_id=operation_id,
+            delivery_status=delivery_status,
+            delivery_generation=delivery_generation,
+            delivery_outcome=delivery_outcome,
+            delivery_message_count=delivery_message_count,
+            delivery_owner=delivery_owner,
+            delivery_lease=delivery_lease,
+            delivery_manifest=delivery_manifest,
+            delivery_failure_code=delivery_failure_code,
+            delivered=delivered,
+        )
+
+
+def test_product_action_committed_requires_action_undo_payload(
+    migrated_db: tuple[Path, sqlite3.Connection],
+) -> None:
+    _path, connection = migrated_db
+    operation_id = _uuid(132)
+    action_call_id = _uuid(133)
+    _insert_product_primary(
+        connection,
+        operation_id=operation_id,
+        action_call_id=action_call_id,
+        action_name="confirm_interview_story",
+    )
+    _insert_product_route(
+        connection,
+        operation_id=operation_id,
+        action_call_id=action_call_id,
+        action_name="confirm_interview_story",
+        source_kind="story_proposal",
+    )
+    _transition(connection, operation_id, 1, "proposed")
+    with pytest.raises(sqlite3.IntegrityError):
+        _attempt_product_commit_with_delivery(
+            connection,
+            operation_id=operation_id,
+            delivery_status="not_applicable",
+            delivery_generation=0,
+            delivery_outcome=None,
+            delivery_message_count=0,
+            delivered=True,
+            undo_json=None,
+        )
+
+
 @pytest.mark.parametrize(
     ("action_name", "compensation_name"),
     [
-        ("save_review_readiness_signal", "undo:confirm_interview_story"),
-        ("confirm_interview_story", "undo:save_review_readiness_signal"),
-        ("save_review_readiness_signal", "undo:add_note"),
-        ("confirm_interview_story", "undo:create_application"),
+        (action_name, compensation_name)
+        for action_name, exact_compensation in (
+            ("confirm_interview_story", "undo:confirm_interview_story"),
+            ("save_review_readiness_signal", "undo:save_review_readiness_signal"),
+        )
+        for compensation_name in (
+            "undo:confirm_interview_story",
+            "undo:save_review_readiness_signal",
+            "undo:update_application_status",
+            "undo:create_application",
+            "undo:create_application_event",
+            "undo:add_note",
+        )
+        if compensation_name != exact_compensation
     ],
 )
 def test_product_compensation_rejects_every_cross_pair(
@@ -754,6 +1447,17 @@ def test_parent_terminal_transition_clears_route_in_same_statement(
         "WHERE operation_id=?",
         (operation_id,),
     ).fetchone()[0] is None
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "UPDATE product_action_proposals SET route_payload_json='{}' "
+            "WHERE operation_id=?",
+            (operation_id,),
+        )
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "UPDATE product_action_proposals SET terminalized_at=NULL WHERE operation_id=?",
+            (operation_id,),
+        )
 
 
 def test_signal_semantic_claim_is_unique_only_while_route_is_active(
@@ -850,7 +1554,7 @@ def test_product_action_rejected_and_failed_terminals_clear_the_route(
             UPDATE write_operations SET status='rejected',operation_request_fingerprint=?,
               result_contract='rejection_json_v1',result_json='{}',visible_result='cancelled',
               transport_json='{}',terminal_payload_sha256=?,delivery_status='not_applicable',
-              delivery_outcome='none',delivery_message_count=0,
+              delivery_outcome=NULL,delivery_message_count=0,
               rejected_at=CURRENT_TIMESTAMP,delivered_at=CURRENT_TIMESTAMP
             WHERE id=?
             """,
@@ -866,7 +1570,7 @@ def test_product_action_rejected_and_failed_terminals_clear_the_route(
               operation_request_fingerprint=?,result_contract='product_action_json_v1',
               result_json='{}',visible_result='failed',transport_json='{}',
               terminal_payload_sha256=?,failure_category='conflict',failure_code='story_conflict',
-              delivery_status='not_applicable',delivery_outcome='none',delivery_message_count=0,
+              delivery_status='not_applicable',delivery_outcome=NULL,delivery_message_count=0,
               approved_at=CURRENT_TIMESTAMP,claimed_at=CURRENT_TIMESTAMP,
               failed_at=CURRENT_TIMESTAMP,delivered_at=CURRENT_TIMESTAMP
             WHERE id=?
@@ -949,6 +1653,11 @@ def test_signal_composite_parent_fk_delete_order_and_direct_delete_guard(
             "DELETE FROM interview_readiness_signal_versions WHERE id=?",
             (version1,),
         )
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "DELETE FROM interview_readiness_signal_versions WHERE id=?",
+            (retracted_version_id,),
+        )
 
     connection.execute("DELETE FROM applications WHERE id=?", (app1,))
     connection.commit()
@@ -997,14 +1706,18 @@ def test_adaptive_v2_truth_partial_uniques_fingerprints_and_locator_history(
     migrated_db: tuple[Path, sqlite3.Connection],
 ) -> None:
     _path, connection = migrated_db
-    source_app, _source_event, _signal, version_id = _create_signal_version(
+    source_app, _source_event, signal_id, version_id = _create_signal_version(
         connection,
         app_seed=4,
         operation_seed=440,
     )
-    target_app, target_event, _note, _proposal = _insert_application_graph(
-        connection,
-        app_seed=5,
+    target_app = source_app
+    target_event = int(
+        connection.execute(
+            "INSERT INTO application_events(application_id,event_type,status) "
+            "VALUES (?,'interview','scheduled')",
+            (source_app,),
+        ).lastrowid
     )
     values = _v2_plan_values(
         application_id=target_app,
@@ -1032,6 +1745,13 @@ def test_adaptive_v2_truth_partial_uniques_fingerprints_and_locator_history(
     )
     second_target_values[4] = values[4]
     connection.execute(V2_PLAN_INSERT, tuple(second_target_values))
+    connection.execute(
+        "UPDATE adaptive_practice_plans SET status='completed',revision=2,"
+        "response_text='answer',reflection_text='reflection',self_assessment='ready',"
+        "completion_idempotency_key=start_idempotency_key || '-complete',"
+        "completion_fingerprint=?,completed_at=CURRENT_TIMESTAMP",
+        (SHA_A,),
+    )
     with pytest.raises(sqlite3.IntegrityError):
         connection.execute(
             "UPDATE adaptive_practice_plans SET target_fingerprint=? WHERE start_idempotency_key='start-1'",
@@ -1042,29 +1762,39 @@ def test_adaptive_v2_truth_partial_uniques_fingerprints_and_locator_history(
         (second_target_event,),
     )
     assert connection.execute(
-        "SELECT readiness_signal_version_id,target_application_event_id,"
+        "SELECT status,readiness_signal_version_id,target_application_event_id,"
         "source_fingerprint,target_fingerprint FROM adaptive_practice_plans "
         "WHERE start_idempotency_key='start-2'"
-    ).fetchone() == (version_id, None, SHA_B, SHA_C)
-    connection.execute("DELETE FROM applications WHERE id=?", (source_app,))
+    ).fetchone() == ("completed", version_id, None, SHA_B, SHA_C)
+    connection.execute(
+        "DELETE FROM interview_readiness_signals WHERE id=?",
+        (signal_id,),
+    )
     row = connection.execute(
-        "SELECT origin_contract,readiness_signal_version_id,target_application_event_id,"
+        "SELECT status,origin_contract,readiness_signal_version_id,target_application_event_id,"
         "source_fingerprint,target_fingerprint FROM adaptive_practice_plans "
         "WHERE start_idempotency_key='start-1'"
     ).fetchone()
-    assert row == ("confirmed_readiness_signal_v1", None, target_event, SHA_B, SHA_C)
+    assert row == (
+        "completed",
+        "confirmed_readiness_signal_v1",
+        None,
+        target_event,
+        SHA_B,
+        SHA_C,
+    )
     assert connection.execute(
-        "SELECT readiness_signal_version_id,target_application_event_id,"
+        "SELECT status,readiness_signal_version_id,target_application_event_id,"
         "source_fingerprint,target_fingerprint FROM adaptive_practice_plans "
         "WHERE start_idempotency_key='start-2'"
-    ).fetchone() == (None, None, SHA_B, SHA_C)
+    ).fetchone() == ("completed", None, None, SHA_B, SHA_C)
     connection.execute("DELETE FROM application_events WHERE id=?", (target_event,))
     row = connection.execute(
-        "SELECT readiness_signal_version_id,target_application_event_id,"
+        "SELECT status,readiness_signal_version_id,target_application_event_id,"
         "source_fingerprint,target_fingerprint FROM adaptive_practice_plans "
         "WHERE start_idempotency_key='start-1'"
     ).fetchone()
-    assert row == (None, None, SHA_B, SHA_C)
+    assert row == ("completed", None, None, SHA_B, SHA_C)
 
     with pytest.raises(sqlite3.IntegrityError):
         connection.execute(
@@ -1121,7 +1851,173 @@ def test_adaptive_origin_truth_table_rejects_invalid_shapes(
         )
 
 
-def test_migration_preserves_every_write_operation_and_transition_column(
+def test_normal_init_upgrades_fixed_0028_history_without_changing_ledger_bytes(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "fixed-0028.db"
+    _create_fixed_pre_0029_database(db_path)
+    with sqlite3.connect(db_path) as connection:
+        operation_columns = [
+            str(row[1]) for row in connection.execute("PRAGMA table_info(write_operations)")
+        ]
+        transition_columns = [
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(write_operation_transitions)")
+        ]
+        before_operations = connection.execute(
+            "SELECT " + ",".join(f'\"{name}\"' for name in operation_columns)
+            + " FROM write_operations ORDER BY id"
+        ).fetchall()
+        before_transitions = connection.execute(
+            "SELECT " + ",".join(f'\"{name}\"' for name in transition_columns)
+            + " FROM write_operation_transitions ORDER BY operation_id,seq,id"
+        ).fetchall()
+        assert len(before_operations) == 19
+        assert len(before_transitions) == 19 * 4
+        assert connection.execute(
+            "SELECT adapter_kind,count(*) FROM write_operations "
+            "GROUP BY adapter_kind ORDER BY adapter_kind"
+        ).fetchall() == [
+            ("compensation", 4),
+            ("legacy_deterministic", 3),
+            ("typed", 12),
+        ]
+        assert "content_revision" not in _table_columns(connection, "interview_notes")
+        assert "proposal_schema_version" not in _table_columns(
+            connection, "interview_review_proposals"
+        )
+        assert "product_action_generation" not in _table_columns(
+            connection, "interview_story_proposal_attempts"
+        )
+        assert "origin_contract" not in _table_columns(
+            connection, "adaptive_practice_plans"
+        )
+
+    baseline = json.loads(
+        (FIXTURE_DIRECTORY / "review_to_readiness_baseline_c5a020c.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert (
+        baseline["provider_tools"],
+        baseline["legacy_deterministic"],
+        baseline["agent_compensations"],
+    ) == (25, 3, 4)
+
+    first = init_database(db_path)
+    _dispose(first)
+    second = init_database(db_path)
+    _dispose(second)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        after_operations = connection.execute(
+            "SELECT " + ",".join(f'\"{name}\"' for name in operation_columns)
+            + " FROM write_operations ORDER BY id"
+        ).fetchall()
+        after_transitions = connection.execute(
+            "SELECT " + ",".join(f'\"{name}\"' for name in transition_columns)
+            + " FROM write_operation_transitions ORDER BY operation_id,seq,id"
+        ).fetchall()
+        assert after_operations == before_operations
+        assert after_transitions == before_transitions
+        assert connection.execute(
+            "SELECT adapter_kind,count(*) FROM write_operations "
+            "GROUP BY adapter_kind ORDER BY adapter_kind"
+        ).fetchall() == [
+            ("compensation", 4),
+            ("legacy_deterministic", 3),
+            ("typed", 12),
+        ]
+        assert connection.execute(
+            "SELECT questions,content_revision,updated_at,created_at FROM interview_notes "
+            "WHERE id=1"
+        ).fetchone() == (
+            "逐字正文\\u0000保留",
+            1,
+            "2026-08-29 01:00:03.000004",
+            "2026-08-29 01:00:03.000004",
+        )
+        assert connection.execute(
+            "SELECT proposal_schema_version,source_note_revision,proposal_json,"
+            "proposal_hash,created_at FROM interview_review_proposals WHERE id=1"
+        ).fetchone() == (
+            1,
+            None,
+            '{"focuses":["历史"]}',
+            SHA_B,
+            "2026-08-29 01:00:04.000005",
+        )
+        assert connection.execute(
+            "SELECT attempt_status,product_action_operation_id,product_action_generation "
+            "FROM interview_story_proposal_attempts ORDER BY id"
+        ).fetchall() == [
+            ("generating", None, 0),
+            ("ready", None, 0),
+            ("confirmed", None, 0),
+        ]
+        assert connection.execute(
+            "SELECT status,origin_contract,readiness_signal_version_id,"
+            "target_application_event_id,target_fingerprint,source_excerpt "
+            "FROM adaptive_practice_plans ORDER BY id"
+        ).fetchall() == [
+            ("in_progress", "legacy_review_focus_v1", None, None, None, "逐字证据"),
+            ("completed", "legacy_review_focus_v1", None, None, None, "逐字证据"),
+        ]
+        indexes = {
+            str(row[1])
+            for row in connection.execute("PRAGMA index_list(adaptive_practice_plans)")
+        }
+        assert "uq_adaptive_practice_proposal_focus" not in indexes
+        assert {
+            "uq_adaptive_practice_legacy_proposal_focus",
+            "uq_adaptive_practice_signal_target",
+        } <= indexes
+        assert connection.execute(
+            "SELECT count(*) FROM schema_migrations "
+            "WHERE version='0029_review_to_readiness_feedback'"
+        ).fetchone() == (1,)
+        route_columns = _table_columns(connection, "product_action_proposals")
+        route_table_sql = str(
+            connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='product_action_proposals'"
+            ).fetchone()[0]
+        ).upper()
+        for column_name in ("schema_version", "source_id", "source_revision"):
+            declared_type = str(route_columns[column_name][2]).upper()
+            assert "INT" not in declared_type
+            assert declared_type in {"", "BLOB"}
+            declaration = route_table_sql.split(column_name.upper(), 1)[1].split(",", 1)[0]
+            assert "INT" not in declaration
+        operation_id = _uuid(990)
+        action_call_id = _uuid(991)
+        _insert_product_primary(
+            connection,
+            operation_id=operation_id,
+            action_call_id=action_call_id,
+            action_name="confirm_interview_story",
+        )
+        connection.execute(
+            """
+            INSERT INTO product_action_proposals(
+              operation_id,action_call_id,action_name,request_origin,source_kind,
+              source_id,source_revision,route_payload_json,route_payload_fingerprint,
+              route_binding_fingerprint,request_idempotency_fingerprint
+            ) VALUES (?,?,'confirm_interview_story','current','story_proposal',1,1,
+              '{}',?,?,?)
+            """,
+            (operation_id, action_call_id, HMAC_A, HMAC_B, HMAC_C),
+        )
+        assert connection.execute(
+            "SELECT typeof(schema_version),typeof(source_id),typeof(source_revision) "
+            "FROM product_action_proposals WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone() == ("integer", "integer", "integer")
+        assert connection.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_forced_rebuild_preserves_every_write_operation_and_transition_column(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "history.db"
@@ -1129,9 +2025,6 @@ def test_migration_preserves_every_write_operation_and_transition_column(
     engine = factory.kw["bind"]
     operation_id = _uuid(600)
     with engine.begin() as connection:
-        connection.execute(
-            text("DELETE FROM schema_migrations WHERE version='0029_review_to_readiness_feedback'")
-        )
         connection.execute(
             text("INSERT INTO conversations(id,title) VALUES (1,'history')")
         )
@@ -1205,16 +2098,13 @@ def test_migration_preserves_every_write_operation_and_transition_column(
     assert after_transition == before_transition
 
 
-def test_0029_preserves_domain_history_and_replaces_ordinary_practice_unique(
+def test_forced_rebuild_preserves_domain_history_and_practice_indexes(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "domain-history.db"
     factory = init_database(db_path)
     engine = factory.kw["bind"]
     with engine.begin() as connection:
-        connection.execute(
-            text("DELETE FROM schema_migrations WHERE version='0029_review_to_readiness_feedback'")
-        )
         connection.execute(
             text(
                 "INSERT INTO applications(id,company_name,position_name) "
@@ -1368,12 +2258,9 @@ def test_migration_rolls_back_rebuild_and_marker_when_swap_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     db_path = tmp_path / "rollback.db"
-    factory = init_database(db_path)
-    engine = factory.kw["bind"]
-    with engine.begin() as connection:
-        connection.execute(
-            text("DELETE FROM schema_migrations WHERE version='0029_review_to_readiness_feedback'")
-        )
+    _create_fixed_pre_0029_database(db_path)
+    engine = create_engine(f"sqlite:///{db_path}")
+    Base.metadata.create_all(engine)
 
     def fail_swap(checkpoint: str) -> None:
         if checkpoint == "before_adaptive_swap":
@@ -1391,4 +2278,4 @@ def test_migration_rolls_back_rebuild_and_marker_when_swap_fails(
             text("SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE '%_0029'")
         ).scalar_one() == 0
         assert connection.execute(text("PRAGMA integrity_check")).scalar_one() == "ok"
-    _dispose(factory)
+    engine.dispose()

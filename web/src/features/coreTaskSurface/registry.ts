@@ -55,6 +55,10 @@ export const CORE_TASK_ENTRYPOINT_CUTOVERS = Object.freeze({
     category: 'core_task',
     taskId: 'application.opportunity_fit',
   }),
+  'InterviewReadinessCenter.actionFor': Object.freeze({
+    category: 'core_task',
+    taskId: 'application.interview_prepare',
+  }),
 } as const);
 
 export type CoreTaskOwnerLookupResult =

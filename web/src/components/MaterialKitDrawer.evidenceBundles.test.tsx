@@ -19,6 +19,7 @@ const queryState = vi.hoisted(() => ({
   preview: undefined as EvidenceBundlePreview | undefined,
   previewRefetch: vi.fn(),
   previewUpdatedAt: 1,
+  resumes: [] as Array<Record<string, unknown>>,
   queryClient: {
     invalidateQueries: vi.fn(),
     setQueryData: vi.fn(),
@@ -57,7 +58,7 @@ vi.mock('@tanstack/react-query', () => ({
       'application-evidence-bundle-preview': queryState.preview,
       'application-evidence-bundles': queryState.history,
       'application-material-kit': queryState.kit,
-      resumes: [{ id: 11, name: 'Backend Resume' }],
+      resumes: queryState.resumes,
     };
     const data = dataByKey[key];
     const error = key === 'application-evidence-bundle-preview'
@@ -123,7 +124,7 @@ vi.mock('antd', () => {
         value={value ?? ''}
         onChange={(event) => onChange?.(options.find((option: any) => String(option.value) === event.target.value)?.value)}
       >
-        {options.map((option: any) => <option key={option.value} value={option.value}>{option.label}</option>)}
+        {options.map((option: any) => <option key={option.value} value={option.value} disabled={option.disabled}>{option.label}</option>)}
       </select>
     ),
     Space: (props: any) => <div>{props.children}</div>,
@@ -146,6 +147,7 @@ vi.mock('@/services/materialKits', () => materialKitService);
 vi.mock('@/services/resumes', () => ({ listResumes: vi.fn() }));
 
 const { default: MaterialKitDrawer } = await import('./MaterialKitDrawer');
+const { materialKitOwnerStore } = await import('@/features/materialSurfaces/materialKitOwnerStore');
 
 declare global {
   var IS_REACT_ACT_ENVIRONMENT: boolean | undefined;
@@ -211,6 +213,7 @@ type SurfaceProps = {
   pendingState?: 'none' | 'pending' | 'unknown' | 'result_unknown';
   resultUnknown?: boolean;
   sourceConflict?: boolean;
+  onOwnerStateChange?: (state: { pending: boolean; resultUnknown: boolean; sourceConflict: boolean }) => void;
 };
 
 function render(nextApplication: Application = application, surfaceProps: SurfaceProps = {}) {
@@ -224,6 +227,7 @@ function render(nextApplication: Application = application, surfaceProps: Surfac
       onClose={vi.fn()}
       initialJdSnapshot="Build services"
       initialJdVersionID={1}
+      onOwnerStateChange={surfaceProps.onOwnerStateChange}
       {...surfaceProps}
     />,
   ));
@@ -238,9 +242,17 @@ function rerender(nextApplication: Application, surfaceProps: SurfaceProps = {})
       onClose={vi.fn()}
       initialJdSnapshot="Build services"
       initialJdVersionID={1}
+      onOwnerStateChange={surfaceProps.onOwnerStateChange}
       {...surfaceProps}
     />,
   ));
+}
+
+function unmountDrawer() {
+  act(() => root?.unmount());
+  container?.remove();
+  root = undefined;
+  container = undefined;
 }
 
 async function flush() {
@@ -280,9 +292,18 @@ function formatLocalDateTime(date: Date) {
 }
 
 beforeEach(() => {
+  materialKitOwnerStore.clear();
   queryState.kit = materialKit();
   queryState.preview = readyPreview;
   queryState.history = [];
+  queryState.resumes = [{
+    id: 11,
+    name: 'Backend Resume',
+    title: 'Backend Resume',
+    is_master: true,
+    parent_resume_id: null,
+    deleted_at: null,
+  }];
   queryState.previewError = null;
   queryState.previewFetching = false;
   queryState.previewUpdatedAt = 1;
@@ -312,6 +333,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.useRealTimers();
   vi.clearAllMocks();
+  materialKitOwnerStore.clear();
 });
 
 describe('MaterialKitDrawer evidence confirmation', () => {
@@ -445,6 +467,45 @@ describe('MaterialKitDrawer evidence confirmation', () => {
     expect(view.querySelector('[data-material-primary="true"]')?.textContent).toContain('确认处理结果');
   });
 
+  it('projects an internal confirmation failure as result-unknown and blocks every write', async () => {
+    const ownerStates: Array<{ pending: boolean; resultUnknown: boolean; sourceConflict: boolean }> = [];
+    evidenceService.confirmEvidenceBundle.mockRejectedValueOnce(new Error('provider timeout'));
+    const view = render(application, {
+      onOwnerStateChange: (state) => ownerStates.push(state),
+    });
+    await flush();
+
+    clickByText(view, '确认已投递');
+    clickByText(view, '确认投递');
+    await flush();
+
+    expect(view.querySelector('[data-testid="material-kit-surface-state"]')?.getAttribute('data-state')).toBe('result_unknown');
+    expect(ownerStates[ownerStates.length - 1]).toEqual({ pending: false, resultUnknown: true, sourceConflict: false });
+    expect(buttonByText(view, '生成材料包')).toBeUndefined();
+    expect(buttonByText(view, '保存')?.disabled).toBe(true);
+    expect(buttonByText(view, '生成基于证据的简历提案')?.disabled).toBe(true);
+    expect(buttonByText(view, '确认已投递')?.disabled).toBe(true);
+
+    clickByText(view, '确认投递');
+    await flush();
+    expect(evidenceService.confirmEvidenceBundle).toHaveBeenCalledTimes(1);
+  });
+
+  it('blocks every write while an external owner state is unresolved and reports it to the owner', async () => {
+    const ownerStates: Array<{ pending: boolean; resultUnknown: boolean; sourceConflict: boolean }> = [];
+    const view = render(application, {
+      pendingState: 'pending',
+      onOwnerStateChange: (state) => ownerStates.push(state),
+    });
+    await flush();
+
+    expect(buttonByText(view, '生成材料包')?.disabled).toBe(true);
+    expect(buttonByText(view, '保存')?.disabled).toBe(true);
+    expect(buttonByText(view, '生成基于证据的简历提案')?.disabled).toBe(true);
+    expect(buttonByText(view, '确认已投递')?.disabled).toBe(true);
+    expect(ownerStates).toHaveLength(0);
+  });
+
   it('labels a ready evidence preview as pending until confirmation', async () => {
     const view = render();
     await flush();
@@ -467,6 +528,66 @@ describe('MaterialKitDrawer evidence confirmation', () => {
     expect(buttonByText(view, '确认已投递')).toBeUndefined();
     expect(view.querySelectorAll('input:not([type="hidden"]):not(:disabled), textarea:not(:disabled), select:not(:disabled)')).toHaveLength(0);
     expect(evidenceService.confirmEvidenceBundle).not.toHaveBeenCalled();
+  });
+
+  it('fails closed and disables every write for a deleted application or unowned kit', async () => {
+    queryState.kit = { ...materialKit(), application_id: undefined } as never;
+    const deletedApplication = { ...application, deleted_at: '2026-08-30T00:00:00.000Z' };
+    const view = render(deletedApplication);
+    await flush();
+
+    expect(view.querySelector('[data-testid="material-kit-surface-state"]')?.getAttribute('data-state')).toBe('unavailable');
+    expect(view.querySelectorAll('input:not([type="hidden"]):not(:disabled), textarea:not(:disabled), select:not(:disabled)')).toHaveLength(0);
+    expect(buttonByText(view, '保存')?.disabled).toBe(true);
+    expect(buttonByText(view, '生成基于证据的简历提案')?.disabled).toBe(true);
+    expect(buttonByText(view, '确认已投递')).toBeUndefined();
+    expect(materialKitService.generateApplicationMaterialKit).not.toHaveBeenCalled();
+    expect(materialKitService.updateMaterialKit).not.toHaveBeenCalled();
+    expect(proposalService.createMaterialRevisionProposal).not.toHaveBeenCalled();
+    expect(evidenceService.confirmEvidenceBundle).not.toHaveBeenCalled();
+  });
+
+  it('uses safe resume lineage labels and blocks a resume with an unknown relationship', async () => {
+    queryState.resumes = [
+      {
+        id: 11,
+        name: '基础简历文件名',
+        title: '基础简历',
+        is_master: true,
+        parent_resume_id: null,
+        deleted_at: null,
+      },
+      {
+        id: 12,
+        name: '岗位简历文件名',
+        title: '岗位简历',
+        is_master: false,
+        parent_resume_id: 11,
+        deleted_at: null,
+      },
+      {
+        id: 13,
+        name: '关系异常简历',
+        title: '关系异常简历',
+        is_master: false,
+        parent_resume_id: 999,
+        deleted_at: null,
+      },
+    ];
+    queryState.kit = { ...materialKit(), resume_id: 13 };
+    const view = render();
+    await flush();
+
+    const options = [...(view.querySelector('select')?.querySelectorAll('option') || [])] as HTMLOptionElement[];
+    expect(options.map((option) => option.textContent)).toEqual([
+      '基础简历 · 基础简历',
+      '岗位简历 · 岗位版本 · 基于 基础简历',
+      '关系异常简历 · 关系待确认',
+    ]);
+    expect(options[2]?.disabled).toBe(true);
+    expect(buttonByText(view, '生成材料包')?.disabled).toBe(true);
+    expect(buttonByText(view, '保存')?.disabled).toBe(true);
+    expect(buttonByText(view, '生成基于证据的简历提案')?.disabled).toBe(true);
   });
 
   it('defaults to local civil time and confirms its ISO instant with one idempotency key per modal opening', async () => {
@@ -544,6 +665,82 @@ describe('MaterialKitDrawer evidence confirmation', () => {
 
     expect(view.querySelector('[role="dialog"]')).toBeNull();
     expect(queryState.previewRefetch).not.toHaveBeenCalled();
+    expect(materialKitOwnerStore.getSnapshot(7).confirmation).toMatchObject({ pending: false, resultUnknown: true });
+  });
+
+  it('restores the complete application-scoped draft after close and reopen', async () => {
+    const view = render();
+    await flush();
+
+    setProposalAssertions(view, 'I own the migration.');
+    const summary = view.querySelector<HTMLTextAreaElement>('textarea[rows="3"]');
+    expect(summary).toBeInstanceOf(HTMLTextAreaElement);
+    act(() => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+      setter?.call(summary, 'Edited summary');
+      summary?.dispatchEvent(new Event('input', { bubbles: true }));
+      summary?.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await flush();
+    expect(materialKitOwnerStore.getSnapshot(7).draft?.draftDirty).toBe(true);
+
+    unmountDrawer();
+    const reopened = render();
+    await flush();
+
+    const textareas = [...reopened.querySelectorAll('textarea')] as HTMLTextAreaElement[];
+    expect(textareas.some((input) => input.value === 'Edited summary')).toBe(true);
+    expect(textareas.some((input) => input.value === 'I own the migration.')).toBe(true);
+    expect(materialKitOwnerStore.getSnapshot(7).draft?.resumeID).toBe(11);
+    expect(materialKitOwnerStore.getSnapshot(7).draft?.jdSnapshot).toBe('Build services');
+  });
+
+  it('isolates drafts by application while preserving the original app on return', async () => {
+    const view = render();
+    await flush();
+    setProposalAssertions(view, 'Only app seven.');
+    await flush();
+
+    rerender(switchedApplication);
+    await flush();
+    expect(materialKitOwnerStore.getSnapshot(8).draft).toBeNull();
+    expect(materialKitOwnerStore.getSnapshot(8).confirmation).toBeNull();
+    expect([...view.querySelectorAll('textarea')].some((input) => input.value === 'Only app seven.')).toBe(false);
+
+    rerender(application);
+    await flush();
+    expect([...view.querySelectorAll('textarea')].some((input) => input.value === 'Only app seven.')).toBe(true);
+  });
+
+  it('restores a pending confirmation identity after unmount and does not issue a second write', async () => {
+    let resolveConfirmation: ((value: { id: number }) => void) | undefined;
+    evidenceService.confirmEvidenceBundle.mockReturnValueOnce(new Promise((resolve) => {
+      resolveConfirmation = resolve;
+    }));
+    const view = render();
+    await flush();
+
+    clickByText(view, '确认已投递');
+    clickByText(view, '确认投递');
+    await flush();
+    const pendingKey = materialKitOwnerStore.getSnapshot(7).confirmation?.key;
+    expect(pendingKey).toBe('e2ddc6c1-2a4d-4bd6-8969-7c0bc29cc771');
+    expect(materialKitOwnerStore.getSnapshot(7).confirmation?.pending).toBe(true);
+
+    unmountDrawer();
+    const reopened = render();
+    await flush();
+    expect(reopened.querySelector('[role="dialog"]')).not.toBeNull();
+    expect(buttonByText(reopened, '确认投递')?.disabled).toBe(true);
+    expect(materialKitOwnerStore.getSnapshot(7).confirmation?.key).toBe(pendingKey);
+    expect(evidenceService.confirmEvidenceBundle).toHaveBeenCalledTimes(1);
+
+    // Completing the old request cannot clear the new generation's owner
+    // state; it remains unresolved until the user gets an explicit recovery.
+    act(() => resolveConfirmation?.({ id: 2 }));
+    await flush();
+    expect(materialKitOwnerStore.getSnapshot(7).confirmation?.key).toBe(pendingKey);
+    expect(materialKitOwnerStore.getSnapshot(7).confirmation).toMatchObject({ pending: false, resultUnknown: true });
   });
 
   it('keeps stale evidence hidden and confirmation gated when the 409 preview refresh fails', async () => {

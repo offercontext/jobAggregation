@@ -18,7 +18,6 @@ import ApplicationDetail from '@/components/ApplicationDetail';
 import type { InterviewReviewProposalAttemptState } from '@/components/InterviewReviewProposalDrawer';
 import type { InterviewKnowledgeCaptureDraft } from '@/components/InterviewKnowledgeCaptureDrawer';
 import type { InterviewPreparationAttemptState, InterviewPreparationDraft, InterviewPreparationKnowledgeOption } from '@/components/InterviewPreparationProposalDrawer';
-import MockInterviewDrawer, { type MockInterviewDrawerDraft } from '@/components/MockInterviewDrawer';
 import InterviewStudio, { type InterviewStudioContext as RealInterviewStudioContext, type QuickPracticeStudioContext } from '@/features/interviewStudio/InterviewStudio';
 import PilotOpportunityFitV2Card from '@/features/pilot/PilotOpportunityFitV2Card';
 import {
@@ -27,12 +26,10 @@ import {
   type OpportunityFitOwnerStore,
 } from '@/components/OpportunityFitReviewDrawer';
 import { normalizeOpportunityFitHistoryDate } from '@/features/applicationTasks/opportunityFitHistory';
-import type { VoiceCoachingRecommendation } from '@/types/voiceCoaching';
 import { type InterviewStoryOpenDraft } from '@/components/InterviewStoryLibraryView';
 import InterviewStoryDrawer, { createInterviewStoryDraft, type InterviewStoryDraft } from '@/components/InterviewStoryDrawer';
 import { type OfferNegotiationDraft } from '@/components/OfferNegotiationDrawer';
 import { listOfferBindingState } from '@/components/offerWorkspaceModel';
-import { discardMockInterviewAttempt } from '@/services/mockInterviews';
 import type { EvidenceTarget } from '@/components/ChatPanel/model';
 import CommandPalette from './CommandPalette';
 import { moduleTabsForView, type ViewMode } from './navigation';
@@ -47,7 +44,6 @@ import {
   type PipelineInsight,
 } from '@/lib/pipelineInsights';
 import { getPracticeStats } from '@/services/questions';
-import { getCurrentApplicationJd } from '@/services/applicationJdVersions';
 import type { ApplicationJdDraft } from '@/types/applicationJdVersion';
 import type { AdaptivePracticeFocus } from '@/types/adaptiveInterviewPractice';
 import { fetchConfirmedInterviewKnowledgeNotes } from '@/services/knowledge';
@@ -171,6 +167,7 @@ const OfferCenterView = lazy(() => import('@/components/OfferCenterView'));
 const DashboardView = lazy(() => import('@/features/dashboard/DashboardView'));
 const RemindersView = lazy(() => import('@/features/reminders/RemindersView'));
 const InterviewV01View = lazy(() => import('@/components/InterviewV01View'));
+const InterviewReadinessCenter = lazy(() => import('@/features/interviewReadiness/InterviewReadinessCenter'));
 const VoiceCoachingGrowthView = lazy(() => import('@/components/VoiceCoachingGrowthView'));
 const ResumeLibraryView = lazy(() => import('@/components/ResumeLibraryView'));
 const SettingsView = lazy(() => import('@/components/SettingsView'));
@@ -186,6 +183,45 @@ export type PilotInterviewReviewIntent =
   | { readonly kind: 'event'; readonly applicationId: number; readonly eventId: number }
   | { readonly kind: 'invalid' };
 
+type UniqueInterviewEventResult =
+  | { readonly ok: true; readonly event: ScheduleEvent }
+  | { readonly ok: false };
+
+function resolveUniqueInterviewEvent(
+  applicationId: number,
+  eventId: number,
+  events: readonly Pick<ScheduleEvent, 'id' | 'application_id' | 'event_type'>[],
+): UniqueInterviewEventResult {
+  if (!Number.isSafeInteger(applicationId) || applicationId <= 0
+    || !Number.isSafeInteger(eventId) || eventId <= 0) return { ok: false };
+  let matched: ScheduleEvent | null = null;
+  try {
+    if (!Array.isArray(events)) return { ok: false };
+    for (let index = 0; index < events.length; index += 1) {
+      if (!(index in events)) return { ok: false };
+      const candidate = events[index];
+      if (candidate === null || typeof candidate !== 'object') return { ok: false };
+      const candidateId = candidate.id;
+      if (!Number.isSafeInteger(candidateId) || candidateId <= 0) return { ok: false };
+      if (candidateId !== eventId) continue;
+      if (matched !== null
+        || candidate.application_id !== applicationId
+        || candidate.event_type !== 'interview') return { ok: false };
+      matched = candidate as ScheduleEvent;
+    }
+  } catch {
+    return { ok: false };
+  }
+  return matched ? { ok: true, event: matched } : { ok: false };
+}
+
+export interface InterviewPreparationSelection {
+  readonly generation: number;
+  readonly applicationId: number;
+  readonly eventId: number;
+  readonly resumeId: number;
+}
+
 /**
  * Resolve Pilot's review intent without guessing an Event identity. An
  * application-only request always remains a chooser request, even for a
@@ -199,19 +235,9 @@ export function resolvePilotInterviewReviewIntent(
   if (!Number.isSafeInteger(applicationId) || applicationId <= 0) return { kind: 'invalid' };
   if (eventId === undefined) return { kind: 'choose', applicationId };
   if (!Number.isSafeInteger(eventId) || eventId <= 0) return { kind: 'invalid' };
-  try {
-    return events.some((event) => (
-      event !== null
-      && typeof event === 'object'
-      && event.id === eventId
-      && event.application_id === applicationId
-      && event.event_type === 'interview'
-    ))
-      ? { kind: 'event', applicationId, eventId }
-      : { kind: 'invalid' };
-  } catch {
-    return { kind: 'invalid' };
-  }
+  return resolveUniqueInterviewEvent(applicationId, eventId, events).ok
+    ? { kind: 'event', applicationId, eventId }
+    : { kind: 'invalid' };
 }
 
 /**
@@ -244,35 +270,6 @@ export function scopeApplicationOffers(
     if (owner === applicationId) scoped.push(candidate);
   }
   return { offers: scoped, hasInvalidOwner };
-}
-
-function createMockInterviewDraft(): MockInterviewDrawerDraft {
-  return {
-    jdText: '',
-    jdVersionId: undefined,
-    attemptKey: null,
-    questionKey: null,
-    feedbackKey: null,
-    turnKey: null,
-    nextQuestionKey: null,
-    confirmationKey: null,
-    answerSubmitted: false,
-    editedBlocks: {},
-    attemptId: null,
-    turnNo: 1,
-    question: '',
-    answer: '',
-    proposalId: null,
-    proposal: null,
-    selectedIds: [],
-    preparationItemIds: [],
-    resultUnknown: false,
-    voiceCoachingReview: null,
-    voicePracticeFocus: null,
-    hasSavedVoiceCoachingSnapshot: false,
-    hasSubmittedVoiceAnswer: false,
-    error: null,
-  };
 }
 
 function interviewStoryDraftScope(input: InterviewStoryOpenDraft): string {
@@ -394,6 +391,7 @@ function AppShellContent() {
     taskSurfaceGuardRef.current = guardBeforeClose.pending || guardBeforeClose.unsaved
       ? guardBeforeClose
       : { pending: false, unsaved: false };
+    setInterviewPreparationSelection(null);
   }, [coreTaskController]);
   const [view, setView] = useState<ViewMode>(readInitialWorkspaceView);
   const [applicationViewState, setApplicationViewState] = useState<ApplicationViewState>(
@@ -403,7 +401,6 @@ function AppShellContent() {
   const [addOpen, setAddOpen] = useState(false);
   const [resumeUploadRequestToken, setResumeUploadRequestToken] = useState(0);
   const [offerCreateRequestToken, setOfferCreateRequestToken] = useState(0);
-  const [interviewPracticeRequestToken, setInterviewPracticeRequestToken] = useState(0);
   const [pilotMascotVisible, setPilotMascotVisible] = useState(readPilotMascotVisible);
   const [pilotMascotZoom, setPilotMascotZoom] = useState(readPilotMascotZoom);
   const [pilotMascotAnimationLevel, setPilotMascotAnimationLevel] = useState(readPilotMascotAnimationLevel);
@@ -417,12 +414,22 @@ function AppShellContent() {
   const [pilotInterviewReviewApplicationId, setPilotInterviewReviewApplicationId] = useState<number | null>(null);
   const [pilotInterviewPreparationApplicationId, setPilotInterviewPreparationApplicationId] = useState<number | null>(null);
   const [pilotInterviewPreparationEventId, setPilotInterviewPreparationEventId] = useState<number | null>(null);
-  const [mockInterviewContext, setMockInterviewContext] = useState<{ applicationId: number; eventId: number } | null>(null);
-  const mockInterviewDraftsRef = useRef(new Map<string, MockInterviewDrawerDraft>());
-  const [mockInterviewDraft, setMockInterviewDraft] = useState<MockInterviewDrawerDraft | null>(null);
+  const [interviewPreparationSelection, setInterviewPreparationSelection] = useState<InterviewPreparationSelection | null>(null);
   const [interviewStudioContext, setInterviewStudioContext] = useState<(RealInterviewStudioContext | QuickPracticeStudioContext) | null>(null);
   const [interviewStudioHaruVisible, setInterviewStudioHaruVisible] = useState(false);
   const [interviewStudioEvidenceOpen, setInterviewStudioEvidenceOpen] = useState(true);
+  useEffect(() => {
+    if (!interviewPreparationSelection) return;
+    const active = coreTaskSurfaceState.active;
+    if (
+      active?.generation !== interviewPreparationSelection.generation
+      || active.ref.taskId !== 'application.interview_prepare'
+      || active.ref.applicationId !== interviewPreparationSelection.applicationId
+      || active.ref.eventId !== interviewPreparationSelection.eventId
+    ) {
+      setInterviewPreparationSelection(null);
+    }
+  }, [coreTaskSurfaceState.active, interviewPreparationSelection]);
   const offerNegotiationDraftsRef = useRef(new Map<number, OfferNegotiationDraft>());
   const [offerNegotiationDrafts, setOfferNegotiationDrafts] = useState<Record<number, OfferNegotiationDraft>>({});
   const offerNegotiationPilotDraftsRef = useRef(new Map<number, OfferNegotiationDraft>());
@@ -875,7 +882,12 @@ function AppShellContent() {
   };
 
   const navigateToView = (nextView: ViewMode, { preserveEvidenceFocus = false }: { preserveEvidenceFocus?: boolean } = {}) => {
+    const activeBeforeNavigation = coreTaskController.getState().active;
     closeCoreTaskSurface();
+    if (activeBeforeNavigation?.ref.taskId === 'interview.free_practice') {
+      setInterviewStudioContext(null);
+      setInterviewStudioHaruVisible(false);
+    }
     setSelected(null);
     if (!preserveEvidenceFocus) setEvidenceFocus(null);
     if (nextView === 'pilot') {
@@ -1049,17 +1061,15 @@ function AppShellContent() {
         taskSurfaceGuardRef.current = { pending: false, unsaved: false };
       }
     } else {
-      const launchResult = launchCoreTaskViaController(coreTaskController, {
+      const launchResult = openExactInterviewTask({
         ref: { taskId: 'application.interview_prepare', applicationId, eventId: trustedEventId },
         source: 'pilot',
         focus: 'current',
       });
       if (launchResult.kind === 'invalid' || launchResult.kind === 'unavailable' || launchResult.kind === 'replacement_denied') return;
-      if (launchResult.kind === 'focused_existing') {
-        setSelected(app);
-        setView('board');
-        return;
-      }
+      setPilotInterviewPreparationApplicationId(null);
+      setPilotInterviewPreparationEventId(null);
+      return;
     }
     setPilotApplicationContext(null);
     setPilotInterviewPreparationApplicationId(applicationId);
@@ -1068,58 +1078,98 @@ function AppShellContent() {
     openApplicationDetail(app);
   };
 
-  const openMockInterview = async (
-    applicationId: number,
-    eventId: number,
-    voicePracticeFocus?: VoiceCoachingRecommendation,
-  ) => {
-    const draftKey = `${applicationId}:${eventId}`;
-    const existingDraft = mockInterviewDraftsRef.current.get(draftKey);
-    const preserveRecoveryDraft = Boolean(
-      existingDraft && (
-        existingDraft.resultUnknown
-        || existingDraft.voiceCoachingReview?.saveState === 'unknown'
-        || existingDraft.voiceCoachingReview?.saveState === 'conflict'
-      )
-    );
-    let draft = preserveRecoveryDraft
-      ? existingDraft!
-      : voicePracticeFocus
-        ? createMockInterviewDraft()
-        : existingDraft ?? createMockInterviewDraft();
-    const hasFrozenAttempt = Boolean(
-      draft.attemptKey
-      || draft.questionKey
-      || draft.turnKey
-      || draft.nextQuestionKey
-      || draft.feedbackKey
-      || draft.confirmationKey
-      || draft.attemptId
-      || draft.proposalId
-      || draft.resultUnknown,
-    );
-    if (!hasFrozenAttempt) {
-      try {
-        const currentJd = await getCurrentApplicationJd(applicationId);
-        if (currentJd.current) {
-          draft = {
-            ...draft,
-            jdVersionId: currentJd.current.id,
-            jdText: currentJd.current.jd_text,
-          };
-        } else {
-          draft = { ...draft, jdVersionId: undefined, jdText: '' };
-        }
-      } catch {
-        draft = { ...draft, jdVersionId: undefined, jdText: '', error: '岗位资料暂时无法加载，请稍后重试' };
+  function openExactInterviewTask(request: TaskLaunchRequest): CoreTaskLaunchResult {
+    const { ref } = request;
+    const applicationId = ref.applicationId;
+    const eventId = ref.eventId;
+    if (
+      (ref.taskId !== 'application.interview_prepare' && ref.taskId !== 'application.interview_review')
+      || !Number.isSafeInteger(applicationId)
+      || (applicationId ?? 0) <= 0
+      || !Number.isSafeInteger(eventId)
+      || (eventId ?? 0) <= 0
+    ) {
+      return { kind: 'invalid', reason: 'invalid_task_identity' };
+    }
+    const app = apps.find((item) => item.id === applicationId);
+    const intent = resolvePilotInterviewReviewIntent(applicationId!, eventId, evs);
+    if (!app || intent.kind !== 'event') {
+      message.warning('指定的面试当前不可用，请刷新面试列表后重试。');
+      return { kind: 'unavailable', reason: 'task_owner_unavailable' };
+    }
+    const result = launchCoreTask(request);
+    if (result.kind !== 'launched' && result.kind !== 'focused_existing') return result;
+    setPilotApplicationContext(null);
+    setPilotInterviewPreparationApplicationId(null);
+    setPilotInterviewPreparationEventId(null);
+    if (ref.taskId === 'application.interview_prepare') {
+      const suggestedResumeId = request.hints?.suggestedResumeId;
+      const validResumeId = Number.isSafeInteger(suggestedResumeId) && (suggestedResumeId ?? 0) > 0
+        ? suggestedResumeId as number
+        : null;
+      const existingSelection = interviewPreparationSelection
+        && interviewPreparationSelection.generation === result.generation
+        && interviewPreparationSelection.applicationId === applicationId
+        && interviewPreparationSelection.eventId === eventId
+        ? interviewPreparationSelection
+        : null;
+      if (validResumeId !== null) {
+        setInterviewPreparationSelection(Object.freeze({
+          generation: result.generation,
+          applicationId: applicationId!,
+          eventId: eventId!,
+          resumeId: validResumeId,
+        }));
+        setSelected(app);
+        setView('board');
+      } else if (existingSelection) {
+        setSelected(app);
+        setView('board');
+      } else {
+        setInterviewPreparationSelection(null);
+        setSelected(null);
+        setVoiceCoachingGrowthOpen(false);
+        setInterviewStoryLibraryOpen(false);
+        setView('interview');
       }
+      return result;
     }
-    if (voicePracticeFocus && !hasFrozenAttempt) {
-      draft = { ...draft, voicePracticeFocus };
+    setInterviewPreparationSelection(null);
+    setSelected(app);
+    setView('board');
+    return result;
+  }
+
+  function launchTaskFromApplicationDetail(request: TaskLaunchRequest): CoreTaskLaunchResult {
+    return request.ref.taskId === 'application.interview_prepare'
+      ? openExactInterviewTask(request)
+      : launchCoreTask(request);
+  }
+
+  const openFreePractice = (): CoreTaskLaunchResult => {
+    const result = launchCoreTask({
+      ref: { taskId: 'interview.free_practice' },
+      source: 'deep_link',
+      focus: 'current',
+    });
+    if (result.kind !== 'launched' && result.kind !== 'focused_existing') return result;
+    setSelected(null);
+    setEvidenceFocus(null);
+    setVoiceCoachingGrowthOpen(false);
+    setInterviewStoryLibraryOpen(false);
+    setView('interview');
+    return result;
+  };
+
+  const openInterviewEventEditor = (applicationId: number, eventId: number) => {
+    const resolved = resolveUniqueInterviewEvent(applicationId, eventId, evs);
+    const event = resolved.ok ? resolved.event : null;
+    if (!event || typeof event.scheduled_at !== 'string' || event.scheduled_at.length === 0) {
+      message.warning('该面试日程当前不可编辑，请刷新后重试。');
+      return;
     }
-    mockInterviewDraftsRef.current.set(draftKey, draft);
-    setMockInterviewDraft(draft);
-    setMockInterviewContext({ applicationId, eventId });
+    setEvidenceFocus({ kind: 'event', id: event.id, scheduledAt: event.scheduled_at });
+    navigateToView('calendar', { preserveEvidenceFocus: true });
   };
 
   const openOfferNegotiation = (offer: Offer, entrypoint: 'ui' | 'pilot' = 'ui') => {
@@ -1180,72 +1230,6 @@ function AppShellContent() {
       });
     }
   }, []);
-
-  const updateMockInterviewDraft = (patch: Partial<MockInterviewDrawerDraft>) => {
-    if (!mockInterviewContext || !mockInterviewDraft) return;
-    const draftKey = `${mockInterviewContext.applicationId}:${mockInterviewContext.eventId}`;
-    const currentDraft = mockInterviewDraftsRef.current.get(draftKey) ?? mockInterviewDraft;
-    const next = { ...currentDraft, ...patch };
-    mockInterviewDraftsRef.current.set(draftKey, next);
-    setMockInterviewDraft(next);
-  };
-
-  const closeMockInterview = async () => {
-    const context = mockInterviewContext;
-    const draft = mockInterviewDraft;
-    if (!context || !draft) {
-      setMockInterviewContext(null);
-      setMockInterviewDraft(null);
-      return;
-    }
-    if (!draft.attemptId && draft.attemptKey) {
-      const retained = {
-        ...draft,
-        resultUnknown: true,
-        error: '操作结果待确认，请稍后使用原尝试重试。',
-      };
-      mockInterviewDraftsRef.current.set(`${context.applicationId}:${context.eventId}`, retained);
-      setMockInterviewContext(null);
-      setMockInterviewDraft(null);
-      return;
-    }
-    if (!draft.attemptId || draft.resultUnknown) {
-      setMockInterviewContext(null);
-      setMockInterviewDraft(null);
-      return;
-    }
-    const preserveSubmittedVoiceAnswer = Boolean(
-      draft.hasSubmittedVoiceAnswer
-      || draft.voiceCoachingReview?.saveState === 'unknown'
-      || draft.voiceCoachingReview?.saveState === 'conflict',
-    );
-    if (draft.hasSavedVoiceCoachingSnapshot || preserveSubmittedVoiceAnswer) {
-      mockInterviewDraftsRef.current.set(`${context.applicationId}:${context.eventId}`, draft);
-      setMockInterviewContext(null);
-      setMockInterviewDraft(null);
-      return;
-    }
-    try {
-      await discardMockInterviewAttempt({
-        applicationId: context.applicationId,
-        eventId: context.eventId,
-        attemptId: draft.attemptId,
-      });
-      mockInterviewDraftsRef.current.delete(`${context.applicationId}:${context.eventId}`);
-      setMockInterviewContext(null);
-      setMockInterviewDraft(null);
-    } catch (error) {
-      const response = (error as { response?: { status?: number; data?: { error_code?: string } } })?.response;
-      if (response?.status === 404 || response?.data?.error_code === 'mock_interview_attempt_confirmed') {
-        mockInterviewDraftsRef.current.delete(`${context.applicationId}:${context.eventId}`);
-        setMockInterviewContext(null);
-        setMockInterviewDraft(null);
-        message.info(response?.data?.error_code === 'mock_interview_attempt_confirmed' ? '本次模拟面试已保存，可在历史记录中查看。' : '本次模拟面试已关闭。');
-        return;
-      }
-      updateMockInterviewDraft({ error: '操作结果待确认，请稍后使用原尝试重试。' });
-    }
-  };
 
   const clearEvidenceFocus = (target: EvidenceTarget) => {
     setEvidenceFocus((current) => (current === target ? null : current));
@@ -1446,11 +1430,28 @@ function AppShellContent() {
     });
   };
 
+  const activeInterviewPreparation = coreTaskSurfaceState.active?.ref.taskId === 'application.interview_prepare'
+    ? coreTaskSurfaceState.active
+    : null;
+  const activeInterviewPreparationApplication = activeInterviewPreparation?.ref.applicationId
+    ? apps.find((item) => item.id === activeInterviewPreparation.ref.applicationId) ?? null
+    : null;
+  const activeInterviewPreparationEvent = activeInterviewPreparation?.ref.eventId
+    ? (() => {
+      const resolved = resolveUniqueInterviewEvent(
+        activeInterviewPreparation.ref.applicationId ?? 0,
+        activeInterviewPreparation.ref.eventId ?? 0,
+        evs,
+      );
+      return resolved.ok ? resolved.event : null;
+    })()
+    : null;
+
   const workspaceContent = selectedApp ? (
     <ApplicationDetail
       application={selectedApp}
       taskController={coreTaskController}
-      onLaunchTask={launchCoreTask}
+      onLaunchTask={launchTaskFromApplicationDetail}
       onConfirmedFitToMaterial={launchConfirmedFitToMaterial}
       onTaskSurfaceGuardChange={(guard) => { taskSurfaceGuardRef.current = guard; }}
       taskNow={now.valueOf()}
@@ -1496,6 +1497,7 @@ function AppShellContent() {
       interviewPreparationDrafts={interviewPreparationDrafts}
       onInterviewPreparationDraftChange={updateInterviewPreparationDraft}
       interviewPreparationKnowledgeOptions={interviewPreparationKnowledgeOptions}
+      interviewPreparationSelection={interviewPreparationSelection}
       nextStepSuggestions={selectedNextStepSuggestions ?? undefined}
       nextStepSessionState={selectedNextStepSessionState}
       onSetDisposition={updateSuggestionSessionState}
@@ -1593,13 +1595,9 @@ function AppShellContent() {
           {view === 'interview' && (voiceCoachingGrowthOpen ? (
             <VoiceCoachingGrowthView
               onBack={() => setVoiceCoachingGrowthOpen(false)}
-              onPractice={(recommendation) => {
+              onPractice={() => {
                 setVoiceCoachingGrowthOpen(false);
-                void openMockInterview(
-                  recommendation.application_id,
-                  recommendation.event_id,
-                  recommendation,
-                );
+                openFreePractice();
               }}
             />
           ) : interviewStoryLibraryOpen ? (
@@ -1611,22 +1609,62 @@ function AppShellContent() {
               confirmedCapturesLoading={confirmedInterviewKnowledgeNotesLoading}
               confirmedCapturesError={confirmedInterviewKnowledgeNotesError}
             />
+          ) : activeInterviewPreparation ? (
+            <InterviewReadinessCenter
+              lockedEvent={activeInterviewPreparationApplication && activeInterviewPreparationEvent
+                ? {
+                    applicationId: activeInterviewPreparationApplication.id,
+                    eventId: activeInterviewPreparationEvent.id,
+                    companyName: activeInterviewPreparationApplication.company_name,
+                    positionName: activeInterviewPreparationApplication.position_name,
+                  }
+                : null}
+              fixedMode="real"
+              generation={activeInterviewPreparation.generation}
+              selectedResumeId={interviewPreparationSelection?.generation === activeInterviewPreparation.generation
+                ? interviewPreparationSelection.resumeId
+                : null}
+              resumes={resumesLoading
+                ? { status: 'loading' }
+                : resumesError
+                  ? { status: 'error' }
+                  : { status: 'ready', value: resumes }}
+              onOpenTask={openExactInterviewTask}
+            />
+          ) : coreTaskSurfaceState.active?.ref.taskId === 'interview.free_practice' ? (
+            <InterviewReadinessCenter
+              initialMode="quick"
+              fixedMode="quick"
+              actionEmphasis="primary"
+              resumes={resumesLoading
+                ? { status: 'loading' }
+                : resumesError
+                  ? { status: 'error' }
+                  : { status: 'ready', value: resumes }}
+              onOpenStudio={(context) => {
+                const active = coreTaskController.getState().active;
+                if (!active || active.ref.taskId !== 'interview.free_practice') return;
+                setInterviewStudioHaruVisible(false);
+                setInterviewStudioContext(context);
+              }}
+            />
           ) : (
             <InterviewV01View
-              practiceRequestToken={interviewPracticeRequestToken}
               onOpenApplication={goDetailById}
-              onOpenPreparation={openPilotInterviewPreparation}
-              onOpenMockInterview={openMockInterview}
-              applications={apps}
+              onOpenTask={openExactInterviewTask}
+              onOpenPreparation={(applicationId, eventId) => {
+                openExactInterviewTask({
+                  ref: { taskId: 'application.interview_prepare', applicationId, eventId },
+                  source: 'interview_event_card',
+                  focus: 'current',
+                });
+              }}
+              onOpenEventEditor={openInterviewEventEditor}
+              onOpenFreePractice={openFreePractice}
               events={evs}
               eventsLoading={eventsLoading}
               eventsError={eventsError}
               onRetryEvents={() => void qc.invalidateQueries({ queryKey: ['events'] })}
-              resumes={resumes}
-              onOpenStudio={(context) => {
-                setInterviewStudioHaruVisible(false);
-                setInterviewStudioContext(context);
-              }}
               onOpenStoryLibrary={(reviewNoteId) => {
                 setVoiceCoachingGrowthOpen(false);
                 setInterviewStoryLibraryOpen(true);
@@ -1698,7 +1736,7 @@ function AppShellContent() {
       topBarPrimaryAction = {
         label: '开始练习',
         ariaLabel: '开始面试练习',
-        onClick: () => setInterviewPracticeRequestToken((token) => token + 1),
+        onClick: () => { openFreePractice(); },
       };
     } else if (view === 'offers') {
       topBarPrimaryAction = {
@@ -1853,7 +1891,11 @@ function AppShellContent() {
       {interviewStudioContext ? (
         <InterviewStudio
           context={interviewStudioContext}
-          onClose={() => setInterviewStudioContext(null)}
+          onClose={() => {
+            setInterviewStudioContext(null);
+            const active = coreTaskController.getState().active;
+            if (active?.ref.taskId === 'interview.free_practice') closeCoreTaskSurface();
+          }}
           onToggleHaru={() => setInterviewStudioHaruVisible((visible) => !visible)}
           onActivityChange={setPilotMascotActivity}
           onEvidenceVisibilityChange={setInterviewStudioEvidenceOpen}
@@ -1894,18 +1936,6 @@ function AppShellContent() {
         pipelineActions={pipelineActions}
         onRunPipelineAction={runPipelineAction}
       />
-      {mockInterviewContext && mockInterviewDraft ? (
-        <MockInterviewDrawer
-          open
-          applicationId={mockInterviewContext.applicationId}
-          eventId={mockInterviewContext.eventId}
-          resumes={resumes}
-          draft={mockInterviewDraft}
-          onDraftChange={updateMockInterviewDraft}
-          onVoiceActivityChange={setPilotMascotActivity}
-          onClose={() => void closeMockInterview()}
-        />
-      ) : null}
       {interviewStoryDrawerOpen && interviewStoryDraft ? (
         <InterviewStoryDrawer
           open

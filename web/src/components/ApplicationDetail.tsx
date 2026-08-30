@@ -48,6 +48,7 @@ import InterviewPreparationProposalDrawer, {
 } from './InterviewPreparationProposalDrawer';
 import type { Resume } from '@/types/resume';
 import MaterialKitDrawer from './MaterialKitDrawer';
+import { materialKitOwnerStore } from '@/features/materialSurfaces/materialKitOwnerStore';
 import OpportunityFitReviewDrawer, {
   type OpportunityFitOwnerProjection,
   type OpportunityFitOwnerStore,
@@ -234,6 +235,105 @@ function projectApplicationEvent(
   });
 }
 
+export interface ApplicationInterviewChoice {
+  readonly eventId: number;
+  readonly label: string;
+  readonly scheduledAtTimestamp: number | null;
+  readonly lifecycle: ApplicationTaskEvent['lifecycle'];
+}
+
+export interface ApplicationInterviewChoices {
+  readonly preparation: readonly ApplicationInterviewChoice[];
+  readonly review: readonly ApplicationInterviewChoice[];
+}
+
+/**
+ * Project an application-only chooser from the same lifecycle contract used
+ * by task resolution. Duplicate identities and malformed/foreign rows are
+ * omitted instead of letting input order choose an owner.
+ */
+export function projectApplicationInterviewChoices(
+  events: readonly ScheduleEvent[],
+  applicationId: number,
+  now: number,
+): ApplicationInterviewChoices {
+  const preparation: ApplicationInterviewChoice[] = [];
+  const review: ApplicationInterviewChoice[] = [];
+  if (!Number.isSafeInteger(applicationId) || applicationId <= 0 || !Number.isFinite(now)) {
+    return Object.freeze({ preparation: Object.freeze(preparation), review: Object.freeze(review) });
+  }
+  try {
+    if (!Array.isArray(events)) throw new TypeError('invalid events');
+    const unique = new Map<number, ScheduleEvent | null>();
+    for (let index = 0; index < events.length; index += 1) {
+      if (!(index in events)) throw new TypeError('sparse events');
+      const candidate = events[index];
+      let eventId: unknown;
+      try {
+        eventId = candidate?.id;
+      } catch {
+        continue;
+      }
+      if (typeof eventId !== 'number' || !Number.isSafeInteger(eventId) || eventId <= 0) continue;
+      unique.set(eventId, unique.has(eventId) ? null : candidate);
+    }
+
+    for (const [eventId, event] of unique) {
+      if (!event) continue;
+      try {
+        if (event.application_id !== applicationId || event.event_type !== 'interview') continue;
+        const projected = projectApplicationEvent(event, undefined, now);
+        const subtype = typeof event.subtype === 'string' && event.subtype.trim()
+          ? event.subtype.trim().slice(0, 80)
+          : '面试';
+        const timeLabel = projected.scheduledAtTimestamp === null
+          ? '时间待确认'
+          : formatWorkspaceDate(event.scheduled_at, '时间待确认');
+        const choice = Object.freeze({
+          eventId,
+          label: `${subtype} · ${timeLabel}`,
+          scheduledAtTimestamp: projected.scheduledAtTimestamp,
+          lifecycle: projected.lifecycle,
+        });
+        const scheduledWithinWindow = projected.lifecycle === 'scheduled'
+          && projected.bucket === 'upcoming'
+          && projected.primaryAction === 'prepare'
+          && projected.scheduledAtTimestamp !== null
+          && projected.scheduledAtTimestamp > now
+          && projected.scheduledAtTimestamp - now <= 24 * 60 * 60_000;
+        const currentInProgress = projected.lifecycle === 'in_progress'
+          && projected.bucket === 'upcoming'
+          && projected.primaryAction === 'enter_preparation';
+        if (scheduledWithinWindow || currentInProgress) preparation.push(choice);
+        if (projected.lifecycle === 'completed'
+          && projected.bucket === 'completed'
+          && (projected.primaryAction === 'record_review' || projected.primaryAction === 'view_review')) {
+          review.push(choice);
+        }
+      } catch {
+        // A malformed row cannot become a chooser option.
+      }
+    }
+  } catch {
+    return Object.freeze({ preparation: Object.freeze([]), review: Object.freeze([]) });
+  }
+  const compare = (left: ApplicationInterviewChoice, right: ApplicationInterviewChoice): number => {
+    if (left.scheduledAtTimestamp === null && right.scheduledAtTimestamp !== null) return 1;
+    if (left.scheduledAtTimestamp !== null && right.scheduledAtTimestamp === null) return -1;
+    if (left.scheduledAtTimestamp !== null && right.scheduledAtTimestamp !== null
+      && left.scheduledAtTimestamp !== right.scheduledAtTimestamp) {
+      return left.scheduledAtTimestamp < right.scheduledAtTimestamp ? -1 : 1;
+    }
+    return left.eventId - right.eventId;
+  };
+  preparation.sort(compare);
+  review.sort(compare);
+  return Object.freeze({
+    preparation: Object.freeze(preparation),
+    review: Object.freeze(review),
+  });
+}
+
 interface ApplicationDetailProps {
   application: Application | null;
   open: boolean;
@@ -279,6 +379,13 @@ interface ApplicationDetailProps {
   interviewPreparationDrafts?: Record<string, InterviewPreparationDraft>;
   onInterviewPreparationDraftChange?: (key: string, draft: InterviewPreparationDraft | null) => void;
   interviewPreparationKnowledgeOptions?: InterviewPreparationKnowledgeOption[];
+  /** AppShell's generation-fenced result from the locked readiness surface. */
+  interviewPreparationSelection?: {
+    readonly generation: number;
+    readonly applicationId: number;
+    readonly eventId: number;
+    readonly resumeId: number;
+  } | null;
   offerNegotiationDrafts?: Record<number, OfferNegotiationDraft>;
   onOfferNegotiationDraftChange?: (offerId: number, draft: OfferNegotiationDraft | null) => void;
   offerNegotiationEntryPoint?: 'ui' | 'pilot';
@@ -296,7 +403,7 @@ interface ApplicationDetailProps {
   onApplicationJdDraftChange?: (applicationId: number, patch: Partial<ApplicationJdDraft> | null) => void;
 }
 
-export default function ApplicationDetail({ application, open, onClose, taskController, onLaunchTask, onConfirmedFitToMaterial, onTaskSurfaceGuardChange, onOpenOffers, offers, offersLoading = false, offersError = false, onRetryOffers, onMockInterview: _onMockInterview, onAskPilot, onOpenPilotOpportunityFit: _onOpenPilotOpportunityFit, externalTaskBlocked = false, onOpportunityFitOwnerStateChange, onOpportunityFitProjectionChange, opportunityFitOwnerStore, pilotInterviewReviewApplicationId, onPilotInterviewReviewFocusConsumed, pilotInterviewPreparationApplicationId, pilotInterviewPreparationEventId, onPilotInterviewPreparationFocusConsumed, onAttachToPilot, interviewReviewProposalAttempts, onInterviewReviewProposalAttemptChange, onInterviewNoteChanged, interviewKnowledgeCaptureDrafts, onInterviewKnowledgeCaptureDraftChange, onInterviewKnowledgeCaptureNoteChanged, resumes, resumesLoading = false, resumesError = false, taskNow, interviewPreparationAttempts, onInterviewPreparationAttemptChange, interviewPreparationDrafts, onInterviewPreparationDraftChange, interviewPreparationKnowledgeOptions = [], offerNegotiationDrafts = {}, onOfferNegotiationDraftChange, offerNegotiationEntryPoint = 'ui', nextStepSuggestions, nextStepSessionState = null, onSetDisposition, onNextStepNavigate, isNavigationAvailable, onNextStepReadonlyNavigate, isReadonlyNavigationAvailable, applicationJdDraft, onApplicationJdDraftChange }: ApplicationDetailProps) {
+export default function ApplicationDetail({ application, open, onClose, taskController, onLaunchTask, onConfirmedFitToMaterial, onTaskSurfaceGuardChange, onOpenOffers, offers, offersLoading = false, offersError = false, onRetryOffers, onMockInterview: _onMockInterview, onAskPilot, onOpenPilotOpportunityFit: _onOpenPilotOpportunityFit, externalTaskBlocked = false, onOpportunityFitOwnerStateChange, onOpportunityFitProjectionChange, opportunityFitOwnerStore, pilotInterviewReviewApplicationId, onPilotInterviewReviewFocusConsumed, pilotInterviewPreparationApplicationId, pilotInterviewPreparationEventId, onPilotInterviewPreparationFocusConsumed, onAttachToPilot, interviewReviewProposalAttempts, onInterviewReviewProposalAttemptChange, onInterviewNoteChanged, interviewKnowledgeCaptureDrafts, onInterviewKnowledgeCaptureDraftChange, onInterviewKnowledgeCaptureNoteChanged, resumes, resumesLoading = false, resumesError = false, taskNow, interviewPreparationAttempts, onInterviewPreparationAttemptChange, interviewPreparationDrafts, onInterviewPreparationDraftChange, interviewPreparationKnowledgeOptions = [], interviewPreparationSelection, offerNegotiationDrafts = {}, onOfferNegotiationDraftChange, offerNegotiationEntryPoint = 'ui', nextStepSuggestions, nextStepSessionState = null, onSetDisposition, onNextStepNavigate, isNavigationAvailable, onNextStepReadonlyNavigate, isReadonlyNavigationAvailable, applicationJdDraft, onApplicationJdDraftChange }: ApplicationDetailProps) {
   const queryClient = useQueryClient();
   const [eventFormOpen, setEventFormOpen] = useState(false);
   const [materialKitPrefill, setMaterialKitPrefill] = useState<{
@@ -306,9 +413,9 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
   }>({});
   const [editingNote, setEditingNote] = useState<InterviewNote | null>(null);
   const [knowledgeCaptureOpen, setKnowledgeCaptureOpen] = useState(false);
-  const [pilotPreparationChoices, setPilotPreparationChoices] = useState<ScheduleEvent[]>([]);
+  const [pilotPreparationChoices, setPilotPreparationChoices] = useState<readonly ApplicationInterviewChoice[]>([]);
   const [pilotPreparationChooserOpen, setPilotPreparationChooserOpen] = useState(false);
-  const [pilotReviewChoices, setPilotReviewChoices] = useState<ScheduleEvent[]>([]);
+  const [pilotReviewChoices, setPilotReviewChoices] = useState<readonly ApplicationInterviewChoice[]>([]);
   const [pilotReviewChooserOpen, setPilotReviewChooserOpen] = useState(false);
   const [jdEditorOpen, setJdEditorOpen] = useState(false);
   const [jdHistoryOpen, setJdHistoryOpen] = useState(false);
@@ -319,6 +426,31 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
     resultUnknown: false,
     unsaved: false,
   });
+  const materialKitOwnerApplicationID = application?.id ?? 0;
+  const materialKitOwnerSubscribe = useMemo(
+    () => (listener: () => void) => materialKitOwnerStore.subscribe(materialKitOwnerApplicationID, listener),
+    [materialKitOwnerApplicationID],
+  );
+  const materialKitOwnerGetSnapshot = useMemo(
+    () => () => materialKitOwnerStore.getSnapshot(materialKitOwnerApplicationID),
+    [materialKitOwnerApplicationID],
+  );
+  const materialKitOwnerSnapshot = useSyncExternalStore(
+    materialKitOwnerSubscribe,
+    materialKitOwnerGetSnapshot,
+    materialKitOwnerGetSnapshot,
+  );
+  // The store snapshot is the only canonical material-owner state.  Deriving
+  // this synchronously avoids a one-render mirror window in the host guard.
+  const materialKitOwnerState = useMemo(() => ({
+    applicationId: application?.id ?? null,
+    pending: materialKitOwnerSnapshot.confirmation?.pending === true
+      || materialKitOwnerSnapshot.proposal?.pending === true,
+    resultUnknown: materialKitOwnerSnapshot.confirmation?.resultUnknown === true
+      || materialKitOwnerSnapshot.proposal?.resultUnknown === true,
+    sourceConflict: materialKitOwnerSnapshot.confirmation?.sourceConflict === true
+      || materialKitOwnerSnapshot.proposal?.sourceConflict === true,
+  }), [application?.id, materialKitOwnerSnapshot]);
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const handledPilotReviewIntentRef = useRef<string | null>(null);
   const handledPilotPreparationIntentRef = useRef<string | null>(null);
@@ -523,6 +655,10 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
   const noteRowsAreObjects = Array.isArray(notesQuery.data) && notesQuery.data.every(isObjectRow);
   const allEvents: ScheduleEvent[] = eventRowsAreObjects ? (eventsQuery.data as ScheduleEvent[]) : [];
   const noteRecords: InterviewNote[] = noteRowsAreObjects ? (notesQuery.data as InterviewNote[]) : [];
+  const canonicalInterviewChoices = useMemo(
+    () => projectApplicationInterviewChoices(allEvents, application?.id ?? 0, resolverNow),
+    [allEvents, application?.id, resolverNow],
+  );
   const interviewStageDataReady = application?.status !== 'interview'
     || (
       !eventsQuery.isLoading
@@ -551,12 +687,10 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
     // Pilot's application-only intent has no trusted Event identity. Always
     // show an explicit chooser, including the singleton case; only a user
     // click may construct the exact event review ref.
-    setPilotReviewChoices(allEvents.filter(
-      (event) => event.application_id === application.id && event.event_type === 'interview',
-    ));
+    setPilotReviewChoices(canonicalInterviewChoices.review);
     setPilotReviewChooserOpen(true);
     onPilotInterviewReviewFocusConsumed?.();
-  }, [allEvents, application, interviewReviewDataReady, open, onPilotInterviewReviewFocusConsumed, pilotInterviewReviewApplicationId]);
+  }, [application, canonicalInterviewChoices.review, interviewReviewDataReady, open, onPilotInterviewReviewFocusConsumed, pilotInterviewReviewApplicationId]);
 
   useEffect(() => {
     if (pilotInterviewPreparationApplicationId == null) {
@@ -567,15 +701,14 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
     const intentKey = `${application.id}:${pilotInterviewPreparationEventId ?? 'choose'}`;
     if (handledPilotPreparationIntentRef.current === intentKey) return;
     handledPilotPreparationIntentRef.current = intentKey;
-    const interviewEvents = allEvents.filter(
-      (event) => event.application_id === application.id && event.event_type === 'interview',
-    );
     if (pilotInterviewPreparationEventId == null) {
       // An application-only intent enters an explicit chooser even when there
       // happens to be one event; event identity is never inferred here.
-      setPilotPreparationChoices(interviewEvents);
+      setPilotPreparationChoices(canonicalInterviewChoices.preparation);
       setPilotPreparationChooserOpen(true);
-    } else if (interviewEvents.some((event) => event.id === pilotInterviewPreparationEventId)) {
+    } else if (canonicalInterviewChoices.preparation.some(
+      (choice) => choice.eventId === pilotInterviewPreparationEventId,
+    )) {
       const result = launchTask({
         ref: {
           taskId: 'application.interview_prepare',
@@ -595,7 +728,7 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
       setPilotPreparationChooserOpen(true);
     }
     onPilotInterviewPreparationFocusConsumed?.();
-  }, [allEvents, application, eventRowsAreObjects, eventsQuery.data, eventsQuery.isError, eventsQuery.isLoading, open, pilotInterviewPreparationEventId, onPilotInterviewPreparationFocusConsumed, pilotInterviewPreparationApplicationId]);
+  }, [application, canonicalInterviewChoices.preparation, eventRowsAreObjects, eventsQuery.data, eventsQuery.isError, eventsQuery.isLoading, open, pilotInterviewPreparationEventId, onPilotInterviewPreparationFocusConsumed, pilotInterviewPreparationApplicationId]);
 
   const invalidateNotes = () => {
     if (application) queryClient.invalidateQueries({ queryKey: ['notes', application.id] });
@@ -657,6 +790,9 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
     if (!activeTask) return { pending: false, resultUnknown: false };
     const fitOwnerPending = activeTask.ref.taskId === 'application.opportunity_fit'
       && opportunityFitOwnerState.pending;
+    const materialOwnerStateForApplication = materialKitOwnerState.applicationId === application?.id
+      ? materialKitOwnerState
+      : null;
     const reviewNote = activeTask.ref.taskId === 'application.interview_review' && activeTask.ref.eventId !== undefined
       ? noteRecords.find((note) => note.application_event_id === activeTask.ref.eventId)
       : undefined;
@@ -668,13 +804,16 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
     const localResultUnknown = Boolean(
       (preparationAttempt?.result_unknown)
       || (reviewAttempt?.result_unknown)
-      || (activeTask.ref.taskId === 'application.opportunity_fit' && opportunityFitOwnerState.resultUnknown),
+      || (activeTask.ref.taskId === 'application.opportunity_fit' && opportunityFitOwnerState.resultUnknown)
+      || (activeTask.ref.taskId === 'application.material_kit' && materialOwnerStateForApplication?.resultUnknown),
     );
     return {
-      pending: fitOwnerPending || localPending,
+      pending: fitOwnerPending || localPending || Boolean(
+        activeTask.ref.taskId === 'application.material_kit' && materialOwnerStateForApplication?.pending,
+      ),
       resultUnknown: localResultUnknown,
     };
-  }, [activeTask, application?.id, interviewPreparationAttempts, interviewReviewProposalAttempts, noteRecords, notesQuery.data, opportunityFitOwnerState.pending, opportunityFitOwnerState.resultUnknown]);
+  }, [activeTask, application?.id, interviewPreparationAttempts, interviewReviewProposalAttempts, materialKitOwnerState, noteRecords, notesQuery.data, opportunityFitOwnerState.pending, opportunityFitOwnerState.resultUnknown]);
 
   const taskSnapshot = useMemo<FrozenApplicationTaskSnapshot>(() => {
     if (!application) return emptyTaskSnapshot();
@@ -848,7 +987,10 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
             }}
           />
         );
-      case 'application.material_kit':
+      case 'application.material_kit': {
+        const ownerState = materialKitOwnerState.applicationId === application.id
+          ? materialKitOwnerState
+          : { pending: false, resultUnknown: false, sourceConflict: false };
         return (
           <MaterialKitDrawer
             application={application}
@@ -862,8 +1004,16 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
             initialJdVersionID={materialKitPrefill.jdSnapshot && !materialKitPrefill.jdVersionID
               ? undefined
               : materialKitPrefill.jdVersionID ?? applicationJdQuery.data?.current?.id}
+            pendingState={ownerState.pending ? 'pending' : 'none'}
+            resultUnknown={ownerState.resultUnknown}
+            sourceConflict={ownerState.sourceConflict}
+            onOwnerStateChange={(state) => {
+              if (!isCurrent()) return;
+              materialKitOwnerStore.updateTransientState(application.id, state);
+            }}
           />
         );
+      }
       case 'application.interview_prepare': {
         const eventId = active.ref.eventId;
         if (eventId === undefined) return <div role="alert">请先选择要准备的面试。</div>;
@@ -871,15 +1021,38 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
           (task) => task.taskId === 'application.interview_prepare' && task.ref.eventId === eventId,
         );
         if (!preparationTask?.executable) return <div role="status">该面试当前不可准备，请先确认日程状态。</div>;
+        const lockedSelection = interviewPreparationSelection
+          && interviewPreparationSelection.generation === active.generation
+          && interviewPreparationSelection.applicationId === application.id
+          && interviewPreparationSelection.eventId === eventId
+          && Number.isSafeInteger(interviewPreparationSelection.resumeId)
+          && interviewPreparationSelection.resumeId > 0
+          && resumeRecords.some((resume) => {
+            try {
+              const candidate = resume as Resume & { deleted?: boolean; hidden?: boolean; visible?: boolean };
+              return candidate.id === interviewPreparationSelection.resumeId
+                && candidate.deleted_at == null
+                && candidate.deleted !== true
+                && candidate.hidden !== true
+                && candidate.visible !== false;
+            } catch {
+              return false;
+            }
+          })
+          ? interviewPreparationSelection
+          : null;
+        if (taskController && !lockedSelection) {
+          return <div role="status">请先在面试准备中心选择一份可用简历。</div>;
+        }
         const preparationKey = `${application.id}:${eventId}`;
         return (
           <InterviewPreparationProposalDrawer
-            key={`${application.id}:${eventId}`}
+            key={`${application.id}:${eventId}:${active.generation}:${lockedSelection?.resumeId ?? 0}`}
             open={taskOwnerOpen}
             context={{
               applicationId: application.id,
               eventId,
-              resumeId: 0,
+              resumeId: lockedSelection?.resumeId ?? 0,
               jdText: applicationJdQuery.data?.current?.jd_text ?? '',
               jdVersionId: applicationJdQuery.data?.current?.id ?? null,
               knowledgeSelections: [],
@@ -1005,6 +1178,9 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
       ? Boolean(
       (active.ref.taskId === 'application.opportunity_fit'
         && (opportunityFitOwnerState.pending || opportunityFitOwnerState.resultUnknown))
+      || (active.ref.taskId === 'application.material_kit'
+        && materialKitOwnerState.applicationId === application.id
+        && (materialKitOwnerState.pending || materialKitOwnerState.resultUnknown || materialKitOwnerState.sourceConflict))
       || (active.ref.taskId === 'application.interview_prepare' && active.ref.eventId !== undefined
         && interviewPreparationAttempts?.[`${application.id}:${active.ref.eventId}`])
       || (active.ref.taskId === 'application.interview_review' && active.ref.eventId !== undefined
@@ -1014,7 +1190,14 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
     const unsaved = active
       ? Boolean(
       active.ref.taskId === 'application.opportunity_fit' && opportunityFitOwnerState.unsaved
-      || active.ref.taskId === 'application.material_kit' && (materialKitPrefill.jdSnapshot || materialKitPrefill.resumeID)
+      || active.ref.taskId === 'application.material_kit' && (
+        Boolean(materialKitPrefill.jdSnapshot || materialKitPrefill.resumeID)
+        || (
+          materialKitOwnerSnapshot.generation > 0
+          && Boolean(materialKitOwnerSnapshot.draft?.hasLocalState)
+          && Boolean(materialKitOwnerSnapshot.draft?.draftDirty || materialKitOwnerSnapshot.draft?.resumeID || materialKitOwnerSnapshot.draft?.jdSnapshot)
+        )
+      )
       || active.ref.taskId === 'application.interview_prepare'
         && active.ref.eventId !== undefined
         && interviewPreparationDrafts?.[`${application?.id}:${active.ref.eventId}`]
@@ -1023,7 +1206,7 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
       )
       : false;
     onTaskSurfaceGuardChange?.({ pending, unsaved });
-  }, [activeTask, application?.id, interviewPreparationAttempts, interviewPreparationDrafts, interviewReviewProposalAttempts, materialKitPrefill, noteRecords, notesQuery.data, offerNegotiationDrafts, offers, onTaskSurfaceGuardChange, opportunityFitOwnerState.pending, opportunityFitOwnerState.resultUnknown, opportunityFitOwnerState.unsaved]);
+  }, [activeTask, application?.id, interviewPreparationAttempts, interviewPreparationDrafts, interviewReviewProposalAttempts, materialKitOwnerSnapshot, materialKitOwnerState, materialKitPrefill, noteRecords, notesQuery.data, offerNegotiationDrafts, offers, onTaskSurfaceGuardChange, opportunityFitOwnerState.pending, opportunityFitOwnerState.resultUnknown, opportunityFitOwnerState.unsaved]);
 
   if (!application || !open) return null;
 
@@ -1035,9 +1218,6 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
       })
     : undefined;
 
-  const interviewEvents = allEvents.filter(
-    (event) => event.application_id === application.id && event.event_type === 'interview',
-  );
   const hasCompletedInterview = taskSnapshot.events.status === 'ready'
     && taskSnapshot.events.value.some((event) => event.lifecycle === 'completed');
   const completedReviewTask = applicationTaskResolution.tasks.find(
@@ -1087,7 +1267,7 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
         if (task?.ref.eventId !== undefined) {
           launchTask({ ref: task.ref, source: 'application_header', focus: 'current' });
         } else {
-          setPilotPreparationChoices(interviewEvents);
+          setPilotPreparationChoices(canonicalInterviewChoices.preparation);
           setPilotPreparationChooserOpen(true);
         }
         break;
@@ -1100,7 +1280,7 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
         if (completedReviewTask) {
           const eventId = completedReviewTask.ref.eventId;
           if (eventId === undefined) {
-            setPilotReviewChoices(interviewEvents);
+            setPilotReviewChoices(canonicalInterviewChoices.review);
             setPilotReviewChooserOpen(true);
             break;
           }
@@ -1114,7 +1294,7 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
         } else {
           // A review without a trusted completed Event is not a general
           // review. Keep the user in the explicit chooser/safe empty state.
-          setPilotReviewChoices(interviewEvents);
+          setPilotReviewChoices(canonicalInterviewChoices.review);
           setPilotReviewChooserOpen(true);
         }
         break;
@@ -1270,9 +1450,9 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
       >
         {pilotPreparationChoices.length > 0 ? (
           <Space direction="vertical" style={{ width: '100%' }}>
-            {pilotPreparationChoices.map((event) => (
+            {pilotPreparationChoices.map((choice) => (
               <Button
-                key={event.id}
+                key={choice.eventId}
                 block
                 disabled={externalTaskBlocked}
                 onClick={() => {
@@ -1280,7 +1460,7 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
                     ref: {
                       taskId: 'application.interview_prepare',
                       applicationId: application.id,
-                      eventId: event.id,
+                      eventId: choice.eventId,
                     },
                     source: 'interview_event_card',
                     focus: 'current',
@@ -1291,7 +1471,7 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
                   }
                 }}
               >
-                {event.subtype || '面试'} · {event.scheduled_at}
+                {choice.label}
               </Button>
             ))}
           </Space>
@@ -1308,15 +1488,15 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
       >
         {pilotReviewChoices.length > 0 ? (
           <Space direction="vertical" style={{ width: '100%' }}>
-            {pilotReviewChoices.map((event) => (
+            {pilotReviewChoices.map((choice) => (
               <Button
-                key={event.id}
+                key={choice.eventId}
                 block
                 disabled={externalTaskBlocked}
                 onClick={() => {
                   const task = applicationTaskResolution.tasks.find(
                     (candidate) => candidate.taskId === 'application.interview_review'
-                      && candidate.ref.eventId === event.id,
+                      && candidate.ref.eventId === choice.eventId,
                   );
                   if (!task?.executable) {
                     message.warning('该面试尚无可用复盘，请先确认事件已完成。');
@@ -1326,19 +1506,19 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
                     ref: {
                       taskId: 'application.interview_review',
                       applicationId: application.id,
-                      eventId: event.id,
+                      eventId: choice.eventId,
                     },
                     source: 'interview_event_card',
                     focus: 'current',
                   });
                   if (taskLaunchAccepted(result)) {
-                    setEditingNote(noteRecords.find((note) => note.application_event_id === event.id) ?? null);
+                    setEditingNote(noteRecords.find((note) => note.application_event_id === choice.eventId) ?? null);
                     setPilotReviewChooserOpen(false);
                     setPilotReviewChoices([]);
                   }
                 }}
               >
-                {event.subtype || '面试'} · {event.scheduled_at}
+                {choice.label}
               </Button>
             ))}
           </Space>
@@ -1759,7 +1939,7 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
           style={{ marginBottom: 16 }}
           onClick={() => {
             if (!interviewReviewDataReady) return;
-            setPilotReviewChoices(interviewEvents);
+            setPilotReviewChoices(canonicalInterviewChoices.review);
             setPilotReviewChooserOpen(true);
           }}
           disabled={!interviewReviewDataReady}

@@ -7,6 +7,8 @@ export interface ResumeSelectionCandidate {
   readonly deleted?: boolean;
   readonly deletedAt?: string | null;
   readonly deleted_at?: string | null;
+  readonly hidden?: boolean;
+  readonly visible?: boolean;
   readonly isMaster?: boolean;
   readonly is_master?: boolean;
 }
@@ -60,7 +62,7 @@ export interface ResumeSelectionResult {
   readonly resumeId: number | null;
   readonly selection: ResumeSelectionCandidate | null;
   readonly shouldAsk: boolean;
-  readonly reason: 'source_loading' | 'source_error' | 'source_absent' | 'source_unknown' | 'resume_deleted' | 'selection_missing' | null;
+  readonly reason: 'source_loading' | 'source_error' | 'source_absent' | 'source_unknown' | 'context_invalid' | 'resume_deleted' | 'selection_missing' | null;
 }
 
 export interface ResumeSelectionLeaseSelection {
@@ -76,6 +78,7 @@ export interface ResumeSelectionLease {
   select(applicationId: number, eventId: number, resumeId: number): boolean;
   setSelection(selection: ResumeSelectionLeaseSelection): boolean;
   getSelection(applicationId: number, eventId: number): number | null;
+  clearSelection(applicationId: number, eventId: number): boolean;
   hasAsked(applicationId: number, eventId: number): boolean;
   markAsked(applicationId: number, eventId: number): boolean;
   isUsable(generation?: number): boolean;
@@ -122,7 +125,9 @@ function isVisible(candidate: ResumeSelectionCandidate): boolean {
   return validId(candidate.id)
     && candidate.deleted !== true
     && candidate.deletedAt == null
-    && candidate.deleted_at == null;
+    && candidate.deleted_at == null
+    && candidate.hidden !== true
+    && candidate.visible !== false;
 }
 
 function belongsToContext(candidate: ResumeSelectionCandidate, input: ResumeSelectionInput): boolean {
@@ -226,6 +231,10 @@ function makeResult(
  * only when it is scoped to this application/event and still visible.
  */
 function resolveResumeSelectionUnsafe(input: ResumeSelectionInput): ResumeSelectionResult {
+  if (!validId(input.applicationId) || !validId(input.eventId)) {
+    return makeResult('unavailable', 'unavailable', null, null, false, 'context_invalid');
+  }
+
   const resumeSource = input.resumes ?? input.resumeSource;
   const status = sourceStatus(resumeSource);
   if (status !== 'direct' && status !== 'ready') {
@@ -275,7 +284,6 @@ function resolveResumeSelectionUnsafe(input: ResumeSelectionInput): ResumeSelect
     || (input.askOnce === false)
     || (lease ? lease.hasAsked(input.applicationId, input.eventId) : false);
   const shouldAsk = !alreadyAsked;
-  if (shouldAsk && lease) lease.markAsked(input.applicationId, input.eventId);
   const attemptedResumeId = leaseResumeId ?? explicitResumeId;
   const attemptedWasDeleted = validId(attemptedResumeId)
     && safeRows.some((candidate) => candidate.id === attemptedResumeId && !isVisible(candidate));
@@ -327,6 +335,10 @@ export function createResumeSelectionLease(generation: number): ResumeSelectionL
         && current.eventId === eventId
         ? current.resumeId
         : null;
+    },
+    clearSelection(applicationId: number, eventId: number): boolean {
+      if (!active || !validId(applicationId) || !validId(eventId)) return false;
+      return selections.delete(pairKey(applicationId, eventId));
     },
     hasAsked(applicationId: number, eventId: number): boolean {
       return active && asked.has(pairKey(applicationId, eventId));

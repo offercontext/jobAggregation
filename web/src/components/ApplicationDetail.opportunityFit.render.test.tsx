@@ -5,11 +5,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { writeMaterialKitHandoff } from '@/features/pilot/materialKitHandoff';
 import type { Application } from '@/types/application';
 import type { Resume } from '@/types/resume';
+import { createCoreTaskSurfaceController } from '@/features/coreTaskSurface/controller';
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const state = vi.hoisted(() => ({
   materialProps: vi.fn(),
+  preparationProps: vi.fn(),
   analyzeJD: vi.fn(),
   events: [] as unknown[],
   materialKit: null as unknown,
@@ -59,13 +61,30 @@ vi.mock('./PilotAttachmentHandle', () => ({ createPilotAttachmentDragBinding: ()
 vi.mock('./ScheduleEventForm', () => ({ default: () => null }));
 vi.mock('./ReviewFormDrawer', () => ({ default: () => null }));
 vi.mock('./MaterialKitDrawer', () => ({
-  default: (props: { initialResumeID?: number; initialJdSnapshot?: string; initialJdVersionID?: number; onClose?: () => void }) => {
+  default: (props: {
+    initialResumeID?: number;
+    initialJdSnapshot?: string;
+    initialJdVersionID?: number;
+    pendingState?: string;
+    resultUnknown?: boolean;
+    sourceConflict?: boolean;
+    onOwnerStateChange?: (state: { pending: boolean; resultUnknown: boolean; sourceConflict: boolean }) => void;
+    onClose?: () => void;
+  }) => {
     state.materialProps(props);
     return (
-      <div data-testid="material-kit" data-resume-id={props.initialResumeID} data-jd={props.initialJdSnapshot} data-jd-version-id={props.initialJdVersionID}>
+      <div data-testid="material-kit" data-resume-id={props.initialResumeID} data-jd={props.initialJdSnapshot} data-jd-version-id={props.initialJdVersionID} data-owner-pending={props.pendingState} data-owner-unknown={props.resultUnknown ? 'true' : 'false'} data-owner-conflict={props.sourceConflict ? 'true' : 'false'}>
         <button type="button" aria-label="close material kit" onClick={props.onClose}>close</button>
+        <button type="button" aria-label="mark material pending" onClick={() => props.onOwnerStateChange?.({ pending: true, resultUnknown: false, sourceConflict: false })}>pending</button>
+        <button type="button" aria-label="mark material unknown" onClick={() => props.onOwnerStateChange?.({ pending: false, resultUnknown: true, sourceConflict: false })}>unknown</button>
       </div>
     );
+  },
+}));
+vi.mock('./InterviewPreparationProposalDrawer', () => ({
+  default: (props: { context: { applicationId: number; eventId: number; resumeId: number } }) => {
+    state.preparationProps(props);
+    return <div data-testid="interview-preparation" data-resume-id={props.context.resumeId} />;
   },
 }));
 vi.mock('./OpportunityFitReviewDrawer', () => ({
@@ -138,7 +157,10 @@ vi.mock('antd', () => {
   };
 });
 
-const { default: ApplicationDetail } = await import('./ApplicationDetail');
+const {
+  default: ApplicationDetail,
+  projectApplicationInterviewChoices,
+} = await import('./ApplicationDetail');
 
 const application: Application = {
   id: 7,
@@ -177,6 +199,7 @@ let container: HTMLDivElement | undefined;
 
 beforeEach(() => {
   state.materialProps.mockReset();
+  state.preparationProps.mockReset();
   state.analyzeJD.mockReset();
   state.events = [];
   state.materialKit = null;
@@ -196,6 +219,90 @@ afterEach(() => {
 });
 
 describe('ApplicationDetail opportunity fit handoff', () => {
+  it('projects application-only interview choices with stable lifecycle and identity guards', () => {
+    const now = Date.parse('2026-07-24T09:00:00Z');
+    const event = (id: number, overrides: Record<string, unknown> = {}) => ({
+      id,
+      application_id: 7,
+      event_type: 'interview',
+      subtype: `round-${id}`,
+      scheduled_at: `2026-07-24T${id === 32 ? '11' : '10'}:00:00Z`,
+      duration_minutes: 45,
+      status: 'scheduled',
+      ...overrides,
+    });
+    const rows = [
+      event(32),
+      event(31),
+      event(33),
+      event(33, { application_id: 8 }),
+      event(34, { status: 'cancelled' }),
+      event(35, { scheduled_at: '2026-07-26T10:00:00Z' }),
+      event(36, { status: 'done', scheduled_at: '' }),
+      event(37, { duration_minutes: 0 }),
+    ] as never;
+
+    const forward = projectApplicationInterviewChoices(rows, 7, now);
+    const reverse = projectApplicationInterviewChoices([...rows].reverse() as never, 7, now);
+
+    expect(forward.preparation.map((choice) => choice.eventId)).toEqual([31, 32]);
+    expect(reverse.preparation.map((choice) => choice.eventId)).toEqual([31, 32]);
+    expect(forward.review.map((choice) => choice.eventId)).toEqual([36]);
+    expect(forward.preparation.some((choice) => [33, 34, 35, 37].includes(choice.eventId))).toBe(false);
+  });
+
+  it('accepts only the generation-fenced resume selected by the readiness owner', () => {
+    state.events = [{
+      id: 31,
+      application_id: 7,
+      event_type: 'interview',
+      subtype: '',
+      tags: [],
+      round: 1,
+      scheduled_at: '2026-07-25T09:00:00Z',
+      duration_minutes: 60,
+      location: '',
+      notes: '',
+      status: 'todo',
+      created_at: '2026-07-20T00:00:00Z',
+    }];
+    state.jdCurrent = { current: { id: 41, application_id: 7, jd_text: '已确认岗位资料' } };
+    const controller = createCoreTaskSurfaceController();
+    const result = controller.launch({
+      ref: { taskId: 'application.interview_prepare', applicationId: 7, eventId: 31 },
+      source: 'interview_event_card',
+    });
+    expect(result.kind).toBe('launched');
+    const generation = result.kind === 'launched' ? result.generation : 0;
+
+    act(() => root?.render(
+      <ApplicationDetail
+        application={{ ...application, status: 'interview' }}
+        resumes={[resume]}
+        taskController={controller}
+        interviewPreparationSelection={{ generation, applicationId: 7, eventId: 31, resumeId: 11 }}
+        open
+        taskNow={Date.parse('2026-07-24T09:00:00Z')}
+        onClose={vi.fn()}
+      />,
+    ));
+
+    expect(container?.querySelector('[data-testid="interview-preparation"]')?.getAttribute('data-resume-id')).toBe('11');
+
+    act(() => root?.render(
+      <ApplicationDetail
+        application={{ ...application, status: 'interview' }}
+        resumes={[resume]}
+        taskController={controller}
+        interviewPreparationSelection={{ generation: generation + 1, applicationId: 7, eventId: 31, resumeId: 11 }}
+        open
+        taskNow={Date.parse('2026-07-24T09:00:00Z')}
+        onClose={vi.fn()}
+      />,
+    ));
+    expect(container?.textContent).toContain('请先在面试准备中心选择一份可用简历');
+  });
+
   it('renders the current source tag only for the mounted application context', () => {
     act(() => root?.render(<ApplicationDetail application={application} open onClose={vi.fn()} />));
 
@@ -410,6 +517,36 @@ describe('ApplicationDetail opportunity fit handoff', () => {
     expect(state.materialProps.mock.calls.some(([props]) => (
       props.initialResumeID === 12 && props.initialJdSnapshot === undefined
     ))).toBe(true);
+  });
+
+  it('connects Material Kit owner state to the application-scoped surface guard', async () => {
+    writeMaterialKitHandoff({
+      applicationId: 7,
+      source: 'deep_link',
+      hints: { suggestedResumeId: 12 },
+    });
+    const guards: Array<{ pending: boolean; unsaved: boolean }> = [];
+    act(() => root?.render(
+      <ApplicationDetail
+        application={application}
+        open
+        onClose={vi.fn()}
+        onTaskSurfaceGuardChange={(guard) => guards.push(guard)}
+      />,
+    ));
+    await act(async () => { await Promise.resolve(); });
+
+    act(() => {
+      (container?.querySelector('[aria-label="mark material pending"]') as HTMLButtonElement)?.click();
+    });
+    expect(guards[guards.length - 1]).toEqual({ pending: true, unsaved: true });
+    expect(container?.querySelector('[data-testid="material-kit"]')?.getAttribute('data-owner-pending')).toBe('pending');
+
+    act(() => {
+      (container?.querySelector('[aria-label="mark material unknown"]') as HTMLButtonElement)?.click();
+    });
+    expect(guards[guards.length - 1]).toEqual({ pending: true, unsaved: true });
+    expect(container?.querySelector('[data-testid="material-kit"]')?.getAttribute('data-owner-unknown')).toBe('true');
   });
 
   it('exposes the canonical Application-scoped evaluation task without URL analysis', () => {

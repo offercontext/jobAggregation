@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   createResumeSelectionLease,
   resolveResumeSelection,
@@ -56,10 +56,12 @@ describe('ResumeSelectionLease', () => {
     }).kind).toBe('needs_selection');
   });
 
-  it('does not reuse a deleted, cross-application, or cross-event selection', () => {
+  it('does not reuse a deleted, hidden, cross-application, or cross-event selection', () => {
     const lease = createResumeSelectionLease(3);
     lease.select({ applicationId: 7, eventId: 8, resumeId: 12 });
     expect(resolveResumeSelection({ ...baseInput, lease, resumes: [{ id: 12, deletedAt: '2026-08-30T00:00:00Z' }] }).kind).toBe('needs_selection');
+    expect(resolveResumeSelection({ ...baseInput, lease, resumes: [{ id: 12, hidden: true }] }).kind).toBe('needs_selection');
+    expect(resolveResumeSelection({ ...baseInput, lease, resumes: [{ id: 12, visible: false }] }).kind).toBe('needs_selection');
     expect(resolveResumeSelection({ ...baseInput, applicationId: 9, lease }).kind).toBe('needs_selection');
     expect(resolveResumeSelection({ ...baseInput, eventId: 10, lease }).kind).toBe('needs_selection');
   });
@@ -74,10 +76,26 @@ describe('ResumeSelectionLease', () => {
 
   it('asks only once when multiple visible resumes remain unresolved', () => {
     const lease = createResumeSelectionLease(3);
+    const markAsked = vi.spyOn(lease, 'markAsked');
     const first = resolveResumeSelection({ ...baseInput, lease });
+    expect(markAsked).not.toHaveBeenCalled();
+    expect(lease.hasAsked(7, 8)).toBe(false);
+    expect(lease.markAsked(7, 8)).toBe(true);
     const second = resolveResumeSelection({ ...baseInput, lease });
     expect(first).toMatchObject({ kind: 'needs_selection', shouldAsk: true });
     expect(second).toMatchObject({ kind: 'needs_selection', shouldAsk: false });
+  });
+
+  it('clears only the scoped selection without revoking the lease', () => {
+    const lease = createResumeSelectionLease(3);
+    lease.select({ applicationId: 7, eventId: 8, resumeId: 12 });
+    lease.select({ applicationId: 7, eventId: 9, resumeId: 11 });
+
+    expect(lease.clearSelection(7, 8)).toBe(true);
+    expect(lease.getSelection(7, 8)).toBeNull();
+    expect(lease.getSelection(7, 9)).toBe(11);
+    expect(lease.isUsable(3)).toBe(true);
+    expect(lease.clearSelection(7, 8)).toBe(false);
   });
 
   it('revokes selection on close/cancel and rejects a stale generation', () => {
@@ -107,6 +125,25 @@ describe('ResumeSelectionLease', () => {
       ...baseInput,
       resumes: { status: 'ready', value: null },
     })).toMatchObject({ kind: 'unavailable', reason: 'source_unknown' });
+  });
+
+  it('fails closed for an invalid application or event context before selecting a visible resume', () => {
+    for (const context of [
+      { applicationId: 0, eventId: 8 },
+      { applicationId: 7, eventId: 0 },
+      { applicationId: Number.NaN, eventId: 8 },
+    ]) {
+      expect(resolveResumeSelection({
+        ...baseInput,
+        ...context,
+        resumes: [{ id: 11, deletedAt: null }],
+      })).toMatchObject({
+        kind: 'unavailable',
+        source: 'unavailable',
+        resumeId: null,
+        reason: 'context_invalid',
+      });
+    }
   });
 
   it('fails closed when a source getter throws', () => {

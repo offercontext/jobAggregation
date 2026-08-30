@@ -21,12 +21,12 @@ describe('projectMaterialKitSurface', () => {
     ['missing JD', { jd: { status: 'absent' as const, value: null } }, 'open_jd'],
     ['missing Resume', { resumes: { status: 'ready' as const, value: [{ id: 11, deletedAt: null }, { id: 12, deletedAt: null }] }, selectedResumeId: null }, 'select_resume'],
     ['not generated', { materialKit: { status: 'ready' as const, value: null }, selectedResumeId: 11 }, 'generate'],
-    ['dirty draft', { materialKit: { status: 'ready' as const, value: { status: 'draft' as const } }, draftDirty: true, selectedResumeId: 11 }, 'save'],
+    ['dirty draft', { materialKit: { status: 'ready' as const, value: { applicationId: 7, status: 'draft' as const } }, draftDirty: true, selectedResumeId: 11 }, 'save'],
     ['waiting confirmation', { pendingState: 'pending' as const, selectedResumeId: 11 }, 'confirm'],
     ['result unknown', { pendingState: 'unknown' as const, selectedResumeId: 11 }, 'resolve'],
     ['source conflict', { sourceConflict: true, selectedResumeId: 11 }, 'resolve'],
-    ['ready and unsubmitted', { materialKit: { status: 'ready' as const, value: { status: 'ready' as const } }, selectedResumeId: 11 }, 'record_submission'],
-    ['submitted', { materialKit: { status: 'ready' as const, value: { status: 'submitted' as const } }, selectedResumeId: 11 }, 'view_submission'],
+    ['ready and unsubmitted', { materialKit: { status: 'ready' as const, value: { applicationId: 7, status: 'ready' as const } }, selectedResumeId: 11 }, 'record_submission'],
+    ['submitted', { materialKit: { status: 'ready' as const, value: { applicationId: 7, status: 'submitted' as const } }, selectedResumeId: 11 }, 'view_submission'],
   ] as const)('maps %s to one primary action', (_name, overrides, actionId) => {
     const result = project(overrides);
     expect(result.primaryAction.id).toBe(actionId);
@@ -45,8 +45,85 @@ describe('projectMaterialKitSurface', () => {
       materialKit: { status: 'ready', value: { applicationId: 99, status: 'ready' } },
     }).state).toBe('unavailable');
     expect(project({
+      materialKit: { status: 'ready', value: { status: 'ready' } },
+    }).state).toBe('unavailable');
+    expect(project({
+      materialKit: { status: 'ready', value: { applicationId: 7, application_id: 8, status: 'ready' } },
+    }).state).toBe('unavailable');
+    expect(project({
       jd: { status: 'ready', value: { id: 3, text: 'Old JD', deleted: true } },
     }).state).toBe('missing_jd');
+  });
+
+  it.each([
+    { deleted: true },
+    { deletedAt: '2026-08-30T00:00:00Z' },
+    { deleted_at: '2026-08-30T00:00:00Z' },
+    { stale: true },
+  ])('fails closed for a deleted material kit snapshot (%o)', (deletion) => {
+    const result = project({
+      materialKit: { status: 'ready' as const, value: { applicationId: 7, status: 'ready' as const, ...deletion } },
+      selectedResumeId: 11,
+    });
+    expect(result.state).toBe('unavailable');
+    expect(result.primaryAction.id).toBe('none');
+    expect(result.hasExecutableAction).toBe(false);
+  });
+
+  it('does not let an explicit ready state bypass a deleted kit snapshot', () => {
+    const result = project({
+      state: 'ready_unsubmitted',
+      materialKit: { status: 'ready' as const, value: { applicationId: 7, status: 'ready' as const, deleted_at: '2026-08-30' } },
+      selectedResumeId: 11,
+    });
+    expect(result.state).toBe('unavailable');
+    expect(result.primaryAction.id).toBe('none');
+  });
+
+  it.each([
+    ['foreign kit owner', {
+      materialKit: { status: 'ready' as const, value: { applicationId: 99, status: 'ready' as const } },
+    }],
+    ['malformed kit row', {
+      materialKit: { status: 'ready' as const, value: { applicationId: 7, status: 'unexpected' } },
+    }],
+    ['missing ready kit value', {
+      materialKit: { status: 'ready' as const },
+    }],
+    ['malformed JD row', {
+      jd: { status: 'ready' as const, value: { id: 0, text: '' } },
+    }],
+    ['malformed Resume rows', {
+      resumes: { status: 'ready' as const, value: { id: 11 } },
+    }],
+  ] as const)('does not let an explicit executable state bypass %s', (_name, overrides) => {
+    const result = project({
+      state: 'ready_unsubmitted',
+      selectedResumeId: 11,
+      ...overrides,
+    } as Partial<MaterialKitSurfaceInput>);
+
+    expect(result.state).toBe('unavailable');
+    expect(result.primaryAction.id).toBe('none');
+    expect(result.hasExecutableAction).toBe(false);
+  });
+
+  it('also fails closed when a source envelope carries the deletion marker', () => {
+    const result = project({
+      materialKit: {
+        status: 'ready' as const,
+        deletedAt: '2026-08-30T00:00:00Z',
+        value: { applicationId: 7, status: 'ready' as const },
+      } as never,
+      selectedResumeId: 11,
+    });
+    expect(result.state).toBe('unavailable');
+    expect(result.primaryAction.id).toBe('none');
+  });
+
+  it('keeps an unknown or conflicting result ahead of the open confirmation state', () => {
+    expect(project({ pendingState: 'pending', resultUnknown: true }).state).toBe('result_unknown');
+    expect(project({ pendingState: 'pending', sourceConflict: true }).state).toBe('source_conflict');
   });
 
   it('keeps primary action identity independent of handoff hints and freezes the model', () => {

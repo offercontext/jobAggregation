@@ -18,7 +18,7 @@ export const MATERIAL_FLOW_COPY = {
     createDerivedResume: '创建派生简历',
     backToReview: '返回审核',
     confirmBody: '这会创建一个新的派生简历版本，并将投递准备改为指向该版本。不会覆盖来源简历。',
-    selectChange: (id: string) => `选择变更 ${id}`,
+    selectChange: '选择此项变更',
   },
   drawer: {
     materialKitTitle: '投递准备',

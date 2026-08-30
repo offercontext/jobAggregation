@@ -6,6 +6,20 @@ import {
 } from './interviewReadinessModel';
 
 describe('interview readiness model', () => {
+  it('fails closed for malformed locked real identities', () => {
+    const result = buildRealInterviewReadiness({
+      application: { id: 0 },
+      jd: { status: 'ready' },
+      resume: { id: Number.NaN },
+      event: { id: -1 },
+    });
+
+    expect(result.ready).toBe(false);
+    expect(result.items
+      .filter((item) => item.key === 'application' || item.key === 'resume' || item.key === 'event')
+      .every((item) => item.status === 'needs_input')).toBe(true);
+  });
+
   it('keeps unknown real sources from being marked ready', () => {
     const result = buildRealInterviewReadiness({
       application: null,
@@ -42,6 +56,17 @@ describe('interview readiness model', () => {
     expect(validateQuickPracticeDraft({ positionName: '工程师', jdText: 'JD', jdConfirmed: false, resumeId: 1 })).toEqual({
       ok: false,
       field: 'jdConfirmed',
+    });
+    expect(validateQuickPracticeDraft({ positionName: '工程师', jdText: 'JD', jdConfirmed: true, resumeId: 0 })).toEqual({
+      ok: false,
+      field: 'resumeId',
+    });
+    expect(validateQuickPracticeDraft({ positionName: '工程师', jdText: 'JD', jdConfirmed: true, resumeId: 1.5 })).toEqual({
+      ok: false,
+      field: 'resumeId',
+    });
+    expect(buildQuickPracticeReadiness({ positionName: '工程师', jdText: 'JD', jdConfirmed: true, resumeId: Number.NaN }).items.find((item) => item.key === 'resume')).toMatchObject({
+      status: 'needs_input',
     });
   });
 });

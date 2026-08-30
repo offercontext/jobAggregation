@@ -10,7 +10,7 @@ export interface ReadinessItem {
 
 export interface ReadinessResult {
   ready: boolean;
-  items: ReadinessItem[];
+  items: readonly ReadinessItem[];
 }
 
 export interface RealInterviewReadinessInput {
@@ -27,14 +27,21 @@ export interface QuickPracticeDraft {
   resumeId: number | undefined;
 }
 
+function isValidId(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+}
+
 export function buildRealInterviewReadiness(input: RealInterviewReadinessInput): ReadinessResult {
+  const applicationReady = isValidId(input.application?.id);
+  const resumeReady = isValidId(input.resume?.id);
+  const eventReady = isValidId(input.event?.id);
   const items: ReadinessItem[] = [
     {
       key: 'application',
       label: '投递',
-      status: input.application ? 'ready' : 'needs_input',
-      detail: input.application ? '已选择当前可见的投递。' : '需要选择一条当前可见的投递。',
-      actionLabel: input.application ? undefined : '选择投递',
+      status: applicationReady ? 'ready' : 'needs_input',
+      detail: applicationReady ? '已锁定当前可见的投递。' : '需要一条当前可见的投递。',
+      actionLabel: applicationReady ? undefined : '选择投递',
     },
     {
       key: 'jd',
@@ -52,22 +59,22 @@ export function buildRealInterviewReadiness(input: RealInterviewReadinessInput):
     {
       key: 'resume',
       label: '简历',
-      status: input.resume ? 'ready' : 'needs_input',
-      detail: input.resume ? '已选择一份已保存简历。' : '需要显式选择一份当前可见的已保存简历。',
-      actionLabel: input.resume ? undefined : '选择简历',
+      status: resumeReady ? 'ready' : 'needs_input',
+      detail: resumeReady ? '已选择一份已保存简历。' : '需要显式选择一份当前可见的已保存简历。',
+      actionLabel: resumeReady ? undefined : '选择简历',
     },
     {
       key: 'event',
       label: '面试安排',
-      status: input.event ? 'ready' : 'needs_input',
-      detail: input.event ? '已选择已排期的面试事件。' : '需要选择一条已排期且可见的面试事件。',
-      actionLabel: input.event ? undefined : '安排面试',
+      status: eventReady ? 'ready' : 'needs_input',
+      detail: eventReady ? '已锁定已排期的面试事件。' : '需要一条已排期且可见的面试事件。',
+      actionLabel: eventReady ? undefined : '安排面试',
     },
   ];
-  return {
+  return Object.freeze({
     ready: items.slice(0, 4).every((item) => item.status === 'ready'),
-    items,
-  };
+    items: Object.freeze(items.map((item) => Object.freeze(item))),
+  });
 }
 
 export function buildQuickPracticeReadiness(draft: QuickPracticeDraft): ReadinessResult {
@@ -82,15 +89,15 @@ export function buildQuickPracticeReadiness(draft: QuickPracticeDraft): Readines
     {
       key: 'jd',
       label: '岗位资料',
-      status: draft.positionName.trim() && draft.jdText.trim() && draft.jdConfirmed ? 'ready' : 'needs_input',
+      status: draft.positionName.trim().length > 0 && draft.jdText.trim().length > 0 && draft.jdConfirmed ? 'ready' : 'needs_input',
       detail: draft.jdConfirmed ? '已核对，本次按此岗位资料练习。' : '粘贴 JD 后请明确勾选已核对。',
       actionLabel: '粘贴 JD',
     },
     {
       key: 'resume',
       label: '简历',
-      status: draft.resumeId ? 'ready' : 'needs_input',
-      detail: draft.resumeId ? '将冻结当前已保存版本。' : '需要选择一份当前可见的已保存简历。',
+      status: isValidId(draft.resumeId) ? 'ready' : 'needs_input',
+      detail: isValidId(draft.resumeId) ? '将冻结当前已保存版本。' : '需要选择一份当前可见的已保存简历。',
       actionLabel: '选择简历',
     },
     {
@@ -106,7 +113,10 @@ export function buildQuickPracticeReadiness(draft: QuickPracticeDraft): Readines
       detail: '仅发送冻结 JD、冻结简历和本次确认的问答。',
     },
   ];
-  return { ready: draftStatus.ok && items.slice(1, 3).every((item) => item.status === 'ready'), items };
+  return Object.freeze({
+    ready: draftStatus.ok && items.slice(1, 3).every((item) => item.status === 'ready'),
+    items: Object.freeze(items.map((item) => Object.freeze(item))),
+  });
 }
 
 export function validateQuickPracticeDraft(
@@ -115,6 +125,6 @@ export function validateQuickPracticeDraft(
   if (!draft.positionName.trim() || [...draft.positionName].length > 200) return { ok: false, field: 'positionName' };
   if (!draft.jdText.trim() || draft.jdText.length > 100_000) return { ok: false, field: 'jdText' };
   if (!draft.jdConfirmed) return { ok: false, field: 'jdConfirmed' };
-  if (!draft.resumeId) return { ok: false, field: 'resumeId' };
+  if (!isValidId(draft.resumeId)) return { ok: false, field: 'resumeId' };
   return { ok: true };
 }

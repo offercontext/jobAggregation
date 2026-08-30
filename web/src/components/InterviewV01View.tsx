@@ -5,10 +5,15 @@ import { listInterviews } from '@/services/interviews';
 import { listAdaptivePracticeRecommendations } from '@/services/adaptiveInterviewPractice';
 import type { InterviewIndexItem } from '@/types/interviewIndex';
 import type { AdaptivePracticeFocus, AdaptivePracticeRecommendation } from '@/types/adaptiveInterviewPractice';
+import { normalizeInterviewIndexItem } from '@/features/interviewEvents/interviewIndexContract';
+import {
+  compareInterviewEventCards,
+  projectInterviewEventCard,
+  type InterviewEventCardModel,
+} from '@/features/interviewEvents/interviewEventCard';
+import type { TaskLaunchRequest } from '@/features/coreTaskSurface/contracts';
 import workflowStyles from './ui/WorkflowSurface.module.css';
 import actionStyles from './InterviewNextActionCard.module.css';
-import InterviewReadinessCenter from '@/features/interviewReadiness/InterviewReadinessCenter';
-import type { QuickPracticeStudioContext, RealInterviewStudioContext } from '@/features/interviewReadiness/InterviewReadinessCenter';
 import type { Application } from '@/types/application';
 import type { ScheduleEvent } from '@/types/event';
 import type { Resume } from '@/types/resume';
@@ -16,56 +21,292 @@ import type { Resume } from '@/types/resume';
 const { Paragraph, Title } = Typography;
 
 type InterviewTabKey = 'upcoming' | 'completed' | 'practice';
+type TaskLauncher = (request: TaskLaunchRequest) => unknown;
 
-interface Props {
+export interface InterviewV01ViewProps {
   onOpenApplication?: (applicationId: number) => void;
+  /** Canonical task launcher supplied by the single workspace controller. */
+  onOpenTask?: TaskLauncher;
+  /** Explicit alias used by controller hosts that name the boundary launch. */
+  onLaunchTask?: TaskLauncher;
+  /** Transitional exact preparation adapter; it must already target the canonical owner. */
   onOpenPreparation?: (applicationId: number, eventId: number) => void;
-  /** Legacy entry retained for older hosts; only shown when preparation is unavailable. */
-  onOpenMockInterview?: (applicationId: number, eventId: number) => void;
+  onOpenEventEditor?: (applicationId: number, eventId: number) => void;
+  onOpenFreePractice?: () => void;
+  /** Navigation-only story library entry; event cards never pass a note id. */
   onOpenStoryLibrary?: (reviewNoteId?: number) => void;
   onOpenAdaptivePractice?: (focus: AdaptivePracticeFocus) => void;
   onOpenVoiceCoachingGrowth?: () => void;
   onOpenQuestionBank?: () => void;
-  /** Increases when the root workspace asks the interview page to start practice. */
+  /** Increases when the root workspace asks the interview page to focus practice. */
   practiceRequestToken?: number;
+  /** Retained as read-only composition inputs for hosts that already load them. */
   applications?: Application[];
   events?: ScheduleEvent[];
   eventsLoading?: boolean;
   eventsError?: boolean;
   onRetryEvents?: () => void;
   resumes?: Resume[];
-  onOpenStudio?: (context: RealInterviewStudioContext | QuickPracticeStudioContext) => void;
 }
 
-interface InterviewListProps {
-  items: InterviewIndexItem[];
+type InterviewListProps = {
+  cards: readonly InterviewEventCardModel[];
   bucket: 'upcoming' | 'completed';
   loading: boolean;
   error: boolean;
   onOpenApplication?: (applicationId: number) => void;
+  onOpenTask?: TaskLauncher;
+  onLaunchTask?: TaskLauncher;
   onOpenPreparation?: (applicationId: number, eventId: number) => void;
-  onOpenMockInterview?: (applicationId: number, eventId: number) => void;
-  onOpenStoryLibrary?: (reviewNoteId?: number) => void;
-  eventStatuses: ReadonlyMap<number, string>;
-}
+  onOpenEventEditor?: (applicationId: number, eventId: number) => void;
+  onRetryEvents?: () => void;
+};
 
-const ENDED_EVENT_STATUSES = new Set(['cancelled', 'deleted', 'soft_deleted']);
+const PRIMARY_LABELS: Readonly<Partial<Record<InterviewEventCardModel['primaryAction'], string>>> = Object.freeze({
+  prepare: '准备面试',
+  enter_preparation: '进入面试准备',
+  record_review: '记录复盘',
+  view_review: '查看复盘',
+  update_status: '更新事件状态',
+});
 
-function scheduledTimestamp(item: InterviewIndexItem): number {
-  const raw = (item as InterviewIndexItem & { scheduled_at?: string | null }).scheduled_at;
-  if (!raw) return Number.NaN;
-  const value = Date.parse(raw);
-  return Number.isFinite(value) ? value : Number.NaN;
+const LIFECYCLE_LABELS: Readonly<Record<InterviewEventCardModel['lifecycle'], string>> = Object.freeze({
+  scheduled: '待进行',
+  in_progress: '进行中',
+  completed: '已完成',
+  cancelled: '已取消',
+  unknown: '状态待确认',
+});
+
+const BUCKET_LABELS: Readonly<Record<InterviewEventCardModel['bucket'], string>> = Object.freeze({
+  upcoming: '即将进行',
+  completed: '已完成',
+  cancelled: '已取消',
+  needs_status_update: '状态待更新',
+  unavailable: '暂不可用',
+});
+
+function eventSourceMap(events: readonly ScheduleEvent[] | undefined): {
+  readonly values: ReadonlyMap<number, ScheduleEvent | null>;
+  readonly unavailable: boolean;
+} {
+  const byId = new Map<number, ScheduleEvent | null>();
+  let unavailable = false;
+  try {
+    for (const event of events ?? []) {
+      try {
+        const eventId = event.id;
+        if (typeof eventId === 'number' && Number.isSafeInteger(eventId) && eventId > 0) {
+          if (byId.has(eventId)) byId.set(eventId, null);
+          else byId.set(eventId, event);
+        } else unavailable = true;
+      } catch {
+        unavailable = true;
+      }
+    }
+  } catch {
+    unavailable = true;
+  }
+  return { values: byId, unavailable };
 }
 
 /**
- * The index is a read-only projection. We only use its existing scheduled time
- * to group rows; this function never infers or writes an Application status.
+ * Projects and orders the read-only interview index in one place. Duplicate
+ * application/event identities are collapsed after the central card
+ * projector has selected the deterministic representation.
  */
-export function isUpcomingInterview(item: InterviewIndexItem, now = Date.now(), eventStatus?: string): boolean {
-  if (eventStatus && ENDED_EVENT_STATUSES.has(eventStatus)) return false;
-  const timestamp = scheduledTimestamp(item);
-  return !Number.isFinite(timestamp) || timestamp >= now;
+export function projectInterviewEventCards(
+  items: readonly InterviewIndexItem[],
+  now = Date.now(),
+  events?: readonly ScheduleEvent[],
+): readonly InterviewEventCardModel[] {
+  const sources = eventSourceMap(events);
+  const projected: InterviewEventCardModel[] = [];
+  let length = 0;
+  try {
+    length = items.length;
+  } catch {
+    return Object.freeze(projected);
+  }
+  for (let index = 0; index < length; index += 1) {
+    try {
+      if (!(index in items)) continue;
+      const item = items[index];
+      let source: ScheduleEvent | null | undefined;
+      try {
+        source = sources.unavailable
+          ? null
+          : sources.values.has(item.event_id)
+            ? sources.values.get(item.event_id)
+            : events === undefined
+              ? undefined
+              : null;
+      } catch {
+        source = null;
+      }
+      const normalized = normalizeInterviewIndexItem(item, source);
+      // Collection rows without a trustworthy identity cannot be rendered or
+      // focused safely. Keep the single-row projector fail-closed for direct
+      // diagnostics, but never synthesize an application/event identity (0)
+      // inside the canonical list.
+      if (normalized.application_id === null || normalized.event_id === null) continue;
+      projected.push(projectInterviewEventCard(normalized, now));
+    } catch {
+      // One hostile row must not hide other valid Event cards or escape the
+      // read-only projection boundary.
+    }
+  }
+  projected.sort(compareInterviewEventCards);
+  const seen = new Set<string>();
+  const unique = projected.filter((card) => {
+    const identity = `${card.applicationId}:${card.eventId}`;
+    if (seen.has(identity)) return false;
+    seen.add(identity);
+    return true;
+  });
+  return Object.freeze(unique);
+}
+
+function formatCardTime(card: InterviewEventCardModel): string {
+  return Number.isFinite(card.scheduledAtTimestamp)
+    ? new Date(card.scheduledAtTimestamp).toLocaleString()
+    : '时间待确认';
+}
+
+function taskRequestFor(card: InterviewEventCardModel): TaskLaunchRequest | null {
+  if (card.primaryAction === 'prepare' || card.primaryAction === 'enter_preparation') {
+    return {
+      ref: {
+        taskId: 'application.interview_prepare',
+        applicationId: card.applicationId,
+        eventId: card.eventId,
+      },
+      source: 'interview_event_card',
+      focus: 'current',
+    };
+  }
+  if (card.primaryAction === 'record_review' || card.primaryAction === 'view_review') {
+    return {
+      ref: {
+        taskId: 'application.interview_review',
+        applicationId: card.applicationId,
+        eventId: card.eventId,
+      },
+      source: 'interview_event_card',
+      focus: 'current',
+    };
+  }
+  return null;
+}
+
+function primaryCanExecute(
+  card: InterviewEventCardModel,
+  props: Pick<InterviewListProps, 'onOpenTask' | 'onLaunchTask' | 'onOpenPreparation' | 'onOpenEventEditor'>,
+): boolean {
+  if (card.primaryAction === 'update_status') return Boolean(props.onOpenEventEditor);
+  if (card.primaryAction === 'prepare' || card.primaryAction === 'enter_preparation') {
+    return Boolean(props.onOpenTask || props.onLaunchTask || props.onOpenPreparation);
+  }
+  if (card.primaryAction === 'record_review' || card.primaryAction === 'view_review') {
+    return Boolean(props.onOpenTask || props.onLaunchTask);
+  }
+  return false;
+}
+
+function InterviewList({
+  cards,
+  bucket,
+  loading,
+  error,
+  onOpenApplication,
+  onOpenTask,
+  onLaunchTask,
+  onOpenPreparation,
+  onOpenEventEditor,
+  onRetryEvents,
+}: InterviewListProps) {
+  if (loading) return <Spin aria-label="正在加载面试列表" />;
+  if (error) return <Alert type="error" showIcon message="面试列表暂时无法加载，请稍后重试。" />;
+  if (cards.length === 0) {
+    return (
+      <div className="op-empty-state">
+        <Empty
+          description={bucket === 'upcoming' ? '暂无即将进行的面试' : '暂无已完成或已取消的面试'}
+          image={Empty.PRESENTED_IMAGE_SIMPLE}
+        />
+      </div>
+    );
+  }
+
+  return (
+    <List
+      dataSource={[...cards]}
+      rowKey={(card) => `${card.applicationId}:${card.eventId}`}
+      renderItem={(card) => {
+        const primaryLabel = PRIMARY_LABELS[card.primaryAction];
+        const request = taskRequestFor(card);
+        const canExecute = primaryCanExecute(card, {
+          onOpenTask,
+          onLaunchTask,
+          onOpenPreparation,
+          onOpenEventEditor,
+        });
+        const launch = onOpenTask ?? onLaunchTask;
+        const actions: React.ReactNode[] = [];
+        if (primaryLabel) {
+          actions.push(
+            <Button
+              key="primary"
+              type="primary"
+              data-interview-primary="true"
+              disabled={!canExecute}
+              onClick={() => {
+                if (card.primaryAction === 'update_status') {
+                  onOpenEventEditor?.(card.applicationId, card.eventId);
+                } else if (request && launch) {
+                  launch(request);
+                } else if (card.primaryAction === 'prepare' || card.primaryAction === 'enter_preparation') {
+                  onOpenPreparation?.(card.applicationId, card.eventId);
+                }
+              }}
+            >
+              {primaryLabel}
+            </Button>,
+          );
+        }
+        for (const secondary of card.secondaryActions) {
+          if (secondary === 'retry' && onRetryEvents) {
+            actions.push(<Button key="retry" type="link" onClick={onRetryEvents}>重试</Button>);
+          }
+          if (secondary === 'view_application' && onOpenApplication) {
+            actions.push(<Button key="application" type="link" onClick={() => onOpenApplication(card.applicationId)}>查看投递详情</Button>);
+          }
+        }
+        const lifecycleLabel = LIFECYCLE_LABELS[card.lifecycle];
+        return (
+          <List.Item
+            className={workflowStyles.listRow}
+            data-testid={`interview-event-card-${card.eventId}`}
+            data-interview-card-bucket={card.bucket}
+            actions={actions}
+          >
+            <List.Item.Meta
+              title={`${card.companyName} · ${card.positionName}`}
+              description={(
+                <Space wrap className="op-long-text">
+                  <span>{formatCardTime(card)}</span>
+                  <Tag>{BUCKET_LABELS[card.bucket]}</Tag>
+                  <Tag>{lifecycleLabel}</Tag>
+                  {card.noteId !== null && card.lifecycle === 'completed' ? <span>已有复盘</span> : null}
+                  {card.contractReasons.length > 0 ? <span>部分状态待确认</span> : null}
+                </Space>
+              )}
+            />
+          </List.Item>
+        );
+      }}
+    />
+  );
 }
 
 export async function listAllInterviews(): Promise<InterviewIndexItem[]> {
@@ -82,110 +323,28 @@ export async function listAllInterviews(): Promise<InterviewIndexItem[]> {
   }
 }
 
-function formatScheduledAt(item: InterviewIndexItem): string {
-  const timestamp = scheduledTimestamp(item);
-  return Number.isFinite(timestamp) ? new Date(timestamp).toLocaleString() : '时间待确认';
-}
-
-function InterviewList({
-  items,
-  bucket,
-  loading,
-  error,
-  onOpenApplication,
-  onOpenPreparation,
-  onOpenMockInterview,
-  onOpenStoryLibrary,
-  eventStatuses,
-}: InterviewListProps) {
-  if (loading) return <Spin aria-label="正在加载面试列表" />;
-  if (error) return <Alert type="error" showIcon message="面试列表暂时无法加载，请稍后重试。" />;
-  if (items.length === 0) {
-    return (
-      <div className="op-empty-state">
-        <Empty
-          description={bucket === 'upcoming' ? '暂无即将进行的面试' : '暂无已完成的面试'}
-          image={Empty.PRESENTED_IMAGE_SIMPLE}
-        />
-      </div>
-    );
-  }
-
-  return (
-    <List
-      dataSource={items}
-      renderItem={(item) => {
-        const eventStatus = eventStatuses.get(item.event_id);
-        const wasCancelled = Boolean(eventStatus && ENDED_EVENT_STATUSES.has(eventStatus));
-        return (
-        <List.Item className={workflowStyles.listRow} actions={[
-          onOpenApplication ? (
-            <Button key="detail" type="link" onClick={() => onOpenApplication(item.application_id)}>
-              查看投递详情
-            </Button>
-          ) : null,
-          bucket === 'upcoming' && item.preparation_available && onOpenPreparation ? (
-            <Button key="prepare" type="link" onClick={() => onOpenPreparation?.(item.application_id, item.event_id)}>
-              准备面试
-            </Button>
-          ) : null,
-          // Keep the old drawer reachable for legacy hosts, but never show it
-          // next to the canonical preparation entry supplied by AppShell.
-          bucket === 'upcoming' && !onOpenPreparation && onOpenMockInterview ? (
-            <Button key="legacy-mock" type="link" onClick={() => onOpenMockInterview(item.application_id, item.event_id)}>
-              开始模拟面试
-            </Button>
-          ) : null,
-          bucket === 'completed' && item.note_id && onOpenStoryLibrary ? (
-            <Button key="story" type="link" onClick={() => onOpenStoryLibrary(item.note_id ?? undefined)}>
-              整理为故事
-            </Button>
-          ) : null,
-        ].filter(Boolean)}>
-          <List.Item.Meta
-            title={`${item.company_name} · ${item.position_name}`}
-            description={(
-              <Space wrap className="op-long-text">
-                <span>{formatScheduledAt(item)}</span>
-                <Tag>{wasCancelled ? '已取消' : item.note_id ? '已有复盘' : bucket === 'completed' ? '待记录复盘' : '待进行'}</Tag>
-                {item.review_summary ? <span>{item.review_summary}</span> : null}
-                {item.note_source_status === 'source_changed' ? <Tag color="warning">原资料已更新，本次结果仍使用旧版</Tag> : null}
-                {item.has_review_proposal ? <Tag color="blue">有复盘建议</Tag> : null}
-                {item.has_confirmed_knowledge ? <Tag color="green">已有复盘沉淀</Tag> : null}
-                {bucket === 'upcoming' && item.preparation_available ? <Tag>可准备面试</Tag> : null}
-              </Space>
-            )}
-          />
-        </List.Item>
-        );
-      }}
-    />
-  );
-}
-
 export default function InterviewV01View({
   onOpenApplication,
+  onOpenTask,
+  onLaunchTask,
   onOpenPreparation,
-  onOpenMockInterview,
+  onOpenEventEditor,
+  onOpenFreePractice,
   onOpenStoryLibrary,
   onOpenAdaptivePractice,
   onOpenVoiceCoachingGrowth,
   onOpenQuestionBank,
   practiceRequestToken,
-  applications,
   events,
   eventsLoading,
   eventsError,
   onRetryEvents,
-  resumes,
-  onOpenStudio,
-}: Props) {
+}: InterviewV01ViewProps) {
   const [items, setItems] = useState<InterviewIndexItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
   const [practice, setPractice] = useState<AdaptivePracticeRecommendation | null>(null);
   const [practiceError, setPracticeError] = useState(false);
-  const hasReadinessCenter = applications !== undefined || events !== undefined || resumes !== undefined || onOpenStudio !== undefined;
   const [activeTab, setActiveTab] = useState<InterviewTabKey>('upcoming');
   const [currentTime, setCurrentTime] = useState(() => Date.now());
   const lastPracticeRequestTokenRef = useRef<number | undefined>(practiceRequestToken);
@@ -225,22 +384,18 @@ export default function InterviewV01View({
 
   useEffect(() => { void loadPractice(); }, []);
 
-  const eventStatuses = useMemo(
-    () => new Map((events ?? []).map((event) => [event.id, event.status])),
-    [events],
+  const cards = useMemo(
+    () => projectInterviewEventCards(items, currentTime, events),
+    [currentTime, events, items],
   );
-
-  const groupedItems = useMemo(() => {
-    const upcoming = items.filter((item) => isUpcomingInterview(item, currentTime, eventStatuses.get(item.event_id))).sort((a, b) => {
-      const left = scheduledTimestamp(a);
-      const right = scheduledTimestamp(b);
-      if (!Number.isFinite(left)) return 1;
-      if (!Number.isFinite(right)) return -1;
-      return left - right;
-    });
-    const completed = items.filter((item) => !isUpcomingInterview(item, currentTime, eventStatuses.get(item.event_id))).sort((a, b) => scheduledTimestamp(b) - scheduledTimestamp(a));
-    return { upcoming, completed };
-  }, [currentTime, eventStatuses, items]);
+  const upcomingCards = useMemo(
+    () => cards.filter((card) => card.bucket === 'upcoming' || card.bucket === 'needs_status_update' || card.bucket === 'unavailable'),
+    [cards],
+  );
+  const completedCards = useMemo(
+    () => cards.filter((card) => card.bucket === 'completed' || card.bucket === 'cancelled'),
+    [cards],
+  );
 
   const eventStateNotice = eventsLoading ? (
     <Spin aria-label="正在确认面试状态" />
@@ -274,84 +429,68 @@ export default function InterviewV01View({
       />
 
       {activeTab === 'upcoming' ? (
-        eventStateNotice ?? <>
-          {hasReadinessCenter ? (
-            <InterviewReadinessCenter
-              initialMode="real"
-              fixedMode="real"
-              actionEmphasis="secondary"
-              applications={applications}
-              events={events}
-              resumes={resumes}
-              onOpenApplication={onOpenApplication}
-              onOpenPreparation={onOpenPreparation}
-              onOpenStudio={onOpenStudio}
-            />
-          ) : null}
-          <section aria-labelledby="upcoming-interviews-title" style={{ marginTop: hasReadinessCenter ? 24 : 0 }}>
+        eventStateNotice ?? (
+          <section aria-labelledby="upcoming-interviews-title">
             <Title id="upcoming-interviews-title" level={3}>即将进行</Title>
             <InterviewList
-              items={groupedItems.upcoming}
+              cards={upcomingCards}
               bucket="upcoming"
               loading={loading}
               error={error}
               onOpenApplication={onOpenApplication}
+              onOpenTask={onOpenTask}
+              onLaunchTask={onLaunchTask}
               onOpenPreparation={onOpenPreparation}
-              onOpenMockInterview={onOpenMockInterview}
-              eventStatuses={eventStatuses}
+              onOpenEventEditor={onOpenEventEditor}
+              onRetryEvents={onRetryEvents}
             />
           </section>
-        </>
+        )
       ) : null}
 
       {activeTab === 'completed' ? (
-        eventStateNotice ?? <section aria-labelledby="completed-interviews-title">
-          <div className="op-section-heading" style={{ marginBottom: 20 }}>
-            <div>
-              <Title id="completed-interviews-title" level={3} style={{ margin: 0 }}>已完成</Title>
-              <Paragraph type="secondary" style={{ margin: '6px 0 0' }}>查看本次面试的复盘、来源状态和经历素材入口。</Paragraph>
+        eventStateNotice ?? (
+          <section aria-labelledby="completed-interviews-title">
+            <div className="op-section-heading" style={{ marginBottom: 20 }}>
+              <div>
+                <Title id="completed-interviews-title" level={3} style={{ margin: 0 }}>已完成</Title>
+                <Paragraph type="secondary" style={{ margin: '6px 0 0' }}>查看本次面试的复盘和来源状态。</Paragraph>
+              </div>
+              <Space wrap>
+                {onOpenVoiceCoachingGrowth ? <Button icon={<SoundOutlined />} onClick={onOpenVoiceCoachingGrowth}>表达成长</Button> : null}
+                {onOpenStoryLibrary ? <Button data-story-audit="ui-library" onClick={() => onOpenStoryLibrary()}>经历素材</Button> : null}
+              </Space>
             </div>
-            <Space wrap>
-              {onOpenVoiceCoachingGrowth ? <Button icon={<SoundOutlined />} onClick={onOpenVoiceCoachingGrowth}>表达成长</Button> : null}
-              {onOpenStoryLibrary ? <Button data-story-audit="ui-library" onClick={() => onOpenStoryLibrary()}>经历素材</Button> : null}
-            </Space>
-          </div>
-          <InterviewList
-            items={groupedItems.completed}
-            bucket="completed"
-            loading={loading}
-            error={error}
-            onOpenApplication={onOpenApplication}
-            onOpenStoryLibrary={onOpenStoryLibrary}
-            eventStatuses={eventStatuses}
-          />
-        </section>
+            <InterviewList
+              cards={completedCards}
+              bucket="completed"
+              loading={loading}
+              error={error}
+              onOpenApplication={onOpenApplication}
+              onOpenTask={onOpenTask}
+              onLaunchTask={onLaunchTask}
+              onOpenPreparation={onOpenPreparation}
+              onOpenEventEditor={onOpenEventEditor}
+              onRetryEvents={onRetryEvents}
+            />
+          </section>
+        )
       ) : null}
 
       {activeTab === 'practice' ? (
-        <section aria-labelledby="free-practice-title">
+        <section data-testid="free-practice-workspace" aria-labelledby="free-practice-title">
           <div className="op-section-heading" style={{ marginBottom: 20 }}>
             <div>
               <Title id="free-practice-title" level={3} style={{ margin: 0 }}>自由练习</Title>
-              <Paragraph type="secondary" style={{ margin: '6px 0 0' }}>题库和快速练习共用同一练习工作台，文字与语音只是本次练习的回答方式。</Paragraph>
+              <Paragraph type="secondary" style={{ margin: '6px 0 0' }}>题库和快速练习共用同一练习工作台，开始前不会自动调用模型。</Paragraph>
             </div>
-            {onOpenQuestionBank ? <Button icon={<BookOutlined />} onClick={onOpenQuestionBank}>进入题库</Button> : null}
+            <Space wrap>
+              {onOpenFreePractice ? <Button type="primary" onClick={onOpenFreePractice}>开始自由练习</Button> : null}
+              {onOpenQuestionBank ? <Button icon={<BookOutlined />} onClick={onOpenQuestionBank}>进入题库</Button> : null}
+            </Space>
           </div>
-          {hasReadinessCenter ? (
-            <InterviewReadinessCenter
-              initialMode="quick"
-              fixedMode="quick"
-              actionEmphasis="secondary"
-              applications={applications}
-              events={events}
-              resumes={resumes}
-              onOpenApplication={onOpenApplication}
-              onOpenPreparation={onOpenPreparation}
-              onOpenStudio={onOpenStudio}
-            />
-          ) : null}
           {practice ? (
-            <section className={actionStyles.card} aria-labelledby="interview-next-action-title" style={{ marginTop: hasReadinessCenter ? 20 : 0 }}>
+            <section className={actionStyles.card} aria-labelledby="interview-next-action-title">
               <div className={actionStyles.content}>
                 <span className={actionStyles.eyebrow}>下一项行动</span>
                 <h2 id="interview-next-action-title" className={actionStyles.title}>{practice.title}</h2>
@@ -370,7 +509,7 @@ export default function InterviewV01View({
             </section>
           ) : null}
           {practiceError && onOpenAdaptivePractice ? <Alert style={{ marginTop: 20 }} type="warning" showIcon message="复盘训练建议暂时无法加载" action={<Button size="large" onClick={() => void loadPractice()}>重新加载建议</Button>} /> : null}
-          {!hasReadinessCenter && !practice && !practiceError ? (
+          {!practice && !practiceError ? (
             <div className="op-empty-state" style={{ marginTop: 20 }}>
               <Empty description="从题库选择题目，或开始一次快速练习。" image={Empty.PRESENTED_IMAGE_SIMPLE} />
             </div>

@@ -31,7 +31,10 @@ describe('AppShell application task composition', () => {
     expect((appShellSource.match(/createCoreTaskSurfaceController\(/g) ?? []).length).toBe(1);
     expect(appShellSource).toContain('launchCoreTask');
     expect(appShellSource).toContain('taskController={coreTaskController}');
-    expect(appShellSource).toContain('onLaunchTask={launchCoreTask}');
+    expect(appShellSource).toContain('onLaunchTask={launchTaskFromApplicationDetail}');
+    expect(appShellSource).toContain("request.ref.taskId === 'application.interview_prepare'");
+    expect(appShellSource).toContain('? openExactInterviewTask(request)');
+    expect(appShellSource).toContain(': launchCoreTask(request)');
     expect(applicationDetailSource).toContain('CoreTaskSurfaceHost');
     expect((applicationDetailSource.match(/<CoreTaskSurfaceHost/g) ?? []).length).toBe(1);
     expect(applicationDetailSource).toContain('resolveApplicationTasks');

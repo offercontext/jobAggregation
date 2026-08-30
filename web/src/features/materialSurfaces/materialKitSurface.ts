@@ -37,6 +37,7 @@ export interface MaterialKitSurfaceJd {
   readonly text?: string;
   readonly jdText?: string;
   readonly jd_text?: string;
+  readonly deleted?: boolean;
   readonly deletedAt?: string | null;
   readonly deleted_at?: string | null;
 }
@@ -172,6 +173,21 @@ function sourceIsAbsent(value: unknown): boolean {
   return sourceStatus(value) === 'absent';
 }
 
+function hasOwn(value: unknown, key: string): boolean {
+  return isRecord(value) && Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function readyKitEnvelopeMissingValue(value: unknown): boolean {
+  if (!isRecord(value) || value.status !== 'ready' || hasOwn(value, 'value')) return false;
+  // `MaterialKitSurfaceKit` and the source envelope both use `status`. A
+  // direct kit is still distinguishable by its persisted owner fields; a bare
+  // `{ status: 'ready' }` is an incomplete source envelope, not an empty kit.
+  return !hasOwn(value, 'applicationId')
+    && !hasOwn(value, 'application_id')
+    && !hasOwn(value, 'resumeId')
+    && !hasOwn(value, 'resume_id');
+}
+
 function visibleResume(resume: MaterialKitSurfaceResume): boolean {
   return isValidId(resume.id)
     && resume.deleted !== true
@@ -195,17 +211,42 @@ function normalizedJd(value: SourceOrValue<MaterialKitSurfaceJd> | string): Mate
   return { id: isValidId(id) ? id : undefined, text };
 }
 
+function hasDeletionMarker(value: unknown): boolean {
+  return isRecord(value)
+    && (value.deleted === true || value.deletedAt != null || value.deleted_at != null);
+}
+
 function kitStatus(value: unknown): MaterialKitStatus | null {
   const resolved = sourceValue(value as SourceOrValue<MaterialKitSurfaceKit>);
   if (!isRecord(resolved)) return null;
+  // A deleted/stale snapshot must never look like a usable kit merely because
+  // its last persisted status was ready or submitted.  The API has exposed
+  // both camel- and snake-case deletion timestamps over time, so treat either
+  // spelling as authoritative on both the source envelope and row.
+  if (hasDeletionMarker(value) || hasDeletionMarker(resolved)) return null;
   const status = resolved.status;
   return status === 'draft' || status === 'ready' || status === 'submitted' ? status : null;
+}
+
+function kitIsDeleted(value: unknown): boolean {
+  const resolved = sourceValue(value as SourceOrValue<MaterialKitSurfaceKit>);
+  return hasDeletionMarker(value) || hasDeletionMarker(resolved);
+}
+
+function kitIsStale(value: unknown): boolean {
+  const resolved = sourceValue(value as SourceOrValue<MaterialKitSurfaceKit>);
+  return (isRecord(value) && (value.stale === true || value.is_stale === true))
+    || (isRecord(resolved) && (resolved.stale === true || resolved.is_stale === true));
 }
 
 function kitBelongsToApplication(value: unknown, applicationId: number): boolean {
   if (!isRecord(value)) return false;
   const applicationValues = [value.applicationId, value.application_id]
     .filter((candidate) => candidate !== undefined && candidate !== null);
+  // A usable persisted kit must carry an explicit application owner.  Treat a
+  // missing owner as untrusted rather than silently attributing the row to the
+  // application currently being rendered.
+  if (applicationValues.length === 0) return false;
   return applicationValues.every((candidate) => isValidId(candidate) && candidate === applicationId)
     && (applicationValues.length < 2 || applicationValues[0] === applicationValues[1]);
 }
@@ -231,9 +272,9 @@ function explicitState(input: MaterialKitSurfaceInput): MaterialKitSurfaceState 
   if (input.sourceState && input.sourceState !== 'ready') {
     return input.sourceState === 'loading' ? 'loading' : 'unavailable';
   }
-  if (input.pendingState === 'pending' || input.pending === true) return 'waiting_confirmation';
   if (input.pendingState === 'unknown' || input.pendingState === 'result_unknown' || input.resultUnknown === true) return 'result_unknown';
   if (input.sourceConflict === true) return 'source_conflict';
+  if (input.pendingState === 'pending' || input.pending === true) return 'waiting_confirmation';
   return null;
 }
 
@@ -269,6 +310,8 @@ function projectMaterialKitSurfaceUnsafe(input: MaterialKitSurfaceInput): Materi
   const key = coreTaskCanonicalKey({ taskId: 'application.material_kit', applicationId });
   const invalidApplication = !isValidId(applicationId);
   let state = invalidApplication ? 'unavailable' : explicitState(input);
+  const projectedStateProvided = state !== null;
+  const recoveryTruth = state === 'result_unknown' || state === 'source_conflict';
   let reason: string | null = invalidApplication
     ? 'application_invalid'
     : input.sourceState && input.sourceState !== 'ready' && state
@@ -279,7 +322,8 @@ function projectMaterialKitSurfaceUnsafe(input: MaterialKitSurfaceInput): Materi
   const resumeSource = getSource(input.resumes, input.resumeSource);
   const kitSource = getSource(input.materialKit, input.materialKitSource ?? input.kit);
 
-  if (!state && (sourceIsBlocked(jdSource) || sourceIsBlocked(resumeSource) || sourceIsBlocked(kitSource))) {
+  const sourceBlocked = sourceIsBlocked(jdSource) || sourceIsBlocked(resumeSource) || sourceIsBlocked(kitSource);
+  if (!invalidApplication && !recoveryTruth && sourceBlocked) {
     const statuses = [jdSource, resumeSource, kitSource].map(sourceStatus);
     state = statuses.includes('loading') ? 'loading' : 'unavailable';
     reason = 'source_unavailable';
@@ -300,17 +344,46 @@ function projectMaterialKitSurfaceUnsafe(input: MaterialKitSurfaceInput): Materi
   const hasResumeSource = resumeStatus === 'ready' || Array.isArray(resumesValue);
   const kit = sourceValue(kitSource);
   const status = kitStatus(kitSource);
+  const kitDeleted = kitIsDeleted(kitSource);
+  const kitStale = kitIsStale(kitSource);
   const kitApplicationMismatch = kit !== null
     && kit !== undefined
     && status !== null
     && !kitBelongsToApplication(kit, applicationId);
 
-  if (!state && kitApplicationMismatch) {
+  const kitStatusValue = sourceStatus(kitSource);
+  const kitSourceReady = kitStatusValue === 'ready';
+  const kitValueMissing = readyKitEnvelopeMissingValue(kitSource);
+  const kitMalformed = kitValueMissing || (kitSourceReady
+    && kit !== null
+    && kit !== undefined
+    && (!isRecord(kit) || kitStatus(kitSource) === null));
+  const directKitMalformed = kitSource !== undefined
+    && kitSource !== null
+    && kitStatusValue === null
+    && (kit === null || kit === undefined || !isRecord(kit) || kitStatus(kitSource) === null);
+  const jdMalformed = jdSource !== undefined
+    && jdSource !== null
+    && !sourceIsAbsent(jdSource)
+    && !sourceIsBlocked(jdSource)
+    && (!jd || !jd.text?.trim() || !isValidId(jd.id));
+  const sourceContractInvalid = kitDeleted
+    || kitStale
+    || kitMalformed
+    || directKitMalformed
+    || kitApplicationMismatch
+    || resumeSourceMalformed
+    || (projectedStateProvided && jdMalformed);
+
+  if (!invalidApplication && !recoveryTruth && !sourceBlocked && sourceContractInvalid) {
     state = 'unavailable';
-    reason = 'material_kit_mismatch';
-  } else if (!state && resumeSourceMalformed) {
-    state = 'unavailable';
-    reason = 'resume_invalid';
+    reason = kitApplicationMismatch
+      ? 'material_kit_mismatch'
+      : resumeSourceMalformed
+        ? 'resume_invalid'
+        : projectedStateProvided && jdMalformed
+          ? 'jd_invalid'
+          : 'material_kit_invalid';
   }
 
   if (!state && sourceIsAbsent(jdSource)) {
@@ -336,16 +409,6 @@ function projectMaterialKitSurfaceUnsafe(input: MaterialKitSurfaceInput): Materi
     state = 'dirty_draft';
   }
 
-  const kitStatusValue = sourceStatus(kitSource);
-  const kitSourceReady = kitStatusValue === 'ready';
-  const kitMalformed = kitSourceReady
-    && kit !== null
-    && kit !== undefined
-    && (!isRecord(kit) || kitStatus(kitSource) === null);
-  const directKitMalformed = kitSource !== undefined
-    && kitSource !== null
-    && kitStatusValue === null
-    && (kit === null || kit === undefined || !isRecord(kit) || kitStatus(kitSource) === null);
   if (!state && (kitMalformed || directKitMalformed || kitApplicationMismatch)) {
     state = 'unavailable';
     reason = kitApplicationMismatch ? 'material_kit_mismatch' : 'material_kit_invalid';

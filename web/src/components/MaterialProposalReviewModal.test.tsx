@@ -68,7 +68,14 @@ const proposal: MaterialRevisionProposal = {
 let root: Root | undefined;
 let container: HTMLDivElement | undefined;
 
-function render(nextProposal: MaterialRevisionProposal = proposal) {
+function render(
+  nextProposal: MaterialRevisionProposal = proposal,
+  writeBlocked = false,
+  ownerProps: {
+    ownerGeneration?: number;
+    onOwnerOperationStateChange?: (state: unknown) => void;
+  } = {},
+) {
   container = document.createElement('div');
   document.body.appendChild(container);
   root = createRoot(container);
@@ -77,6 +84,9 @@ function render(nextProposal: MaterialRevisionProposal = proposal) {
       applicationID={7}
       proposal={nextProposal}
       open
+      writeBlocked={writeBlocked}
+      ownerGeneration={ownerProps.ownerGeneration}
+      onOwnerOperationStateChange={ownerProps.onOwnerOperationStateChange}
       onClose={vi.fn()}
       onAccepted={vi.fn()}
     />,
@@ -119,6 +129,8 @@ describe('MaterialProposalReviewModal', () => {
     expect(view.textContent).toContain('Built APIs');
     expect(view.textContent).toContain('用户断言：I led the migration.');
     expect(view.querySelector<HTMLInputElement>('input[type="checkbox"]')?.checked).toBe(true);
+    expect(view.querySelector<HTMLInputElement>('input[type="checkbox"]')?.getAttribute('aria-label')).toBe('选择此项变更');
+    expect(view.querySelector<HTMLInputElement>('input[type="checkbox"]')?.getAttribute('aria-label')).not.toContain('change-fastapi');
     expect(button(view, '接受选中的修改')?.disabled).toBe(false);
     for (const phrase of knownLegacyFixedPhrases) {
       expect(view.textContent).not.toContain(phrase);
@@ -183,6 +195,18 @@ describe('MaterialProposalReviewModal', () => {
     expect(proposalService.acceptMaterialRevisionProposal).not.toHaveBeenCalled();
   });
 
+  it('blocks both proposal writes while the material owner is unresolved', async () => {
+    const view = render(proposal, true);
+
+    expect(button(view, '接受选中的修改')?.disabled).toBe(true);
+    expect(button(view, '拒绝提案')?.disabled).toBe(true);
+    await act(async () => button(view, '创建派生简历')?.click());
+    await act(async () => button(view, '拒绝提案')?.click());
+
+    expect(proposalService.acceptMaterialRevisionProposal).not.toHaveBeenCalled();
+    expect(proposalService.rejectMaterialRevisionProposal).not.toHaveBeenCalled();
+  });
+
   it('disables stale acceptance after a source conflict', async () => {
     proposalService.acceptMaterialRevisionProposal.mockRejectedValueOnce({
       isAxiosError: true,
@@ -204,5 +228,50 @@ describe('MaterialProposalReviewModal', () => {
 
     expect(view.textContent).toContain('操作未完成，请稍后重试');
     expect(view.textContent).not.toContain('SECRET_RAW_ERROR');
+  });
+
+  it('fails closed without rendering or writing for a malformed source envelope', async () => {
+    const malformed = { ...proposal, source: undefined } as never as MaterialRevisionProposal;
+    const view = render(malformed);
+
+    expect(view.textContent).toContain('提案来源无效，已停止写入');
+    expect(button(view, '接受选中的修改')?.disabled).toBe(true);
+    expect(button(view, '拒绝提案')?.disabled).toBe(true);
+    await act(async () => button(view, '拒绝提案')?.click());
+    expect(proposalService.acceptMaterialRevisionProposal).not.toHaveBeenCalled();
+    expect(proposalService.rejectMaterialRevisionProposal).not.toHaveBeenCalled();
+  });
+
+  it('reports proposal operation identity and generation to the canonical owner', async () => {
+    const ownerStates: unknown[] = [];
+    const view = render(proposal, false, {
+      ownerGeneration: 4,
+      onOwnerOperationStateChange: (state) => ownerStates.push(state),
+    });
+
+    act(() => button(view, '接受选中的修改')?.click());
+    await act(async () => button(view, '创建派生简历')?.click());
+
+    expect(ownerStates).toEqual([
+      expect.objectContaining({
+        applicationID: 7,
+        proposalID: 3,
+        proposalSha256: 'abc',
+        generation: 4,
+        pending: true,
+        resultUnknown: false,
+        sourceConflict: false,
+      }),
+      expect.objectContaining({
+        applicationID: 7,
+        proposalID: 3,
+        proposalSha256: 'abc',
+        generation: 4,
+        pending: false,
+        resultUnknown: false,
+        sourceConflict: false,
+        completed: true,
+      }),
+    ]);
   });
 });

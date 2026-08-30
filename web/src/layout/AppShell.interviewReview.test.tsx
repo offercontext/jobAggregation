@@ -13,12 +13,40 @@ describe('Pilot interview review navigation', () => {
     expect(resolvePilotInterviewReviewIntent(7, 31, [{ ...event, application_id: 8 }])).toEqual({ kind: 'invalid' });
   });
 
-  it('keeps the entry in Application context and focuses the native review flow', () => {
-    expect(pilotCardSource).toContain('onOpenInterviewReview');
-    expect(pilotCardSource).toContain('打开面试复盘');
-    expect(appShellSource).toContain('pilotInterviewReviewApplicationId');
-    expect(appShellSource).toContain('onPilotInterviewReviewFocusConsumed');
-    expect(appShellSource).toContain('onOpenInterviewReview');
+  it('fails closed when an exact event identity is duplicated or contradicted', () => {
+    const event = { id: 31, application_id: 7, event_type: 'interview' as const };
+    const foreign = { ...event, application_id: 8 };
+    const wrongType = { ...event, event_type: 'deadline' as const };
+
+    for (const events of [
+      [event, foreign],
+      [foreign, event],
+      [event, { ...event }],
+      [event, wrongType],
+      [wrongType, event],
+    ]) {
+      expect(resolvePilotInterviewReviewIntent(7, 31, events)).toEqual({ kind: 'invalid' });
+    }
+
+    const hostile = new Proxy(event, { get() { throw new Error('hostile event row'); } });
+    expect(resolvePilotInterviewReviewIntent(7, 31, [event, hostile])).toEqual({ kind: 'invalid' });
+  });
+
+  it('routes exact event cards through the shared controller and application owner', () => {
+    expect(appShellSource).toContain('openExactInterviewTask');
+    expect(appShellSource).toContain('onOpenTask={openExactInterviewTask}');
+    expect(appShellSource).toContain("taskId: 'application.interview_review'");
+    expect(appShellSource).not.toContain('onOpenMockInterview');
+    expect(appShellSource).not.toContain('openMockInterview');
+  });
+
+  it('locks real preparation to the exact event and saved resume before opening the owner', () => {
+    expect(appShellSource).toContain('activeInterviewPreparation');
+    expect(appShellSource).toContain('fixedMode="real"');
+    expect(appShellSource).toContain('generation={activeInterviewPreparation.generation}');
+    expect(appShellSource).toContain('suggestedResumeId');
+    expect(appShellSource).toContain('interviewPreparationSelection');
+    expect(appShellSource).toContain('onLaunchTask={launchTaskFromApplicationDetail}');
   });
 
   it('does not make Pilot call proposal APIs or create cross-domain writes', () => {
@@ -26,5 +54,13 @@ describe('Pilot interview review navigation', () => {
     expect(pilotCardSource).not.toContain('createNote');
     expect(pilotCardSource).not.toContain('createEvent');
     expect(appShellSource).not.toContain('writeInterviewReviewProposal');
+  });
+
+  it('keeps one controller-backed free-practice owner and removes the mock fallback', () => {
+    expect(appShellSource).toContain("ref: { taskId: 'interview.free_practice' }");
+    expect(appShellSource).toContain('onOpenFreePractice={openFreePractice}');
+    expect(appShellSource).toContain("active?.ref.taskId === 'interview.free_practice'");
+    expect(appShellSource).not.toContain("@/components/MockInterviewDrawer");
+    expect(appShellSource).not.toContain('discardMockInterviewAttempt');
   });
 });

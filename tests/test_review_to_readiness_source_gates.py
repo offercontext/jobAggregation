@@ -697,6 +697,51 @@ def _application_event_delete_violations(path: Path, tree: ast.Module) -> list[s
     return violations
 
 
+def _call_terminal(node: ast.Call) -> str | None:
+    if isinstance(node.func, ast.Name):
+        return node.func.id
+    if isinstance(node.func, ast.Attribute):
+        return node.func.attr
+    return None
+
+
+def _is_request_call(node: ast.Call, method: str) -> bool:
+    return (
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr == method
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "request"
+        and not node.args
+        and not node.keywords
+    )
+
+
+def _is_awaited_request_body(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Await)
+        and isinstance(node.value, ast.Call)
+        and _is_request_call(node.value, "body")
+    )
+
+
+def _raw_body_binding(statement: ast.stmt) -> str | None:
+    if (
+        isinstance(statement, ast.Assign)
+        and len(statement.targets) == 1
+        and isinstance(statement.targets[0], ast.Name)
+        and _is_awaited_request_body(statement.value)
+    ):
+        return statement.targets[0].id
+    if (
+        isinstance(statement, ast.AnnAssign)
+        and isinstance(statement.target, ast.Name)
+        and statement.value is not None
+        and _is_awaited_request_body(statement.value)
+    ):
+        return statement.target.id
+    return None
+
+
 def _unsafe_product_action_http_bodies(tree: ast.AST | None) -> list[str]:
     """Reject normalization/coercion before the duplicate-aware raw decoder."""
 
@@ -756,14 +801,109 @@ def _unsafe_product_action_http_bodies(tree: ast.AST | None) -> list[str]:
             child
             for child in ast.walk(node)
             if isinstance(child, ast.Call)
-            and (
-                isinstance(child.func, ast.Name)
-                and child.func.id == RAW_DECODER_NAME
-                or isinstance(child.func, ast.Attribute)
-                and child.func.attr == RAW_DECODER_NAME
-            )
+            and _call_terminal(child) == RAW_DECODER_NAME
         ]
         if body_or_model_parameter or not has_raw_request or len(decoder_calls) != 1:
+            violations.append(f"ui:unsafe-product-action-body:{node.name}")
+            continue
+
+        decoder_call = decoder_calls[0]
+        decoder_statement_index = next(
+            (
+                index
+                for index, statement in enumerate(node.body)
+                if any(child is decoder_call for child in ast.walk(statement))
+            ),
+            None,
+        )
+        if decoder_statement_index is None:
+            violations.append(f"ui:unsafe-product-action-body:{node.name}")
+            continue
+
+        raw_body_sources = {
+            binding: index
+            for index, statement in enumerate(node.body[:decoder_statement_index])
+            if (binding := _raw_body_binding(statement)) is not None
+        }
+        decoder_input = decoder_call.args[0] if decoder_call.args else None
+        bound_input_is_unchanged = False
+        if isinstance(decoder_input, ast.Name) and decoder_input.id in raw_body_sources:
+            source_index = raw_body_sources[decoder_input.id]
+            bound_input_is_unchanged = not any(
+                isinstance(child, ast.Name)
+                and child.id == decoder_input.id
+                and not isinstance(child.ctx, ast.Load)
+                for statement in node.body[source_index + 1 : decoder_statement_index]
+                for child in ast.walk(statement)
+            )
+        decoder_uses_raw_body = (
+            decoder_input is not None
+            and (
+                _is_awaited_request_body(decoder_input)
+                or (
+                    isinstance(decoder_input, ast.Name)
+                    and bound_input_is_unchanged
+                )
+            )
+        )
+        request_body_calls = [
+            child
+            for child in ast.walk(node)
+            if isinstance(child, ast.Call) and _is_request_call(child, "body")
+        ]
+        request_json_calls = [
+            child
+            for child in ast.walk(node)
+            if isinstance(child, ast.Call) and _is_request_call(child, "json")
+        ]
+        calls_before_decoder_are_safe = all(
+            _raw_body_binding(statement) is not None
+            or not any(isinstance(child, ast.Call) for child in ast.walk(statement))
+            for statement in node.body[:decoder_statement_index]
+        )
+
+        decoder_result_name: str | None = None
+        decoder_statement = node.body[decoder_statement_index]
+        if (
+            isinstance(decoder_statement, ast.Assign)
+            and len(decoder_statement.targets) == 1
+            and isinstance(decoder_statement.targets[0], ast.Name)
+            and decoder_statement.value is decoder_call
+        ):
+            decoder_result_name = decoder_statement.targets[0].id
+        elif (
+            isinstance(decoder_statement, ast.AnnAssign)
+            and isinstance(decoder_statement.target, ast.Name)
+            and decoder_statement.value is decoder_call
+        ):
+            decoder_result_name = decoder_statement.target.id
+        decoder_result_is_unchanged = decoder_result_name is not None and not any(
+            isinstance(child, ast.Name)
+            and child.id == decoder_result_name
+            and not isinstance(child.ctx, ast.Load)
+            for statement in node.body[decoder_statement_index + 1 :]
+            for child in ast.walk(statement)
+        )
+        result_used_by_business = decoder_result_name is not None and any(
+            isinstance(call, ast.Call)
+            and any(
+                isinstance(child, ast.Name)
+                and child.id == decoder_result_name
+                and isinstance(child.ctx, ast.Load)
+                for argument in (*call.args, *(item.value for item in call.keywords))
+                for child in ast.walk(argument)
+            )
+            for statement in node.body[decoder_statement_index + 1 :]
+            for call in ast.walk(statement)
+        )
+        if (
+            not decoder_uses_raw_body
+            or len(request_body_calls) != 1
+            or request_json_calls
+            or not calls_before_decoder_are_safe
+            or not decoder_result_is_unchanged
+            or not result_used_by_business
+        ):
             violations.append(f"ui:unsafe-product-action-body:{node.name}")
     return violations
 
@@ -1821,6 +1961,17 @@ async def decide(operation_id: str, request: Request):
     )
     assert _unsafe_product_action_http_bodies(safe) == []
 
+    safe_bound_body = ast.parse(
+        '''
+@router.patch("/api/product-actions/{operation_id}/decisions")
+async def decide(operation_id: str, request: Request):
+    raw_body = await request.body()
+    payload = decode_product_action_request_v1(raw_body, contract="decision")
+    return service.decide(operation_id, payload)
+'''
+    )
+    assert _unsafe_product_action_http_bodies(safe_bound_body) == []
+
     coerced_dict = ast.parse(
         '''
 @router.post("/api/product-actions/{operation_id}/decisions")
@@ -1853,6 +2004,83 @@ async def propose(note_id: int, request: Request):
     )
     assert _unsafe_product_action_http_bodies(missing_decoder) == [
         "ui:unsafe-product-action-body:propose"
+    ]
+
+    forged_decoder_input = ast.parse(
+        '''
+@router.post("/api/product-actions/{operation_id}/decisions")
+async def decide(operation_id: str, request: Request):
+    payload = decode_product_action_request_v1(b"{}", contract="decision")
+    return service.decide(operation_id, payload)
+'''
+    )
+    assert _unsafe_product_action_http_bodies(forged_decoder_input) == [
+        "ui:unsafe-product-action-body:decide"
+    ]
+
+    parsed_before_raw_decode = ast.parse(
+        '''
+@router.post("/api/product-actions/{operation_id}/decisions")
+async def decide(operation_id: str, request: Request):
+    await request.json()
+    payload = decode_product_action_request_v1(await request.body(), contract="decision")
+    return service.decide(operation_id, payload)
+'''
+    )
+    assert _unsafe_product_action_http_bodies(parsed_before_raw_decode) == [
+        "ui:unsafe-product-action-body:decide"
+    ]
+
+    business_before_raw_decode = ast.parse(
+        '''
+@router.post("/api/product-actions/{operation_id}/decisions")
+async def decide(operation_id: str, request: Request):
+    operation_id = normalize_operation_id(operation_id)
+    payload = decode_product_action_request_v1(await request.body(), contract="decision")
+    return service.decide(operation_id, payload)
+'''
+    )
+    assert _unsafe_product_action_http_bodies(business_before_raw_decode) == [
+        "ui:unsafe-product-action-body:decide"
+    ]
+
+    ignored_decoder_result = ast.parse(
+        '''
+@router.post("/api/product-actions/{operation_id}/decisions")
+async def decide(operation_id: str, request: Request):
+    payload = decode_product_action_request_v1(await request.body(), contract="decision")
+    return service.decide(operation_id, {})
+'''
+    )
+    assert _unsafe_product_action_http_bodies(ignored_decoder_result) == [
+        "ui:unsafe-product-action-body:decide"
+    ]
+
+    overwritten_raw_body = ast.parse(
+        '''
+@router.post("/api/product-actions/{operation_id}/decisions")
+async def decide(operation_id: str, request: Request):
+    raw_body = await request.body()
+    raw_body = b"{}"
+    payload = decode_product_action_request_v1(raw_body, contract="decision")
+    return service.decide(operation_id, payload)
+'''
+    )
+    assert _unsafe_product_action_http_bodies(overwritten_raw_body) == [
+        "ui:unsafe-product-action-body:decide"
+    ]
+
+    overwritten_decoder_result = ast.parse(
+        '''
+@router.post("/api/product-actions/{operation_id}/decisions")
+async def decide(operation_id: str, request: Request):
+    payload = decode_product_action_request_v1(await request.body(), contract="decision")
+    payload = {}
+    return service.decide(operation_id, payload)
+'''
+    )
+    assert _unsafe_product_action_http_bodies(overwritten_decoder_result) == [
+        "ui:unsafe-product-action-body:decide"
     ]
 
 

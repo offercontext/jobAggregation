@@ -6,10 +6,10 @@ import hmac
 import re
 from dataclasses import dataclass, fields
 from types import SimpleNamespace
-from typing import Any, Literal, cast
+from typing import Any, Literal, NoReturn, SupportsIndex, cast
 
 from sqlalchemy import text
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session, sessionmaker
 
 from offerpilot.ai.write_operations import payload_from_operation
@@ -137,6 +137,84 @@ class ProductActionPublicationV1:
     bundle: ProductActionBundleV1 | None = None
 
 
+_PUBLICATION_UOW_CONSTRUCTION_SEAL = object()
+
+
+class ProductActionPublicationUoWV1:
+    """Opaque evidence for one Repository-issued BEGIN IMMEDIATE transaction."""
+
+    __slots__ = (
+        "_repository",
+        "_session",
+        "_transaction",
+        "_driver_connection",
+        "_seal",
+    )
+    _repository: object
+    _session: Session
+    _transaction: object
+    _driver_connection: object
+    _seal: tuple[object, Session, object, object]
+
+    def __new__(
+        cls,
+        construction_seal: object | None = None,
+        *_args: object,
+        **_kwargs: object,
+    ) -> ProductActionPublicationUoWV1:
+        if construction_seal is not _PUBLICATION_UOW_CONSTRUCTION_SEAL:
+            raise TypeError("Product Action publication UoW is Repository-issued")
+        return object.__new__(cls)
+
+    def __init__(
+        self,
+        construction_seal: object | None = None,
+        repository: object | None = None,
+        session: Session | None = None,
+        transaction: object | None = None,
+        driver_connection: object | None = None,
+    ) -> None:
+        if construction_seal is not _PUBLICATION_UOW_CONSTRUCTION_SEAL or any(
+            value is None
+            for value in (repository, session, transaction, driver_connection)
+        ):
+            raise TypeError("Product Action publication UoW is Repository-issued")
+        object.__setattr__(self, "_repository", repository)
+        object.__setattr__(self, "_session", session)
+        object.__setattr__(self, "_transaction", transaction)
+        object.__setattr__(self, "_driver_connection", driver_connection)
+        object.__setattr__(
+            self,
+            "_seal",
+            (repository, session, transaction, driver_connection),
+        )
+
+    def __setattr__(self, name: str, value: object) -> NoReturn:
+        del name, value
+        raise AttributeError("Product Action publication UoW is sealed")
+
+    def __repr__(self) -> str:
+        return "<ProductActionPublicationUoWV1>"
+
+    @staticmethod
+    def _serialization_error() -> NoReturn:
+        raise TypeError("Product Action publication UoW cannot be copied or serialized")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> NoReturn:
+        del protocol
+        self._serialization_error()
+
+    def __getstate__(self) -> NoReturn:
+        self._serialization_error()
+
+    def __copy__(self) -> NoReturn:
+        self._serialization_error()
+
+    def __deepcopy__(self, memo: dict[int, object]) -> NoReturn:
+        del memo
+        self._serialization_error()
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class _RawBundleRows:
     operation: dict[str, Any] | None
@@ -148,6 +226,10 @@ class _PublicationUnresolved(RuntimeError):
     def __init__(self, result: ProductActionPublicationV1) -> None:
         self.result = result
         super().__init__(result.classification)
+
+
+class _PublicationCommitUnknown(RuntimeError):
+    pass
 
 
 _OPERATION_COLUMNS = tuple(field.name for field in fields(ProductActionOperationSnapshotV1))
@@ -187,27 +269,80 @@ class ProductActionProposalRepository:
             return HistoricalStoryRouteProof
         return ProductActionRouteProof
 
-    @staticmethod
-    def _require_publication_uow(session: Session) -> None:
-        if not session.in_transaction():
+    def begin_publication_uow(self, session: Session) -> ProductActionPublicationUoWV1:
+        """Acquire BEGIN IMMEDIATE while leaving commit/rollback to the caller."""
+
+        if not isinstance(session, Session) or session.in_transaction():
             raise ProductActionContractError("publication_uow_required")
-        driver_connection = session.connection().connection.driver_connection
-        if getattr(driver_connection, "in_transaction", False) is not True:
+        try:
+            session.execute(text("BEGIN IMMEDIATE"))
+            transaction = session.get_transaction()
+            driver_connection = session.connection().connection.driver_connection
+            if (
+                transaction is None
+                or getattr(transaction, "is_active", False) is not True
+                or getattr(driver_connection, "in_transaction", False) is not True
+            ):
+                raise ProductActionContractError("publication_uow_required")
+            return ProductActionPublicationUoWV1(
+                _PUBLICATION_UOW_CONSTRUCTION_SEAL,
+                self,
+                session,
+                transaction,
+                driver_connection,
+            )
+        except BaseException:
+            try:
+                session.rollback()
+            except BaseException:
+                pass
+            raise
+
+    def _require_publication_uow(
+        self,
+        session: Session,
+        publication_uow: object,
+    ) -> None:
+        if type(publication_uow) is not ProductActionPublicationUoWV1:
             raise ProductActionContractError("publication_uow_required")
+        typed = publication_uow
+        try:
+            sealed = typed._seal
+            if (
+                len(sealed) != 4
+                or sealed[0] is not typed._repository
+                or sealed[1] is not typed._session
+                or sealed[2] is not typed._transaction
+                or sealed[3] is not typed._driver_connection
+                or typed._repository is not self
+                or typed._session is not session
+                or session.get_transaction() is not typed._transaction
+                or getattr(typed._transaction, "is_active", False) is not True
+            ):
+                raise ProductActionContractError("publication_uow_required")
+            driver_connection = session.connection().connection.driver_connection
+            if (
+                driver_connection is not typed._driver_connection
+                or getattr(driver_connection, "in_transaction", False) is not True
+            ):
+                raise ProductActionContractError("publication_uow_required")
+        except (AttributeError, TypeError) as exc:
+            raise ProductActionContractError("publication_uow_required") from exc
 
     def publish_bundle_in_session(
         self,
         session: Session,
+        publication_uow: ProductActionPublicationUoWV1,
         prepared: PreparedProductActionProposalV1,
     ) -> ProductActionPublicationV1:
         """Join a caller-owned BEGIN IMMEDIATE UoW without ending its transaction."""
 
+        self._require_publication_uow(session, publication_uow)
         validate_prepared_product_action(
             prepared,
             catalog=self._catalog,
             key_profiles=self._key_profiles,
         )
-        self._require_publication_uow(session)
         with self._proof_registry.claim(
             prepared.route_proof,
             proof_type=self._route_proof_type(prepared),
@@ -219,6 +354,7 @@ class ProductActionProposalRepository:
     def publish_historical_story_bridge_in_session(
         self,
         session: Session,
+        publication_uow: ProductActionPublicationUoWV1,
         *,
         issuer: InterviewStoryActionIssuer,
         route_payload_raw: bytes,
@@ -226,7 +362,7 @@ class ProductActionProposalRepository:
     ) -> ProductActionPublicationV1:
         """Validate a pre-0029 ready Attempt under the caller's write lock."""
 
-        self._require_publication_uow(session)
+        self._require_publication_uow(session, publication_uow)
         if (
             type(issuer) is not InterviewStoryActionIssuer
             or issuer._catalog is not self._catalog
@@ -309,7 +445,7 @@ class ProductActionProposalRepository:
                 proof=proof,
                 binding=binding,
             )
-            return self.publish_bundle_in_session(session, prepared)
+            return self.publish_bundle_in_session(session, publication_uow, prepared)
         except BaseException:
             try:
                 self._proof_registry.revoke(proof)
@@ -335,7 +471,7 @@ class ProductActionProposalRepository:
             ):
                 try:
                     return self._publish_once(prepared)
-                except OperationalError:
+                except _PublicationCommitUnknown:
                     first = self.reconcile_publication(prepared)
                     if first.classification in {"exact_proposed", "exact_terminal"}:
                         return first
@@ -343,7 +479,7 @@ class ProductActionProposalRepository:
                         raise _PublicationUnresolved(first)
                     try:
                         return self._publish_once(prepared)
-                    except OperationalError:
+                    except _PublicationCommitUnknown:
                         final = self.reconcile_publication(prepared)
                         if final.classification in {"exact_proposed", "exact_terminal"}:
                             return final
@@ -357,12 +493,18 @@ class ProductActionProposalRepository:
     ) -> ProductActionPublicationV1:
         with self.session_factory() as session:
             try:
-                session.execute(text("BEGIN IMMEDIATE"))
+                self.begin_publication_uow(session)
                 result = self._publish_bundle_in_session_unclaimed(session, prepared)
-                session.commit()
+                try:
+                    session.commit()
+                except DBAPIError as exc:
+                    raise _PublicationCommitUnknown from exc
                 return result
             except BaseException:
-                session.rollback()
+                try:
+                    session.rollback()
+                except BaseException:
+                    pass
                 raise
 
     def _publish_bundle_in_session_unclaimed(
@@ -447,62 +589,57 @@ class ProductActionProposalRepository:
             key_profiles=self._key_profiles,
             require_route_proof=False,
         )
-        try:
-            with self.session_factory() as session:
+        with self.session_factory() as session:
+            try:
                 rows = self._load_rows(session, prepared.operation_id)
-                classification = self._classify_rows(rows)
-                if classification == "all_absent":
-                    return ProductActionPublicationV1(
-                        "all_absent",
-                        prepared.operation_id,
-                        prepared.action_call_id,
-                        None,
-                        False,
-                    )
-                bundle = self._validated_bundle(rows, expected=prepared)
-                return self._publication_from_bundle(prepared, bundle, created=False)
-        except ProductActionIntegrityError:
-            raise
-        except OperationalError:
-            return ProductActionPublicationV1(
-                "unreadable",
-                prepared.operation_id,
-                prepared.action_call_id,
-                None,
-                False,
-            )
+            except DBAPIError:
+                return ProductActionPublicationV1(
+                    "unreadable",
+                    prepared.operation_id,
+                    prepared.action_call_id,
+                    None,
+                    False,
+                )
+            classification = self._classify_rows(rows)
+            if classification == "all_absent":
+                return ProductActionPublicationV1(
+                    "all_absent",
+                    prepared.operation_id,
+                    prepared.action_call_id,
+                    None,
+                    False,
+                )
+            bundle = self._validated_bundle(rows, expected=prepared)
+            return self._publication_from_bundle(prepared, bundle, created=False)
 
     def load_bundle(self, operation_id: str) -> ProductActionBundleV1:
         normalized = require_product_action_uuid(operation_id, "operation_id")
-        try:
-            with self.session_factory() as session:
+        with self.session_factory() as session:
+            try:
                 rows = self._load_rows(session, normalized)
-                if self._classify_rows(rows) == "all_absent":
-                    raise ProductActionIntegrityError("product_action_bundle_absent")
-                return self._validated_bundle(rows, expected=None)
-        except ProductActionIntegrityError:
-            raise
-        except OperationalError as exc:
-            raise ProductActionIntegrityError("product_action_bundle_unreadable") from exc
+            except DBAPIError as exc:
+                raise ProductActionIntegrityError("product_action_bundle_unreadable") from exc
+            if self._classify_rows(rows) == "all_absent":
+                raise ProductActionIntegrityError("product_action_bundle_absent")
+            return self._validated_bundle(rows, expected=None)
 
     def load_bundle_in_session(
         self,
         session: Session,
+        publication_uow: ProductActionPublicationUoWV1,
         operation_id: str,
     ) -> ProductActionBundleV1:
         """Load and validate the exact bundle inside a caller-owned writer UoW."""
 
         normalized = require_product_action_uuid(operation_id, "operation_id")
-        self._require_publication_uow(session)
+        self._require_publication_uow(session, publication_uow)
         try:
             rows = self._load_rows(session, normalized)
-            if self._classify_rows(rows) == "all_absent":
-                raise ProductActionIntegrityError("product_action_bundle_absent")
-            return self._validated_bundle(rows, expected=None)
-        except ProductActionIntegrityError:
-            raise
-        except OperationalError as exc:
+        except DBAPIError as exc:
             raise ProductActionIntegrityError("product_action_bundle_unreadable") from exc
+        if self._classify_rows(rows) == "all_absent":
+            raise ProductActionIntegrityError("product_action_bundle_absent")
+        return self._validated_bundle(rows, expected=None)
 
     def _load_rows(self, session: Session, operation_id: str) -> _RawBundleRows:
         # Explicit SQL is intentional: publication verification must not trust the
@@ -963,5 +1100,6 @@ __all__ = [
     "ProductActionOperationSnapshotV1",
     "ProductActionProposalRepository",
     "ProductActionPublicationV1",
+    "ProductActionPublicationUoWV1",
     "ProductActionRouteSnapshotV1",
 ]

@@ -6,7 +6,8 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import select, text
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import DatabaseError, OperationalError
+from sqlalchemy.orm import Session
 
 from offerpilot.ai.write_operations import (
     LedgerKeyDomain,
@@ -21,7 +22,6 @@ from offerpilot.models import (
 )
 from offerpilot.product_actions.catalog import ProductActionCatalogV1
 from offerpilot.product_actions.contracts import (
-    HistoricalStoryRouteProof,
     ProductActionContractError,
     ProductActionIntegrityError,
     ProductActionProofRegistryV1,
@@ -31,7 +31,10 @@ from offerpilot.product_actions.issuer import (
     LedgerKeyProfileStoreV1,
     ReviewReadinessActionIssuer,
 )
-from offerpilot.product_actions.repository import ProductActionProposalRepository
+from offerpilot.product_actions.repository import (
+    ProductActionProposalRepository,
+    ProductActionPublicationUoWV1,
+)
 from tests.product_actions.conftest import (
     KEY_ONE,
     KEY_TWO,
@@ -190,11 +193,11 @@ def test_session_bound_publication_joins_caller_uow_and_never_commits_or_rolls_b
     _insert_historical_ready_attempt(product_database)
 
     with product_database() as session:
-        session.execute(text("BEGIN IMMEDIATE"))
+        publication_uow = repository.begin_publication_uow(session)
         attempt = session.get(InterviewStoryProposalAttempt, 51)
         assert attempt is not None
         attempt.failure_category = "caller-uow-marker"
-        result = repository.publish_bundle_in_session(session, prepared)
+        result = repository.publish_bundle_in_session(session, publication_uow, prepared)
         assert result.created is True
         assert session.in_transaction()
         assert session.get(WriteOperation, prepared.operation_id) is not None
@@ -216,14 +219,40 @@ def test_session_bound_publication_requires_caller_owned_transaction_before_sql(
 
     with product_database() as session:
         with pytest.raises(ProductActionContractError, match="publication_uow_required"):
-            repository.publish_bundle_in_session(session, prepared)
+            repository.publish_bundle_in_session(session, object(), prepared)
 
-    fresh = issuer.prepare(route_payload_raw=raw_json(signal_route()))
     with product_database() as session, session.begin():
         with pytest.raises(ProductActionContractError, match="publication_uow_required"):
-            repository.publish_bundle_in_session(session, fresh)
+            repository.begin_publication_uow(session)
 
     assert repository.reconcile_publication(prepared).classification == "all_absent"
+
+
+def test_publication_uow_is_issued_only_after_begin_immediate_and_is_session_transaction_bound(
+    product_database: Any,
+    product_core: tuple[object, ...],
+) -> None:
+    repository, issuer = _repository(product_database, product_core)
+    prepared = issuer.prepare(route_payload_raw=raw_json(signal_route()))
+    with pytest.raises(TypeError, match="Repository-issued"):
+        ProductActionPublicationUoWV1()
+
+    with product_database() as session:
+        publication_uow = repository.begin_publication_uow(session)
+        with product_database() as competing:
+            competing.connection().exec_driver_sql("PRAGMA busy_timeout=1")
+            with pytest.raises(OperationalError):
+                competing.execute(text("BEGIN IMMEDIATE"))
+            with pytest.raises(ProductActionContractError, match="publication_uow_required"):
+                repository.load_bundle_in_session(
+                    competing,
+                    publication_uow,
+                    prepared.operation_id,
+                )
+        repository.publish_bundle_in_session(session, publication_uow, prepared)
+        session.rollback()
+        with pytest.raises(ProductActionContractError, match="publication_uow_required"):
+            repository.publish_bundle_in_session(session, publication_uow, prepared)
 
 
 def test_session_bound_load_reuses_caller_writer_session_and_full_integrity_validation(
@@ -235,8 +264,12 @@ def test_session_bound_load_reuses_caller_writer_session_and_full_integrity_vali
     repository.publish_bundle(prepared)
 
     with product_database() as session:
-        session.execute(text("BEGIN IMMEDIATE"))
-        loaded = repository.load_bundle_in_session(session, prepared.operation_id)
+        publication_uow = repository.begin_publication_uow(session)
+        loaded = repository.load_bundle_in_session(
+            session,
+            publication_uow,
+            prepared.operation_id,
+        )
         assert loaded.classification == "exact_proposed"
         assert loaded.transition_prefix == ((1, "proposed"),)
         assert session.in_transaction()
@@ -244,7 +277,7 @@ def test_session_bound_load_reuses_caller_writer_session_and_full_integrity_vali
 
     with product_database() as session, session.begin():
         with pytest.raises(ProductActionContractError, match="publication_uow_required"):
-            repository.load_bundle_in_session(session, prepared.operation_id)
+            repository.load_bundle_in_session(session, object(), prepared.operation_id)
 
 
 def test_historical_story_bridge_requires_locked_exact_legacy_ready_attempt_and_baseline_token(
@@ -270,9 +303,10 @@ def test_historical_story_bridge_requires_locked_exact_legacy_ready_attempt_and_
 
     _insert_historical_ready_attempt(product_database)
     with product_database() as session:
-        session.execute(text("BEGIN IMMEDIATE"))
+        publication_uow = repository.begin_publication_uow(session)
         result = repository.publish_historical_story_bridge_in_session(
             session,
+            publication_uow,
             issuer=story_issuer,
             route_payload_raw=route,
             legacy_confirmation_token="legacy_token_0001",
@@ -282,9 +316,7 @@ def test_historical_story_bridge_requires_locked_exact_legacy_ready_attempt_and_
         assert result.bundle is not None
         assert result.bundle.route.request_origin == "historical_story_bridge"
         assert result.bundle.route.historical_request_token_fingerprint is not None
-        assert {
-            record.proof_type for record in registry._records.values()  # type: ignore[attr-defined]
-        } == {HistoricalStoryRouteProof}
+        assert registry._records == {}  # type: ignore[attr-defined]
         session.rollback()
 
 
@@ -321,10 +353,11 @@ def test_historical_story_bridge_rejects_every_non_baseline_attempt_or_token_bef
         session.commit()
 
     with product_database() as session:
-        session.execute(text("BEGIN IMMEDIATE"))
+        publication_uow = repository.begin_publication_uow(session)
         with pytest.raises(ProductActionContractError, match="historical_story_bridge"):
             repository.publish_historical_story_bridge_in_session(
                 session,
+                publication_uow,
                 issuer=story_issuer,  # type: ignore[arg-type]
                 route_payload_raw=raw_json(story_route(product_action_generation=1)),
                 legacy_confirmation_token=token,
@@ -648,6 +681,53 @@ def test_unreadable_reconciliation_is_bounded_and_never_generates_a_new_key(
     assert profiles.active().key_id == active_before  # type: ignore[attr-defined]
 
 
+def test_non_operational_dbapi_commit_unknown_reconciles_at_the_commit_boundary(
+    product_database: Any,
+    product_core: tuple[object, ...],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, issuer = _repository(product_database, product_core)
+    prepared = issuer.prepare(route_payload_raw=raw_json(signal_route()))
+    original_commit = Session.commit
+    commit_calls = 0
+
+    def commit_then_lose_response(session: Session) -> None:
+        nonlocal commit_calls
+        commit_calls += 1
+        original_commit(session)
+        raise DatabaseError("COMMIT", {}, RuntimeError("lost response"))
+
+    monkeypatch.setattr(Session, "commit", commit_then_lose_response)
+
+    result = repository.publish_bundle(prepared)
+
+    assert result.classification == "exact_proposed"
+    assert result.created is False
+    assert commit_calls == 1
+
+
+def test_non_operational_dbapi_read_is_unreadable_but_contract_errors_propagate(
+    product_database: Any,
+    product_core: tuple[object, ...],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, issuer = _repository(product_database, product_core)
+    prepared = issuer.prepare(route_payload_raw=raw_json(signal_route()))
+
+    def unreadable(*_args: object, **_kwargs: object) -> object:
+        raise DatabaseError("SELECT", {}, RuntimeError("unreadable"))
+
+    monkeypatch.setattr(repository, "_load_rows", unreadable)
+    assert repository.reconcile_publication(prepared).classification == "unreadable"
+
+    def contract_failure(*_args: object, **_kwargs: object) -> object:
+        raise ProductActionContractError("deliberate_contract_failure")
+
+    monkeypatch.setattr(repository, "_load_rows", contract_failure)
+    with pytest.raises(ProductActionContractError, match="deliberate_contract_failure"):
+        repository.reconcile_publication(prepared)
+
+
 def test_restart_recovery_uses_stored_key_after_rotation_and_missing_profile_fails_closed(
     product_database: Any,
     product_core: tuple[object, ...],
@@ -710,7 +790,7 @@ def test_publication_cleanup_propagates_baseexception_and_revokes_route_proof(
     monkeypatch.setattr(repository, "_publish_once", interrupted)
     with pytest.raises(KeyboardInterrupt):
         repository.publish_bundle(prepared)
-    with pytest.raises(ValueError, match="revoked"):
+    with pytest.raises(ValueError, match="provenance"):
         product_core[1].claim(  # type: ignore[attr-defined]
             prepared.route_proof,
             proof_type=type(prepared.route_proof),
@@ -726,17 +806,17 @@ def test_commit_unknown_all_absent_replays_at_most_once(
 ) -> None:
     repository, issuer = _repository(product_database, product_core)
     prepared = issuer.prepare(route_payload_raw=raw_json(signal_route()))
-    real_publish_once = repository._publish_once  # noqa: SLF001
+    original_commit = Session.commit
     calls = 0
 
-    def first_commit_unknown_then_real(item: object) -> object:
+    def first_commit_unknown_then_real(session: Session) -> None:
         nonlocal calls
         calls += 1
         if calls == 1:
             raise OperationalError("COMMIT", {}, RuntimeError("lost response"))
-        return real_publish_once(item)  # type: ignore[arg-type]
+        original_commit(session)
 
-    monkeypatch.setattr(repository, "_publish_once", first_commit_unknown_then_real)
+    monkeypatch.setattr(Session, "commit", first_commit_unknown_then_real)
 
     result = repository.publish_bundle(prepared)
 
@@ -752,16 +832,17 @@ def test_commit_unknown_exact_bundle_reconciles_in_a_fresh_session_without_repla
 ) -> None:
     repository, issuer = _repository(product_database, product_core)
     prepared = issuer.prepare(route_payload_raw=raw_json(signal_route()))
-    real_publish_once = repository._publish_once  # noqa: SLF001
+    original_commit = Session.commit
     calls = 0
 
-    def commit_then_lose_response(item: object) -> object:
+    def commit_then_lose_response(session: Session) -> None:
         nonlocal calls
         calls += 1
-        real_publish_once(item)  # type: ignore[arg-type]
-        raise OperationalError("COMMIT", {}, RuntimeError("lost response"))
+        original_commit(session)
+        if calls == 1:
+            raise OperationalError("COMMIT", {}, RuntimeError("lost response"))
 
-    monkeypatch.setattr(repository, "_publish_once", commit_then_lose_response)
+    monkeypatch.setattr(Session, "commit", commit_then_lose_response)
 
     result = repository.publish_bundle(prepared)
 

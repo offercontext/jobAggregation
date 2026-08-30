@@ -741,18 +741,22 @@ class ProductActionProofRegistryV1:
         proof: ProductActionProof,
         state: Literal["consumed", "revoked"],
     ) -> None:
-        record = self._record(proof)
         with self._lock:
+            record = self._record(proof)
             if record.state != "in_flight":
                 raise ValueError(f"Product Action proof is {record.state}")
             record.state = state
+            if self._records.pop(id(proof), None) is not record:
+                raise ValueError("Product Action proof Registry integrity drift")
 
     def revoke(self, proof: object) -> None:
-        record = self._record(proof)
         with self._lock:
+            record = self._record(proof)
             if record.state not in {"issued", "in_flight"}:
                 raise ValueError(f"Product Action proof is {record.state}")
             record.state = "revoked"
+            if self._records.pop(id(proof), None) is not record:
+                raise ValueError("Product Action proof Registry integrity drift")
 
 
 __all__ = [

@@ -13,10 +13,12 @@ from pathlib import Path
 import pytest
 
 import offerpilot.product_actions.issuer as issuer_module
+from offerpilot.ai.write_operations import LedgerKeyDomain
 from offerpilot.product_actions.contracts import (
     HistoricalStoryRouteProof,
     ProductActionContractError,
     ProductActionExecutionAuthorization,
+    ProductActionIntegrityError,
     ProductActionProofRegistryV1,
     ProductActionRouteProof,
     RejectionOnlyRecoveryProof,
@@ -25,6 +27,7 @@ from offerpilot.product_actions.contracts import (
     decode_product_action_route_payload,
     tagged_optional,
 )
+from offerpilot.product_actions.issuer import LedgerKeyProfileStoreV1
 from tests.product_actions.conftest import raw_json, signal_route, story_route
 
 
@@ -358,9 +361,10 @@ def test_identity_goldens_are_exact_across_fresh_processes_hash_seeds_and_sqlite
             ))
             session.commit()
         with sessions() as session:
-            session.execute(text("BEGIN IMMEDIATE"))
+            publication_uow = repository.begin_publication_uow(session)
             published = repository.publish_historical_story_bridge_in_session(
                 session,
+                publication_uow,
                 issuer=story_issuer,
                 route_payload_raw=raw_json(story_route(product_action_generation=1)),
                 legacy_confirmation_token="legacy_token_0001",
@@ -429,6 +433,24 @@ def test_raw_server_token_never_appears_in_repr_or_safe_identity_projection(
     assert prepared.confirmation_token not in repr(prepared)
     assert prepared.confirmation_token not in repr(profiles)
     assert prepared.confirmation_token not in json.dumps(prepared.identity_projection())
+
+
+def test_key_profile_store_uses_an_immutable_mapping_and_seals_profile_content() -> None:
+    profile = LedgerKeyDomain(
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        b"a" * 32,
+    )
+    profiles = LedgerKeyProfileStoreV1((profile,), active_key_id=profile.key_id)
+
+    with pytest.raises(TypeError):
+        profiles._profiles[profile.key_id] = LedgerKeyDomain(  # type: ignore[attr-defined,index]
+            profile.key_id,
+            b"b" * 32,
+        )
+
+    object.__setattr__(profile, "secret", b"b" * 32)
+    with pytest.raises(ProductActionIntegrityError, match="key_profile_store_integrity"):
+        profiles.active()
 
 
 def test_generation_revision_and_product_action_generation_are_distinct_identity_inputs(
@@ -536,7 +558,7 @@ def test_proof_registry_rejects_cross_container_owner_source_action_union_reuse_
                 action_name="save_review_readiness_signal",
                 expected_binding=binding,
             )
-    with pytest.raises(ValueError, match="consumed"):
+    with pytest.raises(ValueError, match="provenance"):
         registry.claim(
             proof,
             proof_type=ProductActionRouteProof,
@@ -555,7 +577,7 @@ def test_proof_registry_rejects_cross_container_owner_source_action_union_reuse_
         action_name="save_review_readiness_signal",
         binding=binding,
     )
-    with pytest.raises(ValueError, match="revoked"):
+    with pytest.raises(ValueError, match="provenance"):
         registry.claim(
             second,
             proof_type=ProductActionRouteProof,
@@ -588,13 +610,48 @@ def test_base_exception_revokes_in_flight_proof() -> None:
             expected_binding=binding,
         ):
             raise KeyboardInterrupt
-    with pytest.raises(ValueError, match="revoked"):
+    with pytest.raises(ValueError, match="provenance"):
         registry.claim(
             proof,
             proof_type=ProductActionRouteProof,
             action_name="confirm_interview_story",
             expected_binding=binding,
         )
+
+
+def test_terminal_proof_records_are_removed_without_permitting_reuse_or_cross_registry_use() -> None:
+    registry = ProductActionProofRegistryV1()
+    foreign = ProductActionProofRegistryV1()
+    binding = ("owner", 1)
+    consumed = registry._issue(  # noqa: SLF001 - lifecycle cleanup contract
+        ProductActionRouteProof,
+        action_name="confirm_interview_story",
+        binding=binding,
+    )
+    revoked = registry._issue(  # noqa: SLF001 - lifecycle cleanup contract
+        ProductActionRouteProof,
+        action_name="confirm_interview_story",
+        binding=binding,
+    )
+
+    with registry.claim(
+        consumed,
+        proof_type=ProductActionRouteProof,
+        action_name="confirm_interview_story",
+        expected_binding=binding,
+    ):
+        pass
+    registry.revoke(revoked)
+
+    assert registry._records == {}  # type: ignore[attr-defined]
+    for owner, proof in ((registry, consumed), (registry, revoked), (foreign, consumed)):
+        with pytest.raises(ValueError, match="provenance|consumed|revoked"):
+            owner.claim(
+                proof,
+                proof_type=ProductActionRouteProof,
+                action_name="confirm_interview_story",
+                expected_binding=binding,
+            )
 
 
 def test_signal_and_story_recovery_proof_field_contracts_are_not_nullable_unions() -> None:

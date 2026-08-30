@@ -6,6 +6,7 @@ import hashlib
 import hmac
 from datetime import datetime, timezone
 from threading import RLock
+from types import MappingProxyType
 from typing import Any, Literal, NoReturn, Protocol, SupportsIndex, cast
 from uuid import UUID, uuid5
 
@@ -37,10 +38,14 @@ class LedgerKeyProfileStoreV1:
     """Bounded key-profile lookup; active rotation never rewrites stored identities."""
 
     __slots__ = ("_profiles", "_active_key_id", "_lock", "_integrity_seal")
-    _profiles: dict[str, LedgerKeyDomain]
+    _profiles: MappingProxyType[str, LedgerKeyDomain]
     _active_key_id: str
     _lock: RLock
-    _integrity_seal: tuple[dict[str, LedgerKeyDomain], RLock]
+    _integrity_seal: tuple[
+        MappingProxyType[str, LedgerKeyDomain],
+        tuple[tuple[str, LedgerKeyDomain, str, bytes], ...],
+        RLock,
+    ]
 
     def __init__(
         self,
@@ -64,10 +69,19 @@ class LedgerKeyProfileStoreV1:
         if active not in normalized:
             raise ProductActionContractError("missing_active_key_profile")
         lock = RLock()
-        object.__setattr__(self, "_profiles", normalized)
+        immutable_profiles = MappingProxyType(normalized)
+        content_seal = tuple(
+            (key_id, profile, profile.key_id, profile.secret)
+            for key_id, profile in sorted(normalized.items())
+        )
+        object.__setattr__(self, "_profiles", immutable_profiles)
         object.__setattr__(self, "_active_key_id", active)
         object.__setattr__(self, "_lock", lock)
-        object.__setattr__(self, "_integrity_seal", (normalized, lock))
+        object.__setattr__(
+            self,
+            "_integrity_seal",
+            (immutable_profiles, content_seal, lock),
+        )
 
     def __setattr__(self, name: str, value: object) -> NoReturn:
         del name, value
@@ -77,7 +91,16 @@ class LedgerKeyProfileStoreV1:
         return f"<LedgerKeyProfileStoreV1 profiles={len(self._profiles)}>"
 
     def _ensure_integrity(self) -> None:
-        if self._integrity_seal != (self._profiles, self._lock):
+        profiles, content_seal, lock = self._integrity_seal
+        current_content = tuple(
+            (key_id, profile, profile.key_id, profile.secret)
+            for key_id, profile in sorted(self._profiles.items())
+        )
+        if (
+            self._profiles is not profiles
+            or self._lock is not lock
+            or current_content != content_seal
+        ):
             raise ProductActionIntegrityError("key_profile_store_integrity")
         if self._active_key_id not in self._profiles:
             raise ProductActionIntegrityError("missing_key_profile")

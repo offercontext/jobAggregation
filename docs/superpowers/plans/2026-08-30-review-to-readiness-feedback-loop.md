@@ -196,23 +196,30 @@ git commit -m "feat: AI 建立复盘准备闭环数据模型"
 **Files:**
 
 - Modify: `src/offerpilot/repositories/notes.py`
+- Modify: `src/offerpilot/repositories/application_events.py`
 - Modify: `src/offerpilot/repositories/interview_review_proposals.py`
 - Modify: `src/offerpilot/ai/interview_review_proposals.py`
+- Modify: `src/offerpilot/pilot_runtime/compensation.py`
 - Modify: `src/offerpilot/schemas.py`
 - Modify: `src/offerpilot/api.py`
 - Modify: `tests/test_notes_api.py`
+- Modify: `tests/test_events_api.py`
+- Modify: `tests/test_conditional_delete_repositories.py`
 - Modify: `tests/tool_authority/test_scoped_writes.py`
+- Modify: `tests/tool_metadata/test_compensation_registry.py`
 - Modify: `tests/test_interview_review_proposals_repository.py`
 - Modify: `tests/test_interview_review_proposals_api.py`
+- Modify: `tests/test_review_to_readiness_source_gates.py`
 
 - [ ] **Step 1: Write revision and V2 RED tests**
 
-Cover create revision 1; every content/application/event update increments once and updates timestamp; REST, scoped Agent and bulk paths use the same rule; reads/generation/capture do not increment. Add Provider-before/after races including ABA content restored to identical bytes: generation must reject because revision changed. Historical V1/NULL remains readable but ineligible; every new ready Proposal is V2 with exact source revision.
+Cover create revision 1; every content/application/event update increments once and updates timestamp; REST, scoped Agent and bulk paths use the same rule; reads/generation/capture do not increment. Event hard delete is also a binding write: REST delete, scoped Agent delete, conditional delete and Agent compensation must explicitly unbind every surviving Note through the same revision helper in the same transaction before deleting the Event. Successful delete increments once; missing/cross-scope/predicate mismatch/compensation conflict/rollback and already-unbound Note increment zero. Add an Event `BEFORE DELETE RAISE(ABORT)` rollback case and an AST ownership gate against direct production `ApplicationEvent` deletes outside the approved owner primitive. Add Provider-before/after races including ABA content restored to identical bytes and Event deletion: generation must reject because revision changed or the source Event is missing. Historical V1/NULL remains readable but ineligible; every new ready Proposal is V2 with exact source revision.
 
 - [ ] **Step 2: Verify RED**
 
 ```powershell
-uv run pytest tests/test_notes_api.py tests/tool_authority/test_scoped_writes.py tests/test_interview_review_proposals_repository.py tests/test_interview_review_proposals_api.py -q
+uv run pytest tests/test_notes_api.py tests/test_events_api.py tests/test_conditional_delete_repositories.py tests/tool_authority/test_scoped_writes.py tests/tool_metadata/test_compensation_registry.py tests/test_interview_review_proposals_repository.py tests/test_interview_review_proposals_api.py -q
+uv run pytest tests/test_review_to_readiness_source_gates.py -k "not production_cutover_gate" -q
 ```
 
 - [ ] **Step 3: Centralize the atomic Note update**
@@ -230,6 +237,8 @@ def _revisioned_note_values(values: Mapping[str, object]) -> dict[str, object]:
 
 Do not increment on read-only or downstream writes. Add `content_revision` and `updated_at` to additive API/TypeScript output later without requiring clients to submit them.
 
+Event deletion must not rely on the FK's implicit `ON DELETE SET NULL`, which bypasses revision. Add one Session-bound owner primitive that first performs an `UPDATE interview_notes` restricted by the exact final Event/scope/conditional predicate, sets `application_event_id=NULL` through `_revisioned_note_values(...)`, and then deletes that exact Event under the same writer transaction. REST, scoped Agent, conditional delete and Agent compensation all delegate to it. Because the Note locator is already NULL, the subsequent FK action cannot double-increment. Event DELETE failure rolls the unbind/revision back; direct production Event deletes are mechanically forbidden outside this owner. Do not add a migration trigger.
+
 - [ ] **Step 4: Freeze and recheck Proposal V2 identity**
 
 Before Provider call freeze Note revision and canonical source fingerprint; after Provider returns, the ready write transaction must reload exact Note/Event and compare resource, revision and fingerprint. Persist `proposal_schema_version=2` and `source_note_revision=<frozen revision>` without changing Provider-visible snapshot bytes or proposal JSON shape.
@@ -237,11 +246,12 @@ Before Provider call freeze Note revision and canonical source fingerprint; afte
 - [ ] **Step 5: Verify GREEN and commit**
 
 ```powershell
-uv run pytest tests/test_notes_api.py tests/tool_authority/test_scoped_writes.py tests/test_interview_review_proposals_repository.py tests/test_interview_review_proposals_api.py -q
-uv run ruff check src/offerpilot/repositories/notes.py src/offerpilot/repositories/interview_review_proposals.py src/offerpilot/ai/interview_review_proposals.py src/offerpilot/schemas.py src/offerpilot/api.py
+uv run pytest tests/test_notes_api.py tests/test_events_api.py tests/test_conditional_delete_repositories.py tests/tool_authority/test_scoped_writes.py tests/tool_metadata/test_compensation_registry.py tests/test_interview_review_proposals_repository.py tests/test_interview_review_proposals_api.py -q
+uv run pytest tests/test_review_to_readiness_source_gates.py -k "not production_cutover_gate" -q
+uv run ruff check src/offerpilot/repositories/notes.py src/offerpilot/repositories/application_events.py src/offerpilot/repositories/interview_review_proposals.py src/offerpilot/ai/interview_review_proposals.py src/offerpilot/pilot_runtime/compensation.py src/offerpilot/schemas.py src/offerpilot/api.py
 uv run mypy src
 git diff --check
-git add src/offerpilot/repositories/notes.py src/offerpilot/repositories/interview_review_proposals.py src/offerpilot/ai/interview_review_proposals.py src/offerpilot/schemas.py src/offerpilot/api.py tests/test_notes_api.py tests/tool_authority/test_scoped_writes.py tests/test_interview_review_proposals_repository.py tests/test_interview_review_proposals_api.py
+git add src/offerpilot/repositories/notes.py src/offerpilot/repositories/application_events.py src/offerpilot/repositories/interview_review_proposals.py src/offerpilot/ai/interview_review_proposals.py src/offerpilot/pilot_runtime/compensation.py src/offerpilot/schemas.py src/offerpilot/api.py tests/test_notes_api.py tests/test_events_api.py tests/test_conditional_delete_repositories.py tests/tool_authority/test_scoped_writes.py tests/tool_metadata/test_compensation_registry.py tests/test_interview_review_proposals_repository.py tests/test_interview_review_proposals_api.py tests/test_review_to_readiness_source_gates.py
 git commit -m "feat: AI 版本化面试复盘来源"
 ```
 

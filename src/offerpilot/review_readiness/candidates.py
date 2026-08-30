@@ -171,12 +171,16 @@ def _candidate_from_focus(
     )
 
 
-def project_readiness_candidates(
+def resolve_readiness_candidates(
     note_id: int,
     proposal_id: int,
     session: Session,
 ) -> CandidateProjectionV1:
-    """Project at most eight safe candidates without writing or calling a Provider."""
+    """Resolve every exact V2 candidate without considering confirmed Signals.
+
+    This is the canonical source-integrity resolver shared by candidate listing and
+    downstream Signal projections.  It owns no transaction and has no side effects.
+    """
 
     if type(note_id) is not int or note_id < 1 or type(proposal_id) is not int or proposal_id < 1:
         return CandidateProjectionV1("unavailable", note_id, proposal_id)
@@ -260,24 +264,39 @@ def project_readiness_candidates(
         return CandidateProjectionV1("not_eligible", note_id, proposal_id)
     if not candidates:
         return CandidateProjectionV1("not_eligible", note_id, proposal_id)
+    return CandidateProjectionV1("ready", note_id, proposal_id, candidates)
+
+
+def project_readiness_candidates(
+    note_id: int,
+    proposal_id: int,
+    session: Session,
+) -> CandidateProjectionV1:
+    """Project at most eight unconfirmed candidates without writing or Provider use."""
+
+    resolved = resolve_readiness_candidates(note_id, proposal_id, session)
+    if resolved.state != "ready":
+        return resolved
     confirmed_focuses = set(
         session.scalars(
             select(InterviewReadinessSignal.focus_id).where(
-                InterviewReadinessSignal.source_proposal_id == proposal.id
+                InterviewReadinessSignal.source_proposal_id == proposal_id
             )
         )
     )
     available = tuple(
-        candidate for candidate in candidates if candidate.focus_id not in confirmed_focuses
+        candidate
+        for candidate in resolved.candidates
+        if candidate.focus_id not in confirmed_focuses
     )[:8]
     if not available:
         return CandidateProjectionV1(
             "already_confirmed",
             note_id,
             proposal_id,
-            candidates,
+            resolved.candidates[:8],
         )
     return CandidateProjectionV1("ready", note_id, proposal_id, available)
 
 
-__all__ = ["project_readiness_candidates"]
+__all__ = ["project_readiness_candidates", "resolve_readiness_candidates"]

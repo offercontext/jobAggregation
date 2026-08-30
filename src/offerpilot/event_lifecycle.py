@@ -25,7 +25,7 @@ _EVENT_LIFECYCLE_V1: dict[str, EventLifecycleV1] = {
 
 
 def classify_event_lifecycle_v1(status: object) -> EventLifecycleV1:
-    """Classify only the closed V1 status aliases; never infer from dates."""
+    """Classify the shared V1 alias fixture only; never infer from timestamps."""
 
     if type(status) is not str:
         return "unknown"

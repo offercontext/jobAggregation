@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "contract": "event_lifecycle_v1",
+  "unknown_fallback": "unknown",
   "cases": [
     {"status": "todo", "expected": "scheduled"},
     {"status": "pending", "expected": "scheduled"},

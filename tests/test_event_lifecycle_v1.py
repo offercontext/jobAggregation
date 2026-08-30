@@ -20,10 +20,17 @@ def test_backend_classifier_matches_every_pinned_event_lifecycle_case() -> None:
     fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
 
     assert fixture["contract"] == "event_lifecycle_v1"
+    assert fixture["unknown_fallback"] == "unknown"
     assert [
         classify_event_lifecycle_v1(case["status"])
         for case in fixture["cases"]
     ] == [case["expected"] for case in fixture["cases"]]
+
+
+def test_unknown_fallback_is_pinned_by_the_shared_fixture() -> None:
+    fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
+
+    assert classify_event_lifecycle_v1("not-in-the-fixture") == fixture["unknown_fallback"]
 
 
 @pytest.mark.parametrize(

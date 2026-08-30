@@ -73,6 +73,7 @@ from offerpilot.models import (
 from offerpilot.repositories.json_contract import canonical_json, sha256_text
 from offerpilot.repositories.interview_stories import InterviewStoriesRepository
 from offerpilot.repositories.application_events import _delete_application_event_owned
+from offerpilot.repositories.notes import NoteUpdate, NotesRepository
 from offerpilot.reliability.policy import get_recovery_policy
 from offerpilot.reliability.trace import read_mock_interview_traces
 
@@ -2635,7 +2636,25 @@ def _run_interview_story_http_smoke(
             note = session.get(InterviewNote, seed["note_id"])
             if note is None:
                 raise RuntimeError("story smoke note disappeared")
-            note.questions = "如何排查线上延迟并同步风险？"
+            previous_revision = note.content_revision
+            previous_updated_at = note.updated_at
+            updated_note = NotesRepository(session_factory, session).update(
+                note.id,
+                NoteUpdate(
+                    company=note.company,
+                    position=note.position,
+                    round=note.round,
+                    date=note.date,
+                    questions="如何排查线上延迟并同步风险？",
+                    self_reflection=note.self_reflection,
+                    difficulty_points=note.difficulty_points,
+                    mood=note.mood,
+                ),
+            )
+            if updated_note is None or updated_note.content_revision != previous_revision + 1:
+                raise RuntimeError("story smoke note update did not advance source revision")
+            if updated_note.updated_at <= previous_updated_at:
+                raise RuntimeError("story smoke note update did not advance source timestamp")
             session.commit()
     finally:
         bind = session_factory.kw.get("bind")

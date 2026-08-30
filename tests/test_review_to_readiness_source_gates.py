@@ -514,9 +514,25 @@ def _application_event_delete_violations(path: Path, tree: ast.Module) -> list[s
                 return bool(node.args) and is_event_model(node.args[0])
             if node.func.attr == "scalar":
                 return bool(node.args) and select_targets_event(node.args[0])
+            if node.func.attr in {"scalar_one", "scalar_one_or_none"}:
+                return select_targets_event(node.func.value)
             if node.func.attr in {"first", "one", "one_or_none"}:
                 return query_targets_event(node.func.value)
             return False
+
+        def contains_raw_event_delete(node: ast.Call) -> bool:
+            if not (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"execute", "exec_driver_sql"}
+            ):
+                return False
+            return any(
+                isinstance(child, ast.Constant)
+                and isinstance(child.value, str)
+                and "delete from application_events"
+                in " ".join(child.value.lower().split())
+                for child in ast.walk(node)
+            )
 
         def annotation_targets_event(annotation: ast.expr | None) -> bool:
             return annotation is not None and any(
@@ -610,11 +626,13 @@ def _application_event_delete_violations(path: Path, tree: ast.Module) -> list[s
                 and bool(candidate.args)
                 and is_event_row_source(candidate.args[0])
             )
+            raw_sql_delete = contains_raw_event_delete(candidate)
             if (
                 direct_sql_delete
                 or table_delete
                 or query_delete
                 or orm_delete
+                or raw_sql_delete
             ) and not approved_owner:
                 violations.append(
                     f"{path.relative_to(ROOT).as_posix()}:{candidate.lineno}"
@@ -692,6 +710,348 @@ def _unsafe_product_action_http_bodies(tree: ast.AST | None) -> list[str]:
         ]
         if body_or_model_parameter or not has_raw_request or len(decoder_calls) != 1:
             violations.append(f"ui:unsafe-product-action-body:{node.name}")
+    return violations
+
+
+def _interview_note_mutation_violations(path: Path, tree: ast.Module) -> list[str]:
+    guarded_fields = {
+        "application_event_id",
+        "application_id",
+        "company",
+        "content",
+        "content_revision",
+        "date",
+        "difficulty_points",
+        "mood",
+        "position",
+        "questions",
+        "round",
+        "self_reflection",
+        "updated_at",
+    }
+    scope_types = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+    violations: list[str] = []
+
+    def assigned_names(target: ast.expr) -> set[str]:
+        if isinstance(target, ast.Name):
+            return {target.id}
+        if isinstance(target, ast.Starred):
+            return assigned_names(target.value)
+        if isinstance(target, (ast.List, ast.Tuple)):
+            return {
+                name
+                for element in target.elts
+                for name in assigned_names(element)
+            }
+        return set()
+
+    def assignment_parts(
+        node: ast.AST,
+    ) -> tuple[tuple[ast.expr, ...], ast.expr | None]:
+        if isinstance(node, ast.Assign):
+            return tuple(node.targets), node.value
+        if isinstance(node, ast.AnnAssign):
+            return (node.target,), node.value
+        if isinstance(node, ast.NamedExpr):
+            return (node.target,), node.value
+        return (), None
+
+    class Lineage:
+        def __init__(self, parent: Lineage | None = None) -> None:
+            self.models = set(parent.models) if parent is not None else {"InterviewNote"}
+            self.tables = set(parent.tables) if parent is not None else set()
+            self.queries = set(parent.queries) if parent is not None else set()
+            self.rows = set(parent.rows) if parent is not None else set()
+
+        def discard(self, names: set[str]) -> None:
+            self.models.difference_update(names)
+            self.tables.difference_update(names)
+            self.queries.difference_update(names)
+            self.rows.difference_update(names)
+
+    def local_nodes(scope: ast.AST) -> list[ast.AST]:
+        nodes: list[ast.AST] = []
+        pending = list(ast.iter_child_nodes(scope))
+        while pending:
+            candidate = pending.pop()
+            if isinstance(candidate, scope_types):
+                continue
+            nodes.append(candidate)
+            pending.extend(ast.iter_child_nodes(candidate))
+        return nodes
+
+    def child_scopes(scope: ast.AST) -> list[ast.AST]:
+        children: list[ast.AST] = []
+        pending = list(ast.iter_child_nodes(scope))
+        while pending:
+            candidate = pending.pop()
+            if isinstance(candidate, scope_types):
+                children.append(candidate)
+                continue
+            pending.extend(ast.iter_child_nodes(candidate))
+        return children
+
+    def scope_arguments(scope: ast.AST) -> tuple[ast.arg, ...]:
+        if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            return (
+                *scope.args.posonlyargs,
+                *scope.args.args,
+                *scope.args.kwonlyargs,
+            )
+        return ()
+
+    def local_bindings(scope: ast.AST, nodes: list[ast.AST]) -> set[str]:
+        names = {argument.arg for argument in scope_arguments(scope)}
+        for candidate in nodes:
+            targets, _value = assignment_parts(candidate)
+            names.update(
+                name
+                for target in targets
+                for name in assigned_names(target)
+            )
+            if isinstance(candidate, (ast.For, ast.AsyncFor)):
+                names.update(assigned_names(candidate.target))
+            elif isinstance(candidate, (ast.Import, ast.ImportFrom)):
+                names.update(alias.asname or alias.name.split(".")[0] for alias in candidate.names)
+        names.update(
+            child.name
+            for child in child_scopes(scope)
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        )
+        return names
+
+    def analyze_scope(scope: ast.AST, inherited: Lineage | None) -> None:
+        nodes = local_nodes(scope)
+        lineage = Lineage(inherited)
+        lineage.discard(local_bindings(scope, nodes))
+        for candidate in nodes:
+            if isinstance(candidate, ast.ImportFrom) and candidate.module == "offerpilot.models":
+                lineage.models.update(
+                    alias.asname or alias.name
+                    for alias in candidate.names
+                    if alias.name == "InterviewNote"
+                )
+
+        def is_note_model(node: ast.AST) -> bool:
+            if isinstance(node, ast.Name):
+                return node.id in lineage.models
+            if isinstance(node, ast.Attribute):
+                return node.attr == "InterviewNote"
+            return (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, (ast.Name, ast.Attribute))
+                and (
+                    (isinstance(node.func, ast.Name) and node.func.id == "aliased")
+                    or (isinstance(node.func, ast.Attribute) and node.func.attr == "aliased")
+                )
+                and bool(node.args)
+                and is_note_model(node.args[0])
+            )
+
+        def is_note_table(node: ast.AST) -> bool:
+            if isinstance(node, ast.Name):
+                return node.id in lineage.tables
+            if (
+                isinstance(node, ast.Attribute)
+                and node.attr == "__table__"
+                and is_note_model(node.value)
+            ):
+                return True
+            return (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"alias", "table_valued"}
+                and is_note_table(node.func.value)
+            )
+
+        def query_targets_note(node: ast.AST) -> bool:
+            if isinstance(node, ast.Name) and node.id in lineage.queries:
+                return True
+            return any(
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Attribute)
+                and child.func.attr == "query"
+                and any(is_note_model(argument) for argument in child.args)
+                for child in ast.walk(node)
+            )
+
+        def select_targets_note(node: ast.AST) -> bool:
+            return any(
+                isinstance(child, ast.Call)
+                and isinstance(child.func, (ast.Name, ast.Attribute))
+                and (
+                    (isinstance(child.func, ast.Name) and child.func.id == "select")
+                    or (isinstance(child.func, ast.Attribute) and child.func.attr == "select")
+                )
+                and any(is_note_model(argument) for argument in child.args)
+                for child in ast.walk(node)
+            )
+
+        def annotation_targets_note(annotation: ast.expr | None) -> bool:
+            return annotation is not None and any(
+                is_note_model(child) for child in ast.walk(annotation)
+            )
+
+        def is_note_row_source(node: ast.AST) -> bool:
+            if isinstance(node, ast.Name):
+                return node.id in lineage.rows
+            if not isinstance(node, ast.Call):
+                return False
+            if isinstance(node.func, ast.Name) and node.func.id == "cast":
+                return bool(node.args) and annotation_targets_note(node.args[0])
+            if not isinstance(node.func, ast.Attribute):
+                return False
+            if node.func.attr == "get":
+                return bool(node.args) and is_note_model(node.args[0])
+            if node.func.attr == "scalar":
+                return bool(node.args) and select_targets_note(node.args[0])
+            if node.func.attr in {"scalar_one", "scalar_one_or_none"}:
+                return select_targets_note(node.func.value)
+            if node.func.attr in {"first", "one", "one_or_none"}:
+                return query_targets_note(node.func.value)
+            return False
+
+        lineage.rows.update(
+            argument.arg
+            for argument in scope_arguments(scope)
+            if annotation_targets_note(argument.annotation)
+        )
+        lineage.rows.update(
+            name
+            for candidate in nodes
+            if isinstance(candidate, ast.AnnAssign)
+            and annotation_targets_note(candidate.annotation)
+            for name in assigned_names(candidate.target)
+        )
+
+        changed = True
+        while changed:
+            changed = False
+            for candidate in nodes:
+                targets, value = assignment_parts(candidate)
+                if value is None:
+                    continue
+                names = {
+                    name
+                    for target in targets
+                    for name in assigned_names(target)
+                }
+                target_sets: tuple[tuple[bool, set[str]], ...] = (
+                    (is_note_model(value), lineage.models),
+                    (is_note_table(value), lineage.tables),
+                    (query_targets_note(value), lineage.queries),
+                    (is_note_row_source(value), lineage.rows),
+                )
+                for matches, known_names in target_sets:
+                    if matches and not names.issubset(known_names):
+                        known_names.update(names)
+                        changed = True
+
+        owner = (
+            scope.name
+            if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef))
+            else ""
+        )
+        uses_revision_helper = any(
+            isinstance(candidate, ast.Call)
+            and isinstance(candidate.func, ast.Name)
+            and candidate.func.id == "_revisioned_note_values"
+            for candidate in nodes
+        )
+        approved_sql_owner = uses_revision_helper and (
+            (
+                path.as_posix().endswith("repositories/notes.py")
+                and owner in {"update", "update_note_scoped"}
+            )
+            or (
+                path.as_posix().endswith("repositories/application_events.py")
+                and owner == "_delete_application_event_owned"
+            )
+        )
+
+        def contains_raw_note_update(node: ast.Call) -> bool:
+            if not (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"execute", "exec_driver_sql"}
+            ):
+                return False
+            return any(
+                isinstance(child, ast.Constant)
+                and isinstance(child.value, str)
+                and "update interview_notes"
+                in " ".join(child.value.lower().split())
+                for child in ast.walk(node)
+            )
+
+        for candidate in nodes:
+            mutation = False
+            if isinstance(candidate, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                targets = (
+                    candidate.targets
+                    if isinstance(candidate, ast.Assign)
+                    else [candidate.target]
+                )
+                mutation = any(
+                    isinstance(target, ast.Attribute)
+                    and target.attr in guarded_fields
+                    and is_note_row_source(target.value)
+                    for root_target in targets
+                    for target in ast.walk(root_target)
+                )
+            elif isinstance(candidate, ast.Call):
+                direct_update = (
+                    isinstance(candidate.func, (ast.Name, ast.Attribute))
+                    and (
+                        (isinstance(candidate.func, ast.Name) and candidate.func.id == "update")
+                        or (
+                            isinstance(candidate.func, ast.Attribute)
+                            and candidate.func.attr == "update"
+                        )
+                    )
+                    and bool(candidate.args)
+                    and is_note_model(candidate.args[0])
+                )
+                table_update = (
+                    isinstance(candidate.func, ast.Attribute)
+                    and candidate.func.attr == "update"
+                    and is_note_table(candidate.func.value)
+                )
+                query_update = (
+                    isinstance(candidate.func, ast.Attribute)
+                    and candidate.func.attr == "update"
+                    and query_targets_note(candidate.func.value)
+                )
+                mapping_update = (
+                    isinstance(candidate.func, ast.Attribute)
+                    and candidate.func.attr == "bulk_update_mappings"
+                    and bool(candidate.args)
+                    and is_note_model(candidate.args[0])
+                )
+                setattr_update = (
+                    isinstance(candidate.func, ast.Name)
+                    and candidate.func.id == "setattr"
+                    and len(candidate.args) >= 2
+                    and is_note_row_source(candidate.args[0])
+                    and isinstance(candidate.args[1], ast.Constant)
+                    and candidate.args[1].value in guarded_fields
+                )
+                mutation = (
+                    (direct_update and not approved_sql_owner)
+                    or table_update
+                    or query_update
+                    or mapping_update
+                    or setattr_update
+                    or contains_raw_note_update(candidate)
+                )
+            if mutation:
+                violations.append(
+                    f"{path.relative_to(ROOT).as_posix()}:{candidate.lineno}"
+                )
+
+        for child in child_scopes(scope):
+            analyze_scope(child, lineage)
+
+    analyze_scope(tree, None)
     return violations
 
 
@@ -810,6 +1170,15 @@ def test_application_event_delete_owner_detector_rejects_direct_sql_and_orm_path
         "def delete_event(session):\n"
         "    session.query(ApplicationEvent).filter_by(id=1).delete()\n"
     )
+    execute_scalar_delete = ast.parse(
+        "def delete_event(session):\n"
+        "    row = session.execute(select(ApplicationEvent)).scalar_one()\n"
+        "    session.delete(row)\n"
+    )
+    raw_text_delete = ast.parse(
+        "def delete_event(connection):\n"
+        "    connection.exec_driver_sql('DELETE FROM application_events WHERE id = 1')\n"
+    )
     owner = ast.parse(
         "def _delete_application_event_owned(session):\n"
         "    session.execute(delete(ApplicationEvent))\n"
@@ -823,6 +1192,8 @@ def test_application_event_delete_owner_detector_rejects_direct_sql_and_orm_path
     assert _application_event_delete_violations(arbitrary, assigned_model_alias)
     assert _application_event_delete_violations(arbitrary, table_delete)
     assert _application_event_delete_violations(arbitrary, query_delete)
+    assert _application_event_delete_violations(arbitrary, execute_scalar_delete)
+    assert _application_event_delete_violations(arbitrary, raw_text_delete)
     assert _application_event_delete_violations(approved, owner) == []
 
 
@@ -850,12 +1221,79 @@ def test_application_event_delete_owner_detector_keeps_lineage_in_lexical_scope(
     assert _application_event_delete_violations(arbitrary, interview_note_row) == []
 
 
+def test_interview_note_mutation_detector_requires_revisioned_owners() -> None:
+    direct_content_assignment = ast.parse(
+        "def mutate(session):\n"
+        "    row = session.get(InterviewNote, 1)\n"
+        "    row.questions = 'changed'\n"
+    )
+    direct_binding_assignment = ast.parse(
+        "def mutate(session, row: InterviewNote):\n"
+        "    row.application_event_id = None\n"
+    )
+    direct_bulk_update = ast.parse(
+        "def mutate(session):\n"
+        "    session.execute(update(InterviewNote).values(questions='changed'))\n"
+    )
+    table_update = ast.parse(
+        "def mutate(session):\n"
+        "    session.execute(InterviewNote.__table__.update().values(application_id=1))\n"
+    )
+    query_update = ast.parse(
+        "def mutate(session):\n"
+        "    session.query(InterviewNote).update({'questions': 'changed'})\n"
+    )
+    approved_owner = ast.parse(
+        "def update(session):\n"
+        "    session.execute(\n"
+        "        update(InterviewNote).values(**_revisioned_note_values({'questions': 'changed'}))\n"
+        "    )\n"
+    )
+    unrevisioned_owner = ast.parse(
+        "def update(session):\n"
+        "    session.execute(update(InterviewNote).values(questions='changed'))\n"
+    )
+    arbitrary = ROOT / "src" / "offerpilot" / "other.py"
+    notes_owner = ROOT / "src" / "offerpilot" / "repositories" / "notes.py"
+
+    assert _interview_note_mutation_violations(arbitrary, direct_content_assignment)
+    assert _interview_note_mutation_violations(arbitrary, direct_binding_assignment)
+    assert _interview_note_mutation_violations(arbitrary, direct_bulk_update)
+    assert _interview_note_mutation_violations(arbitrary, table_update)
+    assert _interview_note_mutation_violations(arbitrary, query_update)
+    assert _interview_note_mutation_violations(notes_owner, approved_owner) == []
+    assert _interview_note_mutation_violations(notes_owner, unrevisioned_owner)
+
+
+def test_interview_note_mutation_detector_avoids_read_and_unrelated_writes() -> None:
+    safe = ast.parse(
+        "def inspect(session, other):\n"
+        "    row = session.get(InterviewNote, 1)\n"
+        "    observed = row.questions\n"
+        "    other.questions = 'unrelated'\n"
+        "    created = InterviewNote(questions='new')\n"
+        "    return observed, created\n"
+    )
+    arbitrary = ROOT / "src" / "offerpilot" / "other.py"
+
+    assert _interview_note_mutation_violations(arbitrary, safe) == []
+
+
 def test_application_event_hard_delete_has_one_production_owner() -> None:
     violations = []
     for path in sorted(SRC.rglob("*.py")):
         tree = _parse(path)
         if tree is not None:
             violations.extend(_application_event_delete_violations(path, tree))
+    assert violations == []
+
+
+def test_interview_note_content_mutations_have_revisioned_production_owners() -> None:
+    violations = []
+    for path in sorted(SRC.rglob("*.py")):
+        tree = _parse(path)
+        if tree is not None:
+            violations.extend(_interview_note_mutation_violations(path, tree))
     assert violations == []
 
 

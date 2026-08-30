@@ -1966,7 +1966,7 @@ function AppShellContent() {
         </Content>
       </Layout>
 
-      {view !== 'pilot' && !interviewStudioContext ? (
+      {view !== 'pilot' && !interviewStudioContext && !coreTaskSurfaceState.active ? (
         <HaruDock
           visible={pilotMascotVisible}
           activity={pilotMascotActivity}

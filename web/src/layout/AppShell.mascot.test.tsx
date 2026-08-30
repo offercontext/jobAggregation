@@ -4,9 +4,19 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import AppShell from './AppShell';
 
+const mascotTestState = vi.hoisted(() => ({
+  applications: [] as Array<Record<string, unknown>>,
+}));
+
 vi.mock('@tanstack/react-query', () => ({
   useMutation: () => ({ isPending: false, mutate: vi.fn() }),
-  useQuery: () => ({ data: [], isError: false, isLoading: false, isFetching: false, error: null }),
+  useQuery: (options: { queryKey?: readonly unknown[] }) => ({
+    data: options.queryKey?.[0] === 'applications' ? mascotTestState.applications : [],
+    isError: false,
+    isLoading: false,
+    isFetching: false,
+    error: null,
+  }),
   useQueryClient: () => ({ invalidateQueries: vi.fn() }),
 }));
 vi.mock('@dnd-kit/core', () => ({
@@ -37,7 +47,41 @@ vi.mock('./CommandPalette', () => ({ default: () => <div /> }));
 vi.mock('@/components/AddApplicationForm', () => ({ default: () => <div /> }));
 vi.mock('@/components/ResumeUploadModal', () => ({ default: () => <div /> }));
 vi.mock('@/components/AISettingsDrawer', () => ({ default: () => <div /> }));
-vi.mock('@/components/ApplicationDetail', () => ({ default: () => <div /> }));
+vi.mock('@/components/ApplicationDetail', () => ({
+  default: (props: {
+    taskController?: {
+      getState: () => { active: { generation: number } | null };
+      close: (generation: number) => void;
+      markClosed: (generation: number) => void;
+    };
+    onLaunchTask?: (request: unknown) => void;
+  }) => {
+    const active = props.taskController?.getState().active;
+    return (
+      <div data-testid="application-detail">
+        <button
+          type="button"
+          data-testid="launch-core-task"
+          onClick={() => props.onLaunchTask?.({
+            ref: { taskId: 'application.material_kit', applicationId: 7 },
+            source: 'application_header',
+            focus: 'overview',
+          })}
+        >launch task</button>
+        {active ? (
+          <button
+            type="button"
+            data-testid="close-core-task"
+            onClick={() => {
+              props.taskController?.close(active.generation);
+              props.taskController?.markClosed(active.generation);
+            }}
+          >close task</button>
+        ) : null}
+      </div>
+    );
+  },
+}));
 vi.mock('@/components/KanbanBoard', () => ({ default: () => <div /> }));
 vi.mock('@/components/ApplicationListView', () => ({ default: () => <div /> }));
 vi.mock('@/components/CalendarView', () => ({ default: () => <div /> }));
@@ -49,7 +93,21 @@ vi.mock('@/components/OfferCenterView', () => ({
   ),
 }));
 vi.mock('@/components/ResumeLibraryView', () => ({ default: () => <div /> }));
-vi.mock('@/features/dashboard/DashboardView', () => ({ default: () => <div /> }));
+vi.mock('@/features/dashboard/DashboardView', () => ({
+  default: (props: {
+    applications?: Array<Record<string, unknown>>;
+    onOpenDetailById?: (applicationId: number) => void;
+  }) => (
+    <button
+      type="button"
+      data-testid="open-app-detail"
+      onClick={() => {
+        const application = props.applications?.[0];
+        if (application && typeof application.id === 'number') props.onOpenDetailById?.(application.id);
+      }}
+    >open application</button>
+  ),
+}));
 vi.mock('@/features/reminders/RemindersView', () => ({ default: () => <div /> }));
 vi.mock('@/components/MockInterviewDrawer', () => ({ default: () => <div /> }));
 vi.mock('@/components/OfferNegotiationDrawer', () => ({ default: () => <div /> }));
@@ -205,6 +263,7 @@ describe('AppShell Pilot mascot integration', () => {
     window.history.replaceState(null, '', '/');
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
     localStorage.clear();
+    mascotTestState.applications = [];
     window.matchMedia = vi.fn().mockReturnValue({
       matches: true,
       addEventListener: vi.fn(),
@@ -265,6 +324,35 @@ describe('AppShell Pilot mascot integration', () => {
       xRatio: 0.96,
       yRatio: 0.9,
     });
+  });
+
+  it('removes the contextual Haru hit area while a core task is active, then restores it after close', async () => {
+    mascotTestState.applications = [{
+      id: 7,
+      company_name: 'Example Co.',
+      position_name: 'Engineer',
+      job_url: '',
+      status: 'applied',
+      source: 'manual',
+      notes: '',
+      applied_at: '2026-08-01T00:00:00Z',
+      created_at: '2026-08-01T00:00:00Z',
+      updated_at: '2026-08-01T00:00:00Z',
+    }];
+    await act(async () => root.render(<AppShell />));
+    await flush();
+
+    act(() => host.querySelector<HTMLButtonElement>('[data-testid="open-app-detail"]')?.click());
+    await flush();
+    act(() => host.querySelector<HTMLButtonElement>('[data-testid="launch-core-task"]')?.click());
+    await flush();
+
+    expect(host.querySelector('[data-testid="application-detail"]')).not.toBeNull();
+    expect(host.querySelector('[data-testid="pilot-mascot"]')).toBeNull();
+
+    act(() => host.querySelector<HTMLButtonElement>('[data-testid="close-core-task"]')?.click());
+    await flush();
+    expect(host.querySelector('[data-testid="pilot-mascot"]')).not.toBeNull();
   });
 
   it('keeps one contextual controller mounted and opens its exact completed conversation in Haru', async () => {

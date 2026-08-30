@@ -28,7 +28,7 @@ LIFECYCLE_FIXTURE = FIXTURES / "event_lifecycle_v1.json"
 PREPARATION_FIXTURE = FIXTURES / "interview_preparation_v1_c5a020c.json"
 
 RAW_FIXTURE_SHA256 = {
-    "event_lifecycle_v1.json": "99c8af7f91379e3ed8448a421829bb1dd664bef9526f9f6ecbd0d2057393b6ad",
+    "event_lifecycle_v1.json": "68019d4b67830b4cb1ad197e685a63d50c531ae3c61d75896bf65e8209895a6b",
     "interview_preparation_v1_c5a020c.json": (
         "e6cb81f3251250be03296ab738232731eae67e9a4a19eeaf0a1eb44278a4aaed"
     ),
@@ -110,9 +110,15 @@ def test_review_to_readiness_baseline_is_closed_unique_and_pinned() -> None:
 def test_event_lifecycle_fixture_freezes_all_aliases_and_unknown_types() -> None:
     fixture = _load(LIFECYCLE_FIXTURE)
 
-    assert set(fixture) == {"schema_version", "contract", "cases"}
+    assert set(fixture) == {
+        "schema_version",
+        "contract",
+        "unknown_fallback",
+        "cases",
+    }
     assert fixture["schema_version"] == 1
     assert fixture["contract"] == "event_lifecycle_v1"
+    assert fixture["unknown_fallback"] == "unknown"
     assert all(set(case) == {"status", "expected"} for case in fixture["cases"])
     assert tuple((case["status"], case["expected"]) for case in fixture["cases"]) == (
         EXPECTED_LIFECYCLE_CASES

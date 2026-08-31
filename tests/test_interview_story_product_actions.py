@@ -2557,12 +2557,12 @@ def test_rejected_story_generation_requires_explicit_n_plus_one_and_rotates_toke
     assert refused_after_confirm.status_code == 409
 
 
-def test_n_plus_one_compat_confirm_accepts_public_client_evidence_aliases(
+def test_n_plus_one_compat_confirm_accepts_public_client_evidence_aliases_and_replays(
     story_client,
 ) -> None:
-    """The compatibility confirm route must accept the Drawer evidence shape."""
+    """The compatibility confirm route must replay the exact Drawer request."""
 
-    client, _ = story_client
+    client, data_dir = story_client
     note = _note(client)
     attempt = client.post(
         "/api/interview-story-proposals",
@@ -2610,8 +2610,25 @@ def test_n_plus_one_compat_confirm_accepts_public_client_evidence_aliases(
         f"/api/interview-story-proposals/{attempt['id']}/confirm",
         json=confirmation,
     )
+    with sqlite3.connect(data_dir / "data.db") as connection:
+        side_effects_after_save = (
+            connection.execute("SELECT COUNT(*) FROM interview_stories").fetchone(),
+            connection.execute("SELECT COUNT(*) FROM interview_story_versions").fetchone(),
+        )
+
+    replay = client.post(
+        f"/api/interview-story-proposals/{attempt['id']}/confirm",
+        json=confirmation,
+    )
 
     assert saved.status_code == 201, saved.json()
+    assert replay.status_code == 200, replay.json()
+    assert replay.json() == {**saved.json(), "created": False}
+    with sqlite3.connect(data_dir / "data.db") as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM interview_stories").fetchone(),
+            connection.execute("SELECT COUNT(*) FROM interview_story_versions").fetchone(),
+        ) == side_effects_after_save == ((1,), (1,))
 
 
 @pytest.mark.parametrize("value", [True, 1.0, "1"])

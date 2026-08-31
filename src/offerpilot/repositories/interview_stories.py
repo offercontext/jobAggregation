@@ -4070,6 +4070,58 @@ class InterviewStoryProductActionHandler:
         return "sha256:" + hashlib.sha256(raw).hexdigest()
 
     @staticmethod
+    def _normalize_effective_payload(
+        effective_payload: Mapping[str, JSONValue],
+        snapshot: StorySourceSnapshot,
+    ) -> dict[str, JSONValue]:
+        if set(effective_payload) != {
+            "content",
+            "evidence_links",
+            "expected_current_version_id",
+            "expected_story_revision",
+        }:
+            raise ProductActionCoordinatorError(
+                "product_action_invalid_request",
+                status_code=422,
+            )
+        current = effective_payload["expected_current_version_id"]
+        revision = effective_payload["expected_story_revision"]
+        content = effective_payload["content"]
+        links = effective_payload["evidence_links"]
+        if (
+            not _is_optional_positive_int(current)
+            or not _is_optional_positive_int(revision)
+            or type(content) is not dict
+            or type(links) is not list
+            or not all(type(item) is dict for item in links)
+        ):
+            raise ProductActionCoordinatorError(
+                "product_action_invalid_request",
+                status_code=422,
+            )
+        try:
+            canonical = canonical_story_content(content)
+            canonical_links = validate_story_evidence_links(
+                canonical,
+                cast(list[dict[str, Any]], links),
+                snapshot,
+            )
+        except StoryValidationError as exc:
+            raise ProductActionCoordinatorError(
+                "product_action_invalid_request",
+                status_code=422,
+            ) from exc
+        return {
+            "content": cast(JSONValue, _manual_content_from_canonical(canonical)),
+            "evidence_links": cast(
+                JSONValue,
+                [_client_link_fields(item.as_dict()) for item in canonical_links],
+            ),
+            "expected_current_version_id": current,
+            "expected_story_revision": revision,
+        }
+
+    @staticmethod
     def _original_effective_payload(
         attempt: InterviewStoryProposalAttempt,
         route_payload: Mapping[str, JSONValue],
@@ -4163,57 +4215,16 @@ class InterviewStoryProductActionHandler:
                     "source_changed",
                 )
             raise ProductActionCoordinatorError("story_source_conflict")
-        if set(effective_payload) != {
-            "content",
-            "evidence_links",
-            "expected_current_version_id",
-            "expected_story_revision",
-        }:
-            raise ProductActionCoordinatorError(
-                "product_action_invalid_request",
-                status_code=422,
-            )
-        current = effective_payload["expected_current_version_id"]
-        revision = effective_payload["expected_story_revision"]
+        normalized = self._normalize_effective_payload(effective_payload, snapshot)
+        current = normalized["expected_current_version_id"]
+        revision = normalized["expected_story_revision"]
         if (
             current != route_payload["expected_current_version_id"]
             or revision != route_payload["expected_story_revision"]
-            or not _is_optional_positive_int(current)
-            or not _is_optional_positive_int(revision)
-            or type(effective_payload["content"]) is not dict
-            or type(effective_payload["evidence_links"]) is not list
         ):
             raise ProductActionCoordinatorError(
                 "product_action_revision_conflict",
             )
-        content = cast(dict[str, Any], effective_payload["content"])
-        links = cast(list[Any], effective_payload["evidence_links"])
-        if not all(type(item) is dict for item in links):
-            raise ProductActionCoordinatorError(
-                "product_action_invalid_request",
-                status_code=422,
-            )
-        try:
-            canonical = canonical_story_content(content)
-            canonical_links = validate_story_evidence_links(
-                canonical,
-                cast(list[dict[str, Any]], links),
-                snapshot,
-            )
-        except StoryValidationError as exc:
-            raise ProductActionCoordinatorError(
-                "product_action_invalid_request",
-                status_code=422,
-            ) from exc
-        normalized: dict[str, JSONValue] = {
-            "content": cast(JSONValue, _manual_content_from_canonical(canonical)),
-            "evidence_links": cast(
-                JSONValue,
-                [_client_link_fields(item.as_dict()) for item in canonical_links],
-            ),
-            "expected_current_version_id": current,
-            "expected_story_revision": revision,
-        }
         effective_hash = self._hash_payload(normalized)
         trusted = TrustedStoryDecision(
             _TRUSTED_STORY_DECISION_SEAL,
@@ -4409,7 +4420,22 @@ class InterviewStoryProductActionHandler:
                 "product_action_invalid_request",
                 status_code=422,
             )
-        return self._hash_payload(decision.edited_payload)
+        with self._session_factory() as session:
+            attempt = session.scalar(
+                select(InterviewStoryProposalAttempt).where(
+                    InterviewStoryProposalAttempt.product_action_operation_id
+                    == operation_id
+                )
+            )
+            if attempt is None or attempt.attempt_status not in {"ready", "confirmed"}:
+                raise ProductActionIntegrityError("story_terminal_attempt")
+            input_payload = _attempt_input_payload(attempt)
+            snapshot = _snapshot_from_attempt(input_payload, attempt.source_fingerprint)
+        normalized = self._normalize_effective_payload(
+            decision.edited_payload,
+            snapshot,
+        )
+        return self._hash_payload(normalized)
 
     def persisted_terminal_effective_payload_sha256(self, operation_id: str) -> str:
         with self._session_factory() as session:

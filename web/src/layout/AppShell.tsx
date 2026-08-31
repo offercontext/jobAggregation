@@ -118,6 +118,57 @@ export function adaptivePracticeOwnerIdentity(focus: AdaptivePracticeFocus | und
   return focus ? `${focus.signalVersionId}:${focus.targetEventId}` : 'three-mode';
 }
 
+export interface InterviewPreparationPracticeHandoff {
+  readonly applicationId: number;
+  readonly eventId: number;
+  readonly ownerGeneration: number;
+  readonly signalVersionId: number;
+  readonly targetEventId: number;
+}
+
+export function authorizeInterviewPreparationPracticeHandoff(
+  active: ActiveCoreTask | null,
+  focus: AdaptivePracticeFocus,
+): InterviewPreparationPracticeHandoff | null {
+  const applicationId = active?.ref.applicationId;
+  const eventId = active?.ref.eventId;
+  if (
+    active?.ref.taskId !== 'application.interview_prepare'
+    || !Number.isSafeInteger(applicationId)
+    || Number(applicationId) <= 0
+    || !Number.isSafeInteger(eventId)
+    || Number(eventId) <= 0
+    || !Number.isSafeInteger(focus.ownerGeneration)
+    || focus.ownerGeneration !== active.generation
+    || !Number.isSafeInteger(focus.signalVersionId)
+    || focus.signalVersionId <= 0
+    || !Number.isSafeInteger(focus.targetEventId)
+    || focus.targetEventId !== eventId
+  ) return null;
+  return {
+    applicationId: applicationId as number,
+    eventId: eventId as number,
+    ownerGeneration: active.generation,
+    signalVersionId: focus.signalVersionId,
+    targetEventId: focus.targetEventId,
+  };
+}
+
+export function interviewPreparationPracticeHandoffAllowsUnsavedBypass(
+  active: ActiveCoreTask,
+  transition: InterviewPreparationPracticeHandoff | null,
+): boolean {
+  return Boolean(
+    transition
+    && active.ref.taskId === 'application.interview_prepare'
+    && active.ref.applicationId === transition.applicationId
+    && active.ref.eventId === transition.eventId
+    && active.generation === transition.ownerGeneration
+    && transition.targetEventId === transition.eventId
+    && transition.signalVersionId > 0,
+  );
+}
+
 export function adaptivePracticeDraftGuard(
   drafts: Readonly<Record<string, AdaptivePracticeOwnerDraft>>,
   ownerGeneration: number,
@@ -898,6 +949,7 @@ function AppShellContent() {
   const taskSurfaceGuardRef = useRef({ pending: false, unsaved: false });
   const pilotControllerRef = useRef(pilotController);
   const fitToMaterialTransitionRef = useRef<{ applicationId: number; generation: number } | null>(null);
+  const preparationToPracticeTransitionRef = useRef<InterviewPreparationPracticeHandoff | null>(null);
   pilotControllerRef.current = pilotController;
   // Composition-root authority: every application task opener delegates to
   // this one generation-safe controller and no child creates another owner.
@@ -917,6 +969,9 @@ function AppShellContent() {
           );
       },
       hasUnsavedChanges: (active) => {
+        if (interviewPreparationPracticeHandoffAllowsUnsavedBypass(active, preparationToPracticeTransitionRef.current)) {
+          return false;
+        }
         const transition = fitToMaterialTransitionRef.current;
         if (
           transition
@@ -1845,11 +1900,18 @@ function AppShellContent() {
   };
 
   const openReadinessPractice = (focus: AdaptivePracticeFocus): CoreTaskLaunchResult => {
-    const result = launchAdaptivePracticeOwner(focus, {
-      ref: { taskId: 'interview.free_practice' },
-      source: 'application_task_card',
-      focus: 'source',
-    });
+    const active = coreTaskController.getState().active;
+    preparationToPracticeTransitionRef.current = authorizeInterviewPreparationPracticeHandoff(active, focus);
+    let result: CoreTaskLaunchResult;
+    try {
+      result = launchAdaptivePracticeOwner(focus, {
+        ref: { taskId: 'interview.free_practice' },
+        source: 'application_task_card',
+        focus: 'source',
+      });
+    } finally {
+      preparationToPracticeTransitionRef.current = null;
+    }
     if (result.kind !== 'launched' && result.kind !== 'focused_existing') return result;
     setSelected(null);
     setEvidenceFocus(null);

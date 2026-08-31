@@ -5,7 +5,9 @@ import {
   adaptivePracticeDraftGuard,
   adaptivePracticeGuardAfterOwnerLaunch,
   adaptivePracticeSubOwnerReplacementDenied,
+  authorizeInterviewPreparationPracticeHandoff,
   closeCoreTaskOwnerWithGuard,
+  interviewPreparationPracticeHandoffAllowsUnsavedBypass,
   settleRecoveredCoreTaskAfterGuardTransition,
   transactAdaptivePracticeDraftSnapshot,
   transactReviewReadinessDraftSnapshot,
@@ -25,6 +27,58 @@ function draft(patch: Partial<AdaptivePracticeOwnerDraft> = {}): AdaptivePractic
 }
 
 describe('AppShell canonical adaptive-practice sub-owner guard', () => {
+  it('allows only the exact active Preparation generation and event to hand off its preserved draft to readiness practice', () => {
+    let pending = false;
+    let transition: ReturnType<typeof authorizeInterviewPreparationPracticeHandoff> = null;
+    const controller = createCoreTaskSurfaceController({
+      hasPending: () => pending,
+      hasUnsavedChanges: (active) => !interviewPreparationPracticeHandoffAllowsUnsavedBypass(active, transition),
+    });
+    const preparation = controller.launch({
+      ref: { taskId: 'application.interview_prepare', applicationId: 7, eventId: 103 },
+      source: 'application_task_card',
+    });
+    if (preparation.kind !== 'launched') throw new Error('Preparation should launch');
+    const preservedDrafts = { '7:103': { marker: 'preserve-me' } };
+    const readinessRequest: TaskLaunchRequest = {
+      ref: { taskId: 'interview.free_practice' }, source: 'application_task_card', focus: 'source',
+      childOwnerIdentity: '91:103',
+    };
+
+    expect(authorizeInterviewPreparationPracticeHandoff(controller.getState().active, {
+      ownerGeneration: preparation.generation + 1, signalVersionId: 91, targetEventId: 103,
+    })).toBeNull();
+    expect(authorizeInterviewPreparationPracticeHandoff(controller.getState().active, {
+      ownerGeneration: preparation.generation, signalVersionId: 91, targetEventId: 104,
+    })).toBeNull();
+    expect(controller.launch(readinessRequest)).toMatchObject({ kind: 'replacement_denied' });
+
+    transition = authorizeInterviewPreparationPracticeHandoff(controller.getState().active, {
+      ownerGeneration: preparation.generation, signalVersionId: 91, targetEventId: 103,
+    });
+    pending = true;
+    expect(controller.launch(readinessRequest)).toMatchObject({ kind: 'replacement_denied' });
+    pending = false;
+    expect(controller.launch(readinessRequest)).toMatchObject({
+      kind: 'launched', generation: preparation.generation + 1,
+    });
+    transition = null;
+    expect(preservedDrafts).toEqual({ '7:103': { marker: 'preserve-me' } });
+  });
+
+  it('wires the exact Preparation-to-practice authorization around only the readiness launch and always clears it', () => {
+    const start = appShellSource.indexOf('const openReadinessPractice');
+    const end = appShellSource.indexOf('const openInterviewEventEditor', start);
+    const source = appShellSource.slice(start, end);
+    expect(appShellSource).toContain('const preparationToPracticeTransitionRef = useRef');
+    expect(appShellSource).toContain('interviewPreparationPracticeHandoffAllowsUnsavedBypass(active, preparationToPracticeTransitionRef.current)');
+    expect(source).toContain('authorizeInterviewPreparationPracticeHandoff(active, focus)');
+    expect(source).toMatch(/try\s*\{[\s\S]*launchAdaptivePracticeOwner\(focus/);
+    expect(source).toMatch(/finally\s*\{[\s\S]*preparationToPracticeTransitionRef\.current = null/);
+    expect(source).not.toContain('setInterviewPreparationDrafts');
+    expect(source).not.toContain('setInterviewPreparationSelection(null)');
+  });
+
   it('denies focused-to-three-mode and exact-pair replacement for immediate pending, unknown or unsaved drafts', () => {
     const currentFocus = { ownerGeneration: 7, signalVersionId: 91, targetEventId: 103 };
     for (const guarded of [

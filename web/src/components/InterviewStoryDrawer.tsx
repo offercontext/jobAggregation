@@ -1,13 +1,23 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Button, Checkbox, Divider, Drawer, Empty, Input, List, Space, Spin, Tag, Typography, message } from 'antd';
 import {
   confirmInterviewStoryProposal,
+  createInterviewStoryProductAction,
   createInterviewStory,
   createInterviewStoryVersion,
   createInterviewStoryProposal,
+  getInterviewStoryProposal,
   InterviewStoryError,
   listInterviewStorySourceCandidates,
 } from '@/services/interviewStories';
+import { ProductActionConfirmation, productActionDraftFromProposal } from '@/features/reviewReadiness/ProductActionConfirmation';
+import { decideProductAction, recoverRejectionControl, undoInterviewStory } from '@/features/reviewReadiness/service';
+import type {
+  ProductActionDecisionRequest,
+  ProductActionDecisionResponse,
+  ProductActionOwnerDraft,
+  ProductActionUndoRequest,
+} from '@/features/reviewReadiness/contracts';
 import type {
   InterviewStoryClientEvidenceLink,
   InterviewStoryContent,
@@ -25,6 +35,7 @@ type EntryPoint = 'ui' | 'pilot';
 
 export interface InterviewStoryDraft {
   entrypoint: EntryPoint;
+  applicationId: number | null;
   reviewNoteId?: number;
   targetStoryId: number | null;
   expectedCurrentVersionId: number | null;
@@ -42,14 +53,24 @@ export interface InterviewStoryDraft {
   resultUnknown: boolean;
   retryAvailableAt: number | null;
   pendingOperation: 'generate' | 'confirm' | 'manual' | null;
-  confirmationToken: string | null;
+  attemptGenerationRevision: number;
+  productActionGeneration: number;
+  productAction: ProductActionOwnerDraft | null;
+  serverConfirmationToken: string | null;
   error: string | null;
+}
+
+export interface InterviewStoryDraftChangeContext {
+  readonly undoRequest: ProductActionUndoRequest;
 }
 
 interface Props {
   open: boolean;
   draft: InterviewStoryDraft;
-  onDraftChange: (draft: InterviewStoryDraft | null) => void;
+  onDraftChange: (
+    draft: InterviewStoryDraft | null,
+    context?: InterviewStoryDraftChangeContext,
+  ) => boolean | void;
   onClose: () => void;
 }
 
@@ -77,10 +98,11 @@ function key(prefix: string): string {
 export function createInterviewStoryDraft(
   entrypoint: EntryPoint,
   reviewNoteId?: number,
-  revision?: { targetStoryId?: number; expectedCurrentVersionId?: number; expectedStoryRevision?: number },
+  revision?: { applicationId?: number; targetStoryId?: number; expectedCurrentVersionId?: number; expectedStoryRevision?: number },
 ): InterviewStoryDraft {
   return {
     entrypoint,
+    applicationId: revision?.applicationId ?? null,
     reviewNoteId,
     targetStoryId: revision?.targetStoryId ?? null,
     expectedCurrentVersionId: revision?.expectedCurrentVersionId ?? null,
@@ -98,7 +120,10 @@ export function createInterviewStoryDraft(
     resultUnknown: false,
     retryAvailableAt: null,
     pendingOperation: null,
-    confirmationToken: null,
+    attemptGenerationRevision: 0,
+    productActionGeneration: 0,
+    productAction: null,
+    serverConfirmationToken: null,
     error: null,
   };
 }
@@ -177,6 +202,82 @@ function clientEvidence(links: InterviewStoryEvidenceLink[]): InterviewStoryClie
   }));
 }
 
+type GeneratedStoryProposal = {
+  proposal_status: 'normal' | 'safe_empty';
+  content: InterviewStoryContent;
+  evidence_links: InterviewStoryEvidenceLink[];
+};
+
+function storyEffectivePayload(
+  proposal: GeneratedStoryProposal,
+  content: InterviewStoryEditableContent,
+  draft: Pick<InterviewStoryDraft, 'expectedCurrentVersionId' | 'expectedStoryRevision'>,
+): Record<string, unknown> {
+  return {
+    content,
+    evidence_links: clientEvidence(proposal.evidence_links),
+    expected_current_version_id: draft.expectedCurrentVersionId,
+    expected_story_revision: draft.expectedStoryRevision,
+  };
+}
+
+function storyProductActionDraft(
+  attempt: InterviewStoryProposalAttempt,
+  proposal: GeneratedStoryProposal,
+  content: InterviewStoryEditableContent,
+  revision: Pick<InterviewStoryDraft, 'expectedCurrentVersionId' | 'expectedStoryRevision'>,
+): { action: ProductActionOwnerDraft; serverConfirmationToken: string | null } | null {
+  const control = attempt.product_action;
+  if (!control || !attempt.product_action_generation) return null;
+  if (control.action_name !== 'confirm_interview_story') {
+    throw new Error('story_product_action_owner_mismatch');
+  }
+  const originalPayload = storyEffectivePayload(proposal, content, revision);
+  const ownerKey = `story:${attempt.id}:${attempt.generation_revision}:${attempt.product_action_generation}`;
+  if (!('confirmation_token' in control)) {
+    return {
+      action: {
+        ownerKey,
+        operationId: control.operation_id,
+        actionCallId: '',
+        actionName: control.action_name,
+        confirmationToken: null,
+        allowedDecisions: [],
+        status: control.status,
+        result: control.terminal_result ?? {},
+        originalPayload,
+        pendingDecision: null,
+        resultUnknown: false,
+      },
+      serverConfirmationToken: null,
+    };
+  }
+  if (!control.confirmation_token || !('action_call_id' in control)) return null;
+  const serverConfirmationToken = control.confirmation_token;
+  const action = productActionDraftFromProposal(
+    ownerKey,
+    {
+      schema_version: 1,
+      operation_id: control.operation_id,
+      action_call_id: control.action_call_id,
+      action_name: control.action_name,
+      status: 'proposed',
+      created: true,
+      replayed: false,
+      confirmation_token: serverConfirmationToken,
+    },
+    originalPayload,
+    'confirm_interview_story',
+  );
+  return {
+    action: {
+      ...action,
+      allowedDecisions: control.allowed_decisions ?? (control.rejection_only ? ['reject'] : ['approve', 'modify', 'reject']),
+    },
+    serverConfirmationToken,
+  };
+}
+
 function isUnknownResult(error: unknown): boolean {
   if (!(error instanceof InterviewStoryError)) return true;
   if (error.code === 'story_provider_error' || error.status === 0) return true;
@@ -188,6 +289,7 @@ function isUnknownResult(error: unknown): boolean {
 function resetAfterDefiniteFailure(draft: InterviewStoryDraft, error: string | null): InterviewStoryDraft {
   return {
     ...createInterviewStoryDraft(draft.entrypoint, draft.reviewNoteId, {
+      applicationId: draft.applicationId ?? undefined,
       targetStoryId: draft.targetStoryId ?? undefined,
       expectedCurrentVersionId: draft.expectedCurrentVersionId ?? undefined,
       expectedStoryRevision: draft.expectedStoryRevision ?? undefined,
@@ -201,6 +303,7 @@ function resetAfterDefiniteFailure(draft: InterviewStoryDraft, error: string | n
 function resetAfterSourceConflict(draft: InterviewStoryDraft, error: string): InterviewStoryDraft {
   return {
     ...createInterviewStoryDraft(draft.entrypoint, draft.reviewNoteId, {
+      applicationId: draft.applicationId ?? undefined,
       targetStoryId: draft.targetStoryId ?? undefined,
       expectedCurrentVersionId: draft.expectedCurrentVersionId ?? undefined,
       expectedStoryRevision: draft.expectedStoryRevision ?? undefined,
@@ -212,6 +315,8 @@ function resetAfterSourceConflict(draft: InterviewStoryDraft, error: string): In
 }
 
 export default function InterviewStoryDrawer({ open, draft, onDraftChange, onClose }: Props) {
+  const headingRef = useRef<HTMLSpanElement | null>(null);
+  const returnFocusRef = useRef<HTMLElement | null>(null);
   const [candidates, setCandidates] = useState<InterviewStorySourceCandidates | null>(null);
   const [candidatesLoading, setCandidatesLoading] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -221,6 +326,17 @@ export default function InterviewStoryDrawer({ open, draft, onDraftChange, onClo
   const [busy, setBusy] = useState(false);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [authoringMode, setAuthoringMode] = useState<'proposal' | 'manual'>('proposal');
+
+  useEffect(() => {
+    if (!open) return;
+    returnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const frame = window.requestAnimationFrame(() => headingRef.current?.focus());
+    return () => {
+      window.cancelAnimationFrame(frame);
+      const target = returnFocusRef.current;
+      if (target?.isConnected) target.focus();
+    };
+  }, [open, draft.entrypoint, draft.reviewNoteId]);
 
   useEffect(() => {
     // AppShell keeps independent UI/Pilot drafts alive for an unknown-result
@@ -253,7 +369,11 @@ export default function InterviewStoryDrawer({ open, draft, onDraftChange, onClo
   }, [open, pickerOpen, candidates, draft.reviewNoteId]);
 
   const sourceSelected = draft.selections.length > 0 || draft.assertions.some((item) => item.trim());
-  const frozen = draft.resultUnknown || busy;
+  const frozen = draft.resultUnknown
+    || draft.productAction?.resultUnknown === true
+    || Boolean(draft.productAction?.undoRequest)
+    || draft.productAction?.undoResultUnknown === true
+    || busy;
   const retryWaiting = draft.resultUnknown
     && draft.pendingOperation === 'generate'
     && draft.retryAvailableAt !== null
@@ -301,7 +421,10 @@ export default function InterviewStoryDrawer({ open, draft, onDraftChange, onClo
     return sources;
   }, [candidates, draft.assertions, draft.selections]);
 
-  const update = (changes: Partial<InterviewStoryDraft>) => onDraftChange({ ...draft, ...changes });
+  const update = (
+    changes: Partial<InterviewStoryDraft>,
+    context?: InterviewStoryDraftChangeContext,
+  ): boolean => onDraftChange({ ...draft, ...changes }, context) !== false;
 
   const discardChangedInput = (changes: Partial<InterviewStoryDraft>) => update({
     ...changes,
@@ -317,7 +440,10 @@ export default function InterviewStoryDrawer({ open, draft, onDraftChange, onClo
     resultUnknown: false,
     retryAvailableAt: null,
     pendingOperation: null,
-    confirmationToken: null,
+    attemptGenerationRevision: 0,
+    productActionGeneration: 0,
+    productAction: null,
+    serverConfirmationToken: null,
     error: null,
   });
 
@@ -443,11 +569,20 @@ export default function InterviewStoryDrawer({ open, draft, onDraftChange, onClo
         });
         return;
       }
+      const responseProposal = response.proposal?.proposal_status === 'normal' ? response.proposal : null;
+      const initialContent = responseProposal ? editableContent(responseProposal.content) : null;
+      const productActionControl = responseProposal && initialContent
+        ? storyProductActionDraft(response, responseProposal, initialContent, requestDraft)
+        : null;
       onDraftChange({
         ...requestDraft,
         attemptId: response.id,
+        attemptGenerationRevision: response.generation_revision,
         proposal: response.proposal ?? null,
-        editedContent: response.proposal?.proposal_status === 'normal' ? editableContent(response.proposal.content) : null,
+        editedContent: initialContent,
+        productActionGeneration: response.product_action_generation ?? 0,
+        productAction: productActionControl?.action ?? null,
+        serverConfirmationToken: productActionControl?.serverConfirmationToken ?? null,
         proposalInput: null,
         resultUnknown: false,
         retryAvailableAt: null,
@@ -480,38 +615,135 @@ export default function InterviewStoryDrawer({ open, draft, onDraftChange, onClo
     }
   };
 
-  const confirm = async () => {
-    if (!draft.proposal || draft.proposal.proposal_status !== 'normal' || !draft.attemptId) return;
-    setBusy(true);
-    const token = draft.confirmationToken ?? key('story-confirm');
+  const decideStoryProductAction = async (
+    request: ProductActionDecisionRequest,
+  ): Promise<ProductActionDecisionResponse> => {
+    if (!draft.attemptId || !draft.serverConfirmationToken || !draft.productAction) {
+      throw new Error('story_server_confirmation_control_missing');
+    }
+    if (request.confirmation_token !== draft.serverConfirmationToken) {
+      throw new Error('story_server_confirmation_control_changed');
+    }
+    if (request.decision === 'reject') {
+      return decideProductAction(draft.productAction.operationId, request);
+    }
+    if (!normalProposal) throw new Error('story_proposal_missing');
+    const result = await confirmInterviewStoryProposal(draft.attemptId, {
+      confirmation_token: draft.serverConfirmationToken,
+      content: draft.editedContent ?? editableContent(normalProposal.content),
+      evidence_links: clientEvidence(normalProposal.evidence_links),
+      expected_current_version_id: draft.expectedCurrentVersionId,
+      expected_story_revision: draft.expectedStoryRevision,
+    });
+    return {
+      schema_version: 1,
+      operation_id: draft.productAction.operationId,
+      action_name: 'confirm_interview_story',
+      status: 'committed',
+      result,
+      replayed: false,
+      direct_commit: false,
+    };
+  };
+
+  const recoverStoryProductAction = async () => {
+    if (!draft.attemptId) throw new Error('story_attempt_missing');
     try {
-      await confirmInterviewStoryProposal(draft.attemptId, {
-        confirmation_token: token,
-        content: draft.editedContent ?? editableContent(draft.proposal.content),
-        evidence_links: clientEvidence(draft.proposal.evidence_links),
-        expected_current_version_id: draft.expectedCurrentVersionId,
-        expected_story_revision: draft.expectedStoryRevision,
+      const response = await getInterviewStoryProposal(draft.attemptId);
+      if (
+        !('proposal' in response)
+        || !response.product_action
+        || !('confirmation_token' in response.product_action)
+        || !response.product_action.confirmation_token
+        || !('action_call_id' in response.product_action)
+      ) throw new Error('story_server_confirmation_control_missing');
+      const control = response.product_action;
+      return {
+        schema_version: 1 as const,
+        operation_id: control.operation_id,
+        action_call_id: control.action_call_id,
+        action_name: control.action_name,
+        status: 'proposed' as const,
+        confirmation_token: control.confirmation_token,
+        allowed_decisions: control.allowed_decisions ?? (control.rejection_only ? ['reject' as const] : ['approve' as const, 'modify' as const, 'reject' as const]),
+        rejection_only: control.rejection_only ?? false,
+        live_source_state: 'current' as const,
+      };
+    } catch {
+      if (!draft.applicationId || !draft.productAction) throw new Error('story_application_rejection_control_missing');
+      return recoverRejectionControl(draft.applicationId, draft.productAction.operationId);
+    }
+  };
+
+  const restartStoryProductAction = async () => {
+    if (!draft.attemptId || !normalProposal || !draft.productAction) {
+      throw new Error('story_product_action_owner_missing');
+    }
+    const response = await createInterviewStoryProductAction(draft.attemptId, {
+      expected_generation_revision: draft.attemptGenerationRevision,
+      expected_product_action_generation: draft.productActionGeneration,
+    });
+    const content = draft.editedContent ?? editableContent(normalProposal.content);
+    const ownerKey = `story:${draft.attemptId}:${draft.attemptGenerationRevision}:${response.product_action_generation}`;
+    if (response.status !== 'proposed') {
+      update({
+        productActionGeneration: response.product_action_generation,
+        productAction: {
+          ownerKey,
+          operationId: response.operation_id,
+          actionCallId: response.action_call_id,
+          actionName: 'confirm_interview_story',
+          confirmationToken: null,
+          allowedDecisions: [],
+          status: response.status,
+          result: response.terminal_result ?? {},
+          originalPayload: storyEffectivePayload(normalProposal, content, draft),
+          pendingDecision: null,
+          resultUnknown: false,
+        },
+        serverConfirmationToken: null,
+        error: null,
       });
+      if (response.status === 'committed') message.success('故事版本已保存。');
+      return;
+    }
+    if (!response.confirmation_token) throw new Error('story_next_confirmation_control_missing');
+    const serverConfirmationToken = response.confirmation_token;
+    const action = productActionDraftFromProposal(
+      ownerKey,
+      {
+        schema_version: 1,
+        operation_id: response.operation_id,
+        action_call_id: response.action_call_id,
+        action_name: 'confirm_interview_story',
+        status: 'proposed',
+        created: response.proposal_created,
+        replayed: false,
+        confirmation_token: serverConfirmationToken,
+      },
+      storyEffectivePayload(normalProposal, content, draft),
+      'confirm_interview_story',
+    );
+    update({
+      productActionGeneration: response.product_action_generation,
+      productAction: action,
+      serverConfirmationToken,
+      error: null,
+    });
+  };
+
+  const handleStoryTerminal = (response: ProductActionDecisionResponse) => {
+    if (response.status === 'committed') {
       message.success('故事版本已确认保存。');
-      onDraftChange(null);
-      onClose();
-    } catch (error) {
-      const safe = safeMessage(error);
-      if (isUnknownResult(error)) {
-        update({ confirmationToken: token, resultUnknown: true, pendingOperation: 'confirm', error: safe });
-      } else if (error instanceof InterviewStoryError && error.code === 'story_source_conflict') {
-        onDraftChange(resetAfterSourceConflict(draft, safe));
-      } else {
-        onDraftChange(resetAfterDefiniteFailure(draft, safe));
-      }
-      message.error(safe);
-    } finally {
-      setBusy(false);
+      return;
+    }
+    if (response.status === 'failed' && response.result.error_code === 'story_source_conflict') {
+      onDraftChange(resetAfterSourceConflict(draft, '故事来源已变化，请重新选择并确认。'));
     }
   };
 
   return (
-    <Drawer open={open} width={720} destroyOnClose={false} onClose={onClose} title={draft.entrypoint === 'pilot' ? 'Pilot · 整理面试故事' : '整理面试故事'}>
+    <Drawer open={open} width={720} destroyOnClose={false} onClose={onClose} title={<span ref={headingRef} tabIndex={-1}>{draft.entrypoint === 'pilot' ? 'Pilot · 整理面试故事' : '整理面试故事'}</span>}>
       <Alert
         type="info"
         showIcon
@@ -523,7 +755,7 @@ export default function InterviewStoryDrawer({ open, draft, onDraftChange, onClo
         type="warning"
         showIcon
         message={retryWaiting ? `${draft.error} 安全租约仍在处理中，约 ${retryWaitSeconds} 秒后可重试。` : draft.error}
-        action={draft.resultUnknown ? <Button size="small" disabled={retryWaiting} onClick={() => void (draft.pendingOperation === 'confirm' ? confirm() : draft.pendingOperation === 'manual' ? saveManualStory() : generate())}>使用原尝试重试</Button> : undefined}
+        action={draft.resultUnknown ? <Button size="small" disabled={retryWaiting} onClick={() => void (draft.pendingOperation === 'manual' ? saveManualStory() : generate())}>使用原尝试重试</Button> : undefined}
         style={{ marginBottom: 16 }}
       /> : null}
       <Title level={5}>选择原始来源</Title>
@@ -711,7 +943,48 @@ export default function InterviewStoryDrawer({ open, draft, onDraftChange, onClo
             />
           ))}
           <Alert type="info" showIcon message="确认前可编辑标题和故事区块；证据引用仍会在保存时严格复核。" style={{ marginBottom: 12 }} />
-          <Button data-story-audit={`${draft.entrypoint}-confirm`} type="primary" loading={busy} disabled={frozen} onClick={() => void confirm()}>确认保存这个故事版本</Button>
+          {draft.productAction ? (
+            <ProductActionConfirmation
+              draft={draft.productAction}
+              editedPayload={storyEffectivePayload(
+                normalProposal,
+                draft.editedContent ?? editableContent(normalProposal.content),
+                draft,
+              )}
+              approveLabel="确认保存这个故事版本"
+              modifyLabel="保存修改后的故事版本"
+              rejectLabel="暂不保存这个故事"
+              committedLabel="故事版本已保存。"
+              rejectedLabel="本次未保存故事，你可以继续编辑后创建新一轮确认。"
+              failedLabel="本次故事保存未完成，请重新检查来源。"
+              onDraftChange={(productAction, context) => update({
+                productAction,
+                serverConfirmationToken: productAction.confirmationToken,
+              }, context)}
+              onDecision={decideStoryProductAction}
+              onRecoverControl={recoverStoryProductAction}
+              onRestart={restartStoryProductAction}
+              onTerminal={handleStoryTerminal}
+              onUndo={draft.productAction.status === 'committed'
+                && Number.isSafeInteger(draft.productAction.result?.story_id)
+                && Number(draft.productAction.result?.story_id) > 0
+                ? async (request) => {
+                  if (
+                    request.ownerKey !== draft.productAction?.ownerKey
+                    || request.parentOperationId !== draft.productAction?.operationId
+                    || request.actionName !== 'confirm_interview_story'
+                  ) throw new Error('story_undo_owner_mismatch');
+                  return undoInterviewStory(Number(draft.productAction?.result?.story_id), request.parentOperationId);
+                }
+                : undefined}
+            />
+          ) : (
+            <Alert
+              type="warning"
+              showIcon
+              message="缺少服务器签发的确认控制，请重新生成故事建议。"
+            />
+          )}
         </>
       ) : null}
     </Drawer>

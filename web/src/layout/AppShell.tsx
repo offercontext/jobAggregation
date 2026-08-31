@@ -29,7 +29,11 @@ import {
 } from '@/components/OpportunityFitReviewDrawer';
 import { normalizeOpportunityFitHistoryDate } from '@/features/applicationTasks/opportunityFitHistory';
 import { type InterviewStoryOpenDraft } from '@/components/InterviewStoryLibraryView';
-import InterviewStoryDrawer, { createInterviewStoryDraft, type InterviewStoryDraft } from '@/components/InterviewStoryDrawer';
+import InterviewStoryDrawer, {
+  createInterviewStoryDraft,
+  type InterviewStoryDraft,
+  type InterviewStoryDraftChangeContext,
+} from '@/components/InterviewStoryDrawer';
 import { type OfferNegotiationDraft } from '@/components/OfferNegotiationDrawer';
 import { listOfferBindingState } from '@/components/offerWorkspaceModel';
 import type { EvidenceTarget } from '@/components/ChatPanel/model';
@@ -47,7 +51,15 @@ import {
 } from '@/lib/pipelineInsights';
 import { getPracticeStats } from '@/services/questions';
 import type { ApplicationJdDraft } from '@/types/applicationJdVersion';
-import type { AdaptivePracticeFocus } from '@/types/adaptiveInterviewPractice';
+import type { AdaptivePracticeFocus, AdaptivePracticeOwnerDraft } from '@/types/adaptiveInterviewPractice';
+import {
+  isReviewReadinessDraftPending,
+  isReviewReadinessDraftUnsaved,
+  isSafeReviewReadinessTerminalDraft,
+  type ProductActionOwnerDraft,
+  type ProductActionUndoRequest,
+  type ReviewReadinessOwnerDraft,
+} from '@/features/reviewReadiness/contracts';
 import { fetchConfirmedInterviewKnowledgeNotes } from '@/services/knowledge';
 import { buildPilotPageContext } from '@/lib/pilotPageContext';
 import {
@@ -93,12 +105,501 @@ import {
 import {
   createCoreTaskSurfaceController,
   launchCoreTask as launchCoreTaskViaController,
+  requestCoreTaskClose,
+  type ActiveCoreTask,
   type CoreTaskLaunchResult,
   type CoreTaskSurfaceController,
 } from '@/features/coreTaskSurface/controller';
 import type { TaskLaunchRequest } from '@/features/coreTaskSurface/contracts';
 
 const { Content } = Layout;
+
+export function adaptivePracticeOwnerIdentity(focus: AdaptivePracticeFocus | undefined): string {
+  return focus ? `${focus.signalVersionId}:${focus.targetEventId}` : 'three-mode';
+}
+
+export function adaptivePracticeDraftGuard(
+  drafts: Readonly<Record<string, AdaptivePracticeOwnerDraft>>,
+  ownerGeneration: number,
+): { pending: boolean; unsaved: boolean } {
+  const relevant = Object.values(drafts).filter((draft) => draft.ownerGeneration === ownerGeneration);
+  return {
+    pending: relevant.some((draft) => draft.pendingOperation !== null || draft.resultUnknown),
+    unsaved: relevant.some((draft) => Boolean(
+      draft.answer || draft.reflection || draft.assessment || draft.startInput || draft.completionInput,
+    )),
+  };
+}
+
+export function transactReviewReadinessDraftSnapshot(
+  current: Readonly<Record<string, ReviewReadinessOwnerDraft>>,
+  ownerKey: string,
+  draft: ReviewReadinessOwnerDraft | null,
+  retireOwnerKey?: string,
+): Record<string, ReviewReadinessOwnerDraft> | null {
+  if (draft && draft.ownerKey !== ownerKey) return null;
+  const retired = retireOwnerKey ? current[retireOwnerKey] : undefined;
+  const installed = current[ownerKey];
+  if (retireOwnerKey && draft && (
+    !retired
+    || retired.noteId !== draft.noteId
+    || retired.proposalId !== draft.proposalId
+    || retired.applicationId !== draft.applicationId
+    || retired.ownerGeneration >= draft.ownerGeneration
+  )) return null;
+  if (!draft && !installed && !retired) return null;
+  if (!draft && installed && retired && (
+    installed.noteId !== retired.noteId
+    || installed.proposalId !== retired.proposalId
+    || installed.applicationId !== retired.applicationId
+  )) return null;
+  const next = { ...current };
+  if (retireOwnerKey) delete next[retireOwnerKey];
+  if (draft) next[ownerKey] = draft;
+  else delete next[ownerKey];
+  return next;
+}
+
+function reviewDraftCanonicalOwnerKey(draft: ReviewReadinessOwnerDraft): string {
+  return `review:${draft.ownerGeneration}:${draft.noteId}:${draft.proposalId}`;
+}
+
+function sameReviewDraftIdentity(left: ReviewReadinessOwnerDraft, right: ReviewReadinessOwnerDraft): boolean {
+  return left.noteId === right.noteId
+    && left.proposalId === right.proposalId
+    && left.applicationId === right.applicationId
+    && left.ownerGeneration === right.ownerGeneration
+    && left.ownerKey === right.ownerKey
+    && left.ownerKey === reviewDraftCanonicalOwnerKey(left);
+}
+
+function sameSafeReviewTerminalLineage(left: ReviewReadinessOwnerDraft, right: ReviewReadinessOwnerDraft): boolean {
+  return isSafeReviewReadinessTerminalDraft(left)
+    && isSafeReviewReadinessTerminalDraft(right)
+    && left.noteId === right.noteId
+    && left.proposalId === right.proposalId
+    && left.applicationId === right.applicationId
+    && left.selectedFocusId === right.selectedFocusId
+    && left.actionDraft?.operationId === right.actionDraft?.operationId
+    && left.actionDraft?.status === right.actionDraft?.status
+    && left.actionDraft?.result?.signal_id === right.actionDraft?.result?.signal_id
+    && left.actionDraft?.result?.signal_version_id === right.actionDraft?.result?.signal_version_id;
+}
+
+function reviewUndoOriginGeneration(
+  draft: ReviewReadinessOwnerDraft,
+  request: ProductActionUndoRequest,
+): number | null {
+  const match = /^review:([1-9]\d*):([1-9]\d*):([1-9]\d*):(.+)$/.exec(request.originOwnerKey);
+  if (!match || request.actionName !== 'save_review_readiness_signal') return null;
+  const generation = Number(match[1]);
+  const noteId = Number(match[2]);
+  const proposalId = Number(match[3]);
+  if (
+    !Number.isSafeInteger(generation)
+    || !Number.isSafeInteger(noteId)
+    || !Number.isSafeInteger(proposalId)
+    || generation > draft.ownerGeneration
+    || noteId !== draft.noteId
+    || proposalId !== draft.proposalId
+    || !Number.isSafeInteger(draft.applicationId)
+    || Number(draft.applicationId) <= 0
+  ) return null;
+  return generation;
+}
+
+function sameReviewUndoRequest(left: ProductActionUndoRequest, right: ProductActionUndoRequest): boolean {
+  return left.ownerKey === right.ownerKey
+    && left.originOwnerKey === right.originOwnerKey
+    && left.parentOperationId === right.parentOperationId
+    && left.actionName === right.actionName;
+}
+
+function authorizeInstalledReviewUndoTransition(
+  installed: ReviewReadinessOwnerDraft,
+  draft: ReviewReadinessOwnerDraft,
+  request: ProductActionUndoRequest,
+): boolean {
+  const installedAction = installed.actionDraft;
+  const incomingAction = draft.actionDraft;
+  if (
+    !installedAction
+    || !incomingAction
+    || !sameSafeReviewTerminalLineage(installed, draft)
+    || incomingAction.status !== 'committed'
+    || request.ownerKey !== incomingAction.ownerKey
+    || request.parentOperationId !== incomingAction.operationId
+    || request.actionName !== incomingAction.actionName
+    || reviewUndoOriginGeneration(draft, request) === null
+  ) return false;
+  const existingRequest = installedAction.undoRequest;
+  if (existingRequest) {
+    if (!sameReviewUndoRequest(existingRequest, request)) return false;
+  } else if (
+    request.originOwnerKey !== installedAction.ownerKey
+    || reviewUndoOriginGeneration(installed, request) !== installed.ownerGeneration
+  ) return false;
+  const pendingOrUnknown = incomingAction.undoStatus == null
+    && incomingAction.undoRequest !== null
+    && incomingAction.undoRequest !== undefined
+    && sameReviewUndoRequest(incomingAction.undoRequest, request);
+  const terminal = incomingAction.undoRequest == null
+    && incomingAction.undoResultUnknown !== true
+    && (incomingAction.undoStatus === 'committed' || incomingAction.undoStatus === 'failed');
+  return pendingOrUnknown || terminal;
+}
+
+function routeLateReviewUndoSettlement(
+  current: Readonly<Record<string, ReviewReadinessOwnerDraft>>,
+  ownerKey: string,
+  draft: ReviewReadinessOwnerDraft,
+  lateUndoRequest: ProductActionUndoRequest,
+): { ownerKey: string; draft: ReviewReadinessOwnerDraft } | null {
+  if (
+    ownerKey !== draft.ownerKey
+    || reviewDraftCanonicalOwnerKey(draft) !== ownerKey
+    || !isSafeReviewReadinessTerminalDraft(draft)
+    || (!draft.actionDraft?.undoStatus && !draft.actionDraft?.undoResultUnknown)
+    || lateUndoRequest.ownerKey !== draft.actionDraft.ownerKey
+    || lateUndoRequest.originOwnerKey.length === 0
+    || lateUndoRequest.parentOperationId !== draft.actionDraft.operationId
+    || lateUndoRequest.actionName !== draft.actionDraft.actionName
+  ) return null;
+  const incomingAction = draft.actionDraft;
+  const incomingUnknown = incomingAction.undoResultUnknown === true && incomingAction.undoStatus == null;
+  const incomingTerminal = (incomingAction.undoStatus === 'committed' || incomingAction.undoStatus === 'failed')
+    && incomingAction.undoResultUnknown !== true;
+  if (
+    (incomingUnknown && (
+      !incomingAction.undoRequest
+      || !sameReviewUndoRequest(incomingAction.undoRequest, lateUndoRequest)
+    ))
+    || (incomingTerminal && incomingAction.undoRequest != null)
+    || (!incomingUnknown && !incomingTerminal)
+  ) return null;
+  const matches = Object.values(current).filter((candidate) => {
+    const action = candidate.actionDraft;
+    const undoRequest = action?.undoRequest;
+    return candidate.ownerKey === reviewDraftCanonicalOwnerKey(candidate)
+      && candidate.applicationId === draft.applicationId
+      && candidate.noteId === draft.noteId
+      && candidate.proposalId === draft.proposalId
+      && isSafeReviewReadinessTerminalDraft(candidate)
+      && action?.status === 'committed'
+      && action.operationId === incomingAction.operationId
+      && action.actionName === incomingAction.actionName
+      && action.result?.signal_id === incomingAction.result?.signal_id
+      && action.result?.signal_version_id === incomingAction.result?.signal_version_id
+      && action.undoStatus == null
+      && undoRequest?.ownerKey === action.ownerKey
+      && undoRequest.originOwnerKey === lateUndoRequest.originOwnerKey
+      && undoRequest.parentOperationId === action.operationId
+      && undoRequest.actionName === action.actionName;
+  });
+  if (matches.length !== 1) return null;
+  const target = matches[0]!;
+  const targetAction = target.actionDraft!;
+  const routed: ReviewReadinessOwnerDraft = {
+    ...draft,
+    ownerKey: target.ownerKey,
+    ownerGeneration: target.ownerGeneration,
+    actionDraft: {
+      ...incomingAction,
+      ownerKey: targetAction.ownerKey,
+      undoRequest: incomingAction.undoRequest
+        ? { ...incomingAction.undoRequest, ownerKey: targetAction.ownerKey }
+        : null,
+    },
+  };
+  return isSafeReviewReadinessTerminalDraft(routed)
+    ? { ownerKey: target.ownerKey, draft: routed }
+    : null;
+}
+
+export function authorizeReviewReadinessDraftTransaction(
+  current: Readonly<Record<string, ReviewReadinessOwnerDraft>>,
+  ownerKey: string,
+  draft: ReviewReadinessOwnerDraft | null,
+  retireOwnerKey: string | undefined,
+  active: ActiveCoreTask | null,
+  lateUndoRequest?: ProductActionUndoRequest,
+): {
+  readonly snapshot: Record<string, ReviewReadinessOwnerDraft>;
+  readonly affectsCurrentOwner: boolean;
+  readonly settledGeneration: number | null;
+} | null {
+  const installed = current[ownerKey];
+  const undoOriginGeneration = draft && lateUndoRequest
+    ? reviewUndoOriginGeneration(draft, lateUndoRequest)
+    : null;
+  if (draft && lateUndoRequest && undoOriginGeneration === null) return null;
+  if (draft && !installed && !retireOwnerKey && lateUndoRequest) {
+    const lateUndo = routeLateReviewUndoSettlement(current, ownerKey, draft, lateUndoRequest);
+    if (lateUndo) {
+      return {
+        snapshot: { ...current, [lateUndo.ownerKey]: lateUndo.draft },
+        affectsCurrentOwner: active?.generation === lateUndo.draft.ownerGeneration
+          && active.ref.applicationId === lateUndo.draft.applicationId,
+        settledGeneration: isReviewReadinessDraftPending(lateUndo.draft) ? null : undoOriginGeneration,
+      };
+    }
+  }
+  if (draft) {
+    if (draft.ownerKey !== ownerKey || reviewDraftCanonicalOwnerKey(draft) !== ownerKey) return null;
+    if (installed) {
+      if (retireOwnerKey || !sameReviewDraftIdentity(installed, draft)) return null;
+      if (lateUndoRequest && !authorizeInstalledReviewUndoTransition(installed, draft, lateUndoRequest)) return null;
+    } else {
+      const activeOwnsDraft = active?.ref.taskId === 'application.interview_review'
+        && active.generation === draft.ownerGeneration
+        && active.ref.applicationId === draft.applicationId;
+      if (!activeOwnsDraft) return null;
+      if (retireOwnerKey) {
+        const retired = current[retireOwnerKey];
+        if (!retired) return null;
+        const recoveryMigration = active.recoveryGeneration === retired.ownerGeneration;
+        const safeTerminalMigration = sameSafeReviewTerminalLineage(retired, draft);
+        if (!recoveryMigration && !safeTerminalMigration) return null;
+      }
+    }
+    const snapshot = transactReviewReadinessDraftSnapshot(current, ownerKey, draft, retireOwnerKey);
+    if (!snapshot) return null;
+    return {
+      snapshot,
+      affectsCurrentOwner: active?.generation === draft.ownerGeneration
+        && active.ref.applicationId === draft.applicationId,
+      settledGeneration: isSafeReviewReadinessTerminalDraft(draft) && !isReviewReadinessDraftPending(draft)
+        ? undoOriginGeneration
+          ?? (retireOwnerKey ? current[retireOwnerKey]?.ownerGeneration ?? draft.ownerGeneration : draft.ownerGeneration)
+        : null,
+    };
+  }
+  if (!installed || installed.ownerKey !== reviewDraftCanonicalOwnerKey(installed)) return null;
+  if (retireOwnerKey) {
+    const retired = current[retireOwnerKey];
+    if (retired && (
+      retired.noteId !== installed.noteId
+      || retired.proposalId !== installed.proposalId
+      || retired.applicationId !== installed.applicationId
+    )) return null;
+  }
+  const snapshot = transactReviewReadinessDraftSnapshot(current, ownerKey, null, retireOwnerKey);
+  if (!snapshot) return null;
+  return {
+    snapshot,
+    affectsCurrentOwner: active?.generation === installed.ownerGeneration
+      && active.ref.applicationId === installed.applicationId,
+    settledGeneration: installed.ownerGeneration,
+  };
+}
+
+function sameProductActionUndoRequest(
+  left: ProductActionUndoRequest | null | undefined,
+  right: ProductActionUndoRequest | null | undefined,
+): boolean {
+  return Boolean(left && right
+    && left.ownerKey === right.ownerKey
+    && left.originOwnerKey === right.originOwnerKey
+    && left.parentOperationId === right.parentOperationId
+    && left.actionName === right.actionName);
+}
+
+function canonicalInterviewStoryActionOwnerKey(draft: InterviewStoryDraft): string | null {
+  return draft.attemptId === null
+    ? null
+    : `story:${draft.attemptId}:${draft.attemptGenerationRevision}:${draft.productActionGeneration}`;
+}
+
+function exactInterviewStoryUndoRequest(
+  action: ProductActionOwnerDraft,
+  request: ProductActionUndoRequest | null | undefined,
+): request is ProductActionUndoRequest {
+  return Boolean(request
+    && request.ownerKey === action.ownerKey
+    && request.originOwnerKey.length > 0
+    && request.parentOperationId === action.operationId
+    && request.actionName === action.actionName
+    && request.actionName === 'confirm_interview_story');
+}
+
+function sameInterviewStoryScope(left: InterviewStoryDraft, right: InterviewStoryDraft): boolean {
+  return left.entrypoint === right.entrypoint
+    && left.applicationId === right.applicationId
+    && left.reviewNoteId === right.reviewNoteId
+    && left.targetStoryId === right.targetStoryId;
+}
+
+function sameInterviewStoryUndoEnvelope(left: InterviewStoryDraft, right: InterviewStoryDraft): boolean {
+  const { productAction: _leftAction, ...leftEnvelope } = left;
+  const { productAction: _rightAction, ...rightEnvelope } = right;
+  return JSON.stringify(leftEnvelope) === JSON.stringify(rightEnvelope);
+}
+
+function sameInterviewStoryUndoAction(
+  left: ProductActionOwnerDraft,
+  right: ProductActionOwnerDraft,
+): boolean {
+  const {
+    undoStatus: _leftUndoStatus,
+    undoReplayed: _leftUndoReplayed,
+    undoRequest: _leftUndoRequest,
+    undoResultUnknown: _leftUndoResultUnknown,
+    ...leftFrozen
+  } = left;
+  const {
+    undoStatus: _rightUndoStatus,
+    undoReplayed: _rightUndoReplayed,
+    undoRequest: _rightUndoRequest,
+    undoResultUnknown: _rightUndoResultUnknown,
+    ...rightFrozen
+  } = right;
+  return JSON.stringify(leftFrozen) === JSON.stringify(rightFrozen);
+}
+
+export function authorizeInterviewStoryDraftUpdate(
+  current: InterviewStoryDraft | undefined,
+  next: InterviewStoryDraft | null,
+  context?: InterviewStoryDraftChangeContext,
+): boolean {
+  if (next === null) return context === undefined;
+  if (!current || !sameInterviewStoryScope(current, next)) return false;
+
+  const currentAction = current.productAction;
+  if (!context) {
+    return !currentAction?.undoRequest && currentAction?.undoResultUnknown !== true;
+  }
+
+  const nextAction = next.productAction;
+  const request = context.undoRequest;
+  if (
+    !currentAction
+    || !nextAction
+    || current.attemptId === null
+    || current.attemptId !== next.attemptId
+    || current.attemptGenerationRevision !== next.attemptGenerationRevision
+    || current.productActionGeneration !== next.productActionGeneration
+    || canonicalInterviewStoryActionOwnerKey(current) !== currentAction.ownerKey
+    || canonicalInterviewStoryActionOwnerKey(next) !== nextAction.ownerKey
+    || currentAction.ownerKey !== nextAction.ownerKey
+    || currentAction.operationId !== nextAction.operationId
+    || currentAction.actionName !== 'confirm_interview_story'
+    || nextAction.actionName !== currentAction.actionName
+    || !exactInterviewStoryUndoRequest(currentAction, request)
+    || !sameInterviewStoryUndoEnvelope(current, next)
+    || !sameInterviewStoryUndoAction(currentAction, nextAction)
+  ) return false;
+
+  const existingRequest = currentAction.undoRequest;
+  if (existingRequest) {
+    if (!sameProductActionUndoRequest(existingRequest, request)) return false;
+  } else if (
+    currentAction.status !== 'committed'
+    || currentAction.undoStatus != null
+    || currentAction.undoResultUnknown === true
+    || request.originOwnerKey !== currentAction.ownerKey
+  ) return false;
+
+  const nextPendingOrUnknown = exactInterviewStoryUndoRequest(nextAction, nextAction.undoRequest)
+    && sameProductActionUndoRequest(nextAction.undoRequest, request)
+    && nextAction.undoStatus == null;
+  const nextTerminal = nextAction.undoRequest == null
+    && nextAction.undoResultUnknown !== true
+    && (nextAction.undoStatus === 'committed' || nextAction.undoStatus === 'failed');
+  return nextPendingOrUnknown || nextTerminal;
+}
+
+export function transactAdaptivePracticeDraftSnapshot(
+  current: Readonly<Record<string, AdaptivePracticeOwnerDraft>>,
+  ownerKey: string,
+  draft: AdaptivePracticeOwnerDraft | null,
+  retireOwnerKey?: string,
+): Record<string, AdaptivePracticeOwnerDraft> | null {
+  if (draft && draft.ownerKey !== ownerKey) return null;
+  const retired = retireOwnerKey ? current[retireOwnerKey] : undefined;
+  const installed = current[ownerKey];
+  if (retireOwnerKey && draft && (
+    !retired
+    || retired.signalVersionId !== draft.signalVersionId
+    || retired.targetEventId !== draft.targetEventId
+    || retired.planId !== draft.planId
+    || retired.ownerGeneration >= draft.ownerGeneration
+  )) return null;
+  if (!draft && !installed && !retired) return null;
+  if (!draft && installed && retired && (
+    installed.signalVersionId !== retired.signalVersionId
+    || installed.targetEventId !== retired.targetEventId
+    || installed.planId !== retired.planId
+  )) return null;
+  const next = { ...current };
+  if (retireOwnerKey) delete next[retireOwnerKey];
+  if (draft) next[ownerKey] = draft;
+  else delete next[ownerKey];
+  return next;
+}
+
+export function adaptivePracticeSubOwnerReplacementDenied(input: {
+  currentFocus: AdaptivePracticeFocus | undefined;
+  nextFocus: AdaptivePracticeFocus | undefined;
+  drafts: Readonly<Record<string, AdaptivePracticeOwnerDraft>>;
+  ownerGeneration: number;
+  surfaceGuard: { pending: boolean; unsaved: boolean };
+}): boolean {
+  if (adaptivePracticeOwnerIdentity(input.currentFocus) === adaptivePracticeOwnerIdentity(input.nextFocus)) return false;
+  const draftGuard = adaptivePracticeDraftGuard(input.drafts, input.ownerGeneration);
+  return input.surfaceGuard.pending || input.surfaceGuard.unsaved || draftGuard.pending || draftGuard.unsaved;
+}
+
+export function adaptivePracticeGuardAfterOwnerLaunch(input: {
+  launchKind: 'launched' | 'focused_existing';
+  drafts: Readonly<Record<string, AdaptivePracticeOwnerDraft>>;
+  ownerGeneration: number;
+  recoveryOwnerGeneration?: number | null;
+  nextFocus?: AdaptivePracticeFocus;
+  surfaceGuard: { pending: boolean; unsaved: boolean };
+}): { pending: boolean; unsaved: boolean } {
+  if (input.launchKind === 'launched') {
+    if (input.recoveryOwnerGeneration == null) return { pending: false, unsaved: false };
+    const recoveryIdentity = adaptivePracticeOwnerIdentity(input.nextFocus);
+    const recoverable = Object.values(input.drafts).filter((draft) => (
+      draft.ownerGeneration === input.recoveryOwnerGeneration
+      && (draft.pendingOperation !== null || draft.resultUnknown || (draft.planId !== null && Boolean(draft.answer || draft.reflection || draft.assessment)))
+      && (draft.signalVersionId === null && draft.targetEventId === null
+        ? recoveryIdentity === 'three-mode'
+        : recoveryIdentity === `${draft.signalVersionId}:${draft.targetEventId}`)
+    ));
+    return {
+      pending: recoverable.some((draft) => draft.pendingOperation !== null || draft.resultUnknown),
+      unsaved: recoverable.some((draft) => Boolean(
+        draft.answer || draft.reflection || draft.assessment || draft.startInput || draft.completionInput,
+      )),
+    };
+  }
+  const draftGuard = adaptivePracticeDraftGuard(input.drafts, input.ownerGeneration);
+  return {
+    pending: input.surfaceGuard.pending || draftGuard.pending,
+    unsaved: input.surfaceGuard.unsaved || draftGuard.unsaved,
+  };
+}
+
+export function settleRecoveredCoreTaskAfterGuardTransition(
+  controller: CoreTaskSurfaceController,
+  previous: { pending: boolean; unsaved: boolean },
+  next: { pending: boolean; unsaved: boolean },
+): void {
+  if ((!previous.pending && !previous.unsaved) || next.pending || next.unsaved) return;
+  const active = controller.getState().active;
+  if (!active) return;
+  controller.settleRecovery(active.recoveryGeneration ?? active.generation);
+}
+
+export function closeCoreTaskOwnerWithGuard(
+  controller: CoreTaskSurfaceController,
+  guard: { pending: boolean; unsaved: boolean },
+): void {
+  const active = controller.getState().active;
+  if (!active) return;
+  if (requestCoreTaskClose(controller, active, guard)) controller.markClosed(active.generation);
+}
 
 const PILOT_FIT_PROJECTION_STATUSES = new Set<OpportunityFitOwnerProjection['status']>([
   'idle',
@@ -462,10 +963,7 @@ function AppShellContent() {
   const closeCoreTaskSurface = useCallback(() => {
     const active = coreTaskController.getState().active;
     const guardBeforeClose = taskSurfaceGuardRef.current;
-    if (active) {
-      coreTaskController.close(active.generation);
-      coreTaskController.markClosed(active.generation);
-    }
+    if (active) closeCoreTaskOwnerWithGuard(coreTaskController, guardBeforeClose);
     // Closing the visual owner must not discard an in-flight or uncertain
     // operation. Detail normally refreshes this ref before unmount; preserve
     // a guarded snapshot when the close happens in the same event turn.
@@ -473,12 +971,19 @@ function AppShellContent() {
       ? guardBeforeClose
       : { pending: false, unsaved: false };
     setInterviewPreparationSelection(null);
+    if (active?.ref.taskId === 'interview.free_practice') {
+      adaptivePracticeFocusRef.current = undefined;
+      setAdaptivePracticeFocus(undefined);
+    }
   }, [coreTaskController]);
   const [view, setView] = useState<ViewMode>(readInitialWorkspaceView);
   const [applicationViewState, setApplicationViewState] = useState<ApplicationViewState>(
     DEFAULT_APPLICATION_VIEW_STATE,
   );
   const [adaptivePracticeFocus, setAdaptivePracticeFocus] = useState<AdaptivePracticeFocus | undefined>();
+  const adaptivePracticeFocusRef = useRef<AdaptivePracticeFocus | undefined>();
+  const [adaptivePracticeDrafts, setAdaptivePracticeDrafts] = useState<Record<string, AdaptivePracticeOwnerDraft>>({});
+  const adaptivePracticeDraftsRef = useRef<Record<string, AdaptivePracticeOwnerDraft>>({});
   const [addOpen, setAddOpen] = useState(false);
   const [resumeUploadRequestToken, setResumeUploadRequestToken] = useState(0);
   const [offerCreateRequestToken, setOfferCreateRequestToken] = useState(0);
@@ -499,6 +1004,10 @@ function AppShellContent() {
   const [interviewStudioContext, setInterviewStudioContext] = useState<(RealInterviewStudioContext | QuickPracticeStudioContext) | null>(null);
   const [interviewStudioHaruVisible, setInterviewStudioHaruVisible] = useState(false);
   const [interviewStudioEvidenceOpen, setInterviewStudioEvidenceOpen] = useState(true);
+  const openQuickPracticeStudio = useCallback((context: QuickPracticeStudioContext) => {
+    setInterviewStudioHaruVisible(false);
+    setInterviewStudioContext(context);
+  }, []);
   useEffect(() => {
     if (!interviewPreparationSelection) return;
     const active = coreTaskSurfaceState.active;
@@ -522,6 +1031,8 @@ function AppShellContent() {
   const applicationJdDraftsRef = useRef(new Map<number, ApplicationJdDraft>());
   const [applicationJdDrafts, setApplicationJdDrafts] = useState<Record<number, ApplicationJdDraft>>({});
   const [interviewReviewProposalAttempts, setInterviewReviewProposalAttempts] = useState<Record<number, InterviewReviewProposalAttemptState>>({});
+  const [reviewReadinessDrafts, setReviewReadinessDrafts] = useState<Record<string, ReviewReadinessOwnerDraft>>({});
+  const reviewReadinessDraftsRef = useRef<Record<string, ReviewReadinessOwnerDraft>>({});
   const [interviewKnowledgeCaptureDrafts, setInterviewKnowledgeCaptureDrafts] = useState<Record<number, InterviewKnowledgeCaptureDraft>>({});
   const [interviewPreparationAttempts, setInterviewPreparationAttempts] = useState<Record<string, InterviewPreparationAttemptState>>({});
   const [interviewPreparationDrafts, setInterviewPreparationDrafts] = useState<Record<string, InterviewPreparationDraft>>({});
@@ -1025,8 +1536,7 @@ function AppShellContent() {
         message.warning('当前任务还有未完成内容，请先处理后再切换投递');
         return;
       }
-      coreTaskController.close(active.generation);
-      coreTaskController.markClosed(active.generation);
+      closeCoreTaskOwnerWithGuard(coreTaskController, { pending: false, unsaved: false });
       taskSurfaceGuardRef.current = { pending: false, unsaved: false };
     }
     if (!active || active.ref.applicationId !== app.id) setPilotApplicationContext(null);
@@ -1144,8 +1654,7 @@ function AppShellContent() {
         return;
       }
       if (active && active.ref.applicationId !== applicationId) {
-        coreTaskController.close(active.generation);
-        coreTaskController.markClosed(active.generation);
+        closeCoreTaskOwnerWithGuard(coreTaskController, { pending: false, unsaved: false });
         taskSurfaceGuardRef.current = { pending: false, unsaved: false };
       }
     } else {
@@ -1241,11 +1750,105 @@ function AppShellContent() {
       : launchCoreTask(request);
   }
 
-  const openFreePractice = (): CoreTaskLaunchResult => {
+  const launchAdaptivePracticeOwner = (
+    nextFocus: AdaptivePracticeFocus | undefined,
+    request: TaskLaunchRequest,
+  ): CoreTaskLaunchResult => {
+    const active = coreTaskController.getState().active;
+    if (active?.ref.taskId === 'interview.free_practice') {
+      if (adaptivePracticeSubOwnerReplacementDenied({
+        currentFocus: adaptivePracticeFocusRef.current,
+        nextFocus,
+        drafts: adaptivePracticeDraftsRef.current,
+        ownerGeneration: active.generation,
+        surfaceGuard: taskSurfaceGuardRef.current,
+      })) {
+        message.warning('当前练习还有待确认或未保存内容，请先处理后再切换。');
+        return { kind: 'replacement_denied', reason: 'replacement_guard_denied', generation: active.generation };
+      }
+    }
     const result = launchCoreTask({
+      ...request,
+      childOwnerIdentity: adaptivePracticeOwnerIdentity(nextFocus),
+    });
+    if (result.kind !== 'launched' && result.kind !== 'focused_existing') return result;
+    const normalizedFocus = nextFocus ? { ...nextFocus, ownerGeneration: result.generation } : undefined;
+    adaptivePracticeFocusRef.current = normalizedFocus;
+    setAdaptivePracticeFocus(normalizedFocus);
+    taskSurfaceGuardRef.current = adaptivePracticeGuardAfterOwnerLaunch({
+      launchKind: result.kind,
+      drafts: adaptivePracticeDraftsRef.current,
+      ownerGeneration: result.generation,
+      recoveryOwnerGeneration: coreTaskController.getState().active?.recoveryGeneration,
+      nextFocus: normalizedFocus,
+      surfaceGuard: taskSurfaceGuardRef.current,
+    });
+    return result;
+  };
+
+  const openFreePractice = (): CoreTaskLaunchResult => {
+    const result = launchAdaptivePracticeOwner(undefined, {
       ref: { taskId: 'interview.free_practice' },
       source: 'deep_link',
       focus: 'current',
+    });
+    if (result.kind !== 'launched' && result.kind !== 'focused_existing') return result;
+    setSelected(null);
+    setEvidenceFocus(null);
+    setVoiceCoachingGrowthOpen(false);
+    setInterviewStoryLibraryOpen(false);
+    setView('interview');
+    return result;
+  };
+
+  const updateReviewReadinessDraft = (
+    key: string,
+    draft: ReviewReadinessOwnerDraft | null,
+    retireOwnerKey?: string,
+    undoRequest?: ProductActionUndoRequest,
+  ): boolean => {
+    const active = coreTaskController.getState().active;
+    const authorized = authorizeReviewReadinessDraftTransaction(
+      reviewReadinessDraftsRef.current, key, draft, retireOwnerKey, active, undoRequest,
+    );
+    if (!authorized) return false;
+    reviewReadinessDraftsRef.current = authorized.snapshot;
+    if (draft && authorized.affectsCurrentOwner) {
+      const nextGuard = {
+        pending: isReviewReadinessDraftPending(draft),
+        unsaved: isReviewReadinessDraftUnsaved(draft),
+      };
+      settleRecoveredCoreTaskAfterGuardTransition(coreTaskController, taskSurfaceGuardRef.current, nextGuard);
+      taskSurfaceGuardRef.current = nextGuard;
+    }
+    if (authorized.settledGeneration !== null) {
+      coreTaskController.settleRecovery(authorized.settledGeneration);
+    }
+    if (!draft && authorized.affectsCurrentOwner) {
+      settleRecoveredCoreTaskAfterGuardTransition(coreTaskController, taskSurfaceGuardRef.current, { pending: false, unsaved: false });
+      taskSurfaceGuardRef.current = { pending: false, unsaved: false };
+    }
+    setReviewReadinessDrafts(authorized.snapshot);
+    return true;
+  };
+
+  const updateAdaptivePracticeDraft = (key: string, draft: AdaptivePracticeOwnerDraft | null, retireOwnerKey?: string): boolean => {
+    const active = coreTaskController.getState().active;
+    if (draft && active?.ref.taskId === 'interview.free_practice' && draft.ownerGeneration !== active.generation) return false;
+    if (retireOwnerKey && draft
+      && active?.recoveryGeneration !== adaptivePracticeDraftsRef.current[retireOwnerKey]?.ownerGeneration) return false;
+    const nextSnapshot = transactAdaptivePracticeDraftSnapshot(adaptivePracticeDraftsRef.current, key, draft, retireOwnerKey);
+    if (!nextSnapshot) return false;
+    adaptivePracticeDraftsRef.current = nextSnapshot;
+    setAdaptivePracticeDrafts(nextSnapshot);
+    return true;
+  };
+
+  const openReadinessPractice = (focus: AdaptivePracticeFocus): CoreTaskLaunchResult => {
+    const result = launchAdaptivePracticeOwner(focus, {
+      ref: { taskId: 'interview.free_practice' },
+      source: 'application_task_card',
+      focus: 'source',
     });
     if (result.kind !== 'launched' && result.kind !== 'focused_existing') return result;
     setSelected(null);
@@ -1488,6 +2091,7 @@ function AppShellContent() {
     setInterviewStoryDrafts((current) => {
       const existing = interviewStoryDraftsRef.current.get(scope);
       const next = existing ?? createInterviewStoryDraft(input.entrypoint, input.reviewNoteId, {
+        applicationId: input.applicationId,
         targetStoryId: input.targetStoryId,
         expectedCurrentVersionId: input.expectedCurrentVersionId,
         expectedStoryRevision: input.expectedStoryRevision,
@@ -1508,21 +2112,27 @@ function AppShellContent() {
     ? interviewStoryDrafts[activeInterviewStoryDraftScope] ?? null
     : null;
 
-  const updateInterviewStoryDraft = (draft: InterviewStoryDraft | null) => {
+  const updateInterviewStoryDraft = (
+    draft: InterviewStoryDraft | null,
+    context?: InterviewStoryDraftChangeContext,
+  ) => {
     const scope = activeInterviewStoryDraftScope;
-    if (!scope) return;
+    if (!scope) return false;
+    const currentDraft = interviewStoryDraftsRef.current.get(scope);
+    if (!authorizeInterviewStoryDraftUpdate(currentDraft, draft, context)) return false;
     if (draft === null) setInterviewStoryLibraryRevision((current) => current + 1);
+    if (draft === null) interviewStoryDraftsRef.current.delete(scope);
+    else interviewStoryDraftsRef.current.set(scope, draft);
     setInterviewStoryDrafts((current) => {
       const next = { ...current };
       if (draft === null) {
-        interviewStoryDraftsRef.current.delete(scope);
         delete next[scope];
       } else {
-        interviewStoryDraftsRef.current.set(scope, draft);
         next[scope] = draft;
       }
       return next;
     });
+    return true;
   };
 
   const activeInterviewPreparation = coreTaskSurfaceState.active?.ref.taskId === 'application.interview_prepare'
@@ -1583,6 +2193,10 @@ function AppShellContent() {
       onApplicationJdDraftChange={updateApplicationJdDraft}
       interviewReviewProposalAttempts={interviewReviewProposalAttempts}
       onInterviewReviewProposalAttemptChange={updateInterviewReviewProposalAttempt}
+      reviewReadinessDrafts={reviewReadinessDrafts}
+      onReviewReadinessDraftChange={updateReviewReadinessDraft}
+      onOpenReviewStory={(noteId) => openInterviewStoryDraft({ entrypoint: 'ui', applicationId: selectedApp.id, reviewNoteId: noteId })}
+      onOpenReadinessPractice={openReadinessPractice}
       onInterviewNoteChanged={clearInterviewReviewProposalAttempt}
       interviewKnowledgeCaptureDrafts={interviewKnowledgeCaptureDrafts}
       onInterviewKnowledgeCaptureDraftChange={updateInterviewKnowledgeCaptureDraft}
@@ -1686,7 +2300,19 @@ function AppShellContent() {
               confirmedCapturesError={confirmedInterviewKnowledgeNotesError}
             />
           )}
-          {view === 'questions' && <QuestionBankView adaptiveFocus={adaptivePracticeFocus} onAdaptiveFocusConsumed={() => setAdaptivePracticeFocus(undefined)} />}
+          {view === 'questions' && <QuestionBankView
+            adaptiveFocus={adaptivePracticeFocus}
+            adaptiveOwnerGeneration={adaptivePracticeFocus?.ownerGeneration}
+            adaptivePracticeDrafts={adaptivePracticeDrafts}
+            onAdaptivePracticeDraftChange={updateAdaptivePracticeDraft}
+            onAdaptiveFocusConsumed={() => undefined}
+            quickPracticeResumes={resumesLoading
+              ? { status: 'loading' }
+              : resumesError
+                ? { status: 'error' }
+                : { status: 'ready', value: resumes }}
+            onOpenStudio={openQuickPracticeStudio}
+          />}
           {view === 'interview' && (voiceCoachingGrowthOpen ? (
             <VoiceCoachingGrowthView
               onBack={() => setVoiceCoachingGrowthOpen(false)}
@@ -1727,22 +2353,28 @@ function AppShellContent() {
               onOpenTask={openExactInterviewTask}
             />
           ) : coreTaskSurfaceState.active?.ref.taskId === 'interview.free_practice' ? (
-            <InterviewReadinessCenter
-              initialMode="quick"
-              fixedMode="quick"
-              actionEmphasis="primary"
-              resumes={resumesLoading
-                ? { status: 'loading' }
-                : resumesError
-                  ? { status: 'error' }
-                  : { status: 'ready', value: resumes }}
-              onOpenStudio={(context) => {
+            <QuestionBankView
+              adaptiveFocus={adaptivePracticeFocus}
+              adaptiveOwnerGeneration={coreTaskSurfaceState.active.generation}
+              recoveryOwnerGeneration={coreTaskSurfaceState.active.recoveryGeneration}
+              adaptivePracticeDrafts={adaptivePracticeDrafts}
+              onAdaptivePracticeDraftChange={updateAdaptivePracticeDraft}
+              onAdaptivePracticeGuardChange={(guard) => {
                 const active = coreTaskController.getState().active;
-                if (!active || active.ref.taskId !== 'interview.free_practice') return;
-                setInterviewStudioHaruVisible(false);
-                setInterviewStudioContext(context);
+                if (active?.ref.taskId === 'interview.free_practice'
+                  && active.generation === coreTaskSurfaceState.active?.generation) {
+                  settleRecoveredCoreTaskAfterGuardTransition(coreTaskController, taskSurfaceGuardRef.current, guard);
+                  taskSurfaceGuardRef.current = guard;
+                }
               }}
-            />
+               onAdaptiveFocusConsumed={() => undefined}
+               quickPracticeResumes={resumesLoading
+                 ? { status: 'loading' }
+                 : resumesError
+                   ? { status: 'error' }
+                   : { status: 'ready', value: resumes }}
+               onOpenStudio={openQuickPracticeStudio}
+             />
           ) : (
             <InterviewV01View
               onOpenApplication={goDetailById}
@@ -1767,10 +2399,6 @@ function AppShellContent() {
               }}
               onOpenVoiceCoachingGrowth={openVoiceCoachingGrowth}
               onOpenQuestionBank={() => navigateToView('questions')}
-              onOpenAdaptivePractice={(focus) => {
-                setAdaptivePracticeFocus(focus);
-                navigateToView('questions');
-              }}
             />
           ))}
           {view === 'resumes' && (

@@ -67,6 +67,8 @@ export interface TaskLaunchRequest {
   readonly source: TaskLaunchSource;
   readonly focus?: TaskLaunchFocus;
   readonly hints?: Readonly<TaskLaunchHints>;
+  /** UI-only child owner identity used to bind close/reopen recovery exactly. */
+  readonly childOwnerIdentity?: string;
 }
 
 export type CoreTaskParseFailureReason = 'unknown_task' | 'invalid_task_identity';

@@ -84,7 +84,7 @@ describe('QuestionBankView', () => {
   });
 
   it('keeps the practice path wired to due questions, answer reveal, review ratings, and stats refresh', () => {
-    expect(source).toContain("value: 'practice'");
+    expect(source).toContain("value: 'quick_practice'");
     expect(source).toContain('listDueQuestions(40)');
     expect(source).toContain('getPracticeStats()');
     expect(source).toContain('submitReview(id, rating)');

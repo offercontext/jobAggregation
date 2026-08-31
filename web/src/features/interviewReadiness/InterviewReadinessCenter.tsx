@@ -58,7 +58,7 @@ export interface ReadinessJdSource {
 }
 
 type ResumeRows = readonly (ResumeSelectionCandidate & Partial<Resume>)[];
-type ResumeInput = ResumeRows | ResumeSelectionSource<ResumeRows>;
+export type ResumeInput = ResumeRows | ResumeSelectionSource<ResumeRows>;
 type TaskLauncher = (request: TaskLaunchRequest) => unknown;
 
 interface Props {

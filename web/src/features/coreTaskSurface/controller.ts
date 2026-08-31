@@ -3,6 +3,7 @@ import { parseCoreTaskRef } from './contracts';
 import { CORE_TASK_REGISTRY, type CoreTaskOwner } from './registry';
 
 export type CoreTaskSurfacePhase = 'closed' | 'opening' | 'open' | 'closing';
+export type CoreTaskRecoveryCloseMode = 'ordinary' | 'discard' | 'preserve';
 
 export interface ActiveCoreTask {
   readonly ref: CoreTaskRef;
@@ -11,6 +12,9 @@ export interface ActiveCoreTask {
   readonly owner: string;
   readonly ownerId: string;
   readonly generation: number;
+  /** Exact immediately-closed owner generation eligible for draft recovery. */
+  readonly recoveryGeneration: number | null;
+  readonly childOwnerIdentity: string | null;
   readonly request: TaskLaunchRequest;
 }
 
@@ -47,8 +51,40 @@ export interface CoreTaskSurfaceController {
   focus(generation: number): void;
   subscribeFocus(listener: (active: ActiveCoreTask) => void): () => void;
   markOpen(generation: number): void;
-  close(generation: number): void;
+  close(generation: number, recoveryMode?: CoreTaskRecoveryCloseMode): void;
   markClosed(generation: number): void;
+  /** Explicitly confirms that the owner generation no longer needs retry recovery. */
+  settleRecovery(generation: number): void;
+  /** Explicitly invalidates retry recovery for an owner generation. */
+  revokeRecovery(generation: number): void;
+}
+
+export interface CoreTaskCloseGuard {
+  readonly pending: boolean;
+  readonly unsaved: boolean;
+}
+
+/**
+ * The single close authority for UI entrypoints. A stale Drawer, keyboard
+ * listener, or animation callback cannot close a replacement owner because
+ * all canonical and child-owner identity fields must still match.
+ */
+export function requestCoreTaskClose(
+  controller: CoreTaskSurfaceController,
+  expected: Pick<ActiveCoreTask, 'generation' | 'key' | 'ownerId' | 'childOwnerIdentity'>,
+  guard: CoreTaskCloseGuard,
+): boolean {
+  const active = controller.getState().active;
+  if (
+    !active
+    || active.generation !== expected.generation
+    || active.key !== expected.key
+    || active.ownerId !== expected.ownerId
+    || active.childOwnerIdentity !== expected.childOwnerIdentity
+  ) return false;
+  controller.close(active.generation, guard.pending || guard.unsaved ? 'preserve' : 'discard');
+  return controller.getState().phase === 'closing'
+    && controller.getState().active?.generation === active.generation;
 }
 
 /**
@@ -69,7 +105,23 @@ function frozenRequest(request: TaskLaunchRequest, ref: CoreTaskRef): TaskLaunch
   const source = request.source;
   const focus = request.focus;
   const hints = request.hints ? Object.freeze({ ...request.hints }) : undefined;
-  return Object.freeze({ ref, source, ...(focus ? { focus } : {}), ...(hints ? { hints } : {}) });
+  const childOwnerIdentity = request.childOwnerIdentity;
+  if (childOwnerIdentity !== undefined && (
+    typeof childOwnerIdentity !== 'string'
+    || childOwnerIdentity.length === 0
+    || childOwnerIdentity.length > 200
+  )) throw new Error('invalid_child_owner_identity');
+  return Object.freeze({
+    ref,
+    source,
+    ...(focus ? { focus } : {}),
+    ...(hints ? { hints } : {}),
+    ...(childOwnerIdentity === undefined ? {} : { childOwnerIdentity }),
+  });
+}
+
+function recoveryCertificateKey(key: string, ownerId: string, childOwnerIdentity: string | null): string {
+  return `${ownerId}\u0000${key}\u0000${childOwnerIdentity ?? ''}`;
 }
 
 function ownerFor(
@@ -91,6 +143,14 @@ function ownerFor(
  */
 export function createCoreTaskSurfaceController(options: CoreTaskControllerOptions = {}): CoreTaskSurfaceController {
   let state: CoreTaskSurfaceState = CLOSED_STATE;
+  // This live set is lifecycle-bounded, not cardinality-evicted: every entry
+  // represents an explicitly unsettled owner. A numeric FIFO ceiling would
+  // make an unknown write unreachable; explicit settlement, revocation, or a
+  // guard-cleared discard close are the only safe release operations.
+  const closedRecoveryCertificates = new Map<string, ActiveCoreTask>();
+  const recoveryCertificateKeyByGeneration = new Map<number, string>();
+  const dismissedActiveGenerations = new Set<number>();
+  let closingRecoveryIntent: { readonly generation: number; readonly mode: CoreTaskRecoveryCloseMode } | null = null;
   const listeners = new Set<() => void>();
   const focusListeners = new Set<(active: ActiveCoreTask) => void>();
 
@@ -124,11 +184,28 @@ export function createCoreTaskSurfaceController(options: CoreTaskControllerOptio
 
     const active = state.active;
     if (active && active.key === parsed.key) {
-      try { options.onFocus?.(active); } catch { /* observer isolation */ }
-      for (const listener of [...focusListeners]) {
-        try { listener(active); } catch { /* observer isolation */ }
+      let focusedActive = active;
+      let normalizedRequest: TaskLaunchRequest;
+      try {
+        normalizedRequest = frozenRequest(request, active.ref);
+      } catch {
+        return { kind: 'invalid', reason: 'invalid_task_identity' };
       }
-      return { kind: 'focused_existing', generation: active.generation, key: active.key, ownerId: active.ownerId };
+      const childOwnerIdentity = normalizedRequest.childOwnerIdentity ?? null;
+      if (childOwnerIdentity !== active.childOwnerIdentity) {
+        focusedActive = Object.freeze({
+          ...active,
+          childOwnerIdentity,
+          recoveryGeneration: null,
+          request: normalizedRequest,
+        });
+        setState({ ...state, active: focusedActive });
+      }
+      try { options.onFocus?.(focusedActive); } catch { /* observer isolation */ }
+      for (const listener of [...focusListeners]) {
+        try { listener(focusedActive); } catch { /* observer isolation */ }
+      }
+      return { kind: 'focused_existing', generation: focusedActive.generation, key: focusedActive.key, ownerId: focusedActive.ownerId };
     }
 
     if (active) {
@@ -160,6 +237,7 @@ export function createCoreTaskSurfaceController(options: CoreTaskControllerOptio
     }
 
     const generation = state.generation + 1;
+    if (active) dismissedActiveGenerations.delete(active.generation);
     const canonicalRef = Object.freeze({ ...parsed.ref });
     let normalizedRequest: TaskLaunchRequest;
     try {
@@ -167,19 +245,44 @@ export function createCoreTaskSurfaceController(options: CoreTaskControllerOptio
     } catch {
       return { kind: 'invalid', reason: 'invalid_task_identity' };
     }
+    const childOwnerIdentity = normalizedRequest.childOwnerIdentity ?? null;
+    const certificateKey = recoveryCertificateKey(parsed.key, ownerId, childOwnerIdentity);
+    const recoveryCertificate = closedRecoveryCertificates.get(certificateKey) ?? null;
     const activeTask: ActiveCoreTask = Object.freeze({
       ref: canonicalRef,
       key: parsed.key,
       owner: ownerId,
       ownerId,
       generation,
+      recoveryGeneration: !active ? recoveryCertificate?.generation ?? null : null,
+      childOwnerIdentity,
       request: normalizedRequest,
     });
+    // A relaunch borrows the exact certificate but never consumes it. Only an
+    // explicit owner/draft settlement, revocation, or guard-cleared discard
+    // may make an uncertain operation unreachable; repeated close/reopen
+    // therefore keeps the original generation available.
     setState({ phase: 'opening', generation, active: activeTask });
     if (state.generation !== generation || state.active?.generation !== generation) {
       return { kind: 'superseded', generation: state.generation, key: parsed.key };
     }
     return { kind: 'launched', generation, key: parsed.key, ownerId };
+  };
+
+  const deleteRecoveryCertificate = (certificateKey: string) => {
+    const certificate = closedRecoveryCertificates.get(certificateKey);
+    if (!certificate) return;
+    closedRecoveryCertificates.delete(certificateKey);
+    recoveryCertificateKeyByGeneration.delete(certificate.generation);
+  };
+
+  const dismissRecovery = (generation: number) => {
+    const certificateKey = recoveryCertificateKeyByGeneration.get(generation);
+    if (certificateKey) deleteRecoveryCertificate(certificateKey);
+    const active = state.active;
+    if (active && (active.generation === generation || active.recoveryGeneration === generation)) {
+      dismissedActiveGenerations.add(active.generation);
+    }
   };
 
   const controller: CoreTaskSurfaceController = {
@@ -206,14 +309,34 @@ export function createCoreTaskSurfaceController(options: CoreTaskControllerOptio
       if (state.phase !== 'opening' || state.active?.generation !== generation) return;
       setState({ ...state, phase: 'open' });
     },
-    close: (generation) => {
+    close: (generation, recoveryMode = 'ordinary') => {
       if ((state.phase !== 'opening' && state.phase !== 'open') || state.active?.generation !== generation) return;
+      closingRecoveryIntent = Object.freeze({ generation, mode: recoveryMode });
       setState({ ...state, phase: 'closing' });
     },
     markClosed: (generation) => {
       if (state.phase !== 'closing' || state.active?.generation !== generation) return;
+      const certificateKey = recoveryCertificateKey(
+        state.active.key,
+        state.active.ownerId,
+        state.active.childOwnerIdentity,
+      );
+      const recoveryIntent = closingRecoveryIntent;
+      closingRecoveryIntent = null;
+      const preserveRecovery = recoveryIntent?.generation === generation
+        && recoveryIntent.mode === 'preserve';
+      const discardRecovery = recoveryIntent?.generation === generation
+        && recoveryIntent.mode === 'discard';
+      if (dismissedActiveGenerations.delete(state.active.generation) || discardRecovery) {
+        deleteRecoveryCertificate(certificateKey);
+      } else if (preserveRecovery && !closedRecoveryCertificates.has(certificateKey)) {
+        closedRecoveryCertificates.set(certificateKey, state.active);
+        recoveryCertificateKeyByGeneration.set(state.active.generation, certificateKey);
+      }
       setState({ phase: 'closed', generation: state.generation, active: null });
     },
+    settleRecovery: dismissRecovery,
+    revokeRecovery: dismissRecovery,
   };
   return controller;
 }

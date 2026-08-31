@@ -44,7 +44,11 @@ vi.mock('@/components/KanbanBoard', () => ({ default: () => <div /> }));
 vi.mock('@/components/ApplicationListView', () => ({ default: () => <div /> }));
 vi.mock('@/components/CalendarView', () => ({ default: () => <div /> }));
 vi.mock('@/components/KnowledgeSourcesView', () => ({ default: () => <div /> }));
-vi.mock('@/components/QuestionBankView', () => ({ default: () => <div /> }));
+vi.mock('@/components/QuestionBankView', () => ({
+  default: () => <section data-testid="three-mode-practice-owner">
+    <button type="button">复盘训练</button><button type="button">题库</button><button type="button">快速练习</button>
+  </section>,
+}));
 vi.mock('@/components/OfferCenterView', () => ({ default: () => <div /> }));
 vi.mock('@/components/ResumeLibraryView', () => ({ default: () => <div /> }));
 vi.mock('@/components/SettingsView', () => ({ default: () => <div /> }));
@@ -147,14 +151,9 @@ describe('AppShell voice coaching navigation', () => {
     expect(host.querySelector('[data-testid="voice-growth-view"]')).not.toBeNull();
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="practice-growth"]')?.click());
     await flush();
-    expect(host.querySelector('[data-testid="interview-readiness-center"]')?.getAttribute('data-readiness-mode')).toBe('quick');
-    act(() => host.querySelector<HTMLButtonElement>('[data-testid="open-quick-studio"]')?.click());
-    await flush();
-    expect(host.querySelector('[data-testid="interview-studio"]')?.getAttribute('data-context-kind')).toBe('quick_practice');
-    expect(host.querySelector('[data-testid="interview-studio"]')?.getAttribute('data-case-id')).toBe('101');
-    act(() => host.querySelector<HTMLButtonElement>('[data-testid="close-studio"]')?.click());
-    await flush();
-    expect(host.querySelector('[data-testid="interview-studio"]')).toBeNull();
+    expect(host.querySelector('[data-testid="three-mode-practice-owner"]')?.textContent).toContain('复盘训练');
+    expect(host.querySelector('[data-testid="three-mode-practice-owner"]')?.textContent).toContain('题库');
+    expect(host.querySelector('[data-testid="three-mode-practice-owner"]')?.textContent).toContain('快速练习');
 
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="nav-pilot"]')?.click());
     await flush();
@@ -163,7 +162,7 @@ describe('AppShell voice coaching navigation', () => {
     expect(host.querySelector('[data-testid="voice-growth-view"]')).not.toBeNull();
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="practice-growth"]')?.click());
     await flush();
-    expect(host.querySelector('[data-testid="interview-readiness-center"]')?.getAttribute('data-readiness-mode')).toBe('quick');
+    expect(host.querySelector('[data-testid="three-mode-practice-owner"]')).not.toBeNull();
   });
 
   it('keeps the composition root write-free while the canonical studio owns close', async () => {
@@ -175,12 +174,8 @@ describe('AppShell voice coaching navigation', () => {
     await flush();
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="practice-growth"]')?.click());
     await flush();
-    expect(host.querySelector('[data-testid="interview-readiness-center"]')).not.toBeNull();
+    expect(host.querySelector('[data-testid="three-mode-practice-owner"]')).not.toBeNull();
     expect(host.querySelector('[data-testid="interview-studio"]')).toBeNull();
-    act(() => host.querySelector<HTMLButtonElement>('[data-testid="open-quick-studio"]')?.click());
-    await flush();
-    act(() => host.querySelector<HTMLButtonElement>('[data-testid="close-studio"]')?.click());
-    await flush();
     expect(host.querySelector('[data-testid="interview-studio"]')).toBeNull();
   });
 
@@ -193,11 +188,7 @@ describe('AppShell voice coaching navigation', () => {
     await flush();
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="practice-growth"]')?.click());
     await flush();
-    act(() => host.querySelector<HTMLButtonElement>('[data-testid="open-quick-studio"]')?.click());
-    await flush();
-    expect(host.querySelector('[data-testid="interview-studio"]')?.getAttribute('data-case-id')).toBe('101');
-    act(() => host.querySelector<HTMLButtonElement>('[data-testid="close-studio"]')?.click());
-    await flush();
+    expect(host.querySelector('[data-testid="three-mode-practice-owner"]')).not.toBeNull();
 
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="nav-interview"]')?.click());
     await flush();
@@ -205,6 +196,6 @@ describe('AppShell voice coaching navigation', () => {
     await flush();
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="practice-growth"]')?.click());
     await flush();
-    expect(host.querySelector('[data-testid="interview-readiness-center"]')?.getAttribute('data-readiness-mode')).toBe('quick');
+    expect(host.querySelector('[data-testid="three-mode-practice-owner"]')).not.toBeNull();
   });
 });

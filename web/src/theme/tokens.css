@@ -17,7 +17,7 @@
   --op-on-primary: #000000;
   --op-on-warning: #23213a;
   --op-ink: #23213a;
-  --op-muted: #8b87b3;
+  --op-muted: #6f6b95;
   --op-muted-strong: #5b587a;
   --op-layout-bg: #f6f6fb;
   --op-surface: #ffffff;
@@ -33,13 +33,14 @@
     rgba(168, 85, 247, 0.035) 60%,
     transparent
   );
-  --ring: 0 0 0 3px rgba(99, 102, 241, 0.16);
+  --op-focus-ring-color: #4f46e5;
+  --ring: 0 0 0 3px var(--op-focus-ring-color);
   --op-control-height: 36px;
   --op-control-radius: 8px;
   --op-control-gap: 8px;
   --op-control-border: var(--op-border-strong);
   --op-control-bg-subtle: var(--surface-sunken);
-  --op-focus-ring: 0 0 0 3px rgba(99, 102, 241, 0.16);
+  --op-focus-ring: 0 0 0 3px var(--op-focus-ring-color);
 
   /* 渐变 */
   --op-gradient-brand: linear-gradient(135deg, #6366f1, #a855f7);
@@ -82,8 +83,9 @@
     rgba(168, 85, 247, 0.05) 60%,
     transparent
   );
-  --ring: 0 0 0 3px rgba(165, 180, 252, 0.2);
-  --op-focus-ring: 0 0 0 3px rgba(165, 180, 252, 0.2);
+  --op-focus-ring-color: #a5b4fc;
+  --ring: 0 0 0 3px var(--op-focus-ring-color);
+  --op-focus-ring: 0 0 0 3px var(--op-focus-ring-color);
   --op-on-accent: #ffffff;
   --op-on-danger: #111827;
   --op-on-primary: #000000;
@@ -103,7 +105,7 @@ button,
 
 :where(button, [role="button"], input, textarea, select, .ant-btn, .ant-input,
   .ant-select-selector, .ant-input-number):focus-visible {
-  outline: 2px solid var(--op-primary);
+  outline: 2px solid var(--op-focus-ring-color);
   outline-offset: 2px;
   box-shadow: var(--op-focus-ring);
 }

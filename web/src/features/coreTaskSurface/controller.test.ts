@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import type { TaskLaunchRequest } from './contracts';
-import { createCoreTaskSurfaceController } from './controller';
+import { createCoreTaskSurfaceController, requestCoreTaskClose } from './controller';
+import controllerSource from './controller.ts?raw';
 
 const request = (applicationId: number, source: TaskLaunchRequest['source'] = 'application_header', hints?: TaskLaunchRequest['hints']): TaskLaunchRequest => ({
   ref: { taskId: 'application.material_kit', applicationId },
@@ -28,6 +29,230 @@ describe('CoreTaskSurfaceController', () => {
     controller.markClosed(opened.generation);
     expect(controller.getState()).toMatchObject({ phase: 'closed', generation: 1, active: null });
     expect(notifications).toEqual(['opening', 'open', 'closing', 'closed']);
+  });
+
+  it('certifies only an exact close-to-relaunch owner as recovery lineage', () => {
+    const controller = createCoreTaskSurfaceController();
+    const first = controller.launch(request(7));
+    if (first.kind !== 'launched') throw new Error('launch should succeed');
+    controller.markOpen(first.generation);
+    controller.close(first.generation, 'preserve');
+    controller.markClosed(first.generation);
+
+    const reopened = controller.launch(request(7));
+    if (reopened.kind !== 'launched') throw new Error('relaunch should succeed');
+    expect(reopened.generation).toBe(first.generation + 1);
+    expect(controller.getState().active).toMatchObject({
+      generation: reopened.generation,
+      recoveryGeneration: first.generation,
+      key: 'application.material_kit:applicationId=7',
+    });
+
+    controller.markOpen(reopened.generation);
+    controller.close(reopened.generation, 'preserve');
+    controller.markClosed(reopened.generation);
+    const differentOwner = controller.launch(request(8));
+    if (differentOwner.kind !== 'launched') throw new Error('different owner launch should succeed');
+    expect(controller.getState().active).toMatchObject({
+      generation: differentOwner.generation,
+      recoveryGeneration: null,
+      key: 'application.material_kit:applicationId=8',
+    });
+  });
+
+  it('retains a closed child-owner recovery certificate across unrelated child launches', () => {
+    const controller = createCoreTaskSurfaceController();
+    const freePractice = (childOwnerIdentity: string): TaskLaunchRequest => ({
+      ref: { taskId: 'interview.free_practice' },
+      source: 'application_task_card',
+      focus: 'source',
+      childOwnerIdentity,
+    } as TaskLaunchRequest);
+
+    const exact = controller.launch(freePractice('91:103'));
+    if (exact.kind !== 'launched') throw new Error('exact child should launch');
+    controller.close(exact.generation, 'preserve');
+    controller.markClosed(exact.generation);
+
+    const ordinary = controller.launch(freePractice('three-mode'));
+    if (ordinary.kind !== 'launched') throw new Error('ordinary child should launch');
+    expect(controller.getState().active?.recoveryGeneration).toBeNull();
+    controller.close(ordinary.generation);
+    controller.markClosed(ordinary.generation);
+
+    const otherExact = controller.launch(freePractice('92:104'));
+    if (otherExact.kind !== 'launched') throw new Error('other exact child should launch');
+    expect(controller.getState().active?.recoveryGeneration).toBeNull();
+    controller.close(otherExact.generation);
+    controller.markClosed(otherExact.generation);
+
+    const returned = controller.launch(freePractice('91:103'));
+    if (returned.kind !== 'launched') throw new Error('original exact child should relaunch');
+    expect(controller.getState().active).toMatchObject({
+      generation: returned.generation,
+      recoveryGeneration: exact.generation,
+      childOwnerIdentity: '91:103',
+    });
+  });
+
+  it('never evicts an unsettled child-owner certificate after more than 64 unrelated closes', () => {
+    const controller = createCoreTaskSurfaceController();
+    const freePractice = (childOwnerIdentity: string): TaskLaunchRequest => ({
+      ref: { taskId: 'interview.free_practice' },
+      source: 'application_task_card',
+      focus: 'source',
+      childOwnerIdentity,
+    });
+    const close = (generation: number, recovery: 'discard' | 'preserve' = 'discard') => {
+      controller.close(generation, recovery);
+      controller.markClosed(generation);
+    };
+
+    const original = controller.launch(freePractice('91:103'));
+    if (original.kind !== 'launched') throw new Error('original child should launch');
+    close(original.generation, 'preserve');
+
+    for (let index = 0; index < 70; index += 1) {
+      const unrelated = controller.launch(freePractice(`other:${index}`));
+      if (unrelated.kind !== 'launched') throw new Error(`unrelated child ${index} should launch`);
+      expect(controller.getState().active?.recoveryGeneration).toBeNull();
+      close(unrelated.generation);
+    }
+
+    const returned = controller.launch(freePractice('91:103'));
+    if (returned.kind !== 'launched') throw new Error('original child should relaunch');
+    expect(controller.getState().active).toMatchObject({
+      childOwnerIdentity: '91:103',
+      recoveryGeneration: original.generation,
+    });
+  });
+
+  it('keeps an existing unknown certificate across an ordinary close until explicit cleanup', () => {
+    const controller = createCoreTaskSurfaceController();
+    const exact = (): TaskLaunchRequest => ({
+      ref: { taskId: 'interview.free_practice' }, source: 'application_task_card', focus: 'source',
+      childOwnerIdentity: '91:103',
+    });
+    const original = controller.launch(exact());
+    if (original.kind !== 'launched') throw new Error('original child should launch');
+    controller.close(original.generation, 'preserve'); controller.markClosed(original.generation);
+    const recovered = controller.launch(exact());
+    if (recovered.kind !== 'launched') throw new Error('unknown child should recover');
+    controller.close(recovered.generation); controller.markClosed(recovered.generation);
+    const returned = controller.launch(exact());
+    if (returned.kind !== 'launched') throw new Error('unknown child should return');
+    expect(controller.getState().active?.recoveryGeneration).toBe(original.generation);
+  });
+
+  it('revokes an existing certificate when a guard-cleared close explicitly discards recovery', () => {
+    const controller = createCoreTaskSurfaceController();
+    const exact = (): TaskLaunchRequest => ({
+      ref: { taskId: 'interview.free_practice' }, source: 'application_task_card', focus: 'source',
+      childOwnerIdentity: '91:103',
+    });
+    const original = controller.launch(exact());
+    if (original.kind !== 'launched') throw new Error('original child should launch');
+    controller.close(original.generation, 'preserve'); controller.markClosed(original.generation);
+    const recovered = controller.launch(exact());
+    if (recovered.kind !== 'launched') throw new Error('unknown child should recover');
+    controller.close(recovered.generation, 'discard'); controller.markClosed(recovered.generation);
+    const returned = controller.launch(exact());
+    if (returned.kind !== 'launched') throw new Error('discarded child should return');
+    expect(controller.getState().active?.recoveryGeneration).toBeNull();
+  });
+
+  it('does not retain certificates for many ordinary application and child-owner closes', () => {
+    const controller = createCoreTaskSurfaceController();
+    const close = (generation: number) => {
+      controller.close(generation);
+      controller.markClosed(generation);
+    };
+
+    for (let applicationId = 1; applicationId <= 70; applicationId += 1) {
+      const opened = controller.launch(request(applicationId));
+      if (opened.kind !== 'launched') throw new Error(`application ${applicationId} should launch`);
+      close(opened.generation);
+    }
+    for (let index = 0; index < 70; index += 1) {
+      const opened = controller.launch({
+        ref: { taskId: 'interview.free_practice' }, source: 'application_task_card', focus: 'source',
+        childOwnerIdentity: `ordinary:${index}`,
+      });
+      if (opened.kind !== 'launched') throw new Error(`ordinary child ${index} should launch`);
+      close(opened.generation);
+    }
+
+    for (const reopen of [
+      request(1),
+      request(70),
+      { ref: { taskId: 'interview.free_practice' }, source: 'application_task_card', focus: 'source', childOwnerIdentity: 'ordinary:0' } as const,
+      { ref: { taskId: 'interview.free_practice' }, source: 'application_task_card', focus: 'source', childOwnerIdentity: 'ordinary:69' } as const,
+    ]) {
+      const opened = controller.launch(reopen);
+      if (opened.kind !== 'launched') throw new Error('ordinary owner should relaunch');
+      expect(controller.getState().active?.recoveryGeneration).toBeNull();
+      close(opened.generation);
+    }
+  });
+
+  it('deletes a pending recovery certificate only after explicit settlement or revocation', () => {
+    const controller = createCoreTaskSurfaceController();
+    const close = (generation: number, recovery: 'discard' | 'preserve' = 'discard') => {
+      controller.close(generation, recovery);
+      controller.markClosed(generation);
+    };
+
+    const settled = controller.launch(request(71));
+    if (settled.kind !== 'launched') throw new Error('settled owner should launch');
+    close(settled.generation, 'preserve');
+    controller.settleRecovery(settled.generation);
+    const afterSettlement = controller.launch(request(71));
+    if (afterSettlement.kind !== 'launched') throw new Error('settled owner should relaunch');
+    expect(controller.getState().active?.recoveryGeneration).toBeNull();
+    close(afterSettlement.generation);
+
+    controller.revokeRecovery(afterSettlement.generation);
+    const afterRevocation = controller.launch(request(71));
+    if (afterRevocation.kind !== 'launched') throw new Error('revoked owner should relaunch');
+    expect(controller.getState().active?.recoveryGeneration).toBeNull();
+  });
+
+  it('indexes recovery cleanup by exact generation instead of scanning unrelated certificates', () => {
+    const dismissBody = controllerSource.match(/const dismissRecovery\s*=\s*\([^)]*\)\s*=>\s*\{([\s\S]*?)\n\s*\};/)?.[1] ?? '';
+    expect(dismissBody).toContain('recoveryCertificateKeyByGeneration.get(generation)');
+    expect(dismissBody).not.toMatch(/for\s*\(|\.forEach\s*\(/);
+  });
+
+  it('tracks an in-place child focus change before issuing its close certificate', () => {
+    const controller = createCoreTaskSurfaceController();
+    const launch = (childOwnerIdentity: string) => controller.launch({
+      ref: { taskId: 'interview.free_practice' }, source: 'application_task_card', focus: 'source', childOwnerIdentity,
+    });
+    const first = launch('91:103');
+    if (first.kind !== 'launched') throw new Error('first child should launch');
+    const focused = launch('92:104');
+    expect(focused).toMatchObject({ kind: 'focused_existing', generation: first.generation });
+    expect(controller.getState().active?.childOwnerIdentity).toBe('92:104');
+    controller.close(first.generation);
+    controller.markClosed(first.generation);
+    const oldChild = launch('91:103');
+    if (oldChild.kind !== 'launched') throw new Error('old child should relaunch');
+    expect(controller.getState().active?.recoveryGeneration).toBeNull();
+  });
+
+  it('rejects a stale close authority after the exact child owner changes in place', () => {
+    const controller = createCoreTaskSurfaceController();
+    const first = controller.launch({
+      ref: { taskId: 'interview.free_practice' }, source: 'application_task_card', childOwnerIdentity: '91:103',
+    });
+    if (first.kind !== 'launched') throw new Error('first child should launch');
+    const stale = controller.getState().active!;
+    const focused = controller.launch({
+      ref: { taskId: 'interview.free_practice' }, source: 'application_task_card', childOwnerIdentity: '92:104',
+    });
+    expect(focused.kind).toBe('focused_existing');
+    expect(requestCoreTaskClose(controller, stale, { pending: true, unsaved: true })).toBe(false);
+    expect(controller.getState()).toMatchObject({ phase: 'opening', active: { childOwnerIdentity: '92:104' } });
   });
 
   it('deduplicates by canonical key and ignores source, focus and hints', () => {

@@ -15,7 +15,10 @@ export async function createInterviewPreparationProposal(
   input: CreateInterviewPreparationProposalInput,
 ): Promise<InterviewPreparationProposal | InterviewPreparationPendingResponse> {
   try {
-    const { application_id, ...body } = input;
+    const { application_id, readiness_feedback_version_ids, ...legacyBody } = input;
+    const body = Object.prototype.hasOwnProperty.call(input, 'readiness_feedback_version_ids')
+      ? { ...legacyBody, readiness_feedback_version_ids }
+      : legacyBody;
     const response = await http.post<InterviewPreparationProposal | InterviewPreparationPendingResponse>(
       `/applications/${application_id}/interview-preparation-proposals`,
       body,

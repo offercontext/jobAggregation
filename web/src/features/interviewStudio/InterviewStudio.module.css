@@ -93,7 +93,7 @@
 .questionHint { display: inline-block; margin-top: 11px; color: var(--op-warning-strong); font-size: 12px; }
 .alert { margin: 18px 0 0; }
 .studioStatus { margin-top: 14px; }
-.studioStatus:focus { outline: 2px solid var(--op-focus-ring); outline-offset: 3px; border-radius: 10px; }
+.studioStatus:focus { outline: 2px solid var(--op-focus-ring-color); outline-offset: 3px; border-radius: 10px; }
 .studioStatus .alert { margin: 0; }
 .feedbackProgress {
   display: flex;
@@ -117,7 +117,7 @@
 .completeCard div { display: grid; gap: 4px; }
 .completeCard span, .feedbackCard p { color: var(--op-muted-strong); font-size: 13px; line-height: 1.6; }
 .feedbackCard { display: block; margin-left: 54px; border-color: color-mix(in srgb, var(--op-primary) 24%, var(--op-border)); background: color-mix(in srgb, var(--op-primary) 5%, var(--op-surface)); }
-.feedbackCard:focus-visible { outline: 2px solid var(--op-focus-ring); outline-offset: 3px; }
+.feedbackCard:focus-visible { outline: 2px solid var(--op-focus-ring-color); outline-offset: 3px; }
 .feedbackCard h2 { margin: 5px 0; }
 .feedbackCard p { margin: 0; }
 .feedbackCard ul { margin: 13px 0 0; padding-left: 20px; color: var(--op-muted-strong); line-height: 1.75; }
@@ -145,7 +145,7 @@
 .workspaceHeader { display: flex; align-items: center; min-height: 58px; padding: 0 14px; border-bottom: 1px solid var(--op-border); }
 .workspaceTabs { display: grid; grid-template-columns: 1fr 1fr; flex: 1; gap: 4px; padding: 4px; border-radius: 12px; background: color-mix(in srgb, var(--op-layout-bg) 78%, var(--op-surface)); }
 .workspaceTabs button { min-height: 40px; border: 0; border-radius: 9px; background: transparent; color: var(--op-muted-strong); cursor: pointer; font: inherit; font-size: 13px; font-weight: 700; }
-.workspaceTabs button:focus-visible { outline: 2px solid var(--op-focus-ring); outline-offset: 2px; }
+.workspaceTabs button:focus-visible { outline: 2px solid var(--op-focus-ring-color); outline-offset: 2px; }
 .workspaceTabs .activeWorkspaceTab { background: var(--op-surface); color: var(--op-primary-strong); box-shadow: 0 4px 14px color-mix(in srgb, var(--op-ink) 8%, transparent); }
 .answerWorkspacePanel { min-height: 0; display: flex; flex: 1; flex-direction: column; overflow: hidden; }
 .answerWorkspaceBody { min-height: 0; flex: 1 1 auto; padding: 16px; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }

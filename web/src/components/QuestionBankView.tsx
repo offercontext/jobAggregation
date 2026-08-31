@@ -45,7 +45,12 @@ import type {
 } from '@/types/question';
 import styles from './QuestionBankView.module.css';
 import AdaptiveInterviewPracticeWorkspace from './AdaptiveInterviewPracticeWorkspace';
-import type { AdaptivePracticeFocus } from '@/types/adaptiveInterviewPractice';
+import type { AdaptivePracticeFocus, AdaptivePracticeOwnerDraft } from '@/types/adaptiveInterviewPractice';
+import InterviewReadinessCenter, {
+  type QuickPracticeStudioContext,
+  type RealInterviewStudioContext,
+  type ResumeInput,
+} from '@/features/interviewReadiness/InterviewReadinessCenter';
 
 const { Paragraph } = Typography;
 
@@ -61,8 +66,33 @@ const STATUS_META: Record<QuestionStatus, { label: string; color: string }> = {
   mastered: { label: '已掌握', color: 'green' },
 };
 
-export default function QuestionBankView({ focusId, adaptiveFocus, onAdaptiveFocusConsumed }: { focusId?: number; adaptiveFocus?: AdaptivePracticeFocus; onAdaptiveFocusConsumed?: () => void }) {
-  const [tab, setTab] = useState<'adaptive' | 'bank' | 'practice'>(adaptiveFocus ? 'adaptive' : 'bank');
+interface QuestionBankViewProps {
+  focusId?: number;
+  adaptiveFocus?: AdaptivePracticeFocus;
+  adaptiveOwnerGeneration?: number;
+  recoveryOwnerGeneration?: number | null;
+  adaptivePracticeDrafts?: Readonly<Record<string, AdaptivePracticeOwnerDraft>>;
+  onAdaptivePracticeDraftChange?: (key: string, draft: AdaptivePracticeOwnerDraft | null, retireOwnerKey?: string) => boolean | void;
+  onAdaptivePracticeGuardChange?: (guard: { pending: boolean; unsaved: boolean }) => void;
+  onAdaptiveFocusConsumed?: () => void;
+  quickPracticeResumes?: ResumeInput;
+  onOpenStudio?: (context: QuickPracticeStudioContext) => void;
+}
+
+export default function QuestionBankView({
+  focusId,
+  adaptiveFocus,
+  adaptiveOwnerGeneration,
+  recoveryOwnerGeneration,
+  adaptivePracticeDrafts,
+  onAdaptivePracticeDraftChange,
+  onAdaptivePracticeGuardChange,
+  onAdaptiveFocusConsumed,
+  quickPracticeResumes,
+  onOpenStudio,
+}: QuestionBankViewProps) {
+  const [tab, setTab] = useState<'review_feedback' | 'question_bank' | 'quick_practice'>(adaptiveFocus ? 'review_feedback' : 'question_bank');
+  const [resolvedAdaptiveFocus, setResolvedAdaptiveFocus] = useState(adaptiveFocus);
 
   // When launched from a mock-interview drill link, surface the target id.
   useEffect(() => {
@@ -72,11 +102,17 @@ export default function QuestionBankView({ focusId, adaptiveFocus, onAdaptiveFoc
   }, [focusId]);
 
   useEffect(() => {
+    setResolvedAdaptiveFocus(adaptiveFocus);
     if (adaptiveFocus) {
-      setTab('adaptive');
+      setTab('review_feedback');
       onAdaptiveFocusConsumed?.();
     }
   }, [adaptiveFocus, onAdaptiveFocusConsumed]);
+
+  const handleQuickPracticeStudioOpen = (context: RealInterviewStudioContext | QuickPracticeStudioContext) => {
+    if (context.kind !== 'quick_practice') return;
+    onOpenStudio?.(Object.freeze({ ...context }));
+  };
 
   return (
     <div className={styles.page}>
@@ -87,16 +123,36 @@ export default function QuestionBankView({ focusId, adaptiveFocus, onAdaptiveFoc
         </div>
         <Segmented
           value={tab}
-          onChange={(v) => setTab(v as 'adaptive' | 'bank' | 'practice')}
+          onChange={(v) => setTab(v as 'review_feedback' | 'question_bank' | 'quick_practice')}
           options={[
-            { label: '复盘训练', value: 'adaptive' },
-            { label: '题库', value: 'bank' },
-            { label: '刷题打卡', value: 'practice' },
+            { label: '复盘训练', value: 'review_feedback' },
+            { label: '题库', value: 'question_bank' },
+            { label: '快速练习', value: 'quick_practice' },
           ]}
         />
       </div>
 
-      {tab === 'adaptive' ? <AdaptiveInterviewPracticeWorkspace focus={adaptiveFocus} /> : tab === 'bank' ? <BankTab /> : <PracticeTab />}
+      <section hidden={tab !== 'review_feedback'} aria-label="复盘训练模式">
+        <AdaptiveInterviewPracticeWorkspace
+          focus={resolvedAdaptiveFocus}
+          ownerGeneration={adaptiveOwnerGeneration}
+          recoveryOwnerGeneration={recoveryOwnerGeneration}
+          drafts={adaptivePracticeDrafts}
+          onDraftChange={onAdaptivePracticeDraftChange}
+          onGuardChange={onAdaptivePracticeGuardChange}
+        />
+      </section>
+      <section hidden={tab !== 'question_bank'} aria-label="题库模式"><BankTab /></section>
+      <section hidden={tab !== 'quick_practice'} aria-label="快速练习模式">
+        <InterviewReadinessCenter
+          initialMode="quick"
+          fixedMode="quick"
+          actionEmphasis="primary"
+          resumes={quickPracticeResumes}
+          onOpenStudio={handleQuickPracticeStudioOpen}
+        />
+        <PracticeTab />
+      </section>
     </div>
   );
 }

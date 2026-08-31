@@ -15,11 +15,14 @@ const storyService = vi.hoisted(() => {
       super(code ?? 'interview_story_error');
     }
   }
-  return { proposal: vi.fn(), confirm: vi.fn(), create: vi.fn(), createVersion: vi.fn(), candidates: vi.fn(), StoryError };
+  return { proposal: vi.fn(), getProposal: vi.fn(), nextAction: vi.fn(), confirm: vi.fn(), create: vi.fn(), createVersion: vi.fn(), candidates: vi.fn(), StoryError };
 });
 const noteService = vi.hoisted(() => ({ list: vi.fn() }));
+const actionService = vi.hoisted(() => ({ decide: vi.fn(), state: vi.fn(), undo: vi.fn(), recover: vi.fn() }));
 vi.mock('@/services/interviewStories', () => ({
   createInterviewStoryProposal: storyService.proposal,
+  getInterviewStoryProposal: storyService.getProposal,
+  createInterviewStoryProductAction: storyService.nextAction,
   confirmInterviewStoryProposal: storyService.confirm,
   createInterviewStory: storyService.create,
   createInterviewStoryVersion: storyService.createVersion,
@@ -27,6 +30,12 @@ vi.mock('@/services/interviewStories', () => ({
   InterviewStoryError: storyService.StoryError,
 }));
 vi.mock('@/services/notes', () => ({ listNotes: noteService.list }));
+vi.mock('@/features/reviewReadiness/service', () => ({
+  decideProductAction: actionService.decide,
+  getProductActionState: actionService.state,
+  undoInterviewStory: actionService.undo,
+  recoverRejectionControl: actionService.recover,
+}));
 
 const { default: InterviewStoryDrawer, createInterviewStoryDraft } = await import('./InterviewStoryDrawer');
 
@@ -49,6 +58,39 @@ function bindManualEvidence(target: string, source: string) {
   act(() => setControlValue(control, source));
 }
 
+function withServerStoryAction(
+  draft: InterviewStoryDraft,
+  proposal: NonNullable<InterviewStoryDraft['proposal']>,
+  token = 'server-story-token',
+): InterviewStoryDraft {
+  const content = draft.editedContent ?? ('content' in proposal ? {
+    title: proposal.content.title.text,
+    blocks: proposal.content.blocks.map(({ kind, text, fact_mode }) => ({ kind, text, fact_mode })),
+    capability_labels: [], applicable_questions: [], fact_gap_codes: [],
+  } : draft.manualContent);
+  return {
+    ...draft,
+    attemptGenerationRevision: 3,
+    productActionGeneration: 1,
+    serverConfirmationToken: token,
+    productAction: {
+      ownerKey: `story:${draft.attemptId}:3:1`, operationId: 'story-operation-1', actionCallId: 'story-call-1',
+      actionName: 'confirm_interview_story', confirmationToken: token,
+      allowedDecisions: ['approve', 'modify', 'reject'], status: 'proposed', result: null,
+      originalPayload: {
+        content,
+        evidence_links: 'evidence_links' in proposal ? proposal.evidence_links.map((link) => ({
+          target_kind: link.target_kind, target_id: link.target_id, source_kind: link.source_kind,
+          source_id: link.source_stable_id, source_path: link.source_path, excerpt: link.excerpt,
+        })) : [],
+        expected_current_version_id: draft.expectedCurrentVersionId,
+        expected_story_revision: draft.expectedStoryRevision,
+      },
+      pendingDecision: null, resultUnknown: false,
+    },
+  };
+}
+
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   Object.defineProperty(window, 'matchMedia', {
@@ -58,17 +100,23 @@ beforeEach(() => {
   const nativeGetComputedStyle = window.getComputedStyle.bind(window);
   vi.spyOn(window, 'getComputedStyle').mockImplementation((element) => nativeGetComputedStyle(element));
   storyService.proposal.mockReset();
+  storyService.getProposal.mockReset();
+  storyService.nextAction.mockReset();
   storyService.confirm.mockReset();
   storyService.create.mockReset();
   storyService.createVersion.mockReset();
   storyService.candidates.mockReset();
   noteService.list.mockReset();
+  actionService.decide.mockReset();
+  actionService.state.mockReset();
+  actionService.undo.mockReset();
+  actionService.recover.mockReset();
   storyService.candidates.mockResolvedValue({
     resumes: [{ id: 2, label: '筱哲的后端简历', leaves: [{ path: '/content_json/projects/0/detail', preview: '定位缓存击穿' }] }],
     interview_notes: [{ id: 4, label: '星云数据 · 后端工程师', leaves: [{ path: '/questions', preview: '如何排查延迟？' }] }],
     mock_turns: [{ attempt_id: 7, turn_no: 1, label: '模拟面试 #7 · 第 1 题', leaves: [{ path: '/turns/001/answer', preview: '我分段定位了延迟' }] }],
   });
-  noteService.list.mockResolvedValue([{ id: 4, company: '星云数据', position: '后端工程师', questions: '如何排查延迟？', self_reflection: '', difficulty_points: '', mood: '', round: '', date: '', created_at: '' }]);
+  noteService.list.mockResolvedValue([{ id: 4, company: '星云数据', position: '后端工程师', questions: '如何排查延迟？', self_reflection: '', difficulty_points: '', mood: '', round: '', date: '', revision: 1, created_at: '' }]);
   container = document.createElement('div');
   document.body.appendChild(container);
   root = createRoot(container);
@@ -282,9 +330,9 @@ describe('InterviewStoryDrawer', () => {
         source_stable_id: '4', source_version_or_snapshot: 'snapshot', source_path: '/questions', excerpt: '如何排查延迟',
       }],
     };
-    let current: InterviewStoryDraft = { ...createInterviewStoryDraft('pilot'), attemptId: 33, proposal, editedContent: {
+    let current: InterviewStoryDraft = withServerStoryAction({ ...createInterviewStoryDraft('pilot'), attemptId: 33, proposal, editedContent: {
       title: '我编辑后的故事标题', blocks: proposal.content.blocks, capability_labels: [], applicable_questions: [], fact_gap_codes: [],
-    } };
+    } }, proposal);
     const render = () => root?.render(<InterviewStoryDrawer open draft={current} onDraftChange={(draft) => {
       if (draft) {
         current = draft;
@@ -300,12 +348,17 @@ describe('InterviewStoryDrawer', () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    const initialToken = current.confirmationToken;
+    const initialToken = current.serverConfirmationToken;
     const initialPayload = storyService.confirm.mock.calls[0]?.[1];
     expect(initialToken).toBeTruthy();
-    expect(current.pendingOperation).toBe('confirm');
+    expect(current.productAction?.pendingDecision?.decision).toBe('approve');
+    expect(current.productAction?.resultUnknown).toBe(true);
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    const retry = [...document.body.querySelectorAll('button')].find((button) => button.textContent === '使用原操作重试') as HTMLButtonElement;
+    expect(retry).toBeTruthy();
+    expect(retry.disabled).toBe(false);
     await act(async () => {
-      [...document.body.querySelectorAll('button')].find((button) => button.textContent === '使用原尝试重试')?.click();
+      retry.click();
       await Promise.resolve();
       await Promise.resolve();
     });
@@ -330,14 +383,14 @@ describe('InterviewStoryDrawer', () => {
       }],
     };
     const authoredTitle = 'Edited incident story';
-    let current: InterviewStoryDraft = {
+    let current: InterviewStoryDraft = withServerStoryAction({
       ...createInterviewStoryDraft('ui'),
       attemptId: 33,
       proposal,
       selections: [{ source_kind: 'interview_note', source_id: 4, path: '/questions' }],
       assertions: ['I personally owned this work.'],
       editedContent: { title: authoredTitle, blocks: proposal.content.blocks, capability_labels: [], applicable_questions: [], fact_gap_codes: [] },
-    };
+    }, proposal);
     const originalKey = current.idempotencyKey;
     const render = () => root?.render(<InterviewStoryDrawer open draft={current} onDraftChange={(draft) => {
       if (draft) {
@@ -346,10 +399,22 @@ describe('InterviewStoryDrawer', () => {
       }
     }} onClose={() => {}} />);
     storyService.confirm.mockRejectedValueOnce(new storyService.StoryError(409, 'story_source_conflict'));
+    actionService.state.mockResolvedValueOnce({
+      schema_version: 1,
+      operation_id: 'story-operation-1',
+      action_name: 'confirm_interview_story',
+      status: 'failed',
+      result: { error_code: 'story_source_conflict' },
+    });
 
     act(render);
     await act(async () => {
       [...document.body.querySelectorAll('button')].find((button) => button.textContent === '确认保存这个故事版本')?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      [...document.body.querySelectorAll('button')].find((button) => button.textContent === '确认操作结果')?.click();
       await Promise.resolve();
       await Promise.resolve();
     });
@@ -361,6 +426,384 @@ describe('InterviewStoryDrawer', () => {
     expect(current.resultUnknown).toBe(false);
     expect(current.assertions).toEqual(['I personally owned this work.']);
     expect(current.manualContent.title).toBe(authoredTitle);
+  });
+
+  it('creates an explicit N+1 server confirmation only after Story rejection', async () => {
+    const proposal = {
+      proposal_status: 'normal' as const,
+      content: {
+        title: { id: 'title' as const, text: '排查延迟' },
+        blocks: [{ id: 'situation_001', kind: 'situation' as const, text: '服务延迟', fact_mode: 'evidence_backed' as const }],
+        capability_labels: [], applicable_questions: [], fact_gap_codes: [],
+      },
+      evidence_links: [],
+    };
+    let current = withServerStoryAction({
+      ...createInterviewStoryDraft('ui'), attemptId: 33, proposal,
+      editedContent: { title: '排查延迟', blocks: proposal.content.blocks, capability_labels: [], applicable_questions: [], fact_gap_codes: [] },
+    }, proposal);
+    const render = () => root?.render(<InterviewStoryDrawer open draft={current} onDraftChange={(draft) => {
+      if (draft) { current = draft; render(); }
+    }} onClose={() => {}} />);
+    actionService.decide.mockResolvedValue({
+      schema_version: 1, operation_id: 'story-operation-1', action_name: 'confirm_interview_story',
+      status: 'rejected', result: {}, replayed: false, direct_commit: false,
+    });
+    storyService.nextAction.mockResolvedValue({
+      schema_version: 1, contract: 'story_product_action_proposal_response_v1',
+      operation_id: 'story-operation-2', action_call_id: 'story-call-2', product_action_generation: 2,
+      status: 'proposed', proposal_created: true, confirmation_token: 'server-story-token-2',
+    });
+    act(render);
+    await act(async () => {
+      [...document.body.querySelectorAll('button')].find((button) => button.textContent === '暂不保存这个故事')?.click();
+      await Promise.resolve(); await Promise.resolve();
+    });
+    expect(current.productAction?.status).toBe('rejected');
+    expect(current.serverConfirmationToken).toBeNull();
+    expect(storyService.nextAction).not.toHaveBeenCalled();
+    await act(async () => {
+      [...document.body.querySelectorAll('button')].find((button) => button.textContent === '再次保存')?.click();
+      await Promise.resolve(); await Promise.resolve();
+    });
+    expect(storyService.nextAction).toHaveBeenCalledWith(33, {
+      expected_generation_revision: 3,
+      expected_product_action_generation: 1,
+    });
+    expect(current.productActionGeneration).toBe(2);
+    expect(current.serverConfirmationToken).toBe('server-story-token-2');
+  });
+
+  it('recovers a lost N+1 response as a replayed proposed control without getting stuck', async () => {
+    const proposal = {
+      proposal_status: 'normal' as const,
+      content: {
+        title: { id: 'title' as const, text: '排查延迟' },
+        blocks: [{ id: 'situation_001', kind: 'situation' as const, text: '服务延迟', fact_mode: 'evidence_backed' as const }],
+        capability_labels: [], applicable_questions: [], fact_gap_codes: [],
+      },
+      evidence_links: [],
+    };
+    const proposed = withServerStoryAction({ ...createInterviewStoryDraft('ui'), attemptId: 33, proposal }, proposal);
+    let current: InterviewStoryDraft = {
+      ...proposed,
+      serverConfirmationToken: null,
+      productAction: proposed.productAction ? { ...proposed.productAction, confirmationToken: null, status: 'rejected', result: {} } : null,
+    };
+    const render = () => root?.render(<InterviewStoryDrawer open draft={current} onDraftChange={(draft) => {
+      if (draft) { current = draft; render(); }
+    }} onClose={() => {}} />);
+    storyService.nextAction
+      .mockRejectedValueOnce(new Error('response lost'))
+      .mockResolvedValueOnce({
+        schema_version: 1, contract: 'story_product_action_proposal_response_v1',
+        operation_id: 'story-operation-2', action_call_id: 'story-call-2', product_action_generation: 2,
+        status: 'proposed', proposal_created: false, confirmation_token: 'server-story-token-2',
+      });
+    act(render);
+    const restart = () => [...document.body.querySelectorAll('button')].find((button) => button.textContent === '再次保存');
+    await act(async () => { restart()?.click(); await Promise.resolve(); await Promise.resolve(); });
+    expect(current.productAction?.status).toBe('rejected');
+    expect(document.body.textContent).toContain('再次保存');
+    await act(async () => { restart()?.click(); await Promise.resolve(); await Promise.resolve(); });
+    expect(storyService.nextAction).toHaveBeenCalledTimes(2);
+    expect(storyService.nextAction).toHaveBeenNthCalledWith(2, 33, {
+      expected_generation_revision: 3,
+      expected_product_action_generation: 1,
+    });
+    expect(current.productAction).toMatchObject({
+      operationId: 'story-operation-2', status: 'proposed', confirmationToken: 'server-story-token-2',
+    });
+    expect(current.serverConfirmationToken).toBe('server-story-token-2');
+  });
+
+  it('installs a terminal N+1 replay with no token and preserves its safe Undo result', async () => {
+    const proposal = {
+      proposal_status: 'normal' as const,
+      content: { title: { id: 'title' as const, text: '排查延迟' }, blocks: [], capability_labels: [], applicable_questions: [], fact_gap_codes: [] },
+      evidence_links: [],
+    };
+    const proposed = withServerStoryAction({ ...createInterviewStoryDraft('ui'), attemptId: 33, proposal }, proposal);
+    let current: InterviewStoryDraft = {
+      ...proposed,
+      serverConfirmationToken: null,
+      productAction: proposed.productAction ? { ...proposed.productAction, confirmationToken: null, status: 'rejected', result: {} } : null,
+    };
+    const render = () => root?.render(<InterviewStoryDrawer open draft={current} onDraftChange={(draft) => {
+      if (draft) { current = draft; render(); }
+    }} onClose={() => {}} />);
+    storyService.nextAction.mockResolvedValue({
+      schema_version: 1, contract: 'story_product_action_proposal_response_v1',
+      operation_id: 'story-operation-2', action_call_id: 'story-call-2', product_action_generation: 2,
+      status: 'committed', proposal_created: false, terminal_result: { story_id: 8, version_id: 12 },
+    });
+    act(render);
+    await act(async () => {
+      [...document.body.querySelectorAll('button')].find((button) => button.textContent === '再次保存')?.click();
+      await Promise.resolve(); await Promise.resolve();
+    });
+    expect(current.productAction).toMatchObject({
+      operationId: 'story-operation-2', status: 'committed', confirmationToken: null,
+      result: { story_id: 8, version_id: 12 },
+    });
+    expect(current.serverConfirmationToken).toBeNull();
+    expect(document.body.textContent).toContain('撤销本次保存');
+  });
+
+  it('does not invent terminal failed state for a coded pre-executor Story decision failure', async () => {
+    const proposal = {
+      proposal_status: 'normal' as const,
+      content: { title: { id: 'title' as const, text: '排查延迟' }, blocks: [], capability_labels: [], applicable_questions: [], fact_gap_codes: [] },
+      evidence_links: [],
+    };
+    let current = withServerStoryAction({ ...createInterviewStoryDraft('ui'), attemptId: 33, proposal }, proposal);
+    const render = () => root?.render(<InterviewStoryDrawer open draft={current} onDraftChange={(draft) => {
+      if (draft) { current = draft; render(); }
+    }} onClose={() => {}} />);
+    storyService.confirm.mockRejectedValue(new storyService.StoryError(409, 'story_source_conflict'));
+    act(render);
+    await act(async () => {
+      [...document.body.querySelectorAll('button')].find((button) => button.textContent === '确认保存这个故事版本')?.click();
+      await Promise.resolve(); await Promise.resolve();
+    });
+    expect(current.productAction).toMatchObject({
+      operationId: 'story-operation-1', status: 'proposed', confirmationToken: 'server-story-token', resultUnknown: true,
+    });
+    expect(current.serverConfirmationToken).toBe('server-story-token');
+    expect(document.body.textContent).toContain('确认操作结果');
+  });
+
+  it('falls back to application-bound rejection-only Story recovery when the source owner is invalid', async () => {
+    const proposal = {
+      proposal_status: 'normal' as const,
+      content: { title: { id: 'title' as const, text: '排查延迟' }, blocks: [], capability_labels: [], applicable_questions: [], fact_gap_codes: [] },
+      evidence_links: [],
+    };
+    let current = withServerStoryAction({ ...createInterviewStoryDraft('ui', 4, { applicationId: 6 }), attemptId: 33, proposal }, proposal);
+    const render = () => root?.render(<InterviewStoryDrawer open draft={current} onDraftChange={(draft) => {
+      if (draft) { current = draft; render(); }
+    }} onClose={() => {}} />);
+    storyService.confirm.mockRejectedValue(new storyService.StoryError(409, 'story_source_conflict'));
+    actionService.state.mockResolvedValue({ schema_version: 1, operation_id: 'story-operation-1', action_name: 'confirm_interview_story', status: 'proposed' });
+    storyService.getProposal.mockRejectedValue(new storyService.StoryError(409, 'story_source_conflict'));
+    actionService.recover.mockResolvedValue({
+      schema_version: 1, operation_id: 'story-operation-1', action_call_id: 'rejection-call',
+      action_name: 'confirm_interview_story', status: 'proposed', confirmation_token: 'rejection-token',
+      allowed_decisions: ['reject'], rejection_only: true, live_source_state: 'not_observed',
+    });
+    act(render);
+    await act(async () => {
+      [...document.body.querySelectorAll('button')].find((button) => button.textContent === '确认保存这个故事版本')?.click();
+      await Promise.resolve(); await Promise.resolve();
+    });
+    await act(async () => {
+      [...document.body.querySelectorAll('button')].find((button) => button.textContent === '确认操作结果')?.click();
+      await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    });
+    expect(actionService.recover).toHaveBeenCalledWith(6, 'story-operation-1');
+    expect([...document.body.querySelectorAll('button')].find((button) => button.textContent === '确认保存这个故事版本')).toBeUndefined();
+    expect((([...document.body.querySelectorAll('button')].find((button) => button.textContent === '暂不保存这个故事')) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('keeps Story Undo local to the committed owner and treats failed compensation as deterministic terminal', async () => {
+    const proposal = {
+      proposal_status: 'normal' as const,
+      content: { title: { id: 'title' as const, text: '排查延迟' }, blocks: [], capability_labels: [], applicable_questions: [], fact_gap_codes: [] },
+      evidence_links: [],
+    };
+    const proposed = withServerStoryAction({ ...createInterviewStoryDraft('ui'), attemptId: 33, proposal }, proposal);
+    let current: InterviewStoryDraft = {
+      ...proposed,
+      serverConfirmationToken: null,
+      productAction: proposed.productAction ? {
+        ...proposed.productAction,
+        confirmationToken: null,
+        status: 'committed',
+        result: { story_id: 8, version_id: 12 },
+      } : null,
+    };
+    const render = () => root?.render(<InterviewStoryDrawer open draft={current} onDraftChange={(draft) => {
+      if (draft) { current = draft; render(); }
+    }} onClose={() => {}} />);
+    actionService.undo.mockResolvedValue({
+      schema_version: 1, operation_id: 'story-undo-operation', compensation_kind: 'undo:confirm_interview_story',
+      status: 'failed', result: { reason: 'story_has_dependents' }, replayed: true,
+    });
+    act(render);
+    await act(async () => {
+      [...document.body.querySelectorAll('button')].find((button) => button.textContent === '撤销本次保存')?.click();
+      await Promise.resolve(); await Promise.resolve();
+    });
+    expect(actionService.undo).toHaveBeenCalledWith(8, 'story-operation-1');
+    expect(document.body.textContent).toContain('撤销未完成');
+    expect(document.body.textContent).not.toContain('已撤销本次保存');
+    expect([...document.body.querySelectorAll('button')].find((button) => button.textContent === '撤销本次保存')).toBeUndefined();
+    expect(current.productAction).toMatchObject({ undoStatus: 'failed', undoReplayed: true });
+    act(render);
+    expect(actionService.undo).toHaveBeenCalledTimes(1);
+  });
+
+  it('persists the exact Story Undo before transport and replays only its unknown request after remount', async () => {
+    const proposal = {
+      proposal_status: 'normal' as const,
+      content: { title: { id: 'title' as const, text: '排查延迟' }, blocks: [], capability_labels: [], applicable_questions: [], fact_gap_codes: [] },
+      evidence_links: [],
+    };
+    const proposed = withServerStoryAction({ ...createInterviewStoryDraft('ui'), attemptId: 33, proposal }, proposal);
+    let current: InterviewStoryDraft = {
+      ...proposed,
+      serverConfirmationToken: null,
+      productAction: proposed.productAction ? {
+        ...proposed.productAction, confirmationToken: null, status: 'committed', result: { story_id: 8, version_id: 12 },
+      } : null,
+    };
+    let allowPersistence = false;
+    const render = () => root?.render(<InterviewStoryDrawer open draft={current} onDraftChange={(next) => {
+      if (!allowPersistence) return false;
+      if (next) { current = next; render(); }
+      return true;
+    }} onClose={() => {}} />);
+    actionService.undo
+      .mockRejectedValueOnce(new Error('response lost'))
+      .mockResolvedValueOnce({
+        schema_version: 1, operation_id: 'story-undo-operation', compensation_kind: 'undo:confirm_interview_story',
+        status: 'committed', result: {}, replayed: true,
+      });
+    act(render);
+    await act(async () => {
+      [...document.body.querySelectorAll('button')].find((button) => button.textContent === '撤销本次保存')?.click();
+      await Promise.resolve();
+    });
+    expect(actionService.undo).not.toHaveBeenCalled();
+
+    allowPersistence = true;
+    await act(async () => {
+      [...document.body.querySelectorAll('button')].find((button) => button.textContent === '撤销本次保存')?.click();
+      await Promise.resolve(); await Promise.resolve();
+    });
+    expect(current.productAction).toMatchObject({
+      undoRequest: {
+        ownerKey: 'story:33:3:1', parentOperationId: 'story-operation-1', actionName: 'confirm_interview_story',
+      },
+      undoResultUnknown: true,
+    });
+    act(() => root?.unmount());
+    root = createRoot(container!);
+    act(render);
+    expect(actionService.undo).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      [...document.body.querySelectorAll('button')].find((button) => button.textContent === '使用原撤销操作重试')?.click();
+      await Promise.resolve(); await Promise.resolve();
+    });
+    expect(actionService.undo).toHaveBeenCalledTimes(2);
+    expect(actionService.undo.mock.calls[0]).toEqual(actionService.undo.mock.calls[1]);
+    expect(current.productAction).toMatchObject({ undoStatus: 'committed', undoRequest: null, undoResultUnknown: false });
+  });
+
+  it('routes a late Story Undo settlement into the remounted exact draft without duplicating transport', async () => {
+    const proposal = {
+      proposal_status: 'normal' as const,
+      content: { title: { id: 'title' as const, text: '排查延迟' }, blocks: [], capability_labels: [], applicable_questions: [], fact_gap_codes: [] },
+      evidence_links: [],
+    };
+    const proposed = withServerStoryAction({ ...createInterviewStoryDraft('ui'), attemptId: 33, proposal }, proposal);
+    let current: InterviewStoryDraft = {
+      ...proposed,
+      serverConfirmationToken: null,
+      productAction: proposed.productAction ? {
+        ...proposed.productAction, confirmationToken: null, status: 'committed', result: { story_id: 8, version_id: 12 },
+      } : null,
+    };
+    let settle!: (value: unknown) => void;
+    actionService.undo.mockReturnValueOnce(new Promise((resolve) => { settle = resolve; }));
+    const render = () => root?.render(<InterviewStoryDrawer open draft={current} onDraftChange={(next) => {
+      if (next) { current = next; render(); }
+      return true;
+    }} onClose={() => {}} />);
+    act(render);
+    act(() => [...document.body.querySelectorAll('button')].find((button) => button.textContent === '撤销本次保存')?.click());
+    expect(current.productAction).toMatchObject({ undoRequest: expect.any(Object), undoResultUnknown: false });
+    act(() => root?.unmount());
+    root = createRoot(container!);
+    act(render);
+    expect(actionService.undo).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      settle({
+        schema_version: 1, operation_id: 'story-undo-operation', compensation_kind: 'undo:confirm_interview_story',
+        status: 'committed', result: {}, replayed: false,
+      });
+      await Promise.resolve(); await Promise.resolve();
+    });
+    expect(current.productAction).toMatchObject({ undoStatus: 'committed', undoRequest: null, undoResultUnknown: false });
+    expect(actionService.undo).toHaveBeenCalledTimes(1);
+    expect(document.body.textContent).toContain('已撤销本次保存');
+  });
+
+  it('freezes Story source, edit, and replacement controls while exact Undo is pending', async () => {
+    const proposal = {
+      proposal_status: 'normal' as const,
+      content: {
+        title: { id: 'title' as const, text: '排查延迟' },
+        blocks: [{ id: 'situation' as const, kind: 'situation' as const, text: '我定位了缓存问题', fact_mode: 'evidence_backed' as const }],
+        capability_labels: [], applicable_questions: [], fact_gap_codes: [],
+      },
+      evidence_links: [],
+    };
+    const proposed = withServerStoryAction({ ...createInterviewStoryDraft('ui'), attemptId: 33, proposal }, proposal);
+    let current: InterviewStoryDraft = {
+      ...proposed,
+      serverConfirmationToken: null,
+      productAction: proposed.productAction ? {
+        ...proposed.productAction,
+        confirmationToken: null,
+        status: 'committed',
+        result: { story_id: 8, version_id: 12 },
+      } : null,
+    };
+    let settle!: (value: unknown) => void;
+    actionService.undo.mockReturnValueOnce(new Promise((resolve) => { settle = resolve; }));
+    const render = () => root?.render(<InterviewStoryDrawer open draft={current} onDraftChange={(next) => {
+      if (next) { current = next; render(); }
+      return true;
+    }} onClose={() => {}} />);
+    act(render);
+    act(() => [...document.body.querySelectorAll('button')].find((button) => button.textContent === '撤销本次保存')?.click());
+
+    expect(current.productAction).toMatchObject({
+      ownerKey: 'story:33:3:1',
+      operationId: 'story-operation-1',
+      undoRequest: {
+        ownerKey: 'story:33:3:1',
+        originOwnerKey: 'story:33:3:1',
+        parentOperationId: 'story-operation-1',
+        actionName: 'confirm_interview_story',
+      },
+    });
+    const sourceButton = [...document.body.querySelectorAll('button')]
+      .find((button) => button.textContent === '打开来源选择器') as HTMLButtonElement;
+    const assertionInput = document.body.querySelector('[aria-label="用户明确原始陈述"]') as HTMLInputElement;
+    const storyBlock = document.body.querySelector('[aria-label="故事区块 1"]') as HTMLTextAreaElement;
+    expect(sourceButton.disabled).toBe(true);
+    expect(assertionInput.disabled).toBe(true);
+    expect(storyBlock.disabled).toBe(true);
+
+    act(() => {
+      sourceButton.click();
+      setControlValue(assertionInput, '旧回调不得创建新输入');
+      setControlValue(storyBlock, '旧回调不得覆盖故事正文');
+    });
+    expect(current.attemptId).toBe(33);
+    expect(current.assertions).toEqual([]);
+    expect(current.productAction).toMatchObject({ ownerKey: 'story:33:3:1', operationId: 'story-operation-1' });
+
+    await act(async () => {
+      settle({
+        schema_version: 1, operation_id: 'story-undo-operation', compensation_kind: 'undo:confirm_interview_story',
+        status: 'committed', result: {}, replayed: false,
+      });
+      await Promise.resolve(); await Promise.resolve();
+    });
+    expect(current.productAction).toMatchObject({ undoStatus: 'committed', undoRequest: null });
   });
 
   it('allows an explicit source-backed manual save without calling the proposal endpoint', async () => {

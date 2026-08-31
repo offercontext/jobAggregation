@@ -7,7 +7,12 @@ import {
   type RefObject,
 } from 'react';
 
-import type { ActiveCoreTask, CoreTaskSurfaceController } from './controller';
+import {
+  requestCoreTaskClose,
+  type ActiveCoreTask,
+  type CoreTaskCloseGuard,
+  type CoreTaskSurfaceController,
+} from './controller';
 import styles from './CoreTaskSurfaceHost.module.css';
 
 export interface CoreTaskSurfaceHostProps {
@@ -19,6 +24,8 @@ export interface CoreTaskSurfaceHostProps {
   readonly focusReturnRef?: RefObject<HTMLElement | null>;
   readonly heading?: string;
   readonly className?: string;
+  /** Synchronously reads the exact active owner's mutation guard. */
+  readonly closeGuard?: (active: ActiveCoreTask) => CoreTaskCloseGuard;
 }
 
 function resolveElement(
@@ -54,6 +61,7 @@ export function CoreTaskSurfaceHost({
   focusReturnRef,
   heading = '当前任务',
   className,
+  closeGuard,
 }: CoreTaskSurfaceHostProps) {
   const state = useSyncExternalStore(controller.subscribe, controller.getState, controller.getState);
   const ownerRef = useRef<HTMLDivElement | null>(null);
@@ -63,6 +71,17 @@ export function CoreTaskSurfaceHost({
   const mountedRef = useRef(false);
   const observedGenerationRef = useRef<number | null>(null);
   const [reducedMotion, setReducedMotion] = useState(readReducedMotion);
+  const requestClose = (active: ActiveCoreTask) => {
+    let guard: CoreTaskCloseGuard = { pending: false, unsaved: false };
+    try {
+      guard = closeGuard?.(active) ?? guard;
+    } catch {
+      // A broken guard must fail safe: losing an uncertain operation is worse
+      // than retaining an explicitly settleable recovery certificate.
+      guard = { pending: true, unsaved: true };
+    }
+    requestCoreTaskClose(controller, active, guard);
+  };
 
   useEffect(() => controller.subscribeFocus((active) => {
     if (active.generation !== controller.getState().generation) return;
@@ -103,12 +122,12 @@ export function CoreTaskSurfaceHost({
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         event.preventDefault();
-        if (state.active) controller.close(state.active.generation);
+        if (state.active) requestClose(state.active);
       }
     };
     document.addEventListener('keydown', onKeyDown);
     return () => document.removeEventListener('keydown', onKeyDown);
-  }, [controller, state.active, state.phase]);
+  }, [controller, closeGuard, state.active, state.phase]);
 
   useEffect(() => {
     if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return undefined;
@@ -164,7 +183,7 @@ export function CoreTaskSurfaceHost({
         onTransitionEnd={completeAnimation}
       >
         <h2 id={`core-task-heading-${active.generation}`} className={styles.heading}>{heading}</h2>
-        <button type="button" className={styles.close} aria-label="关闭任务" onClick={() => controller.close(active.generation)}>
+        <button type="button" className={styles.close} aria-label="关闭任务" onClick={() => requestClose(active)}>
           关闭
         </button>
         <div className={styles.content}>{content}</div>

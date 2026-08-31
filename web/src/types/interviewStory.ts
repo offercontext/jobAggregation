@@ -136,6 +136,47 @@ export interface InterviewStoryPendingAttempt {
   retry_after_ms: number;
 }
 
+export interface InterviewStoryProductActionControl {
+  operation_id: string;
+  action_call_id: string;
+  confirmation_token: string;
+  action_name: 'confirm_interview_story';
+  allowed_decisions?: Array<'approve' | 'modify' | 'reject'>;
+  rejection_only?: boolean;
+}
+
+export interface InterviewStoryProductActionTerminal {
+  operation_id: string;
+  action_name: 'confirm_interview_story';
+  status: 'rejected' | 'committed' | 'failed';
+  terminal_result?: Record<string, unknown>;
+}
+
+export type InterviewStoryProductAction = InterviewStoryProductActionControl | InterviewStoryProductActionTerminal;
+
+interface InterviewStoryNextProductActionBase {
+  schema_version: 1;
+  contract: 'story_product_action_proposal_response_v1';
+  operation_id: string;
+  action_call_id: string;
+  product_action_generation: number;
+}
+
+export type InterviewStoryNextProductActionResponse = InterviewStoryNextProductActionBase & (
+  | {
+      status: 'proposed';
+      proposal_created: boolean;
+      confirmation_token: string;
+      terminal_result?: never;
+    }
+  | {
+      status: 'rejected' | 'committed' | 'failed';
+      proposal_created: false;
+      confirmation_token?: never;
+      terminal_result: Record<string, unknown>;
+    }
+);
+
 export interface InterviewStoryProposalAttempt {
   id: number;
   attempt_status: InterviewStoryAttemptStatus;
@@ -146,6 +187,8 @@ export interface InterviewStoryProposalAttempt {
     | { proposal_status: 'manual' }
     | null;
   proposal_hash?: string | null;
+  product_action_generation?: number;
+  product_action?: InterviewStoryProductAction;
   target_story_id?: number | null;
   entrypoint?: 'ui' | 'pilot';
   failure_category?: string | null;

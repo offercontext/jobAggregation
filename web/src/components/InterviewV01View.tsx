@@ -1,10 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Button, Empty, List, Space, Spin, Tabs, Tag, Typography } from 'antd';
-import { ArrowRightOutlined, BookOutlined, CompassOutlined, SoundOutlined } from '@ant-design/icons';
+import { BookOutlined, SoundOutlined } from '@ant-design/icons';
 import { listInterviews } from '@/services/interviews';
-import { listAdaptivePracticeRecommendations } from '@/services/adaptiveInterviewPractice';
 import type { InterviewIndexItem } from '@/types/interviewIndex';
-import type { AdaptivePracticeFocus, AdaptivePracticeRecommendation } from '@/types/adaptiveInterviewPractice';
 import { normalizeInterviewIndexItem } from '@/features/interviewEvents/interviewIndexContract';
 import {
   compareInterviewEventCards,
@@ -13,7 +11,6 @@ import {
 } from '@/features/interviewEvents/interviewEventCard';
 import type { TaskLaunchRequest } from '@/features/coreTaskSurface/contracts';
 import workflowStyles from './ui/WorkflowSurface.module.css';
-import actionStyles from './InterviewNextActionCard.module.css';
 import type { Application } from '@/types/application';
 import type { ScheduleEvent } from '@/types/event';
 import type { Resume } from '@/types/resume';
@@ -35,7 +32,6 @@ export interface InterviewV01ViewProps {
   onOpenFreePractice?: () => void;
   /** Navigation-only story library entry; event cards never pass a note id. */
   onOpenStoryLibrary?: (reviewNoteId?: number) => void;
-  onOpenAdaptivePractice?: (focus: AdaptivePracticeFocus) => void;
   onOpenVoiceCoachingGrowth?: () => void;
   onOpenQuestionBank?: () => void;
   /** Increases when the root workspace asks the interview page to focus practice. */
@@ -331,7 +327,6 @@ export default function InterviewV01View({
   onOpenEventEditor,
   onOpenFreePractice,
   onOpenStoryLibrary,
-  onOpenAdaptivePractice,
   onOpenVoiceCoachingGrowth,
   onOpenQuestionBank,
   practiceRequestToken,
@@ -343,8 +338,6 @@ export default function InterviewV01View({
   const [items, setItems] = useState<InterviewIndexItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
-  const [practice, setPractice] = useState<AdaptivePracticeRecommendation | null>(null);
-  const [practiceError, setPracticeError] = useState(false);
   const [activeTab, setActiveTab] = useState<InterviewTabKey>('upcoming');
   const [currentTime, setCurrentTime] = useState(() => Date.now());
   const lastPracticeRequestTokenRef = useRef<number | undefined>(practiceRequestToken);
@@ -374,15 +367,6 @@ export default function InterviewV01View({
     const timer = window.setInterval(() => setCurrentTime(Date.now()), 60_000);
     return () => window.clearInterval(timer);
   }, []);
-
-  const loadPractice = () => {
-    setPracticeError(false);
-    return listAdaptivePracticeRecommendations()
-      .then((result) => setPractice(result[0] ?? null))
-      .catch(() => { setPractice(null); setPracticeError(true); });
-  };
-
-  useEffect(() => { void loadPractice(); }, []);
 
   const cards = useMemo(
     () => projectInterviewEventCards(items, currentTime, events),
@@ -489,31 +473,9 @@ export default function InterviewV01View({
               {onOpenQuestionBank ? <Button icon={<BookOutlined />} onClick={onOpenQuestionBank}>进入题库</Button> : null}
             </Space>
           </div>
-          {practice ? (
-            <section className={actionStyles.card} aria-labelledby="interview-next-action-title">
-              <div className={actionStyles.content}>
-                <span className={actionStyles.eyebrow}>下一项行动</span>
-                <h2 id="interview-next-action-title" className={actionStyles.title}>{practice.title}</h2>
-                <p className={actionStyles.observation}>{practice.observation}</p>
-                <div className={actionStyles.meta} aria-label="训练说明">
-                  <span className={actionStyles.metaItem}>来自已保存复盘</span>
-                  <span className={actionStyles.metaItem}>适合一次短时训练</span>
-                  <span className={actionStyles.metaItem}>不会自动写入故事库</span>
-                </div>
-              </div>
-              {onOpenAdaptivePractice ? (
-                <Button className={actionStyles.action} size="large" onClick={() => onOpenAdaptivePractice({ proposalId: practice.proposal_id, focusId: practice.focus_id })}>
-                  <CompassOutlined /> 开始这项训练 <ArrowRightOutlined />
-                </Button>
-              ) : null}
-            </section>
-          ) : null}
-          {practiceError && onOpenAdaptivePractice ? <Alert style={{ marginTop: 20 }} type="warning" showIcon message="复盘训练建议暂时无法加载" action={<Button size="large" onClick={() => void loadPractice()}>重新加载建议</Button>} /> : null}
-          {!practice && !practiceError ? (
-            <div className="op-empty-state" style={{ marginTop: 20 }}>
-              <Empty description="从题库选择题目，或开始一次快速练习。" image={Empty.PRESENTED_IMAGE_SIMPLE} />
-            </div>
-          ) : null}
+          <div className="op-empty-state" style={{ marginTop: 20 }}>
+            <Empty description="从题库选择题目，或从面试准备中的已确认重点开始一次精确练习。" image={Empty.PRESENTED_IMAGE_SIMPLE} />
+          </div>
         </section>
       ) : null}
     </div>

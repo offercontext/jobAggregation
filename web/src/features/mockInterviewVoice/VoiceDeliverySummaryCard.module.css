@@ -28,7 +28,7 @@
 .metricButton:disabled { cursor: default; opacity: .76; }
 .metricButton:focus-visible,
 .fillerList button:focus-visible,
-.method summary:focus-visible { outline: 2px solid var(--op-focus-ring); outline-offset: 2px; }
+.method summary:focus-visible { outline: 2px solid var(--op-focus-ring-color); outline-offset: 2px; }
 .fillers { display: grid; grid-template-columns: minmax(130px, .28fr) 1fr; gap: 14px; margin-top: 12px; padding: 13px 14px; border-radius: 14px; background: color-mix(in srgb, var(--op-primary) 5%, transparent); }
 .fillers > div:first-child { display: grid; align-content: start; gap: 3px; }
 .fillers span { color: var(--op-muted); font-size: 12px; }

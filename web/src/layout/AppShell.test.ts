@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import source from './AppShell.tsx?raw';
-import { scopeApplicationOffers } from './AppShell';
+import questionBankSource from '@/components/QuestionBankView.tsx?raw';
+import { authorizeInterviewStoryDraftUpdate, scopeApplicationOffers } from './AppShell';
+import { createInterviewStoryDraft, type InterviewStoryDraft } from '@/components/InterviewStoryDrawer';
+import type { ProductActionUndoRequest } from '@/features/reviewReadiness/contracts';
 import calendarView from '@/components/CalendarView.tsx?raw';
 import offerCenterView from '@/components/OfferCenterView.tsx?raw';
 import resumeLibraryView from '@/components/ResumeLibraryView.tsx?raw';
@@ -9,6 +12,78 @@ import { runPilotTriage } from '@/features/pilot/pilotOpportunityFitLifecycle';
 import { consumeMaterialKitHandoff, writeMaterialKitHandoff } from '@/features/pilot/materialKitHandoff';
 
 describe('AppShell source contract', () => {
+  it('freezes an exact Story Undo lineage and rejects stale composition-root callbacks', () => {
+    const ownerKey = 'story:33:0:0';
+    const request: ProductActionUndoRequest = {
+      ownerKey,
+      originOwnerKey: ownerKey,
+      parentOperationId: 'story-operation-1',
+      actionName: 'confirm_interview_story',
+    };
+    const committed: InterviewStoryDraft = {
+      ...createInterviewStoryDraft('ui', 4, { applicationId: 6 }),
+      attemptId: 33,
+      productAction: {
+        ownerKey,
+        operationId: 'story-operation-1',
+        actionCallId: 'story-call-1',
+        actionName: 'confirm_interview_story',
+        confirmationToken: null,
+        allowedDecisions: ['approve', 'modify', 'reject'],
+        status: 'committed',
+        result: { story_id: 8, version_id: 12 },
+        originalPayload: {},
+        pendingDecision: null,
+        resultUnknown: false,
+        undoStatus: null,
+        undoRequest: null,
+        undoResultUnknown: false,
+      },
+    };
+    const pending: InterviewStoryDraft = {
+      ...committed,
+      productAction: { ...committed.productAction!, undoRequest: request },
+    };
+    const terminal: InterviewStoryDraft = {
+      ...pending,
+      productAction: {
+        ...pending.productAction!,
+        undoStatus: 'committed',
+        undoRequest: null,
+        undoResultUnknown: false,
+      },
+    };
+
+    expect(authorizeInterviewStoryDraftUpdate(committed, pending, { undoRequest: request })).toBe(true);
+    expect(authorizeInterviewStoryDraftUpdate(pending, {
+      ...pending,
+      assertions: ['stale callback must not overwrite the current envelope'],
+      productAction: terminal.productAction,
+    }, { undoRequest: request })).toBe(false);
+    expect(authorizeInterviewStoryDraftUpdate(pending, {
+      ...pending,
+      attemptId: 34,
+      productAction: { ...pending.productAction!, ownerKey: 'story:34:0:0' },
+    })).toBe(false);
+    expect(authorizeInterviewStoryDraftUpdate(pending, terminal, { undoRequest: request })).toBe(true);
+    expect(authorizeInterviewStoryDraftUpdate(pending, {
+      ...terminal,
+      productAction: { ...terminal.productAction!, result: { story_id: 999, version_id: 999 } },
+    }, { undoRequest: request })).toBe(false);
+    expect(authorizeInterviewStoryDraftUpdate(pending, terminal, {
+      undoRequest: { ...request, parentOperationId: 'foreign-operation' },
+    })).toBe(false);
+    expect(authorizeInterviewStoryDraftUpdate(undefined, terminal, { undoRequest: request })).toBe(false);
+    expect(authorizeInterviewStoryDraftUpdate(committed, null)).toBe(true);
+  });
+
+  it('keeps the QuestionBank quick-practice frozen readiness handoff to the single Studio opener', () => {
+    expect(questionBankSource).toContain('fixedMode="quick"');
+    expect(questionBankSource).toContain('onOpenStudio={handleQuickPracticeStudioOpen}');
+    expect(source).toContain('const openQuickPracticeStudio = useCallback((context: QuickPracticeStudioContext) => {');
+    expect(source.match(/onOpenStudio=\{openQuickPracticeStudio\}/g)).toHaveLength(2);
+  });
+
   it('closes stale application detail when a selected application disappears', () => {
     expect(source).toContain('!apps.some((app) => app.id === selected.id)');
     expect(source).toContain('setSelected(null)');

@@ -3,6 +3,7 @@ import type {
   AdaptivePracticeCompleteInput,
   AdaptivePracticePlan,
   AdaptivePracticeRecommendation,
+  AdaptivePracticeV2StartInput,
 } from '@/types/adaptiveInterviewPractice';
 import { createApiClient } from './http';
 
@@ -45,17 +46,11 @@ export async function listAdaptivePracticePlans(): Promise<AdaptivePracticePlan[
   }
 }
 
-export async function startAdaptivePractice(
-  recommendation: AdaptivePracticeRecommendation,
-  idempotencyKey: string,
+export async function startAdaptivePracticeV2(
+  input: AdaptivePracticeV2StartInput,
 ): Promise<AdaptivePracticePlan> {
   try {
-    return (await http.post('/interview-practice/plans', {
-      proposal_id: recommendation.proposal_id,
-      focus_id: recommendation.focus_id,
-      expected_source_fingerprint: recommendation.source_fingerprint,
-      idempotency_key: idempotencyKey,
-    })).data;
+    return (await http.post('/interview-practice/plans', input)).data;
   } catch (error) {
     throw safeError(error);
   }

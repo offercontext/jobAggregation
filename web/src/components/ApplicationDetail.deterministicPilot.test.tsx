@@ -3,6 +3,7 @@ import { act, type ReactNode } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Application } from '@/types/application';
+import { createCoreTaskSurfaceController } from '@/features/coreTaskSurface/controller';
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -68,8 +69,8 @@ vi.mock('./ReviewFormDrawer', () => ({
     : null,
 }));
 vi.mock('./InterviewReviewProposalDrawer', () => ({
-  default: (props: { open?: boolean }) => props.open
-    ? <div data-testid="review-proposal-drawer">复盘建议</div>
+  default: (props: { open?: boolean; onClose?: () => void }) => props.open
+    ? <div data-testid="review-proposal-drawer">复盘建议<button type="button" onClick={props.onClose}>关闭复盘建议</button></div>
     : null,
 }));
 vi.mock('./InterviewKnowledgeCaptureDrawer', () => ({
@@ -398,6 +399,45 @@ describe('ApplicationDetail deterministic Pilot JD entry', () => {
 
     expect(container?.querySelector('[data-testid="review-proposal-drawer"]')).not.toBeNull();
     expect(container?.querySelector('[data-testid="review-form-drawer"]')).toBeNull();
+  });
+
+  it('preserves an exact pending Review owner through the real Drawer close callback', () => {
+    state.events = [{
+      id: 31, application_id: application.id, event_type: 'interview', subtype: '一面', tags: [], round: 1,
+      scheduled_at: '2026-01-01T00:00:00Z', duration_minutes: 45, location: '线上', notes: '', status: 'done',
+      created_at: '2025-12-20T00:00:00Z',
+    }];
+    state.notes = [{ id: 51, application_id: application.id, application_event_id: 31, round: '一面' }];
+    const controller = createCoreTaskSurfaceController();
+    const request = { ref: { taskId: 'application.interview_review' as const, applicationId: application.id, eventId: 31 }, source: 'application_task_card' as const };
+    const first = controller.launch(request);
+    if (first.kind !== 'launched') throw new Error('review launch failed');
+    controller.markOpen(first.generation);
+    const frozenInput = {
+      proposal_id: 61, focus_id: 'focus-1', expected_note_revision: 4, expected_candidate_fingerprint: 'a'.repeat(64),
+      idempotency_key: '00000000-0000-4000-8000-000000000051', user_note: '冻结正文',
+    };
+    const draft = {
+      ownerKey: `review:${first.generation}:51:61`, ownerGeneration: first.generation, noteId: 51, proposalId: 61,
+      applicationId: application.id, selectedFocusId: 'focus-1', userNote: '冻结正文', idempotencyKey: frozenInput.idempotency_key,
+      frozenProposalInput: frozenInput, proposalUnknown: true, actionDraft: null,
+    };
+    act(() => root?.render(<ApplicationDetail
+      application={{ ...application, status: 'interview' } as never} open onClose={vi.fn()} taskController={controller}
+      reviewReadinessDrafts={{ [draft.ownerKey]: draft }}
+    />));
+    const closeReview = [...(container?.querySelectorAll('button') ?? [])]
+      .find((button) => button.textContent === '关闭复盘建议') as HTMLButtonElement | undefined;
+    if (!closeReview) throw new Error('review Drawer close should render');
+    act(() => closeReview.click());
+    const owner = container?.querySelector('[data-core-task-owner]') as HTMLElement;
+    act(() => owner.dispatchEvent(new Event('animationend', { bubbles: true })));
+    let reopened: ReturnType<typeof controller.launch> | undefined;
+    act(() => { reopened = controller.launch(request); });
+    if (!reopened) throw new Error('review relaunch should produce a result');
+    if (reopened.kind !== 'launched') throw new Error('review relaunch failed');
+    expect(controller.getState().active).toMatchObject({ recoveryGeneration: first.generation, key: 'application.interview_review:applicationId=7:eventId=31' });
+    expect(draft.frozenProposalInput).toEqual(frozenInput);
   });
 
   it('maps event subtype and status enums to user-facing progress copy', () => {

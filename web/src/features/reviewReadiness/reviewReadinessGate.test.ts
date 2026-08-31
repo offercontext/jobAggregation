@@ -272,15 +272,17 @@ function evaluateLocalFunction(
   const nextActive = new Set(activeFunctions).add(value.node);
   const functionScope = new LexicalScope(value.closure);
   value.node.parameters.forEach((parameter, index) => {
+    const argument = arguments_[index];
     declareBinding(
       parameter.name,
-      arguments_[index]
-        ? evaluateExpression(arguments_[index], callerScope, activeFunctions)
+      argument
+        ? evaluateExpression(argument, callerScope, activeFunctions)
         : UNKNOWN,
       functionScope,
       activeFunctions,
     );
   });
+  if (!value.node.body) return UNKNOWN;
   if (!ts.isBlock(value.node.body)) {
     return evaluateExpression(value.node.body, functionScope, nextActive);
   }
@@ -599,7 +601,7 @@ function hasExportedCanonicalComponent(sourceFile: ts.SourceFile, name: string):
 }
 
 function normalizeSourcePath(path: string): string {
-  return path.replaceAll('\\', '/').replace(/\.tsx?$/, '');
+  return path.replace(/\\/g, '/').replace(/\.tsx?$/, '');
 }
 
 function importTargetsSource(
@@ -725,7 +727,7 @@ function collectProductionSources(root: string): Map<string, string> {
       if (statSync(path).isDirectory()) {
         walk(path);
       } else if (/\.tsx?$/.test(name) && !/\.(?:test|spec)\.tsx?$/.test(name)) {
-        const relativePath = relative(root, path).replaceAll('\\', '/');
+        const relativePath = relative(root, path).replace(/\\/g, '/');
         sources.set(relativePath, readFileSync(path, 'utf8'));
       }
     }

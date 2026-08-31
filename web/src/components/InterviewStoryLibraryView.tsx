@@ -553,6 +553,7 @@ export function normalizeInterviewStoryList(input: unknown): { values: readonly 
 
 export interface InterviewStoryOpenDraft {
   entrypoint: 'ui' | 'pilot';
+  applicationId?: number;
   reviewNoteId?: number;
   targetStoryId?: number;
   expectedCurrentVersionId?: number;

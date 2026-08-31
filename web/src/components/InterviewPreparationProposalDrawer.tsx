@@ -10,6 +10,8 @@ import type {
   InterviewPreparationItem,
   InterviewPreparationProposal,
 } from '@/types/interviewPreparationProposal';
+import { ReadinessFeedbackAdvisory } from '@/features/reviewReadiness/ReadinessFeedbackAdvisory';
+import type { ReadinessPracticeLaunch } from '@/features/reviewReadiness/contracts';
 import { SourceStateTag } from './ui/SourceStateTag';
 import workflowStyles from './ui/WorkflowSurface.module.css';
 
@@ -42,6 +44,7 @@ export interface InterviewPreparationDraft {
   jdVersionId?: number | null;
   assertionsText: string;
   knowledgeSelections: Array<Record<string, unknown>>;
+  readinessFeedbackSelection?: { present: true; orderedVersionIds: number[] };
 }
 
 interface Props {
@@ -55,6 +58,8 @@ interface Props {
   knowledgeOptions?: InterviewPreparationKnowledgeOption[];
   draft?: InterviewPreparationDraft;
   onDraftChange?: (draft: InterviewPreparationDraft | null) => void;
+  onOpenPractice?: (launch: ReadinessPracticeLaunch) => void;
+  ownerGeneration?: number;
 }
 
 const SECTION_LABELS: Array<[keyof InterviewPreparationProposal['proposal'], string]> = [
@@ -117,6 +122,8 @@ export default function InterviewPreparationProposalDrawer({
   knowledgeOptions = [],
   draft,
   onDraftChange,
+  onOpenPractice,
+  ownerGeneration = 1,
 }: Props) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -134,27 +141,50 @@ export default function InterviewPreparationProposalDrawer({
         : [],
     ),
   );
+  const [readinessSelectionPresent, setReadinessSelectionPresent] = useState(
+    () => draft?.readinessFeedbackSelection?.present === true,
+  );
+  const [selectedReadinessVersionIds, setSelectedReadinessVersionIds] = useState<number[]>(
+    () => draft?.readinessFeedbackSelection?.orderedVersionIds ?? [],
+  );
+  const headingRef = useRef<HTMLHeadingElement | null>(null);
+  const returnFocusRef = useRef<HTMLElement | null>(null);
   const suppressDraftPersistence = useRef(false);
   const mountedRef = useRef(false);
   const activeAttemptKeyRef = useRef<string | null>(null);
   const activeAttemptGenerationRef = useRef(0);
   const activeAttemptDraftRef = useRef<InterviewPreparationDraft | null>(null);
+  const readinessContractReadyRef = useRef(readinessSelectionPresent);
+  const resultUnknownRef = useRef(false);
   const onAttemptStateChangeRef = useRef(onAttemptStateChange);
   const onDraftChangeRef = useRef(onDraftChange);
   onAttemptStateChangeRef.current = onAttemptStateChange;
   onDraftChangeRef.current = onDraftChange;
   const hasInput = Boolean(resumeId && jdVersionId);
   const resultUnknown = attemptState?.result_unknown ?? draft?.attemptState.result_unknown ?? false;
+  resultUnknownRef.current = resultUnknown;
   const isSafeEmpty = proposal?.proposal_status === 'safe_empty';
+
+  useEffect(() => {
+    if (!open) return;
+    returnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const frame = window.requestAnimationFrame(() => headingRef.current?.focus());
+    return () => {
+      window.cancelAnimationFrame(frame);
+      const target = returnFocusRef.current;
+      if (target?.isConnected) target.focus();
+    };
+  }, [context.applicationId, context.eventId, open]);
   const setJdText = (value: string) => {
     if (!jdVersionId) setJdTextState(value);
   };
-  const input = useMemo<CreateInterviewPreparationProposalInput>(() => ({
-    application_id: context.applicationId,
-    event_id: context.eventId,
-    resume_id: resumeId,
-    jd_version_id: jdVersionId ?? 0,
-    knowledge_selections: knowledgeOptions.length > 0
+  const input = useMemo<CreateInterviewPreparationProposalInput>(() => {
+    const base = {
+      application_id: context.applicationId,
+      event_id: context.eventId,
+      resume_id: resumeId,
+      jd_version_id: jdVersionId ?? 0,
+      knowledge_selections: knowledgeOptions.length > 0
       ? knowledgeOptions
         .filter((option) => selectedEvidenceIds.includes(option.evidence_id))
         .reduce<Array<{ note_version_id: number; evidence_ids: string[] }>>((groups, option) => {
@@ -163,10 +193,14 @@ export default function InterviewPreparationProposalDrawer({
           else groups.push({ note_version_id: option.note_version_id, evidence_ids: [option.evidence_id] });
           return groups;
         }, [])
-      : context.knowledgeSelections,
-    user_assertions: assertionsText.split('\n').map((value) => value.trim()).filter(Boolean),
-    idempotency_key: attemptKey,
-  }), [assertionsText, attemptKey, context, jdVersionId, knowledgeOptions, resumeId, selectedEvidenceIds]);
+        : context.knowledgeSelections,
+      user_assertions: assertionsText.split('\n').map((value) => value.trim()).filter(Boolean),
+      idempotency_key: attemptKey,
+    };
+    return readinessSelectionPresent
+      ? { ...base, readiness_feedback_version_ids: [...selectedReadinessVersionIds] }
+      : base;
+  }, [assertionsText, attemptKey, context, jdVersionId, knowledgeOptions, readinessSelectionPresent, resumeId, selectedEvidenceIds, selectedReadinessVersionIds]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -227,14 +261,28 @@ export default function InterviewPreparationProposalDrawer({
       jdVersionId,
       assertionsText,
       knowledgeSelections: input.knowledge_selections,
+      ...(readinessSelectionPresent
+        ? { readinessFeedbackSelection: { present: true as const, orderedVersionIds: [...selectedReadinessVersionIds] } }
+        : {}),
     });
-  }, [assertionsText, attemptKey, attemptState?.result_unknown, input.knowledge_selections, jdText, jdVersionId, onDraftChange, open, resumeId]);
+  }, [assertionsText, attemptKey, attemptState?.result_unknown, input.knowledge_selections, jdText, jdVersionId, onDraftChange, open, readinessSelectionPresent, resumeId, selectedReadinessVersionIds]);
 
   if (!open) return null;
 
   const generate = async () => {
     if (!hasInput || busy) return;
     if (!window.confirm('仅 JD、所选简历和已确认 Knowledge Evidence 会发送给 AI；用户断言仅保存于本次快照，不会发送给 AI，也不作为建议依据。是否继续？')) return;
+    const frozenUnknownDraft = resultUnknown
+      ? activeAttemptDraftRef.current ?? draft ?? null
+      : null;
+    const selectionPresentForRequest = frozenUnknownDraft
+      ? frozenUnknownDraft.readinessFeedbackSelection?.present === true
+      : readinessSelectionPresent || readinessContractReadyRef.current;
+    const selectionForRequest = frozenUnknownDraft?.readinessFeedbackSelection?.orderedVersionIds
+      ?? selectedReadinessVersionIds;
+    const requestInput = selectionPresentForRequest
+      ? { ...input, readiness_feedback_version_ids: [...selectionForRequest] }
+      : Object.fromEntries(Object.entries(input).filter(([key]) => key !== 'readiness_feedback_version_ids')) as CreateInterviewPreparationProposalInput;
     const requestKey = attemptKey;
     const requestGeneration = activeAttemptGenerationRef.current + 1;
     activeAttemptGenerationRef.current = requestGeneration;
@@ -246,6 +294,9 @@ export default function InterviewPreparationProposalDrawer({
       jdVersionId,
       assertionsText,
       knowledgeSelections: input.knowledge_selections,
+      ...(selectionPresentForRequest
+        ? { readinessFeedbackSelection: { present: true as const, orderedVersionIds: [...selectionForRequest] } }
+        : {}),
     };
     activeAttemptDraftRef.current = requestDraft;
     onAttemptStateChangeRef.current?.({ key: requestKey, result_unknown: false });
@@ -254,7 +305,7 @@ export default function InterviewPreparationProposalDrawer({
     setError(null);
     suppressDraftPersistence.current = false;
     try {
-      const result = await createInterviewPreparationProposal(input);
+      const result = await createInterviewPreparationProposal(requestInput);
       if (
         !mountedRef.current
         || activeAttemptGenerationRef.current !== requestGeneration
@@ -267,6 +318,7 @@ export default function InterviewPreparationProposalDrawer({
         onDraftChangeRef.current?.(null);
         activeAttemptDraftRef.current = null;
         setAttemptKey(newAttemptKey());
+        if (readinessContractReadyRef.current) setReadinessSelectionPresent(true);
       } else {
         onAttemptStateChangeRef.current?.({ key: requestKey, result_unknown: true });
         const unknownDraft = { ...requestDraft, attemptState: { key: requestKey, result_unknown: true } };
@@ -296,6 +348,7 @@ export default function InterviewPreparationProposalDrawer({
         onDraftChangeRef.current?.(null);
         activeAttemptDraftRef.current = null;
         setAttemptKey(newAttemptKey());
+        if (readinessContractReadyRef.current) setReadinessSelectionPresent(true);
       }
       setError(safeErrorMessage(caught));
     } finally {
@@ -333,7 +386,7 @@ export default function InterviewPreparationProposalDrawer({
     <section aria-label="面试准备建议" className={`${workflowStyles.surface} ${workflowStyles.stack}`}>
       <header className={workflowStyles.sectionHeader}>
         <div>
-          <h2>面试准备建议</h2>
+          <h2 ref={headingRef} tabIndex={-1}>面试准备建议</h2>
           <p className={workflowStyles.mutedText}>围绕当前面试事件，生成可审阅、可引用的准备建议。</p>
           <p className={workflowStyles.mutedText}>仅 JD、所选简历和已确认 Knowledge Evidence 会发送给 AI；用户断言仅保存于本次快照，不会发送给 AI。</p>
         </div>
@@ -382,6 +435,21 @@ export default function InterviewPreparationProposalDrawer({
           ))}
         </select>
       </label>
+      <ReadinessFeedbackAdvisory
+        applicationId={context.applicationId}
+        eventId={context.eventId}
+        selectedVersionIds={selectedReadinessVersionIds}
+        onSelectionChange={setSelectedReadinessVersionIds}
+        onContractReady={() => {
+          readinessContractReadyRef.current = true;
+          if (!activeAttemptKeyRef.current && !resultUnknownRef.current) {
+            setReadinessSelectionPresent(true);
+          }
+        }}
+        onOpenPractice={onOpenPractice}
+        ownerGeneration={ownerGeneration}
+        frozen={busy || resultUnknown}
+      />
       <label className={workflowStyles.stack}>
         粘贴 JD
         <textarea

@@ -10,13 +10,18 @@
   align-items: flex-start;
 }
 
+.title { margin:0; font-size:24px; line-height:1.35; }
+.title:focus-visible { outline:3px solid var(--op-focus-ring-color); outline-offset:4px; border-radius:4px; }
+
 .history {
-  background: #fafafa;
+  color: var(--op-ink);
+  background: var(--surface-sunken);
 }
 
 .item {
+  color: var(--op-ink);
   padding: 8px 0;
-  border-bottom: 1px solid #f0f0f0;
+  border-bottom: 1px solid var(--op-border);
 }
 
 .evidence {
@@ -27,5 +32,5 @@
 
 .excerpt {
   margin: 4px 0 0 8px !important;
-  color: #64748b;
+  color: var(--op-muted);
 }

@@ -41,6 +41,8 @@ export interface InterviewReviewProposal {
   id: number;
   note_id: number | null;
   application_event_id?: number | null;
+  proposal_schema_version: 1 | 2;
+  source_note_revision: number | null;
   source_fingerprint: string;
   source_status: InterviewReviewSourceStatus;
   proposal: InterviewReviewProposalContent;

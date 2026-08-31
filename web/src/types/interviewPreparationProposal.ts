@@ -56,6 +56,7 @@ export interface CreateInterviewPreparationProposalInput {
   knowledge_selections: Array<Record<string, unknown>>;
   user_assertions: string[];
   idempotency_key: string;
+  readiness_feedback_version_ids?: number[];
 }
 
 export class InterviewPreparationProposalError extends Error {

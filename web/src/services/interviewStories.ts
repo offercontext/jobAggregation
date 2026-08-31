@@ -4,6 +4,7 @@ import type {
   InterviewStoryClientEvidenceLink,
   InterviewStoryManualInput,
   InterviewStoryPendingAttempt,
+  InterviewStoryNextProductActionResponse,
   InterviewStoryProposalAttempt,
   InterviewStoryProposalInput,
   InterviewStorySourceCandidates,
@@ -17,6 +18,36 @@ export { InterviewStoryError } from '@/types/interviewStory';
 const http = createApiClient({ baseURL: '/api', timeout: 130000 });
 
 type ProposalResponse = InterviewStoryProposalAttempt | InterviewStoryPendingAttempt;
+
+function parseNextProductAction(value: unknown): InterviewStoryNextProductActionResponse {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new StoryError(0, 'story_invalid_response');
+  const record = value as Record<string, unknown>;
+  const required = ['schema_version', 'contract', 'operation_id', 'action_call_id', 'product_action_generation', 'status', 'proposal_created'];
+  const allowed = new Set([...required, 'confirmation_token', 'terminal_result']);
+  if (required.some((key) => !(key in record)) || Object.keys(record).some((key) => !allowed.has(key))) {
+    throw new StoryError(0, 'story_invalid_response');
+  }
+  const status = record.status;
+  const validStatus = status === 'proposed' || status === 'rejected' || status === 'committed' || status === 'failed';
+  const token = record.confirmation_token;
+  const terminalResult = record.terminal_result;
+  const closedUnionValid = status === 'proposed'
+    ? typeof record.proposal_created === 'boolean' && typeof token === 'string' && token.length > 0 && terminalResult === undefined
+    : record.proposal_created === false && token === undefined
+      && typeof terminalResult === 'object' && terminalResult !== null && !Array.isArray(terminalResult);
+  if (
+    record.schema_version !== 1
+    || record.contract !== 'story_product_action_proposal_response_v1'
+    || typeof record.operation_id !== 'string'
+    || typeof record.action_call_id !== 'string'
+    || typeof record.product_action_generation !== 'number'
+    || !Number.isSafeInteger(record.product_action_generation)
+    || record.product_action_generation < 1
+    || !validStatus
+    || !closedUnionValid
+  ) throw new StoryError(0, 'story_invalid_response');
+  return record as unknown as InterviewStoryNextProductActionResponse;
+}
 
 function toStoryError(error: unknown): StoryError {
   const response = axios.isAxiosError(error)
@@ -93,6 +124,16 @@ export function createInterviewStoryProposal(
 
 export function getInterviewStoryProposal(attemptId: number): Promise<ProposalResponse> {
   return request(() => http.get<ProposalResponse>(`/interview-story-proposals/${attemptId}`));
+}
+
+export function createInterviewStoryProductAction(
+  attemptId: number,
+  input: { expected_generation_revision: number; expected_product_action_generation: number },
+): Promise<InterviewStoryNextProductActionResponse> {
+  return request(() => http.post<InterviewStoryNextProductActionResponse>(
+    `/interview-story-proposals/${attemptId}/product-actions`,
+    input,
+  )).then(parseNextProductAction);
 }
 
 export function confirmInterviewStoryProposal(

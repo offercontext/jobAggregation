@@ -1,47 +1,90 @@
-.workspace { display: grid; gap: 22px; color: var(--op-text, #17152e); }
-.hero { position: relative; display: grid; grid-template-columns: auto minmax(0,1fr) auto; gap: 18px; align-items: center; padding: 24px; overflow: hidden; border-radius: 22px; background: linear-gradient(135deg,#f4f0ff 0%,#fbfaff 52%,#eef7ff 100%); box-shadow: inset 0 0 0 1px rgba(88,67,184,.10),0 18px 45px rgba(64,45,140,.08); }
-.hero::after { content:""; position:absolute; width:220px; height:220px; right:90px; top:-150px; border-radius:50%; background:rgba(102,83,255,.10); filter:blur(2px); pointer-events:none; }
-.heroIcon { width: 50px; height: 50px; display:grid; place-items:center; border-radius:16px; color:#fff; font-size:23px; background:#6155e8; box-shadow:0 10px 26px rgba(79,65,200,.24); }
-.hero h2,.section h3,.practiceCard h3 { margin:4px 0 6px; text-wrap:balance; }
-.hero p { margin:0; color:#6d6884; text-wrap:pretty; }
-.eyebrow { color:#6254d9; font-size:12px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; }
-.heroMetric { display:grid; min-width:92px; padding:14px 16px; border-radius:16px; text-align:center; background:rgba(255,255,255,.78); box-shadow:0 8px 24px rgba(52,38,120,.08); }
-.heroMetric strong { font-size:24px; font-variant-numeric:tabular-nums; }
-.heroMetric span { color:#777189; font-size:12px; }
-.section,.practiceCard,.evidencePanel { border-radius:22px; background:#fff; box-shadow:0 12px 36px rgba(37,30,75,.07),inset 0 0 0 1px rgba(35,27,73,.07); }
-.section,.practiceCard { padding:22px; }
-.sectionHeading { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; margin-bottom:16px; }
-.recommendationGrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:14px; }
-.recommendationCard { display:flex; flex-direction:column; justify-content:space-between; gap:16px; min-height:238px; padding:18px; border-radius:18px; background:linear-gradient(180deg,#fff 0%,#faf9ff 100%); box-shadow:inset 0 0 0 1px rgba(64,49,135,.09),0 8px 22px rgba(51,40,103,.05); transition-property:transform,box-shadow; transition-duration:.18s; }
-.recommendationCard:hover { transform:translateY(-2px); box-shadow:inset 0 0 0 1px rgba(82,63,184,.18),0 14px 30px rgba(51,40,103,.10); }
-.recommendationCard h4 { margin:12px 0 6px; font-size:18px; }
-.recommendationCard p { margin:0; color:#635f74; }
-.sourcePreview { display:grid; gap:5px; padding:12px; border-radius:12px; background:#f1effa; }
-.sourcePreview span,.evidenceLabel,.historyBody span,.confirmation span { color:#756daa; font-size:12px; font-weight:700; }
-.sourcePreview q { color:#38334f; quotes:none; line-height:1.65; }
-.activeGrid { display:grid; grid-template-columns:minmax(0,1.55fr) minmax(280px,.75fr); gap:18px; align-items:start; }
-.practiceCard { display:grid; gap:14px; }
-.promptBox { display:grid; gap:6px; padding:16px; border-radius:15px; background:#f2f0ff; }
-.promptBox span { color:#6f64ca; font-size:12px; font-weight:700; }
-.fieldLabel { margin-top:4px; color:#3b374b; font-size:13px; font-weight:700; }
-.assessmentOptions { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-top:8px; }
-.assessment,.assessmentActive { min-height:70px; height:auto; display:flex; flex-direction:column; align-items:flex-start; justify-content:center; text-align:left; border-radius:14px; transition-property:transform,box-shadow,background-color; }
-.assessment span,.assessmentActive span { color:#858093; font-size:11px; }
-.assessmentActive { color:#5144d6; background:#f0eeff; box-shadow:inset 0 0 0 2px #7062ef; }
-.assessment:active,.assessmentActive:active,.recommendationCard button:active { transform:scale(.96); }
-.evidencePanel { position:sticky; top:16px; display:grid; gap:12px; padding:20px; }
-.evidencePanel p { margin:0; color:#5f5a70; line-height:1.65; }
-.evidencePanel blockquote,.confirmation blockquote { margin:0; padding:13px 14px; border-left:3px solid #8a7ff1; border-radius:0 12px 12px 0; background:#f6f4ff; color:#39354a; line-height:1.65; }
-.historyList { display:grid; gap:10px; }
-.historyCard { border-radius:15px; background:#fbfbfe; box-shadow:inset 0 0 0 1px rgba(53,43,95,.08); }
-.historyCard summary { min-height:64px; display:grid; grid-template-columns:auto 1fr auto; align-items:center; gap:12px; padding:12px 15px; cursor:pointer; list-style:none; }
-.historyCard summary:focus-visible { outline:3px solid rgba(99,102,241,.22); outline-offset:2px; border-radius:14px; }
-.historyCard summary::-webkit-details-marker { display:none; }
-.historyCard summary span:nth-child(2) { display:grid; gap:2px; }
-.historyCard small { color:#878292; }
-.historyIcon { width:34px; height:34px; display:grid; place-items:center; border-radius:11px; color:#2f9e64; background:#eaf8f0; }
-.historyBody { display:grid; gap:12px; padding:0 16px 16px 61px; }
-.historyBody p { margin:4px 0 0; white-space:pre-wrap; color:#494556; line-height:1.65; }
-.confirmation { display:grid; gap:14px; }
-.confirmation > p { margin:0; }
-@media (max-width: 900px) { .hero{grid-template-columns:auto 1fr}.heroMetric{display:none}.activeGrid{grid-template-columns:1fr}.evidencePanel{position:static}.assessmentOptions{grid-template-columns:1fr}.recommendationGrid{grid-template-columns:1fr}.historyBody{padding-left:16px} }
+.workspace {
+  --practice-accent-tint: color-mix(in srgb, var(--op-primary) 8%, var(--op-surface));
+  display: grid;
+  gap: 22px;
+  color: var(--op-ink);
+}
+
+:global(:root[data-theme='dark']) .workspace {
+  --practice-accent-tint: color-mix(in srgb, var(--op-primary) 14%, var(--op-surface));
+  color-scheme: dark;
+}
+
+.hero {
+  position: relative;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 18px;
+  align-items: center;
+  padding: 24px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--op-primary) 18%, var(--op-border));
+  border-radius: 22px;
+  background: linear-gradient(135deg, var(--practice-accent-tint), var(--op-surface));
+  box-shadow: var(--op-shadow-md);
+}
+.hero::after { content: ''; position: absolute; width: 220px; height: 220px; right: 90px; top: -150px; border-radius: 50%; background: color-mix(in srgb, var(--op-primary) 12%, transparent); pointer-events: none; }
+.heroIcon { width: 50px; height: 50px; display: grid; place-items: center; border-radius: 16px; color: var(--op-on-primary); font-size: 23px; background: var(--op-primary); box-shadow: var(--op-shadow-lg); }
+.hero h2, .section h3, .practiceCard h3 { margin: 4px 0 6px; color: var(--op-ink); text-wrap: balance; }
+.hero p { margin: 0; color: var(--op-muted-strong); text-wrap: pretty; }
+.eyebrow { color: var(--op-primary-strong); font-size: 12px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.heroMetric { display: grid; min-width: 92px; padding: 14px 16px; border: 1px solid var(--op-border); border-radius: 16px; text-align: center; background: var(--op-surface); box-shadow: var(--op-shadow-sm); }
+.heroMetric strong { font-size: 24px; font-variant-numeric: tabular-nums; }
+.heroMetric span { color: var(--op-muted); font-size: 12px; }
+
+.section, .practiceCard, .evidencePanel { border: 1px solid var(--op-border); border-radius: 22px; background: var(--op-surface); box-shadow: var(--op-shadow-md); }
+.section, .practiceCard { padding: 22px; }
+.sectionHeading { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 16px; }
+.recommendationGrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+.recommendationCard { display: flex; flex-direction: column; justify-content: space-between; gap: 16px; min-height: 238px; padding: 18px; border: 1px solid var(--op-border); border-radius: 18px; background: var(--surface-sunken); box-shadow: var(--op-shadow-sm); transition-property: transform, box-shadow, border-color; transition-duration: .18s; }
+.recommendationCard:hover { transform: translateY(-2px); border-color: color-mix(in srgb, var(--op-primary) 36%, var(--op-border)); box-shadow: var(--op-shadow-md); }
+.recommendationCard h4 { margin: 12px 0 6px; color: var(--op-ink); font-size: 18px; }
+.recommendationCard p { margin: 0; color: var(--op-muted-strong); }
+.sourcePreview { display: grid; gap: 5px; padding: 12px; border-radius: 12px; background: var(--practice-accent-tint); }
+.sourcePreview span, .evidenceLabel, .historyBody span, .confirmation span { color: var(--op-primary-strong); font-size: 12px; font-weight: 700; }
+.sourcePreview q { color: var(--op-ink); quotes: none; line-height: 1.65; }
+
+.activeGrid { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(280px, .75fr); gap: 18px; align-items: start; }
+.practiceCard { display: grid; gap: 14px; }
+.promptBox { display: grid; gap: 6px; padding: 16px; border-radius: 15px; background: var(--practice-accent-tint); color: var(--op-ink); }
+.promptBox span { color: var(--op-primary-strong); font-size: 12px; font-weight: 700; }
+.fieldLabel { margin-top: 4px; color: var(--op-ink); font-size: 13px; font-weight: 700; }
+.practiceCard :global(.ant-input) { border-color: var(--op-border-strong); background: var(--op-surface); color: var(--op-ink); }
+.practiceCard :global(.ant-input::placeholder) { color: var(--op-muted); }
+.practiceCard :global(.ant-input:hover), .practiceCard :global(.ant-input:focus) { border-color: var(--op-primary); box-shadow: var(--op-focus-ring); }
+.assessmentOptions { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 8px; }
+.assessment, .assessmentActive { min-height: 70px; height: auto; display: flex; flex-direction: column; align-items: flex-start; justify-content: center; text-align: left; border-radius: 14px; color: var(--op-ink); transition-property: transform, box-shadow, background-color; }
+.assessment span, .assessmentActive span { color: var(--op-muted-strong); font-size: 11px; }
+.assessmentActive { color: var(--op-primary-strong); background: var(--practice-accent-tint); box-shadow: inset 0 0 0 2px var(--op-primary); }
+.assessment:active, .assessmentActive:active, .recommendationCard button:active { transform: scale(.96); }
+
+.evidencePanel { position: sticky; top: 16px; display: grid; gap: 12px; padding: 20px; }
+.evidencePanel p { margin: 0; color: var(--op-muted-strong); line-height: 1.65; }
+.evidencePanel blockquote, .confirmation blockquote { margin: 0; padding: 13px 14px; border-left: 3px solid var(--op-primary); border-radius: 0 12px 12px 0; background: var(--practice-accent-tint); color: var(--op-ink); line-height: 1.65; }
+.historyList { display: grid; gap: 10px; }
+.historyCard { border: 1px solid var(--op-border); border-radius: 15px; background: var(--surface-sunken); }
+.historyCard summary { min-height: 64px; display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 12px; padding: 12px 15px; cursor: pointer; list-style: none; }
+.historyCard summary:focus-visible { outline: 3px solid var(--op-focus-ring-color); outline-offset: 2px; border-radius: 14px; }
+.historyCard summary::-webkit-details-marker { display: none; }
+.historyCard summary span:nth-child(2) { display: grid; gap: 2px; }
+.historyCard small { color: var(--op-muted); }
+.historyIcon { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 11px; color: var(--op-success); background: color-mix(in srgb, var(--op-success) 10%, var(--op-surface)); }
+.historyBody { display: grid; gap: 12px; padding: 0 16px 16px 61px; }
+.historyBody p { margin: 4px 0 0; white-space: pre-wrap; color: var(--op-ink); line-height: 1.65; }
+.confirmation { display: grid; gap: 14px; }
+.confirmation > p { margin: 0; }
+.liveStatus { min-height: 20px; color: var(--op-muted); font-size: 13px; }
+
+@media (max-width: 900px) {
+  .hero { grid-template-columns: auto 1fr; }
+  .heroMetric { display: none; }
+  .activeGrid { grid-template-columns: 1fr; }
+  .evidencePanel { position: static; }
+  .assessmentOptions, .recommendationGrid { grid-template-columns: 1fr; }
+  .historyBody { padding-left: 16px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .recommendationCard, .assessment, .assessmentActive { transition-duration: .01ms; }
+  .recommendationCard:hover, .assessment:active, .assessmentActive:active, .recommendationCard button:active { transform: none; }
+}

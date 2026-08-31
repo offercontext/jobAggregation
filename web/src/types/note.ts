@@ -11,6 +11,7 @@ export interface InterviewNote {
   self_reflection: string;
   difficulty_points: string;
   mood: string;
+  revision: number;
   created_at: string;
 }
 

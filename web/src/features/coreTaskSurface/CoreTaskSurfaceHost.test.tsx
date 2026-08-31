@@ -77,6 +77,41 @@ describe('CoreTaskSurfaceHost', () => {
     expect(controller.getState().phase).toBe('closing');
   });
 
+  it.each([
+    ['button', (host: HTMLElement) => (host.querySelector('button[aria-label="关闭任务"]') as HTMLButtonElement).click()],
+    ['Escape', () => document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))],
+  ])('uses the exact guard-aware close authority for the real %s close path', (_label, closeOwner) => {
+    const controller = createCoreTaskSurfaceController();
+    const host = document.createElement('div');
+    document.body.append(host);
+    const root = createRoot(host);
+    roots.push(root);
+    const request = {
+      ref: { taskId: 'interview.free_practice' as const },
+      source: 'application_task_card' as const,
+      childOwnerIdentity: '91:103',
+    };
+    act(() => root.render(<CoreTaskSurfaceHost controller={controller} closeGuard={() => ({ pending: true, unsaved: true })} />));
+    let firstResult: ReturnType<typeof controller.launch> | undefined;
+    act(() => { firstResult = controller.launch(request); });
+    const first = requireLaunch(firstResult);
+    act(() => root.render(<CoreTaskSurfaceHost controller={controller} closeGuard={() => ({ pending: true, unsaved: true })} />));
+    const owner = host.querySelector('[data-core-task-owner]') as HTMLElement;
+    act(() => owner.dispatchEvent(new Event('animationend', { bubbles: true })));
+    act(() => closeOwner(host));
+    expect(controller.getState().phase).toBe('closing');
+    act(() => owner.dispatchEvent(new Event('animationend', { bubbles: true })));
+
+    let reopened: ReturnType<typeof controller.launch> | undefined;
+    act(() => { reopened = controller.launch(request); });
+    if (!reopened) throw new Error('relaunch should produce a result');
+    if (reopened.kind !== 'launched') throw new Error('relaunch should succeed');
+    expect(controller.getState().active).toMatchObject({
+      recoveryGeneration: first.generation,
+      childOwnerIdentity: '91:103',
+    });
+  });
+
   it('finishes opening and closing deterministically when reduced motion is requested', () => {
     vi.stubGlobal('matchMedia', vi.fn(() => ({ matches: true, media: '', onchange: null, addListener: vi.fn(), removeListener: vi.fn(), addEventListener: vi.fn(), removeEventListener: vi.fn(), dispatchEvent: vi.fn() })));
     const controller = createCoreTaskSurfaceController();

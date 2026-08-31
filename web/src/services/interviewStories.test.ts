@@ -93,4 +93,63 @@ describe('interview story service', () => {
       retryAfterMs: 30_250,
     });
   });
+
+  it('requests Story N+1 with both exact generation counters', async () => {
+    const response = {
+      schema_version: 1,
+      contract: 'story_product_action_proposal_response_v1',
+      operation_id: 'operation-2',
+      action_call_id: 'call-2',
+      product_action_generation: 2,
+      status: 'proposed',
+      proposal_created: true,
+      confirmation_token: 'server-token-2',
+    };
+    apiPost.mockResolvedValue({ data: response });
+    await expect(service.createInterviewStoryProductAction(44, {
+      expected_generation_revision: 3,
+      expected_product_action_generation: 1,
+    })).resolves.toEqual(response);
+    expect(apiPost).toHaveBeenCalledWith('/interview-story-proposals/44/product-actions', {
+      expected_generation_revision: 3,
+      expected_product_action_generation: 1,
+    });
+    apiPost.mockResolvedValue({ data: { ...response, leaked: 'nope' } });
+    await expect(service.createInterviewStoryProductAction(44, {
+      expected_generation_revision: 3,
+      expected_product_action_generation: 1,
+    })).rejects.toMatchObject({ code: 'story_invalid_response' });
+  });
+
+  it('decodes the Story N+1 response as a closed proposed-or-terminal union', async () => {
+    const base = {
+      schema_version: 1, contract: 'story_product_action_proposal_response_v1',
+      operation_id: 'operation-2', action_call_id: 'call-2', product_action_generation: 2,
+    };
+    const invalid = [
+      { ...base, status: 'proposed', proposal_created: true, confirmation_token: 'server-token-2', terminal_result: {} },
+      { ...base, status: 'committed', proposal_created: false },
+      { ...base, status: 'rejected', proposal_created: true, terminal_result: {} },
+      { ...base, status: 'failed', proposal_created: false, confirmation_token: 'leaked', terminal_result: {} },
+    ];
+    for (const response of invalid) {
+      apiPost.mockResolvedValueOnce({ data: response });
+      await expect(service.createInterviewStoryProductAction(44, {
+        expected_generation_revision: 3,
+        expected_product_action_generation: 1,
+      })).rejects.toMatchObject({ code: 'story_invalid_response' });
+    }
+    const terminal = { ...base, status: 'committed', proposal_created: false, terminal_result: { story_id: 8, version_id: 12 } };
+    apiPost.mockResolvedValueOnce({ data: terminal });
+    await expect(service.createInterviewStoryProductAction(44, {
+      expected_generation_revision: 3,
+      expected_product_action_generation: 1,
+    })).resolves.toEqual(terminal);
+    const replayedProposal = { ...base, status: 'proposed', proposal_created: false, confirmation_token: 'server-token-2' };
+    apiPost.mockResolvedValueOnce({ data: replayedProposal });
+    await expect(service.createInterviewStoryProductAction(44, {
+      expected_generation_revision: 3,
+      expected_product_action_generation: 1,
+    })).resolves.toEqual(replayedProposal);
+  });
 });

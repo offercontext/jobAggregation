@@ -21,6 +21,7 @@ from sqlalchemy import delete, func, select
 
 from offerpilot.ai.agent_contracts import ChatModel
 from offerpilot.ai.tool_runtime.contracts import ProviderToolContract
+from offerpilot.ai.tool_specs import build_model_tool_catalog
 from offerpilot.ai.interview_preparation_proposals import (
     InterviewPreparationModelError,
     validate_interview_preparation,
@@ -40,6 +41,8 @@ from offerpilot.models import (
     ApplicationEvidenceBundle,
     ApplicationEvent,
     ApplicationMaterialKit,
+    AgentContextSnapshot,
+    AgentEvent,
     ChatMessage,
     Conversation,
     InterviewKnowledgeCaptureAttempt,
@@ -69,6 +72,7 @@ from offerpilot.models import (
     Question,
     Resume,
     Wakeup,
+    WriteOperation,
 )
 from offerpilot.repositories.json_contract import canonical_json, sha256_text
 from offerpilot.repositories.interview_stories import InterviewStoriesRepository
@@ -314,13 +318,28 @@ class _MutableSmokeChatModel(ChatModel):
 class _InterviewStorySmokeChatModel(ChatModel):
     """Deterministic local-only model used by the Story API acceptance path."""
 
+    def __init__(self) -> None:
+        self._model_calls = 0
+        self._provider_calls = 0
+
+    @property
+    def model_calls(self) -> int:
+        return self._model_calls
+
+    @property
+    def provider_calls(self) -> int:
+        return self._provider_calls
+
     def complete(
         self,
         messages: list[Message],
         tools: list[ProviderToolContract],
         response_format: dict[str, Any] | None = None,
     ) -> Assistant:
-        del tools, response_format
+        del response_format
+        self._model_calls += 1
+        self._provider_calls += 1
+        del tools
         prompt = messages[-1].content if messages else ""
         marker = "catalog: "
         if marker not in prompt:
@@ -2353,11 +2372,27 @@ def run_interview_story_smoke(
         isolated_data_dir = Path(temp_dir)
         if real_ai:
             _copy_real_ai_config(source_data_dir, isolated_data_dir)
+        story_model = None if real_ai else _InterviewStorySmokeChatModel()
+        story_provider_tool_names = tuple(
+            contract.name
+            for contract in build_model_tool_catalog().provider_contracts()
+        )
         app = create_app(
             data_dir=isolated_data_dir,
             static_dir=static_dir,
-            chat_model=None if real_ai else _InterviewStorySmokeChatModel(),
+            chat_model=story_model,
         )
+        runtime = app.state.pilot_runtime
+        manifest_counts = (
+            len(runtime.metadata_bundle.legacy_boundary().ordered_adapter_bindings),
+            len(runtime.metadata_bundle.compensation_view().ordered_handler_bindings),
+            len(app.state.product_action_coordinator._catalog.names()),
+            len(app.state.product_action_compensation_coordinator._catalog.names()),
+        )
+        if manifest_counts != (3, 4, 2, 2):
+            raise RuntimeError(
+                "Story smoke runtime manifests were not exact Legacy3/AgentComp4/PA2/PAComp2"
+            )
         seed: dict[str, int] | None = None
         cleanup_safe = True
         try:
@@ -2370,7 +2405,29 @@ def run_interview_story_smoke(
                     if real_ai and not bool(settings.json().get("has_api_key")):
                         raise RuntimeError("interview story real-ai smoke requires a configured API key")
                     _run_interview_story_http_smoke(
-                        client, isolated_data_dir, seed, steps, exercise_recovery=not real_ai
+                        client,
+                        isolated_data_dir,
+                        seed,
+                        steps,
+                        exercise_recovery=not real_ai,
+                        model_call_count=(
+                            (lambda: story_model.model_calls)
+                            if story_model is not None
+                            else None
+                        ),
+                        provider_call_count=(
+                            (lambda: story_model.provider_calls)
+                            if story_model is not None
+                            else None
+                        ),
+                        provider_tool_names=(
+                            lambda: story_provider_tool_names
+                        ),
+                        provider_surface_exclusion=(
+                            "real_ai_model_provider_counters_unobservable"
+                            if real_ai
+                            else None
+                        ),
                     )
             return SmokeReport(ok=True, steps=steps)
         except SmokeServerShutdownError:
@@ -2467,6 +2524,10 @@ def _run_interview_story_http_smoke(
     steps: list[SmokeStep],
     *,
     exercise_recovery: bool,
+    model_call_count: Callable[[], int] | None,
+    provider_call_count: Callable[[], int] | None,
+    provider_tool_names: Callable[[], tuple[str, ...]] | None,
+    provider_surface_exclusion: str | None,
 ) -> None:
     note_source = {
         "source_kind": "interview_note",
@@ -2475,7 +2536,7 @@ def _run_interview_story_http_smoke(
         "excerpt": "如何排查线上延迟？",
     }
     manual_content = {
-        "title": "筱哲的线上延迟排查",
+        "title": "task12-private-previous-title-7d31",
         "blocks": [{"kind": "situation", "text": "线上出现延迟", "fact_mode": "evidence_backed"}],
         "capability_labels": ["问题定位"],
         "applicable_questions": ["请介绍一次线上问题排查。"],
@@ -2525,27 +2586,39 @@ def _run_interview_story_http_smoke(
         client,
         endpoint="/api/interview-story-proposals",
         idempotency_key="story-ui-smoke-000001",
-        confirmation_token="story-ui-confirm-0001",
         story=restored.json(),
         selections=selections,
         assertions=["我确认这是我亲自负责的排查经历。"],
+        model_call_count=model_call_count,
+        provider_call_count=provider_call_count,
+        provider_tool_names=provider_tool_names,
+        provider_surface_exclusion=provider_surface_exclusion,
     )
     steps.append(SmokeStep("story_ui_proposal_confirm", f"UI proposal {ui['attempt_id']} confirmed"))
+    _assert_task12_runtime_privacy_canary_absent(
+        data_dir,
+        str(ui["privacy_canary"]),
+        previous_title_canary=str(ui["previous_title_canary"]),
+    )
     updated_story = client.get(f"/api/interview-stories/{story_id}")
     _assert_status(updated_story.status_code, 200, "story_after_ui_confirm")
     pilot = _create_and_confirm_story_proposal(
         client,
         endpoint="/api/pilot/interview-story-proposals",
         idempotency_key="story-pilot-smoke-0001",
-        confirmation_token="story-pilot-confirm-01",
         story=updated_story.json(),
         selections=[{"source_kind": "interview_note", "source_id": seed["note_id"], "path": "/questions"}],
         assertions=["我确认这是我亲自负责的排查经历。"],
         entry_context={"review_note_id": seed["note_id"]},
+        model_call_count=model_call_count,
+        provider_call_count=provider_call_count,
+        provider_tool_names=provider_tool_names,
+        provider_surface_exclusion=provider_surface_exclusion,
     )
     if ui["attempt_id"] == pilot["attempt_id"]:
         raise RuntimeError("Story UI and Pilot reused the same attempt")
     steps.append(SmokeStep("story_pilot_proposal_confirm", f"Pilot proposal {pilot['attempt_id']} confirmed"))
+    _assert_task12_runtime_privacy_canary_absent(data_dir, str(pilot["privacy_canary"]))
     if _chat_domain_counts(data_dir) != chat_before:
         raise RuntimeError("Story smoke wrote Chat data")
     steps.append(SmokeStep("story_chat_isolation", "Story UI and Pilot wrappers wrote no Chat data"))
@@ -2672,12 +2745,21 @@ def _create_and_confirm_story_proposal(
     *,
     endpoint: str,
     idempotency_key: str,
-    confirmation_token: str,
     story: dict[str, Any],
     selections: list[dict[str, Any]],
     assertions: list[str],
     entry_context: dict[str, int] | None = None,
-) -> dict[str, int]:
+    model_call_count: Callable[[], int] | None,
+    provider_call_count: Callable[[], int] | None,
+    provider_tool_names: Callable[[], tuple[str, ...]] | None,
+    provider_surface_exclusion: str | None,
+) -> dict[str, int | str]:
+    previous_title_canary = (
+        story.get("title")
+        if isinstance(story.get("title"), str)
+        and story["title"].startswith("task12-private-previous-title-")
+        else None
+    )
     payload: dict[str, Any] = {
         "target_story_id": story["id"],
         "expected_current_version_id": story["current_version_id"],
@@ -2693,59 +2775,335 @@ def _create_and_confirm_story_proposal(
         code = created.json().get("error_code", "unknown")
         raise RuntimeError(f"Story proposal did not become ready: {created.status_code}:{code}")
     body = created.json()
+    if previous_title_canary is not None:
+        _assert_task12_privacy_canary_absent(
+            body,
+            previous_title_canary,
+            "story_ready_http_previous_title",
+        )
     if body.get("attempt_status") != "ready" or not isinstance(body.get("proposal"), dict):
         raise RuntimeError("Story proposal did not return a confirmable draft")
     attempt_id = int(body["id"])
-    proposal_content = body["proposal"]["content"]
-    editable_content = {
-        "title": proposal_content["title"]["text"],
-        "blocks": [
-            {key: block[key] for key in ("kind", "text", "fact_mode")}
-            for block in proposal_content["blocks"]
-        ],
-        "capability_labels": [item["text"] for item in proposal_content["capability_labels"]],
-        "applicable_questions": [item["text"] for item in proposal_content["applicable_questions"]],
-        "fact_gap_codes": proposal_content["fact_gap_codes"],
+    product_action = body.get("product_action")
+    if not isinstance(product_action, dict) or set(product_action) != {
+        "operation_id",
+        "action_call_id",
+        "confirmation_token",
+        "action_name",
+    }:
+        raise RuntimeError("Story ready response omitted the server Product Action identity")
+    if product_action["action_name"] != "confirm_interview_story" or not all(
+        isinstance(product_action[field], str) and product_action[field]
+        for field in ("operation_id", "action_call_id", "confirmation_token")
+    ):
+        raise RuntimeError("Story ready response returned an invalid Product Action identity")
+    privacy_canary = product_action["confirmation_token"]
+
+    decision_request = {
+        "confirmation_token": product_action["confirmation_token"],
+        "decision": "approve",
     }
-    client_links = [
-        {
-            "target_kind": link["target_kind"],
-            "target_id": link["target_id"],
-            "source_kind": link["source_kind"],
-            "source_id": link["source_stable_id"],
-            "source_path": link["source_path"],
-            "excerpt": link["excerpt"],
-            "text_location": link["text_location"],
-        }
-        for link in body["proposal"]["evidence_links"]
-    ]
-    confirmed = client.post(
-        f"/api/interview-story-proposals/{attempt_id}/confirm",
-        json={
-            "confirmation_token": confirmation_token,
-            "content": editable_content,
-            "evidence_links": client_links,
-            "expected_current_version_id": story["current_version_id"],
-            "expected_story_revision": story["story_revision"],
-        },
+    decision_url = f"/api/product-actions/{product_action['operation_id']}/decisions"
+    if provider_tool_names is None:
+        raise RuntimeError("Story smoke did not provide a Provider tool surface gate")
+    provider_names = provider_tool_names()
+    if len(provider_names) != 25 or len(set(provider_names)) != 25:
+        raise RuntimeError("Story smoke Provider surface did not contain exactly 25 tools")
+    if {"confirm_interview_story", "save_review_readiness_signal"} & set(provider_names):
+        raise RuntimeError("Story Product Actions leaked into the Provider tool surface")
+
+    counters_observable = provider_surface_exclusion is None
+    if counters_observable:
+        if model_call_count is None or provider_call_count is None:
+            raise RuntimeError("Story smoke local model/provider counters were unavailable")
+        model_calls_before = model_call_count()
+        provider_calls_before = provider_call_count()
+    elif provider_surface_exclusion != "real_ai_model_provider_counters_unobservable":
+        raise RuntimeError("Story smoke used an unapproved model/provider counter exclusion")
+
+    story_before_decision = client.get(f"/api/interview-stories/{story['id']}")
+    _assert_status(story_before_decision.status_code, 200, "story_before_product_action")
+    _assert_task12_privacy_canary_absent(
+        story_before_decision.json(),
+        privacy_canary,
+        "story_before_decision_http",
     )
-    if confirmed.status_code != 201:
-        raise RuntimeError(
-            "story_proposal_confirm returned "
-            f"{confirmed.status_code}: {confirmed.text[:200]!r}"
+    recovery_url = f"/api/product-actions/{product_action['operation_id']}"
+    generic_proposed = client.get(recovery_url)
+    _assert_status(
+        generic_proposed.status_code,
+        200,
+        "story_generic_proposed_recovery",
+    )
+    generic_proposed_body = generic_proposed.json()
+    _assert_task12_privacy_canary_absent(
+        generic_proposed_body,
+        privacy_canary,
+        "story_pending_generic_http",
+    )
+    if previous_title_canary is not None:
+        _assert_task12_privacy_canary_absent(
+            generic_proposed_body,
+            previous_title_canary,
+            "story_pending_generic_http_previous_title",
         )
-    replay = client.post(
-        f"/api/interview-story-proposals/{attempt_id}/confirm",
-        json={
-            "confirmation_token": confirmation_token,
-            "content": editable_content,
-            "evidence_links": client_links,
-            "expected_current_version_id": story["current_version_id"],
-            "expected_story_revision": story["story_revision"],
-        },
+    if (
+        not isinstance(generic_proposed_body, dict)
+        or "confirmation_token" in generic_proposed_body
+        or generic_proposed_body.get("operation_id") != product_action["operation_id"]
+        or generic_proposed_body.get("status") != "proposed"
+    ):
+        raise RuntimeError("Story generic GET exposed token or lost proposed identity")
+
+    source_owner = client.get(f"/api/interview-story-proposals/{attempt_id}")
+    _assert_status(source_owner.status_code, 200, "story_source_owner_recovery")
+    source_owner_body = source_owner.json()
+    source_owner_action = source_owner_body.get("product_action")
+    if source_owner_action != product_action:
+        raise RuntimeError("Story source-bound recovery did not retain the original token")
+    if previous_title_canary is not None:
+        _assert_task12_privacy_canary_absent(
+            source_owner_body,
+            previous_title_canary,
+            "story_source_owner_http_previous_title",
+        )
+    source_replay = client.post(endpoint, json=payload)
+    _assert_status(source_replay.status_code, 200, "story_source_owner_replay")
+    source_replay_body = source_replay.json()
+    if (
+        source_replay_body.get("id") != attempt_id
+        or source_replay_body.get("product_action") != product_action
+    ):
+        raise RuntimeError("Story source-bound replay did not retain the original token")
+    if previous_title_canary is not None:
+        _assert_task12_privacy_canary_absent(
+            source_replay_body,
+            previous_title_canary,
+            "story_source_replay_http_previous_title",
+        )
+    story_after_source_replay = client.get(f"/api/interview-stories/{story['id']}")
+    _assert_status(
+        story_after_source_replay.status_code,
+        200,
+        "story_after_source_owner_replay",
     )
-    _assert_status(replay.status_code, 200, "story_proposal_confirm_replay")
-    return {"attempt_id": attempt_id, "version_id": int(confirmed.json()["version_id"])}
+    if story_after_source_replay.json() != story_before_decision.json():
+        raise RuntimeError("Story source-bound recovery or replay mutated the Story")
+    _assert_task12_privacy_canary_absent(
+        story_after_source_replay.json(),
+        privacy_canary,
+        "story_after_source_owner_replay_http",
+    )
+    if counters_observable:
+        assert model_call_count is not None
+        assert provider_call_count is not None
+        if model_call_count() != model_calls_before:
+            raise RuntimeError("Story source-bound replay called the Story model")
+        if provider_call_count() != provider_calls_before:
+            raise RuntimeError("Story source-bound replay called the Provider")
+    # Simulate losing the first terminal HTTP response: issue the decision, but
+    # deliberately do not bind, inspect, or depend on the response object/body.
+    client.post(decision_url, json=decision_request)
+    story_after_decision_response = client.get(f"/api/interview-stories/{story['id']}")
+    _assert_status(
+        story_after_decision_response.status_code,
+        200,
+        "story_after_product_action",
+    )
+    story_after_decision = story_after_decision_response.json()
+    _assert_task12_privacy_canary_absent(
+        story_after_decision,
+        privacy_canary,
+        "story_after_decision_http",
+    )
+    if previous_title_canary is not None:
+        _assert_task12_privacy_canary_absent(
+            story_after_decision,
+            previous_title_canary,
+            "story_after_decision_http_previous_title",
+        )
+    if story_after_decision == story_before_decision.json():
+        raise RuntimeError("Story Product Action decision did not update the Story")
+    if counters_observable:
+        assert model_call_count is not None
+        assert provider_call_count is not None
+        if model_call_count() != model_calls_before:
+            raise RuntimeError("Story Product Action decision called the Story model")
+        if provider_call_count() != provider_calls_before:
+            raise RuntimeError("Story Product Action decision called the Provider")
+
+    recovery = client.get(recovery_url)
+    _assert_status(recovery.status_code, 200, "story_product_action_response_loss_recovery")
+    recovery_body = recovery.json()
+    _assert_task12_privacy_canary_absent(
+        recovery_body,
+        privacy_canary,
+        "story_recovery_http",
+    )
+    if previous_title_canary is not None:
+        _assert_task12_privacy_canary_absent(
+            recovery_body,
+            previous_title_canary,
+            "story_recovery_http_previous_title",
+        )
+    if not isinstance(recovery_body, dict) or "confirmation_token" in recovery_body:
+        raise RuntimeError("Story Product Action recovery exposed a confirmation token")
+    if (
+        recovery_body.get("operation_id") != product_action["operation_id"]
+        or recovery_body.get("status") != "committed"
+    ):
+        raise RuntimeError("Story Product Action recovery did not observe the commit")
+
+    replay = client.post(decision_url, json=decision_request)
+    _assert_status(replay.status_code, 200, "story_product_action_decision_replay")
+    replay_body = replay.json()
+    _assert_task12_privacy_canary_absent(
+        replay_body,
+        privacy_canary,
+        "story_terminal_http",
+    )
+    if previous_title_canary is not None:
+        _assert_task12_privacy_canary_absent(
+            replay_body,
+            previous_title_canary,
+            "story_terminal_http_previous_title",
+        )
+    result = replay_body.get("result") if isinstance(replay_body, dict) else None
+    if (
+        not isinstance(replay_body, dict)
+        or "confirmation_token" in replay_body
+        or replay_body.get("operation_id") != product_action["operation_id"]
+        or replay_body.get("action_name") != "confirm_interview_story"
+        or replay_body.get("status") != "committed"
+        or replay_body.get("replayed") is not True
+        or not isinstance(result, dict)
+        or result.get("action_name") != "confirm_interview_story"
+    ):
+        raise RuntimeError("Story Product Action decision did not replay exactly")
+    replay_recovery = client.get(recovery_url)
+    _assert_status(
+        replay_recovery.status_code,
+        200,
+        "story_product_action_replay_recovery",
+    )
+    replay_recovery_body = replay_recovery.json()
+    _assert_task12_privacy_canary_absent(
+        replay_recovery_body,
+        privacy_canary,
+        "story_replay_recovery_http",
+    )
+    if previous_title_canary is not None:
+        _assert_task12_privacy_canary_absent(
+            replay_recovery_body,
+            previous_title_canary,
+            "story_replay_recovery_http_previous_title",
+        )
+    if (
+        not isinstance(replay_recovery_body, dict)
+        or "confirmation_token" in replay_recovery_body
+        or replay_recovery_body != recovery_body
+    ):
+        raise RuntimeError("Story Product Action replay recovery was not stable and private")
+    story_after_replay_response = client.get(f"/api/interview-stories/{story['id']}")
+    _assert_status(
+        story_after_replay_response.status_code,
+        200,
+        "story_after_product_action_replay",
+    )
+    story_after_replay = story_after_replay_response.json()
+    _assert_task12_privacy_canary_absent(
+        story_after_replay,
+        privacy_canary,
+        "story_visible_http",
+    )
+    if previous_title_canary is not None:
+        _assert_task12_privacy_canary_absent(
+            story_after_replay,
+            previous_title_canary,
+            "story_visible_http_previous_title",
+        )
+    if story_after_replay != story_after_decision:
+        raise RuntimeError("Story Product Action replay mutated the Story")
+    if counters_observable:
+        assert model_call_count is not None
+        assert provider_call_count is not None
+        if model_call_count() != model_calls_before:
+            raise RuntimeError("Story Product Action replay called the Story model")
+        if provider_call_count() != provider_calls_before:
+            raise RuntimeError("Story Product Action replay called the Provider")
+    return {
+        "attempt_id": attempt_id,
+        "version_id": int(result["story_version_id"]),
+        "privacy_canary": privacy_canary,
+        "previous_title_canary": previous_title_canary or "",
+    }
+
+
+def _assert_task12_privacy_canary_absent(
+    value: Any,
+    canary: str,
+    surface: str,
+) -> None:
+    serialized = json.dumps(value, ensure_ascii=False, default=str)
+    if canary in serialized:
+        raise RuntimeError(f"Story privacy canary leaked into {surface}")
+
+
+def _assert_task12_runtime_privacy_canary_absent(
+    data_dir: Path,
+    canary: str,
+    *,
+    previous_title_canary: str = "",
+) -> None:
+    session_factory = session_factory_for_data_dir(data_dir)
+    try:
+        with session_factory() as session:
+            surfaces: dict[str, list[str | None]] = {
+                "snapshot_manifest": [
+                    row.manifest_json
+                    for row in session.scalars(select(AgentContextSnapshot)).all()
+                ],
+                "event_journal": [
+                    row.payload_json for row in session.scalars(select(AgentEvent)).all()
+                ],
+            }
+            operations = session.scalars(select(WriteOperation)).all()
+            surfaces.update(
+                {
+                    "terminal_result": [row.result_json for row in operations],
+                    "visible_result": [row.visible_result for row in operations],
+                    "transport": [row.transport_json for row in operations],
+                    "undo": [row.undo_json for row in operations],
+                    "error": [row.failure_code for row in operations],
+                }
+            )
+            for surface, values in surfaces.items():
+                _assert_task12_privacy_canary_absent(values, canary, surface)
+                if previous_title_canary and surface != "undo":
+                    _assert_task12_privacy_canary_absent(
+                        values,
+                        previous_title_canary,
+                        f"{surface}_previous_title",
+                    )
+            if previous_title_canary:
+                undo_owners = [
+                    row
+                    for row in operations
+                    if row.undo_json is not None and previous_title_canary in row.undo_json
+                ]
+                if not undo_owners or any(
+                    row.adapter_kind != "product_action"
+                    or row.tool_name != "confirm_interview_story"
+                    or row.operation_role != "primary"
+                    for row in undo_owners
+                ):
+                    raise RuntimeError(
+                        "Story previous_title canary escaped the sealed parent undo_json"
+                    )
+    finally:
+        bind = session_factory.kw.get("bind")
+        if bind is not None:
+            bind.dispose()
 
 
 def _cleanup_interview_story_smoke_records(data_dir: Path, seed: dict[str, int]) -> None:

@@ -1652,7 +1652,7 @@ V2 增加：
       "statement": "用户确认的准备重点",
       "user_note": "",
       "source_event": {"round": 1, "subtype": "technical"},
-      "practice_state": "completed",
+      "practice_state": "not_started",
       "evidence": [
         {"path": "/difficulty_points", "excerpt": "逐字片段", "excerpt_sha256": "..."}
       ]
@@ -1662,6 +1662,11 @@ V2 增加：
 ~~~
 
 Provider payload 不包含 Signal/Version/Event 内部 ID。内容作为 untrusted user context，不进入 system policy。
+
+`practice_state` 只由 exact `(Signal Version, target Event)` 的权威 Practice
+投影得出：不存在 V2 Plan 时为 `not_started`，exact V2 Plan 进行中/完成时分别为
+`in_progress`/`completed`。Preparation selection 不读取或发出 `legacy_only`；也不得由
+Signal 已确认、Selection 存在或其他非 exact Pair 的 Plan 推导为 `completed`。
 
 ### 12.3 Selection Loader
 

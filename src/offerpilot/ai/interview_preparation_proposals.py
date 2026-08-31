@@ -24,6 +24,7 @@ MAX_ITEM_TEXT_CHARS = 1000
 _ID_PATTERN = re.compile(r"^[\x21-\x7e]{1,64}$")
 _ALLOWED_SOURCES = {"jd", "resume", "knowledge_evidence"}
 _V2_ALLOWED_SOURCES = _ALLOWED_SOURCES | {"confirmed_readiness_feedback"}
+_V2_PRACTICE_STATES = {"not_started", "in_progress", "completed"}
 _TOP_LEVEL_FIELDS = set(PREPARATION_FIELDS)
 _ITEM_FIELDS = {"id", "text", "evidence_refs"}
 _REPAIR_CATEGORIES = {
@@ -516,7 +517,8 @@ def _validate_snapshot_v2(snapshot: dict[str, Any]) -> None:
             or type(source_event.get("round")) is not int
             or source_event["round"] < 0
             or not isinstance(source_event.get("subtype"), str)
-            or item.get("practice_state") != "completed"
+            or not isinstance(item.get("practice_state"), str)
+            or item["practice_state"] not in _V2_PRACTICE_STATES
             or not isinstance(feedback_evidence, list)
             or not 1 <= len(feedback_evidence) <= 5
         ):

@@ -93,6 +93,46 @@ def _v2_snapshot() -> dict[str, object]:
     return snapshot
 
 
+@pytest.mark.parametrize(
+    "practice_state", ("not_started", "in_progress", "completed")
+)
+def test_v2_snapshot_accepts_authoritative_exact_pair_practice_states(
+    practice_state: str,
+) -> None:
+    from offerpilot.ai.interview_preparation_proposals import (
+        validate_interview_preparation_v2,
+    )
+
+    snapshot = _v2_snapshot()
+    feedback = snapshot["readiness_feedback"]
+    assert isinstance(feedback, list)
+    feedback[0]["practice_state"] = practice_state
+
+    assert validate_interview_preparation_v2(
+        safe_empty_interview_preparation_proposal(), snapshot
+    ) == safe_empty_interview_preparation_proposal()
+
+
+@pytest.mark.parametrize("practice_state", ("legacy_only", [], {}))
+def test_v2_snapshot_rejects_non_authoritative_practice_states(
+    practice_state: object,
+) -> None:
+    from offerpilot.ai.interview_preparation_proposals import (
+        validate_interview_preparation_v2,
+    )
+
+    snapshot = _v2_snapshot()
+    feedback = snapshot["readiness_feedback"]
+    assert isinstance(feedback, list)
+    feedback[0]["practice_state"] = practice_state
+
+    with pytest.raises(InterviewPreparationModelError) as exc_info:
+        validate_interview_preparation_v2(
+            safe_empty_interview_preparation_proposal(), snapshot
+        )
+    assert exc_info.value.validation_category == "invalid_item_shape"
+
+
 def _ref(source: str, path: str, excerpt: str) -> dict[str, str]:
     return {"source": source, "path": path, "excerpt": excerpt}
 

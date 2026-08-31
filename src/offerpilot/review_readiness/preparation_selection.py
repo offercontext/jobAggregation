@@ -18,6 +18,7 @@ from offerpilot.event_lifecycle import classify_event_lifecycle_v1
 from offerpilot.models import Application, ApplicationEvent, Resume
 from offerpilot.review_readiness.projection import (
     load_canonical_readiness_signal,
+    project_practice_focus,
     project_practice_target,
 )
 
@@ -295,6 +296,19 @@ class PreparationReadinessSelectionLoader:
                 raise PreparationReadinessSelectionError(
                     "preparation_readiness_excerpt_too_large"
                 )
+            practice_projection = project_practice_focus(
+                self._session,
+                signal_version_id=aggregate.version_id,
+                target_event_id=target_event_id,
+            )
+            if practice_projection.state == "ready":
+                practice_state = "not_started"
+            elif practice_projection.state in {"in_progress", "completed"}:
+                practice_state = practice_projection.state
+            else:
+                raise PreparationReadinessSelectionError(
+                    "preparation_readiness_practice_unavailable"
+                )
             feedback_items.append(
                 PreparationReadinessFeedbackV2(
                     statement=aggregate.statement_text,
@@ -303,7 +317,7 @@ class PreparationReadinessSelectionLoader:
                         source_event.round,
                         source_event.subtype,
                     ),
-                    practice_state="completed",
+                    practice_state=practice_state,
                     evidence=evidence,
                 )
             )

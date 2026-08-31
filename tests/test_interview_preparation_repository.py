@@ -41,6 +41,10 @@ from offerpilot.repositories.interview_preparation_proposals import (
     InterviewPreparationValidationError,
     _InterviewPreparationLeaseHeartbeat,
 )
+from offerpilot.repositories.adaptive_interview_practice import (
+    AdaptivePracticeRepository,
+)
+from offerpilot.review_readiness.projection import project_practice_focus
 from tests.review_readiness_support import seed_review_candidate
 from tests.test_review_readiness_projection import _commit_signal
 
@@ -1446,7 +1450,7 @@ def test_v2_request_input_and_selection_fingerprints_match_ordered_golden(
         '"user_assertions":[]}'
     )
     assert sha256_text(canonical_json(snapshot)) == (
-        "f1dfbc72c0d67dfb6ed016c4c6b5e3638fcca82c9c6d6e7649bb2d3e9fe039fc"
+        "1744f3e0914fe2006c167e218724e3faa3577a86af6d04ff7eef6e12d90b42e3"
     )
     assert snapshot["readiness_feedback_selection_fingerprint"] == (
         "sha256:e01e6b1b7694c479f1f3756373681a6518500b0b9a80c3b0239ea90aaf4f166b"
@@ -1455,7 +1459,7 @@ def test_v2_request_input_and_selection_fingerprints_match_ordered_golden(
         "sha256:9fc8aa910f3ce983b053d642df340a32eee689d0b60a74add0e2eb62d1202160"
     )
     assert sha256_text(canonical_json(forward_snapshot)) == (
-        "17cb4250d9ef470f245fbd93253914290e980718e26daa70f89d22afcea64f01"
+        "352e8acb8fe8277974fa83ca9cb58ec7717b799a1d6447db0facb8dd60bce863"
     )
 
 
@@ -1502,6 +1506,63 @@ def test_selection_loader_preserves_order_and_uses_no_signal_query_for_empty(tmp
     ]
     assert selection.selection_fingerprint.startswith("sha256:")
     assert all(not hasattr(item, "version_id") for item in selection.readiness_feedback)
+
+
+@pytest.mark.parametrize(
+    ("practice_lifecycle", "expected_practice_state"),
+    (
+        ("not_started", "not_started"),
+        ("in_progress", "in_progress"),
+        ("completed", "completed"),
+    ),
+)
+def test_selection_loader_projects_exact_v2_practice_pair_state(
+    tmp_path,
+    practice_lifecycle: str,
+    expected_practice_state: str,
+) -> None:
+    from offerpilot.review_readiness.preparation_selection import (
+        PreparationReadinessSelectionLoader,
+    )
+
+    factory, seeded, version_ids, target_id, resume_id = _setup_selected_signal(tmp_path)
+    if practice_lifecycle != "not_started":
+        with factory() as session:
+            focus = project_practice_focus(
+                session,
+                signal_version_id=version_ids[0],
+                target_event_id=target_id,
+            )
+            assert focus.state == "ready"
+            assert focus.source is not None and focus.target is not None
+            source_fingerprint = focus.source.practice_source_fingerprint
+            target_fingerprint = focus.target.practice_target_fingerprint
+        plan, _created = AdaptivePracticeRepository(factory).start_v2(
+            readiness_signal_version_id=version_ids[0],
+            target_application_event_id=target_id,
+            expected_source_fingerprint=source_fingerprint,
+            expected_target_fingerprint=target_fingerprint,
+            idempotency_key=str(uuid4()),
+        )
+        if practice_lifecycle == "completed":
+            AdaptivePracticeRepository(factory).complete(
+                plan_id=int(plan["id"]),
+                expected_revision=1,
+                response_text="先说明系统约束，再解释取舍。",
+                reflection_text="补齐结构化表达。",
+                self_assessment="clearer",
+                idempotency_key=str(uuid4()),
+            )
+
+    with factory() as session:
+        selection = PreparationReadinessSelectionLoader(session).load(
+            application_id=int(seeded["application_id"]),
+            target_event_id=target_id,
+            resume_id=resume_id,
+            ordered_version_ids=version_ids,
+        )
+
+    assert selection.readiness_feedback[0].practice_state == expected_practice_state
 
 
 def test_selection_loader_returns_deeply_immutable_copied_dto(tmp_path) -> None:
@@ -1660,7 +1721,7 @@ def _exact_feedback_high_water_fixture(target_bytes: int) -> list[dict[str, obje
                 "statement": "准备重点",
                 "user_note": "备注",
                 "source_event": {"round": 2, "subtype": "technical"},
-                "practice_state": "completed",
+                "practice_state": "not_started",
                 "evidence": evidence,
             }
         )

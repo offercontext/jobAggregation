@@ -2557,6 +2557,63 @@ def test_rejected_story_generation_requires_explicit_n_plus_one_and_rotates_toke
     assert refused_after_confirm.status_code == 409
 
 
+def test_n_plus_one_compat_confirm_accepts_public_client_evidence_aliases(
+    story_client,
+) -> None:
+    """The compatibility confirm route must accept the Drawer evidence shape."""
+
+    client, _ = story_client
+    note = _note(client)
+    attempt = client.post(
+        "/api/interview-story-proposals",
+        json=_proposal_request(note["id"], key="story-client-evidence-n-plus-one-0001"),
+    ).json()
+    first = attempt["product_action"]
+    assert client.post(
+        f"/api/product-actions/{first['operation_id']}/decisions",
+        json={"confirmation_token": first["confirmation_token"], "decision": "reject"},
+    ).status_code == 200
+
+    next_action_response = client.post(
+        f"/api/interview-story-proposals/{attempt['id']}/product-actions",
+        json={
+            "expected_generation_revision": attempt["generation_revision"],
+            "expected_product_action_generation": 1,
+        },
+    )
+    assert next_action_response.status_code == 201, next_action_response.json()
+    next_action = next_action_response.json()
+    current = client.get(f"/api/interview-story-proposals/{attempt['id']}").json()
+    confirmation = _confirmation_from_attempt(
+        current,
+        token=next_action["confirmation_token"],
+    )
+    confirmation["content"]["title"] = "Incident recovery revised"
+    confirmation["evidence_links"] = [
+        {
+            key: link[key]
+            for key in (
+                "target_kind",
+                "target_id",
+                "source_kind",
+                "source_path",
+                "excerpt",
+                "text_location",
+            )
+            if key in link
+        }
+        | {"source_id": link["source_stable_id"]}
+        for link in confirmation["evidence_links"]
+    ]
+
+    saved = client.post(
+        f"/api/interview-story-proposals/{attempt['id']}/confirm",
+        json=confirmation,
+    )
+
+    assert saved.status_code == 201, saved.json()
+
+
 @pytest.mark.parametrize("value", [True, 1.0, "1"])
 def test_n_plus_one_exact_integers_are_rejected_before_attempt_lookup(
     story_client,

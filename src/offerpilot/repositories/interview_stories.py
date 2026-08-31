@@ -4482,7 +4482,10 @@ def _client_link_fields(link: Any) -> dict[str, Any]:
         "excerpt",
         "text_location",
     }
-    return {key: value for key, value in link.items() if key in allowed}
+    normalized = {key: value for key, value in link.items() if key in allowed}
+    if "source_stable_id" not in normalized and "source_id" in link:
+        normalized["source_stable_id"] = link["source_id"]
+    return normalized
 
 
 def _attempt_input_payload(attempt: InterviewStoryProposalAttempt) -> dict[str, Any]:

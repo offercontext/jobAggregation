@@ -4380,11 +4380,11 @@ class _SealedProductActionCompensationHandlerV1:
 def _seal_product_action_compensation_handler(
     handler: _ProductActionCompensationHandlerV1,
     *,
-    catalog: ProductActionCompensationCatalogV1 | None = None,
+    catalog: ProductActionCompensationCatalogV1,
 ) -> _SealedProductActionCompensationHandlerV1:
     return _SealedProductActionCompensationHandlerV1(
         handler,
-        catalog=catalog or ProductActionCompensationCatalogV1(),
+        catalog=catalog,
     )
 
 

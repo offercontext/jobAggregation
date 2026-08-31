@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import gc
+import inspect
 import json
 import subprocess
 import sys
@@ -57,6 +58,7 @@ from offerpilot.product_actions.compensation import (
     readiness_signal_retraction_domain_key,
     _decode_json_object,
     _enforce_compensation_terminal_budgets,
+    _seal_product_action_compensation_handler,
     _CompensationExecutionUowV1,
 )
 from offerpilot.product_actions.contracts import (
@@ -85,6 +87,13 @@ from tests.review_readiness_support import seed_review_candidate
 
 PARENT_OPERATION_ID = "00000000-0000-4000-8000-000000000001"
 PARENT_TERMINAL_DIGEST = "sha256:" + "a" * 64
+
+
+def test_compensation_handler_seal_requires_composition_catalog_injection() -> None:
+    signature = inspect.signature(_seal_product_action_compensation_handler)
+
+    assert signature.parameters["catalog"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert signature.parameters["catalog"].default is inspect.Parameter.empty
 
 
 def _create_committed_signal(session_factory):  # type: ignore[no-untyped-def]

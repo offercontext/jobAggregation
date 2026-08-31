@@ -204,7 +204,12 @@ export function ProductActionConfirmation({
         actionCallId: control.action_call_id,
         confirmationToken: control.confirmation_token,
         allowedDecisions: [...control.allowed_decisions],
-        resultUnknown: false,
+        // Full-owner recovery may rotate the server-owned control, but it
+        // cannot turn an unknown transport outcome back into an editable
+        // decision. A rejection-only recovery is a distinct, explicit branch:
+        // the old decision is no longer executable and only reject is offered.
+        pendingDecision: control.rejection_only ? null : draft.pendingDecision,
+        resultUnknown: !control.rejection_only,
       });
     } catch {
       setError('暂时无法确认操作结果，请稍后重试。');

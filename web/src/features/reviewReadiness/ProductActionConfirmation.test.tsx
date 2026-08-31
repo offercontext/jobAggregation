@@ -169,6 +169,83 @@ describe('ProductActionConfirmation', () => {
     expect(service.decide.mock.calls[0]![1]).toEqual(service.decide.mock.calls[1]![1]);
   });
 
+  it('keeps the frozen unknown decision after proposed-state control recovery', async () => {
+    service.decide
+      .mockRejectedValueOnce(new Error('network'))
+      .mockResolvedValueOnce({
+        schema_version: 1,
+        operation_id: proposal.operation_id,
+        action_name: proposal.action_name,
+        status: 'committed',
+        result: { signal_id: 8, signal_version_id: 9, signal_revision: 1 },
+        replayed: true,
+        direct_commit: false,
+      });
+    service.state.mockResolvedValue({
+      schema_version: 1,
+      operation_id: proposal.operation_id,
+      action_name: proposal.action_name,
+      status: 'proposed',
+    });
+    const recover = vi.fn().mockResolvedValue({
+      schema_version: 1,
+      operation_id: proposal.operation_id,
+      action_call_id: '00000000-0000-4000-8000-000000000004',
+      action_name: proposal.action_name,
+      status: 'proposed',
+      confirmation_token: 'b'.repeat(64),
+      allowed_decisions: ['approve', 'modify', 'reject'],
+      rejection_only: false,
+      live_source_state: 'current',
+    });
+    let editedPayload = { user_note: '下次先给结论。' };
+    let draft = productActionDraftFromProposal('review:7:11:focus-1', proposal, { user_note: '' });
+    const render = () => root.render(<ProductActionConfirmation
+      draft={draft}
+      editedPayload={editedPayload}
+      onDraftChange={(next) => { draft = next; render(); }}
+      onRecoverControl={recover}
+    />);
+    act(render);
+
+    await act(async () => {
+      [...host.querySelectorAll('button')].find((button) => button.textContent === '保存修改')?.click();
+      await Promise.resolve();
+    });
+    expect(draft).toMatchObject({
+      resultUnknown: true,
+      pendingDecision: { decision: 'modify', edited_payload: { user_note: '下次先给结论。' } },
+    });
+
+    editedPayload = { user_note: '这是不得替换原决定的后续编辑。' };
+    act(render);
+    await act(async () => {
+      [...host.querySelectorAll('button')].find((button) => button.textContent === '确认操作结果')?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(draft).toMatchObject({
+      confirmationToken: 'b'.repeat(64),
+      resultUnknown: true,
+      pendingDecision: { decision: 'modify', edited_payload: { user_note: '下次先给结论。' } },
+    });
+    expect([...host.querySelectorAll('button')].map((button) => button.textContent)).toEqual([
+      '使用原操作重试',
+      '确认操作结果',
+    ]);
+
+    await act(async () => {
+      [...host.querySelectorAll('button')].find((button) => button.textContent === '使用原操作重试')?.click();
+      await Promise.resolve();
+    });
+    expect(service.decide.mock.calls[1]![1]).toEqual({
+      confirmation_token: 'b'.repeat(64),
+      decision: 'modify',
+      edited_payload: { user_note: '下次先给结论。' },
+    });
+  });
+
   it('persists the exact pending decision before a close and replays it after remount', async () => {
     service.decide.mockReturnValueOnce(new Promise(() => undefined)).mockResolvedValueOnce({
       schema_version: 1, operation_id: proposal.operation_id, action_name: proposal.action_name,

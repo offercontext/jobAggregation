@@ -128,6 +128,47 @@ describe('InterviewPreparationProposalDrawer interaction', () => {
     }));
   });
 
+  it('discloses every selected readiness-feedback field sent to the AI', async () => {
+    readinessService.advisory.mockResolvedValue({
+      schema_version: 1,
+      application_id: 7,
+      event_id: 11,
+      items: [{
+        signalId: 4,
+        versionId: 91,
+        practiceSourceFingerprint: `sha256:${'a'.repeat(64)}`,
+        practiceTargetFingerprint: `sha256:${'b'.repeat(64)}`,
+        state: 'available',
+        practiceState: 'not_started',
+        selected: false,
+        title: '准备重点',
+        sourceLabel: '第 1 轮面试复盘',
+      }],
+    });
+    service.create.mockResolvedValue(proposalResult());
+    act(() => root?.render(<InterviewPreparationProposalDrawer open context={context} onClose={() => {}} />));
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); });
+    act(() => container?.querySelector<HTMLInputElement>('[aria-label="已确认的复盘准备重点"] input[type="checkbox"]')?.click());
+
+    expect(container?.textContent).toContain('所选复盘准备重点');
+    expect(container?.textContent).toContain('用户备注');
+    expect(container?.textContent).toContain('证据片段');
+    expect(container?.textContent).toContain('来源轮次/类型');
+
+    await act(async () => {
+      container?.querySelector<HTMLButtonElement>('[data-testid="interview-preparation-generate"]')?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('所选复盘准备重点'));
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('用户备注'));
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('证据片段'));
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('来源轮次/类型'));
+    expect(service.create).toHaveBeenCalledWith(expect.objectContaining({
+      readiness_feedback_version_ids: [91],
+    }));
+  });
+
   it('keeps the original V1 omission when the advisory contract arrives during an unknown request', async () => {
     const advisory = deferred<{ schema_version: 1; application_id: number; event_id: number; items: [] }>();
     const firstRequest = deferred<ReturnType<typeof proposalResult>>();

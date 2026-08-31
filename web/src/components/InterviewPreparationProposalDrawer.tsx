@@ -97,6 +97,13 @@ function safeErrorMessage(error: unknown): string {
   return '面试准备建议暂时不可用，请稍后重试。';
 }
 
+function aiDisclosureCopy(hasSelectedReadinessFeedback: boolean): string {
+  const providerInputs = hasSelectedReadinessFeedback
+    ? 'JD、所选简历、已确认 Knowledge Evidence，以及所选复盘准备重点会发送给 AI。所选复盘准备重点包含准备重点正文、用户备注、证据片段和来源轮次/类型'
+    : '仅 JD、所选简历和已确认 Knowledge Evidence 会发送给 AI';
+  return `${providerInputs}；用户断言仅保存于本次快照，不会发送给 AI，也不作为建议依据。`;
+}
+
 function Evidence({ item }: { item: InterviewPreparationItem }) {
   return (
     <div>
@@ -271,7 +278,6 @@ export default function InterviewPreparationProposalDrawer({
 
   const generate = async () => {
     if (!hasInput || busy) return;
-    if (!window.confirm('仅 JD、所选简历和已确认 Knowledge Evidence 会发送给 AI；用户断言仅保存于本次快照，不会发送给 AI，也不作为建议依据。是否继续？')) return;
     const frozenUnknownDraft = resultUnknown
       ? activeAttemptDraftRef.current ?? draft ?? null
       : null;
@@ -280,6 +286,9 @@ export default function InterviewPreparationProposalDrawer({
       : readinessSelectionPresent || readinessContractReadyRef.current;
     const selectionForRequest = frozenUnknownDraft?.readinessFeedbackSelection?.orderedVersionIds
       ?? selectedReadinessVersionIds;
+    if (!window.confirm(`${aiDisclosureCopy(
+      selectionPresentForRequest && selectionForRequest.length > 0,
+    )}是否继续？`)) return;
     const requestInput = selectionPresentForRequest
       ? { ...input, readiness_feedback_version_ids: [...selectionForRequest] }
       : Object.fromEntries(Object.entries(input).filter(([key]) => key !== 'readiness_feedback_version_ids')) as CreateInterviewPreparationProposalInput;
@@ -388,7 +397,9 @@ export default function InterviewPreparationProposalDrawer({
         <div>
           <h2 ref={headingRef} tabIndex={-1}>面试准备建议</h2>
           <p className={workflowStyles.mutedText}>围绕当前面试事件，生成可审阅、可引用的准备建议。</p>
-          <p className={workflowStyles.mutedText}>仅 JD、所选简历和已确认 Knowledge Evidence 会发送给 AI；用户断言仅保存于本次快照，不会发送给 AI。</p>
+          <p className={workflowStyles.mutedText}>{aiDisclosureCopy(
+            readinessSelectionPresent && selectedReadinessVersionIds.length > 0,
+          )}</p>
         </div>
       </header>
       <div data-testid="interview-preparation-source-panel" className={workflowStyles.section}>

@@ -8,7 +8,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping, cast
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from sqlalchemy import case, select, update
 from sqlalchemy.exc import DBAPIError, IntegrityError, SQLAlchemyError
@@ -24,6 +24,13 @@ from offerpilot.models import (
     MockInterviewAttempt,
     MockInterviewTurn,
     Resume,
+    WriteOperation,
+    WriteOperationTransition,
+)
+from offerpilot.product_actions.compensation import (
+    ProductActionCompensationStale,
+    _CompensationExecutionUowClaimV1,
+    _CompensationExecutionUowV1,
 )
 from offerpilot.product_actions.contracts import (
     JSONValue,
@@ -138,6 +145,8 @@ _MAX_FACT_GAPS = 1
 _MAX_ASSERTION_CHARS = 4_000
 _STORY_VERSION_SCHEMA = "interview-story-v1"
 _IDEMPOTENCY_KEY = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+_STORY_LIFECYCLE_LEGACY_IDEMPOTENCY_PREFIX = "story_lifecycle_"
+_STORY_LIFECYCLE_INTERNAL_IDEMPOTENCY_PREFIX = "story:lifecycle:"
 _STORY_LEASE_SECONDS = 30
 _STORY_HEARTBEAT_SECONDS = 10
 _STORY_RETRY_SAFETY_MARGIN_MS = 250
@@ -484,6 +493,61 @@ def _manual_request_fingerprint(
     return sha256_text(canonical_json(payload))
 
 
+def _story_datetime_iso(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    aware = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+    return aware.astimezone(timezone.utc).isoformat()
+
+
+def _story_lifecycle_request_fingerprint(payload: Mapping[str, Any]) -> str:
+    """Bind one owner-local lifecycle transition to its exact raw CAS and states."""
+
+    return sha256_text(canonical_json(dict(payload)))
+
+
+def _story_lifecycle_idempotency_key(
+    *,
+    story_id: int,
+    expected_story_revision: int,
+    desired_status: str,
+) -> str:
+    material = canonical_json(
+        {
+            "operation": "story_lifecycle_v1",
+            "target_story_id": story_id,
+            "expected_story_revision": expected_story_revision,
+            "desired_status": desired_status,
+        }
+    )
+    # The colon is deliberately outside the public idempotency-key alphabet.
+    # This keeps internal audit identities disjoint from all client writers.
+    return _STORY_LIFECYCLE_INTERNAL_IDEMPOTENCY_PREFIX + sha256_text(material)
+
+
+def _story_lifecycle_legacy_idempotency_key(
+    *,
+    story_id: int,
+    expected_story_revision: int,
+    desired_status: str,
+) -> str:
+    """Return the pre-isolation identity for validating persisted audit rows."""
+
+    material = canonical_json(
+        {
+            "operation": "story_lifecycle_v1",
+            "target_story_id": story_id,
+            "expected_story_revision": expected_story_revision,
+            "desired_status": desired_status,
+        }
+    )
+    return _STORY_LIFECYCLE_LEGACY_IDEMPOTENCY_PREFIX + sha256_text(material)
+
+
+def _uses_reserved_story_idempotency_namespace(idempotency_key: str) -> bool:
+    return idempotency_key.startswith(_STORY_LIFECYCLE_LEGACY_IDEMPOTENCY_PREFIX)
+
+
 @dataclass(frozen=True)
 class StoryProposalClaim:
     attempt_id: int
@@ -520,6 +584,14 @@ class StoryWriteResult:
     story_revision: int
     outcome: str
     undo: Mapping[str, JSONValue]
+
+
+@dataclass(frozen=True, slots=True)
+class StoryUndoResultV1:
+    story_id: int
+    current_version_id: int
+    story_revision: int
+    status: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -1046,7 +1118,14 @@ class InterviewStoriesRepository:
         with self._session_factory() as session:
             try:
                 _begin_immediate(session)
-                replay = self._replay_manual_save(session, idempotency_key, request_fingerprint)
+                replay = self._replay_manual_save(
+                    session,
+                    idempotency_key,
+                    request_fingerprint,
+                    raw_target_story_id=None,
+                    raw_expected_current_version_id=None,
+                    raw_expected_story_revision=None,
+                )
                 if replay is not None:
                     session.commit()
                     return replay
@@ -1071,6 +1150,9 @@ class InterviewStoriesRepository:
                     session,
                     idempotency_key=idempotency_key,
                     request_fingerprint=request_fingerprint,
+                    raw_target_story_id=None,
+                    raw_expected_current_version_id=None,
+                    raw_expected_story_revision=None,
                     story=story,
                     version=version,
                     snapshot=snapshot,
@@ -1107,7 +1189,14 @@ class InterviewStoriesRepository:
         with self._session_factory() as session:
             try:
                 _begin_immediate(session)
-                replay = self._replay_manual_save(session, idempotency_key, request_fingerprint)
+                replay = self._replay_manual_save(
+                    session,
+                    idempotency_key,
+                    request_fingerprint,
+                    raw_target_story_id=story_id,
+                    raw_expected_current_version_id=expected_current_version_id,
+                    raw_expected_story_revision=expected_story_revision,
+                )
                 if replay is not None:
                     session.commit()
                     return replay
@@ -1143,6 +1232,9 @@ class InterviewStoriesRepository:
                     session,
                     idempotency_key=idempotency_key,
                     request_fingerprint=request_fingerprint,
+                    raw_target_story_id=story_id,
+                    raw_expected_current_version_id=expected_current_version_id,
+                    raw_expected_story_revision=expected_story_revision,
                     story=story,
                     version=version,
                     snapshot=snapshot,
@@ -1212,6 +1304,8 @@ class InterviewStoriesRepository:
                         payload=payload,
                         now=now,
                     )
+                if _uses_reserved_story_idempotency_namespace(idempotency_key):
+                    raise StoryValidationError("idempotency key is reserved")
                 self._validate_target_story_for_claim(
                     session,
                     target_story_id=target_story_id,
@@ -1969,7 +2063,9 @@ class InterviewStoriesRepository:
     def get_attempt(self, attempt_id: int) -> dict[str, Any] | None:
         with self._session_factory() as session:
             attempt = session.get(InterviewStoryProposalAttempt, attempt_id)
-            return _attempt_payload(attempt) if attempt is not None else None
+            if attempt is None or _is_story_lifecycle_attempt(attempt):
+                return None
+            return _attempt_payload(attempt)
 
     def product_action_source_is_current(
         self,
@@ -2035,7 +2131,7 @@ class InterviewStoriesRepository:
             raise StoryValidationError("confirmation request is invalid")
         with self._session_factory() as session:
             attempt = session.get(InterviewStoryProposalAttempt, attempt_id)
-            if attempt is None:
+            if attempt is None or _is_story_lifecycle_attempt(attempt):
                 raise StoryNotFoundError("story proposal is missing")
             historical_baseline = (
                 attempt.product_action_generation == 0
@@ -2513,7 +2609,7 @@ class InterviewStoriesRepository:
         current_generation = 0
         with self._session_factory() as session:
             attempt = session.get(InterviewStoryProposalAttempt, attempt_id)
-            if attempt is None:
+            if attempt is None or _is_story_lifecycle_attempt(attempt):
                 raise StoryNotFoundError("story proposal is missing")
             if (
                 attempt.generation_revision != expected_generation_revision
@@ -3217,6 +3313,265 @@ class InterviewStoriesRepository:
                 undo,
             )
 
+    def undo_product_action_in_session(
+        self,
+        session: Session,
+        *,
+        story_id: int,
+        source_attempt_id: int,
+        parent_operation_id: str,
+        compensation_operation_id: str,
+        validated_undo_json: dict[str, JSONValue],
+        authorization: ProductActionExecutionAuthorization,
+        authorization_binding: tuple[object, ...],
+        execution_uow: _CompensationExecutionUowV1 | None = None,
+    ) -> dict[str, JSONValue]:
+        """Apply one exact Product Action Story Undo inside the caller's UoW."""
+
+        registry = self._proof_registry
+        if registry is None:
+            raise ProductActionIntegrityError(
+                "interview_story_compensation_registry"
+            )
+        if (
+            type(authorization_binding) is not tuple
+            or len(authorization_binding) != 7
+            or authorization_binding[0]
+            != "product_action_compensation_execution_v1"
+            or authorization_binding[1] != compensation_operation_id
+            or authorization_binding[2] != parent_operation_id
+            or authorization_binding[4] != "undo:confirm_interview_story"
+            or type(authorization_binding[5]) is not str
+            or type(authorization_binding[6]) is not str
+            or len(authorization_binding[6]) != 76
+            or not authorization_binding[6].startswith("hmac-sha256:")
+        ):
+            try:
+                registry.revoke(authorization)
+            except (TypeError, ValueError):
+                pass
+            raise ProductActionIntegrityError(
+                "interview_story_compensation_authorization_binding"
+            )
+        if type(execution_uow) is not _CompensationExecutionUowV1:
+            raise ProductActionIntegrityError(
+                "interview_story_compensation_execution_uow"
+            )
+        try:
+            execution_claim_context = execution_uow._claim_story(
+                session,
+                operation_id=compensation_operation_id,
+                parent_operation_id=parent_operation_id,
+                authorization_binding=authorization_binding,
+            )
+        except AttributeError as exc:
+            raise ProductActionIntegrityError(
+                "interview_story_compensation_execution_uow"
+            ) from exc
+        with execution_claim_context as execution_claim:
+            with registry.claim(
+                authorization,
+                proof_type=ProductActionExecutionAuthorization,
+                action_name="confirm_interview_story",
+                expected_binding=authorization_binding,
+            ):
+                return self._undo_product_action_authorized_in_session(
+                    session,
+                    story_id=story_id,
+                    source_attempt_id=source_attempt_id,
+                    parent_operation_id=parent_operation_id,
+                    compensation_operation_id=compensation_operation_id,
+                    validated_undo_json=validated_undo_json,
+                    authorization_binding=authorization_binding,
+                    execution_claim=execution_claim,
+                )
+
+    def _undo_product_action_authorized_in_session(
+        self,
+        session: Session,
+        *,
+        story_id: int,
+        source_attempt_id: int,
+        parent_operation_id: str,
+        compensation_operation_id: str,
+        validated_undo_json: dict[str, JSONValue],
+        authorization_binding: tuple[object, ...],
+        execution_claim: _CompensationExecutionUowClaimV1,
+    ) -> dict[str, JSONValue]:
+        if (
+            type(story_id) is not int
+            or story_id < 1
+            or type(source_attempt_id) is not int
+            or source_attempt_id < 1
+            or type(validated_undo_json) is not dict
+            or type(execution_claim) is not _CompensationExecutionUowClaimV1
+        ):
+            raise ProductActionIntegrityError("interview_story_compensation_identity")
+        try:
+            parent_operation_id = str(UUID(parent_operation_id))
+            compensation_operation_id = str(UUID(compensation_operation_id))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ProductActionIntegrityError(
+                "interview_story_compensation_identity"
+            ) from exc
+        compensation = session.get(WriteOperation, compensation_operation_id)
+        transitions = tuple(
+            session.scalars(
+                select(WriteOperationTransition)
+                .where(
+                    WriteOperationTransition.operation_id
+                    == compensation_operation_id
+                )
+                .order_by(WriteOperationTransition.seq)
+            )
+        )
+        if (
+            compensation is None
+            or compensation.operation_role != "compensation"
+            or compensation.adapter_kind != "compensation"
+            or compensation.tool_name != "undo:confirm_interview_story"
+            or compensation.parent_operation_id != parent_operation_id
+            or compensation.status != "proposed"
+            or tuple((row.seq, row.state) for row in transitions)
+            != ((1, "proposed"), (2, "approved"), (3, "claimed"))
+        ):
+            raise ProductActionIntegrityError(
+                "interview_story_compensation_operation"
+            )
+        expected_undo_json = canonical_product_action_json(validated_undo_json)
+        parent = session.get(WriteOperation, parent_operation_id)
+        if (
+            authorization_binding[3]
+            != compensation.parent_terminal_payload_sha256
+            or authorization_binding[5] != expected_undo_json
+            or parent is None
+            or parent.operation_role != "primary"
+            or parent.adapter_kind != "product_action"
+            or parent.tool_name != "confirm_interview_story"
+            or parent.status != "committed"
+            or parent.undo_json != expected_undo_json
+            or parent.terminal_payload_sha256
+            != compensation.parent_terminal_payload_sha256
+        ):
+            raise ProductActionIntegrityError(
+                "interview_story_compensation_parent_binding"
+            )
+        attempt = session.get(InterviewStoryProposalAttempt, source_attempt_id)
+        created_version_id = validated_undo_json.get("created_version_id")
+        if (
+            attempt is None
+            or attempt.attempt_status != "confirmed"
+            or attempt.product_action_operation_id != parent_operation_id
+            or attempt.confirmed_story_id != story_id
+            or attempt.confirmed_story_version_id != created_version_id
+            or type(created_version_id) is not int
+        ):
+            raise ProductActionIntegrityError(
+                "interview_story_compensation_attempt_lineage"
+            )
+        story = session.get(InterviewStory, story_id)
+        created = session.get(InterviewStoryVersion, created_version_id)
+        if (
+            story is None
+            or created is None
+            or created.story_id != story.id
+            or created.origin_kind != "proposal"
+        ):
+            raise ProductActionIntegrityError(
+                "interview_story_compensation_domain"
+            )
+        kind = validated_undo_json.get("kind")
+        now = datetime.now(timezone.utc)
+        if kind == "archive_created_story_v1":
+            if set(validated_undo_json) != {
+                "kind",
+                "story_id",
+                "created_version_id",
+                "expected_current_version_id",
+                "expected_story_revision",
+                "expected_status",
+            }:
+                raise ProductActionIntegrityError(
+                    "interview_story_compensation_undo"
+                )
+            if (
+                validated_undo_json.get("story_id") != story.id
+                or validated_undo_json.get("expected_status") != "active"
+                or story.status != "active"
+                or story.current_version_id
+                != validated_undo_json.get("expected_current_version_id")
+                or story.story_revision
+                != validated_undo_json.get("expected_story_revision")
+            ):
+                raise ProductActionCompensationStale(
+                    "interview_story_undo_stale"
+                )
+            story.status = "archived"
+            story.archived_at = now
+        elif kind == "restore_story_pointer_v1":
+            if set(validated_undo_json) != {
+                "kind",
+                "story_id",
+                "created_version_id",
+                "previous_current_version_id",
+                "previous_title",
+                "expected_post_revision",
+            }:
+                raise ProductActionIntegrityError(
+                    "interview_story_compensation_undo"
+                )
+            previous_id = validated_undo_json.get("previous_current_version_id")
+            previous_title = validated_undo_json.get("previous_title")
+            previous = (
+                session.get(InterviewStoryVersion, previous_id)
+                if type(previous_id) is int
+                else None
+            )
+            if (
+                validated_undo_json.get("story_id") != story.id
+                or previous is None
+                or previous.story_id != story.id
+                or type(previous_title) is not str
+                or not previous_title.strip()
+                or len(previous_title) > 200
+            ):
+                raise ProductActionIntegrityError(
+                    "interview_story_compensation_undo"
+                )
+            if (
+                story.status != "active"
+                or story.current_version_id != created.id
+                or story.story_revision
+                != validated_undo_json.get("expected_post_revision")
+            ):
+                raise ProductActionCompensationStale(
+                    "interview_story_undo_stale"
+                )
+            story.current_version_id = previous.id
+            story.title = previous_title
+            story.archived_at = None
+        else:
+            raise ProductActionIntegrityError("interview_story_compensation_undo")
+        story.story_revision += 1
+        story.updated_at = now
+        self._invalidate_active_target_attempts(session, story.id)
+        session.flush()
+        if story.current_version_id is None:
+            raise ProductActionIntegrityError(
+                "interview_story_compensation_domain"
+            )
+        domain_result = StoryUndoResultV1(
+            story.id,
+            story.current_version_id,
+            story.story_revision,
+            story.status,
+        )
+        try:
+            return execution_claim.terminalize_story(session, domain_result)
+        except BaseException:
+            session.rollback()
+            raise
+
     def start_heartbeat(
         self,
         *,
@@ -3322,22 +3677,114 @@ class InterviewStoriesRepository:
                 if story.status == desired_status:
                     session.commit()
                     return self._story_payload(session, story)
+                transitioned_at = datetime.now(timezone.utc)
+                before = {
+                    "status": story.status,
+                    "story_revision": story.story_revision,
+                    "archived_at": _story_datetime_iso(story.archived_at),
+                    "current_version_id": story.current_version_id,
+                    "title": story.title,
+                }
+                after = {
+                    "status": desired_status,
+                    "story_revision": story.story_revision + 1,
+                    "archived_at": (
+                        _story_datetime_iso(transitioned_at)
+                        if desired_status == "archived"
+                        else None
+                    ),
+                    "current_version_id": story.current_version_id,
+                    "title": story.title,
+                }
                 story.status = desired_status
-                story.archived_at = datetime.now(timezone.utc) if desired_status == "archived" else None
+                story.archived_at = transitioned_at if desired_status == "archived" else None
                 story.story_revision += 1
-                story.updated_at = datetime.now(timezone.utc)
+                story.updated_at = transitioned_at
                 self._invalidate_active_target_attempts(session, story.id)
+                self._record_lifecycle_transition(
+                    session,
+                    story=story,
+                    expected_story_revision=expected_story_revision,
+                    desired_status=desired_status,
+                    transitioned_at=transitioned_at,
+                    before=before,
+                    after=after,
+                )
                 session.commit()
                 return self._story_payload(session, story)
             except Exception:
                 session.rollback()
                 raise
 
+    @staticmethod
+    def _record_lifecycle_transition(
+        session: Session,
+        *,
+        story: InterviewStory,
+        expected_story_revision: int,
+        desired_status: str,
+        transitioned_at: datetime,
+        before: dict[str, Any],
+        after: dict[str, Any],
+    ) -> None:
+        fingerprint_fields = {
+            "operation": "story_lifecycle_v1",
+            "target_story_id": story.id,
+            "expected_story_revision": expected_story_revision,
+            "desired_status": desired_status,
+            "transitioned_at": _story_datetime_iso(transitioned_at),
+            "before": before,
+            "after": after,
+        }
+        request_fingerprint = _story_lifecycle_request_fingerprint(
+            fingerprint_fields
+        )
+        payload = fingerprint_fields | {
+            "request_fingerprint": request_fingerprint,
+        }
+        payload_json = canonical_json(payload)
+        idempotency_key = _story_lifecycle_idempotency_key(
+            story_id=story.id,
+            expected_story_revision=expected_story_revision,
+            desired_status=desired_status,
+        )
+        marker = canonical_json({"proposal_status": "story_lifecycle"})
+        session.add(
+            InterviewStoryProposalAttempt(
+                target_story_id=story.id,
+                idempotency_key=idempotency_key,
+                entrypoint="internal",
+                entry_context_json=canonical_json(
+                    {"operation": "story_lifecycle_v1"}
+                ),
+                attempt_status="confirmed",
+                generation_revision=1,
+                provider_call_token="",
+                provider_lease_until=None,
+                input_snapshot_json=payload_json,
+                source_fingerprint=request_fingerprint,
+                proposal_json=marker,
+                proposal_hash=sha256_text(marker),
+                failure_category="",
+                confirmation_token_hash=sha256_text(idempotency_key),
+                confirmation_payload_hash=sha256_text(payload_json),
+                confirmed_story_id=story.id,
+                confirmed_story_version_id=None,
+                product_action_operation_id=None,
+                product_action_generation=0,
+                confirmed_at=transitioned_at,
+            )
+        )
+
     def _replay_manual_save(
         self,
         session: Session,
         idempotency_key: str,
         request_fingerprint: str,
+        *,
+        raw_target_story_id: int | None,
+        raw_expected_current_version_id: int | None,
+        raw_expected_story_revision: int | None,
     ) -> dict[str, Any] | None:
         if not isinstance(idempotency_key, str) or not _IDEMPOTENCY_KEY.fullmatch(idempotency_key):
             raise StoryValidationError("idempotency key is invalid")
@@ -3347,11 +3794,32 @@ class InterviewStoriesRepository:
             )
         )
         if existing is None:
+            if _uses_reserved_story_idempotency_namespace(idempotency_key):
+                raise StoryValidationError("idempotency key is reserved")
             return None
         payload = _attempt_input_payload(existing)
+        legacy_shape = set(payload) == {"operation", "request_fingerprint"}
+        raw_shape = set(payload) == {
+            "operation",
+            "request_fingerprint",
+            "target_story_id",
+            "expected_current_version_id",
+            "expected_story_revision",
+        }
         if (
-            payload.get("operation") != "manual_save"
+            (not legacy_shape and not raw_shape)
+            or payload.get("operation") != "manual_save"
             or payload.get("request_fingerprint") != request_fingerprint
+            or (
+                raw_shape
+                and (
+                    payload.get("target_story_id") != raw_target_story_id
+                    or payload.get("expected_current_version_id")
+                    != raw_expected_current_version_id
+                    or payload.get("expected_story_revision")
+                    != raw_expected_story_revision
+                )
+            )
             or existing.attempt_status != "confirmed"
             or existing.confirmed_story_id is None
             or existing.confirmed_story_version_id is None
@@ -3369,11 +3837,20 @@ class InterviewStoriesRepository:
         *,
         idempotency_key: str,
         request_fingerprint: str,
+        raw_target_story_id: int | None,
+        raw_expected_current_version_id: int | None,
+        raw_expected_story_revision: int | None,
         story: InterviewStory,
         version: InterviewStoryVersion,
         snapshot: StorySourceSnapshot,
     ) -> None:
-        payload = {"operation": "manual_save", "request_fingerprint": request_fingerprint}
+        payload = {
+            "operation": "manual_save",
+            "request_fingerprint": request_fingerprint,
+            "target_story_id": raw_target_story_id,
+            "expected_current_version_id": raw_expected_current_version_id,
+            "expected_story_revision": raw_expected_story_revision,
+        }
         payload_json = canonical_json(payload)
         session.add(
             InterviewStoryProposalAttempt(
@@ -4016,6 +4493,17 @@ def _attempt_input_payload(attempt: InterviewStoryProposalAttempt) -> dict[str, 
     if not isinstance(parsed, dict):
         raise StoryConflictError("story proposal snapshot is invalid")
     return parsed
+
+
+def _is_story_lifecycle_attempt(attempt: InterviewStoryProposalAttempt) -> bool:
+    """Keep internal lifecycle audit rows out of every Proposal surface."""
+
+    if attempt.entrypoint == "internal":
+        return True
+    try:
+        return _attempt_input_payload(attempt).get("operation") == "story_lifecycle_v1"
+    except StoryConflictError:
+        return False
 
 
 def _snapshot_from_attempt(payload: dict[str, Any], fingerprint: str) -> StorySourceSnapshot:

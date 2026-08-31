@@ -47,6 +47,8 @@ from offerpilot.product_actions.compensation import (
     ProductActionCompensationError,
     ProductActionCompensationProofRegistryV1,
     ProductActionCompensationStale,
+    InterviewStoryProductActionUndoProof,
+    InterviewStoryUndoIssuer,
     ReadinessSignalProductActionUndoProof,
     ReadinessSignalUndoIssuer,
     product_action_compensation_input_fingerprint,
@@ -58,6 +60,7 @@ from offerpilot.product_actions.compensation import (
     _CompensationExecutionUowV1,
 )
 from offerpilot.product_actions.contracts import (
+    ProductActionContractError,
     ProductActionExecutionAuthorization,
     ProductActionIntegrityError,
     ProductActionProofRegistryV1,
@@ -461,6 +464,59 @@ def test_signal_retraction_key_is_deterministic_and_proofs_are_not_constructible
     )
     with pytest.raises(TypeError):
         ReadinessSignalProductActionUndoProof()
+    with pytest.raises(TypeError):
+        InterviewStoryProductActionUndoProof()
+
+
+def test_story_owner_issuer_short_circuits_capability_before_database_access() -> None:
+    queried = False
+
+    def forbidden_factory():
+        nonlocal queried
+        queried = True
+        raise AssertionError("database must not be queried")
+
+    issuer = InterviewStoryUndoIssuer(
+        forbidden_factory,
+        catalog=ProductActionCompensationCatalogV1(),
+        proof_registry=ProductActionCompensationProofRegistryV1(),
+        key_profiles=LedgerKeyProfileStoreV1(
+            (KEY_ONE, KEY_TWO),
+            active_key_id=KEY_ONE.key_id,
+        ),
+        capability_check=lambda _capability: False,
+    )
+    with pytest.raises(ProductActionCompensationError) as captured:
+        issuer.issue(story_id=1, parent_operation_id=PARENT_OPERATION_ID)
+    assert captured.value.code == "product_action_compensation_permission_denied"
+    assert queried is False
+
+
+def test_story_owner_issuer_rejects_noncanonical_parent_uuid_before_database_access() -> None:
+    queried = False
+
+    def forbidden_factory():
+        nonlocal queried
+        queried = True
+        raise AssertionError("database must not be queried")
+
+    issuer = InterviewStoryUndoIssuer(
+        forbidden_factory,
+        catalog=ProductActionCompensationCatalogV1(),
+        proof_registry=ProductActionCompensationProofRegistryV1(),
+        key_profiles=LedgerKeyProfileStoreV1(
+            (KEY_ONE, KEY_TWO),
+            active_key_id=KEY_ONE.key_id,
+        ),
+        capability_check=lambda _capability: True,
+    )
+    with pytest.raises(ProductActionContractError) as captured:
+        issuer.issue(
+            story_id=1,
+            parent_operation_id="AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+        )
+    assert captured.value.code == "parent_operation_id_invalid_uuid"
+    assert queried is False
 
 
 def test_signal_retraction_appends_immutable_byte_copies_after_source_deletion(tmp_path) -> None:

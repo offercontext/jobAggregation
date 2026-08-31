@@ -121,7 +121,18 @@ from offerpilot.pilot_runtime.errors import (
     RuntimeFailureCode,
     RuntimeTransportAborted,
 )
-from offerpilot.product_actions.catalog import ProductActionCatalogV1
+from offerpilot.product_actions.catalog import (
+    ProductActionCatalogV1,
+    ProductActionCompensationCatalogV1,
+)
+from offerpilot.product_actions.compensation import (
+    InterviewStoryUndoIssuer,
+    ProductActionCompensationCoordinator,
+    ProductActionCompensationError,
+    ProductActionCompensationProofRegistryV1,
+    ProductActionCompensationResultV1,
+    ReadinessSignalUndoIssuer,
+)
 from offerpilot.product_actions.contracts import (
     ProductActionContractError,
     ProductActionIntegrityError,
@@ -1258,6 +1269,39 @@ def create_app(
         ),
         additional_handlers=(story_product_action_handler,),
     )
+    product_action_compensation_proofs = ProductActionCompensationProofRegistryV1()
+    product_action_compensation_catalog = ProductActionCompensationCatalogV1()
+
+    def product_action_compensation_capability_check(capability: str) -> bool:
+        return capability in {
+            "application.interview_readiness_feedback.write",
+            "stories.write",
+        }
+
+    readiness_signal_undo_issuer = ReadinessSignalUndoIssuer(
+        session_factory,
+        catalog=product_action_compensation_catalog,
+        proof_registry=product_action_compensation_proofs,
+        key_profiles=product_action_keys,
+        capability_check=product_action_compensation_capability_check,
+    )
+    interview_story_undo_issuer = InterviewStoryUndoIssuer(
+        session_factory,
+        catalog=product_action_compensation_catalog,
+        proof_registry=product_action_compensation_proofs,
+        key_profiles=product_action_keys,
+        capability_check=product_action_compensation_capability_check,
+    )
+    product_action_compensation_coordinator = ProductActionCompensationCoordinator(
+        session_factory,
+        catalog=product_action_compensation_catalog,
+        proof_registry=product_action_compensation_proofs,
+        execution_registry=product_action_proofs,
+        key_profiles=product_action_keys,
+        capability_check=product_action_compensation_capability_check,
+        readiness_repository=readiness_signals,
+        story_repository=interview_stories,
+    )
     context_source_loader: ContextSourceLoader[Any, Any] = ContextSourceLoader(
         resolved_data_dir / "data.db"
     )
@@ -1339,6 +1383,11 @@ def create_app(
     app.state.run_recorder_factory = resolved_run_recorder_factory
     app.state.write_operation_coordinator = write_coordinator
     app.state.product_action_coordinator = product_action_coordinator
+    app.state.product_action_compensation_coordinator = (
+        product_action_compensation_coordinator
+    )
+    app.state.readiness_signal_undo_issuer = readiness_signal_undo_issuer
+    app.state.interview_story_undo_issuer = interview_story_undo_issuer
     app.state.interview_stories_repository = interview_stories
     app.state.product_action_proposal_repository = product_action_proposals
     app.state.knowledge_runtime = knowledge_runtime
@@ -1431,6 +1480,16 @@ def create_app(
     async def product_action_coordinator_exception_handler(
         _request: Request,
         exc: ProductActionCoordinatorError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error_code": exc.code, "retryable": exc.retryable},
+        )
+
+    @app.exception_handler(ProductActionCompensationError)
+    async def product_action_compensation_exception_handler(
+        _request: Request,
+        exc: ProductActionCompensationError,
     ) -> JSONResponse:
         return JSONResponse(
             status_code=exc.status_code,
@@ -3450,6 +3509,56 @@ def create_app(
             }
         )
 
+    def _product_action_compensation_response(
+        result: ProductActionCompensationResultV1,
+    ) -> JSONResponse:
+        return JSONResponse(
+            {
+                "schema_version": 1,
+                "operation_id": result.operation_id,
+                "compensation_kind": result.compensation_kind,
+                "status": result.status,
+                "result": dict(result.result),
+                "replayed": result.replayed,
+            }
+        )
+
+    def _undo_readiness_signal_product_action(
+        application_id: int,
+        signal_id: int,
+        payload: dict[str, Any],
+    ) -> JSONResponse:
+        if (
+            set(payload) != {"parent_operation_id"}
+            or type(payload.get("parent_operation_id")) is not str
+        ):
+            raise ProductActionContractError("product_action_invalid_request")
+        proof = readiness_signal_undo_issuer.issue(
+            application_id=application_id,
+            signal_id=signal_id,
+            parent_operation_id=cast(str, payload["parent_operation_id"]),
+        )
+        return _product_action_compensation_response(
+            product_action_compensation_coordinator.execute(proof)
+        )
+
+    def _undo_interview_story_product_action(
+        story_id: int,
+        payload: dict[str, Any],
+    ) -> JSONResponse:
+        if (
+            set(payload) != {"parent_operation_id"}
+            or type(payload.get("parent_operation_id")) is not str
+        ):
+            raise ProductActionContractError("product_action_invalid_request")
+        proof = interview_story_undo_issuer.issue(
+            story_id=story_id,
+            parent_operation_id=cast(str, payload["parent_operation_id"]),
+        )
+        return _product_action_compensation_response(
+            product_action_compensation_coordinator.execute(proof)
+        )
+
     def _propose_review_readiness_action(
         note_id: int,
         payload: dict[str, Any],
@@ -3587,6 +3696,21 @@ def create_app(
                     for evidence in aggregate.evidence
                 ],
             }
+        )
+
+    @app.post(
+        "/api/applications/{application_id}/readiness-signals/{signal_id}/undo"
+    )
+    async def undo_readiness_signal_product_action(
+        application_id: int,
+        signal_id: int,
+        request: Request,
+    ) -> JSONResponse:
+        payload = decode_product_action_request_v1(await request.body())
+        return _undo_readiness_signal_product_action(
+            application_id,
+            signal_id,
+            payload,
         )
 
     @app.get("/api/interview-practice/focus/{signal_version_id}")
@@ -7661,6 +7785,14 @@ def create_app(
         if story is None:
             return error_response(404, "面试故事不存在", code="interview_story_not_found")
         return JSONResponse(story)
+
+    @app.post("/api/interview-stories/{story_id}/product-action-undo")
+    async def undo_interview_story_product_action(
+        story_id: int,
+        request: Request,
+    ) -> JSONResponse:
+        payload = decode_product_action_request_v1(await request.body())
+        return _undo_interview_story_product_action(story_id, payload)
 
     @app.get("/api/interview-stories/{story_id}/versions")
     def list_interview_story_versions(story_id: int) -> JSONResponse:

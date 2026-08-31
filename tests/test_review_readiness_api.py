@@ -75,6 +75,109 @@ def _create_readiness_signal(client, session_factory, seeded):  # type: ignore[n
         return signal.id, signal.current_version_id
 
 
+def test_readiness_signal_product_action_undo_is_owner_scoped_and_replay_safe(
+    tmp_path,
+) -> None:
+    app = create_app(data_dir=tmp_path)
+    session_factory = session_factory_for_data_dir(tmp_path)
+    seeded = seed_review_candidate(session_factory)
+    client = TestClient(app)
+    signal_id, active_version_id = _create_readiness_signal(
+        client,
+        session_factory,
+        seeded,
+    )
+    with session_factory() as session:
+        active = session.get(InterviewReadinessSignalVersion, active_version_id)
+        assert active is not None
+        parent_operation_id = active.write_operation_id
+        proposal = session.get(InterviewReviewProposal, seeded["proposal_id"])
+        note = session.get(InterviewNote, seeded["note_id"])
+        event = session.get(ApplicationEvent, seeded["event_id"])
+        assert proposal is not None and note is not None and event is not None
+        session.delete(proposal)
+        session.delete(note)
+        session.delete(event)
+        session.commit()
+
+    response = client.post(
+        f"/api/applications/{seeded['application_id']}/readiness-signals/"
+        f"{signal_id}/undo",
+        content=json.dumps(
+            {"parent_operation_id": parent_operation_id},
+            separators=(",", ":"),
+        ).encode(),
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 200, response.json()
+    assert response.json() == {
+        "schema_version": 1,
+        "operation_id": response.json()["operation_id"],
+        "compensation_kind": "undo:save_review_readiness_signal",
+        "status": "committed",
+        "result": {
+            "kind": "review_readiness_signal_retracted_v1",
+            "signal_id": signal_id,
+            "retracted_version_id": response.json()["result"]["retracted_version_id"],
+            "signal_revision": 2,
+        },
+        "replayed": False,
+    }
+    replay = client.post(
+        f"/api/applications/{seeded['application_id']}/readiness-signals/"
+        f"{signal_id}/undo",
+        json={"parent_operation_id": parent_operation_id},
+    )
+    assert replay.status_code == 200
+    assert replay.json()["operation_id"] == response.json()["operation_id"]
+    assert replay.json()["result"] == response.json()["result"]
+    assert replay.json()["replayed"] is True
+
+    cross_owner = client.post(
+        f"/api/applications/{seeded['application_id'] + 1}/readiness-signals/"
+        f"{signal_id}/undo",
+        json={"parent_operation_id": parent_operation_id},
+    )
+    assert cross_owner.status_code == 404
+    assert cross_owner.json() == {
+        "error_code": "product_action_compensation_not_found",
+        "retryable": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "raw_body",
+    [
+        b"[]",
+        b"{}",
+        b'{"parent_operation_id":true}',
+        b'{"parent_operation_id":"00000000-0000-4000-8000-000000000001","extra":1}',
+        b'{"parent_operation_id":"00000000-0000-4000-8000-000000000001",'
+        b'"parent_operation_id":"00000000-0000-4000-8000-000000000001"}',
+        b'{"parent_operation_id":"00000000-0000-4000-8000-000000000001"',
+    ],
+)
+def test_readiness_signal_product_action_undo_rejects_non_exact_raw_body_before_query(
+    tmp_path,
+    raw_body: bytes,
+    monkeypatch,
+) -> None:
+    app = create_app(data_dir=tmp_path)
+    issuer = app.state.readiness_signal_undo_issuer
+    monkeypatch.setattr(
+        issuer,
+        "issue",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("issuer queried")),
+    )
+    response = TestClient(app).post(
+        "/api/applications/1/readiness-signals/1/undo",
+        content=raw_body,
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 422
+    assert response.json() == {"error_code": "product_action_invalid_request"}
+
+
 def _create_target(session_factory, application_id: int, *, status: str = "todo") -> int:  # type: ignore[no-untyped-def]
     with session_factory() as session:
         target = ApplicationEvent(
@@ -397,7 +500,9 @@ def test_product_action_owner_and_rejection_recovery_cross_scope_are_safe_404(
     }
 
 
-def test_review_readiness_read_routes_have_one_exact_manifest_entry(tmp_path) -> None:
+def test_review_readiness_read_and_signal_undo_routes_have_exact_manifest_entries(
+    tmp_path,
+) -> None:
     app = create_app(data_dir=tmp_path)
     manifest = [
         (route.path, method)
@@ -420,6 +525,10 @@ def test_review_readiness_read_routes_have_one_exact_manifest_entry(tmp_path) ->
             (
                 "/api/applications/{application_id}/readiness-signals/{signal_id}",
                 "GET",
+            ),
+            (
+                "/api/applications/{application_id}/readiness-signals/{signal_id}/undo",
+                "POST",
             ),
             ("/api/interview-practice/focus/{signal_version_id}", "GET"),
         ]

@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 from urllib.request import urlopen
 
 import websockets
+from websockets.exceptions import ConnectionClosed
 
 
 _CDP_MAX_MESSAGE_BYTES = 8 * 1024 * 1024
@@ -312,7 +313,7 @@ class BrowserAudit:
         except asyncio.CancelledError:
             raise
         except BaseException as exc:
-            if isinstance(exc, websockets.exceptions.ConnectionClosed):
+            if isinstance(exc, ConnectionClosed):
                 self.close_code = exc.code
                 self._set_failure("cdp_connection_closed", exc)
             else:
@@ -375,7 +376,7 @@ class BrowserAudit:
         except asyncio.CancelledError:
             raise
         except BaseException as exc:
-            category = "cdp_connection_closed" if isinstance(exc, websockets.exceptions.ConnectionClosed) else "cdp_keepalive_error"
+            category = "cdp_connection_closed" if isinstance(exc, ConnectionClosed) else "cdp_keepalive_error"
             self._set_failure(category, exc)
 
     async def flush_response_tasks(self) -> None:
@@ -589,7 +590,7 @@ class BrowserAudit:
                 # no longer prove the browser contract, including if CDP itself
                 # disconnected while a body was being read.
                 record["response_body_status"] = "unavailable"
-                if isinstance(exc, websockets.exceptions.ConnectionClosed):
+                if isinstance(exc, ConnectionClosed):
                     self.close_code = exc.code
                     self._set_failure("cdp_connection_closed", exc)
                 elif isinstance(exc, (RuntimeError, asyncio.TimeoutError, json.JSONDecodeError, TypeError)):
@@ -784,7 +785,7 @@ async def main_async(args: argparse.Namespace) -> None:
     except asyncio.CancelledError:
         raise
     except BaseException as exc:
-        if isinstance(exc, websockets.exceptions.ConnectionClosed):
+        if isinstance(exc, ConnectionClosed):
             category = "cdp_connection_closed"
         elif isinstance(exc, asyncio.TimeoutError):
             category = "cdp_command_timeout"

@@ -12,9 +12,11 @@ def test_calendar_includes_applications_and_events(tmp_path):
         json={"company_name": "ByteDance", "position_name": "Backend"},
     ).json()
     applied_at = datetime.fromisoformat(app["applied_at"].replace("Z", "+00:00"))
-    month_start = applied_at.astimezone(timezone.utc).replace(
-        day=1, hour=0, minute=0, second=0, microsecond=0
-    )
+    if applied_at.tzinfo is None:
+        applied_at = applied_at.replace(tzinfo=timezone.utc)
+    else:
+        applied_at = applied_at.astimezone(timezone.utc)
+    month_start = applied_at.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     next_month_start = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
     calendar_month = month_start.strftime("%Y-%m")
     client.post(

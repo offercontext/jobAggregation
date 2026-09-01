@@ -16,6 +16,8 @@ import pytest
 
 _AUDIT_PATH = Path(__file__).parents[1] / "scripts" / "browser-network-audit.py"
 _HARNESS_PATH = Path(__file__).parents[1] / "scripts" / "interview-story-real-ai-browser-harness.ps1"
+_HARNESS_TIMEOUT_SECONDS = 180
+_HARNESS_DIAGNOSTIC_TAIL_CHARS = 8_000
 _SPEC = importlib.util.spec_from_file_location("browser_network_audit", _AUDIT_PATH)
 assert _SPEC and _SPEC.loader
 _MODULE = importlib.util.module_from_spec(_SPEC)
@@ -77,23 +79,116 @@ def _request(url: str, payload: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _process_output_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return value
+
+
 def _run_harness(*args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [
-            "powershell",
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(_HARNESS_PATH),
-            *args,
-        ],
-        check=False,
-        capture_output=True,
+    command = [
+        "powershell",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(_HARNESS_PATH),
+        *args,
+    ]
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         env=env,
-        timeout=90,
     )
+    try:
+        stdout, stderr = process.communicate(timeout=_HARNESS_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as exc:
+        cleanup_detail = ""
+        try:
+            cleanup = subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            cleanup_detail = (
+                f"taskkill returncode={cleanup.returncode}\n"
+                f"{cleanup.stdout}{cleanup.stderr}"
+            )
+        except (OSError, subprocess.SubprocessError) as cleanup_error:
+            cleanup_detail = f"taskkill failed: {type(cleanup_error).__name__}: {cleanup_error}"
+        if process.poll() is None:
+            process.kill()
+        final_stdout, final_stderr = process.communicate()
+        stdout = final_stdout or _process_output_text(exc.output)
+        stderr = final_stderr or _process_output_text(exc.stderr)
+        raise AssertionError(
+            f"Interview Story browser harness timed out after {_HARNESS_TIMEOUT_SECONDS} seconds.\n"
+            f"stdout tail:\n{stdout[-_HARNESS_DIAGNOSTIC_TAIL_CHARS:]}\n"
+            f"stderr tail:\n{stderr[-_HARNESS_DIAGNOSTIC_TAIL_CHARS:]}\n"
+            f"cleanup:\n{cleanup_detail[-_HARNESS_DIAGNOSTIC_TAIL_CHARS:]}"
+        ) from exc
+    assert process.returncode is not None
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
+def test_run_harness_terminates_the_process_tree_and_reports_output_on_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TimedOutProcess:
+        pid = 4242
+        returncode: int | None = None
+
+        def __init__(self) -> None:
+            self.communicate_timeouts: list[float | None] = []
+            self.killed = False
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            self.communicate_timeouts.append(timeout)
+            if timeout is not None:
+                raise subprocess.TimeoutExpired(
+                    ["powershell"], timeout, output="partial stdout", stderr="partial stderr"
+                )
+            return "final stdout", "final stderr"
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = 1
+
+    process = TimedOutProcess()
+    popen_calls: list[tuple[object, ...]] = []
+    taskkill_calls: list[list[str]] = []
+
+    def fake_popen(*popen_args: object, **_popen_kwargs: object) -> TimedOutProcess:
+        popen_calls.append(popen_args)
+        return process
+
+    def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        taskkill_calls.append(command)
+        assert command == ["taskkill", "/PID", "4242", "/T", "/F"]
+        process.returncode = 1
+        return subprocess.CompletedProcess(command, 0, "terminated", "")
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(AssertionError, match="timed out after 180 seconds") as caught:
+        _run_harness("-ValidateAudit")
+
+    assert len(popen_calls) == 1
+    assert taskkill_calls == [["taskkill", "/PID", "4242", "/T", "/F"]]
+    assert process.communicate_timeouts == [180, None]
+    assert process.killed is False
+    assert "final stdout" in str(caught.value)
+    assert "final stderr" in str(caught.value)
 
 
 def _write_gray_png(path: Path, *, width: int = 1455, height: int = 1200) -> None:

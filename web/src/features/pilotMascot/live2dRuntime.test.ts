@@ -1,4 +1,6 @@
 // @vitest-environment jsdom
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import {
   createLive2dPilotMascotRuntime,
@@ -123,6 +125,24 @@ function runtimeDependencies(overrides: Partial<Live2dRuntimeDependencies> = {})
 }
 
 describe('createLive2dPilotMascotRuntime', () => {
+  it('registers a neutral empty expression instead of reusing a facial expression as reset', () => {
+    const modelPath = resolve(process.cwd(), 'public/live2d/haru-receptionist/haru_greeter_t03.model3.json');
+    const model = JSON.parse(readFileSync(modelPath, 'utf8')) as {
+      FileReferences: { Expressions: Array<{ Name: string; File: string }> };
+    };
+
+    expect(model.FileReferences.Expressions).toContainEqual({
+      Name: 'neutral',
+      File: 'expressions/neutral.exp3.json',
+    });
+    const neutralPath = resolve(process.cwd(), 'public/live2d/haru-receptionist/expressions/neutral.exp3.json');
+    const neutral = JSON.parse(readFileSync(neutralPath, 'utf8')) as {
+      Type: string;
+      Parameters: unknown[];
+    };
+    expect(neutral).toEqual({ Type: 'Live2D Expression', Parameters: [] });
+  });
+
   it('destroys a partially initialized Pixi application when model loading fails', async () => {
     const fixture = runtimeDependencies();
     fixture.Live2DModel.from.mockRejectedValueOnce(new Error('model failed'));
@@ -178,6 +198,7 @@ describe('createLive2dPilotMascotRuntime', () => {
     const controller = await createLive2dPilotMascotRuntime(fixture.dependencies).mount(canvas, undefined, 'off');
     expect(fixture.Application).toHaveBeenCalledWith(expect.objectContaining({ autoStart: false }));
     expect(fixture.Live2DModel.from).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ autoUpdate: false }));
+    controller.setActivity('idle');
     controller.setActivity('success');
     expect(fixture.model.motion).not.toHaveBeenCalled();
     expect(fixture.model.expression).not.toHaveBeenCalled();
@@ -239,6 +260,7 @@ describe('createLive2dPilotMascotRuntime', () => {
     host.appendChild(canvas);
 
     const controller = await createLive2dPilotMascotRuntime(fixture.dependencies).mount(canvas);
+    controller.setActivity('idle');
     controller.setActivity('thinking');
     await Promise.resolve();
     expect(fixture.model.motion).toHaveBeenCalledWith('Idle', 1, expect.any(Number));
@@ -248,6 +270,106 @@ describe('createLive2dPilotMascotRuntime', () => {
     expect(fixture.model.motion).toHaveBeenCalledWith('Tap', 0, expect.any(Number));
     expect(fixture.model.expression).toHaveBeenCalledWith('f06');
     controller.dispose();
+  });
+
+  it('deterministically applies the neutral expression for the first idle activity', async () => {
+    const fixture = runtimeDependencies();
+    const host = document.createElement('div');
+    const canvas = document.createElement('canvas');
+    host.appendChild(canvas);
+
+    const controller = await createLive2dPilotMascotRuntime(fixture.dependencies).mount(canvas);
+    controller.setActivity('idle');
+
+    expect(fixture.model.expression).toHaveBeenCalledWith('neutral');
+    controller.dispose();
+  });
+
+  it.each([
+    ['success', 'idle'],
+    ['speaking', 'idle'],
+    ['speaking', 'thinking'],
+    ['success', 'preparing_voice'],
+    ['success', 'transcribing'],
+    ['success', 'reviewing_voice'],
+  ] as const)('replaces the transient f06 expression with neutral when %s enters %s', async (feedbackActivity, nextActivity) => {
+    const fixture = runtimeDependencies();
+    const host = document.createElement('div');
+    const canvas = document.createElement('canvas');
+    host.appendChild(canvas);
+
+    const controller = await createLive2dPilotMascotRuntime(fixture.dependencies).mount(canvas);
+    controller.setActivity(feedbackActivity);
+    controller.setActivity(nextActivity);
+
+    expect(fixture.model.expression).toHaveBeenNthCalledWith(1, 'f06');
+    expect(fixture.model.expression).toHaveBeenNthCalledWith(2, 'neutral');
+    controller.dispose();
+  });
+
+  it('keeps target expression mappings and cancels a stale success reset before listening or error', async () => {
+    vi.useFakeTimers();
+    try {
+      const fixture = runtimeDependencies();
+      const host = document.createElement('div');
+      const canvas = document.createElement('canvas');
+      host.appendChild(canvas);
+      const controller = await createLive2dPilotMascotRuntime(fixture.dependencies).mount(canvas);
+
+      controller.setActivity('success');
+      controller.setActivity('listening');
+      vi.advanceTimersByTime(1_001);
+      expect(fixture.model.expression.mock.calls).toEqual([['f06'], ['f01']]);
+
+      controller.setActivity('success');
+      controller.setActivity('error');
+      vi.advanceTimersByTime(1_001);
+      expect(fixture.model.expression.mock.calls).toEqual([['f06'], ['f01'], ['f06'], ['f02']]);
+      controller.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('expires f06 feedback to neutral and can replay f06 after returning to idle', async () => {
+    vi.useFakeTimers();
+    try {
+      const fixture = runtimeDependencies();
+      const host = document.createElement('div');
+      const canvas = document.createElement('canvas');
+      host.appendChild(canvas);
+      const controller = await createLive2dPilotMascotRuntime(fixture.dependencies).mount(canvas);
+
+      controller.setActivity('success');
+      vi.advanceTimersByTime(1_001);
+      expect(fixture.model.expression.mock.calls).toEqual([['f06'], ['neutral']]);
+
+      controller.setActivity('idle');
+      controller.setActivity('success');
+      expect(fixture.model.expression.mock.calls).toEqual([['f06'], ['neutral'], ['neutral'], ['f06']]);
+      controller.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels pending transient expression feedback when disposed', async () => {
+    vi.useFakeTimers();
+    try {
+      const fixture = runtimeDependencies();
+      const host = document.createElement('div');
+      const canvas = document.createElement('canvas');
+      host.appendChild(canvas);
+      const controller = await createLive2dPilotMascotRuntime(fixture.dependencies).mount(canvas);
+
+      controller.setActivity('speaking');
+      controller.dispose();
+      vi.advanceTimersByTime(1_001);
+
+      expect(fixture.model.expression.mock.calls).toEqual([['f06']]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('maps speaking, listening and transcribing to distinct mascot feedback', async () => {

@@ -40,6 +40,10 @@
       {
         "Name": "f07",
         "File": "expressions/F08.exp3.json"
+      },
+      {
+        "Name": "neutral",
+        "File": "expressions/neutral.exp3.json"
       }
     ],
     "Motions": {

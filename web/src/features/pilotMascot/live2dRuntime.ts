@@ -71,6 +71,7 @@ export function serializePilotMascotRuntime(runtime: PilotMascotRuntime): PilotM
 const MODEL_URL = '/live2d/haru-receptionist/haru_greeter_t03.model3.json';
 const CUBISM_CORE_URL = '/live2d/live2dcubismcore.min.js';
 const CUBISM_CORE_SCRIPT_ID = 'offerpilot-live2d-cubism-core';
+const TRANSIENT_EXPRESSION_DURATION_MS = 1_000;
 
 interface Live2dApplication {
   stage: { addChild: (model: Live2dModelInstance) => void };
@@ -150,16 +151,23 @@ export function createLive2dPilotMascotRuntime(
     let disposed = false;
     let zoom = 1;
     let activity: PilotMascotActivity = 'idle';
+    let hasAppliedActivity = false;
     let thinkingTimer: number | undefined;
+    let transientExpressionTimer: number | undefined;
     let fit: (() => void) | undefined;
     const stopThinkingLoop = () => {
       if (thinkingTimer !== undefined) window.clearTimeout(thinkingTimer);
       thinkingTimer = undefined;
     };
+    const stopTransientExpressionReset = () => {
+      if (transientExpressionTimer !== undefined) window.clearTimeout(transientExpressionTimer);
+      transientExpressionTimer = undefined;
+    };
     const dispose = () => {
       if (disposed) return;
       disposed = true;
       stopThinkingLoop();
+      stopTransientExpressionReset();
       observer?.disconnect();
       model?.destroy({ children: true });
       application?.destroy(false, { children: true, texture: false, baseTexture: false });
@@ -219,6 +227,14 @@ export function createLive2dPilotMascotRuntime(
           // Motion feedback is decorative; text remains the source of truth.
         }
       };
+      const scheduleTransientExpressionReset = () => {
+        stopTransientExpressionReset();
+        transientExpressionTimer = window.setTimeout(() => {
+          transientExpressionTimer = undefined;
+          if (disposed || staticRender || (activity !== 'speaking' && activity !== 'success')) return;
+          setExpression('neutral');
+        }, TRANSIENT_EXPRESSION_DURATION_MS);
+      };
       const isThinkingLoop = () => activity === 'thinking' || activity === 'preparing_voice' || activity === 'transcribing';
       const playThinking = () => {
         if (disposed || !isThinkingLoop() || staticRender || animationLevel !== 'full') return;
@@ -230,17 +246,27 @@ export function createLive2dPilotMascotRuntime(
 
       return {
         setActivity(nextActivity) {
-          if (disposed || nextActivity === activity) return;
+          if (disposed || (hasAppliedActivity && nextActivity === activity)) return;
           activity = nextActivity;
+          hasAppliedActivity = true;
           stopThinkingLoop();
+          stopTransientExpressionReset();
           if (staticRender) return;
-          if (activity === 'thinking' || activity === 'preparing_voice' || activity === 'transcribing') {
-            playThinking();
+          if (
+            activity === 'idle'
+            || activity === 'thinking'
+            || activity === 'preparing_voice'
+            || activity === 'transcribing'
+            || activity === 'reviewing_voice'
+          ) {
+            setExpression('neutral');
+            if (activity === 'thinking' || activity === 'preparing_voice' || activity === 'transcribing') playThinking();
             return;
           }
           if (activity === 'speaking') {
             setExpression('f06');
             void runMotion('Tap', 0);
+            scheduleTransientExpressionReset();
             return;
           }
           if (activity === 'listening' || activity === 'waiting_for_speech') {
@@ -256,6 +282,7 @@ export function createLive2dPilotMascotRuntime(
           if (activity === 'success') {
             setExpression('f06');
             void runMotion('Tap', 0);
+            scheduleTransientExpressionReset();
             return;
           }
           if (activity === 'error') {

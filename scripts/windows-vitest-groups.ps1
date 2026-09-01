@@ -280,9 +280,12 @@ function Invoke-FrontendGroup([string]$Name) {
         'test', '--', '--run', '--pool=forks', '--maxWorkers=1', '--minWorkers=1',
         '--no-file-parallelism', '--reporter=json', "--outputFile=$jsonPath"
     ) + $files
+    [IO.File]::WriteAllText($runPath, '', [Text.UTF8Encoding]::new($false))
     $null = & npm.cmd @arguments 2>&1 | Tee-Object -FilePath $runPath
     $exitCode = $LASTEXITCODE
-    if (-not (Test-Path -LiteralPath $jsonPath)) { throw "$Name did not produce a Vitest JSON report" }
+    if (-not (Test-Path -LiteralPath $jsonPath)) {
+        throw "$Name did not produce a Vitest JSON report (exit code $exitCode). Child process output was preserved at $runPath"
+    }
     $report = Get-Content -LiteralPath $jsonPath -Raw -Encoding utf8 | ConvertFrom-Json
     $records = @(Get-AssertionRecords $report $files)
     $duplicates = @($records | Group-Object -Property id | Where-Object Count -gt 1)

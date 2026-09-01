@@ -100,6 +100,10 @@ $allArguments = @($args)
 $outputArgument = $allArguments | Where-Object { $_ -like '--outputFile=*' } | Select-Object -First 1
 $outputPath = $outputArgument.Substring('--outputFile='.Length)
 if ($env:FAKE_VITEST_FAIL -eq '1') { exit 17 }
+if ($env:FAKE_VITEST_NO_REPORT -eq '1') {
+    Write-Output 'fake Vitest intentionally omitted its report'
+    exit 23
+}
 $manifest = Get-Content $env:FAKE_VITEST_MANIFEST -Raw -Encoding utf8 | ConvertFrom-Json
 $files = @($manifest.groups | ForEach-Object { $_.PSObject.Properties[$env:FAKE_VITEST_GROUP].Value })
 if ($env:FAKE_VITEST_OMIT_FILE -eq '1') { $files = @() }
@@ -250,6 +254,26 @@ def test_frontend_group_does_not_reuse_old_result_after_failed_run(tmp_path: Pat
     assert second.returncode != 0
     assert not (result_dir / "theme.results.json").exists()
     assert not (result_dir / "theme.complete.json").exists()
+
+
+@pytest.mark.skipif(not _powershell_available(), reason="Windows PowerShell is required")
+def test_frontend_group_preserves_diagnostics_when_vitest_omits_report(tmp_path: Path) -> None:
+    repository_root, script, web_root = _make_gate_fixture(tmp_path)
+    result_dir = tmp_path / "results"
+    collected = _run_gate(result_dir, "-Collect", script=script, repository_root=repository_root)
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    environment = _fake_npm_environment(tmp_path, result_dir / "frontend-manifest.json", web_root)
+    environment["FAKE_VITEST_GROUP"] = "theme"
+    environment["FAKE_VITEST_NO_REPORT"] = "1"
+
+    run = _run_gate(result_dir, "-Group", "theme", env=environment, script=script, repository_root=repository_root)
+
+    output = run.stdout + run.stderr
+    run_log = result_dir / "theme.run.txt"
+    assert run.returncode != 0
+    assert "theme did not produce a Vitest JSON report (exit code 23)" in output
+    assert run_log.exists()
+    assert "fake Vitest intentionally omitted its report" in run_log.read_text(encoding="utf-16")
 
 
 @pytest.mark.skipif(not _powershell_available(), reason="Windows PowerShell is required")

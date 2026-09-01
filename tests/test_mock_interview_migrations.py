@@ -116,11 +116,24 @@ def test_0016_preserves_formal_interview_notes_but_creates_no_legacy_mock_data(t
     _write_legacy_mock_database(path)
     connection = sqlite3.connect(path)
     try:
-        connection.execute(
-            "CREATE TABLE interview_notes (id INTEGER PRIMARY KEY, company TEXT NOT NULL, position TEXT NOT NULL)"
-        )
-        connection.execute(
-            "INSERT INTO interview_notes(id, company, position) VALUES (1, '公司', '职位')"
+        connection.executescript(
+            """
+            CREATE TABLE interview_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                application_id INTEGER,
+                company TEXT NOT NULL,
+                position TEXT NOT NULL,
+                round TEXT NOT NULL DEFAULT '',
+                date TEXT NOT NULL DEFAULT '',
+                questions TEXT NOT NULL DEFAULT '',
+                self_reflection TEXT NOT NULL DEFAULT '',
+                difficulty_points TEXT NOT NULL DEFAULT '',
+                mood TEXT NOT NULL DEFAULT '',
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO interview_notes(id, company, position)
+            VALUES (1, '公司', '职位');
+            """
         )
         connection.commit()
     finally:

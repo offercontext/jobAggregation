@@ -21,7 +21,6 @@ from sqlalchemy import delete, func, select
 
 from offerpilot.ai.agent_contracts import ChatModel
 from offerpilot.ai.tool_runtime.contracts import ProviderToolContract
-from offerpilot.ai.tool_specs import build_model_tool_catalog
 from offerpilot.ai.interview_preparation_proposals import (
     InterviewPreparationModelError,
     validate_interview_preparation,
@@ -2373,16 +2372,16 @@ def run_interview_story_smoke(
         if real_ai:
             _copy_real_ai_config(source_data_dir, isolated_data_dir)
         story_model = None if real_ai else _InterviewStorySmokeChatModel()
-        story_provider_tool_names = tuple(
-            contract.name
-            for contract in build_model_tool_catalog().provider_contracts()
-        )
         app = create_app(
             data_dir=isolated_data_dir,
             static_dir=static_dir,
             chat_model=story_model,
         )
         runtime = app.state.pilot_runtime
+        story_provider_tool_names = tuple(
+            contract.name
+            for contract in runtime.metadata_bundle.provider_view().ordered_contracts
+        )
         manifest_counts = (
             len(runtime.metadata_bundle.legacy_boundary().ordered_adapter_bindings),
             len(runtime.metadata_bundle.compensation_view().ordered_handler_bindings),

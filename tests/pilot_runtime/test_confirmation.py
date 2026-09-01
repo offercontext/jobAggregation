@@ -3162,7 +3162,10 @@ def test_slow_stream_drops_late_chained_pending_after_fallback_delivery() -> Non
         prepared,
         event_sink=Sink(),
         signal_sink=None,
-        execution_host=SseAgentExecutionHost(timeout_seconds=2, poll_seconds=0.005),
+        # The timeout is the behavior under test; keep enough startup margin that
+        # thread scheduling under a full-suite load cannot expire it before the
+        # Driver reaches the explicit ``entered`` barrier above.
+        execution_host=SseAgentExecutionHost(timeout_seconds=5, poll_seconds=0.005),
         cancel_check=lambda: False,
     )
 

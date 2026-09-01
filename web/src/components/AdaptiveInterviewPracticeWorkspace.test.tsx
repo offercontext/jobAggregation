@@ -4,16 +4,26 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AdaptivePracticeOwnerDraft } from '@/types/adaptiveInterviewPractice';
 
-const service = vi.hoisted(() => ({ plans: vi.fn(), start: vi.fn(), complete: vi.fn(), focus: vi.fn() }));
+const service = vi.hoisted(() => {
+  class MockAdaptivePracticeError extends Error {
+    code?: string;
+    status?: number;
+    constructor(code?: string, status?: number) { super(code ?? 'unknown'); this.code = code; this.status = status; }
+  }
+  return {
+    plans: vi.fn(),
+    start: vi.fn(),
+    complete: vi.fn(),
+    focus: vi.fn(),
+    AdaptivePracticeError: MockAdaptivePracticeError,
+  };
+});
 
 vi.mock('@/services/adaptiveInterviewPractice', () => ({
   listAdaptivePracticePlans: service.plans,
   startAdaptivePracticeV2: service.start,
   completeAdaptivePractice: service.complete,
-  AdaptivePracticeError: class extends Error {
-    code?: string;
-    constructor(code?: string) { super(code ?? 'unknown'); this.code = code; }
-  },
+  AdaptivePracticeError: service.AdaptivePracticeError,
 }));
 vi.mock('@/features/reviewReadiness/service', () => ({ getReadinessPracticeFocus: service.focus }));
 
@@ -164,6 +174,56 @@ describe('AdaptiveInterviewPracticeWorkspace', () => {
     expect(service.start.mock.calls[0][0].idempotency_key).not.toContain('adaptive-practice');
   });
 
+  it('keeps a coded 503 start draft frozen and retries the exact body', async () => {
+    service.start.mockRejectedValueOnce(new service.AdaptivePracticeError('adaptive_practice_unavailable', 503)).mockResolvedValueOnce(plan);
+    let drafts: Record<string, AdaptivePracticeOwnerDraft> = {};
+    const render = () => root?.render(<ControlledAdaptiveInterviewPracticeWorkspace
+      focus={ownerFocus} ownerGeneration={7} drafts={drafts}
+      onDraftChange={(key: string, draft: AdaptivePracticeOwnerDraft | null) => {
+        drafts = draft ? { ...drafts, [key]: draft } : Object.fromEntries(Object.entries(drafts).filter(([entryKey]) => entryKey !== key));
+        render();
+      }}
+    />);
+    act(render);
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    act(() => [...(container?.querySelectorAll('button') ?? [])].find((button) => button.textContent?.includes('确认这组重点与目标'))?.click());
+    await act(async () => {
+      [...document.body.querySelectorAll('button')].find((button) => button.textContent === '确认开始')?.click();
+      await Promise.resolve(); await Promise.resolve();
+    });
+    const first = service.start.mock.calls[0]?.[0];
+    expect(drafts['practice:7:91:103:new']).toMatchObject({
+      resultUnknown: true, pendingOperation: 'start', startInput: first,
+    });
+    expect(container?.textContent).toContain('开始结果待确认');
+    await act(async () => {
+      [...(container?.querySelectorAll('button') ?? [])].find((button) => button.textContent === '使用原操作重试')?.click();
+      await Promise.resolve(); await Promise.resolve();
+    });
+    expect(service.start.mock.calls[1]?.[0]).toEqual(first);
+  });
+
+  it('clears a deterministic coded 4xx start draft', async () => {
+    service.start.mockRejectedValueOnce(new service.AdaptivePracticeError('adaptive_practice_source_conflict', 409));
+    let drafts: Record<string, AdaptivePracticeOwnerDraft> = {};
+    const render = () => root?.render(<ControlledAdaptiveInterviewPracticeWorkspace
+      focus={ownerFocus} ownerGeneration={7} drafts={drafts}
+      onDraftChange={(key: string, draft: AdaptivePracticeOwnerDraft | null) => {
+        drafts = draft ? { ...drafts, [key]: draft } : Object.fromEntries(Object.entries(drafts).filter(([entryKey]) => entryKey !== key));
+        render();
+      }}
+    />);
+    act(render);
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    act(() => [...(container?.querySelectorAll('button') ?? [])].find((button) => button.textContent?.includes('确认这组重点与目标'))?.click());
+    await act(async () => {
+      [...document.body.querySelectorAll('button')].find((button) => button.textContent === '确认开始')?.click();
+      await Promise.resolve(); await Promise.resolve();
+    });
+    expect(drafts['practice:7:91:103:new']).toBeUndefined();
+    expect(container?.textContent).not.toContain('开始结果待确认');
+  });
+
   it('completes a V2 plan with a bare UUID and semantic self assessment', async () => {
     service.plans.mockResolvedValue([plan]);
     act(() => root?.render(<AdaptiveInterviewPracticeWorkspace focus={ownerFocus} />));
@@ -203,6 +263,39 @@ describe('AdaptiveInterviewPracticeWorkspace', () => {
       await Promise.resolve(); await Promise.resolve();
     });
     expect(service.complete.mock.calls[1][1]).toEqual(first);
+  });
+
+  it('keeps a coded 503 completion draft frozen and retries the exact answer', async () => {
+    service.plans.mockResolvedValue([plan]);
+    service.complete.mockRejectedValueOnce(new service.AdaptivePracticeError('adaptive_practice_unavailable', 503)).mockResolvedValueOnce({ ...plan, status: 'completed', practice_state: 'completed', revision: 2 });
+    let drafts: Record<string, AdaptivePracticeOwnerDraft> = {};
+    const render = () => root?.render(<ControlledAdaptiveInterviewPracticeWorkspace
+      focus={ownerFocus} ownerGeneration={7} drafts={drafts}
+      onDraftChange={(key: string, draft: AdaptivePracticeOwnerDraft | null) => {
+        drafts = draft ? { ...drafts, [key]: draft } : Object.fromEntries(Object.entries(drafts).filter(([entryKey]) => entryKey !== key));
+        render();
+      }}
+    />);
+    act(render);
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    const response = container?.querySelector<HTMLTextAreaElement>('textarea[aria-label="练习回答"]')!;
+    act(() => setTextArea(response, '保留的 503 回答'));
+    act(() => [...(container?.querySelectorAll('button') ?? [])].find((button) => button.textContent?.includes('更清楚了'))?.click());
+    await act(async () => {
+      [...(container?.querySelectorAll('button') ?? [])].find((button) => button.textContent === '完成本次练习')?.click();
+      await Promise.resolve(); await Promise.resolve();
+    });
+    const first = service.complete.mock.calls[0]?.[1];
+    expect(drafts['practice:7:91:103:plan:8']).toMatchObject({
+      resultUnknown: true, pendingOperation: 'complete', completionInput: first,
+      answer: '保留的 503 回答', assessment: 'clearer',
+    });
+    expect((container?.querySelector('textarea[aria-label="练习回答"]') as HTMLTextAreaElement).disabled).toBe(true);
+    await act(async () => {
+      [...(container?.querySelectorAll('button') ?? [])].find((button) => button.textContent === '使用原操作重试')?.click();
+      await Promise.resolve(); await Promise.resolve();
+    });
+    expect(service.complete.mock.calls[1]?.[1]).toEqual(first);
   });
 
   it('fails closed without an explicit target and does not query a recommendation list', async () => {

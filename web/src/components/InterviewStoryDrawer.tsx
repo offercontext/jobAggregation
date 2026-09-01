@@ -280,7 +280,7 @@ function storyProductActionDraft(
 
 function isUnknownResult(error: unknown): boolean {
   if (!(error instanceof InterviewStoryError)) return true;
-  if (error.code === 'story_provider_error' || error.status === 0) return true;
+  if (error.code === 'story_provider_error' || error.code === 'operation_result_unknown' || error.status === 0) return true;
   // Stable contract/source failures intentionally use 5xx/409 response codes
   // but have a machine-readable code and must start a fresh user attempt.
   return error.code === null && error.status >= 500;
@@ -737,8 +737,8 @@ export default function InterviewStoryDrawer({ open, draft, onDraftChange, onClo
       message.success('故事版本已确认保存。');
       return;
     }
-    if (response.status === 'failed' && response.result.error_code === 'story_source_conflict') {
-      onDraftChange(resetAfterSourceConflict(draft, '故事来源已变化，请重新选择并确认。'));
+    if (response.status === 'failed' && response.result.code === 'product_action_story_write_conflict') {
+      onDraftChange(resetAfterSourceConflict(draft, '故事写入发生冲突，请重新选择并确认。'));
     }
   };
 

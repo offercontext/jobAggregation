@@ -67,6 +67,14 @@ function planOwnerKey(generation: number, plan: AdaptivePracticePlan): string {
     : `practice:${generation}:legacy:plan:${plan.id}`;
 }
 
+function isDeterministicClientFailure(cause: unknown): boolean {
+  return cause instanceof AdaptivePracticeError
+    && Boolean(cause.code)
+    && cause.status !== undefined
+    && cause.status >= 400
+    && cause.status < 500;
+}
+
 function emptyDraft(key: string, generation: number, plan?: AdaptivePracticePlan, focus?: AdaptivePracticeFocus): AdaptivePracticeOwnerDraft {
   return {
     ownerKey: key,
@@ -329,7 +337,7 @@ export default function AdaptiveInterviewPracticeWorkspace({ focus, ownerGenerat
       setPendingOperation(null);
     } catch (cause) {
       if (!mounted.current || scopeIdentityRef.current !== requestScope) return;
-      if (cause instanceof AdaptivePracticeError && cause.code) {
+      if (isDeterministicClientFailure(cause)) {
         persistDraft(currentStartKey, null);
         setConfirming(false);
         setResultUnknown(false);
@@ -393,7 +401,7 @@ export default function AdaptiveInterviewPracticeWorkspace({ focus, ownerGenerat
       message.success('练习已完成并保存');
     } catch (cause) {
       if (!mounted.current || scopeIdentityRef.current !== requestScope) return;
-      if (cause instanceof AdaptivePracticeError && cause.code) {
+      if (isDeterministicClientFailure(cause)) {
         persistDraft(currentPlanKey, null);
         setResultUnknown(false);
         setPendingOperation(null);

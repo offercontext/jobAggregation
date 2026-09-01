@@ -314,6 +314,83 @@ describe('InterviewStoryDrawer', () => {
     vi.useRealTimers();
   });
 
+  it.each([
+    { label: 'the coded error Attempt', existingAttemptId: null, errorAttemptId: 73, expectedAttemptId: 73 },
+    { label: 'the persisted draft Attempt', existingAttemptId: 52, errorAttemptId: null, expectedAttemptId: 52 },
+  ])('preserves $label and the frozen proposal identity after a coded operation-result-unknown response', async ({
+    existingAttemptId,
+    errorAttemptId,
+    expectedAttemptId,
+  }) => {
+    const frozenInput = {
+      target_story_id: null,
+      expected_current_version_id: null,
+      expected_story_revision: null,
+      selections: [{ source_kind: 'interview_note' as const, source_id: 4, path: '/questions' }],
+      assertions: ['I personally owned this work.'],
+      idempotency_key: 'story-unknown-operation-key',
+    };
+    let current: InterviewStoryDraft = {
+      ...createInterviewStoryDraft('ui'),
+      idempotencyKey: frozenInput.idempotency_key,
+      attemptId: existingAttemptId,
+      proposalInput: frozenInput,
+      resultUnknown: true,
+      retryAvailableAt: 0,
+      pendingOperation: 'generate',
+      error: 'AI 结果待确认，请使用原尝试重试。',
+    };
+    const render = () => root?.render(<InterviewStoryDrawer open draft={current} onDraftChange={(draft) => {
+      if (draft) {
+        current = draft;
+        render();
+      }
+    }} onClose={() => {}} />);
+    storyService.proposal
+      .mockRejectedValueOnce(new storyService.StoryError(503, 'operation_result_unknown', errorAttemptId, 0))
+      .mockResolvedValueOnce({
+        id: expectedAttemptId,
+        attempt_status: 'ready',
+        generation_revision: 1,
+        source_fingerprint: 'fingerprint',
+        proposal: {
+          proposal_status: 'normal',
+          content: {
+            title: { id: 'title', text: '排查延迟' },
+            blocks: [],
+            capability_labels: [],
+            applicable_questions: [],
+            fact_gap_codes: [],
+          },
+          evidence_links: [],
+        },
+      });
+
+    act(render);
+    await act(async () => {
+      [...document.body.querySelectorAll('button')].find((button) => button.textContent === '使用原尝试重试')?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(current.resultUnknown).toBe(true);
+    expect(current.attemptId).toBe(expectedAttemptId);
+    expect(current.proposalInput).toEqual(frozenInput);
+    expect(current.idempotencyKey).toBe(frozenInput.idempotency_key);
+
+    await act(async () => {
+      [...document.body.querySelectorAll('button')].find((button) => button.textContent === '使用原尝试重试')?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(storyService.proposal).toHaveBeenCalledTimes(2);
+    expect(storyService.proposal.mock.calls[0]?.[0]).toEqual(frozenInput);
+    expect(storyService.proposal.mock.calls[1]?.[0]).toEqual(frozenInput);
+    expect(current.attemptId).toBe(expectedAttemptId);
+    expect(current.resultUnknown).toBe(false);
+  });
+
   it('replays an unknown confirmation with the original token and selected content', async () => {
     const proposal = {
       proposal_status: 'normal' as const,
@@ -366,7 +443,7 @@ describe('InterviewStoryDrawer', () => {
     expect(storyService.confirm.mock.calls[1]?.[1]).toEqual(initialPayload);
   });
 
-  it('preserves authored content and assertions while requiring a fresh source selection after a source conflict', async () => {
+  it('preserves authored content and assertions while requiring a fresh Attempt after a canonical Story CAS failure', async () => {
     const proposal = {
       proposal_status: 'normal' as const,
       content: {
@@ -398,13 +475,18 @@ describe('InterviewStoryDrawer', () => {
         render();
       }
     }} onClose={() => {}} />);
-    storyService.confirm.mockRejectedValueOnce(new storyService.StoryError(409, 'story_source_conflict'));
+    storyService.confirm.mockRejectedValueOnce(new storyService.StoryError(409, 'product_action_story_write_conflict'));
     actionService.state.mockResolvedValueOnce({
       schema_version: 1,
       operation_id: 'story-operation-1',
       action_name: 'confirm_interview_story',
       status: 'failed',
-      result: { error_code: 'story_source_conflict' },
+      result: {
+        schema_version: 1,
+        action_name: 'confirm_interview_story',
+        outcome: 'failed',
+        code: 'product_action_story_write_conflict',
+      },
     });
 
     act(render);

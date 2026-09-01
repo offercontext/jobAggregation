@@ -18,16 +18,25 @@ const COPY: Record<string, string> = {
 };
 
 export class AdaptivePracticeError extends Error {
-  constructor(public readonly code?: string) {
+  constructor(public readonly code?: string, public readonly status?: number) {
     super(code && COPY[code] ? COPY[code] : '复盘训练暂时不可用，请稍后重试。');
     this.name = 'AdaptivePracticeError';
   }
 }
 
 function safeError(error: unknown): AdaptivePracticeError {
-  const data = axios.isAxiosError(error) ? error.response?.data : undefined;
+  const response = axios.isAxiosError(error)
+    ? error.response
+    : (error as { response?: { status?: unknown; data?: unknown } } | null)?.response;
+  const data = response?.data as { error_code?: unknown } | undefined;
   const code = typeof data?.error_code === 'string' ? data.error_code : undefined;
-  return new AdaptivePracticeError(code);
+  const status = typeof response?.status === 'number'
+    && Number.isInteger(response.status)
+    && response.status >= 100
+    && response.status <= 599
+    ? response.status
+    : undefined;
+  return new AdaptivePracticeError(code, status);
 }
 
 export async function listAdaptivePracticeRecommendations(): Promise<AdaptivePracticeRecommendation[]> {

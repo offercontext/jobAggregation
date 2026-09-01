@@ -19,15 +19,48 @@ param(
   [string]$CompletionSignalPath,
   [string]$SessionStatePath,
   [string]$CleanupAuditPath,
-  [switch]$ForceAuditorStartupCleanupFailureForTest
+  [switch]$ForceAuditorStartupCleanupFailureForTest,
+  [int]$ForceChromiumStartupExitFailuresForTest = 0,
+  [int]$ForceChromiumStartupTimeoutFailuresForTest = 0,
+  [int]$ForceChromiumStartupLateReadyFailuresForTest = 0,
+  [int]$ChromiumStartupDeadlineMillisecondsForTest = 0,
+  [switch]$ForceChromiumStartupCleanupFailureForTest
 )
 
 $ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Net.Http
+
+if ($ForceChromiumStartupExitFailuresForTest -lt 0 -or $ForceChromiumStartupExitFailuresForTest -gt 3) {
+  throw 'ForceChromiumStartupExitFailuresForTest must be between zero and three.'
+}
+if ($ForceChromiumStartupTimeoutFailuresForTest -lt 0 -or $ForceChromiumStartupTimeoutFailuresForTest -gt 3) {
+  throw 'ForceChromiumStartupTimeoutFailuresForTest must be between zero and three.'
+}
+if ($ForceChromiumStartupLateReadyFailuresForTest -lt 0 -or $ForceChromiumStartupLateReadyFailuresForTest -gt 3) {
+  throw 'ForceChromiumStartupLateReadyFailuresForTest must be between zero and three.'
+}
+$chromiumStartupFaultModeCount = @(
+  $ForceChromiumStartupExitFailuresForTest,
+  $ForceChromiumStartupTimeoutFailuresForTest,
+  $ForceChromiumStartupLateReadyFailuresForTest
+).Where({ $_ -gt 0 }).Count
+if ($chromiumStartupFaultModeCount -gt 1) {
+  throw 'Only one Chromium startup fault mode can be enabled per test run.'
+}
+if ($ChromiumStartupDeadlineMillisecondsForTest -ne 0 -and (
+  $ChromiumStartupDeadlineMillisecondsForTest -lt 100 -or
+  $ChromiumStartupDeadlineMillisecondsForTest -gt 5000
+)) {
+  throw 'ChromiumStartupDeadlineMillisecondsForTest must be zero or between 100 and 5000.'
+}
+if ($ChromiumStartupDeadlineMillisecondsForTest -gt 0 -and $ForceChromiumStartupLateReadyFailuresForTest -eq 0) {
+  throw 'ChromiumStartupDeadlineMillisecondsForTest requires ForceChromiumStartupLateReadyFailuresForTest.'
+}
 
 $repo = Split-Path -Parent $PSScriptRoot
 $sourceData = if ($env:OFFERPILOT_DATA) { $env:OFFERPILOT_DATA } else { Join-Path $HOME '.offerpilot' }
 $tempData = Join-Path ([IO.Path]::GetTempPath()) ('offerpilot-interview-story-' + [Guid]::NewGuid().ToString('N'))
-$browserProfile = Join-Path $tempData 'browser-profile'
+$browserProfile = $null
 $browserAudit = Join-Path $tempData 'browser-network.jsonl'
 $browserStop = Join-Path $tempData 'browser-network.stop'
 $browserReady = Join-Path $tempData 'browser-network.ready'
@@ -38,6 +71,7 @@ $providerAllowlist = Join-Path $tempData 'provider-allowlist.json'
 $server = $null
 $proxy = $null
 $browser = $null
+$browserStartupAttempt = $null
 $auditor = $null
 $previousData = $env:OFFERPILOT_DATA
 $previousHttpProxy = $env:HTTP_PROXY
@@ -50,6 +84,14 @@ function Get-FreePort {
   $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
   try { $listener.Start(); return ([Net.IPEndPoint]$listener.LocalEndpoint).Port }
   finally { $listener.Stop() }
+}
+
+function Get-DistinctFreePort([System.Collections.Generic.HashSet[int]]$reservedPorts) {
+  for ($attempt = 0; $attempt -lt 100; $attempt++) {
+    $candidate = Get-FreePort
+    if ($reservedPorts.Add($candidate)) { return $candidate }
+  }
+  throw 'Could not allocate a distinct local port for Chromium CDP.'
 }
 
 function Assert-ExitCode([string]$label) {
@@ -141,7 +183,259 @@ function Get-ProcessDiagnostic([string]$stdoutPath, [string]$stderrPath) {
   }
   $text = ($lines -join [Environment]::NewLine).Trim()
   if ([string]::IsNullOrWhiteSpace($text)) { return 'no local diagnostic output' }
-  return $text.Substring(0, [Math]::Min($text.Length, 4096))
+  $start = [Math]::Max(0, $text.Length - 4096)
+  return $text.Substring($start)
+}
+
+function Wait-ForChromiumCdpReady([object]$process, [string]$uri, [int]$deadlineMilliseconds) {
+  $deadline = [DateTime]::UtcNow.AddMilliseconds($deadlineMilliseconds)
+  $handler = [Net.Http.HttpClientHandler]::new()
+  $handler.UseProxy = $false
+  $client = [Net.Http.HttpClient]::new($handler)
+  try {
+    while ($true) {
+      $now = [DateTime]::UtcNow
+      if ($now -ge $deadline) {
+        return [pscustomobject]@{ Outcome = 'timed_out'; DeadlineMilliseconds = $deadlineMilliseconds }
+      }
+      $process.Refresh()
+      if ($process.HasExited) {
+        return [pscustomobject]@{ Outcome = 'exited'; DeadlineMilliseconds = $deadlineMilliseconds }
+      }
+
+      $remainingMilliseconds = [int][Math]::Max(1, [Math]::Ceiling(($deadline - $now).TotalMilliseconds))
+      $cancellation = [Threading.CancellationTokenSource]::new()
+      $response = $null
+      try {
+        $cancellation.CancelAfter($remainingMilliseconds)
+        $response = $client.GetAsync($uri, $cancellation.Token).GetAwaiter().GetResult()
+        if ([DateTime]::UtcNow -ge $deadline) {
+          return [pscustomobject]@{ Outcome = 'timed_out'; DeadlineMilliseconds = $deadlineMilliseconds }
+        }
+        $response.EnsureSuccessStatusCode()
+        $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        if ([DateTime]::UtcNow -ge $deadline) {
+          return [pscustomobject]@{ Outcome = 'timed_out'; DeadlineMilliseconds = $deadlineMilliseconds }
+        }
+        $version = $body | ConvertFrom-Json -ErrorAction Stop
+        if ([DateTime]::UtcNow -ge $deadline) {
+          return [pscustomobject]@{ Outcome = 'timed_out'; DeadlineMilliseconds = $deadlineMilliseconds }
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$version.webSocketDebuggerUrl)) {
+          return [pscustomobject]@{ Outcome = 'ready'; DeadlineMilliseconds = $deadlineMilliseconds }
+        }
+      } catch {
+        if ([DateTime]::UtcNow -ge $deadline) {
+          return [pscustomobject]@{ Outcome = 'timed_out'; DeadlineMilliseconds = $deadlineMilliseconds }
+        }
+      } finally {
+        if ($null -ne $response) { $response.Dispose() }
+        $cancellation.Dispose()
+      }
+
+      $sleepMilliseconds = [int][Math]::Min(
+        250,
+        [Math]::Max(1, [Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalMilliseconds))
+      )
+      if ([DateTime]::UtcNow -lt $deadline) {
+        Start-Sleep -Milliseconds $sleepMilliseconds
+      }
+    }
+  } finally {
+    $client.Dispose()
+  }
+}
+
+function Remove-ChromiumAttemptProfile([string]$profile) {
+  if (Test-Path -LiteralPath $profile) {
+    Remove-Item -LiteralPath $profile -Recurse -Force -ErrorAction Stop
+  }
+  if (Test-Path -LiteralPath $profile) {
+    throw "Chromium startup profile still exists after cleanup: $profile"
+  }
+}
+
+function Start-DedicatedChromium([string]$chromium, [int[]]$reservedPortValues) {
+  $reservedPorts = [System.Collections.Generic.HashSet[int]]::new()
+  foreach ($reservedPort in $reservedPortValues) { [void]$reservedPorts.Add($reservedPort) }
+  $attemptDiagnostics = [System.Collections.Generic.List[string]]::new()
+
+  for ($attempt = 1; $attempt -le 3; $attempt++) {
+    $deadlineMilliseconds = if (
+      $attempt -le $ForceChromiumStartupLateReadyFailuresForTest -and
+      $ChromiumStartupDeadlineMillisecondsForTest -gt 0
+    ) {
+      $ChromiumStartupDeadlineMillisecondsForTest
+    } else {
+      20000
+    }
+    $deadlineSecondsLabel = ($deadlineMilliseconds / 1000.0).ToString(
+      '0.###',
+      [Globalization.CultureInfo]::InvariantCulture
+    )
+    $attemptPort = Get-DistinctFreePort $reservedPorts
+    $attemptProfile = Join-Path $tempData "browser-profile-attempt-$attempt"
+    $attemptStdout = Join-Path $tempData "chromium-startup-attempt-$attempt.stdout.log"
+    $attemptStderr = Join-Path $tempData "chromium-startup-attempt-$attempt.stderr.log"
+    New-Item -ItemType Directory -Force -Path $attemptProfile | Out-Null
+    $process = $null
+    $outcome = 'launch_error'
+    $launchDiagnostic = $null
+    $observedExitCode = $null
+    $readinessElapsedMilliseconds = 0
+    $lateReadyStubReady = $null
+    try {
+      if ($attempt -le $ForceChromiumStartupExitFailuresForTest) {
+        $faultScript = Join-Path $tempData "forced-chromium-startup-exit-$attempt.py"
+        [IO.File]::WriteAllText(
+          $faultScript,
+          "import sys, time`nprint('forced Chromium startup exit', file=sys.stderr, flush=True)`ntime.sleep(0.25)`nraise SystemExit(73)`n",
+          [Text.UTF8Encoding]::new($false)
+        )
+        $process = Start-Process -FilePath $projectPython -WorkingDirectory $repo -WindowStyle Hidden -PassThru -ArgumentList @($faultScript) -RedirectStandardOutput $attemptStdout -RedirectStandardError $attemptStderr
+      } elseif ($attempt -le $ForceChromiumStartupTimeoutFailuresForTest) {
+        $faultScript = Join-Path $tempData "forced-chromium-startup-timeout-$attempt.py"
+        [IO.File]::WriteAllText(
+          $faultScript,
+          "import sys, time`nprint('forced Chromium startup timeout', file=sys.stderr, flush=True)`ntime.sleep(60)`n",
+          [Text.UTF8Encoding]::new($false)
+        )
+        $process = Start-Process -FilePath $projectPython -WorkingDirectory $repo -WindowStyle Hidden -PassThru -ArgumentList @($faultScript) -RedirectStandardOutput $attemptStdout -RedirectStandardError $attemptStderr
+      } elseif ($attempt -le $ForceChromiumStartupLateReadyFailuresForTest) {
+        $faultScript = Join-Path $tempData "forced-chromium-startup-late-ready-$attempt.py"
+        $lateReadyStubReady = Join-Path $tempData "forced-chromium-startup-late-ready-$attempt.ready"
+        [IO.File]::WriteAllText(
+          $faultScript,
+          @'
+import http.server
+import json
+import pathlib
+import sys
+import time
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, _format, *_args):
+        return
+
+    def do_GET(self):
+        print("forced Chromium late-ready CDP stub accepted request", file=sys.stderr, flush=True)
+        time.sleep(0.35)
+        payload = json.dumps(
+            {"webSocketDebuggerUrl": "ws://127.0.0.1:1/devtools/browser/late"}
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+server = http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler)
+pathlib.Path(sys.argv[2]).write_text("ready", encoding="utf-8")
+print("forced Chromium late-ready CDP stub listening", file=sys.stderr, flush=True)
+server.handle_request()
+'@,
+          [Text.UTF8Encoding]::new($false)
+        )
+        $process = Start-Process -FilePath $projectPython -WorkingDirectory $repo -WindowStyle Hidden -PassThru -ArgumentList @($faultScript, [string]$attemptPort, $lateReadyStubReady) -RedirectStandardOutput $attemptStdout -RedirectStandardError $attemptStderr
+      } else {
+        $process = Start-Process -FilePath $chromium -PassThru -ArgumentList @(
+          "--remote-debugging-port=$attemptPort",
+          "--user-data-dir=$attemptProfile",
+          '--no-first-run',
+          '--no-default-browser-check',
+          '--remote-allow-origins=*',
+          '--window-size=1455,1200',
+          '--force-color-profile=srgb',
+          '--enable-logging=stderr',
+          'about:blank'
+        ) -RedirectStandardOutput $attemptStdout -RedirectStandardError $attemptStderr
+      }
+      [void]$process.Handle
+      $script:browserStartupAttempt = $process
+      if ($null -ne $lateReadyStubReady) {
+        $stubDeadline = [DateTime]::UtcNow.AddSeconds(5)
+        while (-not (Test-Path -LiteralPath $lateReadyStubReady)) {
+          $process.Refresh()
+          if ($process.HasExited) { throw 'Forced Chromium late-ready CDP stub exited before listening.' }
+          if ([DateTime]::UtcNow -ge $stubDeadline) { throw 'Forced Chromium late-ready CDP stub did not begin listening.' }
+          Start-Sleep -Milliseconds 10
+        }
+      }
+      $readinessStopwatch = [Diagnostics.Stopwatch]::StartNew()
+      $readiness = Wait-ForChromiumCdpReady $process "http://127.0.0.1:$attemptPort/json/version" $deadlineMilliseconds
+      $readinessStopwatch.Stop()
+      $readinessElapsedMilliseconds = [int]$readinessStopwatch.ElapsedMilliseconds
+      $outcome = [string]$readiness.Outcome
+      if ($outcome -eq 'exited') {
+        $process.WaitForExit()
+        $process.Refresh()
+        $observedExitCode = $process.ExitCode
+      }
+      if ($outcome -eq 'ready') {
+        foreach ($diagnostic in $attemptDiagnostics) {
+          Write-Host "Dedicated Chromium startup retry diagnostic: $diagnostic"
+        }
+        return [pscustomobject]@{
+          Process = $process
+          Port = $attemptPort
+          Profile = $attemptProfile
+          Attempt = $attempt
+        }
+      }
+    } catch {
+      $outcome = 'launch_error'
+      $launchDiagnostic = $_.Exception.Message
+    }
+
+    $exitCode = 'not_available'
+    if ($null -ne $observedExitCode) {
+      $exitCode = [string]$observedExitCode
+    }
+    $localDiagnostic = Get-ProcessDiagnostic $attemptStdout $attemptStderr
+    if (-not [string]::IsNullOrWhiteSpace($launchDiagnostic)) {
+      $localDiagnostic = "$launchDiagnostic | $localDiagnostic"
+    }
+    try {
+      if ($null -ne $process) { Stop-Tree $process "Chromium startup attempt $attempt" }
+      if ($null -eq $observedExitCode -and $null -ne $process) {
+        $process.Refresh()
+        if ($process.HasExited) {
+          $process.WaitForExit()
+          $exitCode = [string]$process.ExitCode
+        }
+      }
+      if ($ForceChromiumStartupCleanupFailureForTest -and $attempt -eq 1) {
+        throw "Forced Chromium startup cleanup failure for test after attempt $attempt."
+      }
+      Remove-ChromiumAttemptProfile $attemptProfile
+    } catch {
+      $cleanupError = $_.Exception.Message
+      if ($exitCode -eq 'not_available' -and $null -ne $process) {
+        try {
+          $process.Refresh()
+          if ($process.HasExited) {
+            $process.WaitForExit()
+            $exitCode = [string]$process.ExitCode
+          }
+        } catch { }
+      }
+      $failedCleanupDiagnostic = "attempt=$attempt; outcome=$outcome; port=$attemptPort; profile=$attemptProfile; exit_code=$exitCode; deadline_seconds=$deadlineSecondsLabel; deadline_milliseconds=$deadlineMilliseconds; readiness_elapsed_ms=$readinessElapsedMilliseconds; cleanup=failed; diagnostic=$localDiagnostic; cleanup_error=$cleanupError"
+      [Console]::Error.WriteLine("Dedicated Chromium startup cleanup diagnostic: $failedCleanupDiagnostic")
+      throw "Chromium startup attempt $attempt cleanup failed; refusing another launch."
+    }
+    $script:browserStartupAttempt = $null
+
+    $attemptDiagnostics.Add(
+      "attempt=$attempt; outcome=$outcome; port=$attemptPort; profile=$attemptProfile; exit_code=$exitCode; deadline_seconds=$deadlineSecondsLabel; deadline_milliseconds=$deadlineMilliseconds; readiness_elapsed_ms=$readinessElapsedMilliseconds; cleanup=complete; diagnostic=$localDiagnostic"
+    )
+  }
+
+  foreach ($diagnostic in $attemptDiagnostics) {
+    [Console]::Error.WriteLine("Dedicated Chromium startup failure diagnostic: $diagnostic")
+  }
+  throw 'Dedicated Chromium CDP endpoint did not become ready after three bounded attempts.'
 }
 
 function Start-BrowserAuditor([string]$cdpUrl, [string]$expectedUrl, [ref]$trackedAuditor) {
@@ -789,7 +1083,6 @@ try {
 
   $port = Get-FreePort
   $proxyPort = Get-FreePort
-  $cdpPort = Get-FreePort
   $baseUrl = "http://127.0.0.1:$port"
   $env:OFFERPILOT_DATA = $tempData
   $env:HTTP_PROXY = "http://127.0.0.1:$proxyPort"
@@ -802,8 +1095,11 @@ try {
   $seed = Seed-StoryContext
   $baseline = Get-ForbiddenDomainSnapshot
   $chromium = Find-Chromium
-  $browser = Start-Process -FilePath $chromium -PassThru -ArgumentList @("--remote-debugging-port=$cdpPort", "--user-data-dir=$browserProfile", '--no-first-run', '--no-default-browser-check', '--remote-allow-origins=*', '--window-size=1455,1200', '--force-color-profile=srgb', 'about:blank')
-  Wait-ForHttpReady $browser "http://127.0.0.1:$cdpPort/json/version" 'Dedicated Chromium CDP endpoint' | Out-Null
+  $chromiumHandle = Start-DedicatedChromium $chromium @($port, $proxyPort)
+  $browser = $chromiumHandle.Process
+  $browserProfile = $chromiumHandle.Profile
+  $cdpPort = $chromiumHandle.Port
+  $browserStartupAttempt = $null
   $auditorHandle = Start-BrowserAuditor "http://127.0.0.1:$cdpPort" $baseUrl ([ref]$auditor)
   $auditor = $auditorHandle.Process
   if (-not [string]::IsNullOrWhiteSpace($SessionStatePath)) {
@@ -814,6 +1110,8 @@ try {
       auditor_session_id = $auditorHandle.SessionId
       completion_signal_path = $CompletionSignalPath
       temp_data_path = $tempData
+      browser_profile = $browserProfile
+      chromium_startup_attempt = $chromiumHandle.Attempt
     } | ConvertTo-Json -Compress
     [IO.File]::WriteAllText($SessionStatePath, $sessionState, [Text.UTF8Encoding]::new($false))
   }
@@ -879,12 +1177,19 @@ finally {
     try { New-Item -ItemType File -Force -Path $browserStop -ErrorAction Stop | Out-Null }
     catch { $cleanupErrors.Add('browser auditor stop signal') }
   }
-  foreach ($item in @(
+  $processesToClean = @(
     [pscustomobject]@{ Process = $auditor; Label = 'browser auditor' },
     [pscustomobject]@{ Process = $browser; Label = 'dedicated browser' },
     [pscustomobject]@{ Process = $server; Label = 'isolated service' },
     [pscustomobject]@{ Process = $proxy; Label = 'provider proxy' }
-  )) {
+  )
+  if ($null -ne $browserStartupAttempt) {
+    $processesToClean = @(
+      [pscustomobject]@{ Process = $browserStartupAttempt; Label = 'browser startup attempt' }
+      $processesToClean
+    )
+  }
+  foreach ($item in $processesToClean) {
     $processId = if ($null -eq $item.Process) { $null } else { [int]$item.Process.Id }
     try { Stop-Tree $item.Process $item.Label }
     catch { $cleanupErrors.Add([string]$item.Label) }

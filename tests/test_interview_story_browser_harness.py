@@ -6,9 +6,11 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import struct
 from contextlib import suppress
+import time
 import zlib
 
 import pytest
@@ -1011,6 +1013,198 @@ def test_story_browser_harness_starts_audited_chromium_before_honoring_completio
     assert state["base_url"].startswith("http://127.0.0.1:")
     assert state["cdp_url"].startswith("http://127.0.0.1:")
     assert not Path(state["temp_data_path"]).exists()
+
+
+def _run_faulted_chromium_startup(
+    tmp_path: Path,
+    *fault_args: str,
+    with_completion_signal: bool = True,
+) -> tuple[subprocess.CompletedProcess[str], Path, Path, set[str], float]:
+    source_data = tmp_path / "configured-data"
+    source_data.mkdir()
+    (source_data / "config.json").write_text(
+        json.dumps(
+            {
+                "active_provider_id": "browser-harness-stub",
+                "providers": [
+                    {
+                        "id": "browser-harness-stub",
+                        "enabled": True,
+                        "base_url": "https://provider.example",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    completion_signal = tmp_path / "complete.signal"
+    if with_completion_signal:
+        completion_signal.touch()
+    session_state = tmp_path / "story-browser-session.json"
+    cleanup_audit = tmp_path / "cleanup-audit.json"
+    environment = dict(os.environ)
+    environment["OFFERPILOT_DATA"] = str(source_data)
+    before = {path.name for path in Path(os.environ["TEMP"]).glob("offerpilot-interview-story-*")}
+
+    started = time.monotonic()
+    result = _run_harness(
+        "-CompletionSignalPath",
+        str(completion_signal),
+        "-SessionStatePath",
+        str(session_state),
+        "-CleanupAuditPath",
+        str(cleanup_audit),
+        *fault_args,
+        env=environment,
+    )
+    return result, session_state, cleanup_audit, before, time.monotonic() - started
+
+
+def _chromium_attempt_records(output: str) -> list[tuple[int, str, int, str]]:
+    return [
+        (int(attempt), outcome, int(port), profile)
+        for attempt, outcome, port, profile in re.findall(
+            r"attempt=(\d+); outcome=(exited|timed_out); port=(\d+); profile=([^;\r\n]+)",
+            output,
+        )
+    ]
+
+
+def test_story_browser_harness_retries_an_exited_chromium_with_a_new_port_and_profile(tmp_path: Path) -> None:
+    result, session_state, _cleanup_audit, before, _elapsed = _run_faulted_chromium_startup(
+        tmp_path,
+        "-ForceChromiumStartupExitFailuresForTest",
+        "1",
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "Dedicated browser target is ready" in output
+    assert "Browser did not execute one UI and one Pilot Story proposal sequence" in output
+    assert "exit_code=73" in output
+    assert "forced Chromium startup exit" in output
+    attempts = _chromium_attempt_records(output)
+    assert len(attempts) == 1
+    assert attempts[0][0:2] == (1, "exited")
+    assert "cleanup=complete" in output
+    state = json.loads(session_state.read_text(encoding="utf-8"))
+    assert state["chromium_startup_attempt"] == 2
+    assert state["browser_profile"].endswith("browser-profile-attempt-2")
+    assert int(state["cdp_url"].rsplit(":", 1)[1]) != attempts[0][2]
+    assert state["browser_profile"] != attempts[0][3]
+    assert not Path(state["temp_data_path"]).exists()
+    after = {path.name for path in Path(os.environ["TEMP"]).glob("offerpilot-interview-story-*")}
+    assert after == before
+
+
+def test_story_browser_harness_aggregates_three_exited_chromium_attempts(tmp_path: Path) -> None:
+    result, session_state, cleanup_audit, before, _elapsed = _run_faulted_chromium_startup(
+        tmp_path,
+        "-ForceChromiumStartupExitFailuresForTest",
+        "3",
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "Dedicated Chromium CDP endpoint did not become ready after three bounded attempts" in output
+    assert "Dedicated browser target is ready" not in output
+    attempts = _chromium_attempt_records(output)
+    assert [attempt for attempt, _outcome, _port, _profile in attempts] == [1, 2, 3]
+    assert all(outcome == "exited" for _attempt, outcome, _port, _profile in attempts)
+    assert len({port for _attempt, _outcome, port, _profile in attempts}) == 3
+    assert len({profile for _attempt, _outcome, _port, profile in attempts}) == 3
+    assert output.count("exit_code=73") == 3
+    assert output.count("cleanup=complete") == 3
+    assert not session_state.exists()
+    cleanup = json.loads(cleanup_audit.read_text(encoding="utf-8"))
+    assert all(record["exited"] is True for record in cleanup["processes"])
+    after = {path.name for path in Path(os.environ["TEMP"]).glob("offerpilot-interview-story-*")}
+    assert after == before
+
+
+def test_story_browser_harness_retries_after_a_fixed_chromium_cdp_deadline(tmp_path: Path) -> None:
+    result, session_state, _cleanup_audit, before, elapsed = _run_faulted_chromium_startup(
+        tmp_path,
+        "-ForceChromiumStartupTimeoutFailuresForTest",
+        "1",
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "Dedicated browser target is ready" in output
+    attempts = _chromium_attempt_records(output)
+    assert len(attempts) == 1
+    assert attempts[0][0:2] == (1, "timed_out")
+    assert "deadline_seconds=20" in output
+    assert "cleanup=complete" in output
+    readiness_elapsed_match = re.search(r"readiness_elapsed_ms=(\d+)", output)
+    assert readiness_elapsed_match is not None
+    assert 18_000 <= int(readiness_elapsed_match.group(1)) <= 25_000
+    assert elapsed >= 18
+    state = json.loads(session_state.read_text(encoding="utf-8"))
+    assert state["chromium_startup_attempt"] == 2
+    assert int(state["cdp_url"].rsplit(":", 1)[1]) != attempts[0][2]
+    assert state["browser_profile"] != attempts[0][3]
+    assert not Path(state["temp_data_path"]).exists()
+    after = {path.name for path in Path(os.environ["TEMP"]).glob("offerpilot-interview-story-*")}
+    assert after == before
+
+
+def test_story_browser_harness_rejects_a_cdp_response_that_arrives_after_the_deadline(tmp_path: Path) -> None:
+    result, session_state, _cleanup_audit, before, _elapsed = _run_faulted_chromium_startup(
+        tmp_path,
+        "-ForceChromiumStartupLateReadyFailuresForTest",
+        "1",
+        "-ChromiumStartupDeadlineMillisecondsForTest",
+        "200",
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "Dedicated browser target is ready" in output
+    attempts = _chromium_attempt_records(output)
+    assert len(attempts) == 1
+    assert attempts[0][0:2] == (1, "timed_out")
+    assert "deadline_milliseconds=200" in output
+    assert "forced Chromium late-ready CDP stub accepted request" in output
+    elapsed_match = re.search(r"readiness_elapsed_ms=(\d+)", output)
+    assert elapsed_match is not None
+    assert 100 <= int(elapsed_match.group(1)) <= 1_500
+    state = json.loads(session_state.read_text(encoding="utf-8"))
+    assert state["chromium_startup_attempt"] == 2
+    assert int(state["cdp_url"].rsplit(":", 1)[1]) != attempts[0][2]
+    assert state["browser_profile"] != attempts[0][3]
+    assert not Path(state["temp_data_path"]).exists()
+    after = {path.name for path in Path(os.environ["TEMP"]).glob("offerpilot-interview-story-*")}
+    assert after == before
+
+
+def test_story_browser_harness_fails_closed_when_failed_chromium_cleanup_is_uncertain(tmp_path: Path) -> None:
+    result, session_state, cleanup_audit, before, _elapsed = _run_faulted_chromium_startup(
+        tmp_path,
+        "-ForceChromiumStartupExitFailuresForTest",
+        "1",
+        "-ForceChromiumStartupCleanupFailureForTest",
+    )
+
+    output = result.stdout + result.stderr
+    normalized_output = " ".join(output.split())
+    assert result.returncode != 0
+    assert "Chromium startup attempt 1 cleanup failed; refusing another launch" in normalized_output
+    assert "Forced Chromium startup cleanup failure" in normalized_output
+    attempts = _chromium_attempt_records(output)
+    assert len(attempts) == 1
+    assert attempts[0][0:2] == (1, "exited")
+    assert "exit_code=73" in output
+    assert "diagnostic=forced Chromium startup exit" in output
+    assert "cleanup=failed" in output
+    assert "attempt=2" not in output
+    assert "Dedicated browser target is ready" not in output
+    assert not session_state.exists()
+    cleanup = json.loads(cleanup_audit.read_text(encoding="utf-8"))
+    assert all(record["exited"] is True for record in cleanup["processes"])
+    after = {path.name for path in Path(os.environ["TEMP"]).glob("offerpilot-interview-story-*")}
+    assert after == before
 
 
 def test_story_browser_harness_keeps_a_startup_auditor_handle_for_outer_cleanup() -> None:

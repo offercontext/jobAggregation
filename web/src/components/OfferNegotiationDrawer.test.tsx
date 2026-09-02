@@ -101,6 +101,25 @@ describe('OfferNegotiationDrawer', () => {
     expect(service.create).not.toHaveBeenCalled();
   });
 
+  it('shows the first actionable step before the Offer facts', async () => {
+    await act(async () => { root?.render(<OfferNegotiationDrawer open offer={offer} onClose={vi.fn()} />); });
+
+    const nextStep = host?.querySelector('[data-testid="offer-negotiation-next-step"]');
+    const facts = host?.querySelector('[data-testid="offer-negotiation-input-facts"]');
+    const goal = host?.querySelector<HTMLInputElement>('#negotiation-goal');
+    const concerns = host?.querySelector<HTMLTextAreaElement>('#negotiation-concerns');
+    const scenario = host?.querySelector<HTMLInputElement>('#negotiation-scenario');
+    const button = host?.querySelector<HTMLButtonElement>('[data-testid="offer-negotiation-generate"]');
+
+    expect(nextStep?.textContent).toContain('第 1 步，共 3 步');
+    expect(nextStep?.textContent).toContain('先填写这次谈薪的目标');
+    expect(nextStep?.compareDocumentPosition(facts as Node) ?? 0).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(goal?.placeholder).toContain('固定月薪');
+    expect(concerns?.placeholder).toContain('试用期');
+    expect(scenario?.placeholder).toContain('HR 电话');
+    expect(button?.textContent).toContain('下一步：检查输入');
+  });
+
   it('rejects a directly supplied historical unbound Offer before any negotiation read or write', async () => {
     await act(async () => {
       root?.render(<OfferNegotiationDrawer open offer={{ ...offer, application_id: undefined }} onClose={vi.fn()} />);

@@ -37,6 +37,7 @@ describe('AppShell application task composition', () => {
     expect(appShellSource).toContain(': launchCoreTask(request)');
     expect(applicationDetailSource).toContain('CoreTaskSurfaceHost');
     expect((applicationDetailSource.match(/<CoreTaskSurfaceHost/g) ?? []).length).toBe(1);
+    expect(applicationDetailSource).toContain('revealOnOpen');
     expect(applicationDetailSource).toContain('resolveApplicationTasks');
     expect(applicationDetailSource).not.toContain('const [opportunityFitOpen');
     expect(applicationDetailSource).not.toContain('const [materialKitOpen');

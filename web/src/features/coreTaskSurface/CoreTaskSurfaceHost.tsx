@@ -24,6 +24,8 @@ export interface CoreTaskSurfaceHostProps {
   readonly focusReturnRef?: RefObject<HTMLElement | null>;
   readonly heading?: string;
   readonly className?: string;
+  /** Reveal a newly launched owner when it is mounted below the current viewport. */
+  readonly revealOnOpen?: boolean;
   /** Synchronously reads the exact active owner's mutation guard. */
   readonly closeGuard?: (active: ActiveCoreTask) => CoreTaskCloseGuard;
 }
@@ -61,6 +63,7 @@ export function CoreTaskSurfaceHost({
   focusReturnRef,
   heading = '当前任务',
   className,
+  revealOnOpen = false,
   closeGuard,
 }: CoreTaskSurfaceHostProps) {
   const state = useSyncExternalStore(controller.subscribe, controller.getState, controller.getState);
@@ -95,13 +98,19 @@ export function CoreTaskSurfaceHost({
         typeof document === 'undefined' ? null : document.activeElement instanceof HTMLElement ? document.activeElement : null
       );
       ownerRef.current?.focus({ preventScroll: true });
+      if (revealOnOpen) {
+        ownerRef.current?.scrollIntoView?.({
+          behavior: reducedMotion ? 'auto' : 'smooth',
+          block: 'start',
+        });
+      }
     }
     if (state.phase === 'closed' && !state.active) {
       returnFocusRef.current?.focus({ preventScroll: true });
       returnFocusRef.current = null;
       observedGenerationRef.current = null;
     }
-  }, [focusReturnRef, sourceElement, state.active, state.phase]);
+  }, [focusReturnRef, reducedMotion, revealOnOpen, sourceElement, state.active, state.phase]);
 
   useEffect(() => {
     mountedRef.current = true;

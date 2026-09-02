@@ -1,6 +1,7 @@
 .surface {
   position: relative;
   min-height: 12rem;
+  scroll-margin-block-start: 24px;
   color: var(--text-primary, #171717);
 }
 

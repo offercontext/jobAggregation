@@ -897,13 +897,22 @@ export function scopeApplicationOffers(
   const scoped: Offer[] = [];
   let hasInvalidOwner = false;
   for (const candidate of offers) {
+    if (typeof candidate !== 'object' || candidate === null || Array.isArray(candidate)) {
+      hasInvalidOwner = true;
+      continue;
+    }
     let owner: unknown;
     try {
-      owner = (candidate as Offer | undefined)?.application_id;
+      owner = candidate.application_id;
     } catch {
       hasInvalidOwner = true;
       continue;
     }
+    // A missing owner is the supported representation for historical Offers
+    // created before Application binding became mandatory. They are excluded
+    // from this Application projection without poisoning an otherwise valid
+    // bound Offer in the same global response.
+    if (owner === null || owner === undefined) continue;
     if (typeof owner !== 'number' || !Number.isSafeInteger(owner) || owner <= 0) {
       hasInvalidOwner = true;
       continue;

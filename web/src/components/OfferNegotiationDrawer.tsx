@@ -241,6 +241,26 @@ function BoundOfferNegotiationDrawer({ open, offer, dimensionIds = [], onClose, 
 
   const briefValue: NegotiationBriefValue = { goal, concerns, scenario };
   const briefValid = Boolean(goal.trim() && concerns.trim() && scenario.trim());
+  const workflowStep = displayedProposal ? 3 : (activePreview ? 2 : 1);
+  const workflowMessage = workflowStep === 1
+    ? {
+        title: '先填写这次谈薪的目标',
+        detail: '补充你想争取的结果、当前顾虑和沟通场景，填完后再核对发送给 AI 的内容。',
+      }
+    : workflowStep === 2
+      ? {
+          title: '核对这次准备内容',
+          detail: '确认 Offer 事实和你的输入无误后，再生成谈薪准备草稿。',
+        }
+      : hasBrief
+        ? {
+            title: '谈薪准备已保存',
+            detail: '下方是本次实际保存的内容，你可以随时回来查看。',
+          }
+        : {
+            title: '选择你要带走的建议',
+            detail: '勾选需要的内容并按需编辑，保存前还会再次确认。',
+          };
 
   const previewGeneration = async () => {
     if (frozen || !briefValid || !dimensionFactsReady) return;
@@ -398,6 +418,49 @@ function BoundOfferNegotiationDrawer({ open, offer, dimensionIds = [], onClose, 
       {resultUnknown && !isHistoryView && (
         <button type="button" onClick={retry} disabled={busy}>使用原尝试重试</button>
       )}
+      {!isHistoryView && (
+        <section className={styles.workflowGuide} data-testid="offer-negotiation-next-step" aria-label="谈薪准备进度">
+          <div className={styles.workflowEyebrow}>第 {workflowStep} 步，共 3 步</div>
+          <ol className={styles.workflowSteps} aria-label="谈薪准备步骤">
+            <li data-active={workflowStep === 1}>定目标</li>
+            <li data-active={workflowStep === 2}>核对并生成</li>
+            <li data-active={workflowStep === 3}>选择并保存</li>
+          </ol>
+          <h3>{workflowMessage.title}</h3>
+          <p>{workflowMessage.detail}</p>
+        </section>
+      )}
+      {!displayedProposal && (
+        <fieldset className={styles.briefFieldset} disabled={frozen || Boolean(showGenerateConfirmation)}>
+          <NegotiationBriefForm
+            value={briefValue}
+            disabled={frozen || Boolean(showGenerateConfirmation)}
+            errors={{
+              goal: goal.trim() ? undefined : '请填写本次沟通目标。',
+              concerns: concerns.trim() ? undefined : '请填写本次顾虑。',
+              scenario: scenario.trim() ? undefined : '请填写沟通场景。',
+            }}
+            onChange={(next) => {
+              setGoal(next.goal);
+              setConcerns(next.concerns);
+              setScenario(next.scenario);
+            }}
+          />
+          {!activePreview && (
+            <Button
+              type="primary"
+              data-testid="offer-negotiation-generate"
+              onClick={() => void previewGeneration()}
+              disabled={frozen || !dimensionFactsReady || !briefValid}
+            >
+              下一步：检查输入
+            </Button>
+          )}
+          {dimensionFactsState === 'loading' && frozenDimensionIds.length > 0 && (
+            <p className={styles.fieldHint} role="status">正在读取比较维度，读取完成后才能继续。</p>
+          )}
+        </fieldset>
+      )}
       <section aria-label="AI input facts" data-testid="offer-negotiation-input-facts" className={styles.factsSection}>
         <h3>本次将使用的 Offer 事实</h3>
         <p>{displayedProposal?.input_snapshot || activePreview ? '以下为本次冻结输入' : '当前 Offer 事实，尚未冻结'}</p>
@@ -429,53 +492,23 @@ function BoundOfferNegotiationDrawer({ open, offer, dimensionIds = [], onClose, 
           </ul>
         )}
       </section>
-      {!displayedProposal && (
-        <>
-          <fieldset className={styles.briefFieldset} disabled={frozen || Boolean(showGenerateConfirmation)}>
-            <NegotiationBriefForm
-              value={briefValue}
-              disabled={frozen || Boolean(showGenerateConfirmation)}
-              errors={{
-                goal: goal.trim() ? undefined : '请填写本次沟通目标。',
-                concerns: concerns.trim() ? undefined : '请填写本次顾虑。',
-                scenario: scenario.trim() ? undefined : '请填写沟通场景。',
-              }}
-              onChange={(next) => {
-                setGoal(next.goal);
-                setConcerns(next.concerns);
-                setScenario(next.scenario);
-              }}
-            />
-            {!activePreview && (
-              <Button
-                type="primary"
-                data-testid="offer-negotiation-generate"
-                onClick={() => void previewGeneration()}
-                disabled={frozen || !dimensionFactsReady || !briefValid}
-              >
-                预览本次 AI 输入
-              </Button>
-            )}
-          </fieldset>
-          {activePreview && showGenerateConfirmation && (
-            <ConfirmationPanel
-              title="确认本次 AI 输入"
-              description="核对冻结的 Offer 事实与本次填写内容后，才会发送给 AI。"
-              sources={[{ state: 'frozen', detail: '本次 Offer 与用户输入快照' }]}
-            >
-              <Button onClick={clearPreview} disabled={busy}>返回修改</Button>
-              <Button
-                type="primary"
-                data-testid="offer-negotiation-generate"
-                data-action="confirm-generate"
-                onClick={() => void submitGeneration()}
-                disabled={busy}
-              >
-                确认生成谈薪准备草稿
-              </Button>
-            </ConfirmationPanel>
-          )}
-        </>
+      {!displayedProposal && activePreview && showGenerateConfirmation && (
+        <ConfirmationPanel
+          title="确认本次 AI 输入"
+          description="核对冻结的 Offer 事实与本次填写内容后，才会发送给 AI。"
+          sources={[{ state: 'frozen', detail: '本次 Offer 与用户输入快照' }]}
+        >
+          <Button onClick={clearPreview} disabled={busy}>返回修改</Button>
+          <Button
+            type="primary"
+            data-testid="offer-negotiation-generate"
+            data-action="confirm-generate"
+            onClick={() => void submitGeneration()}
+            disabled={busy}
+          >
+            确认生成谈薪准备草稿
+          </Button>
+        </ConfirmationPanel>
       )}
       {dimensionFactsState === 'loading' && <p role="status">正在读取本次谈薪准备所需的 Offer 事实……</p>}
       {dimensionFactsState === 'error' && <p role="alert">Offer 自定义维度暂时无法读取，请稍后重试。</p>}

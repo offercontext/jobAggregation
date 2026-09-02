@@ -24,6 +24,91 @@ const launchRequest = (applicationId: number, source: 'application_header' | 'pi
 });
 
 describe('CoreTaskSurfaceHost', () => {
+  it('reveals a newly opened owner once in StrictMode, keeps focus, and restores the source', () => {
+    const originalScrollIntoView = HTMLElement.prototype.scrollIntoView;
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', {
+      configurable: true,
+      value: scrollIntoView,
+    });
+    try {
+      const controller = createCoreTaskSurfaceController();
+      const host = document.createElement('div');
+      const source = document.createElement('button');
+      source.textContent = '准备谈薪';
+      document.body.append(source, host);
+      source.focus();
+      const root = createRoot(host);
+      roots.push(root);
+      act(() => root.render(<StrictMode><CoreTaskSurfaceHost controller={controller} sourceElement={source} revealOnOpen><Draft /></CoreTaskSurfaceHost></StrictMode>));
+      const opened = requireLaunch(launch(controller, 7));
+      act(() => root.render(<StrictMode><CoreTaskSurfaceHost controller={controller} sourceElement={source} revealOnOpen><Draft /></CoreTaskSurfaceHost></StrictMode>));
+
+      expect(scrollIntoView).toHaveBeenCalledTimes(1);
+      expect(scrollIntoView).toHaveBeenCalledWith({ behavior: 'smooth', block: 'start' });
+      expect(document.activeElement).toBe(host.querySelector('[data-core-task-owner]'));
+
+      act(() => { controller.launch(launchRequest(7, 'pilot')); });
+      expect(controller.getState().generation).toBe(opened.generation);
+      expect(scrollIntoView).toHaveBeenCalledTimes(1);
+
+      act(() => controller.close(opened.generation));
+      act(() => controller.markClosed(opened.generation));
+      expect(document.activeElement).toBe(source);
+    } finally {
+      if (originalScrollIntoView) {
+        Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', {
+          configurable: true,
+          value: originalScrollIntoView,
+        });
+      } else {
+        delete (HTMLElement.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+      }
+    }
+  });
+
+  it('reveals without motion when reduced motion is requested', () => {
+    vi.stubGlobal('matchMedia', vi.fn(() => ({
+      matches: true,
+      media: '(prefers-reduced-motion: reduce)',
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    })));
+    const originalScrollIntoView = HTMLElement.prototype.scrollIntoView;
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', {
+      configurable: true,
+      value: scrollIntoView,
+    });
+    try {
+      const controller = createCoreTaskSurfaceController();
+      const host = document.createElement('div');
+      document.body.append(host);
+      const root = createRoot(host);
+      roots.push(root);
+      act(() => root.render(<CoreTaskSurfaceHost controller={controller} revealOnOpen><Draft /></CoreTaskSurfaceHost>));
+      launch(controller, 7);
+      act(() => root.render(<CoreTaskSurfaceHost controller={controller} revealOnOpen><Draft /></CoreTaskSurfaceHost>));
+
+      expect(scrollIntoView).toHaveBeenCalledOnce();
+      expect(scrollIntoView).toHaveBeenCalledWith({ behavior: 'auto', block: 'start' });
+      expect(document.activeElement).toBe(host.querySelector('[data-core-task-owner]'));
+    } finally {
+      if (originalScrollIntoView) {
+        Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', {
+          configurable: true,
+          value: originalScrollIntoView,
+        });
+      } else {
+        delete (HTMLElement.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+      }
+    }
+  });
+
   it('completes enter/exit animations, unloads once, and restores source focus', () => {
     const controller = createCoreTaskSurfaceController();
     const host = document.createElement('div');

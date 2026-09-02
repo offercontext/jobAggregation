@@ -30,6 +30,80 @@
   font-size: 13px;
 }
 
+.workflowGuide {
+  display: grid;
+  gap: 8px;
+  padding: 16px;
+  border: 1px solid color-mix(in srgb, var(--op-primary, #635bff) 22%, var(--op-border));
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--op-primary, #635bff) 6%, var(--op-surface, #fff));
+}
+
+.workflowEyebrow {
+  color: var(--op-primary, #635bff);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .02em;
+}
+
+.workflowSteps {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.workflowSteps li {
+  padding: 6px 8px;
+  border-radius: 999px;
+  background: var(--op-surface-muted);
+  color: var(--op-muted-strong);
+  font-size: 12px;
+  text-align: center;
+}
+
+.workflowSteps li[data-active='true'] {
+  background: var(--op-primary, #635bff);
+  color: #fff;
+  font-weight: 700;
+}
+
+.workflowGuide h3,
+.workflowGuide p {
+  margin: 0;
+}
+
+.workflowGuide h3 {
+  font-size: 16px;
+}
+
+.workflowGuide p,
+.fieldHint {
+  color: var(--op-muted-strong);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.briefFieldset {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  margin: 0;
+  padding: 16px;
+  border: 1px solid var(--op-border);
+  border-radius: 14px;
+}
+
+.briefFieldset > button {
+  justify-self: start;
+}
+
+.fieldHint {
+  margin: 0;
+}
+
 .factsSection,
 .proposalSection {
   display: grid;

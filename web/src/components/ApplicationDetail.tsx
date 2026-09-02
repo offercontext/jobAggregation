@@ -2133,6 +2133,7 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
           controller={effectiveTaskController}
           renderOwner={renderTaskOwner}
           heading="当前任务"
+          revealOnOpen
           closeGuard={(closingActive) => closingActive.generation === effectiveTaskController.getState().active?.generation
             ? localTaskSurfaceGuardRef.current
             : { pending: true, unsaved: true }}

@@ -408,18 +408,33 @@ describe('AppShell source contract', () => {
     expect(source.slice(detailStart, detailEnd)).toContain('offers={selectedOfferScope.offers}');
   });
 
-  it('scopes global Offers to the current Application and fails closed on malformed ownership', () => {
+  it('scopes global Offers to the current Application without treating legacy unbound rows as corruption', () => {
     const current = { id: 71, application_id: 7, status: 'pending' } as never;
     const foreign = { id: 72, application_id: 8, status: 'pending' } as never;
-    const malformed = { id: 73, status: 'pending' } as never;
+    const legacyNull = { id: 73, application_id: null, status: 'pending' } as never;
+    const legacyMissing = { id: 74, status: 'pending' } as never;
     expect(scopeApplicationOffers([current, foreign], 7)).toEqual({
       offers: [current],
       hasInvalidOwner: false,
     });
-    expect(scopeApplicationOffers([current, malformed], 7)).toEqual({
+    expect(scopeApplicationOffers([current, legacyNull, legacyMissing], 7)).toEqual({
+      offers: [current],
+      hasInvalidOwner: false,
+    });
+    expect(scopeApplicationOffers([current, { id: 75, application_id: '7', status: 'pending' } as never], 7)).toEqual({
       offers: [current],
       hasInvalidOwner: true,
     });
+    const throwingOwner = {};
+    Object.defineProperty(throwingOwner, 'application_id', {
+      get: () => { throw new Error('poisoned Offer owner'); },
+    });
+    for (const malformed of [null, 'not-an-offer', 75, [], throwingOwner]) {
+      expect(scopeApplicationOffers([current, malformed as never], 7)).toEqual({
+        offers: [current],
+        hasInvalidOwner: true,
+      });
+    }
     expect(scopeApplicationOffers(undefined, 7)).toEqual({ offers: undefined, hasInvalidOwner: false });
   });
 

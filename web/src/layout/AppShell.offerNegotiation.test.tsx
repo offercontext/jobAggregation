@@ -25,6 +25,13 @@ const offer = {
   updated_at: '2026-08-01T00:00:00Z',
 } as const;
 
+const historicalUnboundOffer = {
+  ...offer,
+  id: 41,
+  application_id: null,
+  company_name: '历史公司',
+} as const;
+
 const runtime = vi.hoisted(() => ({
   projection: null as { status: string; summary: string | null } | null,
   openOwner: vi.fn(),
@@ -65,7 +72,7 @@ vi.mock('@tanstack/react-query', () => ({
         { id: 8, company_name: '另一家公司', position_name: '平台工程师', applied_at: '2026-08-02T00:00:00Z' },
       ],
       events: [],
-      offers: [offer],
+      offers: [offer, historicalUnboundOffer],
       resumes: [{ id: 11, title: '简历' }],
       knowledge: [],
       questions: undefined,
@@ -170,7 +177,11 @@ vi.mock('@/components/ApplicationDetail', () => ({
       return () => document.removeEventListener('keydown', onKeyDown);
     }, [isPilotNegotiation, props.onClose]);
     return (
-      <section data-testid="application-detail-harness">
+      <section
+        data-testid="application-detail-harness"
+        data-offers-error={String(Boolean(props.offersError))}
+        data-offer-count={String(props.offers?.length ?? 0)}
+      >
         <button type="button" data-testid="open-opportunity-fit" onClick={() => props.onOpenPilotOpportunityFit?.(props.application)}>
           打开岗位判断
         </button>
@@ -348,6 +359,25 @@ describe('AppShell canonical opportunity-fit owner', () => {
 });
 
 describe('AppShell Offer negotiation draft isolation', () => {
+  it('opens the current Application negotiation owner beside historical unbound Offers', async () => {
+    await act(async () => root?.render(<AppShell />));
+    await flush();
+
+    act(() => host?.querySelector<HTMLButtonElement>('[data-testid="open-application-detail"]')?.click());
+    await flush();
+    const detail = host?.querySelector<HTMLElement>('[data-testid="application-detail-harness"]');
+    expect(detail?.dataset.offersError).toBe('false');
+    expect(detail?.dataset.offerCount).toBe('1');
+
+    act(() => host?.querySelector<HTMLButtonElement>('[data-testid="nav-pilot"]')?.click());
+    await flush();
+    act(() => host?.querySelector<HTMLButtonElement>('[data-testid="open-pilot-offer"]')?.click());
+    await flush();
+
+    expect(host?.querySelector('[data-testid="offer-negotiation-drawer-harness"]')).not.toBeNull();
+    expect(host?.querySelector('[data-testid="pilot-draft-goal"]')?.textContent).toBe('');
+  });
+
   it('keeps UI and Pilot drafts isolated for the same Offer', async () => {
     await act(async () => root?.render(<AppShell />));
     await flush();

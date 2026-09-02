@@ -82,6 +82,18 @@ class ModelSurfaceProjector:
             - conservative_units(mandatory_bytes)
             - fixed_assembly_cost
         )
+        if remainder < 0 and any(message.role == "tool" for message in mandatory):
+            without_tool_results = tuple(
+                message for message in mandatory if message.role != "tool"
+            )
+            baseline_remainder = (
+                input_limit
+                - len(tool_bytes)
+                - conservative_units(canonical_messages(without_tool_results))
+                - fixed_assembly_cost
+            )
+            if baseline_remainder >= 0:
+                raise ProjectionError("mandatory_tool_result_over_budget")
         shares, shared_pool = optional_shares(remainder)
 
         scope_messages = self._messages_for(contributors, "current_scope") + self._messages_for(

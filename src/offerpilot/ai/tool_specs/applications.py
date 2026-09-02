@@ -45,7 +45,11 @@ from offerpilot.ai.tool_specs.common import (
     resolve_identity_argument,
     spaced_json,
 )
-from offerpilot.repositories.applications import ApplicationCreate
+from offerpilot.repositories.applications import (
+    APPLICATION_INDEX_TEXT_CODEPOINT_CAP,
+    ApplicationCreate,
+    ApplicationListIndexRow,
+)
 
 
 class ApplicationArgs(TypedDict, total=False):
@@ -56,6 +60,10 @@ class ApplicationArgs(TypedDict, total=False):
     job_url: str
     confirmed_new_position: bool
     closed_reason: str
+
+
+LIST_APPLICATIONS_QUERY_ROW_LIMIT = 256
+LIST_APPLICATIONS_RESULT_BYTE_CAP = 16 * 1024
 
 
 def _decode(values: Mapping[str, JSONValue]) -> ApplicationArgs:
@@ -96,13 +104,93 @@ def _application_identity_resolver(implementation_id: str) -> ResolverImplementa
 
 
 def _list(args: ApplicationArgs, context: ToolExecutionContext) -> list[dict[str, Any]]:
-    return [
-        application_json(app)
-        for app in context.applications.list_applications_scoped(
-            context.scope_constraint,
-            status=str(args.get("status") or ""),
-        )
+    status = str(args.get("status") or "")
+    loaded = context.applications.list_application_index_scoped(
+        context.scope_constraint,
+        status=status,
+        limit=LIST_APPLICATIONS_QUERY_ROW_LIMIT + 1,
+    )
+    query_has_more = len(loaded) > LIST_APPLICATIONS_QUERY_ROW_LIMIT
+    applications = loaded[:LIST_APPLICATIONS_QUERY_ROW_LIMIT]
+    full_payload_upper_bound = 2 + sum(
+        item.full_payload_byte_upper_bound for item in applications
+    )
+    if not query_has_more and full_payload_upper_bound <= LIST_APPLICATIONS_RESULT_BYTE_CAP:
+        complete = [
+            application_json(app)
+            for app in context.applications.list_applications_scoped(
+                context.scope_constraint,
+                status=status,
+                limit=LIST_APPLICATIONS_QUERY_ROW_LIMIT + 1,
+            )
+        ]
+        if _rendered_bytes(complete) <= LIST_APPLICATIONS_RESULT_BYTE_CAP:
+            return complete
+    return _bounded_application_index(applications, query_has_more=query_has_more)
+
+
+def _bounded_application_index(
+    applications: list[ApplicationListIndexRow],
+    *,
+    query_has_more: bool,
+) -> list[dict[str, Any]]:
+    compact = [
+        {
+            "id": app.id,
+            "company_name": _bounded_list_text(app.company_name),
+            "position_name": _bounded_list_text(app.position_name),
+            "status": _bounded_list_text(app.status),
+        }
+        for app in applications
     ]
+    selected: list[dict[str, Any]] = []
+    for index, item in enumerate(compact):
+        results_omitted = query_has_more or index + 1 < len(compact)
+        candidate = [
+            *selected,
+            item,
+            _application_list_summary(
+                len(selected) + 1,
+                results_omitted=results_omitted,
+            ),
+        ]
+        if _rendered_bytes(candidate) > LIST_APPLICATIONS_RESULT_BYTE_CAP:
+            break
+        selected.append(item)
+    results_omitted = query_has_more or len(selected) < len(compact)
+    result = [
+        *selected,
+        _application_list_summary(len(selected), results_omitted=results_omitted),
+    ]
+    if _rendered_bytes(result) > LIST_APPLICATIONS_RESULT_BYTE_CAP:
+        raise RuntimeError("bounded application index exceeds its static byte cap")
+    return result
+
+
+def _application_list_summary(
+    returned_count: int,
+    *,
+    results_omitted: bool,
+) -> dict[str, Any]:
+    return {
+        "record_type": "application_list_summary",
+        "returned_count": returned_count,
+        "results_omitted": results_omitted,
+        "details_omitted": True,
+        "full_details_tool": "get_application",
+        "refine_with": "status",
+    }
+
+
+def _bounded_list_text(value: object) -> str:
+    text = str(value or "")
+    if len(text) <= APPLICATION_INDEX_TEXT_CODEPOINT_CAP:
+        return text
+    return text[: APPLICATION_INDEX_TEXT_CODEPOINT_CAP - 1] + "…"
+
+
+def _rendered_bytes(value: object) -> int:
+    return len(spaced_json(value).encode("utf-8"))
 
 
 def _get(args: ApplicationArgs, context: ToolExecutionContext) -> dict[str, Any]:

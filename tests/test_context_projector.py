@@ -504,6 +504,68 @@ def test_projection_mandatory_overflow_fails_before_provider() -> None:
         ModelSurfaceProjector().project(request)
 
 
+def test_projection_identifies_oversized_active_tool_result() -> None:
+    signals = ToolSelectionSignals(current_request="看看投递")
+    values = list(contributors())
+    values[CONTRIBUTOR_ORDER.index("current_request")] = ContributorResult(
+        "current_request",
+        "ready",
+        (
+            FrozenMessage.freeze(Message(role="user", content="看看投递")),
+            FrozenMessage.freeze(
+                Message(
+                    role="assistant",
+                    tool_calls=[ToolCall(id="read-1", name="list_applications", args="{}")],
+                )
+            ),
+            FrozenMessage.freeze(
+                Message(role="tool", content="x" * 20_000, tool_call_id="read-1")
+            ),
+        ),
+    )
+    request = ProjectionRequest(
+        model_call_id="call-after-large-tool",
+        contributors=tuple(values),
+        history=(),
+        tool_signals=signals,
+        provider_budgets=(ProviderBudget(context_window=10_000),),
+        selection=_selection_for(signals),
+    )
+
+    with pytest.raises(ProjectionError, match="mandatory_tool_result_over_budget"):
+        ModelSurfaceProjector().project(request)
+
+
+def test_oversized_user_request_is_not_misclassified_as_tool_result_overflow() -> None:
+    signals = ToolSelectionSignals(current_request="x" * 20_000)
+    values = list(contributors())
+    values[CONTRIBUTOR_ORDER.index("current_request")] = ContributorResult(
+        "current_request",
+        "ready",
+        (
+            FrozenMessage.freeze(Message(role="user", content="x" * 20_000)),
+            FrozenMessage.freeze(
+                Message(
+                    role="assistant",
+                    tool_calls=[ToolCall(id="read-1", name="list_applications", args="{}")],
+                )
+            ),
+            FrozenMessage.freeze(Message(role="tool", content="[]", tool_call_id="read-1")),
+        ),
+    )
+    request = ProjectionRequest(
+        model_call_id="call-after-large-request",
+        contributors=tuple(values),
+        history=(),
+        tool_signals=signals,
+        provider_budgets=(ProviderBudget(context_window=10_000),),
+        selection=_selection_for(signals),
+    )
+
+    with pytest.raises(ProjectionError, match="^mandatory_surface_over_budget$"):
+        ModelSurfaceProjector().project(request)
+
+
 def test_bound_response_rejects_unexposed_tool_without_executor() -> None:
     signals = ToolSelectionSignals(page_kind="offers", current_request="offer")
     surface = ModelSurfaceProjector().project(

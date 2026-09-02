@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from builtins import list as BuiltinList
 
-from sqlalchemy import and_, case, exists, select, update
+from sqlalchemy import and_, case, exists, func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from offerpilot.application_status import (
@@ -41,6 +41,18 @@ class ApplicationCreate:
     notes: str = ""
     applied_at: Optional[datetime] = None
     closed_reason: str = ""
+
+
+APPLICATION_INDEX_TEXT_CODEPOINT_CAP = 160
+
+
+@dataclass(frozen=True)
+class ApplicationListIndexRow:
+    id: int
+    company_name: str
+    position_name: str
+    status: str
+    full_payload_byte_upper_bound: int
 
 
 class ApplicationsRepository:
@@ -129,15 +141,20 @@ class ApplicationsRepository:
         self,
         constraint: ApplicationScopeConstraint,
         status: str = "",
+        limit: int | None = None,
     ) -> BuiltinList[Application]:
         binding = self._require_scoped(constraint)
+        if limit is not None and (type(limit) is not int or limit <= 0):
+            raise ValueError("application list limit must be a positive integer")
         session = binding.session
         if constraint.mode == "unrestricted":
             with session.no_autoflush:
                 statement = select(Application).where(Application.deleted_at.is_(None))
                 if status:
                     statement = statement.where(Application.status == normalize_application_status(status))
-                statement = statement.order_by(Application.applied_at.desc())
+                statement = statement.order_by(Application.applied_at.desc(), Application.id.desc())
+                if limit is not None:
+                    statement = statement.limit(limit)
                 return [_normalize_model_status(item) for item in session.scalars(statement)]
 
         allowed_id = _restricted_scope_id(constraint)
@@ -155,13 +172,78 @@ class ApplicationsRepository:
         statement = (
             select(Application, scope_parent.c._scope_application_id)
             .select_from(scope_parent.outerjoin(Application, join_condition))
-            .order_by(Application.applied_at.desc())
+            .order_by(Application.applied_at.desc(), Application.id.desc())
         )
+        if limit is not None:
+            statement = statement.limit(limit)
         with session.no_autoflush:
             rows = session.execute(statement).all()
         if not rows or rows[0][1] is None:
             raise ScopeAccessDenied("application scope is unavailable")
         return [_normalize_model_status(row[0]) for row in rows if row[0] is not None]
+
+    def list_application_index_scoped(
+        self,
+        constraint: ApplicationScopeConstraint,
+        status: str = "",
+        limit: int | None = None,
+    ) -> BuiltinList[ApplicationListIndexRow]:
+        binding = self._require_scoped(constraint)
+        if limit is not None and (type(limit) is not int or limit <= 0):
+            raise ValueError("application index limit must be a positive integer")
+        session = binding.session
+        columns = (
+            Application.id.label("application_id"),
+            func.substr(
+                Application.company_name,
+                1,
+                APPLICATION_INDEX_TEXT_CODEPOINT_CAP,
+            ).label("company_name"),
+            func.substr(
+                Application.position_name,
+                1,
+                APPLICATION_INDEX_TEXT_CODEPOINT_CAP,
+            ).label("position_name"),
+            func.substr(
+                Application.status,
+                1,
+                APPLICATION_INDEX_TEXT_CODEPOINT_CAP,
+            ).label("status"),
+            _application_payload_upper_bound().label("full_payload_byte_upper_bound"),
+        )
+        status_filter = normalize_application_status(status) if status else ""
+        if constraint.mode == "unrestricted":
+            statement = select(*columns).where(Application.deleted_at.is_(None))
+            if status_filter:
+                statement = statement.where(Application.status == status_filter)
+            statement = statement.order_by(Application.applied_at.desc(), Application.id.desc())
+            if limit is not None:
+                statement = statement.limit(limit)
+            with session.no_autoflush:
+                rows = session.execute(statement).all()
+            return [_application_index_row(row) for row in rows]
+
+        allowed_id = _restricted_scope_id(constraint)
+        scope_parent = (
+            select(Application.id.label("_scope_application_id"))
+            .where(Application.id == allowed_id, Application.deleted_at.is_(None))
+            .cte("scoped_application_index")
+        )
+        join_condition = Application.id == scope_parent.c._scope_application_id
+        if status_filter:
+            join_condition = and_(join_condition, Application.status == status_filter)
+        statement = (
+            select(*columns, scope_parent.c._scope_application_id)
+            .select_from(scope_parent.outerjoin(Application, join_condition))
+            .order_by(Application.applied_at.desc(), Application.id.desc())
+        )
+        if limit is not None:
+            statement = statement.limit(limit)
+        with session.no_autoflush:
+            rows = session.execute(statement).all()
+        if not rows or rows[0]._scope_application_id is None:
+            raise ScopeAccessDenied("application scope is unavailable")
+        return [_application_index_row(row) for row in rows if row.application_id is not None]
 
     def get_application_scoped(
         self,
@@ -395,3 +477,30 @@ def _restricted_scope_id(constraint: ApplicationScopeConstraint) -> int:
         )
     identity = next(iter(constraint.allowed_identities))
     return require_scoped_positive_int64(identity, "restricted Application scope identity")
+
+
+def _application_payload_upper_bound() -> Any:
+    text_columns = (
+        Application.company_name,
+        Application.position_name,
+        Application.job_url,
+        Application.status,
+        Application.source,
+        Application.notes,
+        Application.closed_reason,
+    )
+    text_codepoints = sum(func.length(func.coalesce(column, "")) for column in text_columns)
+    # Python's ensure_ascii=False JSON encoding uses at most six UTF-8 bytes per
+    # source codepoint (for escaped controls). The fixed allowance covers keys,
+    # numeric identities, nullable timestamps, separators, and list framing.
+    return text_codepoints * 6 + 1_024
+
+
+def _application_index_row(row: Any) -> ApplicationListIndexRow:
+    return ApplicationListIndexRow(
+        id=int(row.application_id),
+        company_name=str(row.company_name or ""),
+        position_name=str(row.position_name or ""),
+        status=normalize_application_status(str(row.status or "applied")),
+        full_payload_byte_upper_bound=int(row.full_payload_byte_upper_bound),
+    )

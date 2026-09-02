@@ -18,6 +18,7 @@ from offerpilot.ai.tool_authority import (
     TrustedContextScope,
 )
 from offerpilot.db import init_database
+from offerpilot.models import Application
 from offerpilot.repositories.application_events import (
     ApplicationEventCreate,
     ApplicationEventsRepository,
@@ -170,12 +171,14 @@ def test_scoped_ports_require_caller_owned_session_and_registered_constraint(see
     )
     methods = (
         ("list_applications_scoped", ()),
+        ("list_application_index_scoped", ()),
         ("list_application_events_scoped", ()),
         ("list_notes_scoped", ()),
         ("list_offers_scoped", ()),
         ("list_jd_analyses_scoped", ()),
     )
 
+    repositories = (repositories[0], repositories[0], *repositories[1:])
     with seeded["session_factory"]() as session:
         for repo, (method_name, args) in zip(repositories, methods):
             with pytest.raises(AuthorityPhaseError):
@@ -590,7 +593,47 @@ def test_every_final_scoped_read_is_one_statement(seeded) -> None:
             assert [row.id for row in rows] == [seeded["first"].id]
             assert len(statements) == 1
             statements.clear()
+            index_rows = apps.list_application_index_scoped(constraint, limit=257)
+            assert [row.id for row in index_rows] == [seeded["first"].id]
+            assert len(statements) == 1
+            statements.clear()
             apps.get_application_scoped(constraint, seeded["first"].id)
             assert len(statements) == 1
     finally:
         event.remove(engine, "before_cursor_execute", capture)
+
+
+def test_application_index_limit_has_stable_id_tie_breaker(tmp_path) -> None:
+    session_factory = init_database(tmp_path / "stable-index.db")
+    applied_at = datetime(2026, 9, 2, tzinfo=timezone.utc)
+    with session_factory() as session:
+        session.add_all(
+            Application(
+                company_name=f"Company {index}",
+                position_name="Engineer",
+                status="applied",
+                applied_at=applied_at,
+                created_at=applied_at,
+                updated_at=applied_at,
+            )
+            for index in range(1, 259)
+        )
+        session.commit()
+    factory = AuthorityFactory()
+    _, authority, constraint = _constraint(
+        factory,
+        context_type="workspace",
+        context_ref=None,
+    )
+    with session_factory() as session:
+        repository = ApplicationsRepository(session_factory).bind_scoped(
+            session,
+            constraint,
+            authority_factory=factory,
+            authority=authority,
+        )
+        first = repository.list_application_index_scoped(constraint, limit=257)
+        second = repository.list_application_index_scoped(constraint, limit=257)
+
+    assert [row.id for row in first] == list(range(258, 1, -1))
+    assert [row.id for row in second] == [row.id for row in first]

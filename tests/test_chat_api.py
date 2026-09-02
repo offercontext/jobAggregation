@@ -31,6 +31,7 @@ from offerpilot.ai.tool_runtime.contracts import (
 )
 from offerpilot.ai.tool_runtime.metadata import ToolMetadataBundleV1
 from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
+from offerpilot.ai.tool_specs.applications import LIST_APPLICATIONS_RESULT_BYTE_CAP
 from offerpilot.ai.write_operations import (
     TypedPendingRouteHandle,
     WriteOperationError,
@@ -51,6 +52,7 @@ from offerpilot.models import (
     AgentContextSnapshot,
     AgentEvent,
     AgentRun,
+    Application,
     ApplicationMaterialKit,
     ChatMessage,
     Conversation,
@@ -61,6 +63,7 @@ from offerpilot.models import (
     WriteOperation,
     WriteOperationTransition,
 )
+from offerpilot.context_projector.budget import ProviderBudget
 from offerpilot.pilot_runtime.contracts import (
     MessageOutcome,
     PreparedStreamExecution,
@@ -4802,6 +4805,61 @@ def test_chat_stream_emits_tool_call_and_result_events(tmp_path):
     assert tool_result["status"] == "success"
     assert tool_result["affected_resources"] == []
     assert tool_result["changed_entities"] == []
+
+
+@pytest.mark.parametrize("endpoint", ["/api/chat", "/api/chat/stream"])
+def test_large_application_list_can_continue_to_second_model_call(tmp_path, endpoint):
+    now = datetime(2026, 9, 2, tzinfo=timezone.utc)
+    model = CapturingScriptedModel(
+        [
+            Assistant(tool_calls=[ToolCall(id="read-many", name="list_applications", args="{}")]),
+            Assistant(content="已读取投递索引。"),
+        ]
+    )
+    model.agent_provider_budgets = (
+        ProviderBudget(context_window=258_000, output_reserve=126_000),
+    )
+    app = create_app(
+        data_dir=tmp_path,
+        chat_model=model,
+        title_model=ScriptedModel([Assistant(content="投递索引")]),
+    )
+    with session_factory_for_data_dir(tmp_path)() as session:
+        session.add_all(
+            Application(
+                company_name=f"Company {index}",
+                position_name=f"Engineer {index}",
+                job_url="https://example.test/" + "x" * 512,
+                status="applied",
+                source="manual",
+                notes="n" * 1_024,
+                applied_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+            for index in range(1, 167)
+        )
+        session.commit()
+    client = TestClient(app)
+
+    response = client.post(endpoint, json={"message": "看看所有投递", "conversation_id": 0})
+
+    assert response.status_code == 200
+    body = (
+        _parse_sse_events(response.text)[-1]["data"]["data"]["response"]
+        if endpoint.endswith("/stream")
+        else response.json()
+    )
+    assert body["type"] == "message"
+    assert body["message"] == "已读取投递索引。"
+    assert len(model.calls) == 2
+    tool_messages = [message for message in model.calls[1] if message.role == "tool"]
+    assert len(tool_messages) == 1
+    assert len(tool_messages[0].content.encode("utf-8")) <= LIST_APPLICATIONS_RESULT_BYTE_CAP
+    projected = json.loads(tool_messages[0].content)
+    assert projected[-1]["record_type"] == "application_list_summary"
+    assert projected[-1]["returned_count"] == 166
+    assert projected[-1]["results_omitted"] is False
 
 
 @pytest.mark.parametrize("endpoint", ["/api/chat", "/api/chat/stream"])

@@ -165,6 +165,11 @@ def _provider_error_message(error: Exception, config: Config) -> str:
     """Keep provider diagnostics useful while masking configured secrets."""
 
     detail = str(error).strip() or "模型供应商连接失败"
+    if detail == "mandatory_tool_result_over_budget":
+        return (
+            "本次工具查询返回的内容过多，无法安全继续生成回答。"
+            "请缩小查询范围后重试。"
+        )
     if detail in {
         "mandatory_surface_over_budget",
         "invalid_provider_budget",

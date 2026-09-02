@@ -118,15 +118,20 @@ describe('Offer negotiation presentation components', () => {
     expect(rendered.querySelector('label[for="negotiation-goal"]')).not.toBeNull();
   });
 
-  it('reveals raw evidence without changing the selected block', () => {
+  it('keeps evidence secondary and reveals human-readable details before the technical path', () => {
     const onToggle = vi.fn();
     const rendered = mount(<NegotiationProposalCard block={block} selected={false} editedText={block.text} disabled={false} onToggle={onToggle} onEdit={vi.fn()} />);
-    expect(rendered.textContent).toContain('Offer 固定月薪');
+    expect(rendered.textContent).toContain('可直接使用或编辑');
+    expect(rendered.textContent).not.toContain('Offer 固定月薪');
     expect(rendered.textContent).not.toContain('/offer_snapshot/base_monthly');
     const evidenceToggle = rendered.querySelector<HTMLButtonElement>('[data-action="toggle-evidence"]');
     expect(evidenceToggle?.getAttribute('aria-expanded')).toBe('false');
+    expect(evidenceToggle?.textContent).toContain('查看依据');
     act(() => evidenceToggle?.click());
     expect(evidenceToggle?.getAttribute('aria-expanded')).toBe('true');
+    expect(rendered.textContent).toContain('当前固定月薪');
+    expect(rendered.textContent).toContain('¥28,000/月');
+    expect(rendered.textContent).toContain('来源路径 /offer_snapshot/base_monthly');
     expect(onToggle).not.toHaveBeenCalled();
   });
 
@@ -146,8 +151,119 @@ describe('Offer negotiation presentation components', () => {
         onEdit={vi.fn()}
       />,
     );
-    expect(rendered.textContent).toContain('Offer 状态：待处理');
+    const evidenceToggle = rendered.querySelector<HTMLButtonElement>('[data-action="toggle-evidence"]');
+    act(() => evidenceToggle?.click());
+    expect(rendered.textContent).toContain('当前 Offer 状态');
+    expect(rendered.textContent).toContain('待处理');
     expect(rendered.textContent).not.toContain('pending');
+  });
+
+  it('formats salary evidence with product language instead of raw numbers', () => {
+    const rendered = mount(
+      <NegotiationProposalCard
+        block={{
+          ...block,
+          evidence_refs: [
+            { source: 'offer_snapshot', path: '/offer_snapshot/base_monthly', excerpt: '24000' },
+            { source: 'offer_snapshot', path: '/offer_snapshot/months_per_year', excerpt: '16' },
+            { source: 'offer_snapshot', path: '/offer_snapshot/signing_bonus', excerpt: '0' },
+          ],
+        }}
+        selected={false}
+        editedText={block.text}
+        disabled={false}
+        onToggle={vi.fn()}
+        onEdit={vi.fn()}
+      />,
+    );
+    act(() => rendered.querySelector<HTMLButtonElement>('[data-action="toggle-evidence"]')?.click());
+    expect(rendered.textContent).toContain('当前固定月薪');
+    expect(rendered.textContent).toContain('¥24,000/月');
+    expect(rendered.textContent).toContain('计薪月数');
+    expect(rendered.textContent).toContain('16 薪');
+    expect(rendered.textContent).toContain('签字费');
+    expect(rendered.textContent).toContain('¥0');
+    expect(rendered.textContent).not.toContain('已验证来源：16');
+  });
+
+  it('copies the edited talking point and announces success', async () => {
+    const writeText = vi.fn(async () => undefined);
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
+    const rendered = mount(
+      <NegotiationProposalCard
+        kind="talking_points"
+        block={block}
+        selected={false}
+        editedText="用户编辑后的表达"
+        disabled={false}
+        onToggle={vi.fn()}
+        onEdit={vi.fn()}
+      />,
+    );
+    const copyButton = rendered.querySelector<HTMLButtonElement>('[aria-label="复制这段表达"]');
+    await act(async () => { copyButton?.click(); });
+    expect(writeText).toHaveBeenCalledWith('用户编辑后的表达');
+    expect(rendered.querySelector('[aria-live="polite"]')?.textContent).toContain('表达已复制');
+  });
+
+  it('announces a clipboard failure without changing the proposal', async () => {
+    const writeText = vi.fn(async () => { throw new Error('denied'); });
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
+    const rendered = mount(
+      <NegotiationProposalCard
+        kind="talking_points"
+        block={block}
+        selected={false}
+        editedText={block.text}
+        disabled={false}
+        onToggle={vi.fn()}
+        onEdit={vi.fn()}
+      />,
+    );
+    await act(async () => { rendered.querySelector<HTMLButtonElement>('[aria-label="复制这段表达"]')?.click(); });
+    expect(rendered.querySelector('[aria-live="polite"]')?.textContent).toContain('复制失败');
+    expect(rendered.textContent).toContain(block.text);
+  });
+
+  it('copies an intentionally empty edit without restoring the generated text', async () => {
+    const writeText = vi.fn(async () => undefined);
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
+    const rendered = mount(
+      <NegotiationProposalCard
+        kind="talking_points"
+        block={block}
+        selected
+        editedText=""
+        disabled={false}
+        onToggle={vi.fn()}
+        onEdit={vi.fn()}
+      />,
+    );
+    await act(async () => { rendered.querySelector<HTMLButtonElement>('[aria-label="复制这段表达"]')?.click(); });
+    expect(writeText).toHaveBeenCalledWith('');
+  });
+
+  it('renders user evidence as text without leaking HTML entities or markup', () => {
+    const rendered = mount(
+      <NegotiationProposalCard
+        block={{
+          ...block,
+          text: '希望多 2K & 保留 Offer <script>🙂',
+          evidence_refs: [
+            { source: 'user_brief', path: '/user_brief/goal', excerpt: '多 2K & 保留 Offer <script>🙂' },
+          ],
+        }}
+        selected={false}
+        editedText=""
+        disabled={false}
+        onToggle={vi.fn()}
+        onEdit={vi.fn()}
+      />,
+    );
+    act(() => rendered.querySelector<HTMLButtonElement>('[data-action="toggle-evidence"]')?.click());
+    expect(rendered.textContent).toContain('多 2K & 保留 Offer <script>🙂');
+    expect(rendered.innerHTML).not.toContain('<script>🙂</script>');
+    expect(rendered.textContent).not.toContain('&#');
   });
 
   it('visually marks a selected proposal card', () => {

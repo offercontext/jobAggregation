@@ -12,6 +12,10 @@ from offerpilot.ai.offer_negotiation import (
     safe_empty_offer_negotiation_proposal,
     validate_offer_negotiation,
 )
+from offerpilot.ai.offer_negotiation_templates import (
+    TEMPLATE_IDS,
+    build_template_catalog,
+)
 from offerpilot.ai.types import Assistant
 
 
@@ -51,23 +55,20 @@ def _snapshot(*, dimension_order: list[int] | None = None) -> dict:
             "assessment": "不得进入快照",
         },
         dimensions=dimensions,
-        user_brief={"goal": "争取入职时间", "concerns": "通勤", "scenario": "电话沟通"},
+        user_brief={
+            "goal": "争取固定月薪再增加 2K",
+            "concerns": "担心提出后影响 Offer",
+            "scenario": "电话沟通",
+        },
         idempotency_key="A" * 16,
     )
 
 
-def _item(
-    *,
-    topic: str = "offer_fact",
-    source: str = "offer_snapshot",
-    path: str = "/offer_snapshot/company_name",
-    excerpt: str = "星云数据",
-    item_id: str = "item-1",
-) -> dict:
+def _item(item_id: str, template_id: str, *evidence_ref_ids: str) -> dict:
     return {
         "id": item_id,
-        "topic": topic,
-        "evidence_refs": [{"source": source, "path": path, "excerpt": excerpt}],
+        "template_id": template_id,
+        "evidence_ref_ids": list(evidence_ref_ids),
     }
 
 
@@ -76,37 +77,25 @@ def _valid_payload() -> dict:
         "proposal_status": "normal",
         "communication_goals": [
             _item(
-                item_id="goal-1",
-                topic="user_goal",
-                source="user_brief",
-                path="/user_brief/goal",
-                excerpt="争取入职时间",
+                "goal-1",
+                "goal_interest_then_request",
+                "offer.company_name",
+                "offer.position_name",
+                "brief.goal",
             )
         ],
-        "clarification_questions": [
-            _item(
-                item_id="question-1",
-                topic="offer_fact",
-                path="/offer_snapshot/position_name",
-                excerpt="后端工程师",
-            )
-        ],
+        "clarification_questions": [_item("question-1", "ask_concern_details", "brief.concerns")],
         "talking_points": [
             _item(
-                item_id="point-1",
-                topic="offer_fact",
-                path="/offer_snapshot/base_monthly",
-                excerpt="28000",
+                "point-1",
+                "say_current_offer_and_request",
+                "offer.base_monthly",
+                "offer.months_per_year",
+                "brief.goal",
             )
         ],
         "preparation_checks": [
-            _item(
-                item_id="check-1",
-                topic="user_goal",
-                source="user_brief",
-                path="/user_brief/goal",
-                excerpt="争取入职时间",
-            )
+            _item("check-1", "check_goal_and_concern", "brief.goal", "brief.concerns")
         ],
     }
 
@@ -140,6 +129,29 @@ def test_provider_projection_omits_missing_dimension_label_and_value() -> None:
     assert '"label":"成长空间"' not in prompt
 
 
+def test_provider_receives_stable_evidence_ids_and_no_database_ids() -> None:
+    model = FakeModel([_json(_valid_payload())])
+    generate_offer_negotiation_proposal(model, _snapshot())
+    prompt = "\n".join(message.content for message in model.calls[0][0])
+    assert '"evidence_id":"offer.base_monthly"' in prompt
+    assert '"evidence_id":"brief.goal"' in prompt
+    assert '"evidence_id":"offer.dimension.dimension_001"' in prompt
+    assert '"id":9' not in prompt
+
+
+def test_provider_receives_only_evidence_referenced_by_available_templates() -> None:
+    snapshot = _snapshot()
+    snapshot["offer_snapshot"]["notes"] = "PRIVATE-NOTE-CANARY"
+    model = FakeModel([_json(_valid_payload())])
+    generate_offer_negotiation_proposal(model, snapshot)
+    prompt = "\n".join(message.content for message in model.calls[0][0])
+    assert '"evidence_id":"offer.status"' not in prompt
+    assert '"evidence_id":"offer.notes"' not in prompt
+    assert "PRIVATE-NOTE-CANARY" not in prompt
+    assert '"evidence_id":"offer.base_monthly"' in prompt
+    assert '"evidence_id":"brief.goal"' in prompt
+
+
 def test_evidence_catalog_omits_blank_values_but_preserves_nonblank_raw_text() -> None:
     snapshot = _snapshot()
     snapshot["offer_snapshot"]["notes"] = " \t"
@@ -150,58 +162,141 @@ def test_evidence_catalog_omits_blank_values_but_preserves_nonblank_raw_text() -
     model = FakeModel([_json(_valid_payload())])
     generate_offer_negotiation_proposal(model, snapshot)
     catalog = model.calls[0][0][0].content.split("evidence_catalog", 1)[1]
-    assert "/offer_snapshot/notes" not in catalog
-    assert "/offer_snapshot/equity" not in catalog
-    assert "/offer_snapshot/perks" not in catalog
-    assert "/offer_snapshot/deadline" not in catalog
+    assert '"evidence_id":"offer.notes"' not in catalog
+    assert '"evidence_id":"offer.equity"' not in catalog
+    assert '"evidence_id":"offer.perks"' not in catalog
+    assert '"evidence_id":"offer.deadline"' not in catalog
     assert "dimension_002" not in catalog
     assert "地铁 35 分钟" in catalog
 
 
-@pytest.mark.parametrize(
-    ("source", "path", "excerpt"),
-    [
-        ("user_brief", "/offer_snapshot/company_name", "星云数据"),
-        ("offer_snapshot", "/offer_snapshot/dimensions/dimension_001/label", "通勤"),
-        ("offer_snapshot", "/user_brief/goal", "争取入职时间"),
-    ],
-)
-def test_evidence_source_has_a_fixed_path_allowlist(source: str, path: str, excerpt: str) -> None:
+def test_server_renders_an_actionable_kit_from_only_verified_values() -> None:
+    result = validate_offer_negotiation(_valid_payload(), _snapshot())
+    goal = result["communication_goals"][0]
+    question = result["clarification_questions"][0]
+    script = result["talking_points"][0]
+    check = result["preparation_checks"][0]
+
+    assert "星云数据" in goal["text"]
+    assert "后端工程师" in goal["text"]
+    assert "争取固定月薪再增加 2K" in goal["text"]
+    assert "担心提出后影响 Offer" in question["text"]
+    assert "¥28,000/月 × 12 薪" in script["text"]
+    assert "可以接受的底线" in check["text"]
+    assert all(
+        set(item) == {"id", "text", "rationale", "evidence_refs"}
+        for field in OFFER_NEGOTIATION_FIELDS[1:]
+        for item in result[field]
+    )
+    assert all("该建议由系统" not in item["rationale"] for item in (goal, question, script, check))
+
+
+def test_every_catalog_template_has_a_server_renderer_and_public_shape() -> None:
+    snapshot = _snapshot()
+    catalog = build_template_catalog(snapshot)
+    expected_template_ids = {
+        "goal_focus_request",
+        "goal_interest_then_request",
+        "ask_current_compensation_structure",
+        "ask_request_flexibility",
+        "ask_concern_details",
+        "ask_offer_validity_after_request",
+        "ask_signing_bonus_terms",
+        "ask_equity_terms",
+        "ask_benefit_terms",
+        "ask_decision_deadline",
+        "ask_comparison_dimension",
+        "say_interest_and_request",
+        "say_current_offer_and_request",
+        "say_concern_and_request",
+        "say_request_and_preserve_offer",
+        "say_scenario_opening",
+        "check_current_compensation",
+        "check_goal_and_concern",
+        "check_decision_deadline",
+        "check_written_follow_up",
+        "check_comparison_dimension",
+    }
+    assert set(TEMPLATE_IDS) == expected_template_ids
+    assert {option.template_id for option in catalog} == expected_template_ids
+
+    for index, option in enumerate(catalog):
+        payload = {
+            "proposal_status": "normal",
+            **{field: [] for field in OFFER_NEGOTIATION_FIELDS[1:]},
+        }
+        payload[option.section] = [
+            _item(f"catalog-{index}", option.template_id, *option.evidence_ref_ids)
+        ]
+        result = validate_offer_negotiation(payload, snapshot)
+        rendered = result[option.section][0]
+        assert set(rendered) == {"id", "text", "rationale", "evidence_refs"}
+        assert rendered["text"].strip()
+        assert rendered["rationale"].strip()
+        assert [ref["path"] for ref in rendered["evidence_refs"]]
+        assert "template_id" not in rendered
+        assert "evidence_ref_ids" not in rendered
+
+
+def test_same_template_changes_with_the_frozen_goal_and_offer_facts() -> None:
+    first = validate_offer_negotiation(_valid_payload(), _snapshot())["talking_points"][0]["text"]
+    changed = _snapshot()
+    changed["offer_snapshot"]["base_monthly"] = 24000
+    changed["offer_snapshot"]["months_per_year"] = 16
+    changed["user_brief"]["goal"] = "希望能多 2K"
+    second = validate_offer_negotiation(_valid_payload(), changed)["talking_points"][0]["text"]
+    assert first != second
+    assert "¥24,000/月 × 16 薪" in second
+    assert "希望能多 2K" in second
+
+
+def test_offer_cancellation_concern_can_select_a_direct_safe_script() -> None:
     payload = _valid_payload()
-    payload["communication_goals"][0]["evidence_refs"] = [
-        {"source": source, "path": path, "excerpt": excerpt}
-    ]
-    with pytest.raises(OfferNegotiationModelError) as error:
-        validate_offer_negotiation(payload, _snapshot())
-    assert error.value.validation_category == "unknown_evidence_ref"
+    payload["clarification_questions"][0] = _item(
+        "question-1",
+        "ask_offer_validity_after_request",
+        "brief.concerns",
+    )
+    payload["talking_points"][0] = _item(
+        "point-1",
+        "say_request_and_preserve_offer",
+        "brief.goal",
+        "brief.concerns",
+    )
+    result = validate_offer_negotiation(payload, _snapshot())
+    assert "当前已经发出的 Offer 是否仍然有效" in result["clarification_questions"][0]["text"]
+    assert "原回复截止时间是否保持不变" in result["talking_points"][0]["text"]
+    assert "争取固定月薪再增加 2K" in result["talking_points"][0]["text"]
 
 
-def test_numeric_evidence_requires_exact_ascii_representation() -> None:
-    for excerpt in ["28,000", "二万八", "8000"]:
+def test_interest_template_does_not_mislabel_a_non_salary_goal() -> None:
+    snapshot = _snapshot()
+    snapshot["user_brief"]["goal"] = "确认远程办公安排"
+    payload = _valid_payload()
+    payload["talking_points"][0] = _item(
+        "point-1",
+        "say_interest_and_request",
+        "offer.company_name",
+        "offer.position_name",
+        "brief.goal",
+    )
+    text = validate_offer_negotiation(payload, snapshot)["talking_points"][0]["text"]
+    assert "关于这次沟通" in text
+    assert "关于薪酬" not in text
+
+
+def test_provider_cannot_supply_free_form_text_or_rationale() -> None:
+    for field in ("text", "rationale", "intent", "topic", "evidence_refs"):
         invalid = _valid_payload()
-        invalid["talking_points"][0]["evidence_refs"][0]["excerpt"] = excerpt
+        invalid["communication_goals"][0][field] = "建议接受这份 Offer。"
         with pytest.raises(OfferNegotiationModelError) as error:
             validate_offer_negotiation(invalid, _snapshot())
-        assert error.value.validation_category == "excerpt_mismatch"
-    assert validate_offer_negotiation(_valid_payload(), _snapshot())["proposal_status"] == "normal"
+        assert error.value.validation_category == "invalid_item_shape"
 
 
-def test_structure_failure_repairs_once_and_renders_server_text() -> None:
-    model = FakeModel(["{", _json(_valid_payload())])
-    result = generate_offer_negotiation_proposal(model, _snapshot())
-    assert result["proposal_status"] == "normal"
-    assert len(model.calls) == 2
-    assert "沟通请求" in result["communication_goals"][0]["text"]
-    assert '"text"' not in model.calls[1][0][1].content
-
-
-def test_semantic_evidence_failure_is_not_repaired() -> None:
+def test_unknown_evidence_id_is_semantic_and_not_repaired() -> None:
     invalid = _valid_payload()
-    invalid["communication_goals"][0]["evidence_refs"][0] = {
-        "source": "attacker",
-        "path": "/offer_snapshot/company_name",
-        "excerpt": "星云数据",
-    }
+    invalid["communication_goals"][0]["evidence_ref_ids"][0] = "attacker.secret"
     model = FakeModel([_json(invalid), _json(_valid_payload())])
     with pytest.raises(OfferNegotiationModelError) as error:
         generate_offer_negotiation_proposal(model, _snapshot())
@@ -210,93 +305,107 @@ def test_semantic_evidence_failure_is_not_repaired() -> None:
     assert error.value.provider_request_id.startswith("request-redacted-")
 
 
-@pytest.mark.parametrize(
-    "bad_ref",
-    [
-        "not-an-object",
-        {},
-        {"source": "offer_snapshot", "path": "/offer_snapshot/company_name", "excerpt": "星云数据", "extra": "x"},
-        {"source": "offer_snapshot", "path": 1, "excerpt": "星云数据"},
-        {"source": "offer_snapshot", "path": "/offer_snapshot/company_name", "excerpt": 1},
-    ],
-)
-def test_evidence_object_shape_failure_repairs_once(bad_ref: object) -> None:
+def test_template_must_belong_to_its_section() -> None:
     invalid = _valid_payload()
-    invalid["communication_goals"][0]["evidence_refs"] = [bad_ref]
-    model = FakeModel([_json(invalid), _json(_valid_payload())])
-    result = generate_offer_negotiation_proposal(model, _snapshot())
-    assert result["proposal_status"] == "normal"
-    assert len(model.calls) == 2
-
-
-@pytest.mark.parametrize("bad_refs", ["not-an-array", []])
-def test_evidence_refs_shape_failure_repairs_once(bad_refs: object) -> None:
-    invalid = _valid_payload()
-    invalid["communication_goals"][0]["evidence_refs"] = bad_refs
-    model = FakeModel([_json(invalid), _json(_valid_payload())])
-    result = generate_offer_negotiation_proposal(model, _snapshot())
-    assert result["proposal_status"] == "normal"
-    assert len(model.calls) == 2
-
-
-def test_evidence_refs_limit_is_terminal_without_repair() -> None:
-    invalid = _valid_payload()
-    invalid["communication_goals"][0]["evidence_refs"] = [
-        {"source": "offer_snapshot", "path": "/offer_snapshot/company_name", "excerpt": "星云数据"}
-    ] * 5
-    model = FakeModel([_json(invalid), _json(_valid_payload())])
-    with pytest.raises(OfferNegotiationModelError) as error:
-        generate_offer_negotiation_proposal(model, _snapshot())
-    assert error.value.validation_category == "limit_exceeded"
-    assert len(model.calls) == 1
-
-
-@pytest.mark.parametrize(
-    ("topic", "path", "excerpt"),
-    [
-        ("user_goal", "/offer_snapshot/company_name", "星云数据"),
-        ("user_concern", "/user_brief/goal", "争取入职时间"),
-        ("user_scenario", "/offer_snapshot/company_name", "星云数据"),
-        ("comparison_dimension", "/user_brief/concerns", "通勤"),
-        ("offer_fact", "/user_brief/goal", "争取入职时间"),
-    ],
-)
-def test_topic_requires_an_matching_evidence_anchor(topic: str, path: str, excerpt: str) -> None:
-    invalid = _valid_payload()
-    invalid["communication_goals"][0]["topic"] = topic
-    invalid["communication_goals"][0]["evidence_refs"] = [
-        {"source": "offer_snapshot" if path.startswith("/offer_") else "user_brief", "path": path, "excerpt": excerpt}
-    ]
+    invalid["communication_goals"][0] = _item(
+        "goal-1",
+        "say_current_offer_and_request",
+        "offer.base_monthly",
+        "offer.months_per_year",
+        "brief.goal",
+    )
     with pytest.raises(OfferNegotiationModelError) as error:
         validate_offer_negotiation(invalid, _snapshot())
-    assert error.value.validation_category == "topic_evidence_mismatch"
+    assert error.value.validation_category == "template_section_mismatch"
 
 
-def test_comparison_dimension_topic_accepts_only_dimension_value_anchor() -> None:
-    valid = _valid_payload()
-    valid["communication_goals"][0]["topic"] = "comparison_dimension"
-    valid["communication_goals"][0]["evidence_refs"] = [
+def test_template_requires_the_exact_evidence_set() -> None:
+    invalid = _valid_payload()
+    invalid["talking_points"][0]["evidence_ref_ids"] = ["brief.goal"]
+    with pytest.raises(OfferNegotiationModelError) as error:
+        validate_offer_negotiation(invalid, _snapshot())
+    assert error.value.validation_category == "template_evidence_mismatch"
+
+
+def test_template_cannot_use_a_missing_offer_fact() -> None:
+    snapshot = _snapshot()
+    snapshot["offer_snapshot"]["deadline"] = None
+    payload = _valid_payload()
+    payload["clarification_questions"][0] = _item(
+        "question-1", "ask_decision_deadline", "offer.deadline"
+    )
+    with pytest.raises(OfferNegotiationModelError) as error:
+        validate_offer_negotiation(payload, snapshot)
+    assert error.value.validation_category == "unknown_evidence_ref"
+
+
+def test_dynamic_dimension_template_uses_its_label_and_value_server_side() -> None:
+    payload = _valid_payload()
+    payload["clarification_questions"][0] = _item(
+        "question-1",
+        "ask_comparison_dimension",
+        "offer.dimension.dimension_001",
+    )
+    result = validate_offer_negotiation(payload, _snapshot())
+    question = result["clarification_questions"][0]
+    assert "通勤" in question["text"]
+    assert "地铁 35 分钟" in question["text"]
+    assert question["evidence_refs"] == [
         {
             "source": "offer_snapshot",
             "path": "/offer_snapshot/dimensions/dimension_001/value_text",
             "excerpt": "地铁 35 分钟",
         }
     ]
-    assert validate_offer_negotiation(valid, _snapshot())["proposal_status"] == "normal"
 
 
-def test_array_field_selects_the_rendered_intent() -> None:
-    result = validate_offer_negotiation(_valid_payload(), _snapshot())
-    assert "沟通请求" in result["communication_goals"][0]["text"]
-    assert "确认" in result["clarification_questions"][0]["text"]
-    assert "表达" in result["talking_points"][0]["text"]
-    assert "检查" not in result["talking_points"][0]["text"]
-    assert "确认" in result["preparation_checks"][0]["text"]
-
-
-def test_excerpt_over_limit_is_terminal_limit_exceeded() -> None:
+def test_duplicate_template_selection_is_rejected_even_with_different_item_ids() -> None:
     invalid = _valid_payload()
-    invalid["communication_goals"][0]["evidence_refs"][0]["excerpt"] = "x" * 401
+    invalid["communication_goals"].append({**invalid["communication_goals"][0], "id": "goal-2"})
+    with pytest.raises(OfferNegotiationModelError) as error:
+        validate_offer_negotiation(invalid, _snapshot())
+    assert error.value.validation_category == "duplicate_template"
+
+
+def test_structure_failure_repairs_once_and_uses_the_same_closed_dsl() -> None:
+    model = FakeModel(["{", _json(_valid_payload())])
+    result = generate_offer_negotiation_proposal(model, _snapshot())
+    assert result["proposal_status"] == "normal"
+    assert len(model.calls) == 2
+    assert "争取固定月薪再增加 2K" in result["communication_goals"][0]["text"]
+    assert '"text"' not in model.calls[1][0][1].content
+
+
+def test_unknown_template_id_is_repaired_once_as_a_shape_error() -> None:
+    invalid = _valid_payload()
+    invalid["communication_goals"][0]["template_id"] = "invented_template"
+    model = FakeModel([_json(invalid), _json(_valid_payload())])
+    result = generate_offer_negotiation_proposal(model, _snapshot())
+    assert result["proposal_status"] == "normal"
+    assert len(model.calls) == 2
+
+
+@pytest.mark.parametrize("bad_refs", ["not-an-array", [], [1], ["brief.goal"] * 5])
+def test_evidence_id_shape_is_repaired_or_stopped_by_the_limit(bad_refs: object) -> None:
+    invalid = _valid_payload()
+    invalid["communication_goals"][0]["evidence_ref_ids"] = bad_refs
+    model = FakeModel([_json(invalid), _json(_valid_payload())])
+    if isinstance(bad_refs, list) and len(bad_refs) > 4:
+        with pytest.raises(OfferNegotiationModelError) as error:
+            generate_offer_negotiation_proposal(model, _snapshot())
+        assert error.value.validation_category == "limit_exceeded"
+        assert len(model.calls) == 1
+    else:
+        result = generate_offer_negotiation_proposal(model, _snapshot())
+        assert result["proposal_status"] == "normal"
+        assert len(model.calls) == 2
+
+
+def test_provider_item_count_is_bounded_to_three_per_section() -> None:
+    invalid = _valid_payload()
+    invalid["communication_goals"] = [
+        _item(f"goal-{index}", "goal_focus_request", "brief.goal") for index in range(4)
+    ]
     model = FakeModel([_json(invalid), _json(_valid_payload())])
     with pytest.raises(OfferNegotiationModelError) as error:
         generate_offer_negotiation_proposal(model, _snapshot())
@@ -304,82 +413,26 @@ def test_excerpt_over_limit_is_terminal_limit_exceeded() -> None:
     assert len(model.calls) == 1
 
 
-def test_empty_excerpt_is_structural_and_repairs_once() -> None:
-    invalid = _valid_payload()
-    invalid["communication_goals"][0]["evidence_refs"][0]["excerpt"] = ""
-    model = FakeModel([_json(invalid), _json(_valid_payload())])
-    result = generate_offer_negotiation_proposal(model, _snapshot())
-    assert result["proposal_status"] == "normal"
-    assert len(model.calls) == 2
-
-
-def test_whitespace_excerpt_is_semantic_and_not_repaired() -> None:
-    invalid = _valid_payload()
-    invalid["communication_goals"][0]["evidence_refs"][0]["excerpt"] = " \t"
-    model = FakeModel([_json(invalid), _json(_valid_payload())])
-    with pytest.raises(OfferNegotiationModelError) as error:
-        generate_offer_negotiation_proposal(model, _snapshot())
-    assert error.value.validation_category == "excerpt_mismatch"
-    assert len(model.calls) == 1
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "建议接受这份 Offer。",
-        "我的建议如下；由你自行决定接受这份 Offer。",
-        "这份 Offer 是首选。",
-        "优先选这份 Offer。",
-        "我更推荐这份 Offer。",
-        "这份 Offer 性价比最高。",
-        "I prefer this offer.",
-        "Pick this offer.",
-        "This offer should be your first choice.",
-        "请确认公司政策允许哪些远程办公安排。",
-        "公司政策允许远程办公？",
-        "请核对公司制度要求的到岗天数。",
-        "Does the company policy allow remote work?",
-        "公司的政策规定所有人必须到岗。",
-        "录用可能性高达 90%。",
-        "获聘概率为 90%。",
-    ],
-)
-def test_provider_free_form_language_is_never_accepted(text: str) -> None:
-    payload = _valid_payload()
-    payload["communication_goals"][0]["text"] = text
-    with pytest.raises(OfferNegotiationModelError) as error:
-        validate_offer_negotiation(payload, _snapshot())
-    assert error.value.validation_category == "invalid_item_shape"
-
-
-def test_removed_free_form_intent_is_a_shape_failure() -> None:
-    invalid = _valid_payload()
-    invalid["communication_goals"][0]["intent"] = "recommend_accept"
-    model = FakeModel([_json(invalid), _json(_valid_payload())])
-    result = generate_offer_negotiation_proposal(model, _snapshot())
-    assert result["proposal_status"] == "normal"
-    assert len(model.calls) == 2
-
-
-def test_generation_prompt_declares_constrained_contract() -> None:
+def test_generation_prompt_declares_templates_and_evidence_ids_only() -> None:
     model = FakeModel([_json(_valid_payload())])
     generate_offer_negotiation_proposal(model, _snapshot())
     prompt = "\n".join(message.content for message in model.calls[0][0])
-    assert "prepare_question" not in prompt
-    assert "communication_context" not in prompt
-    assert "comparison_dimension" in prompt
-    assert '"/offer_snapshot/company_name"' in prompt
-    assert '"id":' not in prompt.split("evidence_catalog", 1)[1]
+    assert "template_catalog" in prompt
+    assert "evidence_ref_ids" in prompt
+    assert "goal_interest_then_request" in prompt
+    assert '"topic":' not in prompt
+    assert "模型不得返回 text" in prompt
 
 
-def test_native_schema_uses_the_same_constrained_provider_contract() -> None:
+def test_native_schema_uses_the_same_closed_provider_contract() -> None:
     model = FakeModel([_json(_valid_payload())])
     model.supports_json_schema = True
     generate_offer_negotiation_proposal(model, _snapshot())
     schema = model.calls[0][1]["json_schema"]["schema"]
     item_schema = schema["properties"]["communication_goals"]["items"]
-    assert item_schema["required"] == ["id", "topic", "evidence_refs"]
-    assert "intent" not in item_schema["properties"]
+    assert item_schema["required"] == ["id", "template_id", "evidence_ref_ids"]
+    assert item_schema["properties"]["template_id"]["enum"]
+    assert "topic" not in item_schema["properties"]
     assert "text" not in item_schema["properties"]
     assert "rationale" not in item_schema["properties"]
 
@@ -394,7 +447,9 @@ def test_safe_empty_has_exact_four_empty_arrays() -> None:
 def test_safe_empty_repair_emits_only_redacted_diagnostic() -> None:
     diagnostics: list[dict[str, object]] = []
     model = FakeModel(["{", "{"])
-    result = generate_offer_negotiation_proposal(model, _snapshot(), on_diagnostic=diagnostics.append)
+    result = generate_offer_negotiation_proposal(
+        model, _snapshot(), on_diagnostic=diagnostics.append
+    )
     assert result["proposal_status"] == "safe_empty"
     assert len(diagnostics) == 1
     assert diagnostics[0]["failure_category"] == "invalid_json"

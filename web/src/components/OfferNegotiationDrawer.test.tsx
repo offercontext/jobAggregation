@@ -82,6 +82,13 @@ describe('OfferNegotiationDrawer', () => {
     service.get.mockClear();
     service.preview.mockResolvedValue(preview());
     service.list.mockResolvedValue([]);
+    window.matchMedia = () => ({
+      matches: false,
+      addListener: () => undefined,
+      removeListener: () => undefined,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+    }) as unknown as MediaQueryList;
     vi.stubGlobal('confirm', vi.fn(() => true));
     host = document.createElement('div');
     document.body.appendChild(host);
@@ -240,6 +247,10 @@ describe('OfferNegotiationDrawer', () => {
 
   it('shows the complete frozen Offer facts before generation', async () => {
     await act(async () => { root?.render(<OfferNegotiationDrawer open offer={{ ...offer, equity: '期权', perks: '补充医疗', deadline: '周五', notes: '用户备注' }} onClose={vi.fn()} />); });
+    const showSources = Array.from(host?.querySelectorAll('[role="button"]') ?? []).find(
+      (button) => button.textContent?.includes('查看完整来源'),
+    );
+    await act(async () => { showSources?.dispatchEvent(new MouseEvent('click', { bubbles: true })); });
     expect(host?.querySelector('[data-testid="offer-negotiation-input-facts"]')?.textContent).toContain('期权');
     expect(host?.querySelector('[data-testid="offer-negotiation-input-facts"]')?.textContent).toContain('用户备注');
   });
@@ -364,6 +375,11 @@ describe('OfferNegotiationDrawer', () => {
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
     await act(async () => { host?.querySelector<HTMLButtonElement>('[data-testid="offer-negotiation-generate"]')?.click(); });
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(host?.textContent).toContain('可以这样说');
+    expect(host?.textContent).toContain('需要问清楚');
+    expect(host?.textContent).toContain('沟通前核对');
+    expect(host?.textContent).toContain('本次沟通目标');
+    expect(host?.textContent).toContain('先从“本次沟通目标”开始');
     expect(host?.textContent).toContain('请选择至少一项建议后才能保存。');
     const checkbox = host?.querySelector('article input[type="checkbox"]') as HTMLInputElement;
     await act(async () => { checkbox.click(); });

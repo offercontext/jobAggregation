@@ -59,38 +59,36 @@ def _offer(client: TestClient) -> dict:
 
 
 def _payload() -> dict:
-    item = {
-        "topic": "offer_fact",
-        "evidence_refs": [
-            {"source": "offer_snapshot", "path": "/offer_snapshot/company_name", "excerpt": "星云数据"}
-        ],
-    }
     return {
         "proposal_status": "normal",
-        "communication_goals": [{**item, "id": "goal-1"}],
+        "communication_goals": [
+            {
+                "id": "goal-1",
+                "template_id": "goal_interest_then_request",
+                "evidence_ref_ids": ["offer.company_name", "offer.position_name", "brief.goal"],
+            }
+        ],
         "clarification_questions": [
             {
-                **item,
                 "id": "question-1",
-                "topic": "user_goal",
-                "evidence_refs": [
-                    {"source": "user_brief", "path": "/user_brief/goal", "excerpt": "goal"}
-                ],
+                "template_id": "ask_request_flexibility",
+                "evidence_ref_ids": ["brief.goal"],
             }
         ],
         "talking_points": [
             {
-                **item,
                 "id": "point-1",
-                "topic": "offer_fact",
-                "evidence_refs": [
-                    {"source": "offer_snapshot", "path": "/offer_snapshot/base_monthly", "excerpt": "28000"}
-                ],
+                "template_id": "say_current_offer_and_request",
+                "evidence_ref_ids": ["offer.base_monthly", "offer.months_per_year", "brief.goal"],
             }
         ],
-        "preparation_checks": [{**item, "id": "check-1", "topic": "user_goal", "evidence_refs": [
-            {"source": "user_brief", "path": "/user_brief/goal", "excerpt": "goal"}
-        ]}],
+        "preparation_checks": [
+            {
+                "id": "check-1",
+                "template_id": "check_goal_and_concern",
+                "evidence_ref_ids": ["brief.goal", "brief.concerns"],
+            }
+        ],
     }
 
 
@@ -101,7 +99,9 @@ def _request(client: TestClient, key: str = "A" * 16) -> object:
         "concerns": "concerns",
         "scenario": "scenario",
     }
-    preview_fingerprint = client.post("/api/offers/1/negotiation/preview", json=preview_payload).json()["source_fingerprint"]
+    preview_fingerprint = client.post(
+        "/api/offers/1/negotiation/preview", json=preview_payload
+    ).json()["source_fingerprint"]
     return client.post(
         "/api/offers/1/negotiation/proposals",
         json={
@@ -174,7 +174,7 @@ def test_generation_rejects_blank_user_brief_fields(tmp_path, field: str) -> Non
 
 def test_invalidated_attempts_are_not_in_history_list(tmp_path) -> None:
     invalid = _payload()
-    invalid["communication_goals"][0]["evidence_refs"][0]["source"] = "attacker"
+    invalid["communication_goals"][0]["evidence_ref_ids"][0] = "attacker.secret"
     model = FakeModel([json.dumps(invalid, ensure_ascii=False)])
     client = TestClient(create_app(data_dir=tmp_path, chat_model=model))
     _offer(client)
@@ -185,8 +185,10 @@ def test_invalidated_attempts_are_not_in_history_list(tmp_path) -> None:
 
 def test_semantic_failure_is_502_and_same_key_does_not_call_again(tmp_path) -> None:
     invalid = _payload()
-    invalid["communication_goals"][0]["evidence_refs"][0]["source"] = "attacker"
-    model = FakeModel([json.dumps(invalid, ensure_ascii=False), json.dumps(_payload(), ensure_ascii=False)])
+    invalid["communication_goals"][0]["evidence_ref_ids"][0] = "attacker.secret"
+    model = FakeModel(
+        [json.dumps(invalid, ensure_ascii=False), json.dumps(_payload(), ensure_ascii=False)]
+    )
     client = TestClient(create_app(data_dir=tmp_path, chat_model=model))
     _offer(client)
     response = _request(client, "B" * 16)
@@ -232,7 +234,9 @@ def test_provider_diagnostic_keeps_only_hashed_request_id(tmp_path) -> None:
     response = _request(client, "R" * 16)
     assert response.status_code == 502
     messages = [entry["message"] for entry in client.get("/api/logs?limit=20").json()["entries"]]
-    failure = next(message for message in messages if message.startswith("offer_negotiation_diagnostic"))
+    failure = next(
+        message for message in messages if message.startswith("offer_negotiation_diagnostic")
+    )
     assert "provider-request-secret" not in failure
     assert "request-redacted-" in failure
     assert "repair_count" in failure
@@ -247,7 +251,11 @@ def test_provider_diagnostic_marks_timeout_without_status(tmp_path) -> None:
     response = _request(client, "T" * 16)
     assert response.status_code == 502
     entries = client.get("/api/logs?limit=50").json()["entries"]
-    failure = next(entry["message"] for entry in entries if entry["message"].startswith("offer_negotiation_diagnostic "))
+    failure = next(
+        entry["message"]
+        for entry in entries
+        if entry["message"].startswith("offer_negotiation_diagnostic ")
+    )
     assert '"http_status":null' in failure
     assert '"timeout":true' in failure
     assert "provider-timeout-secret" not in failure
@@ -260,7 +268,11 @@ def test_provider_diagnostic_reads_nested_provider_diagnostic(tmp_path) -> None:
     response = _request(client, "U" * 16)
     assert response.status_code == 502
     entries = client.get("/api/logs?limit=50").json()["entries"]
-    failure = next(entry["message"] for entry in entries if entry["message"].startswith("offer_negotiation_diagnostic "))
+    failure = next(
+        entry["message"]
+        for entry in entries
+        if entry["message"].startswith("offer_negotiation_diagnostic ")
+    )
     assert '"http_status":503' in failure
     assert '"timeout":true' in failure
     assert "nested-provider-secret" not in failure
@@ -279,11 +291,20 @@ def test_generation_rejects_stale_preview_fingerprint_before_provider(tmp_path) 
     assert preview.status_code == 200
     client.put(
         f"/api/offers/{offer['id']}",
-        json={"company_name": offer["company_name"], "position_name": offer["position_name"], "base_monthly": 29000},
+        json={
+            "company_name": offer["company_name"],
+            "position_name": offer["position_name"],
+            "base_monthly": 29000,
+        },
     )
     response = client.post(
         f"/api/offers/{offer['id']}/negotiation/proposals",
-        json={"idempotency_key": "V" * 16, "dimension_ids": [], **brief, "source_fingerprint": preview.json()["source_fingerprint"]},
+        json={
+            "idempotency_key": "V" * 16,
+            "dimension_ids": [],
+            **brief,
+            "source_fingerprint": preview.json()["source_fingerprint"],
+        },
     )
     assert response.status_code == 409
     assert response.json()["error_code"] == "offer_negotiation_source_changed"
@@ -320,7 +341,12 @@ def test_dimension_value_change_marks_history_source_changed(tmp_path) -> None:
             "idempotency_key": "J" * 16,
             "source_fingerprint": client.post(
                 f"/api/offers/{offer['id']}/negotiation/preview",
-                json={"dimension_ids": [dimension["id"]], "goal": "goal", "concerns": "concerns", "scenario": "scenario"},
+                json={
+                    "dimension_ids": [dimension["id"]],
+                    "goal": "goal",
+                    "concerns": "concerns",
+                    "scenario": "scenario",
+                },
             ).json()["source_fingerprint"],
             "dimension_ids": [dimension["id"]],
             "goal": "goal",
@@ -382,17 +408,20 @@ def test_confirmation_is_hitl_idempotent_and_history_retains_brief(tmp_path) -> 
     )
     assert replay.status_code == 200
     assert replay.json()["id"] == confirmed.json()["id"]
-    assert client.put(
-        f"/api/offers/{offer['id']}",
-        json={
-            "company_name": "星云数据",
-            "position_name": "后端工程师",
-            "base_monthly": 28000,
-            "months_per_year": 12,
-            "signing_bonus": 0,
-            "notes": "更新后的备注",
-        },
-    ).status_code == 200
+    assert (
+        client.put(
+            f"/api/offers/{offer['id']}",
+            json={
+                "company_name": "星云数据",
+                "position_name": "后端工程师",
+                "base_monthly": 28000,
+                "months_per_year": 12,
+                "signing_bonus": 0,
+                "notes": "更新后的备注",
+            },
+        ).status_code
+        == 200
+    )
     history = client.get(f"/api/offer-negotiation/proposals/{proposal_id}")
     assert history.status_code == 200
     assert history.json()["source_changed"] is True

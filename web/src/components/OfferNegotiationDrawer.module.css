@@ -116,6 +116,17 @@
   font-size: 15px;
 }
 
+.proposalIntro {
+  margin: 0;
+  padding: 12px 14px;
+  border-left: 3px solid var(--op-primary, #635bff);
+  border-radius: 8px;
+  background: var(--op-surface-muted);
+  color: var(--op-muted-strong);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
 .factsSection > dl {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

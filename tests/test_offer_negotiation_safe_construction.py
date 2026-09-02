@@ -43,10 +43,8 @@ def test_provider_intent_is_rendered_by_server_templates() -> None:
         "communication_goals": [
             {
                 "id": "goal-1",
-                "topic": "user_goal",
-                "evidence_refs": [
-                    {"source": "user_brief", "path": "/user_brief/goal", "excerpt": "争取入职时间"}
-                ],
+                "template_id": "goal_focus_request",
+                "evidence_ref_ids": ["brief.goal"],
             }
         ],
         "clarification_questions": [],
@@ -67,11 +65,9 @@ def test_provider_cannot_supply_free_form_decision_text() -> None:
             {
                 "id": "goal-1",
                 "intent": "prepare_request",
-                "topic": "user_goal",
+                "template_id": "goal_focus_request",
                 "text": "建议接受这份 Offer。",
-                "evidence_refs": [
-                    {"source": "user_brief", "path": "/user_brief/goal", "excerpt": "争取入职时间"}
-                ],
+                "evidence_ref_ids": ["brief.goal"],
             }
         ],
         "clarification_questions": [],
@@ -80,7 +76,9 @@ def test_provider_cannot_supply_free_form_decision_text() -> None:
     }
     diagnostics: list[dict] = []
     try:
-        generate_offer_negotiation_proposal(FakeModel(payload), _snapshot(), on_diagnostic=diagnostics.append)
+        generate_offer_negotiation_proposal(
+            FakeModel(payload), _snapshot(), on_diagnostic=diagnostics.append
+        )
     except ValueError:
         pass
     assert diagnostics[0]["failure_category"] in {"unexpected_field", "invalid_item_shape"}

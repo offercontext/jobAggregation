@@ -9,9 +9,15 @@ from time import perf_counter
 from typing import Any
 
 from offerpilot.ai.agent_contracts import ChatModel
+from offerpilot.ai.offer_negotiation_templates import (
+    TEMPLATE_IDS,
+    TemplateContractError,
+    provider_evidence_catalog,
+    provider_template_catalog,
+    render_template,
+)
 from offerpilot.ai.types import Message
 from offerpilot.ai.workflows import parse_json_reply
-from offerpilot.repositories.json_contract import canonical_json
 
 OFFER_NEGOTIATION_FIELDS = (
     "proposal_status",
@@ -21,41 +27,7 @@ OFFER_NEGOTIATION_FIELDS = (
     "preparation_checks",
 )
 _ARRAY_FIELDS = OFFER_NEGOTIATION_FIELDS[1:]
-_ITEM_FIELDS = {"id", "topic", "evidence_refs"}
-_REF_FIELDS = {"source", "path", "excerpt"}
-_ALLOWED_SOURCES = {"offer_snapshot", "user_brief"}
-_ALLOWED_TOPICS = {
-    "offer_fact",
-    "user_goal",
-    "user_concern",
-    "user_scenario",
-    "comparison_dimension",
-}
-_TOPIC_LABELS = {
-    "offer_fact": "Offer 固定事实",
-    "user_goal": "本次谈薪目标",
-    "user_concern": "本次谈薪顾虑",
-    "user_scenario": "本次沟通场景",
-    "comparison_dimension": "自定义比较维度",
-}
-_FIXED_OFFER_EVIDENCE_PATHS = {
-    "/offer_snapshot/company_name",
-    "/offer_snapshot/position_name",
-    "/offer_snapshot/status",
-    "/offer_snapshot/base_monthly",
-    "/offer_snapshot/months_per_year",
-    "/offer_snapshot/signing_bonus",
-    "/offer_snapshot/equity",
-    "/offer_snapshot/perks",
-    "/offer_snapshot/deadline",
-    "/offer_snapshot/notes",
-}
-_TOPIC_ANCHORS = {
-    "offer_fact": _FIXED_OFFER_EVIDENCE_PATHS,
-    "user_goal": {"/user_brief/goal"},
-    "user_concern": {"/user_brief/concerns"},
-    "user_scenario": {"/user_brief/scenario"},
-}
+_ITEM_FIELDS = {"id", "template_id", "evidence_ref_ids"}
 _SHAPE_CATEGORIES = {
     "invalid_json",
     "duplicate_json_key",
@@ -68,9 +40,6 @@ _SHAPE_CATEGORIES = {
 }
 OfferNegotiationDiagnosticSink = Callable[[dict[str, Any]], None]
 _ID_RE = re.compile(r"^[\x21-\x7e]{1,64}$")
-_DIMENSION_VALUE_PATH_RE = re.compile(
-    r"^/offer_snapshot/dimensions/dimension_[0-9]{3}/value_text$"
-)
 
 OFFER_NEGOTIATION_JSON_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -81,27 +50,22 @@ OFFER_NEGOTIATION_JSON_SCHEMA: dict[str, Any] = {
         **{
             field: {
                 "type": "array",
-                "maxItems": 8,
+                "maxItems": 3,
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["id", "topic", "evidence_refs"],
+                    "required": ["id", "template_id", "evidence_ref_ids"],
                     "properties": {
                         "id": {"type": "string", "minLength": 1, "maxLength": 64},
-                        "topic": {"enum": sorted(_ALLOWED_TOPICS)},
-                        "evidence_refs": {
+                        "template_id": {"enum": list(TEMPLATE_IDS)},
+                        "evidence_ref_ids": {
                             "type": "array",
                             "minItems": 1,
                             "maxItems": 4,
                             "items": {
-                                "type": "object",
-                                "additionalProperties": False,
-                                "required": ["source", "path", "excerpt"],
-                                "properties": {
-                                    "source": {"enum": sorted(_ALLOWED_SOURCES)},
-                                    "path": {"type": "string", "minLength": 1},
-                                    "excerpt": {"type": "string", "minLength": 1, "maxLength": 400},
-                                },
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 64,
                             },
                         },
                     },
@@ -164,8 +128,16 @@ def build_offer_negotiation_snapshot(
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"{field} must not be blank")
     fields = (
-        "company_name", "position_name", "status", "base_monthly", "months_per_year",
-        "signing_bonus", "equity", "perks", "deadline", "notes",
+        "company_name",
+        "position_name",
+        "status",
+        "base_monthly",
+        "months_per_year",
+        "signing_bonus",
+        "equity",
+        "perks",
+        "deadline",
+        "notes",
     )
     offer_snapshot = {field: offer.get(field) for field in fields}
     sorted_dimensions = sorted(dimensions, key=lambda item: int(item["id"]))
@@ -200,15 +172,18 @@ def validate_offer_negotiation(payload: dict[str, Any], snapshot: dict[str, Any]
         raise OfferNegotiationModelError("proposal_status is invalid", "invalid_field_type")
     if status == "safe_empty":
         if any(payload[field] != [] for field in _ARRAY_FIELDS):
-            raise OfferNegotiationModelError("safe_empty must have empty arrays", "invalid_item_shape")
+            raise OfferNegotiationModelError(
+                "safe_empty must have empty arrays", "invalid_item_shape"
+            )
         return safe_empty_offer_negotiation_proposal()
     seen_ids: set[str] = set()
+    seen_templates: set[tuple[str, str, tuple[str, ...]]] = set()
     normalized: dict[str, Any] = {"proposal_status": "normal"}
     for field in _ARRAY_FIELDS:
         items = payload.get(field)
         if not isinstance(items, list):
             raise OfferNegotiationModelError(f"{field} must be an array", "invalid_field_type")
-        if len(items) > 8:
+        if len(items) > 3:
             raise OfferNegotiationModelError(f"{field} exceeds the limit", "limit_exceeded")
         normalized[field] = []
         for item in items:
@@ -216,6 +191,19 @@ def validate_offer_negotiation(payload: dict[str, Any], snapshot: dict[str, Any]
             if checked["id"] in seen_ids:
                 raise OfferNegotiationModelError("item ids must be unique", "duplicate_item_id")
             seen_ids.add(checked["id"])
+            raw_template_id = item.get("template_id")
+            raw_evidence_ids = item.get("evidence_ref_ids")
+            template_key = (
+                field,
+                str(raw_template_id),
+                tuple(raw_evidence_ids) if isinstance(raw_evidence_ids, list) else (),
+            )
+            if template_key in seen_templates:
+                raise OfferNegotiationModelError(
+                    "template selections must be unique",
+                    "duplicate_template",
+                )
+            seen_templates.add(template_key)
             normalized[field].append(checked)
     if all(not normalized[field] for field in _ARRAY_FIELDS):
         return safe_empty_offer_negotiation_proposal()
@@ -233,7 +221,11 @@ def generate_offer_negotiation_proposal(
     provider_request_id = ""
     for attempt in range(2):
         prompt = _generation_prompt(snapshot) if attempt == 0 else _repair_prompt(last_category)
-        response_format = OFFER_NEGOTIATION_RESPONSE_FORMAT if getattr(model, "supports_json_schema", False) is True else None
+        response_format = (
+            OFFER_NEGOTIATION_RESPONSE_FORMAT
+            if getattr(model, "supports_json_schema", False) is True
+            else None
+        )
         try:
             assistant = model.complete(
                 [
@@ -252,13 +244,19 @@ def generate_offer_negotiation_proposal(
             )
             status = diagnostic_map.get(
                 "http_status",
-                diagnostic_map.get("status_code", getattr(exc, "status_code", getattr(exc, "http_status", None))),
+                diagnostic_map.get(
+                    "status_code", getattr(exc, "status_code", getattr(exc, "http_status", None))
+                ),
             )
             try:
                 error.http_status = int(status) if status is not None else None
             except (TypeError, ValueError):
                 error.http_status = None
-            error.timeout = bool(diagnostic_map.get("timeout", False)) or isinstance(exc, TimeoutError) or "timeout" in type(exc).__name__.lower()
+            error.timeout = (
+                bool(diagnostic_map.get("timeout", False))
+                or isinstance(exc, TimeoutError)
+                or "timeout" in type(exc).__name__.lower()
+            )
             error.repair_count = attempt
             error.elapsed_ms = int((perf_counter() - started) * 1000)
             _emit_diagnostic(
@@ -286,7 +284,9 @@ def generate_offer_negotiation_proposal(
         except OfferNegotiationModelError as exc:
             last_category = exc.validation_category
         except (TypeError, ValueError, RuntimeError) as exc:
-            last_category = "duplicate_json_key" if "duplicate" in str(exc).lower() else "invalid_json"
+            last_category = (
+                "duplicate_json_key" if "duplicate" in str(exc).lower() else "invalid_json"
+            )
         if last_category not in _SHAPE_CATEGORIES:
             error = OfferNegotiationModelError("proposal is not verifiable", last_category)
             error.provider_request_id = provider_request_id
@@ -343,121 +343,51 @@ def _validate_item(item: Any, snapshot: dict[str, Any], field: str) -> dict[str,
     if not isinstance(item, dict) or set(item) != _ITEM_FIELDS:
         raise OfferNegotiationModelError("item fields are invalid", "invalid_item_shape")
     item_id = item.get("id")
-    topic = item.get("topic")
-    refs = item.get("evidence_refs")
+    template_id = item.get("template_id")
+    evidence_ref_ids = item.get("evidence_ref_ids")
     if not isinstance(item_id, str) or not item_id:
         raise OfferNegotiationModelError("item id is invalid", "invalid_item_shape")
     if len(item_id) > 64:
         raise OfferNegotiationModelError("item id exceeds the limit", "limit_exceeded")
     if not _ID_RE.fullmatch(item_id):
         raise OfferNegotiationModelError("item id is invalid", "invalid_item_shape")
-    if not isinstance(topic, str) or topic not in _ALLOWED_TOPICS:
-        raise OfferNegotiationModelError("topic is invalid", "invalid_field_type")
-    if not isinstance(refs, list) or not refs:
-        raise OfferNegotiationModelError("evidence_refs is invalid", "missing_evidence_ref")
-    if len(refs) > 4:
-        raise OfferNegotiationModelError("evidence_refs exceeds the limit", "limit_exceeded")
-    checked_refs = [_validate_ref(ref, snapshot) for ref in refs]
-    _validate_topic_anchor(topic, checked_refs)
-    rendered = _render_item(item_id, field, topic, checked_refs)
+    if not isinstance(template_id, str) or template_id not in TEMPLATE_IDS:
+        raise OfferNegotiationModelError("template_id is invalid", "invalid_field_type")
+    if not isinstance(evidence_ref_ids, list) or not evidence_ref_ids:
+        raise OfferNegotiationModelError(
+            "evidence_ref_ids is invalid",
+            "missing_evidence_ref",
+        )
+    if len(evidence_ref_ids) > 4:
+        raise OfferNegotiationModelError(
+            "evidence_ref_ids exceeds the limit",
+            "limit_exceeded",
+        )
+    if any(not isinstance(value, str) or not value for value in evidence_ref_ids):
+        raise OfferNegotiationModelError(
+            "evidence_ref_ids contains an invalid value",
+            "invalid_evidence_shape",
+        )
+    if len(set(evidence_ref_ids)) != len(evidence_ref_ids):
+        raise OfferNegotiationModelError(
+            "evidence_ref_ids must be unique",
+            "invalid_evidence_shape",
+        )
+    try:
+        text, rationale, checked_refs = render_template(
+            section=field,
+            template_id=template_id,
+            evidence_ref_ids=evidence_ref_ids,
+            snapshot=snapshot,
+        )
+    except TemplateContractError as exc:
+        raise OfferNegotiationModelError(str(exc), exc.category) from exc
     return {
         "id": item_id,
-        "text": rendered[0],
-        "rationale": rendered[1],
+        "text": text,
+        "rationale": rationale,
         "evidence_refs": checked_refs,
     }
-
-
-def _render_item(
-    item_id: str,
-    field: str,
-    topic: str,
-    evidence_refs: list[dict[str, str]],
-) -> tuple[str, str]:
-    del item_id, evidence_refs
-    label = _TOPIC_LABELS[topic]
-    text_templates = {
-        "communication_goals": f"可以围绕{label}准备沟通请求。",
-        "clarification_questions": f"可向对方确认与{label}相关的问题。",
-        "talking_points": f"准备围绕{label}表达你的诉求。",
-        "preparation_checks": f"请在沟通前确认{label}相关信息。",
-    }
-    text = text_templates[field]
-    rationale = "该建议由系统依据已提供的冻结来源生成，最终沟通内容由你决定。"
-    return text, rationale
-
-
-def _validate_topic_anchor(topic: str, evidence_refs: list[dict[str, str]]) -> None:
-    paths = {ref["path"] for ref in evidence_refs}
-    if topic == "comparison_dimension":
-        matched = any(_DIMENSION_VALUE_PATH_RE.fullmatch(path) for path in paths)
-    else:
-        matched = bool(paths & _TOPIC_ANCHORS[topic])
-    if not matched:
-        raise OfferNegotiationModelError(
-            "topic evidence anchor is missing",
-            "topic_evidence_mismatch",
-        )
-
-
-def _validate_ref(ref: Any, snapshot: dict[str, Any]) -> dict[str, str]:
-    if not isinstance(ref, dict) or set(ref) != _REF_FIELDS:
-        raise OfferNegotiationModelError("evidence reference shape is invalid", "invalid_evidence_shape")
-    source, path, excerpt = ref.get("source"), ref.get("path"), ref.get("excerpt")
-    if not isinstance(source, str) or not isinstance(path, str) or not isinstance(excerpt, str):
-        raise OfferNegotiationModelError("evidence reference field type is invalid", "invalid_evidence_shape")
-    if source not in _ALLOWED_SOURCES:
-        raise OfferNegotiationModelError("evidence reference is unknown", "unknown_evidence_ref")
-    if excerpt == "":
-        raise OfferNegotiationModelError("evidence excerpt shape is invalid", "invalid_evidence_shape")
-    if len(excerpt) > 400:
-        raise OfferNegotiationModelError("evidence excerpt exceeds the limit", "limit_exceeded")
-    if not excerpt.strip():
-        raise OfferNegotiationModelError("evidence excerpt is invalid", "excerpt_mismatch")
-    if source == "offer_snapshot":
-        value = _resolve_snapshot_path(snapshot, source, path)
-        if not isinstance(value, (str, int)) or value is None:
-            raise OfferNegotiationModelError("offer evidence path is invalid", "unknown_evidence_ref")
-        expected = str(value)
-        if isinstance(value, int) and excerpt != expected:
-            raise OfferNegotiationModelError("numeric evidence must be exact", "excerpt_mismatch")
-        if isinstance(value, str) and excerpt not in value:
-            raise OfferNegotiationModelError("evidence excerpt does not match", "excerpt_mismatch")
-    else:
-        value = _resolve_snapshot_path(snapshot, source, path)
-        if not isinstance(value, str) or excerpt not in value:
-            raise OfferNegotiationModelError("user brief excerpt does not match", "excerpt_mismatch")
-    return {"source": source, "path": path, "excerpt": excerpt}
-
-
-def _resolve_snapshot_path(snapshot: dict[str, Any], source: str, path: str) -> Any:
-    if source == "offer_snapshot":
-        fixed_fields = {
-            "company_name", "position_name", "status", "base_monthly", "months_per_year",
-            "signing_bonus", "equity", "perks", "deadline", "notes",
-        }
-        prefix = "/offer_snapshot/"
-        if path.startswith(prefix):
-            field = path[len(prefix):]
-            if field in fixed_fields:
-                value = snapshot.get("offer_snapshot", {}).get(field)
-                if value is None or isinstance(value, (dict, list, bool)):
-                    raise OfferNegotiationModelError("offer evidence path is invalid", "unknown_evidence_ref")
-                return value
-        dimension_match = re.fullmatch(r"/offer_snapshot/dimensions/(dimension_[0-9]{3})/value_text", path)
-        if dimension_match:
-            path_id = dimension_match.group(1)
-            dimensions = snapshot.get("offer_snapshot", {}).get("dimensions", [])
-            dimension = next((item for item in dimensions if item.get("path_id") == path_id), None)
-            if dimension is None or not isinstance(dimension.get("value_text"), str) or not dimension["value_text"]:
-                raise OfferNegotiationModelError("missing dimension value has no evidence", "unknown_evidence_ref")
-            return dimension["value_text"]
-    elif source == "user_brief":
-        if path in {"/user_brief/goal", "/user_brief/concerns", "/user_brief/scenario"}:
-            value = snapshot.get("user_brief", {}).get(path.rsplit("/", 1)[-1])
-            if isinstance(value, str) and value:
-                return value
-    raise OfferNegotiationModelError("evidence path is unknown", "unknown_evidence_ref")
 
 
 def _reject_non_finite(value: Any) -> None:
@@ -471,96 +401,36 @@ def _reject_non_finite(value: Any) -> None:
             _reject_non_finite(item)
 
 
-def _evidence_catalog(snapshot: dict[str, Any]) -> list[dict[str, str]]:
-    catalog: list[dict[str, str]] = []
-    offer_snapshot = snapshot.get("offer_snapshot", {})
-    if isinstance(offer_snapshot, dict):
-        for field, value in offer_snapshot.items():
-            if (
-                isinstance(value, (str, int))
-                and not isinstance(value, bool)
-                and (not isinstance(value, str) or value.strip())
-            ):
-                catalog.append(
-                    {
-                        "source": "offer_snapshot",
-                        "path": f"/offer_snapshot/{field}",
-                        "excerpt": str(value),
-                    }
-                )
-    dimensions = offer_snapshot.get("dimensions", [])
-    if isinstance(dimensions, list):
-        for dimension in dimensions:
-            if not isinstance(dimension, dict):
-                continue
-            value = dimension.get("value_text")
-            path_id = dimension.get("path_id")
-            if isinstance(path_id, str) and isinstance(value, str) and value.strip():
-                catalog.append(
-                    {
-                        "source": "offer_snapshot",
-                        "path": f"/offer_snapshot/dimensions/{path_id}/value_text",
-                        "excerpt": value,
-                    }
-                )
-    user_brief = snapshot.get("user_brief", {})
-    if isinstance(user_brief, dict):
-        for field, value in user_brief.items():
-            if isinstance(value, str) and value:
-                catalog.append(
-                    {
-                        "source": "user_brief",
-                        "path": f"/user_brief/{field}",
-                        "excerpt": value,
-                    }
-                )
-    return sorted(catalog, key=lambda item: (item["source"], item["path"]))
-
-
-def _provider_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
-    """Project the persisted snapshot to the minimum Provider input."""
-    offer_snapshot = snapshot.get("offer_snapshot")
-    if not isinstance(offer_snapshot, dict):
-        return snapshot
-    projected_offer = dict(offer_snapshot)
-    projected_dimensions: list[dict[str, str]] = []
-    for dimension in offer_snapshot.get("dimensions", []):
-        if not isinstance(dimension, dict):
-            continue
-        path_id = dimension.get("path_id")
-        value_text = dimension.get("value_text")
-        if isinstance(path_id, str) and isinstance(value_text, str) and value_text.strip():
-            projected_dimensions.append({"path_id": path_id, "value_text": value_text})
-    projected_offer["dimensions"] = projected_dimensions
-    return {**snapshot, "offer_snapshot": projected_offer}
-
-
 def _system_prompt(snapshot: dict[str, Any]) -> str:
     return (
-        "只输出严格 JSON，不要 Markdown。Provider 只能返回受限的主题枚举，不能输出自由文本或 intent。"
-        "topic 只能是 offer_fact、user_goal、user_concern、user_scenario、comparison_dimension。"
+        "只输出严格 JSON，不要 Markdown。Provider 只能选择服务端提供的封闭 template_id 和 evidence_ref_ids，"
+        "不能输出自由文本或 intent。"
         "communication_goals、clarification_questions、talking_points、preparation_checks "
-        "分别表示沟通请求、待澄清问题、表达要点和沟通前检查。每条记录必须包含 id、topic、evidence_refs；"
-        "topic 必须至少有一条匹配的证据锚点：user_goal=/user_brief/goal，"
-        "user_concern=/user_brief/concerns，user_scenario=/user_brief/scenario，"
-        "comparison_dimension=/offer_snapshot/dimensions/dimension_NNN/value_text，"
-        "offer_fact 只能引用固定 Offer 字段路径。每个 evidence_refs 必须来自输入目录，"
-        "excerpt 必须逐字连续匹配。系统会根据数组字段/topic 生成中文 text/rationale，模型不得自行写入决定、排名、"
-        "优劣、市场薪酬、法律结论、公司政策或录用概率。没有可验证建议时输出 proposal_status=safe_empty 和四个空数组。"
+        "分别表示沟通目标、待澄清问题、可直接参考的表达和沟通前检查。每组最多选择三条，"
+        "同一个 template_id 与 evidence_ref_ids 组合不得重复。每条记录必须包含 id、template_id、evidence_ref_ids；"
+        "template_id、所属分组和 evidence_ref_ids 必须逐字匹配 template_catalog 中的一项。"
+        "服务端会生成最终中文 text/rationale，模型不得返回 text、rationale、topic、决定、排名、优劣、"
+        "市场薪酬、法律结论、公司政策或录用概率。没有可验证建议时输出 proposal_status=safe_empty 和四个空数组。"
         + json.dumps(OFFER_NEGOTIATION_JSON_SCHEMA, ensure_ascii=False, separators=(",", ":"))
-        + "\n只能从以下 evidence_catalog 逐条选择 source/path/excerpt；不得创造目录外引用："
-        + json.dumps(_evidence_catalog(snapshot), ensure_ascii=False, separators=(",", ":"))
+        + "\nevidence_catalog："
+        + json.dumps(provider_evidence_catalog(snapshot), ensure_ascii=False, separators=(",", ":"))
+        + "\ntemplate_catalog："
+        + json.dumps(provider_template_catalog(snapshot), ensure_ascii=False, separators=(",", ":"))
     )
 
 
 def _generation_prompt(snapshot: dict[str, Any]) -> str:
-    return "基于以下冻结输入生成 Offer 谈薪准备建议，只能引用输入中的路径和原文：" + canonical_json(_provider_snapshot(snapshot))
+    del snapshot
+    return (
+        "从 system 消息中的 template_catalog 选择一组精简、互不重复且可执行的 Offer 谈薪准备内容。"
+    )
 
 
 def _repair_prompt(category: str) -> str:
     return (
-        "上次输出未通过机器校验。只修复失败类别：" + category
+        "上次输出未通过机器校验。只修复失败类别："
+        + category
         + "。请重新输出完整严格 JSON；不要输出解释、原始模型内容或输入快照。"
-        + "只能返回受限 topic/evidence_refs，不得返回 intent、text 或 rationale。"
+        + "只能返回受限 template_id/evidence_ref_ids，不得返回 intent、topic、evidence_refs、text 或 rationale。"
         + json.dumps(OFFER_NEGOTIATION_JSON_SCHEMA, ensure_ascii=False, separators=(",", ":"))
     )

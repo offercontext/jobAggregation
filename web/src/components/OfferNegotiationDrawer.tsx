@@ -10,7 +10,7 @@ import {
   listOfferComparisonValues,
   OfferNegotiationError,
 } from '@/services/offers';
-import { OFFER_STATUS_LABELS, type Offer, type OfferComparisonDimension, type OfferNegotiationBlock, type OfferNegotiationProposal, type OfferNegotiationPending, type OfferNegotiationPreview, type OfferNegotiationSnapshot } from '@/types/offer';
+import { type Offer, type OfferComparisonDimension, type OfferNegotiationBlock, type OfferNegotiationProposal, type OfferNegotiationPending, type OfferNegotiationPreview, type OfferNegotiationSnapshot } from '@/types/offer';
 import { ConfirmationPanel } from './ui/ConfirmationPanel';
 import NegotiationBriefForm, { type NegotiationBriefValue } from './offer-negotiation/NegotiationBriefForm';
 import NegotiationHistoryList from './offer-negotiation/NegotiationHistoryList';
@@ -50,10 +50,10 @@ type BlockField = 'communication_goals' | 'clarification_questions' | 'talking_p
 type PendingOperation = 'generate' | 'confirm' | null;
 
 const SECTIONS: Array<[BlockField, string]> = [
-  ['communication_goals', '沟通目标'],
-  ['clarification_questions', '待澄清问题'],
-  ['talking_points', '建议表达'],
-  ['preparation_checks', '沟通前检查项'],
+  ['talking_points', '可以这样说'],
+  ['clarification_questions', '需要问清楚'],
+  ['preparation_checks', '沟通前核对'],
+  ['communication_goals', '本次沟通目标'],
 ];
 
 function newKey(prefix: string): string {
@@ -231,6 +231,9 @@ function BoundOfferNegotiationDrawer({ open, offer, dimensionIds = [], onClose, 
   const visibleBrief = displayedProposal?.input_snapshot.user_brief ?? activePreview?.snapshot.user_brief;
   const displayedSelectedBlocks = isHistoryView ? (displayedProposal?.brief?.selected_blocks ?? []) : selectedBlocks;
   const displayedEdits = isHistoryView ? (displayedProposal?.brief?.edited_content.edits ?? {}) : edits;
+  const suggestedStartLabel = displayedProposal
+    ? SECTIONS.find(([field]) => displayedProposal.proposal[field].length > 0)?.[1]
+    : null;
   const snapshotOffer: OfferNegotiationSnapshot['offer_snapshot'] = {
     company_name: displayedOffer.company_name,
     position_name: displayedOffer.position_name,
@@ -472,32 +475,6 @@ function BoundOfferNegotiationDrawer({ open, offer, dimensionIds = [], onClose, 
         <h3>本次将使用的 Offer 事实</h3>
         <p>{displayedProposal?.input_snapshot || activePreview ? '以下为本次冻结输入' : '当前 Offer 事实，尚未冻结'}</p>
         <OfferSnapshotSummary offer={snapshotOffer} brief={visibleBrief} sourceState={sourceState} />
-        <dl>
-          <div><dt>公司</dt><dd>{snapshotOffer.company_name}</dd></div>
-          <div><dt>职位</dt><dd>{snapshotOffer.position_name}</dd></div>
-          <div><dt>状态</dt><dd>{OFFER_STATUS_LABELS[snapshotOffer.status]}</dd></div>
-          <div><dt>月薪</dt><dd>{snapshotOffer.base_monthly ?? '尚未填写'}</dd></div>
-          <div><dt>计薪月数</dt><dd>{snapshotOffer.months_per_year ?? '尚未填写'}</dd></div>
-          <div><dt>签字费</dt><dd>{snapshotOffer.signing_bonus ?? '尚未填写'}</dd></div>
-          <div><dt>股权</dt><dd>{snapshotOffer.equity || '尚未填写'}</dd></div>
-          <div><dt>福利</dt><dd>{snapshotOffer.perks || '尚未填写'}</dd></div>
-          <div><dt>截止时间</dt><dd>{snapshotOffer.deadline || '尚未填写'}</dd></div>
-          <div><dt>备注</dt><dd>{snapshotOffer.notes || '尚未填写'}</dd></div>
-          {visibleBrief && (
-            <>
-              <div><dt>本次目标</dt><dd>{visibleBrief.goal}</dd></div>
-              <div><dt>本次顾虑</dt><dd>{visibleBrief.concerns}</dd></div>
-              <div><dt>沟通场景</dt><dd>{visibleBrief.scenario}</dd></div>
-            </>
-          )}
-        </dl>
-        {visibleDimensions.length > 0 && (
-          <ul>
-            {visibleDimensions.map((dimension) => (
-              <li key={dimension.path_id}>{dimension.label}：{dimension.value_text?.trim() ? dimension.value_text : '尚未填写'}</li>
-            ))}
-          </ul>
-        )}
       </section>
       {!displayedProposal && activePreview && showGenerateConfirmation && (
         <ConfirmationPanel
@@ -523,25 +500,33 @@ function BoundOfferNegotiationDrawer({ open, offer, dimensionIds = [], onClose, 
         <div aria-label="谈薪准备草稿">
           {displayedProposal.proposal_status === 'safe_empty' ? (
             <p>目前没有可验证、可给出的谈薪准备建议。</p>
-          ) : SECTIONS.map(([field, label]) => (
-            <section key={field} className={styles.proposalSection}>
-              <h3>{label}</h3>
-              {displayedProposal.proposal[field].map((block: OfferNegotiationBlock) => {
-                const selected = displayedSelectedBlocks.includes(block.id);
-                return (
-                  <NegotiationProposalCard
-                    key={block.id}
-                    block={block}
-                    selected={selected}
-                    editedText={displayedEdits[block.id] ?? block.text}
-                    disabled={frozen || isHistoryView || hasBrief || displayedProposal.source_changed}
-                    onToggle={() => setSelectedBlocks((current) => selected ? current.filter((id) => id !== block.id) : [...current, block.id])}
-                    onEdit={(text) => setEdits((current) => ({ ...current, [block.id]: text }))}
-                  />
-                );
-              })}
-            </section>
-          ))}
+          ) : (
+            <>
+              {suggestedStartLabel && (
+                <p className={styles.proposalIntro}>先从“{suggestedStartLabel}”开始，勾选想带走的内容；你可以直接编辑后保存。</p>
+              )}
+              {SECTIONS.map(([field, label]) => (
+                <section key={field} className={styles.proposalSection}>
+                  <h3>{label}</h3>
+                  {displayedProposal.proposal[field].map((block: OfferNegotiationBlock) => {
+                    const selected = displayedSelectedBlocks.includes(block.id);
+                    return (
+                      <NegotiationProposalCard
+                        key={block.id}
+                        kind={field}
+                        block={block}
+                        selected={selected}
+                        editedText={displayedEdits[block.id] ?? block.text}
+                        disabled={frozen || isHistoryView || hasBrief || displayedProposal.source_changed}
+                        onToggle={() => setSelectedBlocks((current) => selected ? current.filter((id) => id !== block.id) : [...current, block.id])}
+                        onEdit={(text) => setEdits((current) => ({ ...current, [block.id]: text }))}
+                      />
+                    );
+                  })}
+                </section>
+              ))}
+            </>
+          )}
           {displayedProposal.proposal_status !== 'safe_empty' && !isHistoryView && !hasBrief && !displayedProposal.source_changed && (
             <>
               {selectedBlocks.length === 0 && <p className={styles.selectionHint} role="status">请选择至少一项建议后才能保存。</p>}

@@ -65,6 +65,8 @@ describe('settings service v0.1 contract', () => {
     expect(source).toContain("responseType: 'blob'");
     expect(source).not.toContain('window.location.href');
     expect(source).not.toContain('api_key: string;');
+    expect(source).toContain('context_window: number;');
+    expect(source).toContain('max_output_tokens: number;');
   });
 
   it('downloads the full backup through the authenticated API client', async () => {

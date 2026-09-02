@@ -94,6 +94,7 @@ from offerpilot.config import (
 )
 from offerpilot.context_projector.loader import ContextSourceLoader, fetch_rows
 from offerpilot.context_projector.contracts import ProjectionError
+from offerpilot.context_projector.budget import PROVIDER_FRAMING_RESERVE
 from offerpilot.pilot_runtime import (
     AttachmentReference,
     ConfirmationRequest,
@@ -7385,9 +7386,14 @@ def create_app(
         cfg = load_config(resolved_data_dir)
         return _settings_backup_payload(cfg)
 
-    @app.put("/api/settings")
-    def update_settings(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    @app.put("/api/settings", response_model=None)
+    def update_settings(
+        payload: dict[str, Any] = Body(...),
+    ) -> dict[str, Any] | JSONResponse:
         current = load_config(resolved_data_dir)
+        budget_error = _settings_provider_budget_payload_error(payload, current)
+        if budget_error is not None:
+            return error_response(400, budget_error)
         providers = _settings_providers_from_payload(payload, current)
         active_provider_id = str(payload.get("active_provider_id") or current.active_provider_id)
         active = _active_provider_from(providers, active_provider_id)
@@ -7397,6 +7403,15 @@ def create_app(
             providers,
             active.id,
         )
+        selection_budget_error = _settings_selected_provider_budget_error(
+            payload,
+            current,
+            providers,
+            active.id,
+            fallback_provider_ids,
+        )
+        if selection_budget_error is not None:
+            return error_response(400, selection_budget_error)
         next_config = Config(
             api_key=active.api_key,
             base_url=active.base_url,
@@ -9671,6 +9686,8 @@ def _provider_from_payload(
         base_url=str(payload.get("base_url") or (current.base_url if current is not None else "")),
         model=str(payload.get("model") or (current.model if current is not None else "")),
         enabled=bool(payload.get("enabled", current.enabled if current is not None else True)),
+        context_window=_provider_budget_value(payload, "context_window", current),
+        max_output_tokens=_provider_budget_value(payload, "max_output_tokens", current),
         supports_json_schema=(
             payload.get(
                 "supports_json_schema",
@@ -9679,6 +9696,104 @@ def _provider_from_payload(
             is True
         ),
     )
+
+
+def _provider_budget_value(
+    payload: dict[str, Any],
+    field: str,
+    current: AIProviderProfile | None,
+) -> int:
+    fallback = getattr(current, field) if current is not None else 0
+    value = payload.get(field, fallback)
+    return value if type(value) is int else 0
+
+
+def _valid_provider_budget_values(context_window: object, max_output_tokens: object) -> bool:
+    return (
+        type(context_window) is int
+        and type(max_output_tokens) is int
+        and context_window > 0
+        and max_output_tokens > 0
+        and context_window > max_output_tokens + PROVIDER_FRAMING_RESERVE
+    )
+
+
+def _settings_provider_budget_payload_error(
+    payload: dict[str, Any], current: Config
+) -> str | None:
+    raw_providers = payload.get("providers")
+    if not isinstance(raw_providers, list) or not raw_providers:
+        return None
+    active_provider_id = str(payload.get("active_provider_id") or current.active_provider_id)
+    raw_fallback_provider_ids = payload.get(
+        "fallback_provider_ids", current.fallback_provider_ids
+    )
+    fallback_provider_ids = (
+        {
+            str(provider_id)
+            for provider_id in raw_fallback_provider_ids
+            if isinstance(provider_id, str)
+        }
+        if isinstance(raw_fallback_provider_ids, list)
+        else set()
+    )
+    for raw_provider in raw_providers:
+        if not isinstance(raw_provider, dict):
+            continue
+        provider_id = str(raw_provider.get("id") or "")
+        requires_budget = (
+            raw_provider.get("enabled", True) is not False
+            or provider_id == active_provider_id
+            or provider_id in fallback_provider_ids
+        )
+        if not requires_budget:
+            continue
+        if not _valid_provider_budget_values(
+            raw_provider.get("context_window"),
+            raw_provider.get("max_output_tokens"),
+        ):
+            return "启用、默认或 Fallback 模型供应商必须填写有效的上下文窗口和单次最大输出"
+    return None
+
+
+def _provider_budget_configuration_error(provider: AIProviderProfile) -> str | None:
+    if _valid_provider_budget_values(provider.context_window, provider.max_output_tokens):
+        return None
+    return "请先填写有效的上下文窗口和单次最大输出"
+
+
+def _settings_selected_provider_budget_error(
+    payload: dict[str, Any],
+    current: Config,
+    providers: list[AIProviderProfile],
+    active_provider_id: str,
+    fallback_provider_ids: list[str],
+) -> str | None:
+    submitted_providers = payload.get("providers")
+    required_provider_ids: set[str] = set()
+    if isinstance(submitted_providers, list) and submitted_providers:
+        required_provider_ids.update(profile.id for profile in providers if profile.enabled)
+        required_provider_ids.add(active_provider_id)
+        required_provider_ids.update(fallback_provider_ids)
+    else:
+        if (
+            "active_provider_id" in payload
+            and active_provider_id != current.active_provider_id
+        ):
+            required_provider_ids.add(active_provider_id)
+        if (
+            "fallback_provider_ids" in payload
+            and fallback_provider_ids != current.fallback_provider_ids
+        ):
+            required_provider_ids.update(fallback_provider_ids)
+    for profile in providers:
+        if profile.id not in required_provider_ids:
+            continue
+        if not _valid_provider_budget_values(
+            profile.context_window, profile.max_output_tokens
+        ):
+            return "启用、默认或 Fallback 模型供应商必须填写有效的上下文窗口和单次最大输出"
+    return None
 
 
 def _active_provider_from(
@@ -9720,6 +9835,8 @@ def _provider_payload(profile: AIProviderProfile) -> dict[str, Any]:
         "model": profile.model,
         "enabled": profile.enabled,
         "supports_json_schema": profile.supports_json_schema,
+        "context_window": profile.context_window,
+        "max_output_tokens": profile.max_output_tokens,
         "has_api_key": bool(profile.api_key),
     }
 
@@ -9735,16 +9852,24 @@ def _provider_for_connection_test(
             return None, "未找到模型供应商配置"
         if not provider.api_key:
             return None, "模型供应商尚未配置 API Key"
+        if budget_error := _provider_budget_configuration_error(provider):
+            return None, budget_error
         return provider, None
 
     raw_provider = payload.get("provider")
     if not isinstance(raw_provider, dict):
         return None, "请提供 provider_id 或临时供应商配置"
+    if not _valid_provider_budget_values(
+        raw_provider.get("context_window"), raw_provider.get("max_output_tokens")
+    ):
+        return None, "请先填写有效的上下文窗口和单次最大输出"
     provider = _provider_from_payload(
         raw_provider, cfg.provider_by_id(str(raw_provider.get("id") or ""))
     )
     if not provider.api_key:
         return None, "模型供应商尚未配置 API Key"
+    if budget_error := _provider_budget_configuration_error(provider):
+        return None, budget_error
     return provider, None
 
 

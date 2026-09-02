@@ -231,7 +231,11 @@ export function createLive2dPilotMascotRuntime(
         stopTransientExpressionReset();
         transientExpressionTimer = window.setTimeout(() => {
           transientExpressionTimer = undefined;
-          if (disposed || staticRender || (activity !== 'speaking' && activity !== 'success')) return;
+          if (
+            disposed
+            || staticRender
+            || (activity !== 'speaking' && activity !== 'success' && activity !== 'error')
+          ) return;
           setExpression('neutral');
         }, TRANSIENT_EXPRESSION_DURATION_MS);
       };
@@ -288,6 +292,7 @@ export function createLive2dPilotMascotRuntime(
           if (activity === 'error') {
             setExpression('f02');
             void runMotion('Tap', 1);
+            scheduleTransientExpressionReset();
           }
         },
         setZoom(nextZoom) {

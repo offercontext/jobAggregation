@@ -56,7 +56,7 @@ Provider 编辑区新增两个整数输入：
 以下本地投影错误统一显示为“模型上下文配置不足”，并指向 AI 设置中的两个字段：
 
 - `mandatory_surface_over_budget`
-- `provider_budget_invalid`
+- `invalid_provider_budget`
 - `adapter_context_window_exceeded`
 
 错误仍保持现有 HTTP/SSE failure envelope，不增加 Provider 调用、fallback 或重试。

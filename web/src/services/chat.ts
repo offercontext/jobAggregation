@@ -325,6 +325,8 @@ export interface AIProviderProfile {
   model: string;
   enabled: boolean;
   supports_json_schema: boolean;
+  context_window: number;
+  max_output_tokens: number;
   has_api_key: boolean;
 }
 

@@ -6,6 +6,7 @@ import {
   Divider,
   Form,
   Input,
+  InputNumber,
   List,
   Popconfirm,
   Select,
@@ -57,6 +58,8 @@ interface FormValues {
   provider: string;
   base_url: string;
   model: string;
+  context_window: number;
+  max_output_tokens: number;
   enabled: boolean;
   supports_json_schema: boolean;
   chat_auto_approve_writes: boolean;
@@ -78,6 +81,7 @@ const PROVIDER_OPTIONS = [
 
 const DEFAULT_BASE_URL = 'https://api.openai.com/v1';
 const DEFAULT_MODEL = 'gpt-4o';
+const PROVIDER_FRAMING_RESERVE = 1_024;
 
 export default function AISettingsDrawer({ open, onClose }: Props) {
   const [form] = Form.useForm<FormValues>();
@@ -125,6 +129,13 @@ export default function AISettingsDrawer({ open, onClose }: Props) {
           ),
         ),
       );
+      const incompleteProvider = nextProviders.find(
+        (provider) => providerRequiresValidBudget(provider, nextActiveId, nextFallbackIds)
+          && !hasValidProviderBudget(provider),
+      );
+      if (incompleteProvider) {
+        throw new Error(`请先补全 ${incompleteProvider.label || incompleteProvider.id} 的模型预算配置`);
+      }
       const nextActive = nextProviders.find((item) => item.id === nextActiveId) ?? nextProviders[0];
       setProviders(nextProviders);
       setActiveProviderId(nextActiveId);
@@ -150,8 +161,8 @@ export default function AISettingsDrawer({ open, onClose }: Props) {
       form.setFieldValue('api_key', '');
       onClose();
     },
-    onError: () => {
-      message.error('AI 设置保存失败');
+    onError: (error) => {
+      message.error(error instanceof Error ? error.message : 'AI 设置保存失败');
     },
   });
 
@@ -181,6 +192,7 @@ export default function AISettingsDrawer({ open, onClose }: Props) {
   });
 
   const hasKey = Boolean(activeProvider?.has_api_key);
+  const hasBudget = Boolean(activeProvider && hasValidProviderBudget(activeProvider));
 
   function startNewProvider() {
     const id = uniqueProviderId('provider', providers);
@@ -190,6 +202,8 @@ export default function AISettingsDrawer({ open, onClose }: Props) {
       provider: 'openai',
       base_url: DEFAULT_BASE_URL,
       model: DEFAULT_MODEL,
+      context_window: 0,
+      max_output_tokens: 0,
       enabled: true,
       supports_json_schema: false,
       api_key: '',
@@ -227,9 +241,13 @@ export default function AISettingsDrawer({ open, onClose }: Props) {
     }
   }
 
-  function markDefault(providerId: string) {
-    setActiveProviderId(providerId);
-    setFallbackProviderIds((current) => current.filter((item) => item !== providerId));
+  function markDefault(provider: EditableProvider) {
+    if (!hasValidProviderBudget(provider)) {
+      message.warning('请先补全该供应商的模型预算配置');
+      return;
+    }
+    setActiveProviderId(provider.id);
+    setFallbackProviderIds((current) => current.filter((item) => item !== provider.id));
   }
 
   if (!open) return null;
@@ -256,11 +274,17 @@ export default function AISettingsDrawer({ open, onClose }: Props) {
       </div>
       <Space direction="vertical" size={16} style={{ width: '100%' }}>
         <Alert
-          type={hasKey ? 'success' : 'warning'}
+          type={hasKey && hasBudget ? 'success' : 'warning'}
           showIcon
-          icon={hasKey ? <CheckCircleOutlined /> : <WarningOutlined />}
-          message={hasKey ? '密钥已配置' : '尚未配置密钥'}
-          description={hasKey ? '密钥留空保存会保留当前密钥。' : '配置模型供应商密钥后即可使用 AI 能力。'}
+          icon={hasKey && hasBudget ? <CheckCircleOutlined /> : <WarningOutlined />}
+          message={!hasKey ? '尚未配置密钥' : hasBudget ? 'AI 配置已就绪' : '预算配置待补全'}
+          description={
+            !hasKey
+              ? '配置模型供应商密钥后即可使用 AI 能力。'
+              : hasBudget
+                ? '密钥留空保存会保留当前密钥。'
+                : '请按当前模型的官方规格填写上下文窗口和单次最大输出。'
+          }
         />
 
         <section data-testid="ai-provider-list" className={workflowStyles.section}>
@@ -287,8 +311,8 @@ export default function AISettingsDrawer({ open, onClose }: Props) {
                     key="default"
                     size="small"
                     icon={<StarOutlined />}
-                    disabled={provider.id === activeProviderId}
-                    onClick={() => markDefault(provider.id)}
+                    disabled={provider.id === activeProviderId || !hasValidProviderBudget(provider)}
+                    onClick={() => markDefault(provider)}
                   >
                     设为默认
                   </Button>,
@@ -313,6 +337,9 @@ export default function AISettingsDrawer({ open, onClose }: Props) {
                       {provider.id === activeProviderId ? <Tag color="blue">默认</Tag> : null}
                       {fallbackProviderIds.includes(provider.id) ? <Tag color="gold">Fallback</Tag> : null}
                       {provider.has_api_key ? <Tag color="green">密钥已配置</Tag> : <Tag>未配置密钥</Tag>}
+                      {provider.enabled && !hasValidProviderBudget(provider) ? (
+                        <Tag color="orange">预算配置待补全</Tag>
+                      ) : null}
                     </Space>
                   }
                   description={`${PROVIDER_LABELS[provider.provider] || provider.provider} · ${provider.model}`}
@@ -362,6 +389,60 @@ export default function AISettingsDrawer({ open, onClose }: Props) {
             <Input placeholder={DEFAULT_MODEL} />
           </Form.Item>
 
+          <Form.Item
+            label="上下文窗口（tokens）"
+            name="context_window"
+            required
+            dependencies={['enabled', 'max_output_tokens']}
+            tooltip="填写当前模型官方公布的上下文窗口，不会根据模型名称自动猜测。"
+            rules={[
+              ({ getFieldValue }) => ({
+                validator(_, value) {
+                  if (getFieldValue('enabled') !== true && (!value || value <= 0)) return Promise.resolve();
+                  if (!Number.isInteger(value) || value <= 0) {
+                    return Promise.reject(new Error('请输入大于 0 的整数上下文窗口'));
+                  }
+                  const output = getFieldValue('max_output_tokens');
+                  if (Number.isInteger(output) && output > 0 && value <= output + PROVIDER_FRAMING_RESERVE) {
+                    return Promise.reject(new Error('上下文窗口必须大于最大输出与协议预留之和'));
+                  }
+                  return Promise.resolve();
+                },
+              }),
+            ]}
+          >
+            <InputNumber min={1} precision={0} step={1_024} style={{ width: '100%' }} placeholder="例如 131072" />
+          </Form.Item>
+
+          <Form.Item
+            label="单次最大输出（tokens）"
+            name="max_output_tokens"
+            required
+            dependencies={['enabled', 'context_window']}
+            tooltip="填写每次请求允许模型生成的最大 token 数。"
+            rules={[
+              ({ getFieldValue }) => ({
+                validator(_, value) {
+                  if (getFieldValue('enabled') !== true && (!value || value <= 0)) return Promise.resolve();
+                  if (!Number.isInteger(value) || value <= 0) {
+                    return Promise.reject(new Error('请输入大于 0 的整数最大输出'));
+                  }
+                  const contextWindow = getFieldValue('context_window');
+                  if (
+                    Number.isInteger(contextWindow)
+                    && contextWindow > 0
+                    && contextWindow <= value + PROVIDER_FRAMING_RESERVE
+                  ) {
+                    return Promise.reject(new Error('单次最大输出必须为上下文和协议预留留出空间'));
+                  }
+                  return Promise.resolve();
+                },
+              }),
+            ]}
+          >
+            <InputNumber min={1} precision={0} step={1_024} style={{ width: '100%' }} placeholder="例如 8192" />
+          </Form.Item>
+
           <Form.Item label="启用" name="enabled" valuePropName="checked">
             <Switch />
           </Form.Item>
@@ -383,7 +464,11 @@ export default function AISettingsDrawer({ open, onClose }: Props) {
               onChange={(value: string[]) => setFallbackProviderIds(value)}
               options={providers
                 .filter((provider) => provider.id !== activeProviderId)
-                .map((provider) => ({ value: provider.id, label: provider.label || provider.id }))}
+                .map((provider) => ({
+                  value: provider.id,
+                  label: provider.label || provider.id,
+                  disabled: !hasValidProviderBudget(provider),
+                }))}
             />
           </Form.Item>
 
@@ -436,6 +521,8 @@ function toEditableProviders(settings?: Settings): EditableProvider[] {
           provider: 'openai',
           base_url: DEFAULT_BASE_URL,
           model: DEFAULT_MODEL,
+          context_window: 0,
+          max_output_tokens: 0,
           enabled: true,
           supports_json_schema: false,
           has_api_key: false,
@@ -452,6 +539,8 @@ function providerToForm(provider?: EditableProvider, settings?: Settings): FormV
     provider: provider?.provider || 'openai',
     base_url: provider?.base_url || settings?.base_url || DEFAULT_BASE_URL,
     model: provider?.model || settings?.model || DEFAULT_MODEL,
+    context_window: provider?.context_window ?? 0,
+    max_output_tokens: provider?.max_output_tokens ?? 0,
     enabled: provider?.enabled ?? true,
     supports_json_schema: provider?.supports_json_schema ?? false,
     chat_auto_approve_writes: settings?.chat_auto_approve_writes ?? false,
@@ -466,6 +555,8 @@ function formToProvider(values: FormValues, existing?: EditableProvider): Editab
     api_key: values.api_key?.trim() || '',
     base_url: values.base_url.trim() || DEFAULT_BASE_URL,
     model: values.model.trim() || DEFAULT_MODEL,
+    context_window: values.context_window,
+    max_output_tokens: values.max_output_tokens,
     enabled: values.enabled,
     supports_json_schema: values.supports_json_schema,
     has_api_key: Boolean(values.api_key?.trim() || existing?.has_api_key),
@@ -485,6 +576,8 @@ function providerPayload(provider: EditableProvider): Omit<AIProviderProfile, 'h
     provider: provider.provider,
     base_url: provider.base_url,
     model: provider.model,
+    context_window: provider.context_window,
+    max_output_tokens: provider.max_output_tokens,
     enabled: provider.enabled,
     supports_json_schema: provider.supports_json_schema,
   };
@@ -499,8 +592,27 @@ function providerMatchesSavedFields(provider: EditableProvider, saved: EditableP
     provider.provider === saved.provider &&
     provider.base_url === saved.base_url &&
     provider.model === saved.model &&
+    provider.context_window === saved.context_window &&
+    provider.max_output_tokens === saved.max_output_tokens &&
     provider.enabled === saved.enabled
   );
+}
+
+function hasValidProviderBudget(provider: Pick<AIProviderProfile, 'context_window' | 'max_output_tokens'>) {
+  return (
+    Number.isInteger(provider.context_window)
+    && Number.isInteger(provider.max_output_tokens)
+    && provider.context_window > provider.max_output_tokens + PROVIDER_FRAMING_RESERVE
+    && provider.max_output_tokens > 0
+  );
+}
+
+function providerRequiresValidBudget(
+  provider: Pick<AIProviderProfile, 'id' | 'enabled'>,
+  activeProviderId: string,
+  fallbackProviderIds: string[],
+) {
+  return provider.enabled || provider.id === activeProviderId || fallbackProviderIds.includes(provider.id);
 }
 
 function uniqueProviderId(prefix: string, providers: EditableProvider[]) {

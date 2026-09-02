@@ -165,6 +165,15 @@ def _provider_error_message(error: Exception, config: Config) -> str:
     """Keep provider diagnostics useful while masking configured secrets."""
 
     detail = str(error).strip() or "模型供应商连接失败"
+    if detail in {
+        "mandatory_surface_over_budget",
+        "invalid_provider_budget",
+        "adapter_context_window_exceeded",
+    }:
+        return (
+            "模型上下文配置不足：当前请求的必要内容超出已配置窗口。"
+            "请在 AI 设置中填写正确的上下文窗口和单次最大输出。"
+        )
     profiles = config.provider_profiles()
     for profile in profiles:
         if profile.api_key:

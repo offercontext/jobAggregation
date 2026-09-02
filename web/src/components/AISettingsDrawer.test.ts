@@ -37,4 +37,15 @@ describe('AISettingsDrawer localization', () => {
     expect(source).toContain('原生 JSON Schema');
     expect(source).toContain('仅在 Provider 明确支持时启用');
   });
+
+  it('requires explicit provider context and output budgets', () => {
+    expect(source).toContain('上下文窗口（tokens）');
+    expect(source).toContain('单次最大输出（tokens）');
+    expect(source).toContain('context_window');
+    expect(source).toContain('max_output_tokens');
+    expect(source).toContain('预算配置待补全');
+    expect(source).toContain('InputNumber');
+    expect(source).toContain('providerRequiresValidBudget');
+    expect(source).toContain('disabled: !hasValidProviderBudget(provider)');
+  });
 });

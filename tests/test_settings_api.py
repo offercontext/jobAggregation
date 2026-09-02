@@ -109,6 +109,8 @@ def test_get_settings_exposes_provider_profiles_without_keys(tmp_path):
                     api_key="sk-deepseek",
                     base_url="https://api.deepseek.com/v1",
                     model="deepseek-chat",
+                    context_window=131_072,
+                    max_output_tokens=8_192,
                 )
             ],
         ),
@@ -127,9 +129,248 @@ def test_get_settings_exposes_provider_profiles_without_keys(tmp_path):
         "model": "deepseek-chat",
         "enabled": True,
         "supports_json_schema": False,
+        "context_window": 131_072,
+        "max_output_tokens": 8_192,
         "has_api_key": True,
     }
     assert "api_key" not in provider
+
+
+def test_provider_budget_round_trips_settings_and_backup(tmp_path):
+    client = TestClient(create_app(data_dir=tmp_path))
+
+    response = client.put(
+        "/api/settings",
+        json={
+            "active_provider_id": "default",
+            "providers": [
+                {
+                    "id": "default",
+                    "label": "Default",
+                    "provider": "openai",
+                    "base_url": "https://api.openai.com/v1",
+                    "model": "gpt-4o",
+                    "enabled": True,
+                    "context_window": 262_144,
+                    "max_output_tokens": 16_384,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["providers"][0]["context_window"] == 262_144
+    assert response.json()["providers"][0]["max_output_tokens"] == 16_384
+    stored = load_config(tmp_path).active_provider()
+    assert stored.context_window == 262_144
+    assert stored.max_output_tokens == 16_384
+    backup = client.get("/api/settings/backup").json()["providers"][0]
+    assert backup["context_window"] == 262_144
+    assert backup["max_output_tokens"] == 16_384
+
+
+@pytest.mark.parametrize(
+    ("context_window", "max_output_tokens"),
+    [
+        (None, 4_096),
+        (0, 4_096),
+        (-1, 4_096),
+        ("32768", 4_096),
+        (32_768, None),
+        (32_768, 0),
+        (32_768, -1),
+        (32_768, "4096"),
+        (4_096, 4_096),
+    ],
+)
+def test_put_settings_rejects_incomplete_enabled_provider_budget(
+    tmp_path, context_window, max_output_tokens
+):
+    client = TestClient(create_app(data_dir=tmp_path), raise_server_exceptions=False)
+    provider = {
+        "id": "default",
+        "label": "Default",
+        "provider": "openai",
+        "base_url": "https://api.openai.com/v1",
+        "model": "gpt-4o",
+        "enabled": True,
+    }
+    if context_window is not None:
+        provider["context_window"] = context_window
+    if max_output_tokens is not None:
+        provider["max_output_tokens"] = max_output_tokens
+
+    response = client.put(
+        "/api/settings",
+        json={"active_provider_id": "default", "providers": [provider]},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "启用、默认或 Fallback 模型供应商必须填写有效的上下文窗口和单次最大输出"
+
+
+def test_put_settings_allows_incomplete_disabled_provider_budget(tmp_path):
+    client = TestClient(create_app(data_dir=tmp_path))
+
+    response = client.put(
+        "/api/settings",
+        json={
+            "active_provider_id": "default",
+            "providers": [
+                {
+                    "id": "default",
+                    "label": "Default",
+                    "provider": "openai",
+                    "enabled": True,
+                    "context_window": 128_000,
+                    "max_output_tokens": 4_096,
+                },
+                {
+                    "id": "disabled",
+                    "label": "Disabled",
+                    "provider": "openai",
+                    "enabled": False,
+                    "context_window": 0,
+                    "max_output_tokens": 0,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    disabled = next(
+        provider for provider in response.json()["providers"] if provider["id"] == "disabled"
+    )
+    assert disabled["context_window"] == 0
+    assert disabled["max_output_tokens"] == 0
+
+
+@pytest.mark.parametrize(
+    ("active_provider_id", "fallback_provider_ids"),
+    [
+        ("disabled", []),
+        ("default", ["disabled"]),
+    ],
+)
+def test_put_settings_rejects_incomplete_active_or_fallback_provider_budget(
+    tmp_path, active_provider_id, fallback_provider_ids
+):
+    client = TestClient(create_app(data_dir=tmp_path), raise_server_exceptions=False)
+
+    response = client.put(
+        "/api/settings",
+        json={
+            "active_provider_id": active_provider_id,
+            "fallback_provider_ids": fallback_provider_ids,
+            "providers": [
+                {
+                    "id": "default",
+                    "label": "Default",
+                    "provider": "openai",
+                    "enabled": True,
+                    "context_window": 128_000,
+                    "max_output_tokens": 4_096,
+                },
+                {
+                    "id": "disabled",
+                    "label": "Disabled",
+                    "provider": "openai",
+                    "enabled": False,
+                    "context_window": 0,
+                    "max_output_tokens": 0,
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "启用、默认或 Fallback 模型供应商必须填写有效的上下文窗口和单次最大输出"
+
+
+@pytest.mark.parametrize(
+    "selection_payload",
+    [
+        {"active_provider_id": "disabled"},
+        {"fallback_provider_ids": ["disabled"]},
+    ],
+)
+def test_legacy_put_rejects_selecting_incomplete_active_or_fallback_provider(
+    tmp_path, selection_payload
+):
+    save_config(
+        tmp_path,
+        Config(
+            active_provider_id="default",
+            providers=[
+                AIProviderProfile(
+                    id="default",
+                    label="Default",
+                    provider="openai",
+                    enabled=True,
+                    context_window=128_000,
+                    max_output_tokens=4_096,
+                ),
+                AIProviderProfile(
+                    id="disabled",
+                    label="Disabled",
+                    provider="openai",
+                    enabled=False,
+                    context_window=0,
+                    max_output_tokens=0,
+                ),
+            ],
+        ),
+    )
+
+    response = TestClient(create_app(data_dir=tmp_path), raise_server_exceptions=False).put(
+        "/api/settings", json=selection_payload
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "启用、默认或 Fallback 模型供应商必须填写有效的上下文窗口和单次最大输出"
+
+
+def test_legacy_put_rejects_reordering_incomplete_fallback_providers(tmp_path):
+    save_config(
+        tmp_path,
+        Config(
+            active_provider_id="default",
+            fallback_provider_ids=["first", "second"],
+            providers=[
+                AIProviderProfile(
+                    id="default",
+                    label="Default",
+                    provider="openai",
+                    enabled=True,
+                    context_window=128_000,
+                    max_output_tokens=4_096,
+                ),
+                AIProviderProfile(
+                    id="first",
+                    label="First",
+                    provider="openai",
+                    enabled=False,
+                    context_window=0,
+                    max_output_tokens=0,
+                ),
+                AIProviderProfile(
+                    id="second",
+                    label="Second",
+                    provider="openai",
+                    enabled=False,
+                    context_window=0,
+                    max_output_tokens=0,
+                ),
+            ],
+        ),
+    )
+
+    response = TestClient(create_app(data_dir=tmp_path), raise_server_exceptions=False).put(
+        "/api/settings", json={"fallback_provider_ids": ["second", "first"]}
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "启用、默认或 Fallback 模型供应商必须填写有效的上下文窗口和单次最大输出"
 
 
 @pytest.mark.parametrize("raw_capability", ["false", "0", 1, None])
@@ -151,6 +392,8 @@ def test_put_settings_treats_non_boolean_json_schema_capability_as_disabled(
                     "base_url": "https://api.openai.com/v1",
                     "model": "gpt-4o",
                     "enabled": True,
+                    "context_window": 128_000,
+                    "max_output_tokens": 4_096,
                     "supports_json_schema": raw_capability,
                 }
             ],
@@ -203,6 +446,8 @@ def test_provider_json_schema_capability_round_trips_settings_and_backup(tmp_pat
                     "base_url": "https://example.test/v1",
                     "model": "structured-model",
                     "enabled": True,
+                    "context_window": 128_000,
+                    "max_output_tokens": 4_096,
                     "supports_json_schema": False,
                 }
             ],
@@ -250,6 +495,8 @@ def test_put_settings_preserves_blank_provider_api_key(tmp_path):
                     "model": "gpt-4o-mini",
                     "api_key": "",
                     "enabled": True,
+                    "context_window": 128_000,
+                    "max_output_tokens": 4_096,
                 }
             ],
         },
@@ -279,6 +526,8 @@ def test_put_settings_accepts_new_provider_profile(tmp_path):
                     "model": "openai/gpt-4o",
                     "api_key": "sk-openrouter",
                     "enabled": True,
+                    "context_window": 128_000,
+                    "max_output_tokens": 4_096,
                 }
             ],
         },
@@ -304,6 +553,8 @@ def test_put_settings_without_providers_preserves_existing_provider_profiles(tmp
                     api_key="sk-openai",
                     base_url="https://api.openai.com/v1",
                     model="gpt-4o",
+                    context_window=128_000,
+                    max_output_tokens=4_096,
                 ),
                 AIProviderProfile(
                     id="deepseek",
@@ -312,6 +563,8 @@ def test_put_settings_without_providers_preserves_existing_provider_profiles(tmp
                     api_key="sk-deepseek",
                     base_url="https://api.deepseek.com/v1",
                     model="deepseek-chat",
+                    context_window=64_000,
+                    max_output_tokens=8_192,
                 ),
             ],
         ),
@@ -334,6 +587,10 @@ def test_put_settings_without_providers_preserves_existing_provider_profiles(tmp
     assert [(profile.id, profile.api_key) for profile in cfg.providers] == [
         ("openai", "sk-openai"),
         ("deepseek", "sk-deepseek"),
+    ]
+    assert [(profile.context_window, profile.max_output_tokens) for profile in cfg.providers] == [
+        (128_000, 4_096),
+        (64_000, 8_192),
     ]
 
 
@@ -365,6 +622,8 @@ def test_put_settings_persists_ordered_fallback_providers(tmp_path):
                     "model": "gpt-4o",
                     "api_key": "",
                     "enabled": True,
+                    "context_window": 128_000,
+                    "max_output_tokens": 4_096,
                 },
                 {
                     "id": "openrouter",
@@ -374,6 +633,8 @@ def test_put_settings_persists_ordered_fallback_providers(tmp_path):
                     "model": "openai/gpt-4o",
                     "api_key": "",
                     "enabled": True,
+                    "context_window": 128_000,
+                    "max_output_tokens": 4_096,
                 },
             ],
         },
@@ -403,6 +664,8 @@ def test_provider_connection_test_uses_saved_profile(monkeypatch, tmp_path):
                     provider="openai",
                     api_key="sk-openai",
                     model="gpt-4o-mini",
+                    context_window=128_000,
+                    max_output_tokens=4_096,
                 )
             ],
         ),
@@ -419,6 +682,46 @@ def test_provider_connection_test_uses_saved_profile(monkeypatch, tmp_path):
     assert body["latency_ms"] >= 0
     assert body["message"] == "连接成功"
     assert captured["api_key"] == "sk-openai"
+
+
+def test_provider_connection_test_rejects_incomplete_budget_without_network(
+    monkeypatch, tmp_path
+):
+    calls: list[dict[str, object]] = []
+
+    def fake_completion(**kwargs):
+        calls.append(kwargs)
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr(ai_client, "completion", fake_completion)
+    save_config(
+        tmp_path,
+        Config(
+            active_provider_id="openai",
+            providers=[
+                AIProviderProfile(
+                    id="openai",
+                    label="OpenAI",
+                    provider="openai",
+                    api_key="sk-openai",
+                    model="gpt-4o-mini",
+                    context_window=0,
+                    max_output_tokens=0,
+                )
+            ],
+        ),
+    )
+
+    response = TestClient(create_app(data_dir=tmp_path)).post(
+        "/api/settings/providers/test", json={"provider_id": "openai"}
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": False,
+        "error": "请先填写有效的上下文窗口和单次最大输出",
+    }
+    assert calls == []
 
 
 def test_provider_connection_test_masks_secret_and_logs_failure(monkeypatch, tmp_path):
@@ -439,6 +742,8 @@ def test_provider_connection_test_masks_secret_and_logs_failure(monkeypatch, tmp
                 "model": "gpt-4o",
                 "api_key": "sk-secret-value",
                 "enabled": True,
+                "context_window": 128_000,
+                "max_output_tokens": 4_096,
             }
         },
     )
@@ -469,6 +774,8 @@ def test_provider_connection_test_reuses_saved_key_for_draft_profile(monkeypatch
                     provider="openai",
                     api_key="sk-openai",
                     model="gpt-4o",
+                    context_window=128_000,
+                    max_output_tokens=4_096,
                 )
             ],
         ),
@@ -486,6 +793,8 @@ def test_provider_connection_test_reuses_saved_key_for_draft_profile(monkeypatch
                 "model": "gpt-4o-mini",
                 "api_key": "",
                 "enabled": True,
+                "context_window": 128_000,
+                "max_output_tokens": 4_096,
             }
         },
     )

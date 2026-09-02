@@ -17,6 +17,8 @@ const settings: Settings = {
       model: 'stub',
       enabled: true,
       supports_json_schema: false,
+      context_window: 128_000,
+      max_output_tokens: 4_096,
       has_api_key: true,
     },
   ],

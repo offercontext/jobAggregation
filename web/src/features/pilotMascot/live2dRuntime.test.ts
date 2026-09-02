@@ -324,7 +324,47 @@ describe('createLive2dPilotMascotRuntime', () => {
       controller.setActivity('success');
       controller.setActivity('error');
       vi.advanceTimersByTime(1_001);
-      expect(fixture.model.expression.mock.calls).toEqual([['f06'], ['f01'], ['f06'], ['f02']]);
+      expect(fixture.model.expression.mock.calls).toEqual([['f06'], ['f01'], ['f06'], ['f02'], ['neutral']]);
+      controller.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps error text authoritative while expiring the surprised face to neutral', async () => {
+    vi.useFakeTimers();
+    try {
+      const fixture = runtimeDependencies();
+      const host = document.createElement('div');
+      const canvas = document.createElement('canvas');
+      host.appendChild(canvas);
+      const controller = await createLive2dPilotMascotRuntime(fixture.dependencies).mount(canvas);
+
+      controller.setActivity('error');
+      vi.advanceTimersByTime(1_001);
+
+      expect(fixture.model.expression.mock.calls).toEqual([['f02'], ['neutral']]);
+      controller.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels a stale error reset when another activity replaces it', async () => {
+    vi.useFakeTimers();
+    try {
+      const fixture = runtimeDependencies();
+      const host = document.createElement('div');
+      const canvas = document.createElement('canvas');
+      host.appendChild(canvas);
+      const controller = await createLive2dPilotMascotRuntime(fixture.dependencies).mount(canvas);
+
+      controller.setActivity('error');
+      controller.setActivity('thinking');
+      vi.advanceTimersByTime(1_001);
+
+      expect(fixture.model.expression.mock.calls).toEqual([['f02'], ['neutral']]);
+      expect(fixture.model.motion).toHaveBeenNthCalledWith(2, 'Idle', 1, 3);
       controller.dispose();
     } finally {
       vi.useRealTimers();
@@ -353,7 +393,10 @@ describe('createLive2dPilotMascotRuntime', () => {
     }
   });
 
-  it('cancels pending transient expression feedback when disposed', async () => {
+  it.each([
+    ['speaking', 'f06'],
+    ['error', 'f02'],
+  ] as const)('cancels pending %s expression feedback when disposed', async (activity, expression) => {
     vi.useFakeTimers();
     try {
       const fixture = runtimeDependencies();
@@ -362,11 +405,11 @@ describe('createLive2dPilotMascotRuntime', () => {
       host.appendChild(canvas);
       const controller = await createLive2dPilotMascotRuntime(fixture.dependencies).mount(canvas);
 
-      controller.setActivity('speaking');
+      controller.setActivity(activity);
       controller.dispose();
       vi.advanceTimersByTime(1_001);
 
-      expect(fixture.model.expression.mock.calls).toEqual([['f06']]);
+      expect(fixture.model.expression.mock.calls).toEqual([[expression]]);
     } finally {
       vi.useRealTimers();
     }

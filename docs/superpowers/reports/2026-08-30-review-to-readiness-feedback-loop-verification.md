@@ -117,5 +117,5 @@
 ## 集成状态
 
 - 分支未 push、未 merge。
-- 代码审查 HEAD 为 `97db2c332acc3ca15ec7b67b4bb34f5de8763868`；本报告与已完成计划将在独立文档提交中落盘。
-- 最终 repository hygiene 要求：报告提交后 `git diff --check`、tracked/untracked scope、HEAD 与 worktree clean 再次回读确认。
+- 代码审查 HEAD 为 `97db2c332acc3ca15ec7b67b4bb34f5de8763868`；本报告与实施计划已由 `2acf7e0a6b30b67543838b1452d396c406e27e7e` 落盘。
+- 报告提交后已回读 `git diff --check`、完整 baseline diff、untracked scope、HEAD 与 worktree 状态；最终 checklist 提交后会再次确认 clean。

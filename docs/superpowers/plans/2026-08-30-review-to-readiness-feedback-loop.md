@@ -876,7 +876,7 @@ Give fresh GPT-5.6 Sol xhigh reviewers the approved design, this plan, `BASE_SHA
 
 The report records: 0029 and destructive internal rebuild; exact `25/3/4 + 2/2`; Story confirm internal cutover and historical compatibility; V1/V2 coexistence; Signal fact level and no Memory/Knowledge/Summary writes; commit-unknown and Undo matrices; privacy scan; browser evidence; external exclusions; remaining risks; final reviewer verdict; and no claim of global exactly-once.
 
-- [ ] **Step 6: Run final repository hygiene checks**
+- [x] **Step 6: Run final repository hygiene checks**
 
 ```powershell
 git diff --check
@@ -887,7 +887,7 @@ git ls-files --others --exclude-standard
 
 Every changed/untracked file must belong to the approved project and the worktree must be clean after the final commit.
 
-- [ ] **Step 7: Commit the verified report and checked plan**
+- [x] **Step 7: Commit the verified report and checked plan**
 
 ```powershell
 git add docs/superpowers/plans/2026-08-30-review-to-readiness-feedback-loop.md

@@ -12,6 +12,8 @@ interface Props {
   disabledReason?: string;
   placeholder?: string;
   resetKey?: number;
+  draftValue?: string;
+  onDraftChange?: (value: string) => void;
   suggestions?: string[];
   onSuggestionSelect?: (question: string) => void;
   onboardingFocusToken?: number;
@@ -28,20 +30,28 @@ export default function Composer({
   disabledReason,
   placeholder,
   resetKey,
+  draftValue,
+  onDraftChange,
   suggestions,
   onSuggestionSelect,
   onboardingFocusToken,
   onSend,
 }: Props) {
-  const [value, setValue] = useState('');
+  const [localValue, setLocalValue] = useState('');
   const [sel, setSel] = useState(0);
   const [onboardingFocusActive, setOnboardingFocusActive] = useState(false);
   const composerRef = useRef<HTMLDivElement>(null);
+  const controlled = draftValue !== undefined;
+  const value = controlled ? draftValue : localValue;
+  const setValue = (next: string) => {
+    if (controlled) onDraftChange?.(next);
+    else setLocalValue(next);
+  };
 
   useEffect(() => {
-    setValue('');
+    if (!controlled) setLocalValue('');
     setSel(0);
-  }, [resetKey]);
+  }, [controlled, resetKey]);
 
   useEffect(() => {
     if (!onboardingFocusToken) {

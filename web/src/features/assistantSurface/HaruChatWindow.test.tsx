@@ -87,6 +87,16 @@ function FirstUseHarness() {
   return <HaruChatWindow returnFocusRef={{ current: null }} />;
 }
 
+function SharedDraftHarness() {
+  const controller = usePilotConversationController();
+  const surface = useAssistantSurface();
+  useEffect(() => {
+    controller.setComposerDraft('先讨论目标，再演练开场');
+    surface.openHaru();
+  }, []);
+  return <HaruChatWindow returnFocusRef={{ current: null }} />;
+}
+
 describe('HaruChatWindow', () => {
   beforeEach(() => {
     host = document.createElement('div');
@@ -207,5 +217,14 @@ describe('HaruChatWindow', () => {
     ));
     expect(host!.textContent).toContain('Haru 是 Pilot 的轻量窗口');
     expect(host!.textContent).toContain('对话不会丢失');
+  });
+
+  it('shows the controller-owned composer draft without sending it', async () => {
+    await act(async () => root?.render(
+      <AssistantSurfaceProvider><SharedDraftHarness /></AssistantSurfaceProvider>,
+    ));
+
+    expect(host!.querySelector<HTMLTextAreaElement>('#haru-composer')?.value).toBe('先讨论目标，再演练开场');
+    expect(host!.querySelector('[role="dialog"]')).not.toBeNull();
   });
 });

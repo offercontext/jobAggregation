@@ -35,6 +35,10 @@ import InterviewStoryDrawer, {
   type InterviewStoryDraftChangeContext,
 } from '@/components/InterviewStoryDrawer';
 import { type OfferNegotiationDraft } from '@/components/OfferNegotiationDrawer';
+import {
+  buildOfferNegotiationPilotDraft,
+  type OfferNegotiationPilotBrief,
+} from '@/features/offerNegotiation/pilotHandoff';
 import { listOfferBindingState } from '@/components/offerWorkspaceModel';
 import type { EvidenceTarget } from '@/components/ChatPanel/model';
 import CommandPalette from './CommandPalette';
@@ -1552,9 +1556,10 @@ function AppShellContent() {
   };
 
   const claimChatStartRequest = (requestKey: number) => {
-    if (consumedChatStartRequestKeysRef.current.has(requestKey)) return false;
-    consumedChatStartRequestKeysRef.current.add(requestKey);
+    const alreadyConsumed = consumedChatStartRequestKeysRef.current.has(requestKey);
     setChatStartRequest((current) => (current?.requestKey === requestKey ? undefined : current));
+    if (alreadyConsumed) return false;
+    consumedChatStartRequestKeysRef.current.add(requestKey);
     return true;
   };
 
@@ -2003,6 +2008,47 @@ function AppShellContent() {
     setView('board');
   };
 
+  const startOfferNegotiationPilotChat = (
+    offer: Offer,
+    brief: OfferNegotiationPilotBrief,
+  ): boolean => {
+    if (listOfferBindingState(offer) === 'unbound') {
+      message.warning('历史未绑定 Offer 无法进入谈薪对话');
+      return false;
+    }
+    if (!Number.isSafeInteger(offer.id) || offer.id <= 0 || !Number.isSafeInteger(offer.application_id)) {
+      message.warning('当前 Offer 信息暂不可用');
+      return false;
+    }
+    const application = apps.find((item) => item.id === offer.application_id);
+    if (!application) {
+      message.warning('所属投递当前不可见');
+      return false;
+    }
+    if (hasLivePilotWork()) {
+      message.warning('Pilot 当前有待处理内容，请先处理后再开始谈薪对话');
+      return false;
+    }
+
+    setCoachOfferId(offer.id);
+    setChatStartRequest({
+      requestKey: ++nextChatStartRequestKey.current,
+      context_type: 'application',
+      context_ref: String(application.id),
+      context_label: `${application.company_name} · ${application.position_name}`,
+      mode: 'nego_coach',
+      attachments: [{
+        kind: 'offer',
+        id: String(offer.id),
+        label: `${offer.company_name} · ${offer.position_name}`,
+      }],
+      composerDraft: buildOfferNegotiationPilotDraft(offer, brief),
+    });
+    if (view === 'pilot') setView('dashboard');
+    assistantSurface.openHaru();
+    return true;
+  };
+
   const updateOfferNegotiationDraft = useCallback((offerId: number, draft: OfferNegotiationDraft | null) => {
     if (draft) {
       offerNegotiationDraftsRef.current.set(offerId, draft);
@@ -2291,6 +2337,7 @@ function AppShellContent() {
       offerNegotiationEntryPoint={offerNegotiationEntryPoint}
       offerNegotiationDrafts={offerNegotiationEntryPoint === 'pilot' ? offerNegotiationPilotDrafts : offerNegotiationDrafts}
       onOfferNegotiationDraftChange={offerNegotiationEntryPoint === 'pilot' ? handleOfferNegotiationDrawerDraftChange : updateOfferNegotiationDraft}
+      onOpenOfferNegotiationPilot={startOfferNegotiationPilotChat}
       applicationJdDraft={selectedApp ? applicationJdDrafts[selectedApp.id] : undefined}
       onApplicationJdDraftChange={updateApplicationJdDraft}
       interviewReviewProposalAttempts={interviewReviewProposalAttempts}

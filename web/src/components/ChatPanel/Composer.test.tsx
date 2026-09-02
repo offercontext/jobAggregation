@@ -35,6 +35,25 @@ afterEach(() => {
 });
 
 describe('Composer quick questions', () => {
+  it('uses the shared controlled draft without sending it', () => {
+    const onSend = vi.fn();
+    const onDraftChange = vi.fn();
+    const view = render(
+      <Composer
+        capabilities={[]}
+        draftValue="和 Pilot 讨论这份 Offer"
+        onDraftChange={onDraftChange}
+        onSend={onSend}
+      />,
+    );
+    const input = view.querySelector<HTMLTextAreaElement>('textarea');
+
+    expect(input?.value).toBe('和 Pilot 讨论这份 Offer');
+    expect(onSend).not.toHaveBeenCalled();
+    act(() => changeValue(input!, '保留新的共享草稿'));
+    expect(onDraftChange).toHaveBeenCalledWith('保留新的共享草稿');
+  });
+
   it('fills the composer without sending when a quick question is selected', () => {
     const onSend = vi.fn();
     const view = render(

@@ -141,7 +141,8 @@ describe('ChatPanel docked layout contract', () => {
   });
 
   it('snapshots current context attachments into the chat stream request', () => {
-    expect(controller).toContain('attachments: [...input.attachments]');
+    expect(controller).toContain('mergePilotRequestAttachments(');
+    expect(controller).toContain('input.draftContext?.attachments');
     expect(component).toContain('const requestContext');
     expect(component).toContain('streamChatRequest(requestLease, trimmed, convID, requestContext');
   });
@@ -489,7 +490,7 @@ describe('ChatPanel docked layout contract', () => {
     expect(component).toContain("setConfirmPhase('saving');");
     expect(component).toContain('const selectedConfirmationLock = confirmationLocksRef.current.get(id);');
     expect(component).toContain('if (selectedConfirmationLock) {');
-    const newChatStart = component.indexOf('function startNewChat()');
+    const newChatStart = component.indexOf('function canStartNewChat()');
     const newChatEnd = component.indexOf('async function selectConversation', newChatStart);
     const newChat = component.slice(newChatStart, newChatEnd);
     expect(newChat).toContain("if (activeRequestRef.current?.kind === 'confirmation')");
@@ -535,9 +536,11 @@ describe('ChatPanel docked layout contract', () => {
   it('clears draft context before activating an existing conversation', () => {
     const selectionStart = component.indexOf('async function selectConversation(id: number)');
     const draftReset = component.indexOf('setDraftContext(null);', selectionStart);
+    const composerReset = component.indexOf("setComposerDraft('');", selectionStart);
     const contextActivation = component.indexOf('activateConversationContext(id);', selectionStart);
     expect(draftReset).toBeGreaterThan(selectionStart);
-    expect(contextActivation).toBeGreaterThan(draftReset);
+    expect(composerReset).toBeGreaterThan(draftReset);
+    expect(contextActivation).toBeGreaterThan(composerReset);
   });
 
   it('keeps the shared busy state while a background confirmation owns the request lease', () => {
@@ -549,9 +552,11 @@ describe('ChatPanel docked layout contract', () => {
     expect(controller).toContain('activeConversationSelectionRef.current !== null');
     expect(controller).toContain('setLoading(activeConversationSelectionRef.current !== null);');
     expect(controller).toContain('setLoading(activeRequestRef.current !== null);');
-    expect(component).toContain('if (!startNewChat()) return;');
-    expect(component).toContain('startedRequestKeyRef.current === startRequest.requestKey');
-    expect(component).toContain('[startRequest?.requestKey, loading]');
+    expect(component).toContain('if (!canStartNewChat()) return;');
+    expect(component).toContain('if (onStartRequestConsumed && !onStartRequestConsumed(startRequest.requestKey))');
+    expect(component).toContain('resetForNewChat();');
+    expect(component).toContain('acceptedStartRequestKeyRef.current === startRequest.requestKey');
+    expect(component).toContain('[startRequest?.requestKey, loading, onStartRequestConsumed]');
   });
 
   it('guards conversation list refreshes against stale view responses', () => {

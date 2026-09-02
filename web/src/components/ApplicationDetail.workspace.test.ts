@@ -43,4 +43,15 @@ describe('ApplicationDetail staged workspace', () => {
     expect(source).toContain('eventSubtypeLabel');
     expect(source).toContain('eventStatusLabel');
   });
+
+  it('generation-fences the Offer negotiation handoff before closing the task owner', () => {
+    const handoffStart = source.indexOf('onOpenPilotChat={onOpenOfferNegotiationPilot');
+    const handoffEnd = source.indexOf('onClose={close}', handoffStart);
+    const handoffSource = source.slice(handoffStart, handoffEnd);
+
+    expect(handoffStart).toBeGreaterThanOrEqual(0);
+    expect(handoffSource).toContain('if (!isCurrent()) return;');
+    expect(handoffSource).toContain('if (!onOpenOfferNegotiationPilot(currentOffer, brief)) return;');
+    expect(handoffSource).toContain('close();');
+  });
 });

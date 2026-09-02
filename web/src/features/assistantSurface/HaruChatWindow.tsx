@@ -55,7 +55,8 @@ interface Props {
 export default function HaruChatWindow({ returnFocusRef, onExpand, anchorRect }: Props) {
   const surface = useAssistantSurface();
   const controller = usePilotConversationController();
-  const [draft, setDraft] = useState('');
+  const draft = controller.composerDraft;
+  const setDraft = controller.setComposerDraft;
   const [viewport, setViewport] = useState(() => (
     typeof window === 'undefined'
       ? { width: 1440, height: 900, navigationRight: 12 }

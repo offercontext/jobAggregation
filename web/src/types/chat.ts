@@ -66,7 +66,12 @@ export interface ChatStartRequest {
   context_type: 'application';
   context_ref: string;
   context_label: string;
-  mode: 'general';
+  mode: 'general' | 'nego_coach';
+  /** Trusted request-scoped references that must accompany the first and follow-up sends. */
+  attachments?: PilotContextAttachment[];
+  /** A user-editable, unsent composer value. Never starts a request by itself. */
+  composerDraft?: string;
+  /** An explicit deterministic action that retains the existing auto-send contract. */
   initialMessage?: string;
   pilot_action?: PilotActionRequest;
 }

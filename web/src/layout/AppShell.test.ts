@@ -451,4 +451,27 @@ describe('AppShell source contract', () => {
     expect(applicationChatSource).not.toContain('streamChat');
     expect(applicationChatSource).not.toContain('sendMessage');
   });
+
+  it('hands Offer negotiation to the shared Pilot owner as an unsent bound draft', () => {
+    const handoffStart = source.indexOf('const startOfferNegotiationPilotChat =');
+    const handoffEnd = source.indexOf('const updateOfferNegotiationDraft =', handoffStart);
+    const handoffSource = source.slice(handoffStart, handoffEnd);
+
+    expect(handoffStart).toBeGreaterThanOrEqual(0);
+    expect(handoffSource).toContain("mode: 'nego_coach'");
+    expect(handoffSource).toContain("kind: 'offer'");
+    expect(handoffSource).toContain('id: String(offer.id)');
+    expect(handoffSource).toContain('composerDraft: buildOfferNegotiationPilotDraft(offer, brief)');
+    expect(handoffSource).toContain('setCoachOfferId(offer.id)');
+    expect(handoffSource).toContain('assistantSurface.openHaru()');
+    expect(handoffSource).not.toContain('initialMessage');
+    expect(handoffSource).not.toContain('streamChat');
+    expect(handoffSource).not.toContain('sendMessage');
+
+    const detailStart = source.indexOf('<ApplicationDetail');
+    const detailEnd = source.indexOf('/>', detailStart);
+    expect(source.slice(detailStart, detailEnd)).toContain(
+      'onOpenOfferNegotiationPilot={startOfferNegotiationPilotChat}',
+    );
+  });
 });

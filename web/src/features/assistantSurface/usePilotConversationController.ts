@@ -69,6 +69,34 @@ interface BuildRequestContextInput {
   attachments: PilotContextAttachment[];
 }
 
+const CHAT_ATTACHMENT_LIMIT = 5;
+
+/**
+ * Preserve a start request's exact entity binding while accepting the user's
+ * other current attachments. A scoped Offer replaces any ambient Offer so a
+ * negotiation can never silently drift to another Offer from the same
+ * Application.
+ */
+export function mergePilotRequestAttachments(
+  scoped: readonly PilotContextAttachment[] = [],
+  ambient: readonly PilotContextAttachment[] = [],
+): PilotContextAttachment[] {
+  const scopedOfferId = scoped.find((item) => item.kind === 'offer')?.id;
+  const merged = scopedOfferId
+    ? [...scoped, ...ambient.filter((item) => item.kind !== 'offer')]
+    : [...scoped, ...ambient];
+  const seen = new Set<string>();
+  const result: PilotContextAttachment[] = [];
+  for (const item of merged) {
+    const key = `${item.kind}:${item.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push({ ...item });
+    if (result.length === CHAT_ATTACHMENT_LIMIT) break;
+  }
+  return result;
+}
+
 function contextDisplayLabel(context: PilotPageContext): string {
   return context.entity?.label || context.label;
 }
@@ -125,6 +153,7 @@ export function usePilotConversationControllerState() {
   const [loadingLabel, setLoadingLabel] = useState<string>();
   const [hasStreamingAssistantContent, setHasStreamingAssistantContent] = useState(false);
   const [composerResetKey, setComposerResetKey] = useState(0);
+  const [composerDraft, setComposerDraft] = useState('');
   const [followingContext, setFollowingContextState] = useState<PilotPageContext>();
   const [pinnedContext, setPinnedContext] = useState<PilotPageContext>();
   const [contextChangeNotice, setContextChangeNotice] = useState<ContextChangeNotice | null>(null);
@@ -141,6 +170,7 @@ export function usePilotConversationControllerState() {
   const confirmationLocksRef = useRef(new Map<number, ConfirmationExecution>());
   const confirmationReconcileOnOpenRef = useRef<ConfirmationExecution | null>(null);
   const lockedConfirmationRef = useRef<ConfirmationExecution | null>(null);
+  const acceptedStartRequestKeyRef = useRef<number | null>(null);
   const startedRequestKeyRef = useRef<number | null>(null);
   const pendingAutoSelectSuppressedRef = useRef(false);
   const conversationSelectionRequestRef = useRef(0);
@@ -339,9 +369,13 @@ export function usePilotConversationControllerState() {
           offerId: input.offerId,
           pageContext: input.pageContext,
         });
+    const requestAttachments = mergePilotRequestAttachments(
+      input.draftContext?.attachments,
+      input.attachments,
+    );
     return {
       ...base,
-      ...(input.attachments.length ? { attachments: [...input.attachments] } : {}),
+      ...(requestAttachments.length ? { attachments: requestAttachments } : {}),
     };
   }, []);
 
@@ -469,6 +503,8 @@ export function usePilotConversationControllerState() {
     setHasStreamingAssistantContent,
     composerResetKey,
     setComposerResetKey,
+    composerDraft,
+    setComposerDraft,
     followingContext,
     setFollowingContext,
     pinnedContext,
@@ -492,6 +528,7 @@ export function usePilotConversationControllerState() {
     confirmationLocksRef,
     confirmationReconcileOnOpenRef,
     lockedConfirmationRef,
+    acceptedStartRequestKeyRef,
     startedRequestKeyRef,
     pendingAutoSelectSuppressedRef,
     conversationSelectionRequestRef,
@@ -538,6 +575,7 @@ export function usePilotConversationControllerState() {
     clearActiveContext,
     clearLastFailure,
     composerResetKey,
+    composerDraft,
     confirmError,
     confirmPhase,
     contextChangeNotice,

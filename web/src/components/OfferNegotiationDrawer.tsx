@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from 'antd';
+import { MessageOutlined } from '@ant-design/icons';
 import {
   confirmOfferNegotiationProposal,
   createOfferNegotiationProposal,
@@ -27,6 +28,7 @@ interface Props {
   draft?: OfferNegotiationDraft;
   onDraftChange?: (draft: OfferNegotiationDraft | null) => void;
   entrypoint?: 'ui' | 'pilot';
+  onOpenPilotChat?: (offer: Offer, brief: NegotiationBriefValue) => void;
 }
 
 export interface OfferNegotiationDraft {
@@ -101,7 +103,16 @@ export default function OfferNegotiationDrawer(props: Props) {
   return <BoundOfferNegotiationDrawer {...props} />;
 }
 
-function BoundOfferNegotiationDrawer({ open, offer, dimensionIds = [], onClose, draft, onDraftChange, entrypoint = 'ui' }: Props) {
+function BoundOfferNegotiationDrawer({
+  open,
+  offer,
+  dimensionIds = [],
+  onClose,
+  draft,
+  onDraftChange,
+  entrypoint = 'ui',
+  onOpenPilotChat,
+}: Props) {
   const [goal, setGoal] = useState(draft?.goal ?? '');
   const [concerns, setConcerns] = useState(draft?.concerns ?? '');
   const [scenario, setScenario] = useState(draft?.scenario ?? '');
@@ -438,6 +449,20 @@ function BoundOfferNegotiationDrawer({ open, offer, dimensionIds = [], onClose, 
           </ol>
           <h3>{workflowMessage.title}</h3>
           <p>{workflowMessage.detail}</p>
+          {entrypoint !== 'pilot' && onOpenPilotChat && !isHistoryView && !resultUnknown && !displayedProposal?.source_changed ? (
+            <div className={styles.workflowActions}>
+              <Button
+                icon={<MessageOutlined />}
+                disabled={busy}
+                data-testid="offer-negotiation-open-pilot"
+                aria-label="和 Pilot 深聊这份 Offer"
+                onClick={() => onOpenPilotChat(offer, briefValue)}
+              >
+                和 Pilot 深聊这份 Offer
+              </Button>
+              <span>会带入当前 Offer 和已填写内容，消息由你决定是否发送。</span>
+            </div>
+          ) : null}
         </section>
       )}
       {!displayedProposal && (

@@ -148,6 +148,16 @@ export function isVoiceCoachingPilotIntent(text: string): boolean {
   return VOICE_COACHING_PILOT_INTENTS.has(text.trim());
 }
 
+export function draftContextMatchesOfferScope(
+  draftContext: ChatStartRequest | null,
+  offerId: number | undefined,
+): boolean {
+  if (!draftContext) return true;
+  const scopedOffers = draftContext.attachments?.filter((item) => item.kind === 'offer') ?? [];
+  if (offerId === undefined) return false;
+  return scopedOffers.length === 1 && scopedOffers[0]?.id === String(offerId);
+}
+
 export function VoiceCoachingPilotEntry({ onOpen }: { onOpen: () => void }) {
   return (
     <Button type="text" icon={<RobotOutlined />} onClick={onOpen} data-testid="pilot-open-voice-coaching-growth">
@@ -318,6 +328,8 @@ function ChatPanelView({
     setHasStreamingAssistantContent,
     composerResetKey,
     setComposerResetKey,
+    composerDraft,
+    setComposerDraft,
     pinnedContext,
     pinConversationContext,
     activateConversationContext,
@@ -333,6 +345,7 @@ function ChatPanelView({
     confirmationLocksRef,
     confirmationReconcileOnOpenRef,
     lockedConfirmationRef,
+    acceptedStartRequestKeyRef,
     startedRequestKeyRef,
     pendingAutoSelectSuppressedRef,
     conversationSelectionRequestRef,
@@ -359,6 +372,8 @@ function ChatPanelView({
   } = controller;
   const [offer, setOffer] = useState<Offer | null>(null);
   const [panelOpen, setPanelOpen] = useState(false);
+  const draftContextRef = useRef(draftContext);
+  draftContextRef.current = draftContext;
 
   useEffect(() => {
     setControllerAttachments((current) => {
@@ -414,7 +429,9 @@ function ChatPanelView({
   const inlinePage = variant === 'page';
 
   const activeConv = conversations.find((c) => c.id === convID);
-  const isNego = activeConv ? activeConv.mode === 'nego_coach' : offerId !== undefined;
+  const isNego = activeConv
+    ? activeConv.mode === 'nego_coach'
+    : draftContext?.mode === 'nego_coach' || offerId !== undefined;
   const contextResetKey = JSON.stringify({
     conversationId: convID ?? null,
     draftRequestKey: draftContext?.requestKey ?? null,
@@ -579,6 +596,10 @@ function ChatPanelView({
       markPendingAutoSelect('allow');
       lastConfirmationInputRef.current = null;
       setDegraded(false);
+      if (!draftContextMatchesOfferScope(draftContextRef.current, offerId)) {
+        setDraftContext(null);
+        setComposerDraft('');
+      }
       threadOfferId.current = offerId;
     }
     refreshConversations(showArchived);
@@ -634,11 +655,15 @@ function ChatPanelView({
     window.addEventListener('pointerup', onUp);
   }
 
-  function startNewChat() {
+  function canStartNewChat() {
     if (activeRequestRef.current?.kind === 'confirmation') {
       toast.info('操作确认仍在处理中，请稍候');
       return false;
     }
+    return true;
+  }
+
+  function resetForNewChat() {
     beginNewAttachmentDraft();
     markPendingAutoSelect('suppress');
     cancelConversationSelection();
@@ -662,33 +687,43 @@ function ChatPanelView({
     setLoadingLabel(undefined);
     setHasStreamingAssistantContent(false);
     setDraftContext(null);
+    setComposerDraft('');
     setRequestContextSnapshot(undefined);
     activateConversationContext(undefined);
     setComposerResetKey((key) => key + 1);
     setLoading(false);
+  }
+
+  function startNewChat() {
+    if (!canStartNewChat()) return false;
+    resetForNewChat();
     return true;
   }
 
   useEffect(() => {
-    if (!startRequest || startedRequestKeyRef.current === startRequest.requestKey) return;
-    if (!startNewChat()) return;
+    if (!startRequest || acceptedStartRequestKeyRef.current === startRequest.requestKey) return;
+    if (!canStartNewChat()) return;
+    if (onStartRequestConsumed && !onStartRequestConsumed(startRequest.requestKey)) {
+      acceptedStartRequestKeyRef.current = startRequest.requestKey;
+      return;
+    }
+    acceptedStartRequestKeyRef.current = startRequest.requestKey;
+    resetForNewChat();
     setDraftContext(startRequest);
-  }, [startRequest?.requestKey, loading]);
+    setComposerDraft(startRequest.composerDraft ?? '');
+  }, [startRequest?.requestKey, loading, onStartRequestConsumed]);
 
   useEffect(() => {
     if (!draftContext?.initialMessage || startedRequestKeyRef.current === draftContext.requestKey) return;
-    if (onStartRequestConsumed && !onStartRequestConsumed(draftContext.requestKey)) {
-      startedRequestKeyRef.current = draftContext.requestKey;
-      return;
-    }
     startedRequestKeyRef.current = draftContext.requestKey;
     void sendMessage(draftContext.initialMessage);
-  }, [draftContext?.requestKey, onStartRequestConsumed]);
+  }, [draftContext?.requestKey]);
 
   async function selectConversation(id: number) {
     markPendingAutoSelect('allow');
     if (id === convID) return;
     setDraftContext(null);
+    setComposerDraft('');
     setRequestContextSnapshot(undefined);
     activateConversationContext(id);
     visibleRequestGenerationRef.current += 1;
@@ -778,6 +813,7 @@ function ChatPanelView({
   async function clearActiveContext() {
     if (!convID) {
       setDraftContext(null);
+      setComposerDraft('');
       activateConversationContext(undefined);
       return;
     }
@@ -1118,7 +1154,12 @@ function ChatPanelView({
 
   function retryLastMessage() {
     if (!lastFailedText || loading || activePending) return;
-    void sendMessage(lastFailedText);
+    const retryText = lastFailedText;
+    void sendMessage(retryText).then((outcome) => {
+      if (outcome === 'sent') {
+        setComposerDraft((current) => (current === retryText ? '' : current));
+      }
+    });
   }
 
   function clearLastFailure() {
@@ -1725,6 +1766,8 @@ function ChatPanelView({
                 disabled={composerDisabled}
                 disabledReason={composerDisabledReason}
                 resetKey={composerResetKey}
+                draftValue={composerDraft}
+                onDraftChange={setComposerDraft}
                 suggestions={attachmentSuggestions}
                 onboardingFocusToken={onboardingFocusEventToken}
                 onSend={sendMessage}

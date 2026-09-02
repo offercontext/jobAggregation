@@ -86,6 +86,24 @@
   line-height: 1.55;
 }
 
+.workflowActions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding-top: 4px;
+}
+
+.workflowActions > button {
+  min-height: 40px;
+}
+
+.workflowActions > span {
+  color: var(--op-muted-strong);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .briefFieldset {
   display: grid;
   gap: 12px;

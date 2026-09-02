@@ -12,6 +12,8 @@ if (!HTMLElement.prototype.scrollIntoView) HTMLElement.prototype.scrollIntoView 
 const chatState = vi.hoisted(() => ({
   streamChat: vi.fn(),
   getConversation: vi.fn().mockResolvedValue([]),
+  getOffer: vi.fn().mockResolvedValue({ id: 17, application_id: 42 }),
+  attachments: [] as Array<{ kind: 'application' | 'offer' | 'resume'; id: string; label: string }>,
 }));
 
 vi.mock('@/services/chat', () => ({
@@ -26,7 +28,7 @@ vi.mock('@/services/chat', () => ({
   updateConversation: vi.fn(),
   undoLastWrite: vi.fn(),
 }));
-vi.mock('@/services/offers', () => ({ getOffer: vi.fn() }));
+vi.mock('@/services/offers', () => ({ getOffer: chatState.getOffer }));
 vi.mock('@/services/onboarding', () => ({ ONBOARDING_QUERY_KEY: ['onboarding'] }));
 vi.mock('@tanstack/react-query', () => ({
   useQueryClient: () => ({ invalidateQueries: vi.fn() }),
@@ -35,7 +37,7 @@ vi.mock('@tanstack/react-query', () => ({
 vi.mock('@/features/pilot/PilotAttachmentContext', () => ({
   usePilotAttachments: () => ({
     activeKey: undefined,
-    attachments: [],
+    attachments: chatState.attachments,
     notice: null,
     addAttachment: vi.fn(),
     removeAttachment: vi.fn(),
@@ -48,13 +50,26 @@ vi.mock('@/features/pilot/PilotAttachmentContext', () => ({
 vi.mock('./ThreadRail', () => ({ default: () => null }));
 vi.mock('./MessageBubble', () => ({ default: () => null }));
 vi.mock('./ThinkingIndicator', () => ({ default: () => null }));
-vi.mock('./Composer', () => ({ default: () => null }));
+vi.mock('./Composer', () => ({
+  default: (props: { draftValue?: string; onSend?: (value: string) => void }) => (
+    <>
+      <textarea data-testid="mock-pilot-composer" value={props.draftValue ?? ''} readOnly />
+      <button
+        type="button"
+        data-testid="mock-pilot-send"
+        onClick={() => props.onSend?.(props.draftValue ?? '')}
+      >
+        发送
+      </button>
+    </>
+  ),
+}));
 vi.mock('./ContextAttachmentRail', () => ({ default: () => null }));
 vi.mock('./NativePilotAttachmentDropSurface', () => ({ default: (props: { children?: ReactNode }) => <>{props.children}</> }));
 vi.mock('./ContextPanel', () => ({ default: () => null }));
 vi.mock('@/components/KanbanBoard/PilotContextDropTarget', () => ({ default: (props: { children?: ReactNode }) => <>{props.children}</> }));
 
-const { default: ChatPanel } = await import('./index');
+const { default: ChatPanel, draftContextMatchesOfferScope } = await import('./index');
 
 let root: Root | undefined;
 let container: HTMLDivElement | undefined;
@@ -62,6 +77,8 @@ let container: HTMLDivElement | undefined;
 afterEach(() => {
   chatState.streamChat.mockReset();
   chatState.getConversation.mockClear();
+  chatState.getOffer.mockClear();
+  chatState.attachments = [];
   act(() => root?.unmount());
   container?.remove();
 });
@@ -107,6 +124,191 @@ const jdAction: PendingAction = {
 };
 
 describe('deterministic Pilot JD confirmation card', () => {
+  it('binds an unsent negotiation draft to exactly one Offer scope', () => {
+    const request = {
+      requestKey: 90,
+      context_type: 'application' as const,
+      context_ref: '42',
+      context_label: '去哪儿旅行 · Agent 开发',
+      mode: 'nego_coach' as const,
+      attachments: [{ kind: 'offer' as const, id: '17', label: '去哪儿旅行 · Agent 开发' }],
+      composerDraft: '谈薪草稿',
+    };
+
+    expect(draftContextMatchesOfferScope(request, 17)).toBe(true);
+    expect(draftContextMatchesOfferScope(request, 18)).toBe(false);
+    expect(draftContextMatchesOfferScope(request, undefined)).toBe(false);
+  });
+
+  it('accepts a negotiation composer prefill without starting Chat or SSE', async () => {
+    const claim = vi.fn(() => true);
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+    await act(async () => root?.render(
+      <AntApp>
+        <ChatPanel
+          open
+          variant="page"
+          onClose={vi.fn()}
+          startRequest={{
+            requestKey: 91,
+            context_type: 'application',
+            context_ref: '42',
+            context_label: '去哪儿旅行 · Agent 开发',
+            mode: 'nego_coach',
+            attachments: [{ kind: 'offer', id: '17', label: '去哪儿旅行 · Agent 开发' }],
+            composerDraft: '我想继续讨论这份 Offer 的谈薪策略。',
+          }}
+          onStartRequestConsumed={claim}
+        />
+      </AntApp>,
+    ));
+
+    expect(claim).toHaveBeenCalledWith(91);
+    expect(container.querySelector<HTMLTextAreaElement>('[data-testid="mock-pilot-composer"]')?.value)
+      .toBe('我想继续讨论这份 Offer 的谈薪策略。');
+    expect(chatState.streamChat).not.toHaveBeenCalled();
+  });
+
+  it('sends the clicked Offer attachment instead of an ambient Offer from the same application', async () => {
+    chatState.attachments = [
+      { kind: 'offer', id: '18', label: '同投递下的另一份 Offer' },
+      { kind: 'resume', id: '6', label: '主简历' },
+    ];
+    chatState.streamChat.mockResolvedValue({
+      type: 'message',
+      conversation_id: 501,
+      message: '谈薪建议',
+    });
+    const claim = vi.fn(() => true);
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+    await act(async () => root?.render(
+      <AntApp>
+        <ChatPanel
+          open
+          offerId={17}
+          variant="page"
+          onClose={vi.fn()}
+          startRequest={{
+            requestKey: 93,
+            context_type: 'application',
+            context_ref: '42',
+            context_label: '去哪儿旅行 · Agent 开发',
+            mode: 'nego_coach',
+            attachments: [{ kind: 'offer', id: '17', label: '去哪儿旅行 · Agent 开发' }],
+            composerDraft: '请结合这份 Offer 帮我谈薪。',
+          }}
+          onStartRequestConsumed={claim}
+        />
+      </AntApp>,
+    ));
+
+    await act(async () => {
+      container?.querySelector<HTMLButtonElement>('[data-testid="mock-pilot-send"]')?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(chatState.streamChat).toHaveBeenCalledTimes(1);
+    expect(chatState.streamChat.mock.calls[0]?.[2]).toMatchObject({
+      context_type: 'application',
+      context_ref: '42',
+      mode: 'nego_coach',
+      attachments: [
+        { kind: 'offer', id: '17', label: '去哪儿旅行 · Agent 开发' },
+        { kind: 'resume', id: '6', label: '主简历' },
+      ],
+    });
+  });
+
+  it('drops an Offer-scoped draft on a general-chat reopen but preserves the same Offer scope', async () => {
+    const request = {
+      requestKey: 94,
+      context_type: 'application' as const,
+      context_ref: '42',
+      context_label: '去哪儿旅行 · Agent 开发',
+      mode: 'nego_coach' as const,
+      attachments: [{ kind: 'offer' as const, id: '17', label: '去哪儿旅行 · Agent 开发' }],
+      composerDraft: '只属于 Offer #17 的谈薪草稿',
+    };
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+    await act(async () => root?.render(
+      <AntApp>
+        <ChatPanel open offerId={17} variant="page" onClose={vi.fn()} startRequest={request} />
+      </AntApp>,
+    ));
+
+    await act(async () => root?.render(
+      <AntApp>
+        <ChatPanel open={false} variant="page" onClose={vi.fn()} startRequest={request} />
+      </AntApp>,
+    ));
+    await act(async () => root?.render(
+      <AntApp>
+        <ChatPanel open offerId={17} variant="page" onClose={vi.fn()} startRequest={request} />
+      </AntApp>,
+    ));
+    expect(container.querySelector<HTMLTextAreaElement>('[data-testid="mock-pilot-composer"]')?.value)
+      .toBe('只属于 Offer #17 的谈薪草稿');
+
+    await act(async () => root?.render(
+      <AntApp>
+        <ChatPanel open variant="page" onClose={vi.fn()} startRequest={request} />
+      </AntApp>,
+    ));
+    expect(container.querySelector<HTMLTextAreaElement>('[data-testid="mock-pilot-composer"]')?.value)
+      .toBe('');
+    expect(chatState.streamChat).not.toHaveBeenCalled();
+  });
+
+  it('leaves the current draft untouched when another owner already claimed a start request', async () => {
+    const claim = vi.fn((requestKey: number) => requestKey === 91);
+    const acceptedRequest = {
+      requestKey: 91,
+      context_type: 'application' as const,
+      context_ref: '42',
+      context_label: '去哪儿旅行 · Agent 开发',
+      mode: 'nego_coach' as const,
+      composerDraft: '保留当前谈薪草稿',
+    };
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+    await act(async () => root?.render(
+      <AntApp>
+        <ChatPanel
+          open
+          variant="page"
+          onClose={vi.fn()}
+          startRequest={acceptedRequest}
+          onStartRequestConsumed={claim}
+        />
+      </AntApp>,
+    ));
+
+    await act(async () => root?.render(
+      <AntApp>
+        <ChatPanel
+          open
+          variant="page"
+          onClose={vi.fn()}
+          startRequest={{ ...acceptedRequest, requestKey: 92, composerDraft: '不应覆盖当前草稿' }}
+          onStartRequestConsumed={claim}
+        />
+      </AntApp>,
+    ));
+
+    expect(claim).toHaveBeenLastCalledWith(92);
+    expect(container.querySelector<HTMLTextAreaElement>('[data-testid="mock-pilot-composer"]')?.value)
+      .toBe('保留当前谈薪草稿');
+    expect(chatState.streamChat).not.toHaveBeenCalled();
+  });
+
   it('keeps an ordinary reply running after close and reports the exact background conversation', async () => {
     let resolveReply: ((value: { type: 'message'; conversation_id: number; message: string }) => void) | undefined;
     chatState.streamChat.mockImplementation(() => new Promise((resolve) => { resolveReply = resolve; }));

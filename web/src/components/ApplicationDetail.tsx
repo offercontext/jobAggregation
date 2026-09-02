@@ -55,6 +55,7 @@ import OpportunityFitReviewDrawer, {
 } from './OpportunityFitReviewDrawer';
 import ApplicationOutcomeDrawer from './ApplicationOutcomeDrawer';
 import OfferNegotiationDrawer, { type OfferNegotiationDraft } from './OfferNegotiationDrawer';
+import type { OfferNegotiationPilotBrief } from '@/features/offerNegotiation/pilotHandoff';
 import { getApplicationMaterialKit } from '@/services/materialKits';
 import { listOpportunityFitV2Reviews } from '@/services/opportunityFitReviews';
 import {
@@ -397,6 +398,7 @@ interface ApplicationDetailProps {
   } | null;
   offerNegotiationDrafts?: Record<number, OfferNegotiationDraft>;
   onOfferNegotiationDraftChange?: (offerId: number, draft: OfferNegotiationDraft | null) => void;
+  onOpenOfferNegotiationPilot?: (offer: Offer, brief: OfferNegotiationPilotBrief) => boolean;
   offerNegotiationEntryPoint?: 'ui' | 'pilot';
   resumesLoading?: boolean;
   resumesError?: boolean;
@@ -412,7 +414,7 @@ interface ApplicationDetailProps {
   onApplicationJdDraftChange?: (applicationId: number, patch: Partial<ApplicationJdDraft> | null) => void;
 }
 
-export default function ApplicationDetail({ application, open, onClose, taskController, onLaunchTask, onConfirmedFitToMaterial, onTaskSurfaceGuardChange, onOpenOffers, offers, offersLoading = false, offersError = false, onRetryOffers, onMockInterview: _onMockInterview, onAskPilot, onOpenPilotOpportunityFit: _onOpenPilotOpportunityFit, externalTaskBlocked = false, onOpportunityFitOwnerStateChange, onOpportunityFitProjectionChange, opportunityFitOwnerStore, pilotInterviewReviewApplicationId, onPilotInterviewReviewFocusConsumed, pilotInterviewPreparationApplicationId, pilotInterviewPreparationEventId, onPilotInterviewPreparationFocusConsumed, onAttachToPilot, interviewReviewProposalAttempts, onInterviewReviewProposalAttemptChange, reviewReadinessDrafts, onReviewReadinessDraftChange, onOpenReviewStory, onOpenReadinessPractice, onInterviewNoteChanged, interviewKnowledgeCaptureDrafts, onInterviewKnowledgeCaptureDraftChange, onInterviewKnowledgeCaptureNoteChanged, resumes, resumesLoading = false, resumesError = false, taskNow, interviewPreparationAttempts, onInterviewPreparationAttemptChange, interviewPreparationDrafts, onInterviewPreparationDraftChange, interviewPreparationKnowledgeOptions = [], interviewPreparationSelection, offerNegotiationDrafts = {}, onOfferNegotiationDraftChange, offerNegotiationEntryPoint = 'ui', nextStepSuggestions, nextStepSessionState = null, onSetDisposition, onNextStepNavigate, isNavigationAvailable, onNextStepReadonlyNavigate, isReadonlyNavigationAvailable, applicationJdDraft, onApplicationJdDraftChange }: ApplicationDetailProps) {
+export default function ApplicationDetail({ application, open, onClose, taskController, onLaunchTask, onConfirmedFitToMaterial, onTaskSurfaceGuardChange, onOpenOffers, offers, offersLoading = false, offersError = false, onRetryOffers, onMockInterview: _onMockInterview, onAskPilot, onOpenPilotOpportunityFit: _onOpenPilotOpportunityFit, externalTaskBlocked = false, onOpportunityFitOwnerStateChange, onOpportunityFitProjectionChange, opportunityFitOwnerStore, pilotInterviewReviewApplicationId, onPilotInterviewReviewFocusConsumed, pilotInterviewPreparationApplicationId, pilotInterviewPreparationEventId, onPilotInterviewPreparationFocusConsumed, onAttachToPilot, interviewReviewProposalAttempts, onInterviewReviewProposalAttemptChange, reviewReadinessDrafts, onReviewReadinessDraftChange, onOpenReviewStory, onOpenReadinessPractice, onInterviewNoteChanged, interviewKnowledgeCaptureDrafts, onInterviewKnowledgeCaptureDraftChange, onInterviewKnowledgeCaptureNoteChanged, resumes, resumesLoading = false, resumesError = false, taskNow, interviewPreparationAttempts, onInterviewPreparationAttemptChange, interviewPreparationDrafts, onInterviewPreparationDraftChange, interviewPreparationKnowledgeOptions = [], interviewPreparationSelection, offerNegotiationDrafts = {}, onOfferNegotiationDraftChange, onOpenOfferNegotiationPilot, offerNegotiationEntryPoint = 'ui', nextStepSuggestions, nextStepSessionState = null, onSetDisposition, onNextStepNavigate, isNavigationAvailable, onNextStepReadonlyNavigate, isReadonlyNavigationAvailable, applicationJdDraft, onApplicationJdDraftChange }: ApplicationDetailProps) {
   const queryClient = useQueryClient();
   const [eventFormOpen, setEventFormOpen] = useState(false);
   const [materialKitPrefill, setMaterialKitPrefill] = useState<{
@@ -1175,6 +1177,11 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
             onDraftChange={(draft) => {
               if (isCurrent()) onOfferNegotiationDraftChange?.(offer.id, draft);
             }}
+            onOpenPilotChat={onOpenOfferNegotiationPilot ? (currentOffer, brief) => {
+              if (!isCurrent()) return;
+              if (!onOpenOfferNegotiationPilot(currentOffer, brief)) return;
+              close();
+            } : undefined}
             onClose={close}
           />
         );

@@ -127,6 +127,61 @@ describe('OfferNegotiationDrawer', () => {
     expect(button?.textContent).toContain('下一步：检查输入');
   });
 
+  it('hands the current Offer and editable brief to Pilot without starting any service call', async () => {
+    const onOpenPilotChat = vi.fn();
+    await act(async () => {
+      root?.render(
+        <OfferNegotiationDrawer
+          open
+          offer={offer}
+          onClose={vi.fn()}
+          onOpenPilotChat={onOpenPilotChat}
+        />,
+      );
+    });
+    const inputs = host?.querySelectorAll('input') ?? [];
+    const textareas = host?.querySelectorAll('textarea') ?? [];
+    await act(async () => {
+      changeValue(inputs[0] as HTMLInputElement, '希望固定月薪多 2K');
+      changeValue(textareas[0] as HTMLTextAreaElement, '担心对方取消 Offer');
+      changeValue(inputs[1] as HTMLInputElement, 'HR 电话沟通');
+    });
+    service.preview.mockClear();
+    service.create.mockClear();
+    service.confirm.mockClear();
+
+    const handoff = host?.querySelector<HTMLButtonElement>('[data-testid="offer-negotiation-open-pilot"]');
+    expect(handoff?.textContent).toContain('和 Pilot 深聊这份 Offer');
+    expect(host?.textContent).toContain('消息由你决定是否发送');
+    await act(async () => handoff?.click());
+
+    expect(onOpenPilotChat).toHaveBeenCalledTimes(1);
+    expect(onOpenPilotChat).toHaveBeenCalledWith(offer, {
+      goal: '希望固定月薪多 2K',
+      concerns: '担心对方取消 Offer',
+      scenario: 'HR 电话沟通',
+    });
+    expect(service.preview).not.toHaveBeenCalled();
+    expect(service.create).not.toHaveBeenCalled();
+    expect(service.confirm).not.toHaveBeenCalled();
+  });
+
+  it('does not offer a second Pilot handoff when the task already came from Pilot', async () => {
+    await act(async () => {
+      root?.render(
+        <OfferNegotiationDrawer
+          open
+          offer={offer}
+          entrypoint="pilot"
+          onClose={vi.fn()}
+          onOpenPilotChat={vi.fn()}
+        />,
+      );
+    });
+
+    expect(host?.querySelector('[data-testid="offer-negotiation-open-pilot"]')).toBeNull();
+  });
+
   it('rejects a directly supplied historical unbound Offer before any negotiation read or write', async () => {
     await act(async () => {
       root?.render(<OfferNegotiationDrawer open offer={{ ...offer, application_id: undefined }} onClose={vi.fn()} />);
@@ -263,11 +318,13 @@ describe('OfferNegotiationDrawer', () => {
           open
           offer={{ ...offer, company_name: 'Current company', equity: 'Current equity', perks: 'Current perks', deadline: 'Current deadline', notes: 'Current notes' }}
           onClose={vi.fn()}
+          onOpenPilotChat={vi.fn()}
         />,
       );
     });
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
     await act(async () => { host?.querySelector<HTMLButtonElement>('section[aria-label="历史谈薪准备"] button')?.click(); });
+    expect(host?.querySelector('[data-testid="offer-negotiation-open-pilot"]')).toBeNull();
     const facts = host?.querySelector('[data-testid="offer-negotiation-input-facts"]')?.textContent ?? '';
     expect(host?.querySelector('h2')?.textContent).toContain('Company');
     expect(host?.querySelector('h2')?.textContent).not.toContain('Current company');

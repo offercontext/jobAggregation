@@ -329,6 +329,7 @@ def _project_create_offer_success(result: object) -> str:
 def _pending_create_offer(
     args: Mapping[str, Any], context: object | None = None
 ) -> dict[str, Any]:
+    del context
     application_id = args.get("application_id")
     target: dict[str, Any] = {
         "id": f"offer-draft-{application_id or 'unknown'}",
@@ -344,19 +345,6 @@ def _pending_create_offer(
         ),
         "source": "pending_action",
     }
-    if context is not None and application_id not in (None, ""):
-        try:
-            tool_context = cast(Any, context)
-            application = tool_context.applications.get(int(str(application_id)))
-        except (AttributeError, TypeError, ValueError):
-            application = None
-        if application is not None:
-            target["title"] = application.company_name
-            target["meta"] = " · ".join(
-                value
-                for value in (application.position_name, "Offer")
-                if value
-            )
     proposed_changes = [
         {"field": field, "before": "", "after": args[field]}
         for field in (

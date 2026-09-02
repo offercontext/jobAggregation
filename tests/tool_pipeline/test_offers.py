@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
@@ -47,6 +48,49 @@ def test_create_offer_is_provider_visible_and_bound_to_application() -> None:
     assert create.metadata.operation.undo_payload_kind.value == "delete_offer"
     assert create.metadata.operation.compensation_kind.value == "undo:create_offer"
     assert create.metadata.operation.undo_builder_id == "create_offer_delete_v1"
+
+
+def test_create_offer_pending_projection_is_generic_and_does_not_read_repository() -> None:
+    create = next(spec for spec in offer_specs() if spec.name == "create_offer")
+    arguments = create.decoder(
+        {
+            "application_id": 1,
+            "base_monthly": 24_000,
+            "months_per_year": 16,
+        }
+    )
+
+    class ForbiddenApplications:
+        def get(self, *_args: object, **_kwargs: object) -> object:
+            raise AssertionError("Pending projection must not read applications")
+
+    details = create.presentation.pending_details_projector(
+        arguments,
+        SimpleNamespace(applications=ForbiddenApplications()),
+    )
+
+    assert details == {
+        "target": {
+            "id": "offer-draft-1",
+            "kind": "offer",
+            "title": "新建 Offer",
+            "meta": "",
+            "source": "pending_action",
+        },
+        "proposed_changes": [
+            {"field": "base_monthly", "before": "", "after": 24_000},
+            {"field": "months_per_year", "before": "", "after": 16},
+        ],
+        "evidence": [
+            {
+                "id": "offer-draft-1",
+                "kind": "offer",
+                "title": "新建 Offer",
+                "meta": "",
+                "source": "pending_action",
+            }
+        ],
+    }
 
 
 def test_create_offer_persists_against_an_existing_application(tmp_path: Path) -> None:

@@ -6446,8 +6446,8 @@ def test_chat_create_offer_confirmation_is_bound_to_the_existing_application(tmp
     assert pending["target"] == {
         "id": "offer-draft-1",
         "kind": "offer",
-        "title": "去哪儿旅行",
-        "meta": "后端工程师 · Offer",
+        "title": "新建 Offer",
+        "meta": "",
         "source": "pending_action",
     }
     assert pending["proposed_changes"] == [
@@ -6456,6 +6456,158 @@ def test_chat_create_offer_confirmation_is_bound_to_the_existing_application(tmp
         {"field": "deadline", "before": "", "after": "2026-09-15"},
     ]
     assert client.get("/api/offers").json() == []
+
+
+def _create_offer_confirmation(tmp_path, model):
+    app_client = TestClient(create_app(data_dir=tmp_path))
+    application = app_client.post(
+        "/api/applications",
+        json={
+            "company_name": "Acme",
+            "position_name": "Engineer",
+            "status": "offer",
+        },
+    ).json()
+    client = TestClient(create_app(data_dir=tmp_path, chat_model=model))
+    pending = client.post(
+        "/api/chat",
+        json={"message": "记录 Offer", "conversation_id": 0},
+    ).json()
+    assert pending["type"] == "confirmation_required"
+    return app_client, client, application, pending
+
+
+def test_chat_create_offer_modify_terminal_replay_and_undo_use_one_real_ledger_operation(
+    tmp_path,
+):
+    model = ScriptedModel(
+        [
+            Assistant(
+                tool_calls=[
+                    ToolCall(
+                        id="create-offer-lifecycle",
+                        name="create_offer",
+                        args=json.dumps(
+                            {
+                                "application_id": 1,
+                                "base_monthly": 24_000,
+                                "months_per_year": 16,
+                            }
+                        ),
+                    )
+                ]
+            ),
+            Assistant(content="Offer 已保存。"),
+        ]
+    )
+    _, client, application, pending = _create_offer_confirmation(tmp_path, model)
+    token = pending["pending_action"]["confirmation_token"]
+    edited_args = {"base_monthly": 30_000, "months_per_year": 15}
+
+    confirmed = client.post(
+        "/api/chat/confirm",
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": True,
+            "confirmation_token": token,
+            "edited_args": edited_args,
+        },
+    )
+
+    assert confirmed.status_code == 200
+    body = confirmed.json()
+    assert body["write_status"] == "success"
+    assert body["replayed"] is False
+    assert body["undo"]["offer_id"] == 1
+    offers = client.get("/api/offers").json()
+    assert len(offers) == 1
+    assert offers[0]["application_id"] == application["id"]
+    assert offers[0]["base_monthly"] == 30_000
+    assert offers[0]["months_per_year"] == 15
+
+    operations, transitions = _ledger_rows(tmp_path)
+    primary = next(operation for operation in operations if operation.id == body["operation_id"])
+    assert primary.status == "committed"
+    assert primary.delivery_status == "completed"
+    assert [
+        transition.state
+        for transition in transitions
+        if transition.operation_id == primary.id
+    ] == ["proposed", "approved", "claimed", "committed"]
+
+    replayed = client.post(
+        "/api/chat/confirm",
+        json={
+            "conversation_id": pending["conversation_id"],
+            "operation_id": body["operation_id"],
+            "approved": True,
+            "confirmation_token": token,
+            "edited_args": edited_args,
+        },
+    )
+
+    assert replayed.status_code == 200
+    assert replayed.json()["replayed"] is True
+    assert len(client.get("/api/offers").json()) == 1
+    operations, _ = _ledger_rows(tmp_path)
+    assert len(operations) == 1
+
+    undone = client.post(
+        "/api/chat/undo-last-write",
+        json={"conversation_id": pending["conversation_id"]},
+    )
+
+    assert undone.status_code == 200
+    assert undone.json()["replayed"] is False
+    assert client.get("/api/offers").json() == []
+    operations, transitions = _ledger_rows(tmp_path)
+    compensation = next(
+        operation for operation in operations if operation.operation_role == "compensation"
+    )
+    assert compensation.status == "committed"
+    assert compensation.delivery_status == "not_applicable"
+    assert compensation.parent_operation_id == primary.id
+    assert [
+        transition.state
+        for transition in transitions
+        if transition.operation_id == compensation.id
+    ] == ["proposed", "approved", "claimed", "committed"]
+
+
+def test_chat_create_offer_reject_terminalizes_without_creating_offer(tmp_path):
+    model = ScriptedModel(
+        [
+            Assistant(
+                tool_calls=[
+                    ToolCall(
+                        id="create-offer-reject",
+                        name="create_offer",
+                        args=json.dumps({"application_id": 1, "base_monthly": 24_000}),
+                    )
+                ]
+            )
+        ]
+    )
+    _, client, _, pending = _create_offer_confirmation(tmp_path, model)
+
+    rejected = client.post(
+        "/api/chat/confirm",
+        json={
+            "conversation_id": pending["conversation_id"],
+            "approved": False,
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+            "rejection_feedback": "先不记录。",
+        },
+    )
+
+    assert rejected.status_code == 200
+    assert rejected.json()["write_status"] == "cancelled"
+    assert client.get("/api/offers").json() == []
+    operations, transitions = _ledger_rows(tmp_path)
+    assert len(operations) == 1
+    assert operations[0].status == "rejected"
+    assert operations[0].delivery_status == "completed"
+    assert [transition.state for transition in transitions] == ["proposed", "rejected"]
 
 
 def test_chat_add_note_confirmation_includes_review_details(tmp_path):

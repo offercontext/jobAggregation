@@ -72,6 +72,13 @@ function safeError(error: unknown): string {
   return '谈薪准备暂时不可用，请稍后重试。';
 }
 
+function safeMutationError(error: unknown): string {
+  if (error instanceof OfferNegotiationError && error.status === 0) {
+    return '请求可能仍在后台处理，请使用原尝试重试；输入已冻结。';
+  }
+  return safeError(error);
+}
+
 function isPending(value: OfferNegotiationProposal | OfferNegotiationPending): value is OfferNegotiationPending {
   return value.attempt_status === 'generating' || value.attempt_status === 'provider_unknown';
 }
@@ -345,7 +352,7 @@ function BoundOfferNegotiationDrawer({ open, offer, dimensionIds = [], onClose, 
         setFrozenPreview(null);
         setPreviewInputKey(null);
       }
-      setError(safeError(caught));
+      setError(safeMutationError(caught));
     } finally {
       setBusy(false);
     }
@@ -378,7 +385,7 @@ function BoundOfferNegotiationDrawer({ open, offer, dimensionIds = [], onClose, 
         setResultUnknown(true);
         setPendingOperation('confirm');
       }
-      setError(safeError(caught));
+      setError(safeMutationError(caught));
     } finally {
       setBusy(false);
     }

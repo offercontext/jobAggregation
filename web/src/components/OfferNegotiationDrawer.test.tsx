@@ -420,9 +420,10 @@ describe('OfferNegotiationDrawer', () => {
   });
 
   it.each([
-    ['provider error', new OfferNegotiationError(502, 'offer_negotiation_provider_error')],
-    ['bare 5xx', new OfferNegotiationError(502, null)],
-  ])('keeps %s input frozen and exposes retry', async (_label, error) => {
+    ['network timeout', new OfferNegotiationError(0, null), '请求可能仍在后台处理，请使用原尝试重试；输入已冻结。'],
+    ['provider error', new OfferNegotiationError(502, 'offer_negotiation_provider_error'), 'AI 服务暂不可用，请使用原尝试重试。'],
+    ['bare 5xx', new OfferNegotiationError(502, null), '谈薪准备暂时不可用，请稍后重试。'],
+  ])('keeps %s input frozen and exposes retry', async (_label, error, expectedMessage) => {
     service.create.mockRejectedValueOnce(error);
     await act(async () => { root?.render(<OfferNegotiationDrawer open offer={offer} onClose={vi.fn()} />); });
     const inputs = host?.querySelectorAll('input') ?? [];
@@ -437,5 +438,31 @@ describe('OfferNegotiationDrawer', () => {
     await act(async () => { host?.querySelector<HTMLButtonElement>('[data-testid="offer-negotiation-generate"]')?.click(); });
     expect(host?.querySelector('fieldset')?.hasAttribute('disabled')).toBe(true);
     expect(service.create).toHaveBeenCalledTimes(1);
+    expect(host?.textContent).toContain(expectedMessage);
+    expect(host?.textContent).toContain('使用原尝试重试');
+  });
+
+  it('explains that an interrupted save may still finish before offering the original retry', async () => {
+    service.create.mockResolvedValue(proposal());
+    service.confirm.mockRejectedValueOnce(new OfferNegotiationError(0, null));
+    await act(async () => { root?.render(<OfferNegotiationDrawer open offer={offer} onClose={vi.fn()} />); });
+    const inputs = host?.querySelectorAll('input') ?? [];
+    const textareas = host?.querySelectorAll('textarea') ?? [];
+    await act(async () => {
+      changeValue(inputs[0] as HTMLInputElement, 'Goal');
+      changeValue(textareas[0] as HTMLTextAreaElement, 'Concern');
+      changeValue(inputs[1] as HTMLInputElement, 'Call');
+      host?.querySelector<HTMLButtonElement>('[data-testid="offer-negotiation-generate"]')?.click();
+    });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    await act(async () => { host?.querySelector<HTMLButtonElement>('[data-action="confirm-generate"]')?.click(); });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    await act(async () => { host?.querySelector<HTMLInputElement>('article input[type="checkbox"]')?.click(); });
+    await act(async () => { host?.querySelector<HTMLButtonElement>('[data-testid="offer-negotiation-confirm"]')?.click(); });
+    await act(async () => { host?.querySelector<HTMLButtonElement>('[data-action="confirm-save"]')?.click(); });
+
+    expect(host?.textContent).toContain('请求可能仍在后台处理，请使用原尝试重试；输入已冻结。');
+    expect(host?.textContent).toContain('使用原尝试重试');
+    expect(service.confirm).toHaveBeenCalledTimes(1);
   });
 });

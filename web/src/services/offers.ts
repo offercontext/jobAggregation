@@ -14,6 +14,7 @@ import { OfferNegotiationError } from '@/types/offer';
 import { createApiClient } from './http';
 
 const http = createApiClient({ baseURL: '/api', timeout: 10000 });
+const aiHttp = createApiClient({ baseURL: '/api', timeout: 130000 });
 
 export { OfferNegotiationError } from '@/types/offer';
 
@@ -52,7 +53,7 @@ export function createOfferNegotiationProposal(
   input: OfferNegotiationInput,
   entrypoint: 'ui' | 'pilot' = 'ui',
 ): Promise<OfferNegotiationResponse> {
-  return offerNegotiationRequest(() => http.post<OfferNegotiationResponse>(
+  return offerNegotiationRequest(() => aiHttp.post<OfferNegotiationResponse>(
     `/offers/${offerId}/negotiation/proposals`, input, { headers: { 'X-OfferPilot-Entrypoint': entrypoint } },
   ));
 }

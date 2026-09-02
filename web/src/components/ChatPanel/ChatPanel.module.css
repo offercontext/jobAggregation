@@ -155,6 +155,38 @@
   box-shadow: var(--op-shadow-md);
   flex-shrink: 0;
 }
+.pageExit {
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex: 0 0 auto;
+  padding: 0 10px;
+  border: 1px solid var(--op-border);
+  border-radius: 9px;
+  color: var(--op-ink);
+  background: var(--op-surface);
+  box-shadow: var(--op-shadow-sm);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  transition-property: background-color, border-color, color, transform;
+  transition-duration: 150ms;
+  transition-timing-function: var(--op-ease);
+}
+.pageExit:hover {
+  border-color: color-mix(in srgb, var(--op-primary) 45%, var(--op-border));
+  color: var(--op-primary);
+  background: var(--chat-tint-soft);
+}
+.pageExit:focus-visible {
+  outline: 2px solid var(--op-primary);
+  outline-offset: 2px;
+}
+.pageExit:active {
+  transform: scale(0.98);
+}
 .headTitle {
   font-size: 15px;
   font-weight: 600;
@@ -2229,5 +2261,11 @@
   .threadActions,
   .threadAction {
     transition: none;
+  }
+  .pageExit {
+    transition: none;
+  }
+  .pageExit:active {
+    transform: none;
   }
 }

@@ -39,6 +39,19 @@ describe('ChatPanel docked layout contract', () => {
     expect(component).toContain('if (docked || inlinePage) return panelWorkspace');
   });
 
+  it('keeps the immersive exit action inside the existing page header', async () => {
+    const css = await loadCss();
+
+    expect(component).toContain('onExitPage?: () => void');
+    expect(component).toContain('inlinePage && onExitPage');
+    expect(component).toContain('data-testid="pilot-exit-immersive"');
+    expect(component).toContain('退出沉浸模式，返回原页面');
+    expect(component).toContain('styles.pageExit');
+    expect(css).toContain('.pageExit');
+    expect(css).toContain('min-height: 40px;');
+    expect(css).toContain('.pageExit:focus-visible');
+  });
+
   it('mounts Kanban drop targeting inside the visible rail or drawer surface', () => {
     expect(component).toContain("from '@/components/KanbanBoard/PilotContextDropTarget'");
     expect(component).toContain('pilotDropTarget?: boolean');

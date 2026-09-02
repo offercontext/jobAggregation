@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Drawer, App as AntApp, Button } from 'antd';
 import {
   CloseOutlined,
+  ArrowLeftOutlined,
   RobotOutlined,
   AppstoreOutlined,
   PlusOutlined,
@@ -93,6 +94,7 @@ export interface Props {
   open: boolean;
   controllerActive?: boolean;
   onClose: () => void;
+  onExitPage?: () => void;
   offerId?: number;
   onOpenSettings?: () => void;
   variant?: 'drawer' | 'rail' | 'page';
@@ -239,6 +241,7 @@ function ChatPanelView({
   open,
   controllerActive = false,
   onClose,
+  onExitPage,
   offerId,
   onOpenSettings,
   variant = 'drawer',
@@ -1437,6 +1440,19 @@ function ChatPanelView({
           </div>
         ) : null}
         <header className={styles.header}>
+          {inlinePage && onExitPage ? (
+            <button
+              type="button"
+              className={styles.pageExit}
+              data-testid="pilot-exit-immersive"
+              aria-label="退出沉浸模式，返回原页面"
+              title="退出沉浸模式，返回原页面"
+              onClick={onExitPage}
+            >
+              <ArrowLeftOutlined aria-hidden="true" />
+              <span>返回原页面</span>
+            </button>
+          ) : null}
           <div className={styles.avatar} aria-hidden="true">
             <RobotOutlined />
           </div>

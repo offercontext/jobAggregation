@@ -35,14 +35,14 @@ vi.mock('antd', () => {
 });
 vi.mock('./Sidebar', () => ({
   default: (props: { onChange: (view: string) => void }) => (
-    <nav>
+    <nav data-testid="global-sidebar">
       <button type="button" data-testid="nav-settings" onClick={() => props.onChange('settings')}>settings</button>
       <button type="button" data-testid="nav-offers" onClick={() => props.onChange('offers')}>offers</button>
       <button type="button" data-testid="nav-pilot" onClick={() => props.onChange('pilot')}>pilot</button>
     </nav>
   ),
 }));
-vi.mock('./TopBar', () => ({ default: () => <div /> }));
+vi.mock('./TopBar', () => ({ default: () => <div data-testid="global-topbar" /> }));
 vi.mock('./CommandPalette', () => ({ default: () => <div /> }));
 vi.mock('@/components/AddApplicationForm', () => ({ default: () => <div /> }));
 vi.mock('@/components/ResumeUploadModal', () => ({ default: () => <div /> }));
@@ -157,6 +157,7 @@ vi.mock('@/components/ChatPanel', async () => {
     variant?: string;
     open?: boolean;
     onClose?: () => void;
+    onExitPage?: () => void;
     onExpand?: () => void;
     onActivityChange?: (activity: string) => void;
     onReplyLifecycle?: (event: { status: 'success'; conversationId: number; background: boolean }) => void;
@@ -175,6 +176,9 @@ vi.mock('@/components/ChatPanel', async () => {
         data-controller-active={String(props.controllerActive)}
         data-offer-id={props.offerId}
       >
+        {props.variant === 'page' && props.onExitPage ? (
+          <button type="button" data-testid="pilot-exit-immersive" onClick={props.onExitPage}>返回原页面</button>
+        ) : null}
         {props.variant !== 'rail' ? <button type="button" data-testid="close-pilot" onClick={props.onClose}>close</button> : null}
         {props.variant === 'rail' ? <button type="button" data-testid="expand-pilot-rail" onClick={props.onExpand}>expand</button> : null}
         <button
@@ -460,5 +464,71 @@ describe('AppShell Pilot mascot integration', () => {
     expect(host.querySelector('.op-app-main-pilot')).not.toBeNull();
     expect(host.querySelector('.op-app-content-pilot')).not.toBeNull();
     expect(host.querySelector('.op-pilot-page-layout')).not.toBeNull();
+  });
+
+  it('enters Pilot without global chrome and returns to the last non-Pilot view', async () => {
+    await act(async () => root.render(<AppShell />));
+    await flush();
+
+    act(() => host.querySelector<HTMLButtonElement>('[data-testid="nav-offers"]')?.click());
+    await flush();
+    expect(host.querySelector('[data-testid="global-sidebar"]')).not.toBeNull();
+    expect(host.querySelector('[data-testid="global-topbar"]')).not.toBeNull();
+
+    act(() => host.querySelector<HTMLButtonElement>('[data-testid="nav-pilot"]')?.click());
+    await flush();
+
+    expect(host.querySelector('[data-testid="global-sidebar"]')).toBeNull();
+    expect(host.querySelector('[data-testid="global-topbar"]')).toBeNull();
+    const content = host.querySelector<HTMLElement>('.op-app-content-pilot');
+    expect(content).not.toBeNull();
+    expect(content?.style.padding).toBe('0px');
+    expect(content?.style.height).toBe('100dvh');
+    expect(host.querySelector('[data-testid="pilot-exit-immersive"]')?.textContent).toContain('返回原页面');
+
+    act(() => host.querySelector<HTMLButtonElement>('[data-testid="pilot-exit-immersive"]')?.click());
+    await flush();
+    expect(host.querySelector('[data-testid="global-sidebar"]')).not.toBeNull();
+    expect(host.querySelector('[data-testid="global-topbar"]')).not.toBeNull();
+    expect(host.querySelector('.op-app-content-pilot')).toBeNull();
+  });
+
+  it('uses Escape only as an auxiliary exit outside editing and confirmation interactions', async () => {
+    await act(async () => root.render(<AppShell />));
+    await flush();
+    act(() => host.querySelector<HTMLButtonElement>('[data-testid="nav-offers"]')?.click());
+    await flush();
+    act(() => host.querySelector<HTMLButtonElement>('[data-testid="nav-pilot"]')?.click());
+    await flush();
+
+    const input = document.createElement('input');
+    document.body.appendChild(input);
+    input.focus();
+    act(() => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })));
+    await flush();
+    expect(host.querySelector('.op-app-content-pilot')).not.toBeNull();
+
+    input.remove();
+    const editor = document.createElement('div');
+    editor.setAttribute('contenteditable', 'true');
+    editor.tabIndex = 0;
+    document.body.appendChild(editor);
+    editor.focus();
+    act(() => editor.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })));
+    await flush();
+    expect(host.querySelector('.op-app-content-pilot')).not.toBeNull();
+    editor.remove();
+
+    act(() => window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })));
+    await flush();
+    expect(host.querySelector('.op-app-content-pilot')).toBeNull();
+
+    act(() => host.querySelector<HTMLButtonElement>('[data-testid="nav-pilot"]')?.click());
+    await flush();
+    act(() => host.querySelector<HTMLButtonElement>('[data-testid="set-pending"]')?.click());
+    await flush();
+    act(() => window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })));
+    await flush();
+    expect(host.querySelector('.op-app-content-pilot')).not.toBeNull();
   });
 });

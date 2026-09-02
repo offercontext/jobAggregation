@@ -114,6 +114,14 @@ import type { TaskLaunchRequest } from '@/features/coreTaskSurface/contracts';
 
 const { Content } = Layout;
 
+function isPilotEscapeBlocked(event: KeyboardEvent, confirmationActive: boolean): boolean {
+  if (event.defaultPrevented || event.isComposing || confirmationActive) return true;
+  const target = event.target instanceof Element ? event.target : document.activeElement;
+  if (!target) return false;
+  if (target.closest('input, textarea, select, [contenteditable]')) return true;
+  return Boolean(target.closest('[role="dialog"], [role="group"][aria-label="AI 修改提议"]'));
+}
+
 export function adaptivePracticeOwnerIdentity(focus: AdaptivePracticeFocus | undefined): string {
   return focus ? `${focus.signalVersionId}:${focus.targetEventId}` : 'three-mode';
 }
@@ -1032,6 +1040,8 @@ function AppShellContent() {
     }
   }, [coreTaskController]);
   const [view, setView] = useState<ViewMode>(readInitialWorkspaceView);
+  const isPilotView = view === 'pilot';
+  const lastNonPilotViewRef = useRef<ViewMode>(isPilotView ? 'dashboard' : view);
   const [applicationViewState, setApplicationViewState] = useState<ApplicationViewState>(
     DEFAULT_APPLICATION_VIEW_STATE,
   );
@@ -1312,6 +1322,10 @@ function AppShellContent() {
   }), [closeCoreTaskSurface]);
 
   useEffect(() => {
+    if (!isPilotView) lastNonPilotViewRef.current = view;
+  }, [isPilotView, view]);
+
+  useEffect(() => {
     if (!hasMountedRouteRef.current) {
       hasMountedRouteRef.current = true;
       return;
@@ -1536,6 +1550,7 @@ function AppShellContent() {
   };
 
   const navigateToView = (nextView: ViewMode, { preserveEvidenceFocus = false }: { preserveEvidenceFocus?: boolean } = {}) => {
+    if (nextView !== 'pilot') lastNonPilotViewRef.current = nextView;
     const activeBeforeNavigation = coreTaskController.getState().active;
     closeCoreTaskSurface();
     if (activeBeforeNavigation?.ref.taskId === 'interview.free_practice') {
@@ -1551,6 +1566,22 @@ function AppShellContent() {
     }
     setView(nextView);
   };
+
+  useEffect(() => {
+    if (!isPilotView) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || isPilotEscapeBlocked(
+        event,
+        Boolean(pilotController.pending)
+          || pilotController.confirmPhase === 'saving'
+          || pilotController.confirmPhase === 'error',
+      )) return;
+      event.preventDefault();
+      navigateToView(lastNonPilotViewRef.current);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [isPilotView, navigateToView, pilotController.confirmPhase, pilotController.pending]);
 
   const previousAssistantSurfaceRef = useRef(assistantSurface.surface);
   useEffect(() => {
@@ -2551,15 +2582,17 @@ function AppShellContent() {
       <Layout
       className="op-app-shell"
       style={{ minHeight: '100dvh', background: 'var(--op-layout-bg)' }}
-      hasSider
+      hasSider={!isPilotView}
     >
-      <Sidebar
-        view={view}
-        onChange={navigateToView}
-        reminderCount={actions.length}
-      />
+      {!isPilotView ? (
+        <Sidebar
+          view={view}
+          onChange={navigateToView}
+          reminderCount={actions.length}
+        />
+      ) : null}
       <Layout
-        className={`op-app-main${view === 'pilot' ? ' op-app-main-pilot' : ''}`}
+        className={`op-app-main${isPilotView ? ' op-app-main-pilot' : ''}`}
         style={{
           background: 'var(--op-layout-bg)',
           minWidth: 0,
@@ -2567,19 +2600,22 @@ function AppShellContent() {
           paddingRight: contextualPilotRailMode ? 380 : undefined,
         }}
       >
-        <TopBar
-          primaryAction={topBarPrimaryAction}
-          onSearch={() => setPaletteOpen(true)}
-          onOpenSettings={() => navigateToView('settings')}
-        />
+        {!isPilotView ? (
+          <TopBar
+            primaryAction={topBarPrimaryAction}
+            onSearch={() => setPaletteOpen(true)}
+            onOpenSettings={() => navigateToView('settings')}
+          />
+        ) : null}
         <Content
           ref={contentRef}
           tabIndex={-1}
           aria-label="主要内容"
-          className={`op-app-content${view === 'pilot' ? ' op-app-content-pilot' : ''}`}
+          className={`op-app-content${isPilotView ? ' op-app-content-pilot' : ''}`}
           style={{
-            padding: '0 24px 24px',
-            ...(view === 'pilot' && !isLoading && !appsError
+            padding: isPilotView ? 0 : '0 24px 24px',
+            ...(isPilotView ? { height: '100dvh' } : {}),
+            ...(isPilotView && !isLoading && !appsError
               ? {
                   display: 'grid',
                   gridTemplateColumns: pilotApplicationContext
@@ -2604,7 +2640,11 @@ function AppShellContent() {
             </ViewErrorBoundary>
           )}
           <div
-            className={contextualPilotRailMode ? 'op-pilot-rail' : 'op-pilot-background-host'}
+            className={contextualPilotRailMode
+              ? 'op-pilot-rail'
+              : isPilotView
+                ? 'op-pilot-page-host'
+                : 'op-pilot-background-host'}
             data-pilot-surface-host
             aria-label={contextualPilotRailMode ? 'Pilot' : undefined}
             style={contextualPilotRailMode ? { position: 'fixed', inset: '0 0 0 auto', zIndex: 1040 } : undefined}
@@ -2612,7 +2652,8 @@ function AppShellContent() {
             <PilotWorkspace
               pageActive={view === 'pilot'}
               variant={view === 'pilot' ? 'page' : contextualPilotRailMode ? 'rail' : 'drawer'}
-              open={view === 'pilot' || contextualPilotOpen}
+              open={isPilotView || contextualPilotOpen}
+              onExitPage={isPilotView ? () => navigateToView(lastNonPilotViewRef.current) : undefined}
               controllerActive={pilotControllerTransportActive}
               onboardingFocusToken={pilotOnboardingFocusToken}
               onOnboardingFocusConsumed={consumePilotOnboardingFocus}

@@ -51,6 +51,7 @@ REQUIRED_UNDO = {
     "update_application_status",
     "create_application_event",
     "add_note",
+    "create_offer",
 }
 
 ROOT = Path(__file__).parents[2]
@@ -427,7 +428,7 @@ def _provider_gate_paths() -> tuple[Path, ...]:
 
 def _provider_baseline_payloads() -> list[dict[str, Any]]:
     fixture = (
-        Path(__file__).parents[1] / "fixtures" / "tool_pipeline" / "provider_manifest_30c944f.json"
+        Path(__file__).parents[1] / "fixtures" / "tool_pipeline" / "provider_manifest_current.json"
     )
     value = json.loads(fixture.read_bytes().decode("utf-8"))
     return copy.deepcopy(value["tools"])
@@ -441,14 +442,14 @@ def _patch_provider_verifier(monkeypatch: pytest.MonkeyPatch, verifier: Any) -> 
     return catalog_module
 
 
-def test_compiler_exposes_exact_ordered_25_typed_specs() -> None:
+def test_compiler_exposes_exact_ordered_26_typed_specs() -> None:
     catalog = _TEST_TOOL_CATALOG
     specs = catalog.specs
-    assert len(specs) == 25
-    assert len({spec.name for spec in specs}) == 25
+    assert len(specs) == 26
+    assert len({spec.name for spec in specs}) == 26
     assert tuple(spec.name for spec in specs) == tuple(
         item["provider_name"]
-        for item in load_asset("tool_metadata_manifest_v1.json")["typed_tools"]
+        for item in load_asset("tool_metadata_manifest_current.json")["typed_tools"]
     )
     assert all(spec.metadata.provider_visibility.value == "model_eligible" for spec in specs)
 
@@ -949,7 +950,7 @@ def test_catalog_precompiles_schema_once_and_returns_detached_validators(
     assert "description" not in second.schema
 
 
-def test_exact_four_required_undo_bindings_and_complete_presentation_bindings() -> None:
+def test_exact_five_required_undo_bindings_and_complete_presentation_bindings() -> None:
     specs = _TEST_TOOL_CATALOG.specs
     actual_required = {
         spec.name

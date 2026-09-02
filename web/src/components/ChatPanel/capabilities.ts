@@ -71,6 +71,7 @@ export const TOOL_META: Record<string, ToolMeta> = {
   create_application_event: { label: '新建投递事件', kind: 'write', icon: PlusCircleOutlined },
   update_application_event: { label: '更新投递事件', kind: 'write', icon: EditOutlined },
   delete_application_event: { label: '删除投递事件', kind: 'write', icon: DeleteOutlined },
+  create_offer: { label: '新建 Offer', kind: 'write', icon: PlusCircleOutlined },
   update_offer: { label: '更新 Offer', kind: 'write', icon: EditOutlined },
   save_offer_assessment: { label: '保存 Offer 评估', kind: 'write', icon: SaveOutlined },
   resume_update_career_intent: { label: '更新简历求职意向', kind: 'write', icon: AimOutlined },

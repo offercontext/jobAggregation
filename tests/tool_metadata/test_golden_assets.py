@@ -25,6 +25,13 @@ ASSET_NAMES = (
     "tool_operation_matrix_0c10e05.json",
     "resolver_implementation_bindings_0c10e05.json",
 )
+CURRENT_ASSET_NAMES = (
+    "golden_index_current.json",
+    "tool_metadata_manifest_current.json",
+    "tool_selection_matrix_current.json",
+    "tool_operation_matrix_current.json",
+    "resolver_implementation_bindings_current.json",
+)
 INDEXED_ASSETS = ASSET_NAMES[1:]
 INDEPENDENT_GOLDENS = (
     "tool_pipeline/provider_manifest_30c944f.json",
@@ -169,7 +176,7 @@ def _provider_names(provider: Mapping[str, Any]) -> tuple[str, ...]:
 
 def test_required_assets_exist_before_the_loader_can_read_them() -> None:
     assert tuple(path.name for path in sorted(METADATA_FIXTURES.glob("*.json"))) == tuple(
-        sorted(ASSET_NAMES)
+        sorted((*ASSET_NAMES, *CURRENT_ASSET_NAMES))
     )
     for name in ASSET_NAMES:
         assert load_asset(name) is not None

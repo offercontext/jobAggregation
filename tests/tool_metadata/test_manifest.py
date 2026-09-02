@@ -83,6 +83,7 @@ COMPENSATION_OPERATION_ORDER = (
     "undo:create_application",
     "undo:create_application_event",
     "undo:add_note",
+    "undo:create_offer",
 )
 
 Path = tuple[str | int, ...]
@@ -339,7 +340,7 @@ VALUE_MUTATIONS = (
         _mutation(f"{field}-bool", ("typed_tools", 2, "operation", field), True)
         for field in ("result_bytes", "visible_bytes", "transport_bytes", "undo_bytes")
     ),
-    # Every Undo member is closed and coupled to the exact four required bindings.
+    # Every Undo member is closed and coupled to the exact five required bindings.
     _mutation("undo-policy-unknown", ("typed_tools", 2, "operation", "undo_policy"), "optional"),
     _mutation(
         "undo-policy-required-to-none", ("typed_tools", 2, "operation", "undo_policy"), "none"
@@ -650,15 +651,15 @@ def test_manifest_object_setattr_replacement_fails_before_projection_returns(
 
 def test_production_manifest_has_exact_keys_order_and_baseline_projection() -> None:
     actual = _projection(_compile_manifest())
-    expected = load_asset("tool_metadata_manifest_v1.json")
+    expected = load_asset("tool_metadata_manifest_current.json")
 
     assert tuple(actual) == TOP_LEVEL_KEYS
     assert actual == expected
     assert actual["schema_version"] == 1
     assert actual["metadata_version"] == "tool-surface-metadata-v1"
     assert actual["catalog_profile"] == "agent_typed_v1"
-    assert len(actual["typed_tools"]) == 25
-    assert tuple(item["ordinal"] for item in actual["typed_tools"]) == tuple(range(1, 26))
+    assert len(actual["typed_tools"]) == 26
+    assert tuple(item["ordinal"] for item in actual["typed_tools"]) == tuple(range(1, 27))
 
 
 def test_manifest_nested_keys_and_nullable_write_shape_are_exact() -> None:

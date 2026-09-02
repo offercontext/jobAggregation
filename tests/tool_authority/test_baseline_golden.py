@@ -1373,7 +1373,7 @@ def _counted_write_catalog(spec: ToolSpec[Any, Any]) -> ToolCatalog:
     )
     return ToolCatalog(
         specs,
-        expected_names=MODEL_TOOL_NAMES,
+        expected_names=tuple(candidate.name for candidate in MODEL_TOOL_CATALOG.specs),
         authority_manifest=MODEL_TOOL_CATALOG.authority_manifest,
     )
 
@@ -1886,13 +1886,14 @@ def test_policy_fingerprints_are_independent_fixed_reviewed_digests() -> None:
 
 
 def test_dependency_closure_manifest_pins_current_catalog_coverage() -> None:
-    baseline = load_golden("tool_authority/baseline_2427fa6.json")
+    closure = load_golden("tool_authority/dependency_policy_current.json")
     discovery_view = _metadata_bundle(MODEL_TOOL_CATALOG).discovery_view()
 
-    closure = baseline["dependency_closure"]
     assert closure["dependency_policy_version"] == "dependency-policy-v1"
-    assert tuple(closure["catalog_names"]) == MODEL_TOOL_NAMES
-    assert closure["coverage"] == 25
+    assert tuple(closure["catalog_names"]) == tuple(
+        spec.name for spec in MODEL_TOOL_CATALOG.specs
+    )
+    assert closure["coverage"] == 26
     expected = {
         entry.provider_name: sorted(entry.dependencies) for entry in discovery_view.ordered_entries
     }

@@ -1,4 +1,4 @@
-"""Exact, Bundle-bound handlers for the four trusted compensation operations."""
+"""Exact, Bundle-bound handlers for the five trusted compensation operations."""
 
 from __future__ import annotations
 
@@ -9,9 +9,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from threading import RLock
 from types import MappingProxyType
-from typing import Literal, NoReturn, TypeAlias, cast
+from typing import Any, Literal, NoReturn, TypeAlias, cast
 
-from sqlalchemy import delete, exists, or_, select, update
+from sqlalchemy import ColumnElement, String, cast as sql_cast, delete, exists, or_, select, update
 from sqlalchemy.orm import Session
 
 from offerpilot.ai.tool_runtime.contracts import TransientToolRuntimeValue
@@ -29,6 +29,10 @@ from offerpilot.models import (
     Application,
     ApplicationEvent,
     InterviewNote,
+    Offer,
+    OfferComparisonValue,
+    OfferNegotiationBrief,
+    OfferNegotiationProposal,
 )
 from offerpilot.repositories.application_events import _delete_application_event_owned
 
@@ -210,6 +214,28 @@ def _require_optional_datetime(value: object, field_name: str) -> datetime | Non
     return parsed
 
 
+def _offer_datetime_predicate(
+    column: Any,
+    value: object,
+    field_name: str,
+) -> ColumnElement[bool]:
+    parsed = _require_optional_datetime(value, field_name)
+    if parsed is None:
+        return cast(ColumnElement[bool], column.is_(None))
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    # SQLite's DateTime bind/result format is either second precision (the
+    # CURRENT_TIMESTAMP server default) or six fractional digits (a Python
+    # datetime value).  Compare the stored text exactly in either canonical
+    # form; truncating with strftime would allow a changed sub-second value to
+    # pass the compensation guard.
+    stored = sql_cast(column, String)
+    return or_(
+        stored == parsed.strftime("%Y-%m-%d %H:%M:%S"),
+        stored == parsed.strftime("%Y-%m-%d %H:%M:%S.%f"),
+    )
+
+
 def _require_status_payload(undo: object) -> FrozenJSONObject:
     payload = _require_object(
         undo,
@@ -354,6 +380,64 @@ def _require_delete_note_payload(undo: object) -> FrozenJSONObject:
     return payload
 
 
+def _require_delete_offer_payload(undo: object) -> FrozenJSONObject:
+    payload = _require_object(
+        undo,
+        "delete-offer Undo payload",
+        ("kind", "label", "offer_id", "expected_after"),
+    )
+    if payload["kind"] != UndoPayloadKind.DELETE_OFFER.value:
+        raise ValueError("Undo payload kind does not match the offer handler")
+    if payload["label"] != "撤销新建 Offer":
+        raise ValueError("Undo payload label does not match the offer handler")
+    _require_positive_id(payload["offer_id"], "offer id")
+    expected = _require_object(
+        payload["expected_after"],
+        "expected offer",
+        (
+            "application_id",
+            "company_name",
+            "position_name",
+            "status",
+            "base_monthly",
+            "months_per_year",
+            "signing_bonus",
+            "equity",
+            "perks",
+            "deadline",
+            "notes",
+            "assessment",
+            "total_cash",
+            "created_at",
+            "updated_at",
+        ),
+    )
+    _require_positive_id(expected["application_id"], "expected offer application id")
+    for name in (
+        "company_name",
+        "position_name",
+        "status",
+        "equity",
+        "perks",
+        "deadline",
+        "notes",
+        "assessment",
+    ):
+        _require_text(expected[name], f"expected offer {name}")
+    for name in ("base_monthly", "months_per_year", "signing_bonus", "total_cash"):
+        if type(expected[name]) is not int:
+            raise TypeError(f"expected offer {name} must be an integer")
+    base_monthly = cast(int, expected["base_monthly"])
+    months_per_year = cast(int, expected["months_per_year"])
+    signing_bonus = cast(int, expected["signing_bonus"])
+    total_cash = cast(int, expected["total_cash"])
+    if total_cash != base_monthly * months_per_year + signing_bonus:
+        raise ValueError("expected offer total_cash is inconsistent")
+    _require_optional_datetime(expected["created_at"], "expected offer created_at")
+    _require_optional_datetime(expected["updated_at"], "expected offer updated_at")
+    return payload
+
+
 def validate_update_application_status_undo(undo: FrozenJSONObject) -> None:
     _require_status_payload(undo)
 
@@ -495,6 +579,63 @@ def execute_delete_note_undo(session: Session, undo: FrozenJSONObject) -> str:
     return "已撤销最近一次 AI 写入：复盘记录已删除。"
 
 
+def validate_delete_offer_undo(undo: FrozenJSONObject) -> None:
+    _require_delete_offer_payload(undo)
+
+
+def execute_delete_offer_undo(session: Session, undo: FrozenJSONObject) -> str:
+    payload = _require_delete_offer_payload(undo)
+    expected = cast(FrozenJSONObject, payload["expected_after"])
+    statement = (
+        delete(Offer)
+        .where(Offer.id == cast(int, payload["offer_id"]))
+        .where(Offer.application_id == expected["application_id"])
+        .where(Offer.company_name == expected["company_name"])
+        .where(Offer.position_name == expected["position_name"])
+        .where(Offer.status == expected["status"])
+        .where(Offer.base_monthly == expected["base_monthly"])
+        .where(Offer.months_per_year == expected["months_per_year"])
+        .where(Offer.signing_bonus == expected["signing_bonus"])
+        .where(Offer.equity == expected["equity"])
+        .where(Offer.perks == expected["perks"])
+        .where(Offer.deadline == expected["deadline"])
+        .where(Offer.notes == expected["notes"])
+        .where(Offer.assessment == expected["assessment"])
+        .where(
+            _offer_datetime_predicate(
+                Offer.created_at,
+                expected["created_at"],
+                "expected offer created_at",
+            )
+        )
+        .where(
+            _offer_datetime_predicate(
+                Offer.updated_at,
+                expected["updated_at"],
+                "expected offer updated_at",
+            )
+        )
+    )
+    active_application = exists(
+        select(Application.id)
+        .where(Application.id == Offer.application_id)
+        .where(Application.deleted_at.is_(None))
+    )
+    statement = statement.where(active_application)
+    for dependency_model in (
+        OfferComparisonValue,
+        OfferNegotiationProposal,
+        OfferNegotiationBrief,
+    ):
+        statement = statement.where(
+            ~exists().where(dependency_model.offer_id == payload["offer_id"])
+        )
+    result = session.execute(statement)
+    if getattr(result, "rowcount", 0) != 1:
+        raise CompensationConflictError("undo_conflict")
+    return "已撤销最近一次 AI 写入：新建 Offer 已删除。"
+
+
 _ORDERED_SPECS = (
     CompensationHandlerSpec(
         ordinal=1,
@@ -539,6 +680,17 @@ _ORDERED_SPECS = (
         handler_id="add_note_delete_handler_v1",
         validate_undo_payload=validate_delete_note_undo,
         execute=execute_delete_note_undo,
+    ),
+    CompensationHandlerSpec(
+        ordinal=5,
+        undo_payload_kind=UndoPayloadKind.DELETE_OFFER,
+        compensation_operation_kind=CompensationKind.UNDO_CREATE_OFFER,
+        adapter_kind="compensation",
+        result_contract="compensation_json_v1",
+        undo_contract_version=_UNDO_CONTRACT_VERSION,
+        handler_id="create_offer_delete_handler_v1",
+        validate_undo_payload=validate_delete_offer_undo,
+        execute=execute_delete_offer_undo,
     ),
 )
 
@@ -827,7 +979,7 @@ class CompensationHandlerComponents(TransientToolRuntimeValue):
         if len(ordered_specs) != len(_ORDERED_SPECS) or any(
             actual is not expected for actual, expected in zip(ordered_specs, _ORDERED_SPECS)
         ):
-            raise ValueError("Compensation handler specs must be the exact sealed four")
+            raise ValueError("Compensation handler specs must be the exact sealed five")
         for spec in ordered_specs:
             spec._ensure_integrity()
         object.__setattr__(self, "_ordered_specs", ordered_specs)

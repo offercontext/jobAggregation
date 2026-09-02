@@ -119,18 +119,18 @@ def test_historical_story_catalog_resolution_rejects_an_ordinary_route_proof() -
     ).action_name == "confirm_interview_story"
 
 
-def test_agent_provider_bytes_and_order_remain_exactly_the_pinned_25() -> None:
+def test_agent_provider_bytes_and_order_remain_exactly_the_pinned_26() -> None:
     fixture = json.loads(
         (
             __import__("pathlib").Path(__file__).resolve().parents[1]
             / "fixtures"
             / "tool_pipeline"
-            / "provider_manifest_30c944f.json"
+            / "provider_manifest_current.json"
         ).read_text(encoding="utf-8")
     )
     model_catalog = build_model_tool_catalog()
 
-    assert len(model_catalog.specs) == 25
+    assert len(model_catalog.specs) == 26
     assert model_catalog.materialize_provider_payloads() == fixture["tools"]
     assert tuple(spec.name for spec in model_catalog.specs) == tuple(
         item["function"]["name"] for item in fixture["tools"]

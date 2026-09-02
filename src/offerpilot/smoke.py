@@ -2388,9 +2388,9 @@ def run_interview_story_smoke(
             len(app.state.product_action_coordinator._catalog.names()),
             len(app.state.product_action_compensation_coordinator._catalog.names()),
         )
-        if manifest_counts != (3, 4, 2, 2):
+        if manifest_counts != (3, 5, 2, 2):
             raise RuntimeError(
-                "Story smoke runtime manifests were not exact Legacy3/AgentComp4/PA2/PAComp2"
+                "Story smoke runtime manifests were not exact Legacy3/AgentComp5/PA2/PAComp2"
             )
         seed: dict[str, int] | None = None
         cleanup_safe = True
@@ -2806,8 +2806,8 @@ def _create_and_confirm_story_proposal(
     if provider_tool_names is None:
         raise RuntimeError("Story smoke did not provide a Provider tool surface gate")
     provider_names = provider_tool_names()
-    if len(provider_names) != 25 or len(set(provider_names)) != 25:
-        raise RuntimeError("Story smoke Provider surface did not contain exactly 25 tools")
+    if len(provider_names) != 26 or len(set(provider_names)) != 26:
+        raise RuntimeError("Story smoke Provider surface did not contain exactly 26 tools")
     if {"confirm_interview_story", "save_review_readiness_signal"} & set(provider_names):
         raise RuntimeError("Story Product Actions leaked into the Provider tool surface")
 

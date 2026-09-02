@@ -6014,7 +6014,7 @@ def test_chat_exposes_module_tools_to_model(tmp_path):
     assert "list_knowledge_documents" not in captured_tools
     assert "search_knowledge" not in captured_tools
     assert "save_application_jd_version" not in captured_tools
-    assert len(captured_tools) == 25
+    assert len(captured_tools) == 26
 
 
 def test_chat_injects_response_structure_prompt(tmp_path):
@@ -6397,6 +6397,65 @@ def test_chat_create_application_for_existing_company_requires_user_confirmation
         item["role"] == "tool" and "requires explicit user confirmation" in item["content"]
         for item in stored
     )
+
+
+def test_chat_create_offer_confirmation_is_bound_to_the_existing_application(tmp_path):
+    model = ScriptedModel(
+        [
+            Assistant(
+                content="我先把这份 Offer 记录下来。",
+                tool_calls=[
+                    ToolCall(
+                        id="offer-create-1",
+                        name="create_offer",
+                        args=json.dumps(
+                            {
+                                "application_id": 1,
+                                "base_monthly": 24_000,
+                                "months_per_year": 16,
+                                "deadline": "2026-09-15",
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
+                ],
+            )
+        ]
+    )
+    client = TestClient(create_app(data_dir=tmp_path, chat_model=model))
+    application = client.post(
+        "/api/applications",
+        json={
+            "company_name": "去哪儿旅行",
+            "position_name": "后端工程师",
+            "status": "offer",
+        },
+    ).json()
+    assert application["id"] == 1
+
+    response = client.post(
+        "/api/chat",
+        json={"message": "记录去哪儿 24k×16 的 Offer", "conversation_id": 0},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["type"] == "confirmation_required"
+    pending = response.json()["pending_action"]
+    assert pending["tool_name"] == "create_offer"
+    assert pending["human"] == "新建 Offer：投递 #1 · 24000 × 16"
+    assert pending["target"] == {
+        "id": "offer-draft-1",
+        "kind": "offer",
+        "title": "去哪儿旅行",
+        "meta": "后端工程师 · Offer",
+        "source": "pending_action",
+    }
+    assert pending["proposed_changes"] == [
+        {"field": "base_monthly", "before": "", "after": 24_000},
+        {"field": "months_per_year", "before": "", "after": 16},
+        {"field": "deadline", "before": "", "after": "2026-09-15"},
+    ]
+    assert client.get("/api/offers").json() == []
 
 
 def test_chat_add_note_confirmation_includes_review_details(tmp_path):
@@ -7954,6 +8013,17 @@ def test_chat_confirm_fallback_timeout_before_handler_keeps_retry_claim(
             },
             "✅ 创建成功：日程 #1 已保存。",
         ),
+        (
+            "create_offer",
+            "为牛客网投递记录 24k×16 的 Offer",
+            {
+                "application_id": 1,
+                "base_monthly": 24_000,
+                "months_per_year": 16,
+                "deadline": "2026-09-15",
+            },
+            "✅ 创建成功：Offer #1 已保存（牛客网 · 软件测试工程师）。",
+        ),
     ),
 )
 def test_chat_confirm_special_write_returns_exact_saved_record_summary(
@@ -7964,7 +8034,7 @@ def test_chat_confirm_special_write_returns_exact_saved_record_summary(
     tool_args,
     expected_summary,
 ):
-    if tool_name == "create_application_event":
+    if tool_name in {"create_application_event", "create_offer"}:
         app_client = TestClient(create_app(data_dir=tmp_path))
         application = app_client.post(
             "/api/applications",
@@ -8015,6 +8085,12 @@ def test_chat_confirm_special_write_returns_exact_saved_record_summary(
     message = body["message"]
     assert message.startswith(f"{expected_summary}\n\n")
     assert "后续可以继续补充面试官追问。" in message
+    if tool_name == "create_offer":
+        offers = client.get("/api/offers").json()
+        assert len(offers) == 1
+        assert offers[0]["application_id"] == tool_args["application_id"]
+        assert offers[0]["base_monthly"] == 24_000
+        assert offers[0]["months_per_year"] == 16
 
 
 def test_chat_confirm_create_application_continues_to_review_note_card(tmp_path):

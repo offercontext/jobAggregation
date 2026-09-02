@@ -1445,7 +1445,7 @@ def build_production_tool_metadata_components(
     *,
     pending_identity_verifier_port: LegacyPendingIdentityVerifierPort,
 ) -> ProductionToolMetadataComponents:
-    """Assemble and publish the closed 25/3/4 Tool Metadata graph atomically."""
+    """Assemble and publish the closed 26/3/5 Tool Metadata graph atomically."""
 
     if type(pending_identity_verifier_port) is not LegacyPendingIdentityVerifierPort:
         raise TypeError("production metadata requires the exact Legacy verifier Port")

@@ -59,7 +59,7 @@ CURRENT_MANIFEST_SQL = (
     "(operation_role = 'primary' AND adapter_kind = 'typed' AND tool_name IN "
     "('create_application','update_application_status','create_application_event',"
     "'update_application_event','delete_application_event','add_note','update_note',"
-    "'delete_note','update_offer','save_offer_assessment','resume_update_career_intent',"
+    "'delete_note','update_offer','save_offer_assessment','create_offer','resume_update_career_intent',"
     "'resume_rewrite_highlight')) OR "
     "(operation_role = 'primary' AND adapter_kind = 'legacy_deterministic' AND tool_name IN "
     "('save_application_jd_version','create_application_submission_snapshot',"
@@ -68,17 +68,17 @@ CURRENT_MANIFEST_SQL = (
     "('confirm_interview_story','save_review_readiness_signal')) OR "
     "(operation_role = 'compensation' AND adapter_kind = 'compensation' AND tool_name IN "
     "('undo:update_application_status','undo:create_application',"
-    "'undo:create_application_event','undo:add_note','undo:confirm_interview_story',"
+    "'undo:create_application_event','undo:add_note','undo:create_offer','undo:confirm_interview_story',"
     "'undo:save_review_readiness_signal'))"
 )
 CURRENT_UNDO_POLICY_SQL = (
     "status <> 'committed' OR "
     "(operation_role = 'primary' AND tool_name IN "
-    "('create_application','update_application_status','create_application_event','add_note',"
+    "('create_application','update_application_status','create_application_event','add_note','create_offer',"
     "'confirm_interview_story','save_review_readiness_signal') "
     "AND undo_json IS NOT NULL) OR "
     "((operation_role = 'compensation' OR tool_name NOT IN "
-    "('create_application','update_application_status','create_application_event','add_note',"
+    "('create_application','update_application_status','create_application_event','add_note','create_offer',"
     "'confirm_interview_story','save_review_readiness_signal')) "
     "AND undo_json IS NULL)"
 )
@@ -138,6 +138,13 @@ def _all_published_routes() -> frozenset[PublishedRoute]:
             *(("compensation", "compensation", name) for name in COMPENSATION_NAMES),
         ]
     )
+
+
+def _all_current_published_routes() -> frozenset[PublishedRoute]:
+    return _all_published_routes() | {
+        ("primary", "typed", "create_offer"),
+        ("compensation", "compensation", "undo:create_offer"),
+    }
 
 
 def _create_published_schema(
@@ -214,6 +221,18 @@ def test_published_operation_constraints_preserve_agent_routes_and_add_product_r
     assert checks[MANIFEST_CONSTRAINT] == _normalized_sql(CURRENT_MANIFEST_SQL)
     assert checks[UNDO_POLICY_CONSTRAINT] == _normalized_sql(CURRENT_UNDO_POLICY_SQL)
     assert checks[UNDO_BYTES_CONSTRAINT] == _normalized_sql(BASELINE_UNDO_BYTES_SQL)
+
+
+def test_create_offer_routes_are_additive_to_the_historical_agent_schema(
+    published_schemas: tuple[sqlite3.Connection, sqlite3.Connection],
+) -> None:
+    baseline, current = published_schemas
+    for route in (
+        ("primary", "typed", "create_offer"),
+        ("compensation", "compensation", "undo:create_offer"),
+    ):
+        assert not _accepted(baseline, route)
+        assert _accepted(current, route)
 
 
 @pytest.mark.parametrize(
@@ -406,8 +425,8 @@ def test_operation_port_projection_equals_published_sqlite_allow_set() -> None:
         if entry.result_contract is not None
     )
 
-    assert len(typed_entries) == 25
-    assert actual_routes == _all_published_routes()
+    assert len(typed_entries) == 26
+    assert actual_routes == _all_current_published_routes()
 
 
 def test_completed_production_bundle_operation_port_equals_published_allow_set() -> None:
@@ -450,7 +469,7 @@ def test_completed_production_bundle_operation_port_equals_published_allow_set()
     assert port.bundle_instance_token is bundle.operation_view().bundle_instance_token
     assert port.bundle_instance_token is bundle.legacy_boundary().bundle_instance_token
     assert port.bundle_instance_token is bundle.compensation_view().bundle_instance_token
-    assert actual_routes == _all_published_routes()
+    assert actual_routes == _all_current_published_routes()
 
 
 def test_coordinator_and_repository_do_not_parse_published_check_sql() -> None:

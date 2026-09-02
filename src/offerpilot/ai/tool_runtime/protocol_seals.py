@@ -11,6 +11,9 @@ from typing import Any
 APPROVED_PROVIDER_TOOL_BOUNDARY_V1 = (
     "sha256:db60a499a2c76fa46e769214cbdce1488bb86b2f67941d6ae961f25ed997e98b"
 )
+APPROVED_PROVIDER_TOOL_BOUNDARY_V2 = (
+    "sha256:96da7cd82b470da433ec43220000000c6dd4a38c1efff9a8738e0ca880aec7b9"
+)
 APPROVED_LEGACY_DETERMINISTIC_BOUNDARY_V1 = (
     "sha256:7d1d6b7e6cf3953b1a17e7a81c9d5655b5366de25b263ea6bd89a646c2f2a580"
 )
@@ -43,11 +46,17 @@ def verify_provider_boundary(
 ) -> None:
     """Verify the complete ordered Provider payload boundary as one unit."""
 
-    if expected_digest != APPROVED_PROVIDER_TOOL_BOUNDARY_V1:
+    if expected_digest not in {
+        APPROVED_PROVIDER_TOOL_BOUNDARY_V1,
+        APPROVED_PROVIDER_TOOL_BOUNDARY_V2,
+    }:
         raise ValueError("provider boundary expected digest is not approved")
     ordered = list(payloads)
-    if len(ordered) != 25:
-        raise ValueError("provider boundary must contain exactly 25 ordered tools")
+    expected_count = 25 if expected_digest == APPROVED_PROVIDER_TOOL_BOUNDARY_V1 else 26
+    if len(ordered) != expected_count:
+        raise ValueError(
+            f"provider boundary must contain exactly {expected_count} ordered tools"
+        )
     actual = _canonical_digest(
         {"schema": "provider-tool-boundary-v1", "ordered_tools": ordered}
     )
@@ -92,6 +101,7 @@ def approved_legacy_boundary_input() -> tuple[tuple[str, ...], str, str]:
 __all__ = [
     "APPROVED_LEGACY_DETERMINISTIC_BOUNDARY_V1",
     "APPROVED_PROVIDER_TOOL_BOUNDARY_V1",
+    "APPROVED_PROVIDER_TOOL_BOUNDARY_V2",
     "approved_legacy_boundary_input",
     "verify_legacy_boundary",
     "verify_provider_boundary",

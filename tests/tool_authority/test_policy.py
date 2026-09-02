@@ -35,11 +35,11 @@ FIXTURES = Path(__file__).parents[1] / "fixtures" / "tool_authority"
 
 
 def _manifest() -> dict[str, Any]:
-    return json.loads((FIXTURES / "authority_manifest_v1.json").read_text(encoding="utf-8"))
+    return json.loads((FIXTURES / "authority_manifest_current.json").read_text(encoding="utf-8"))
 
 
 def _reviewed_policy() -> dict[str, Any]:
-    return json.loads((FIXTURES / "policy_fingerprints_v1.json").read_text(encoding="utf-8"))
+    return json.loads((FIXTURES / "policy_fingerprints_current.json").read_text(encoding="utf-8"))
 
 
 def _resolution(
@@ -154,7 +154,7 @@ def test_binding_policy_input_uses_one_ordered_manifest_projection() -> None:
     assert value["aggregation_rule_version"] == BINDING_AGGREGATION_VERSION
     assert value["collection_scope_rule_version"] == APPLICATION_COLLECTION_SCOPE_VERSION
     assert value["public_denial_rule_version"] == SCOPE_DENIAL_VERSION
-    assert len(value["tools"]) == 25
+    assert len(value["tools"]) == 26
     assert set(value["tools"][0]) == {
         "name",
         "tool_kind",

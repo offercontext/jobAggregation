@@ -147,6 +147,7 @@ def test_dependency_closure_uses_catalog_order_and_excludes_legacy_adapters() ->
         "list_offers",
         "get_offer",
         "compare_offers",
+        "create_offer",
         "update_offer",
         "save_offer_assessment",
     )

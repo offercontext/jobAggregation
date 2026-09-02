@@ -74,3 +74,15 @@ def test_golden_loader_has_no_writer_or_update_helper() -> None:
 
     assert function_names == {"canonical_json", "load_golden"}
     assert not any(token in source_path.read_text(encoding="utf-8") for token in ("write_text", "open("))
+
+
+def test_current_provider_golden_is_canonical_and_includes_create_offer() -> None:
+    path = FIXTURES / "provider_manifest_current.json"
+    value = load_golden("provider_manifest_current.json")
+    raw = path.read_text(encoding="utf-8")
+
+    assert value["baseline"] == "create-offer-current-v1"
+    assert raw == canonical_json(value) + "\n"
+    assert len(value["tools"]) == 26
+    assert value["tools"][16]["function"]["name"] == "create_offer"
+    assert value["tools"][16]["function"]["parameters"]["required"] == ["application_id"]

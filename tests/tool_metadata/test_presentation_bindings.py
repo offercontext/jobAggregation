@@ -95,7 +95,7 @@ def test_final_tool_spec_shape_has_metadata_and_no_legacy_forwarding_fields() ->
 
 def test_every_production_spec_has_complete_named_presentation_binding() -> None:
     specs = _TEST_TOOL_CATALOG.specs
-    assert len(specs) == 25
+    assert len(specs) == 26
     for spec in specs:
         presentation = spec.presentation
         assert isinstance(presentation, ToolPresentationBindingV1)

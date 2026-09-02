@@ -2085,7 +2085,7 @@ class WriteOperation(Base):
             "(operation_role = 'primary' AND adapter_kind = 'typed' AND tool_name IN "
             "('create_application','update_application_status','create_application_event',"
             "'update_application_event','delete_application_event','add_note','update_note',"
-            "'delete_note','update_offer','save_offer_assessment','resume_update_career_intent',"
+            "'delete_note','update_offer','save_offer_assessment','create_offer','resume_update_career_intent',"
             "'resume_rewrite_highlight')) OR "
             "(operation_role = 'primary' AND adapter_kind = 'legacy_deterministic' AND tool_name IN "
             "('save_application_jd_version','create_application_submission_snapshot',"
@@ -2094,7 +2094,7 @@ class WriteOperation(Base):
             "('confirm_interview_story','save_review_readiness_signal')) OR "
             "(operation_role = 'compensation' AND adapter_kind = 'compensation' AND tool_name IN "
             "('undo:update_application_status','undo:create_application',"
-            "'undo:create_application_event','undo:add_note','undo:confirm_interview_story',"
+            "'undo:create_application_event','undo:add_note','undo:create_offer','undo:confirm_interview_story',"
             "'undo:save_review_readiness_signal'))",
             name="ck_write_operations_manifest",
         ),
@@ -2240,11 +2240,11 @@ class WriteOperation(Base):
         CheckConstraint(
             "status <> 'committed' OR "
             "(operation_role = 'primary' AND tool_name IN "
-            "('create_application','update_application_status','create_application_event','add_note',"
+            "('create_application','update_application_status','create_application_event','add_note','create_offer',"
             "'confirm_interview_story','save_review_readiness_signal') "
             "AND undo_json IS NOT NULL) OR "
             "((operation_role = 'compensation' OR tool_name NOT IN "
-            "('create_application','update_application_status','create_application_event','add_note',"
+            "('create_application','update_application_status','create_application_event','add_note','create_offer',"
             "'confirm_interview_story','save_review_readiness_signal')) "
             "AND undo_json IS NULL)",
             name="ck_write_operations_undo_policy",

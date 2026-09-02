@@ -84,7 +84,7 @@ from tests.tool_authority.test_pending_claim import (
 )
 
 
-_OPERATION_MATRIX = load_asset("tool_operation_matrix_0c10e05.json")
+_OPERATION_MATRIX = load_asset("tool_operation_matrix_current.json")
 _TYPED_WRITE_NAMES = tuple(
     item["name"]
     for item in _OPERATION_MATRIX["typed_operations"]
@@ -894,6 +894,7 @@ def test_legacy_commit_unknown_reconciliation_revokes_parent_route(
         ("create_application", "undo:create_application"),
         ("create_application_event", "undo:create_application_event"),
         ("add_note", "undo:add_note"),
+        ("create_offer", "undo:create_offer"),
     ),
 )
 def test_all_compensation_adapters_execute_once_and_replay(

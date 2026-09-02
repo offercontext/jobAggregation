@@ -224,7 +224,7 @@ def _approval_request_fingerprint(key, operation_id: str, pending: PendingAction
 
 def test_write_operation_manifests_are_exact() -> None:
     components = _production_components()
-    matrix = load_asset("tool_operation_matrix_0c10e05.json")
+    matrix = load_asset("tool_operation_matrix_current.json")
     assert tuple(
         entry.operation_name
         for entry in components.operation_port.typed_primary_entries
@@ -249,6 +249,7 @@ def test_write_operation_manifests_are_exact() -> None:
         ("undo:create_application", "007fcd71-31a0-5489-a474-9fe0ab59bb90"),
         ("undo:create_application_event", "920dc6a7-e9b8-5484-8749-9a1cf37b1b06"),
         ("undo:add_note", "9d8c2d9c-8a14-5e26-bad1-9fd5fb5ef73c"),
+        ("undo:create_offer", "5a7d9a39-9ba4-5137-84cd-e374108c6831"),
     ),
 )
 def test_compensation_operation_id_matches_design_golden(kind: str, expected: str) -> None:

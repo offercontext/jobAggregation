@@ -105,6 +105,41 @@ class OffersRepository:
             session.refresh(offer)
             return offer
 
+    def create_offer_scoped(
+        self,
+        constraint: ApplicationScopeConstraint,
+        data: OfferCreate,
+    ) -> Offer:
+        binding = self._require_scoped(constraint)
+        application_id = require_scoped_positive_int64(data.application_id, "application_id")
+        parent = select(Application.id).where(
+            Application.id == application_id,
+            Application.deleted_at.is_(None),
+        )
+        if constraint.mode == "restricted":
+            parent = parent.where(Application.id == _restricted_scope_id(constraint))
+        with binding.session.no_autoflush:
+            if binding.session.scalar(parent) is None:
+                raise ScopeAccessDenied("application scope denied")
+            offer = Offer(
+                application_id=application_id,
+                company_name=data.company_name,
+                position_name=data.position_name,
+                status=data.status or "pending",
+                base_monthly=data.base_monthly,
+                months_per_year=data.months_per_year or 12,
+                signing_bonus=data.signing_bonus,
+                equity=data.equity,
+                perks=data.perks,
+                deadline=data.deadline,
+                notes=data.notes,
+                assessment=data.assessment,
+            )
+            binding.session.add(offer)
+            finish_repository_write(binding.session, self._session)
+            binding.session.refresh(offer)
+            return offer
+
     def list(self, status: str = "") -> list[Offer]:
         statement = select(Offer)
         if status:

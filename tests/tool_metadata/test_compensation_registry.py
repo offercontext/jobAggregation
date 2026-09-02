@@ -132,6 +132,7 @@ def _resolved_handler_specs(bundle: ToolMetadataBundleV1, registry: object) -> t
         "create_application",
         "create_application_event",
         "add_note",
+        "create_offer",
     )
     port = _operation_port(bundle, registry)
     return tuple(
@@ -162,9 +163,9 @@ def _utc_text(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def test_compensation_registry_has_the_exact_four_sealed_handler_specs() -> None:
+def test_compensation_registry_has_the_exact_five_sealed_handler_specs() -> None:
     components, bundle, registry = _components_bundle_registry()
-    matrix = load_asset("tool_operation_matrix_0c10e05.json")
+    matrix = load_asset("tool_operation_matrix_current.json")
     resolved_specs = _resolved_handler_specs(bundle, registry)
 
     assert tuple(
@@ -830,9 +831,33 @@ def test_all_handlers_accept_the_canonical_ledger_round_trip_payload_shape() -> 
                 "mood": "calm",
             },
         },
+        {
+            "kind": "delete_offer",
+            "label": "撤销新建 Offer",
+            "offer_id": 1,
+            "expected_after": {
+                "application_id": 1,
+                "company_name": "Example",
+                "position_name": "Engineer",
+                "status": "pending",
+                "base_monthly": 24_000,
+                "months_per_year": 16,
+                "signing_bonus": 0,
+                "equity": "",
+                "perks": "",
+                "deadline": "2026-09-15",
+                "notes": "",
+                "assessment": "",
+                "total_cash": 384_000,
+                "created_at": "2026-08-25T00:00:00Z",
+                "updated_at": "2026-08-25T00:00:00Z",
+            },
+        },
     )
 
-    for handler, payload in zip(_resolved_handler_specs(bundle, registry), payloads):
+    handlers = _resolved_handler_specs(bundle, registry)
+    assert len(payloads) == len(handlers)
+    for handler, payload in zip(handlers, payloads):
         frozen = freeze_json(payload)
         persisted = json.loads(canonical_json_bytes(frozen))
         handler.validate_undo_payload(freeze_json(persisted))

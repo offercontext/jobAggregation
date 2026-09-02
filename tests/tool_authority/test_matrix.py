@@ -22,7 +22,7 @@ from offerpilot.ai.tool_specs.catalog import build_model_tool_catalog
 from offerpilot.ai.tool_specs.legacy import build_static_adapter_catalog
 
 
-FIXTURE = Path(__file__).parents[1] / "fixtures" / "tool_authority" / "authority_manifest_v1.json"
+FIXTURE = Path(__file__).parents[1] / "fixtures" / "tool_authority" / "authority_manifest_current.json"
 _TEST_TOOL_CATALOG = build_model_tool_catalog()
 _TEST_TOOL_NAMES = tuple(spec.name for spec in _TEST_TOOL_CATALOG.specs)
 _TEST_LEGACY_NAMES = frozenset(
@@ -57,7 +57,7 @@ def test_model_catalog_matches_the_single_canonical_authority_manifest() -> None
 
 def test_matrix_metadata_is_closed_and_exact() -> None:
     manifest = _manifest()
-    assert len(manifest["tools"]) == 25
+    assert len(manifest["tools"]) == 26
     for spec, expected in zip(_TEST_TOOL_CATALOG.specs, manifest["tools"]):
         assert spec.name == expected["name"]
         operation_kind = (

@@ -1440,7 +1440,7 @@ def test_maximal_semantic_manifest_reaches_every_array_limit_under_cap() -> None
     assert len(manifest["providers"]) == 8
     assert len(manifest["contributors"]) == 10
     assert len(manifest["history_groups"]) == 32
-    assert len(manifest["tools"]) == 25
+    assert len(manifest["tools"]) == 26
     assert len(manifest["sources"]) == 8
     assert sum(len(source["chunks"]) for source in manifest["sources"]) == 64
     assert len(manifest["signals"]) == 32
@@ -1716,7 +1716,7 @@ def test_real_chat_adapter_uses_projected_surface_and_persists_v2_manifest(
         response = client.post("/api/chat", json={"message": "请比较 offer"})
         assert response.status_code == 200
     assert requests
-    assert 0 < len(requests[0].get("tools", [])) < 25  # type: ignore[arg-type]
+    assert 0 < len(requests[0].get("tools", [])) < 26  # type: ignore[arg-type]
     runs, events, snapshots = _wait_for_projector_journal_completion(tmp_path)
     assert len(runs) == 1
     assert runs[0].status == "completed"

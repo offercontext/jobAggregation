@@ -7159,14 +7159,14 @@ def _task12_story_smoke_violations(source: str) -> list[str]:
         findings.append("smoke:missing-nonowner-http-canary-scan")
 
     if not (
-        any(isinstance(node, ast.Constant) and node.value == 25 for node in ast.walk(helper))
+        any(isinstance(node, ast.Constant) and node.value == 26 for node in ast.walk(helper))
         and {
             "confirm_interview_story",
             "save_review_readiness_signal",
         }.issubset(active_strings)
         and "provider_names" in {node.id for node in ast.walk(helper) if isinstance(node, ast.Name)}
     ):
-        findings.append("smoke:missing-provider-25-check")
+        findings.append("smoke:missing-provider-26-check")
     if "real_ai_model_provider_counters_unobservable" not in active_strings:
         findings.append("smoke:missing-real-ai-exclusion")
     privacy_canary_from_server_token = any(
@@ -7213,7 +7213,7 @@ def _task12_story_smoke_violations(source: str) -> list[str]:
                 for item in child.elts
                 if isinstance(item, ast.Constant) and isinstance(item.value, int)
             ]
-            == [3, 4, 2, 2]
+            == [3, 5, 2, 2]
             for child in ast.walk(node)
         )
         for node in ast.walk(tree)
@@ -10263,7 +10263,7 @@ def _create_and_confirm_story_proposal(client):
 '''
     smoke_findings = _task12_story_smoke_violations(missing_privacy_and_tools)
     assert "smoke:missing-token-absence-check" in smoke_findings
-    assert "smoke:missing-provider-25-check" in smoke_findings
+    assert "smoke:missing-provider-26-check" in smoke_findings
     assert "smoke:missing-real-ai-exclusion" in smoke_findings
 
 

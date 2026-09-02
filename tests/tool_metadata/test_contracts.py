@@ -52,12 +52,14 @@ def test_policy_enums_are_exact_closed_string_contracts() -> None:
         "update_application_status",
         "delete_application_event",
         "delete_note",
+        "delete_offer",
     )
     assert _values(CompensationKind) == (
         "undo:create_application",
         "undo:update_application_status",
         "undo:create_application_event",
         "undo:add_note",
+        "undo:create_offer",
     )
 
     for enum_type in (

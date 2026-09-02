@@ -197,7 +197,7 @@ def _actual_legacy_projection(components: Any) -> dict[str, object]:
     }
 
 
-def test_production_components_publish_one_complete_25_3_4_bundle_graph() -> None:
+def test_production_components_publish_one_complete_26_3_5_bundle_graph() -> None:
     components = _production_components()
     bundle = components.bundle
     assert type(bundle) is ToolMetadataBundleV1
@@ -213,15 +213,15 @@ def test_production_components_publish_one_complete_25_3_4_bundle_graph() -> Non
     token = bundle.bundle_instance_token
     assert len(views) == 6
     assert all(view.bundle_instance_token is token for view in views)
-    assert len(bundle.provider_view().ordered_contracts) == 25
-    assert len(bundle.discovery_view().ordered_entries) == 25
-    assert len(bundle.authority_view().entries) == 25
-    assert len(bundle.operation_view().entries) == 25
+    assert len(bundle.provider_view().ordered_contracts) == 26
+    assert len(bundle.discovery_view().ordered_entries) == 26
+    assert len(bundle.authority_view().entries) == 26
+    assert len(bundle.operation_view().entries) == 26
     assert (
         tuple(binding.name for binding in bundle.legacy_boundary().ordered_adapter_bindings)
         == ORDERED_LEGACY_NAMES
     )
-    assert len(bundle.compensation_view().ordered_handler_bindings) == 4
+    assert len(bundle.compensation_view().ordered_handler_bindings) == 5
 
     initial = components.initial_routes
     confirmation = components.confirmation_routes
@@ -247,17 +247,17 @@ def test_production_components_publish_one_complete_25_3_4_bundle_graph() -> Non
         operation_port.legacy_route_registry_token is not initial.initial_route_port.registry_token
     )
     assert operation_port.compensation_registry_token is compensation_registry.registry_token
-    assert len(operation_port.typed_primary_entries) == 25
+    assert len(operation_port.typed_primary_entries) == 26
     assert len(operation_port.legacy_primary_entries) == 3
-    assert len(operation_port.compensation_entries) == 4
-    assert len(operation_port.required_undo_entries) == 4
+    assert len(operation_port.compensation_entries) == 5
+    assert len(operation_port.required_undo_entries) == 5
 
     for binding in bundle.compensation_view().ordered_handler_bindings:
         handler = compensation_registry.bind_handler(binding)
         assert compensation_registry.require_handler_handle(handler) is binding
 
 
-def test_agent_bundle_stays_exact_25_3_4_and_product_catalogs_are_independent_2_2() -> None:
+def test_agent_bundle_stays_exact_26_3_5_and_product_catalogs_are_independent_2_2() -> None:
     components = _production_components()
     registry = ProductActionProofRegistryV1()
     actions = ProductActionCatalogV1(registry)
@@ -282,14 +282,14 @@ def test_agent_bundle_stays_exact_25_3_4_and_product_catalogs_are_independent_2_
         len(agent_compensation_names),
         len(actions.ordered_specs),
         len(compensations.ordered_specs),
-    ) == (25, 3, 4, 2, 2)
+    ) == (26, 3, 5, 2, 2)
     assert actions.names() == PRODUCT_ACTION_NAMES
     assert compensations.names() == PRODUCT_ACTION_COMPENSATION_NAMES
     assert set(PRODUCT_ACTION_NAMES).isdisjoint(provider_names)
     assert set(PRODUCT_ACTION_NAMES).isdisjoint(legacy_names)
     assert set(PRODUCT_ACTION_COMPENSATION_NAMES).isdisjoint(agent_compensation_names)
     provider_fixture = json.loads(
-        (ROOT / "tests" / "fixtures" / "tool_pipeline" / "provider_manifest_30c944f.json")
+        (ROOT / "tests" / "fixtures" / "tool_pipeline" / "provider_manifest_current.json")
         .read_text(encoding="utf-8")
     )
     assert [

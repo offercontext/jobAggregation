@@ -108,16 +108,16 @@ def test_provider_pipeline_returns_both_product_names_as_unknown_without_executo
 
 def test_product_actions_never_enter_agent_metadata_or_compensation_fixtures() -> None:
     manifest = json.loads(
-        (ROOT / "tests" / "fixtures" / "tool_metadata" / "tool_metadata_manifest_v1.json")
+        (ROOT / "tests" / "fixtures" / "tool_metadata" / "tool_metadata_manifest_current.json")
         .read_text(encoding="utf-8")
     )
     provider_names = tuple(item["provider_name"] for item in manifest["typed_tools"])
     legacy_names = tuple(manifest["legacy_boundary"]["ordered_names"])
     agent_compensations = tuple(manifest["compensation_operation_order"])
 
-    assert len(provider_names) == 25
+    assert len(provider_names) == 26
     assert len(legacy_names) == 3
-    assert len(agent_compensations) == 4
+    assert len(agent_compensations) == 5
     assert set(PRODUCT_ACTION_NAMES).isdisjoint(provider_names)
     assert set(PRODUCT_ACTION_NAMES).isdisjoint(legacy_names)
     assert set(PRODUCT_ACTION_COMPENSATION_NAMES).isdisjoint(agent_compensations)
@@ -144,7 +144,7 @@ def test_all_three_chat_delivery_ownership_paths_explicitly_exclude_product_acti
         assert "product_action" in source
 
 
-def test_runtime_classification_is_exactly_25_3_4_plus_2_2() -> None:
+def test_historical_runtime_classification_is_exactly_25_3_4_plus_2_2() -> None:
     fixture = json.loads(
         (
             ROOT

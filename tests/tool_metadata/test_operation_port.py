@@ -107,9 +107,9 @@ def _assert_transient(value: object) -> None:
     assert "tool_call" not in rendered
 
 
-def test_operation_port_projects_the_exact_closed_25_3_4_and_required_undo_matrix() -> None:
+def test_operation_port_projects_the_exact_closed_26_3_5_and_required_undo_matrix() -> None:
     port, bundle, registry, legacy_issuer = _operation_graph()
-    matrix = load_asset("tool_operation_matrix_0c10e05.json")
+    matrix = load_asset("tool_operation_matrix_current.json")
 
     typed = tuple(_route_projection(item) for item in port.typed_primary_entries)
     legacy = tuple(_route_projection(item) for item in port.legacy_primary_entries)

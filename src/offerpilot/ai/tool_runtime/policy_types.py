@@ -69,6 +69,7 @@ class UndoPayloadKind(_PolicyValue):
     UPDATE_APPLICATION_STATUS = "update_application_status"
     DELETE_APPLICATION_EVENT = "delete_application_event"
     DELETE_NOTE = "delete_note"
+    DELETE_OFFER = "delete_offer"
 
 
 @unique
@@ -77,6 +78,7 @@ class CompensationKind(_PolicyValue):
     UNDO_UPDATE_APPLICATION_STATUS = "undo:update_application_status"
     UNDO_CREATE_APPLICATION_EVENT = "undo:create_application_event"
     UNDO_ADD_NOTE = "undo:add_note"
+    UNDO_CREATE_OFFER = "undo:create_offer"
 
 
 __all__ = [

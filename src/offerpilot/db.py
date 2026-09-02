@@ -323,6 +323,7 @@ def init_database(db_path: Path) -> SessionFactory:
     # canonicalizes legacy mode values or installs scope triggers.
     _ensure_scoped_tool_authority_schema(engine)
     _ensure_review_to_readiness_feedback_schema(engine)
+    _ensure_create_offer_write_operation_schema(engine)
 
     resume_migrations = [
         _ensure_column(engine, "resumes", "name", "TEXT DEFAULT ''"),
@@ -2012,6 +2013,10 @@ def _ensure_review_to_readiness_feedback_schema(
             "SELECT 1 FROM schema_migrations "
             "WHERE version='0029_review_to_readiness_feedback'"
         ).fetchone() is not None
+        create_offer_migration_exists = cursor.execute(
+            "SELECT 1 FROM schema_migrations "
+            "WHERE version='0030_create_offer_write_operation'"
+        ).fetchone() is not None
 
         if not marker_exists:
             additive_columns = (
@@ -2583,7 +2588,15 @@ def _ensure_review_to_readiness_feedback_schema(
             """
         )
 
-        product_compensation_parent = """
+        create_offer_compensation_pair = (
+            """
+                OR (parent.tool_name = 'create_offer'
+                    AND NEW.tool_name = 'undo:create_offer')
+            """
+            if create_offer_migration_exists
+            else ""
+        )
+        product_compensation_parent = f"""
           SELECT 1 FROM write_operations parent
           WHERE parent.id = NEW.parent_operation_id
             AND parent.operation_role = 'primary'
@@ -2601,6 +2614,7 @@ def _ensure_review_to_readiness_feedback_schema(
                 (parent.tool_name = 'create_application_event'
                  AND NEW.tool_name = 'undo:create_application_event') OR
                 (parent.tool_name = 'add_note' AND NEW.tool_name = 'undo:add_note')
+                {create_offer_compensation_pair}
               )) OR
               (parent.adapter_kind = 'product_action' AND (
                 (parent.tool_name = 'confirm_interview_story'
@@ -2648,6 +2662,173 @@ def _ensure_review_to_readiness_feedback_schema(
                     "Add review-to-readiness Product Action, Signal, and Practice V2 schema",
                 ),
             )
+        raw.commit()
+    except Exception:
+        raw.rollback()
+        raise
+    finally:
+        try:
+            cursor.execute("PRAGMA foreign_keys = ON")
+        finally:
+            cursor.close()
+            raw.close()
+
+
+def _ensure_create_offer_write_operation_schema(engine: Engine) -> None:
+    """Rebuild the ledger table once so existing databases accept ``create_offer`` Undo."""
+
+    with engine.begin() as conn:
+        already_migrated = conn.scalar(
+            text(
+                "SELECT 1 FROM schema_migrations "
+                "WHERE version = '0030_create_offer_write_operation'"
+            )
+        )
+        if already_migrated is not None:
+            return
+
+    table_sql = _review_to_readiness_table_sql(
+        engine,
+        "write_operations",
+        "write_operations_0030",
+    )
+    index_sql = _compile_review_to_readiness_indexes(engine, "write_operations")
+    raw = engine.raw_connection()
+    cursor = raw.cursor()
+    try:
+        cursor.execute("PRAGMA foreign_keys = OFF")
+        cursor.execute("BEGIN IMMEDIATE")
+        if cursor.execute(
+            "SELECT 1 FROM schema_migrations "
+            "WHERE version = '0030_create_offer_write_operation'"
+        ).fetchone() is not None:
+            raw.rollback()
+            return
+        operation_columns = [
+            str(row[1]) for row in cursor.execute("PRAGMA table_info(write_operations)")
+        ]
+        expected_columns = [
+            column.name for column in Base.metadata.tables["write_operations"].columns
+        ]
+        if set(operation_columns) != set(expected_columns):
+            raise RuntimeError("unsupported pre-0030 write_operations columns")
+        operation_triggers = [
+            (str(row[0]), str(row[1]))
+            for row in cursor.execute(
+                "SELECT name,sql FROM sqlite_master "
+                "WHERE type='trigger' AND sql IS NOT NULL "
+                "AND instr(lower(sql),'write_operations') > 0 ORDER BY name"
+            )
+        ]
+        for trigger_name, _statement in operation_triggers:
+            cursor.execute(f'DROP TRIGGER "{trigger_name}"')
+        operation_before = cursor.execute(
+            "SELECT "
+            + ",".join(f'"{column}"' for column in operation_columns)
+            + " FROM write_operations ORDER BY id"
+        ).fetchall()
+        transition_columns = [
+            str(row[1])
+            for row in cursor.execute("PRAGMA table_info(write_operation_transitions)")
+        ]
+        transition_before = cursor.execute(
+            "SELECT "
+            + ",".join(f'"{column}"' for column in transition_columns)
+            + " FROM write_operation_transitions ORDER BY operation_id,seq,id"
+        ).fetchall()
+        cursor.execute("DROP TABLE IF EXISTS write_operations_0030")
+        cursor.execute(table_sql)
+        quoted_columns = ",".join(f'"{column}"' for column in operation_columns)
+        cursor.execute(
+            f"INSERT INTO write_operations_0030 ({quoted_columns}) "
+            f"SELECT {quoted_columns} FROM write_operations"
+        )
+        cursor.execute("DROP TABLE write_operations")
+        cursor.execute("ALTER TABLE write_operations_0030 RENAME TO write_operations")
+        for statement in index_sql:
+            cursor.execute(statement)
+        for _trigger_name, statement in operation_triggers:
+            cursor.execute(statement)
+        cursor.execute("DROP TRIGGER IF EXISTS trg_write_operation_compensation_insert")
+        cursor.execute("DROP TRIGGER IF EXISTS trg_write_operation_compensation_update")
+        compensation_parent = """
+          SELECT 1 FROM write_operations parent
+          WHERE parent.id = NEW.parent_operation_id
+            AND parent.operation_role = 'primary'
+            AND parent.status = 'committed'
+            AND parent.terminal_payload_sha256 = NEW.parent_terminal_payload_sha256
+            AND length(NEW.parent_terminal_payload_sha256) = 71
+            AND substr(NEW.parent_terminal_payload_sha256,1,7) = 'sha256:'
+            AND substr(NEW.parent_terminal_payload_sha256,8) NOT GLOB '*[^0-9a-f]*'
+            AND (
+              (parent.adapter_kind = 'typed' AND (
+                (parent.tool_name = 'update_application_status'
+                 AND NEW.tool_name = 'undo:update_application_status') OR
+                (parent.tool_name = 'create_application'
+                 AND NEW.tool_name = 'undo:create_application') OR
+                (parent.tool_name = 'create_application_event'
+                 AND NEW.tool_name = 'undo:create_application_event') OR
+                (parent.tool_name = 'add_note' AND NEW.tool_name = 'undo:add_note') OR
+                (parent.tool_name = 'create_offer' AND NEW.tool_name = 'undo:create_offer')
+              )) OR
+              (parent.adapter_kind = 'product_action' AND (
+                (parent.tool_name = 'confirm_interview_story'
+                 AND NEW.tool_name = 'undo:confirm_interview_story') OR
+                (parent.tool_name = 'save_review_readiness_signal'
+                 AND NEW.tool_name = 'undo:save_review_readiness_signal')
+              ))
+            )
+        """
+        cursor.execute(
+            f"""
+            CREATE TRIGGER trg_write_operation_compensation_insert
+            BEFORE INSERT ON write_operations
+            WHEN NEW.operation_role = 'compensation'
+            BEGIN
+                SELECT CASE WHEN NOT EXISTS ({compensation_parent})
+                  THEN RAISE(ABORT, 'invalid compensation parent') END;
+            END
+            """
+        )
+        cursor.execute(
+            f"""
+            CREATE TRIGGER trg_write_operation_compensation_update
+            BEFORE UPDATE OF parent_operation_id, parent_terminal_payload_sha256,
+                             operation_role, tool_name ON write_operations
+            WHEN NEW.operation_role = 'compensation'
+            BEGIN
+                SELECT CASE WHEN NOT EXISTS ({compensation_parent})
+                  THEN RAISE(ABORT, 'invalid compensation parent') END;
+            END
+            """
+        )
+        operation_after = cursor.execute(
+            "SELECT "
+            + ",".join(f'"{column}"' for column in operation_columns)
+            + " FROM write_operations ORDER BY id"
+        ).fetchall()
+        if operation_after != operation_before:
+            raise RuntimeError("0030 changed historical write operation bytes")
+        transition_after = cursor.execute(
+            "SELECT "
+            + ",".join(f'"{column}"' for column in transition_columns)
+            + " FROM write_operation_transitions ORDER BY operation_id,seq,id"
+        ).fetchall()
+        if transition_after != transition_before:
+            raise RuntimeError("0030 changed historical write operation transition bytes")
+        integrity = cursor.execute("PRAGMA integrity_check").fetchall()
+        if integrity != [("ok",)]:
+            raise RuntimeError("0030 integrity check failed")
+        foreign_key_violations = cursor.execute("PRAGMA foreign_key_check").fetchall()
+        if foreign_key_violations:
+            raise RuntimeError("0030 foreign key check failed")
+        cursor.execute(
+            "INSERT INTO schema_migrations(version,description) VALUES (?,?)",
+            (
+                "0030_create_offer_write_operation",
+                "Allow create_offer primary and Undo operations in the write ledger",
+            ),
+        )
         raw.commit()
     except Exception:
         raw.rollback()

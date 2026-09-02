@@ -127,6 +127,7 @@ _COMPENSATION_OPERATION_ORDER = (
     CompensationKind.UNDO_CREATE_APPLICATION.value,
     CompensationKind.UNDO_CREATE_APPLICATION_EVENT.value,
     CompensationKind.UNDO_ADD_NOTE.value,
+    CompensationKind.UNDO_CREATE_OFFER.value,
 )
 
 
@@ -149,7 +150,7 @@ def _legacy_manifest_boundary() -> dict[str, object]:
 def _ordered_compensations(
     values: Sequence[tuple[str | None, int, str]],
 ) -> tuple[str, ...]:
-    if len(values) != 4:
+    if len(values) != 5:
         raise ValueError("compensation bindings do not match the closed V1 set")
     actual: set[CompensationKind] = set()
     for _phase, _ordinal, value in values:
@@ -514,7 +515,7 @@ class ToolCatalog:
             _validate_spec(spec)
         _validate_dependencies(ordered)
 
-        strict_authority = authority_manifest is not None or len(ordered) == 25
+        strict_authority = authority_manifest is not None or len(ordered) == 26
         projected_manifest = authority_manifest_for_specs(ordered, strict=True)
         if authority_manifest is not None and projected_manifest != dict(authority_manifest):
             raise ValueError("authority manifest drift")
@@ -1038,8 +1039,8 @@ def compile_tool_metadata_manifest(
     specs: Sequence[ToolSpec[Any, Any]],
 ) -> ToolMetadataManifestV1:
     ordered = tuple(specs)
-    if len(ordered) != 25:
-        raise ValueError("production metadata manifest requires exactly 25 Typed tools")
+    if len(ordered) != 26:
+        raise ValueError("production metadata manifest requires exactly 26 Typed tools")
     for spec in ordered:
         _validate_spec(spec)
     _validate_dependencies(ordered)
@@ -1368,8 +1369,8 @@ def validate_tool_metadata_manifest(value: object) -> None:
         raise ValueError("metadata manifest catalog profile mismatch")
 
     typed_tools = _require_array(manifest["typed_tools"], "Typed tools")
-    if len(typed_tools) != 25:
-        raise ValueError("metadata manifest must contain exactly 25 Typed tools")
+    if len(typed_tools) != 26:
+        raise ValueError("metadata manifest must contain exactly 26 Typed tools")
     typed_keys = (
         "ordinal",
         "provider_name",

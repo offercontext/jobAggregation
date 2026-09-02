@@ -44,7 +44,7 @@ CAPABILITY_PROFILE_FINGERPRINT: Final = (
     "sha256:be49ef8b3335740931fc3dee690948d87fed499921cd9c6f4f8586c786ec7487"
 )
 BINDING_POLICY_FINGERPRINT: Final = (
-    "sha256:0cb3e67abade3b5e986414267facd41d49f866050f90a97d50aec32d54320ca7"
+    "sha256:f91fef0c018648b27a94798ebba58c1737e05ebbb9a6df6bbdc25a7deb55118f"
 )
 
 # Names used by the characterization tests and by downstream composition code.
@@ -329,8 +329,8 @@ def _validate_manifest(manifest: Mapping[str, object]) -> Sequence[Mapping[str, 
     if type(manifest.get("schema_version")) is not int or manifest.get("schema_version") != 1:
         raise AuthorityPolicyError("unknown authority manifest schema version")
     tools_value = manifest.get("tools")
-    if type(tools_value) is not list or len(tools_value) != 25:
-        raise AuthorityPolicyError("authority manifest must contain exactly 25 tools")
+    if type(tools_value) is not list or len(tools_value) != 26:
+        raise AuthorityPolicyError("authority manifest must contain exactly 26 tools")
     tools: list[Mapping[str, object]] = []
     names: set[str] = set()
     binding_kinds: set[str] = set()

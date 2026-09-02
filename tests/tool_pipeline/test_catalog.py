@@ -196,11 +196,11 @@ def test_prepared_tool_call_requires_a_typed_segment_spec_handle() -> None:
 
 
 def test_model_catalog_is_exact_provider_golden_in_exact_order() -> None:
-    manifest = load_golden("provider_manifest_30c944f.json")
+    manifest = load_golden("provider_manifest_current.json")
     contracts = _TEST_TOOL_CATALOG.provider_contracts()
 
-    assert len(_TEST_TOOL_NAMES) == 25
-    assert len(set(_TEST_TOOL_NAMES)) == 25
+    assert len(_TEST_TOOL_NAMES) == 26
+    assert len(set(_TEST_TOOL_NAMES)) == 26
     assert tuple(contract.name for contract in contracts) == _TEST_TOOL_NAMES
     payloads = materialize_provider_payloads(contracts)
     assert canonical_json(payloads) == canonical_json(manifest["tools"])
@@ -215,7 +215,7 @@ def test_model_catalog_is_exact_provider_golden_in_exact_order() -> None:
 
 
 def test_final_provider_adapter_receives_exact_golden_envelopes(monkeypatch) -> None:
-    manifest = load_golden("provider_manifest_30c944f.json")
+    manifest = load_golden("provider_manifest_current.json")
     captured: dict[str, Any] = {}
 
     def fake_completion(**kwargs: Any) -> dict[str, Any]:
@@ -231,13 +231,13 @@ def test_final_provider_adapter_receives_exact_golden_envelopes(monkeypatch) -> 
     assert canonical_json(captured["tools"]) == canonical_json(manifest["tools"])
 
 
-def test_complete_tool_classification_is_exactly_twenty_five_typed_plus_three_legacy() -> None:
+def test_complete_tool_classification_is_exactly_twenty_six_typed_plus_three_legacy() -> None:
     typed = frozenset(_TEST_TOOL_NAMES)
 
-    assert len(typed) == 25
+    assert len(typed) == 26
     assert len(_TEST_LEGACY_NAMES) == 3
     assert typed.isdisjoint(_TEST_LEGACY_NAMES)
-    assert len(typed | _TEST_LEGACY_NAMES) == 28
+    assert len(typed | _TEST_LEGACY_NAMES) == 29
 
 
 def test_catalog_rejects_unknown_capability_and_resolver_metadata() -> None:

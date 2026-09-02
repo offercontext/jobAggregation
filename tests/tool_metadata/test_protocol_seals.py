@@ -11,6 +11,7 @@ import pytest
 from offerpilot.ai.tool_runtime.protocol_seals import (
     APPROVED_LEGACY_DETERMINISTIC_BOUNDARY_V1,
     APPROVED_PROVIDER_TOOL_BOUNDARY_V1,
+    APPROVED_PROVIDER_TOOL_BOUNDARY_V2,
     verify_legacy_boundary,
     verify_provider_boundary,
 )
@@ -33,6 +34,15 @@ def _canonical_bytes(value: object) -> bytes:
 
 def _provider_payloads() -> list[dict[str, Any]]:
     value = json.loads(PROVIDER_FIXTURE.read_bytes().decode("utf-8"))
+    return copy.deepcopy(value["tools"])
+
+
+def _current_provider_payloads() -> list[dict[str, Any]]:
+    value = json.loads(
+        (FIXTURES / "tool_pipeline" / "provider_manifest_current.json")
+        .read_bytes()
+        .decode("utf-8")
+    )
     return copy.deepcopy(value["tools"])
 
 
@@ -69,6 +79,16 @@ def test_provider_boundary_seal_is_recomputed_from_full_ordered_baseline_payload
     assert len(payloads) == 25
     assert _provider_digest(payloads) == APPROVED_PROVIDER_TOOL_BOUNDARY_V1
     assert verify_provider_boundary(payloads) is None
+
+
+def test_provider_boundary_seal_covers_the_current_create_offer_surface() -> None:
+    payloads = _current_provider_payloads()
+    assert len(payloads) == 26
+    assert _provider_digest(payloads) == APPROVED_PROVIDER_TOOL_BOUNDARY_V2
+    assert verify_provider_boundary(
+        payloads,
+        expected_digest=APPROVED_PROVIDER_TOOL_BOUNDARY_V2,
+    ) is None
 
 
 def test_legacy_boundary_seal_is_recomputed_from_ordered_baseline_boundary() -> None:

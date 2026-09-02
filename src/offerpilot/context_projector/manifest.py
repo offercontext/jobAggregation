@@ -358,7 +358,7 @@ def validate_surface_manifest_v2(
     if tuple(item["name"] for item in contributors) != CONTRIBUTOR_ORDER:
         raise ManifestV2ValidationError("invalid contributor order")
     tools = manifest["tools"]
-    if type(tools) is not list or len(tools) > 25:
+    if type(tools) is not list or len(tools) > 26:
         raise ManifestV2ValidationError("invalid tools")
     _check_budget(budget_check)
     for item in tools:

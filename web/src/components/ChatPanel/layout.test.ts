@@ -18,6 +18,14 @@ async function loadCss(): Promise<string> {
   return readFileSync(new URL('./ChatPanel.module.css', import.meta.url), 'utf8');
 }
 
+async function loadThemeCss(): Promise<string> {
+  const fsModule = 'node:fs';
+  const { readFileSync } = (await import(fsModule)) as {
+    readFileSync: (path: URL, encoding: string) => string;
+  };
+  return readFileSync(new URL('../../theme/tokens.css', import.meta.url), 'utf8');
+}
+
 describe('ChatPanel docked layout contract', () => {
   it('keeps a new-chat control visible when the docked layout hides the thread rail', () => {
     expect(component).toContain('styles.workspaceDocked');
@@ -50,6 +58,22 @@ describe('ChatPanel docked layout contract', () => {
     expect(css).toContain('.pageExit');
     expect(css).toContain('min-height: 40px;');
     expect(css).toContain('.pageExit:focus-visible');
+  });
+
+  it('gives the immersive workspace a calm inset frame instead of touching viewport edges', async () => {
+    const css = await loadCss();
+    const themeCss = await loadThemeCss();
+
+    expect(themeCss).toMatch(
+      /\.op-pilot-page-host\s*\{[^}]*box-sizing:\s*border-box;[^}]*padding:\s*clamp\(10px, 1vw, 16px\);/s,
+    );
+    expect(css).toMatch(
+      /\.workspacePage\s*\{[^}]*border:\s*1px solid var\(--op-border\);[^}]*border-radius:\s*16px;[^}]*overflow:\s*hidden;/s,
+    );
+    expect(css).toMatch(/\.workspacePage \.header\s*\{[^}]*padding:\s*12px 16px;/s);
+    expect(css).toMatch(/\.workspacePage \.rail\s*\{[^}]*padding:\s*14px 12px 12px;/s);
+    expect(css).toMatch(/\.workspacePage \.context\s*\{[^}]*padding:\s*16px 12px 12px 16px;/s);
+    expect(css).toMatch(/\.workspacePage \.composer\s*\{[^}]*padding:\s*12px 18px 16px;/s);
   });
 
   it('mounts Kanban drop targeting inside the visible rail or drawer surface', () => {

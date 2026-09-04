@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, type Ref } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { ArrowLeftOutlined } from '@ant-design/icons';
 import { Button, DatePicker, Form, Input, InputNumber, Select, Space, message } from 'antd';
@@ -16,6 +16,8 @@ interface ScheduleEventFormProps {
   initialApplication?: Application;
   event?: ScheduleEvent;
   onClose: () => void;
+  headingRef?: Ref<HTMLHeadingElement>;
+  onSuccess?: (event: ScheduleEvent) => void;
 }
 
 interface ScheduleEventFormValues {
@@ -46,6 +48,8 @@ export default function ScheduleEventForm({
   initialApplication,
   event,
   onClose,
+  headingRef,
+  onSuccess,
 }: ScheduleEventFormProps) {
   const [form] = Form.useForm<ScheduleEventFormValues>();
   const queryClient = useQueryClient();
@@ -54,8 +58,9 @@ export default function ScheduleEventForm({
   const mutation = useMutation({
     mutationFn: (input: ScheduleEventInput) =>
       isEdit ? updateEvent(event.id, input) : createEvent(input),
-    onSuccess: () => {
+    onSuccess: (savedEvent) => {
       message.success(isEdit ? '日程已更新' : '日程已创建');
+      onSuccess?.(savedEvent);
       queryClient.invalidateQueries({ queryKey: ['calendar'] });
       queryClient.invalidateQueries({ queryKey: ['events'] });
       form.resetFields();
@@ -128,22 +133,24 @@ export default function ScheduleEventForm({
     <section data-testid="schedule-event-form" aria-label={isEdit ? '编辑日程' : '新建日程'} className={`${workflowStyles.surface} ${workflowStyles.stack}`}>
       <div className={workflowStyles.sectionHeader}>
         <div>
-        <Button
-          type="link"
-          icon={<ArrowLeftOutlined />}
-          onClick={handleClose}
-          style={{ width: 'fit-content', height: 'auto', padding: 0 }}
-        >
-          返回上一层
-        </Button>
-        <h2 style={{ margin: '8px 0 0' }}>{isEdit ? '编辑日程' : '新建日程'}</h2>
+          <Button
+            type="link"
+            icon={<ArrowLeftOutlined />}
+            onClick={handleClose}
+            style={{ width: 'fit-content', height: 'auto', padding: 0 }}
+          >
+            返回上一层
+          </Button>
+          <h2 ref={headingRef} tabIndex={-1} style={{ margin: '8px 0 0' }}>
+            {isEdit ? '编辑日程' : '新建日程'}
+          </h2>
         </div>
-          <Space className={workflowStyles.actionGroup}>
+        <Space className={workflowStyles.actionGroup}>
           <Button onClick={handleClose}>取消</Button>
           <Button type="primary" loading={mutation.isPending} onClick={() => form.submit()}>
             {isEdit ? '保存' : '创建'}
           </Button>
-          </Space>
+        </Space>
       </div>
       <Form form={form} layout="vertical" onFinish={handleFinish} requiredMark={false} className={workflowStyles.section}>
         <Form.Item

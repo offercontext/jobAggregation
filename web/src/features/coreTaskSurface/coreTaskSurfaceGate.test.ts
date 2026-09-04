@@ -80,7 +80,10 @@ const CORE_TASK_OWNER_SURFACES = new Map<string, string>([
   ['web/src/components/OfferNegotiationDrawer.tsx#OfferNegotiationDrawer', 'application.offer_review'],
   ['web/src/features/interviewReadiness/InterviewReadinessCenter.tsx#InterviewReadinessCenter.startQuickPractice', 'interview.free_practice'],
   ['web/src/features/interviewStudio/InterviewStudio.tsx#InterviewStudio', 'interview.free_practice'],
+  // Retain the captured baseline surface so the immutable entrypoint asset
+  // remains auditable, while registering the replacement runtime owner below.
   ['web/src/components/QuestionBankView.tsx#QuestionBankView', 'interview.free_practice'],
+  ['web/src/components/InterviewPracticeView.tsx#InterviewPracticeView', 'interview.free_practice'],
   ['web/src/components/ResumeEditorDrawer.tsx#ResumeEditorDrawer', 'materials.resume'],
   ['web/src/components/InterviewStoryDrawer.tsx#InterviewStoryDrawer', 'materials.story'],
   ['web/src/components/InterviewStoryLibraryView.tsx#InterviewStoryLibraryView.openStory', 'materials.story'],

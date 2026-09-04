@@ -77,11 +77,17 @@ describe('AppShell source contract', () => {
     expect(authorizeInterviewStoryDraftUpdate(committed, null)).toBe(true);
   });
 
-  it('keeps the QuestionBank quick-practice frozen readiness handoff to the single Studio opener', () => {
-    expect(questionBankSource).toContain('fixedMode="quick"');
-    expect(questionBankSource).toContain('onOpenStudio={handleQuickPracticeStudioOpen}');
+  it('keeps quick practice in the dedicated interview-practice surface', () => {
+    expect(questionBankSource).not.toContain('fixedMode="quick"');
+    expect(questionBankSource).not.toContain('onOpenStudio');
     expect(source).toContain('const openQuickPracticeStudio = useCallback((context: QuickPracticeStudioContext) => {');
-    expect(source.match(/onOpenStudio=\{openQuickPracticeStudio\}/g)).toHaveLength(2);
+    expect(source.match(/onOpenStudio=\{openQuickPracticeStudio\}/g)).toHaveLength(1);
+  });
+
+  it('renders free practice in a dedicated interview-practice surface', () => {
+    expect(source).toContain("const InterviewPracticeView = lazy(() => import('@/components/InterviewPracticeView'));");
+    expect(source).toContain('<InterviewPracticeView');
+    expect(source).not.toContain('<QuestionBankView\n               adaptiveFocus=');
   });
 
   it('closes stale application detail when a selected application disappears', () => {
@@ -370,7 +376,7 @@ describe('AppShell source contract', () => {
       source.indexOf('let topBarPrimaryAction'),
       source.indexOf('return (', source.indexOf('let topBarPrimaryAction')),
     );
-    for (const label of ['添加投递', '开始练习', '上传简历', '添加经历']) {
+    for (const label of ['添加投递', '开始面试练习', '开始刷题', '上传简历', '添加经历']) {
       expect(topBarSource).toContain(`label: '${label}'`);
     }
     expect(topBarSource).toContain("? '添加投递' : '录入 Offer'");

@@ -115,13 +115,13 @@ describe('InterviewV01View event and free-practice surface', () => {
     expect(container?.textContent).not.toContain('选择投递');
   });
 
-  it('opens free practice only through the canonical launcher and performs no write on mount', async () => {
+  it('opens interview practice only through the canonical launcher and performs no write on mount', async () => {
     const openFreePractice = vi.fn();
     act(() => root?.render(<InterviewV01View onOpenFreePractice={openFreePractice} />));
     await flush();
     expect(services.createPracticeCase).not.toHaveBeenCalled();
-    act(() => [...(container?.querySelectorAll('[role="tab"]') ?? [])].find((tab) => tab.textContent?.includes('自由练习'))?.dispatchEvent(new MouseEvent('click', { bubbles: true })));
-    const entry = [...(container?.querySelectorAll('button') ?? [])].find((button) => button.textContent?.includes('开始自由练习'));
+    act(() => [...(container?.querySelectorAll('[role="tab"]') ?? [])].find((tab) => tab.textContent?.includes('面试练习'))?.dispatchEvent(new MouseEvent('click', { bubbles: true })));
+    const entry = [...(container?.querySelectorAll('button') ?? [])].find((button) => button.textContent?.includes('开始面试练习'));
     expect(entry).toBeTruthy();
     expect(openFreePractice).not.toHaveBeenCalled();
     act(() => entry?.dispatchEvent(new MouseEvent('click', { bubbles: true })));

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import questionBankSource from '@/components/QuestionBankView.tsx?raw';
+import interviewPracticeSource from '@/components/InterviewPracticeView.tsx?raw';
 
 const readinessCss = readFileSync(join(process.cwd(), 'src/features/reviewReadiness/reviewReadiness.module.css'), 'utf8');
 const adaptiveCss = readFileSync(join(process.cwd(), 'src/components/AdaptiveInterviewPracticeWorkspace.module.css'), 'utf8');
@@ -71,10 +72,13 @@ describe('review readiness responsive and accessibility polish', () => {
     expect(`${readinessCss}\n${adaptiveCss}`).not.toMatch(/transition(?:-property)?:\s*all/);
   });
 
-  it('keeps the three modes inside one free-practice owner component', () => {
-    expect(questionBankSource).toContain("'review_feedback'");
+  it('keeps interview training separate from the question-bank owner', () => {
     expect(questionBankSource).toContain("'question_bank'");
-    expect(questionBankSource).toContain("'quick_practice'");
+    expect(questionBankSource).toContain("'review'");
+    expect(questionBankSource).not.toContain('AdaptiveInterviewPracticeWorkspace');
+    expect(questionBankSource).not.toContain('InterviewReadinessCenter');
+    expect(interviewPracticeSource).toContain('<AdaptiveInterviewPracticeWorkspace');
+    expect(interviewPracticeSource).toContain('<InterviewReadinessCenter');
   });
 
   it('mechanically keeps muted text at AA and focus indicators at 3:1 in both data themes', () => {

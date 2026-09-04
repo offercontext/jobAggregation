@@ -83,8 +83,16 @@ describe('QuestionBankView', () => {
     expect(markup).toContain('删除题目');
   });
 
-  it('keeps the practice path wired to due questions, answer reveal, review ratings, and stats refresh', () => {
-    expect(source).toContain("value: 'quick_practice'");
+  it('keeps the brush page limited to the bank and spaced review', () => {
+    expect(source).toContain("value: 'question_bank'");
+    expect(source).toContain("value: 'review'");
+    expect(source).toContain("label: '今日复习'");
+    expect(source).not.toContain('AdaptiveInterviewPracticeWorkspace');
+    expect(source).not.toContain('InterviewReadinessCenter');
+    expect(source).not.toContain('quick_practice');
+  });
+
+  it('keeps the spaced-review path wired to due questions, answer reveal, review ratings, and stats refresh', () => {
     expect(source).toContain('listDueQuestions(40)');
     expect(source).toContain('getPracticeStats()');
     expect(source).toContain('submitReview(id, rating)');

@@ -4,13 +4,6 @@ import { createRoot, type Root } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('./AdaptiveInterviewPracticeWorkspace', () => ({
-  default: ({ focus }: { focus?: { signalVersionId: number; targetEventId: number } }) => <div
-    data-testid="review-feedback-mode"
-    data-signal-version={focus?.signalVersionId ?? 'ordinary'}
-    data-target-event={focus?.targetEventId ?? 'ordinary'}
-  >复盘训练内容</div>,
-}));
 vi.mock('@/services/questions', () => ({
   listQuestions: vi.fn().mockResolvedValue([]),
   listDueQuestions: vi.fn().mockResolvedValue([]),
@@ -37,38 +30,28 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe('QuestionBankView three-mode free-practice owner', () => {
-  it('interactively keeps review feedback, question bank and quick practice in one owner', async () => {
+describe('QuestionBankView question-bank and spaced-review owner', () => {
+  it('keeps only the bank and today review surfaces', async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     await act(async () => root.render(<QueryClientProvider client={queryClient}><QuestionBankView /></QueryClientProvider>));
     const mode = (label: string) => [...host.querySelectorAll<HTMLElement>('.ant-segmented-item')]
       .find((item) => item.textContent === label);
-    expect(mode('复盘训练')).toBeTruthy();
     expect(mode('题库')).toBeTruthy();
-    expect(mode('快速练习')).toBeTruthy();
-    act(() => mode('复盘训练')?.click());
-    expect(host.querySelector<HTMLElement>('[aria-label="复盘训练模式"]')?.hidden).toBe(false);
-    expect(host.querySelector('[data-testid="review-feedback-mode"]')).not.toBeNull();
-    act(() => mode('快速练习')?.click());
-    expect(host.querySelector<HTMLElement>('[aria-label="快速练习模式"]')?.hidden).toBe(false);
-    expect(host.querySelector<HTMLElement>('[aria-label="复盘训练模式"]')?.hidden).toBe(true);
+    expect(mode('今日复习')).toBeTruthy();
+    expect(mode('复盘训练')).toBeFalsy();
+    expect(mode('快速练习')).toBeFalsy();
+    expect(host.querySelector('[data-testid="interview-readiness-center"]')).toBeNull();
+    expect(host.querySelector('[data-testid="adaptive-practice-workspace"]')).toBeNull();
+
+    act(() => mode('今日复习')?.click());
+    expect(host.querySelector<HTMLElement>('[aria-label="今日复习模式"]')?.hidden).toBe(false);
+    expect(host.querySelector<HTMLElement>('[aria-label="题库模式"]')?.hidden).toBe(true);
   });
 
-  it('clears a consumed exact focus when the mounted owner transitions to ordinary practice', async () => {
+  it('opens today review when the top-level starts a new brushing session', async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const render = (adaptiveFocus?: { ownerGeneration: number; signalVersionId: number; targetEventId: number }) => root.render(
-      <QueryClientProvider client={queryClient}><QuestionBankView adaptiveFocus={adaptiveFocus} adaptiveOwnerGeneration={8} /></QueryClientProvider>,
-    );
-    await act(async () => render({ ownerGeneration: 8, signalVersionId: 91, targetEventId: 103 }));
-    const workspace = () => host.querySelector<HTMLElement>('[data-testid="review-feedback-mode"]');
-    expect(workspace()?.dataset.signalVersion).toBe('91');
-    expect(workspace()?.dataset.targetEvent).toBe('103');
-
-    await act(async () => render(undefined));
-    const mode = [...host.querySelectorAll<HTMLElement>('.ant-segmented-item')]
-      .find((item) => item.textContent === '复盘训练');
-    act(() => mode?.click());
-    expect(workspace()?.dataset.signalVersion).toBe('ordinary');
-    expect(workspace()?.dataset.targetEvent).toBe('ordinary');
+    await act(async () => root.render(<QueryClientProvider client={queryClient}><QuestionBankView practiceRequestToken={1} /></QueryClientProvider>));
+    expect(host.querySelector<HTMLElement>('[aria-label="今日复习模式"]')?.hidden).toBe(false);
+    expect(host.querySelector<HTMLElement>('[aria-label="题库模式"]')?.hidden).toBe(true);
   });
 });

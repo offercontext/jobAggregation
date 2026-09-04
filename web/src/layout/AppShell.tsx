@@ -729,6 +729,7 @@ const CalendarView = lazy(() => import('@/components/CalendarView'));
 const KnowledgeSourcesView = lazy(() => import('@/components/KnowledgeSourcesView'));
 const ExperienceMaterialsView = lazy(() => import('@/components/ExperienceMaterialsView'));
 const QuestionBankView = lazy(() => import('@/components/QuestionBankView'));
+const InterviewPracticeView = lazy(() => import('@/components/InterviewPracticeView'));
 const OfferCenterView = lazy(() => import('@/components/OfferCenterView'));
 const DashboardView = lazy(() => import('@/features/dashboard/DashboardView'));
 const RemindersView = lazy(() => import('@/features/reminders/RemindersView'));
@@ -1131,6 +1132,7 @@ function AppShellContent() {
   const nextChatStartRequestKey = useRef(0);
   const consumedChatStartRequestKeysRef = useRef(new Set<number>());
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [questionPracticeRequestToken, setQuestionPracticeRequestToken] = useState(0);
   const [now, setNow] = useState(() => dayjs());
   const contentRef = useRef<HTMLElement | null>(null);
   const currentViewRef = useRef(view);
@@ -2449,19 +2451,7 @@ function AppShellContent() {
               confirmedCapturesError={confirmedInterviewKnowledgeNotesError}
             />
           )}
-          {view === 'questions' && <QuestionBankView
-            adaptiveFocus={adaptivePracticeFocus}
-            adaptiveOwnerGeneration={adaptivePracticeFocus?.ownerGeneration}
-            adaptivePracticeDrafts={adaptivePracticeDrafts}
-            onAdaptivePracticeDraftChange={updateAdaptivePracticeDraft}
-            onAdaptiveFocusConsumed={() => undefined}
-            quickPracticeResumes={resumesLoading
-              ? { status: 'loading' }
-              : resumesError
-                ? { status: 'error' }
-                : { status: 'ready', value: resumes }}
-            onOpenStudio={openQuickPracticeStudio}
-          />}
+          {view === 'questions' && <QuestionBankView practiceRequestToken={questionPracticeRequestToken} />}
           {view === 'interview' && (voiceCoachingGrowthOpen ? (
             <VoiceCoachingGrowthView
               onBack={() => setVoiceCoachingGrowthOpen(false)}
@@ -2502,7 +2492,7 @@ function AppShellContent() {
               onOpenTask={openExactInterviewTask}
             />
           ) : coreTaskSurfaceState.active?.ref.taskId === 'interview.free_practice' ? (
-            <QuestionBankView
+            <InterviewPracticeView
               adaptiveFocus={adaptivePracticeFocus}
               adaptiveOwnerGeneration={coreTaskSurfaceState.active.generation}
               recoveryOwnerGeneration={coreTaskSurfaceState.active.recoveryGeneration}
@@ -2516,14 +2506,13 @@ function AppShellContent() {
                   taskSurfaceGuardRef.current = guard;
                 }
               }}
-               onAdaptiveFocusConsumed={() => undefined}
-               quickPracticeResumes={resumesLoading
-                 ? { status: 'loading' }
-                 : resumesError
-                   ? { status: 'error' }
-                   : { status: 'ready', value: resumes }}
-               onOpenStudio={openQuickPracticeStudio}
-             />
+              quickPracticeResumes={resumesLoading
+                ? { status: 'loading' }
+                : resumesError
+                  ? { status: 'error' }
+                  : { status: 'ready', value: resumes }}
+              onOpenStudio={openQuickPracticeStudio}
+            />
           ) : (
             <InterviewV01View
               onOpenApplication={goDetailById}
@@ -2547,7 +2536,6 @@ function AppShellContent() {
                 if (reviewNoteId) openInterviewStoryDraft({ entrypoint: 'ui', reviewNoteId });
               }}
               onOpenVoiceCoachingGrowth={openVoiceCoachingGrowth}
-              onOpenQuestionBank={() => navigateToView('questions')}
             />
           ))}
           {view === 'resumes' && (
@@ -2606,9 +2594,15 @@ function AppShellContent() {
       };
     } else if (view === 'interview') {
       topBarPrimaryAction = {
-        label: '开始练习',
+        label: '开始面试练习',
         ariaLabel: '开始面试练习',
         onClick: () => { openFreePractice(); },
+      };
+    } else if (view === 'questions') {
+      topBarPrimaryAction = {
+        label: '开始刷题',
+        ariaLabel: '开始刷题',
+        onClick: () => setQuestionPracticeRequestToken((token) => token + 1),
       };
     } else if (view === 'offers') {
       topBarPrimaryAction = {

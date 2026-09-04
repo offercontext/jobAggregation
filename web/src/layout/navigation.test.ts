@@ -73,6 +73,11 @@ describe('module navigation contract', () => {
     expect(moduleTabsForView('offers')).toEqual([{ view: 'offers', label: 'Offer' }]);
     expect(moduleTabsForView('interview')).toEqual([
       { view: 'interview', label: '面试' },
+      { view: 'questions', label: '刷题' },
+    ]);
+    expect(moduleTabsForView('questions')).toEqual([
+      { view: 'interview', label: '面试' },
+      { view: 'questions', label: '刷题' },
     ]);
     expect(moduleTabsForView('knowledge')).toEqual([
       { view: 'resumes', label: '简历' },

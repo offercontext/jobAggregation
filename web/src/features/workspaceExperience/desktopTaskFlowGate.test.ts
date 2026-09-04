@@ -140,7 +140,7 @@ describe('Desktop Task Flow independent frontend gate', () => {
     const topBarStart = appShell.indexOf('let topBarPrimaryAction');
     const topBarSource = appShell.slice(topBarStart, appShell.indexOf('return (', topBarStart));
 
-    for (const label of ['添加投递', '开始练习', '上传简历', '添加经历']) {
+    for (const label of ['添加投递', '开始面试练习', '开始刷题', '上传简历', '添加经历']) {
       expect(topBarSource).toContain(`label: '${label}'`);
     }
     expect(topBarSource).toContain("? '添加投递' : '录入 Offer'");

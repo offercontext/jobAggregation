@@ -9,5 +9,7 @@ describe('ScheduleEventForm presentation', () => {
     expect(source).toContain('name="scheduled_at"');
     expect(source).toContain('name="duration_minutes"');
     expect(source).toContain('handleFinish');
+    expect(source).toContain('headingRef');
+    expect(source).toContain('onSuccess?.(savedEvent)');
   });
 });

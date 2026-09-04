@@ -3,6 +3,10 @@
   color: var(--op-ink);
 }
 
+.scheduleFormWorkspace {
+  min-width: 0;
+}
+
 .header {
   display: grid;
   gap: 8px;

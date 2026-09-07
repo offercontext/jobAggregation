@@ -12,6 +12,10 @@ from offerpilot.repositories.questions import QuestionCreate, QuestionsRepositor
 from offerpilot.repositories.resumes import ResumeMatchCreate, ResumesRepository
 
 
+class InvalidJSONReply(RuntimeError):
+    """The provider returned a response that violates the requested JSON contract."""
+
+
 @dataclass
 class JDAnalysisResult:
     id: int
@@ -154,19 +158,30 @@ def complete_json(
     user: str,
     *,
     strict_json: bool = False,
+    max_reply_bytes: int | None = None,
 ) -> dict[str, Any]:
     try:
         assistant = model.complete(
             [Message(role="system", content=system), Message(role="user", content=user)],
             [],
         )
+    except Exception as exc:
+        raise RuntimeError(str(exc)) from exc
+    try:
+        if not isinstance(assistant.content, str):
+            raise InvalidJSONReply("AI response content must be text")
+        if max_reply_bytes is not None and len(assistant.content.encode("utf-8")) > max_reply_bytes:
+            raise InvalidJSONReply("AI response exceeds the configured byte limit")
         return parse_json_reply(
             assistant.content,
             allow_fenced=not strict_json,
             reject_non_finite=strict_json,
+            reject_duplicate_keys=strict_json,
         )
+    except InvalidJSONReply:
+        raise
     except Exception as exc:
-        raise RuntimeError(str(exc)) from exc
+        raise InvalidJSONReply(str(exc)) from exc
 
 
 def parse_json_reply(

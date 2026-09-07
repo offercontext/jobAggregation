@@ -47,6 +47,7 @@ from offerpilot.ai.mock_interview import (
     generate_question,
 )
 from offerpilot.ai.opportunity_fit_reviews import OpportunityFitModelError, validate_triage
+from offerpilot.ai.resume_structured_import import generate_structured_fields
 from offerpilot.ai.offer_negotiation import (
     OfferNegotiationModelError,
     generate_offer_negotiation_proposal,
@@ -328,6 +329,12 @@ from offerpilot.repositories.json_contract import canonical_json, sha256_text
 from offerpilot.repositories.questions import QuestionCreate, QuestionsRepository, question_hash
 from offerpilot.repositories.resumes import ResumeCreate, ResumeMatchCreate, ResumesRepository
 from offerpilot.repositories.wakeups import WakeupCreate, WakeupsRepository, wakeup_payload
+from offerpilot.resume_structured_import import (
+    ResumeStructureError,
+    fields_json,
+    require_preview_source,
+    source_fingerprint,
+)
 from offerpilot.onboarding import onboarding_payload
 from offerpilot.schemas import (
     ApplicationOut,
@@ -4730,6 +4737,113 @@ def create_app(
             )
         )
         return JSONResponse(_resume_json(resume), status_code=201)
+
+    @app.post("/api/resumes/{resume_id}/structure-preview")
+    def preview_resume_structure(
+        resume_id: int, payload: Any = Body(default={})
+    ) -> JSONResponse:
+        if not isinstance(payload, dict) or payload:
+            return error_response(
+                422,
+                "分类预览请求不能包含额外字段。",
+                code="resume_structure_invalid_request",
+            )
+        try:
+            resume = resumes.get(resume_id)
+            if resume is None:
+                return error_response(404, "简历不存在。", code="resume_structure_not_found")
+            raw_text = require_preview_source(resume)
+            frozen_fingerprint = source_fingerprint(resume)
+        except ResumeStructureError as exc:
+            return error_response(exc.status_code, exc.message, code=exc.code)
+        except Exception:
+            return error_response(
+                500,
+                "无法安全读取简历分类来源。",
+                code="resume_structure_preview_failed",
+            )
+
+        if chat_model is not None:
+            model = chat_model
+        else:
+            try:
+                # This opt-in preview does not attach provider callbacks: even
+                # safe provider diagnostics do not belong in resume-content logs.
+                model = ConfiguredAIClient(load_config(resolved_data_dir))
+            except Exception:
+                return error_response(
+                    503,
+                    "尚未配置可用的 AI 服务。",
+                    code="resume_structure_ai_not_configured",
+                )
+        try:
+            fields = generate_structured_fields(model, raw_text)
+        except ResumeStructureError as exc:
+            return error_response(exc.status_code, exc.message, code=exc.code)
+        try:
+            current = resumes.get(resume_id)
+            source_changed = (
+                current is None or source_fingerprint(current) != frozen_fingerprint
+            )
+        except Exception:
+            return error_response(
+                500,
+                "无法安全读取简历分类来源。",
+                code="resume_structure_preview_failed",
+            )
+        if source_changed:
+            return error_response(
+                409,
+                "简历原文或内容已变化，请重新分类并核对。",
+                code="resume_structure_source_conflict",
+            )
+        return JSONResponse(
+            {
+                "resume_id": resume.id,
+                "source_fingerprint": frozen_fingerprint,
+                "fields": fields_json(fields),
+            }
+        )
+
+    @app.post("/api/resumes/{resume_id}/structure-confirm")
+    def confirm_resume_structure(
+        resume_id: int, payload: Any = Body(...)
+    ) -> JSONResponse:
+        if not isinstance(payload, dict) or set(payload) != {"source_fingerprint", "fields"}:
+            return error_response(
+                422,
+                "分类确认请求格式无效。",
+                code="resume_structure_invalid_request",
+            )
+        expected = payload.get("source_fingerprint")
+        if not isinstance(expected, str) or re.fullmatch(r"[0-9a-f]{64}", expected) is None:
+            return error_response(
+                422,
+                "分类确认请求格式无效。",
+                code="resume_structure_invalid_request",
+            )
+        try:
+            updated = resumes.merge_structured_import(
+                resume_id,
+                expected,
+                payload.get("fields"),
+            )
+        except ResumeStructureError as exc:
+            return error_response(exc.status_code, exc.message, code=exc.code)
+        except Exception:
+            return error_response(
+                500,
+                "分类结果保存失败，请重新读取简历确认状态。",
+                code="resume_structure_save_failed",
+            )
+        try:
+            return JSONResponse(_resume_json(updated))
+        except Exception:
+            return error_response(
+                500,
+                "分类结果保存失败，请重新读取简历确认状态。",
+                code="resume_structure_save_failed",
+            )
 
     @app.get("/api/resumes/{resume_id}")
     def get_resume(resume_id: int) -> JSONResponse:

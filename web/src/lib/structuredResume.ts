@@ -10,6 +10,7 @@ export interface StructuredResumeDraft {
   projects: ResumeEntry[];
   skills: string[];
   rawText: string;
+  additionalText?: string;
 }
 
 export type StructuredResumeParseResult =
@@ -71,6 +72,7 @@ export function parseStructuredResume(value: unknown): StructuredResumeParseResu
       projects: clone(projects),
       skills: clone(skills),
       rawText: typeof content.raw_text === 'string' ? content.raw_text : '',
+      additionalText: typeof content.additional_text === 'string' ? content.additional_text : undefined,
     },
   };
 }
@@ -92,6 +94,7 @@ export function serializeStructuredResume(original: unknown, draft: StructuredRe
     projects: clone(draft.projects),
     skills: [...draft.skills],
     raw_text: draft.rawText,
+    ...(draft.additionalText !== undefined ? { additional_text: draft.additionalText } : {}),
   };
 }
 

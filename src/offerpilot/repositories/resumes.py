@@ -11,6 +11,15 @@ from sqlalchemy.orm import Session, sessionmaker
 from offerpilot.models import ApplicationJDVersion, Resume, ResumeMatch
 from offerpilot.repositories.application_jd_versions import JDVersionConflictError
 from offerpilot.repositories.session_binding import finish_repository_write, repository_session
+from offerpilot.resume_structured_import import (
+    ResumeStructureError,
+    apply_structured_fields,
+    raw_text_sha256,
+    require_preview_source,
+    resume_content,
+    source_fingerprint,
+    validate_structured_fields,
+)
 
 
 @dataclass
@@ -186,6 +195,47 @@ class ResumesRepository:
                 return None
             resume.file_path = file_path
             resume.source_file_path = file_path
+            session.commit()
+            session.refresh(resume)
+            return resume
+
+    def merge_structured_import(
+        self,
+        resume_id: int,
+        expected_source_fingerprint: str,
+        fields: Any,
+    ) -> Resume:
+        """Atomically revalidate and merge a user-reviewed import preview.
+
+        This method deliberately owns its SQLite transaction.  A caller-bound
+        session could already hold a deferred transaction and would weaken the
+        version check performed under ``BEGIN IMMEDIATE``.
+        """
+
+        if self._session is not None:
+            raise RuntimeError("structured resume import requires an owned session")
+        with self._session_factory() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            resume = session.get(Resume, resume_id)
+            if resume is None or resume.deleted_at is not None:
+                raise ResumeStructureError(
+                    "resume_structure_not_found", "简历不存在。", 404
+                )
+            if source_fingerprint(resume) != expected_source_fingerprint:
+                raise ResumeStructureError(
+                    "resume_structure_source_conflict",
+                    "简历原文或内容已变化，请重新分类并核对。",
+                    409,
+                )
+            raw_text = require_preview_source(resume)
+            validated = validate_structured_fields(fields, raw_text)
+            content = resume_content(resume)
+            merged = apply_structured_fields(content, validated)
+            merged["import_review"] = {
+                "version": 1,
+                "raw_text_sha256": raw_text_sha256(raw_text),
+            }
+            resume.content_json = _compact_json(merged)
             session.commit()
             session.refresh(resume)
             return resume

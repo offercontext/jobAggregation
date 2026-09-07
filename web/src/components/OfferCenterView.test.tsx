@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Offer } from '@/types/offer';
 import type { Application } from '@/types/application';
 import OfferCenterView from './OfferCenterView';
-import { confirmOfferNegotiationProposal, createOfferNegotiationProposal } from '@/services/offers';
+import { confirmOfferNegotiationProposal, createOfferNegotiationProposal, listOfferComparisonValues } from '@/services/offers';
 
 Object.defineProperty(window, 'matchMedia', {
   writable: true,
@@ -129,7 +129,8 @@ describe('OfferCenterView comparison guardrails', () => {
   });
 
   it('preserves the user selection order in comparison columns', async () => {
-    queryState.offers = [offer(1), offer(2)];
+    queryState.offers = [offer(1), offer(2), offer(3)];
+    vi.mocked(listOfferComparisonValues).mockClear();
     host = document.createElement('div');
     document.body.appendChild(host);
     root = createRoot(host);
@@ -138,6 +139,12 @@ describe('OfferCenterView comparison guardrails', () => {
     await act(async () => { host?.querySelector<HTMLButtonElement>('[data-testid="select-1"]')?.click(); });
     await act(async () => { [...(host?.querySelectorAll('button') ?? [])].find((button) => button.textContent?.includes('开始比较'))?.click(); });
     expect(host?.querySelector('[data-testid="compare-offers"]')?.textContent).toContain('2,1');
+    const settings = host?.querySelector('details');
+    expect(settings).not.toBeNull();
+    expect(settings?.open).toBe(false);
+    const comparison = host?.querySelector('[data-testid="compare-offers"]');
+    expect(comparison!.compareDocumentPosition(settings!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(vi.mocked(listOfferComparisonValues).mock.calls.map(([id]) => id)).toEqual([2, 1]);
   });
 
   it('closes comparison before handing negotiation to the canonical owner', async () => {

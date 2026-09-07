@@ -4948,9 +4948,7 @@ def create_app(
                     "app_id": item.event.application_id,
                     "event_id": event_id,
                     "event_type": item.event.event_type,
-                    "scheduled_at": scheduled_at.astimezone(timezone.utc)
-                    .isoformat()
-                    .replace("+00:00", "Z"),
+                    "scheduled_at": _format_rfc3339(scheduled_at),
                     "duration_minutes": duration_minutes(item.event.duration_minutes),
                     "location": item.event.location,
                     "editable": True,

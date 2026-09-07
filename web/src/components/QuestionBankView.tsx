@@ -91,7 +91,7 @@ export default function QuestionBankView({
       <div className={styles.header}>
         <div>
           <h1 className={styles.title}>题库刷题</h1>
-          <p className={styles.subtitle}>基于你的知识库与面试复盘生成题目，管理题库，按间隔复习巩固面试知识</p>
+          <p className={styles.subtitle}>基于已记录的面试问题生成题目，管理题库，按间隔复习巩固面试知识</p>
         </div>
         <Segmented
           value={tab}
@@ -236,7 +236,7 @@ function BankTab() {
               className="op-ai-btn"
               onClick={() => setGenerateOpen(true)}
             >
-              从知识库生成你的第一批题目
+              从面试复盘生成题目，或手动添加
             </Button>
           )}
         </Empty>
@@ -321,7 +321,7 @@ function BankTab() {
 
 function GenerateDrawer({ open, onClose }: { open: boolean; onClose: () => void }) {
   const qc = useQueryClient();
-  const [source, setSource] = useState<'knowledge' | 'notes'>('knowledge');
+  const [source, setSource] = useState<'knowledge' | 'notes'>('notes');
   const [count, setCount] = useState(8);
 
   const genMutation = useMutation({
@@ -365,7 +365,7 @@ function GenerateDrawer({ open, onClose }: { open: boolean; onClose: () => void 
             value={source}
             onChange={(v) => setSource(v as 'knowledge' | 'notes')}
             options={[
-              { label: '知识库', value: 'knowledge' },
+              { label: '参考资料（暂未开放）', value: 'knowledge', disabled: true },
               { label: '面试复盘真题', value: 'notes' },
             ]}
           />
@@ -373,13 +373,13 @@ function GenerateDrawer({ open, onClose }: { open: boolean; onClose: () => void 
 
         {source === 'knowledge' && (
           <Paragraph type="secondary" style={{ margin: 0 }}>
-            将从知识库文档中提炼题目。
+            参考资料出题暂未开放，可选择面试复盘或手动添加题目。
           </Paragraph>
         )}
 
         {source === 'notes' && (
           <Paragraph type="secondary" style={{ margin: 0 }}>
-            将从你已记录的面试复盘（面试问题 + 薄弱点）中提炼题目。
+            将从已记录的面试问题中提炼题目。参考资料出题暂未开放，可先手动添加题目。
           </Paragraph>
         )}
 

@@ -4015,6 +4015,7 @@ class InterviewStoriesRepository:
             "content_hash": version.content_hash,
             "source_fingerprint": version.source_fingerprint,
             "origin_kind": version.origin_kind,
+            "confirmed_at": version.confirmed_at.isoformat() if version.confirmed_at else None,
             "evidence_links": [
                 {
                     "target_kind": link.target_kind,

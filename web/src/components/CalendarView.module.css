@@ -1,5 +1,6 @@
 .wrap {
-  background: #fff;
+  background: var(--op-surface);
+  color: var(--op-ink);
   border-radius: 12px;
   padding: 16px;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
@@ -52,7 +53,7 @@
 .weekCell {
   text-align: center;
   padding: 6px 0;
-  color: #64748b;
+  color: var(--op-muted-strong);
   font-size: 13px;
   font-weight: 600;
 }
@@ -65,7 +66,7 @@
 
 .cell {
   min-height: 112px;
-  border: 1px solid #f1f5f9;
+  border: 1px solid var(--op-border);
   border-radius: 8px;
   padding: 6px 8px;
   cursor: default;
@@ -80,17 +81,17 @@
 }
 
 .cellActive:hover {
-  background: #f8fafc;
-  border-color: #cbd5e1;
+  background: var(--surface-hover);
+  border-color: var(--op-muted);
 }
 
 .cellMuted {
-  background: #fbfbfb;
-  color: #cbd5e1;
+  background: var(--surface-sunken);
+  color: var(--op-muted);
 }
 
 .cellMuted .dateNum {
-  color: #cbd5e1;
+  color: var(--op-muted);
 }
 
 .cellToday {
@@ -100,12 +101,12 @@
 .dateNum {
   font-size: 14px;
   font-weight: 600;
-  color: #0f172a;
+  color: var(--op-ink);
   line-height: 20px;
 }
 
 .cellMuted .dateNum {
-  color: #cbd5e1;
+  color: var(--op-muted);
 }
 
 .dots {
@@ -128,10 +129,10 @@
   width: 100%;
   height: 20px;
   padding: 0 6px;
-  border: 1px solid #dbeafe;
+  border: 1px solid var(--op-border-strong);
   border-radius: 6px;
-  background: #eff6ff;
-  color: #1d4ed8;
+  background: var(--surface-hover);
+  color: var(--op-primary-strong);
   font-size: 12px;
   line-height: 18px;
   overflow: hidden;
@@ -159,13 +160,13 @@
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: #2563eb;
+  background: var(--op-primary-strong);
   display: inline-block;
 }
 
 .count {
   font-size: 11px;
-  color: #64748b;
+  color: var(--op-muted-strong);
   margin-left: 2px;
 }
 
@@ -176,8 +177,8 @@
   height: 18px;
   padding: 0 6px;
   border-radius: 999px;
-  background: #f1f5f9;
-  color: #64748b;
+  background: var(--op-border);
+  color: var(--op-muted-strong);
   font-size: 11px;
   line-height: 18px;
 }
@@ -187,7 +188,7 @@
   align-items: center;
   margin-top: 12px;
   font-size: 13px;
-  color: #64748b;
+  color: var(--op-muted-strong);
 }
 
 .legendDot {
@@ -197,13 +198,13 @@
 
 .entryItem {
   padding: 10px 0;
-  border-bottom: 1px solid #f0f0f0;
+  border-bottom: 1px solid var(--op-border);
   cursor: pointer;
   min-width: 0;
 }
 
 .entryItem:hover {
-  background: #f8fafc;
+  background: var(--surface-hover);
 }
 
 .entryItemStatic {
@@ -211,8 +212,8 @@
 }
 
 .entryItemFocused {
-  background: #eff6ff;
-  box-shadow: inset 3px 0 0 #2563eb;
+  background: var(--surface-hover);
+  box-shadow: inset 3px 0 0 var(--op-primary-strong);
 }
 
 .entryHeader {
@@ -233,7 +234,7 @@
 
 .entryTime {
   flex: 0 0 auto;
-  color: #2563eb;
+  color: var(--op-primary-strong);
   font-size: 12px;
   font-weight: 600;
   line-height: 22px;
@@ -262,13 +263,13 @@
 .entrySubtitle,
 .entryLocation {
   margin-top: 4px;
-  color: #64748b;
+  color: var(--op-muted-strong);
   font-size: 13px;
   overflow-wrap: anywhere;
 }
 
 .entryLocation {
-  color: #475569;
+  color: var(--op-muted-strong);
 }
 
 @media (max-width: 720px) {

@@ -62,11 +62,11 @@ describe('QuestionBankView', () => {
     const markup = renderWithQuestions([]);
 
     expect(markup).toContain('题库刷题');
-    expect(markup).toContain('基于你的知识库与面试复盘生成题目');
+    expect(markup).toContain('基于已记录的面试问题生成题目');
     expect(markup).toContain('AI 生成题目');
     expect(markup).toContain('手动添加');
     expect(markup).toContain('题库还是空的');
-    expect(markup).toContain('从知识库生成你的第一批题目');
+    expect(markup).toContain('从面试复盘生成题目，或手动添加');
   });
 
   it('renders generated questions with filters, status, difficulty, and edit/delete controls', () => {
@@ -104,10 +104,11 @@ describe('QuestionBankView', () => {
     expect(source).toContain("invalidateQueries({ queryKey: ['questions'] })");
   });
 
-  it('keeps AI generation connected to knowledge and interview-review sources', () => {
+  it('does not offer unsupported knowledge generation as executable', () => {
     expect(source).toContain('generateQuestions');
     expect(source).toContain("source,");
-    expect(source).toContain("label: '知识库'");
+    expect(source).toContain("label: '参考资料（暂未开放）', value: 'knowledge', disabled: true");
+    expect(source).toContain("useState<'knowledge' | 'notes'>('notes')");
     expect(source).toContain("label: '面试复盘真题'");
     expect(source).toContain('已存在的题目会自动去重');
   });

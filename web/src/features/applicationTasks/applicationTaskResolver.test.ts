@@ -37,6 +37,16 @@ function event(overrides: Record<string, unknown> = {}) {
 }
 
 describe('resolveApplicationTasks', () => {
+  it('allows deliberate preparation beyond 24h without blocking a completed event review', () => {
+    const result = resolveApplicationTasks(base({ events: ready([
+      event({ scheduledAtTimestamp: NOW + 48 * 60 * 60_000 }),
+      event({ eventId: 4, lifecycle: 'completed', bucket: 'completed', primaryAction: 'record_review' }),
+    ]) }), NOW);
+    expect(result.tasks.find((task) => task.ref.eventId === 3)?.executable).toBe(true);
+    expect(result.tasks.find((task) => task.ref.eventId === 4)?.executable).toBe(true);
+    expect(result.primaryTask?.ref.eventId).toBe(4);
+    expect(result.issues).toEqual([]);
+  });
   it.each([
     ['pending', 'application.opportunity_fit'],
     ['applied', 'application.material_kit'],
@@ -269,7 +279,7 @@ describe('resolveApplicationTasks', () => {
     expect(result.tasks.some((task) => task.ref.eventId !== undefined && task.taskId === 'application.general_review')).toBe(false);
   });
 
-  it('requires the canonical upcoming/action contract and 24 hour window', () => {
+  it('rejects malformed upcoming event contracts without promoting lower-priority work', () => {
     const invalid = resolveApplicationTasks(base({ events: ready([
       event({ durationMinutes: 0 }), event({ eventId: 4, scheduledAtTimestamp: Number.NaN }),
       event({ eventId: 5, primaryAction: 'none' }), event({ eventId: 6, bucket: 'unavailable' }),

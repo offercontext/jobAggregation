@@ -763,6 +763,8 @@ export default function KnowledgeSourcesView() {
             hits={searchHits.filter((hit) => externalSourceIds.has(hit.source_id))}
             unavailable={searchResponseUnavailable}
             onPick={(sourceId, evidenceId) => {
+              // Search can outlive the detail cache populated during extraction.
+              void queryClient.invalidateQueries({ queryKey: ['knowledge', 'source', sourceId] });
               setSelectedSourceId(sourceId);
               setHighlightEvidenceId(evidenceId);
             }}
@@ -970,6 +972,19 @@ function SourceDetailContent({
     queryKey: ['knowledge', 'source', sourceId, 'content'],
     queryFn: () => fetchKnowledgeSourceContent(sourceId),
   });
+  const extractionStatus = safeRead(sourceQuery.data, 'extraction_status');
+  const snapshotId = safeRead(sourceQuery.data, 'active_snapshot_id');
+  const previousExtraction = useRef<{ sourceId: number; status: unknown; snapshotId: unknown } | null>(null);
+  useEffect(() => {
+    if (!sourceQuery.data) return;
+    const previous = previousExtraction.current;
+    previousExtraction.current = { sourceId, status: extractionStatus, snapshotId };
+    if (previous?.sourceId === sourceId && extractionStatus === 'extracted'
+      && (previous.status !== extractionStatus || previous.snapshotId !== snapshotId)) {
+      void queryClient.invalidateQueries({ queryKey: ['knowledge', 'source', sourceId, 'evidence'] });
+      void queryClient.invalidateQueries({ queryKey: ['knowledge', 'source', sourceId, 'content'] });
+    }
+  }, [sourceId, extractionStatus, snapshotId, sourceQuery.data, queryClient]);
   // KV1-02：V1 不展示 Brief UI，briefQuery 在 V1 不启用（不发请求、不轮询）；
   // SHOW_BRIEF_UI 恢复 true 时自动启用 fetch 与 brief_status 轮询。
   const briefQuery = useQuery({
@@ -2092,12 +2107,12 @@ function EvidenceBlock({
 }) {
   const highlightRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    if (!highlightEvidenceId) return;
+    if (!highlightEvidenceId || loading || !highlightRef.current) return;
     if (highlightRef.current) {
       highlightRef.current.scrollIntoView({ behavior: 'auto', block: 'center' });
     }
     onHighlightConsumed();
-  }, [highlightEvidenceId, onHighlightConsumed]);
+  }, [highlightEvidenceId, loading, evidence, onHighlightConsumed]);
   if (loading) {
     return <Spin />;
   }

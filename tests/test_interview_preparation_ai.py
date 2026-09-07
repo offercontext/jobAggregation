@@ -266,6 +266,29 @@ def test_v2_prompt_uses_bounded_untrusted_feedback_without_internal_ids() -> Non
     assert "selection_fingerprint" not in prompt
 
 
+def test_v2_prompt_spells_out_all_canonical_evidence_paths() -> None:
+    from offerpilot.ai.interview_preparation_proposals import (
+        _repair_prompt_v2,
+        _system_prompt_v2,
+    )
+
+    system = _system_prompt_v2()
+    repair = _repair_prompt_v2("excerpt_mismatch")
+    for prompt in (system, repair):
+        assert "/jd/text" in prompt
+        assert "/raw_text" in prompt
+        assert "/experience/0/highlights/0" in prompt
+        assert "/knowledge_evidence/001" in prompt
+        assert "/readiness_feedback/0/statement" in prompt
+        assert "/readiness_feedback/0/evidence/0/excerpt" in prompt
+        assert "规范 JSON Pointer" in prompt
+        assert "完整冻结 excerpt" in prompt
+        assert "user_note" in prompt
+        assert "每个数组最多 8 条" in prompt
+        assert "每条最多 1000 个字符" in prompt
+        assert "每条最多 5 个引用" in prompt
+
+
 def test_v1_schema_prompt_and_validator_remain_closed_to_readiness_v2() -> None:
     from offerpilot.ai.interview_preparation_proposals import (
         INTERVIEW_PREPARATION_JSON_SCHEMA,
@@ -469,8 +492,87 @@ def test_generate_repairs_once_with_machine_failure_category() -> None:
 
     assert result == _proposal()
     assert model.calls == 2
-    assert "missing_evidence_ref" in model.messages[1][-1].content
-    assert "Built reliable API services" not in model.messages[1][-1].content
+    assert [message.role for message in model.messages[1]] == ["system", "user", "user"]
+    assert model.messages[1][0].content == model.messages[0][0].content
+    assert model.messages[1][1].content.encode("utf-8") == model.messages[0][1].content.encode(
+        "utf-8"
+    )
+    repair = model.messages[1][-1].content
+    assert "missing_evidence_ref" in repair
+    assert "Built reliable API services" not in repair
+
+
+def test_v2_stateless_repair_reuses_frozen_input_without_invalid_output() -> None:
+    from offerpilot.ai.interview_preparation_proposals import (
+        INTERVIEW_PREPARATION_V2_RESPONSE_FORMAT,
+        _repair_prompt_v2,
+        generate_interview_preparation_proposal_v2,
+    )
+
+    invalid = _proposal()
+    invalid["preparation_directions"][0]["evidence_refs"][0]["excerpt"] = (  # type: ignore[index]
+        "invalid assistant excerpt"
+    )
+
+    class StatelessRepairModel:
+        supports_json_schema = True
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.messages: list[list[object]] = []
+            self.response_formats: list[object] = []
+
+        def complete(self, messages, tools, response_format=None):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            self.messages.append(messages)
+            self.response_formats.append(response_format)
+            if self.calls == 1:
+                payload = invalid
+            else:
+                current_input = "\n".join(message.content for message in messages)
+                payload = (
+                    _proposal()
+                    if "Build reliable APIs with Python and SQL." in current_input
+                    and "Built reliable API services" in current_input
+                    else safe_empty_interview_preparation_proposal()
+                )
+            return Assistant(content=json.dumps(payload, ensure_ascii=False))
+
+    model = StatelessRepairModel()
+
+    result = generate_interview_preparation_proposal_v2(model, _v2_snapshot())
+
+    assert result == _proposal()
+    assert model.calls == 2
+    assert [message.role for message in model.messages[1]] == ["system", "user", "user"]
+    assert model.messages[1][0].content == model.messages[0][0].content
+    assert model.messages[1][1].content.encode("utf-8") == model.messages[0][1].content.encode(
+        "utf-8"
+    )
+    repair = model.messages[1][2].content
+    assert repair == _repair_prompt_v2("excerpt_mismatch")
+    assert "Build reliable APIs with Python and SQL." not in repair
+    assert "Built reliable API services" not in repair
+    assert "invalid assistant excerpt" not in repair
+    assert all(message.role != "assistant" for message in model.messages[1])
+    assert model.response_formats == [
+        INTERVIEW_PREPARATION_V2_RESPONSE_FORMAT,
+        INTERVIEW_PREPARATION_V2_RESPONSE_FORMAT,
+    ]
+
+
+def test_v2_provider_failure_is_called_once_and_not_repaired() -> None:
+    from offerpilot.ai.interview_preparation_proposals import (
+        generate_interview_preparation_proposal_v2,
+    )
+
+    model = FakeModel([], error=TimeoutError("private provider detail"))
+
+    with pytest.raises(InterviewPreparationModelError) as exc_info:
+        generate_interview_preparation_proposal_v2(model, _v2_snapshot())
+
+    assert model.calls == 1
+    assert exc_info.value.failure_category == "provider_error"
 
 
 def test_provider_failure_is_called_once_and_not_repaired() -> None:
@@ -625,7 +727,7 @@ def test_invalid_item_shape_prompt_repeats_fixed_json_contract() -> None:
 
     initial_system = model.messages[0][0].content
     initial_user = model.messages[0][1].content
-    repair_user = model.messages[1][1].content
+    repair_user = model.messages[1][-1].content
     for prompt in (initial_system, initial_user, repair_user):
         assert "The top-level JSON object must have exactly these five keys" in prompt
         assert "preparation_directions, story_prompts, review_points, interviewer_questions, items_to_clarify" in prompt

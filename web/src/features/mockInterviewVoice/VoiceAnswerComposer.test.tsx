@@ -136,6 +136,90 @@ afterEach(async () => {
 });
 
 describe('VoiceAnswerComposer', () => {
+  it('keeps text mode free of native voice probes across rerenders', async () => {
+    const { browser, SpeechRecognition, rerender } = await renderComposer();
+
+    expect(SpeechRecognition.available).not.toHaveBeenCalled();
+    expect(SpeechRecognition.install).not.toHaveBeenCalled();
+    expect(browser.getUserMedia).not.toHaveBeenCalled();
+
+    await rerender({ question: '请说明一次你如何推进跨团队协作。' });
+
+    expect(SpeechRecognition.available).not.toHaveBeenCalled();
+    expect(SpeechRecognition.install).not.toHaveBeenCalled();
+    expect(browser.getUserMedia).not.toHaveBeenCalled();
+  });
+
+  it('probes local speech once for each transition into voice mode', async () => {
+    const { SpeechRecognition } = await renderComposer();
+
+    await act(async () => { click('语音回答'); await Promise.resolve(); });
+    expect(SpeechRecognition.available).toHaveBeenCalledTimes(1);
+
+    await act(async () => { click('语音回答'); await Promise.resolve(); });
+    expect(SpeechRecognition.available).toHaveBeenCalledTimes(1);
+
+    click('文字回答');
+    await act(async () => { click('语音回答'); await Promise.resolve(); });
+    expect(SpeechRecognition.available).toHaveBeenCalledTimes(2);
+  });
+
+  it('discards a local speech probe that completes after returning to text mode', async () => {
+    const fixture = browserFixture();
+    let resolveFirst!: (state: unknown) => void;
+    let resolveSecond!: (state: unknown) => void;
+    vi.mocked(fixture.SpeechRecognition.available).mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve; }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveSecond = resolve; }));
+    await renderComposer({ browser: fixture.browser });
+
+    click('语音回答');
+    click('文字回答');
+    await act(async () => {
+      resolveFirst('downloadable');
+      await Promise.resolve();
+    });
+
+    click('语音回答');
+    await act(async () => { click('开始录音'); await Promise.resolve(); });
+    await act(async () => { click('完成录音'); await vi.runAllTimersAsync(); });
+
+    expect(host!.textContent).toContain('本机转写不可用');
+    expect(host!.textContent).not.toContain('下载中文本机语言包');
+
+    await act(async () => {
+      resolveSecond('downloadable');
+      await Promise.resolve();
+    });
+
+    expect(host!.textContent).toContain('下载中文本机语言包');
+  });
+
+  it('ignores a speech probe that completes after unmount', async () => {
+    const fixture = browserFixture();
+    let resolveProbe!: (state: unknown) => void;
+    vi.mocked(fixture.SpeechRecognition.available).mockImplementationOnce(
+      () => new Promise((resolve) => { resolveProbe = resolve; }),
+    );
+    const { props } = await renderComposer({ browser: fixture.browser });
+    click('语音回答');
+    expect(fixture.SpeechRecognition.available).toHaveBeenCalledTimes(1);
+    await act(async () => { root!.unmount(); });
+    root = undefined;
+    vi.mocked(props.onActivityChange!).mockClear();
+    vi.mocked(props.onDirtyChange!).mockClear();
+
+    await act(async () => {
+      resolveProbe('downloadable');
+      await Promise.resolve();
+    });
+
+    expect(host!.childElementCount).toBe(0);
+    expect(props.onActivityChange).not.toHaveBeenCalled();
+    expect(props.onDirtyChange).not.toHaveBeenCalled();
+    expect(fixture.SpeechRecognition.install).not.toHaveBeenCalled();
+    expect(fixture.browser.getUserMedia).not.toHaveBeenCalled();
+  });
+
   it('reads the question aloud and cancels speech on unmount', async () => {
     const { browser, props } = await renderComposer();
     click('朗读题目');
@@ -270,6 +354,7 @@ describe('VoiceAnswerComposer', () => {
   it('uses local-only recognition and confirms editable transcript explicitly', async () => {
     const { recognition, props } = await renderComposer({}, { local: true });
     click('语音回答');
+    await act(async () => { await Promise.resolve(); });
     await act(async () => { click('开始录音'); });
     expect(recognition.processLocally).toBe(true);
     expect(recognition.start).toHaveBeenCalled();
@@ -329,7 +414,10 @@ describe('VoiceAnswerComposer', () => {
     const decodeAudio = vi.fn(async () => new Float32Array([0.1]));
     const { recognition } = await renderComposer({ offlineController, decodeAudio }, { local: true });
     click('语音回答');
+    await act(async () => { await Promise.resolve(); });
     await act(async () => { click('开始录音'); });
+    expect(recognition.start).toHaveBeenCalledOnce();
+    expect(recognition.onresult).not.toBeNull();
     await act(async () => {
       recognition.onresult?.({ resultIndex: 0, results: [{ isFinal: true, 0: { transcript: '原生本地文字' } }] });
       click('完成录音');
@@ -458,6 +546,7 @@ describe('VoiceAnswerComposer', () => {
   it('cleans tracks, object URLs and local recognition on unmount', async () => {
     const { browser, recognition, track } = await renderComposer({}, { local: true });
     click('语音回答');
+    await act(async () => { await Promise.resolve(); });
     await act(async () => { click('开始录音'); });
     await act(async () => { click('完成录音'); });
     await act(async () => { root!.unmount(); root = undefined; });
@@ -492,11 +581,15 @@ describe('VoiceAnswerComposer', () => {
   it('fences late native recognition results after re-recording starts', async () => {
     const { recognition } = await renderComposer({}, { local: true });
     click('语音回答');
+    await act(async () => { await Promise.resolve(); });
     await act(async () => { click('开始录音'); });
+    expect(recognition.start).toHaveBeenCalledOnce();
+    expect(recognition.onresult).not.toBeNull();
     const lateResult = recognition.onresult;
     await act(async () => { click('完成录音'); await vi.runAllTimersAsync(); });
     await act(async () => { click('重录'); });
     await act(async () => { click('开始录音'); });
+    expect(recognition.start).toHaveBeenCalledTimes(2);
 
     await act(async () => {
       lateResult?.({ resultIndex: 0, results: [{ isFinal: true, 0: { transcript: '旧一轮迟到文字' } }] });

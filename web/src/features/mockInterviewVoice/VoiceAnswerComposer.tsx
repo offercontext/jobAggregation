@@ -353,12 +353,13 @@ export default function VoiceAnswerComposer({
   }, [cleanupRef]);
 
   useEffect(() => {
+    if (mode !== 'voice') return;
     let active = true;
     void queryLocalSpeechLanguage(browser.SpeechRecognition, 'zh-CN').then((state) => {
       if (active) setLocalLanguageState(state);
     });
     return () => { active = false; };
-  }, [browser]);
+  }, [browser, mode]);
 
   useEffect(() => {
     if (submitRevision > 0) resetVoiceDraft();

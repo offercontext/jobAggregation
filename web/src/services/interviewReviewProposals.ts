@@ -78,6 +78,7 @@ export async function createInterviewReviewProposal(
     const { data } = await http.post<InterviewReviewProposal>(
       `/notes/${noteID}/interview-review-proposals`,
       { idempotency_key: idempotencyKey },
+      { timeout: 130000 },
     );
     return data;
   } catch (error) {

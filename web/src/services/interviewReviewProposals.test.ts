@@ -1,35 +1,76 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import axios, { type AxiosAdapter, type InternalAxiosRequestConfig } from 'axios';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { apiGet, apiPost, createApiClient } = vi.hoisted(() => ({
-  apiGet: vi.fn(),
-  apiPost: vi.fn(),
+const { adapter, createApiClient } = vi.hoisted(() => ({
+  adapter: vi.fn<AxiosAdapter>(),
   createApiClient: vi.fn(),
 }));
 
+const client = axios.create({ adapter, baseURL: '/api', timeout: 10000 });
 vi.mock('./http', () => ({ createApiClient }));
-createApiClient.mockReturnValue({ get: apiGet, post: apiPost });
+createApiClient.mockReturnValue(client);
 
 const { createInterviewReviewProposal, listInterviewReviewProposals } = await import(
   './interviewReviewProposals'
 );
 
+function response(config: InternalAxiosRequestConfig, data: unknown) {
+  return { config, data, headers: {}, status: 200, statusText: 'OK' };
+}
+
 beforeEach(() => {
-  apiGet.mockReset();
-  apiPost.mockReset();
+  adapter.mockReset();
+});
+
+afterEach(() => {
+  vi.useRealTimers();
 });
 
 describe('interview review proposal service', () => {
-  it('uses the proposal API contract', async () => {
-    apiPost.mockResolvedValue({ data: { id: 3 } });
-    apiGet.mockResolvedValue({ data: [] });
+  it('allows an 11-second proposal response through the 130-second Axios request window', async () => {
+    vi.useFakeTimers();
+    adapter.mockImplementation(
+      (config) =>
+        new Promise((resolve) => {
+          setTimeout(() => resolve(response(config, { id: 3 })), 11000);
+        }),
+    );
 
-    await expect(createInterviewReviewProposal(7, 'attempt-1')).resolves.toEqual({ id: 3 });
+    let settled = false;
+    const proposal = createInterviewReviewProposal(7, 'attempt-1').then((value) => {
+      settled = true;
+      return value;
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(createApiClient).toHaveBeenCalledTimes(1);
+    expect(createApiClient).toHaveBeenCalledWith({ baseURL: '/api', timeout: 10000 });
+    expect(adapter).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: 'post',
+        timeout: 130000,
+        url: '/notes/7/interview-review-proposals',
+      }),
+    );
+    expect(settled).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(11000);
+    await expect(proposal).resolves.toEqual({ id: 3 });
+    expect(adapter).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps proposal reads on the 10-second Axios client default', async () => {
+    adapter.mockImplementation(async (config) => response(config, []));
+
     await expect(listInterviewReviewProposals(7)).resolves.toEqual([]);
 
-    expect(apiPost).toHaveBeenCalledWith('/notes/7/interview-review-proposals', {
-      idempotency_key: 'attempt-1',
-    });
-    expect(apiGet).toHaveBeenCalledWith('/notes/7/interview-review-proposals');
+    expect(adapter).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: 'get',
+        timeout: 10000,
+        url: '/notes/7/interview-review-proposals',
+      }),
+    );
   });
 
   it.each([
@@ -39,7 +80,7 @@ describe('interview review proposal service', () => {
     ['interview_review_provider_error', 'AI 服务暂不可用，请稍后重试。'],
     ['interview_review_unverifiable', 'AI 建议未通过证据校验，原复盘未受影响，请重试。'],
   ])('maps %s without exposing server text', async (code, message) => {
-    apiPost.mockRejectedValue({
+    adapter.mockRejectedValue({
       response: { status: 502, data: { error_code: code, error: 'secret server detail' } },
       message: 'Axios secret',
     });
@@ -49,7 +90,7 @@ describe('interview review proposal service', () => {
   });
 
   it('uses a neutral fallback for unknown failures', async () => {
-    apiPost.mockRejectedValue(new Error('raw internal error'));
+    adapter.mockRejectedValue(new Error('raw internal error'));
 
     await expect(createInterviewReviewProposal(7, 'attempt-1')).rejects.toMatchObject({
       message: '复盘建议暂时不可用，请稍后重试。',
@@ -57,7 +98,7 @@ describe('interview review proposal service', () => {
   });
 
   it('keeps a bare 502 distinguishable as an unknown result', async () => {
-    apiPost.mockRejectedValue({
+    adapter.mockRejectedValue({
       response: { status: 502, data: { error: 'provider detail' } },
       message: 'Axios provider detail',
     });
@@ -66,5 +107,18 @@ describe('interview review proposal service', () => {
 
     expect(error).toMatchObject({ message: 'AI 服务暂不可用，请稍后重试。' });
     expect(error).toMatchObject({ code: undefined });
+  });
+
+  it('keeps the original idempotency key and does not retry a failed creation', async () => {
+    adapter.mockRejectedValue({ response: { status: 502, data: {} } });
+
+    await expect(createInterviewReviewProposal(7, 'original-key')).rejects.toMatchObject({
+      message: 'AI 服务暂不可用，请稍后重试。',
+    });
+
+    expect(adapter).toHaveBeenCalledTimes(1);
+    const request = adapter.mock.calls[0]?.[0];
+    expect(request).toMatchObject({ method: 'post', timeout: 130000 });
+    expect(JSON.parse(request?.data as string)).toEqual({ idempotency_key: 'original-key' });
   });
 });

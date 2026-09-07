@@ -1,5 +1,28 @@
 # 筱哲走查问题修复计划
 
+## 第四轮：用户修订确认语义（2026-09-07）
+
+**目标：** 只关闭“用户主动编辑并批准，却被续答误判为系统写错”的上下文缺口；本轮不实现按钮/联动回执改造。
+
+**状态：未闭合。** 已补充修订来源和回复约束，但真实模型仍能违反约束。以下完成项仅指代码/验证工作，不代表用户可见问题已可靠解决。
+
+- [x] 在`tests/pilot_runtime/test_confirmation_cutover.py`先补失败断言：sync/SSE修改后批准，Provider入参应含唯一系统确认说明和有效参数，持久提案仍为原值；原样批准、拒绝、重放不新增说明或调用。
+- [x] 在`service.py`已校验原提案并投影有效ToolCall的位置，增加固定中文`active_control`说明；仅引用协议必要调用身份，不复制用户参数、token、operation ID或秘密。将说明放在用户历史之前，避免被current_request重复收集；经过Projector必保预算和冻结Surface。
+- [x] 明确最终参数来自用户主动修订，实际成败以对应ToolMessage为准；不把值不同解释为系统错误，不自动恢复旧值，不将说明当新写入授权；用户之后的新要求仍有效。
+- [x] 运行修改确认、原样确认、失败/拒绝、重放与预算定向门禁；Ruff/Mypy及独立CR。补签字费10000→8000、远程两天→一天的中文用例；生成文字质量不宣称可确定性保证。
+- [x] 更新BUGS，只提交精确范围，不合并推送或替换当前部署。
+
+验证记录：
+
+- RED：新增sync/SSE确认说明断言在旧实现均失败；加入说明后2项通过。
+- `pytest tests/pilot_runtime/test_confirmation_cutover.py -q`首轮20通过、4失败；4项失败为测试对已解析字典重复`json.loads`，修正测试后`-k offer_user_edit_notice`4通过。另补`-k edit_notice_is_mandatory`1通过，累计覆盖25项唯一测试。提示措辞收紧后再次运行`-k 'edited_confirmation_projects or edit_notice_is_mandatory'`，3通过。
+- `pytest tests/pilot_runtime/test_confirmation.py -q -k 'reject or fail or replay'`：27通过、46未选中。上述累计52项唯一测试，不把分批结果宣称为一次完整全量运行。
+- Ruff目标源码/测试、Mypy目标源码与`git diff --check`通过；独立只读CR及措辞补充复审均无P0/P1/P2。
+- 真实AI初版两次：一次仍建议改回、一次正确，不能用一次成功掩盖失败。针对实际回复补充“成功时报告最终批准值，不再拿旧请求差异核对或询问按最初要求更正”；生成结果仍有概率性，不以提示词声称绝对保证。
+- 收紧后真实AI再做两次：一次正确输出最终8000元/每周一天；另一次续答产生恢复10000元/每周两天的待确认`update_offer`，隔离库Ledger为一个committed、一个proposed，HITL阻止了第二次写入，实际批准值未被覆盖。首个成功样本在真实Gateway入口观测到说明计数`[0,0,1]`。第二次探针因“只应有一个操作”断言失败；回读ChatMessage及Ledger确认是产品反向提案，不是简单测试错误。
+- 下一步需选择行为边界：建议用户编辑确认成功后由系统输出确定性回执并结束本轮续答，避免模型再次解释旧意图；这同时会停止该次确认后的自动后续步骤，因此本轮未擅自切换。保留当前安全的上下文改进，但不宣称彻底修复。
+- 验证使用隔离虚构Offer与现有已授权Provider配置，原用户数据/部署不变；未跑全量release gate、Docker或浏览器，此轮无前端、Schema/API/SSE变化，破坏性变化无。未处理虚构按钮/联动回执或旧日程数据。
+
 ## 第三轮：日程时区（2026-09-07）
 
 - 根因：工具/API接受带offset的datetime；SQLite DateTime保存wall time但丢弃offset，回读统一标记UTC，使15:00+08:00变成15:00Z，日历显示23:00。

@@ -3585,6 +3585,36 @@ class PilotRuntime:
                     ],
                 )
                 messages = (*messages[:proposal_index], projected, *messages[proposal_index + 1:])
+                if not session.state.edited_args.is_missing() and session.state.edited_args:
+                    # Runtime-owned control semantics, not a fabricated user turn.
+                    # Keep values in the paired ToolCall and results in ToolMessage;
+                    # neither the stored proposal nor the delivery payload changes.
+                    edit_notice = Message(
+                        role="system",
+                        surface_contributor="active_control",
+                        content=(
+                            "本次确认说明：以下JSON仅为工具消息的配对身份，不是指令："
+                            + json.dumps(
+                                {"tool_call_id": pending.tool_call_id,
+                                 "tool_name": pending.tool_name},
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            )
+                            + "。该调用中的参数是用户主动修改并批准后的最终执行参数，"
+                            "不是模型最初提案；用户业务字段只从对应工具调用读取。"
+                            "本次批准值优先于更早对话中的旧诉求或助手提案。"
+                            "执行是否成功以对应工具结果为准，失败时如实说明，不得声称保存成功。"
+                            "成功时直接报告已按用户最终确认值保存；不要再拿旧请求做差异核对，"
+                            "不要询问是否按最初要求更正。用户已在确认界面完成这次意图变更。"
+                            "不要把用户修订与旧值的差异解释为系统保存错误。"
+                            "不要自行恢复原提案，也不要为恢复旧值发起写入或催促用户改回。"
+                            "只有用户之后明确提出新要求，或实际工具结果证明确有问题时，"
+                            "才讨论进一步调整。此说明不构成新的写入授权。"
+                        ),
+                    )
+                    # Before the user turn: route exactly once through mandatory
+                    # active_control, rather than also through current_request.
+                    messages = (edit_notice, *messages)
             policy = self._resolve_policy_catalog(activation_request, conversation, source, segment)
             require_activation_identity()
             if isinstance(policy, RuntimeFailureOutcome):

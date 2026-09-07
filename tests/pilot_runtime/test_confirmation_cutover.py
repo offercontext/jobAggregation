@@ -140,6 +140,15 @@ def test_edited_confirmation_projects_effective_call_but_preserves_proposal(tmp_
         calls = [call for message in model.calls[1][0] for call in message.tool_calls if call.id == origin.id]
         assert len(calls) == 1
         assert json.loads(calls[0].args) == {"id": 1, "status": "offer"}
+        notices = [message for message in model.calls[1][0]
+                   if message.role == "system" and "用户主动修改并批准" in message.content]
+        assert len(notices) == 1
+        assert origin.id in notices[0].content
+        assert "不要自行恢复原提案" in notices[0].content
+        assert "以对应工具结果为准" in notices[0].content
+        assert "不要再拿旧请求做差异核对" in notices[0].content
+        assert pending['pending_action']['confirmation_token'] not in notices[0].content
+        assert not any("用户主动修改并批准" in message.content for message in model.calls[0][0])
         assert client.get('/api/applications/1').json()['status'] == 'offer'
         with session_factory_for_data_dir(tmp_path)() as session:
             stored = session.scalars(select(ChatMessage).where(ChatMessage.conversation_id == pending['conversation_id'], ChatMessage.role == 'assistant')).all()
@@ -148,6 +157,8 @@ def test_edited_confirmation_projects_effective_call_but_preserves_proposal(tmp_
             operations = session.scalars(select(WriteOperation)).all()
             assert len(operations) == 1
             assert operations[0].status == 'committed'
+            all_messages = session.scalars(select(ChatMessage)).all()
+            assert not any("用户主动修改并批准" in message.content for message in all_messages)
 
 
 @pytest.mark.parametrize("endpoint", ("/api/chat/confirm", "/api/chat/confirm/stream"))
@@ -169,6 +180,118 @@ def test_confirmation_explicit_null_edited_args_remains_422(
 
     assert response.status_code == 422
     assert "edited_args must be a JSON object" in response.text
+
+
+@pytest.mark.parametrize("endpoint", ("/api/chat/confirm", "/api/chat/confirm/stream"))
+@pytest.mark.parametrize(
+    ("field", "proposed", "approved"),
+    [("signing_bonus", 10000, 8000), ("perks", "每周远程办公两天", "每周远程办公一天")],
+)
+def test_offer_user_edit_notice_is_transient_and_replay_does_not_reexecute(
+    tmp_path, endpoint, field, proposed, approved,
+):
+    origin = ToolCall("offer-user-edit", "update_offer", json.dumps({"id": 1, field: proposed}))
+    model = _CutoverModel(origin)
+    with TestClient(create_app(data_dir=tmp_path, chat_model=model)) as client:
+        application = _application(client, "筱哲的远帆科技")
+        offer = client.post("/api/offers", json={
+            "application_id": application["id"], "company_name": "远帆科技",
+            "position_name": "AI工程师", "base_monthly": 24000, "months_per_year": 16,
+        })
+        assert offer.status_code == 201
+        assert offer.json()["id"] == 1
+        pending = _propose(client)
+        response = _confirm(client, endpoint, pending, edited_args={field: approved})
+        assert response.status_code == 200
+        assert len(model.calls) == 2
+        messages = model.calls[1][0]
+        notices = [m for m in messages if m.role == "system" and "用户主动修改并批准" in m.content]
+        assert len(notices) == 1
+        assert str(proposed) not in notices[0].content
+        assert str(approved) not in notices[0].content
+        assert "不构成新的写入授权" in notices[0].content
+        effective = [c for m in messages for c in m.tool_calls if c.id == origin.id]
+        assert len(effective) == 1
+        assert json.loads(effective[0].args)[field] == approved
+        assert client.get("/api/offers/1").json()[field] == approved
+        replay = client.post(endpoint, json={
+            "conversation_id": pending["conversation_id"],
+            "operation_id": pending["pending_action"]["operation_id"],
+            "confirmation_token": pending["pending_action"]["confirmation_token"],
+            "approved": True, "edited_args": {field: approved},
+        })
+        assert replay.status_code == 200
+        assert len(model.calls) == 2
+        with session_factory_for_data_dir(tmp_path)() as session:
+            operations = list(session.scalars(select(WriteOperation)))
+            assert len(operations) == 1
+            assert operations[0].status == "committed"
+            stored = list(session.scalars(select(ChatMessage)))
+            assert not any("用户主动修改并批准" in m.content for m in stored)
+            persisted = [c for m in stored if m.tool_calls for c in json.loads(m.tool_calls)]
+            original = next(c for c in persisted if c["id"] == origin.id)
+            assert original["args"][field] == proposed
+
+
+@pytest.mark.parametrize("edits", [None, {}, {"status": "interview"}])
+def test_unchanged_confirmation_does_not_claim_user_changed_values(tmp_path, edits):
+    model = _CutoverModel(ToolCall("unchanged", "update_application_status", '{"id":1,"status":"interview"}'))
+    with TestClient(create_app(data_dir=tmp_path, chat_model=model)) as client:
+        _application(client, "筱哲原样确认")
+        pending = _propose(client)
+        response = _confirm(client, "/api/chat/confirm", pending, edited_args=edits)
+        assert response.status_code == 200
+        assert len(model.calls) == 2
+        assert not any("用户主动修改并批准" in m.content for m in model.calls[1][0])
+
+
+def test_edit_notice_is_mandatory_budgeted_without_reexecuting_committed_write(tmp_path, monkeypatch):
+    from offerpilot.ai.tool_runtime.contracts import materialize_provider_payloads
+    from offerpilot.context_projector import budget
+    from offerpilot.context_projector.contracts import ProjectionError, canonical_json
+    from offerpilot.context_projector.projector import ModelSurfaceProjector
+
+    original_project = ModelSurfaceProjector.project
+    blocked = []
+
+    def project(self, request):
+        notices = [m for c in request.contributors if c.name == "active_control"
+                   for m in c.messages if "用户主动修改并批准" in m.content]
+        if not notices:
+            return original_project(self, request)
+        assert len(notices) == 1
+        without = replace(request, contributors=tuple(
+            replace(c, messages=tuple(m for m in c.messages if m not in notices))
+            if c.name == "active_control" else c for c in request.contributors
+        ))
+        mandatory = tuple(m for c in without.contributors
+                          if c.name in {"static_policy", "active_control", "current_request"}
+                          for m in c.messages)
+        cap = len(budget.canonical_messages(mandatory)) + len(canonical_json(
+            materialize_provider_payloads(request.selection.provider_contracts)
+        )) + 64
+        with monkeypatch.context() as context:
+            context.setattr(budget, "PRODUCT_INPUT_CAP", cap)
+            original_project(self, without)  # Without the notice, the same input fits.
+            with pytest.raises(ProjectionError) as failure:
+                original_project(self, request)
+            assert failure.value.code == "mandatory_surface_over_budget"
+        blocked.append(True)
+        raise failure.value
+
+    model = _CutoverModel(ToolCall("budget-edit", "update_application_status", '{"id":1,"status":"interview"}'))
+    monkeypatch.setattr(ModelSurfaceProjector, "project", project)
+    with TestClient(create_app(data_dir=tmp_path, chat_model=model)) as client:
+        _application(client, "筱哲预算验证")
+        pending = _propose(client)
+        response = _confirm(client, "/api/chat/confirm", pending, edited_args={"status": "offer"})
+        assert response.status_code == 200
+        assert blocked == [True]
+        assert len(model.calls) == 1  # No continuation Provider call, no projection fallback.
+        assert client.get("/api/applications/1").json()["status"] == "offer"
+        with session_factory_for_data_dir(tmp_path)() as session:
+            operations = list(session.scalars(select(WriteOperation)))
+            assert len(operations) == 1 and operations[0].status == "committed"
 
 
 def _sse_events(raw: str) -> list[tuple[str, dict[str, Any]]]:

@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { Alert, Button, Modal, Form, Input, InputNumber, Select, App as AntApp } from 'antd';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import type { Application } from '@/types/application';
@@ -25,9 +25,14 @@ export default function AddOfferForm({ open, onClose, applications, editing, req
   const { message: toast } = AntApp.useApp();
   const qc = useQueryClient();
   const historicalReadOnly = Boolean(editing && listOfferBindingState(editing) === 'unbound');
+  const autoFilledApplicationFields = useRef<{
+    company_name?: string;
+    position_name?: string;
+  }>({});
 
   useEffect(() => {
     if (open) {
+      autoFilledApplicationFields.current = {};
       if (editing) {
         form.setFieldsValue({ ...editing, application_id: editing.application_id });
       } else {
@@ -41,6 +46,23 @@ export default function AddOfferForm({ open, onClose, applications, editing, req
     value: application.id,
     label: `#${application.id} ${application.company_name} - ${application.position_name}`,
   }));
+
+  const handleApplicationChange = (applicationId?: number) => {
+    if (editing || applicationId === undefined) return;
+    const application = applications.find((item) => item.id === applicationId);
+    if (!application) return;
+
+    const patch: Partial<Pick<OfferInput, 'company_name' | 'position_name'>> = {};
+    const current = form.getFieldsValue(['company_name', 'position_name']);
+    (['company_name', 'position_name'] as const).forEach((field) => {
+      const currentValue = current[field];
+      if (!currentValue?.trim() || currentValue === autoFilledApplicationFields.current[field]) {
+        patch[field] = application[field];
+        autoFilledApplicationFields.current[field] = application[field];
+      }
+    });
+    form.setFieldsValue(patch);
+  };
   const editingApplicationId = editing?.application_id;
   if (
     editing
@@ -125,6 +147,7 @@ export default function AddOfferForm({ open, onClose, applications, editing, req
             allowClear={!editing}
             placeholder="选择投递记录"
             options={applicationOptions}
+            onChange={handleApplicationChange}
           />
         </Form.Item>
         <Form.Item name="status" label="状态">

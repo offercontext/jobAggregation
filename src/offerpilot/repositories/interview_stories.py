@@ -673,6 +673,9 @@ def materialize_selected_sources(
             raise StoryValidationError("source selection is duplicated")
         selection_identities.add(selection_identity)
         if kind == "resume_version":
+            pointer = _resume_content_pointer(path)
+            if pointer == "/import_review" or pointer.startswith("/import_review/"):
+                raise StoryValidationError("resume source path is internal metadata")
             sources.append(_materialize_resume(session, source_id, path))
         elif kind == "interview_note":
             sources.append(_materialize_note(session, source_id, path))
@@ -858,6 +861,10 @@ def _resume_string_leaves(value: Any, pointer: str = "/content_json") -> list[tu
     if isinstance(value, dict):
         leaves: list[tuple[str, str]] = []
         for key in sorted(value):
+            # Import bookkeeping is not a claim about the applicant. Keep
+            # arbitrary user content (including hash-related skills) eligible.
+            if pointer == "/content_json" and key == "import_review":
+                continue
             if isinstance(key, str):
                 leaves.extend(_resume_string_leaves(value[key], f"{pointer}/{_escape_json_pointer_token(key)}"))
         return leaves

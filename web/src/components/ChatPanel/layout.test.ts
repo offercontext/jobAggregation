@@ -579,6 +579,8 @@ describe('ChatPanel docked layout contract', () => {
     expect(component).toContain('lastUndo');
     expect(component).toContain('undoLastWrite');
     expect(component).toContain('撤销最近一次 AI 写入');
+    expect(component).toContain("confirmError || '保存失败'");
+    expect(component).toContain('当前记录已被修改，无法安全撤销。现有内容已保留。');
   });
 
   it('keeps the context evidence panel fully localized for Chinese users', () => {

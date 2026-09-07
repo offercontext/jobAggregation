@@ -11,6 +11,7 @@ if (!HTMLElement.prototype.scrollIntoView) HTMLElement.prototype.scrollIntoView 
 
 const chatState = vi.hoisted(() => ({
   streamChat: vi.fn(),
+  undoLastWrite: vi.fn(),
   getConversation: vi.fn().mockResolvedValue([]),
   getOffer: vi.fn().mockResolvedValue({ id: 17, application_id: 42 }),
   attachments: [] as Array<{ kind: 'application' | 'offer' | 'resume'; id: string; label: string }>,
@@ -26,7 +27,7 @@ vi.mock('@/services/chat', () => ({
   getConversation: chatState.getConversation,
   deleteConversation: vi.fn(),
   updateConversation: vi.fn(),
-  undoLastWrite: vi.fn(),
+  undoLastWrite: chatState.undoLastWrite,
 }));
 vi.mock('@/services/offers', () => ({ getOffer: chatState.getOffer }));
 vi.mock('@/services/onboarding', () => ({ ONBOARDING_QUERY_KEY: ['onboarding'] }));
@@ -76,6 +77,7 @@ let container: HTMLDivElement | undefined;
 
 afterEach(() => {
   chatState.streamChat.mockReset();
+  chatState.undoLastWrite.mockReset();
   chatState.getConversation.mockClear();
   chatState.getOffer.mockClear();
   chatState.attachments = [];
@@ -169,6 +171,23 @@ describe('deterministic Pilot JD confirmation card', () => {
     expect(container.querySelector<HTMLTextAreaElement>('[data-testid="mock-pilot-composer"]')?.value)
       .toBe('我想继续讨论这份 Offer 的谈薪策略。');
     expect(chatState.streamChat).not.toHaveBeenCalled();
+  });
+
+  it('shows the server undo conflict and preserves the existing undo owner without retrying', async () => {
+    chatState.streamChat.mockResolvedValue({ type: 'message', conversation_id: 501, message: '保存成功', undo: { parent_operation_id: 'operation-1' } });
+    chatState.undoLastWrite.mockRejectedValue({ response: { data: { error_code: 'undo_conflict', error: 'internal detail' } } });
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+    await act(async () => root?.render(<AntApp><ChatPanel open variant="page" onClose={vi.fn()} startRequest={{ requestKey: 95, context_type: 'application', context_ref: '42', context_label: '筱哲的投递', mode: 'general', composerDraft: '保存筱哲的记录' }} /></AntApp>));
+    await act(async () => container?.querySelector<HTMLButtonElement>('[data-testid="mock-pilot-send"]')?.click());
+    const undoButton = Array.from(container.querySelectorAll('button')).find((button) => button.textContent?.includes('撤销最近一次 AI 写入'));
+    expect(undoButton).toBeDefined();
+    await act(async () => undoButton?.click());
+    expect(container.textContent).toContain('当前记录已被修改，无法安全撤销。现有内容已保留。');
+    expect(container.textContent).not.toContain('internal detail');
+    expect(container.textContent).toContain('撤销最近一次 AI 写入');
+    expect(chatState.undoLastWrite).toHaveBeenCalledTimes(1);
   });
 
   it('sends the clicked Offer attachment instead of an ambient Offer from the same application', async () => {

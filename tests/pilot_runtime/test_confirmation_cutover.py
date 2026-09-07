@@ -126,6 +126,31 @@ def _confirm(
 
 
 @pytest.mark.parametrize("endpoint", ("/api/chat/confirm", "/api/chat/confirm/stream"))
+def test_edited_confirmation_projects_effective_call_but_preserves_proposal(tmp_path, endpoint):
+    origin = ToolCall("edited-origin", "update_application_status", '{"id":1,"status":"interview"}')
+    model = _CutoverModel(origin)
+    app = create_app(data_dir=tmp_path, chat_model=model)
+    with TestClient(app) as client:
+        application = _application(client, "筱哲的面试示例")
+        assert application["id"] == 1
+        pending = _propose(client)
+        response = _confirm(client, endpoint, pending, edited_args={"status": "offer"})
+        assert response.status_code == 200
+        assert len(model.calls) == 2
+        calls = [call for message in model.calls[1][0] for call in message.tool_calls if call.id == origin.id]
+        assert len(calls) == 1
+        assert json.loads(calls[0].args) == {"id": 1, "status": "offer"}
+        assert client.get('/api/applications/1').json()['status'] == 'offer'
+        with session_factory_for_data_dir(tmp_path)() as session:
+            stored = session.scalars(select(ChatMessage).where(ChatMessage.conversation_id == pending['conversation_id'], ChatMessage.role == 'assistant')).all()
+            proposals = [json.loads(message.tool_calls) for message in stored if message.tool_calls]
+            assert any('interview' in json.dumps(calls) for calls in proposals)
+            operations = session.scalars(select(WriteOperation)).all()
+            assert len(operations) == 1
+            assert operations[0].status == 'committed'
+
+
+@pytest.mark.parametrize("endpoint", ("/api/chat/confirm", "/api/chat/confirm/stream"))
 def test_confirmation_explicit_null_edited_args_remains_422(
     tmp_path: Any,
     endpoint: str,

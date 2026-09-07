@@ -22,6 +22,7 @@ from offerpilot.repositories.interview_stories import (
     InterviewStoriesRepository,
     StoryConflictError,
     StoryValidationError,
+    _revalidate_persisted_source,
     canonical_story_content,
     derive_story_source_states,
     materialize_selected_sources,
@@ -56,6 +57,34 @@ def test_canonical_story_content_assigns_stable_target_ids_to_duplicate_text() -
         "capability_002",
     ]
     assert content["blocks"][2]["fact_mode"] == "user_view"
+
+
+def test_resume_import_metadata_is_not_a_story_source(tmp_path) -> None:
+    factory = init_database(tmp_path / "story.db")
+    try:
+        with factory() as session:
+            resume = Resume(name="筱哲", content_json=json.dumps({
+                "skills": ["SHA-256 数据完整性校验"],
+                "import_review": {"version": 1, "raw_text_sha256": "a" * 64},
+            }))
+            session.add(resume)
+            session.commit()
+            resume_id = resume.id
+        leaves = InterviewStoriesRepository(factory).list_source_candidates()["resumes"][0]["leaves"]
+        assert [leaf["path"] for leaf in leaves] == ["/content_json/skills/0"]
+        with factory() as session:
+            historical = InterviewStoryVersionEvidenceLink(
+                source_kind="resume_version", source_stable_id=str(resume_id),
+                source_path="/content_json/import_review/raw_text_sha256",
+            )
+            assert _revalidate_persisted_source(session, historical)["excerpt"] == "a" * 64
+            with pytest.raises(StoryValidationError, match="path"):
+                materialize_selected_sources(session, [{
+                    "source_kind": "resume_version", "source_id": resume_id,
+                    "path": "/content_json/import_review/raw_text_sha256",
+                }], [])
+    finally:
+        factory.kw["bind"].dispose()
 
 
 @pytest.mark.parametrize(

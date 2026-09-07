@@ -507,6 +507,29 @@ function msg(patch: Partial<ChatMessage> & Pick<ChatMessage, 'role'>): ChatMessa
 }
 
 describe('buildTurns evidence normalization', () => {
+  it('uses the correct status domain in Offer and application task summaries', () => {
+    for (const [name, expected] of [['create_offer', '待处理'], ['update_offer', '待处理'], ['update_application_status', '待投递']]) {
+      const turns = buildTurns([
+        msg({ role: 'user', content: '更新状态' }),
+        msg({ role: 'assistant', tool_calls: JSON.stringify([{ id: 'status-write', name, args: { status: 'pending' } }]) }),
+      ]);
+      expect(turns.flatMap((turn) => turn.steps ?? [])[0].detail).toBe(expected);
+    }
+  });
+
+  it('uses Offer status labels without confusing pending with an unsent application', () => {
+    for (const [status, label] of Object.entries({ pending: '待处理', negotiating: '谈判中', accepted: '已接受', declined: '已拒绝', expired: '已过期' })) {
+      const turns = buildTurns([
+        msg({ role: 'user', content: '查看 Offer' }),
+        msg({ role: 'assistant', tool_calls: JSON.stringify([{ id: 'offer-read', name: 'list_offers', args: {} }]) }),
+        msg({ role: 'tool', tool_call_id: 'offer-read', content: JSON.stringify([{ id: 2, company_name: '远帆科技', position_name: '工程师', total_cash: 400000, status }]) }),
+      ]);
+      const evidence = collectEvidence(turns);
+      expect(evidence[0].meta).toContain(label);
+      expect(evidence[0].meta).not.toContain('待投递');
+    }
+  });
+
   it('has localized metadata for resume match read tools', () => {
     const meta = toolMeta('list_resume_matches');
 

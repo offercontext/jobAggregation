@@ -1153,7 +1153,12 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
         const preparationTask = applicationTaskResolution.tasks.find(
           (task) => task.taskId === 'application.interview_prepare' && task.ref.eventId === eventId,
         );
-        if (!preparationTask?.executable) return <div role="status">该面试当前不可准备，请先确认日程状态。</div>;
+        if (!preparationTask?.executable) {
+          if (resumesLoading || eventsQuery.isLoading || eventsQuery.isFetching || notesQuery.isLoading || notesQuery.isFetching) {
+            return <div role="status">正在核对面试资料，请稍候。</div>;
+          }
+          return <div role="status">该面试当前不可准备，请先确认日程状态。</div>;
+        }
         const lockedSelection = interviewPreparationSelection
           && interviewPreparationSelection.generation === active.generation
           && interviewPreparationSelection.applicationId === application.id
@@ -1175,6 +1180,9 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
           ? interviewPreparationSelection
           : null;
         if (taskController && !lockedSelection) {
+          if (resumesLoading) {
+            return <div role="status">正在核对面试资料，请稍候。</div>;
+          }
           return <div role="status">请先在面试准备中心选择一份可用简历。</div>;
         }
         const preparationKey = `${application.id}:${eventId}`;
@@ -1214,7 +1222,12 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
           const reviewTask = applicationTaskResolution.tasks.find(
             (task) => task.taskId === 'application.interview_review' && task.ref.eventId === eventId,
           );
-          if (!reviewTask?.executable) return <div role="status">该面试当前不可复盘，请先确认日程状态。</div>;
+          if (!reviewTask?.executable) {
+            if (eventsQuery.isLoading || eventsQuery.isFetching || notesQuery.isLoading || notesQuery.isFetching) {
+              return <div role="status">正在核对面试资料，请稍候。</div>;
+            }
+            return <div role="status">该面试当前不可复盘，请先确认日程状态。</div>;
+          }
         }
         const note = eventId === undefined
           ? noteRecords.find((item) => item.application_event_id === null)
@@ -2050,10 +2063,12 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
               <div key={event.id} style={{ border: '1px solid #e2e8f0', borderRadius: 8, padding: 12 }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
                   <Text strong>{EVENT_TYPE_LABELS[event.event_type]}</Text>
-                  <Text type="secondary">{dayjs(event.scheduled_at).format('YYYY-MM-DD HH:mm')}</Text>
+                  <Text type="secondary">{formatWorkspaceDate(event.scheduled_at, '时间待确认')}</Text>
                 </div>
                 <div style={{ color: '#64748b', fontSize: 13, marginTop: 4 }}>
-                  时长 {event.duration_minutes} 分钟{event.location ? ` · ${event.location}` : ''}{terminalEvent ? ` · ${eventStatusLabel(event.status)}` : ''}
+                  {Number.isFinite(event.duration_minutes) && event.duration_minutes > 0
+                    ? `时长 ${event.duration_minutes} 分钟`
+                    : '时长未设置'}{event.location ? ` · ${event.location}` : ''}{terminalEvent ? ` · ${eventStatusLabel(event.status)}` : ''}
                 </div>
                 {event.event_type === 'interview' && terminalEvent ? (
                   <Text type="secondary">该面试已结束或取消，暂不提供准备与复盘操作。</Text>

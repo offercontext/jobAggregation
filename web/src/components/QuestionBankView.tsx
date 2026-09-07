@@ -150,6 +150,7 @@ function BankTab() {
     onSuccess: () => {
       message.success('已删除');
       qc.invalidateQueries({ queryKey: ['questions'] });
+      qc.invalidateQueries({ queryKey: ['questions-due'] });
     },
     onError: () => message.error('删除失败'),
   });
@@ -439,6 +440,7 @@ function QuestionFormModal({
     onSuccess: () => {
       message.success(isEdit ? '已保存' : '已添加');
       qc.invalidateQueries({ queryKey: ['questions'] });
+      qc.invalidateQueries({ queryKey: ['questions-due'] });
       onClose();
     },
     onError: () => message.error('保存失败'),

@@ -1354,6 +1354,7 @@ function ChatPanelView({
     const requestLease = beginActiveRequest('undo', convID);
     if (!requestLease) return;
     const visibleRequestGeneration = ++visibleRequestGenerationRef.current;
+    setConfirmError(null);
     setConfirmPhase('saving');
     try {
       const resp = await undoLastWrite(
@@ -1371,7 +1372,10 @@ function ChatPanelView({
     } catch (e: any) {
       if (!isCurrentVisibleRequest(visibleRequestGeneration)) return;
       if (isAbortError(e)) return;
-      const error = e?.response?.data?.error ?? '撤销失败';
+      const error = e?.response?.data?.error_code === 'undo_conflict'
+        ? '当前记录已被修改，无法安全撤销。现有内容已保留。'
+        : '撤销未完成，请刷新对话核对结果后再操作。';
+      setConfirmError(error);
       setConfirmPhase('error');
       toast.error(error);
     } finally {
@@ -1715,7 +1719,7 @@ function ChatPanelView({
                   {confirmPhase === 'saving'
                     ? '正在保存'
                     : confirmPhase === 'error'
-                      ? '保存失败'
+                      ? confirmError || '保存失败'
                       : confirmPhase === 'success'
                         ? '保存成功'
                         : '最近一次 AI 写入可撤销'}

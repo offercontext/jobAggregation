@@ -2730,7 +2730,11 @@ def test_delivery_race_has_one_active_owner_call() -> None:
     assert persistence.calls == 1
 
 
-def test_timeout_after_terminal_preserves_authoritative_undo_payload() -> None:
+@pytest.mark.parametrize("terminal_undo, expected_undo", [
+    ('{"kind":"delete_application","id":1}', {"kind": "delete_application", "id": 1}),
+    (None, {}),
+])
+def test_timeout_after_terminal_preserves_authoritative_undo_payload(terminal_undo, expected_undo) -> None:
     operations = _Operations(status="proposed")
     pending = PendingAction("call-1", "create_application", "{}", "create", operations.operation_id)
     persistence = _Persistence(pending)
@@ -2751,7 +2755,7 @@ def test_timeout_after_terminal_preserves_authoritative_undo_payload() -> None:
                 result_json='{"id":1}',
                 visible_result="created",
                 transport_json="{}",
-                undo_json='{"kind":"delete_application","id":1}',
+                undo_json=terminal_undo,
                 failure_category=None,
                 failure_code=None,
                 digest="sha256:undo",
@@ -2793,7 +2797,20 @@ def test_timeout_after_terminal_preserves_authoritative_undo_payload() -> None:
 
     assert getattr(fallback, "status", None) is PersistenceStatus.PERSISTED
     assert session.state.succeeded is True
-    assert captured[0]["undo"] == {"kind": "delete_application", "id": 1}
+    assert captured[0]["undo"] == expected_undo
+
+
+def test_successful_write_without_undo_clears_previous_undo_owner() -> None:
+    operations = _Operations(status="proposed")
+    pending = PendingAction("call-1", "create_application", "{}", "create", operations.operation_id)
+    coordinator = ConfirmationCoordinator(_deps(_Persistence(pending), operations, _WriteCoordinator()))
+    state = SimpleNamespace(
+        lock=RLock(), active=True, cancelled=False, claim_id="claimed",
+        terminal_execution=SimpleNamespace(payload=SimpleNamespace(status="committed", undo_json=None)),
+        undo=None, undo_update=None,
+    )
+    coordinator.record_result(cast(Any, state), pending, True, Message(role="tool", content="saved"), None)
+    assert state.undo_update == {}
 
 
 def test_timeout_during_executor_late_terminal_fallback_clears_once() -> None:

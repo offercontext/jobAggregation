@@ -13,7 +13,7 @@ import inspect
 import json
 from hashlib import sha256
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from math import isfinite
@@ -3563,6 +3563,28 @@ class PilotRuntime:
                 raise WriteOperationError("operation_integrity_error")
             elif proposal_matches[0][0] >= origin_indices[0]:
                 raise WriteOperationError("operation_integrity_error")
+            effective = session.state.effective_pending
+            effective_args = _canonical_tool_args(effective.args)
+            if (
+                effective.tool_call_id != pending.tool_call_id
+                or effective.tool_name != pending.tool_name
+                or effective_args is None
+            ):
+                raise WriteOperationError("operation_integrity_error")
+            if session.state.approved and effective_args != expected_args:
+                # Validate the stored proposal above, then project the approved
+                # call for this continuation only. Never rewrite audit history.
+                proposal_index = proposal_matches[0][0]
+                proposal_message = messages[proposal_index]
+                projected = replace(
+                    proposal_message,
+                    tool_calls=[
+                        replace(call, args=effective_args)
+                        if call.id == pending.tool_call_id else call
+                        for call in proposal_message.tool_calls
+                    ],
+                )
+                messages = (*messages[:proposal_index], projected, *messages[proposal_index + 1:])
             policy = self._resolve_policy_catalog(activation_request, conversation, source, segment)
             require_activation_identity()
             if isinstance(policy, RuntimeFailureOutcome):

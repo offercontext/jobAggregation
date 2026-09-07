@@ -17,6 +17,7 @@ const state = vi.hoisted(() => ({
   notes: [] as unknown[],
   queryErrors: new Set<string>(),
   queryLoading: new Set<string>(),
+  queryFetching: new Set<string>(),
   refetch: vi.fn(),
 }));
 
@@ -51,6 +52,7 @@ vi.mock('@tanstack/react-query', () => ({
               ? []
               : null,
     isLoading: state.queryLoading.has(String(options.queryKey?.[0] ?? '')),
+    isFetching: state.queryFetching.has(String(options.queryKey?.[0] ?? '')),
     isError: state.queryErrors.has(String(options.queryKey?.[0] ?? '')),
     refetch: state.refetch,
   }),
@@ -170,6 +172,7 @@ beforeEach(() => {
   state.notes = [];
   state.queryErrors.clear();
   state.queryLoading.clear();
+  state.queryFetching.clear();
   state.refetch.mockReset();
   container = document.createElement('div');
   document.body.appendChild(container);
@@ -182,6 +185,39 @@ afterEach(() => {
 });
 
 describe('ApplicationDetail deterministic Pilot JD entry', () => {
+  it('does not ask for another resume while the locked preparation source is still loading', () => {
+    const controller = createCoreTaskSurfaceController();
+    controller.launch({ ref: { taskId: 'application.interview_prepare', applicationId: 7, eventId: 31 }, source: 'application_task_card' });
+    state.events = [{ id: 31, application_id: 7, event_type: 'interview', status: 'todo', scheduled_at: '2027-01-01T00:00:00Z', duration_minutes: 60 }];
+    act(() => root?.render(<ApplicationDetail application={{ ...application, status: 'interview' }} open onClose={vi.fn()} taskController={controller} resumesLoading />));
+    expect(container?.textContent).toContain('正在核对面试资料');
+    expect(container?.textContent).not.toContain('请先在面试准备中心选择一份可用简历');
+  });
+
+  it('waits for the scoped event refresh before rejecting an exact review handoff', () => {
+    const controller = createCoreTaskSurfaceController();
+    controller.launch({ ref: { taskId: 'application.interview_review', applicationId: 7, eventId: 31 }, source: 'application_task_card' });
+    state.events = [{ id: 31, application_id: 7, event_type: 'interview', status: 'todo', scheduled_at: '2027-01-01T00:00:00Z', duration_minutes: 60 }];
+    state.queryFetching.add('events');
+    const draw = () => act(() => root?.render(<ApplicationDetail application={{ ...application, status: 'interview' }} open onClose={vi.fn()} taskController={controller} />));
+    draw();
+    expect(container?.textContent).toContain('正在核对面试资料');
+    expect(container?.textContent).not.toContain('该面试当前不可复盘');
+    state.queryFetching.clear();
+    state.events = [{ ...(state.events[0] as object), status: 'done' }];
+    state.notes = [{ id: 51, application_id: 7, application_event_id: 31 }];
+    draw();
+    expect(container?.querySelector('[data-testid="review-proposal-drawer"]')).not.toBeNull();
+  });
+
+  it('shows an unscheduled audit event without inventing a date or zero-minute appointment', () => {
+    state.events = [{ id: 61, application_id: application.id, event_type: 'custom', status: 'done', scheduled_at: '', duration_minutes: 0, notes: '已接受材料修改建议' }];
+    act(() => root?.render(<ApplicationDetail application={application} open onClose={vi.fn()} />));
+    expect(container?.textContent).not.toContain('Invalid Date');
+    expect(container?.textContent).not.toContain('时长 0 分钟');
+    expect(container?.textContent).toContain('时间待确认');
+  });
+
   const completedInterview = (id: number) => ({
     id,
     application_id: application.id,

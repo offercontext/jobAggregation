@@ -1,6 +1,7 @@
 import type { ChatMessage, Conversation, PendingAction, PilotPageContext } from '@/types/chat';
 import type { ConfirmationInput } from '@/services/chat';
 import { STATUS_LABELS, type ApplicationStatus } from '@/types/application';
+import { OFFER_STATUS_LABELS, type OfferStatus } from '@/types/offer';
 import dayjs from 'dayjs';
 import { toolMeta } from './capabilities';
 
@@ -469,20 +470,22 @@ function parseToolCalls(raw?: string): ToolStep[] {
     const name = c?.function?.name ?? c?.name;
     if (!name) continue;
     const argsStr = c?.function?.arguments ?? c?.arguments ?? stringifyArgs(c?.args);
-    steps.push({ name, toolCallId: c?.id, detail: extractDetail(argsStr) });
+    steps.push({ name, toolCallId: c?.id, detail: extractDetail(argsStr, name) });
   }
   return steps;
 }
 
 /** Best-effort short label from a JSON arguments string (status / query / id). */
-function extractDetail(argsStr?: string): string | undefined {
+function extractDetail(argsStr?: string, toolName?: string): string | undefined {
   if (!argsStr) return undefined;
   try {
     const args = JSON.parse(argsStr) as Record<string, unknown>;
     for (const key of ['status', 'query', 'event_type', 'title', 'company_name']) {
       const v = args[key];
       if (typeof v === 'string' && v.trim()) {
-        const label = key === 'status' ? applicationStatusLabel(v) ?? v.trim() : v.trim();
+        const statusLabel = toolName === 'create_offer' || toolName === 'update_offer'
+          || OFFER_EVIDENCE_SOURCES.has(toolName ?? '') ? offerStatusLabel : applicationStatusLabel;
+        const label = key === 'status' ? statusLabel(v) ?? v.trim() : v.trim();
         return label.slice(0, 24);
       }
     }
@@ -621,7 +624,7 @@ function evidenceFromRecord(row: unknown, source: string, index: number): Eviden
           kind: 'offer',
           ...(target ? { target } : {}),
           title: company,
-          meta: compact([position, amount, text(record.deadline), applicationStatusLabel(record.status)]).join(' \u00b7 '),
+          meta: compact([position, amount, text(record.deadline), offerStatusLabel(record.status)]).join(' \u00b7 '),
           snippet: previewText(text(record.assessment) || text(record.notes)),
           source,
         },
@@ -709,6 +712,12 @@ function eventTarget(record: Record<string, unknown>): EvidenceTarget | undefine
 
 function isApplicationStatus(value: unknown): value is ApplicationStatus {
   return typeof value === 'string' && value in STATUS_LABELS;
+}
+
+function offerStatusLabel(value: unknown): string | undefined {
+  return typeof value === 'string' && Object.prototype.hasOwnProperty.call(OFFER_STATUS_LABELS, value)
+    ? OFFER_STATUS_LABELS[value as OfferStatus]
+    : undefined;
 }
 
 function applicationStatusLabel(value: unknown): string | undefined {

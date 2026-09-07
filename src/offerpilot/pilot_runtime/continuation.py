@@ -1889,7 +1889,7 @@ class ConfirmationCoordinator:
                 terminal_status == "committed" or _record_succeeded(execution_record)
             )
             state.replayed = bool(_attribute(execution_record, "replayed", False))
-            state.undo_update = dict(state.undo) if state.succeeded and state.undo else None
+            state.undo_update = dict(state.undo) if state.succeeded and state.undo else {}
             if state.terminal_execution is not None and _attribute(
                 _attribute(state.terminal_execution, "payload"), "undo_json"
             ):
@@ -2052,6 +2052,10 @@ class ConfirmationCoordinator:
             state.succeeded = terminal_status == "committed"
         raw_undo = _attribute(_attribute(terminal, "payload"), "undo_json")
         if not raw_undo:
+            if terminal_status in {"committed", "failed"}:
+                # None preserves an earlier owner; a terminal write without
+                # Undo must instead atomically clear that stale owner.
+                state.undo_update = {}
             return
         try:
             decoded = json.loads(cast(str, raw_undo))

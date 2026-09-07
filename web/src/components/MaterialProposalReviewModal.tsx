@@ -9,6 +9,24 @@ import {
   materialFlowErrorMessage,
 } from './materialFlowCopy';
 import styles from './MaterialProposalReviewModal.module.css';
+import { storySourceLabel } from '@/lib/storySourcePresentation';
+
+function resumeChangeLabel(path: string): string {
+  const normalized = path.startsWith('/content_json/') ? path : `/content_json${path}`;
+  return storySourceLabel('resume_version', normalized);
+}
+
+function evidenceLocationLabel(source: string, path: string): string {
+  if (source === 'resume') return resumeChangeLabel(path);
+  if (source === 'evidence_bundle' && path.startsWith('/resume/content_json/')) {
+    return resumeChangeLabel(path.slice('/resume'.length));
+  }
+  if (source === 'user_assertion') {
+    const match = /^\/user_assertions\/(\d+)\/text$/.exec(path);
+    return match ? `我的补充说明 ${Number(match[1]) + 1}` : '我的补充说明';
+  }
+  return '投递参考内容';
+}
 
 export interface MaterialProposalOwnerOperationState {
   applicationID: number;
@@ -279,7 +297,7 @@ export default function MaterialProposalReviewModal({
                       aria-label={MATERIAL_FLOW_COPY.proposal.selectChange}
                     />
                     <div className={styles.changeText}>
-                      <Typography.Text strong>{change.path}</Typography.Text>
+                      <Typography.Text strong>{resumeChangeLabel(change.path)}</Typography.Text>
                       <Typography.Text className={styles.before}>{MATERIAL_FLOW_COPY.proposal.before}：{change.before}</Typography.Text>
                       <Typography.Text className={styles.after}>{MATERIAL_FLOW_COPY.proposal.after}：{change.after}</Typography.Text>
                       <Typography.Text>{MATERIAL_FLOW_COPY.proposal.why}：{change.rationale}</Typography.Text>
@@ -289,7 +307,7 @@ export default function MaterialProposalReviewModal({
                     {change.evidence_refs.map((ref) => (
                       <div className={styles.evidence} key={`${change.id}-${ref.source}-${ref.path}`}>
                         <Tag>{materialEvidenceSourceLabel(ref.source)}</Tag>
-                        <div>{ref.path}: {ref.excerpt}</div>
+                        <div>{evidenceLocationLabel(ref.source, ref.path)}：{ref.excerpt}</div>
                       </div>
                     ))}
                   </div>

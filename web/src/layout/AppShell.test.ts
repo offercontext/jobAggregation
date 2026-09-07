@@ -340,20 +340,21 @@ describe('AppShell source contract', () => {
     expect(offerCenterView).toContain('if (focusOfferId === undefined || isLoading || isError || isFetching) return;');
     expect(resumeLibraryView).toContain('resumesQuery.isFetching');
     expect(calendarView).toContain('const { data: rawEntries, isLoading, isError, isFetching, refetch } = useQuery({');
-    expect(calendarView).toContain('if (focusedEventId === null || !selectedDate || isLoading || isError || isFetching) return;');
+    expect(calendarView).toContain("if (isLoading || isError || isFetching || monthKey !== dayjs(date).format('YYYY-MM') || consumedEvidenceTarget.current === focusEvent) return;");
   });
 
-  it('keeps missing calendar-event cleanup local after handing off valid focus', () => {
-    const initialFocusStart = calendarView.indexOf('const date = eventFocusDate(focusEvent.scheduledAt);');
-    const verificationStart = calendarView.indexOf('if (focusedEventId === null', initialFocusStart);
-    const verificationEnd = calendarView.indexOf('const deleteMutation', verificationStart);
+  it('consumes calendar evidence once after an authoritative local-date query', () => {
+    const initialFocusStart = calendarView.indexOf('const date = calendarLocalEventDate(focusEvent.scheduledAt);');
+    const verificationStart = calendarView.indexOf('if (isLoading || isError || isFetching', initialFocusStart);
+    const verificationEnd = calendarView.indexOf('const invalidate', verificationStart);
     const initialFocus = calendarView.slice(initialFocusStart, verificationStart);
     const verification = calendarView.slice(verificationStart, verificationEnd);
 
     expect(initialFocus).toContain('setFocusedEventId(focusEvent.id);');
-    expect(initialFocus).toContain('if (isError || isFetching || consumedEvidenceTarget.current === focusEvent) return;');
+    expect(verification).toContain('consumedEvidenceTarget.current === focusEvent) return;');
+    expect(verification).toContain('consumedEvidenceTarget.current = focusEvent;');
     expect(verification).toContain('setFocusedEventId(null);');
-    expect(verification).not.toContain('onEvidenceFocusConsumed?.();');
+    expect(verification.indexOf('consumedEvidenceTarget.current = focusEvent;')).toBeLessThan(verification.indexOf('onEvidenceFocusConsumed?.();'));
   });
 
   it('routes onboarding setup actions through their declared intents', () => {

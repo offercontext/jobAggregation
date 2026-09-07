@@ -1,438 +1,208 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type RefCallback } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import {
-  DeleteOutlined,
-  EditOutlined,
-  LeftOutlined,
-  PlusOutlined,
-  RightOutlined,
-} from '@ant-design/icons';
-import { Button, Spin, Empty, Tag, Popconfirm, Tooltip, message } from 'antd';
+import { DeleteOutlined, EditOutlined, LeftOutlined, PlusOutlined, RightOutlined, CheckCircleOutlined, EnvironmentOutlined } from '@ant-design/icons';
+import { Button, Spin, Empty, Tag, Popconfirm, Tooltip, message, Drawer, Select } from 'antd';
 import dayjs from 'dayjs';
 import type { Application } from '@/types/application';
 import type { CalendarEntry } from '@/types/calendar';
 import ScheduleEventForm from '@/components/ScheduleEventForm';
-import { deleteEvent, getEvent } from '@/services/events';
+import { deleteEvent, getEvent, updateEvent } from '@/services/events';
 import { getCalendar } from '@/services/calendar';
 import type { ScheduleEvent } from '@/types/event';
-import { EVENT_TYPE_LABELS } from '@/types/event';
 import type { EvidenceTarget } from '@/components/ChatPanel/model';
-import { eventFocusDate } from '@/lib/pilotEvidenceFocus';
+import { calendarDays, calendarLocalEventDate, calendarEntryKey, presentCalendar, CALENDAR_KINDS, visibleEntryCount, type CalendarKind, type PresentedCalendarEntry } from './calendarPresentation';
 import styles from './CalendarView.module.css';
 
 const WEEKDAYS = ['一', '二', '三', '四', '五', '六', '日'];
-
+const EMPTY_ENTRIES: CalendarEntry[] = [];
 interface CalendarViewProps {
   onOpenDetail: (app: Application) => void;
   applications: Application[];
   focusEvent?: Extract<EvidenceTarget, { kind: 'event' }>;
   onEvidenceFocusConsumed?: () => void;
+  haruHostRef?: RefCallback<HTMLDivElement>;
 }
 
-export default function CalendarView({
-  onOpenDetail,
-  applications,
-  focusEvent,
-  onEvidenceFocusConsumed,
-}: CalendarViewProps) {
+export default function CalendarView({ onOpenDetail, applications, focusEvent, onEvidenceFocusConsumed, haruHostRef }: CalendarViewProps) {
   const queryClient = useQueryClient();
-  const [currentMonth, setCurrentMonth] = useState(() => dayjs().date(1));
+  const [currentMonth, setCurrentMonth] = useState(() => dayjs().startOf('month'));
+  const [selectedDate, setSelectedDate] = useState(() => dayjs().format('YYYY-MM-DD'));
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const [focusedEventId, setFocusedEventId] = useState<number | null>(null);
+  const [kind, setKind] = useState<CalendarKind | 'all'>('all');
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [narrow, setNarrow] = useState(() => typeof window !== 'undefined' && window.innerWidth < 1280);
   const [formOpen, setFormOpen] = useState(false);
   const [editingEvent, setEditingEvent] = useState<ScheduleEvent | null>(null);
-  const [loadingEventId, setLoadingEventId] = useState<number | null>(null);
-  const latestEditEventId = useRef<number | null>(null);
+  const [cellHeight, setCellHeight] = useState(120);
+  const gridRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLElement | null>(null);
+  const headingRef = useRef<HTMLHeadingElement>(null);
   const editRequestToken = useRef(0);
-  const focusedEvidenceTarget = useRef<Extract<EvidenceTarget, { kind: 'event' }> | null>(null);
-  const consumedEvidenceTarget = useRef<Extract<EvidenceTarget, { kind: 'event' }> | null>(null);
+  const focusedEvidenceTarget = useRef<typeof focusEvent>();
+  const consumedEvidenceTarget = useRef<typeof focusEvent>();
   const monthKey = currentMonth.format('YYYY-MM');
-
   const { data: rawEntries, isLoading, isError, isFetching, refetch } = useQuery({
-    queryKey: ['calendar', monthKey],
-    queryFn: () => getCalendar(monthKey),
+    queryKey: ['calendar', monthKey, 'six-weeks-local'],
+    queryFn: async () => {
+      // The unchanged API partitions by UTC month. Adjacent partitions cover
+      // six-week spillover and local-time events across a month boundary.
+      const partitions = await Promise.all([-1, 0, 1].map((offset) => getCalendar(currentMonth.add(offset, 'month').format('YYYY-MM'))));
+      const seen = new Set<string>();
+      return partitions.flatMap((part) => part ?? []).filter((entry) => {
+        const key = calendarEntryKey(entry);
+        if (seen.has(key)) return false;
+        seen.add(key); return true;
+      });
+    },
   });
-  // Backend serializes an empty []T as JSON `null`; coalesce so iteration is safe.
-  const entries = rawEntries ?? [];
-
-  // Group entries by date string for O(1) lookup per cell.
+  const entries = useMemo(() => presentCalendar(rawEntries ?? EMPTY_ENTRIES), [rawEntries]);
+  const grid = useMemo(() => calendarDays(monthKey), [monthKey]);
+  const filtered = useMemo(() => entries.filter((entry) => kind === 'all' || entry.kind === kind), [entries, kind]);
   const byDate = useMemo(() => {
-    const map = new Map<string, CalendarEntry[]>();
-    for (const e of entries) {
-      const list = map.get(e.date) ?? [];
-      list.push(e);
-      map.set(e.date, list);
-    }
-    return map;
-  }, [entries]);
-
-  // Build a 6x7 grid covering the month (Monday-start week).
-  const grid = useMemo(() => {
-    const start = currentMonth.startOf('month');
-    // dayjs day: 0=Sun..6=Sat. Convert to Monday-start offset.
-    const offset = (start.day() + 6) % 7;
-    const gridStart = start.subtract(offset, 'day');
-    const cells: dayjs.Dayjs[] = [];
-    for (let i = 0; i < 42; i++) {
-      cells.push(gridStart.add(i, 'day'));
-    }
-    return cells;
-  }, [currentMonth]);
-
-  const today = dayjs();
-  const [selectedDate, setSelectedDate] = useState<string | null>(null);
-  const [focusedEventId, setFocusedEventId] = useState<number | null>(null);
-  const selectedEntries = selectedDate ? byDate.get(selectedDate) ?? [] : [];
-
-  const cancelPendingEdit = () => {
-    editRequestToken.current += 1;
-    latestEditEventId.current = null;
-    setLoadingEventId(null);
-  };
-
+    const result = new Map<string, PresentedCalendarEntry[]>();
+    for (const entry of filtered) result.set(entry.date, [...(result.get(entry.date) ?? []), entry]);
+    return result;
+  }, [filtered]);
+  const selectedEntries = byDate.get(selectedDate) ?? [];
+  const selected = selectedEntries.find((entry) => entry.source.event_id === focusedEventId)
+    ?? selectedEntries.find((entry) => entry.key === selectedKey) ?? selectedEntries[0];
+  const eventId = selected?.source.event_id;
+  const detail = useQuery({
+    queryKey: ['events', 'calendar-detail', eventId, selected?.source.app_id],
+    enabled: Boolean(eventId) && !isError && !isFetching,
+    queryFn: async () => {
+      const event = await getEvent(eventId!);
+      if (!event || event.id !== eventId || event.application_id !== selected?.source.app_id) throw new Error('日程身份不匹配');
+      return event;
+    }, retry: false,
+  });
+  const selectedDetail = eventId && detail.data?.id === eventId && detail.data?.application_id === selected?.source.app_id ? detail.data : undefined;
+  const cancelPendingEdit = () => { editRequestToken.current += 1; };
   useEffect(() => {
-    if (!focusEvent) {
-      focusedEvidenceTarget.current = null;
-      consumedEvidenceTarget.current = null;
-      return;
-    }
-    const date = eventFocusDate(focusEvent.scheduledAt);
-    if (!date) {
-      setFocusedEventId(null);
-      message.warning('引用的记录已不存在');
-      onEvidenceFocusConsumed?.();
-      return;
-    }
-
+    const resize = () => setNarrow(window.innerWidth < 1280);
+    window.addEventListener('resize', resize);
+    return () => { window.removeEventListener('resize', resize); editRequestToken.current += 1; };
+  }, []);
+  useEffect(() => {
+    if (!gridRef.current || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(([entry]) => setCellHeight(entry.contentRect.height / 6));
+    observer.observe(gridRef.current); return () => observer.disconnect();
+  }, [isLoading, isError]);
+  useEffect(() => {
+    if (!focusEvent) { focusedEvidenceTarget.current = undefined; consumedEvidenceTarget.current = undefined; return; }
+    const date = calendarLocalEventDate(focusEvent.scheduledAt);
+    if (!date) { setFocusedEventId(null); message.warning('引用的记录已不存在'); onEvidenceFocusConsumed?.(); return; }
     if (focusedEvidenceTarget.current !== focusEvent) {
-      focusedEvidenceTarget.current = focusEvent;
-      consumedEvidenceTarget.current = null;
-      cancelPendingEdit();
-      setFormOpen(false);
-      setEditingEvent(null);
-      setCurrentMonth(dayjs(date).startOf('month'));
-      setSelectedDate(date);
-      setFocusedEventId(focusEvent.id);
+      focusedEvidenceTarget.current = focusEvent; consumedEvidenceTarget.current = undefined;
+      cancelPendingEdit(); setFormOpen(false); setEditingEvent(null);
+      setCurrentMonth(dayjs(date).startOf('month')); setSelectedDate(date); setFocusedEventId(focusEvent.id); setKind('all'); setDrawerOpen(true);
     }
-
-    if (isError || isFetching || consumedEvidenceTarget.current === focusEvent) return;
+    if (isLoading || isError || isFetching || monthKey !== dayjs(date).format('YYYY-MM') || consumedEvidenceTarget.current === focusEvent) return;
     consumedEvidenceTarget.current = focusEvent;
+    if (!entries.some((entry) => entry.source.event_id === focusEvent.id && entry.date === date)) { message.warning('引用的记录已不存在'); setFocusedEventId(null); }
     onEvidenceFocusConsumed?.();
-  }, [focusEvent, isError, isFetching, onEvidenceFocusConsumed]);
-
-  useEffect(() => {
-    if (focusedEventId === null || !selectedDate || isLoading || isError || isFetching) return;
-    if (monthKey !== dayjs(selectedDate).format('YYYY-MM')) return;
-    if (selectedEntries.some((entry) => entry.event_id === focusedEventId)) return;
-    message.warning('引用的记录已不存在');
-    setFocusedEventId(null);
-  }, [focusedEventId, isLoading, isError, isFetching, monthKey, selectedDate, selectedEntries]);
-
-  const deleteMutation = useMutation({
-    mutationFn: deleteEvent,
-    onSuccess: (_data, deletedId) => {
-      cancelPendingEdit();
-      setFormOpen(false);
-      setEditingEvent(null);
-      message.success('日程已删除');
-      queryClient.invalidateQueries({ queryKey: ['calendar'] });
-      if (selectedEntries.filter((entry) => entry.event_id !== deletedId).length === 0) {
-        setSelectedDate(null);
-      }
+  }, [focusEvent, entries, monthKey, isLoading, isError, isFetching, onEvidenceFocusConsumed]);
+  const invalidate = () => {
+    void queryClient.invalidateQueries({ queryKey: ['calendar'] });
+    void queryClient.invalidateQueries({ queryKey: ['events'] });
+    void queryClient.invalidateQueries({ queryKey: ['interviews'] });
+  };
+  const deleteMutation = useMutation({ mutationFn: deleteEvent, onSuccess: () => { cancelPendingEdit(); invalidate(); message.success('日程已删除'); }, onError: () => message.error('删除日程失败') });
+  const completeMutation = useMutation({
+    mutationFn: async (target: { id: number; appId: number }) => {
+      const latest = await getEvent(target.id);
+      if (latest.id !== target.id || latest.application_id !== target.appId) throw new Error('日程身份不匹配');
+      if (['done', 'completed', 'cancelled', 'deleted', 'soft_deleted'].includes(latest.status)) throw new Error('日程状态已变化');
+      return updateEvent(latest.id, { application_id: latest.application_id, event_type: latest.event_type, subtype: latest.subtype, tags: latest.tags, round: latest.round, scheduled_at: latest.scheduled_at, duration_minutes: latest.duration_minutes, location: latest.location, notes: latest.notes, remind_at: latest.remind_at, status: 'done' });
     },
-    onError: () => message.error('删除日程失败'),
+    onSuccess: () => { invalidate(); message.success('日程已标记完成'); }, onError: () => message.error('更新日程失败，请刷新后重试'),
   });
-
   const editMutation = useMutation({
-    mutationFn: ({ eventId }: { eventId: number; token: number }) => getEvent(eventId),
-    onMutate: ({ eventId, token }) => {
-      editRequestToken.current = token;
-      latestEditEventId.current = eventId;
-      setLoadingEventId(eventId);
-      setEditingEvent(null);
-    },
-    onSuccess: (event, { token }) => {
-      if (token !== editRequestToken.current || event.id !== latestEditEventId.current) return;
-      setEditingEvent(event);
-      setFormOpen(true);
-    },
-    onError: (_error, { eventId, token }) => {
-      if (token !== editRequestToken.current || eventId !== latestEditEventId.current) return;
-      message.error('获取日程失败');
-    },
-    onSettled: (_data, _error, { eventId, token }) => {
-      if (token !== editRequestToken.current || eventId !== latestEditEventId.current) return;
-      setLoadingEventId(null);
-      latestEditEventId.current = null;
-    },
+    mutationFn: async ({ id, appId }: { id: number; appId: number; token: number }) => { const event = await getEvent(id); if (event.id !== id || event.application_id !== appId) throw new Error('日程身份不匹配'); return event; },
+    onSuccess: (event, input) => { if (input.token !== editRequestToken.current) return; setEditingEvent(event); setFormOpen(true); },
+    onError: (_error, input) => { if (input.token === editRequestToken.current) message.error('获取日程失败'); },
   });
-
-  const getEntryLabel = (entry: CalendarEntry) => {
-    if (entry.event_type) return EVENT_TYPE_LABELS[entry.event_type];
-    if (entry.type === 'applied') return '投递';
-    if (entry.note_id) return '复盘';
-    return entry.type === 'interview' ? '复盘' : EVENT_TYPE_LABELS[entry.type];
+  const selectDate = (date: string, entry?: PresentedCalendarEntry) => {
+    cancelPendingEdit(); setSelectedDate(date); setSelectedKey(entry?.key ?? null); setFocusedEventId(null); setDrawerOpen(true);
   };
-
-  const getEntryTagColor = (entry: CalendarEntry) => {
-    if (entry.event_type === 'written_test' || entry.type === 'written_test') return 'blue';
-    if (entry.event_type === 'offer_step' || entry.type === 'offer_step') return 'orange';
-    if (entry.event_type === 'deadline' || entry.type === 'deadline') return 'red';
-    if (entry.event_type === 'custom' || entry.type === 'custom') return 'purple';
-    if (entry.type === 'applied') return 'default';
-    return 'green';
-  };
-
-  const getEntryChipText = (entry: CalendarEntry) => {
-    const time = entry.scheduled_at ? `${dayjs(entry.scheduled_at).format('HH:mm')} ` : '';
-    const label = getEntryLabel(entry);
-    if (entry.event_type) {
-      const company = entry.title.replace(` · ${label}`, '');
-      const position = entry.subtitle ? ` · ${entry.subtitle}` : '';
-      return `${time}${label} ${company}${position}`;
-    }
-    const position = entry.subtitle ? ` · ${entry.subtitle}` : '';
-    return `${time}${label} ${entry.title}${position}`;
-  };
-
-  const getEntryKey = (entry: CalendarEntry, index: number) =>
-    `${entry.type}-${entry.event_id ?? entry.note_id ?? entry.app_id}-${entry.scheduled_at ?? entry.date}-${index}`;
-
-  const openEntry = (e: CalendarEntry) => {
-    cancelPendingEdit();
-    setSelectedDate(null);
-    const app = applications.find((a) => a.id === e.app_id);
-    if (app) onOpenDetail(app);
-  };
-
-  if (formOpen) {
-    return (
-      <div className={styles.wrap}>
-        <ScheduleEventForm
-          open={formOpen}
-          applications={applications}
-          event={editingEvent ?? undefined}
-          onClose={() => {
-            cancelPendingEdit();
-            setFormOpen(false);
-            setEditingEvent(null);
-          }}
-        />
-      </div>
-    );
-  }
-
-  if (selectedDate) {
-    return (
-      <div className={styles.wrap}>
-        <div className={styles.detailHeader}>
-          <Button
-            type="link"
-            icon={<LeftOutlined />}
-            className={styles.backButton}
-            onClick={() => {
-              cancelPendingEdit();
-              setSelectedDate(null);
-              setFocusedEventId(null);
-            }}
-          >
-            返回日历
-          </Button>
-          <h2 className={styles.detailTitle}>{dayjs(selectedDate).format('M月D日 记录')}</h2>
-        </div>
-        {isLoading ? (
-          <div role="status" style={{ textAlign: 'center', padding: 48 }}>
-            <Spin />
-            <div>正在加载日程</div>
-          </div>
-        ) : isError ? (
-          <div role="alert" style={{ textAlign: 'center', padding: 48 }}>
-            <div style={{ marginBottom: 12 }}>加载日程失败</div>
-            <Button onClick={() => void refetch()}>重试</Button>
-          </div>
-        ) : selectedEntries.length === 0 ? (
-          <Empty description="这一天没有记录" />
-        ) : (
-          <div>
-            {selectedEntries.map((e, i) => (
-              <div
-                key={getEntryKey(e, i)}
-                className={[
-                  styles.entryItem,
-                  focusedEventId === e.event_id ? styles.entryItemFocused : '',
-                  e.editable ? styles.entryItemStatic : '',
-                ].join(' ')}
-                onClick={() => !e.editable && openEntry(e)}
-              >
-                <div className={styles.entryHeader}>
-                  <div className={styles.entryTitleWrap}>
-                    {e.scheduled_at && (
-                      <span className={styles.entryTime}>{dayjs(e.scheduled_at).format('HH:mm')}</span>
-                    )}
-                    <strong className={styles.entryTitle}>{e.title}</strong>
-                  </div>
-                  <div className={styles.entryMeta}>
-                    <Tag color={getEntryTagColor(e)}>{getEntryLabel(e)}</Tag>
-                    {e.editable && (
-                      <div className={styles.entryActions} onClick={(event) => event.stopPropagation()}>
-                        <Tooltip title="编辑日程">
-                          <Button
-                            size="small"
-                            type="text"
-                            icon={<EditOutlined />}
-                            disabled={editMutation.isPending}
-                            loading={loadingEventId === e.event_id}
-                            onClick={() => {
-                              if (!e.event_id || editMutation.isPending) return;
-                              const token = editRequestToken.current + 1;
-                              editRequestToken.current = token;
-                              editMutation.mutate({
-                                eventId: e.event_id,
-                                token,
-                              });
-                            }}
-                          />
-                        </Tooltip>
-                        <Popconfirm
-                          title="删除日程"
-                          description="确定删除这个日程吗？"
-                          okText="删除"
-                          cancelText="取消"
-                          okButtonProps={{ danger: true, loading: deleteMutation.isPending }}
-                          onConfirm={() => {
-                            cancelPendingEdit();
-                            if (e.event_id) deleteMutation.mutate(e.event_id);
-                          }}
-                        >
-                          <Tooltip title="删除日程">
-                            <Button
-                              size="small"
-                              type="text"
-                              danger
-                              icon={<DeleteOutlined />}
-                            />
-                          </Tooltip>
-                        </Popconfirm>
-                      </div>
-                    )}
-                  </div>
-                </div>
-                {e.subtitle && <div className={styles.entrySubtitle}>{e.subtitle}</div>}
-                {e.location && <div className={styles.entryLocation}>{e.location}</div>}
-              </div>
-            ))}
-            <p style={{ marginTop: 12, color: '#94a3b8', fontSize: 12 }}>
-              点击投递或复盘记录可打开对应投递详情。
-            </p>
-          </div>
-        )}
-      </div>
-    );
-  }
-
-  return (
-    <div className={styles.wrap}>
-      <div className={styles.toolbar}>
-        <Button
-          shape="circle"
-          icon={<LeftOutlined />}
-          onClick={() => setCurrentMonth((m) => m.subtract(1, 'month'))}
-        />
-        <span className={styles.monthLabel}>{currentMonth.format('YYYY 年 M 月')}</span>
-        <Button
-          shape="circle"
-          icon={<RightOutlined />}
-          onClick={() => setCurrentMonth((m) => m.add(1, 'month'))}
-        />
-        <Button
-          size="small"
-          onClick={() => setCurrentMonth(dayjs().date(1))}
-          style={{ marginLeft: 8 }}
-        >
-          今天
-        </Button>
-        <Button
-          type="primary"
-          size="small"
-          icon={<PlusOutlined />}
-          className={styles.createButton}
-          onClick={() => {
-            cancelPendingEdit();
-            setEditingEvent(null);
-            setFormOpen(true);
-          }}
-        >
-          新建日程
-        </Button>
-      </div>
-
-      {isLoading ? (
-        <div role="status" style={{ textAlign: 'center', padding: 48 }}>
-          <Spin />
-          <div>正在加载日程</div>
-        </div>
-      ) : isError ? (
-        <div role="alert" style={{ textAlign: 'center', padding: 48 }}>
-          <div style={{ marginBottom: 12 }}>加载日程失败</div>
-          <Button onClick={() => void refetch()}>重试</Button>
-        </div>
+  const create = () => { cancelPendingEdit(); setEditingEvent(null); setFormOpen(true); };
+  const closeDrawer = () => { setDrawerOpen(false); triggerRef.current?.focus({ preventScroll: true }); };
+  const text = (entry: PresentedCalendarEntry) => `${entry.time ? `${entry.time} ` : ''}${entry.label} · ${entry.title}${entry.source.subtitle ? ` · ${entry.source.subtitle}` : ''}`;
+  const busy = deleteMutation.isPending || completeMutation.isPending || editMutation.isPending;
+  const sourceReady = !isError && !isFetching && !detail.isError && !detail.isFetching && selectedDetail;
+  const terminal = selectedDetail && ['done', 'completed', 'cancelled', 'deleted', 'soft_deleted'].includes(selectedDetail.status);
+  const dateLabel = `${dayjs(selectedDate).format('M 月 D 日')}（周${WEEKDAYS[(dayjs(selectedDate).day() + 6) % 7]}）`;
+  const detailContent = (
+    <section className={styles.dayDetail} aria-label="日期详情" data-selected-date={selectedDate}>
+      <h2 className={styles.detailTitle}>{dateLabel}</h2>
+      {isLoading ? <div role="status"><Spin />正在加载日程</div> : isError ? <div role="alert">加载日程失败<Button onClick={() => void refetch()}>重试</Button></div> : !selected ? (
+        <div className={styles.emptyDay}><Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="当天暂无安排" /><Button icon={<PlusOutlined />} onClick={create}>在这一天新建日程</Button></div>
       ) : (
         <>
-          <div className={styles.weekHeader}>
-            {WEEKDAYS.map((w) => (
-              <div key={w} className={styles.weekCell}>
-                {w}
-              </div>
-            ))}
-          </div>
-          <div className={styles.grid}>
-            {grid.map((d) => {
-              const ds = d.format('YYYY-MM-DD');
-              const dayEntries = byDate.get(ds) ?? [];
-              const inMonth = d.month() === currentMonth.month();
-              const isToday = d.isSame(today, 'day');
-              return (
-                <div
-                  key={ds}
-                  className={[
-                    styles.cell,
-                    !inMonth ? styles.cellMuted : '',
-                    isToday ? styles.cellToday : '',
-                    dayEntries.length > 0 ? styles.cellActive : '',
-                  ].join(' ')}
-                  onClick={() => {
-                    if (dayEntries.length === 0) return;
-                    setFocusedEventId(null);
-                    setSelectedDate(ds);
-                  }}
-                >
-                  <div className={styles.dateNum}>{d.date()}</div>
-                  {dayEntries.length > 0 && (
-                    <div className={styles.entries}>
-                      {dayEntries.slice(0, 3).map((entry, index) => (
-                        <Tooltip
-                          key={getEntryKey(entry, index)}
-                          title={getEntryChipText(entry)}
-                        >
-                          <span className={styles.entryChip}>{getEntryChipText(entry)}</span>
-                        </Tooltip>
-                      ))}
-                      {dayEntries.length > 3 && (
-                        <span className={styles.moreCount}>+{dayEntries.length - 3}</span>
-                      )}
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-
-          <div className={styles.legend}>
-            <span className={styles.legendDot + ' ' + styles.dotSchedule} /> 日程
-            <span className={styles.legendDot + ' ' + styles.dotInterview} style={{ marginLeft: 16 }} /> 复盘
-            <span className={styles.legendDot + ' ' + styles.dotApplied} style={{ marginLeft: 16 }} /> 投递
-          </div>
+          <article data-selected-event={eventId} className={focusedEventId === eventId ? styles.entryItemFocused : undefined}>
+            <div className={styles.detailMeta}><span data-kind={selected.kind} className={styles.kindBadge}>{selected.label}</span><span>{selected.time || '全天'}{selected.time && selected.source.duration_minutes ? `–${dayjs(selected.source.scheduled_at).add(selected.source.duration_minutes, 'minute').format('HH:mm')}` : ''}</span></div>
+            <h3 className={styles.eventTitle}>{selected.label} · {selected.title}</h3>
+            {selected.source.subtitle && <p className={styles.secondary}>{selected.source.subtitle}</p>}
+            {(selectedDetail?.location || selected.source.location) && <p className={styles.location}><EnvironmentOutlined />{selectedDetail?.location || selected.source.location}</p>}
+            {selectedDetail?.notes && <section className={styles.detailSection}><h4>备注</h4><p>{selectedDetail.notes}</p></section>}
+            {selectedDetail?.status && <section className={styles.detailSection}><h4>状态</h4><Tag>{({ todo: '待处理', done: '已完成', completed: '已完成', cancelled: '已取消', in_progress: '进行中' } as Record<string, string>)[selectedDetail.status] ?? '其他状态'}</Tag></section>}
+            {detail.isLoading && eventId && <p role="status" className={styles.secondary}>正在加载详情</p>}
+            {detail.isError && eventId && <p role="alert">日程详情暂不可用 <Button size="small" onClick={() => void detail.refetch()}>重试详情</Button></p>}
+            <div className={styles.detailActions}>
+              {applications.some((app) => app.id === selected.source.app_id) && <Button onClick={() => { const app = applications.find((app) => app.id === selected.source.app_id); if (app) onOpenDetail(app); }}>查看岗位</Button>}
+              {selected.source.editable && sourceReady && eventId && <>
+                <Button icon={<EditOutlined />} disabled={busy} loading={editMutation.isPending} onClick={() => { const token = ++editRequestToken.current; editMutation.mutate({ id: eventId, appId: selected.source.app_id, token }); }}>调整时间</Button>
+                {!terminal && <Popconfirm title="将这项日程标记为已完成？" onConfirm={() => completeMutation.mutate({ id: eventId, appId: selected.source.app_id })} okText="标记完成" cancelText="取消"><Button icon={<CheckCircleOutlined />} disabled={busy}>标记完成</Button></Popconfirm>}
+                <Popconfirm title="删除日程" description="确定删除这个日程吗？" okText="删除" cancelText="取消" onConfirm={() => deleteMutation.mutate(eventId)}><Button danger icon={<DeleteOutlined />} disabled={busy}>删除日程</Button></Popconfirm>
+              </>}
+            </div>
+          </article>
+          <section className={styles.otherEvents}><h4>当天其他安排</h4>{selectedEntries.length === 1 ? <p className={styles.secondary}>暂无其他安排</p> : selectedEntries.filter((entry) => entry.key !== selected.key).map((entry) => <button key={entry.key} className={styles.otherEvent} onClick={() => selectDate(selectedDate, entry)}>{text(entry)}</button>)}</section>
         </>
       )}
-
+    </section>
+  );
+  return (
+    <div className={styles.workspace} data-calendar-workspace>
+      <section className={styles.panel} aria-label="月历">
+        <div className={styles.toolbar}>
+          <div className={styles.monthControls}>
+            <Button shape="circle" aria-label="上一个月" icon={<LeftOutlined />} onClick={() => setCurrentMonth((month) => month.subtract(1, 'month'))} />
+            <h2 className={styles.monthLabel}>{currentMonth.format('YYYY 年 M 月')}</h2>
+            <Button shape="circle" aria-label="下一个月" icon={<RightOutlined />} onClick={() => setCurrentMonth((month) => month.add(1, 'month'))} />
+            <Button onClick={() => { setCurrentMonth(dayjs().startOf('month')); selectDate(dayjs().format('YYYY-MM-DD')); }}>今天</Button>
+          </div>
+          <div className={styles.toolbarActions}>
+            <Select aria-label="日程类型" value={kind} onChange={(value: CalendarKind | 'all') => { cancelPendingEdit(); setKind(value); setSelectedKey(null); setFocusedEventId(null); }} options={[{ value: 'all', label: '全部类型' }, ...Object.entries(CALENDAR_KINDS).map(([value, label]) => ({ value, label }))]} />
+            <Button type="primary" icon={<PlusOutlined />} onClick={create}>新建日程</Button>
+          </div>
+        </div>
+        <div className={styles.weekHeader}>{WEEKDAYS.map((day) => <div key={day}>{day}</div>)}</div>
+        {isLoading ? <div role="status" className={styles.queryState}><Spin />正在加载日程</div> : isError ? <div role="alert" className={styles.queryState}>加载日程失败<Button onClick={() => void refetch()}>重试</Button></div> : (
+          <div className={styles.grid} ref={gridRef}>
+            {grid.map((date) => {
+              const dayEntries = byDate.get(date) ?? [];
+              const count = visibleEntryCount(cellHeight, dayEntries.length);
+              const today = date === dayjs().format('YYYY-MM-DD');
+              return <div key={date} data-calendar-date={date} className={`${styles.cell} ${date.slice(0, 7) !== monthKey ? styles.cellMuted : ''} ${selectedDate === date ? styles.cellSelected : ''}`}>
+                <button data-date-select={date} className={styles.dateButton} aria-label={`${date}${today ? ' 今天' : ''}，${dayEntries.length} 项安排`} aria-pressed={selectedDate === date} onClick={(event) => { triggerRef.current = event.currentTarget; selectDate(date); }}><span className={today ? styles.today : ''}>{dayjs(date).date()}</span></button>
+                <div className={styles.entries}>{dayEntries.slice(0, count).map((entry) => <Tooltip title={text(entry)} key={entry.key}><button data-calendar-event={entry.source.event_id} data-kind={entry.kind} className={styles.entryChip} onClick={(event) => { triggerRef.current = event.currentTarget; selectDate(date, entry); }}><span>{entry.time} {entry.label}</span><span className={styles.chipTitle}> · {entry.title}{entry.source.subtitle ? ` · ${entry.source.subtitle}` : ''}</span></button></Tooltip>)}
+                  {dayEntries.length > count && <button className={styles.moreCount} onClick={(event) => { triggerRef.current = event.currentTarget; selectDate(date); }}>另有 {dayEntries.length - count} 项</button>}
+                </div>
+              </div>;
+            })}
+          </div>
+        )}
+      </section>
+      <aside className={styles.rightRail} aria-label="日历侧栏">
+        {!narrow && detailContent}
+        <div ref={haruHostRef} className={styles.haruHost} data-calendar-haru-host />
+      </aside>
+      <Drawer title="当天安排" open={narrow && drawerOpen && !formOpen} width={360} onClose={closeDrawer} afterOpenChange={(open) => { if (!open && !formOpen) triggerRef.current?.focus({ preventScroll: true }); }} destroyOnClose>{narrow ? detailContent : null}</Drawer>
+      <Drawer title={editingEvent ? '编辑日程' : '新建日程'} open={formOpen} width={620} onClose={() => { cancelPendingEdit(); setFormOpen(false); setEditingEvent(null); }} afterOpenChange={(open) => { if (open) headingRef.current?.focus({ preventScroll: true }); }} destroyOnClose>
+        {formOpen && <ScheduleEventForm open applications={applications} event={editingEvent ?? undefined} initialDate={selectedDate} headingRef={headingRef} onClose={() => { cancelPendingEdit(); setFormOpen(false); setEditingEvent(null); }} />}
+      </Drawer>
     </div>
   );
 }

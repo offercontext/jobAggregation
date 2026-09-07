@@ -1067,6 +1067,7 @@ function AppShellContent() {
   const [resumeUploadRequestToken, setResumeUploadRequestToken] = useState(0);
   const [offerCreateRequestToken, setOfferCreateRequestToken] = useState(0);
   const [pilotMascotVisible, setPilotMascotVisible] = useState(readPilotMascotVisible);
+  const [calendarHaruHost, setCalendarHaruHost] = useState<HTMLDivElement | null>(null);
   const [pilotMascotZoom, setPilotMascotZoom] = useState(readPilotMascotZoom);
   const [pilotMascotAnimationLevel, setPilotMascotAnimationLevel] = useState(readPilotMascotAnimationLevel);
   const [pilotMascotPositionResetToken, setPilotMascotPositionResetToken] = useState(0);
@@ -2302,6 +2303,13 @@ function AppShellContent() {
     })()
     : null;
 
+  const calendarWorkspaceActive = view === 'calendar' && !selectedApp;
+  const calendarTodayInterviews = !eventsLoading && !eventsError
+    ? evs.filter((event) => event.event_type === 'interview' && dayjs(event.scheduled_at).isSame(dayjs(), 'day') && !['done', 'completed', 'cancelled', 'deleted', 'soft_deleted'].includes(event.status)).length
+    : 0;
+  const calendarSummary = calendarWorkspaceActive && !isLoading && !appsError && !eventsLoading && !eventsError && !offersLoading && !offersError && !practiceLoading && !practiceError
+    ? [calendarTodayInterviews ? `今天有 ${calendarTodayInterviews} 场面试` : '', actions.length ? `${actions.length} 项待处理` : ''].filter(Boolean).join(' · ')
+    : undefined;
   const workspaceContent = selectedApp ? (
     <ApplicationDetail
       application={selectedApp}
@@ -2418,6 +2426,7 @@ function AppShellContent() {
           )}
           {view === 'calendar' && (
             <CalendarView
+              haruHostRef={setCalendarHaruHost}
               applications={apps}
               onOpenDetail={openApplicationDetail}
               focusEvent={calendarEvidenceFocus}
@@ -2652,6 +2661,7 @@ function AppShellContent() {
       >
         {!isPilotView ? (
           <TopBar
+            summary={calendarSummary}
             primaryAction={topBarPrimaryAction}
             onSearch={() => setPaletteOpen(true)}
             onOpenSettings={() => navigateToView('settings')}
@@ -2661,7 +2671,7 @@ function AppShellContent() {
           ref={contentRef}
           tabIndex={-1}
           aria-label="主要内容"
-          className={`op-app-content${isPilotView ? ' op-app-content-pilot' : ''}`}
+          className={`op-app-content${isPilotView ? ' op-app-content-pilot' : ''}${calendarWorkspaceActive ? ' op-app-content-calendar' : ''}`}
           style={{
             padding: isPilotView ? 0 : '0 24px 24px',
             ...(isPilotView ? { height: '100dvh' } : {}),
@@ -2749,6 +2759,8 @@ function AppShellContent() {
 
       {view !== 'pilot' && !interviewStudioContext && !coreTaskSurfaceState.active ? (
         <HaruDock
+          calendarActive={calendarWorkspaceActive}
+          calendarHost={calendarHaruHost}
           visible={pilotMascotVisible}
           activity={pilotMascotActivity}
           onHide={() => setPilotMascotPreference(false)}

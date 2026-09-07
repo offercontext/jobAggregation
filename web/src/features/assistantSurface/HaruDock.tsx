@@ -1,4 +1,6 @@
 import { useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import CalendarHaruPresentation from './CalendarHaruPresentation';
 import PilotMascot, {
   type PilotMascotActivity,
   type PilotMascotAnimationLevel,
@@ -17,6 +19,8 @@ interface Props {
   onHide: () => void;
   onOpen?: () => void;
   onExpand?: () => void;
+  calendarHost?: HTMLElement | null;
+  calendarActive?: boolean;
 }
 
 export default function HaruDock({
@@ -29,6 +33,8 @@ export default function HaruDock({
   onHide,
   onOpen,
   onExpand,
+  calendarHost,
+  calendarActive = false,
 }: Props) {
   const surface = useAssistantSurface();
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -45,7 +51,19 @@ export default function HaruDock({
 
   return (
     <>
-      <PilotMascot
+      {calendarActive ? (calendarHost ? createPortal(<CalendarHaruPresentation
+        activity={notification?.status ?? activity}
+        panelOpen={surface.surface === 'haru_chat'}
+        onToggle={() => {
+          if (notification) surface.openCompletionNotice();
+          else if (surface.surface === 'haru_chat') surface.closeSurface();
+          else if (onOpen) onOpen();
+          else surface.openHaru();
+        }}
+        triggerRef={triggerRef}
+        onAnchorRectChange={setAnchorRect}
+        animationLevel={animationLevel}
+      />, calendarHost) : null) : <PilotMascot
         activity={notification?.status ?? activity}
         panelOpen={surface.surface === 'haru_chat'}
         onTogglePilot={() => {
@@ -66,7 +84,7 @@ export default function HaruDock({
         notification={notification}
         placement="contextual"
         triggerRef={triggerRef}
-      />
+      />}
       <HaruChatWindow returnFocusRef={triggerRef} onExpand={onExpand} anchorRect={anchorRect} />
     </>
   );

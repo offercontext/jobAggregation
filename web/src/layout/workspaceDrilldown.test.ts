@@ -20,7 +20,6 @@ const migratedWorkspaceFlows = [
   ['action detail', actionDetail],
   ['AI settings', aiSettings],
   ['application detail', applicationDetail],
-  ['calendar view', calendarView],
   ['material kit', materialKit],
   ['offer compare', offerCompare],
   ['question generator', questionBank],
@@ -58,11 +57,13 @@ describe('workspace drill-down layout contract', () => {
     expect(actionDetail).toContain('返回工作台');
   });
 
-  it('opens calendar and event editing as replacement workspace layers', () => {
-    expect(calendarView).toContain('if (formOpen) {');
-    expect(calendarView).toContain('if (selectedDate) {');
+  it('keeps the calendar visible with the approved local date and edit drawers', () => {
+    expect(calendarView).toContain('data-calendar-workspace');
+    expect(calendarView).toContain('open={narrow && drawerOpen && !formOpen}');
+    expect(calendarView).toContain('open={formOpen}');
+    expect(calendarView).toContain('initialDate={selectedDate}');
     expect(scheduleEventForm).toContain('返回上一层');
-    expect(calendarView).toContain('返回日历');
+    expect(calendarView).not.toContain('if (selectedDate) {');
   });
 
   it('opens application subflows through the shared task owner and keeps record forms local', () => {

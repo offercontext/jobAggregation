@@ -58,7 +58,7 @@ export const MODULE_NAV: ModuleNavItem[] = [
 
 export const MODULE_TABS: Record<ModuleKey, ModuleTabItem[]> = {
   today: [
-    { view: 'dashboard', label: '今日重点' },
+    { view: 'dashboard', label: '概览' },
     { view: 'reminders', label: '提醒' },
     { view: 'calendar', label: '日历' },
   ],

@@ -77,3 +77,7 @@ export interface MatchResumeResponse {
 }
 
 export type ResumeStatus = 'text-ready' | 'parse-failed';
+
+export interface ResumeImportField { path: string; value: string; evidence: string }
+export interface ResumeImportPreview { resume_id: number; source_fingerprint: string; fields: ResumeImportField[] }
+export interface ConfirmResumeImportInput { source_fingerprint: string; fields: ResumeImportField[] }

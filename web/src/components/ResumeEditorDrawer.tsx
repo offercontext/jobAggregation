@@ -11,6 +11,7 @@ import styles from './ResumeLibraryView.module.css';
 import ResumeEvidenceAuditPanel from './ResumeEvidenceAuditPanel';
 import ResumeFactSupplementWorkspace from './ResumeFactSupplementWorkspace';
 import type { ResumeAuditFinding } from '@/lib/resumeEvidenceAudit';
+import ResumeImportReview from './ResumeImportReview';
 
 interface Props {
   resume: Resume | null;
@@ -25,7 +26,7 @@ interface Props {
   resumes?: readonly Resume[];
 }
 
-type SectionKey = 'intent' | 'contact' | 'education' | 'experience' | 'projects' | 'skills' | 'other';
+type SectionKey = 'intent' | 'contact' | 'education' | 'experience' | 'projects' | 'skills' | 'other' | 'original';
 
 const SECTION_LABELS: Record<string, string> = {
   career_intent: '求职意向', contact: '基本信息', education: '教育经历', experience: '工作经历', projects: '项目经历', skills: '技能',
@@ -56,7 +57,8 @@ export default function ResumeEditorDrawer({
   resumes,
 }: Props) {
   const qc = useQueryClient();
-  const parsed = useMemo(() => parseStructuredResume(resume?.content_json), [resume?.content_json]);
+  const parsed = useMemo(() => parseStructuredResume(resume?.source === 'upload' && resume.content_json && typeof resume.content_json === 'object' && !('raw_text' in resume.content_json)
+    ? { ...resume.content_json, raw_text: resume.parsed_data } : resume?.content_json), [resume?.content_json, resume?.source, resume?.parsed_data]);
   const baselineDraft = parsed.mode === 'structured' ? parsed.draft : EMPTY_DRAFT;
   const baselineFingerprint = useMemo(() => JSON.stringify(baselineDraft), [baselineDraft]);
   const [title, setTitle] = useState('');
@@ -64,7 +66,10 @@ export default function ResumeEditorDrawer({
   const [activeSection, setActiveSection] = useState<SectionKey>('intent');
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [advancedJson, setAdvancedJson] = useState('');
+  const [advancedBaseline, setAdvancedBaseline] = useState('');
   const [auditOpen, setAuditOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
+  const [importReviewed, setImportReviewed] = useState(false);
   const [supplementFinding, setSupplementFinding] = useState<ResumeAuditFinding | null>(null);
   const lineageResumes = useMemo(() => {
     if (!resume) return resumes ?? [];
@@ -81,11 +86,27 @@ export default function ResumeEditorDrawer({
     setTitle(resume.title || resume.name || '');
     setDraft(parsed.mode === 'structured' ? parsed.draft : EMPTY_DRAFT);
     setAdvancedJson(parsed.mode === 'recovery' ? parsed.raw : JSON.stringify(resume.content_json, null, 2));
+    setAdvancedBaseline(parsed.mode === 'recovery' ? parsed.raw : JSON.stringify(resume.content_json, null, 2));
     setActiveSection('intent');
     setAdvancedOpen(false);
     setAuditOpen(false);
+    setImportOpen(false);
     setSupplementFinding(null);
   }, [open, parsed, resume]);
+
+  useEffect(() => {
+    let current = true;
+    setImportReviewed(false);
+    const review = resume?.content_json?.import_review;
+    if (resume?.source === 'upload' && review && typeof review === 'object' && 'version' in review && review.version === 1 && 'raw_text_sha256' in review && typeof review.raw_text_sha256 === 'string' && globalThis.crypto?.subtle) {
+      const expected = review.raw_text_sha256;
+      const raw = typeof resume.content_json.raw_text === 'string' ? resume.content_json.raw_text : resume.parsed_data;
+      void crypto.subtle.digest('SHA-256', new TextEncoder().encode(raw)).then((buffer) => {
+        if (current) setImportReviewed(Array.from(new Uint8Array(buffer), (byte) => byte.toString(16).padStart(2, '0')).join('') === expected);
+      }).catch(() => { /* A status hint must not block editing. */ });
+    }
+    return () => { current = false; };
+  }, [resume?.content_json, resume?.parsed_data, resume?.source]);
 
   const saveMut = useMutation({
     mutationFn: (input: UpdateResumeInput) => updateResume(resume!.id, input),
@@ -105,7 +126,7 @@ export default function ResumeEditorDrawer({
   const editorDirty = Boolean(resume) && (
     title !== (resume?.title || resume?.name || '')
     || JSON.stringify(draft) !== baselineFingerprint
-    || (advancedOpen && advancedJson !== JSON.stringify(resume?.content_json, null, 2))
+    || (advancedOpen && advancedJson !== advancedBaseline)
   );
 
   if (!open || !resume) return null;
@@ -136,7 +157,9 @@ export default function ResumeEditorDrawer({
   const toggleAdvancedEditor = () => {
     if (!advancedOpen) {
       if (parsed.mode === 'structured') {
-        setAdvancedJson(buildAdvancedResumeJson(resume.content_json, draft));
+        const generated = buildAdvancedResumeJson(resume.content_json, draft);
+        setAdvancedJson(generated);
+        setAdvancedBaseline(generated);
       }
       setAdvancedOpen(true);
       return;
@@ -191,6 +214,15 @@ export default function ResumeEditorDrawer({
         </Space>
       </div>
 
+      {resume.source === 'upload' && <Alert type="info" showIcon
+        message={importReviewed ? '已核对分类' : baselineDraft.rawText.trim() ? '已提取文字，待分类' : '未提取到文字'}
+        description="PDF 原文单独保留。AI 只生成待核对候选，确认后填入空白模块，不覆盖已有内容。扫描件暂不支持 OCR。"
+        action={<Button disabled={parsed.mode === 'recovery' || !baselineDraft.rawText.trim() || saveMut.isPending} onClick={() => {
+          if (editorDirty) { message.warning('请先保存或取消当前编辑，再进行 AI 分类'); return; }
+          setImportOpen(true);
+        }}>{importReviewed ? '重新解析并核对' : 'AI 分类并核对'}</Button>}
+      />}
+
       <div className={styles.editorHeader}>
         <Input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="简历标题" className={styles.editorTitleInput} />
         <div className={styles.editorMeta}>
@@ -229,17 +261,24 @@ export default function ResumeEditorDrawer({
       ) : (
         <div className={styles.editorGrid}>
           <nav className={styles.sectionNav} aria-label="简历章节">
-            {SECTIONS.map((section) => (
+            {(resume.source === 'upload' ? [...SECTIONS, { key: 'original' as const, label: 'PDF 提取原文' }] : SECTIONS).map((section) => (
               <button key={section.key} type="button" className={activeSection === section.key ? styles.sectionNavActive : undefined} onClick={() => setActiveSection(section.key)}>
                 {section.label}
               </button>
             ))}
           </nav>
           <section className={styles.sectionEditor}>
-            <StructuredSection section={activeSection} draft={draft} onChange={setDraft} />
+            <StructuredSection section={activeSection} draft={draft} onChange={setDraft} imported={resume.source === 'upload'} />
           </section>
         </div>
       )}
+
+      {importOpen && <ResumeImportReview key={resume.id} resume={resume} onClose={() => setImportOpen(false)} onSaved={(updated) => {
+        setImportOpen(false);
+        void qc.invalidateQueries({ queryKey: ['resumes'] });
+        onSaved?.(updated);
+        onClose();
+      }} />}
 
       {supplementFinding ? (
         <ResumeFactSupplementWorkspace
@@ -255,7 +294,12 @@ export default function ResumeEditorDrawer({
   );
 }
 
-function StructuredSection({ section, draft, onChange }: { section: SectionKey; draft: StructuredResumeDraft; onChange: (draft: StructuredResumeDraft) => void }) {
+function StructuredSection({ section, draft, onChange, imported = false }: { section: SectionKey; draft: StructuredResumeDraft; onChange: (draft: StructuredResumeDraft) => void; imported?: boolean }) {
+  if (section === 'original') return <>
+    <div className={styles.sectionTitle}>PDF 提取原文</div>
+    <p>这是上传文件提取的文字，分类和填写“其他”不会修改它。需要重新提取时请重新上传文件。</p>
+    <Input.TextArea rows={18} value={draft.rawText} readOnly aria-label="PDF 提取原文" />
+  </>;
   if (section === 'intent') {
     return <>
       <div className={styles.sectionTitle}>求职意向</div>
@@ -280,7 +324,7 @@ function StructuredSection({ section, draft, onChange }: { section: SectionKey; 
   if (section === 'other') {
     return <>
       <div className={styles.sectionTitle}>其他</div>
-      <Input.TextArea rows={14} value={draft.rawText} placeholder="补充现有简历中的其他文本" onChange={(event) => onChange({ ...draft, rawText: event.target.value })} />
+      <Input.TextArea rows={14} value={imported ? draft.additionalText ?? '' : draft.rawText} placeholder="补充现有简历中的其他文本" onChange={(event) => onChange(imported ? { ...draft, additionalText: event.target.value } : { ...draft, rawText: event.target.value })} />
     </>;
   }
   const meta = {

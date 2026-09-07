@@ -14,6 +14,7 @@ interface ScheduleEventFormProps {
   open: boolean;
   applications: Application[];
   initialApplication?: Application;
+  initialDate?: string;
   event?: ScheduleEvent;
   onClose: () => void;
   headingRef?: Ref<HTMLHeadingElement>;
@@ -46,6 +47,7 @@ export default function ScheduleEventForm({
   open,
   applications,
   initialApplication,
+  initialDate,
   event,
   onClose,
   headingRef,
@@ -97,14 +99,14 @@ export default function ScheduleEventForm({
       subtype: '',
       tags: [],
       round: 0,
-      scheduled_at: getDefaultScheduledAt(),
+      scheduled_at: initialDate ? dayjs(initialDate).hour(9).minute(0).second(0) : getDefaultScheduledAt(),
       remind_at: null,
       duration_minutes: 60,
       location: '',
       notes: '',
       status: 'todo',
     });
-  }, [event, form, initialApplication, open]);
+  }, [event, form, initialApplication, initialDate, open]);
 
   const handleClose = () => {
     form.resetFields();

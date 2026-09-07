@@ -101,7 +101,7 @@ export default function ResumeLibraryView({
   const uploadMut = useMutation({
     mutationFn: (file: File) => uploadResume(file),
     onSuccess: (res) => {
-      message.success(res.parse_status === 'text-ready' ? '上传成功' : '已上传，但文本提取失败，请手动校正');
+      message.success(res.parse_status === 'text-ready' ? '已提取文字，可在简历编辑器中进行 AI 分类并核对' : '已上传，但未提取到文字；请检查文件是否为扫描件');
       qc.invalidateQueries({ queryKey: ['resumes'] });
       qc.invalidateQueries({ queryKey: ONBOARDING_QUERY_KEY });
       setUploadOpen(false);

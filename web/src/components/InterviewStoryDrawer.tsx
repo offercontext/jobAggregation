@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Alert, Button, Checkbox, Divider, Drawer, Empty, Input, List, Space, Spin, Tag, Typography, message } from 'antd';
+import { Alert, Button, Checkbox, Divider, Drawer, Empty, Input, Space, Spin, Tag, Typography, message } from 'antd';
 import {
   confirmInterviewStoryProposal,
   createInterviewStoryProductAction,
@@ -28,6 +28,9 @@ import type {
   InterviewStorySourceCandidates,
   InterviewStorySourceSelection,
 } from '@/types/interviewStory';
+
+import StorySourcePicker from './StorySourcePicker';
+import { STORY_SOURCE_KINDS, storySourceLabel } from '@/lib/storySourcePresentation';
 
 const { Text, Title } = Typography;
 
@@ -391,12 +394,17 @@ export default function InterviewStoryDrawer({ open, draft, onDraftChange, onClo
         ? candidates?.resumes.find((item) => item.id === selection.source_id)?.leaves
         : selection.source_kind === 'interview_note'
           ? candidates?.interview_notes.find((item) => item.id === selection.source_id)?.leaves
-          : candidates?.mock_turns.find((item) => item.attempt_id === selection.source_id)?.leaves;
+          : candidates?.mock_turns.filter((item) => item.attempt_id === selection.source_id).flatMap((item) => item.leaves);
       const preview = leaves?.find((item) => item.path === selection.path)?.preview;
       if (!preview) continue;
+      const materialTitle = selection.source_kind === 'resume_version'
+        ? candidates?.resumes.find((item) => item.id === selection.source_id)?.label
+        : selection.source_kind === 'interview_note'
+          ? candidates?.interview_notes.find((item) => item.id === selection.source_id)?.label
+          : '模拟面试';
       sources.push({
         key: `selection:${selection.source_kind}:${selection.source_id}:${selection.path}`,
-        label: `${selection.source_kind} · ${selection.path}`,
+        label: `${STORY_SOURCE_KINDS[selection.source_kind]} · ${materialTitle || '未命名材料'}（记录 ${selection.source_id}） · ${storySourceLabel(selection.source_kind, selection.path)} · ${preview.slice(0, 60)}`,
         link: {
           source_kind: selection.source_kind,
           source_id: selection.source_id,
@@ -426,7 +434,9 @@ export default function InterviewStoryDrawer({ open, draft, onDraftChange, onClo
     context?: InterviewStoryDraftChangeContext,
   ): boolean => onDraftChange({ ...draft, ...changes }, context) !== false;
 
-  const discardChangedInput = (changes: Partial<InterviewStoryDraft>) => update({
+  const discardChangedInput = (changes: Partial<InterviewStoryDraft>) => {
+    setPreviewConfirmed(false);
+    return update({
     ...changes,
     // Changed sources or assertions produce a different frozen input. Never
     // reuse a key that may already name an earlier Attempt or manual save.
@@ -446,6 +456,8 @@ export default function InterviewStoryDrawer({ open, draft, onDraftChange, onClo
     serverConfirmationToken: null,
     error: null,
   });
+
+  };
 
   const toggleSource = (selection: InterviewStorySourceSelection) => {
     if (frozen) return;
@@ -743,12 +755,30 @@ export default function InterviewStoryDrawer({ open, draft, onDraftChange, onClo
   };
 
   return (
-    <Drawer open={open} width={720} destroyOnClose={false} onClose={onClose} title={<span ref={headingRef} tabIndex={-1}>{draft.entrypoint === 'pilot' ? 'Pilot · 整理面试故事' : '整理面试故事'}</span>}>
+    <Drawer open={open} width={720} destroyOnClose={false} onClose={onClose} footer={!draft.proposal ? <div aria-label="整理故事操作" style={{ padding: '8px 0' }}>
+        <Text strong>3. 确认后整理 · 已选{draft.selections.length}项内容{draft.assertions.length ? `，补充${draft.assertions.length}条经历` : ''}</Text>
+        <p style={{ margin: '6px 0 10px' }}>{showPreview && authoringMode === 'manual' ? '手动编写不会调用 AI；请在下方填写故事，并为每段内容选择依据后保存。' : '仅将所选内容发送给 AI；生成后需核对并确认保存。'}</p>
+        {!sourceSelected ? <Button type="primary" disabled>先选择内容或补充经历</Button> : null}
+      {sourceSelected && !draft.proposal && !showPreview ? (
+        <Space>
+          <Button onClick={() => { setAuthoringMode('proposal'); setShowPreview(true); }}>使用 AI 整理</Button>
+          {draft.entrypoint === 'ui' ? <Button onClick={() => { setAuthoringMode('manual'); setShowPreview(true); }}>手动编写并保存</Button> : null}
+        </Space>
+      ) : null}
+      {sourceSelected && !draft.proposal && showPreview && authoringMode === 'proposal' ? (
+        <>
+          <p style={{ margin: '0 0 8px' }}>生成建议前请确认来源</p>
+          <Checkbox disabled={frozen} checked={previewConfirmed} onChange={(event) => setPreviewConfirmed(event.target.checked)}>我确认发送所选内容和补充经历</Checkbox>
+          <div style={{ marginTop: 12 }}><Button data-story-audit={`${draft.entrypoint}-generate`} type="primary" disabled={!previewConfirmed || frozen} loading={busy} onClick={() => void generate()}>根据所选内容整理故事</Button></div>
+        </>
+      ) : null}
+
+      </div> : null} title={<span ref={headingRef} tabIndex={-1}>{draft.entrypoint === 'pilot' ? 'Pilot · 整理面试故事' : '整理面试故事'}</span>}>
       <Alert
         type="info"
         showIcon
-        message="先选择原始证据，再确认发送给 AI"
-        description="不会自动选择来源，不会写入知识库；每一条保存内容都需要原始证据或你的明确陈述。"
+        message="选一些能说明你经历的材料，Pilot 会帮你整理成面试故事。"
+        description="你选择内容后才会发送给 AI；生成后由你核对，再决定是否保存。不会自动保存或写入知识库。"
         style={{ marginBottom: 16 }}
       />
       {draft.error ? <Alert
@@ -758,74 +788,18 @@ export default function InterviewStoryDrawer({ open, draft, onDraftChange, onClo
         action={draft.resultUnknown ? <Button size="small" disabled={retryWaiting} onClick={() => void (draft.pendingOperation === 'manual' ? saveManualStory() : generate())}>使用原尝试重试</Button> : undefined}
         style={{ marginBottom: 16 }}
       /> : null}
-      <Title level={5}>选择原始来源</Title>
+      <Title level={5}>1. 选择参考材料</Title>
       {!pickerOpen ? <Button data-story-audit={`${draft.entrypoint}-source-picker`} disabled={frozen} onClick={() => setPickerOpen(true)}>打开来源选择器</Button> : null}
       {candidatesLoading ? <Spin aria-label="正在加载可选原始来源" /> : null}
-      {pickerOpen && !candidatesLoading && candidates ? (
-        <Space direction="vertical" size={12} style={{ width: '100%' }}>
-          {candidates.resumes.length > 0 ? <List
-            size="small"
-            header="已保存简历中的原文叶子"
-            dataSource={candidates.resumes}
-            renderItem={(resume) => <List.Item><Space direction="vertical" size={4} style={{ width: '100%' }}>
-              <Text strong>{resume.label}</Text>
-              {resume.leaves.map((leaf) => {
-                const selection = { source_kind: 'resume_version' as const, source_id: resume.id, path: leaf.path };
-                const checked = draft.selections.some((item) => item.source_kind === selection.source_kind && item.source_id === selection.source_id && item.path === selection.path);
-                return <Checkbox key={leaf.path} disabled={frozen} checked={checked} onChange={() => toggleSource(selection)}>{leaf.path}：{leaf.preview}</Checkbox>;
-              })}
-            </Space></List.Item>}
-          /> : null}
-          {candidates.interview_notes.length > 0 ? <List
-            size="small"
-            header="已保存面试复盘的原文"
-            dataSource={candidates.interview_notes}
-            renderItem={(note) => <List.Item><Space direction="vertical" size={4} style={{ width: '100%' }}>
-              <Text strong>{note.label || `复盘 #${note.id}`}</Text>
-              {note.leaves.map((leaf) => {
-                const selection = { source_kind: 'interview_note' as const, source_id: note.id, path: leaf.path };
-                const checked = draft.selections.some((item) => item.source_kind === selection.source_kind && item.source_id === selection.source_id && item.path === selection.path);
-                return <Checkbox key={leaf.path} disabled={frozen} checked={checked} onChange={() => toggleSource(selection)}>{leaf.path}：{leaf.preview}</Checkbox>;
-              })}
-            </Space></List.Item>}
-          /> : null}
-          {candidates.mock_turns.length > 0 ? <List
-            size="small"
-            header="已完成模拟面试的题目与回答"
-            dataSource={candidates.mock_turns}
-            renderItem={(turn) => <List.Item><Space direction="vertical" size={4} style={{ width: '100%' }}>
-              <Text strong>{turn.label}</Text>
-              {turn.leaves.map((leaf) => {
-                const selection = { source_kind: 'mock_turn' as const, source_id: turn.attempt_id, path: leaf.path };
-                const checked = draft.selections.some((item) => item.source_kind === selection.source_kind && item.source_id === selection.source_id && item.path === selection.path);
-                return <Checkbox key={leaf.path} disabled={frozen} checked={checked} onChange={() => toggleSource(selection)}>{leaf.path}：{leaf.preview}</Checkbox>;
-              })}
-            </Space></List.Item>}
-          /> : null}
-          {!candidates.resumes.length && !candidates.interview_notes.length && !candidates.mock_turns.length ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无可选择的已保存原始来源" /> : null}
-        </Space>
-      ) : null}
+      {pickerOpen && !candidatesLoading && candidates ? <StorySourcePicker candidates={candidates} selections={draft.selections} frozen={frozen} onToggle={toggleSource} /> : null}
       <Divider />
-      <Title level={5}>补充你的明确原始陈述</Title>
+      <Title level={5}>2. 勾选相关内容，或补充自己的经历</Title>
       <Space.Compact style={{ width: '100%' }}>
-        <Input aria-label="用户明确原始陈述" disabled={frozen} value={assertion} onChange={(event) => setAssertion(event.target.value)} placeholder="例如：这是我本人负责的工作内容" />
+        <Input aria-label="用户明确原始陈述" disabled={frozen} value={assertion} onChange={(event) => setAssertion(event.target.value)} placeholder="例如：我负责接口性能优化，将平均响应时间从 800ms 降至 300ms" />
         <Button disabled={frozen || !assertion.trim()} onClick={addAssertion}>加入</Button>
       </Space.Compact>
-      {draft.assertions.map((item) => <Tag key={item} closable={!frozen} onClose={() => discardChangedInput({ assertions: draft.assertions.filter((value) => value !== item) })} style={{ marginTop: 8 }}>用户陈述 · {item}</Tag>)}
+      {draft.assertions.map((item) => <Tag key={item} closable={!frozen} onClose={() => discardChangedInput({ assertions: draft.assertions.filter((value) => value !== item) })} style={{ marginTop: 8 }}>我的补充 · {item}</Tag>)}
       <Divider />
-      {sourceSelected && !draft.proposal && !showPreview ? (
-        <Space>
-          <Button onClick={() => { setAuthoringMode('proposal'); setShowPreview(true); }}>使用 AI 整理</Button>
-          {draft.entrypoint === 'ui' ? <Button onClick={() => { setAuthoringMode('manual'); setShowPreview(true); }}>手动编写并保存</Button> : null}
-        </Space>
-      ) : null}
-      {sourceSelected && !draft.proposal && showPreview && authoringMode === 'proposal' ? (
-        <>
-          <Alert type="info" message="生成建议前请确认来源" description="将只发送你勾选的原文片段和明确陈述。" style={{ marginBottom: 12 }} />
-          <Checkbox disabled={frozen} checked={previewConfirmed} onChange={(event) => setPreviewConfirmed(event.target.checked)}>我已确认上述原始来源和陈述</Checkbox>
-          <div style={{ marginTop: 12 }}><Button data-story-audit={`${draft.entrypoint}-generate`} type="primary" disabled={!previewConfirmed || frozen} loading={busy} onClick={() => void generate()}>生成故事建议</Button></div>
-        </>
-      ) : null}
       {sourceSelected && !draft.proposal && showPreview && authoringMode === 'manual' ? (
         <>
           <Alert type="info" message="手动保存前请确认原始来源" description="手动保存不会调用 AI；所选来源会随新版本冻结保存。" style={{ marginBottom: 12 }} />

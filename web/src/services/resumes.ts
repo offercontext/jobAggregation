@@ -5,6 +5,8 @@ import type {
   MatchResumeResponse,
   Resume,
   UpdateResumeInput,
+  ResumeImportPreview,
+  ConfirmResumeImportInput,
 } from '@/types/resume';
 import { createApiClient } from './http';
 
@@ -18,6 +20,18 @@ export async function createResume(input: CreateResumeInput): Promise<Resume> {
 export async function listResumes(): Promise<Resume[]> {
   const { data } = await http.get<Resume[]>('/resumes');
   return data;
+}
+
+export async function getResume(id: number, signal?: AbortSignal): Promise<Resume> {
+  return (await http.get<Resume>(`/resumes/${id}`, { signal })).data;
+}
+
+export async function previewResumeStructure(id: number, signal?: AbortSignal): Promise<ResumeImportPreview> {
+  return (await http.post<ResumeImportPreview>(`/resumes/${id}/structure-preview`, {}, { signal })).data;
+}
+
+export async function confirmResumeStructure(id: number, input: ConfirmResumeImportInput, signal?: AbortSignal): Promise<Resume> {
+  return (await http.post<Resume>(`/resumes/${id}/structure-confirm`, input, { signal })).data;
 }
 
 export async function createResumeFromSample(input: CreateResumeFromSampleInput): Promise<Resume> {

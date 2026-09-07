@@ -52,6 +52,8 @@ vi.mock('antd', () => {
     Button,
     Col: Box,
     Dropdown: Box,
+    Drawer: (props: any) => props.open ? <div>{props.children}</div> : null,
+    Select: () => <select />,
     Empty,
     Input,
     message: antdState.message,
@@ -68,6 +70,8 @@ vi.mock('antd', () => {
 
 vi.mock('@ant-design/icons', () => ({
   CloudUploadOutlined: () => null,
+  CheckCircleOutlined: () => null,
+  EnvironmentOutlined: () => null,
   DeleteOutlined: () => null,
   EditOutlined: () => null,
   FileAddOutlined: () => null,
@@ -130,6 +134,7 @@ function setQueryState({
 
 beforeEach(() => {
   window.scrollTo = vi.fn();
+  Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1440 });
 });
 
 afterEach(() => {
@@ -322,9 +327,7 @@ describe('evidence destination query states', () => {
     );
 
     expect(view.querySelector('[class*="entryItemFocused"]')).not.toBeNull();
-    act(() => Array.from(view.querySelectorAll('button')).find((button) => button.textContent === '返回日历')?.click());
-    const otherDay = Array.from(view.querySelectorAll('div')).find((element) => element.textContent === '12');
-    act(() => otherDay?.parentElement?.click());
+    act(() => view.querySelector<HTMLButtonElement>('[data-date-select="2026-07-12"]')?.click());
 
     expect(antdState.message.warning).not.toHaveBeenCalled();
     expect(view.querySelector('[class*="entryItemFocused"]')).toBeNull();

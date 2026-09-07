@@ -142,7 +142,7 @@ describe('InterviewStoryDrawer', () => {
     }} onClose={() => {}} />);
     act(render);
     await act(async () => { await Promise.resolve(); await Promise.resolve(); });
-    expect(document.body.textContent).toContain('先选择原始证据');
+    expect(document.body.textContent).toContain('选一些能说明你经历的材料');
     expect(storyService.proposal).not.toHaveBeenCalled();
 
     act(() => [...document.body.querySelectorAll('button')].find((button) => button.textContent === '打开来源选择器')?.click());
@@ -154,6 +154,27 @@ describe('InterviewStoryDrawer', () => {
     expect(document.body.textContent).toContain('生成建议前请确认来源');
     expect(storyService.proposal).not.toHaveBeenCalled();
     expect(changes.length).toBeGreaterThan(0);
+  });
+
+  it('requires fresh AI consent after changing selected material', async () => {
+    let current = createInterviewStoryDraft('ui');
+    const render = () => root?.render(<InterviewStoryDrawer open draft={current} onDraftChange={(draft) => {
+      if (draft) { current = draft; render(); }
+    }} onClose={() => {}} />);
+    const button = (text: string) => [...document.body.querySelectorAll('button')].find((item) => item.textContent === text);
+    act(render);
+    act(() => button('打开来源选择器')?.click());
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    act(() => (document.body.querySelector('input[type="checkbox"]') as HTMLInputElement).click());
+    act(() => button('使用 AI 整理')?.click());
+    const consent = () => [...document.body.querySelectorAll('label')].find((item) => item.textContent === '我确认发送所选内容和补充经历')?.querySelector('input') as HTMLInputElement;
+    act(() => consent().click());
+    expect(consent().checked).toBe(true);
+    act(() => (document.body.querySelectorAll('input[type="checkbox"]')[1] as HTMLInputElement).click());
+    act(() => button('使用 AI 整理')?.click());
+    expect(consent().checked).toBe(false);
+    expect(button('根据所选内容整理故事')?.disabled).toBe(true);
+    expect(storyService.proposal).not.toHaveBeenCalled();
   });
 
   it('renders Resume, saved-review, and completed Mock sources only after the user opens the picker', async () => {
@@ -171,9 +192,9 @@ describe('InterviewStoryDrawer', () => {
     await act(async () => { await Promise.resolve(); await Promise.resolve(); });
 
     expect(storyService.candidates).toHaveBeenCalledWith(undefined);
-    expect(document.body.textContent).toContain('/content_json/projects/0/detail');
-    expect(document.body.textContent).toContain('/questions');
-    expect(document.body.textContent).toContain('/turns/001/answer');
+    expect(document.body.textContent).not.toContain('/content_json/projects/0/detail');
+    expect(document.body.textContent).not.toContain('/questions');
+    expect(document.body.textContent).not.toContain('/turns/001/answer');
   });
 
   it('creates a fresh idempotency key whenever the selected source input changes', async () => {
@@ -280,7 +301,7 @@ describe('InterviewStoryDrawer', () => {
     const confirmation = checkboxes[checkboxes.length - 1] as HTMLInputElement;
     act(() => confirmation.click());
     await act(async () => {
-      [...document.body.querySelectorAll('button')].find((button) => button.textContent === '生成故事建议')?.click();
+      [...document.body.querySelectorAll('button')].find((button) => button.textContent === '根据所选内容整理故事')?.click();
       await Promise.resolve();
       await Promise.resolve();
     });
@@ -947,6 +968,9 @@ describe('InterviewStoryDrawer', () => {
     await act(async () => { await Promise.resolve(); });
     act(() => setControlValue(situation, '我确认了指标并定位问题。'));
     await act(async () => { await Promise.resolve(); });
+    const evidenceOption = document.body.querySelector('option[value="selection:resume_version:2:/content_json/projects/0/detail"]');
+    expect(evidenceOption?.textContent).toContain('筱哲的后端简历（记录 2）');
+    expect(evidenceOption?.textContent).not.toContain('/content_json/');
     bindManualEvidence('title-title', 'selection:resume_version:2:/content_json/projects/0/detail');
     bindManualEvidence('block-situation_001', 'selection:resume_version:2:/content_json/projects/0/detail');
     await act(async () => {

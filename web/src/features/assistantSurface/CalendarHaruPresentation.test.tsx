@@ -1,0 +1,35 @@
+// @vitest-environment jsdom
+import { act, createRef } from 'react';
+import { createRoot } from 'react-dom/client';
+import { expect, it, vi } from 'vitest';
+import CalendarHaruPresentation from './CalendarHaruPresentation';
+vi.mock('@/features/pilotMascot/live2dRuntime', () => ({ live2dPilotMascotRuntime: { mount: vi.fn().mockResolvedValue({ setActivity: vi.fn(), dispose: vi.fn(), setZoom: vi.fn() }) } }));
+(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+it('right-clicks without opening chat, persists mode, and retains the same toggle callback', async () => {
+  localStorage.clear();
+  window.matchMedia = vi.fn().mockReturnValue({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() });
+  Object.defineProperty(window, 'innerWidth', { value: 1792, configurable: true });
+  Object.defineProperty(window, 'innerHeight', { value: 853, configurable: true });
+  const host = document.createElement('div'); document.body.append(host); const root = createRoot(host); const toggle = vi.fn();
+  const ref = createRef<HTMLButtonElement>();
+  await act(async () => root.render(<CalendarHaruPresentation activity="idle" panelOpen={false} onToggle={toggle} triggerRef={ref} onAnchorRectChange={() => undefined} />));
+  expect(host.querySelector('[data-haru-mode="compact"]')).not.toBeNull();
+  await act(async () => { ref.current?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 1780, clientY: 830 })); });
+  expect(toggle).not.toHaveBeenCalled();
+  const option = Array.from(document.querySelectorAll<HTMLElement>('[role="menuitemradio"]')).find((item) => item.textContent?.includes('人物展示'));
+  expect(option).toBeDefined(); act(() => option?.click());
+  expect(localStorage.getItem('offerpilot.haru.presentationMode')).toBe('character');
+  expect(host.querySelector('[data-haru-mode="character"]')).not.toBeNull();
+  act(() => ref.current?.click()); expect(toggle).toHaveBeenCalledTimes(1);
+  Object.defineProperty(window, 'innerWidth', { value: 1200, configurable: true }); act(() => window.dispatchEvent(new Event('resize')));
+  expect(host.querySelector('[data-haru-mode="compact"]')).not.toBeNull();
+  expect(localStorage.getItem('offerpilot.haru.presentationMode')).toBe('character');
+  Object.defineProperty(window, 'innerWidth', { value: 1792, configurable: true }); act(() => window.dispatchEvent(new Event('resize')));
+  expect(host.querySelector('[data-haru-mode="character"]')).not.toBeNull();
+  act(() => ref.current?.dispatchEvent(new KeyboardEvent('keydown', { key: 'F10', shiftKey: true, bubbles: true })));
+  expect(ref.current?.className).toContain('ant-dropdown-open');
+  act(() => ref.current?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })));
+  expect(ref.current?.className).not.toContain('ant-dropdown-open');
+  expect(toggle).toHaveBeenCalledTimes(1);
+  act(() => root.unmount()); host.remove();
+});

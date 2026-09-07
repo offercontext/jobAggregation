@@ -41,6 +41,34 @@ _BINDING_DIGEST = "sha256:" + "b" * 64
 _WHEN = datetime(2026, 8, 24, 9, tzinfo=timezone.utc)
 
 
+@pytest.mark.parametrize("context_type", ["application", "workspace"])
+def test_scoped_event_offset_create_update_and_rollback(seeded, context_type):
+    factory = AuthorityFactory()
+    authority, constraint = _scope(
+        factory,
+        seeded["first_id"] if context_type == "application" else None,
+        context_type=context_type,
+    )
+    data = _event_data(seeded["first_id"])
+    data.scheduled_at = datetime.fromisoformat("2026-09-14T15:00:00+08:00")
+    data.remind_at = datetime.fromisoformat("2026-09-14T14:30:00+08:00")
+    with seeded["session_factory"]() as session:
+        events = _bind(seeded["events"], session, factory, authority, constraint)
+        created = events.create_application_event_scoped(constraint, data)
+        assert created.scheduled_at == datetime(2026, 9, 14, 7)
+        assert created.remind_at == datetime(2026, 9, 14, 6, 30)
+        created_id = created.id
+        data.scheduled_at = datetime.fromisoformat("2026-09-15T00:30:00+08:00")
+        data.remind_at = None
+        updated = events.update_application_event_scoped(constraint, created_id, data)
+        assert updated is not None
+        assert updated.scheduled_at == datetime(2026, 9, 14, 16, 30)
+        assert updated.remind_at is None
+        session.rollback()
+    assert seeded["events"].get(created_id) is None
+    factory.close()
+
+
 def _authority(
     factory: AuthorityFactory,
     *,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Optional
 
 from builtins import list as BuiltinList
@@ -102,11 +102,11 @@ class ApplicationEventsRepository:
             event_type=data.event_type,
             subtype=data.subtype,
             round=data.round,
-            scheduled_at=data.scheduled_at,
+            scheduled_at=_storage_datetime(data.scheduled_at),
             duration_minutes=data.duration_minutes,
             location=data.location,
             notes=data.notes,
-            remind_at=data.remind_at,
+            remind_at=_storage_datetime(data.remind_at),
             status=data.status or "todo",
         )
         event.tags = data.tags or []
@@ -294,11 +294,11 @@ class ApplicationEventsRepository:
             event.subtype = data.subtype
             event.tags = data.tags or []
             event.round = data.round
-            event.scheduled_at = data.scheduled_at
+            event.scheduled_at = _storage_datetime(data.scheduled_at)
             event.duration_minutes = data.duration_minutes
             event.location = data.location
             event.notes = data.notes
-            event.remind_at = data.remind_at
+            event.remind_at = _storage_datetime(data.remind_at)
             event.status = data.status or event.status
             finish_repository_write(session, self._session)
             session.refresh(event)
@@ -463,6 +463,17 @@ def _get_visible_event(session: Session, event_id: int) -> Optional[ApplicationE
     return event
 
 
+def _storage_datetime(value: datetime | None) -> datetime | None:
+    """SQLite drops offsets: normalize the instant before binding the value.
+
+    Existing naive timestamps retain the API's UTC interpretation. Do not use
+    the host timezone or rewrite historical rows whose original offset is lost.
+    """
+    if value is None or value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 def _event_values(
     data: ApplicationEventCreate,
     *,
@@ -474,11 +485,11 @@ def _event_values(
         "subtype": data.subtype,
         tags_key: json.dumps(data.tags or [], ensure_ascii=False),
         "round": data.round,
-        "scheduled_at": data.scheduled_at,
+        "scheduled_at": _storage_datetime(data.scheduled_at),
         "duration_minutes": data.duration_minutes,
         "location": data.location,
         "notes": data.notes,
-        "remind_at": data.remind_at,
+        "remind_at": _storage_datetime(data.remind_at),
         "status": data.status or "todo",
     }
 

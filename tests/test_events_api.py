@@ -16,6 +16,32 @@ from offerpilot.repositories.applications import ApplicationCreate, Applications
 from offerpilot.repositories.notes import NoteCreate, NotesRepository
 
 
+def test_offset_event_api_roundtrip_matches_local_confirmation(tmp_path):
+    with TestClient(create_app(data_dir=tmp_path)) as client:
+        app = client.post("/api/applications", json={
+            "company_name": "云岚数据", "position_name": "AI工程师",
+        }).json()
+        payload = {
+            "application_id": app["id"], "event_type": "interview",
+            "scheduled_at": "2026-09-14T15:00:00+08:00",
+            "remind_at": "2026-09-14T14:30:00+08:00", "duration_minutes": 60,
+        }
+        response = client.post("/api/application-events", json=payload)
+        assert response.status_code == 201
+        event = response.json()
+        assert event["scheduled_at"] == "2026-09-14T07:00:00Z"
+        assert event["remind_at"] == "2026-09-14T06:30:00Z"
+        # The calendar receives UTC and converts to the user's +08:00 once.
+        offset = datetime.fromisoformat(payload["scheduled_at"]).tzinfo
+        local = datetime.fromisoformat(event["scheduled_at"].replace("Z", "+00:00"))
+        assert local.astimezone(offset).strftime("%H:%M") == "15:00"
+        payload["scheduled_at"] = "2026-09-15T00:30:00+08:00"
+        response = client.put(f"/api/application-events/{event['id']}", json=payload)
+        assert response.status_code == 200
+        listed = client.get("/api/application-events").json()
+        assert listed[0]["scheduled_at"] == "2026-09-14T16:30:00Z"
+
+
 def test_create_and_list_application_events_with_application_fields(tmp_path):
     client = TestClient(create_app(data_dir=tmp_path))
     app = client.post(

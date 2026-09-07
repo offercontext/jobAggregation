@@ -1,5 +1,16 @@
 # 筱哲走查问题修复计划
 
+## 第三轮：日程时区（2026-09-07）
+
+- 根因：工具/API接受带offset的datetime；SQLite DateTime保存wall time但丢弃offset，回读统一标记UTC，使15:00+08:00变成15:00Z，日历显示23:00。
+- 真实样本：只读核对8092演示副本原始ChatMessage 70，create_application_event的scheduled_at确为`2026-09-14T15:00:00+08:00`（remind_at为空），不是从8小时差值猜测输入时区。只读取时间字段，不输出凭据或完整消息。
+- 在ApplicationEventsRepository普通与scoped创建/更新写入前，将scheduled_at与remind_at统一为UTC naive。无时区输入保留既有UTC语义；不依赖主机时区，不修改原参数/HMAC/Provider Schema，不改变调用方事务所有权。
+- 不批量修复历史数据：丢失offset的历史行无法安全区分正确UTC和错误本地时间。用户可核对后用页面编辑；本轮不修改用户部署或原库。
+- RED：普通/绑定仓库6个非零offset用例失败，UTC/naive及原有测试5通过；application/workspace scoped新增2项均因15:00未换算07:00失败。
+- GREEN：重启后的完整定向矩阵（仓库、scoped写入、Events API、事件工具golden）84 passed，39项既有弃用warning，131.75秒；先前中断且无法取回的进程不计成功。Ruff变更源码/测试、Mypy仓库文件通过。未运行全量release gate或浏览器/真实AI重部署验收，本轮无前端代码更改。
+- 独立只读CR无P0/P1/P2阻塞，确认Undo使用规范化UTC结果、跨月日历已读取相邻分区。额外探针发现不带时区的兼容输入在Pending预览与UTC存储解释间仍不一致（1失败/2通过），不是本轮真实样本；探针未纳入本次回归文件，未改变该兼容规则或声称所有时间输入均已闭合。后续可单独收口明确时区输入与预览。
+- 模型质量解释：确认续跑已投影有效批准参数，但没有等价于用户新消息的明确“这是用户主动修订”说明；模型仍可能用原始请求解释新值并提出反向修改。虚构按钮/联动状态为模型正文与实际UI、工具结果不一致；本轮不修改这些回复策略，不宣称已修复。
+
 **目标：** 修复产品说明书走查中能复现的缺陷；区分产品问题、模型回答和采集环境故障，不以放宽 HITL、Surface 或 Ledger 校验消除报错。
 
 **架构：** 沿用现有 Controller、QueryClient、Runtime 和领域边界。基于 main `46fa54a` 的隔离 worktree 实施；保留原数据库与演示数据，不自动合并、推送或替换部署。

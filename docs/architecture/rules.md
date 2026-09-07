@@ -1,7 +1,7 @@
 # Architecture Rules
 
 > 显式约束注册表。每条 RULE 描述"绕过代价极大"或"被破坏过 ≥1 次"的规则。
-> 触发与使用指南见 [`documentation-rules.md`](./documentation-rules.md) §8。
+> 触发与使用指南见 [`documentation-rules.md`](./documentation-rules.md) §5。
 
 ## 当前记录
 

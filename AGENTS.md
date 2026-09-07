@@ -1,78 +1,33 @@
 # OfferPilot Agent 工作指南
 
-这份文件是 Codex、Claude、Cursor 等代码 Agent 在本仓库工作的施工协议。它不是面向用户的公开说明，也不替代飞书 PRD、ADR 或本地设计文档。
+## 0. 指令与授权边界
 
-## 0. 规则 0：推理与输出卫生
+- 遵守系统与开发者指令；用户当前任务和已有明确授权优先于本文件及技能中的流程建议。技能不能扩大任务范围或覆盖业务、安全约束。
+- 在已授权范围内完成工作；常规、可逆的实现选择自行判断。仅当缺失信息实质影响结果且无法从上下文推断，或下一步超出现有授权时询问；等待期间继续独立工作。
+- 发布、部署、向他人发送消息、修改远端文档及破坏性操作需在授权范围内执行。需要额外批准时，先完成可安全进行的准备，给出可审阅的结果；已有授权不重复询问。
+- 若技能导致暂停、额外确认或偏离任务，指出实际读取的 `SKILL.md` 路径、相关原文和适用原因，区分硬性约束与流程建议。不要从建议推导新的审批门槛。
+- 默认简洁中文，不发可选进度；用户请求或更高优先级指令要求时提供必要更新。回答先给结果，再给验证证据与限制。
 
-这些规则用于减少浅层推理和无意义 token 消耗。它们是通用工作规则，不是为了某个特定评测或预期答案定制的提示词。
+## 1. 文档职责
 
-- 可以花费任意多的时间进行思考。
-- 不要发送可选的 commentary 消息。
-- 不要用 commentary 汇报进度、叙述状态或解释中间过程。
-- 只有在工具调用需要、用户明确要求状态更新，或更高优先级指令要求进度更新时，才使用 commentary。
-- 对于不需要工具的任务，先完成推理，然后只在 final 中回答。
+- 本文件是跨 Agent 的仓库施工协议；产品事实见 §4，领域红线见 §6。
+- 写改 Markdown 前读取 [文档规范](docs/architecture/documentation-rules.md)。按任务读取相关参考，不全量加载历史 spec、plan 或技能。
+- `README.md` 面向用户。仅在用户要求，或公开安装、启动、许可证、命令行为确实变化时更新；它是公开承诺，不是内部验收表。
 
-### 推理要求
+## 2. 开工与工具
 
-- 优先使用第一性原理推理，而不是模式匹配。
-- 在解决问题前，先识别哪些信息是可观察的，哪些行动是可控制的，以及要求保证什么。
-- 如果某个属性可以被观察、触摸感知、标记、排序或以其他方式控制，就用一个可以利用分阶段 / 自适应选择的策略来求解；不要把问题简化成盲目的一次性抽样。
-- 对于定量、逻辑、边界或保证类问题，在最终回答前，证明该策略在最坏情况下的充分性，并证明匹配的下界。
-- 如果答案是数字，重新检查算术，并确保最终数值准确回答了问题。
+- 改文件前运行 `git status --short --branch`。不覆盖、回滚、stash 或整理用户未提交改动；提交只包含本任务文件。
+- feature work 新建隔离 worktree，默认基于最新相关上游分支，命名见 §3。文档维护不强制新建 worktree。
+- 涉及产品口径时优先用 `lark-cli` 读取相关飞书 PRD / ADR / Check 表；涉及代码行为时先读对应本地文档、当前代码和附近测试。
+- 对可能变化的状态检查真实仓库、文档或运行时。浏览器验收优先内置 Codex browser，仅在用户明确要求时使用 Chrome。
+- Git 操作（含远程传输）直接用 Git CLI，不因 Git 加载 `web-access`。该技能仅用于实际网页搜索、访问或浏览器交互。
 
-### GPT-5.5 降智检测
+## 3. Git 规范
 
-这个命令只用于检查运行时是否截断 reasoning。不要把仓库行为针对某个 benchmark 的答案做特化。它也不是常规仓库工作流；在安全敏感场景中，先审阅或 pin 远端脚本再运行。
-
-```bash
-curl -fsSL "https://raw.githubusercontent.com/haowang02/codex-candy-eval/main/codex_candy_eval.py" | python3 - -m gpt-5.5 -r high -n 5
-```
-
-参考来源：
-
-- https://github.com/Tai-Wei/codex-516-fix
-- https://github.com/haowang02/codex-candy-eval
-
-## 1. 这份文件是什么
-
-- `AGENTS.md` 是给本仓库 Agent 的施工协议。
-- `README.md` 是给用户和贡献者看的公开文档。做实现时不要顺手改 README。
-- 只有在用户明确要求，或公开安装、启动、许可证、命令行为确实变化时，才更新 `README.md`。
-- 产品和版本事实以飞书 PRD / ADR / Check 表以及下列本地 docs 为准，不以旧记忆或 README 文案为准。
-
-## 2. 开工前先做这些
-
-- 改文件前先运行 `git status --short --branch`，确认当前分支、dirty files，以及是否有用户正在进行中的改动。
-- 除非用户明确要求，不要覆盖、回滚、stash 或整理用户未提交改动。
-- 做 feature work 时，新建隔离 worktree，并按下方分支命名规则建分支。除非用户另有说明，基于最新相关上游分支开始。
-- 开发前确认 Superpowers skills 已安装且可读取，并使用与任务匹配的 workflow。
-- 任务涉及产品口径时，优先通过 `lark-cli` 读取相关飞书 PRD / ADR / Check 表。
-- 任务涉及代码行为时，先读本地 docs、当前代码和附近测试，再编辑。
-- 浏览器验证优先使用内置 Codex browser。只有用户明确要求 Chrome 时才用 Chrome。
-- 如果状态可能已经变化，检查真实仓库、文档或运行时，不要依赖记忆。
-
-## 3. 分支命名
-
-功能开发分支使用这个格式：
-
-```text
-<type>/<yyyymmdd>-<name>
-```
-
-- `type`：`feat`、`fix`、`docs`、`chore`、`refactor` 或 `test`。
-- `yyyymmdd`：当前本地日期。
-- `name`：小写短横线命名，尽量不超过 4-6 个词。
-- 分支名里不要写 Agent 名。执行者信息可以放在 commit、PR、最终汇报或协作记录里。
-
-示例：
-
-```text
-feat/20260708-resume-v01
-fix/20260708-application-events
-docs/20260708-agent-guide
-test/20260708-release-gate
-chore/20260708-lark-cli-update
-```
+- 新分支：`<type>/<yyyymmdd>-<name>`；type 为 `feat/fix/docs/chore/refactor/test`，日期为本地日期，name 为小写短横线短语，建议 4–6 个词以内，不写 Agent 名。
+- 本次任务有改动时，完成验证后做一次小步提交；纯问答或无变更不创建空提交。已有用户提交安排优先。
+- 提交标题：`<type>: AI <中文描述>`。type 使用 conventional commits 的 `build/chore/ci/docs/feat/fix/perf/refactor/revert/style/test`。
+- `git add` 与 `git commit` 分开执行，先检查暂存 diff；不得夹带用户改动。
 
 ## 4. 事实源
 
@@ -89,17 +44,16 @@ OfferPilot 的产品和架构事实源是飞书 wiki：
 - `docs/p0-release-checklist.md`
 - `docs/superpowers/specs/*`
 
-README 是公开说明，应视为用户承诺，而不是最新内部验收表。
-
 ## 5. 代码改动规则
 
 - 领域模型变化必须同步后端 models、schemas、repositories、API routes、AI tool schemas、前端 types、services、components、tests 和 mock data。
 - 不要为已经被 v0.1 最新设计废弃的名称或字段保留长期兼容。如果最新 PRD/ADR 说旧契约已经移除，就干净移除。
-- 当设计需要时，本地开发数据可以破坏性迁移或 reset，但必须在最终汇报里说明破坏性变化。
+- 设计要求的破坏性迁移或 reset 仅限本地开发数据；执行前确认目标与现有授权，未获授权的数据删除先询问。最终汇报说明破坏性变化。
 - API 命名、前端 service 命名、Agent tool schema 应暴露当前产品语言，不要继续暴露旧内部语义。
 - 优先沿用现有 repository/module 边界。实现一个聚焦改动时，不做无关重构。
 - 同一能力同时有 CLI/API 时，尽量保持行为一致。
-- 写工具必须保留 HITL 确认，除非配置明确开启 auto approve。
+- 产品运行时的写工具必须保留 HITL 确认，除非配置明确开启 `chat_auto_approve_writes=true`（默认 false）。开发任务的授权不等于允许关闭产品 HITL。
+- Agent checkpoint 与 pending/confirm 恢复链路必须保持可用；保留 `provider_blocks` 中的 provider 特定内容。provider fallback 行为以当前配置、实现与测试为准。
 
 ## 6. 领域红线
 
@@ -117,86 +71,25 @@ README 是公开说明，应视为用户承诺，而不是最新内部验收表�
 
 ## 7. 验证与 Code Review
 
-功能没测完就不算完成。根据改动面选择最小测试矩阵；release-style handoff 前跑完整 gate。
+- 按改动风险选择最小充分验证：纯文档检查 diff、链接、指令冲突与约束保留；行为变更运行相关测试和静态检查；UI 行为用内置浏览器走查。
+- 不为可逆、低影响改动新增只复述实现的测试。检查通过后，仅在有新变更、失败或未解决疑点时扩大或重复验证。
+- release-style handoff 跑完整本地 gate：`bash scripts/release-gate.sh`（包含 pytest、ruff、mypy、前端测试与构建、HTTP smoke、`oc verify --profile local`）。按发布范围追加 `--docker`、`--install` 或 `--real-ai`；真实 provider 验收沿用已有费用与凭据授权。
+- 非平凡代码改动交付前必须启动子代理 CR，涵盖 schema、API、AI tools、前端主流程、持久化、导航、设置、auth 或 Agent 行为改动。工具不可用时做手工 CR 并明确缺口，不声称已完成子代理审查。
+- CR 问题修复后验证受影响部分；接受的剩余风险说明理由。不要只凭子代理的成功描述判断完成。
+- 报告实际执行的验证及结果。未运行或失败的必要检查说明命令、原因和风险；需要 Docker 却不可用时明确说明，不声称 Docker smoke 通过。
 
-推荐完整本地 gate：
+## 8. 技能工作流
 
-```bash
-uv run pytest
-uv run ruff check .
-uv run mypy src
-cd web && npm test -- --run
-cd web && npm run build
-uv run oc smoke --static-dir web/dist
-```
-
-- 如果 Docker 不可用，要明确说明。不要声称 Docker smoke 已通过。
-- 如果某个命令不能运行，汇报命令、原因和风险。
-- 非平凡代码改动必须在最终交付前启动子代理 CR。包括 schema、API、AI tools、前端主流程、持久化、导航、设置、auth 或 Agent 行为改动。
-- CR 发现的问题要修复，或者明确记录为什么接受为剩余风险。
-- UI 行为需要验收时，用内置 Codex browser 做真实前端走查。
-
-## 8. Superpowers Workflow
-
-- 开发前确认 Superpowers skills 已安装且可读取。
-- 需求 / 设计类任务先用 `brainstorming`。
-- 多步骤实现前用 `writing-plans`。
-- 行为变化和 bugfix 在可行时用 `test-driven-development`。
-- 排查失败时用 `systematic-debugging`。
-- 声称完成前用 `verification-before-completion`。
-- 非平凡实现后用 `requesting-code-review` 或等价子代理 CR。
-- 如果 skill 缺失或无法适用，要说明情况，并采用最接近的手工流程，不要假装已经执行。
+- 使用与任务匹配且可读取的 Superpowers 技能；只检查本次需要的技能，不把安装整套技能作为所有任务的前置条件。
+- 需求尚不清楚或需设计取舍时用 `brainstorming`；多步骤代码实现用 `writing-plans`；可行的行为变更和 bugfix 用 `test-driven-development`；排查失败用 `systematic-debugging`。
+- 完成声明前用 `verification-before-completion`；非平凡实现用 `requesting-code-review` 或等价子代理 CR。无独立工作收益时不为流程形式拆分子代理。
+- 纯文档整理可直接审计、编辑和验证，不机械套用产品设计审批、完整代码计划或 TDD。已授权实施不因技能的执行方式选择题再次暂停。
+- 技能缺失或不适用时说明，并采用最接近的手工流程；不能因此略过必要的安全或业务验证。
 
 ## 9. 飞书文档 / 画板操作
 
-飞书文档使用 `lark-cli docs +fetch` 和 `lark-cli docs +update`。编辑飞书内容前，先通过 `lark-cli skills read lark-doc` 读取相关 `lark-doc` skill 指南。
+涉及飞书文档或画板时读取 [操作参考](docs/architecture/lark-document-operations.md)。编辑前读取 `lark-cli skills read lark-doc`；遵守 §0 授权边界及参考中的备份、块编辑和回读验证要求。
 
-### 跨文档画板引用
+## 10. 最终汇报
 
-- `docs +update --command block_insert_after --content '<whiteboard token="X"></whiteboard>'` 是跨文档复用画板的可靠路径。服务端会把源画板 clone 成新 token 后插入目标位置。
-- 不要用 `block_replace` 复用已有画板 token。它可能返回 `Whiteboard clone failed. Retry later` 并生成空块。
-- clone 出来的画板是一次性快照，不是 live link。源画板后续更新不会同步到 clone。如需手动同步，先用 `whiteboard +query --output_as svg` 导出源 SVG，再用 `whiteboard +update --whiteboard-token 目标 --input_format svg --overwrite --source @./svg` 更新目标画板。
-
-### Mermaid subgraph 和 node ID
-
-Mermaid 的 subgraph 和 node 使用 ASCII ID，中文标签放在方括号里。style 目标引用 ASCII ID。
-
-```mermaid
-%% 错误：中文名不一定能稳定作为 style 目标
-subgraph 只读来源
-  ...
-end
-style 只读来源 fill:#f0f4ff
-
-%% 正确：ASCII ID，中文标签
-subgraph SOURCE[只读来源]
-  ...
-end
-style SOURCE fill:#f0f4ff,stroke:#d1d5db
-```
-
-Node 也一样：使用 `NODE_ID["中文标签"]`，style 写 `NODE_ID`。
-
-### 只改色或装饰时
-
-`whiteboard +query --output_as svg` 返回的是渲染后的 SVG。只改颜色或清理装饰时，可以直接编辑渲染后的 SVG 再推回去，不必重画整张图。只有结构或布局变化时才重画。
-
-### `docs +update str_replace` 雷区
-
-1. 绝不要用 `str_replace` 改 `<pre><code>` 块内的行。匹配到其中一行可能会删除整个代码块，而且命令仍返回 `success`。
-2. pattern 里不要包含 `</code>` 或 `</b>` 这类闭合标签。`str_replace` 用纯 rendered text；需要保留样式时用 `block_replace`。
-3. 大段 `--content @file` / `--source @file` 可能 silent no-op。大内容优先用 stdin 和 `--content -`。
-4. `str_replace` 没匹配到也可能返回 `success`。更新后必须 fetch 回读并验证新旧字符串。
-
-推荐流程：大改前先把 full fetch 备份到 `/tmp`，这样误删 `pre` 或 whiteboard 时还能恢复。先 fetch 目标范围和 block id；结构化内容优先用 `block_replace`；`str_replace` 只用短且唯一的纯文本 pattern；更新后再次 fetch 并 grep 新旧字符串。高风险编辑最终用 `docs +fetch --scope full` 验证，不要只相信 update 命令返回值。
-
-## 10. 最终汇报格式
-
-实现类任务的最终总结必须包含：
-
-- 改了什么。
-- 破坏性变化。
-- 剩余风险。
-- 验证结果。
-
-如果有测试没跑或跑不了，要说明原因。如果更新了飞书文档，要给出链接以及 revision 或回读验证结果。
+简洁说明改了什么、破坏性变化、剩余风险、验证结果；无破坏性变化时写“无”。未运行的相关测试说明原因。若更新飞书文档，提供链接以及 revision 或回读验证结果。

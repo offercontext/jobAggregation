@@ -3184,7 +3184,7 @@ def create_app(
         if isinstance(parsed, JSONResponse):
             return parsed
         app_model = applications.get(app_id)
-        if app_model is None or app_model.source not in HUMAN_APPLICATION_SOURCES:
+        if app_model is None:
             return error_response(
                 404,
                 "该投递已不可见。",

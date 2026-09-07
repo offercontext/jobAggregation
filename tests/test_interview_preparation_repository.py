@@ -205,7 +205,7 @@ def _as_aware_for_test(value: datetime | None) -> datetime | None:
 def _setup(tmp_path):
     factory = init_database(tmp_path / "data.db")
     with factory() as session:
-        application = Application(company_name="Acme", position_name="Backend", source="test")
+        application = Application(company_name="Acme", position_name="Backend", source="web")
         session.add(application)
         session.flush()
         event = ApplicationEvent(
@@ -1676,7 +1676,7 @@ def test_selection_loader_accepts_eight_and_rejects_nine_or_cross_application(
         )
 
     with factory() as session:
-        other = Application(company_name="Other", position_name="Backend", source="test")
+        other = Application(company_name="Other", position_name="Backend", source="web")
         session.add(other)
         session.flush()
         other_target = ApplicationEvent(

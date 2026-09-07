@@ -34,6 +34,7 @@ from offerpilot.models import (
     Resume,
 )
 from offerpilot.repositories.json_contract import canonical_json, parse_json_object, sha256_text
+from offerpilot.repositories.application_preparation_access import can_prepare_application
 from offerpilot.review_readiness.preparation_selection import (
     PreparationReadinessSelectionError,
     PreparationReadinessSelectionLoader,
@@ -240,6 +241,9 @@ class InterviewPreparationProposalsRepository:
         readiness_feedback_version_ids_present: bool,
         readiness_feedback_version_ids: tuple[int, ...],
     ) -> InterviewPreparationGenerationResult | None:
+        application = _require_visible_application(session, application_id)
+        if not can_prepare_application(session, application):
+            raise InterviewPreparationNotFound()
         if not _frozen_request_matches(
             row,
             application_id=application_id,
@@ -1084,7 +1088,9 @@ def _build_v1_snapshot(
         user_assertions: list[str],
     jd_version_id: int | None = None,
 ) -> dict[str, Any]:
-    _require_visible_application(session, application_id)
+    application = _require_visible_application(session, application_id)
+    if not can_prepare_application(session, application):
+        raise InterviewPreparationNotFound()
     event = session.scalar(
         select(ApplicationEvent)
         .where(ApplicationEvent.id == event_id)

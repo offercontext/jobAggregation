@@ -3184,7 +3184,7 @@ def create_app(
         if isinstance(parsed, JSONResponse):
             return parsed
         app_model = applications.get(app_id)
-        if app_model is None or app_model.source not in HUMAN_APPLICATION_SOURCES:
+        if app_model is None:
             return error_response(
                 404,
                 "该投递已不可见。",
@@ -4948,9 +4948,7 @@ def create_app(
                     "app_id": item.event.application_id,
                     "event_id": event_id,
                     "event_type": item.event.event_type,
-                    "scheduled_at": scheduled_at.astimezone(timezone.utc)
-                    .isoformat()
-                    .replace("+00:00", "Z"),
+                    "scheduled_at": _format_rfc3339(scheduled_at),
                     "duration_minutes": duration_minutes(item.event.duration_minutes),
                     "location": item.event.location,
                     "editable": True,

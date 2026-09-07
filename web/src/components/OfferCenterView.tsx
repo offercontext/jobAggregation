@@ -129,7 +129,6 @@ export default function OfferCenterView({
   if (compareOpen) {
     return (
       <div style={{ display: 'grid', gap: 16 }}>
-        <OfferComparisonDimensionPanel offers={offers} onSelectionChange={setSelectedDimensionIds} />
         <div data-selected-comparison-dimensions={selectedDimensionIds.join(',')}>
           <OfferCompareDrawer
             open={compareOpen}
@@ -140,6 +139,10 @@ export default function OfferCenterView({
             onNegotiation={handleOpenNegotiation}
           />
         </div>
+        <details>
+          <summary>设置比较维度</summary>
+          <OfferComparisonDimensionPanel offers={selectedOffers} onSelectionChange={setSelectedDimensionIds} />
+        </details>
       </div>
     );
   }

@@ -74,6 +74,7 @@ function makeVersion(overrides: Record<string, unknown> = {}) {
       source_stable_id: '1',
       source_version_or_snapshot: 'assertion:1',
       source_path: '/statement',
+      text_location: '',
       excerpt: '这是我的陈述',
     }],
     assertions: [{ id: 1, statement: '这是我的陈述', frozen: true }],

@@ -13,9 +13,13 @@ export function compactMessageText(turn: UITurn): string {
     const actions = turn.presentation.actions
       .map((action, index) => `${index + 1}. ${action}`)
       .join('\n');
-    return actions
-      ? `${turn.presentation.conclusion}\n\n下一步\n${actions}`
-      : turn.presentation.conclusion;
+    // Detail contains the actual answer (e.g. the negotiation script). The
+    // structured conclusion is only an index, never a replacement for it.
+    return [
+      turn.presentation.conclusion,
+      turn.content.trim() || turn.presentation.detailMarkdown.trim(),
+      actions ? `下一步\n${actions}` : '',
+    ].filter(Boolean).join('\n\n');
   }
   const text = turn.content.trim();
   const characters = Array.from(text);

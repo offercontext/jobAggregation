@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Button, Empty, List, Space, Spin, Tabs, Tag, Typography } from 'antd';
-import { BookOutlined, SoundOutlined } from '@ant-design/icons';
+import { SoundOutlined } from '@ant-design/icons';
 import { listInterviews } from '@/services/interviews';
 import type { InterviewIndexItem } from '@/types/interviewIndex';
 import { normalizeInterviewIndexItem } from '@/features/interviewEvents/interviewIndexContract';
@@ -33,7 +33,6 @@ export interface InterviewV01ViewProps {
   /** Navigation-only story library entry; event cards never pass a note id. */
   onOpenStoryLibrary?: (reviewNoteId?: number) => void;
   onOpenVoiceCoachingGrowth?: () => void;
-  onOpenQuestionBank?: () => void;
   /** Increases when the root workspace asks the interview page to focus practice. */
   practiceRequestToken?: number;
   /** Retained as read-only composition inputs for hosts that already load them. */
@@ -328,7 +327,6 @@ export default function InterviewV01View({
   onOpenFreePractice,
   onOpenStoryLibrary,
   onOpenVoiceCoachingGrowth,
-  onOpenQuestionBank,
   practiceRequestToken,
   events,
   eventsLoading,
@@ -398,7 +396,7 @@ export default function InterviewV01View({
         <div>
           <Title level={2} style={{ margin: 0 }}>面试</Title>
           <Paragraph type="secondary" style={{ margin: '6px 0 0' }}>
-            围绕具体面试事件准备，完成后再进入自由练习和复盘沉淀。
+            围绕具体面试事件准备，完成后再进入面试练习和复盘沉淀。
           </Paragraph>
         </div>
       </div>
@@ -408,7 +406,7 @@ export default function InterviewV01View({
         items={[
           { key: 'upcoming', label: '即将进行' },
           { key: 'completed', label: '已完成' },
-          { key: 'practice', label: '自由练习' },
+          { key: 'practice', label: '面试练习' },
         ]}
       />
 
@@ -465,16 +463,15 @@ export default function InterviewV01View({
         <section data-testid="free-practice-workspace" aria-labelledby="free-practice-title">
           <div className="op-section-heading" style={{ marginBottom: 20 }}>
             <div>
-              <Title id="free-practice-title" level={3} style={{ margin: 0 }}>自由练习</Title>
-              <Paragraph type="secondary" style={{ margin: '6px 0 0' }}>题库和快速练习共用同一练习工作台，开始前不会自动调用模型。</Paragraph>
+              <Title id="free-practice-title" level={3} style={{ margin: 0 }}>面试练习</Title>
+              <Paragraph type="secondary" style={{ margin: '6px 0 0' }}>快速模拟或围绕已确认的复盘重点练习回答，开始前不会自动调用模型。</Paragraph>
             </div>
             <Space wrap>
-              {onOpenFreePractice ? <Button type="primary" onClick={onOpenFreePractice}>开始自由练习</Button> : null}
-              {onOpenQuestionBank ? <Button icon={<BookOutlined />} onClick={onOpenQuestionBank}>进入题库</Button> : null}
+              {onOpenFreePractice ? <Button type="primary" onClick={onOpenFreePractice}>开始面试练习</Button> : null}
             </Space>
           </div>
           <div className="op-empty-state" style={{ marginTop: 20 }}>
-            <Empty description="从题库选择题目，或从面试准备中的已确认重点开始一次精确练习。" image={Empty.PRESENTED_IMAGE_SIMPLE} />
+            <Empty description="选择快速模拟，或从面试复盘中的已确认重点开始一次回答练习。" image={Empty.PRESENTED_IMAGE_SIMPLE} />
           </div>
         </section>
       ) : null}

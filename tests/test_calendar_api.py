@@ -5,6 +5,30 @@ from fastapi.testclient import TestClient
 from offerpilot.api import create_app
 
 
+def test_calendar_preserves_naive_utc_like_event_detail(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from offerpilot.repositories.application_events import ApplicationEventsRepository
+
+    class StoredUtc(datetime):
+        def astimezone(self, tz=None):
+            if self.tzinfo is None:
+                raise AssertionError("database UTC must not use the host timezone")
+            return super().astimezone(tz)
+
+    row = SimpleNamespace(
+        event=SimpleNamespace(
+            id=1, application_id=7, event_type="interview",
+            scheduled_at=StoredUtc(2026, 9, 8, 6), duration_minutes=60, location="线上",
+        ), company_name="星河智能", position_name="开发",
+    )
+    monkeypatch.setattr(ApplicationEventsRepository, "list", lambda *args, **kwargs: [row])
+    client = TestClient(create_app(data_dir=tmp_path))
+    result = client.get("/api/calendar?month=2026-09")
+    assert result.status_code == 200
+    assert result.json()[0]["scheduled_at"] == "2026-09-08T06:00:00Z"
+
+
 def test_calendar_includes_applications_and_events(tmp_path):
     client = TestClient(create_app(data_dir=tmp_path))
     app = client.post(

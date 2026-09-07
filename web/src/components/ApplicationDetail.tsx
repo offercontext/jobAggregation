@@ -99,6 +99,41 @@ const { Title, Paragraph, Text } = Typography;
 
 type ApplicationDetailTab = 'overview' | 'preparation' | 'progress';
 
+interface ScheduleFormNavigationSnapshot {
+  activeTab: ApplicationDetailTab;
+  scrollTop: number;
+  content: HTMLElement | null;
+  trigger: HTMLElement | null;
+  triggerKind: 'stage' | 'more' | 'schedule' | null;
+}
+
+type ScheduleFormReturn =
+  | { kind: 'restore'; snapshot: ScheduleFormNavigationSnapshot }
+  | { kind: 'schedule' };
+
+function getApplicationContent(): HTMLElement | null {
+  if (typeof document === 'undefined') return null;
+  return document.querySelector<HTMLElement>('.op-app-content');
+}
+
+function prefersReducedMotion(): boolean {
+  return typeof window !== 'undefined'
+    && typeof window.matchMedia === 'function'
+    && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
+
+function getScheduleTrigger(
+  triggerKind: ScheduleFormNavigationSnapshot['triggerKind'],
+): HTMLElement | null {
+  if (typeof document === 'undefined' || triggerKind === null) return null;
+  const testId = triggerKind === 'stage'
+    ? 'application-stage-action'
+    : triggerKind === 'more'
+      ? 'application-more-actions'
+      : 'application-schedule-create';
+  return document.querySelector<HTMLElement>(`[data-testid="${testId}"]`);
+}
+
 const DETAIL_TABS: Array<{ id: ApplicationDetailTab; label: string }> = [
   { id: 'overview', label: '概览' },
   { id: 'preparation', label: '准备' },
@@ -432,6 +467,11 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
   const [jdHistoryOpen, setJdHistoryOpen] = useState(false);
   const [selectedJdVersion, setSelectedJdVersion] = useState<number | null>(null);
   const [activeTab, setActiveTab] = useState<ApplicationDetailTab>('overview');
+  const scheduleFormHeadingRef = useRef<HTMLHeadingElement | null>(null);
+  const scheduleSectionRef = useRef<HTMLElement | null>(null);
+  const scheduleNavigationRef = useRef<ScheduleFormNavigationSnapshot | null>(null);
+  const scheduleReturnRef = useRef<ScheduleFormReturn | null>(null);
+  const scheduleFormResultRef = useRef<'cancel' | 'success'>('cancel');
   const [opportunityFitOwnerState, setOpportunityFitOwnerState] = useState({
     pending: false,
     resultUnknown: false,
@@ -595,6 +635,10 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
 
   useEffect(() => {
     setMaterialKitPrefill({});
+    setEventFormOpen(false);
+    scheduleNavigationRef.current = null;
+    scheduleReturnRef.current = null;
+    scheduleFormResultRef.current = 'cancel';
     setActiveTab('overview');
     setPilotPreparationChooserOpen(false);
     setPilotPreparationChoices([]);
@@ -781,6 +825,9 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
 
   const closeDetail = () => {
     setEventFormOpen(false);
+    scheduleNavigationRef.current = null;
+    scheduleReturnRef.current = null;
+    scheduleFormResultRef.current = 'cancel';
     setMaterialKitPrefill({});
     setEditingNote(null);
     setKnowledgeCaptureOpen(false);
@@ -795,6 +842,71 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
     }
     onClose();
   };
+
+  const openScheduleForm = (
+    trigger: HTMLElement | null = null,
+    triggerKind: ScheduleFormNavigationSnapshot['triggerKind'] = null,
+  ) => {
+    if (eventFormOpen) return;
+    const content = trigger?.closest<HTMLElement>('.op-app-content') ?? getApplicationContent();
+    scheduleNavigationRef.current = {
+      activeTab,
+      scrollTop: content?.scrollTop ?? 0,
+      content,
+      trigger,
+      triggerKind,
+    };
+    scheduleFormResultRef.current = 'cancel';
+    setEventFormOpen(true);
+  };
+
+  const markScheduleFormSuccess = () => {
+    scheduleFormResultRef.current = 'success';
+  };
+
+  const closeScheduleForm = () => {
+    const snapshot = scheduleNavigationRef.current;
+    const result = scheduleFormResultRef.current;
+    scheduleNavigationRef.current = null;
+    scheduleFormResultRef.current = 'cancel';
+    if (result === 'success') {
+      scheduleReturnRef.current = { kind: 'schedule' };
+      setActiveTab('preparation');
+    } else if (snapshot) {
+      scheduleReturnRef.current = { kind: 'restore', snapshot };
+      setActiveTab(snapshot.activeTab);
+    } else {
+      scheduleReturnRef.current = null;
+    }
+    setEventFormOpen(false);
+  };
+
+  useEffect(() => {
+    if (eventFormOpen) {
+      const content = getApplicationContent();
+      if (content) content.scrollTop = 0;
+      scheduleFormHeadingRef.current?.focus({ preventScroll: true });
+      return;
+    }
+
+    const pendingReturn = scheduleReturnRef.current;
+    if (!pendingReturn) return;
+    scheduleReturnRef.current = null;
+    if (pendingReturn.kind === 'restore') {
+      const content = pendingReturn.snapshot.content ?? getApplicationContent();
+      if (content) content.scrollTop = pendingReturn.snapshot.scrollTop;
+      const trigger = pendingReturn.snapshot.trigger?.isConnected
+        ? pendingReturn.snapshot.trigger
+        : getScheduleTrigger(pendingReturn.snapshot.triggerKind);
+      trigger?.focus({ preventScroll: true });
+      return;
+    }
+
+    scheduleSectionRef.current?.scrollIntoView({
+      behavior: prefersReducedMotion() ? 'auto' : 'smooth',
+      block: 'start',
+    });
+  }, [eventFormOpen]);
 
   const openKnowledgeCapture = (note: InterviewNote) => {
     const existing = interviewKnowledgeCaptureDrafts?.[note.id] ?? createInterviewKnowledgeCaptureDraft();
@@ -1259,6 +1371,21 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
 
   if (!application || !open) return null;
 
+  if (eventFormOpen) {
+    return (
+      <div className={styles.scheduleFormWorkspace} data-testid="application-schedule-form-surface">
+        <ScheduleEventForm
+          open
+          applications={[application]}
+          initialApplication={application}
+          headingRef={scheduleFormHeadingRef}
+          onSuccess={markScheduleFormSuccess}
+          onClose={closeScheduleForm}
+        />
+      </div>
+    );
+  }
+
   const applicationDragBinding = onAttachToPilot
     ? createPilotAttachmentDragBinding({
         kind: 'application',
@@ -1305,7 +1432,7 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
     if (notesQuery.isError) void notesQuery.refetch();
   };
 
-  const runStageAction = () => {
+  const runStageAction = (trigger?: HTMLElement) => {
     if (stageDataBlocked) return;
     if (application.status === 'interview') {
       if (headerPrimaryTask) launchResolvedTask(headerPrimaryTask, 'application_header');
@@ -1320,7 +1447,7 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
         break;
       case 'followup':
       case 'written-test':
-        setEventFormOpen(true);
+        openScheduleForm(trigger, 'stage');
         break;
       case 'offer': {
         const result = launchTask({
@@ -1347,7 +1474,7 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
   const moreActionItems = [
     ...(onAskPilot ? [{ key: 'haru', label: '让 Haru 帮我', onClick: () => onAskPilot(application, { type: 'application_jd_save' }) }] : []),
     { key: 'jd', label: applicationJdQuery.data?.current ? '编辑岗位资料' : '添加岗位资料', onClick: startJdEditor },
-    { key: 'schedule', label: '安排日程', onClick: () => setEventFormOpen(true) },
+    { key: 'schedule', label: '安排日程', onClick: () => openScheduleForm(getScheduleTrigger('more'), 'more') },
   ];
 
   const linkedOffers = offerRecords.filter((offer) => offer.application_id === application.id);
@@ -1649,15 +1776,28 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
               <Button
                 type="primary"
                 size="large"
+                data-testid="application-stage-action"
                 disabled={externalTaskBlocked
                   || (stageDataBlocked && !stageDataHasError)
                   || (application.status === 'interview' && !stageDataBlocked && headerPrimaryTask === null)}
-                onClick={stageDataBlocked ? retryStageData : runStageAction}
+                onClick={(event) => {
+                  if (stageDataBlocked) {
+                    retryStageData();
+                    return;
+                  }
+                  runStageAction(event.currentTarget);
+                }}
               >
                 {stagePrimaryActionLabel}
               </Button>
               <Dropdown menu={{ items: moreActionItems }} trigger={['click']}>
-                <Button size="large" icon={<MoreOutlined />}>更多操作</Button>
+                <Button
+                  data-testid="application-more-actions"
+                  size="large"
+                  icon={<MoreOutlined />}
+                >
+                  更多操作
+                </Button>
               </Dropdown>
             </Space>
           </div>
@@ -1861,13 +2001,18 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
         </section>
 
         <Divider />
-        <section className={styles.workspaceSection} aria-labelledby="application-schedule-heading">
+        <section ref={scheduleSectionRef} className={styles.workspaceSection} aria-labelledby="application-schedule-heading">
         <Title id="application-schedule-heading" level={4} className={styles.workspaceSectionTitle}>日程与沟通</Title>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
           <Title level={5} style={{ margin: 0 }}>
             <CalendarOutlined /> 日程
           </Title>
-          <Button size="small" icon={<PlusOutlined />} onClick={() => setEventFormOpen(true)}>
+          <Button
+            data-testid="application-schedule-create"
+            size="small"
+            icon={<PlusOutlined />}
+            onClick={(event) => openScheduleForm(event.currentTarget, 'schedule')}
+          >
             安排日程
           </Button>
         </div>
@@ -2146,13 +2291,6 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
             : { pending: true, unsaved: true }}
         />
       ) : null}
-
-      <ScheduleEventForm
-        open={eventFormOpen}
-        applications={[application]}
-        initialApplication={application}
-        onClose={() => setEventFormOpen(false)}
-      />
 
       {knowledgeCaptureOpen && editingNote ? (
         <InterviewKnowledgeCaptureDrawer

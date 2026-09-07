@@ -311,8 +311,11 @@ export function resolveApplicationTasks(snapshot: FrozenApplicationTaskSnapshot,
         }
         if (event.bucket === 'needs_status_update') { addIssue(makeIssue('unavailable', 'event_status_needs_update', 2, event.eventId)); continue; }
         const end = durationValid && timeValid ? event.scheduledAtTimestamp + event.durationMinutes * 60_000 : null;
-        const inWindow = lifecycle === 'in_progress' ? end !== null && now <= end : timeValid && event.scheduledAtTimestamp > now && event.scheduledAtTimestamp - now <= 24 * 60 * 60_000;
-        if (event.bucket === 'upcoming' && actionAllowed && durationValid && timeValid && inWindow) addTask(makeTask('application.interview_prepare', { taskId: 'application.interview_prepare', applicationId: appId, eventId: event.eventId }, 'ready', 'interview_preparation_available', 2, event.scheduledAtTimestamp, event.eventId));
+        const canPrepare = lifecycle === 'in_progress' ? end !== null && now <= end : timeValid && event.scheduledAtTimestamp > now;
+        // The 24h window ranks recommendations; it is not an execution gate.
+        // A valid later event must not poison an independent completed review.
+        const preparationPriority = lifecycle === 'in_progress' || event.scheduledAtTimestamp! - now <= 24 * 60 * 60_000 ? 2 : 8;
+        if (event.bucket === 'upcoming' && actionAllowed && durationValid && timeValid && canPrepare) addTask(makeTask('application.interview_prepare', { taskId: 'application.interview_prepare', applicationId: appId, eventId: event.eventId }, 'ready', 'interview_preparation_available', preparationPriority, event.scheduledAtTimestamp, event.eventId));
         else if (event.bucket === 'upcoming' || event.bucket === 'unavailable') { addTask(makeTask('application.interview_prepare', { taskId: 'application.interview_prepare', applicationId: appId, eventId: event.eventId }, 'unavailable', 'event_contract_invalid', 99, null, event.eventId)); addIssue(makeIssue('unavailable', 'event_contract_invalid', 2, event.eventId)); }
       }
     }

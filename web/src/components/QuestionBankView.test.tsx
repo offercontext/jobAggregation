@@ -62,11 +62,11 @@ describe('QuestionBankView', () => {
     const markup = renderWithQuestions([]);
 
     expect(markup).toContain('题库刷题');
-    expect(markup).toContain('基于你的知识库与面试复盘生成题目');
+    expect(markup).toContain('基于已记录的面试问题生成题目');
     expect(markup).toContain('AI 生成题目');
     expect(markup).toContain('手动添加');
     expect(markup).toContain('题库还是空的');
-    expect(markup).toContain('从知识库生成你的第一批题目');
+    expect(markup).toContain('从面试复盘生成题目，或手动添加');
   });
 
   it('renders generated questions with filters, status, difficulty, and edit/delete controls', () => {
@@ -83,8 +83,16 @@ describe('QuestionBankView', () => {
     expect(markup).toContain('删除题目');
   });
 
-  it('keeps the practice path wired to due questions, answer reveal, review ratings, and stats refresh', () => {
-    expect(source).toContain("value: 'quick_practice'");
+  it('keeps the brush page limited to the bank and spaced review', () => {
+    expect(source).toContain("value: 'question_bank'");
+    expect(source).toContain("value: 'review'");
+    expect(source).toContain("label: '今日复习'");
+    expect(source).not.toContain('AdaptiveInterviewPracticeWorkspace');
+    expect(source).not.toContain('InterviewReadinessCenter');
+    expect(source).not.toContain('quick_practice');
+  });
+
+  it('keeps the spaced-review path wired to due questions, answer reveal, review ratings, and stats refresh', () => {
     expect(source).toContain('listDueQuestions(40)');
     expect(source).toContain('getPracticeStats()');
     expect(source).toContain('submitReview(id, rating)');
@@ -96,10 +104,11 @@ describe('QuestionBankView', () => {
     expect(source).toContain("invalidateQueries({ queryKey: ['questions'] })");
   });
 
-  it('keeps AI generation connected to knowledge and interview-review sources', () => {
+  it('does not offer unsupported knowledge generation as executable', () => {
     expect(source).toContain('generateQuestions');
     expect(source).toContain("source,");
-    expect(source).toContain("label: '知识库'");
+    expect(source).toContain("label: '参考资料（暂未开放）', value: 'knowledge', disabled: true");
+    expect(source).toContain("useState<'knowledge' | 'notes'>('notes')");
     expect(source).toContain("label: '面试复盘真题'");
     expect(source).toContain('已存在的题目会自动去重');
   });

@@ -26,12 +26,18 @@ const row = (overrides: Partial<InterviewIndexItem> = {}): InterviewIndexItem =>
 const NOW = Date.parse('2026-08-29T10:00:00Z');
 
 describe('InterviewV01View', () => {
-  it('organizes the workspace around upcoming, completed and free practice', () => {
+  it('organizes the workspace around upcoming, completed and interview practice', () => {
     expect(source).toContain("label: '即将进行'");
     expect(source).toContain("label: '已完成'");
-    expect(source).toContain("label: '自由练习'");
+    expect(source).toContain("label: '面试练习'");
     expect(source).not.toContain("label: '模拟练习'");
     expect(source).not.toContain("label: '复盘与成长'");
+  });
+
+  it('labels the interview-only practice entry without linking question-bank content into the page', () => {
+    expect(source).toContain("label: '面试练习'");
+    expect(source).toContain('开始面试练习');
+    expect(source).not.toContain('进入题库');
   });
 
   it('renders the interview index loading surface without a generic mock entry', () => {
@@ -119,7 +125,7 @@ describe('InterviewV01View', () => {
         <InterviewV01View />
       </AntApp>,
     );
-    expect(markup).toContain('自由练习');
+    expect(markup).toContain('面试练习');
     expect(markup).not.toContain('选择投递');
     expect(markup).not.toContain('选择面试事件');
   });

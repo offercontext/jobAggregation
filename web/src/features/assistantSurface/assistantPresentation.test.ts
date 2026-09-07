@@ -33,7 +33,7 @@ describe('assistant compact presentation', () => {
     };
 
     expect(compactMessageText(turn)).toBe(
-      '优先准备项目案例。\n\n下一步\n1. 补充量化结果\n2. 安排模拟面试',
+      '优先准备项目案例。\n\n完整正文\n\n下一步\n1. 补充量化结果\n2. 安排模拟面试',
     );
   });
 

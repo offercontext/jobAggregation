@@ -45,8 +45,11 @@ vi.mock('@/components/ApplicationListView', () => ({ default: () => <div /> }));
 vi.mock('@/components/CalendarView', () => ({ default: () => <div /> }));
 vi.mock('@/components/KnowledgeSourcesView', () => ({ default: () => <div /> }));
 vi.mock('@/components/QuestionBankView', () => ({
-  default: () => <section data-testid="three-mode-practice-owner">
-    <button type="button">复盘训练</button><button type="button">题库</button><button type="button">快速练习</button>
+  default: () => <section data-testid="question-bank-owner" />,
+}));
+vi.mock('@/components/InterviewPracticeView', () => ({
+  default: () => <section data-testid="interview-practice-owner">
+    <button type="button">快速模拟</button><button type="button">复盘重点练习</button>
   </section>,
 }));
 vi.mock('@/components/OfferCenterView', () => ({ default: () => <div /> }));
@@ -151,9 +154,8 @@ describe('AppShell voice coaching navigation', () => {
     expect(host.querySelector('[data-testid="voice-growth-view"]')).not.toBeNull();
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="practice-growth"]')?.click());
     await flush();
-    expect(host.querySelector('[data-testid="three-mode-practice-owner"]')?.textContent).toContain('复盘训练');
-    expect(host.querySelector('[data-testid="three-mode-practice-owner"]')?.textContent).toContain('题库');
-    expect(host.querySelector('[data-testid="three-mode-practice-owner"]')?.textContent).toContain('快速练习');
+    expect(host.querySelector('[data-testid="interview-practice-owner"]')?.textContent).toContain('快速模拟');
+    expect(host.querySelector('[data-testid="interview-practice-owner"]')?.textContent).toContain('复盘重点练习');
 
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="nav-pilot"]')?.click());
     await flush();
@@ -162,7 +164,7 @@ describe('AppShell voice coaching navigation', () => {
     expect(host.querySelector('[data-testid="voice-growth-view"]')).not.toBeNull();
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="practice-growth"]')?.click());
     await flush();
-    expect(host.querySelector('[data-testid="three-mode-practice-owner"]')).not.toBeNull();
+    expect(host.querySelector('[data-testid="interview-practice-owner"]')).not.toBeNull();
   });
 
   it('keeps the composition root write-free while the canonical studio owns close', async () => {
@@ -174,7 +176,7 @@ describe('AppShell voice coaching navigation', () => {
     await flush();
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="practice-growth"]')?.click());
     await flush();
-    expect(host.querySelector('[data-testid="three-mode-practice-owner"]')).not.toBeNull();
+    expect(host.querySelector('[data-testid="interview-practice-owner"]')).not.toBeNull();
     expect(host.querySelector('[data-testid="interview-studio"]')).toBeNull();
     expect(host.querySelector('[data-testid="interview-studio"]')).toBeNull();
   });
@@ -188,7 +190,7 @@ describe('AppShell voice coaching navigation', () => {
     await flush();
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="practice-growth"]')?.click());
     await flush();
-    expect(host.querySelector('[data-testid="three-mode-practice-owner"]')).not.toBeNull();
+    expect(host.querySelector('[data-testid="interview-practice-owner"]')).not.toBeNull();
 
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="nav-interview"]')?.click());
     await flush();
@@ -196,6 +198,6 @@ describe('AppShell voice coaching navigation', () => {
     await flush();
     act(() => host.querySelector<HTMLButtonElement>('[data-testid="practice-growth"]')?.click());
     await flush();
-    expect(host.querySelector('[data-testid="three-mode-practice-owner"]')).not.toBeNull();
+    expect(host.querySelector('[data-testid="interview-practice-owner"]')).not.toBeNull();
   });
 });

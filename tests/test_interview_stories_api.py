@@ -70,6 +70,12 @@ def test_manual_story_api_creates_reads_archives_and_restores_without_ai(app_cli
     assert replay.status_code == 201
     assert replay.json()["id"] == story["id"]
     assert story["title"] == "线上延迟排查"
+    summary = app_client.get(f"/api/interview-stories/{story['id']}/versions").json()[0]
+    detail = app_client.get(
+        f"/api/interview-stories/{story['id']}/versions/{story['current_version_id']}"
+    ).json()
+    assert detail["confirmed_at"] == summary["confirmed_at"]
+    assert story["version"]["confirmed_at"] == summary["confirmed_at"]
     assert app_client.get("/api/interview-stories").json()[0]["id"] == story["id"]
     assert app_client.get(f"/api/interview-stories/{story['id']}/versions").json()[0]["version_number"] == 1
     assert app_client.get(

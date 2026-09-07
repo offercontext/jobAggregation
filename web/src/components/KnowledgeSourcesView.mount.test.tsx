@@ -34,6 +34,7 @@ vi.mock('@/services/knowledge', () => ({
 const { QueryClient, QueryClientProvider } = await import('@tanstack/react-query');
 const { App: AntApp } = await import('antd');
 const { default: KnowledgeSourcesView } = await import('./KnowledgeSourcesView');
+const knowledgeService = await import('@/services/knowledge');
 
 let root: Root | undefined;
 let container: HTMLDivElement | undefined;
@@ -50,6 +51,7 @@ function renderView() {
       <AntApp><KnowledgeSourcesView /></AntApp>
     </QueryClientProvider>,
   ));
+  return queryClient;
 }
 
 async function flush() {
@@ -75,6 +77,8 @@ function submitSearch(query = '延迟') {
 }
 
 beforeEach(() => {
+  vi.clearAllMocks();
+  Element.prototype.scrollIntoView = vi.fn();
   state.confirmed = [];
   state.sources = [];
   state.search.mockReset();
@@ -92,6 +96,65 @@ afterEach(() => {
 });
 
 describe('KnowledgeSourcesView mounted source states', () => {
+  it('retains a search target until asynchronously loaded evidence is present', async () => {
+    const source = { id: 3, source_kind: 'markdown', lifecycle: 'active',
+      title: '搜索测试资料', extraction_status: 'extracted', brief_status: 'pending' };
+    state.sources = [source];
+    vi.mocked(knowledgeService.fetchKnowledgeSource).mockResolvedValue(source as never);
+    vi.mocked(knowledgeService.fetchKnowledgeSourceContent).mockResolvedValue('解析前正文');
+    vi.mocked(knowledgeService.fetchKnowledgeSourceJobs).mockResolvedValue({ jobs: [], origins: [] } as never);
+    let resolveEvidence!: (value: unknown) => void;
+    vi.mocked(knowledgeService.fetchKnowledgeSourceEvidence).mockImplementation(() => new Promise((resolve) => {
+      resolveEvidence = resolve as (value: unknown) => void;
+    }));
+    state.search.mockResolvedValue({ query: '延迟', hits: [{ evidence_id: 'e1', source_id: 3, snippet: '迟到的依据' }] });
+    renderView();
+    await flush();
+    submitSearch();
+    await flush();
+    const open = [...container!.querySelectorAll('button')].find((button) => button.textContent?.includes('打开并定位'));
+    expect(open).toBeTruthy();
+    act(() => open!.click());
+    await flush();
+    await act(async () => resolveEvidence({ items: [{ id: 'e1', source_id: 3,
+      canonical_excerpt: '迟到的依据', heading_path: [], ordinal: 1 }], next_cursor: null }));
+    await flush();
+    expect(Element.prototype.scrollIntoView).toHaveBeenCalledOnce();
+  });
+  it('refreshes evidence after extraction completes without reopening the source', async () => {
+    const source = { id: 3, source_kind: 'markdown', lifecycle: 'active',
+      title: '解析测试资料', display_title: '解析测试资料', extraction_status: 'processing', brief_status: 'pending' };
+    state.sources = [source];
+    vi.mocked(knowledgeService.fetchKnowledgeSource).mockResolvedValue(source as never);
+    vi.mocked(knowledgeService.fetchKnowledgeSourceContent).mockResolvedValue('解析前正文');
+    vi.mocked(knowledgeService.fetchKnowledgeSourceJobs).mockResolvedValue({ jobs: [], origins: [] } as never);
+    vi.mocked(knowledgeService.fetchKnowledgeSourceEvidence).mockResolvedValue({ items: [], next_cursor: null });
+    const client = renderView();
+    await flush();
+    const sourceButton = container!.querySelector<HTMLElement>('.knowledge-source-item');
+    expect(sourceButton).toBeTruthy();
+    act(() => sourceButton!.click());
+    await flush();
+    const before = vi.mocked(knowledgeService.fetchKnowledgeSourceEvidence).mock.calls.length;
+    const contentBefore = vi.mocked(knowledgeService.fetchKnowledgeSourceContent).mock.calls.length;
+    expect(before).toBeGreaterThan(0);
+    expect(contentBefore).toBeGreaterThan(0);
+    vi.mocked(knowledgeService.fetchKnowledgeSourceContent).mockResolvedValue('解析完成后的正文');
+    vi.mocked(knowledgeService.fetchKnowledgeSourceEvidence).mockResolvedValue({ items: [{
+      id: 'e1', source_id: 3, canonical_excerpt: '解析完成后的依据', heading_path: [], ordinal: 1,
+    }], next_cursor: null } as never);
+    act(() => client.setQueryData(['knowledge', 'source', 3], { ...source, extraction_status: 'extracted', active_snapshot_id: 1 }));
+    await flush();
+    await flush();
+    expect(knowledgeService.fetchKnowledgeSourceEvidence).toHaveBeenCalledTimes(before + 1);
+    expect(container!.textContent).toContain('解析完成后的依据');
+    expect(knowledgeService.fetchKnowledgeSourceContent).toHaveBeenCalledTimes(contentBefore + 1);
+    const contentTab = [...container!.querySelectorAll('[role="tab"]')].find((tab) => tab.textContent?.includes('资料正文'));
+    expect(contentTab).toBeTruthy();
+    act(() => (contentTab as HTMLElement).click());
+    await flush();
+    expect(container!.textContent).toContain('解析完成后的正文');
+  });
   it('keeps the empty knowledge list neutral', async () => {
     renderView();
     await flush();

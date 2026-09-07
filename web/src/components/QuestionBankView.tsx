@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Button,
@@ -44,13 +44,6 @@ import type {
   ReviewRating,
 } from '@/types/question';
 import styles from './QuestionBankView.module.css';
-import AdaptiveInterviewPracticeWorkspace from './AdaptiveInterviewPracticeWorkspace';
-import type { AdaptivePracticeFocus, AdaptivePracticeOwnerDraft } from '@/types/adaptiveInterviewPractice';
-import InterviewReadinessCenter, {
-  type QuickPracticeStudioContext,
-  type RealInterviewStudioContext,
-  type ResumeInput,
-} from '@/features/interviewReadiness/InterviewReadinessCenter';
 
 const { Paragraph } = Typography;
 
@@ -68,31 +61,15 @@ const STATUS_META: Record<QuestionStatus, { label: string; color: string }> = {
 
 interface QuestionBankViewProps {
   focusId?: number;
-  adaptiveFocus?: AdaptivePracticeFocus;
-  adaptiveOwnerGeneration?: number;
-  recoveryOwnerGeneration?: number | null;
-  adaptivePracticeDrafts?: Readonly<Record<string, AdaptivePracticeOwnerDraft>>;
-  onAdaptivePracticeDraftChange?: (key: string, draft: AdaptivePracticeOwnerDraft | null, retireOwnerKey?: string) => boolean | void;
-  onAdaptivePracticeGuardChange?: (guard: { pending: boolean; unsaved: boolean }) => void;
-  onAdaptiveFocusConsumed?: () => void;
-  quickPracticeResumes?: ResumeInput;
-  onOpenStudio?: (context: QuickPracticeStudioContext) => void;
+  practiceRequestToken?: number;
 }
 
 export default function QuestionBankView({
   focusId,
-  adaptiveFocus,
-  adaptiveOwnerGeneration,
-  recoveryOwnerGeneration,
-  adaptivePracticeDrafts,
-  onAdaptivePracticeDraftChange,
-  onAdaptivePracticeGuardChange,
-  onAdaptiveFocusConsumed,
-  quickPracticeResumes,
-  onOpenStudio,
+  practiceRequestToken,
 }: QuestionBankViewProps) {
-  const [tab, setTab] = useState<'review_feedback' | 'question_bank' | 'quick_practice'>(adaptiveFocus ? 'review_feedback' : 'question_bank');
-  const [resolvedAdaptiveFocus, setResolvedAdaptiveFocus] = useState(adaptiveFocus);
+  const [tab, setTab] = useState<'question_bank' | 'review'>(practiceRequestToken ? 'review' : 'question_bank');
+  const lastPracticeRequestTokenRef = useRef<number | undefined>(practiceRequestToken);
 
   // When launched from a mock-interview drill link, surface the target id.
   useEffect(() => {
@@ -102,57 +79,32 @@ export default function QuestionBankView({
   }, [focusId]);
 
   useEffect(() => {
-    setResolvedAdaptiveFocus(adaptiveFocus);
-    if (adaptiveFocus) {
-      setTab('review_feedback');
-      onAdaptiveFocusConsumed?.();
+    const previous = lastPracticeRequestTokenRef.current;
+    lastPracticeRequestTokenRef.current = practiceRequestToken;
+    if (practiceRequestToken !== undefined && practiceRequestToken > 0 && practiceRequestToken > (previous ?? 0)) {
+      setTab('review');
     }
-  }, [adaptiveFocus, onAdaptiveFocusConsumed]);
-
-  const handleQuickPracticeStudioOpen = (context: RealInterviewStudioContext | QuickPracticeStudioContext) => {
-    if (context.kind !== 'quick_practice') return;
-    onOpenStudio?.(Object.freeze({ ...context }));
-  };
+  }, [practiceRequestToken]);
 
   return (
     <div className={styles.page}>
       <div className={styles.header}>
         <div>
           <h1 className={styles.title}>题库刷题</h1>
-          <p className={styles.subtitle}>基于你的知识库与面试复盘生成题目，刷题打卡、间隔复习</p>
+          <p className={styles.subtitle}>基于已记录的面试问题生成题目，管理题库，按间隔复习巩固面试知识</p>
         </div>
         <Segmented
           value={tab}
-          onChange={(v) => setTab(v as 'review_feedback' | 'question_bank' | 'quick_practice')}
+          onChange={(v) => setTab(v as 'question_bank' | 'review')}
           options={[
-            { label: '复盘训练', value: 'review_feedback' },
             { label: '题库', value: 'question_bank' },
-            { label: '快速练习', value: 'quick_practice' },
+            { label: '今日复习', value: 'review' },
           ]}
         />
       </div>
 
-      <section hidden={tab !== 'review_feedback'} aria-label="复盘训练模式">
-        <AdaptiveInterviewPracticeWorkspace
-          focus={resolvedAdaptiveFocus}
-          ownerGeneration={adaptiveOwnerGeneration}
-          recoveryOwnerGeneration={recoveryOwnerGeneration}
-          drafts={adaptivePracticeDrafts}
-          onDraftChange={onAdaptivePracticeDraftChange}
-          onGuardChange={onAdaptivePracticeGuardChange}
-        />
-      </section>
       <section hidden={tab !== 'question_bank'} aria-label="题库模式"><BankTab /></section>
-      <section hidden={tab !== 'quick_practice'} aria-label="快速练习模式">
-        <InterviewReadinessCenter
-          initialMode="quick"
-          fixedMode="quick"
-          actionEmphasis="primary"
-          resumes={quickPracticeResumes}
-          onOpenStudio={handleQuickPracticeStudioOpen}
-        />
-        <PracticeTab />
-      </section>
+      <section hidden={tab !== 'review'} aria-label="今日复习模式"><PracticeTab /></section>
     </div>
   );
 }
@@ -284,7 +236,7 @@ function BankTab() {
               className="op-ai-btn"
               onClick={() => setGenerateOpen(true)}
             >
-              从知识库生成你的第一批题目
+              从面试复盘生成题目，或手动添加
             </Button>
           )}
         </Empty>
@@ -369,7 +321,7 @@ function BankTab() {
 
 function GenerateDrawer({ open, onClose }: { open: boolean; onClose: () => void }) {
   const qc = useQueryClient();
-  const [source, setSource] = useState<'knowledge' | 'notes'>('knowledge');
+  const [source, setSource] = useState<'knowledge' | 'notes'>('notes');
   const [count, setCount] = useState(8);
 
   const genMutation = useMutation({
@@ -413,7 +365,7 @@ function GenerateDrawer({ open, onClose }: { open: boolean; onClose: () => void 
             value={source}
             onChange={(v) => setSource(v as 'knowledge' | 'notes')}
             options={[
-              { label: '知识库', value: 'knowledge' },
+              { label: '参考资料（暂未开放）', value: 'knowledge', disabled: true },
               { label: '面试复盘真题', value: 'notes' },
             ]}
           />
@@ -421,13 +373,13 @@ function GenerateDrawer({ open, onClose }: { open: boolean; onClose: () => void 
 
         {source === 'knowledge' && (
           <Paragraph type="secondary" style={{ margin: 0 }}>
-            将从知识库文档中提炼题目。
+            参考资料出题暂未开放，可选择面试复盘或手动添加题目。
           </Paragraph>
         )}
 
         {source === 'notes' && (
           <Paragraph type="secondary" style={{ margin: 0 }}>
-            将从你已记录的面试复盘（面试问题 + 薄弱点）中提炼题目。
+            将从已记录的面试问题中提炼题目。参考资料出题暂未开放，可先手动添加题目。
           </Paragraph>
         )}
 

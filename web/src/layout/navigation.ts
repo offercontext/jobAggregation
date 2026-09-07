@@ -68,6 +68,7 @@ export const MODULE_TABS: Record<ModuleKey, ModuleTabItem[]> = {
   ],
   interview: [
     { view: 'interview', label: '面试' },
+    { view: 'questions', label: '刷题' },
   ],
   offers: [
     { view: 'offers', label: 'Offer' },

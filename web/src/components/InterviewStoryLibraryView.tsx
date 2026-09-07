@@ -162,7 +162,7 @@ function normalizeEvidenceLinks(value: unknown): InterviewStoryEvidenceLink[] | 
     const sourceVersion = safeText(sourceVersionRead.value, 512);
     const sourcePath = safeText(pathRead.value, 1024);
     const excerpt = safeText(excerptRead.value, 4_000);
-    const textLocation = locationRead.value === undefined || locationRead.value === null
+    const textLocation = locationRead.value === undefined || locationRead.value === null || locationRead.value === ''
       ? ''
       : safeText(locationRead.value, 256);
     if (!targetKind || !['title', 'block', 'capability_label', 'applicable_question'].includes(targetKind)

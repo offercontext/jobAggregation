@@ -1,108 +1,55 @@
-# OfferPilot — 本地优先的 AI 求职工作台
+# 👨‍💻  WorkAggregation
+基于数据技术的互联网行业招聘信息聚合系统
+本系统以Python为核心，依托web展示，所有功能在网页就可以完成操作，爬虫、分析、可视化、互动独立成模块，互通有无。具体依托python的丰富库实现，爬虫使用Requests爬取，使用lxml、beautifulsoup4解析。使用numpy、pandas分析数据，使用pyecharts做可视化，使用Flask进行web后台建设。数据通过csv、MySQL、配置文件来进行存储互通。  
+为了拓展功能编写了定时器，微信推送，为了适应团队合作编写了函数注册器，参数迭代器。爬虫数据来自前程无忧、齐鲁人才网、猎聘网、拉勾网等等网站，需要的基本数据一应俱全。
 
-> 把简历、投递、面试与 Offer 放在一个由你掌控的本地工作台；AI 提供建议，你决定下一步。
+## 觉得不错欢迎给star⭐哦
 
-OfferPilot 面向正在认真找工作的普通求职者。它将分散的简历、岗位信息、面试安排、复盘和 Offer 事实整理到本地 SQLite 工作区中，并在需要时由你配置的 AI 服务协助分析与起草。
 
-本仓库提供 OfferPilot 本地部署版本。若想免安装体验网页版，欢迎访问 [offerContext Hub](https://hub.offercontext.cn)。网页版还提供每日岗位更新与求职社区，让求职之路不再孤单。
 
-## 文档入口
+## 部分网站爬虫可能已无法使用 注意使用时的爬虫选项
 
-- [产品介绍与用户指南（Markdown）](docs/product-manual/产品说明书.md)：了解主要场景，按简历、投递、面试、复盘与 Offer 查阅完整操作；正文与配图随仓库维护。
-- [第一次使用](docs/product-manual/产品说明书.md#start)：先创建投递并保存 JD，再体验 AI 辅助材料准备；安装与启动命令见本文的[快速开始](#快速开始)。
-- [常见问题与使用边界](docs/product-manual/产品说明书.md#s12)：确认、结果恢复、数据备份与已知限制。
+## ~~在线demo http://58.87.66.50/~~ 服务器到期
 
-## 它能帮你做什么
+## ToDo 
+- 缺失爬虫补充
+- 改善爬取时UI
 
-- **管理简历与投递**：保留简历版本、记录岗位、公司、状态与日程。
-- **评估岗位匹配、准备投递材料**：基于你提供的简历和岗位信息，生成可审阅的匹配分析与材料建议。
-- **准备面试、进行文本模拟与复盘**：围绕已安排的面试准备问题进行练习；支持文字与可选语音输入，语音转写结果需先确认。
-- **汇总已确认的经验与知识**：将你确认保留的复盘内容整理进知识库，方便下一次准备时查阅。
-- **比较 Offer 已知事实，准备谈薪沟通**：查看薪酬、福利、截止日等已知信息，并准备下一次沟通。
-- **随时唤起 Pilot**：桌面宽屏可通过 Haru 看板娘打开 Pilot；隐藏角色后仍可使用默认 Pilot 侧边栏。
 
-## 真实界面
+## 截图
+<img  src="https://github.com/xming521/picture/blob/master/QQ截图20200220123347.png"/>  
+<img  src="https://github.com/xming521/picture/blob/master/QQ截图20200220123917.png"/>  
+<img  src="https://github.com/xming521/picture/blob/master/QQ截图20200220123715.png"/>  
+<img  src="https://github.com/xming521/picture/blob/master/QQ截图20200220123555.png"/>  
+<img  src="https://github.com/xming521/picture/blob/master/QQ截图20200220124101.png"/>  
+<img  src="https://github.com/xming521/picture/blob/master/QQ截图20200220123731.png"/>  
 
-以下截图采集于 2026 年 9 月 7–8 日，来自本地亮色模式的中文演示案例（候选人：筱哲），与用户指南共用配图。新版练习图沿用原简历与远帆科技岗位资料，重新完成真实 AI 问答与复盘。它们展示的是实际界面，不是设计稿；开发快照及补图所用修复版本见[指南版本说明](docs/product-manual/产品说明书.md)，不代表所有 `0.1.0` 构建均有相同界面。
 
-### 1. 用看板跟进投递阶段
 
-在同一看板中查看公司、岗位与当前阶段，按待投递、已投递、笔试、面试、Offer 和结束整理进展。Haru 会在桌面宽屏陪伴，但不会自动替你执行操作。
+## 环境
+- Windows \ Linux (未测试)
+- Python 3.6 : **numpy , pandas , Requests , pyecharts , lxml , PyMySQL**
+- MySQL 8.0.11  
+- Chrome（内核版本60以上）
 
-![投递看板：按公司、岗位和阶段跟进](docs/product-manual/screenshots/R03-05-page-create-saved.png)
+## 安装
+1. 运行 install_package.bat（出错管理员权限下尝试）   
+2. 修改mysql配置 位于/analysis/analysis_main.py   
+系统本身有一个可视化的配置文件，即您不需要再导入数据进行分析，如果想重新分析，需要导入数据库数据还需按照数据库字段修改input_data.py内容 
+3. 将js.7z 解压放在/static 目录下
+4. 运行 server.py 来运行web服务器  
+5. 使用Chrome访问 http://127.0.0.1  
 
-### 2. 围绕一条投递准备材料
+### 数据库字段
+<img  src="https://github.com/xming521/picture/blob/master/db.png"/>  
 
-在投递详情中选择岗位简历版本、确认当前 JD 后，可以进入材料工作区生成并逐项审阅建议。原始简历不会被静默覆盖。
+## 架构
+系统大致结构如下图，spider目录存放爬虫代码，analysis目录承担了导入、分析、渲染图表、交互等功能，data目录存放原始数据，conf目录存放图表、mysql配置文件。导入处理分析入口统一由analysis_main控制，由server调用，其他功能直接由server调用，所有功能在主页就可以启动。
+![](https://github.com/xming521/picture/blob/master/job2.png)
+![](https://github.com/xming521/picture/blob/master/job1.jpg)
 
-![投递准备：对照岗位与简历审阅 AI 生成的优化建议草稿](docs/product-manual/screenshots/04-03-material-generated.png)
 
-### 3. Pilot 有何不同
 
-Pilot 可以读取你当前授权的本地上下文，协助查询、整理或起草下一步；涉及写入时，它先给出确认卡或草稿，等待你确认。Haru 可提示后台回复已经完成，隐藏角色后则恢复默认 Pilot 侧边栏。
 
-![完整 Pilot 页面：左侧会话列表、中间对话与新建投递确认卡、右侧参考资料及底部输入区](docs/product-manual/screenshots/R03-02-pilot-create-confirm.png)
-
-### 4. 面试前练习，面试后复盘
-
-从已安排的面试进入文本模拟面试，明确选择岗位简历版本并冻结当前 JD 后开始练习；反馈与复盘仍由你审阅和确认。
-
-![新版文字模拟面试：沿用筱哲与远帆科技案例，查看中文提问依据并回答 AI 追问](docs/product-manual/screenshots/R08-studio-evidence.png)
-
-### 5. Offer 与谈薪
-
-录入 Offer 后可以查看已知薪酬事实、补充自定义比较维度，并进入谈薪准备或谈薪教练。多 Offer 对比只整理已知事实，最终选择仍由你决定。
-
-![Offer 横向对比：查看等宽摘要卡片、年薪与回复时间差，并逐项核对薪酬、福利和截止日](docs/product-manual/screenshots/R08-offer-comparison-polished.png)
-
-## 快速开始
-
-### Docker
-
-```bash
-docker build -t offerpilot .
-docker run --rm -p 8080:8080 -v offerpilot-data:/data offerpilot
-```
-
-打开 `http://localhost:8080`。
-
-### 从源码启动
-
-```bash
-git clone https://github.com/offercontext/offerpilot.git
-cd offerpilot
-uv sync
-cd web && npm ci && npm run build
-cd ..
-uv run oc start
-```
-
-默认数据与配置位于 `~/.offerpilot`；可使用 `OFFERPILOT_DATA` 指定其他数据目录。
-
-## 隐私与边界
-
-- OfferPilot 默认在本地运行，数据保存在本地 SQLite 工作区。
-- 模拟面试录音只存在于当前页面，不上传、不持久化；离线 Whisper 模型仅在你主动点击后从 Hugging Face 下载到浏览器缓存。
-- 需要 AI 时，使用你自己配置的 Provider 与密钥；发送给模型的内容由对应功能的页面提示与确认边界约束。
-- **不自动投递**、不代表你发送外部消息，也不在未确认的情况下写入关键求职数据。
-- AI 给出的是可解释、可审阅的建议；OfferPilot **不替用户决定**是否投递、接受 Offer 或如何谈薪。
-
-## English
-
-OfferPilot is a local-first AI job-search workspace for keeping resumes, applications, interviews, confirmed learnings, and offers together. It helps you prepare and review; you keep control of every important action.
-
-Start from source with `uv sync`, build the web app with `npm ci && npm run build`, then run `uv run oc start`. Data is stored locally in SQLite by default. OfferPilot does not auto-apply, send external messages, or decide which offer you should accept.
-
-## 许可证
-
-[AGPLv3](LICENSE)
-
-### 第三方角色与运行时
-
-桌面宽屏的 Pilot 看板娘使用 Live2D 官方样例角色 Haru 受付版与 Cubism Core。相关角色、模型数据及运行时版权归 Live2D Inc. 所有，不包含在 OfferPilot 的 AGPLv3 授权中；使用与分发需同时遵守 [Live2D 样例模型条款](https://www.live2d.com/eula/live2d-sample-model-terms_en.html) 与 [Live2D SDK 许可](https://www.live2d.com/en/sdk/license/)。
-
-> This content uses sample data owned and copyrighted by Live2D Inc. The sample data are utilized in accordance with terms and conditions set by Live2D Inc. This content itself is created at the author’s sole discretion.
-
-### 离线语音模型与运行时
-
-可选离线转写使用 Apache-2.0 许可的 `@huggingface/transformers`、ONNX Runtime Web 与 [`onnx-community/whisper-small`](https://huggingface.co/onnx-community/whisper-small)。模型固定到 revision `461d552a09349d5d0d0779b40dd79800eaa3e35a`，不会提交到 Git 仓库或打入模型权重；用户主动下载后仅缓存在当前浏览器。详细说明见 [`web/public/offline-whisper-NOTICE.md`](web/public/offline-whisper-NOTICE.md)。
+## 鸣谢
+鸣谢 server酱、 pyechart 、腾讯云等的产品或技术支持

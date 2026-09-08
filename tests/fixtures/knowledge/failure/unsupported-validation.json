@@ -1,5 +1,0 @@
-{
-  "comment": "引用不支持故障样本（Validator 输出）。generation 产出的 Brief payload 本身合法，但独立 Validator 对每条 statement 返回 unsupported，使 Brief 被 brief_support_invalid 拒绝。验收工具读取本文件作为 Validator 阶段的 stub 输出，generation 阶段使用动态构造的合法 payload。",
-  "decision": "unsupported",
-  "reason": "stub validator 总是判定不支持，用于验证 support 门禁拒绝发布。"
-}

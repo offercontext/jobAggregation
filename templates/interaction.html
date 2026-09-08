@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>机器人小明</title>
+    <link rel="stylesheet" type="text/css" href="../static/css/c1.css"/>
+    <link rel="stylesheet" type="text/css" href="../static/css/mdui.min.css"/>
+    <script src="../static/webjs/mdui.min.js"></script>
+</head>
+
+
+<style>
+    .card {
+        width: 50%;
+        height: 750px;
+        position: absolute;
+        top: 0;
+        margin: 30px 0 0 30px;
+    }
+
+    .book img {
+        width: 300px;
+        height: 300px;
+        margin-left:50px ;
+        margin-top: 20px;
+    }
+    .card li{
+        height: 50px;}
+
+</style>
+
+<div class="mdui-theme-primary-light-blue mdui-theme-accent-blue">
+
+
+    {#    <div class="loader"></div>#}
+    <div id="robot">
+        <img src="../static/icon/robot.png">
+    </div>
+
+    {#    <div id="robot1" class="container3 mdui-card">#}
+    {#        <div class="text">#}
+    {#            您好，我是机器人小明，感谢您使用本系统。<br>#}
+    {#            假设您是一位在校大学生，正在学习计算机相关的专业，并且热爱计算机。<br>#}
+    {#        </div>#}
+    {#        <button class="mdui-btn mdui-btn-raised mdui-ripple mdui-color-theme-accent mdui-btn-block"#}
+    {#                onclick="document.getElementById('robot1').style.display='none',document.getElementById('robot2').style.display='block'     ">#}
+    {#            好的∑(゜ロ゜;)#}
+    {#        </button>#}
+    {#    </div>#}
+    {##}
+    {##}
+    {#    <div id="robot2" class="container3 mdui-card">#}
+    {#        <div class="text">#}
+    {#            您和您周围的同学肯定会有像这样的苦恼<br>#}
+    {#            究竟是应该准备读研深造呢，还是好好学习技术毕业直接就业呢..(｡•ˇ‸ˇ•｡) ..<br>#}
+    {#        </div>#}
+    {#        <button class="mdui-btn mdui-btn-raised mdui-ripple mdui-color-theme-accent mdui-btn-block"#}
+    {#                onclick="document.getElementById('robot2').style.display='none',document.getElementById('robot3').style.display='block'     ">#}
+    {#            没错啊，很痛苦呢#}
+    {#        </button>#}
+    {##}
+    {#    </div>#}
+
+
+    <div id="robot3" class="container3 mdui-card" style="display:block">
+        <div class="text">
+            下面就让小明来帮您解决这个问题<br>
+            告诉我你想在计算机哪个方向努力，我就会通过大数据分析给你提供一些建议<br><br>
+
+            <a class="mdui-chip" onclick="f1()">
+                <span class="mdui-chip-icon mdui-color-blue-200"></span>
+                <span class="mdui-chip-title">软件</span>
+            </a>
+
+            <a class="mdui-chip"
+               onclick="document.getElementsByClassName('loader')[0].style.display='block'">
+                <span class="mdui-chip-icon mdui-color-indigo-200"></span>
+                <span class="mdui-chip-title">前端</span>
+            </a>
+
+            <a class="mdui-chip"
+               onclick="document.getElementsByClassName('loader')[0].style.display='block'">
+                <span class="mdui-chip-icon mdui-color-teal-200"></span>
+                <span class="mdui-chip-title">后端</span>
+            </a>
+
+            <a class="mdui-chip"
+               onclick="document.getElementsByClassName('loader')[0].style.display='block'">
+                <span class="mdui-chip-icon mdui-color-red-200"></span>
+                <span class="mdui-chip-title">图像</span>
+            </a>
+
+            <a class="mdui-chip"
+               onclick="document.getElementsByClassName('loader')[0].style.display='block'">
+                <span class="mdui-chip-icon mdui-color-deep-purple-200"></span>
+                <span class="mdui-chip-title">语音</span>
+            </a>
+
+            <a class="mdui-chip"
+               onclick="document.getElementsByClassName('loader')[0].style.display='block'">
+                <span class="mdui-chip-icon mdui-color-light-green-200"></span>
+                <span class="mdui-chip-title">游戏</span>
+            </a>
+
+            <a class="mdui-chip"
+               onclick="document.getElementsByClassName('loader')[0].style.display='block'">
+                <span class="mdui-chip-icon mdui-color-pink-200"></span>
+                <span class="mdui-chip-title">自然语言处理</span>
+            </a>
+
+
+            <a class="mdui-chip" href="?name=学习"
+               onclick="document.getElementsByClassName('loader')[0].style.display='block'">
+                <span class="mdui-chip-icon mdui-color-amber-200"></span>
+                <span class="mdui-chip-title">机器学习</span>
+            </a>
+
+
+            <a class="mdui-chip" href="?name=数据"
+               onclick="document.getElementsByClassName('loader')[0].style.display='block'">
+                <span class="mdui-chip-icon mdui-color-deep-purple-200"></span>
+                <span class="mdui-chip-title">数据</span>
+            </a>
+
+
+            <a class="mdui-chip" href="?name=测试"
+               onclick="document.getElementsByClassName('loader')[0].style.display='block'">
+                <span class="mdui-chip-icon mdui-color-blue-grey-200"></span>
+                <span class="mdui-chip-title">测试</span>
+            </a>
+
+            <a class="mdui-chip" href="?name=网络安全"
+               onclick="document.getElementsByClassName('loader')[0].style.display='block'">
+                <span class="mdui-chip-icon mdui-color-yellow-200"></span>
+                <span class="mdui-chip-title">网络安全</span>
+            </a>
+
+            <a class="mdui-chip" href="?name=运维"
+               onclick="document.getElementsByClassName('loader')[0].style.display='block'">
+                <span class="mdui-chip-icon mdui-color-cyan-200"></span>
+                <span class="mdui-chip-title">运维</span>
+            </a>
+
+            <a class="mdui-chip" href="?name=UI"
+               onclick="document.getElementsByClassName('loader')[0].style.display='block'">
+                <span class="mdui-chip-icon mdui-color-light-green-200"></span>
+                <span class="mdui-chip-title">UI</span>
+            </a>
+
+            <a class="mdui-chip" href="?name=区块链"
+               onclick="document.getElementsByClassName('loader')[0].style.display='block'">
+                <span class="mdui-chip-icon mdui-color-brown-200"></span>
+                <span class="mdui-chip-title">区块链</span>
+            </a>
+
+            <a class="mdui-chip" href="?name=网络"
+               onclick="document.getElementsByClassName('loader')[0].style.display='block'">
+                <span class="mdui-chip-icon mdui-color-red-200"></span>
+                <span class="mdui-chip-title">网络</span>
+            </a>
+
+            <a class="mdui-chip" href="?name=全栈"
+               onclick="document.getElementsByClassName('loader')[0].style.display='block'">
+                <span class="mdui-chip-icon mdui-color-blue-200"></span>
+                <span class="mdui-chip-title">全栈工程师</span>
+            </a>
+
+            <a class="mdui-chip" href="?name=嵌入式"
+               onclick="document.getElementsByClassName('loader')[0].style.display='block'">
+                <span class="mdui-chip-icon mdui-color-deep-purple-200"></span>
+                <span class="mdui-chip-title">嵌入式工程师</span>
+            </a>
+
+            <a class="mdui-chip" href="?name=物联网"
+               onclick="document.getElementsByClassName('loader')[0].style.display='block'">
+                <span class="mdui-chip-icon mdui-color-orange-200"></span>
+                <span class="mdui-chip-title">物联网工程师</span>
+            </a>
+
+            <a class="mdui-chip" href="?name=架构"
+               onclick="document.getElementsByClassName('loader')[0].style.display='block'">
+                <span class="mdui-chip-icon mdui-color-cyan-200"></span>
+                <span class="mdui-chip-title">架构工程师</span>
+            </a>
+
+            <a class="mdui-chip" href="?name=算法"
+               onclick="document.getElementsByClassName('loader')[0].style.display='block'">
+                <span class="mdui-chip-icon mdui-color-deep-orange-200"></span>
+                <span class="mdui-chip-title">算法工程师</span>
+            </a>
+        </div>
+
+
+    </div>
+
+
+    <div id="robot4" class="mdui-card" style="display: none;">
+        <div class="text">
+            通过大数据分析后<br>
+            我们为您准备了学习路线<br>要掌握的技能和推荐书籍
+        </div>
+    </div>
+
+
+    <div class="mdui-tab " mdui-tab
+         style="right: 120px;position: absolute;top:100px;display: none;
+         font-weight: 600;letter-spacing: 0.2em;height:50px; ">
+        <a href="#example1-tab4" class="mdui-ripple">分析结果</a>
+        <a href="#example1-tab1" class="mdui-ripple">学习路线</a>
+        <a href="#example1-tab2" class="mdui-ripple">技能</a>
+        <a href="#example1-tab3" class="mdui-ripple">推荐书籍</a>
+    </div>
+
+    <div id="example1-tab1" class="mdui-p-a-2">
+        <div class="mdui-card card" id="1" style=""></div>
+
+    </div>
+
+    <div id="example1-tab2" class="mdui-p-a-2">
+        <div class="mdui-card card" id="1" style="font-size: 1.2em;letter-spacing: 1px;padding-top: 45px">
+            <ul>
+                <li>对 HTML / CSS / JavaScript 具有一定的知识；<br></li>
+                <li>有较熟练使用 AngularJS / Vue / jQuery 或者其它类库的经验；<br></li>
+                <li>较熟悉第三方组件（插件）生态环境及具体案例；</li>
+                <li>有较熟练使用 Jade / Swig / Handlebars / Mustache 或者其它模板引擎的经验；<br></li>
+                <li>有较熟练使用 SASS 或者其它 CSS 预处理器的经验；<br></li>
+                <li>有较熟练使用 CoffeeScript 的经验；<br></li>
+                <li>对 CSS / JavaScript 设计模式有很好的认识及应用；<br></li>
+                <li>对常用数据结构和算法熟悉；<br></li>
+                <li>有使用 GruntJS / GulpJS 任务运行器的经验；<br></li>
+                <li>有使用 Yeoman 生成器的经验；</li>
+                <li>有诸如 Bower / Volo / JSPM 等前端静态资源包管理器使用经验；</li>
+                <li>熟悉本地及远程（真机）调试操作；</li>
+                <li>有 Git 的使用经验；<br></li>
+            </ul>
+
+
+        </div>
+
+    </div>
+
+    <div id="example1-tab3" class="mdui-p-a-2">
+        <div class="mdui-card card book" id="1" style="">
+            <a href="https://detail.tmall.com/item.htm?spm=a230r.1.14.41.60d47936PrHKVN&id=588391570410&ns=1&abbucket=2">            <img src="../static/icon/book/1.png"></a>
+            <a href="https://detail.tmall.com/item.htm?spm=a230r.1.14.97.60d47936PrHKVN&id=569403754016&ns=1&abbucket=2"><img src="../static/icon/book/2.png"></a>
+            <a href="https://detail.tmall.com/item.htm?spm=a230r.1.14.239.60d47936PrHKVN&id=570446617914&ns=1&abbucket=2" ><img src="../static/icon/book/4.png"></a>
+            <a href="" ></a><img src="../static/icon/book/3.png">
+            <img src="../static/icon/book/5.png">
+            <img src="../static/icon/book/6.png">
+        </div>
+    </div>
+
+    <div id="example1-tab4" class="mdui-p-a-2">
+        <div id="displayno">
+            <iframe src="../static/html/bing.html" scrolling="no" frameborder="0" width="55%" height="450"
+                    class="p1"></iframe>
+            <iframe src="../static/html/qiu1.html" scrolling="no" frameborder="0" width="30%" height="400"
+                    class="p2"></iframe>
+            <iframe src="../static/html/qiu2.html" scrolling="no" frameborder="0" width="30%" height="400"
+                    class="p2"></iframe>
+            <iframe src="../static/html/qiu3.html" scrolling="no" frameborder="0" width="30%" height="400"
+                    class="p2"></iframe>
+        </div>
+    </div>
+
+</div>
+<script>
+    function f1() {
+        document.getElementById('displayno').style.display = 'block';
+        document.getElementsByClassName('mdui-tab')[0].style.display = 'flex';
+        document.getElementById('robot3').style.display = 'none';
+        document.getElementById('robot4').style.display = 'block';
+    }
+</script>
+
+
+</body>
+</html>

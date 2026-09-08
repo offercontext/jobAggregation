@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>主页</title>
+    <link rel="stylesheet" type="text/css" href="../static/css/c1.css"/>
+    <link rel="stylesheet" type="text/css" href="../static/css/mdui.min.css"/>
+    <script src="../static/webjs/mdui.min.js"></script>
+
+</head>
+<body class="mdui-theme-primary-light-blue mdui-theme-accent-blue" style="zoom: 0.95 !important;text-align: center;">
+
+<div class="loader"></div>
+
+<div class="container ">
+
+    <a href="/爬虫">
+        <div class="box c1  mdui-ripple mdui-hoverable" mdui-tooltip="{content: '网络爬虫'}">
+            <img src="./static/icon/1.png">
+        </div>
+    </a>
+
+
+{#    <a href="/分析" onclick="document.getElementsByClassName('loader')[0].style.display='block'">#}
+{#        <div class="box c2 mdui-ripple mdui-hoverable" mdui-tooltip="{content: '导入分析'}">#}
+{#            <img src="./static/icon/2.png">#}
+{#        </div>#}
+{#    </a>#}
+
+    <a href="/展示">
+        <div class="box c3 mdui-ripple mdui-hoverable" mdui-tooltip="{content: '结果展示'}">
+            <img src="./static/icon/3.png">
+        </div>
+    </a>
+
+    <a href="/互动">
+        <div class="box c4 mdui-ripple mdui-hoverable" mdui-tooltip="{content: '互动交互'}">
+            <img src="./static/icon/4.png">
+        </div>
+    </a>
+
+
+</div>
+
+
+
+
+<a href="/">
+    <button class="mdui-fab mdui-ripple mdui-fab-fixed mdui-color-light-blue-300">
+        <img src="../static/icon/home.png">
+    </button>
+</a>
+
+<script>
+    document.getElementsByClassName("loader")[0].style.display = "none";
+</script>
+</body>
+</html>

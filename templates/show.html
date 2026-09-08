@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf-8">
+    <title>图表展示</title>
+    <link rel="stylesheet" type="text/css" href="../static/css/c1.css"/>
+    <link rel="stylesheet" type="text/css" href="../static/css/mdui.min.css"/>
+    <script src="../static/webjs/mdui.min.js"></script>
+    <script src="../static/webjs/jquery-3.3.1.min.js"></script>
+    {% for jsfile_name in script_list %}
+        <script src="{{ host }}/{{ jsfile_name }}.js"></script>
+    {% endfor %}
+
+
+    <style>
+        .card {
+            padding-top: 25px;
+            padding-left: 20px;
+            display: inline-block;
+            position: relative!important;
+            margin: 20px 20px 0 30px;
+            border-radius: 10px;
+            float: left;
+            overflow: visible;
+        }
+
+        .mdui-ripple {
+            font-size: 1.1em !important;
+        }
+    </style>
+</head>
+<div class="mdui-tab mdui-color-cyan" mdui-tab
+     style="font-weight: 600;color: white!important;letter-spacing: 0.2em;height:50px ">
+{#    <a href="#example1-tab1" class="mdui-ripple">总览</a>#}
+    <a href="#example1-tab2" class="mdui-ripple" onclick="get([0,16,17,1],$(this).attr('href'))">岗位</a>
+    <a href="#example1-tab3" class="mdui-ripple" onclick="get([13,14,12,11,7],$(this).attr('href'))">薪水</a>
+    <a href="#example1-tab4" class="mdui-ripple" onclick="get([15,3,4,2],$(this).attr('href'))">地区</a>
+    <a href="#example1-tab5" class="mdui-ripple" onclick="get([5,6,9,10],$(this).attr('href'))">学历经验</a>
+    <a href="#example1-tab6" class="mdui-ripple" onclick="get([18,19,20],$(this).attr('href'))">公司</a>
+</div>
+
+<div id="example1-tab2" class="mdui-p-a-2">
+    <div class="mdui-card card" id="1" style="width: 45%"></div>
+    <div class="mdui-card card" id="2" style="width: 45%"></div>
+    <div class="mdui-card card" id="3" style="width: 45%"></div>
+    <div class="mdui-card card" id="4" style="width: 45%"></div>
+</div>
+
+<div id="example1-tab3" class="mdui-p-a-2">
+    <div class="mdui-card card" id="1" style="width: 45%"></div>
+    <div class="mdui-card card" id="2" style="width: 45%"></div>
+    <div class="mdui-card card" id="3" style="width: 45%"></div>
+    <div class="mdui-card card" id="4" style="width: 45%"></div>
+    <div class="mdui-card card" id="5" style="width: 45%"></div>
+</div>
+<div id="example1-tab4" class="mdui-p-a-2">
+    <div class="mdui-card card" id="1" style="width: 45%"></div>
+    <div class="mdui-card card" id="2" style="width: 45%"></div>
+    <div class="mdui-card card" id="3" style="width: 45%"></div>
+    <div class="mdui-card card" id="4" style="width: 45%"></div>
+</div>
+<div id="example1-tab5" class="mdui-p-a-2">
+     <div class="mdui-card card" id="3" style="width: 50%"></div>
+        <div class="mdui-card card" id="4" style="width: 40%"></div>
+    <div class="mdui-card card" id="1" style="width: 50%"></div>
+    <div class="mdui-card card" id="2" style="width: 40%"></div>
+
+
+</div>
+<div id="example1-tab6" class="mdui-p-a-2">
+    <div class="mdui-card card" id="1" style="width: 90%;height: 410px"></div>
+    <div class="mdui-card card" id="2" style="width: 45%"></div>
+    <div class="mdui-card card" id="3" style="width: 45%;padding-left: 5px"></div>
+</div>
+
+</body>
+
+<script>
+      window.onload = function(){
+　　get([0,16,17,1],"#example1-tab2");
+console.log(222)
+}
+
+    function get(url,tab) {
+        for (var i in url){
+            let j=0
+            j=tab+' #'+(eval(i)+1)
+            $.ajax({
+            type: "GET",
+            url: 'http://127.0.0.1/chart/'+url[i],
+            dataType: "html",
+            success: function (data) {//返回数据根据结果进行相应的处理
+                $(j).html(data);
+            },
+            error: function (e) {
+                console.log(e)
+            },
+        });
+        }
+    }
+
+
+
+</script>
+
+
+</html>

@@ -1,6 +1,0 @@
-纯文本样本（.txt）
-
-本文件以 .txt 扩展名上传，Extraction 使用段落解析器而非 Markdown AST。
-第一段落到这里结束。
-
-第二段落开始。Plain text source 使用唯一的 document section 作为 coverage。

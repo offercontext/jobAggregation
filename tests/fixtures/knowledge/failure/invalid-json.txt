@@ -1,2 +1,0 @@
-this is deliberately not json
-模型偶尔会返回自由 Markdown 或叙述文本，BriefWorker 必须以 brief_schema_invalid 拒绝。

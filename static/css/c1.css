@@ -1,0 +1,244 @@
+body{}
+.box {
+    float: left;
+    width: 230px;
+    height: 230px;
+    margin: 60px;
+    border-radius: 125px; /* 圆形为长宽一半*/
+    text-align: center;
+    box-shadow: 1px 1px 400px #9C9C9C; /*方向 方向 模糊程度*/
+}
+.box:hover
+{
+    box-shadow: 1px 1px 60px #9C9C9C!important; /*方向 方向 模糊程度*/
+}
+
+.box img {
+    position: relative; /*垂直居中*/
+    width: 50%;
+    height: 50%;
+    top: 60px;
+}
+
+.container {
+    position: relative;
+    top: 100px;
+    display: inline-block;
+    margin: auto;
+    text-align:center;
+}
+
+.c1 {
+    background-image: linear-gradient(to right, #4facfe 0%, #00f2fe 100%);
+}
+
+.c2 {
+    background-image: linear-gradient(to right, #43e97b 0%, #38f9d7 100%);
+}
+
+.c3 {
+    background-image: linear-gradient(to right, #fa709a 0%, #fee140 100%);
+}
+
+.c4 {
+    background-image: linear-gradient(120deg, #a6c0fe 0%, #f68084 100%);
+}
+
+a {
+    text-decoration-line: none;
+}
+
+span {
+    color: grey
+}
+
+.container2 {
+    position: relative;
+    top: 130px;
+    width: 75%;
+    margin: auto;
+}
+
+.container3 {
+    width: 30%;
+    position: relative;
+    float: right;
+    top: 250px;
+    right: 350px;
+    font-size: medium;
+    z-index: 99;
+}
+
+#robot {
+    position: relative;
+    float: right;
+    top: 180px;
+    right: 90px;
+}
+
+#robot2 {
+    display: none;
+}
+
+#robot3 {
+    display: none;
+    width: 40%;
+!important;
+}
+
+#robot4 {
+    width: 16%;
+    position: relative;
+    float: right;
+    top: 240px;
+    right: 130px;
+    font-size: 1.2em;
+    display: block;
+    color: black;
+}
+
+.text {
+    color: rgba(17, 16, 18, 0.79);
+    margin: 15px;
+}
+
+.mdui-chip
+{
+    margin: 5px;
+!important;}
+
+.p1 {
+    position: relative;
+    top: 30px;
+}
+
+.p2 {
+    position: relative;
+    bottom: 60px;
+}
+
+#fab1 {
+    right: 120px;
+}
+
+#fab2 {
+    right: 210px;
+}
+
+
+
+.boxus {
+    float: left;
+    width: 200px;
+    height: 200px;
+    margin: 50px;
+    border-radius: 125px; /* 圆形为长宽一半*/
+    text-align: center;
+    box-shadow: 1px 1px 400px #9C9C9C; /*方向 方向 模糊程度*/
+    overflow: hidden !important;
+}
+.boxus img {
+    position: relative; /*垂直居中*/
+    width: 100%;
+    height: 100%;
+}
+
+.ustext {
+    float: left;
+    width: 200px;
+    margin: 30px 50px 50px 50px;
+    text-align: center;
+    overflow: visible !important;
+    font-family: "微软雅黑 Light";
+    color: grey;
+}
+
+.p usname {
+    font-size: medium;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+.loader {
+    zoom: 1.6;
+    -webkit-transform: scale(1.5);
+    -moz-transform: scale(1.5);
+    background-color: white;
+    position: fixed;
+    z-index: 999;
+    width: 100%;
+    height: 100%;
+    transform: rotate(165deg);
+}
+
+.loader:before, .loader:after {
+    content: '';
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    display: block;
+    width: 0.5em;
+    height: 0.5em;
+    border-radius: 0.25em;
+    transform: translate(-50%, -50%);
+}
+
+.loader:before {
+    animation: before 2s infinite;
+}
+
+.loader:after {
+    animation: after 2s infinite;
+}
+
+@keyframes before {
+    0% {
+        width: 0.5em;
+        box-shadow: 1em -0.5em rgba(225, 20, 98, 0.75), -1em 0.5em rgba(111, 202, 220, 0.75);
+    }
+    35% {
+        width: 2.5em;
+        box-shadow: 0 -0.5em rgba(225, 20, 98, 0.75), 0 0.5em rgba(111, 202, 220, 0.75);
+    }
+    70% {
+        width: 0.5em;
+        box-shadow: -1em -0.5em rgba(225, 20, 98, 0.75), 1em 0.5em rgba(111, 202, 220, 0.75);
+    }
+    100% {
+        box-shadow: 1em -0.5em rgba(225, 20, 98, 0.75), -1em 0.5em rgba(111, 202, 220, 0.75);
+    }
+}
+
+@keyframes after {
+    0% {
+        height: 0.5em;
+        box-shadow: 0.5em 1em rgba(61, 184, 143, 0.75), -0.5em -1em rgba(233, 169, 32, 0.75);
+    }
+    35% {
+        height: 2.5em;
+        box-shadow: 0.5em 0 rgba(61, 184, 143, 0.75), -0.5em 0 rgba(233, 169, 32, 0.75);
+    }
+    70% {
+        height: 0.5em;
+        box-shadow: 0.5em -1em rgba(61, 184, 143, 0.75), -0.5em 1em rgba(233, 169, 32, 0.75);
+    }
+    100% {
+        box-shadow: 0.5em 1em rgba(61, 184, 143, 0.75), -0.5em -1em rgba(233, 169, 32, 0.75);
+    }
+}
+
+#displayno
+{
+    display: none;
+}

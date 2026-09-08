@@ -1,0 +1,134 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>网络爬虫</title>
+    <link rel="stylesheet" type="text/css" href="../static/css/c1.css"/>
+    <link rel="stylesheet" type="text/css" href="../static/css/mdui.min.css"/>
+    <script src="../static/webjs/mdui.min.js"></script>
+
+
+</head>
+
+
+<body class="mdui-theme-primary-light-blue mdui-theme-accent-blue">
+
+
+<div class="loader"> <h2 style="transform: rotate(0deg); !important">等待数分钟后将自动下载爬取的数据</h2></div>
+
+<div class="container2 mdui-card">
+    <form action="/爬虫完成" method="post">
+        <table>
+            <td>
+                <div class="mdui-list">
+
+                    <label class="mdui-list-item ">
+                        <div class="mdui-list-item-content">爬取目标</div>
+                    </label>
+
+                    <label class="mdui-list-item mdui-ripple">
+                        <div class="mdui-checkbox">
+                            <input type="checkbox" name="type" value="51" checked="" >
+                            <i class="mdui-checkbox-icon"></i>
+                        </div>
+                        <div class="mdui-list-item-content">前程无忧网</div>
+                    </label>
+
+                    <label class="mdui-list-item mdui-ripple">
+                        <div class="mdui-checkbox">
+                            <input type="checkbox" name="type" value="qilu"  disabled="">
+                            <i class="mdui-checkbox-icon"></i>
+                        </div>
+                        <div class="mdui-list-item-content">齐鲁人才网（暂不可用）</div>
+                    </label>
+
+                    <label class="mdui-list-item mdui-ripple">
+                        <div class="mdui-checkbox">
+                            <input type="checkbox" name="type" value="baidu" checked="" />
+                            <i class="mdui-checkbox-icon"></i>
+                        </div>
+                        <div class="mdui-list-item-content" mdui-tooltip="{content: '在百度百聘平台抓取'}">
+                            猎聘网、斗米、BOSS直聘、拉勾网、<br>智联卓聘、脉脉、摩尔精英等
+                        </div>
+                    </label>
+                </div>
+            </td>
+
+            <td>
+                <p>&nbsp;</p>
+            </td>
+
+            <td>
+                <div class="mdui-list">
+                    <li class="mdui-list-item mdui-ripple">
+                        <div class="mdui-list-item-content"
+                             mdui-tooltip="{content: '启动多线程+ 将在已经启用多线程的基础上加大线程数，对反爬较少的网站全速爬取，大幅度提升爬虫速度，但对机器性能要求较高。'}">
+                            多线程➕
+                        </div>
+                        <label class="mdui-switch">
+                            <input type="checkbox" name="threads" value="1" checked/>
+                            <i class="mdui-switch-icon"></i>
+                        </label>
+                    </li>
+                    <div class="mdui-textfield mdui-textfield-floating-label" >
+                        <label class="mdui-textfield-label">必填 每个关键字和城市的爬取量</label>
+                        <input class="mdui-textfield-input" name="number" value="100" >
+                    </div>
+                    <div class="mdui-textfield mdui-textfield-floating-label" >
+                        <label class="mdui-textfield-label">必填 爬取总数</label>
+                        <input class="mdui-textfield-input" name="total" value="500" >
+                    </div>
+
+                </div>
+            </td>
+
+            <td><p></p></td>
+
+            <td>
+
+                <li class="mdui-list-item mdui-ripple">
+                    <div class="mdui-list-item-content" mdui-tooltip="{content: '每天在指定时间爬取'}">
+                        定时爬取
+                    </div>
+                    <label class="mdui-switch">
+                        <input type="checkbox" name="time" value="1" disabled>
+                        <i class="mdui-switch-icon"></i>
+                    </label>
+                </li>
+
+                <div class="mdui-textfield mdui-textfield-floating-label" mdui-tooltip="{content: '24小时制'}">
+                    <label class="mdui-textfield-label">小时</label>
+                    <input class="mdui-textfield-input" name="hour" type="number" disabled>
+                </div>
+                <div class="mdui-textfield mdui-textfield-floating-label">
+                    <label class="mdui-textfield-label">分钟</label>
+                    <input class="mdui-textfield-input" name="minute" type="number" disabled>
+                </div>
+            </td>
+            <td>
+                <h2>&nbsp;服务器性能有限，<br>可能需要等待3-5分钟<br>抓取的数据将自动下载</h2>
+            </td>
+
+        </table>
+        <div class="mdui-dialog-actions">
+            <button type="submit" class="mdui-btn mdui-ripple"
+                   >开始爬取
+            </button>
+        </div>
+    </form>
+
+
+    <a href="/">
+        <button class="mdui-fab mdui-ripple mdui-fab-fixed mdui-color-theme-accent">
+            <img src="../static/icon/home.png">
+        </button>
+    </a>
+</div>
+
+<script>
+    window.onload = function () {
+        document.getElementsByClassName("loader")[0].style.display = "none";
+    }
+</script>
+</body>
+</html>

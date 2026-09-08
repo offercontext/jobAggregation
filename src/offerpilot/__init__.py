@@ -1,2 +1,0 @@
-"""OfferPilot Python backend."""
-

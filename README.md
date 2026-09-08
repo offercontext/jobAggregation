@@ -6,6 +6,12 @@ OfferPilot 面向正在认真找工作的普通求职者。它将分散的简历
 
 本仓库提供 OfferPilot 本地部署版本。若想免安装体验网页版，欢迎访问 [offerContext Hub](https://hub.offercontext.cn)。网页版还提供每日岗位更新与求职社区，让求职之路不再孤单。
 
+## 文档入口
+
+- [产品介绍与用户指南（Markdown）](docs/product-manual/产品说明书.md)：了解主要场景，按简历、投递、面试、复盘与 Offer 查阅完整操作；正文与配图随仓库维护。
+- [第一次使用](docs/product-manual/产品说明书.md#start)：先创建投递并保存 JD，再体验 AI 辅助材料准备；安装与启动命令见本文的[快速开始](#快速开始)。
+- [常见问题与使用边界](docs/product-manual/产品说明书.md#s12)：确认、结果恢复、数据备份与已知限制。
+
 ## 它能帮你做什么
 
 - **管理简历与投递**：保留简历版本、记录岗位、公司、状态与日程。
@@ -17,37 +23,37 @@ OfferPilot 面向正在认真找工作的普通求职者。它将分散的简历
 
 ## 真实界面
 
-以下截图来自本地亮色模式的中文演示案例（候选人：筱哲）。它们展示的是实际页面与实际操作路径，不是设计稿。
+以下截图采集于 2026 年 9 月 7–8 日，来自本地亮色模式的中文演示案例（候选人：筱哲），与用户指南共用配图。它们展示的是实际页面与实际操作路径，不是设计稿；开发快照及补图所用修复版本见[指南版本说明](docs/product-manual/产品说明书.md)，不代表所有 `0.1.0` 构建均有相同界面。
 
-### 1. 从工作台看到当前节奏
+### 1. 用看板跟进投递阶段
 
-工作台将本周求职节奏、下一步建议和今日行动放在一起；Haru 会在桌面宽屏陪伴，但不会自动替你执行操作。
+在同一看板中查看公司、岗位与当前阶段，按待投递、已投递、笔试、面试、Offer 和结束整理进展。Haru 会在桌面宽屏陪伴，但不会自动替你执行操作。
 
-![工作台总览](docs/assets/readme/2026-08-13/01-workspace-overview.png)
+![投递看板：按公司、岗位和阶段跟进](docs/product-manual/screenshots/R03-05-page-create-saved.png)
 
 ### 2. 围绕一条投递准备材料
 
 在投递详情中选择岗位简历版本、确认当前 JD 后，可以进入材料工作区生成并逐项审阅建议。原始简历不会被静默覆盖。
 
-![投递与材料](docs/assets/readme/2026-08-13/02-application-materials.png)
+![投递准备：对照岗位与简历审阅 AI 生成的优化建议草稿](docs/product-manual/screenshots/04-03-material-generated.png)
 
 ### 3. Pilot 有何不同
 
 Pilot 可以读取你当前授权的本地上下文，协助查询、整理或起草下一步；涉及写入时，它先给出确认卡或草稿，等待你确认。Haru 可提示后台回复已经完成，隐藏角色后则恢复默认 Pilot 侧边栏。
 
-![Pilot 确认卡](docs/assets/readme/2026-08-13/03-pilot-confirmation.png)
+![Pilot 确认卡：核对新建 Offer 的公司、薪酬、状态与截止日后再决定是否批准](docs/product-manual/screenshots/08-10-pilot-offer-parameters.png)
 
 ### 4. 面试前练习，面试后复盘
 
 从已安排的面试进入文本模拟面试，明确选择岗位简历版本并冻结当前 JD 后开始练习；反馈与复盘仍由你审阅和确认。
 
-![面试练习](docs/assets/readme/2026-08-13/04-interview-practice.png)
+![文本模拟面试：根据上一轮回答追问，由用户确认并提交本轮回答](docs/product-manual/screenshots/R06-15-mock-followup.png)
 
 ### 5. Offer 与谈薪
 
 录入 Offer 后可以查看已知薪酬事实、补充自定义比较维度，并进入谈薪准备或谈薪教练。多 Offer 对比只整理已知事实，最终选择仍由你决定。
 
-![Offer 与谈薪](docs/assets/readme/2026-08-13/05-offer-negotiation.png)
+![Offer 横向对比：核对两份 Offer 的薪酬、福利与截止日，并进入谈薪准备](docs/product-manual/screenshots/08-13-offer-comparison-table.png)
 
 ## 快速开始
 

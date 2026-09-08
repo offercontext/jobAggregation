@@ -41,6 +41,7 @@ Thumbs.db
 
 # Build output
 build/
+/output/pdf/*.pdf
 
 # Local git worktrees
 .worktrees/

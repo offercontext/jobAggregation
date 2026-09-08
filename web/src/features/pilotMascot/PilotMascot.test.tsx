@@ -53,6 +53,13 @@ async function renderMascot(overrides: Partial<React.ComponentProps<typeof Pilot
 }
 
 describe('PilotMascot', () => {
+  it('keeps application details compact without changing the chat toggle', async () => {
+    const props = await renderMascot({ compact: true });
+    expect(container.querySelector<HTMLElement>('aside')?.style.width).toBe('116px');
+    expect(container.querySelector<HTMLElement>('aside')?.style.height).toBe('174px');
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="打开 OfferPilot 领航员"]')?.click());
+    expect(props.onTogglePilot).toHaveBeenCalledOnce();
+  });
   it('keeps the idle prompt out of the way and gives the contextual mascot a full-body frame', async () => {
     await renderMascot({ activity: 'idle', placement: 'contextual' });
 

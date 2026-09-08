@@ -13,6 +13,7 @@ export interface TopBarAction {
 }
 
 export interface TopBarProps {
+  compact?: boolean;
   summary?: string;
   primaryAction?: TopBarAction;
   onSearch: () => void;
@@ -27,10 +28,10 @@ function greeting(): string {
   return '晚上好，今天辛苦了';
 }
 
-export default function TopBar({ primaryAction, onSearch, onOpenSettings, summary }: TopBarProps) {
+export default function TopBar({ primaryAction, onSearch, onOpenSettings, summary, compact = false }: TopBarProps) {
   return (
-    <header className={`${styles.topbar} op-topbar`}>
-      <div className={styles.greetingBlock}>
+    <header className={`${styles.topbar} ${compact ? styles.compact : ''} op-topbar`}>
+      {!compact ? <div className={styles.greetingBlock}>
         <div className={styles.greeting}>
           {greeting()}
         </div>
@@ -38,7 +39,7 @@ export default function TopBar({ primaryAction, onSearch, onOpenSettings, summar
           {summary ? `${summary} · ` : ''}
           {dayjs().format('YYYY 年 M 月 D 日')}
         </div>
-      </div>
+      </div> : null}
       <div className={`${styles.actions} op-topbar-actions`}>
         <Button className={styles.actionButton} icon={<SearchOutlined />} onClick={onSearch}>
           快速打开 <span style={{ opacity: 0.6, marginLeft: 4 }}>{typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform) ? '⌘ K' : 'Ctrl K'}</span>

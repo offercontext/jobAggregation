@@ -13,6 +13,7 @@ const state = vi.hoisted(() => ({
   jdCurrent: null as unknown,
   jdHistory: [] as unknown[],
   jdDetail: null as unknown,
+  materialKit: null as unknown,
   events: [] as unknown[],
   notes: [] as unknown[],
   queryErrors: new Set<string>(),
@@ -48,6 +49,8 @@ vi.mock('@tanstack/react-query', () => ({
           ? state.jdHistory
           : options.queryKey?.[0] === 'application-jd-detail'
             ? state.jdDetail
+            : options.queryKey?.[0] === 'application-material-kit'
+              ? state.materialKit
             : options.queryKey?.[0] === 'opportunity-fit-v2-reviews'
               ? []
               : null,
@@ -168,6 +171,7 @@ beforeEach(() => {
   state.jdCurrent = null;
   state.jdHistory = [];
   state.jdDetail = null;
+  state.materialKit = null;
   state.events = [];
   state.notes = [];
   state.queryErrors.clear();
@@ -185,6 +189,104 @@ afterEach(() => {
 });
 
 describe('ApplicationDetail deterministic Pilot JD entry', () => {
+  function setSavedMaterials() {
+    state.jdCurrent = { current: { id: 11, application_id: 7, version_number: 2, jd_text: '岗位职责：维护 API 服务。', source_url: null } };
+    state.materialKit = { id: 21, application_id: 7, resume_id: 91, jd_version_id: 11, status: 'draft', updated_at: '2026-09-07T10:00:00Z' };
+  }
+
+  it.each([
+    ['pending', '继续准备'],
+    ['applied', '查看投递材料'],
+    ['written_test', '查看投递材料'],
+    ['interview', '查看投递材料'],
+  ] as const)('uses stage-appropriate material copy for %s without claiming a submitted resume', (status, action) => {
+    setSavedMaterials();
+    act(() => root?.render(<ApplicationDetail application={{ ...application, status }} open onClose={vi.fn()} />));
+    const panel = container?.querySelector('#application-preparation-panel');
+    expect(panel?.textContent).toContain(action);
+    expect(panel?.textContent).toContain('关联材料');
+    expect(panel?.textContent).not.toContain('已提交简历');
+    if (status !== 'pending') expect(panel?.textContent).not.toContain('完成提交前检查');
+  });
+
+  it('does not present a legacy submitted marker as verified submission evidence', () => {
+    setSavedMaterials();
+    state.materialKit = { ...(state.materialKit as object), status: 'submitted' };
+    act(() => root?.render(<ApplicationDetail application={application} open onClose={vi.fn()} />));
+    const materials = container?.querySelector('[aria-labelledby="application-linked-materials-heading"]');
+    expect(materials?.textContent).toContain('旧投递标记，缺少证据快照');
+    expect(materials?.textContent).not.toContain('已记录投递');
+  });
+
+  it('shows only the resume linked by the scoped material kit and preserves the task owner', () => {
+    setSavedMaterials();
+    const controller = createCoreTaskSurfaceController();
+    const resumes = [
+      { id: 90, title: '另一份简历', deleted_at: null },
+      { id: 91, title: '岗位专用简历', deleted_at: null },
+    ] as never;
+    act(() => root?.render(<ApplicationDetail application={{ ...application, status: 'applied' }} open onClose={vi.fn()} resumes={resumes} taskController={controller} />));
+    const materials = container?.querySelector('[aria-labelledby="application-linked-materials-heading"]');
+    expect(materials?.textContent).toContain('关联简历');
+    expect(materials?.textContent).toContain('岗位专用简历');
+    expect(materials?.textContent).not.toContain('另一份简历');
+    const entry = [...(materials?.querySelectorAll('button') ?? [])].find((button) => button.textContent === '查看投递材料');
+    expect(entry).toBeDefined();
+    act(() => entry?.click());
+    const firstOwner = controller.getState().active;
+    expect(firstOwner?.key).toBe('application.material_kit:applicationId=7');
+    act(() => entry?.click());
+    expect(controller.getState().active?.generation).toBe(firstOwner?.generation);
+    expect(state.analyzeJD).not.toHaveBeenCalled();
+  });
+
+  it.each([null, '', '   '])('omits the JD source control when its value is %s', (source_url) => {
+    setSavedMaterials();
+    state.jdCurrent = { current: { ...(state.jdCurrent as { current: object }).current, source_url } };
+    act(() => root?.render(<ApplicationDetail application={application} open onClose={vi.fn()} />));
+    expect(container?.querySelector('#application-preparation-panel')?.textContent).not.toContain('复制来源');
+  });
+
+  it('keeps the real source visible and lets readers expand the original JD', () => {
+    setSavedMaterials();
+    const jdText = '岗位职责：\n' + Array.from({ length: 24 }, (_, index) => `${index + 1}. 维护服务，核对接口来源。`).join('\n');
+    state.jdCurrent = { current: { ...(state.jdCurrent as { current: object }).current, jd_text: jdText, source_url: 'https://example.com/jobs/7' } };
+    act(() => root?.render(<ApplicationDetail application={application} open onClose={vi.fn()} />));
+    const panel = container?.querySelector('#application-preparation-panel');
+    expect(panel?.textContent).toContain('当前 JD · 版本 2');
+    expect(panel?.textContent).toContain('https://example.com/jobs/7');
+    const expand = [...(panel?.querySelectorAll('button') ?? [])].find((button) => button.textContent === '展开全文');
+    expect(expand).toBeDefined();
+    expect(expand?.getAttribute('aria-expanded')).toBe('false');
+    act(() => expand?.click());
+    expect(expand?.getAttribute('aria-expanded')).toBe('true');
+    expect(panel?.querySelector('#application-jd-text')?.textContent).toBe(jdText);
+  });
+
+  it('does not send users into an empty interview review chooser', () => {
+    act(() => root?.render(<ApplicationDetail application={{ ...application, status: 'applied' }} open onClose={vi.fn()} />));
+    const panel = container?.querySelector('#application-preparation-panel');
+    expect(panel?.textContent).toContain('尚无可复盘的面试');
+    expect(panel?.textContent).not.toContain('选择面试并开始复盘');
+  });
+
+  it('does not expose another application material kit as linked materials', () => {
+    setSavedMaterials();
+    state.materialKit = { ...(state.materialKit as object), application_id: 999, resume_id: 91 };
+    act(() => root?.render(<ApplicationDetail application={application} open onClose={vi.fn()} resumes={[{ id: 91, title: '其他投递的材料', deleted_at: null }] as never} />));
+    const materials = container?.querySelector('[aria-labelledby="application-linked-materials-heading"]');
+    expect(materials?.textContent).toContain('材料归属暂不可确认');
+    expect(materials?.textContent).not.toContain('其他投递的材料');
+  });
+
+  it('keeps material read errors distinct from having no saved material', () => {
+    state.queryErrors.add('application-material-kit');
+    act(() => root?.render(<ApplicationDetail application={application} open onClose={vi.fn()} />));
+    const materials = container?.querySelector('[aria-labelledby="application-linked-materials-heading"]');
+    expect(materials?.textContent).toContain('投递材料暂时无法读取');
+    expect(materials?.textContent).not.toContain('尚未保存投递材料');
+  });
+
   it('does not ask for another resume while the locked preparation source is still loading', () => {
     const controller = createCoreTaskSurfaceController();
     controller.launch({ ref: { taskId: 'application.interview_prepare', applicationId: 7, eventId: 31 }, source: 'application_task_card' });

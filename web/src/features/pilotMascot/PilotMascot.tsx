@@ -31,6 +31,7 @@ export interface PilotMascotNotification {
 }
 
 interface Props {
+  compact?: boolean;
   activity: PilotMascotActivity;
   panelOpen: boolean;
   onHide: () => void;
@@ -78,6 +79,7 @@ function notificationCopy(notification: PilotMascotNotification | null | undefin
 }
 
 export default function PilotMascot({
+  compact = false,
   activity,
   panelOpen,
   onHide,
@@ -194,7 +196,7 @@ export default function PilotMascot({
       : panelOpen ? '收起 OfferPilot 领航员' : '打开 OfferPilot 领航员';
   const buttonLabel = loadFailed ? `${actionLabel}（Haru 暂时休息中）` : actionLabel;
 
-  const frame = panelOpen || placement === 'pilot-page' || (studioPlacement && viewport.height < 740)
+  const frame = compact || panelOpen || placement === 'pilot-page' || (studioPlacement && viewport.height < 740)
     ? MASCOT_FRAME.compact
     : viewport.width <= 900
       ? MASCOT_FRAME.narrowDesktop

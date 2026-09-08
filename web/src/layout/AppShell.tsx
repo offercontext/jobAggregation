@@ -2661,6 +2661,7 @@ function AppShellContent() {
       >
         {!isPilotView ? (
           <TopBar
+            compact={Boolean(selectedApp)}
             summary={calendarSummary}
             primaryAction={topBarPrimaryAction}
             onSearch={() => setPaletteOpen(true)}
@@ -2759,6 +2760,7 @@ function AppShellContent() {
 
       {view !== 'pilot' && !interviewStudioContext && !coreTaskSurfaceState.active ? (
         <HaruDock
+          compact={Boolean(selectedApp)}
           calendarActive={calendarWorkspaceActive}
           calendarHost={calendarHaruHost}
           visible={pilotMascotVisible}

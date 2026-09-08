@@ -303,11 +303,11 @@ describe('ApplicationDetail opportunity fit handoff', () => {
     expect(container?.textContent).toContain('请先在面试准备中心选择一份可用简历');
   });
 
-  it('renders the current source tag only for the mounted application context', () => {
+  it('keeps the preparation header free of redundant source badges', () => {
     act(() => root?.render(<ApplicationDetail application={application} open onClose={vi.fn()} />));
 
-    expect(container?.textContent).toContain('当前使用来源');
-    expect(container?.textContent).toContain('当前投递');
+    expect(container?.textContent).not.toContain('当前使用来源');
+    expect(container?.textContent).toContain('投递材料');
     expect(state.analyzeJD).not.toHaveBeenCalled();
   });
 
@@ -363,7 +363,7 @@ describe('ApplicationDetail opportunity fit handoff', () => {
     ));
     act(() => {
       [...(container?.querySelectorAll('button') || [])]
-        .find((button) => button.textContent === '打开准备')
+        .find((button) => button.textContent === '查看投递材料')
         ?.click();
     });
 

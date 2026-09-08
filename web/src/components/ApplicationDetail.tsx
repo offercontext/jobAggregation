@@ -5,7 +5,6 @@ import {
   Tag,
   Timeline,
   Button,
-  Divider,
   Input,
   message,
   Empty,
@@ -61,7 +60,6 @@ import { listOpportunityFitV2Reviews } from '@/services/opportunityFitReviews';
 import {
   type OpportunityFitReview,
 } from '@/types/opportunityFitReview';
-import { SourceStateTag } from './ui/SourceStateTag';
 import { createPilotAttachmentDragBinding } from './PilotAttachmentHandle';
 import { consumeMaterialKitHandoff, materialKitHandoffStore } from '@/features/pilot/materialKitHandoff';
 import {
@@ -198,7 +196,7 @@ function isObjectRow(value: unknown): boolean {
 
 const TASK_COPY: Readonly<Record<string, { title: string; description: string; action: string }>> = Object.freeze({
   'application.opportunity_fit': { title: '岗位匹配与风险', description: '确认是否值得继续，以及需要补充的事实。', action: '开始判断' },
-  'application.material_kit': { title: '投递准备', description: '选择简历、查看调整建议并完成提交前检查。', action: '打开准备' },
+  'application.material_kit': { title: '关联材料', description: '核对本次投递关联的简历与材料记录。', action: '查看投递材料' },
   'application.interview_prepare': { title: '面试准备', description: '围绕这场面试整理准备信息。', action: '开始准备' },
   'application.interview_review': { title: '面试复盘', description: '记录或查看这场面试的复盘。', action: '打开复盘' },
   'application.general_review': { title: '投递复盘', description: '查看不绑定具体事件的投递复盘。', action: '打开复盘' },
@@ -467,6 +465,8 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
   const [jdHistoryOpen, setJdHistoryOpen] = useState(false);
   const [selectedJdVersion, setSelectedJdVersion] = useState<number | null>(null);
   const [activeTab, setActiveTab] = useState<ApplicationDetailTab>('overview');
+  const [expandedJdId, setExpandedJdId] = useState<number | null>(null);
+  const [expandedScheduleApplicationId, setExpandedScheduleApplicationId] = useState<number | null>(null);
   const scheduleFormHeadingRef = useRef<HTMLHeadingElement | null>(null);
   const scheduleSectionRef = useRef<HTMLElement | null>(null);
   const scheduleNavigationRef = useRef<ScheduleFormNavigationSnapshot | null>(null);
@@ -1491,6 +1491,22 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
   ];
 
   const linkedOffers = offerRecords.filter((offer) => offer.application_id === application.id);
+  const currentJd = applicationJdQuery.data?.current;
+  const jdSource = currentJd?.source_url?.trim();
+  const longJd = Boolean(currentJd && (currentJd.jd_text.length > 600 || currentJd.jd_text.split('\n').length > 12));
+  const jdExpanded = Boolean(currentJd && expandedJdId === currentJd.id);
+  const materialKit = materialKitQuery.data;
+  const materialOwnerMismatch = Boolean(materialKit && materialKit.application_id !== application.id);
+  const materialTask = applicationTaskResolution.tasks.find((task) => task.taskId === 'application.material_kit');
+  const linkedResume = !materialOwnerMismatch && materialKit
+    ? resumeRecords.find((resume) => resume.id === materialKit.resume_id && !resume.deleted_at)
+    : undefined;
+  const materialActionLabel = application.status === 'pending' ? '继续准备' : '查看投递材料';
+  const materialEntryBlocked = externalTaskBlocked || materialKitQuery.isLoading || materialKitQuery.isError
+    || materialOwnerMismatch || Boolean(materialTask && !materialTask.executable)
+    || (!materialTask && applicationTaskResolution.tasks.some((task) => task.availability === 'waiting_confirmation' || task.availability === 'result_unknown'));
+  const remainingPreparationTasks = applicationTaskResolution.tasks.filter((task) => task.taskId !== 'application.material_kit');
+  const visibleScheduleEvents = expandedScheduleApplicationId === application.id ? allEvents : allEvents.slice(0, 3);
   const progressItems: ApplicationProgressItem[] = [
     {
       id: `application-created-${application.id}`,
@@ -1773,7 +1789,11 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
               </Title>
               <Space wrap>
               <Tag color={stageDataBlocked ? 'orange' : 'green'}>{stageLabel}</Tag>
-                <SourceStateTag state="current" detail="当前投递" />
+                <Text type="secondary">
+                  {application.first_applied_at
+                    ? `投递时间：${formatWorkspaceDate(application.first_applied_at)}`
+                    : `记录时间：${formatWorkspaceDate(application.created_at)}`}
+                </Text>
                 <Text type="secondary">
                   下一步时间：{eventsQuery.isLoading
                     ? '读取中'
@@ -1785,7 +1805,7 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
                 </Text>
               </Space>
             </div>
-            <Space>
+            <Space className={styles.headerActions} wrap>
               <Button
                 type="primary"
                 size="large"
@@ -1912,10 +1932,7 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
           hidden={activeTab !== 'preparation'}
           className={styles.tabPanel}
         >
-          <section className={styles.preparationIntro} aria-labelledby="application-preparation-heading">
-            <Title id="application-preparation-heading" level={4} className={styles.workspaceSectionTitle}>准备</Title>
-            <Text type="secondary">按下一步任务整理岗位判断、材料、沟通与复盘入口。</Text>
-            {externalTaskBlocked ? (
+          {externalTaskBlocked ? (
               <Alert
                 style={{ marginTop: 12 }}
                 type="warning"
@@ -1923,10 +1940,105 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
                 message="有一项助手操作正在等待处理"
                 description="请先在 Haru / Pilot 中完成确认；当前投递任务不会替换或暴露其他操作的身份。"
               />
-            ) : null}
+          ) : null}
+          <div className={styles.preparationGrid}>
+          <div className={styles.preparationMain}>
+          <section className={styles.preparationCard} aria-labelledby="application-materials-heading">
+            <div className={styles.cardHeader}>
+              <div>
+                <Title id="application-materials-heading" level={4} className={styles.cardTitle}>岗位描述</Title>
+                {currentJd && !applicationJdQuery.isError && !applicationJdQuery.isLoading ? (
+                  <Text type="secondary">当前 JD · 版本 {currentJd.version_number}</Text>
+                ) : null}
+              </div>
+              <Space wrap>
+                <Button onClick={() => { setJdHistoryOpen(true); setSelectedJdVersion(null); }}>查看历史</Button>
+                <Button disabled={applicationJdQuery.isLoading || applicationJdQuery.isError} onClick={startJdEditor}>
+                  {applicationJdQuery.isLoading ? '读取中' : applicationJdQuery.isError ? '暂不可编辑' : currentJd ? '更新 JD' : '添加 JD'}
+                </Button>
+              </Space>
+            </div>
+            {applicationJdQuery.isLoading ? <Spin size="small" /> : applicationJdQuery.isError ? (
+              <Alert type="warning" showIcon message="岗位资料暂时无法读取" action={<Button onClick={() => void applicationJdQuery.refetch()}>重试</Button>} />
+            ) : applicationJdQuery.data === undefined ? (
+              <Text type="secondary">岗位资料状态尚未加载</Text>
+            ) : currentJd ? (
+              <>
+                <div id="application-jd-text" className={`${styles.jdText} ${longJd && !jdExpanded ? styles.jdTextCollapsed : ''}`}>
+                  {currentJd.jd_text}
+                </div>
+                {longJd ? (
+                  <Button type="link" className={styles.inlineAction} aria-expanded={jdExpanded} aria-controls="application-jd-text" onClick={() => setExpandedJdId(jdExpanded ? null : currentJd.id)}>
+                    {jdExpanded ? '收起全文' : '展开全文'}
+                  </Button>
+                ) : null}
+                {jdSource ? (
+                  <div className={styles.jdSource}>
+                    <Text type="secondary">来源：{jdSource}</Text>
+                    <Button onClick={async () => {
+                      try {
+                        if (!navigator.clipboard) throw new Error('clipboard unavailable');
+                        await navigator.clipboard.writeText(jdSource);
+                        message.success('来源已复制');
+                      } catch { message.error('无法复制，请手动选择来源文字'); }
+                    }}>复制来源</Button>
+                  </div>
+                ) : null}
+              </>
+            ) : <Text type="secondary">尚未确认岗位描述</Text>}
+          </section>
+
+          <section className={styles.preparationCard} aria-labelledby="application-linked-materials-heading" data-task-id={materialTask?.taskId} data-primary={materialTask?.primary ? 'true' : undefined}>
+            <div className={styles.cardHeader}>
+              <Title id="application-linked-materials-heading" level={4} className={styles.cardTitle}>关联材料</Title>
+              <Button disabled={materialEntryBlocked} onClick={() => {
+                if (materialEntryBlocked) return;
+                if (materialTask) launchResolvedTask(materialTask);
+                else launchMaterialKit(currentJd ? { jdSnapshot: currentJd.jd_text, jdVersionID: currentJd.id } : {});
+              }}>{materialActionLabel}</Button>
+            </div>
+            {materialKitQuery.isLoading ? <div role="status"><Spin size="small" /> 正在读取投递材料</div> : materialKitQuery.isError ? (
+              <Alert type="warning" showIcon message="投递材料暂时无法读取" action={<Button onClick={() => void materialKitQuery.refetch()}>重试</Button>} />
+            ) : materialOwnerMismatch ? (
+              <Alert type="warning" showIcon message="材料归属暂不可确认" action={<Button onClick={() => void materialKitQuery.refetch()}>重试</Button>} />
+            ) : materialKit ? (
+              <div className={styles.materialSummary}>
+                <div className={styles.linkedResume}>
+                  <Text type="secondary">关联简历</Text>
+                  <Text strong>
+                    {resumesLoading ? '正在读取关联简历' : resumesError ? '关联简历暂时无法读取'
+                      : linkedResume ? linkedResume.title || linkedResume.name || '未命名简历'
+                        : materialKit.resume_id ? '关联简历当前不可用' : '尚未关联简历'}
+                  </Text>
+                  <Text type="secondary">仅表示材料包关联，不代表提交时的简历快照。</Text>
+                </div>
+                <div className={styles.materialMeta}>
+                  <Text>{materialKit.status === 'submitted' ? '旧投递标记，缺少证据快照' : materialKit.status === 'ready' ? '材料已就绪' : materialKit.status === 'draft' ? '准备草稿' : '材料状态待核对'}</Text>
+                  <Text type="secondary">最近保存：{formatWorkspaceDate(materialKit.updated_at)}</Text>
+                </div>
+                {currentJd && materialKit.jd_version_id && materialKit.jd_version_id !== currentJd.id ? (
+                  <Text type="warning">材料使用的 JD 与当前版本不同，请在材料工作区核对来源。</Text>
+                ) : null}
+              </div>
+            ) : materialKitQuery.data === undefined ? (
+              <Text type="secondary">投递材料状态尚未加载</Text>
+            ) : (
+              <Paragraph type="secondary" className={styles.compactCopy}>
+                {application.status === 'pending' ? '尚未保存投递材料。进入准备工作区选择简历，核对岗位要求与提交前检查。' : '尚未保存投递材料。可在材料工作区选择关联简历，补充本次投递的材料记录。'}
+              </Paragraph>
+            )}
+            {materialTask && !materialTask.executable ? <Text type="secondary">请先完成必要资料读取与核对，再打开材料。</Text> : null}
+          </section>
+
+          <section className={styles.preparationCard} aria-labelledby="application-preparation-heading">
+            <Title id="application-preparation-heading" level={4} className={styles.cardTitle}>{application.status === 'pending' ? '准备任务' : '后续准备'}</Title>
             <div className={styles.taskList}>
-              {applicationTaskResolution.tasks.length > 0 ? applicationTaskResolution.tasks.map((task) => {
-                const copy = TASK_COPY[task.taskId] ?? { title: '当前任务', description: '当前任务状态已更新。', action: '查看任务' };
+              {remainingPreparationTasks.length > 0 ? remainingPreparationTasks.map((task) => {
+                const baseCopy = TASK_COPY[task.taskId] ?? { title: '当前任务', description: '当前任务状态已更新。', action: '查看任务' };
+                const copy = task.taskId === 'application.interview_prepare' ? { ...baseCopy, action: '准备这场面试' }
+                  : task.taskId === 'application.interview_review' ? { ...baseCopy, action: task.reason === 'interview_review_available' ? '查看复盘' : '开始复盘' }
+                    : baseCopy;
+                const taskEvent = task.ref.eventId === undefined ? undefined : allEvents.find((event) => event.id === task.ref.eventId);
                 const unavailable = externalTaskBlocked || !task.executable || task.availability === 'loading' || task.availability === 'blocked' || task.availability === 'unavailable';
                 return (
                   <div
@@ -1937,6 +2049,7 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
                   >
                     <div>
                       <Text strong>{copy.title}</Text>
+                      {taskEvent ? <Paragraph type="secondary">{eventSubtypeLabel(taskEvent.subtype)} · {formatWorkspaceDate(taskEvent.scheduled_at, '时间待确认')}</Paragraph> : null}
                       <Paragraph type="secondary">{copy.description}</Paragraph>
                       <Text type="secondary">
                         {task.availability === 'loading' ? '正在读取状态'
@@ -1957,7 +2070,7 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
                   </div>
                 );
               }) : (
-                <Text type="secondary">暂无可执行任务，必要资料加载完成后会显示在这里。</Text>
+                <Text type="secondary">暂无其他准备任务。收到笔试或面试通知后，可添加日程并从对应事件进入准备。</Text>
               )}
             </div>
             {applicationTaskResolution.hasLoading && <div role="status">任务状态正在读取</div>}
@@ -1965,64 +2078,15 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
               <div role="alert">部分任务暂不可用，请先检查相关资料</div>
             )}
           </section>
-
-        <section className={styles.workspaceSection} aria-labelledby="application-materials-heading">
-          <Title id="application-materials-heading" level={4} className={styles.workspaceSectionTitle}>岗位与材料</Title>
-        <div style={{ border: '1px solid #e2e8f0', borderRadius: 10, padding: 14, marginBottom: 16 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
-            <Text strong>{'\u6295\u9012\u5c97\u4f4d\u8d44\u6599'}</Text>
-            <Space>
-              <Button size="small" onClick={() => { setJdHistoryOpen(true); setSelectedJdVersion(null); }}>{'\u67e5\u770b\u5386\u53f2'}</Button>
-              <Button
-                size="small"
-                disabled={applicationJdQuery.isLoading || applicationJdQuery.isError}
-                onClick={startJdEditor}
-              >
-                {applicationJdQuery.isLoading
-                  ? '读取中'
-                  : applicationJdQuery.isError
-                    ? '暂不可编辑'
-                    : applicationJdQuery.data?.current
-                      ? '\u66f4\u65b0 JD'
-                      : '\u6dfb\u52a0 JD'}
-              </Button>
-            </Space>
           </div>
-          {applicationJdQuery.isLoading ? <Spin size="small" /> : applicationJdQuery.isError ? (
-            <Alert type="warning" showIcon message="岗位资料暂时无法读取" action={<Button size="small" onClick={() => void applicationJdQuery.refetch()}>重试</Button>} />
-          ) : applicationJdQuery.data === undefined ? (
-            <Text type="secondary">岗位资料状态尚未加载</Text>
-          ) : applicationJdQuery.data?.current ? (
-            <>
-            <Paragraph ellipsis={{ rows: 3 }} style={{ margin: '10px 0 0', whiteSpace: 'pre-wrap' }}>
-              {applicationJdQuery.data.current.jd_text}
-            </Paragraph>
-            <Space size={8} style={{ marginTop: 8 }}>
-              <Text type="secondary">{'\u6765\u6e90\uff1a'}{applicationJdQuery.data.current.source_url}</Text>
-              <Button
-                size="small"
-                onClick={() => {
-                  void navigator.clipboard?.writeText(applicationJdQuery.data!.current!.source_url!);
-                }}
-              >
-                {'\u590d\u5236\u6765\u6e90'}
-              </Button>
-            </Space>
-            </>
-          ) : <Text type="secondary">{'\u5c1a\u672a\u786e\u8ba4\u5c97\u4f4d\u63cf\u8ff0'}</Text>}
-        </div>
-        </section>
-
-        <Divider />
-        <section ref={scheduleSectionRef} className={styles.workspaceSection} aria-labelledby="application-schedule-heading">
-        <Title id="application-schedule-heading" level={4} className={styles.workspaceSectionTitle}>日程与沟通</Title>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
-          <Title level={5} style={{ margin: 0 }}>
-            <CalendarOutlined /> 日程
+          <aside className={styles.preparationAside} aria-label="跟进与面试安排">
+        <section ref={scheduleSectionRef} className={styles.preparationCard} aria-labelledby="application-schedule-heading">
+        <div className={styles.cardHeader}>
+          <Title id="application-schedule-heading" level={4} className={styles.cardTitle}>
+            <CalendarOutlined /> 跟进与安排
           </Title>
           <Button
             data-testid="application-schedule-create"
-            size="small"
             icon={<PlusOutlined />}
             onClick={(event) => openScheduleForm(event.currentTarget, 'schedule')}
           >
@@ -2041,7 +2105,7 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
           <Text type="secondary">日程状态尚未加载</Text>
         ) : allEvents.length > 0 ? (
           <Space direction="vertical" style={{ width: '100%', marginBottom: 16 }}>
-            {allEvents.map((event) => {
+            {visibleScheduleEvents.map((event) => {
               const notesReady = !notesQuery.isLoading && !notesQuery.isError && noteRowsAreObjects;
               const linkedNote = notesReady ? noteRecords.find((note) => note.application_event_id === event.id) : undefined;
               const projected = taskSnapshot.events.status === 'ready'
@@ -2060,12 +2124,12 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
                 (task) => task.taskId === 'application.interview_review' && task.ref.eventId === event.id,
               );
               return (
-              <div key={event.id} style={{ border: '1px solid #e2e8f0', borderRadius: 8, padding: 12 }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
+              <div key={event.id} className={styles.scheduleSummary}>
+                <div className={styles.scheduleMeta}>
                   <Text strong>{EVENT_TYPE_LABELS[event.event_type]}</Text>
                   <Text type="secondary">{formatWorkspaceDate(event.scheduled_at, '时间待确认')}</Text>
                 </div>
-                <div style={{ color: '#64748b', fontSize: 13, marginTop: 4 }}>
+                <div className={styles.scheduleDetail}>
                   {Number.isFinite(event.duration_minutes) && event.duration_minutes > 0
                     ? `时长 ${event.duration_minutes} 分钟`
                     : '时长未设置'}{event.location ? ` · ${event.location}` : ''}{terminalEvent ? ` · ${eventStatusLabel(event.status)}` : ''}
@@ -2079,7 +2143,7 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
                 ) : event.event_type === 'interview' && !notesReady ? (
                   <Text type="secondary">面试复盘暂不可用，请先完成读取或重试。</Text>
                 ) : event.event_type === 'interview' && (
-                  <Space size={4}>
+                  <Space size={8} wrap>
                     {completedEvent && <Button
                       size="small"
                       type="link"
@@ -2126,16 +2190,19 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
             })}
           </Space>
         ) : (
-          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无笔试、面试或测评日程" style={{ marginBottom: 16 }} />
+          <Paragraph type="secondary" className={styles.compactCopy}>尚未添加日程。收到笔试或面试通知后，可在这里记录时间与地点。</Paragraph>
         )}
+        {!eventsQuery.isLoading && !eventsQuery.isError && allEvents.length > 3 ? (
+          <Button type="link" className={styles.inlineAction} aria-expanded={expandedScheduleApplicationId === application.id} onClick={() => setExpandedScheduleApplicationId(expandedScheduleApplicationId === application.id ? null : application.id)}>
+            {expandedScheduleApplicationId === application.id ? '收起日程' : `查看全部 ${allEvents.length} 条日程`}
+          </Button>
+        ) : null}
+        <Text type="secondary" className={styles.reminderNote}>提醒时间仅作记录，不会自动向你或招聘方发送通知。</Text>
         </section>
-        <section className={styles.workspaceSection} aria-labelledby="application-interview-heading">
-        <Title id="application-interview-heading" level={4} className={styles.workspaceSectionTitle}>面试</Title>
-        <Title level={5} style={{ marginTop: 8 }}>
-          面试复盘
-        </Title>
+        <section className={styles.preparationCard} aria-labelledby="application-interview-heading">
+        <Title id="application-interview-heading" level={4} className={styles.cardTitle}>面试复盘</Title>
 
-        <Button
+        {canonicalInterviewChoices.review.length > 0 ? <Button
           icon={<PlusOutlined />}
           style={{ marginBottom: 16 }}
           onClick={() => {
@@ -2143,10 +2210,10 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
             setPilotReviewChoices(canonicalInterviewChoices.review);
             setPilotReviewChooserOpen(true);
           }}
-          disabled={!interviewReviewDataReady}
+          disabled={!interviewReviewDataReady || externalTaskBlocked}
         >
           选择面试并开始复盘
-        </Button>
+        </Button> : null}
 
         {notesQuery.isLoading ? (
           <div style={{ textAlign: 'center', padding: 24 }}>
@@ -2167,11 +2234,11 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
                   key={n.id}
                   style={{ paddingBottom: 8, borderBottom: '1px solid #f0f0f0' }}
                 >
-                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <div className={styles.reviewHeader}>
                     <Text strong>
                       {n.round || '未标注轮次'} · {n.date} · 心情 {n.mood || '—'}
                     </Text>
-                    <Space size={4}>
+                    <Space size={8} wrap>
                       <Button
                         type="text"
                         size="small"
@@ -2224,21 +2291,24 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
             }))}
           />
         ) : (
-          <Empty description="还没有面试复盘" />
+          <Paragraph type="secondary" className={styles.compactCopy}>
+            {canonicalInterviewChoices.review.length > 0 ? '尚未保存面试复盘，可选择已完成的面试开始记录。' : '尚无可复盘的面试。完成面试并更新事件状态后，再记录问题与反思。'}
+          </Paragraph>
         )}
         </section>
-        <section className={styles.workspaceSection} aria-labelledby="application-result-heading">
-          <Title id="application-result-heading" level={4} className={styles.workspaceSectionTitle}>结果</Title>
+        <section className={styles.resultSummary} aria-label="投递结果">
+          {application.status === 'offer' || application.status === 'closed' ? <>
+          <Title id="application-result-heading" level={4} className={styles.cardTitle}>结果</Title>
           <Text type="secondary">
             {application.status === 'offer'
               ? '已进入 Offer 阶段，可通过顶部主操作查看事实、截止时间和待确认信息。'
               : application.status === 'closed'
                 ? '该投递已结束，结果与经验记录保留在投递事实中。'
                 : '尚未进入结果阶段，后续状态会继续在这里汇总。'}
-          </Text>
-          <div style={{ marginTop: 12 }}>
+          </Text></> : null}
+          <div>
             <Button
-              size="small"
+              type="link"
               onClick={() => launchTask({
                 ref: { taskId: 'application.record_outcome', applicationId: application.id },
                 source: 'application_task_card',
@@ -2249,6 +2319,8 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
             </Button>
           </div>
         </section>
+          </aside>
+          </div>
         </div>
 
         <div

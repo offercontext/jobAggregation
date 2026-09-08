@@ -1,5 +1,7 @@
 .detailWorkspace {
   min-width: 0;
+  container-type: inline-size;
+  container-name: application-detail;
   color: var(--op-ink);
 }
 
@@ -15,7 +17,7 @@
 
 .backButton {
   width: fit-content;
-  height: auto;
+  min-height: 40px;
   padding: 0;
 }
 
@@ -24,9 +26,12 @@
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
+  justify-content: space-between;
 }
 
-.stageIdentity { min-width: 0; }
+.stageIdentity { min-width: 0; flex: 1; }
+
+.headerActions { flex: 0 0 auto; }
 
 .workspaceSection {
   margin-top: 18px;
@@ -84,13 +89,116 @@
 }
 
 .tabActive {
-  color: var(--op-ink, #0f172a);
+  color: var(--op-primary-strong, #4f46e5);
   background: var(--op-surface, #fff);
   box-shadow: 0 4px 12px rgb(15 23 42 / 8%);
 }
 
 .tabPanel {
   min-width: 0;
+}
+
+.preparationGrid {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(300px, 1fr);
+  align-items: start;
+  gap: 20px;
+  margin-top: 20px;
+}
+
+.preparationMain,
+.preparationAside {
+  display: grid;
+  min-width: 0;
+  align-content: start;
+  gap: 18px;
+}
+
+.preparationCard {
+  min-width: 0;
+  padding: 22px;
+  background: var(--op-surface, #fff);
+  border: 1px solid var(--op-border);
+  border-radius: 12px;
+}
+
+.cardHeader {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.cardTitle {
+  margin: 0 !important;
+  color: var(--op-ink) !important;
+  font-size: 18px !important;
+  line-height: 1.5 !important;
+}
+
+.cardTitle + :global(.ant-typography) { display: block; margin-top: 4px; }
+
+.preparationCard :global(.ant-btn) {
+  min-height: 40px;
+  height: auto;
+  white-space: normal;
+}
+
+.jdText {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  font-size: 15px;
+  line-height: 1.9;
+}
+
+.jdTextCollapsed { max-height: 24.7em; overflow: hidden; }
+
+.inlineAction { padding-inline: 0; }
+
+.jdSource {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--op-border);
+  overflow-wrap: anywhere;
+}
+
+.jdSource > :global(.ant-typography) { flex: 1; min-width: 0; }
+
+.materialSummary,
+.linkedResume { display: grid; gap: 6px; min-width: 0; }
+
+.linkedResume {
+  padding: 14px 16px;
+  overflow-wrap: anywhere;
+  background: var(--surface-sunken, #f8fafc);
+  border-radius: var(--op-control-radius, 8px);
+}
+
+.materialMeta { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 6px; }
+
+.compactCopy { margin: 12px 0 0 !important; line-height: 1.75; text-wrap: pretty; }
+
+.scheduleSummary {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--op-border);
+  overflow-wrap: anywhere;
+}
+
+.scheduleSummary:last-child { border-bottom: 0; }
+.scheduleMeta { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; }
+.scheduleDetail { color: var(--op-muted-strong); margin-top: 6px; font-size: 13px; }
+.reminderNote { display: block; margin-top: 14px; font-size: 12px; line-height: 1.7; }
+.reviewHeader { display: grid; gap: 8px; overflow-wrap: anywhere; }
+.resultSummary { padding: 0 12px; min-width: 0; }
+
+@container application-detail (max-width: 850px) {
+  .preparationGrid { grid-template-columns: minmax(0, 1fr); }
 }
 
 .overviewSection,
@@ -147,12 +255,11 @@
   justify-content: space-between;
   gap: 16px;
   min-width: 0;
-  padding: 14px 16px;
-  background: var(--op-surface, #fff);
-  border: 1px solid var(--op-border, #e2e8f0);
-  border-radius: calc(var(--op-control-radius, 8px) + 2px);
-  box-shadow: 0 4px 14px rgb(15 23 42 / 4%);
+  padding: 12px 0;
+  border-bottom: 1px solid var(--op-border);
 }
+
+.taskCard:last-child { border-bottom: 0; }
 
 .taskCard :global(.ant-typography) {
   margin-bottom: 0;
@@ -344,6 +451,11 @@
 }
 
 @media (max-width: 768px) {
+  .preparationGrid { gap: 16px; margin-top: 16px; }
+  .preparationCard { padding: 16px; }
+  .preparationCard :global(.ant-btn) { min-height: 44px; }
+  .headerActions { width: 100%; }
+  .title { font-size: 22px !important; }
   .summaryGrid {
     grid-template-columns: 1fr;
   }

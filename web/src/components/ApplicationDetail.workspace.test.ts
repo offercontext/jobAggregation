@@ -11,8 +11,8 @@ describe('ApplicationDetail staged workspace', () => {
 
   it('uses stable business sections and the unified Haru entry copy', () => {
     expect(source).toContain('概览');
-    expect(source).toContain('岗位与材料');
-    expect(source).toContain('日程与沟通');
+    expect(source).toContain('投递材料');
+    expect(source).toContain('跟进与安排');
     expect(source).toContain('面试');
     expect(source).toContain('结果');
     expect(source).toContain('让 Haru 帮我');

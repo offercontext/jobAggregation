@@ -10,6 +10,7 @@ import { useAssistantSurface } from './AssistantSurfaceProvider';
 import HaruChatWindow from './HaruChatWindow';
 
 interface Props {
+  compact?: boolean;
   visible: boolean;
   activity: PilotMascotActivity;
   zoom: number;
@@ -24,6 +25,7 @@ interface Props {
 }
 
 export default function HaruDock({
+  compact = false,
   visible,
   activity,
   zoom,
@@ -64,6 +66,7 @@ export default function HaruDock({
         onAnchorRectChange={setAnchorRect}
         animationLevel={animationLevel}
       />, calendarHost) : null) : <PilotMascot
+        compact={compact}
         activity={notification?.status ?? activity}
         panelOpen={surface.surface === 'haru_chat'}
         onTogglePilot={() => {

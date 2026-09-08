@@ -10,6 +10,8 @@
   min-width: 0;
 }
 
+.compact { justify-content: flex-end; padding-block: 10px; }
+
 .greeting {
   overflow: hidden;
   color: var(--op-ink);
@@ -58,6 +60,8 @@
     width: 100%;
     justify-content: flex-start;
   }
+  .compact { align-items: flex-end; padding-block: 8px; }
+  .compact .actions { justify-content: flex-end; }
 }
 
 @media (prefers-reduced-motion: reduce) {

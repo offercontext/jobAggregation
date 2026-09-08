@@ -1,5 +1,7 @@
 # README Product Overview Implementation Plan
 
+> 历史施工计划，已归档。下文命令、勾选框与技能要求仅供追溯，不再作为当前执行指令；截图与 README 维护以 [用户指南维护记录](../../product-manual/维护记录.md)为准。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace the technical, duplicated README with a concise Chinese-first product overview that accurately presents OfferPilot through five real, bright, wide-screen screenshots.

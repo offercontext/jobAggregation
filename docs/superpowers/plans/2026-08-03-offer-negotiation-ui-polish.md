@@ -52,7 +52,7 @@ git rev-parse --short HEAD
 | `web/src/components/OfferCenterView.test.tsx` | UI 入口与零额外写入 |
 | `web/src/layout/AppShell.offerNegotiation.test.tsx` | UI/Pilot 草稿隔离挂载测试 |
 | `artifacts/2026-08-03-offer-negotiation/*.png` | 重新生成的亮色宽屏截图 |
-| `artifacts/2026-08-03-offer-negotiation/release-verification.md` | 更新后的验收报告 |
+| `docs/reports/2026-08-01-offer-negotiation-release-verification.md` | 历史验收报告（路径已收敛） |
 
 禁止修改 `src/offerpilot/`、数据库迁移、后端 schema、API 路由、Provider prompt、AI 校验器和共享 HTTP 契约。
 
@@ -783,7 +783,7 @@ git commit -m "test: AI cover polished negotiation workflows"
 - Replace: `artifacts/2026-08-03-offer-negotiation/09-pilot-generated-proposal.png`
 - Replace: `artifacts/2026-08-03-offer-negotiation/10-pilot-confirmed-history.png`
 - Replace: `artifacts/2026-08-03-offer-negotiation/11-single-offer-coach.png`
-- Modify: `artifacts/2026-08-03-offer-negotiation/release-verification.md`
+- Modify: `docs/reports/2026-08-01-offer-negotiation-release-verification.md`
 
 - [ ] **Step 1: 运行前端全量门禁**
 
@@ -885,7 +885,7 @@ P0/P1/P2 必须修复并补回归后，重新执行受影响门禁。
 - [ ] **Step 9: 提交验收证据**
 
 ```powershell
-git add -f artifacts/2026-08-03-offer-negotiation/*.png artifacts/2026-08-03-offer-negotiation/release-verification.md
+git add -f artifacts/2026-08-03-offer-negotiation/*.png docs/reports/2026-08-01-offer-negotiation-release-verification.md
 ```
 
 ```powershell

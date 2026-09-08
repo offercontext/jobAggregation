@@ -1,5 +1,7 @@
 # OfferPilot Python Cutover Verification
 
+> 历史快照：记录 2026-07-06 的 Python 切换验收，不代表当前测试数量或发布状态。当前发布要求见 [P0 发布清单](../p0-release-checklist.md)。
+
 Date: 2026-07-06
 Branch: `feature/20260705-python-rewrite`
 

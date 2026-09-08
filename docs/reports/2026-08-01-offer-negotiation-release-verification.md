@@ -4,7 +4,7 @@
 分支：`feat/20260801-offer-negotiation`
 范围：仅发布收口；未新增 Offer、谈薪、Pilot、HITL 或证据门控语义；未推送、未合并。
 
-本文件是当前分支唯一有效的发布验证报告。`artifacts/2026-08-03-offer-negotiation/release-verification.md` 为历史路径，已明确标记废弃。
+本文件是该次 Offer 谈薪迭代的历史发布验证报告；重复的 artifacts 路径占位文件已移除。下文结论仅适用于记录的验收基线，不代表当前主线发布状态。
 
 ## 本轮收口变更
 

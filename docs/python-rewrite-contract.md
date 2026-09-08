@@ -2,11 +2,11 @@
 
 # OfferPilot Python Rewrite Contract
 
-> Status: final Python cutover in progress; legacy Go references below are the
-> historical source baseline used to prove compatibility.
+> Status: Python cutover completed; see the [2026-07-06 verification snapshot](archive/python-cutover-verification.md).
+> 本文保留迁移兼容契约与历史 Go 基线，不是当前 API 全量清单，也不是待执行迁移计划。下文的 Current、Phase、测试数量与 Go 路径按其历史基线阅读；后续明确修订以 [AGENTS.md](../AGENTS.md) 的领域红线、相关实施契约和当前代码／测试为准，未被修订的安全约束继续保留。
 > Baseline branch: `feature/20260705-python-rewrite`.
 > Source baseline: Go backend at `443c933` from `main`.
-> **[KR] Knowledge 模块执行一次性完整重写**：旧 knowledge API / 表 / AI tool / CLI 条目（标记 `[KR-deprecated]`）仅是历史基线。最终契约见末尾 [Knowledge Rewrite (Final Cutover)](#knowledge-rewrite-final-cutover) 和对应 Spec。
+> **[KR] Knowledge 历史基线**：旧 knowledge API / 表 / AI tool / CLI 条目（标记 `[KR-deprecated]`）不得作为长期兼容要求重新引入。当前方向见末尾 [Knowledge System](#knowledge-system) 及其链接的唯一架构事实源。
 
 This document freezes the compatibility surface for rewriting OfferPilot from Go
 to Python. The Python backend may improve internal structure, but it must keep
@@ -333,5 +333,5 @@ The agent loop lives in `internal/ai/agent.go`.
 Knowledge 的长期产品职责、领域模型和数据流以
 [Knowledge 系统主文档](./architecture/knowledge-system.md) 为唯一事实源。
 
-当前代码仍包含旧自动 Wiki 方向的实现。后续迁移、API、Schema 和发布门禁必须由新的实施
-Spec 定义；本文不再保留已废弃的 Page、Index、Wikilink 和 Review 契约。
+具体迁移、API、Schema 和发布门禁查阅相关实施 Spec、当前代码与测试；本文不据历史基线判断
+当前实现进度，也不再保留已废弃的 Page、Index、Wikilink 和 Review 契约。

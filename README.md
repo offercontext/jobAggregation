@@ -53,7 +53,7 @@ Pilot 可以读取你当前授权的本地上下文，协助查询、整理或�
 
 录入 Offer 后可以查看已知薪酬事实、补充自定义比较维度，并进入谈薪准备或谈薪教练。多 Offer 对比只整理已知事实，最终选择仍由你决定。
 
-![Offer 横向对比：核对两份 Offer 的薪酬、福利与截止日，并进入谈薪准备](docs/product-manual/screenshots/08-13-offer-comparison-table.png)
+![Offer 横向对比：查看等宽摘要卡片、年薪与回复时间差，并逐项核对薪酬、福利和截止日](docs/product-manual/screenshots/R08-offer-comparison-polished.png)
 
 ## 快速开始
 

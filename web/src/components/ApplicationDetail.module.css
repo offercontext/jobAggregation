@@ -148,10 +148,16 @@
 
 .jdText {
   overflow-wrap: anywhere;
-  white-space: pre-wrap;
   font-size: 15px;
   line-height: 1.9;
 }
+
+.jdCard { padding: 12px 22px 16px; }
+.jdIdentity { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; }
+.jdCardHeader { align-items: center; margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--op-border); }
+.jdCardTitle { display: flex; align-items: center; gap: 12px; font-size: 20px !important; font-weight: 700 !important; }
+.jdCardTitle :global(.anticon) { color: var(--op-primary-strong); font-size: 23px; }
+.jdCardHeader .jdCardTitle + :global(.ant-typography) { margin: 0; font-size: 12px; }
 
 .jdTextCollapsed { max-height: 24.7em; overflow: hidden; }
 

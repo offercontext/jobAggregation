@@ -20,8 +20,12 @@ import {
   CalendarOutlined,
   PlusOutlined,
   MoreOutlined,
+  FileTextOutlined,
+  HistoryOutlined,
+  EditOutlined,
 } from '@ant-design/icons';
 import dayjs from 'dayjs';
+import JobDescriptionContent from './JobDescriptionContent';
 import type { Application } from '@/types/application';
 import type { Offer } from '@/types/offer';
 import type { PilotActionRequest } from '@/types/chat';
@@ -1493,7 +1497,7 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
   const linkedOffers = offerRecords.filter((offer) => offer.application_id === application.id);
   const currentJd = applicationJdQuery.data?.current;
   const jdSource = currentJd?.source_url?.trim();
-  const longJd = Boolean(currentJd && (currentJd.jd_text.length > 600 || currentJd.jd_text.split('\n').length > 12));
+  const longJd = Boolean(currentJd && (currentJd.jd_text.length > 1200 || currentJd.jd_text.split('\n').length > 18));
   const jdExpanded = Boolean(currentJd && expandedJdId === currentJd.id);
   const materialKit = materialKitQuery.data;
   const materialOwnerMismatch = Boolean(materialKit && materialKit.application_id !== application.id);
@@ -1943,17 +1947,17 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
           ) : null}
           <div className={styles.preparationGrid}>
           <div className={styles.preparationMain}>
-          <section className={styles.preparationCard} aria-labelledby="application-materials-heading">
-            <div className={styles.cardHeader}>
-              <div>
-                <Title id="application-materials-heading" level={4} className={styles.cardTitle}>岗位描述</Title>
+          <section className={`${styles.preparationCard} ${styles.jdCard}`} aria-labelledby="application-materials-heading">
+            <div className={`${styles.cardHeader} ${styles.jdCardHeader}`}>
+              <div className={styles.jdIdentity}>
+                <Title id="application-materials-heading" level={4} className={`${styles.cardTitle} ${styles.jdCardTitle}`}><FileTextOutlined aria-hidden="true" />岗位描述</Title>
                 {currentJd && !applicationJdQuery.isError && !applicationJdQuery.isLoading ? (
                   <Text type="secondary">当前 JD · 版本 {currentJd.version_number}</Text>
                 ) : null}
               </div>
               <Space wrap>
-                <Button onClick={() => { setJdHistoryOpen(true); setSelectedJdVersion(null); }}>查看历史</Button>
-                <Button disabled={applicationJdQuery.isLoading || applicationJdQuery.isError} onClick={startJdEditor}>
+                <Button icon={<HistoryOutlined aria-hidden="true" />} onClick={() => { setJdHistoryOpen(true); setSelectedJdVersion(null); }}>查看历史</Button>
+                <Button icon={<EditOutlined aria-hidden="true" />} disabled={applicationJdQuery.isLoading || applicationJdQuery.isError} onClick={startJdEditor}>
                   {applicationJdQuery.isLoading ? '读取中' : applicationJdQuery.isError ? '暂不可编辑' : currentJd ? '更新 JD' : '添加 JD'}
                 </Button>
               </Space>
@@ -1965,7 +1969,7 @@ export default function ApplicationDetail({ application, open, onClose, taskCont
             ) : currentJd ? (
               <>
                 <div id="application-jd-text" className={`${styles.jdText} ${longJd && !jdExpanded ? styles.jdTextCollapsed : ''}`}>
-                  {currentJd.jd_text}
+                  <JobDescriptionContent text={currentJd.jd_text} />
                 </div>
                 {longJd ? (
                   <Button type="link" className={styles.inlineAction} aria-expanded={jdExpanded} aria-controls="application-jd-text" onClick={() => setExpandedJdId(jdExpanded ? null : currentJd.id)}>

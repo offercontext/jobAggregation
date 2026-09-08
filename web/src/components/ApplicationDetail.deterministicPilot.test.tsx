@@ -100,6 +100,8 @@ vi.mock('@ant-design/icons', () => ({
   FileTextOutlined: () => null,
   DatabaseOutlined: () => null,
   MoreOutlined: () => null,
+  HistoryOutlined: () => null,
+  EditOutlined: () => null,
 }));
 vi.mock('antd', () => {
   const Form = Object.assign(
@@ -260,7 +262,8 @@ describe('ApplicationDetail deterministic Pilot JD entry', () => {
     expect(expand?.getAttribute('aria-expanded')).toBe('false');
     act(() => expand?.click());
     expect(expand?.getAttribute('aria-expanded')).toBe('true');
-    expect(panel?.querySelector('#application-jd-text')?.textContent).toBe(jdText);
+    expect(panel?.querySelector('#application-jd-text h5')?.textContent).toBe('岗位职责');
+    expect([...panel!.querySelectorAll('#application-jd-text li')].map((item) => item.textContent)).toEqual(jdText.split('\n').slice(1));
   });
 
   it('does not send users into an empty interview review chooser', () => {

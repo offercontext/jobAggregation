@@ -97,6 +97,8 @@ vi.mock('@ant-design/icons', () => ({
   FileTextOutlined: () => null,
   DatabaseOutlined: () => null,
   MoreOutlined: () => null,
+  HistoryOutlined: () => null,
+  EditOutlined: () => null,
 }));
 vi.mock('antd', () => {
   const Form = Object.assign(

@@ -1,0 +1,9 @@
+.content { color: var(--op-muted-strong, #475569); font-family: var(--op-font-sans); font-size: 14px; line-height: 1.6; overflow-wrap: anywhere; }
+.prose { white-space: pre-wrap; }
+.prose:empty { display: none; }
+.section + .section { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--op-border); }
+.prose:not(:empty) + .section { margin-top: 16px; }
+.heading { margin: 0 0 4px; color: var(--op-ink); font-size: 16px; font-weight: 650; line-height: 1.5; }
+.list { margin: 0; padding-left: 21px; list-style: disc; }
+.list li { padding-left: 2px; margin: 0; white-space: pre-wrap; }
+.list li::marker { color: var(--op-primary-strong, #6254e8); font-size: 1.05em; }

@@ -41,7 +41,7 @@ OfferPilot 面向正在认真找工作的普通求职者。它将分散的简历
 
 Pilot 可以读取你当前授权的本地上下文，协助查询、整理或起草下一步；涉及写入时，它先给出确认卡或草稿，等待你确认。Haru 可提示后台回复已经完成，隐藏角色后则恢复默认 Pilot 侧边栏。
 
-![Pilot 确认卡：核对新建 Offer 的公司、薪酬、状态与截止日后再决定是否批准](docs/product-manual/screenshots/08-10-pilot-offer-parameters.png)
+![完整 Pilot 页面：左侧会话列表、中间对话与新建投递确认卡、右侧参考资料及底部输入区](docs/product-manual/screenshots/R03-02-pilot-create-confirm.png)
 
 ### 4. 面试前练习，面试后复盘
 

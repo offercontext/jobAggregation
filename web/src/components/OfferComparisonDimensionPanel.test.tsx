@@ -4,6 +4,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Offer, OfferComparisonDimension, OfferComparisonValue } from '@/types/offer';
 import OfferComparisonDimensionPanel from './OfferComparisonDimensionPanel';
+import { listOfferComparisonValues } from '@/services/offers';
 
 const serviceState = vi.hoisted(() => ({
   dimensions: [] as OfferComparisonDimension[],
@@ -25,6 +26,7 @@ vi.mock('@/services/offers', () => ({
 
 const offer = (id: number): Offer => ({
   id,
+  application_id: id,
   company_name: `Company ${id}`,
   position_name: 'Engineer',
   status: 'pending',
@@ -52,11 +54,11 @@ const dimension = (id: number, label = `维度 ${id}`): OfferComparisonDimension
 let root: Root | null = null;
 let host: HTMLDivElement | null = null;
 
-function render(onSelectionChange?: (dimensionIds: number[]) => void) {
+function render(onSelectionChange?: (dimensionIds: number[]) => void, onChanged?: () => void) {
   host = document.createElement('div');
   document.body.appendChild(host);
   root = createRoot(host);
-  act(() => root?.render(<OfferComparisonDimensionPanel offers={[offer(1), offer(2)]} onSelectionChange={onSelectionChange} />));
+  act(() => root?.render(<OfferComparisonDimensionPanel offers={[offer(1), offer(2)]} onSelectionChange={onSelectionChange} onChanged={onChanged} />));
   return host;
 }
 
@@ -68,6 +70,7 @@ describe('OfferComparisonDimensionPanel', () => {
     serviceState.update.mockReset();
     serviceState.save.mockReset();
     serviceState.clear.mockReset();
+    vi.mocked(listOfferComparisonValues).mockReset().mockImplementation(async () => serviceState.values);
   });
 
   afterEach(() => {
@@ -90,7 +93,8 @@ describe('OfferComparisonDimensionPanel', () => {
     serviceState.clear.mockResolvedValue(undefined);
     serviceState.update.mockResolvedValue({ ...dimension(1, '通勤'), archived_at: '2026-07-02T00:00:00Z' });
     const onSelectionChange = vi.fn();
-    const rendered = render(onSelectionChange);
+    const onChanged = vi.fn();
+    const rendered = render(onSelectionChange, onChanged);
 
     await act(async () => {});
     const labelInput = rendered.querySelector<HTMLInputElement>('input[placeholder="新比较维度"]');
@@ -114,11 +118,13 @@ describe('OfferComparisonDimensionPanel', () => {
       rendered.querySelector<HTMLButtonElement>('button[data-action="save-value"][data-offer-id="1"]')?.click();
     });
     expect(serviceState.save).toHaveBeenCalledWith(1, 1, '地铁 35 分钟');
+    expect(onChanged).toHaveBeenCalledTimes(1);
 
     await act(async () => {
       rendered.querySelector<HTMLButtonElement>('button[data-action="clear-value"][data-offer-id="1"]')?.click();
     });
     expect(serviceState.clear).toHaveBeenCalledWith(1, 1);
+    expect(onChanged).toHaveBeenCalledTimes(2);
 
     await act(async () => {
       rendered.querySelector<HTMLButtonElement>('button[data-action="archive-dimension"][data-dimension-id="1"]')?.click();
@@ -171,6 +177,41 @@ describe('OfferComparisonDimensionPanel', () => {
     expect(rendered.querySelectorAll('[data-action="save-value"]')).toHaveLength(2);
     expect(rendered.querySelectorAll('[data-action="clear-value"]')).toHaveLength(2);
     expect(rendered.textContent).toContain('已选择 0/8');
+  });
+
+  it('keeps historical unbound values read-only in active dimensions', async () => {
+    host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
+    await act(async () => { root?.render(<OfferComparisonDimensionPanel offers={[{ ...offer(1), application_id: undefined }, offer(2)]} />); });
+    expect(host.querySelector('[data-action="save-value"][data-offer-id="1"]')).toBeNull();
+    expect(host.querySelector('[data-action="clear-value"][data-offer-id="1"]')).toBeNull();
+    expect(host.querySelector('input[data-offer-id="1"]')).toBeNull();
+    expect(host.textContent).toContain('历史未绑定，仅可查看');
+    expect(host.querySelector('[data-action="save-value"][data-offer-id="2"]')).not.toBeNull();
+  });
+
+  it('initializes from parent selection and preserves it when another dimension is selected', async () => {
+    serviceState.dimensions = [dimension(1), dimension(2)];
+    const onSelectionChange = vi.fn();
+    host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
+    await act(async () => { root?.render(<OfferComparisonDimensionPanel offers={[offer(1), offer(2)]} selectedDimensionIds={[1]} onSelectionChange={onSelectionChange} />); });
+    const checkboxes = [...host.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')];
+    expect(checkboxes[0].checked).toBe(true);
+    expect(host.textContent).toContain('已选择 1/8');
+    await act(async () => { checkboxes[1].click(); });
+    expect(onSelectionChange).toHaveBeenLastCalledWith([1, 2]);
+  });
+
+  it('ignores a late previous Offer-set read', async () => {
+    let resolveOld!: (values: OfferComparisonValue[]) => void;
+    vi.mocked(listOfferComparisonValues).mockImplementationOnce(() => new Promise((resolve) => { resolveOld = resolve; }));
+    const rendered = render();
+    await act(async () => {});
+    serviceState.values = [{ id: 1, offer_id: 2, dimension_id: 1, value_text: '新值', created_at: '', updated_at: '' }];
+    await act(async () => { root?.render(<OfferComparisonDimensionPanel offers={[offer(2), offer(3)]} />); });
+    expect(rendered.querySelector<HTMLInputElement>('input[data-offer-id="2"]')?.value).toBe('新值');
+    await act(async () => { resolveOld([{ ...serviceState.values[0], value_text: '旧值' }]); });
+    expect(rendered.querySelector<HTMLInputElement>('input[data-offer-id="2"]')?.value).toBe('新值');
+    expect(rendered.textContent).not.toContain('Company 1');
   });
 
   it('keeps archived values readable and marks blank values as missing', async () => {

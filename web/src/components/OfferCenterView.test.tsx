@@ -50,13 +50,15 @@ vi.mock('@/components/OfferCard', () => ({ default: ({
     {onNegotiation ? <button type="button" data-testid={`prepare-${offer.id}`} onClick={() => onNegotiation(offer)}>prepare</button> : null}
   </>
 ) }));
-vi.mock('@/components/AddOfferForm', () => ({ default: ({ open, requestToken }: { open?: boolean; requestToken?: string | null }) => (
-  <div data-testid="add-offer-form" data-open={String(Boolean(open))} data-request-token={requestToken ?? ''} />
+vi.mock('@/components/AddOfferForm', () => ({ default: ({ open, requestToken, editing }: { open?: boolean; requestToken?: string | null; editing?: Offer | null }) => (
+  <div data-testid="add-offer-form" data-open={String(Boolean(open))} data-request-token={requestToken ?? ''} data-editing-id={editing?.id} />
 ) }));
-vi.mock('@/components/OfferCompareDrawer', () => ({ default: ({ offers, onNegotiation }: { offers: Offer[]; onNegotiation?: (offer: Offer) => void }) => (
+vi.mock('@/components/OfferCompareDrawer', () => ({ default: ({ offers, onNegotiation, onEdit, dimensionSettings }: { offers: Offer[]; onNegotiation?: (offer: Offer) => void; onEdit?: (offer: Offer) => void; dimensionSettings?: React.ReactNode }) => (
   <div data-testid="compare-offers">
     {offers.map((offer) => offer.id).join(',')}
     <button type="button" data-testid="compare-negotiate" onClick={() => onNegotiation?.(offers[0])}>prepare</button>
+    <button type="button" data-testid="compare-edit" onClick={() => onEdit?.(offers[0])}>edit</button>
+    {dimensionSettings}
   </div>
 ) }));
 
@@ -139,12 +141,15 @@ describe('OfferCenterView comparison guardrails', () => {
     await act(async () => { host?.querySelector<HTMLButtonElement>('[data-testid="select-1"]')?.click(); });
     await act(async () => { [...(host?.querySelectorAll('button') ?? [])].find((button) => button.textContent?.includes('开始比较'))?.click(); });
     expect(host?.querySelector('[data-testid="compare-offers"]')?.textContent).toContain('2,1');
-    const settings = host?.querySelector('details');
+    const settings = host?.querySelector('[aria-label="自定义比较维度"]');
     expect(settings).not.toBeNull();
-    expect(settings?.open).toBe(false);
     const comparison = host?.querySelector('[data-testid="compare-offers"]');
-    expect(comparison!.compareDocumentPosition(settings!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(comparison?.contains(settings!)).toBe(true);
     expect(vi.mocked(listOfferComparisonValues).mock.calls.map(([id]) => id)).toEqual([2, 1]);
+    await act(async () => { host?.querySelector<HTMLButtonElement>('[data-testid="compare-edit"]')?.click(); });
+    expect(host?.querySelector('[data-testid="add-offer-form"]')?.getAttribute('data-open')).toBe('true');
+    expect(host?.querySelector('[data-testid="add-offer-form"]')?.getAttribute('data-editing-id')).toBe('2');
+    expect(host?.querySelector('[data-testid="compare-offers"]')).not.toBeNull();
   });
 
   it('closes comparison before handing negotiation to the canonical owner', async () => {

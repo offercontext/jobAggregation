@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Alert, Button, Card, Checkbox, Empty, Input, Spin, Tag, Tooltip } from 'antd';
 import type { Offer, OfferComparisonDimension } from '@/types/offer';
 import {
@@ -10,35 +10,45 @@ import {
   updateOfferComparisonDimension,
 } from '@/services/offers';
 import styles from './OfferComparisonDimensionPanel.module.css';
+import { listOfferBindingState } from './offerWorkspaceModel';
 
 interface Props {
   offers: Offer[];
   onSelectionChange?: (dimensionIds: number[]) => void;
+  onChanged?: () => void;
+  selectedDimensionIds?: number[];
 }
 
-export default function OfferComparisonDimensionPanel({ offers, onSelectionChange }: Props) {
+export default function OfferComparisonDimensionPanel({ offers, onSelectionChange, onChanged, selectedDimensionIds }: Props) {
   const [dimensions, setDimensions] = useState<OfferComparisonDimension[]>([]);
-  const [selectedIds, setSelectedIds] = useState<number[]>([]);
+  const [localSelectedIds, setSelectedIds] = useState<number[]>([]);
+  const selectedIds = selectedDimensionIds ?? localSelectedIds;
+  const loadGeneration = useRef(0);
   const [draftLabel, setDraftLabel] = useState('');
   const [draftValues, setDraftValues] = useState<Record<string, string>>({});
   const [loadState, setLoadState] = useState<'loading' | 'ready' | 'error'>('loading');
 
   const reload = async () => {
+    const generation = ++loadGeneration.current;
     setLoadState('loading');
     try {
       const [nextDimensions, valueLists] = await Promise.all([
         listOfferComparisonDimensions(true),
         Promise.all(offers.map((offer) => listOfferComparisonValues(offer.id))),
       ]);
+      if (generation !== loadGeneration.current) return;
       setDimensions(nextDimensions);
       const nextValues: Record<string, string> = {};
       valueLists.flat().forEach((value) => {
         nextValues[`${value.offer_id}:${value.dimension_id}`] = value.value_text ?? '';
       });
       setDraftValues(nextValues);
-      setSelectedIds((current) => current.filter((id) => nextDimensions.some((dimension) => dimension.id === id && dimension.archived_at === null)));
+      const nextSelected = selectedIds.filter((id) => nextDimensions.some((dimension) => dimension.id === id && dimension.archived_at === null));
+      setSelectedIds(nextSelected);
+      if (nextSelected.length !== selectedIds.length) onSelectionChange?.(nextSelected);
       setLoadState('ready');
     } catch {
+      if (generation !== loadGeneration.current) return;
       setDimensions([]);
       setDraftValues({});
       setLoadState('error');
@@ -47,6 +57,7 @@ export default function OfferComparisonDimensionPanel({ offers, onSelectionChang
 
   useEffect(() => {
     void reload();
+    return () => { loadGeneration.current += 1; };
     // The panel intentionally refreshes only when the Offer set changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [offers.map((offer) => offer.id).join(',')]);
@@ -69,23 +80,29 @@ export default function OfferComparisonDimensionPanel({ offers, onSelectionChang
   const archiveDimension = async (id: number) => {
     const updated = await updateOfferComparisonDimension(id, { archived: true });
     setDimensions((current) => current.map((dimension) => dimension.id === id ? updated : dimension));
-    setSelectedIds((current) => {
-      const next = current.filter((item) => item !== id);
-      onSelectionChange?.(next);
-      return next;
-    });
+    const next = selectedIds.filter((item) => item !== id);
+    setSelectedIds(next);
+    onSelectionChange?.(next);
   };
 
   const saveValue = async (offerId: number, dimensionId: number) => {
+    if (!offers.some((offer) => offer.id === offerId && listOfferBindingState(offer) === 'bound')) return;
     const value = draftValues[`${offerId}:${dimensionId}`] ?? '';
     if (!value.trim()) return;
+    const generation = loadGeneration.current;
     const saved = await saveOfferComparisonValue(offerId, dimensionId, value);
+    if (generation !== loadGeneration.current) return;
     setDraftValues((current) => ({ ...current, [`${saved.offer_id}:${saved.dimension_id}`]: saved.value_text ?? '' }));
+    onChanged?.();
   };
 
   const clearValue = async (offerId: number, dimensionId: number) => {
+    if (!offers.some((offer) => offer.id === offerId && listOfferBindingState(offer) === 'bound')) return;
+    const generation = loadGeneration.current;
     await clearOfferComparisonValue(offerId, dimensionId);
+    if (generation !== loadGeneration.current) return;
     setDraftValues((current) => ({ ...current, [`${offerId}:${dimensionId}`]: '' }));
+    onChanged?.();
   };
 
   if (loadState === 'loading') {
@@ -137,7 +154,7 @@ export default function OfferComparisonDimensionPanel({ offers, onSelectionChang
                 return (
                   <div key={key} className={styles.offerValue}>
                     <label htmlFor={`dimension-${dimension.id}-offer-${offer.id}`}>{offer.company_name}</label>
-                    {active ? (
+                    {active && listOfferBindingState(offer) === 'bound' ? (
                       <>
                         <Input
                           id={`dimension-${dimension.id}-offer-${offer.id}`}
@@ -154,7 +171,7 @@ export default function OfferComparisonDimensionPanel({ offers, onSelectionChang
                         </div>
                       </>
                     ) : (
-                      <span data-testid="archived-dimension-value" className={styles.archivedValue}>{draftValues[key] || '尚未填写'}</span>
+                      <span data-testid="archived-dimension-value" className={styles.archivedValue}>{draftValues[key] || '尚未填写'}{active ? ' · 历史未绑定，仅可查看' : ''}</span>
                     )}
                   </div>
                 );

@@ -46,6 +46,7 @@ export default function OfferCenterView({
   const [compareOpen, setCompareOpen] = useState(false);
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
   const [selectedDimensionIds, setSelectedDimensionIds] = useState<number[]>([]);
+  const [comparisonRefresh, setComparisonRefresh] = useState(0);
   const [entryRequestToken, setEntryRequestToken] = useState<string | null>(null);
   const lastCreateRequestTokenRef = useRef<number | undefined>(
     typeof createRequestToken === 'number' ? createRequestToken : undefined,
@@ -137,12 +138,13 @@ export default function OfferCenterView({
             dimensionIds={selectedDimensionIds}
             onCoach={onCoach}
             onNegotiation={handleOpenNegotiation}
+            onEdit={openEditOffer}
+            onAdjustOffers={() => setCompareOpen(false)}
+            refreshKey={comparisonRefresh}
+            dimensionSettings={<OfferComparisonDimensionPanel offers={selectedOffers} selectedDimensionIds={selectedDimensionIds} onSelectionChange={setSelectedDimensionIds} onChanged={() => setComparisonRefresh((value) => value + 1)} />}
           />
         </div>
-        <details>
-          <summary>设置比较维度</summary>
-          <OfferComparisonDimensionPanel offers={selectedOffers} onSelectionChange={setSelectedDimensionIds} />
-        </details>
+        <AddOfferForm open={addOpen} onClose={() => setAddOpen(false)} applications={applications} editing={editing} requestToken={entryRequestToken} />
       </div>
     );
   }

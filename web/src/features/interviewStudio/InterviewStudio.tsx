@@ -29,6 +29,7 @@ import {
 } from './interviewStudioController';
 import { buildEvidenceEntries, evidenceKey, type StudioEvidenceEntry } from './evidenceLocator';
 import styles from './InterviewStudio.module.css';
+import { EvidenceTechnicalDetails } from '@/components/ui/EvidenceTechnicalDetails';
 import ContinuousVoiceModePanel from './ContinuousVoiceModePanel';
 
 export interface InterviewStudioContext {
@@ -1117,7 +1118,7 @@ export default function InterviewStudio({ context, onClose, onActivityChange, on
               </div>
               <div className={styles.sourceCard}><FileTextOutlined /><div><strong>简历 · 已选快照</strong><p>已使用候选人确认的第 {context.resumeId} 份简历快照；原始内容不会在 Studio 中编辑。</p></div></div>
               <div className={styles.evidenceList} aria-label="当前问题引用"><strong>当前问题引用</strong>{currentEvidence.length ? currentEvidence.map((entry) => (
-                <button type="button" key={entry.key} className={styles.evidenceExcerpt} data-evidence-key={entry.key} data-evidence-active={selectedEvidenceKey === entry.key} onClick={() => focusEvidence(entry)}><span>{entry.label}</span><q>{entry.excerpt}</q></button>
+                <div key={entry.key}><button type="button" className={styles.evidenceExcerpt} data-evidence-key={entry.key} data-evidence-active={selectedEvidenceKey === entry.key} onClick={() => focusEvidence(entry)}><span>{entry.label}</span><q>{entry.excerpt}</q></button><EvidenceTechnicalDetails path={entry.path} /></div>
               )) : <p className={styles.emptyEvidence}>当前问题的来源正在整理，旧历史仍保持只读。</p>}</div>
               <div className={styles.sourceNote}>快速练习只关联 Practice Case，不会写入投递、日程、Knowledge、Memory、Story 或 Offer。</div>
             </section>

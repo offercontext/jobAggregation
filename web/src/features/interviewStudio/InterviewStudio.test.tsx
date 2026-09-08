@@ -512,7 +512,7 @@ describe('InterviewStudio continuous voice integration', () => {
     expect(host!.querySelector('[aria-label="回答工作台"]')).not.toBeNull();
     const startCalls = serviceSpies.start.mock.calls.length;
 
-    await act(async () => { button('冻结 JD').click(); });
+    await act(async () => { button('岗位描述 · 本次练习快照').click(); });
     expect(host!.querySelectorAll<HTMLElement>('[role="tab"]')[1]?.getAttribute('aria-selected')).toBe('true');
     expect(host!.querySelector('[aria-label="本轮依据"]')).not.toBeNull();
     await act(async () => { host!.querySelectorAll<HTMLButtonElement>('[role="tab"]')[0]?.click(); });

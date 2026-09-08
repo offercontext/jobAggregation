@@ -68,7 +68,8 @@ const proposal: MaterialRevisionProposal = {
 it('names the proposed resume section in Chinese instead of exposing machine paths', () => {
   const view = render();
   expect(view.textContent).toContain('工作经历1 · 经历亮点 1');
-  expect(view.textContent).not.toContain('/experience/0/highlights/0');
+  const path = [...view.querySelectorAll('code')].find((node) => node.textContent === '/experience/0/highlights/0');
+  expect(path?.closest('details')?.open).toBe(false);
   expect(view.textContent).toContain('Built APIs');
   expect(view.textContent).toContain('Built FastAPI APIs');
 });
@@ -164,8 +165,9 @@ describe('MaterialProposalReviewModal', () => {
     expect(view.textContent).toContain('用户断言');
     expect(view.textContent).toContain('工作经历1 · 经历亮点 1：Built APIs');
     expect(view.textContent).toContain('我的补充说明 1：I led the migration.');
-    expect(view.textContent).not.toContain('/resume/content_json/');
-    expect(view.textContent).not.toContain('/user_assertions/');
+    for (const node of view.querySelectorAll('code')) {
+      expect(node.closest('details')?.open).toBe(false);
+    }
   });
 
   it('shows a fixed Chinese empty state without rendering the model empty summary', () => {

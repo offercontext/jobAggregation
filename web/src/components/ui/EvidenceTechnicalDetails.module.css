@@ -1,0 +1,16 @@
+.details {
+  margin-block: 6px 10px;
+  color: var(--op-muted);
+  font-size: 12px;
+}
+
+.details summary {
+  width: fit-content;
+  cursor: pointer;
+}
+
+.details code {
+  display: block;
+  padding-block: 6px;
+  overflow-wrap: anywhere;
+}

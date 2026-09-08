@@ -87,6 +87,22 @@ describe('InterviewPreparationProposalDrawer interaction', () => {
     };
   }
 
+  it('shows readable evidence locations and keeps exact paths in closed details', async () => {
+    const result = proposalResult();
+    const path = '/resume/content_json/experience/0/highlights/1';
+    await act(async () => {
+      root?.render(<InterviewPreparationProposalDrawer open context={context} onClose={() => {}}
+        initialProposal={{ ...result, proposal_status: 'normal', source_fingerprint: 'test', proposal_hash: 'test', created_at: '2026-09-08', attempt_status: 'ready', source_status: 'current', proposal: { ...result.proposal, preparation_directions: [{ id: 'direction-1', text: '准备重构案例', evidence_refs: [{ source: 'resume', path, excerpt: '完善异常处理' }] }] } }} />);
+    });
+    expect(container?.textContent).toContain('选定简历 · 工作经历1 · 经历亮点 2');
+    const details = container?.querySelector('details');
+    expect(details?.open).toBe(false);
+    expect(details?.querySelector('code')?.textContent).toBe(path);
+    await act(async () => { details?.querySelector('summary')?.click(); });
+    expect(details?.open).toBe(true);
+    expect(service.create).not.toHaveBeenCalled();
+  });
+
   it('records a pending attempt before the generation request settles', async () => {
     const request = deferred<ReturnType<typeof proposalResult>>();
     service.create.mockReturnValue(request.promise);

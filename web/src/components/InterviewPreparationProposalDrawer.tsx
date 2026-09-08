@@ -14,6 +14,8 @@ import { ReadinessFeedbackAdvisory } from '@/features/reviewReadiness/ReadinessF
 import type { ReadinessPracticeLaunch } from '@/features/reviewReadiness/contracts';
 import { SourceStateTag } from './ui/SourceStateTag';
 import workflowStyles from './ui/WorkflowSurface.module.css';
+import { evidenceLocationLabel, evidenceSourceLabel } from '@/lib/evidencePresentation';
+import { EvidenceTechnicalDetails } from './ui/EvidenceTechnicalDetails';
 
 export interface InterviewPreparationDrawerContext {
   applicationId: number;
@@ -109,9 +111,9 @@ function Evidence({ item }: { item: InterviewPreparationItem }) {
     <div>
       {item.evidence_refs.map((ref, index) => (
         <div key={`${ref.source}-${ref.path}-${index}`}>
-          <span>{ref.source === 'jd' ? '岗位描述' : ref.source === 'resume' ? '选定简历' : '已确认 Knowledge Evidence'}</span>
-          <code>{ref.path}</code>
+          <strong>{evidenceSourceLabel(ref.source)} · {evidenceLocationLabel(ref.source, ref.path)}</strong>
           <blockquote>{ref.excerpt}</blockquote>
+          <EvidenceTechnicalDetails path={ref.path} />
         </div>
       ))}
     </div>

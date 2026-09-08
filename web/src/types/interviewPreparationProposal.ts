@@ -1,4 +1,4 @@
-export type InterviewPreparationEvidenceSource = 'jd' | 'resume' | 'knowledge_evidence';
+export type InterviewPreparationEvidenceSource = 'jd' | 'resume' | 'knowledge_evidence' | 'confirmed_readiness_feedback';
 
 export interface InterviewPreparationEvidenceRef {
   source: InterviewPreparationEvidenceSource;

@@ -1,3 +1,5 @@
+import { evidenceLocationLabel, evidenceSourceLabel } from '@/lib/evidencePresentation';
+
 export interface StudioEvidenceReference {
   source: string;
   path: string;
@@ -21,9 +23,9 @@ function turnNumber(path: string): string | null {
 function labelFor(reference: StudioEvidenceReference): string {
   const turn = reference.source === 'turn' ? turnNumber(reference.path) : null;
   if (turn) return `上一轮回答 · 第 ${turn} 轮`;
-  if (reference.source === 'jd') return `冻结 JD · ${reference.path}`;
-  if (reference.source === 'resume') return `冻结简历 · ${reference.path}`;
-  return `${reference.source} · ${reference.path}`;
+  if (reference.source === 'jd') return '岗位描述 · 本次练习快照';
+  if (reference.source === 'resume') return `简历快照 · ${evidenceLocationLabel(reference.source, reference.path)}`;
+  return `${evidenceSourceLabel(reference.source)} · ${evidenceLocationLabel(reference.source, reference.path)}`;
 }
 
 export function buildEvidenceEntries(
